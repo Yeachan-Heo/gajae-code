@@ -18,8 +18,10 @@
  * the per-target adapters so this file stays small enough to audit.
  */
 import * as nodeCrypto from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { exactUnlinkDirect, type NativeExactFileIdentity } from "@gajae-code/natives";
 
 /** Serialization Paseo itself produces. Verified byte-identical against the live config. */
 export function serializeJson(value: unknown): string {
@@ -36,7 +38,8 @@ export const ABSENT_IDENTITY = "absent";
 export type PublishRefusal =
 	| { readonly reason: "parse-refusal"; readonly detail: string }
 	| { readonly reason: "format-drift"; readonly detail: string }
-	| { readonly reason: "cas-conflict"; readonly expected: string; readonly actual: string };
+	| { readonly reason: "cas-conflict"; readonly expected: string; readonly actual: string }
+	| { readonly reason: "sidecar-conflict"; readonly detail: string };
 
 export class PaseoPublishError extends Error {
 	readonly refusal: PublishRefusal;
@@ -58,6 +61,8 @@ function describeRefusal(targetPath: string, refusal: PublishRefusal): string {
 			return `Refusing to write ${targetPath}: ${refusal.detail}. GJC only edits files it can rewrite byte-for-byte, so it will not reformat a file it did not author.`;
 		case "cas-conflict":
 			return `Refusing to write ${targetPath}: the file changed while GJC was preparing its update. Re-run to pick up the current contents.`;
+		case "sidecar-conflict":
+			return `Refusing to preserve the replaced provider value at ${targetPath}: ${refusal.detail}. Inspect or remove the existing sidecar, then re-run.`;
 	}
 }
 
@@ -260,4 +265,167 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 	// `fs.open` honors the mode only on creation, so an existing backup path
 	// keeps its old permissions unless we set them explicitly.
 	await fs.chmod(to, mode);
+}
+/**
+ * Where a pre-`--force` provider value is preserved for a later restore.
+ *
+ * The replaced entry can carry credential-bearing `env` or argument values, so
+ * it must never be serialized into GJC's own provenance ledger or intent record.
+ * Instead it lives in a deterministic, mode-0600 sidecar beside Paseo's own
+ * config file -- the same directory and the same privacy rule the publish-step
+ * backups already use -- and the ledger records only the pointer.
+ *
+ * The name is INJECTIVE in the raw provider key (#4644 review r8): the visible
+ * part is sanitized for readability, and a digest of the exact key is appended
+ * so two distinct keys that sanitize identically (`a/b` and `a_b`) can never
+ * share one sidecar. A shared path would let the second `--force` rename over
+ * the first key's only preserved copy of the user's value.
+ */
+export function replacedProviderBackupPath(configJsonPath: string, providerKey: string): string {
+	const safeKey = providerKey.replace(/[^a-zA-Z0-9_-]/gu, "_");
+	const keyDigest = nodeCrypto.createHash("sha256").update(providerKey, "utf8").digest("hex").slice(0, 16);
+	return `${configJsonPath}.gjc-replaced-${safeKey}-${keyDigest}.json`;
+}
+
+/**
+ * Write the pre-`--force` value of one provider key into its private sidecar.
+ *
+ * Publication is no-clobber: the staged bytes are linked into place, so an
+ * existing sidecar is never replaced. A sidecar that already holds this key's
+ * exact value makes the write idempotent; anything else (a different value for
+ * the same key, a foreign or tampered file on the injective path) fails closed
+ * instead of destroying the only preserved copy of the user's value.
+ */
+export async function writeReplacedProviderBackup(
+	configJsonPath: string,
+	providerKey: string,
+	value: unknown,
+): Promise<ReplacedProviderBackupRef> {
+	const backupPath = replacedProviderBackupPath(configJsonPath, providerKey);
+	const valueSha256 = hashBytes(serializeJson(value));
+	const payload = serializeJson({ key: providerKey, value });
+	const temporary = `${backupPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
+	const handle = await fs.open(temporary, "w", BACKUP_MODE);
+	try {
+		await handle.writeFile(payload, "utf8");
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	// `fs.open` honors the mode only on creation, so set it explicitly.
+	await fs.chmod(temporary, BACKUP_MODE);
+	try {
+		// `link` fails with EEXIST when the sidecar already exists: a rename
+		// would silently replace it, and the FIRST preserved value is the
+		// user's by contract.
+		await fs.link(temporary, backupPath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
+		if (!existing.found) {
+			throw new PaseoPublishError(backupPath, {
+				reason: "sidecar-conflict",
+				detail: `a replaced-provider sidecar already exists at this path with different content for key ${providerKey}`,
+			});
+		}
+		// Idempotent: the existing sidecar already preserves exactly this value.
+	} finally {
+		await fs.rm(temporary, { force: true }).catch(() => undefined);
+	}
+	return { backupPath, valueSha256 };
+}
+
+/** Pointer + integrity digest for one preserved pre-`--force` provider value. */
+export interface ReplacedProviderBackupRef {
+	readonly backupPath: string;
+	/** Hash of the preserved value exactly as serialized into the sidecar. */
+	readonly valueSha256: string;
+}
+
+/** Outcome of reading a replaced-provider sidecar: a `null` prior is a value too. */
+export type ReplacedProviderBackup = { readonly found: true; readonly value: unknown } | { readonly found: false };
+
+/**
+ * Read one provider key's preserved prior value. A missing, corrupt,
+ * key-mismatched, or CONTENT-ALTERED sidecar reports `found: false`, which
+ * callers must treat as a fail-closed condition rather than deleting content it
+ * was meant to restore. The ledger-recorded digest binds the sidecar's bytes to
+ * the record: substituting the sidecar (or swapping a symlink onto its path)
+ * cannot steer the value restoration.
+ */
+export async function readReplacedProviderBackup(
+	backupPath: string,
+	providerKey: string,
+	expectedSha256: string,
+): Promise<ReplacedProviderBackup> {
+	try {
+		// The read is fd-bound and symlink-rejecting (#4644 review r9): the path
+		// is opened with O_NOFOLLOW where the platform provides it, so a symlink
+		// swapped onto the sidecar path fails the open outright instead of
+		// redirecting restoration at attacker-controlled JSON; the regular-file
+		// check and the bytes then share one handle identity. Platforms without
+		// O_NOFOLLOW keep the fstat regular-file check on the same fd.
+		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
+		let bytes: string;
+		try {
+			const stat = await handle.stat();
+			if (!stat.isFile()) return { found: false };
+			bytes = await new Response(await handle.readFile()).text();
+		} finally {
+			await handle.close();
+		}
+		const parsed = JSON.parse(bytes) as { key?: unknown; value?: unknown };
+		if (parsed.key !== providerKey) return { found: false };
+		if (hashBytes(serializeJson(parsed.value)) !== expectedSha256) return { found: false };
+		return { found: true, value: parsed.value };
+	} catch {
+		return { found: false };
+	}
+}
+
+/**
+ * Delete a sidecar only while its authenticated regular-file identity still
+ * owns the pathname. `fs.rm()` after a successful fd-bound read reopens a
+ * destructive pathname race: a replacement could be deleted after the
+ * original sidecar was authenticated. The native exact-unlink protocol
+ * compares the captured inode, bytes, and parent identity atomically before
+ * detaching its private quarantine, so a successor is preserved.
+ */
+export async function removeReplacedProviderBackup(
+	backupPath: string,
+	providerKey: string,
+	expectedSha256: string,
+): Promise<boolean> {
+	try {
+		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
+		let bytes: Buffer;
+		let stat: BigIntStats;
+		try {
+			stat = await handle.stat({ bigint: true });
+			if (!stat.isFile()) return false;
+			bytes = await handle.readFile();
+		} finally {
+			await handle.close();
+		}
+		const parsed = JSON.parse(bytes.toString("utf8")) as { key?: unknown; value?: unknown };
+		if (parsed.key !== providerKey || hashBytes(serializeJson(parsed.value)) !== expectedSha256) return false;
+		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
+		if (!parent.isDirectory()) return false;
+		const identity: NativeExactFileIdentity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+			quarantineName: `.gjc-paseo-sidecar-${process.pid}-${nodeCrypto.randomUUID()}`,
+		};
+		return exactUnlinkDirect(backupPath, identity).ok;
+	} catch {
+		return false;
+	}
 }

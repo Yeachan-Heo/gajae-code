@@ -121,7 +121,7 @@ export function hasProviderConflict(
 	};
 }
 
-export function providerEntryHash(entry: PaseoProviderEntry): string {
+export function providerEntryHash(entry: PaseoProviderEntry | Record<string, unknown>): string {
 	return hashBytes(JSON.stringify(entry));
 }
 

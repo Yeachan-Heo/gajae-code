@@ -114,6 +114,8 @@ export interface JsonStepInput {
 	readonly provenancePath: string;
 	readonly intentPath: string;
 	readonly ownedKeys: readonly string[];
+	/** Target identity the step's decisions were computed from; a mismatch refuses. */
+	readonly expectedPreflightIdentity?: string;
 	/** Mutates the parsed target in place. */
 	readonly mutate: (draft: Record<string, unknown>) => void;
 	/** Produces the ledger that must exist once this step commits. */
@@ -122,6 +124,10 @@ export interface JsonStepInput {
 	readonly revert: (draft: Record<string, unknown>) => void;
 	/** Produces the ledger that must exist once this step is undone. */
 	readonly revertLedger: (ledger: ProvenanceLedger) => ProvenanceLedger;
+	/** Durable artifacts this step's ledger references. Runs only after the target's CAS publish succeeded and before the ledger commit, so a refused or conflicting publish leaves no orphaned artifact. */
+	readonly persist?: () => Promise<void>;
+	/** Removes what {@link persist} created; runs after a successful undo. */
+	readonly unpersist?: () => Promise<void>;
 	readonly now: Date;
 }
 
@@ -141,6 +147,17 @@ export interface JsonStepOutput {
  */
 export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput> {
 	const current = await readTarget(input.targetPath);
+	// Ownership and seed decisions were derived from the caller's preflight
+	// snapshot. A target that changed since must not be mutated under decisions
+	// computed from different bytes (a concurrent user edit between preflight
+	// and this step would be overwritten while provenance claims the stale
+	// pre-state): refuse and let the operator re-run against current bytes.
+	if (input.expectedPreflightIdentity !== undefined && current.identity !== input.expectedPreflightIdentity) {
+		throw new SagaStepError(
+			input.label,
+			`${input.targetPath} changed after setup inspected it; refusing to publish decisions computed from older bytes. Re-run gjc setup paseo.`,
+		);
+	}
 	const plan = planPublish(current, input.mutate);
 
 	const ledgerBefore = await readProvenance(input.provenancePath);
@@ -168,6 +185,13 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 	await writeIntent(input.intentPath, intent);
 
 	let backupPath: string | undefined;
+	let publishSucceeded = false;
+	// #4644 review r14: track whether the persist hook was ATTEMPTED, not
+	// only whether it resolved. `persist` can create the durable artifact and
+	// then throw (a post-creation validation failure); cleanup must remove
+	// the artifact on every post-publish failure, so "attempted" is the
+	// condition — an unattempted persist created nothing to remove.
+	let persistAttempted = false;
 	try {
 		const published = await publishPlan(input.targetPath, plan, {
 			expectedIdentity: current.identity,
@@ -175,8 +199,57 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			now: input.now,
 		});
 		backupPath = published.backupPath;
+		publishSucceeded = published.published;
+		// Durable artifacts the ledger is about to reference are created only
+		// now, inside the same CAS boundary: a refused or conflicting publish
+		// (#4644 review r8) must leave no orphaned artifact behind.
+		if (input.persist) {
+			persistAttempted = true;
+			await input.persist();
+		}
 		await writeProvenance(input.provenancePath, ledgerAfter);
 	} catch (error) {
+		// The publish already succeeded, so any failure before the ledger
+		// commit must undo the publication AND remove the artifact this step
+		// created (#4644 reviews r8/r10): leaving the target carrying this
+		// step's write with no provenance would strand an unowned overwrite,
+		// and leaving a persisted sidecar behind would orphan a
+		// credential-bearing file nothing references. When the rollback itself
+		// fails, the intent record deliberately stays for recovery instead.
+		if (publishSucceeded) {
+			let reverted = false;
+			try {
+				const observed = await currentIdentity(input.targetPath);
+				if (observed === plan.expectedIdentity) {
+					const afterPublish = await readTarget(input.targetPath);
+					const undoPlan = planPublish(afterPublish, input.revert);
+					await publishPlan(input.targetPath, undoPlan, {
+						expectedIdentity: afterPublish.identity,
+						backup: false,
+						now: input.now,
+					});
+					reverted = true;
+				}
+				// A DIFFERENT identity means someone else changed the target
+				// after our publish: the rollback deliberately does not
+				// overwrite it, and that is NOT a successful rollback (#4644
+				// review r15). The published write is now unprovenanced and
+				// unrecoverable by us, so the intent record must SURVIVE for
+				// the next run's recovery classification and the persisted
+				// artifact must stay (the intent's ledger payload still
+				// references it). reverted stays false on this path.
+			} catch {
+				reverted = false;
+			}
+			if (reverted) {
+				// Any ATTEMPTED persist may have created the artifact before
+				// throwing (#4644 review r14): cleanup removes it whether or
+				// not the hook resolved, so no credential-bearing sidecar is
+				// ever left unreferenced.
+				if (persistAttempted && input.unpersist) await input.unpersist();
+				await clearIntent(input.intentPath);
+			}
+		}
 		throw new SagaStepError(input.label, error instanceof Error ? error.message : String(error), [
 			input.intentPath,
 			...(backupPath ? [backupPath] : []),
@@ -205,6 +278,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 					now: input.now,
 				});
 				await writeProvenance(input.provenancePath, input.revertLedger(await readProvenance(input.provenancePath)));
+				if (persistAttempted && input.unpersist) await input.unpersist();
 				return { status: "reverted" };
 			},
 		},
@@ -266,7 +340,14 @@ export async function recoverIntent(
 	intentPath: string,
 	options: RecoverIntentOptions = { repair: false },
 ): Promise<{ recovered: boolean; detail: string } | undefined> {
-	const intent = await readIntent(intentPath);
+	let intent: IntentRecord | undefined;
+	try {
+		intent = await readIntent(intentPath);
+	} catch (error) {
+		// A corrupt intent is an explicit refusal (#4644 review r10): never
+		// proceed as if the record were absent.
+		return { recovered: false, detail: error instanceof Error ? error.message : String(error) };
+	}
 	if (!intent) return undefined;
 	const recovery = await classifyIntent(intent);
 	if (recovery.action === "refuse") return { recovered: false, detail: recovery.detail };

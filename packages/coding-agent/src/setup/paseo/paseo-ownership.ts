@@ -22,14 +22,42 @@ import { ABSENT_IDENTITY, currentIdentity, serializeJson } from "./json-publishe
 export const PROVENANCE_VERSION = 1;
 export const INTENT_VERSION = 1;
 
+/** Pointer to the private sidecar holding a `--force`-replaced provider entry. */
+export interface ProviderReplacedRef {
+	/** Absolute path of the mode-0600 sidecar beside Paseo's own config file. */
+	readonly backupPath: string;
+	/** Digest of the preserved value, binding the sidecar's bytes to this record. */
+	readonly valueSha256: string;
+}
+
 export interface ProvenanceLedger {
 	readonly version: number;
 	/** `agents.providers` keys GJC created, mapped to the value hash it wrote. */
 	readonly providerKeys: Record<string, string>;
+	/**
+	 * `agents.providers` keys that already existed when GJC ran and whose value
+	 * equaled GJC's desired entry. GJC wrote nothing at those keys, so it never
+	 * owns them; the marker keeps a convergence re-run from adopting them.
+	 * Optional because ledgers written before this field existed never carry it.
+	 */
+	readonly providerPreexistingKeys?: Record<string, true>;
+	/**
+	 * For `--force` overwrites, a pointer to the private mode-0600 sidecar that
+	 * preserves the exact provider entry GJC replaced. `--remove` restores from
+	 * that sidecar instead of deleting the key, because the replaced content was
+	 * never GJC's to take. The value itself lives only in the sidecar beside
+	 * Paseo's own config -- never in this ledger or the intent record -- because
+	 * a provider entry can carry credential-bearing `env` or argument values and
+	 * GJC-side state is credential-free by contract. Optional for the same
+	 * legacy-ledger reason.
+	 */
+	readonly providerReplacedEntries?: Record<string, ProviderReplacedRef>;
 	/** Orchestration role keys GJC actually seeded, mapped to the value it wrote. */
 	readonly seededOrchestrationKeys: Record<string, string>;
 	/** Bridge directory path GJC created, when it created it. */
 	readonly bridgePath?: string;
+	/** Source directory the bridge entries were linked from, so `--remove` can verify targets. */
+	readonly bridgeSourceDir?: string;
 	/** Bridge entries GJC created, so the inverse removes exactly those. */
 	readonly bridgeEntries?: readonly string[];
 	/** True when GJC created the bridge directory itself (as opposed to populating an existing one). */
@@ -39,8 +67,19 @@ export interface ProvenanceLedger {
 export const EMPTY_LEDGER: ProvenanceLedger = {
 	version: PROVENANCE_VERSION,
 	providerKeys: {},
+	providerPreexistingKeys: {},
+	providerReplacedEntries: {},
 	seededOrchestrationKeys: {},
 };
+
+export class ProvenanceLedgerCorruptError extends Error {
+	constructor(provenancePath: string, detail: string) {
+		super(
+			`Paseo provenance ledger is corrupt (${provenancePath}): ${detail}. Restore it from a backup or delete it after confirming no Paseo bridge links are live; GJC will not guess ownership from a damaged record.`,
+		);
+		this.name = "ProvenanceLedgerCorruptError";
+	}
+}
 
 export async function readProvenance(provenancePath: string): Promise<ProvenanceLedger> {
 	let raw: string;
@@ -52,31 +91,117 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 	}
 	try {
 		const parsed = JSON.parse(raw) as Partial<ProvenanceLedger>;
+		// Every field that is PRESENT but malformed is corruption, not a
+		// default: silently replacing it with an empty value would let removal
+		// act on a partially tampered record (a dropped replaced-provider
+		// pointer deletes the user's key without restoring it; a filtered
+		// bridgeEntries list abandons links the record still owns). Absent
+		// fields stay defaulted so older ledger shapes keep reading.
+		const strictStringRecord = (value: unknown, field: string): Record<string, string> => {
+			if (value === undefined) return {};
+			if (!isStringRecord(value)) throw new Error(`${field} is present but not a string record`);
+			return value;
+		};
+		if (parsed.version !== undefined && typeof parsed.version !== "number") {
+			throw new Error("version is present but not a number");
+		}
+		if (parsed.providerPreexistingKeys !== undefined && !isTrueRecord(parsed.providerPreexistingKeys)) {
+			throw new Error("providerPreexistingKeys is present but not a boolean record");
+		}
+		if (
+			parsed.providerReplacedEntries !== undefined &&
+			!isProviderReplacedRefRecord(parsed.providerReplacedEntries)
+		) {
+			throw new Error("providerReplacedEntries is present but not a replaced-ref record");
+		}
+		if (parsed.bridgePath !== undefined && typeof parsed.bridgePath !== "string") {
+			throw new Error("bridgePath is present but not a string");
+		}
+		if (parsed.bridgeSourceDir !== undefined && typeof parsed.bridgeSourceDir !== "string") {
+			throw new Error("bridgeSourceDir is present but not a string");
+		}
+		if (parsed.bridgeDirCreated !== undefined && typeof parsed.bridgeDirCreated !== "boolean") {
+			throw new Error("bridgeDirCreated is present but not a boolean");
+		}
+		if (parsed.bridgeEntries !== undefined) {
+			if (!Array.isArray(parsed.bridgeEntries)) throw new Error("bridgeEntries is present but not an array");
+			if (!parsed.bridgeEntries.every(entry => typeof entry === "string")) {
+				throw new Error("bridgeEntries contains a non-string entry");
+			}
+		}
 		return {
 			version: typeof parsed.version === "number" ? parsed.version : PROVENANCE_VERSION,
-			providerKeys: isStringRecord(parsed.providerKeys) ? parsed.providerKeys : {},
-			seededOrchestrationKeys: isStringRecord(parsed.seededOrchestrationKeys) ? parsed.seededOrchestrationKeys : {},
+			providerKeys: strictStringRecord(parsed.providerKeys, "providerKeys"),
+			providerPreexistingKeys: isTrueRecord(parsed.providerPreexistingKeys) ? parsed.providerPreexistingKeys : {},
+			providerReplacedEntries: isProviderReplacedRefRecord(parsed.providerReplacedEntries)
+				? parsed.providerReplacedEntries
+				: {},
+			seededOrchestrationKeys: strictStringRecord(parsed.seededOrchestrationKeys, "seededOrchestrationKeys"),
 			...(typeof parsed.bridgePath === "string" ? { bridgePath: parsed.bridgePath } : {}),
-			...(Array.isArray(parsed.bridgeEntries)
-				? { bridgeEntries: parsed.bridgeEntries.filter((entry): entry is string => typeof entry === "string") }
-				: {}),
+			...(typeof parsed.bridgeSourceDir === "string" ? { bridgeSourceDir: parsed.bridgeSourceDir } : {}),
+			...(Array.isArray(parsed.bridgeEntries) ? { bridgeEntries: parsed.bridgeEntries } : {}),
 			...(typeof parsed.bridgeDirCreated === "boolean" ? { bridgeDirCreated: parsed.bridgeDirCreated } : {}),
 		};
-	} catch {
-		// A corrupt GJC-side ledger must not brick removal: treat it as empty so
-		// nothing is deleted on unproven ownership, which is the safe direction.
-		return EMPTY_LEDGER;
+	} catch (error) {
+		// A corrupt GJC-side ledger is an explicit recovery error, not an empty
+		// ledger: treating it as empty would silently discard every ownership
+		// record while the links those records cover are still live, defeating
+		// the record-before-mutation guarantee.
+		throw new ProvenanceLedgerCorruptError(provenancePath, error instanceof Error ? error.message : String(error));
 	}
 }
 
+function isProviderReplacedRefRecord(value: unknown): value is Record<string, ProviderReplacedRef> {
+	if (!isRecord(value)) return false;
+	for (const ref of Object.values(value)) {
+		if (
+			!isRecord(ref) ||
+			typeof ref.backupPath !== "string" ||
+			!path.isAbsolute(ref.backupPath) ||
+			typeof ref.valueSha256 !== "string"
+		) {
+			return false;
+		}
+	}
+	return true;
+}
 function isStringRecord(value: unknown): value is Record<string, string> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	// Every VALUE must be a string too (#4644 review r10): `{gjc: 7}` is a
+	// malformed record, not a valid string record, and accepting it would let
+	// a tampered ledger carry non-string provenance through fail-closed checks.
+	return Object.values(value).every(entry => typeof entry === "string");
+}
+function isTrueRecord(value: unknown): value is Record<string, true> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	return Object.values(value).every(entry => entry === true);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 export async function writeProvenance(provenancePath: string, ledger: ProvenanceLedger): Promise<void> {
 	await fs.mkdir(path.dirname(provenancePath), { recursive: true, mode: 0o700 });
-	await Bun.write(provenancePath, serializeJson(ledger));
-	await fs.chmod(provenancePath, 0o600);
+	// Write-then-rename: an interrupted Bun.write can leave a truncated file,
+	// which would otherwise read back as a corrupt (now explicit-error) ledger
+	// and strand every published link without ownership metadata. The temporary
+	// is fsynced before the rename so the record is durable once visible.
+	const temporary = `${provenancePath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	const payload = serializeJson(ledger);
+	try {
+		const handle = await fs.open(temporary, "w", 0o600);
+		try {
+			await handle.writeFile(payload, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await fs.rename(temporary, provenancePath);
+	} catch (error) {
+		await fs.rm(temporary, { force: true }).catch(() => undefined);
+		throw error;
+	}
 }
 
 /**
@@ -135,8 +260,35 @@ export interface IntentRecord {
 
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
 	await fs.mkdir(path.dirname(intentPath), { recursive: true, mode: 0o700 });
-	await Bun.write(intentPath, serializeJson(intent));
-	await fs.chmod(intentPath, 0o600);
+	// Write-then-rename with fsync (#4644 review r10), exactly like the
+	// provenance ledger: a truncated intent would read back as absent and
+	// recovery would proceed without the record that reconciles a published
+	// target with its ledger.
+	const temporary = `${intentPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+	const payload = serializeJson(intent);
+	try {
+		const handle = await fs.open(temporary, "w", 0o600);
+		try {
+			await handle.writeFile(payload, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		await fs.rename(temporary, intentPath);
+	} catch (error) {
+		await fs.rm(temporary, { force: true }).catch(() => undefined);
+		throw error;
+	}
+}
+
+/** A present-but-malformed intent record: recovery must refuse, not proceed as if absent. */
+export class IntentRecordCorruptError extends Error {
+	constructor(intentPath: string, detail: string) {
+		super(
+			`Paseo intent record is corrupt (${intentPath}): ${detail}. Delete it only after confirming no Paseo setup step was interrupted; GJC will not guess recovery from a damaged record.`,
+		);
+		this.name = "IntentRecordCorruptError";
+	}
 }
 
 export async function readIntent(intentPath: string): Promise<IntentRecord | undefined> {
@@ -147,13 +299,70 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
 	}
+	// A record that is PRESENT but unparseable or wrong-shaped is corruption,
+	// not absence (#4644 review r10): treating it as absent would let recovery
+	// run without the evidence that reconciles a published target with its
+	// ledger. Callers surface this as a refusal.
 	try {
 		const parsed = JSON.parse(raw) as IntentRecord;
-		if (typeof parsed?.targetPath !== "string" || typeof parsed?.targetExpectedIdentity !== "string")
-			return undefined;
+		// EVERY field the recovery path trusts is validated here (#4644 review
+		// r13): a tampered record that kept only the two target fields could
+		// otherwise steer recovery at an arbitrary provenance path or replay a
+		// crafted ledger payload.
+		const stringField = (value: unknown, name: string): string => {
+			if (typeof value !== "string" || value.length === 0) {
+				throw new IntentRecordCorruptError(intentPath, `${name} is missing or not a string`);
+			}
+			return value;
+		};
+		stringField(parsed?.targetPath, "targetPath");
+		stringField(parsed?.targetExpectedIdentity, "targetExpectedIdentity");
+		stringField(parsed?.targetPreflightIdentity, "targetPreflightIdentity");
+		stringField(parsed?.provenancePath, "provenancePath");
+		stringField(parsed?.provenancePreflightIdentity, "provenancePreflightIdentity");
+		stringField(parsed?.provenanceExpectedIdentity, "provenanceExpectedIdentity");
+		stringField(parsed?.startedAt, "startedAt");
+		if (parsed?.step !== "provider-config" && parsed?.step !== "orchestration-preferences") {
+			throw new IntentRecordCorruptError(intentPath, "step is not a known intent step");
+		}
+		if (typeof parsed?.version !== "number") {
+			throw new IntentRecordCorruptError(intentPath, "version is not a number");
+		}
+		if (
+			!Array.isArray(parsed?.ownedKeys) ||
+			!parsed.ownedKeys.every(key => typeof key === "string" && key.length > 0)
+		) {
+			throw new IntentRecordCorruptError(intentPath, "ownedKeys is not a non-empty string array");
+		}
+		// The provenance path the record names must sit in the SAME agent
+		// directory tree as the intent record itself: recovery writes through
+		// it, so a tampered record must not redirect that write elsewhere.
+		// The check is CANONICAL (#4644 review r19): lexical path.relative can
+		// be satisfied through a symlinked ancestor that resolves outside the
+		// agent directory, so both trees are realpath-resolved first and a
+		// symlinked ancestry that redirects the record's tree out of the
+		// intent's tree is refused.
+		const intentDir = path.dirname(await fs.realpath(path.resolve(intentPath)).catch(() => path.resolve(intentPath)));
+		const namedProvenance = path.resolve(parsed.provenancePath);
+		const namedDir = await fs.realpath(path.dirname(namedProvenance)).catch(() => path.dirname(namedProvenance));
+		const rel = path.relative(intentDir, namedDir);
+		if (rel.startsWith("..") || path.isAbsolute(rel)) {
+			throw new IntentRecordCorruptError(
+				intentPath,
+				`the recorded provenance path (${parsed.provenancePath}) escapes the agent directory that holds the intent record`,
+			);
+		}
+		if (parsed?.provenancePayload !== undefined) {
+			// Shape-only validation; readProvenance's own strict validation runs
+			// before any payload is ever written.
+			if (typeof parsed.provenancePayload !== "object" || parsed.provenancePayload === null) {
+				throw new IntentRecordCorruptError(intentPath, "provenancePayload is not an object");
+			}
+		}
 		return parsed;
-	} catch {
-		return undefined;
+	} catch (error) {
+		if (error instanceof IntentRecordCorruptError) throw error;
+		throw new IntentRecordCorruptError(intentPath, error instanceof Error ? error.message : String(error));
 	}
 }
 

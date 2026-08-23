@@ -20,10 +20,10 @@ export type DriftReasonCode =
 	| "partial-install"
 	| "partial-removal"
 	| "orphan-skill"
-	| "unlinked-skill"
 	| "missing-provider-entry"
 	| "missing-bridge-link"
 	| "missing-skills-directory"
+	| "foreign-skill-link"
 	| "unseeded-orchestration-role";
 
 export interface DriftReason {
