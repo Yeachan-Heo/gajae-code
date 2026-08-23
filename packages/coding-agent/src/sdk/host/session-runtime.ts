@@ -3211,6 +3211,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
 			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
+			if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
 			// Resolve EVERY concurrent waiter for the aborted turn: the turn emits
 			// exactly one agent_end, and each admitted abort of it must observe the
 			// same publication result rather than a single latest-wins slot (review

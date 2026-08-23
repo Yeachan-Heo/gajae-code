@@ -11352,9 +11352,9 @@ export class AgentSession {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
 					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 					this.#sdkRunTokensByQueuedMessage.delete(message);
-					// A canceled follow-up is never promoted: release its
-					// promotion hook so the callback is not retained for the
-					// session lifetime (review thread P2).
+					// A canceled follow-up never reaches the normal promotion boundary,
+					// so terminalize its SDK owner through the same removal disposition.
+					this.#followUpPromotionHooks.get(message)?.({ removed: true });
 					this.#followUpPromotionHooks.delete(message);
 				}
 				return removed;
