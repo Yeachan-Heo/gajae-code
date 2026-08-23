@@ -109,6 +109,56 @@ describe("interactive background activity indicator", () => {
 		expect(renderStatus(mode)).toBe("");
 	});
 
+	it("preserves background activity and re-arms after settled terminal cleanup", async () => {
+		const ownerId = session.getAgentId();
+		if (!ownerId) throw new Error("Expected an owner id");
+		const background = Promise.withResolvers<string>();
+		pendingJobs.push(background);
+		const jobId = manager.register("task", "terminal-boundary activity", () => background.promise, { ownerId });
+		manager.registerSubagentRecord({
+			subagentId: "terminal-boundary-subagent",
+			ownerId,
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		await waitFor(() => mode.loadingAnimation !== undefined);
+
+		mode.ensureLoadingAnimation();
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const controller = new EventController(mode);
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		mode.syncActivityIndicator();
+		const backgroundLoader = mode.loadingAnimation;
+		if (!backgroundLoader) throw new Error("Expected background loader after agent_end");
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		mode.syncActivityIndicator();
+		expect(mode.loadingAnimation).toBe(backgroundLoader);
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		const releaseSuspension = mode.suspendActivityIndicator();
+		expect(renderStatus(mode)).toBe("");
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		releaseSuspension();
+		expect(mode.loadingAnimation).toBe(backgroundLoader);
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		await controller.handleEvent({ type: "agent_start" });
+		expect(renderStatus(mode)).toContain("Working…");
+		expect(renderStatus(mode)).toContain("1 background task");
+
+		background.resolve("done");
+		pendingJobs.pop();
+		await waitFor(() => manager.getAllJobs({ ownerId }).find(job => job.id === jobId)?.status === "completed");
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		await waitFor(() => mode.loadingAnimation === undefined);
+	});
+
 	it("schedules the startup crash relay hook from trusted global settings", async () => {
 		const debug = vi.spyOn(logger, "debug");
 		Settings.instance.set("crashReport.upstream", "sentry");
