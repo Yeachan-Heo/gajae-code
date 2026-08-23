@@ -10,7 +10,6 @@
  * never appear in any rendered line, and `applied` is reported only when the
  * transaction succeeded. All dynamic text is sanitized before rendering.
  */
-import * as os from "node:os";
 import { Container, matchesKey, type SelectItem, SelectList, Text } from "@gajae-code/tui";
 import { sanitizeText } from "@gajae-code/utils";
 import { applyImport, type BuildImportPreviewOptions, buildImportPreview } from "../../../customization/import";
@@ -85,11 +84,11 @@ export class ImportWizard extends Container {
 	#bodyText: Text;
 	#footerText: Text;
 
-	constructor(cwd: string, destinationScope: GjcScope, homeDir?: string, agentDir?: string) {
+	constructor(cwd: string, destinationScope: GjcScope, homeDir: string, agentDir?: string) {
 		super();
 		this.#cwd = cwd;
 		this.#destinationScope = destinationScope;
-		this.#homeDir = homeDir ?? os.homedir();
+		this.#homeDir = homeDir;
 		this.#agentDir = agentDir;
 
 		this.addChild(new DynamicBorder());

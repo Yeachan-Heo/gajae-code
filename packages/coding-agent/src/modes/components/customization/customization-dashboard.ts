@@ -19,7 +19,7 @@
  *   footer key hints
  */
 import { Container, matchesKey, type SelectItem, SelectList, Text } from "@gajae-code/tui";
-import { sanitizeText } from "@gajae-code/utils";
+import { getTrustedHomeDir, sanitizeText } from "@gajae-code/utils";
 import { type CustomizationInventory, loadCustomizationInventory } from "../../../customization/inventory";
 import {
 	removeHookFile,
@@ -95,11 +95,11 @@ export class CustomizationDashboard extends Container {
 	#footerText!: Text;
 	#wizard: ImportWizard | null = null;
 	#confirmRemove: InventoryRow | null = null;
-	#homeDir: string | undefined;
+	#homeDir: string;
 	#statusMessage: string | null = null;
 
 	/** Use `create()` — async inventory load runs before chrome construction. */
-	constructor(cwd: string, settings: CustomizationSettingsSlice | undefined, homeDir: string | undefined) {
+	constructor(cwd: string, settings: CustomizationSettingsSlice | undefined, homeDir: string) {
 		super();
 		this.#cwd = cwd;
 		this.#settings = settings;
@@ -111,7 +111,7 @@ export class CustomizationDashboard extends Container {
 		settings?: CustomizationSettingsSlice,
 		homeDir?: string,
 	): Promise<CustomizationDashboard> {
-		const dashboard = new CustomizationDashboard(cwd, settings, homeDir);
+		const dashboard = new CustomizationDashboard(cwd, settings, homeDir ?? getTrustedHomeDir());
 		await dashboard.#reload();
 		dashboard.#buildChrome();
 		return dashboard;
