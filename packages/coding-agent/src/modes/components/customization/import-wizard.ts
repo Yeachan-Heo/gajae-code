@@ -66,6 +66,7 @@ export class ImportWizard extends Container {
 
 	#cwd: string;
 	#homeDir: string;
+	#agentDir: string | undefined;
 	#destinationScope: GjcScope;
 	#step: WizardStep = "product";
 	#product: ImportProduct = "claude-code";
@@ -84,11 +85,12 @@ export class ImportWizard extends Container {
 	#bodyText: Text;
 	#footerText: Text;
 
-	constructor(cwd: string, destinationScope: GjcScope, homeDir?: string) {
+	constructor(cwd: string, destinationScope: GjcScope, homeDir?: string, agentDir?: string) {
 		super();
 		this.#cwd = cwd;
 		this.#destinationScope = destinationScope;
 		this.#homeDir = homeDir ?? os.homedir();
+		this.#agentDir = agentDir;
 
 		this.addChild(new DynamicBorder());
 		this.#headerText = new Text("", 0, 0);
@@ -134,6 +136,7 @@ export class ImportWizard extends Container {
 			collisionPolicy: this.#collisionPolicy,
 			cwd: this.#cwd,
 			homeDir: this.#homeDir,
+			agentDir: this.#agentDir,
 		};
 	}
 

@@ -199,6 +199,8 @@ export interface ImportPreview {
  */
 export interface ImportPlan {
 	preview: ImportPreview;
+	/** Global destination authority frozen at preview time. */
+	destinationAgentDir?: string;
 	payloads: readonly (NormalizedPayload | undefined)[];
 }
 

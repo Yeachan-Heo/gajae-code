@@ -55,6 +55,8 @@ export interface BuildImportPreviewOptions {
 	collisionPolicy: ImportCollisionPolicy;
 	cwd: string;
 	homeDir: string;
+	/** Owning session agent directory for a global destination. */
+	agentDir?: string;
 }
 
 const PROTECTED_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
@@ -347,7 +349,7 @@ async function readDestinationMcpState(mcpConfigPath: string): Promise<Destinati
  */
 export async function buildImportPreview(options: BuildImportPreviewOptions): Promise<ImportPlan> {
 	const surfaces = options.surfaces ?? (["skills", "hooks", "mcps"] as const);
-	const destination = resolveScopePaths(options.destinationScope, options.cwd);
+	const destination = resolveScopePaths(options.destinationScope, options.cwd, options.agentDir);
 	const entries: ImportPreviewEntry[] = [];
 	const payloads: (NormalizedPayload | undefined)[] = [];
 	const warnings: string[] = [];
@@ -622,6 +624,7 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 			entries,
 			warnings,
 		},
+		destinationAgentDir: options.destinationScope === "global" ? destination.root : undefined,
 		payloads,
 	};
 }
@@ -705,7 +708,7 @@ async function sweepStagingTemps(dir: string): Promise<void> {
  */
 export async function applyImport(plan: ImportPlan, options: { cwd: string }): Promise<ImportResult> {
 	const { preview } = plan;
-	const destination = resolveScopePaths(preview.destinationScope, options.cwd);
+	const destination = resolveScopePaths(preview.destinationScope, options.cwd, plan.destinationAgentDir);
 	const results: ImportResultEntry[] = [];
 
 	const writable: Array<{ entry: ImportPreviewEntry; payload: NormalizedPayload }> = [];

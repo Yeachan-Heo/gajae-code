@@ -329,6 +329,27 @@ describe("import from Codex (user-global → global .gjc, explicit selection)", 
 		await expect(fs.stat(path.join(projectDir, ".gjc", "skills", "codex-skill"))).rejects.toThrow();
 		await expect(fs.stat(path.join(projectDir, ".gjc", "mcp.json"))).rejects.toThrow();
 	});
+
+	test("global import remains bound to the selected agent directory between preview and apply", async () => {
+		const profile = path.join(tmpRoot, "import-profile");
+		await writeFile(path.join(homeDir, ".codex", "skills", "profile-skill", "SKILL.md"), SKILL_MD);
+		const plan = await buildImportPreview(
+			previewOptions({
+				product: "codex",
+				sourceScope: "user",
+				destinationScope: "global",
+				surfaces: ["skills"],
+				agentDir: profile,
+			}),
+		);
+		setAgentDir(path.join(tmpRoot, "late-process-decoy"));
+
+		const result = await applyImport(plan, { cwd: projectDir });
+
+		expect(result.ok).toBe(true);
+		await fs.stat(path.join(profile, "skills", "profile-skill", "SKILL.md"));
+		await expect(fs.stat(path.join(getAgentDir(), "skills", "profile-skill", "SKILL.md"))).rejects.toThrow();
+	});
 });
 
 // ---------------------------------------------------------------------------

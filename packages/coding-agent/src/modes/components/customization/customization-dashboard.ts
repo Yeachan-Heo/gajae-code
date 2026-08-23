@@ -335,7 +335,7 @@ export class CustomizationDashboard extends Container {
 	}
 
 	#openImportWizard(): void {
-		const wizard = new ImportWizard(this.#cwd, this.#scope, this.#homeDir);
+		const wizard = new ImportWizard(this.#cwd, this.#scope, this.#homeDir, this.#settings?.getAgentDir?.());
 		this.#wizard = wizard;
 		wizard.onRequestRender = () => this.onRequestRender?.();
 		wizard.onClose = applied => {
