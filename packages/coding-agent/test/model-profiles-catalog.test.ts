@@ -73,53 +73,53 @@ const expectedProfiles: Array<{
 		mapping: {
 			default: "omlx/Qwen3.6-35B-A3B-4bit:low",
 			executor: "omlx/Qwen3.6-35B-A3B-4bit:low",
-			architect: "omlx/Qwen3.6-35B-A3B-4bit:medium",
+			architect: "omlx/Qwen3.6-35B-A3B-4bit:high",
 			planner: "omlx/Qwen3.6-35B-A3B-4bit:medium",
-			critic: "omlx/Qwen3.6-35B-A3B-4bit:low",
+			critic: "omlx/Qwen3.6-35B-A3B-4bit:high",
 		},
 	},
 	{
 		name: "macos-omlx-balanced",
 		requiredProviders: ["omlx"],
 		mapping: {
-			default: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			default: "omlx/Qwen3.6-35B-A3B-8bit:low",
 			executor: "omlx/Qwen3.6-35B-A3B-8bit:low",
 			architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
-			planner: "omlx/Qwen3.6-35B-A3B-8bit:high",
-			critic: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			planner: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			critic: "omlx/Qwen3.6-35B-A3B-8bit:high",
 		},
 	},
 	{
 		name: "macos-omlx-quality",
 		requiredProviders: ["omlx"],
 		mapping: {
-			default: "omlx/Qwen3.6-35B-A3B-8bit:high",
-			executor: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			default: "omlx/Qwen3.6-35B-A3B-8bit:low",
+			executor: "omlx/Qwen3.6-35B-A3B-8bit:low",
 			architect: "omlx/Qwen3.6-35B-A3B-8bit:high",
-			planner: "omlx/Qwen3.6-35B-A3B-8bit:high",
-			critic: "omlx/Qwen3.6-35B-A3B-8bit:high",
+			planner: "omlx/Qwen3.6-35B-A3B-8bit:medium",
+			critic: "omlx/Qwen3.8-27B-8bit:high",
 		},
 	},
 	{
 		name: "macos-omlx-abliterated-fast",
 		requiredProviders: ["omlx"],
 		mapping: {
-			default: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
-			executor: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:low",
-			architect: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:high",
-			planner: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:high",
-			critic: "omlx/Qwen3.8-27B-Abliterated-MLX-4bit:medium",
+			default: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			executor: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			architect: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
+			planner: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:medium",
+			critic: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
 		},
 	},
 	{
 		name: "macos-omlx-abliterated-balanced",
 		requiredProviders: ["omlx"],
 		mapping: {
-			default: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:medium",
-			executor: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:low",
-			architect: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:high",
-			planner: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:high",
-			critic: "omlx/Qwen3.8-27B-Abliterated-MLX-6bit:medium",
+			default: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			executor: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:low",
+			architect: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
+			planner: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:medium",
+			critic: "omlx/Qwen3.8-27B-Uncensored-MLX-4bit:high",
 		},
 	},
 	{
@@ -688,8 +688,8 @@ const commandCodeGoatModels = new Set([
 const macosOmlxModels = new Set([
 	"Qwen3.6-35B-A3B-4bit",
 	"Qwen3.6-35B-A3B-8bit",
-	"Qwen3.8-27B-Abliterated-MLX-4bit",
-	"Qwen3.8-27B-Abliterated-MLX-6bit",
+	"Qwen3.8-27B-8bit",
+	"Qwen3.8-27B-Uncensored-MLX-4bit",
 ]);
 
 function selectorExists(selector: string): boolean {
@@ -918,11 +918,11 @@ describe("built-in model profile catalog", () => {
 			providerGroup: "COMMAND CODE GOAT",
 		});
 		for (const [name, displayName] of Object.entries({
-			"macos-omlx-fast": "4-bit Fast (24GB~36GB+ / Default Ctx)",
-			"macos-omlx-balanced": "8-bit Balanced (64GB~128GB / Default Ctx)",
-			"macos-omlx-quality": "8-bit Max Quality (M5 Max 128GB / Default Ctx)",
-			"macos-omlx-abliterated-fast": "4-bit Abliterated Fast (Qwen3.8 27B / Default Ctx)",
-			"macos-omlx-abliterated-balanced": "6-bit Abliterated Balanced (Qwen3.8 27B / Default Ctx)",
+			"macos-omlx-fast": "4-bit Fast (MoE measured 93.5 tok/s)",
+			"macos-omlx-balanced": "8-bit Balanced (MoE measured 71.1 tok/s)",
+			"macos-omlx-quality": "Quality mix (8-bit MoE + 8-bit dense critic)",
+			"macos-omlx-abliterated-fast": "Uncensored 4-bit Fast (measured 19.8 tok/s)",
+			"macos-omlx-abliterated-balanced": "Uncensored 4-bit Balanced (same winner as fast)",
 		})) {
 			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "macOS Local (oMLX)" });
 		}
