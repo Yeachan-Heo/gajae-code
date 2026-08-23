@@ -78,6 +78,7 @@ function createMockSession(
 			getHeader: () => undefined,
 			getCwd: () => import.meta.dir,
 		},
+		getSessionAgentDir: () => "",
 		setSlashCommands: () => {},
 		extensionRunner: undefined,
 		subscribe: () => () => {},
@@ -140,6 +141,7 @@ function createPrintModeTrackingSession(
 		configWarnings: [],
 		state: { messages },
 		sessionManager: { getHeader: () => header, getCwd: () => import.meta.dir },
+		getSessionAgentDir: () => "",
 		extensionRunner: undefined,
 		setSlashCommands,
 		subscribe: (listener: (event: unknown) => void) => {

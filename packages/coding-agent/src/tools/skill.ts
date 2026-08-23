@@ -151,7 +151,8 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					this.#session.cwd,
 					requestedName,
 					this.#getRuntimeSkillPolicy(),
-					this.#session.home,
+					this.#session.home ?? this.#session.getSessionHome?.(),
+					this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
 				));
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();

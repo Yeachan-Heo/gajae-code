@@ -1164,7 +1164,11 @@ export class InteractiveMode implements InteractiveModeContext {
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		if (this.#stopped) return;
 		const basePath = cwd ?? this.sessionManager.getCwd();
-		const fileCommands = await loadSlashCommands({ cwd: basePath });
+		const fileCommands = await loadSlashCommands({
+			cwd: basePath,
+			agentDir: this.session.getSessionAgentDir(),
+			settings: this.session.settings,
+		});
 		if (this.#stopped) return;
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;

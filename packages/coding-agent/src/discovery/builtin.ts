@@ -29,6 +29,7 @@ import {
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
 	getExtensionNameFromPath,
+	getUserSkillScanDirs,
 	loadFilesFromDir,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
@@ -41,8 +42,8 @@ const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
 
-function getUserAgentDirs(): string[] {
-	return [PATHS.userAgent];
+function getUserAgentDirs(ctx: LoadContext): string[] {
+	return [resolveUserAgentDir(ctx)];
 }
 
 /**
@@ -87,6 +88,7 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	const userDir = await ifNonEmptyDir(resolveUserAgentDir(ctx));
 	if (userDir) {
 		result.push({ dir: userDir, level: "user" });
+	}
 	}
 
 	return result;
@@ -280,17 +282,18 @@ registerProvider<MCPServer>(mcpCapability.id, {
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
 
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userPath = path.join(ctx.home, userAgentDir, "SYSTEM.md");
-		const userContent = await readFile(userPath);
-		if (userContent) {
-			items.push({
-				path: userPath,
-				content: userContent,
-				level: "user",
-				_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
-			});
-		}
+	// User scope is the agent directory — the directory `gjc config path` prints
+	// and the only user-scope seam. A profile is a separate scope; the default
+	// profile's home-relative SYSTEM.md is not read under one.
+	const userPath = path.join(resolveUserAgentDir(ctx), "SYSTEM.md");
+	const userContent = await readFile(userPath);
+	if (userContent) {
+		items.push({
+			path: userPath,
+			content: userContent,
+			level: "user",
+			_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
+		});
 	}
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
@@ -333,10 +336,11 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		),
 	);
 
-	// User-level scan from the active agent-directory profile.
-	const userScans = [
+	// User-level scan from the selected agent-directory profile plus documented
+	// default-profile legacy scan roots.
+	const userScans = getUserSkillScanDirs(ctx.home, resolveUserAgentDir(ctx)).map(dir =>
 		scanSkillsFromDir(ctx, {
-			dir: path.join(resolveUserAgentDir(ctx), "skills"),
+			dir,
 			providerId: PROVIDER_ID,
 			level: "user",
 			requireDescription: true,
@@ -410,7 +414,8 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// Top-level RULES.md is a sticky always-apply rule. The context-file
 	// discovery contract treats it as the file "re-injected near the current
 	// turn so they keep hold across long conversations".
-	// User scope:    ~/.gjc/agent/RULES.md
+	// User scope:    <agentDir>/RULES.md (a profile is a separate user scope;
+	//                the default profile's home-relative copy is not read)
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
@@ -929,7 +934,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = path.join(ctx.home, PATHS.userAgent, "AGENTS.md");
+	const userPath = path.join(resolveUserAgentDir(ctx), "AGENTS.md");
 	const userContent = await readFile(userPath);
 	if (userContent) {
 		items.push({

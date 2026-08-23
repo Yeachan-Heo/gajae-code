@@ -1,8 +1,9 @@
 /**
  * Authoritative skill management contracts for native `.gjc` skills.
  *
- * Canonical skill locations are project `<project>/.gjc/skills/` and global
- * `~/.gjc/agent/skills/` (plus legacy user roots). Claude Code / Codex layouts
+ * Canonical skill locations are project `<project>/.gjc/skills/` and the selected
+ * user agent directory's `skills/` subdirectory (plus legacy user roots in the
+ * default profile). Claude Code / Codex layouts
  * are explicit import sources into `.gjc` and are enumerated separately by
  * `listConventionSkillImportSources`; they are never loaded as ordinary runtime
  * skills.
@@ -14,13 +15,13 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
+import { getAgentDir, getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import { compareSkillOrder, getUserSkillScanDirs, resolveUserAgentDir, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 export type SkillScope = "project" | "user";
 export type ConventionSkillHost = "claude" | "codex";
@@ -61,6 +62,7 @@ export interface ConventionSkillImportSource {
 export interface WriteNativeSkillInput {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
 	scope: SkillScope;
 	name: string;
 	content: string;
@@ -93,7 +95,37 @@ export class SkillFrontmatterError extends Error {
 	}
 }
 
+/** Raised when the descriptor-relative native skill writer is unavailable. */
+export class SkillNativeWriteUnavailableError extends Error {
+	readonly code = "SKILL_NATIVE_WRITE_UNAVAILABLE";
+	constructor(message = "secure native skill writing is unavailable on this platform") {
+		super(message);
+		this.name = "SkillNativeWriteUnavailableError";
+	}
+}
+
 const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+
+type SecureWriteSkillFile = (
+	rootPath: string,
+	skillName: string,
+	content: string,
+) => { ok: boolean; path?: string; code?: string };
+let secureWriteSkillFileNative: SecureWriteSkillFile | null | undefined;
+
+function getSecureWriteSkillFileNative(): SecureWriteSkillFile | undefined {
+	if (secureWriteSkillFileNative !== undefined) return secureWriteSkillFileNative ?? undefined;
+	try {
+		const natives = require("@gajae-code/natives") as {
+			secureWriteSkillFile?: SecureWriteSkillFile;
+		};
+		secureWriteSkillFileNative =
+			typeof natives.secureWriteSkillFile === "function" ? natives.secureWriteSkillFile : null;
+	} catch {
+		secureWriteSkillFileNative = null;
+	}
+	return secureWriteSkillFileNative ?? undefined;
+}
 
 function getRuntimeHome(): string {
 	return getTrustedHomeDir();
@@ -131,27 +163,27 @@ export async function getProjectSkillDirs(
 }
 
 /** Canonical user skill directories in precedence order (same resolution as runtime discovery). */
-export function getUserSkillDirs(home: string): string[] {
-	return [
-		...new Set([
-			path.join(home, SOURCE_PATHS.native.userAgent, "skills"),
-			path.join(home, SOURCE_PATHS.native.userBase, "skills"),
-			path.join(home, ".gjc", "skills"),
-		]),
-	];
+export function getUserSkillDirs(home: string, agentDir?: string): string[] {
+	return getUserSkillScanDirs(home, agentDir);
 }
 
 /**
  * The canonical directory a write targets for a scope: the repo root (or `cwd`)
- * `.gjc/skills` for project scope, the canonical `<config>/agent/skills` user
- * root for user scope (honoring `GJC_CONFIG_DIR` / `PI_CONFIG_DIR`).
+ * `.gjc/skills` for project scope, the agent directory's `skills` root for user
+ * scope — the same directory every reader scans first (`gjc config path` prints
+ * it; `--agent-dir` / `GJC_CODING_AGENT_DIR` / `setAgentDir()` move it).
  */
 export async function resolveNativeSkillScopeDir(
 	cwd: string,
 	scope: SkillScope,
-	home = getRuntimeHome(),
+	_home?: string,
+	agentDir?: string,
 ): Promise<string> {
-	if (scope === "user") return path.join(home, SOURCE_PATHS.native.userAgent, "skills");
+	const home = _home ?? getRuntimeHome();
+	if (scope === "user") {
+		const resolvedAgentDir = agentDir ?? (_home === undefined ? getAgentDir() : resolveUserAgentDir(home));
+		return path.join(path.resolve(resolvedAgentDir), "skills");
+	}
 	const repoRoot = await findRepoRoot(cwd);
 	return path.join(repoRoot ?? path.resolve(cwd), ".gjc", "skills");
 }
@@ -174,14 +206,17 @@ function isDisabledByExtension(name: string, disabledExtensions: string[] | unde
 export async function listNativeSkillsForManagement(options: {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
 	policy?: SkillManagementPolicy;
 }): Promise<ManagedSkillRecord[]> {
+	const homeWasInjected = options.home !== undefined;
 	const home = options.home ?? getRuntimeHome();
+	const agentDir = options.agentDir ?? (homeWasInjected ? resolveUserAgentDir(home) : getAgentDir());
 	const policy = options.policy;
 	const projectTrusted = resolveSkillScopeTrust(policy ?? {}, "project");
 	const userTrusted = resolveSkillScopeTrust(policy ?? {}, "user");
 
-	const scanJobs: Array<Promise<{ dir: string; items: CapabilitySkill[] }>> = [];
+	const scanJobs: Array<Promise<{ dir: string; scope: SkillScope; items: CapabilitySkill[] }>> = [];
 	const projectDirs = await getProjectSkillDirs(options.cwd, home);
 	if (projectTrusted) {
 		for (const dir of projectDirs.dirs) {
@@ -189,17 +224,17 @@ export async function listNativeSkillsForManagement(options: {
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: projectDirs.repoRoot },
 					{ dir, providerId: "runtime", level: "project", requireDescription: true },
-				).then(result => ({ dir, items: result.items })),
+				).then(result => ({ dir, scope: "project" as const, items: result.items })),
 			);
 		}
 	}
 	if (userTrusted) {
-		for (const dir of getUserSkillDirs(home)) {
+		for (const dir of getUserSkillDirs(home, agentDir)) {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: home },
 					{ dir, providerId: "runtime", level: "user", requireDescription: true },
-				).then(result => ({ dir, items: result.items })),
+				).then(result => ({ dir, scope: "user" as const, items: result.items })),
 			);
 		}
 	}
@@ -208,8 +243,7 @@ export async function listNativeSkillsForManagement(options: {
 	const seenNames = new Set<string>();
 	const seenPaths = new Set<string>();
 
-	for (const { dir, items } of await Promise.all(scanJobs)) {
-		const scope: SkillScope = path.resolve(dir).startsWith(`${path.resolve(home)}${path.sep}`) ? "user" : "project";
+	for (const { dir, scope, items } of await Promise.all(scanJobs)) {
 		const source = scope === "project" ? "project .gjc/skills" : `user ${dir}`;
 		for (const skill of items) {
 			const realPath = await safeRealpath(skill.path);
@@ -256,10 +290,11 @@ export async function listNativeSkillsForManagement(options: {
 }
 
 /**
- * Write a native skill into the canonical `.gjc` scope directory. The content
- * must parse as frontmatter with a non-empty `description`; the effective name
- * comes from `frontmatter.name` when present, else the requested `name`. Bundled
- * workflow skill names are rejected.
+ * Write a native skill into the canonical `.gjc` scope directory through the
+ * descriptor-relative native primitive. The content must parse as frontmatter
+ * with a non-empty `description`; the effective name comes from
+ * `frontmatter.name` when present, else the requested `name`. Bundled workflow
+ * skill names are rejected, and unavailable native containment fails closed.
  */
 export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<WriteNativeSkillReceipt> {
 	const name = input.name.trim();
@@ -272,13 +307,23 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const effectiveName =
 		typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : name;
+	if (effectiveName === "." || effectiveName === ".." || effectiveName.includes("/") || effectiveName.includes("\\"))
+		throw new SkillFrontmatterError("skill name must not contain path separators or traversal segments");
 	if (BUILT_IN_SKILL_NAMES.has(effectiveName)) throw new SkillNameProtectedError(effectiveName);
 
-	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home ?? getRuntimeHome());
-	const skillDir = path.join(directory, effectiveName);
-	await fs.mkdir(skillDir, { recursive: true });
-	const filePath = path.join(skillDir, "SKILL.md");
-	await Bun.write(filePath, `${input.content.trimEnd()}\n`);
+	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
+	const secureWriteSkillFile = getSecureWriteSkillFileNative();
+	if (!secureWriteSkillFile) throw new SkillNativeWriteUnavailableError();
+	const result = secureWriteSkillFile(directory, effectiveName, `${input.content.trimEnd()}\n`);
+	if (!result.ok) {
+		if (result.code === "unsupported_platform" || result.code === "native_unavailable")
+			throw new SkillNativeWriteUnavailableError();
+		if (result.code === "reparse_point")
+			throw new SkillFrontmatterError("secure native skill write rejected a symbolic link");
+		throw new SkillFrontmatterError(`secure native skill write failed: ${result.code ?? "unknown"}`);
+	}
+	const filePath = result.path;
+	if (!filePath) throw new SkillNativeWriteUnavailableError("secure native skill writer returned no path");
 	return { name: effectiveName, scope: input.scope, directory, path: filePath };
 }
 

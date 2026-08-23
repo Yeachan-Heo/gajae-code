@@ -440,6 +440,28 @@ impl NativeNoReplaceResult {
 	}
 }
 
+/// Result of a descriptor-relative native skill write.
+///
+/// The operation is intentionally narrower than a general path write: callers
+/// provide one absolute skills root and one validated skill name, and the
+/// native side creates/writes only that skill's `SKILL.md` entry.
+#[napi(object)]
+pub struct NativeSecureSkillWriteResult {
+	pub ok:   bool,
+	pub path: Option<String>,
+	pub code: Option<String>,
+}
+
+impl NativeSecureSkillWriteResult {
+	fn success(path: String) -> Self {
+		Self { ok: true, path: Some(path), code: None }
+	}
+
+	fn failure(code: &str) -> Self {
+		Self { ok: false, path: None, code: Some(code.to_owned()) }
+	}
+}
+
 /// A deterministic, no-follow description of a directory tree. `relative_path`
 /// is UTF-8, uses `/` separators, and is empty only for the root entry.
 #[napi(object)]
@@ -1422,6 +1444,43 @@ pub fn link_no_replace_path(
 	))
 }
 
+/// Create or overwrite one native skill's `SKILL.md` without following any
+/// path component. Every ancestor is opened descriptor-relatively with
+/// `O_DIRECTORY|O_NOFOLLOW`; the skill directory is created through the
+/// retained skills-root descriptor, and the final regular file is opened with
+/// `O_NOFOLLOW` before its descriptor is truncated and written.
+///
+/// Only Unix targets implement the descriptor-relative primitive. Other
+/// platforms return `unsupported_platform` so callers cannot silently fall
+/// back to a path-based write.
+#[napi]
+pub fn secure_write_skill_file(
+	root_path: String,
+	skill_name: String,
+	content: String,
+) -> NativeSecureSkillWriteResult {
+	if root_path.contains('\0') || skill_name.contains('\0') || !Path::new(&root_path).is_absolute() {
+		return NativeSecureSkillWriteResult::failure("invalid_request");
+	}
+	if skill_name.is_empty()
+		|| skill_name == "."
+		|| skill_name == ".."
+		|| skill_name.contains('/')
+		|| skill_name.contains('\\')
+		|| !matches!(Path::new(&skill_name).components().next(), Some(Component::Normal(_)))
+		|| Path::new(&skill_name).components().count() != 1
+	{
+		return NativeSecureSkillWriteResult::failure("invalid_request");
+	}
+	if Path::new(&root_path)
+		.components()
+		.any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+	{
+		return NativeSecureSkillWriteResult::failure("invalid_request");
+	}
+	platform::secure_write_skill_file(Path::new(&root_path), &skill_name, &content)
+}
+
 /// Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking
 /// pool.
 ///
@@ -1855,17 +1914,19 @@ pub(crate) mod platform {
 		ffi::CString,
 		fmt::Write as _,
 		fs::{self, File},
+		io::Write as IoWrite,
 		os::{
 			fd::{AsRawFd, FromRawFd},
 			unix::ffi::OsStrExt,
 		},
-		path::{Component, Path},
+		path::{Component, Path, PathBuf},
 	};
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativeSecureSkillWriteResult, digest_reader, io_code,
+		security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -4399,6 +4460,252 @@ pub(crate) mod platform {
 		Ok((parent_fd, name))
 	}
 
+	fn skill_write_error(error: &std::io::Error) -> &'static str {
+		match error.raw_os_error() {
+			Some(libc::ELOOP) => "reparse_point",
+			Some(libc::ENOENT) => "not_found",
+			Some(libc::ENOTDIR) => "not_directory",
+			Some(libc::EISDIR) => "not_regular_file",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::ENOSPC) => "no_space",
+			Some(libc::ENAMETOOLONG) => "name_too_long",
+			Some(libc::EFBIG) => "content_too_large",
+			_ => "io_error",
+		}
+	}
+
+	/// Open one directory component beneath a retained descriptor, creating it
+	/// only when the name is absent. The second open is still `O_NOFOLLOW`, so a
+	/// concurrent symlink insertion after `mkdirat` fails closed.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor and NUL-terminated component remain live across each syscall"
+	)]
+	fn open_or_create_skill_directory(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<libc::c_int, &'static str> {
+		let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+		let opened = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+		if opened >= 0 {
+			return Ok(opened);
+		}
+		let first_error = std::io::Error::last_os_error();
+		if first_error.raw_os_error() != Some(libc::ENOENT) {
+			return Err(skill_write_error(&first_error));
+		}
+		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o777) } != 0 {
+			let mkdir_error = std::io::Error::last_os_error();
+			if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
+				return Err(skill_write_error(&mkdir_error));
+			}
+		}
+		let reopened = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
+		if reopened < 0 {
+			return Err(skill_write_error(&std::io::Error::last_os_error()));
+		}
+		Ok(reopened)
+	}
+
+	/// Descriptor-walk an absolute path, creating missing directories along the
+	/// way. The returned path is the no-alias spelling used by the walk (not a
+	/// second, race-prone `realpath` lookup).
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the walk owns the current descriptor and closes each predecessor exactly once"
+	)]
+	fn open_or_create_skill_root(path: &Path) -> Result<(libc::c_int, PathBuf), &'static str> {
+		let walk_path = descriptor_walk_path(path);
+		if !walk_path.is_absolute() {
+			return Err("invalid_request");
+		}
+		let mut current = unsafe {
+			libc::open(
+				b"/\0".as_ptr().cast(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if current < 0 {
+			return Err(skill_write_error(&std::io::Error::last_os_error()));
+		}
+		let mut canonical = PathBuf::from("/");
+		for component in walk_path.components() {
+			let segment = match component {
+				Component::Normal(segment) => segment,
+				Component::RootDir | Component::CurDir => continue,
+				Component::ParentDir | Component::Prefix(_) => {
+					unsafe { libc::close(current) };
+					return Err("invalid_request");
+				},
+			};
+			let Ok(name) = CString::new(segment.as_bytes()) else {
+				unsafe { libc::close(current) };
+				return Err("invalid_request");
+			};
+			let next = match open_or_create_skill_directory(current, &name) {
+				Ok(next) => next,
+				Err(code) => {
+					unsafe { libc::close(current) };
+					return Err(code);
+				},
+			};
+			unsafe { libc::close(current) };
+			current = next;
+			canonical.push(segment);
+		}
+		Ok((current, canonical))
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the opened descriptor and retained parent descriptor remain live through identity checks"
+	)]
+	fn skill_file_matches_name(
+		parent_fd: libc::c_int,
+		name: &CString,
+		file_fd: libc::c_int,
+	) -> Result<(), &'static str> {
+		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(file_fd, &mut opened) } != 0 {
+			return Err(skill_write_error(&std::io::Error::last_os_error()));
+		}
+		if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
+			return Err("not_regular_file");
+		}
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe {
+			libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+		} != 0
+		{
+			return Err(skill_write_error(&std::io::Error::last_os_error()));
+		}
+		if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
+			return Err("reparse_point");
+		}
+		if named.st_mode & libc::S_IFMT != libc::S_IFREG {
+			return Err("not_regular_file");
+		}
+		if opened.st_nlink != 1 || named.st_nlink != 1 {
+			return Err("hard_link");
+		}
+		if opened.st_dev != named.st_dev || opened.st_ino != named.st_ino {
+			return Err("identity_mismatch");
+		}
+		Ok(())
+	}
+
+	/// Open the fixed `SKILL.md` leaf without following or truncating an
+	/// untrusted non-regular entry. Creation races are retried a bounded number
+	/// of times; every successful descriptor is checked against its live name
+	/// before any truncation or write occurs.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor and final component remain live through open, validation, and truncation"
+	)]
+	fn open_skill_file(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<File, &'static str> {
+		const OPEN_RETRY_LIMIT: usize = 4;
+		let base_flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+		for _ in 0..OPEN_RETRY_LIMIT {
+			let existing = unsafe { libc::openat(parent_fd, name.as_ptr(), base_flags) };
+			if existing >= 0 {
+				if let Err(code) = skill_file_matches_name(parent_fd, name, existing) {
+					unsafe { libc::close(existing) };
+					return Err(code);
+				}
+				if unsafe { libc::ftruncate(existing, 0) } != 0 {
+					let code = skill_write_error(&std::io::Error::last_os_error());
+					unsafe { libc::close(existing) };
+					return Err(code);
+				}
+				return Ok(unsafe { File::from_raw_fd(existing) });
+			}
+			let open_error = std::io::Error::last_os_error();
+			if open_error.raw_os_error() != Some(libc::ENOENT) {
+				return Err(skill_write_error(&open_error));
+			}
+			let created = unsafe {
+				libc::openat(
+					parent_fd,
+					name.as_ptr(),
+					base_flags | libc::O_CREAT | libc::O_EXCL,
+					0o666,
+				)
+			};
+			if created >= 0 {
+				if let Err(code) = skill_file_matches_name(parent_fd, name, created) {
+					unsafe { libc::close(created) };
+					return Err(code);
+				}
+				return Ok(unsafe { File::from_raw_fd(created) });
+			}
+			let create_error = std::io::Error::last_os_error();
+			if create_error.raw_os_error() == Some(libc::EEXIST) {
+				continue;
+			}
+			return Err(skill_write_error(&create_error));
+		}
+		Err("race_limit")
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained directory and file descriptors are owned through the complete write"
+	)]
+	pub(super) fn secure_write_skill_file(
+		root_path: &Path,
+		skill_name: &str,
+		content: &str,
+	) -> NativeSecureSkillWriteResult {
+		let (skills_fd, canonical_root) = match open_or_create_skill_root(root_path) {
+			Ok(value) => value,
+			Err(code) => return NativeSecureSkillWriteResult::failure(code),
+		};
+		let Ok(skill_component) = CString::new(skill_name.as_bytes()) else {
+			unsafe { libc::close(skills_fd) };
+			return NativeSecureSkillWriteResult::failure("invalid_request");
+		};
+		let skill_fd = match open_or_create_skill_directory(skills_fd, &skill_component) {
+			Ok(fd) => fd,
+			Err(code) => {
+				unsafe { libc::close(skills_fd) };
+				return NativeSecureSkillWriteResult::failure(code);
+			},
+		};
+		let Ok(file_component) = CString::new("SKILL.md") else {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("invalid_request");
+		};
+		let mut file = match open_skill_file(skill_fd, &file_component) {
+			Ok(file) => file,
+			Err(code) => {
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
+			},
+		};
+		let result = if file.write_all(content.as_bytes()).is_ok() {
+			NativeSecureSkillWriteResult::success(
+				canonical_root.join(skill_name).join("SKILL.md").to_string_lossy().into_owned(),
+			)
+		} else {
+			NativeSecureSkillWriteResult::failure("write_failed")
+		};
+		drop(file);
+		unsafe {
+			libc::close(skill_fd);
+			libc::close(skills_fd);
+		}
+		result
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "owned descriptors remain live through validation and close exactly once on every \
@@ -6203,7 +6510,8 @@ mod platform {
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
+		NativeOwnerOnlySecurityResult, NativeSecureSkillWriteResult, STATUS_INVALID_PARAMETER,
+		STATUS_SHARING_VIOLATION,
 		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
 		sha256,
 	};
@@ -8731,6 +9039,14 @@ mod platform {
 			Err(code) => NativeExactUnlinkResult::detached_failure(code, retained_path),
 		}
 	}
+
+	pub(super) fn secure_write_skill_file(
+		_: &Path,
+		_: &str,
+		_: &str,
+	) -> NativeSecureSkillWriteResult {
+		NativeSecureSkillWriteResult::failure("unsupported_platform")
+	}
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -8740,7 +9056,16 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativeSecureSkillWriteResult,
 	};
+
+	pub(super) fn secure_write_skill_file(
+		_: &Path,
+		_: &str,
+		_: &str,
+	) -> NativeSecureSkillWriteResult {
+		NativeSecureSkillWriteResult::failure("unsupported_platform")
+	}
 
 	pub(super) fn canonical_existing_directory_identity(
 		_: &Path,
@@ -10997,6 +11322,108 @@ mod exact_replace_path_tests {
 		assert_eq!(fs::read(&destination).expect("read committed successor"), b"successor");
 	}
 }
+
+#[cfg(all(test, unix))]
+mod secure_skill_write_tests {
+	use std::{
+		fs,
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::secure_write_skill_file;
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-secure-skill-write-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir(&path).expect("create secure skill-write temp directory");
+			Self(path)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn creates_missing_skill_tree_and_overwrites_regular_file() {
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let first = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "first".to_owned());
+		assert!(first.ok, "{:?}", first.code);
+		let path = root.join("managed").join("SKILL.md");
+		assert_eq!(fs::read_to_string(&path).expect("read first write"), "first");
+
+		let second = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "second".to_owned());
+		assert!(second.ok, "{:?}", second.code);
+		assert_eq!(fs::read_to_string(&path).expect("read overwrite"), "second");
+		assert_eq!(second.path.as_deref(), Some(path.to_string_lossy().as_ref()));
+	}
+
+	#[test]
+	fn rejects_symlinked_skill_root_skill_directory_and_file() {
+		let assert_rejected_link = |code: Option<&str>| {
+			assert!(matches!(code, Some("reparse_point" | "not_directory")), "unexpected code: {code:?}");
+		};
+		let temporary = TempDir::new();
+		let outside = temporary.0.join("outside");
+		fs::create_dir(&outside).expect("create outside directory");
+		let gjc = temporary.0.join(".gjc");
+		std::os::unix::fs::symlink(&outside, &gjc).expect("create .gjc symlink");
+		let gjc_result = secure_write_skill_file(
+			gjc.join("skills").to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"blocked".to_owned(),
+		);
+		assert_rejected_link(gjc_result.code.as_deref());
+
+		fs::remove_file(&gjc).expect("remove .gjc symlink");
+		fs::create_dir(&gjc).expect("create real .gjc directory");
+		let root = gjc.join("skills");
+		std::os::unix::fs::symlink(&outside, &root).expect("create skills symlink");
+		let root_result = secure_write_skill_file(
+			root.to_string_lossy().into_owned(),
+			"managed".to_owned(),
+			"blocked".to_owned(),
+		);
+		assert_rejected_link(root_result.code.as_deref());
+
+		fs::remove_file(&root).expect("remove skills symlink");
+		fs::create_dir(&root).expect("create real skills directory");
+		let skill_link = root.join("managed");
+		std::os::unix::fs::symlink(&outside, &skill_link).expect("create skill symlink");
+		let skill_result = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "blocked".to_owned());
+		assert_rejected_link(skill_result.code.as_deref());
+
+		fs::remove_file(&skill_link).expect("remove skill symlink");
+		fs::create_dir(&skill_link).expect("create real skill directory");
+		let outside_file = outside.join("SKILL.md");
+		fs::write(&outside_file, "outside").expect("seed outside file");
+		std::os::unix::fs::symlink(&outside_file, skill_link.join("SKILL.md"))
+			.expect("create file symlink");
+		let file_result = secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "blocked".to_owned());
+		assert_rejected_link(file_result.code.as_deref());
+		assert_eq!(fs::read_to_string(&outside_file).expect("read outside file"), "outside");
+
+		fs::remove_file(skill_link.join("SKILL.md")).expect("remove file symlink");
+		fs::hard_link(&outside_file, skill_link.join("SKILL.md")).expect("create hard link");
+		let hard_link_result =
+			secure_write_skill_file(root.to_string_lossy().into_owned(), "managed".to_owned(), "blocked".to_owned());
+		assert_eq!(hard_link_result.code.as_deref(), Some("hard_link"));
+		assert_eq!(fs::read_to_string(outside_file).expect("read hard-linked outside file"), "outside");
+	}
+}
+
 #[cfg(test)]
 mod sha256_tests {
 	use std::io::{self, Read};

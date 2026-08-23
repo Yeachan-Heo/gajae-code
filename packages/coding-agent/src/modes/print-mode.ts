@@ -263,7 +263,13 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		// without this the list stays empty and a leading-slash prompt reaches the model as
 		// literal prose — no expansion, no error, and an answer that looks like the command ran.
 		await logger.time("print:slash-commands", async () => {
-			session.setSlashCommands(await loadSlashCommands({ cwd: session.sessionManager.getCwd() }));
+			session.setSlashCommands(
+				await loadSlashCommands({
+					cwd: session.sessionManager.getCwd(),
+					agentDir: session.getSessionAgentDir(),
+					settings: session.settings,
+				}),
+			);
 		});
 
 		// Set up extensions for print mode (no UI, no command context).

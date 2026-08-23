@@ -1,12 +1,12 @@
 import * as fs from "node:fs/promises";
 import { getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
-import { findRepoRoot } from "../capability/fs";
+import { loadCapabilityForHome } from "../capability";
 import { skillCapability } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
-import type { SkillsSettings } from "../config/settings";
+import type { Settings, SkillsSettings } from "../config/settings";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
-import { type Skill as CapabilitySkill, getCapability } from "../discovery";
-import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
+import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
+import { compareSkillOrder, resolveUserAgentDir, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
@@ -109,10 +109,12 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
-	/** Explicit user home for skill discovery. Default: getTrustedHomeDir(). */
+	/** Explicit user home for SDK/test skill discovery. Default: trusted runtime home. */
 	home?: string;
-	/** Explicit user agent directory for native user-scope skill discovery. */
+	/** Agent directory backing native user-scope skills. Default: getAgentDir() */
 	agentDir?: string;
+	/** Settings authority for session-scoped capability discovery. */
+	settings?: Settings;
 }
 
 /**
@@ -131,25 +133,29 @@ const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(n
 export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadSkillsResult> {
 	const {
 		cwd = getProjectDir(),
+		home,
+		agentDir,
 		enabled = true,
 		customDirectories = [],
 		ignoredSkills = [],
 		includeSkills = [],
 		disabledExtensions = [],
+		settings,
 	} = options;
 
 	// Early return if skills are disabled
 	if (!enabled) {
 		return { skills: [], warnings: [] };
 	}
-	const home = options.home ?? getTrustedHomeDir();
 
 	const projectTrusted = resolveSkillScopeTrust(options, "project");
 	const userTrusted = resolveSkillScopeTrust(options, "user");
+	const resolvedHome = home ?? getTrustedHomeDir();
 
 	// Skill scope trust decides which canonical locations are loaded: project
-	// scope covers `.gjc/skills` (walk-up), user scope covers `~/.gjc/agent/skills`
-	// and the legacy user roots. Claude/Codex convention skills are import
+	// scope covers `.gjc/skills` (walk-up), user scope covers the agent
+	// directory's `skills` root (`gjc config path`) and the legacy home-relative
+	// user roots. Claude/Codex convention skills are import
 	// sources into `.gjc`, never loaded directly.
 	function isSourceEnabled(source: SourceMeta): boolean {
 		const { provider, level } = source;
@@ -162,16 +168,16 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
-	const nativeProvider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
-		provider => provider.id === "native",
-	);
-	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
-	const result = await nativeProvider.load({
+	const loadOptions = {
 		cwd,
-		home,
-		userAgentDir: options.agentDir,
-		repoRoot: await findRepoRoot(cwd),
-	});
+		agentDir: agentDir ?? (home === undefined ? undefined : resolveUserAgentDir(resolvedHome)),
+		providers: ["native"],
+		disabledExtensions,
+		settings,
+	};
+	const result = await (home === undefined
+		? loadCapability<CapabilitySkill>(skillCapability.id, loadOptions)
+		: loadCapabilityForHome<CapabilitySkill>(skillCapability.id, resolvedHome, loadOptions));
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -197,7 +203,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// precedence. `all` is already in native provider order with project dirs
 	// before user dirs; a stable sort by level lifts every project item above
 	// every user item, giving: project `.gjc/skills` > user roots.
-	const filteredSkills = result.items
+	const filteredSkills = result.all
 		.filter(capSkill => {
 			if (!isSourceEnabled(capSkill._source)) return false;
 			if (disabledSkillNames.has(capSkill.name)) return false;
@@ -266,9 +272,9 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 
 	const customDirectoryResults = await Promise.all(
 		customDirectories.map(async dir => {
-			const expandedDir = expandTilde(dir, home);
+			const expandedDir = expandTilde(dir, resolvedHome);
 			const scanResult = await scanSkillsFromDir(
-				{ cwd, home, repoRoot: null },
+				{ cwd, home: resolvedHome, repoRoot: null },
 				{
 					dir: expandedDir,
 					providerId: "custom",

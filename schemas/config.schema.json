@@ -2934,7 +2934,7 @@
 				},
 				"trustUserSkills": {
 					"type": "boolean",
-					"description": "Load skills from ~/.gjc/agent/skills (and legacy ~/.gjc/skills / <config>/skills). Set to false to ignore user-installed skills while keeping project skills."
+					"description": "Load skills from the agent directory's skills root (`gjc config path`; ~/.gjc/agent/skills by default, with legacy ~/.gjc/skills / <config>/skills roots in the default profile). Set to false to ignore user-installed skills while keeping project skills."
 				},
 				"enablePiUser": {
 					"type": "boolean"

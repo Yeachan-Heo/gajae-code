@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	isNativeSkillEnabled,
 	listConventionSkillImportSources,
@@ -47,6 +48,7 @@ describe("skill-management", () => {
 				const records = await listNativeSkillsForManagement({
 					cwd,
 					home,
+					agentDir: path.join(home, ".gjc", "agent"),
 					policy: { ignoredSkills: ["ignored-*"], disabledExtensions: ["skill:disabled-helper"] },
 				});
 				const byName = new Map(records.map(record => [record.name, record]));
@@ -82,6 +84,52 @@ describe("skill-management", () => {
 			});
 		});
 
+		it("derives the user profile from an injected home when agentDir is omitted", async () => {
+			await withTempDirs(async (cwd, home) => {
+				await makeSkill(path.join(home, ".gjc", "agent", "skills"), "injected-user", "Injected user");
+				const records = await listNativeSkillsForManagement({ cwd, home });
+
+				expect(records.map(record => record.name)).toContain("injected-user");
+				expect(records.find(record => record.name === "injected-user")?.path).toBe(
+					path.join(home, ".gjc", "agent", "skills", "injected-user", "SKILL.md"),
+				);
+			});
+		});
+
+		it("keeps concurrent injected homes isolated when agentDir is omitted", async () => {
+			await withTempDirs(async (cwd, homeA) => {
+				const homeB = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-mgmt-home-b-"));
+				try {
+					await makeSkill(path.join(homeA, ".gjc", "agent", "skills"), "profile-a", "Profile A");
+					await makeSkill(path.join(homeB, ".gjc", "agent", "skills"), "profile-b", "Profile B");
+					const [recordsA, recordsB] = await Promise.all([
+						listNativeSkillsForManagement({ cwd, home: homeA }),
+						listNativeSkillsForManagement({ cwd, home: homeB }),
+					]);
+
+					expect(recordsA.map(record => record.name)).toEqual(["profile-a"]);
+					expect(recordsB.map(record => record.name)).toEqual(["profile-b"]);
+				} finally {
+					await fs.rm(homeB, { recursive: true, force: true });
+				}
+			});
+		});
+
+		it("uses the configured agent directory when home is omitted", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const originalAgentDir = getAgentDir();
+				const configuredAgentDir = path.join(home, "profile-agent");
+				setAgentDir(configuredAgentDir);
+				try {
+					await makeSkill(path.join(configuredAgentDir, "skills"), "configured-user", "Configured user");
+					const records = await listNativeSkillsForManagement({ cwd });
+					expect(records.map(record => record.name)).toEqual(["configured-user"]);
+				} finally {
+					setAgentDir(originalAgentDir);
+				}
+			});
+		});
+
 		it("does not scan an untrusted scope at all", async () => {
 			await withTempDirs(async (cwd, home) => {
 				await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper");
@@ -90,6 +138,7 @@ describe("skill-management", () => {
 				const records = await listNativeSkillsForManagement({
 					cwd,
 					home,
+					agentDir: path.join(home, ".gjc", "agent"),
 					policy: { trustProjectSkills: false },
 				});
 				expect(records.map(record => record.name)).toEqual(["user-helper"]);
@@ -127,10 +176,77 @@ describe("skill-management", () => {
 					cwd,
 					home,
 					scope: "user",
+					agentDir: path.join(home, ".gjc", "agent"),
 					name: "my-skill",
 					content: validContent,
 				});
 				expect(receipt.path).toBe(path.join(home, ".gjc", "agent", "skills", "my-skill", "SKILL.md"));
+			});
+		});
+
+		it("derives the user write root from injected home when agentDir is omitted", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const receipt = await writeNativeSkill({
+					cwd,
+					home,
+					scope: "user",
+					name: "my-skill",
+					content: validContent,
+				});
+				expect(receipt.path).toBe(path.join(home, ".gjc", "agent", "skills", "my-skill", "SKILL.md"));
+			});
+		});
+
+		it("uses the configured agent directory when user home is omitted", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const originalAgentDir = getAgentDir();
+				const configuredAgentDir = path.join(home, "profile-agent");
+				setAgentDir(configuredAgentDir);
+				try {
+					const receipt = await writeNativeSkill({
+						cwd,
+						scope: "user",
+						name: "configured-skill",
+						content: validContent,
+					});
+					expect(receipt.path).toBe(path.join(configuredAgentDir, "skills", "my-skill", "SKILL.md"));
+				} finally {
+					setAgentDir(originalAgentDir);
+				}
+			});
+		});
+
+		it("rejects frontmatter names that escape the skills directory", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const unsafeContent = ["---", "name: ../outside", "description: Unsafe", "---", "", "# Unsafe"].join("\n");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "safe-name", content: unsafeContent }),
+				).rejects.toThrow("path separators");
+			});
+		});
+
+		it("rejects a pre-existing symlinked skill directory", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const agentDir = path.join(home, ".gjc", "agent");
+				const outside = path.join(home, "outside");
+				await fs.mkdir(path.join(agentDir, "skills"), { recursive: true });
+				await fs.mkdir(outside);
+				await fs.symlink(outside, path.join(agentDir, "skills", "my-skill"), "dir");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", agentDir, name: "my-skill", content: validContent }),
+				).rejects.toThrow("secure native skill write failed");
+			});
+		});
+
+		it("rejects a symlinked project skills root", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const outside = path.join(home, "outside");
+				await fs.mkdir(outside);
+				await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+				await fs.symlink(outside, path.join(cwd, ".gjc", "skills"), "dir");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "project", name: "my-skill", content: validContent }),
+				).rejects.toThrow("secure native skill write failed");
 			});
 		});
 

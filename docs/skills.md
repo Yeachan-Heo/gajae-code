@@ -18,13 +18,24 @@ Project scope (trusted from the repository you open):
 |---|---|
 | `<project>/.gjc/skills/<name>/SKILL.md` | Native GJC location; discovered from every ancestor of `cwd` up to the repo root (closest first) |
 
-User scope (installed once, available in every project):
+User scope (installed once, available in every project). The canonical root is
+the **agent directory** printed by `gjc config path` (`~/.gjc/agent` by default;
+`--agent-dir` / `GJC_CODING_AGENT_DIR` move it) — the same directory
+`gjc migrate` writes user skills into:
 
 | Location | Scope notes |
 |---|---|
-| `~/.gjc/agent/skills/<name>/SKILL.md` | Canonical GJC user location |
+| `<agentDir>/skills/<name>/SKILL.md` | Canonical GJC user location (the agent directory from `gjc config path`) |
+| `~/.gjc/agent/skills/<name>/SKILL.md` | Location of the canonical root in the default profile |
 | `<config>/skills/<name>/SKILL.md` | Configured legacy root (`<config>` is the home-relative directory from `GJC_CONFIG_DIR`, then `PI_CONFIG_DIR`, then `.gjc`) |
 | `~/.gjc/skills/<name>/SKILL.md` | Historical legacy user location (still honored) |
+
+An agent-directory profile is a **separate user scope** (the same contract as
+MCP user config): under `--agent-dir` / `GJC_CODING_AGENT_DIR`, only
+`<agentDir>/skills` is scanned — the default profile's home-relative roots are
+not read into a profile, and a profile's skills never leak into the default
+profile. The legacy roots above apply in the default profile, exactly as
+before.
 
 ## Claude Code / Codex layouts (explicit import sources)
 
@@ -53,8 +64,8 @@ mkdir -p .gjc/skills/my-skill
 cp .claude/skills/my-skill/SKILL.md .gjc/skills/my-skill/SKILL.md
 
 # import one Codex user skill into your user-wide GJC skills
-mkdir -p ~/.gjc/agent/skills/my-skill
-cp ~/.codex/skills/my-skill/SKILL.md ~/.gjc/agent/skills/my-skill/SKILL.md
+mkdir -p "$(gjc config path)/skills/my-skill"
+cp ~/.codex/skills/my-skill/SKILL.md "$(gjc config path)/skills/my-skill/SKILL.md"
 ```
 
 ## Installing a skill
@@ -68,8 +79,8 @@ mkdir -p .gjc/skills/my-skill
 cp my-skill/SKILL.md .gjc/skills/my-skill/SKILL.md
 
 # user-wide, available in every project
-mkdir -p ~/.gjc/agent/skills/my-skill
-cp my-skill/SKILL.md ~/.gjc/agent/skills/my-skill/SKILL.md
+mkdir -p "$(gjc config path)/skills/my-skill"
+cp my-skill/SKILL.md "$(gjc config path)/skills/my-skill/SKILL.md"
 ```
 
 Start a new session and invoke the skill with `/skill:my-skill`, or let the
@@ -83,7 +94,7 @@ Skill discovery is controlled by three settings, all on by default:
 |---|---|
 | `skills.enabled` | Master switch for all filesystem skill discovery |
 | `skills.trustProjectSkills` | Load project-scoped `.gjc/skills` and surface project `.claude`/`.codex` import candidates |
-| `skills.trustUserSkills` | Load user-scoped skills (`~/.gjc/agent/skills` and legacy roots) and surface user-home import candidates |
+| `skills.trustUserSkills` | Load user-scoped skills (the agent directory's `skills` root and legacy home-relative roots) and surface user-home import candidates |
 
 ```sh
 gjc config set skills.trustProjectSkills false   # ignore repo-controlled skills only
@@ -106,8 +117,11 @@ Duplicate names resolve deterministically, first location wins:
 1. project scope beats user scope;
 2. within project scope, the `.gjc/skills` directory nearest to `cwd` wins
    (ancestors are walked from `cwd` up to the repo root, closest first);
-3. within user scope: `<config>/agent/skills` > legacy `<config>/skills` >
-   legacy `~/.gjc/skills`.
+3. within user scope: the agent directory's `skills` root (`gjc config path`);
+   in the default profile its home-relative legacy roots follow at lower
+   precedence: `<config>/agent/skills` > legacy `<config>/skills` >
+   legacy `~/.gjc/skills` (under an agent-directory profile only the agent
+   directory is scanned).
 
 Shadowed duplicates are diagnosed rather than silent. Bundled workflow skill
 names are reserved: a project skill named `autoresearch`, `deep-interview`, `ralplan`,

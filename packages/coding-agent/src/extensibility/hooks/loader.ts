@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import * as zod from "zod/v4";
 import { hookCapability } from "../../capability/hook";
+import type { Settings } from "../../config/settings";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
 import { HookSourceConvention } from "../../hooks/events";
@@ -253,7 +254,12 @@ export async function loadHooks(paths: string[], cwd: string): Promise<LoadHooks
  *
  * Plus any explicitly configured paths from settings.
  */
-export async function discoverAndLoadHooks(configuredPaths: string[], cwd: string): Promise<LoadHooksResult> {
+export async function discoverAndLoadHooks(
+	configuredPaths: string[],
+	cwd: string,
+	agentDir?: string,
+	settings?: Settings,
+): Promise<LoadHooksResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const normalizationErrors: Array<{ path: string; error: string }> = [];
@@ -272,7 +278,12 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 
 	// 1. Discover hooks via capability API and validate the provider descriptor
 	// against the canonical model before importing project-controlled code.
-	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd, providers: ["native"] });
+	const discovered = await loadCapability<Hook>(hookCapability.id, {
+		cwd,
+		agentDir,
+		settings,
+		providers: ["native"],
+	});
 	for (const hook of discovered.items) {
 		const convention =
 			hook._source.provider === "native"
@@ -389,8 +400,10 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 export async function discoverAndLoadHookExtensions(
 	configuredPaths: string[],
 	cwd: string,
+	agentDir?: string,
+	settings?: Settings,
 ): Promise<LoadHookExtensionsResult> {
-	const loaded = await discoverAndLoadHooks(configuredPaths, cwd);
+	const loaded = await discoverAndLoadHooks(configuredPaths, cwd, agentDir, settings);
 	return {
 		factories: loaded.hooks.map(hook => ({
 			factory: createHookExtensionFactory(hook),

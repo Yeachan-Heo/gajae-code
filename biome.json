@@ -77,6 +77,7 @@
 			"packages/*/*.ts",
 			"!packages/*/src/**/*.d.ts",
 			"!packages/natives/native/index.d.ts",
+			"!packages/ai/src/adapter-internals/provider-safety-stop.d.ts",
 			"!**/vendor/**/*",
 			"!packages/coding-agent/src/defaults/gjc/extensions/grok-cli-vendor/**/*",
 			"!**/node_modules/**/*",

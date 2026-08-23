@@ -372,6 +372,7 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	const result = await loadCapability<T>(capability.id, {
 		cwd,
+		agentDir: activeSettings.getAgentDir(),
 		settings: activeSettings,
 		includeDisabled: true,
 		includeInvalid: true,
@@ -1013,7 +1014,9 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// Exact session-startup consumer (interactive/print modes).
-	const loadedNames = new Set((await loadSlashCommands({ cwd })).map(cmd => cmd.name));
+	const loadedNames = new Set(
+		(await loadSlashCommands({ cwd, agentDir: activeSettings.getAgentDir() })).map(cmd => cmd.name),
+	);
 
 	const items: CustomizeDoctorItem[] = entries.map(entry => {
 		const base = baseItem("command", entry);

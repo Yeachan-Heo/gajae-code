@@ -250,6 +250,8 @@ function summarizeSettingsOptions(options: SettingsOptions | null): {
 
 /** Additional layer setup for {@link Settings.isolated}. */
 export interface IsolatedSettingsOptions {
+	/** Agent directory retained by an isolated session or subagent profile. */
+	agentDir?: string;
 	/** Initial runtime overrides. Notification paths are rejected. */
 	overrides?: Partial<Record<SettingPath, unknown>>;
 }
@@ -640,7 +642,7 @@ export class Settings implements NotificationSettingsReader {
 		globalSettings: Partial<Record<SettingPath, unknown>> = {},
 		options: IsolatedSettingsOptions = {},
 	): Settings {
-		const instance = new Settings({ inMemory: true, overrides: options.overrides });
+		const instance = new Settings({ inMemory: true, agentDir: options.agentDir, overrides: options.overrides });
 		for (const [key, value] of Object.entries(globalSettings)) {
 			setByPath(instance.#global, key.split("."), structuredClone(value));
 		}

@@ -257,6 +257,8 @@ export interface ExecutorOptions {
 	 * Manual/direct parents (no active profile) keep exact resolution.
 	 */
 	parentActiveModelProfile?: string;
+	/** Explicit agent profile selected by the parent session. */
+	parentAgentDir?: string;
 	parentSessionId?: string;
 	parentCredentialSessionId?: string;
 	thinkingLevel?: ThinkingLevel;
@@ -838,7 +840,11 @@ function getUsageTokens(usage: unknown): number {
 	return firstNumberField(record, ["totalTokens", "total_tokens"]) ?? 0;
 }
 
-export function createSubagentSettings(baseSettings: Settings, inheritedServiceTier?: ServiceTier): Settings {
+export function createSubagentSettings(
+	baseSettings: Settings,
+	inheritedServiceTier?: ServiceTier,
+	parentAgentDir = baseSettings.getAgentDir(),
+): Settings {
 	const snapshot: Partial<Record<SettingPath, unknown>> = {};
 	for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 		snapshot[key] = baseSettings.get(key);
@@ -853,11 +859,14 @@ export function createSubagentSettings(baseSettings: Settings, inheritedServiceT
 	} else {
 		snapshot.serviceTier = taskServiceTier;
 	}
-	return Settings.isolated({
-		...snapshot,
-		"async.enabled": false,
-		"bash.autoBackground.enabled": false,
-	});
+	return Settings.isolated(
+		{
+			...snapshot,
+			"async.enabled": false,
+			"bash.autoBackground.enabled": false,
+		},
+		{ agentDir: parentAgentDir },
+	);
 }
 
 /**
@@ -1056,7 +1065,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 	}
 
 	const settings = options.settings ?? Settings.isolated();
-	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
+	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier, options.parentAgentDir);
 	const configuredSubagentServiceTier = subagentSettings.get("serviceTier");
 	const subagentServiceTier = configuredSubagentServiceTier === "none" ? undefined : configuredSubagentServiceTier;
 	const isFastForModel = (candidate: Model | undefined): boolean =>
@@ -1954,6 +1963,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 					authStorage,
 					modelRegistry,
 					settings: subagentSettings,
+					agentDir: options.parentAgentDir ?? subagentSettings.getAgentDir(),
 					providerSessionId: canonicalChildScope,
 					model,
 					thinkingLevel: effectiveThinkingLevel,

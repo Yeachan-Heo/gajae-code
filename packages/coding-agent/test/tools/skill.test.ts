@@ -214,11 +214,13 @@ describe("SkillTool", () => {
 	it("uses runtime fallback through createIf while session skills retain name precedence", async () => {
 		const cwd = await makeTempCwd();
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-home-"));
+		const originalHome = process.env.HOME;
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		let unrelated: Skill | undefined;
 		let preloaded: Skill | undefined;
 		try {
+			process.env.HOME = home;
 			process.env.GJC_CONFIG_DIR = ".gjc";
 			delete process.env.PI_CONFIG_DIR;
 			const runtimePath = await makeRuntimeSkill(
@@ -229,7 +231,9 @@ describe("SkillTool", () => {
 			);
 			unrelated = await makeSkill("unrelated", "Unrelated body.");
 			const captured: CapturedSend[] = [];
-			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings(), home });
+			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings() });
+			session.getSessionHome = () => home;
+			session.getSessionAgentDir = () => path.join(home, ".gjc", "agent");
 
 			const tool = SkillTool.createIf(session);
 			expect(tool).not.toBeNull();
@@ -242,6 +246,8 @@ describe("SkillTool", () => {
 			const preloadedTool = SkillTool.createIf(
 				createSession(cwd, [unrelated, preloaded], preloadedCaptured, {
 					settings: runtimeSkillSettings(),
+					getSessionHome: () => home,
+					getSessionAgentDir: () => path.join(home, ".gjc", "agent"),
 				}),
 			);
 			expect(preloadedTool).not.toBeNull();
@@ -250,6 +256,8 @@ describe("SkillTool", () => {
 			expect(preloadedCaptured[0]?.message.content).not.toContain("Runtime fallback body.");
 			expect(preloadedResult.details?.path).toBe(preloaded.filePath);
 		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
@@ -264,6 +272,7 @@ describe("SkillTool", () => {
 	it("uses exact runtime fallback precedence across project, canonical, configured, and historical roots", async () => {
 		const cwd = await makeTempCwd();
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
+		const originalHome = process.env.HOME;
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -271,6 +280,7 @@ describe("SkillTool", () => {
 		const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 		let loaded: Skill | undefined;
 		try {
+			process.env.HOME = home;
 			delete process.env.GJC_CONFIG_DIR;
 			delete process.env.PI_CONFIG_DIR;
 			const gjcAgentDecoyDir = path.join(home, "gjc-agent-decoy");
@@ -288,7 +298,16 @@ describe("SkillTool", () => {
 			const captured: CapturedSend[] = [];
 			loaded = await makeSkill("loaded", "Loaded");
 			const tool = SkillTool.createIf(
-				createSession(cwd, [loaded], captured, { settings: runtimeSkillSettings(), home }),
+				createSession(cwd, [loaded], captured, {
+					settings: runtimeSkillSettings(),
+					getSessionHome: () => home,
+					getSessionAgentDir: () =>
+						process.env.GJC_CONFIG_DIR === ".configured-gjc"
+							? path.join(home, ".configured-gjc", "agent")
+							: process.env.PI_CONFIG_DIR === ".configured-pi"
+								? path.join(home, ".configured-pi", "agent")
+								: path.join(home, ".gjc", "agent"),
+				}),
 			)!;
 			const defaultResult = await tool.execute("call-default-canonical", { name: "default-canonical" });
 			expect(captured.at(-1)?.message.content).toContain("Default canonical body.");
@@ -406,6 +425,8 @@ describe("SkillTool", () => {
 			expect(captured).toHaveLength(capturedBeforeDecoys);
 			expect([gjcDecoyPath, piDecoyPath, xdgDecoyPath]).not.toContain(piResult.details?.path);
 		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;

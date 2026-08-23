@@ -2284,6 +2284,19 @@ export interface SearchResult {
   error?: string
 }
 
+/**
+ * Create or overwrite one native skill's `SKILL.md` without following any
+ * path component. Every ancestor is opened descriptor-relatively with
+ * `O_DIRECTORY|O_NOFOLLOW`; the skill directory is created through the
+ * retained skills-root descriptor, and the final regular file is opened with
+ * `O_NOFOLLOW` before its descriptor is truncated and written.
+ *
+ * Only Unix targets implement the descriptor-relative primitive. Other
+ * platforms return `unsupported_platform` so callers cannot silently fall
+ * back to a path-based write.
+ */
+export declare function secureWriteSkillFile(rootPath: string, skillName: string, content: string): NativeSecureSkillWriteResult
+
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
   /** Command string to execute in the shell. */

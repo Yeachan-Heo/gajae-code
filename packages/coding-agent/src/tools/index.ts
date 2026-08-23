@@ -180,6 +180,8 @@ export interface AskAnswerSource {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	/** @deprecated Use getSessionHome() for the session's trusted discovery home. */
+	home?: string;
 	/** Current working directory */
 	cwd: string;
 	/** Whether UI is available */
@@ -193,16 +195,6 @@ export interface ToolSession {
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
-	/**
-	 * Explicit user home for runtime skill discovery. Tests construct sessions
-	 * against an isolated home because the trusted-home resolver deliberately
-	 * ignores `$HOME` on Linux (it reads the NSS account database instead), so a
-	 * `process.env.HOME` override cannot steer user-scope discovery there.
-	 *
-	 * Production sessions leave this unset and the trusted OS home governs.
-	 * Runtime discovery only; never threaded into capability loading.
-	 */
-	home?: string;
 	skills?: Skill[];
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
@@ -251,6 +243,8 @@ export interface ToolSession {
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
+	/** Get the trusted home directory used for this session's discovery context. */
+	getSessionHome?: () => string;
 	/** Get credential-selection session identity. */
 	getCredentialSessionId?: () => string | null;
 	/** Scope-held MCP facade for mcp:// resolution. */

@@ -4,6 +4,7 @@ import {
 	initializeWithSettings,
 	loadCapability,
 	registerProvider,
+	releaseSettingsScope,
 } from "@gajae-code/coding-agent/capability";
 import type { Settings } from "@gajae-code/coding-agent/config/settings";
 
@@ -50,5 +51,31 @@ describe("session-local disabled provider policy", () => {
 
 		expect(firstResult.items.map(item => item.name)).toEqual(["b"]);
 		expect(secondResult.items.map(item => item.name)).toEqual(["a"]);
+	});
+
+	test("keeps same-cwd session policies isolated across close order", async () => {
+		const cwd = "/shared-session-cwd";
+		const first = {
+			get: (key: string) => (key === "disabledProviders" ? ["session-policy-a"] : []),
+			getCwd: () => cwd,
+		} as unknown as Settings;
+		const second = {
+			get: (key: string) => (key === "disabledProviders" ? ["session-policy-b"] : []),
+			getCwd: () => cwd,
+		} as unknown as Settings;
+		initializeWithSettings(first);
+		initializeWithSettings(second);
+
+		expect(
+			(await loadCapability<{ name: string }>(capability.id, { settings: first })).items.map(item => item.name),
+		).toEqual(["b"]);
+		expect(
+			(await loadCapability<{ name: string }>(capability.id, { settings: second })).items.map(item => item.name),
+		).toEqual(["a"]);
+
+		releaseSettingsScope(second);
+		expect(
+			(await loadCapability<{ name: string }>(capability.id, { settings: first })).items.map(item => item.name),
+		).toEqual(["b"]);
 	});
 });

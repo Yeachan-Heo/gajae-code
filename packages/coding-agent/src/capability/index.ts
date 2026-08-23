@@ -7,7 +7,7 @@
  * - Loading items for a capability across all providers
  */
 import * as path from "node:path";
-import { getAgentDir, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { getAgentDir, getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -234,20 +234,47 @@ function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Pr
 /**
  * Load a capability by ID.
  */
-export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
+async function loadCapabilityWithContext<T>(
+	capabilityId: string,
+	options: LoadOptions,
+	home: string,
+): Promise<CapabilityResult<T>> {
 	const capability = capabilities.get(capabilityId) as Capability<T> | undefined;
 	if (!capability) {
 		throw new Error(`Unknown capability: "${capabilityId}"`);
 	}
 
 	const cwd = options.cwd ?? getProjectDir();
-	const home = getTrustedHomeDir();
-	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
+	const userAgentDir = options.agentDir
+		? path.resolve(options.agentDir)
+		: path.join(home, getConfigDirName(), "agent");
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
+}
+
+export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
+	return await loadCapabilityWithContext(
+		capabilityId,
+		{ ...options, agentDir: options.agentDir || getAgentDir() },
+		getTrustedHomeDir(),
+	);
+}
+
+/**
+ * Load a capability against an explicitly supplied home for SDK compatibility
+ * seams that already expose a home-scoped discovery option. This stays internal
+ * to the coding-agent package; the public loadCapability API remains bound to
+ * the trusted process home.
+ */
+export async function loadCapabilityForHome<T>(
+	capabilityId: string,
+	home: string,
+	options: LoadOptions = {},
+): Promise<CapabilityResult<T>> {
+	return await loadCapabilityWithContext(capabilityId, options, path.resolve(home));
 }
 
 // =============================================================================

@@ -25,8 +25,11 @@ export interface LoadContext {
 	 * `discovery/builtin.ts`).
 	 *
 	 * A native surface whose write path targets the agent directory resolves its
-	 * user scope from here, or discovery reads a different file than the writer
-	 * produced. This includes MCP registrations and user-installed skills.
+	 * user scope from here, or discovery reads a different file than the one the
+	 * writer produced: `gjc mcp add` (user scope) writes `getMCPConfigPath("user")`
+	 * and `gjc migrate` writes `<agentDir>/skills` under this directory.
+	 * Home-relative legacy roots and foreign Claude/Codex scans keep resolving
+	 * from `home`.
 	 */
 	userAgentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */

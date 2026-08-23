@@ -2,6 +2,7 @@ import type { AutocompleteItem } from "@gajae-code/tui";
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
 import { slashCommandCapability } from "../capability/slash-command";
 import { appendInlineArgsFallback, templateUsesInlineArgPlaceholders } from "../config/prompt-templates";
+import type { Settings } from "../config/settings";
 import type { SlashCommand } from "../discovery";
 import { loadCapability } from "../discovery";
 import {
@@ -153,6 +154,10 @@ function parseCommandTemplate(
 export interface LoadSlashCommandsOptions {
 	/** Working directory for project-local commands. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory for session-scoped user commands. Default: getAgentDir(). */
+	agentDir?: string;
+	/** Settings authority for this session-scoped discovery. */
+	settings?: Settings;
 }
 
 /**
@@ -160,7 +165,11 @@ export interface LoadSlashCommandsOptions {
  * Loads from all registered providers (builtin, user, project).
  */
 export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}): Promise<FileSlashCommand[]> {
-	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: options.cwd });
+	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, {
+		cwd: options.cwd,
+		agentDir: options.agentDir,
+		settings: options.settings,
+	});
 
 	const fileCommands: FileSlashCommand[] = result.items.map(cmd => {
 		const { description, body } = parseCommandTemplate(cmd.content, {

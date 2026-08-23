@@ -73,6 +73,18 @@ function withoutTimestamp(report: CustomizeDoctorReport): Omit<CustomizeDoctorRe
 }
 
 describe("customize doctor (#4288)", () => {
+	it("uses the injected settings profile for native capability inventory", async () => {
+		const cwd = await makeTempProject();
+		const profile = path.join(cwd, "profile");
+		await makeSkill(path.join(profile, "skills"), "profile-skill", "Profile skill");
+
+		const report = await runCustomizeDoctor(cwd, Settings.isolated({}, { agentDir: profile }));
+
+		expect(itemsByName(report, "skill").get("profile-skill")?.path).toBe(
+			path.join(profile, "skills", "profile-skill", "SKILL.md"),
+		);
+	});
+
 	it("reports deterministic provenance and precedence across native, Claude, and Codex fixtures", async () => {
 		const cwd = await makeTempProject();
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "fixture-native", "Native project skill");

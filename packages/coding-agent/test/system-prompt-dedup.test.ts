@@ -10,6 +10,7 @@ import {
 	loadProjectContextFiles,
 	loadSystemPromptFiles,
 } from "@gajae-code/coding-agent/system-prompt";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function escapeRegExp(text: string): string {
@@ -20,6 +21,7 @@ describe("SYSTEM.md prompt assembly", () => {
 	let tempDir = "";
 	let tempHomeDir = "";
 	let originalHome: string | undefined;
+	let originalAgentDir = "";
 
 	beforeEach(() => {
 		// Keep project-context fixtures outside the real user HOME even when
@@ -28,11 +30,17 @@ describe("SYSTEM.md prompt assembly", () => {
 		tempDir = fs.mkdtempSync(path.join(path.sep, "tmp", "gjc-system-prompt-"));
 		tempHomeDir = fs.mkdtempSync(path.join(path.sep, "tmp", "gjc-system-home-"));
 		originalHome = process.env.HOME;
+		originalAgentDir = getAgentDir();
 		process.env.HOME = tempHomeDir;
 		vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
+		setAgentDir(path.join(tempHomeDir, ".gjc", "agent"));
 	});
 
-	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
+	afterEach(() => {
+		setAgentDir(originalAgentDir);
+		vi.restoreAllMocks();
+		cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome }))();
+	});
 
 	it("renders SYSTEM.md exactly once when it is used as the custom base prompt", async () => {
 		const projectDir = path.join(tempDir, "project");

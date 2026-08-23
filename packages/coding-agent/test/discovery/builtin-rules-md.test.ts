@@ -36,6 +36,15 @@ async function loadNativeRules(ctx: LoadContext): Promise<Rule[]> {
 	return result.items;
 }
 
+/**
+ * The default-profile context these tests mean: user scope resolves from
+ * `<home>/.gjc/agent` (what `getAgentDir()` would return under that home).
+ * Without it the provider falls back to the process-wide agent directory.
+ */
+function defaultProfileContext(overrides: { cwd: string; home: string; repoRoot: string | null }): LoadContext {
+	return { ...overrides, userAgentDir: path.join(overrides.home, ".gjc", "agent") };
+}
+
 beforeEach(() => {
 	clearCache();
 	tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-rules-md-"));
@@ -57,7 +66,7 @@ test("user ~/.gjc/agent/RULES.md becomes an alwaysApply rule", async () => {
 		"**CRITICAL**: You _MUST_ use beads task tracker for any project\n",
 	);
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(defaultProfileContext({ cwd: project, home, repoRoot: project }));
 
 	const userRule = rules.find(r => r._source.level === "user" && r.name === "RULES");
 	expect(userRule).toBeDefined();
@@ -68,7 +77,7 @@ test("user ~/.gjc/agent/RULES.md becomes an alwaysApply rule", async () => {
 test("project .gjc/RULES.md becomes an alwaysApply rule", async () => {
 	writeFile(path.join(project, ".gjc", "RULES.md"), "# Project rule\nAlways say hi.\n");
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(defaultProfileContext({ cwd: project, home, repoRoot: project }));
 
 	const projectRule = rules.find(r => r._source.level === "project" && r.name === "RULES");
 	expect(projectRule).toBeDefined();
@@ -81,7 +90,7 @@ test("project RULES.md is found walking up from a sub-package cwd", async () => 
 	fs.mkdirSync(subPkg, { recursive: true });
 	writeFile(path.join(project, ".gjc", "RULES.md"), "# Repo-wide sticky rule\n");
 
-	const rules = await loadNativeRules({ cwd: subPkg, home, repoRoot: project });
+	const rules = await loadNativeRules(defaultProfileContext({ cwd: subPkg, home, repoRoot: project }));
 
 	const projectRule = rules.find(r => r._source.level === "project" && r.name === "RULES");
 	expect(projectRule).toBeDefined();
@@ -92,7 +101,7 @@ test("project RULES.md is found walking up from a sub-package cwd", async () => 
 test("alwaysApply is forced even when frontmatter says false", async () => {
 	writeFile(path.join(home, ".gjc", "agent", "RULES.md"), "---\nalwaysApply: false\n---\nStick around anyway.\n");
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(defaultProfileContext({ cwd: project, home, repoRoot: project }));
 
 	const userRule = rules.find(r => r._source.level === "user" && r.name === "RULES");
 	expect(userRule?.alwaysApply).toBe(true);
@@ -103,7 +112,7 @@ test("absent RULES.md does not produce a rule", async () => {
 	// No RULES.md anywhere — only a sibling .gjc/rules/ to make sure the directory exists.
 	writeFile(path.join(home, ".gjc", "agent", "rules", "other.md"), "# Unrelated rule\n");
 
-	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
+	const rules = await loadNativeRules(defaultProfileContext({ cwd: project, home, repoRoot: project }));
 
 	expect(rules.find(r => r.name === "RULES")).toBeUndefined();
 });

@@ -3,6 +3,20 @@ import { Settings } from "../../src/config/settings";
 import { createSubagentSettings } from "../../src/task/executor";
 
 describe("createSubagentSettings service-tier inheritance", () => {
+	it("preserves the parent agent directory", () => {
+		const base = Settings.isolated({}, { agentDir: "/tmp/gjc-parent-profile" });
+
+		expect(createSubagentSettings(base).getAgentDir()).toBe("/tmp/gjc-parent-profile");
+	});
+
+	it("preserves an explicit parent profile over injected settings", () => {
+		const base = Settings.isolated({}, { agentDir: "/tmp/gjc-injected-settings-profile" });
+
+		expect(createSubagentSettings(base, undefined, "/tmp/gjc-explicit-parent-profile").getAgentDir()).toBe(
+			"/tmp/gjc-explicit-parent-profile",
+		);
+	});
+
 	it("inherits the LIVE parent session tier by default (not the stale settings snapshot)", () => {
 		// Runtime `/fast on` lives on the live session tier, not settings: base
 		// settings say `none`, but the live inherited tier must win.
