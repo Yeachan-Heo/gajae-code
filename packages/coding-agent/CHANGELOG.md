@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 
+
 ### Added
 
 - Added an SDK `automationTools` option for host-owned `browser` and `computer` implementations. External automation retains built-in activation and provenance, receives the normal abort signal, works independently of the default browser/platform gates, and fails closed on custom, extension, or MCP name collisions (#4809).
@@ -18,6 +19,7 @@
 
 ### Fixed
 
+- Terminal `agent_end` now retires the foreground `Working…` indicator even when the mutable session streaming flag settles late. The terminal event remains authoritative across later background-task refreshes, while the next `agent_start` re-enables normal streaming activity.
 - Bash tool globs with a trailing separator (`pattern*/`) now match directories only, and literal components after a glob (`*/name`) now require the resulting path to exist, matching bash/POSIX pathname expansion. The vendored shell's expander appended post-glob literal components (including the empty component a trailing `/` splits into) without any filesystem check, so `LICENSE*/` matched the plain file `LICENSE`, `ls -d */` received file arguments and exited 1, `for d in */` iterated over files, and `*/absent` fabricated paths that were never on disk. Directory checks follow symlinks (matching bash `*/` semantics) while literal-suffix existence uses lstat (dangling symlinks still match); patterns whose last component is itself a glob are unchanged since their matches come from directory reads.
 - Workflow handoffs out of autoresearch now transit properly: `/skill:deep-interview`, `/skill:ralplan`, and `/skill:ultragoal` chain from any live autoresearch phase (`intake`/`research`/`verdict`), and ralplan's `final` phase chains via its manifest terminal states; ralplan/ultragoal live phases still require the explicit write-to-handoff step. `gjc autoresearch clear` remains the finalize-only exit.
 - The coordinator idle reaper now judges idle eligibility against the durable WAL's turn activity watermark (`recovery.prompt_watermark_at`, falling back to the session's creation stamp for turn-less sessions) instead of the projection session-state stamp. Projection repair (and any failed close admission) rewrites that state file with a fresh `now` stamp, which reset the idle clock after every failed `session.close` and deferred the reaper's same-key retry by a full idle TTL. The reaper retry contract (`coordinator-reap:<session>:<incarnation>` key reuse) holds again, and an ephemeral session older than the TTL whose last turn completed recently is no longer reapable between turns; the projection stamp remains the fallback only for sessions whose WAL cannot be read. The `stop-session` and `send-prompt-concurrency` lifecycle suites were also re-based onto the post-#4731 durable layout (canonical WAL + namespaced projections; broker `session.create` mocks echo `coordinatorSidecarKeyId`), restoring them to the required CI set (#4835).

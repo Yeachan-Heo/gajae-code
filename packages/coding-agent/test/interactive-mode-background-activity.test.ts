@@ -5,6 +5,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { InteractiveMode, resolveActivityIndicatorMessage } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -80,6 +81,19 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(false, 2, "Working…")).toBe("Background: 2 tasks…");
 		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
 	});
+
+	it("retires the foreground indicator when agent_end races stale streaming state", async () => {
+		mode.ensureLoadingAnimation();
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const controller = new EventController(mode);
+
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		mode.syncActivityIndicator();
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(renderStatus(mode)).toBe("");
+	});
+
 	it("schedules the startup crash relay hook from trusted global settings", async () => {
 		const debug = vi.spyOn(logger, "debug");
 		Settings.instance.set("crashReport.upstream", "sentry");

@@ -66,13 +66,19 @@ export function canApplyComposerSubmission(
 
 type PartialActivityStatusContainer = Partial<Pick<Container, "children" | "clear" | "detachChild" | "addChild">>;
 
+export type ActivityIndicatorStopOptions = Readonly<{
+	restoreBackground?: boolean;
+	/** The terminal event is authoritative even if the session's streaming flag has not settled yet. */
+	foregroundSettled?: boolean;
+}>;
+
 export function stopInteractiveActivityIndicator(
 	ctx: {
 		loadingAnimation?: Loader;
 		statusContainer?: PartialActivityStatusContainer;
-		stopLoadingAnimation?: (options?: { restoreBackground?: boolean }) => void;
+		stopLoadingAnimation?: (options?: ActivityIndicatorStopOptions) => void;
 	},
-	options?: { restoreBackground?: boolean },
+	options?: ActivityIndicatorStopOptions,
 ): void {
 	if (ctx.stopLoadingAnimation) {
 		ctx.stopLoadingAnimation(options);
@@ -111,7 +117,7 @@ export function clearInteractiveActivityLoaders(
 export function suspendInteractiveActivityIndicator(ctx: {
 	loadingAnimation?: Loader;
 	statusContainer?: PartialActivityStatusContainer;
-	stopLoadingAnimation?: (options?: { restoreBackground?: boolean }) => void;
+	stopLoadingAnimation?: (options?: ActivityIndicatorStopOptions) => void;
 	syncActivityIndicator?: () => void;
 	suspendActivityIndicator?: () => () => void;
 }): () => void {
@@ -276,7 +282,7 @@ export interface InteractiveModeContext {
 	ensureLoadingAnimation(): void;
 	syncActivityIndicator(): void;
 	suspendActivityIndicator(): () => void;
-	stopLoadingAnimation(options?: { restoreBackground?: boolean }): void;
+	stopLoadingAnimation(options?: ActivityIndicatorStopOptions): void;
 	/**
 	 * Commit a pet mode through the shared result-returning policy: capability
 	 * is rechecked immediately before mutation and the preference persists only

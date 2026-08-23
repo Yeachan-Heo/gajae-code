@@ -114,6 +114,7 @@ import type { Theme } from "./theme/theme";
 import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
+	type ActivityIndicatorStopOptions,
 	type CompactionQueuedMessage,
 	type ComposerSubmissionOptions,
 	canApplyComposerSubmission,
@@ -496,6 +497,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
 	#foregroundActivity = false;
+	#foregroundTurnSettled = false;
 	#activityIndicatorSuspensions = 0;
 	#suspendedActivityIndicator?: Loader;
 	#stopped = false;
@@ -1841,13 +1843,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	syncActivityIndicator(): void {
 		if (this.#stopped || this.#activityIndicatorSuspensions > 0 || this.autoCompactionLoader || this.retryLoader)
 			return;
-		const foregroundActive = this.#foregroundActivity || this.session.isStreaming;
+		const foregroundActive = this.#foregroundActivity || (!this.#foregroundTurnSettled && this.session.isStreaming);
 		if (!this.isInitialized && !foregroundActive) {
 			this.#stopLoadingAnimation();
 			return;
 		}
 		const message = resolveActivityIndicatorMessage(
-			this.#foregroundActivity || this.session.isStreaming,
+			foregroundActive,
 			this.#activeBackgroundTaskCount(),
 			this.#pendingWorkingMessage ?? this.#defaultWorkingMessage,
 		);
@@ -1874,12 +1876,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	ensureLoadingAnimation(): void {
+		this.#foregroundTurnSettled = false;
 		this.#foregroundActivity = true;
 		this.syncActivityIndicator();
 	}
 
-	stopLoadingAnimation(options?: { restoreBackground?: boolean }): void {
+	stopLoadingAnimation(options?: ActivityIndicatorStopOptions): void {
 		this.#foregroundActivity = false;
+		if (options?.foregroundSettled) this.#foregroundTurnSettled = true;
 		if (options?.restoreBackground === false) {
 			this.#stopLoadingAnimation();
 			return;

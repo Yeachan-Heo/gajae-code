@@ -905,7 +905,7 @@ export class EventController {
 
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		this.ctx.setWorkingMessage(undefined);
-		stopInteractiveActivityIndicator(this.ctx);
+		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		if (this.ctx.streamingComponent) {
 			this.ctx.chatContainer.removeChild(this.ctx.streamingComponent);
 			this.ctx.streamingComponent = undefined;
