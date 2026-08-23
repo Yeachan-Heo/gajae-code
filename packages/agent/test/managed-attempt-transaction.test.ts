@@ -1206,7 +1206,7 @@ describe("managed attempt transaction", () => {
 		await agent.waitForIdle();
 
 		expect(outcomeCalls).toBe(0);
-		expect(agent.state.error).toContain("local status only");
+		expect(agent.state.error).toBe("Agent run failed.");
 		expect(agent.state.messages.find(message => message.role === "assistant")).toBeDefined();
 	});
 
@@ -1635,7 +1635,7 @@ describe("managed attempt transaction", () => {
 		// Local overflow is not provider evidence: the fallback chain must not
 		// be consumed, and the failure surfaces as an explicit local error.
 		expect(outcomeCalls).toBe(0);
-		expect(agent.state.error).toContain("provisional event buffer limit");
+		expect(agent.state.error).toBe("Agent run failed.");
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_buffer_overflow");
 		expect(witnessReads).toBe(0);
 		// One bounded diagnostic per stream invocation, shape-only.
@@ -1686,7 +1686,7 @@ describe("managed attempt transaction", () => {
 			});
 			await agent.waitForIdle();
 			expect(outcomeCalls).toBe(0);
-			expect(agent.state.error).toContain("provisional event buffer limit");
+			expect(agent.state.error).toBe("Agent run failed.");
 			const terminal = agent.state.messages.at(-1) as AssistantMessage;
 			expect(terminal.errorKind).toBe("local_buffer_overflow");
 			const overflow = (terminal as unknown as { bufferOverflow?: { stage: string } }).bufferOverflow;
@@ -1735,7 +1735,7 @@ describe("managed attempt transaction", () => {
 			});
 			await agent.waitForIdle();
 			expect(outcomeCalls).toBe(0);
-			expect(agent.state.error).toContain("provisional event buffer limit");
+			expect(agent.state.error).toBe("Agent run failed.");
 			const terminal = agent.state.messages.at(-1) as AssistantMessage;
 			expect(terminal.errorKind).toBe("local_buffer_overflow");
 			const overflow = (terminal as unknown as { bufferOverflow?: { stage: string; maxStagedBytes: number } })
@@ -1809,10 +1809,10 @@ describe("managed attempt transaction", () => {
 		// as an explicit local error message carrying no provider evidence,
 		// and no provisional streamed content leaks (no message_update).
 		expect(outcomeCalls).toBe(0);
-		expect(agent.state.error).toContain("provisional event buffer limit");
+		expect(agent.state.error).toBe("Agent run failed.");
 		expect(events).not.toContain("message_update");
 		expect(surfaced).toHaveLength(1);
-		expect(surfaced[0]?.errorMessage).toContain("provisional event buffer limit");
+		expect(surfaced[0]?.errorMessage).toBe("Agent run failed.");
 		expect(surfaced[0]?.errorStatus).toBeUndefined();
 		expect(surfaced[0]?.transportFailure).toBeUndefined();
 	});
@@ -1923,7 +1923,7 @@ describe("managed attempt transaction", () => {
 			// error (same behavior as the default cap): the overflow never carries
 			// provider evidence, so the fallback chain is not consumed.
 			expect(outcomeCalls).toBe(0);
-			expect(agent.state.error).toContain("provisional event buffer limit");
+			expect(agent.state.error).toBe("Agent run failed.");
 			expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_buffer_overflow");
 		} finally {
 			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_EVENTS;
@@ -1963,7 +1963,7 @@ describe("managed attempt transaction", () => {
 			// shrink it, so the attempt fails as a local error without consuming
 			// the fallback chain.
 			expect(outcomeCalls).toBe(0);
-			expect(agent.state.error).toContain("provisional event buffer limit");
+			expect(agent.state.error).toBe("Agent run failed.");
 		} finally {
 			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
 			else process.env.GJC_FALLBACK_MAX_STAGED_BYTES = previous;
@@ -2158,7 +2158,7 @@ describe("managed attempt transaction", () => {
 			// The retained batch as a whole exceeded the cap and was rejected
 			// as a typed local overflow without consuming the fallback chain.
 			expect(outcomeCalls).toBe(0);
-			expect(agent.state.error).toContain("provisional event buffer limit");
+			expect(agent.state.error).toBe("Agent run failed.");
 			expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_buffer_overflow");
 		} finally {
 			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
@@ -2212,7 +2212,7 @@ describe("managed attempt transaction", () => {
 			// The typed overflow fired without consuming the fallback chain and
 			// without ever building the full multi-megabyte serialization.
 			expect(outcomeCalls).toBe(0);
-			expect(agent.state.error).toContain("provisional event buffer limit");
+			expect(agent.state.error).toBe("Agent run failed.");
 			const terminal = agent.state.messages.at(-1) as AssistantMessage;
 			expect(terminal.errorKind).toBe("local_buffer_overflow");
 			// The diagnostic names the cap that tripped, proving the guard —
@@ -2366,7 +2366,7 @@ describe("managed attempt transaction", () => {
 			},
 		});
 		expect(outcomes).toBe(0);
-		expect(agent.state.error).toContain("local snapshot");
+		expect(agent.state.error).toBe("Agent run failed.");
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 		// The diagnostic names the exact failing site and carries shape only:
@@ -2535,7 +2535,7 @@ describe("managed attempt transaction", () => {
 
 		await agent.prompt("run", { fallbackManaged: true });
 
-		expect(agent.state.error).toContain("forged local failure");
+		expect(agent.state.error).toBe("Agent run failed.");
 		expect(diagnostics).toHaveLength(0);
 		expect(JSON.stringify(diagnostics)).not.toContain(marker);
 	});
@@ -2709,7 +2709,7 @@ describe("managed attempt transaction", () => {
 			},
 		});
 		await agent.prompt("run", { fallbackManaged: true });
-		expect(agent.state.error).toContain("local snapshot");
+		expect(agent.state.error).toBe("Agent run failed.");
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
 	});
 	it("degrades missing or primitive deltas to an empty increment instead of killing the turn", async () => {
@@ -2965,7 +2965,7 @@ describe("managed attempt transaction", () => {
 			},
 		});
 		await rejected.prompt("run", { fallbackManaged: true });
-		expect(rejected.state.error).toContain("local snapshot");
+		expect(rejected.state.error).toBe("Agent run failed.");
 	});
 });
 
@@ -3637,7 +3637,7 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 			},
 		});
 		expect(outcomes).toBe(0);
-		expect(agent.state.error).toContain("local snapshot");
+		expect(agent.state.error).toBe("Agent run failed.");
 	});
 
 	it("names the event cap, staged counts, and limits in the surfaced byte-overflow error (#4618)", async () => {
@@ -3659,22 +3659,15 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		await agent.prompt("run", { fallbackManaged: true });
 		await agent.waitForIdle();
 
-		// Byte-cap overflow while staging the first assistant payload: stage,
-		// exceeded-cap discriminator, counters, incoming size, and limits are
-		// all named, and the message stays actionable about what the failure
-		// is NOT (provider / context window).
+		// Byte-cap overflow while staging the first assistant payload exposes
+		// its authoritative structured diagnostic without leaking the raw error.
 		const terminal = agent.state.messages.at(-1) as AssistantMessage;
 		expect(terminal.errorKind).toBe("local_buffer_overflow");
-		expect(terminal.errorMessage).toContain("provisional event buffer limit");
-		expect(terminal.errorMessage).toContain("stage=overflow.preMeasure");
-		// The single oversized event explains itself: the byte cap tripped on
-		// the incoming event's own projected size, and `exceeded` says so.
-		expect(terminal.errorMessage).toContain("exceeded=bytes");
-		expect(terminal.errorMessage).toMatch(/staged [1-9]\d*\/10000 events/);
+		expect(terminal.errorMessage).toBe("Agent run failed.");
+		// The single oversized event explains itself through the structured
+		// diagnostic: the byte cap tripped on the incoming event's own size.
 		// The incoming event is itself larger than the whole byte cap.
 		expect(terminal.bufferOverflow!.incomingEventBytes).toBeGreaterThan(MANAGED_ATTEMPT_MAX_STAGED_BYTES);
-		expect(terminal.errorMessage).toContain(`/${MANAGED_ATTEMPT_MAX_STAGED_BYTES} projected bytes`);
-		expect(terminal.errorMessage).toContain("local staging buffer limit, not a provider or context-window failure");
 		// The structured, identity-checked shape rides the terminal message so
 		// parent surfaces never have to trust errorMessage.
 		expect(terminal.bufferOverflow).toMatchObject({
@@ -3711,15 +3704,12 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 
 		const terminal = agent.state.messages.at(-1) as AssistantMessage;
 		expect(terminal.errorKind).toBe("local_buffer_overflow");
-		expect(terminal.errorMessage).toContain("provisional event buffer limit");
+		expect(terminal.errorMessage).toBe("Agent run failed.");
 		// The event cap is the one that tripped: `exceeded` names exactly
 		// `events` (never `both`), the staged counter reports the retained
 		// post-compaction batch, and the projected event count crosses the
 		// limit while projected bytes stay under the byte cap — so a
 		// regression that stopped distinguishing an event-only trip fails here.
-		expect(terminal.errorMessage).toMatch(/stage=overflow\.(preMeasure|staged)/);
-		expect(terminal.errorMessage).toMatch(/exceeded=events/);
-		expect(terminal.errorMessage).toContain(`/${MANAGED_ATTEMPT_MAX_STAGED_EVENTS} events`);
 		expect(terminal.bufferOverflow?.maxStagedEvents).toBe(MANAGED_ATTEMPT_MAX_STAGED_EVENTS);
 		expect(terminal.bufferOverflow?.exceeded).toBe("events");
 		// Projected events (staged + 1) genuinely exceeded the cap at throw time.
@@ -3728,6 +3718,5 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		expect(terminal.bufferOverflow!.stagedBytes + terminal.bufferOverflow!.incomingEventBytes).toBeLessThanOrEqual(
 			terminal.bufferOverflow!.maxStagedBytes,
 		);
-		expect(terminal.errorMessage).toContain("local staging buffer limit, not a provider or context-window failure");
 	});
 });
