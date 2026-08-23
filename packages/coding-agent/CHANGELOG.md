@@ -18,6 +18,7 @@
 
 ### Changed
 
+- `macos-omlx-quality` now routes every role through `omlx/Qwen3.6-35B-A3B-8bit` instead of the BF16 checkpoint, retaining the profile's higher reasoning-effort ladder while reducing the local model footprint and improving measured generation throughput on its M5 Max 128 GB target. The preset group label now uses the branded `macOS Local (oMLX)` casing throughout the public profile picker.
 - Upgrade note: restart the SDK broker after upgrading (`gjc sdk` callers pick this up automatically on the next launch; an already-running daemon does not). This release adds the `model.resolve` broker operation, and the broker discovery record carries no package-generation fence — a daemon left running from an earlier version keeps serving and answers the new operation with `unknown_operation`, so coordinator `model` pins (`gjc_coordinator_start_session`) fail until it is replaced. Verified against a live daemon: the failure is loud, no session is created, and one broker restart clears it.
 - Closed the remaining Sentry triage approval races: `gh` is resolved only from trusted system paths, acknowledgement rechecks and records under the creation lock, pending-create reconciliation uses a per-attempt nonce with compare-and-clear, and malformed timestamp suffixes fail ingestion before rendering. Regression coverage pins the retry/apply interleaving so a newer unresolved create cannot be cleared by an older `--retry-pending` request.
 
