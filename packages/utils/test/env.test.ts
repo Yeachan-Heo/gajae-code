@@ -3,13 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 import { $envpos, $flag, $pickenvpos, $pickflag, filterProcessEnv, parseEnvFile, parseShellEnvFile } from "../src/env";
 
 const tempDirs: string[] = [];
 
 afterEach(() => {
 	for (const dir of tempDirs.splice(0)) {
-		fs.rmSync(dir, { force: true, recursive: true });
+		safeRmSync(dir, { force: true, recursive: true });
 	}
 });
 

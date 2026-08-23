@@ -111,7 +111,7 @@
     "test:rs": "bun scripts/run-rs-task.ts test:rs",
     "check": "bun run --parallel check:ts check:rs",
     "check:ts": "bun run check:tools && bun run check:publish-types && bun run check:node20-baseline && bun run check:public-sync && bun run check:schemas && bun run check:sdk-closure && bun run check:docker-context && bun run check:gjc-ui && bun --cwd=packages/coding-agent run check:autorouting-map && bun run --workspaces --if-present check",
-    "check:tools": "biome check . --no-errors-on-unmatched && tsc -p tsconfig.tools.json --noEmit",
+    "check:tools": "biome check . --no-errors-on-unmatched && tsc -p tsconfig.tools.json --noEmit && bun scripts/check-unsafe-rmrf.ts",
     "check:publish-types": "bun scripts/ci-release-publish.ts --check-types",
     "check:node20-baseline": "bun scripts/check-node20-baseline.ts",
     "check:rs": "bun scripts/run-rs-task.ts check:rs",

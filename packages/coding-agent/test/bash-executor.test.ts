@@ -14,6 +14,7 @@ import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-ou
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 
 const BACKGROUND_COMPLETION_RACE_MS = 750;
 // Direct executor callers retain the shared 20 KiB head alongside the 50 KiB tail.
@@ -38,7 +39,7 @@ describe("executeBash", () => {
 		resetSettingsForTest();
 		vi.restoreAllMocks();
 		if (fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			safeRmSync(tempDir, { recursive: true });
 		}
 	});
 

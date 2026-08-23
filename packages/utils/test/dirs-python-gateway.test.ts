@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import {
 	getAgentDir,
 	getConfigDirName,
+	getGpuCachePath,
 	getLogsDir,
 	getPluginsDir,
 	getPuppeteerDir,
@@ -60,7 +62,7 @@ describe("python gateway directory", () => {
 			process.env.XDG_CACHE_HOME = originalXdgCacheHome;
 		}
 		setAgentDir(originalAgentDir);
-		await fs.rm(tempRoot, { recursive: true, force: true });
+		await safeRm(tempRoot, { recursive: true, force: true });
 	});
 
 	it("uses XDG state for the default agent profile", async () => {
@@ -86,6 +88,14 @@ describe("python gateway directory", () => {
 		setAgentDir(customAgentDir);
 
 		expect(getPythonGatewayDir()).toBe(path.join(customAgentDir, "python-gateway"));
+	});
+
+	it("keeps custom agent profile GPU cache out of the global config root", async () => {
+		const customAgentDir = path.join(tempRoot, "custom-agent");
+
+		setAgentDir(customAgentDir);
+
+		expect(getGpuCachePath()).toBe(path.join(customAgentDir, "gpu_cache.json"));
 	});
 
 	it("refreshes every category path after a post-import config override", async () => {

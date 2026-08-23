@@ -6,6 +6,7 @@
  * interplay with plugin-bundle MCPs, disabledServers bypass via explicit
  * connect, sealed-manager re-discovery, and native file precedence.
  */
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -16,6 +17,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../../src/cli/mcp-cli";
 import { installGjcBundle } from "../../src/extensibility/gjc-plugins";
 import { MCPManager } from "../../src/runtime-mcp";
@@ -76,9 +78,9 @@ describe("red-team: conventional MCP autoload", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		setAgentDir(originalAgentDir);
-		await fs.promises.rm(projectDir, { recursive: true, force: true });
-		await fs.promises.rm(agentDir, { recursive: true, force: true });
-		await fs.promises.rm(tempHome, { recursive: true, force: true });
+		await safeRm(projectDir, { recursive: true, force: true });
+		await safeRm(agentDir, { recursive: true, force: true });
+		await safeRm(tempHome, { recursive: true, force: true });
 	});
 
 	async function writeProjectConfig(relPath: string, content: string | unknown): Promise<void> {

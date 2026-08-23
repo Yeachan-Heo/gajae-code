@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { initializeWithSettings, loadCapability } from "@gajae-code/coding-agent/discovery";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 describe("disabledExtensions runtime filtering", () => {
 	let tempDir = "";
@@ -39,8 +40,8 @@ describe("disabledExtensions runtime filtering", () => {
 		} else {
 			process.env.HOME = originalHome;
 		}
-		await fs.rm(tempHomeDir, { recursive: true, force: true });
-		await fs.rm(tempDir, { recursive: true, force: true });
+		await safeRm(tempHomeDir, { recursive: true, force: true });
+		await safeRm(tempDir, { recursive: true, force: true });
 	});
 
 	test("hides disabled context files from runtime loads by default", async () => {

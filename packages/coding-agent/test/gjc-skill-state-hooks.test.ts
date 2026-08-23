@@ -150,6 +150,22 @@ describe("GJC native skill-state hooks", () => {
 			path.join(artifactsDir, "adversarial-report.txt"),
 			"Adversarial cases covered invalid input, missing state, and repeated operation boundaries.\n",
 		);
+		await Bun.write(
+			path.join(artifactsDir, "native-proof.png"),
+			Buffer.from(
+				"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+				"base64",
+			),
+		);
+		const computerCaseIds = [
+			"kill-switch-bypass",
+			"suspended-enforcement",
+			"permission-revoked",
+			"display-stale",
+			"out-of-bounds-drift",
+			"runaway-loop-halt",
+			"blast-radius",
+		];
 		return JSON.stringify({
 			architectReview: {
 				architectureStatus: "CLEAR",
@@ -186,6 +202,12 @@ describe("GJC native skill-state hooks", () => {
 						path: "artifacts/adversarial-report.txt",
 						description: "Adversarial verification report",
 					},
+					{
+						id: "native-proof",
+						kind: "native screenshot",
+						path: "artifacts/native-proof.png",
+						description: "Live structural native proof",
+					},
 				],
 				contractCoverage: [
 					{
@@ -194,7 +216,7 @@ describe("GJC native skill-state hooks", () => {
 						obligation: "The story satisfies the approved contract",
 						status: "covered",
 						surfaceEvidenceRefs: ["surface"],
-						adversarialCaseRefs: ["case"],
+						adversarialCaseRefs: ["case", ...computerCaseIds],
 					},
 				],
 				surfaceEvidence: [
@@ -216,6 +238,14 @@ describe("GJC native skill-state hooks", () => {
 						verdict: "passed",
 						artifactRefs: ["adversarial"],
 					},
+					...computerCaseIds.map(id => ({
+						id,
+						contractRef: "approved-plan",
+						scenario: `${id} exercises the computer safety boundary`,
+						expectedBehavior: "The runtime fails closed before unsafe desktop input can continue",
+						verdict: "passed",
+						artifactRefs: ["native-proof"],
+					})),
 				],
 				blockers: [],
 			},

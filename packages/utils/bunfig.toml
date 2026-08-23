@@ -1,0 +1,7 @@
+# Package-cwd `bun test` (CI runs `bun test` from each workspace directory)
+# does not read the repository-root bunfig.toml, so without this file the
+# shared test preload — which installs the fail-closed recursive-deletion
+# guard and canonicalizes TMPDIR for the native owner-only primitive —
+# silently never runs in package-cwd test processes (issue #4794).
+[test]
+preload = ["../../scripts/test-preload.ts"]

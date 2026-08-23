@@ -11,6 +11,7 @@ import {
 	parseSkillInvocations,
 	type Skill,
 } from "@gajae-code/coding-agent/extensibility/skills";
+import { safeRm } from "../../../scripts/safe-cleanup";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
 const collisionFixturesDir = path.resolve(import.meta.dirname, "fixtures/skills-collision");
@@ -258,8 +259,8 @@ describe("skills", () => {
 				expect(skills.map(skill => skill.name)).toEqual(["native-project-skill"]);
 				expect(skills[0]?.source).toBe("native:project");
 			} finally {
-				await fs.rm(tempProjectDir, { recursive: true, force: true });
-				await fs.rm(tempHomeDir, { recursive: true, force: true });
+				await safeRm(tempProjectDir, { recursive: true, force: true });
+				await safeRm(tempHomeDir, { recursive: true, force: true });
 			}
 		});
 
@@ -325,7 +326,7 @@ enabled: false
 				});
 				expect(skills.some(s => s.name === "disabled-skill")).toBe(false);
 			} finally {
-				await fs.rm(tempDir, { recursive: true, force: true });
+				await safeRm(tempDir, { recursive: true, force: true });
 			}
 		});
 
@@ -385,7 +386,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				expect(withTilde.length).toBe(withoutTilde.length);
 				expect(withTilde.some(skill => skill.name === "tilde-skill")).toBe(true);
 			} finally {
-				await fs.rm(tempHome, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
 			}
 		});
 
@@ -423,8 +424,8 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const { skills } = await loadSkills({ cwd: tempDir, home: tempHome });
 				expect(skills.map(skill => skill.name).sort()).toEqual(["project-skill", "user-skill"]);
 			} finally {
-				await fs.rm(tempDir, { recursive: true, force: true });
-				await fs.rm(tempHome, { recursive: true, force: true });
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
 			}
 		});
 
@@ -456,21 +457,21 @@ description: Skill loaded from a tilde-expanded custom directory.
 				expect(warnings.filter(w => w.message.includes("name collision")).length).toBe(2);
 
 				// Drop the nested copy: the repo-root project copy still beats user.
-				await fs.rm(path.join(nested, ".gjc"), { recursive: true, force: true });
+				await safeRm(path.join(nested, ".gjc"), { recursive: true, force: true });
 				const { skills: next } = await loadSkills({ cwd: nested, home: tempHome });
 				expect(next.find(skill => skill.name === "shared")?.filePath).toContain(
 					path.join(tempDir, ".gjc", "skills", "shared"),
 				);
 
 				// Drop all project copies: the user copy finally wins.
-				await fs.rm(path.join(tempDir, ".gjc"), { recursive: true, force: true });
+				await safeRm(path.join(tempDir, ".gjc"), { recursive: true, force: true });
 				const { skills: userWins } = await loadSkills({ cwd: nested, home: tempHome });
 				expect(userWins.find(skill => skill.name === "shared")?.filePath).toContain(
 					path.join(tempHome, ".gjc", "agent", "skills", "shared"),
 				);
 			} finally {
-				await fs.rm(tempDir, { recursive: true, force: true });
-				await fs.rm(tempHome, { recursive: true, force: true });
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
 			}
 		});
 
@@ -497,8 +498,8 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const legacyDisabled = await loadSkills({ cwd: tempDir, home: tempHome, enablePiProject: false });
 				expect(legacyDisabled.skills).toHaveLength(0);
 			} finally {
-				await fs.rm(tempDir, { recursive: true, force: true });
-				await fs.rm(tempHome, { recursive: true, force: true });
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
 			}
 		});
 
@@ -533,8 +534,8 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const masterOff = await loadSkills({ cwd: tempDir, home: tempHome, enabled: false });
 				expect(masterOff.skills).toHaveLength(0);
 			} finally {
-				await fs.rm(tempDir, { recursive: true, force: true });
-				await fs.rm(tempHome, { recursive: true, force: true });
+				await safeRm(tempDir, { recursive: true, force: true });
+				await safeRm(tempHome, { recursive: true, force: true });
 			}
 		});
 		it("should filter skills with includeSkills glob patterns", async () => {

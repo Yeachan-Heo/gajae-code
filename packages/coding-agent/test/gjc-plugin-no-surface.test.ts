@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { loadCapability } from "../src/capability";
 import { clearCache as clearFsCache } from "../src/capability/fs";
 import { hookCapability } from "../src/capability/hook";
@@ -86,9 +87,9 @@ afterEach(async () => {
 	} else {
 		process.env.HOME = originalHome;
 	}
-	await fs.rm(tempHome, { recursive: true, force: true });
-	await fs.rm(tempCwd, { recursive: true, force: true });
-	await fs.rm(agentDir, { recursive: true, force: true });
+	await safeRm(tempHome, { recursive: true, force: true });
+	await safeRm(tempCwd, { recursive: true, force: true });
+	await safeRm(agentDir, { recursive: true, force: true });
 });
 
 describe("GJC plugin roots never surface through legacy claude plugin providers", () => {

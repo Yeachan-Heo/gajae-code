@@ -1,3 +1,4 @@
+import { installRuntimeDeletionGuard } from "./safe-cleanup";
 import { decideAgentDirIsolation, readProjectEnvFile, stripAmbientProviderEnvironment } from "./test-agent-dir-isolation";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -70,3 +71,17 @@ if (isolation.action === "isolate") {
 	process.env.GJC_CODING_AGENT_DIR = agentDir;
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 }
+//
+// Recursive-deletion boundary (issue #4794). An operator's real home was
+// destroyed by test cleanup activity; this preload now installs a
+// fail-closed runtime guard over the deletion surfaces Bun 1.4.0 allows
+// intercepting (`fs.promises.rm/rmdir` — shared by reference across every
+// import style — plus the CJS `require("node:fs")` exports). ESM top-level
+// `fs.rmSync` bindings are immutable snapshots in Bun and cannot be patched;
+// repository test source is covered instead by `scripts/check-unsafe-rmrf.ts`
+// (run in `check:tools`), and the interception matrix is pinned by
+// scripts/safe-cleanup-guard.test.ts. The safe world captures the REAL home at
+// module-load time — before any test mutates process.env.HOME — so a cleanup
+// bug that resolves back to the operator home aborts this process instead of
+// deleting it. A refusal exits 70 by default.
+installRuntimeDeletionGuard({ label: "test-preload" });

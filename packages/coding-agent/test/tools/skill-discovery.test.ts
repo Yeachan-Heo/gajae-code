@@ -9,6 +9,7 @@ import { buildSystemPrompt } from "@gajae-code/coding-agent/system-prompt";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SkillTool } from "@gajae-code/coding-agent/tools/skill";
 import { SkillDiscoveryTool } from "@gajae-code/coding-agent/tools/skill-discovery";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 async function makeSkill(
 	root: string,
@@ -356,8 +357,8 @@ describe("SkillDiscoveryTool", () => {
 			else process.env.PI_CODING_AGENT_DIR = originalPiCodingAgentDir;
 			if (originalXdgConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
 			else process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
-			await fs.rm(cwd, { recursive: true, force: true });
-			await fs.rm(home, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -401,8 +402,8 @@ describe("SkillDiscoveryTool", () => {
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
 			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
-			await fs.rm(cwd, { recursive: true, force: true });
-			await fs.rm(home, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -451,7 +452,7 @@ describe("SkillDiscoveryTool", () => {
 				}).map(command => command.name),
 			).not.toContain("skill:hidden-helper");
 		} finally {
-			await fs.rm(cwd, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
 		}
 	});
 
@@ -490,8 +491,8 @@ describe("SkillDiscoveryTool", () => {
 				expect.objectContaining({ name: "alpha", description: "Sort alpha", path: alphaPath, source: "project" }),
 			]);
 		} finally {
-			await fs.rm(cwd, { recursive: true, force: true });
-			await fs.rm(home, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -595,7 +596,7 @@ describe("SkillDiscoveryTool", () => {
 
 			// Drop the native copy: the user-scope copy wins at runtime while the
 			// convention copies remain import candidates with enablement guidance.
-			await fs.rm(path.join(cwd, ".gjc"), { recursive: true, force: true });
+			await safeRm(path.join(cwd, ".gjc"), { recursive: true, force: true });
 			const userWins = await new SkillDiscoveryTool(
 				createSession(cwd, { settings: runtimeSkillSettings(), home }),
 			).execute("call", { query: "shared" });

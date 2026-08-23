@@ -291,6 +291,7 @@ describe("fixture broker root cleanup", () => {
 		expect(env.TMPDIR).not.toBe(process.env.TMPDIR);
 		// A child writing to os.tmpdir() lands inside the owned root...
 		const child = path.join(pinned, "child-artifact.txt");
+		await fs.mkdir(pinned, { recursive: true });
 		await fs.writeFile(child, "x");
 		expect(await exists(child)).toBe(true);
 		// ...and is removed when the fixture root is cleaned up (no external residue).

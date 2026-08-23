@@ -8,6 +8,7 @@
  * This file imports from helpers.ts directly — the native addon IS present in the
  * test environment (verified: `bun run import-helpers.ts` succeeds).
  */
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -19,6 +20,7 @@ import {
 	readInstalledPluginsRegistry,
 	writeInstalledPluginsRegistry,
 } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
+import { safeRmSync } from "../../../../scripts/safe-cleanup";
 import {
 	clearClaudePluginRootsCache,
 	listClaudePluginRoots,
@@ -47,7 +49,7 @@ describe("resolveActiveProjectRegistryPath", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		safeRmSync(tmpDir, { recursive: true, force: true });
 	});
 
 	it("walk-up finds nearest .gjc/ directory", async () => {
@@ -105,15 +107,16 @@ describe("resolveActiveProjectRegistryPath", () => {
 	it("does not treat ~/.git as a project root (pass-2 home-dir guard)", async () => {
 		// Simulate a dotfiles repo managed with a bare-git technique: ~/.git exists.
 		// resolveActiveProjectRegistryPath must NOT return ~/.gjc/.../installed_plugins.json.
-		const homeDir = os.homedir();
+		//
+		// Issue #4794: the fake home is a MOCKED temp home, not the operator's
+		// real home — the previous version created and recursively deleted
+		// ~/.git in the real home, which the safe-cleanup boundary refuses
+		// (correctly), failing the test on machines without a pre-existing ~/.git.
+		const fakeHomeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-bare-git-home-"));
+		const homeDir = path.join(fakeHomeRoot, "home");
 		const fakeHomeGit = path.join(homeDir, ".git");
-		const hadGit = await fs.promises
-			.stat(fakeHomeGit)
-			.then(() => true)
-			.catch(() => false);
-		if (!hadGit) {
-			await fs.promises.mkdir(fakeHomeGit, { recursive: true });
-		}
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+		fs.mkdirSync(fakeHomeGit, { recursive: true });
 		try {
 			// Start from a tmpDir that has no .gjc/ or .git/ of its own.
 			const result = await resolveActiveProjectRegistryPath(tmpDir);
@@ -121,7 +124,8 @@ describe("resolveActiveProjectRegistryPath", () => {
 			const homeGjcPath = path.join(homeDir, ".gjc", "plugins", "installed_plugins.json");
 			expect(result).not.toBe(homeGjcPath);
 		} finally {
-			if (!hadGit) await fs.promises.rm(fakeHomeGit, { recursive: true, force: true });
+			homeSpy.mockRestore();
+			safeRmSync(fakeHomeRoot, { recursive: true, force: true });
 		}
 	});
 
@@ -165,8 +169,8 @@ describe("listClaudePluginRoots — project shadows user", () => {
 	afterEach(() => {
 		// Cache is keyed by home:projectPath — must clear between tests.
 		clearClaudePluginRootsCache();
-		fs.rmSync(tmpHome, { recursive: true, force: true });
-		fs.rmSync(tmpProject, { recursive: true, force: true });
+		safeRmSync(tmpHome, { recursive: true, force: true });
+		safeRmSync(tmpProject, { recursive: true, force: true });
 	});
 
 	it("project entry shadows user entry when plugin IDs match", async () => {

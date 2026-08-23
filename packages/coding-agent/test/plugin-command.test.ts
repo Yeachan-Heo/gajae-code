@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { CliConfig } from "@gajae-code/utils/cli";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import Plugin from "../src/commands/plugin";
 
 const TEST_CONFIG: CliConfig = {
@@ -47,10 +48,10 @@ async function makeTempProject(): Promise<string> {
 describe("Plugin command scope parsing", () => {
 	afterEach(async () => {
 		if (tempRoot) {
-			await fs.rm(tempRoot, { recursive: true, force: true });
+			await safeRm(tempRoot, { recursive: true, force: true });
 			tempRoot = undefined;
 		}
-		for (const dir of agentDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
+		for (const dir of agentDirs.splice(0)) await safeRm(dir, { recursive: true, force: true });
 	});
 	it("rejects invalid scope values", async () => {
 		const command = new Plugin(["install", "--scope", "porject"], TEST_CONFIG);
@@ -221,7 +222,7 @@ describe("Plugin command scope parsing", () => {
 		});
 		const seeded = await runPluginCommand(["install", stagedSource, "--project"], cwd);
 		expect(seeded.exitCode).toBe(0);
-		await fs.rm(stagedSource, { recursive: true, force: true });
+		await safeRm(stagedSource, { recursive: true, force: true });
 
 		const install = await runPluginCommand(["install", hostile, "--project"], cwd);
 		const installJson = await runPluginCommand(["install", hostile, "--project", "--json"], cwd);

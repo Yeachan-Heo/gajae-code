@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { standardizeMacOSPath } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { safeRmSync } from "../../../../scripts/safe-cleanup";
 
 /**
  * `GJC_CONFIG_DIR` is documented as "Config root dirname under home", and
@@ -22,7 +23,7 @@ const PROBE = path.join(import.meta.dir, "..", "fixtures", "config-root-settings
 const roots: string[] = [];
 
 afterEach(() => {
-	for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	for (const dir of roots.splice(0)) safeRmSync(dir, { recursive: true, force: true });
 });
 
 function scenario(

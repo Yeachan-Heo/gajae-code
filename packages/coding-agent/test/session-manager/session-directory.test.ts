@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
+import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
 import {
 	artifactTreeReplayCompatible,
 	deleteManagedSessionCandidate,
@@ -31,11 +32,15 @@ import { SessionArtifactCapacityError, SessionManager } from "../../src/session/
 import { FileSessionStorage } from "../../src/session/session-storage";
 
 const temporaryDirectories: string[] = [];
+// Home-owned fixture roots (under os.homedir()) registered with
+// registerOwnedDeletionRoot before creation; their grants must stay live for
+// the whole cleanup lifetime and are revoked after the afterEach removal.
+const ownedHomeRootReleasers: Array<() => void> = [];
 
 async function removeTemporaryDirectory(directory: string): Promise<void> {
 	for (let attempt = 0; attempt < 3; attempt += 1) {
 		try {
-			await fs.rm(directory, { recursive: true, force: true });
+			await safeRm(directory, { recursive: true, force: true });
 			return;
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EFAULT" || attempt === 2) throw error;
@@ -47,7 +52,11 @@ async function removeTemporaryDirectory(directory: string): Promise<void> {
 afterEach(async () => {
 	ManagedSessionScopeTestHooks.beforeVerifiedDelete = undefined;
 	ManagedSessionScopeTestHooks.beforeManagedLockRelease = undefined;
-	await Promise.all(temporaryDirectories.splice(0).map(removeTemporaryDirectory));
+	try {
+		await Promise.all(temporaryDirectories.splice(0).map(removeTemporaryDirectory));
+	} finally {
+		while (ownedHomeRootReleasers.length > 0) ownedHomeRootReleasers.pop()!();
+	}
 });
 
 function legacyDirectory(sessionsRoot: string, cwd: string): string {
@@ -159,7 +168,7 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 			tempRoot = parent;
 		}
 		const stickyRoot = await fs.mkdtemp(path.join(tempRoot, "gjc-managed-shared-sticky-root-"));
-		await fs.rm(stickyRoot, { recursive: true, force: true });
+		await safeRm(stickyRoot, { recursive: true, force: true });
 		temporaryDirectories.push(stickyRoot);
 		const cwdRoot = await fs.mkdtemp(path.join(tempRoot, "gjc-managed-shared-sticky-workspace-"));
 		temporaryDirectories.push(cwdRoot);
@@ -327,7 +336,7 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 		const agentDir = path.dirname(sessionsRoot);
 		SessionManager.managedDestination(cwd, agentDir);
 		const tombstones = path.join(scope.directoryPath, ".gjc-managed-session-internal", "tombstones");
-		await fs.rm(tombstones, { recursive: true, force: true });
+		await safeRm(tombstones, { recursive: true, force: true });
 		await fs.writeFile(tombstones, "not-a-directory\n", { mode: 0o600 });
 
 		let failure: unknown;
@@ -927,7 +936,7 @@ describe("managed session write protocol", () => {
 				retainedPath,
 			},
 		});
-		await fs.rm(retainedPath, { recursive: true });
+		await safeRm(retainedPath, { recursive: true });
 		await fs.mkdir(retainedPath);
 		await fs.writeFile(path.join(retainedPath, "foreign.txt"), "foreign");
 
@@ -1136,7 +1145,7 @@ describe("managed session write protocol", () => {
 		});
 		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
 			for (const name of syncFs.readdirSync(pathname))
-				syncFs.rmSync(path.join(pathname, name), { recursive: true, force: true });
+				safeRmSync(path.join(pathname, name), { recursive: true, force: true });
 			return { ok: false, code: "cleanup_pending", payloadDurable: true, detachedPath: pathname };
 		});
 		try {
@@ -1240,7 +1249,7 @@ describe("managed session write protocol", () => {
 		});
 		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
 			for (const name of syncFs.readdirSync(pathname))
-				syncFs.rmSync(path.join(pathname, name), { recursive: true, force: true });
+				safeRmSync(path.join(pathname, name), { recursive: true, force: true });
 			return { ok: false, code: "cleanup_pending", detachedPath: pathname };
 		});
 		try {
@@ -1701,8 +1710,15 @@ describe("managed session write protocol", () => {
 		temporaryDirectories.push(root);
 		const sessionsRoot = path.join(root, "agent", "sessions");
 		const home = os.homedir();
-		const child = await fs.mkdtemp(path.join(home, ".gjc-managed-session-child-"));
+		const child = path.join(home, `.gjc-managed-session-child-${process.pid}-${Date.now()}`);
+		// This fixture lives under the REAL home (os.homedir()), which the
+		// safe-cleanup boundary refuses without an explicit grant. Register the
+		// exact root before creation and keep the grant live until the afterEach
+		// cleanup finishes (it is revoked via ownedHomeRootReleasers).
+		const forgetChildGrant = registerOwnedDeletionRoot(child);
+		await fs.mkdir(child);
 		temporaryDirectories.push(child);
+		ownedHomeRootReleasers.push(forgetChildGrant);
 		const encodedHome = encoded(home);
 		const relative = path.relative(home, child);
 		const rootScope = resolveManagedScope({ cwd: home, agentDir: path.join(root, "agent"), sessionsRoot });
@@ -2178,7 +2194,7 @@ describe("managed session write protocol", () => {
 		)
 			throw new Error("Missing retained artifact identity or tree evidence");
 
-		await fs.rm(receipt.detachedArtifactsPath, { recursive: true });
+		await safeRm(receipt.detachedArtifactsPath, { recursive: true });
 
 		await fs.mkdir(receipt.detachedArtifactsPath);
 
@@ -2893,7 +2909,7 @@ describe("managed session write protocol", () => {
 		const pending = JSON.parse(receipt) as { detachedArtifactsPath?: unknown };
 		if (typeof pending.detachedArtifactsPath !== "string")
 			throw new Error("Missing retained artifact authority path");
-		await fs.rm(pending.detachedArtifactsPath, { recursive: true });
+		await safeRm(pending.detachedArtifactsPath, { recursive: true });
 		const replacementTarget = path.join(path.dirname(source), "replacement-target-does-not-exist");
 		await fs.symlink(replacementTarget, pending.detachedArtifactsPath);
 
@@ -2945,7 +2961,7 @@ describe("managed session write protocol", () => {
 		});
 		const remove = vi.spyOn(native, "exactRemoveDirectoryTree").mockImplementation(pathname => {
 			for (const name of syncFs.readdirSync(pathname))
-				syncFs.rmSync(path.join(pathname, name), { recursive: true, force: true });
+				safeRmSync(path.join(pathname, name), { recursive: true, force: true });
 			return { ok: false, code: "cleanup_pending", payloadDurable: true, detachedPath: pathname };
 		});
 		try {

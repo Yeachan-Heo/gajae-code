@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { YAML } from "bun";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 const PROBE = path.join(import.meta.dir, "../fixtures/settings-workflow-migration-probe.ts");
 
@@ -18,7 +19,7 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	await Promise.all(
-		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+		temporaryDirectories.splice(0).map(directory => safeRm(directory, { recursive: true, force: true })),
 	);
 });
 

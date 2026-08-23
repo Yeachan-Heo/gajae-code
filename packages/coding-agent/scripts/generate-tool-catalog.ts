@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { toolWireSchema } from "@gajae-code/ai/utils/schema";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { TaskTool } from "../src/task";
 import { TOOL_CATALOG } from "../src/tools/tool-catalog.generated";
 
@@ -499,7 +500,7 @@ export async function generateToolCatalogData(
 		else process.env.GJC_CODING_AGENT_DIR = previousGjcCodingAgentDir;
 		if (previousPiCodingAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousPiCodingAgentDir;
-		await fs.rm(isolatedRoot, { recursive: true, force: true });
+		await safeRm(isolatedRoot, { recursive: true, force: true });
 	}
 }
 

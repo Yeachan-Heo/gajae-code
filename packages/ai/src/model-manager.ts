@@ -325,10 +325,10 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			// belongs to another context, use no latest fallback and do not
 			// overwrite or downgrade it.
 			const latestCache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
-			const latestCacheMatchesCurrentContext = cacheRowMatchesBoundDynamicProvenance(
-				latestCache,
-				options.cacheDynamicModelProvenance,
-			);
+			const latestCacheMatchesCurrentContext =
+				options.cacheDynamicModelProvenance === undefined
+					? latestCache !== null && latestCache.dynamicModelIds === undefined
+					: cacheRowMatchesBoundDynamicProvenance(latestCache, options.cacheDynamicModelProvenance);
 			const latestCacheIsLegacy =
 				cache?.dynamicModelIds === undefined && latestCache !== null && latestCache.dynamicModelIds === undefined;
 			// An unbound context (the provider supplies no dynamic provenance) has no
@@ -345,7 +345,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				const snapshotModels = applyFinalCodexGpt56ContextCap(
 					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 				);
-				if (latestCacheMatchesCurrentContext || latestCacheIsLegacy) {
+				if (latestCache !== null && (latestCacheMatchesCurrentContext || latestCacheIsLegacy)) {
 					const updated = updateModelCacheIfUnchanged(
 						options.providerId,
 						latestCache.updatedAt,

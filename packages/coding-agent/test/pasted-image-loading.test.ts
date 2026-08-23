@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { registerOwnedDeletionRoot, safeRm } from "../../../scripts/safe-cleanup";
 import type { TransformedImageInput } from "../src/utils/image-loading";
 import { ImageInputTooLargeError } from "../src/utils/image-loading";
 import { loadPastedImageBatch, PastedImageBatchError } from "../src/utils/pasted-image-loading";
@@ -19,7 +20,7 @@ describe("loadPastedImageBatch", () => {
 	});
 
 	afterEach(async () => {
-		await fs.rm(testDirectory, { recursive: true, force: true });
+		await safeRm(testDirectory, { recursive: true, force: true });
 	});
 
 	async function writeImage(name: string, bytes = RED_1X1_PNG): Promise<string> {
@@ -75,7 +76,9 @@ describe("loadPastedImageBatch", () => {
 	});
 
 	it("keeps automatic clipboard paths inside the canonical temp root", async () => {
-		const outsideDirectory = await fs.mkdtemp(path.join(os.homedir(), ".gjc-pasted-image-outside-"));
+		const outsideDirectory = path.join(os.homedir(), `.gjc-pasted-image-outside-${process.pid}-${Date.now()}`);
+		const forgetOutsideGrant = registerOwnedDeletionRoot(outsideDirectory);
+		await fs.mkdir(outsideDirectory, { recursive: true });
 		const outsideImage = path.join(outsideDirectory, "clipboard-2026-07-19-123456-Ab3.png");
 		const linkedParent = path.join(testDirectory, "linked-parent");
 		await Bun.write(outsideImage, RED_1X1_PNG);
@@ -99,7 +102,8 @@ describe("loadPastedImageBatch", () => {
 				}),
 			).resolves.toMatchObject({ sourcePaths: [escapedPath] });
 		} finally {
-			await fs.rm(outsideDirectory, { recursive: true, force: true });
+			await safeRm(outsideDirectory, { recursive: true, force: true });
+			forgetOutsideGrant();
 		}
 	});
 

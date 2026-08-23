@@ -793,6 +793,8 @@ export function getWorktreeDir(segment: string): string {
 
 /** Get the GPU cache path (~/.gjc/gpu_cache.json). */
 export function getGpuCachePath(): string {
+	const defaultAgentDir = path.join(dirs.trustedHome, dirs.configDirName, "agent");
+	if (path.resolve(dirs.agentDir) !== path.resolve(defaultAgentDir)) return path.join(dirs.agentDir, "gpu_cache.json");
 	return dirs.rootSubdir("gpu_cache.json", "cache");
 }
 

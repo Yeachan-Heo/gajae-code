@@ -13,6 +13,7 @@ import {
 import * as git from "@gajae-code/coding-agent/utils/git";
 import { getAgentDir, hashPath, setAgentDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { safeRm } from "../../../../scripts/safe-cleanup";
 
 // Isolate every `git` invocation in this file from the developer's host
 // configuration. The fixture spawns dozens of git subprocesses against tiny
@@ -166,7 +167,7 @@ async function setupTempHome(): Promise<{ home: string; cleanup: () => Promise<v
 		home,
 		cleanup: async () => {
 			setAgentDir(originalAgentDir);
-			await fs.rm(home, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		},
 	};
 }
@@ -1091,7 +1092,7 @@ describe("github tool", () => {
 			expect(runGit(worktreePath, ["branch", "--show-current"])).toBe("pr-123");
 		} finally {
 			await tempHome.cleanup();
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1103,7 +1104,7 @@ describe("github tool", () => {
 		});
 
 		afterAll(async () => {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		});
 
 		it("treats git.remote.add as a no-op when the remote already exists with the same URL", async () => {
@@ -1138,7 +1139,7 @@ describe("github tool", () => {
 				expect(runGit(fixture.repoRoot, ["config", "--get", `branch.race-test.key${idx}`])).toBe(`value-${idx}`);
 			}
 		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1209,7 +1210,7 @@ describe("github tool", () => {
 			expect(summaries?.every(s => s.reused === false)).toBe(true);
 		} finally {
 			await tempHome.cleanup();
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	}, 30_000);
 
@@ -1236,7 +1237,7 @@ describe("github tool", () => {
 				originMainBefore,
 			);
 		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1267,7 +1268,7 @@ describe("github tool", () => {
 				}),
 			);
 		} finally {
-			await fs.rm(fixture.baseDir, { recursive: true, force: true });
+			await safeRm(fixture.baseDir, { recursive: true, force: true });
 		}
 	});
 
@@ -1359,7 +1360,7 @@ describe("github tool", () => {
 			expect(artifactText).toContain("epsilon");
 			expect(artifactText).toContain("zeta");
 		} finally {
-			await fs.rm(artifactsDir, { recursive: true, force: true });
+			await safeRm(artifactsDir, { recursive: true, force: true });
 		}
 	});
 });

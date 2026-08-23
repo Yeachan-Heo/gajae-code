@@ -31,6 +31,7 @@ import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { clampTimeout } from "@gajae-code/coding-agent/tools/tool-timeouts";
 import * as piUtils from "@gajae-code/utils";
 import { sanitizeText, TempDir } from "@gajae-code/utils";
+import { registerOwnedDeletionRoot, safeRm } from "../../../../scripts/safe-cleanup";
 
 describe("lsp regressions", () => {
 	afterEach(() => {
@@ -426,6 +427,7 @@ describe("lsp regressions", () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-tlaplus-");
 		const cwd = path.join(tempDir.path(), "repo");
 		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-tlaplus-${process.pid}-${Date.now()}`);
+		const forgetExternalGrant = registerOwnedDeletionRoot(externalBinDir);
 		const specPath = path.join(cwd, "Spec.tla");
 		const aliasPath = path.join(cwd, "Spec.tlaplus");
 		const tlapmLsp = path.join(externalBinDir, "tlapm_lsp");
@@ -447,7 +449,8 @@ describe("lsp regressions", () => {
 			expect(detectLanguageId(aliasPath)).toBe("tlaplus");
 		} finally {
 			tempDir.removeSync();
-			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
+			await safeRm(externalBinDir, { recursive: true, force: true });
+			forgetExternalGrant();
 		}
 	});
 
@@ -455,6 +458,7 @@ describe("lsp regressions", () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-csharp-ls-");
 		const cwd = path.join(tempDir.path(), "repo");
 		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-csharp-${process.pid}-${Date.now()}`);
+		const forgetExternalGrant = registerOwnedDeletionRoot(externalBinDir);
 		const csharpLs = path.join(externalBinDir, "csharp-ls");
 		const omnisharp = path.join(externalBinDir, "omnisharp");
 		try {
@@ -479,7 +483,8 @@ describe("lsp regressions", () => {
 			expect(whichSpy).toHaveBeenCalledWith("omnisharp");
 		} finally {
 			tempDir.removeSync();
-			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
+			await safeRm(externalBinDir, { recursive: true, force: true });
+			forgetExternalGrant();
 		}
 	});
 
@@ -487,6 +492,7 @@ describe("lsp regressions", () => {
 		const tempDir = TempDir.createSync("@gjc-lsp-omnisharp-fallback-");
 		const cwd = path.join(tempDir.path(), "repo");
 		const externalBinDir = path.join(os.homedir(), `.gjc-lsp-omnisharp-${process.pid}-${Date.now()}`);
+		const forgetExternalGrant = registerOwnedDeletionRoot(externalBinDir);
 		const omnisharp = path.join(externalBinDir, "omnisharp");
 		try {
 			await fs.promises.mkdir(cwd, { recursive: true });
@@ -503,7 +509,8 @@ describe("lsp regressions", () => {
 			expect(getServersForFile(config, path.join(cwd, "Program.cs")).map(([name]) => name)).toEqual(["omnisharp"]);
 		} finally {
 			tempDir.removeSync();
-			await fs.promises.rm(externalBinDir, { recursive: true, force: true });
+			await safeRm(externalBinDir, { recursive: true, force: true });
+			forgetExternalGrant();
 		}
 	});
 	it("rename_file applies LSP willRenameFiles edits and renames the file", async () => {

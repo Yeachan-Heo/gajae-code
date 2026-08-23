@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, logger, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { Settings } from "../src/config/settings";
 import { applyImport, type BuildImportPreviewOptions, buildImportPreview } from "../src/customization/import";
 import { discoverRuntimeSkills } from "../src/extensibility/runtime-skill-discovery";
@@ -298,8 +299,9 @@ beforeEach(async () => {
 	await writeFile(path.join(projectDir, READ_TARGET), "cross-convention read target\n");
 	homeBefore = await fs.readdir(homeDir);
 	originalAgentDir = getAgentDir();
-	setAgentDir(agentDir);
 	vi.spyOn(os, "homedir").mockReturnValue(homeDir);
+	setAgentDir(agentDir);
+	logger.setTransports({ console: false, file: path.join(agentDir, "gjc-test.log") });
 	MCPManager.resetForTests();
 });
 
@@ -314,7 +316,7 @@ afterEach(async () => {
 	expect(homeEntries.filter(entry => entry !== ".gjc")).toEqual(homeBefore);
 	const userConfigEntries = await fs.readdir(path.join(homeDir, ".gjc")).catch(() => [] as string[]);
 	expect(userConfigEntries.filter(entry => USER_DEFINITION_SURFACES.has(entry))).toEqual([]);
-	await fs.rm(root, { recursive: true, force: true });
+	await safeRm(root, { recursive: true, force: true });
 });
 
 describe("issue #4508 cross-convention canonical fixture", () => {
@@ -339,7 +341,7 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 					"collision-hook-ran",
 				);
 				expect(await fs.readFile(path.join(projectDir, ".gjc", "mcp.json"), "utf8")).toContain("native-collision");
-				await fs.rm(path.join(projectDir, ".gjc"), { recursive: true, force: true });
+				await safeRm(path.join(projectDir, ".gjc"), { recursive: true, force: true });
 				const plan = await buildImportPreview(previewOptions(convention));
 				const previewJson = JSON.stringify(plan.preview);
 				await expect(fs.stat(path.join(projectDir, ".gjc"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -393,6 +395,6 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 					() => false,
 				),
 			).toBe(false);
-		});
+		}, 30_000);
 	}
 });

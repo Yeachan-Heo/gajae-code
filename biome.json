@@ -75,6 +75,7 @@
 			"packages/*/examples/**/*.ts",
 			"packages/*/scripts/**/*.ts",
 			"packages/*/*.ts",
+			"!packages/*/src/**/*.d.ts",
 			"!packages/natives/native/index.d.ts",
 			"!**/vendor/**/*",
 			"!packages/coding-agent/src/defaults/gjc/extensions/grok-cli-vendor/**/*",

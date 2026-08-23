@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { safeRm } from "../../../scripts/safe-cleanup";
 
 /**
  * The account home is the evidence that lets the resolver reject a home the
@@ -32,7 +33,7 @@ async function tempDir(): Promise<string> {
 }
 
 afterEach(async () => {
-	await Promise.all(scratch.splice(0).map(entry => fs.rm(entry, { recursive: true, force: true })));
+	await Promise.all(scratch.splice(0).map(entry => safeRm(entry, { recursive: true, force: true })));
 });
 
 /** Resolve the trusted home in a child process under a controlled environment. */
@@ -197,7 +198,7 @@ describe("account home is resolved through the OS account database", () => {
 			// variable must never select the home on Linux.
 			expect(await resolveWith({ HOME: undefined, USERPROFILE: hostile })).toBe(account);
 		} finally {
-			await fs.rm(hostile, { recursive: true, force: true });
+			await safeRm(hostile, { recursive: true, force: true });
 		}
 	});
 
@@ -262,7 +263,7 @@ describe("account home is resolved through the OS account database", () => {
 			expect(first).toBe("REFUSED");
 			expect(second).toBe("REFUSED");
 		} finally {
-			await Promise.all([attacker, project].map(dir => fs.rm(dir, { recursive: true, force: true })));
+			await Promise.all([attacker, project].map(dir => safeRm(dir, { recursive: true, force: true })));
 		}
 	});
 
@@ -303,9 +304,9 @@ describe("account home is resolved through the OS account database", () => {
 			const resolved = stdout.trim().split("\n").at(-1) ?? "";
 			expect(resolved).toBe(home);
 			expect(path.isAbsolute(resolved)).toBe(true);
-			await fs.rm(home, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
 		} finally {
-			await fs.rm(work, { recursive: true, force: true });
+			await safeRm(work, { recursive: true, force: true });
 		}
 	});
 
@@ -325,7 +326,7 @@ describe("account home is resolved through the OS account database", () => {
 			const resolved = await resolveWith({ HOME: account, GJC_TEST_DYNAMIC: account }, project);
 			expect(resolved).toBe(account);
 		} finally {
-			await fs.rm(project, { recursive: true, force: true });
+			await safeRm(project, { recursive: true, force: true });
 		}
 	});
 
@@ -344,7 +345,7 @@ describe("account home is resolved through the OS account database", () => {
 			expect(resolved).not.toBe(aliased);
 			expect(resolved).not.toBe(real);
 		} finally {
-			await Promise.all([base, project].map(dir => fs.rm(dir, { recursive: true, force: true })));
+			await Promise.all([base, project].map(dir => safeRm(dir, { recursive: true, force: true })));
 		}
 	});
 });

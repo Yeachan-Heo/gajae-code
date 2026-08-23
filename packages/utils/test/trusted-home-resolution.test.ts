@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import {
 	CONFIG_DIR_NAME,
 	getAgentDir,
@@ -95,7 +96,7 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
-	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+	await Promise.all(tempDirs.splice(0).map(dir => safeRm(dir, { recursive: true, force: true })));
 });
 
 describe("authoritative home resolution", () => {

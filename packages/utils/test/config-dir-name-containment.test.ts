@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 import { CONFIG_DIR_NAME, getConfigAgentDirName, getConfigDirName } from "../src/dirs";
 
 /**
@@ -108,8 +109,8 @@ describe("config directory name containment", () => {
 			const output = await new Response(proc.stdout).text();
 			expect(output.trim()).toBe(path.join(home, CONFIG_DIR_NAME));
 		} finally {
-			fs.rmSync(project, { recursive: true, force: true });
-			fs.rmSync(home, { recursive: true, force: true });
+			safeRmSync(project, { recursive: true, force: true });
+			safeRmSync(home, { recursive: true, force: true });
 		}
 	});
 });

@@ -17,6 +17,7 @@ import {
 import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-storage";
 
 import { getConfigRootDir, getSessionsDir, getTerminalSessionsDir, Snowflake, setAgentDir } from "@gajae-code/utils";
+import { registerOwnedDeletionRoot, safeRmSync } from "../../../../scripts/safe-cleanup";
 import { listManagedCandidates, resolveManagedScope } from "../../src/session/internal/managed-session-scope";
 
 describe("loadEntriesFromFile", () => {
@@ -28,7 +29,7 @@ describe("loadEntriesFromFile", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		safeRmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("loads valid session file", async () => {
@@ -66,7 +67,7 @@ describe("findMostRecentSession", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		safeRmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("returns single valid session file", async () => {
@@ -163,7 +164,7 @@ describe("getRecentSessions", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		safeRmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("returns enough default entries for the viewport-expanded welcome trail", async () => {
@@ -471,7 +472,7 @@ describe("resolveResumableSession", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		safeRmSync(tempDir, { recursive: true, force: true });
 	});
 
 	function writeSession(fileName: string, headerCwd: string, id: string = Snowflake.next()): string {
@@ -564,7 +565,7 @@ describe("SessionManager temp cwd session dirs", () => {
 			setAgentDir(fallbackAgentDir);
 			delete process.env.PI_CODING_AGENT_DIR;
 		}
-		fs.rmSync(testAgentDir, { recursive: true, force: true });
+		safeRmSync(testAgentDir, { recursive: true, force: true });
 	});
 
 	it("stores symlink-equivalent home cwd sessions in the v2 resolver directory", () => {
@@ -572,7 +573,9 @@ describe("SessionManager temp cwd session dirs", () => {
 
 		const projectsRoot = path.join(os.homedir(), "Projects");
 		fs.mkdirSync(projectsRoot, { recursive: true });
-		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "gjc-session-home-"));
+		const realProjectDir = path.join(projectsRoot, `gjc-session-home-${process.pid}-${Date.now()}`);
+		const forgetRealGrant = registerOwnedDeletionRoot(realProjectDir);
+		fs.mkdirSync(realProjectDir, { recursive: true });
 		const nestedDir = path.join(realProjectDir, "nested");
 		const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-session-home-alias-"));
 		const homeAlias = path.join(aliasRoot, "home-link");
@@ -589,8 +592,9 @@ describe("SessionManager temp cwd session dirs", () => {
 			const expectedDir = path.join(getSessionsDir(), managedDirectoryName(aliasedCwd));
 			expect(path.dirname(sessionFile)).toBe(expectedDir);
 		} finally {
-			fs.rmSync(aliasRoot, { recursive: true, force: true });
-			fs.rmSync(realProjectDir, { recursive: true, force: true });
+			safeRmSync(aliasRoot, { recursive: true, force: true });
+			safeRmSync(realProjectDir, { recursive: true, force: true });
+			forgetRealGrant();
 		}
 	});
 
@@ -724,7 +728,7 @@ describe("SessionManager legacy session migration persistence", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		safeRmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("keeps legacy migration in memory until later persisted activity rewrites the file", async () => {
@@ -893,7 +897,7 @@ describe("discardUncommittedSession", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tempDir, { recursive: true, force: true });
+		safeRmSync(tempDir, { recursive: true, force: true });
 	});
 
 	it("exact-deletes an in-dir uncommitted successor, refusing the active session and out-of-dir paths", async () => {

@@ -1,4 +1,3 @@
-import { mkdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -82,7 +81,6 @@ export function createFixtureBrokerEnvironment(root: string, agentDir: string): 
 	const homeDrive = /^[A-Za-z]:/.exec(windowsRoot)?.[0] ?? windowsRootParts.root;
 	const homePath = windowsRoot.slice(homeDrive.length) || "\\";
 	const tmpDir = path.join(root, "tmp");
-	mkdirSync(tmpDir, { recursive: true });
 	const environment: NodeJS.ProcessEnv = {
 		HOME: root,
 		USERPROFILE: root,
