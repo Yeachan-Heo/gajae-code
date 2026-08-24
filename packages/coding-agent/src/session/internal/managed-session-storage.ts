@@ -105,6 +105,7 @@ export class ManagedCommittedMutationError extends Error {
 	constructor(
 		readonly operation: "replace" | "append",
 		cause: unknown,
+		readonly identity?: ManagedFileIdentity,
 	) {
 		super(`managed_${operation}_committed_outcome_uncertain`, { cause });
 		this.name = "ManagedCommittedMutationError";
@@ -118,14 +119,27 @@ function managedReplacementFailure(value: unknown): Error {
 			? (value as { code: string }).code
 			: undefined;
 	const cause = new Error(rawCode ?? outcome.code ?? "managed_replace_failed");
-	return outcome.mutationState === "not_committed" ? cause : new ManagedCommittedMutationError("replace", cause);
+	return outcome.mutationState === "not_committed"
+		? cause
+		: new ManagedCommittedMutationError(
+				"replace",
+				cause,
+				outcome.identity ? managedFileIdentityFromUnknown(outcome.identity) : undefined,
+			);
 }
 
-function managedAppendFailure(code: string | undefined): Error {
+function managedAppendFailure(value: unknown): Error {
+	const record = asRecord(value);
+	const code = typeof record?.code === "string" ? record.code : undefined;
 	const error = new Error(code ?? "managed_append_failed");
-	return code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed"
-		? error
-		: new ManagedCommittedMutationError("append", error);
+	const mutationState = record?.mutationState;
+	const durabilityState = record?.durabilityState;
+	const identity = managedFileIdentityFromUnknown(record?.identity);
+	if (mutationState === "not_committed" && durabilityState === "not_attempted") return error;
+	if (code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed") {
+		return error;
+	}
+	return new ManagedCommittedMutationError("append", error, identity);
 }
 
 function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
@@ -310,6 +324,35 @@ function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFil
 		ctimeNs: BigInt(identity.ctimeNs),
 		...(identity.sha256 ? { sha256: identity.sha256 } : {}),
 	};
+}
+
+function managedFileIdentityFromUnknown(value: unknown): ManagedFileIdentity | undefined {
+	const record = asRecord(value);
+	if (!record) return undefined;
+	const decimal = (field: unknown): field is string => typeof field === "string" && /^-?[0-9]{1,32}$/.test(field);
+	if (
+		!decimal(record.dev) ||
+		!decimal(record.ino) ||
+		!decimal(record.nlink) ||
+		!decimal(record.size) ||
+		!decimal(record.mtimeNs) ||
+		!decimal(record.ctimeNs) ||
+		(record.sha256 !== undefined && (typeof record.sha256 !== "string" || !/^[0-9a-f]{64}$/i.test(record.sha256)))
+	)
+		return undefined;
+	try {
+		return {
+			dev: BigInt(record.dev),
+			ino: BigInt(record.ino),
+			nlink: BigInt(record.nlink),
+			size: Number(BigInt(record.size)),
+			mtimeNs: BigInt(record.mtimeNs),
+			ctimeNs: BigInt(record.ctimeNs),
+			...(record.sha256 !== undefined ? { sha256: String(record.sha256).toLowerCase() } : {}),
+		};
+	} catch {
+		return undefined;
+	}
 }
 
 function managedAppendReceiptFromIdentity(identity: ManagedFileIdentity): ManagedAppendReceipt {
@@ -1630,7 +1673,11 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
-	replaceExpectedIdentitySync(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): void {
+	replaceExpectedIdentitySync(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedFileIdentity,
+	): ManagedFileIdentity {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
@@ -1638,9 +1685,9 @@ export class ManagedSessionDescendantStore {
 			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
 			if (!sameManagedIdentity(current, expected) || !expected.sha256 || current.sha256 !== expected.sha256)
 				throw new Error("managed_replace_identity_mismatch");
-			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
+			const replaced = replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
 			this.#assertBound();
-			return;
+			return replaced;
 		}
 		const relative = this.#relative(resolved);
 		const observed = this.#authority.stat(relative);
@@ -1673,6 +1720,9 @@ export class ManagedSessionDescendantStore {
 		);
 		if (!replaced.ok) throw managedReplacementFailure(replaced);
 		this.#assertBound();
+		if (!replaced.identity)
+			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
+		return managedFileIdentityFromNative(replaced.identity);
 	}
 
 	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
@@ -1777,7 +1827,7 @@ export class ManagedSessionDescendantStore {
 			expected.ctimeNs,
 			expected.sha256,
 		);
-		if (!appended.ok) throw managedAppendFailure(appended.code);
+		if (!appended.ok) throw managedAppendFailure(appended);
 		if (!appended.identity)
 			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 		this.#assertBound();
@@ -1845,7 +1895,7 @@ export class ManagedSessionDescendantStore {
 				observed.identity.ctimeNs,
 				expectedSha256,
 			);
-			if (!appended.ok) throw managedAppendFailure(appended.code);
+			if (!appended.ok) throw managedAppendFailure(appended);
 			if (!appended.identity)
 				throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
@@ -1974,14 +2024,13 @@ export class ManagedSessionDescendantStore {
 		}
 	}
 
-	#replaceRetained(relative: string, bytes: Uint8Array): void {
+	#replaceRetained(relative: string, bytes: Uint8Array): ManagedFileIdentity {
 		if (!this.#authority) throw new Error("Managed descendant authority is unavailable");
 		this.#assertBound();
 		const existing = this.#authority.readManaged(relative);
 		if (!existing.ok) {
 			if (existing.code !== "not_found") throw new Error(existing.code ?? "managed_replace_failed");
-			this.#publishRetainedNoReplace(relative, bytes);
-			return;
+			return this.#publishRetainedNoReplace(relative, bytes);
 		}
 		if (!existing.identity || !existing.data) throw new Error("Managed descendant identity is unavailable");
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
@@ -1995,6 +2044,11 @@ export class ManagedSessionDescendantStore {
 			existing.identity.sha256 ?? createHash("sha256").update(existing.data).digest("hex"),
 		);
 		if (!replaced.ok) throw managedReplacementFailure(replaced);
+		if (!replaced.identity)
+			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
+		const receipt = managedFileIdentityFromNative(replaced.identity);
+		this.#assertBound();
+		return receipt;
 	}
 
 	/** Capture descriptor identity without copying file bytes when retained authority is available. */
@@ -3063,6 +3117,10 @@ export function publishManagedFileNoReplaceSync(
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
 			throw new Error("destination_identity_changed");
 		}
+		// The staging descriptor remains authoritative through rename. Capture its
+		// terminal metadata (rename advances ctime) before releasing it; the staged
+		// pre-rename identity is not a valid successor receipt.
+		publishedIdentity = identity(fs.fstatSync(fd, { bigint: true }), publishedIdentity.sha256);
 		secureFileDescriptor(destination, fd, "verify");
 		fs.closeSync(fd);
 		fd = undefined;
@@ -3241,14 +3299,19 @@ function replaceManagedFileGeneratedSync(
 		if (!expectedSuccessor) throw new Error("managed_replace_identity_unavailable");
 		if (fd !== undefined) {
 			secureFileDescriptor(destination, fd, "verify");
-			fs.closeSync(fd);
-			fd = undefined;
 		}
 		fsyncDirectory(parent);
-		const verifiedIdentity = captureManagedFileIdentityStreamingNoFollow(destination);
+		const verifiedIdentity =
+			fd !== undefined
+				? identity(fs.fstatSync(fd, { bigint: true }), expectedSuccessor.sha256)
+				: captureManagedFileIdentityStreamingNoFollow(destination);
 		if (!sameReplacementIdentity(verifiedIdentity, expectedSuccessor))
 			throw new Error("destination_identity_changed");
 		publishedIdentity = verifiedIdentity;
+		if (fd !== undefined) {
+			fs.closeSync(fd);
+			fd = undefined;
+		}
 		publicationDurable = true;
 		if (receiptCleanup) {
 			try {
@@ -3327,9 +3390,9 @@ export function replaceManagedFileSync(
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
 	expectedDestination?: ManagedFileSnapshot["identity"],
-): void {
+): ManagedFileSnapshot["identity"] {
 	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
-	replaceManagedFileGeneratedSync(
+	return replaceManagedFileGeneratedSync(
 		destination,
 		fd => {
 			const hash = createHash("sha256");

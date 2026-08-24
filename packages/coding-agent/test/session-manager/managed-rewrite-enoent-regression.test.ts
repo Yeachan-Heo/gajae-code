@@ -305,6 +305,154 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("retains the terminal replacement identity for a committed retry", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const assistant = manager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (assistant?.type !== "message") throw new Error("Expected assistant entry");
+		manager.applyEntryMessageUpdates([assistant]);
+
+		const sessionFile = manager.getSessionFile()!;
+		const replaceManaged = native.RecoveryFsRoot.prototype.replaceManaged;
+		let failOnce = true;
+		const replace = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const committed = replaceManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return committed;
+			failOnce = false;
+			return {
+				...committed,
+				ok: false,
+				code: "io_error",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+				reason: "io_failure",
+				phase: "terminal_identity",
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "first-committed-rewrite", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "retry-after-committed-rewrite", timestamp: Date.now() }),
+		).not.toThrow();
+		expect(replace).toHaveBeenCalledTimes(2);
+		const transcript = fs.readFileSync(sessionFile, "utf8");
+		expect(transcript.match(/first-committed-rewrite/g)).toHaveLength(1);
+		expect(transcript.match(/retry-after-committed-rewrite/g)).toHaveLength(1);
+		await manager.close().catch(() => {});
+	});
+
+	it("queues a full rewrite after a committed append receipt failure", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const appendManaged = native.RecoveryFsRoot.prototype.appendManaged;
+		let failOnce = true;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const committed = appendManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return committed;
+			failOnce = false;
+			return {
+				...committed,
+				ok: false,
+				code: "io_error",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+			};
+		});
+
+		await expect(manager.setSessionName("queued-append-failure")).rejects.toThrow(
+			/managed_append_committed_outcome_uncertain/,
+		);
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "queued-rewrite-recovery", timestamp: Date.now() }),
+		).not.toThrow();
+		const sessionFile = manager.getSessionFile()!;
+		const transcript = fs.readFileSync(sessionFile, "utf8");
+		expect(transcript).toContain("queued-rewrite-recovery");
+		expect(transcript.match(/queued-rewrite-recovery/g)).toHaveLength(1);
+		await manager.close().catch(() => {});
+	});
+
+	it("keeps a pre-write append identity mismatch non-committed", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const sessionFile = manager.getSessionFile()!;
+		const before = fs.readFileSync(sessionFile);
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(() => ({
+			ok: false,
+			code: "identity_mismatch",
+			mutationState: "not_committed",
+			durabilityState: "not_attempted",
+		}));
+
+		const relativePath = path.basename(sessionFile);
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(agentDir), path.dirname(sessionFile));
+		try {
+			const expected = store.captureBoundedAppendExpectation(relativePath);
+			if (!expected) throw new Error("Expected managed transcript identity");
+			expect(() => store.appendExpectedSync(relativePath, Buffer.from("not-written\n"), expected)).toThrow(
+				"identity_mismatch",
+			);
+			expect(fs.readFileSync(sessionFile).equals(before)).toBe(true);
+		} finally {
+			store.close();
+			await manager.close().catch(() => {});
+		}
+	});
+
 	it("keeps resident state when committed no-replace publication throws before returning its identity", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);

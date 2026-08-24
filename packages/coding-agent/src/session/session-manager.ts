@@ -15032,7 +15032,11 @@ export class SessionManager {
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
-							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+							replacementPublication = store.replaceExpectedIdentitySync(
+								relativePath,
+								bytes,
+								this.#managedPersistExpectedIdentity,
+							);
 							replacementPublicationCommitted = true;
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
@@ -15047,20 +15051,18 @@ export class SessionManager {
 						noReplacePublicationAttempted = true;
 						noReplacePublication = store.publishNoReplaceSync(relativePath, bytes);
 					}
-					const descriptor = store.descriptorExpected(relativePath);
-					if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-					if (replacementPublicationCommitted) {
-						replacementPublication = {
-							...managedIdentityFromDescriptor(descriptor),
-							sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-						};
-					}
+					if (!noReplacePublication && !replacementPublication)
+						throw new Error("managed_replace_identity_unavailable");
 					this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
 						sessionFile,
 						noReplacePublication ?? replacementPublication,
 					);
 					this.#publishCommitMarkerFromCurrentTranscriptSync();
 				} catch (error) {
+					if (error instanceof ManagedCommittedMutationError && error.identity) {
+						replacementPublication = error.identity;
+						replacementPublicationCommitted = true;
+					}
 					let recaptureObserved = false;
 					if (noReplacePublicationAttempted && !noReplacePublication) {
 						try {
@@ -16730,6 +16732,15 @@ export class SessionManager {
 				try {
 					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
 				} catch (err) {
+					if (err instanceof ManagedCommittedMutationError && err.operation === "append") {
+						// The append may have committed before the native receipt failed. Keep
+						// the exact descriptor-bound successor when available and force the next
+						// queued persistence task through a complete rewrite; never recapture a
+						// pathname and adopt a racing successor.
+						this.#managedPersistExpectedIdentity = err.identity;
+						this.#needsFullRewriteOnNextPersist = true;
+						throw err;
+					}
 					const predecessorMissing = store.descriptorExpected(relativePath) === null;
 					if (
 						!isEnoent(err) &&
@@ -16742,9 +16753,25 @@ export class SessionManager {
 					this.#rewriteFileSync();
 					return;
 				}
-			} else receipt = store.appendSync(relativePath, bytes);
+			} else {
+				try {
+					receipt = store.appendSync(relativePath, bytes);
+				} catch (err) {
+					if (err instanceof ManagedCommittedMutationError && err.operation === "append") {
+						this.#managedPersistExpectedIdentity = err.identity;
+						this.#needsFullRewriteOnNextPersist = true;
+					}
+					throw err;
+				}
+			}
 			this.#managedPersistExpectedIdentity = receipt.identity;
-			this.#publishSessionCommitMarkerSync(receipt.descriptor);
+			try {
+				this.#publishSessionCommitMarkerSync(receipt.descriptor);
+			} catch (error) {
+				this.#managedPersistExpectedIdentity = receipt.identity;
+				this.#needsFullRewriteOnNextPersist = true;
+				throw new ManagedCommittedMutationError("append", error, receipt.identity);
+			}
 		});
 	}
 

@@ -2137,6 +2137,14 @@ export interface RecoveryFsResult {
   code?: string
   identity?: RecoveryFsIdentity
   data?: Uint8Array
+  /**
+   * Mutation classification is populated only by managed append outcomes.
+   * Read/stat/create callers leave it absent to preserve their existing
+   * result shape while append callers can distinguish a pre-write identity
+   * rejection from a committed write whose terminal receipt is unavailable.
+   */
+  mutationState?: string
+  durabilityState?: string
 }
 
 /**
