@@ -1440,8 +1440,6 @@ export class ModelRegistry {
 	#configuredApiKeyEnvNames: Set<string> = new Set();
 	#optionalAuthPreflightGenerations = new Map<string, number>();
 	#optionalAuthPreflightEpoch = 0;
-	/** Read-only settings snapshot for profile-scoped resolution. */
-	#settings: Pick<Settings, "get" | "getGlobal"> = settings;
 
 	/**
 	 * @param authStorage - Auth storage for API key resolution
