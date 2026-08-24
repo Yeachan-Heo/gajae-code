@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -147,6 +148,19 @@ describe("async native no-replace publication boundary (issue #4394)", () => {
 });
 
 describe("scrubbed protocol remnant reaping (issue #4394)", () => {
+	it("returns the retained native terminal identity for no-replace publication", async () => {
+		await withTempDir("gjc-terminal-publish-identity-", async dir => {
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), dir);
+			const bytes = Buffer.from("terminal-identity\n");
+			const returned = store.publishNoReplaceSync("session.jsonl", bytes);
+			const observed = store.readExpected("session.jsonl");
+			expect(observed).not.toBeNull();
+			if (!observed) throw new Error("published identity unavailable");
+			expect(returned).toEqual(observed.identity);
+			expect(returned.sha256).toBe(createHash("sha256").update(bytes).digest("hex"));
+		});
+	});
+
 	it("reaps aged zero-byte remnants and retains everything else", async () => {
 		await withTempDir("gjc-remnant-reap-", async dir => {
 			const aged = await seedRemnant(dir, `${REMNANT_PREFIX}aged`, 60 * 60 * 1000);

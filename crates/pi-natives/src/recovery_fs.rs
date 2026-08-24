@@ -127,6 +127,16 @@ static REPLACEMENT_AFTER_FINAL_VERIFY_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static REPLACEMENT_BEFORE_PREDECESSOR_RETIRE_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+static APPEND_AFTER_FINAL_SYNC_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 static REPLACEMENT_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
@@ -172,6 +182,54 @@ fn pause_replacement_after_final_verify_for_test() {
 			.send(())
 			.expect("replacement final-verify hook receiver");
 		resume.recv().expect("replacement final-verify hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_replacement_before_predecessor_retire_hook(
+	hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+) {
+	*REPLACEMENT_BEFORE_PREDECESSOR_RETIRE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_replacement_before_predecessor_retire_for_test() {
+	if let Some((entered, resume)) = REPLACEMENT_BEFORE_PREDECESSOR_RETIRE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered
+			.send(())
+			.expect("replacement predecessor retire hook receiver");
+		resume
+			.recv()
+			.expect("replacement predecessor retire hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_append_after_final_sync_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*APPEND_AFTER_FINAL_SYNC_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_append_after_final_sync_for_test() {
+	if let Some((entered, resume)) = APPEND_AFTER_FINAL_SYNC_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered.send(()).expect("append final-sync hook receiver");
+		resume.recv().expect("append final-sync hook resume");
 	}
 }
 
@@ -2933,7 +2991,9 @@ fn rename_managed_file_no_replace_inner(
 	{
 		return Err(post_mutation_code("rollback_unavailable"));
 	}
-	Ok(RetainedPublishSuccess { result: RecoveryFsResult::success(moved), primitive })
+	let mut terminal_identity = after;
+	terminal_identity.sha256 = Some(after_digest);
+	Ok(RetainedPublishSuccess { result: RecoveryFsResult::success(terminal_identity), primitive })
 }
 
 #[cfg(target_os = "linux")]
@@ -3049,9 +3109,13 @@ fn remove_managed(
 }
 
 #[cfg(target_os = "linux")]
-fn append_post_identity(file: &File) -> Option<RecoveryFsIdentity> {
+fn append_post_identity(file: &File, parent: &File, name: &CString) -> Option<RecoveryFsIdentity> {
 	let mut identity = regular_identity(file).ok()?;
 	identity.sha256 = digest_hex(file).ok();
+	let named = statat(parent, name).ok()?;
+	if !stat_matches_regular_identity(&named, &identity) {
+		return None;
+	}
 	Some(identity)
 }
 
@@ -3166,7 +3230,7 @@ fn append_managed(
 			"fsync_failed",
 			"committed",
 			"not_provable",
-			append_post_identity(&file),
+			append_post_identity(&file, &parent, &name),
 		);
 	}
 	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
@@ -3174,10 +3238,10 @@ fn append_managed(
 			"permission_denied",
 			"committed",
 			"not_provable",
-			append_post_identity(&file),
+			append_post_identity(&file, &parent, &name),
 		);
 	}
-	let mut identity = match regular_identity(&file) {
+	let identity = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
 			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
@@ -3191,7 +3255,7 @@ fn append_managed(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
-			append_post_identity(&file),
+			append_post_identity(&file, &parent, &name),
 		);
 	}
 	let named = match statat(&parent, &name) {
@@ -3201,7 +3265,7 @@ fn append_managed(
 				code,
 				"committed",
 				"not_provable",
-				append_post_identity(&file),
+				append_post_identity(&file, &parent, &name),
 			);
 		},
 	};
@@ -3210,7 +3274,7 @@ fn append_managed(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
-			append_post_identity(&file),
+			append_post_identity(&file, &parent, &name),
 		);
 	}
 	// The digest is retained for the next append expectation. Recheck both the
@@ -3223,7 +3287,7 @@ fn append_managed(
 				code,
 				"committed",
 				"not_provable",
-				append_post_identity(&file),
+				append_post_identity(&file, &parent, &name),
 			);
 		},
 	};
@@ -3234,7 +3298,7 @@ fn append_managed(
 				code,
 				"committed",
 				"not_provable",
-				append_post_identity(&file),
+				append_post_identity(&file, &parent, &name),
 			);
 		},
 	};
@@ -3245,7 +3309,7 @@ fn append_managed(
 				code,
 				"committed",
 				"not_provable",
-				append_post_identity(&file),
+				append_post_identity(&file, &parent, &name),
 			);
 		},
 	};
@@ -3254,18 +3318,48 @@ fn append_managed(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
-			append_post_identity(&file),
+			append_post_identity(&file, &parent, &name),
 		);
 	}
-	identity.sha256 = Some(sha256);
 	if parent.sync_all().is_err() {
+		return RecoveryFsResult::append_failure("fsync_failed", "committed", "not_provable", None);
+	}
+	// Directory fsync is the final durability boundary. Re-prove both the
+	// descriptor and the canonical name after it; a successor switch in that
+	// last window must never be reported as a successful append receipt.
+	#[cfg(test)]
+	pause_append_after_final_sync_for_test();
+	let terminal_descriptor = match regular_identity(&file) {
+		Ok(value) => value,
+		Err(code) => {
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
+		},
+	};
+	let terminal_digest = match digest_hex(&file) {
+		Ok(value) => value,
+		Err(code) => {
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
+		},
+	};
+	let terminal_named = match statat(&parent, &name) {
+		Ok(value) => value,
+		Err(code) => {
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
+		},
+	};
+	if terminal_descriptor != identity
+		|| terminal_digest != sha256
+		|| !stat_matches_regular_identity(&terminal_named, &terminal_descriptor)
+	{
 		return RecoveryFsResult::append_failure(
-			"fsync_failed",
+			"identity_mismatch",
 			"committed",
 			"not_provable",
-			Some(identity),
+			None,
 		);
 	}
+	let mut identity = terminal_descriptor;
+	identity.sha256 = Some(terminal_digest);
 	RecoveryFsResult::append_success(identity)
 }
 #[cfg(target_os = "linux")]
@@ -3316,6 +3410,110 @@ fn canonical_replacement_identity(
 	}
 	identity.sha256 = Some(replacement_sha256.to_owned());
 	Some(identity)
+}
+
+#[cfg(target_os = "linux")]
+fn retire_replacement_predecessor(
+	candidate_parent: &File,
+	candidate_name: &CString,
+	displaced_identity: &RecoveryFsIdentity,
+	expected_sha256: &str,
+	primitive: NoReplacePrimitive,
+) -> Result<(), ReplacementExchangeError> {
+	#[cfg(test)]
+	pause_replacement_before_predecessor_retire_for_test();
+	let retired_name = CString::new(format!(
+		".gjc-managed-replace-retire-{}-{}",
+		std::process::id(),
+		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
+	))
+	.expect("retirement name contains no NUL");
+	// Atomically detach the current recovery entry to a unique name. A successor
+	// that races before this syscall is either restored to the canonical recovery
+	// name or retained under the detached evidence name; neither case authorizes
+	// deleting it. The detached path is the only pathname ever passed to unlink.
+	if let Err(error) =
+		renameat2_no_replace(candidate_parent, candidate_name, candidate_parent, &retired_name)
+	{
+		return Err(ReplacementExchangeError::PostMutation {
+			code: if rename_flags_unsupported(error.raw_os_error()) {
+				"rollback_unavailable"
+			} else {
+				"io_error"
+			},
+			phase: "terminal_identity",
+			primitive,
+			identity: None,
+			recovery_path: recovery_evidence_path(candidate_name),
+		});
+	}
+	let detached = statat(candidate_parent, &retired_name);
+	let detached_file = open_existing(
+		candidate_parent,
+		retired_name
+			.to_str()
+			.map_err(|_| ReplacementExchangeError::PostMutation {
+				code: "io_error",
+				phase: "terminal_identity",
+				primitive,
+				identity: None,
+				recovery_path: recovery_evidence_path(&retired_name),
+			})?,
+		false,
+	);
+	let detached_matches = detached.as_ref().is_ok_and(|named| {
+		named.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& named.st_nlink == 1
+			&& named.st_dev.to_string() == displaced_identity.dev
+			&& named.st_ino.to_string() == displaced_identity.ino
+			&& (named.st_size as u64).to_string() == displaced_identity.size
+			&& stat_mtime_ns(named).to_string() == displaced_identity.mtime_ns
+	}) && detached_file
+		.as_ref()
+		.is_ok_and(|file| digest_hex(file).is_ok_and(|digest| digest == expected_sha256));
+	if !detached_matches {
+		// Restore a raced successor only when the recovery name is still free. A
+		// no-replace restore never overwrites a successor that claimed the name.
+		if renameat2_no_replace(candidate_parent, &retired_name, candidate_parent, candidate_name)
+			.is_ok()
+		{
+			return Err(ReplacementExchangeError::PostMutation {
+				code: "identity_mismatch",
+				phase: "terminal_identity",
+				primitive,
+				identity: None,
+				recovery_path: recovery_evidence_path(candidate_name),
+			});
+		}
+		return Err(ReplacementExchangeError::PostMutation {
+			code: "identity_mismatch",
+			phase: "terminal_identity",
+			primitive,
+			identity: None,
+			recovery_path: recovery_evidence_path(&retired_name),
+		});
+	}
+	// The detached identity is now immutable with respect to the recovery name;
+	// delete only the private detached pathname, never the mutable candidate.
+	if unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), retired_name.as_ptr(), 0) } != 0 {
+		return Err(ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+			identity: None,
+			recovery_path: recovery_evidence_path(&retired_name),
+		});
+	}
+	if sync_parent(candidate_parent).is_err() {
+		return Err(ReplacementExchangeError::PostMutation {
+			code: "fsync_failed",
+			phase: "source_parent_sync",
+			primitive,
+			identity: None,
+			recovery_path: None,
+		});
+	}
+	Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -3656,6 +3854,32 @@ fn replace_managed_inner(
 	// returned as a retry identity.
 	#[cfg(test)]
 	pause_replacement_after_final_verify_for_test();
+	let Some(replacement_identity) = canonical_replacement_identity(
+		root,
+		relative_path,
+		&replacement_identity,
+		&replacement_sha256,
+	) else {
+		return Err(replacement_post_failure(
+			"identity_mismatch",
+			"terminal_identity",
+			primitive,
+			&candidate_file,
+			&replacement_sha256,
+		));
+	};
+	retire_replacement_predecessor(
+		&candidate_parent,
+		&candidate_name,
+		&displaced_identity,
+		expected_sha256,
+		primitive,
+	)?;
+	// Retiring the predecessor mutates only the recovery namespace, but a
+	// successor may still have won the canonical name through an uncoordinated
+	// writer while cleanup ran. Re-prove the canonical terminal identity before
+	// returning success; otherwise surface a committed/uncertain result without
+	// handing the caller a stale retry receipt.
 	let Some(replacement_identity) = canonical_replacement_identity(
 		root,
 		relative_path,
@@ -4449,6 +4673,40 @@ mod tests {
 		assert_eq!(fs::read(temporary.0.join("transcript")).expect("transcript"), original);
 	}
 
+	#[test]
+	fn managed_append_returns_digest_bound_terminal_identity() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let appended = b"\nappend";
+		let identity = managed_file(&root, "transcript", original);
+		let result = append_managed(
+			&root,
+			None,
+			"transcript",
+			appended,
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+
+		assert!(result.ok);
+		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
+		assert_eq!(result.durability_state.as_deref(), Some("proven"));
+		let terminal = result.identity.expect("terminal append identity");
+		assert_eq!(
+			terminal.sha256.as_deref(),
+			Some(file_digest(b"original-transcript\nappend").as_str())
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("transcript"),
+			b"original-transcript\nappend"
+		);
+	}
+
 	fn assert_unsynced(result: &RecoveryFsPublishResult, role: &str, failures: usize) {
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("fsync_failed"));
@@ -4682,6 +4940,14 @@ mod tests {
 				result.code
 			);
 			assert_eq!(result.primitive, "linkat_noreplace");
+			assert_eq!(
+				result
+					.identity
+					.as_ref()
+					.and_then(|identity| identity.sha256.as_deref()),
+				Some(file_digest(contents).as_str()),
+				"retained no-replace publishes return the terminal digest-bound identity",
+			);
 			assert!(
 				!temporary.0.join("source-parent/source").exists(),
 				"staging source is removed after the link fallback"
@@ -5240,32 +5506,19 @@ mod tests {
 				"the published replacement is single-linked, matching an exchange"
 			);
 
-			// The exchange leaves the displaced object under the candidate name as
-			// rollback evidence; the fallback must reach the same terminal state.
-			let displaced = fs::read_dir(temporary.0.join(".gjc-recovery"))
-				.expect("recovery directory")
-				.filter_map(Result::ok)
-				.find(|entry| {
-					entry
+			// A successful replacement retires the displaced predecessor. The
+			// fallback's temporary name is an implementation detail and must not
+			// survive either.
+			assert!(
+				!fs::read_dir(temporary.0.join(".gjc-recovery"))
+					.expect("recovery directory")
+					.filter_map(Result::ok)
+					.any(|entry| entry
 						.file_name()
 						.to_string_lossy()
-						.starts_with(".gjc-managed-replace-")
-				})
-				.expect("displaced object retained under the candidate name");
-			assert_eq!(
-				fs::read(displaced.path()).expect("displaced contents"),
-				original,
-				"the displaced object must still hold the replaced contents"
+						.starts_with(".gjc-managed-replace-")),
+				"no displaced predecessor may survive a successful replacement"
 			);
-			assert_eq!(
-				std::os::unix::fs::MetadataExt::nlink(
-					&fs::metadata(displaced.path()).expect("displaced metadata")
-				),
-				1,
-				"the displaced object is single-linked, matching an exchange"
-			);
-			// The fallback's temporary name is an implementation detail and must not
-			// survive a successful replacement.
 			assert!(
 				!fs::read_dir(temporary.0.join(".gjc-recovery"))
 					.expect("recovery directory")
@@ -5277,6 +5530,150 @@ mod tests {
 				"no temporary exchange name may survive"
 			);
 		}
+	}
+
+	#[test]
+	fn managed_replace_does_not_retire_a_recovery_successor() {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		set_retained_publish_faults([RetainedPublishFault::Rename(libc::EINVAL)]);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replacement_before_predecessor_retire_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_replace = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let replace = std::thread::spawn(move || {
+			replace_managed(
+				&root_for_replace,
+				None,
+				"transcript",
+				b"rewritten-transcript",
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for predecessor-retire boundary");
+		let recovery = temporary.0.join(".gjc-recovery");
+		let candidate = fs::read_dir(&recovery)
+			.expect("recovery directory")
+			.filter_map(Result::ok)
+			.find(|entry| {
+				entry
+					.file_name()
+					.to_string_lossy()
+					.starts_with(".gjc-managed-replace-")
+			})
+			.expect("displaced predecessor");
+		let candidate_path = candidate.path();
+		let retained = recovery.join("retained-predecessor");
+		fs::rename(&candidate_path, &retained).expect("retain predecessor");
+		fs::write(&candidate_path, b"concurrent-recovery-successor")
+			.expect("publish recovery successor");
+		resume_tx
+			.send(())
+			.expect("resume predecessor-retire boundary");
+		let result = replace.join().expect("replacement thread");
+		set_replacement_before_predecessor_retire_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert!(
+			result
+				.recovery_path
+				.as_deref()
+				.is_some_and(|path| path.starts_with(".gjc-recovery/.gjc-managed-replace-")),
+			"successor drift must retain bounded recovery evidence"
+		);
+		assert_eq!(
+			fs::read(&candidate_path).expect("recovery successor"),
+			b"concurrent-recovery-successor"
+		);
+		assert_eq!(fs::read(&retained).expect("predecessor evidence"), original);
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("canonical replacement"),
+			b"rewritten-transcript"
+		);
+	}
+
+	#[test]
+	fn managed_append_rechecks_canonical_name_after_final_sync() {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_append_after_final_sync_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_append = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let append = std::thread::spawn(move || {
+			append_managed(
+				&root_for_append,
+				None,
+				"transcript",
+				b"\nappend",
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for append final-sync boundary");
+		fs::rename(temporary.0.join("transcript"), temporary.0.join("retained-append"))
+			.expect("retain appended inode");
+		fs::write(temporary.0.join("transcript"), b"concurrent-successor")
+			.expect("publish canonical successor");
+		resume_tx
+			.send(())
+			.expect("resume append final-sync boundary");
+		let result = append.join().expect("append thread");
+		set_append_after_final_sync_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
+		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
+		assert!(result.identity.is_none(), "a non-canonical descriptor is not a retry receipt");
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("canonical successor"),
+			b"concurrent-successor"
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("retained-append")).expect("retained append"),
+			b"original-transcript\nappend"
+		);
 	}
 
 	#[test]

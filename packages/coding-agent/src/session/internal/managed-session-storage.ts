@@ -2060,7 +2060,11 @@ export class ManagedSessionDescendantStore {
 			publicationCommitted = outcome.mutationState !== "not_committed";
 			if (!outcome.ok) throw publishFailure(outcome);
 			publicationCommitted = true;
-			return managedFileIdentityFromNative(captured.identity);
+			if (!outcome.identity) throw new Error("managed_publish_identity_unavailable");
+			const terminal = managedFileIdentityFromUnknown(outcome.identity);
+			if (!isDescriptorBoundManagedIdentity(terminal))
+				throw new Error("managed_publish_identity_unavailable");
+			return terminal;
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result
