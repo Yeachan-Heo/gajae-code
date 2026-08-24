@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -2191,6 +2191,37 @@ describe("skills bridge", () => {
 		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
 		expect(remove.result.outcome).toBe("removed");
 		await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+	test("empty bridge removal never pathname-removes a successor (#4644 exact-head P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		for (const name of [...SKILL_NAMES]) {
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		await runPaseoSetup({}, fixture.deps);
+
+		const realRmdir = fs.rmdir.bind(fs);
+		const rmdir = spyOn(fs, "rmdir").mockImplementation(async target => {
+			if (target === fixture.paths.bridgeDir) {
+				// The old split identity-check plus pathname rmdir would delete this
+				// empty successor after the replacement is published.
+				const retained = `${fixture.paths.bridgeDir}.owned`;
+				await fs.rename(target, retained);
+				await fs.mkdir(target);
+			}
+			return realRmdir(target);
+		});
+		try {
+			const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+			if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+			expect(remove.result.outcome).toBe("removed");
+			expect(rmdir).not.toHaveBeenCalledWith(fixture.paths.bridgeDir);
+			await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			rmdir.mockRestore();
+		}
 	});
 
 	test("a tampered ledger bridge path never drives destructive removal (#4644 review r4)", async () => {

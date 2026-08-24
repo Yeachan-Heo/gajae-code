@@ -16,7 +16,7 @@ import * as nodeCrypto from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { exactUnlinkSymlink } from "@gajae-code/natives";
+import { exactRemoveDirectoryTree, exactUnlinkSymlink, snapshotDirectoryTree } from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
 import type { RawSettings, Settings } from "../../config/settings";
@@ -651,6 +651,98 @@ async function directoryIdentity(directory: string): Promise<BridgeEntryIdentity
 	};
 }
 
+/**
+ * Remove an empty bridge directory through the native identity-bound tree
+ * protocol. A pathname `rmdir` after a separate identity check can delete an
+ * empty successor that replaced the owned directory in between those calls.
+ * The native operation revalidates the root and its no-follow parent at the
+ * mutation boundary, and POSIX cleanup remains retained authority rather than
+ * being removed through a second pathname race.
+ */
+async function removeOwnedEmptyBridgeDirectory(
+	bridgeDir: string,
+	expected: BridgeEntryIdentity,
+): Promise<void> {
+	const parent = await fs.lstat(path.dirname(bridgeDir), { bigint: true }).catch(error => {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new SkillsBridgeError(`Paseo skills bridge parent became unavailable before removal: ${bridgeDir}`);
+	});
+	if (parent === undefined) return;
+	if (!parent.isDirectory() || parent.isSymbolicLink()) {
+		throw new SkillsBridgeError(`Paseo skills bridge parent diverged before removal: ${bridgeDir}`);
+	}
+
+	const captured = snapshotDirectoryTree(bridgeDir);
+	if (!captured.ok || captured.snapshot === undefined) {
+		if (captured.code === "not_found") return;
+		throw new SkillsBridgeError(
+			`Refusing to remove Paseo skills bridge directory without a complete native snapshot: ${bridgeDir} (${captured.code ?? "unknown"})`,
+		);
+	}
+	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
+	if (
+		root === undefined ||
+		root.kind !== "directory" ||
+		root.dev !== expected.dev ||
+		root.ino !== expected.ino
+	) {
+		throw new SkillsBridgeError(`Paseo skills bridge directory diverged before removal: ${bridgeDir}`);
+	}
+	// The directory was proven empty before handing the snapshot to the native
+	// remover. If foreign content appeared, leave it untouched instead of
+	// recursively deleting it as part of an exact tree removal.
+	if (captured.snapshot.entries.length !== 1) return;
+
+	let removal: ReturnType<typeof exactRemoveDirectoryTree>;
+	try {
+		removal = exactRemoveDirectoryTree(bridgeDir, captured.snapshot, {
+			dev: parent.dev,
+			ino: parent.ino,
+		});
+	} catch (error) {
+		throw new SkillsBridgeError(
+			`Native Paseo skills bridge directory removal failed: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+
+	const retainedAuthority =
+		removal.retainedSuccessorPath ?? removal.retainedPlaceholderPath ?? removal.retainedUnknownPath;
+	if (retainedAuthority !== undefined) {
+		throw new SkillsBridgeError(
+			`Refusing to remove Paseo skills bridge directory with retained native authority: ${bridgeDir}`,
+		);
+	}
+	if (removal.ok) {
+		if (removal.detachedPath !== undefined) {
+			throw new SkillsBridgeError(`Native Paseo skills bridge removal retained an unexpected path: ${bridgeDir}`);
+		}
+		return;
+	}
+	if (removal.code === "not_found") return;
+
+	const expectedDetachedPath = path.resolve(`${bridgeDir}.removing`);
+	if (
+		removal.code !== "cleanup_pending" ||
+		removal.payloadDurable !== true ||
+		removal.detachedPath === undefined ||
+		path.resolve(removal.detachedPath) !== expectedDetachedPath
+	) {
+		throw new SkillsBridgeError(
+			`Native Paseo skills bridge directory removal was not durably detached: ${bridgeDir} (${removal.code ?? "unknown"})`,
+		);
+	}
+	const detached = await fs.lstat(removal.detachedPath, { bigint: true }).catch(() => undefined);
+	if (
+		detached === undefined ||
+		!detached.isDirectory() ||
+		detached.isSymbolicLink() ||
+		detached.dev !== BigInt(expected.dev) ||
+		detached.ino !== BigInt(expected.ino)
+	) {
+		throw new SkillsBridgeError(`Native Paseo skills bridge detached authority diverged: ${bridgeDir}`);
+	}
+}
+
 async function captureInstalledEntryIdentity(
 	bridgeDir: string,
 	name: string,
@@ -743,21 +835,7 @@ export async function inverseSkillsBridge(
 	if (!result.bridgeDirCreated) return;
 	const directory = result.bridgeDirIdentity;
 	if (directory === undefined) throw new SkillsBridgeError(`Missing owned bridge directory identity: ${bridgeDir}`);
-	const currentDirectory = await directoryIdentity(bridgeDir).catch(() => undefined);
-	if (
-		currentDirectory === undefined ||
-		currentDirectory.dev !== directory.dev ||
-		currentDirectory.ino !== directory.ino
-	) {
-		throw new SkillsBridgeError(`Paseo skills bridge directory diverged before removal: ${bridgeDir}`);
-	}
-	try {
-		await fs.rmdir(bridgeDir);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOTEMPTY") return;
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-		throw error;
-	}
+	await removeOwnedEmptyBridgeDirectory(bridgeDir, directory);
 }
 
 /**
