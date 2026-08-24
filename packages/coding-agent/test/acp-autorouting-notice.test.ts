@@ -68,7 +68,7 @@ async function runAutoroutingSession(config: string): Promise<{
 			signal: controller.signal,
 			closed: closed.promise,
 		} as unknown as AgentSideConnection,
-		{ agentDir },
+		{ agentDir, expectedPackageGeneration: started.discovery.packageGeneration },
 	);
 	let sessionId: string | undefined;
 	let closedSession = false;
