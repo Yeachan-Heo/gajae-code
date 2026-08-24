@@ -317,4 +317,39 @@ describe("FoldCoordinator", () => {
 		// No captured intent means no fabricated instruction to complete one.
 		expect(rendered).not.toContain("Complete the original request");
 	});
+
+	// AC6: exactly ONE transcript notice per completion. A delivery can be retried
+	// with the same job object, so an unguarded notice would repeat for a single
+	// completion.
+	test("claims a completion notice exactly once per job", async () => {
+		const h = harness(() => "intent");
+		const first = job("bg_1", "job:1");
+		const second = job("bg_2", "job:2");
+
+		expect(h.coordinator.claimCompletionNotice(first)).toBe(true);
+		expect(h.coordinator.claimCompletionNotice(first)).toBe(false);
+		expect(h.coordinator.claimCompletionNotice(first)).toBe(false);
+
+		// Independent jobs each get their own single notice.
+		expect(h.coordinator.claimCompletionNotice(second)).toBe(true);
+		expect(h.coordinator.claimCompletionNotice(second)).toBe(false);
+	});
+
+	// The delivery seam only notices a receipt-bearing completion, and a retried
+	// delivery of that same completion must not notice again.
+	test("a retried receipt delivery does not claim a second notice", async () => {
+		const h = harness(() => "intent");
+		const target = job("bg_1", "job:1");
+		const probe = adapterFor(target);
+		h.coordinator.registerParticipant(probe.adapter);
+		await h.coordinator.requestFold();
+
+		const first = h.coordinator.onDelivery(target, "payload");
+		expect(first.kind).toBe("receipt");
+		expect(h.coordinator.claimCompletionNotice(target)).toBe(true);
+
+		const retried = h.coordinator.onDelivery(target, "payload");
+		expect(retried.kind).toBe("receipt");
+		expect(h.coordinator.claimCompletionNotice(target)).toBe(false);
+	});
 });
