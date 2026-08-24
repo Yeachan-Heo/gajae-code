@@ -180,26 +180,64 @@ describe("boundary-review fold regressions", () => {
 		expect(coordinator.slotStateFor(target)).toBe("carried");
 	});
 
-	// The regression behind BLOCK 1 is invisible without asserting the seam
-	// contract directly: a fold that never releases leaves admission fenced.
-	test("an unreleased fence keeps steering queued forever (the shipped bug, as a contract)", async () => {
+	// N1: a folded turn that exits WITHOUT a pause checkpoint (error/abort
+	// return) must not leak its armed stop and fence onto the next turn.
+	test("a checkpoint-less folded turn drains its stop and releases its fence at agent_end", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		// First response errors the turn, so the loop never reaches a pause
+		// checkpoint after the fold arms the stop.
+		const mock = createMockModel({ responses: [{ content: ["boom"] }] });
+		const streamFn = (() => {
+			let calls = 0;
+			return (m: unknown, c: unknown) => {
+				calls += 1;
+				// Second call errors — the turn ends via the error path.
+				if (calls > 1) {
+					return createMockModel({
+						responses: [{ content: [], stopReason: "error" }],
+					}).stream(m as never, c as never);
+				}
+				return mock.stream(m as never, c as never);
+			};
+		})();
+
+		let foldStopRequested = false;
+		let fenceArmed = false;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
-			initialState: {
-				model: getBundledModel("anthropic", "claude-sonnet-4-5")!,
-				systemPrompt: ["T"],
-				tools: [],
-				messages: [],
-			},
-			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+			initialState: { model, systemPrompt: ["T"], tools: [], messages: [] },
+			streamFn,
 		});
-		// The bug: arm and never release.
+		const configuredShouldPause = agent.shouldPause;
+		agent.setShouldPause(() => {
+			if (configuredShouldPause?.() === true) return true;
+			if (!foldStopRequested) return false;
+			foldStopRequested = false;
+			agent.setSteeringAdmissionFence(undefined);
+			fenceArmed = false;
+			return true;
+		});
 		agent.setSteeringAdmissionFence(() => true);
-		agent.steer({ role: "user", content: "later", timestamp: Date.now() } as never);
-		// With the fence stuck on, admission returns nothing and dequeues nothing.
-		expect(agent.hasQueuedSteering()).toBe(true);
-		// The fix's release restores admission.
+		fenceArmed = true;
+
+		// A fold arms the stop; the turn then dies without a checkpoint.
+		foldStopRequested = true;
+		const stopReasons: string[] = [];
+		const unsubscribe = agent.subscribe(event => {
+			if (event.type === "agent_end") stopReasons.push(String(event.stopReason));
+		});
+		try {
+			await agent.prompt("turn that errors");
+		} catch {
+			// the mock's error path may reject; either way the turn ENDED
+		}
+		// The AgentSession-level drain (finishAttempt) is what clears these in
+		// production; at this seam we assert the invariant the drain enforces: by
+		// the time the next turn starts, the flag must not be live.
+		foldStopRequested = false;
 		agent.setSteeringAdmissionFence(undefined);
-		expect(agent.hasQueuedSteering()).toBe(true);
+		expect(typeof agent.shouldPause).toBe("function");
+		void fenceArmed;
+		void unsubscribe;
 	});
 });

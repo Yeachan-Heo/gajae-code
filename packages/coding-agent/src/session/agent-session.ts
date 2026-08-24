@@ -7640,6 +7640,10 @@ export class AgentSession {
 				deliveryScope === undefined ||
 				this.#activeAttemptScope === undefined ||
 				deliveryScope === this.#activeAttemptScope;
+			if (this.#foldStopRequested) {
+				this.#foldStopRequested = false;
+				this.agent.setSteeringAdmissionFence(undefined);
+			}
 			if (deliveryScope) {
 				this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
 				this.#sdkRunTokensByAttemptScope.delete(deliveryScope as AttemptScope);
