@@ -2834,7 +2834,7 @@ fn append_managed(
 	Ok(RecoveryFsResult::success(identity))
 }
 #[cfg(target_os = "linux")]
-fn replace_managed_failure(code: &'static str) -> ReplacementExchangeError {
+const fn replace_managed_failure(code: &'static str) -> ReplacementExchangeError {
 	ReplacementExchangeError::PreMutation { code, phase: "preflight" }
 }
 
