@@ -156,14 +156,18 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 		expect(body.tool_choice).toBe("required");
 		expect(body.reasoning_effort).toBeUndefined();
 	});
-	it("omits reasoning on non-Kimi models when a tool is forced", async () => {
-		// Forced tool selection has no reasoning control on this OpenAI-compatible path.
+	it("does not strip reasoning on non-Kimi models even with forced tool_choice", async () => {
+		// Non-kimi reasoning model — OpenAI itself accepts forced tool_choice with reasoning.
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
 			id: "gpt-5-mini",
 			reasoning: true,
-			compat: { supportsReasoningEffort: true },
+			compat: {
+				...getBundledModel("openai", "gpt-4o-mini").compat,
+				disableReasoningOnForcedToolChoice: false,
+				supportsReasoningEffort: true,
+			},
 		};
 
 		const body = (await captureBody(model, {
@@ -172,6 +176,6 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 		})) as CompletionsBody;
 
 		expect(body.tool_choice).toBe("required");
-		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.reasoning_effort).toBe("high");
 	});
 });
