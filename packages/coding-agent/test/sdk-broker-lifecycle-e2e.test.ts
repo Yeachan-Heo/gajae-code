@@ -4810,7 +4810,9 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		await broker.start();
 		const created = await broker.handleRequest(
 			"session.create",
-			{ cwd: root, readinessTimeoutMs: 10_000 },
+			// This boots a real source-workspace host. Preserve enough headroom when
+			// Bun runs this file beside the broker unit shard on loaded CI workers.
+			{ cwd: root, readinessTimeoutMs: 20_000 },
 			"v3-native-create",
 		);
 		if (!created.ok) throw new Error(created.error.message);
@@ -4844,7 +4846,7 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 20_000);
+}, 30_000);
 
 test("broker agentDir profile validates, activates, and is discoverable through session Q27", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-agent-dir-"));
@@ -4861,7 +4863,7 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 		await broker.start();
 		const created = await broker.handleRequest(
 			"session.create",
-			{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 10_000 },
+			{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 20_000 },
 			"agent-dir-profile-create",
 		);
 		if (!created.ok) throw new Error(created.error.message);
@@ -4894,7 +4896,7 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 20_000);
+}, 30_000);
 
 test("child profile activation failures preserve typed codes through readiness and BrokerResponse", async () => {
 	if (process.platform !== "linux") return;
