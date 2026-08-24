@@ -2175,8 +2175,8 @@ describe("skills bridge", () => {
 		let cleanupStarted = false;
 		let oldBridgeReadlinks = 0;
 		const originalReadlink = fs.readlink.bind(fs);
-		const readlink = spyOn(fs, "readlink").mockImplementation(async target => {
-			const value = await originalReadlink(target);
+		const readlink = spyOn(fs, "readlink").mockImplementation((async target => {
+			const value = await originalReadlink(target, "utf8");
 			if (cleanupStarted && String(target).startsWith(`${oldDir}${path.sep}`)) {
 				oldBridgeReadlinks += 1;
 				if (oldBridgeReadlinks === SKILL_NAMES.length + 2) {
@@ -2184,7 +2184,7 @@ describe("skills bridge", () => {
 				}
 			}
 			return value;
-		});
+		}) as typeof fs.readlink);
 		const realSettingsInit = Settings.init.bind(Settings);
 		let settingsCommit: { mockRestore(): void } | undefined;
 		const settingsInit = spyOn(Settings, "init").mockImplementation(async options => {

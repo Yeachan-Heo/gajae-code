@@ -40,6 +40,7 @@ import {
 	legacySourceDirFor,
 	preflightSkillsBridge,
 	registerSkillsBridgeDirectory,
+	SkillsBridgeError,
 	SkillsBridgePartialError,
 } from "./skills-bridge";
 
@@ -569,9 +570,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				createdEntries: migratedOldEntries.map(entry => entry.name),
 				prunedEntries: [],
 				adoptedEntries: [],
-				entryIdentities: Object.fromEntries(
-					migratedOldEntries.map(entry => [entry.name, entry.identity]),
-				),
+				entryIdentities: Object.fromEntries(migratedOldEntries.map(entry => [entry.name, entry.identity])),
 				bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
 				bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
 				sourceDir: oldSourceDir,
@@ -640,7 +639,9 @@ async function captureMigratedOldBridgeEntries(
 		}
 		const linkText = await fs.readlink(destination);
 		if (path.resolve(path.dirname(destination), linkText) !== path.resolve(sourceDir, name)) {
-			throw new SkillsBridgeError(`Refusing to migrate an old Paseo skill bridge entry with a foreign target: ${destination}`);
+			throw new SkillsBridgeError(
+				`Refusing to migrate an old Paseo skill bridge entry with a foreign target: ${destination}`,
+			);
 		}
 		const observed: BridgeEntryIdentity = {
 			dev: stat.dev.toString(),
@@ -730,10 +731,7 @@ async function restoreMigratedOldBridgeEntries(
 
 function sameBridgeEntryIdentity(left: BridgeEntryIdentity, right: BridgeEntryIdentity): boolean {
 	return (
-		left.dev === right.dev &&
-		left.ino === right.ino &&
-		left.size === right.size &&
-		left.mtimeNs === right.mtimeNs
+		left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs
 	);
 }
 
