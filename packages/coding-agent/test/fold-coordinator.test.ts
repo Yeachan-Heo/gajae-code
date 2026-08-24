@@ -87,6 +87,7 @@ function harness(captureRemainingIntent: () => Promise<string | undefined> | str
 			state.stops += 1;
 		},
 		captureRemainingIntent,
+		deliverParked: () => {},
 	});
 	return state;
 }

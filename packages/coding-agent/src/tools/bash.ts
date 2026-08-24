@@ -1410,6 +1410,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const outcome = settleForeground();
 					if (outcome === "resolved") {
 						job.setBackgrounded(true);
+						ownedManager.markBackgrounded(job.jobId, jobGeneration);
 						backgroundRequest.resolve();
 					}
 					return outcome;
@@ -1787,6 +1788,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const outcome = settleBridgeForeground();
 					if (outcome === "resolved") {
 						bridgeHandle.setBackgrounded(true);
+						bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration);
 						bridgeFoldRequest.resolve();
 					}
 					return outcome;
@@ -1912,6 +1914,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							detachObserver: () => {
 								// Output-only continuation: stdin forwarding ends here and the
 								// process is never killed or restarted by folding.
+								ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
 								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
 									requestedTimeoutSec,
 									notices: pendingNotices,

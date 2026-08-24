@@ -343,6 +343,14 @@ export async function runInteractiveBashPty(
 	// Ownership inversion: this runner owns the session and the sink from t0,
 	// started OUTSIDE ui.custom. The overlay is only an observer view, so
 	// dismissing it — or never creating it — can never kill the process.
+	// Seed the real host geometry so the first frame renders at the user's size;
+	// the overlay keeps resizing the session as it lays out. Fallbacks apply only
+	// when the host exposes no terminal (tests, pipes).
+	const initialPtySize = {
+		cols: Math.max(20, (process.stdout.columns ?? 80) - 2),
+		rows: Math.max(5, (process.stdout.rows ?? 24) - 4),
+	};
+
 	const session = new PtySession();
 	let observer: BashInteractiveOverlayComponent | undefined;
 	let settleForeground: ((result: BashInteractiveResult) => void) | undefined;
@@ -391,8 +399,8 @@ export async function runInteractiveBashPty(
 				timeoutMs: options.timeoutMs,
 				env: { ...NON_INTERACTIVE_ENV, ...options.env },
 				signal: options.signal,
-				cols: 120,
-				rows: 40,
+				cols: initialPtySize.cols,
+				rows: initialPtySize.rows,
 				shell: resolvedShell,
 			},
 			(err, chunk) => {
