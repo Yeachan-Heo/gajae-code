@@ -190,6 +190,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			const args = (input.args ?? "").trim();
 			const activationResult = await resolveSubskillActivationForSkillInvocation({
 				cwd: this.#session.cwd,
+				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 				skillName: skill.name,
 				args,
@@ -198,6 +199,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				subskillActivation: activationResult.activation,
 				subskillActivationSet: activationResult.activeSubskillsToPersist,
 				cwd: this.#session.cwd,
+				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 			});
 

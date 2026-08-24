@@ -11,19 +11,21 @@ export interface SubskillActivationResult {
 
 export async function resolveSubskillActivationForSkillInvocation(input: {
 	cwd: string;
+	agentDir?: string;
 	sessionId?: string;
 	threadId?: string;
 	turnId?: string;
 	skillName: string;
 	args: string;
 }): Promise<SubskillActivationResult> {
-	const registry = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const registry = await loadEffectiveGjcPluginRegistry(input.cwd, { agentDir: input.agentDir });
 	const candidates: LoadedSubskillActivation[] = [];
 	for (const entry of registry) {
 		if (!entry.enabled || entry.migration?.status === "failed") continue;
 		for (const surface of entry.surfaces.subskills) {
 			const validated = await resolveValidatedActiveSubskill({
 				cwd: input.cwd,
+				agentDir: input.agentDir,
 				reference: {
 					plugin: entry.name,
 					scope: entry.scope,

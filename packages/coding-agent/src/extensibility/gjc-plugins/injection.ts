@@ -60,6 +60,7 @@ export async function resolveCurrentPhaseForParent(input: {
 
 export async function buildSubskillInjection(input: {
 	cwd: string;
+	agentDir?: string;
 	sessionId?: string;
 	skillName: string;
 	activation?: LoadedSubskillActivation;
@@ -76,7 +77,11 @@ export async function buildSubskillInjection(input: {
 	});
 
 	if (input.activation?.parent === input.skillName && input.activation.phase === resolvedPhase) {
-		const validated = await resolveValidatedActiveSubskill({ cwd: input.cwd, reference: input.activation });
+		const validated = await resolveValidatedActiveSubskill({
+			cwd: input.cwd,
+			agentDir: input.agentDir,
+			reference: input.activation,
+		});
 		if (validated) {
 			await input.beforeInject?.(validated.activation.filePath);
 			return { block: wrapSubskillBlock(validated.activation, validated.body), details: validated.activation };
@@ -90,7 +95,12 @@ export async function buildSubskillInjection(input: {
 		phase: resolvedPhase,
 	});
 	if (!entry) return null;
-	const validated = await resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true });
+	const validated = await resolveValidatedActiveSubskill({
+		cwd: input.cwd,
+		agentDir: input.agentDir,
+		reference: entry,
+		persisted: true,
+	});
 	if (!validated) return null;
 	await input.beforeInject?.(validated.activation.filePath);
 	return { block: wrapSubskillBlock(validated.activation, validated.body), details: validated.activation };
@@ -98,6 +108,7 @@ export async function buildSubskillInjection(input: {
 
 export async function buildAgentSubskillInjection(input: {
 	cwd: string;
+	agentDir?: string;
 	sessionId?: string;
 	agentName: string;
 	/** Test seam runs after validation; injection uses exact verified bytes. */
@@ -114,7 +125,14 @@ export async function buildAgentSubskillInjection(input: {
 	});
 	const validated = (
 		await Promise.all(
-			entries.map(entry => resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true })),
+			entries.map(entry =>
+				resolveValidatedActiveSubskill({
+					cwd: input.cwd,
+					agentDir: input.agentDir,
+					reference: entry,
+					persisted: true,
+				}),
+			),
 		)
 	).filter((item): item is NonNullable<typeof item> => item !== null);
 	if (validated.length === 0) return "";

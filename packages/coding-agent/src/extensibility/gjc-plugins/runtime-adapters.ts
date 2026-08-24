@@ -385,8 +385,8 @@ export async function loadAlwaysOnPluginTools(input: {
  * `cwd`, applying hash-drift + collision quarantine first. Returns "" when no
  * plugins are installed/enabled. Safe to call unconditionally at session start.
  */
-export async function renderAlwaysOnSystemAppendices(input: { cwd: string }): Promise<string> {
-	const { effective, active } = await loadValidatedPluginRegistry(input.cwd);
+export async function renderAlwaysOnSystemAppendices(input: { cwd: string; agentDir?: string }): Promise<string> {
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
 	if (effective.length === 0) return "";
 	const { renderPluginAppendices } = await import("./prompt-appendix");
 	return (await renderPluginAppendices(active)).system;
@@ -400,8 +400,9 @@ export async function renderAlwaysOnSystemAppendices(input: { cwd: string }): Pr
 export async function renderAgentPromptAdditions(input: {
 	cwd: string;
 	agentName: string;
+	agentDir?: string;
 }): Promise<{ appendix: string; advertisement: string }> {
-	const { effective, active } = await loadValidatedPluginRegistry(input.cwd);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
 	if (effective.length === 0) return { appendix: "", advertisement: "" };
 	const { renderPluginAppendices } = await import("./prompt-appendix");
 	const { buildAgentSubskillAdvertisement } = await import("./injection");
@@ -420,8 +421,9 @@ export async function renderSkillAdvertisement(input: {
 	cwd: string;
 	skillName: string;
 	phase?: string;
+	agentDir?: string;
 }): Promise<string> {
-	const { effective, active } = await loadValidatedPluginRegistry(input.cwd);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
 	if (effective.length === 0) return "";
 	const { buildSubskillAdvertisement } = await import("./injection");
 	return buildSubskillAdvertisement(active, input.skillName, input.phase);
@@ -433,11 +435,11 @@ export async function renderSkillAdvertisement(input: {
  * re-resolution for http/sse, stdio root-confinement) before connection. Servers
  * failing policy are quarantined and excluded. Returns {} when none.
  */
-export async function buildPluginMcpConfigs(input: { cwd: string }): Promise<{
+export async function buildPluginMcpConfigs(input: { cwd: string; agentDir?: string }): Promise<{
 	configs: Record<string, any>;
 	quarantine: SessionQuarantine[];
 }> {
-	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd);
+	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
 	if (effective.length === 0) return { configs: {}, quarantine: [] };
 	const { assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed } = await import("./mcp-policy");
 	const nodePath = await import("node:path");

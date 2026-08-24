@@ -1987,7 +1987,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else if (settings.get("skills.enabled")) {
 			const skillsResult = await logger.time("loadSkills", loadSkills, {
 				...settings.getGroup("skills"),
-				agentDir,
 				cwd,
 				agentDir,
 				disabledExtensions: settings.get("disabledExtensions"),
@@ -2258,9 +2257,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const nextCwdCapturing: string[] = [];
 			const nextCustomTools: CustomTool[] = [];
 			try {
-				const declarations = await getGjcPluginToolDeclarations(to);
+				const declarations = await getGjcPluginToolDeclarations(to, agentDir);
 				const pluginToolResult = await loadAlwaysOnPluginTools({
 					cwd: to,
+					agentDir,
 					reservedToolNames: session.getAllToolNames().filter(name => !previousCwdCapturing.includes(name)),
 					declarations,
 				});
@@ -2287,7 +2287,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						nativeOnly: true,
 						settings,
 					});
-					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to });
+					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to, agentDir });
 					const pluginNames = new Set(Object.keys(pluginConfigs));
 					const mergedConfigs = { ...loaded.configs, ...pluginConfigs };
 					const mergedSources = {
@@ -2350,7 +2350,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					const reloaded = await loadSkills({
 						...settings.getGroup("skills"),
-						agentDir,
 						cwd: to,
 						agentDir,
 						disabledExtensions: settings.get("disabledExtensions"),
@@ -3082,7 +3081,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// tools are surfaced as always-on tools rather than gated behind MCP
 			// selection.
 			try {
-				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd });
+				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd, agentDir });
 				for (const q of quarantine) {
 					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
@@ -3920,7 +3919,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				[memoryInstructions, browserBackend.developerInstructions].filter(Boolean).join("\n\n") || undefined;
 			let pluginSystemAppendices = "";
 			try {
-				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd() });
+				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd(), agentDir });
 			} catch (error) {
 				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error: safeErrorForLog(error) });

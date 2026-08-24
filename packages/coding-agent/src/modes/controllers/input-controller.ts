@@ -1641,15 +1641,17 @@ export class InputController {
 				if (!invocation) continue;
 				const activationResult = await resolveSubskillActivationForSkillInvocation({
 					cwd: this.ctx.sessionManager.getCwd(),
+					agentDir: this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.(),
 					sessionId: this.ctx.session.sessionId,
 					skillName: invocation.skill.name,
 					args: invocation.args,
 				});
-				const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
-					subskillActivation: activationResult.activation,
-					subskillActivationSet: activationResult.activeSubskillsToPersist,
-					cwd: this.ctx.sessionManager.getCwd(),
-					sessionId: this.ctx.session.sessionId,
+			const built = await buildSkillPromptMessage(invocation.skill, activationResult.cleanedArgs, {
+				subskillActivation: activationResult.activation,
+				subskillActivationSet: activationResult.activeSubskillsToPersist,
+				cwd: this.ctx.sessionManager.getCwd(),
+				agentDir: this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.(),
+				sessionId: this.ctx.session.sessionId,
 				});
 				const details: SkillPromptDetails = built.details;
 				const displayText = `/${invocation.commandName}${activationResult.cleanedArgs ? ` ${activationResult.cleanedArgs}` : ""}`;

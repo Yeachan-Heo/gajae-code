@@ -42,10 +42,6 @@ const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
 
-function getUserAgentDirs(ctx: LoadContext): string[] {
-	return [resolveUserAgentDir(ctx)];
-}
-
 /**
  * GJC's user-scope config directory.
  *
@@ -88,7 +84,6 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	const userDir = await ifNonEmptyDir(resolveUserAgentDir(ctx));
 	if (userDir) {
 		result.push({ dir: userDir, level: "user" });
-	}
 	}
 
 	return result;
@@ -345,7 +340,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 			level: "user",
 			requireDescription: true,
 		}),
-	];
+	);
 
 	const results = await Promise.all([...projectScans, ...userScans]);
 

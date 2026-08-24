@@ -1945,13 +1945,18 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 
 			const agentSubskillBlock = await buildAgentSubskillInjection({
 				cwd,
+				agentDir: options.parentAgentDir ?? subagentSettings.getAgentDir(),
 				sessionId: options.parentSessionId,
 				agentName: agent.name,
 			});
 
 			let agentPromptAdditions = { appendix: "", advertisement: "" };
 			try {
-				agentPromptAdditions = await renderAgentPromptAdditions({ cwd, agentName: agent.name });
+				agentPromptAdditions = await renderAgentPromptAdditions({
+					cwd,
+					agentDir: options.parentAgentDir ?? subagentSettings.getAgentDir(),
+					agentName: agent.name,
+				});
 			} catch (error) {
 				logger.warn("Failed to render GJC plugin agent prompt additions", { error });
 			}
