@@ -8385,7 +8385,7 @@ export class SessionManager {
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
-			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(terminalDescriptor);
+			this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
 			this.#lazyReopenSucceeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
@@ -8572,7 +8572,7 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
-			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(finalDescriptor);
+			this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
 			this.#sessionId = discovery.header.id;
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
@@ -14945,9 +14945,27 @@ export class SessionManager {
 			this.#managedPersistExpectedIdentity = undefined;
 			return;
 		}
-		const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
-		if (!descriptor) throw new Error("managed_persist_identity_unavailable");
-		this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
+		this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+	}
+
+	/** Capture one descriptor-bound digest for a future metadata-drift comparison. */
+	#captureManagedPersistIdentity(sessionFile: string): ManagedFileIdentity {
+		const store = this.#managedTranscriptStore(sessionFile);
+		const relativePath = path.basename(sessionFile);
+		const bounded = store.captureBoundedAppendExpectation(relativePath);
+		const descriptor = store.descriptorExpected(relativePath);
+		if (!bounded || !descriptor) throw new Error("managed_persist_identity_unavailable");
+		const identity = managedIdentityFromDescriptor(descriptor);
+		if (
+			bounded.dev !== identity.dev.toString() ||
+			bounded.ino !== identity.ino.toString() ||
+			bounded.nlink !== identity.nlink.toString() ||
+			bounded.size !== String(identity.size) ||
+			bounded.mtimeNs !== identity.mtimeNs.toString() ||
+			bounded.ctimeNs !== identity.ctimeNs.toString()
+		)
+			throw new Error("managed_persist_identity_unavailable");
+		return { ...identity, sha256: bounded.sha256 };
 	}
 	/** Current transcript descriptor, or null when unavailable. */
 	#managedDescriptorSnapshotOrNull(): DescriptorSnapshot | null {
@@ -14997,7 +15015,7 @@ export class SessionManager {
 				} else store.replaceSync(relativePath, bytes);
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
+				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				return;
 			}
@@ -19961,7 +19979,7 @@ export class SessionManager {
 				const returnManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
 				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
 					throw new Error("Could not open session: unstable");
-				manager.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(returnManagedDescriptor);
+				manager.#managedPersistExpectedIdentity = manager.#captureManagedPersistIdentity(filePath);
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
@@ -20079,7 +20097,7 @@ export class SessionManager {
 					const finalDescriptor = store.descriptorExpected(path.basename(resolved));
 					if (!finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
 						throw new Error("source_changed");
-					boundedManager.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(finalDescriptor);
+					boundedManager.#managedPersistExpectedIdentity = boundedManager.#captureManagedPersistIdentity(resolved);
 					boundedManager.buildSessionContext();
 					return boundedManager;
 				}

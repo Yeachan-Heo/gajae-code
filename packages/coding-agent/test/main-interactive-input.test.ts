@@ -230,6 +230,29 @@ describe("submitInteractiveInput", () => {
 
 		expect(waiter.dispose).toHaveBeenCalledTimes(1);
 	});
+
+	it("contains an identity-precondition prompt rejection and leaves the input loop usable", async () => {
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: vi.fn(() => ({ promise: Promise.resolve(), dispose: vi.fn() })),
+		};
+		const session = {
+			prompt: vi.fn(async () => {
+				throw new Error("managed_append_identity_mismatch");
+			}),
+			promptCustomMessage: vi.fn(async () => {}),
+		};
+		const input = createInput();
+
+		await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
+
+		expect(mode.showError).toHaveBeenCalledWith("managed_append_identity_mismatch");
+		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
+	});
 });
 
 describe("interactive startup input ordering", () => {

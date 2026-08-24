@@ -54,6 +54,41 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close();
 	});
 
+	it("accepts byte-identical metadata drift before appending", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const original = fs.readFileSync(sessionFile);
+		const before = fs.statSync(sessionFile);
+		fs.utimesSync(sessionFile, new Date(before.atimeMs + 1_000), new Date(before.mtimeMs + 1_000));
+		const drifted = fs.statSync(sessionFile);
+		expect(drifted.ino).toBe(before.ino);
+		expect(drifted.size).toBe(before.size);
+		expect(fs.readFileSync(sessionFile).equals(original)).toBe(true);
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "after-metadata-drift", timestamp: Date.now() }),
+		).not.toThrow();
+		await manager.flush();
+		const afterFirstAppend = fs.statSync(sessionFile);
+		fs.utimesSync(
+			sessionFile,
+			new Date(afterFirstAppend.atimeMs + 1_000),
+			new Date(afterFirstAppend.mtimeMs + 1_000),
+		);
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "after-second-metadata-drift", timestamp: Date.now() }),
+		).not.toThrow();
+		await manager.flush();
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("after-metadata-drift");
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("after-second-metadata-drift");
+		await manager.close();
+	});
+
 	it("still fails closed on identity_mismatch (concurrent successor not overwritten)", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
@@ -62,10 +97,8 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.flush();
 
 		const sessionFile = manager.getSessionFile()!;
-		fs.writeFileSync(
-			sessionFile,
-			`${JSON.stringify({ type: "session", id: "other", timestamp: new Date().toISOString(), cwd })}\n`,
-		);
+		const successor = `${JSON.stringify({ type: "session", id: "other", timestamp: new Date().toISOString(), cwd })}\n`;
+		fs.writeFileSync(sessionFile, successor);
 
 		let threw = false;
 		try {
@@ -75,6 +108,10 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			expect(String(e)).toMatch(/identity_mismatch|managed_replace_identity_mismatch/);
 		}
 		expect(threw).toBe(true);
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "still-fail-closed", timestamp: Date.now() }),
+		).toThrow(/identity_mismatch|managed_replace_identity_mismatch/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
 		await manager.close().catch(() => {});
 	});
 });

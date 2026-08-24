@@ -2694,7 +2694,7 @@ fn append_managed(
 	file.write_all(data).map_err(|_| "io_error")?;
 	file.sync_all().map_err(|_| "fsync_failed")?;
 	crate::path_identity::platform::verify_created_owner_only_file(&file)?;
-	let identity = regular_identity(&file)?;
+	let mut identity = regular_identity(&file)?;
 	if identity.dev != expected_dev
 		|| identity.ino != expected_ino
 		|| identity.size != appended_size.to_string()
@@ -2705,6 +2705,7 @@ fn append_managed(
 	if !stat_matches_regular_identity(&named, &identity) {
 		return Err("identity_mismatch");
 	}
+	identity.sha256 = Some(digest_hex(&file)?);
 	parent.sync_all().map_err(|_| "fsync_failed")?;
 	Ok(RecoveryFsResult::success(identity))
 }

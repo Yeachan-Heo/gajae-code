@@ -242,9 +242,8 @@ export interface ManagedFileSnapshot {
 	};
 }
 /**
- * Descriptor identity of one managed file object. Deliberately excludes the
- * content sha256: append receipts must bind the post-operation object without
- * re-reading the whole payload.
+ * Descriptor identity of one managed file object. Append receipts include a
+ * content digest when the append implementation has already computed it.
  */
 export interface ManagedFileIdentity {
 	dev: bigint;
@@ -253,6 +252,7 @@ export interface ManagedFileIdentity {
 	size: number;
 	mtimeNs: bigint;
 	ctimeNs: bigint;
+	sha256?: string;
 }
 
 /**
@@ -281,6 +281,7 @@ function sameManagedIdentity(left: ManagedFileIdentity, right: ManagedFileIdenti
 export interface ManagedBoundedAppendExpectation {
 	readonly dev: string;
 	readonly ino: string;
+	readonly nlink: string;
 	readonly size: string;
 	readonly mtimeNs: string;
 	readonly ctimeNs: string;
@@ -295,6 +296,7 @@ function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFil
 		size: Number(identity.size),
 		mtimeNs: BigInt(identity.mtimeNs),
 		ctimeNs: BigInt(identity.ctimeNs),
+		...(identity.sha256 ? { sha256: identity.sha256 } : {}),
 	};
 }
 
@@ -1704,6 +1706,7 @@ export class ManagedSessionDescendantStore {
 		return {
 			dev: identity.dev.toString(),
 			ino: identity.ino.toString(),
+			nlink: identity.nlink.toString(),
 			size: identity.size.toString(),
 			mtimeNs: identity.mtimeNs.toString(),
 			ctimeNs: identity.ctimeNs.toString(),
@@ -1723,6 +1726,7 @@ export class ManagedSessionDescendantStore {
 			if (
 				current.dev.toString() !== expected.dev ||
 				current.ino.toString() !== expected.ino ||
+				current.nlink.toString() !== expected.nlink ||
 				current.size.toString() !== expected.size ||
 				current.mtimeNs.toString() !== expected.mtimeNs ||
 				current.ctimeNs.toString() !== expected.ctimeNs ||
@@ -1762,15 +1766,28 @@ export class ManagedSessionDescendantStore {
 		expected: ManagedFileIdentity,
 	): ManagedAppendReceipt {
 		const bounded = this.captureBoundedAppendExpectation(relativePath);
-		if (
-			!bounded ||
-			bounded.dev !== expected.dev.toString() ||
-			bounded.ino !== expected.ino.toString() ||
-			bounded.size !== String(expected.size) ||
-			bounded.mtimeNs !== expected.mtimeNs.toString() ||
-			bounded.ctimeNs !== expected.ctimeNs.toString()
-		)
-			throw new Error("managed_append_identity_mismatch");
+		if (!bounded) throw new Error("managed_append_identity_mismatch");
+		const descriptorMatches =
+			bounded.dev === expected.dev.toString() &&
+			bounded.ino === expected.ino.toString() &&
+			bounded.nlink === expected.nlink.toString() &&
+			bounded.size === String(expected.size) &&
+			bounded.mtimeNs === expected.mtimeNs.toString() &&
+			bounded.ctimeNs === expected.ctimeNs.toString();
+		if (!descriptorMatches) {
+			// Metadata-only drift is safe only when the same unlinked file object and
+			// byte-exact predecessor are independently proven. Never accept a changed
+			// object, length, link count, or digest as a benign touch.
+			if (
+				!expected.sha256 ||
+				bounded.dev !== expected.dev.toString() ||
+				bounded.ino !== expected.ino.toString() ||
+				bounded.nlink !== expected.nlink.toString() ||
+				bounded.size !== String(expected.size) ||
+				bounded.sha256 !== expected.sha256
+			)
+				throw new Error("managed_append_identity_mismatch");
+		}
 		return this.appendExpectedSync(relativePath, bytes, bounded);
 	}
 
