@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import type { AsyncJob } from "@gajae-code/coding-agent/async/job-manager";
 import {
 	describeFoldReceipt,
-	FoldCoordinator,
 	type FoldAdapter,
+	FoldCoordinator,
 	type FoldReceipt,
 	type ForegroundSettleOutcome,
 	type ForegroundTerminalPayload,

@@ -443,6 +443,7 @@ import {
 } from "./contribution-prep";
 import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import { FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter, FoldCoordinator } from "./fold-coordinator";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -471,7 +472,6 @@ import type {
 	SessionManagerCloseOutcome,
 	SessionMemoryStats,
 } from "./session-manager";
-
 import {
 	createReadonlySessionManager,
 	getLatestCompactionEntry,
@@ -496,10 +496,8 @@ import {
 	settleToolLineageRegistrationWindow,
 	unregisterOwnedRegistration,
 } from "./terminal-abort";
-
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
-import { FoldCoordinator, FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter } from "./fold-coordinator";
 import { YieldQueue } from "./yield-queue";
 
 /**

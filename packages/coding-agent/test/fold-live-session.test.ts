@@ -11,13 +11,13 @@ import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
-import { AsyncJobManager, type AsyncJob } from "@gajae-code/coding-agent/async";
+import { type AsyncJob, AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
-import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import type { FoldReceipt } from "@gajae-code/coding-agent/session/fold-coordinator";
+import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
 
@@ -77,10 +77,7 @@ describe("live session fold", () => {
 			},
 		};
 		const mock = createMockModel({
-			responses: [
-				{ content: [{ type: "toolCall", name: "wait", arguments: {} }] },
-				{ content: ["after the fold"] },
-			],
+			responses: [{ content: [{ type: "toolCall", name: "wait", arguments: {} }] }, { content: ["after the fold"] }],
 		});
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -134,9 +131,9 @@ describe("live session fold", () => {
 			// A worktree whose node_modules is a symlink to another checkout resolves
 			// @gajae-code/agent-core there instead, so this method goes missing and the
 			// fold path throws deep inside the coordinator.
-			expect(
-				typeof (agent as unknown as { setSteeringAdmissionFence?: unknown }).setSteeringAdmissionFence,
-			).toBe("function");
+			expect(typeof (agent as unknown as { setSteeringAdmissionFence?: unknown }).setSteeringAdmissionFence).toBe(
+				"function",
+			);
 			expect(session.hasForegroundBashBackgroundRequestHandler()).toBe(true);
 
 			const run = session.prompt("run the tool");

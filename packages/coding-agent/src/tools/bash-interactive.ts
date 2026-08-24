@@ -426,32 +426,32 @@ export async function runInteractiveBashPty(
 		const overlayResult = await Promise.race([
 			foreground.promise,
 			ui.custom<BashInteractiveResult>(
-			(tui, uiTheme, _keybindings, done) => {
-				settleForeground = done;
-				const component = new BashInteractiveOverlayComponent(
-					options.command,
-					uiTheme,
-					() => tui.terminal.rows,
-					XtermTerminal,
-				);
-				component.setSession(session);
-				// Observer view only: stdin still reaches the process while attached,
-				// but dismiss and dispose no longer kill it.
-				component.setHandlers(
-					data => {
-						try {
-							session.write(data);
-						} catch {
-							// ignore writes after the command exits
-						}
-					},
-					() => {},
-					() => {},
-				);
-				observer = component;
-				return component;
-			},
-			{ overlay: true },
+				(tui, uiTheme, _keybindings, done) => {
+					settleForeground = done;
+					const component = new BashInteractiveOverlayComponent(
+						options.command,
+						uiTheme,
+						() => tui.terminal.rows,
+						XtermTerminal,
+					);
+					component.setSession(session);
+					// Observer view only: stdin still reaches the process while attached,
+					// but dismiss and dispose no longer kill it.
+					component.setHandlers(
+						data => {
+							try {
+								session.write(data);
+							} catch {
+								// ignore writes after the command exits
+							}
+						},
+						() => {},
+						() => {},
+					);
+					observer = component;
+					return component;
+				},
+				{ overlay: true },
 			),
 		]);
 		return overlayResult;

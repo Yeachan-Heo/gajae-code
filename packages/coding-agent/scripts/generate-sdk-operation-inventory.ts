@@ -127,8 +127,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal ACP lifecycle quiescence plumbing, not a user-facing control seam",
 	"agent_session:getToolByName": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getToolForExecution": "internal accessor/plumbing, not a user-facing control seam",
-	"agent_session:registerForegroundBashBackgroundRequestHandler":
-		"internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:registerForegroundFoldParticipant": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:hasForegroundBashBackgroundRequestHandler":
 		"internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:requestForegroundBashBackground": "internal accessor/plumbing, not a user-facing control seam",

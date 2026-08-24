@@ -1,15 +1,9 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import type { AsyncJobManager } from "../src/async";
-import {
-	buildJobsListItems,
-} from "../src/modes/components/jobs-overlay-model";
+import { buildJobsListItems } from "../src/modes/components/jobs-overlay-model";
 import { renderSegment, type SegmentContext } from "../src/modes/components/status-line/segments";
+import { type AsyncJobsSnapshot, EMPTY_JOBS_SNAPSHOT, JobsObserver } from "../src/modes/jobs-observer";
 import { initTheme } from "../src/modes/theme/theme";
-import {
-	EMPTY_JOBS_SNAPSHOT,
-	JobsObserver,
-	type AsyncJobsSnapshot,
-} from "../src/modes/jobs-observer";
 
 beforeAll(async () => {
 	await initTheme();

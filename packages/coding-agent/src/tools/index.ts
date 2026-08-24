@@ -1,5 +1,4 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
-import type { FoldAdapter } from "../session/fold-coordinator";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { $env, logger } from "@gajae-code/utils";
 import type { AsyncJobManager } from "../async";
@@ -18,6 +17,7 @@ import type {
 } from "../session/agent-session";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
+import type { FoldAdapter } from "../session/fold-coordinator";
 import type { CustomMessage } from "../session/messages";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import type { SkillActiveEntry } from "../skill-state/active-state";

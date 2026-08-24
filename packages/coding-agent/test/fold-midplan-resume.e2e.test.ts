@@ -12,7 +12,7 @@ import * as path from "node:path";
 import { Agent, type AgentMessage, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
-import { AsyncJobManager, type AsyncJob } from "@gajae-code/coding-agent/async";
+import { type AsyncJob, AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -42,7 +42,9 @@ function textOf(message: unknown): string {
 	if (typeof content === "string") return content;
 	if (Array.isArray(content)) {
 		return content
-			.map(block => (typeof block === "object" && block && "text" in block ? String((block as { text: unknown }).text) : ""))
+			.map(block =>
+				typeof block === "object" && block && "text" in block ? String((block as { text: unknown }).text) : "",
+			)
 			.join("\n");
 	}
 	return "";

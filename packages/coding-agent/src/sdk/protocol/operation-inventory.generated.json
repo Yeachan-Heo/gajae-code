@@ -2937,7 +2937,7 @@
 		}
 	},
 	{
-		"sourceId": "agent_session:registerForegroundBashBackgroundRequestHandler",
+		"sourceId": "agent_session:registerForegroundFoldParticipant",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
