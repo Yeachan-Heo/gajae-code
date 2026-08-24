@@ -814,6 +814,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
+			// Watchdog scaffolding is declared before the proxy handshake so the
+			// first-event deadline can cover setup too: Cursor is a watchdog owner
+			// (the lazy wrapper's first-event timer is disabled for it), and the
+			// proxy tunnel connect below waits up to its own 30s timeout before any
+			// watchdog would otherwise be armed. A caller-supplied
+			// streamFirstEventTimeoutMs shorter than that must still bound setup.
 			if (proxyUrl) {
 				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
 					signal: options?.signal,
@@ -881,6 +887,41 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					() => new Error("Cursor stream stalled while waiting for transport progress"),
 				);
 			};
+			let firstEventWatchdogArmed = false;
+			if (proxyUrl) {
+				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
+				firstEventWatchdogArmed = true;
+				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
+					signal: options?.signal,
+					timeoutMs: 30_000,
+				});
+				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
+			} else {
+				h2Client = http2.connect(baseUrl);
+			}
+			// Recheck after the (possibly async) proxy handshake, immediately before
+			// the bearer-authenticated request is created.
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+			h2ClientErrorHandler = error => settleH2(error);
+			h2Client.on("error", h2ClientErrorHandler);
+
+			h2Request = h2Client.request({
+				":method": "POST",
+				":path": "/agent.v1.AgentService/Run",
+				"content-type": "application/connect+proto",
+				"connect-protocol-version": "1",
+				te: "trailers",
+				authorization: `Bearer ${apiKey}`,
+				"x-ghost-mode": "true",
+				"x-cursor-client-version": CURSOR_CLIENT_VERSION,
+				"x-cursor-client-type": "cli",
+				"x-request-id": crypto.randomUUID(),
+			});
+			h2RequestErrorHandler = error => settleH2(error);
+			h2Request.on("error", h2RequestErrorHandler);
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+
+			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
@@ -1075,7 +1116,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-			armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
+			// Already armed before the proxy handshake: do not restart the clock,
+			// or setup time would be refunded into the first-event budget.
+			if (!firstEventWatchdogArmed) {
+				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
+			}
 			await h2Completion.promise;
 
 			if (state.currentTextBlock) {

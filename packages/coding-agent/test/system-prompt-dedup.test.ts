@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -10,6 +11,7 @@ import {
 	loadProjectContextFiles,
 	loadSystemPromptFiles,
 } from "@gajae-code/coding-agent/system-prompt";
+import { getAgentDir } from "@gajae-code/utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function escapeRegExp(text: string): string {
@@ -95,9 +97,14 @@ describe("SYSTEM.md prompt assembly", () => {
 		const projectDir = path.join(tempDir, "project");
 		fs.mkdirSync(projectDir, { recursive: true });
 		fs.writeFileSync(path.join(projectDir, "AGENTS.md"), "Project instructions");
-		const userAgentsPath = path.join(tempHomeDir, ".gjc", "agent", "AGENTS.md");
+		// Native user scope follows the resolved agent directory, which the test
+		// harness isolates away from the mocked home.
+		const userAgentsPath = path.join(getAgentDir(), "AGENTS.md");
 		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
 		fs.writeFileSync(userAgentsPath, "User-global instructions");
+		// The agent-dir path is constant across tests in this file, so discovery
+		// results for it must not be served from an earlier test's cache.
+		clearCache();
 
 		const files = await loadProjectContextFiles({ cwd: projectDir });
 		const paths = files.map(file => file.path);
@@ -105,6 +112,10 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(paths[0]).toBe(userAgentsPath);
 		expect(files[0]?.content).toBe("User-global instructions");
 		expect(paths).toContain(path.join(projectDir, "AGENTS.md"));
+		// The agent-dir fixture outlives this test's temp dirs; remove it so the
+		// shared user scope stays clean for later tests in this file.
+		fs.rmSync(userAgentsPath, { force: true });
+		clearCache();
 	});
 
 	it("includes the native user-global file while still excluding foreign user-home files", async () => {
@@ -112,13 +123,17 @@ describe("SYSTEM.md prompt assembly", () => {
 		fs.mkdirSync(projectDir, { recursive: true });
 		fs.mkdirSync(path.join(tempHomeDir, ".claude"), { recursive: true });
 		fs.writeFileSync(path.join(tempHomeDir, ".claude", "CLAUDE.md"), "Home Claude instructions");
-		const userAgentsPath = path.join(tempHomeDir, ".gjc", "agent", "AGENTS.md");
+		// Native user scope follows the resolved agent directory, which the test
+		// harness isolates away from the mocked home.
+		const userAgentsPath = path.join(getAgentDir(), "AGENTS.md");
 		fs.mkdirSync(path.dirname(userAgentsPath), { recursive: true });
 		fs.writeFileSync(userAgentsPath, "User-global instructions");
 
 		const files = await loadProjectContextFiles({ cwd: projectDir });
 
 		expect(files.map(file => file.path)).toEqual([userAgentsPath]);
+		fs.rmSync(userAgentsPath, { force: true });
+		clearCache();
 	});
 
 	it("keeps project-level Gemini context files", async () => {
