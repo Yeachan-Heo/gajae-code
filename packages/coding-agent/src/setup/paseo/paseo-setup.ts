@@ -503,6 +503,20 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				undo: async () => {
 					try {
 						await inverseSkillsBridge(deps, bridge);
+						// The bridge ledger was prewritten to make the forward mutation
+						// recoverable. Once compensation has removed that mutation, restore
+						// the pre-step bridge facts so later checks cannot report phantom
+						// links or a directory that no longer exists.
+						const current = await readProvenance(deps.paths.provenanceLedger);
+						await writeProvenance(deps.paths.provenanceLedger, {
+							...current,
+							bridgePath: bridgeLedger.bridgePath,
+							bridgeSourceDir: bridgeLedger.bridgeSourceDir,
+							bridgeEntries: bridgeLedger.bridgeEntries,
+							bridgeEntryIdentities: bridgeLedger.bridgeEntryIdentities,
+							bridgeDirCreated: bridgeLedger.bridgeDirCreated,
+							bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
+						});
 						return { status: "reverted" as const };
 					} catch (error) {
 						return {
