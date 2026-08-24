@@ -1,4 +1,5 @@
 import * as nodeFs from "node:fs";
+import { describeFoldReceipt } from "../session/fold-coordinator";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -2066,13 +2067,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							if (asyncJobManager!.isDeliverySuppressed(jobId, job?.generation)) return;
 							const deniedOwnedDelivery =
 								ownedCompletion !== undefined && !isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+							// Fold disposition is decided by the coordinator's durable slot state.
+							// `parked` means the fold transaction has not finished capturing its
+							// receipt yet; it replays this completion itself, so enqueuing here
+							// would double-deliver.
+							const foldDisposition = job
+								? session.foldCoordinator.onDelivery(job, result)
+								: ({ kind: "ordinary" } as const);
+							if (foldDisposition.kind === "parked") return;
 							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
+							// A folded job's result must arrive with its receipt so the wake turn
+							// completes the original task rather than merely reporting output.
+							const deliveredResult =
+								foldDisposition.kind === "receipt"
+									? `${formattedResult}\n\n${describeFoldReceipt(foldDisposition.receipt)}`
+									: formattedResult;
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
 								jobId,
 								generation: job?.generation ?? "",
-								result: formattedResult,
+								result: deliveredResult,
 								job,
 								durationMs,
 								...(ownedCompletion

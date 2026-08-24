@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AsyncJob } from "@gajae-code/coding-agent/async/job-manager";
 import {
+	describeFoldReceipt,
 	FoldCoordinator,
 	type FoldAdapter,
 	type FoldReceipt,
@@ -282,5 +283,38 @@ describe("FoldCoordinator", () => {
 		expect((await h.coordinator.requestFold(reused)).status).toBe("already-terminal");
 
 		expect((await h.coordinator.requestFold()).status).toBe("unavailable");
+	});
+
+	// AC11: the fold result must carry the job id, a real retrieval handle, and a
+	// retrieval hint, with the cwd caveat only where a wait can change directory.
+	test("renders a receipt carrying the job id, retrieval handle, and remaining intent", async () => {
+		const h = harness(() => "finish the migration");
+		const target = job("bg_7", "job:7");
+		const probe = adapterFor(target);
+		h.coordinator.registerParticipant(probe.adapter);
+		const result = await h.coordinator.requestFold();
+		if (result.status !== "folded") throw new Error("expected a folded result");
+
+		const rendered = describeFoldReceipt(result.receipt);
+		expect(rendered).toContain("bg_7");
+		expect(rendered).toContain("job tool");
+		expect(rendered).toContain("finish the migration");
+		expect(rendered).toContain("Session cwd is unchanged");
+	});
+
+	test("omits the cwd caveat for a wait kind that cannot change directory", async () => {
+		const h = harness(() => undefined);
+		const target = job("bg_8", "job:8");
+		const probe = adapterFor(target);
+		const adapter = { ...probe.adapter, cwdSensitive: false };
+		h.coordinator.registerParticipant(adapter);
+		const result = await h.coordinator.requestFold();
+		if (result.status !== "folded") throw new Error("expected a folded result");
+
+		const rendered = describeFoldReceipt(result.receipt);
+		expect(rendered).toContain("bg_8");
+		expect(rendered).not.toContain("Session cwd");
+		// No captured intent means no fabricated instruction to complete one.
+		expect(rendered).not.toContain("Complete the original request");
 	});
 });
