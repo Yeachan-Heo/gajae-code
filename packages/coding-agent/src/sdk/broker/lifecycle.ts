@@ -2569,10 +2569,9 @@ async function terminateSpawnedChild(
 	if (!pid || (expected && pid !== expected.pid)) return false;
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
 	await broker.index.refresh();
-	const terminationDeadline =
-		expected && !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker)
-			? deadline
-			: terminationStartDeadlineAt;
+	const registered = expected ? broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) : false;
+	const unregisteredTerminationDeadlineAt =
+		deadline - Math.max(POLL_MS, Math.floor((deadline - terminationStartDeadlineAt) / 2));
 	const observe = (): ProcessObservation =>
 		child.exitCode !== null
 			? "exited"
@@ -2595,7 +2594,19 @@ async function terminateSpawnedChild(
 		observation = await waitForExit(deadline);
 	};
 	if (observation === "alive") {
-		await waitUntil(timing, terminationDeadline);
+		if (expected && !registered) {
+			// A child that has not registered yet owns the cutoff receipt. Give it
+			// the bounded pre-registration window to publish that proof, but reserve
+			// the final proof interval for post-signal observation inside the request
+			// deadline. A valid receipt does not interrupt the child's own rollback.
+			while (timing.now() < unregisteredTerminationDeadlineAt) {
+				if (await readLifecycleFailureArtifact(lifecycleFailurePath(root, id, expected.effectMarker), expected))
+					await waitUntil(timing, unregisteredTerminationDeadlineAt);
+				else await timing.sleep(Math.max(0, Math.min(POLL_MS, unregisteredTerminationDeadlineAt - timing.now())));
+			}
+		} else {
+			await waitUntil(timing, terminationStartDeadlineAt);
+		}
 		observation = observe();
 	}
 	if (observation === "alive") {

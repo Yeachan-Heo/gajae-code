@@ -4616,6 +4616,115 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 10_000);
+
+test("unregistered cutoff receipt gets bounded publication and post-signal proof", async () => {
+	if (process.platform !== "linux") return;
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-pre-registration-boundary-"));
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "pre-registration-boundary.ts");
+	const pidPath = path.join(root, "child.pid");
+	const requestPath = path.join(root, "child.request.json");
+	const receivedAt = 1_000;
+	const deadlines = deriveLifecycleDeadlines(receivedAt, 4_000);
+	let nowMs = receivedAt;
+	let receiptPublished = false;
+	const broker = new Broker({ agentDir });
+	await fs.writeFile(
+		fixture,
+		`await Bun.write(${JSON.stringify(pidPath)}, String(process.pid));
+await Bun.write(${JSON.stringify(requestPath)}, process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "");
+setInterval(() => {}, 1_000_000);
+`,
+	);
+	setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+	setLifecycleTimingForTest(broker, {
+		now: () => nowMs,
+		sleep: async ms => {
+			const requestReady = await fs.access(requestPath).then(
+				() => true,
+				() => false,
+			);
+			if (!requestReady) {
+				await Bun.sleep(1);
+				return;
+			}
+			nowMs += ms;
+			if (!receiptPublished && nowMs >= deadlines.semanticReadyDeadlineAt - 100) {
+				const request = JSON.parse(await fs.readFile(requestPath, "utf8")) as {
+					sessionId: string;
+					stateRoot: string;
+					effectMarker: string;
+				};
+				const pid = Number(await fs.readFile(pidPath, "utf8"));
+				const childIncarnation = processIncarnation(pid);
+				if (!childIncarnation) throw new Error("Expected a readable child process incarnation.");
+				await writeSessionLifecycleFailure(
+					request.stateRoot,
+					request.sessionId,
+					request.effectMarker,
+					{
+						phase: "startup",
+						reason: "pending",
+						message: "deterministic cutoff receipt",
+					},
+					{
+						endpointGeneration: null,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+					undefined,
+					childIncarnation,
+					pid,
+				);
+				receiptPublished = true;
+			}
+			await Bun.sleep(1);
+		},
+	});
+	try {
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: deadlines.requestedReadinessTimeoutMs },
+			"pre-registration-boundary",
+		);
+		expect(receiptPublished).toBe(true);
+		expect(response).toMatchObject({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				endpoint: "unavailable",
+				message: "deterministic cutoff receipt",
+			},
+			startupFailure: {
+				phase: "startup",
+				reason: "pending",
+				message: "deterministic cutoff receipt",
+				rollback: {
+					endpointGeneration: null,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+				cleanupProof: {
+					processExited: true,
+					endpointRemoved: true,
+					hostUnregistered: { state: "not_registered" },
+				},
+			},
+		});
+		expect(nowMs).toBeLessThan(deadlines.lifecycleCleanupDeadlineAt);
+	} finally {
+		setLifecycleTimingForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
 test("production post-registration startup failure proves cleanup and exact replay", async () => {
 	if (process.platform !== "linux") return;
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-production-failure-"));
