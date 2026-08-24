@@ -146,6 +146,44 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		expect(seen).toEqual([undefined]);
 	});
 
+	it("settles one archive mutation after caller abort without a late second mutation", async () => {
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let archiveMutationCount = 0;
+		let dispatchedSignal: AbortSignal | undefined;
+		const writeTool = {
+			...makeTool("write"),
+			nonAbortable: true,
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				dispatchedSignal = signal;
+				started.resolve();
+				await release.promise;
+				archiveMutationCount += 1;
+				return { content: [{ type: "text" as const, text: "done" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const pending = handlers.piWrite({
+			args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+			toolCallId: "archive-write-cancelled",
+			signal: controller.signal,
+			markNonAbortable: () => {},
+		});
+
+		await started.promise;
+		controller.abort(new Error("caller cancelled archive mutation"));
+		await Bun.sleep(10);
+		expect(dispatchedSignal).toBeUndefined();
+		expect(archiveMutationCount).toBe(0);
+
+		release.resolve();
+		await pending;
+		expect(archiveMutationCount).toBe(1);
+		await Bun.sleep(10);
+		expect(archiveMutationCount).toBe(1);
+	});
+
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();
 		const { read, ls, grep, shell, write, diagnostics } = handlers;

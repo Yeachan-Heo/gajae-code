@@ -702,7 +702,7 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
-	it("waits for a started non-abortable write before publishing a caller-abort terminal", async () => {
+	it("publishes a caller-abort terminal only after the non-abortable archive mutation is final", async () => {
 		const controller = new AbortController();
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
@@ -724,6 +724,8 @@ describe("Cursor raw transport watchdog", () => {
 		const started = Promise.withResolvers<void>();
 		const settleWrite = Promise.withResolvers<void>();
 		let terminalPublished = false;
+		let archiveMutationCount = 0;
+		let mutationCountAtTerminal: number | undefined;
 		const pending = collectTerminal(baseUrl, {
 			signal: controller.signal,
 			streamIdleTimeoutMs: 40,
@@ -733,6 +735,7 @@ describe("Cursor raw transport watchdog", () => {
 					call.markNonAbortable?.();
 					started.resolve();
 					await settleWrite.promise;
+					archiveMutationCount += 1;
 					return {
 						role: "toolResult",
 						toolCallId: call.toolCallId,
@@ -745,14 +748,20 @@ describe("Cursor raw transport watchdog", () => {
 			},
 		}).then(value => {
 			terminalPublished = true;
+			mutationCountAtTerminal = archiveMutationCount;
 			return value;
 		});
 		await started.promise;
 		controller.abort(new Error("caller cancelled archive write"));
 		await Bun.sleep(20);
 		expect(terminalPublished).toBe(false);
+		expect(archiveMutationCount).toBe(0);
 		settleWrite.resolve();
 		const { events, result } = await pending;
+		expect(mutationCountAtTerminal).toBe(1);
+		expect(archiveMutationCount).toBe(1);
+		await Bun.sleep(20);
+		expect(archiveMutationCount).toBe(1);
 		expect(result.errorMessage).toBe("caller cancelled archive write");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
