@@ -3,6 +3,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir } from "@gajae-code/utils";
+import { $ } from "bun";
 
 export interface MachineIdentityDeps {
 	platform?: NodeJS.Platform;
@@ -138,9 +139,8 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 	const runCommand =
 		deps.runCommand ??
 		(async (command: string, args: readonly string[]) => {
-			const child = Bun.spawn([command, ...args], { stdout: "pipe", stderr: "ignore" });
-			const [stdout, exitCode] = await Promise.all([new Response(child.stdout).bytes(), child.exited]);
-			return { stdout, exitCode };
+			const result = await $`${command} ${[...args]}`.quiet().nothrow();
+			return { stdout: result.bytes(), exitCode: result.exitCode };
 		});
 
 	let rawId: string | undefined;

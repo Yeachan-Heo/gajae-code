@@ -7,13 +7,9 @@ import type {
 	NativeDirectoryTreeSnapshot,
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
-import {
-	genericFileLockDirIsStale,
-	processStartTime as portableProcessStartTime,
-	readFileLockInfoForGc,
-} from "../config/file-lock";
+import { readFileLockInfoForGc } from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
-import { readLinuxProcStartTimeSync } from "./linux-proc";
+import { readLinuxProcStartTime } from "./linux-proc";
 
 /**
  * The one lock implementation for a coordinator-shared session state file.
@@ -231,23 +227,48 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
  * portable `ps` value is used instead of giving up and writing `unknown`, which would
  * make PID reuse undetectable.
  */
-async function ownerStartTime(pid: number, deadline: number): Promise<string> {
-	const linuxStartTime = readLinuxProcStartTimeSync(pid);
-	if (linuxStartTime !== null) return linuxStartTime;
+interface ProcessStartTimeObservation {
+	value: string | null;
+	available: boolean;
+}
+
+/**
+ * Read the portable process start timestamp without putting a synchronous `ps` call on
+ * the stale-recovery path. An unavailable command is an indeterminate result, not proof
+ * that a pid was reused; callers therefore retain the owner in that case.
+ */
+async function readPortableProcessStartTime(pid: number, deadline: number): Promise<ProcessStartTimeObservation> {
 	// Windows has no portable `ps` utility. An unavailable incarnation timestamp is
 	// deliberately recorded as unknown, which liveness recovery treats as indeterminate.
-	if (process.platform === "win32") return "unknown";
+	if (process.platform === "win32") return { value: null, available: false };
 	const remaining = deadline - performance.now();
 	if (remaining <= 0) throw new SessionStateLockUnavailableError();
-	const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
-		stdout: "pipe",
-		stderr: "ignore",
-		timeout: Math.max(1, Math.ceil(remaining)),
-	});
-	const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-	if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
-	const startTime = exitCode === 0 ? output.trim() : "";
-	return startTime || "unknown";
+	try {
+		const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+			stdout: "pipe",
+			stderr: "ignore",
+			timeout: Math.max(1, Math.ceil(remaining)),
+		});
+		const [output, exitCode] = await withinLockAcquireDeadline(deadline, async () => {
+			return await Promise.all([new Response(child.stdout).text(), child.exited]);
+		});
+		if (exitCode !== 0) return { value: null, available: false };
+		const value = output.trim();
+		return value ? { value, available: true } : { value: null, available: false };
+	} catch (error) {
+		// A missing `ps` command is an ordinary unsupported-probe result. Deadline
+		// exhaustion remains a refusal and must propagate to the caller.
+		if (error instanceof SessionStateLockUnavailableError) throw error;
+		if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
+		return { value: null, available: false };
+	}
+}
+
+async function ownerStartTime(pid: number, deadline: number): Promise<string> {
+	const linuxStartTime = await withinLockAcquireDeadline(deadline, () => readLinuxProcStartTime(pid));
+	if (linuxStartTime !== null) return linuxStartTime;
+	const portable = await readPortableProcessStartTime(pid, deadline);
+	return portable.value ?? "unknown";
 }
 
 function validLockOwner(value: unknown): value is SessionStateLockOwner {
@@ -313,13 +334,27 @@ async function currentLegacyOwnerHostId(): Promise<string> {
  * is the mismatch proved — an unreadable or unknown start time is indeterminate, and
  * indeterminate never means "safe to steal".
  */
-function sameOwnerIncarnation(owner: SessionStateLockOwner): boolean {
-	if (owner.start_time === "unknown" || owner.start_time.length === 0) return true;
-	const procStartTime = readLinuxProcStartTimeSync(owner.pid);
-	if (procStartTime !== null && procStartTime === owner.start_time) return true;
-	const psStartTime = portableProcessStartTime(owner.pid);
-	if (psStartTime !== null && psStartTime === owner.start_time) return true;
-	return procStartTime === null && psStartTime === null;
+type OwnerIncarnation = "same" | "different" | "unknown";
+
+async function processIncarnation(pid: number, startTime: string, deadline: number): Promise<OwnerIncarnation> {
+	if (startTime === "unknown" || startTime.length === 0) return "unknown";
+	const procStartTime = await withinLockAcquireDeadline(deadline, () => readLinuxProcStartTime(pid));
+	if (procStartTime !== null && procStartTime === startTime) return "same";
+	const portable = await readPortableProcessStartTime(pid, deadline);
+	if (portable.value !== null && portable.value === startTime) return "same";
+	// A reader that could not produce a value cannot prove PID reuse. In particular, a
+	// Linux `/proc` value that disagrees with a record written by `ps` is inconclusive when
+	// `ps` is unavailable, so recovery must remain fail-closed.
+	if (!portable.available) return "unknown";
+	return "different";
+}
+
+async function ownerIncarnation(owner: SessionStateLockOwner, deadline: number): Promise<OwnerIncarnation> {
+	return await processIncarnation(owner.pid, owner.start_time, deadline);
+}
+
+async function sameOwnerIncarnation(owner: SessionStateLockOwner, deadline: number): Promise<boolean> {
+	return (await ownerIncarnation(owner, deadline)) !== "different";
 }
 
 /**
@@ -372,18 +407,31 @@ async function waitForLockRetry(deadline: number): Promise<boolean> {
 }
 
 /** Run acquisition preflight without allowing it to outlive the shared deadline. */
-async function withinLockAcquireDeadline<T>(deadline: number, operation: () => Promise<T>): Promise<T> {
+async function withinLockAcquireDeadline<T>(
+	deadline: number,
+	operation: () => Promise<T> | T,
+	onTimeout?: (result: { ok: true; value: T } | { ok: false; error: unknown }) => void | Promise<void>,
+): Promise<T> {
 	const remaining = deadline - performance.now();
 	if (remaining <= 0) throw new SessionStateLockUnavailableError();
+	const pending = Promise.resolve().then(operation);
+	const settled = pending.then(
+		value => ({ ok: true as const, value }),
+		error => ({ ok: false as const, error }),
+	);
 	const outcome = await Promise.race([
-		operation().then(value => ({ timedOut: false as const, value })),
+		settled.then(result => ({ timedOut: false as const, result })),
 		Bun.sleep(remaining).then(() => ({ timedOut: true as const })),
 	]);
-	if (outcome.timedOut) throw new SessionStateLockUnavailableError();
-	return outcome.value;
+	if (outcome.timedOut) {
+		if (onTimeout) void settled.then(result => onTimeout(result)).catch(() => undefined);
+		throw new SessionStateLockUnavailableError();
+	}
+	if (!outcome.result.ok) throw outcome.result.error;
+	return outcome.result.value;
 }
 
-async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
+async function lockOwnerIsAlive(value: unknown, deadline: number): Promise<boolean> {
 	if (!validLockOwner(value)) return false;
 	const owner = value;
 	if (owner.owner_host_id === undefined) {
@@ -391,15 +439,15 @@ async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
 		// namespace: a local ext/tmpfs/APFS mount can be shared with a container.
 		// Keep production recovery fail-closed until the legacy owner is qualified.
 		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
-	} else if (owner.owner_host_id !== (await currentOwnerHostId())) {
-		if (owner.owner_host_id !== (await currentLegacyOwnerHostId())) return true;
+	} else if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentOwnerHostId()))) {
+		if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentLegacyOwnerHostId()))) return true;
 	}
 	// PID and process-start values are host-local. A current writer on a shared
 	// volume must never classify a foreign owner from a local ESRCH result.
 	const liveness = probeOwnerProcess(owner.pid);
 	if (liveness === "dead") return false;
 	if (liveness === "unknown") return true;
-	return sameOwnerIncarnation(owner);
+	return await sameOwnerIncarnation(owner, deadline);
 }
 
 /**
@@ -916,6 +964,7 @@ async function acquireOwnerLock(file: string, owner: SessionStateLockOwner): Pro
  * successor strictly alone.
  */
 async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
+	const deadline = lockAcquireDeadline();
 	let owner: unknown;
 	try {
 		owner = JSON.parse(held.bytes);
@@ -925,8 +974,8 @@ async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<
 	if (
 		!validLockOwner(owner) ||
 		owner.pid !== process.pid ||
-		owner.owner_host_id !== (await currentOwnerHostId()) ||
-		!sameOwnerIncarnation(owner)
+		owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentOwnerHostId())) ||
+		!(await sameOwnerIncarnation(owner, deadline))
 	) {
 		throw new SessionStateLockUnavailableError(new Error("Owner record is not held by this process incarnation."));
 	}
@@ -964,8 +1013,9 @@ async function reclaimStaleOwnerRecord(
 		afterInspection?: (file: string) => void | Promise<void>;
 		beforeRemoval?: (file: string) => void | Promise<void>;
 	},
+	deadline: number,
 ): Promise<void> {
-	const snapshot = await captureRegularLockOwner(file);
+	const snapshot = await withinLockAcquireDeadline(deadline, () => captureRegularLockOwner(file));
 	if (!snapshot) return;
 	let owner: unknown;
 	try {
@@ -977,11 +1027,12 @@ async function reclaimStaleOwnerRecord(
 		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
 		// The mtime of the very inode the bytes were read from, not a fresh path `stat`.
 		if (Date.now() - Number(snapshot.mtimeNs / 1_000_000n) < LOCK_STALE_MS) return;
-	} else if (await lockOwnerIsAlive(owner)) return;
-	await hooks.afterInspection?.(file);
-	const current = await captureRegularLockOwner(file);
+	} else if (await lockOwnerIsAlive(owner, deadline)) return;
+	await withinLockAcquireDeadline(deadline, () => hooks.afterInspection?.(file));
+	const current = await withinLockAcquireDeadline(deadline, () => captureRegularLockOwner(file));
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
-	await hooks.beforeRemoval?.(file);
+	await withinLockAcquireDeadline(deadline, () => hooks.beforeRemoval?.(file));
+	if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
 	const outcome = exactUnlinkOwnerRecord(file, current);
 	// A successor that took the path in the final window keeps it; this call just loses.
 	if (outcome === "refused")
@@ -1002,8 +1053,36 @@ async function releaseTransitionClaim(
 	await fs.rmdir(transitionDir);
 }
 
-async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void> {
-	const stat = await fs.lstat(transitionDir).catch(() => null);
+function releasedOwnerFromSnapshot(held: LockOwnerSnapshot): SessionStateLockOwner {
+	let owner: unknown;
+	try {
+		owner = JSON.parse(held.bytes);
+	} catch {
+		owner = null;
+	}
+	return {
+		pid: 1,
+		start_time: "unknown",
+		token: randomUUID(),
+		...(validLockOwner(owner) && owner.owner_host_id !== undefined ? { owner_host_id: owner.owner_host_id } : {}),
+		released: true,
+	};
+}
+
+/** Best-effort cleanup after a bounded transition preflight finishes late. */
+async function cleanupTransitionClaim(
+	transitionDir: string,
+	ownerFile: string,
+	held?: LockOwnerSnapshot,
+): Promise<void> {
+	if (held) {
+		await rewriteHeldOwnerRecord(ownerFile, held, releasedOwnerFromSnapshot(held)).catch(() => undefined);
+	}
+	await fs.rmdir(transitionDir).catch(() => undefined);
+}
+
+async function reclaimStaleTransitionClaim(transitionDir: string, deadline: number): Promise<void> {
+	const stat = await withinLockAcquireDeadline(deadline, () => fs.lstat(transitionDir).catch(() => null));
 	if (!stat) return;
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
@@ -1012,7 +1091,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void>
 		await reclaimStaleOwnerRecord(transitionDir, {
 			afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
 			beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
-		});
+		}, deadline);
 		return;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
@@ -1033,32 +1112,51 @@ async function withLockPathTransition<T>(
 	for (;;) {
 		try {
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
-			await fs.mkdir(transitionDir);
+			await withinLockAcquireDeadline(deadline, () => fs.mkdir(transitionDir), result => {
+				if (result.ok) return fs.rmdir(transitionDir).catch(() => undefined);
+			});
 			if (performance.now() >= deadline) {
-				await fs.rmdir(transitionDir).catch(() => undefined);
+				void fs.rmdir(transitionDir).catch(() => undefined);
 				throw new SessionStateLockUnavailableError();
 			}
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
-			await reclaimStaleTransitionClaim(transitionDir);
+			await reclaimStaleTransitionClaim(transitionDir, deadline);
 			if (await waitForLockRetry(deadline)) continue;
 			break;
 		}
 		let held: LockOwnerSnapshot;
 		try {
-			held = await acquireOwnerLock(ownerFile, owner);
+			held = await withinLockAcquireDeadline(deadline, () => acquireOwnerLock(ownerFile, owner), result => {
+				void cleanupTransitionClaim(transitionDir, ownerFile, result.ok ? result.value : undefined);
+			});
 		} catch (error) {
-			await fs.rmdir(transitionDir).catch(() => undefined);
+			if (performance.now() < deadline) await cleanupTransitionClaim(transitionDir, ownerFile);
+			else void cleanupTransitionClaim(transitionDir, ownerFile);
 			throw error;
 		}
-		const outcome = await transition().then(
-			value => ({ ok: true as const, value }),
-			error => ({ ok: false as const, error }),
-		);
+		let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 		try {
-			await releaseTransitionClaim(transitionDir, ownerFile, held);
+			outcome = {
+				ok: true,
+				value: await withinLockAcquireDeadline(deadline, () => transition(), result => {
+					void cleanupTransitionClaim(transitionDir, ownerFile, held);
+				}),
+			};
+		} catch (error) {
+			if (performance.now() >= deadline) {
+				await cleanupTransitionClaim(transitionDir, ownerFile, held);
+				throw error;
+			}
+			outcome = { ok: false, error };
+		}
+		try {
+			await withinLockAcquireDeadline(deadline, () => releaseTransitionClaim(transitionDir, ownerFile, held), () => {
+				void cleanupTransitionClaim(transitionDir, ownerFile, held);
+			});
 		} catch (releaseError) {
+			if (performance.now() >= deadline) void cleanupTransitionClaim(transitionDir, ownerFile, held);
 			if (!outcome.ok)
 				throw new SessionStateLockUnavailableError(
 					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),
@@ -1087,7 +1185,7 @@ async function reclaimStaleRegularLock(lockFile: string, deadline: number): Prom
 			await reclaimStaleOwnerRecord(lockFile, {
 				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
 				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
-			}),
+			}, deadline),
 		deadline,
 	);
 }
@@ -1146,6 +1244,43 @@ function captureLegacyDirectoryTree(
 	);
 }
 
+/** Async equivalent of the generic directory-lock stale verdict. */
+async function legacyDirectoryIsStale(
+	lockDir: string,
+	staleMs: number,
+	ownerHostId: string | undefined,
+	deadline: number,
+): Promise<boolean> {
+	const owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockDir));
+	if (!owner && ownerHostId !== undefined) return false;
+	if (!owner) {
+		try {
+			const stat = await withinLockAcquireDeadline(deadline, () => fs.stat(lockDir));
+			return Date.now() - stat.mtimeMs > staleMs;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+			throw error;
+		}
+	}
+	if (
+		ownerHostId !== undefined &&
+		owner.owner_host_id !== ownerHostId
+	) {
+		return false;
+	}
+	const liveness = probeOwnerProcess(owner.pid);
+	if (liveness === "alive") {
+		if (!owner.start_time) return false;
+		const incarnation = await processIncarnation(owner.pid, owner.start_time, deadline);
+		if (incarnation !== "different") return false;
+	} else if (liveness === "unknown") {
+		// Preserve the generic protocol's elapsed-time fallback for an unanswerable
+		// signal probe; host qualification above still prevents cross-volume PID use.
+		return Date.now() - owner.timestamp > staleMs;
+	}
+	return liveness === "dead" || Date.now() - owner.timestamp > staleMs;
+}
+
 /**
  * Evaluate a `<file>.lock/` DIRECTORY left behind by a base runtime that guarded this same
  * state file with the generic directory-style lock.
@@ -1153,11 +1288,12 @@ function captureLegacyDirectoryTree(
  * A directory at this path makes an exclusive create fail `EISDIR` forever, which is
  * exactly the stranding this shared lock exists to prevent — in the other direction.
  *
- * The VERDICT stays with the generic implementation, which owns that format: duplicating
- * its parser and liveness rules is how a live owner gets reaped by a timestamp it never
- * wrote. Only the REMOVAL is taken over, because that protocol can offer nothing better
- * than re-reading a token and then unlinking a pathname — and a successor can change the
- * tree underneath a token that still reads the same.
+ * The VERDICT follows the generic implementation's host qualification, liveness, and
+ * elapsed-time rules, but is evaluated here asynchronously so a synchronous `ps` probe
+ * cannot bypass this lock's monotonic deadline. Only the REMOVAL is taken over, because
+ * that protocol can offer nothing better than re-reading a token and then unlinking a
+ * pathname — and a successor can change the tree underneath a token that still reads the
+ * same.
  *
  * But the verdict is rendered against a PATHNAME, and the object it judged is not the
  * object that would be deleted. A legacy writer takes no transition claim, so it can
@@ -1179,18 +1315,27 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			const native = nativeSessionStateLock();
 			const before = captureLegacyDirectoryTree(native, lockFile);
 			if (!before) return;
-			const owner = await readFileLockInfoForGc(lockFile);
+			const owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockFile));
 			if (!owner?.owner_host_id && SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
-			const ownerHostId = owner?.owner_host_id === undefined ? undefined : await currentOwnerHostId();
-			let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
+			const ownerHostId =
+				owner?.owner_host_id === undefined
+					? undefined
+					: await withinLockAcquireDeadline(deadline, () => currentOwnerHostId());
+			let stale = await legacyDirectoryIsStale(lockFile, LOCK_STALE_MS, ownerHostId, deadline);
 			if (!stale && ownerHostId !== undefined)
-				stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
+				stale = await legacyDirectoryIsStale(
+					lockFile,
+					LOCK_STALE_MS,
+					await withinLockAcquireDeadline(deadline, () => currentLegacyOwnerHostId()),
+					deadline,
+				);
 			if (!stale) return;
-			await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
+			await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile));
 			const authorized = captureLegacyDirectoryTree(native, lockFile);
 			// The verdict spoke for `before`; only an unchanged tree carries that authority.
 			if (!authorized || !sameDirectoryTreeSnapshot(before, authorized)) return;
-			await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
+			await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile));
+			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
 			let removed: NativeExactUnlinkResult;
 			try {
 				// The SAME verified capture the verdict was bound to, so a replacement that
@@ -1236,7 +1381,7 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 async function reclaimStaleSessionStateLockUntil(lockFile: string, deadline: number): Promise<void> {
 	let stat: fsSync.Stats;
 	try {
-		stat = await fs.lstat(lockFile);
+		stat = await withinLockAcquireDeadline(deadline, () => fs.lstat(lockFile));
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
@@ -1249,7 +1394,7 @@ async function reclaimStaleSessionStateLockUntil(lockFile: string, deadline: num
 	// Opening one follows an attacker-chosen target and a FIFO read blocks forever, so the
 	// path is refused outright rather than inspected or removed.
 	if (!stat.isFile()) throw new SessionStateLockUnavailableError();
-	await SessionStateLockTestHooks.afterLockTypeDecision?.(lockFile);
+	await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.afterLockTypeDecision?.(lockFile));
 	await reclaimStaleRegularLock(lockFile, deadline);
 }
 

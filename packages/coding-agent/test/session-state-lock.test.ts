@@ -259,6 +259,44 @@ describe("coordinator session state lock", () => {
 		ownerHostId.resolve("local-host");
 	});
 
+	it("bounds stale-reclaim callbacks and removes the owned transition claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-callback-deadline");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+		SessionStateLockTestHooks.afterStaleInspection = () => new Promise<void>(() => undefined);
+		const startedAt = performance.now();
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		await Bun.sleep(50);
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		expect(await readJson(`${lockFile}.transition.owner`)).toMatchObject({ released: true });
+		expect(await fs.readFile(lockFile, "utf8")).toContain("dead-owner-token");
+	});
+
+	it("cleans a transition owner created by work that finishes after the deadline", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-late-transition-owner.json");
+		const lockFile = `${stateFile}.lock`;
+		const ownerFile = `${lockFile}.transition.owner`;
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 25;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+			if (file !== ownerFile) return;
+			await Bun.sleep(100);
+			throw new Error("late transition owner write failure");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		await Bun.sleep(150);
+
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+		expect(fsSync.existsSync(ownerFile)).toBe(false);
+	});
+
 	it("serializes a concurrent writer behind the current lock holder", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-current");
 		// System time is frozen in these tests, so order is recorded explicitly.
