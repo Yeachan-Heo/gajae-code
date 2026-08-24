@@ -330,6 +330,9 @@ function resolveHermesLaunchCommand(flags: HermesSetupFlags): { command: string;
 	if (!tokens) {
 		throw new HermesSetupError("--gjc-command has an unbalanced quote; it is tokenized, never shell-evaluated.", 2);
 	}
+	if (tokens[0] === "") {
+		throw new HermesSetupError("--gjc-command must name a non-empty executable.", 2);
+	}
 	if (tokens.length === 1) return { command: tokens[0]!, args: ["mcp-serve", "coordinator"] };
 	return { command: tokens[0]!, args: tokens.slice(1) };
 }

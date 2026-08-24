@@ -94,10 +94,12 @@ describe("gjc setup hermes --gjc-command", () => {
 		});
 	});
 
-	it("rejects unbalanced quotes", async () => {
+	it("rejects unbalanced quotes and an empty executable", async () => {
 		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-gjc-command-"));
 		await expect(renderServer('env "WRAPPER gjc', tempRoot)).rejects.toThrow("unbalanced quote");
 		await expect(renderServer("python3 'wrapper.py", tempRoot)).rejects.toThrow("unbalanced quote");
+		await expect(renderServer("''", tempRoot)).rejects.toThrow("non-empty executable");
+		await expect(renderServer("'' --flag", tempRoot)).rejects.toThrow("non-empty executable");
 	});
 
 	it("keeps the signature deterministic for the same effective launch argv", () => {
