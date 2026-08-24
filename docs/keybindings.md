@@ -155,7 +155,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.model.select` | ctrl+l | composer |
 | `app.model.selectTemporary` | alt+p | composer |
 | `app.tools.expand` | ctrl+o | composer |
-| `app.tool.backgroundFold` | ctrl+b | composer |
+| `app.tool.backgroundFold` | alt+shift+b, super+b | composer |
 | `app.editor.external` | ctrl+g | composer |
 | `app.message.followUp` | _(none)_ | composer |
 | `app.message.queue` | alt+q (darwin/win32) / alt+enter (linux) | composer |

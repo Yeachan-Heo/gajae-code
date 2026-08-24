@@ -83,6 +83,10 @@ export function defaultClipboardPasteImageKeysForPlatform(platform: NodeJS.Platf
 	return ["ctrl+v"];
 }
 
+export function defaultForegroundFoldKeysForPlatform(platform: NodeJS.Platform = process.platform): KeyId[] {
+	return platform === "darwin" ? ["alt+shift+b", "super+b"] : ["alt+shift+b"];
+}
+
 /**
  * All keybindings definitions: TUI + app-specific.
  */
@@ -137,8 +141,8 @@ export const KEYBINDINGS = {
 		description: "Expand tools",
 	},
 	"app.tool.backgroundFold": {
-		defaultKeys: "ctrl+b",
-		description: "Fold/background supported foreground tool",
+		defaultKeys: defaultForegroundFoldKeysForPlatform(),
+		description: "Fold supported foreground tool into a background job",
 	},
 	"app.editor.external": {
 		defaultKeys: "ctrl+g",
