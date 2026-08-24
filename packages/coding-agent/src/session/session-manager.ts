@@ -15422,11 +15422,12 @@ export class SessionManager {
 								),
 							),
 						);
-						this.#managedTranscriptStore(this.#sessionFile).appendExpectedSync(
+						const receipt = this.#managedTranscriptStore(this.#sessionFile).appendExpectedSync(
 							path.basename(this.#sessionFile),
 							bytes,
 							stage.managedAppendExpectation,
 						);
+						this.#managedPersistExpectedIdentity = receipt.identity;
 					} else {
 						const persistedEntries = materializeResidentEntriesForPersistenceSync(
 							[...stage.entries],
