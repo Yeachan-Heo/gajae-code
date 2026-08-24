@@ -2153,7 +2153,7 @@ describe("skills bridge", () => {
 		}
 	});
 
-	test("a source-less bridge-path migration preserves the current bridge and registration (#4644 exact-head P2)", async () => {
+	test("a source-less bridge-path migration preserves the current bridge and registration before an occupied destination (#4644 exact-head P2)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
 		await seedConfig(fixture.paths);
@@ -2166,9 +2166,13 @@ describe("skills bridge", () => {
 		const newBridge = path.join(path.dirname(oldDir), "source-less-relocated-paseo-skills");
 		const migratedDeps: PaseoSetupDependencies = {
 			...fixture.deps,
-			paths: { ...fixture.deps.paths, bridgeDir: newBridge },
+			paths: { ...fixture.paths, bridgeDir: newBridge },
 			skillsSource: async () => undefined,
 		};
+		const check = await runPaseoSetup({ check: true }, migratedDeps);
+		if (check.kind !== "check") throw new Error("expected a check outcome");
+		expect(check.result.reasons.map(reason => reason.code)).toContain("missing-skills-directory");
+		await fs.writeFile(newBridge, "foreign destination\n");
 
 		const install = await runPaseoSetup({}, migratedDeps);
 		expect(install.kind).toBe("install");
@@ -2181,11 +2185,7 @@ describe("skills bridge", () => {
 		expect(await snapshotTree(oldDir)).toBe(beforeBridge);
 		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(beforeLedger);
 		expect(await fs.readFile(settingsPath, "utf8")).toBe(beforeSettings);
-		await expect(fs.stat(newBridge)).rejects.toMatchObject({ code: "ENOENT" });
-
-		const check = await runPaseoSetup({ check: true }, migratedDeps);
-		if (check.kind !== "check") throw new Error("expected a check outcome");
-		expect(check.result.reasons.map(reason => reason.code)).toContain("missing-skills-directory");
+		expect(await fs.readFile(newBridge, "utf8")).toBe("foreign destination\n");
 	});
 
 	test("a partial old-bridge cleanup restores completed removals before saga rollback (#4644 Codex P2)", async () => {

@@ -32,7 +32,7 @@ import {
 } from "./provider-config";
 import { removePaseoSetup, safeBridgeEntryNames, validatedBridgeDir } from "./remove";
 import type { PaseoInstallResult, PaseoRemoveResult, SetupCheckResult } from "./result-types";
-import type { PaseoSetupDependencies } from "./setup-deps";
+import { type PaseoSetupDependencies, type PaseoSkillSource, resolvePaseoSkillsSource } from "./setup-deps";
 import type { SkillsBridgeInstallResult } from "./skills-bridge";
 import {
 	installSkillsBridge,
@@ -122,12 +122,30 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 }
 
 /**
+ * Resolve the bridge source once before bridge preflight so a source-less path
+ * migration can refuse without allowing preflight to inspect the proposed
+ * destination. Keep the fallback in lockstep with skills-bridge's resolver:
+ * callers that omit the seam still get production discovery, followed by the
+ * explicitly configured legacy user path.
+ */
+async function resolveSkillsBridgeSource(deps: PaseoSetupDependencies): Promise<PaseoSkillSource | undefined> {
+	if (deps.skillsSource !== undefined) return deps.skillsSource();
+	const discovered = await resolvePaseoSkillsSource();
+	if (discovered !== undefined) return discovered;
+	const configured = deps.paths.agentsSkillsDir;
+	if (configured === undefined) return undefined;
+	const stat = await fs.stat(configured).catch(() => undefined);
+	return stat?.isDirectory() ? { dir: configured, origin: "user" } : undefined;
+}
+
+/**
  * Run the four-step install saga.
  *
- * Preflight happens first and is entirely read-only, so the common failure
- * cases (unparseable config, a conflicting entry, an unresolvable executable, a
- * foreign file sitting at one of our bridge names) all abort before anything is
- * written and therefore need no compensation.
+ * Bridge preflight follows the source-less migration guard and is entirely
+ * read-only, so the common failure cases (unparseable config, a conflicting
+ * entry, an unresolvable executable, a foreign file sitting at one of our
+ * bridge names) all abort before anything is written and therefore need no
+ * compensation.
  */
 async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDependencies): Promise<PaseoInstallResult> {
 	const now = deps.now();
@@ -164,29 +182,38 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 
 	const preferences = await readTarget(deps.paths.orchestrationPreferences);
 	const seed = createOrchestrationSeed(preferences.parsed);
-	const bridgePreflight = await preflightSkillsBridge(deps);
 	const bridgeLedgerBeforeInstall = await readProvenance(deps.paths.provenanceLedger);
 	const recordedBridgePathBeforeInstall = bridgeLedgerBeforeInstall.bridgePath;
+	const bridgeSource = await resolveSkillsBridgeSource(deps);
 	// A path cutover cannot be authenticated without a live source. Refuse it
 	// before any saga step so the existing bridge, registration, and complete
 	// provenance ledger remain byte-for-byte unchanged.
 	const sourceLessMigration =
-		bridgePreflight.sourceDir === undefined &&
+		bridgeSource === undefined &&
 		recordedBridgePathBeforeInstall !== undefined &&
 		path.resolve(recordedBridgePathBeforeInstall) !== path.resolve(deps.paths.bridgeDir);
+	// Refuse before bridge preflight can inspect the proposed destination. A
+	// source-less cutover has no authenticated basis for changing the bridge
+	// path, so the old registration, links, and ledger stay untouched.
+	if (sourceLessMigration) {
+		const failure = new SagaStepError(
+			"install",
+			`Refusing Paseo skills bridge path migration from ${recordedBridgePathBeforeInstall} to ${deps.paths.bridgeDir}: no resolved Paseo skills source is available; retaining the recorded bridge at ${recordedBridgePathBeforeInstall} and its registration`,
+			[recordedBridgePathBeforeInstall!, deps.paths.provenanceLedger],
+		);
+		const outcome = await compensate([], failure);
+		return { outcome: "partial-install", ...outcome };
+	}
+	const bridgePreflight = await preflightSkillsBridge({
+		...deps,
+		skillsSource: async () => bridgeSource,
+	});
 
 	const completed: CompletedStep[] = [];
 	const changed: string[] = [];
 	const entryHash = providerEntryHash(entry);
 
 	try {
-		if (sourceLessMigration) {
-			throw new SagaStepError(
-				"install",
-				`Refusing Paseo skills bridge path migration from ${recordedBridgePathBeforeInstall} to ${deps.paths.bridgeDir}: no resolved Paseo skills source is available; retaining the recorded bridge at ${recordedBridgePathBeforeInstall} and its registration`,
-				[recordedBridgePathBeforeInstall!, deps.paths.provenanceLedger],
-			);
-		}
 		// Step 1: provider entry + provider-key provenance.
 		//
 		// Ownership is decided by what existed BEFORE this run, not by value
