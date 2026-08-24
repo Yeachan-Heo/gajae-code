@@ -468,6 +468,21 @@ interface ManagedBashJobHandle {
 	setBackgrounded: (backgrounded: boolean) => void;
 }
 
+/** The placeholder a folded PTY hands back to its (now finished) foreground call. */
+function interactiveResultFromText(text: string): BashInteractiveResult {
+	return {
+		exitCode: undefined,
+		cancelled: false,
+		timedOut: false,
+		output: text,
+		outputBytes: 0,
+		outputLines: 0,
+		totalBytes: 0,
+		totalLines: 0,
+		truncated: false,
+	};
+}
+
 function normalizeResultOutput(result: BashResult | BashInteractiveResult): string {
 	return result.output || "";
 }
@@ -1857,6 +1872,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: canUseInteractiveBashPty(pty, ctx)
 					? ctx?.ui
 					: undefined;
+		// A PTY command is foldable too: the runner owns the session, so the fold
+		// registers a job that delivers the run's real outcome after the foreground
+		// has already returned.
+		let ptyFoldUnregister: (() => void) | undefined;
+		let ptyFoldResult: AgentToolResult<BashToolDetails> | undefined;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
@@ -1870,6 +1890,55 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					artifactPublisher,
 					spillThreshold,
 					headBytes,
+					onControls: controls => {
+						if (!ownedManager) return;
+						const ptyManager = ownedManager;
+						const ptyLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
+						// The job's runner simply awaits the run that is ALREADY executing,
+						// so registering never re-executes the command.
+						const ptyJobId = ptyManager.register(
+							"bash",
+							ptyLabel,
+							async () => {
+								const outcome = await controls.terminalCompletion;
+								return this.#extractTextResult(
+									this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec }),
+								);
+							},
+							{ ownerId: this.session.getAgentId?.() ?? undefined },
+						);
+						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
+						ptyFoldUnregister = this.session.registerForegroundFoldParticipant?.({
+							kind: "bash-pty",
+							jobId: ptyJobId,
+							jobGeneration: ptyGeneration,
+							label: ptyLabel,
+							cwdSensitive: true,
+							outputRef: {
+								jobId: ptyJobId,
+								generation: ptyGeneration,
+								instruction: `Use the job tool's tail operation for ${ptyJobId} to read this command's output.`,
+							},
+							getJob: () => {
+								const current = ptyManager.getJob(ptyJobId);
+								return current?.generation === ptyGeneration ? current : undefined;
+							},
+							detachObserver: () => {
+								// Output-only continuation: stdin forwarding ends here and the
+								// process is never killed or restarted by folding.
+								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
+									requestedTimeoutSec,
+									notices: pendingNotices,
+								});
+								const outcome = controls.detachObserver(
+									interactiveResultFromText(this.#extractTextResult(started)),
+								);
+								if (outcome === "resolved") ptyFoldResult = started;
+								return outcome;
+							},
+							resolveForegroundObserver: () => "already-settled",
+						});
+					},
 				})
 			: await executeBash(command, {
 					cwd: commandCwd,
@@ -1889,6 +1958,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
 					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
 				});
+		ptyFoldUnregister?.();
+		// Folded: the foreground was settled by the fold, so return the background
+		// -start result verbatim instead of presenting a half-finished command.
+		if (ptyFoldResult) return ptyFoldResult;
+
 		if (result.cancelled) {
 			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
 			const baseCancelledText = normalizeResultOutput(result) || "Command aborted";
