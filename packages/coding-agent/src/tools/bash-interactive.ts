@@ -300,6 +300,12 @@ export interface InteractivePtyControls {
 	 * the process running and still writing into the sink. Idempotent.
 	 */
 	detachObserver: (foldResult: BashInteractiveResult) => "resolved" | "already-settled";
+	/**
+	 * Resolves with the run's real summary when the process actually ends,
+	 * regardless of whether the foreground was folded. A folded run is delivered
+	 * from this, so its result can never be silently dropped.
+	 */
+	terminalCompletion: Promise<BashInteractiveResult>;
 }
 
 export async function runInteractiveBashPty(
@@ -342,6 +348,7 @@ export async function runInteractiveBashPty(
 	let settleForeground: ((result: BashInteractiveResult) => void) | undefined;
 	let settled = false;
 	const foreground = Promise.withResolvers<BashInteractiveResult>();
+	const terminal = Promise.withResolvers<BashInteractiveResult>();
 
 	const settle = (result: BashInteractiveResult): "resolved" | "already-settled" => {
 		if (settled) return "already-settled";
@@ -361,12 +368,16 @@ export async function runInteractiveBashPty(
 		void (async () => {
 			await observer?.flushOutput();
 			const summary = await sink.dump();
-			settle({
+			const outcome: BashInteractiveResult = {
 				exitCode: run.exitCode,
 				cancelled: run.cancelled,
 				timedOut: run.timedOut,
 				...summary,
-			});
+			};
+			// Publish the real outcome BEFORE settling: a folded run's foreground is
+			// already gone, and this is the only path that can deliver its result.
+			terminal.resolve(outcome);
+			settle(outcome);
 		})();
 	};
 
@@ -399,6 +410,7 @@ export async function runInteractiveBashPty(
 		});
 
 	options.onControls?.({
+		terminalCompletion: terminal.promise,
 		detachObserver: (foldResult: BashInteractiveResult) => {
 			const outcome = settle(foldResult);
 			if (outcome === "resolved") observer = undefined;
