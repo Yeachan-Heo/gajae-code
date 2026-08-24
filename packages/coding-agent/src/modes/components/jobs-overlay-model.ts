@@ -6,9 +6,9 @@
  * SelectItem lists into nested SelectLists (list -> detail -> confirm).
  */
 import type { SelectItem } from "@gajae-code/tui";
-import { sanitizeStatusText } from "../shared";
-import type { JobsSnapshot } from "../jobs-observer";
 import { replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
+import type { JobsSnapshot } from "../jobs-observer";
+import { sanitizeStatusText } from "../shared";
 
 export type JobRefKind = "monitor" | "cron";
 

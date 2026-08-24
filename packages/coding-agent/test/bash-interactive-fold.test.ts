@@ -112,7 +112,9 @@ describe("interactive PTY fold ownership", () => {
 
 			// The process was NOT killed by folding: its post-fold output still lands
 			// in the artifact, so output/artifact state is continuous across the fold.
-			await waitFor(() => fs.existsSync(artifactPath) && fs.readFileSync(artifactPath, "utf-8").includes("AFTER-FOLD"));
+			await waitFor(
+				() => fs.existsSync(artifactPath) && fs.readFileSync(artifactPath, "utf-8").includes("AFTER-FOLD"),
+			);
 			const artifact = fs.readFileSync(artifactPath, "utf-8");
 			expect(artifact).toContain("BEFORE-FOLD");
 			expect(artifact).toContain("AFTER-FOLD");
@@ -199,9 +201,7 @@ describe("interactive PTY fold ownership", () => {
 		// Structural guard: the overlay's dismiss/dispose handlers used to call
 		// session.kill(), and the native session also kills on Drop. Re-introducing
 		// either would silently kill folded work.
-		const source = await Bun.file(
-			new URL("../src/tools/bash-interactive.ts", import.meta.url).pathname,
-		).text();
+		const source = await Bun.file(new URL("../src/tools/bash-interactive.ts", import.meta.url).pathname).text();
 		expect(source).not.toContain("session.kill()");
 	});
 

@@ -1,5 +1,4 @@
 import * as nodeFs from "node:fs";
-import { describeFoldReceipt } from "../session/fold-coordinator";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -70,6 +69,7 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
+import { describeFoldReceipt } from "../session/fold-coordinator";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
 import "../discovery";
@@ -2043,7 +2043,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									: formattedResult;
 							// Exactly one transcript notice per completion: a retried delivery
 							// reuses the same job object, so the claim guards against repeats.
-							if (foldDisposition.kind === "receipt" && job && session.foldCoordinator.claimCompletionNotice(job)) {
+							if (
+								foldDisposition.kind === "receipt" &&
+								job &&
+								session.foldCoordinator.claimCompletionNotice(job)
+							) {
 								session.emitNotice(
 									"info",
 									`Folded job ${foldDisposition.receipt.jobId} (${foldDisposition.receipt.label}) finished.`,

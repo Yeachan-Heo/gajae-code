@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { TUI_KEYBINDINGS, type KeyId } from "@gajae-code/tui";
+import { type KeyId, TUI_KEYBINDINGS } from "@gajae-code/tui";
 import { defaultForegroundFoldKeysForPlatform, KEYBINDINGS } from "../src/config/keybindings";
 
 function withPlatform<T>(platform: NodeJS.Platform, callback: () => T): T {
@@ -19,10 +19,7 @@ function defaults(definition: { defaultKeys: KeyId | readonly KeyId[] }): readon
 
 describe("foreground fold default chord", () => {
 	it("uses both the fallback and Command chord on Darwin", () => {
-		expect(withPlatform("darwin", () => defaultForegroundFoldKeysForPlatform())).toEqual([
-			"alt+shift+b",
-			"super+b",
-		]);
+		expect(withPlatform("darwin", () => defaultForegroundFoldKeysForPlatform())).toEqual(["alt+shift+b", "super+b"]);
 	});
 
 	it.each(["linux", "win32"] as const)("uses only the fallback chord on %s", platform => {
@@ -30,9 +27,7 @@ describe("foreground fold default chord", () => {
 	});
 
 	it("registers the platform-aware defaults for the action", () => {
-		expect(KEYBINDINGS["app.tool.backgroundFold"].defaultKeys).toEqual(
-			defaultForegroundFoldKeysForPlatform(),
-		);
+		expect(KEYBINDINGS["app.tool.backgroundFold"].defaultKeys).toEqual(defaultForegroundFoldKeysForPlatform());
 	});
 
 	it("keeps every foreground fold default free across app and TUI registries", () => {

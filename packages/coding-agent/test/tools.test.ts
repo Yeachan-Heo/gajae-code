@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -11,6 +10,7 @@ import { DEFAULT_BASH_INTERCEPTOR_RULES, Settings } from "@gajae-code/coding-age
 import { EditTool } from "@gajae-code/coding-agent/edit";
 import { saveAgentBashOriginalArtifact } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
+import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
