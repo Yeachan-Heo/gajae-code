@@ -15001,22 +15001,35 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
-				if (this.#managedPersistExpectedIdentity) {
-					try {
-						store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
-					} catch (err) {
-						// A confirmed missing predecessor can be recreated from the complete
-						// resident transcript. Any present-but-different identity still fails
-						// closed so a concurrent successor is never overwritten.
-						if (!isEnoent(err)) throw err;
-						this.#managedPersistExpectedIdentity = undefined;
+				let noReplacePublicationCommitted = false;
+				try {
+					if (this.#managedPersistExpectedIdentity) {
+						try {
+							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+						} catch (err) {
+							// A confirmed missing predecessor can be recreated from the complete
+							// resident transcript. Any present-but-different identity still fails
+							// closed so a concurrent successor is never overwritten.
+							if (!isEnoent(err)) throw err;
+							this.#managedPersistExpectedIdentity = undefined;
+							store.publishNoReplaceSync(relativePath, bytes);
+							noReplacePublicationCommitted = true;
+						}
+					} else {
 						store.publishNoReplaceSync(relativePath, bytes);
+						noReplacePublicationCommitted = true;
 					}
-				} else store.publishNoReplaceSync(relativePath, bytes);
-				const descriptor = store.descriptorExpected(relativePath);
-				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
-				this.#publishCommitMarkerFromCurrentTranscriptSync();
+					const descriptor = store.descriptorExpected(relativePath);
+					if (!descriptor) throw new Error("managed_replace_identity_unavailable");
+					this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+					this.#publishCommitMarkerFromCurrentTranscriptSync();
+				} catch (error) {
+					// A no-replace publication may have committed before the subsequent
+					// descriptor/digest recapture. Preserve the resident entry in that
+					// case: rolling it back would create a durable ghost transcript row.
+					if (noReplacePublicationCommitted) throw new ManagedCommittedMutationError("replace", error);
+					throw error;
+				}
 				return;
 			}
 			const dir = path.resolve(sessionFile, "..");

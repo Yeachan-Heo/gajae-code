@@ -83,6 +83,42 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("keeps a published missing-predecessor entry resident when recapture fails", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		fs.rmSync(sessionFile);
+		const publishNoReplace = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
+		const captureExpectation = ManagedSessionDescendantStore.prototype.captureBoundedAppendExpectation;
+		let published = false;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+			bytes,
+		) {
+			publishNoReplace.call(this, relativePath, bytes);
+			published = true;
+		});
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "captureBoundedAppendExpectation").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+		) {
+			if (published) throw new Error("recapture_failed");
+			return captureExpectation.call(this, relativePath);
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "durable-after-delete", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-delete"))).toBe(true);
+		await manager.close().catch(() => {});
+	});
+
 	it("accepts byte-identical metadata drift before appending", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
