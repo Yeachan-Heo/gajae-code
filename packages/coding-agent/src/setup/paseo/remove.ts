@@ -284,6 +284,16 @@ export async function removePaseoSetup(
 	const removed: string[] = [];
 	const remaining: string[] = [];
 	let nextLedger = ledger;
+	// A pre-#4638 ledger has no recorded source directory. Keep removal's
+	// omitted-resolver fallback in lockstep with install/check: an explicitly
+	// supplied legacy `paths.agentsSkillsDir` wins over deriving the path from
+	// `home`. Only that exact caller fallback gets the additional trust seam;
+	// recorded sources still use the production rule (or an explicit test hook).
+	const callerLegacySourceFallback =
+		ledger.bridgeSourceDir === undefined &&
+		deps.skillsSource === undefined &&
+		deps.paths.agentsSkillsDir !== undefined;
+	const legacySourceDir = callerLegacySourceFallback ? deps.paths.agentsSkillsDir : legacySourceDirFor(deps);
 
 	// The recorded bridge path is validated BEFORE any settings mutation: a
 	// malformed or tampered ledger must never steer `skills.customDirectories`
@@ -307,8 +317,13 @@ export async function removePaseoSetup(
 	// `skills.customDirectories` registration is unregistered — mirroring the
 	// bridge-path rule directly above.
 	if (ledger.bridgeEntries?.length || ledger.bridgeDirCreated === true) {
-		const sourceDir = ledger.bridgeSourceDir ?? legacySourceDirFor(deps);
-		const sourceTrust = await (deps.trustedSkillsSource ?? isTrustedRecordedSkillsSource)(sourceDir);
+		const sourceDir = ledger.bridgeSourceDir ?? legacySourceDir;
+		const sourceTrust =
+			deps.trustedSkillsSource !== undefined
+				? await deps.trustedSkillsSource(sourceDir)
+				: callerLegacySourceFallback && path.isAbsolute(sourceDir)
+					? { ok: true as const }
+					: await isTrustedRecordedSkillsSource(sourceDir);
 		if (!sourceTrust.ok) {
 			return partial([], [ledger.bridgePath ?? deps.paths.bridgeDir], {
 				failedStep: "provenance ledger validation",
@@ -364,7 +379,7 @@ export async function removePaseoSetup(
 			// legacy ledger that predates `bridgeSourceDir` falls back to the
 			// single location a pre-#4638 install could have linked from, so a
 			// machine wedged by #4638 can still be rolled back.
-			const sourceDir = ledger.bridgeSourceDir ?? legacySourceDirFor(deps);
+			const sourceDir = ledger.bridgeSourceDir ?? legacySourceDir;
 			// The recorded source was validated in the pre-settings window
 			// above (#4644 review r10), exactly like the bridge path.
 			await inverseSkillsBridge(

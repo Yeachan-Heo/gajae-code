@@ -2973,6 +2973,33 @@ describe("skills bridge", () => {
 		expect((await fs.lstat(path.join(deps.paths.bridgeDir, SKILL_NAMES[0]))).isSymbolicLink()).toBe(true);
 	});
 
+	test("remove trusts a caller legacy skills path when skillsSource is omitted (#4644 exact-head P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		const legacySource = path.join(fixture.root, "custom-legacy-skills");
+		const paths: FixturePaths = { ...fixture.paths, agentsSkillsDir: legacySource };
+		await seedSkills(paths);
+		await seedConfig(paths);
+		const installDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths,
+			skillsSource: async () => ({ dir: legacySource, origin: "user" }),
+			trustedSkillsSource: undefined,
+		};
+
+		const install = await runPaseoSetup({}, installDeps);
+		expect(install.kind).toBe("install");
+		const installedLedger = await readProvenance(paths.provenanceLedger);
+		expect(installedLedger.bridgeSourceDir).toBe(legacySource);
+		// Model a pre-#4638 ledger produced through the same caller seam: the
+		// bridge links remain owned, but no source directory was recorded.
+		await writeProvenance(paths.provenanceLedger, { ...installedLedger, bridgeSourceDir: undefined });
+
+		const remove = await runPaseoSetup({ remove: true }, { ...installDeps, skillsSource: undefined });
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		await expect(fs.stat(paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("a non-ENOENT filesystem failure fails removal closed instead of reporting success (#4644 review)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
