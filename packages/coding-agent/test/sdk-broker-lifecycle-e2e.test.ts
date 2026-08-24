@@ -2498,20 +2498,22 @@ test("bounds stale lifecycle marker inspection even when candidates are not reap
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-limit-"));
 	const stateRoot = path.join(root, ".gjc", "state");
 	const sdk = path.join(stateRoot, "sdk");
-	const deadId = "999-dead-session";
+	const originalKill = process.kill;
+	let observations = 0;
 	try {
 		await fs.mkdir(sdk, { recursive: true });
-		await Bun.write(path.join(sdk, "000-malformed.lifecycle.json"), "not lifecycle JSON");
-		const dead = { pid: 999_999_999, effectMarker: "dead", incarnation: "linux:1" };
-		const markerPath = path.join(sdk, `${deadId}.lifecycle.json`);
-		await Bun.write(markerPath, JSON.stringify(dead));
-		await Bun.write(path.join(sdk, `${deadId}.lifecycle.ready.json`), JSON.stringify(dead));
-		const expiredAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
-		await fs.utimes(markerPath, expiredAt, expiredAt);
+		const live = { pid: process.pid, effectMarker: "live", incarnation: await incarnation(process.pid) };
+		for (let index = 0; index < 5; index += 1)
+			await Bun.write(path.join(sdk, `live-${index}.lifecycle.json`), JSON.stringify(live));
+		process.kill = ((pid, signal) => {
+			observations += 1;
+			return originalKill.call(process, pid, signal);
+		}) as typeof process.kill;
 
-		expect(await reapDeadLifecycleMarkers(stateRoot, 1)).toBe(0);
-		await expect(Bun.file(markerPath).exists()).resolves.toBe(true);
+		expect(await reapDeadLifecycleMarkers(stateRoot, 2)).toBe(0);
+		expect(observations).toBe(2);
 	} finally {
+		process.kill = originalKill;
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
