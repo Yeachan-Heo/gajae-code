@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { assertRequiredSymbols, missingRequiredFunctions } from "../scripts/embed-guard";
+import { missingRequiredAddonExports } from "../scripts/embed-native";
 
 describe("memory-guard native build wiring", () => {
 	it("rejects generated bindings that omit the Windows memory probe", () => {
@@ -21,5 +22,14 @@ describe("memory-guard native build wiring", () => {
 				"probeWindowsJobMemory",
 			]),
 		).toEqual([]);
+	});
+
+	it("requires executable identity in embedded and generated native bindings", () => {
+		expect(missingRequiredAddonExports({ nativeBuildInfo: () => ({}), probeWindowsJobMemory: () => ({}) })).toEqual([
+			"currentExecutablePath",
+		]);
+		expect(() => assertRequiredSymbols("export function probeWindowsJobMemory(): unknown;", ["currentExecutablePath"])).toThrow(
+			"currentExecutablePath",
+		);
 	});
 });
