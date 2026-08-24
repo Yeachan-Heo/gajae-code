@@ -172,6 +172,8 @@ export class FoldCoordinator {
 	readonly #carriers = new WeakMap<AsyncJob, FoldReceipt>();
 	readonly #participants = new Map<string, FoldAdapter>();
 	readonly #folding = new WeakSet<AsyncJob>();
+	/** Jobs whose completion notice has already been emitted. */
+	readonly #noticed = new WeakSet<AsyncJob>();
 	readonly #deps: FoldCoordinatorDeps;
 
 	constructor(deps: FoldCoordinatorDeps) {
@@ -326,6 +328,18 @@ export class FoldCoordinator {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Claim the single completion notice for a job.
+	 *
+	 * Returns true exactly once per job. A delivery can be retried with the same
+	 * object, so an unguarded notice would repeat for one completion.
+	 */
+	claimCompletionNotice(job: AsyncJob): boolean {
+		if (this.#noticed.has(job)) return false;
+		this.#noticed.add(job);
+		return true;
 	}
 
 	/** Test/diagnostic view of the durable slot state for a job. */

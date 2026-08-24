@@ -2082,6 +2082,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								foldDisposition.kind === "receipt"
 									? `${formattedResult}\n\n${describeFoldReceipt(foldDisposition.receipt)}`
 									: formattedResult;
+							// Exactly one transcript notice per completion: a retried delivery
+							// reuses the same job object, so the claim guards against repeats.
+							if (foldDisposition.kind === "receipt" && job && session.foldCoordinator.claimCompletionNotice(job)) {
+								session.emitNotice(
+									"info",
+									`Folded job ${foldDisposition.receipt.jobId} (${foldDisposition.receipt.label}) finished.`,
+									"fold",
+								);
+							}
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
