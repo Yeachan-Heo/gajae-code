@@ -7,7 +7,9 @@ import { getConfigRootDir } from "@gajae-code/utils";
 export interface MachineIdentityDeps {
 	platform?: NodeJS.Platform;
 	readFile?: (file: string) => Promise<string>;
-	runCommand?: (command: string, args: readonly string[]) => { exitCode: number; stdout: Uint8Array };
+	runCommand?: (command: string, args: readonly string[]) =>
+		| { exitCode: number; stdout: Uint8Array }
+		| Promise<{ exitCode: number; stdout: Uint8Array }>;
 	installationSecret?: string;
 	configRootDir?: string;
 	link?: (existingPath: string, newPath: string) => Promise<void>;
@@ -134,8 +136,11 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 	const readFile = deps.readFile ?? (async (file: string) => await fs.readFile(file, "utf8"));
 	const runCommand =
 		deps.runCommand ??
-		((command: string, args: readonly string[]) =>
-			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore" }));
+		(async (command: string, args: readonly string[]) => {
+			const child = Bun.spawn([command, ...args], { stdout: "pipe", stderr: "ignore" });
+			const [stdout, exitCode] = await Promise.all([new Response(child.stdout).bytes(), child.exited]);
+			return { stdout, exitCode };
+		});
 
 	let rawId: string | undefined;
 	if (platform === "linux") {
@@ -150,10 +155,10 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 			}
 		}
 	} else if (platform === "win32") {
-		const result = runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
+		const result = await runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
 		if (result.exitCode === 0) rawId = parseWindowsMachineGuid(new TextDecoder().decode(result.stdout));
 	} else if (platform === "darwin") {
-		const result = runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
+		const result = await runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
 		if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
 	} else {
 		throw new Error(`machine-local identity is unsupported on ${platform}`);
