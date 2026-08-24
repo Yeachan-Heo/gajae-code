@@ -100,8 +100,9 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			relativePath,
 			bytes,
 		) {
-			publishNoReplace.call(this, relativePath, bytes);
+			const receipt = publishNoReplace.call(this, relativePath, bytes);
 			published = true;
+			return receipt;
 		});
 		vi.spyOn(ManagedSessionDescendantStore.prototype, "captureBoundedAppendExpectation").mockImplementation(function (
 			this: ManagedSessionDescendantStore,

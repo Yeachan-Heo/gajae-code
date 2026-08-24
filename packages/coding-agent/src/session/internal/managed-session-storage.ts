@@ -1509,17 +1509,18 @@ export class ManagedSessionDescendantStore {
 		await publishManagedFileNoReplace(resolved, bytes, undefined, this.#root, this.#policy);
 	}
 
-	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): void {
+	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): ManagedFileIdentity {
 		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
+			const published = publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
 			this.#assertBound();
-			return;
+			return published;
 		}
 		this.#assertBound();
-		this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
+		const published = this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
 		this.#assertBound();
+		return published;
 	}
 	/**
 	 * Atomically publishes an already-written managed staging file without
@@ -1866,7 +1867,7 @@ export class ManagedSessionDescendantStore {
 		return path.relative(this.#authorityBaseDir, resolved).split(path.sep).join("/");
 	}
 
-	#publishRetainedNoReplace(relative: string, bytes: Uint8Array): void {
+	#publishRetainedNoReplace(relative: string, bytes: Uint8Array): ManagedFileIdentity {
 		if (!this.#authority) throw new Error("Managed descendant authority is unavailable");
 		const separator = relative.lastIndexOf("/");
 		const parent = separator < 0 ? "" : relative.slice(0, separator);
@@ -1914,6 +1915,7 @@ export class ManagedSessionDescendantStore {
 			);
 			const outcome = classifyNativePublishOutcome(published, "retained_file");
 			if (!outcome.ok) throw publishFailure(outcome);
+			return managedFileIdentityFromNative(captured.identity);
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
 			// probe or remove the destination. Only a validated pre-mutation result

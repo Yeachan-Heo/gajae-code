@@ -14949,7 +14949,7 @@ export class SessionManager {
 	}
 
 	/** Capture one descriptor-bound digest for a future metadata-drift comparison. */
-	#captureManagedPersistIdentity(sessionFile: string): ManagedFileIdentity {
+	#captureManagedPersistIdentity(sessionFile: string, expected?: ManagedFileIdentity): ManagedFileIdentity {
 		const store = this.#managedTranscriptStore(sessionFile);
 		const relativePath = path.basename(sessionFile);
 		const bounded = store.captureBoundedAppendExpectation(relativePath);
@@ -14965,7 +14965,17 @@ export class SessionManager {
 			bounded.ctimeNs !== identity.ctimeNs.toString()
 		)
 			throw new Error("managed_persist_identity_unavailable");
-		return { ...identity, sha256: bounded.sha256 };
+		const captured = { ...identity, sha256: bounded.sha256 };
+		if (
+			expected &&
+			(captured.dev !== expected.dev ||
+				captured.ino !== expected.ino ||
+				captured.nlink !== expected.nlink ||
+				captured.size !== expected.size ||
+				captured.sha256 !== expected.sha256)
+		)
+			throw new Error("managed_persist_identity_unavailable");
+		return captured;
 	}
 	/** Current transcript descriptor, or null when unavailable. */
 	#managedDescriptorSnapshotOrNull(): DescriptorSnapshot | null {
@@ -15001,7 +15011,7 @@ export class SessionManager {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
-				let noReplacePublicationCommitted = false;
+				let noReplacePublication: ManagedFileIdentity | undefined;
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
@@ -15012,22 +15022,23 @@ export class SessionManager {
 							// closed so a concurrent successor is never overwritten.
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
-							store.publishNoReplaceSync(relativePath, bytes);
-							noReplacePublicationCommitted = true;
+							noReplacePublication = store.publishNoReplaceSync(relativePath, bytes);
 						}
 					} else {
-						store.publishNoReplaceSync(relativePath, bytes);
-						noReplacePublicationCommitted = true;
+						noReplacePublication = store.publishNoReplaceSync(relativePath, bytes);
 					}
 					const descriptor = store.descriptorExpected(relativePath);
 					if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-					this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+					this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
+						sessionFile,
+						noReplacePublication,
+					);
 					this.#publishCommitMarkerFromCurrentTranscriptSync();
 				} catch (error) {
 					// A no-replace publication may have committed before the subsequent
 					// descriptor/digest recapture. Preserve the resident entry in that
 					// case: rolling it back would create a durable ghost transcript row.
-					if (noReplacePublicationCommitted) throw new ManagedCommittedMutationError("replace", error);
+					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
 					throw error;
 				}
 				return;
