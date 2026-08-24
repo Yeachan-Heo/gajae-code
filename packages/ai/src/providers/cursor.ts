@@ -223,11 +223,21 @@ const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
 
 function cursorAbortError(signal: AbortSignal): Error {
 	const reason = signal.reason;
-	return reason instanceof Error ? reason : new Error("Request was aborted");
+	if (reason instanceof Error) {
+		// Normalize the default AbortError DOMException Bun supplies when abort()
+		// runs without a custom reason: Cursor's established terminal text is
+		// "Request was aborted", and the generic-abort matcher keys on it.
+		if (reason.name === "AbortError") return new Error("Request was aborted");
+		return reason;
+	}
+	return new Error("Request was aborted");
 }
 
 function cursorExecDeadlineMs(idleTimeoutMs: number | undefined): number {
-	if (idleTimeoutMs === undefined) return 120_000;
+	// A non-positive idle override explicitly DISABLES the transport watchdog;
+	// it must not collapse the exec deadline to the minimum clamp. Treat it
+	// like an undefined input so ordinary tool calls keep the normal budget.
+	if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) return 120_000;
 	return Math.max(CURSOR_MIN_EXEC_DEADLINE_MS, idleTimeoutMs * CURSOR_EXEC_DEADLINE_MULTIPLIER);
 }
 
@@ -765,21 +775,35 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			proxiedSocket?.destroy();
 			settleH2(callerAbortError!);
 		};
+		// Terminal publication (caller abort, transport error, or stream end)
+		// must wait for any started non-abortable mutation to settle: a network
+		// reset mid-exec otherwise publishes the terminal and lets a retry start
+		// while the filesystem mutation is still running.
+		const settleBehindFence = (publish: () => void): void => {
+			if (pendingNonAbortableExec) {
+				void pendingNonAbortableExec.finally(publish);
+				return;
+			}
+			publish();
+		};
 		const onCallerAbort = () => {
 			const signal = options?.signal;
 			if (!signal) return;
 			if (callerAbortError) return;
 			callerAbortError = cursorAbortError(signal);
-			if (pendingNonAbortableExec) {
-				void pendingNonAbortableExec.finally(closeForCallerAbort);
-				return;
-			}
-			closeForCallerAbort();
+			settleBehindFence(closeForCallerAbort);
 		};
 		// Abort fence: install the listener before any setup work so a caller that
 		// aborts during payload construction or a proxy handshake can never lose the
 		// race against request creation and credential transmission.
 		if (options?.signal) {
+			// Adding an abort listener to an ALREADY-aborted signal never fires
+			// (and the watchdog-owning provider disabled the wrapper's immediate
+			// aborted check), so onCallerAbort is invoked directly: the cancelled
+			// request must terminate promptly instead of opening an HTTP/2 stream
+			// and lingering until the first-event timeout. The in-try aborted
+			// check converts this into the stream's aborted terminal.
+			if (options.signal.aborted) onCallerAbort();
 			options.signal.addEventListener("abort", onCallerAbort, { once: true });
 		}
 
@@ -882,6 +906,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}, timeoutMs);
 			};
 			const refreshTransportWatchdog = () => {
+				// An in-flight exec handler legitimately produces no inbound frames
+				// while it runs: a heartbeat/checkpoint arriving after it started
+				// must not re-arm the watchdog the exec path cleared, or a slow
+				// local tool call would terminalize the stream mid-exec.
+				if (execInFlight) return;
 				armTransportWatchdog(
 					idleTimeoutMs,
 					() => new Error("Cursor stream stalled while waiting for transport progress"),
@@ -900,20 +929,24 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					timeoutMs: 30_000,
 				});
 				let tunnelDeadline: NodeJS.Timeout | undefined;
+				const deadline = Promise.withResolvers<never>();
 				const boundedTunnel =
 					firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
 						? Promise.race([
 								tunnel,
-								new Promise<never>((_, reject) => {
-									tunnelDeadline = setTimeout(
-										() => reject(createFirstEventTimeoutError()),
-										firstEventTimeoutMs,
-									);
+								deadline.promise.catch(error => {
+									throw error;
 								}),
 							])
-						: tunnel;
+						: null;
+				if (boundedTunnel) {
+					// The rejection may never be observed when the tunnel wins the
+					// race; keep it handled so it cannot surface as unhandled.
+					deadline.promise.catch(() => {});
+					tunnelDeadline = setTimeout(() => deadline.reject(createFirstEventTimeoutError()), firstEventTimeoutMs);
+				}
 				try {
-					proxiedSocket = await boundedTunnel;
+					proxiedSocket = await (boundedTunnel ?? tunnel);
 				} catch (error) {
 					// If the real tunnel still completes after the deadline won the
 					// race, it must not leak: destroy it as soon as it lands.
@@ -938,7 +971,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// Recheck after the (possibly async) proxy handshake, immediately before
 			// the bearer-authenticated request is created.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
-			h2ClientErrorHandler = error => settleH2(error);
+			h2ClientErrorHandler = error => settleBehindFence(() => settleH2(error));
 			h2Client.on("error", h2ClientErrorHandler);
 
 			h2Request = h2Client.request({
@@ -953,7 +986,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
-			h2RequestErrorHandler = error => settleH2(error);
+			h2RequestErrorHandler = error => settleBehindFence(() => settleH2(error));
 			h2Request.on("error", h2RequestErrorHandler);
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 
@@ -1029,6 +1062,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 
 			let processingPausedForExec = false;
+			// True while any exec server message handler is running; suppresses
+			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
+			let execInFlight = false;
 			let processPendingBuffer: (() => void) | undefined;
 			processPendingBuffer = () => {
 				if (processingPausedForExec) return;
@@ -1072,7 +1108,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
-							if (isExecServerMessage) clearTransportWatchdog();
+							if (isExecServerMessage) {
+								clearTransportWatchdog();
+								execInFlight = true;
+							}
 							let execSucceeded = false;
 							try {
 								const run = (execSignal?: AbortSignal, markNonAbortable?: () => void) =>
@@ -1110,6 +1149,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 								execSucceeded = true;
 							} finally {
 								if (isExecServerMessage) {
+									execInFlight = false;
 									if (execSucceeded && !transportWatchdogClosed && !callerAbortError) {
 										processingPausedForExec = false;
 										h2Request!.resume();
@@ -1719,6 +1759,7 @@ async function handleExecServerMessage(
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
 				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1733,6 +1774,7 @@ async function handleExecServerMessage(
 				reason => buildLsRejectedResult(args.path, reason),
 				error => buildLsErrorResult(args.path, error),
 				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1877,6 +1919,7 @@ async function handleExecServerMessage(
 				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
 				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -1907,7 +1950,7 @@ async function handleExecServerMessage(
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", {
 				path: piReadDisplayPath(args.path, args.offset, args.limit),
 			});
-			const call = { args, toolCallId, signal: execSignal };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piRead?.bind(execHandlers),
@@ -2023,7 +2066,7 @@ async function handleExecServerMessage(
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", { path: piLsPath(args.path) });
-			const call = { args, toolCallId, signal: execSignal };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piLs?.bind(execHandlers),

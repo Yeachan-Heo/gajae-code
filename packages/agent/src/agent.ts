@@ -1030,18 +1030,18 @@ export class Agent {
 		// `this === undefined`, throwing "undefined is not an object (this.#optionsForCall)".
 		const read = source.read?.bind(source);
 		if (read) {
-			guarded.read = async (args, signal) => {
+			guarded.read = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await read(args, signal);
+				const result = await read(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const ls = source.ls?.bind(source);
 		if (ls) {
-			guarded.ls = async (args, signal) => {
+			guarded.ls = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await ls(args, signal);
+				const result = await ls(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
@@ -1102,9 +1102,9 @@ export class Agent {
 		}
 		const mcp = source.mcp?.bind(source);
 		if (mcp) {
-			guarded.mcp = async (call, signal) => {
+			guarded.mcp = async (call, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await mcp(call, signal);
+				const result = await mcp(call, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};

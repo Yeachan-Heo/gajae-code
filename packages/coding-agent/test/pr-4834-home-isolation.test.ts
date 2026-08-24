@@ -143,39 +143,29 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		const passthroughStat = realStat.bind(fs) as unknown as (t: nfs.PathLike) => Promise<nfs.Stats>;
 		const passthroughLstat = realLstat.bind(fs) as unknown as (t: nfs.PathLike) => Promise<nfs.Stats>;
 		const passthroughAccess = realAccess.bind(fs) as unknown as (t: nfs.PathLike) => Promise<void>;
-		// Spy implementations record the path then delegate to the captured real binding;
-		// the cast keeps the overloaded node signatures out of the way.
-		const asOverloads = <T>(_fn: T): ReturnType<typeof vi.fn> => _fn as ReturnType<typeof vi.fn>;
-		vi.spyOn(fs, "readdir").mockImplementation(
-			asOverloads(async (target: nfs.PathLike) => {
-				reads.add(path.resolve(String(target)));
-				return passthroughReaddir(target);
-			}),
-		);
-		vi.spyOn(fs, "readFile").mockImplementation(
-			asOverloads((file: nfs.PathLike | number) => {
-				reads.add(path.resolve(String(file)));
-				return passthroughReadFile(file, "utf-8");
-			}),
-		);
-		vi.spyOn(fs, "stat").mockImplementation(
-			asOverloads((target: nfs.PathLike) => {
-				reads.add(path.resolve(String(target)));
-				return passthroughStat(target);
-			}),
-		);
-		vi.spyOn(fs, "lstat").mockImplementation(
-			asOverloads((target: nfs.PathLike) => {
-				reads.add(path.resolve(String(target)));
-				return passthroughLstat(target);
-			}),
-		);
-		vi.spyOn(fs, "access").mockImplementation(
-			asOverloads((target: nfs.PathLike) => {
-				reads.add(path.resolve(String(target)));
-				return passthroughAccess(target);
-			}),
-		);
+		// Spy implementations record the path then delegate to the captured real
+		// binding; the explicit signatures plus concrete-type casts keep the
+		// overloaded node types out of the way without ReturnType<> (repo rule).
+		vi.spyOn(fs, "readdir").mockImplementation(((target: nfs.PathLike) => {
+			reads.add(path.resolve(String(target)));
+			return passthroughReaddir(target);
+		}) as unknown as typeof fs.readdir);
+		vi.spyOn(fs, "readFile").mockImplementation(((file: nfs.PathLike | number) => {
+			reads.add(path.resolve(String(file)));
+			return passthroughReadFile(file, "utf-8");
+		}) as unknown as typeof fs.readFile);
+		vi.spyOn(fs, "stat").mockImplementation(((target: nfs.PathLike) => {
+			reads.add(path.resolve(String(target)));
+			return passthroughStat(target);
+		}) as unknown as typeof fs.stat);
+		vi.spyOn(fs, "lstat").mockImplementation(((target: nfs.PathLike) => {
+			reads.add(path.resolve(String(target)));
+			return passthroughLstat(target);
+		}) as unknown as typeof fs.lstat);
+		vi.spyOn(fs, "access").mockImplementation(((target: nfs.PathLike) => {
+			reads.add(path.resolve(String(target)));
+			return passthroughAccess(target);
+		}) as unknown as typeof fs.access);
 		clearCache();
 
 		for (const capabilityId of ALL_CAPABILITIES) {

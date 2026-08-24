@@ -859,8 +859,18 @@ export interface CursorPiCall<TArgs> {
 }
 
 export interface CursorExecHandlers {
-	read?: (args: ReadArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<ReadResult>>;
-	ls?: (args: LsArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<LsResult>>;
+	read?: (
+		args: ReadArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<ReadResult>>;
+	ls?: (
+		args: LsArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<LsResult>>;
 	grep?: (args: GrepArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<GrepResult>>;
 	write?: (
 		args: WriteArgs,
@@ -876,7 +886,12 @@ export interface CursorExecHandlers {
 		signal?: AbortSignal,
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	diagnostics?: (args: DiagnosticsArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
-	mcp?: (call: CursorMcpCall, signal?: AbortSignal) => Promise<CursorExecHandlerResult<McpResult>>;
+	mcp?: (
+		call: CursorMcpCall,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<McpResult>>;
 	piRead?: (call: CursorPiCall<PiReadExecArgs>) => Promise<CursorExecHandlerResult<PiReadExecResult>>;
 	piBash?: (call: CursorPiCall<PiBashExecArgs>) => Promise<CursorExecHandlerResult<PiBashExecResult>>;
 	piEdit?: (call: CursorPiCall<PiEditExecArgs>) => Promise<CursorExecHandlerResult<PiEditExecResult>>;

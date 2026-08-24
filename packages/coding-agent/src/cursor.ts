@@ -255,7 +255,11 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		};
 	}
 
-	async read(args: Parameters<NonNullable<ICursorExecHandlers["read"]>>[0], signal?: AbortSignal) {
+	async read(
+		args: Parameters<NonNullable<ICursorExecHandlers["read"]>>[0],
+		signal?: AbortSignal,
+		markNonAbortable?: () => void,
+	) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const toolResultMessage = await executeTool(
 			this.#optionsForCall(),
@@ -264,11 +268,16 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			{ path: args.path },
 			undefined,
 			signal,
+			markNonAbortable,
 		);
 		return toolResultMessage;
 	}
 
-	async ls(args: Parameters<NonNullable<ICursorExecHandlers["ls"]>>[0], signal?: AbortSignal) {
+	async ls(
+		args: Parameters<NonNullable<ICursorExecHandlers["ls"]>>[0],
+		signal?: AbortSignal,
+		markNonAbortable?: () => void,
+	) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		// Redirect ls to read tool, which handles directories
 		const toolResultMessage = await executeTool(
@@ -278,6 +287,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			{ path: args.path },
 			undefined,
 			signal,
+			markNonAbortable,
 		);
 		return toolResultMessage;
 	}
@@ -470,7 +480,15 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		if (composed === null) {
 			return createToolResultMessage(call.toolCallId, "read", { content: [{ type: "text", text: "" }] }, false);
 		}
-		return executeTool(this.#optionsForCall(), "read", call.toolCallId, { path: composed }, undefined, call.signal);
+		return executeTool(
+			this.#optionsForCall(),
+			"read",
+			call.toolCallId,
+			{ path: composed },
+			undefined,
+			call.signal,
+			call.markNonAbortable,
+		);
 	}
 
 	async piBash(call: Parameters<NonNullable<ICursorExecHandlers["piBash"]>>[0]) {
@@ -557,6 +575,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			},
 			undefined,
 			call.signal,
+			call.markNonAbortable,
 		);
 	}
 
@@ -576,7 +595,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		return toolResultMessage;
 	}
 
-	async mcp(call: CursorMcpCall, signal?: AbortSignal) {
+	async mcp(call: CursorMcpCall, signal?: AbortSignal, markNonAbortable?: () => void) {
 		const options = this.#optionsForCall();
 		const toolName = call.toolName || call.name;
 		const toolCallId = decodeToolCallId(call.toolCallId);
@@ -589,7 +608,15 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		}
 
 		const args = Object.keys(call.args ?? {}).length > 0 ? call.args : decodeMcpArgs(call.rawArgs ?? {});
-		const toolResultMessage = await executeTool(options, toolName, toolCallId, args, undefined, signal);
+		const toolResultMessage = await executeTool(
+			options,
+			toolName,
+			toolCallId,
+			args,
+			undefined,
+			signal,
+			markNonAbortable,
+		);
 		return toolResultMessage;
 	}
 }
