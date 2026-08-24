@@ -21,7 +21,7 @@ import {
 } from "./json-publisher";
 import { createOrchestrationSeed, removeSeededRoles } from "./orchestration-preferences";
 import { withPaseoMutationLock } from "./paseo-mutation-lock";
-import { type ProvenanceLedger, readProvenance, writeProvenance } from "./paseo-ownership";
+import { type BridgeEntryIdentity, type ProvenanceLedger, readProvenance, writeProvenance } from "./paseo-ownership";
 import {
 	buildProviderEntry,
 	createProviderMutation,
@@ -354,8 +354,9 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		const recordedBridgePath = bridgeLedger.bridgePath;
 		const isMigration =
 			recordedBridgePath !== undefined && path.resolve(recordedBridgePath) !== path.resolve(deps.paths.bridgeDir);
-		let migratedOldEntries: readonly string[] = [];
+		let migratedOldEntries: readonly MigratedOldBridgeEntry[] = [];
 		let migratedOldBridgeDir: string | undefined;
+		let migratedOldSourceDir: string | undefined;
 		if (isMigration && (bridgeLedger.bridgeEntries?.length ?? 0) > 0) {
 			// The migration branch composes destructive cleanup paths from the
 			// ledger's own bytes, so it must fail closed exactly like `--remove`
@@ -366,7 +367,13 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			// later failure restores the old bridge instead of leaving the ledger
 			// pointing at missing links.
 			const oldBridgeDir = await validatedBridgeDir(bridgeLedger, deps);
-			migratedOldEntries = safeBridgeEntryNames(bridgeLedger.bridgeEntries ?? []);
+			migratedOldSourceDir = bridgeLedger.bridgeSourceDir ?? legacySourceDirFor(deps);
+			migratedOldEntries = await captureMigratedOldBridgeEntries(
+				oldBridgeDir,
+				safeBridgeEntryNames(bridgeLedger.bridgeEntries ?? []),
+				migratedOldSourceDir,
+				bridgeLedger.bridgeEntryIdentities,
+			);
 			migratedOldBridgeDir = oldBridgeDir;
 		}
 		const previouslyRecorded = isMigration ? new Set<string>() : new Set(bridgeLedger.bridgeEntries ?? []);
@@ -557,46 +564,35 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// already reverts the swap), instead of stranding a ledger that points at
 		// links that no longer exist.
 		if (migratedOldBridgeDir !== undefined && migratedOldEntries.length > 0) {
-			const oldSourceDir = bridgeLedger.bridgeSourceDir ?? legacySourceDirFor(deps);
+			const oldSourceDir = migratedOldSourceDir ?? bridgeLedger.bridgeSourceDir ?? legacySourceDirFor(deps);
+			const oldCleanup = {
+				createdEntries: migratedOldEntries.map(entry => entry.name),
+				prunedEntries: [],
+				adoptedEntries: [],
+				entryIdentities: Object.fromEntries(
+					migratedOldEntries.map(entry => [entry.name, entry.identity]),
+				),
+				bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
+				bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
+				sourceDir: oldSourceDir,
+			};
+			// Register the compensable step BEFORE the first old-link unlink. A
+			// syscall can fail after inverseSkillsBridge has already removed one
+			// of several entries; keeping the pre-cutover link text and identity
+			// here lets compensation restore only those removals, without ever
+			// replacing a successor that claimed the pathname.
+			completed.push({
+				label: migratedOldBridgeDir,
+				undo: () => restoreMigratedOldBridgeEntries(migratedOldBridgeDir!, migratedOldEntries),
+			});
 			try {
-				await inverseSkillsBridge(
-					deps,
-					{
-						createdEntries: [...migratedOldEntries],
-						prunedEntries: [],
-						adoptedEntries: [],
-						entryIdentities: bridgeLedger.bridgeEntryIdentities ?? {},
-						bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
-						bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
-						sourceDir: oldSourceDir,
-					},
-					{ bridgeDir: migratedOldBridgeDir },
-				);
+				await inverseSkillsBridge(deps, oldCleanup, { bridgeDir: migratedOldBridgeDir });
 			} catch (error) {
 				throw new SagaStepError(
 					"install",
 					`bridge path migrated from ${recordedBridgePath} but the old bridge could not be cleaned: ${error instanceof Error ? error.message : String(error)}`,
 				);
 			}
-			completed.push({
-				label: migratedOldBridgeDir,
-				undo: async () => {
-					// Restore the old bridge exactly as it was recorded: the same
-					// links at the same recorded targets in the old directory.
-					try {
-						for (const name of migratedOldEntries) {
-							await fs.symlink(path.resolve(oldSourceDir, name), path.join(migratedOldBridgeDir ?? "", name));
-						}
-						return { status: "reverted" as const };
-					} catch (error) {
-						return {
-							status: "conflict" as const,
-							detail: error instanceof Error ? error.message : String(error),
-							retained: [migratedOldBridgeDir ?? deps.paths.bridgeDir],
-						};
-					}
-				},
-			});
 			changed.push(migratedOldBridgeDir);
 		}
 	} catch (error) {
@@ -612,6 +608,133 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	}
 
 	return { outcome: "installed", changed };
+}
+
+type MigratedOldBridgeEntry = {
+	readonly name: string;
+	readonly linkText: string;
+	readonly identity: BridgeEntryIdentity;
+};
+
+/**
+ * Capture the exact old links before migration cutover. Historical ledgers
+ * may predate entry identities, so a missing identity is filled from this
+ * no-follow snapshot; an identity that IS recorded must still match it.
+ */
+async function captureMigratedOldBridgeEntries(
+	bridgeDir: string,
+	names: readonly string[],
+	sourceDir: string,
+	recordedIdentities: Readonly<Record<string, BridgeEntryIdentity>> | undefined,
+): Promise<readonly MigratedOldBridgeEntry[]> {
+	const captured: MigratedOldBridgeEntry[] = [];
+	for (const name of names) {
+		const destination = path.join(bridgeDir, name);
+		const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw new SkillsBridgeError(`Cannot inspect old Paseo skill bridge entry: ${destination}`);
+		});
+		if (stat === undefined) continue;
+		if (!stat.isSymbolicLink()) {
+			throw new SkillsBridgeError(`Refusing to migrate a non-symlink old Paseo skill bridge entry: ${destination}`);
+		}
+		const linkText = await fs.readlink(destination);
+		if (path.resolve(path.dirname(destination), linkText) !== path.resolve(sourceDir, name)) {
+			throw new SkillsBridgeError(`Refusing to migrate an old Paseo skill bridge entry with a foreign target: ${destination}`);
+		}
+		const observed: BridgeEntryIdentity = {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: stat.size.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+		};
+		const recorded = recordedIdentities?.[name];
+		if (recorded !== undefined && !sameBridgeEntryIdentity(recorded, observed)) {
+			throw new SkillsBridgeError(`Refusing to migrate a changed old Paseo skill bridge entry: ${destination}`);
+		}
+		captured.push({ name, linkText, identity: recorded ?? observed });
+	}
+	return captured;
+}
+
+/** Restore only old links that the migration inverse actually removed. */
+async function restoreMigratedOldBridgeEntries(
+	bridgeDir: string,
+	entries: readonly MigratedOldBridgeEntry[],
+): Promise<
+	| { readonly status: "reverted" }
+	| { readonly status: "conflict"; readonly detail: string; readonly retained: readonly string[] }
+> {
+	const missing: MigratedOldBridgeEntry[] = [];
+	try {
+		for (const entry of entries) {
+			const destination = path.join(bridgeDir, entry.name);
+			const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw new SkillsBridgeError(
+					`cannot inspect old Paseo skill bridge entry during compensation: ${destination}`,
+				);
+			});
+			if (stat === undefined) {
+				missing.push(entry);
+				continue;
+			}
+			if (!stat.isSymbolicLink()) {
+				return {
+					status: "conflict",
+					detail: `old Paseo skill bridge entry was replaced during compensation: ${destination}`,
+					retained: [bridgeDir],
+				};
+			}
+			const linkText = await fs.readlink(destination);
+			const observed: BridgeEntryIdentity = {
+				dev: stat.dev.toString(),
+				ino: stat.ino.toString(),
+				size: stat.size.toString(),
+				mtimeNs: stat.mtimeNs.toString(),
+			};
+			// An untouched original is already restored. A same-target successor
+			// is not: its identity differs, so compensation must not clobber it.
+			if (linkText !== entry.linkText || !sameBridgeEntryIdentity(observed, entry.identity)) {
+				return {
+					status: "conflict",
+					detail: `old Paseo skill bridge entry changed during compensation: ${destination}`,
+					retained: [bridgeDir],
+				};
+			}
+		}
+
+		for (const entry of missing) {
+			const destination = path.join(bridgeDir, entry.name);
+			// No replacement: EEXIST is a compensation conflict, and the
+			// occupant remains untouched for the operator to inspect.
+			await fs.symlink(entry.linkText, destination);
+			const restored = await fs.lstat(destination, { bigint: true });
+			if (!restored.isSymbolicLink() || (await fs.readlink(destination)) !== entry.linkText) {
+				return {
+					status: "conflict",
+					detail: `old Paseo skill bridge entry could not be proven restored: ${destination}`,
+					retained: [bridgeDir],
+				};
+			}
+		}
+		return { status: "reverted" };
+	} catch (error) {
+		return {
+			status: "conflict",
+			detail: `old Paseo skill bridge compensation failed: ${error instanceof Error ? error.message : String(error)}`,
+			retained: [bridgeDir],
+		};
+	}
+}
+
+function sameBridgeEntryIdentity(left: BridgeEntryIdentity, right: BridgeEntryIdentity): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs
+	);
 }
 
 /** True when the ledger proves GJC owns the current bridge directory and its entries. */

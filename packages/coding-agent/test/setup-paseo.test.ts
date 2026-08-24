@@ -2153,6 +2153,88 @@ describe("skills bridge", () => {
 		}
 	});
 
+	test("a partial old-bridge cleanup restores completed removals before saga rollback (#4644 Codex P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+		const beforeLedger = await readProvenance(fixture.paths.provenanceLedger);
+		const beforeLinks: Record<string, string> = {};
+		for (const name of SKILL_NAMES) beforeLinks[name] = await fs.readlink(path.join(oldDir, name));
+
+		const newDir = path.join(path.dirname(oldDir), "partially-failed-paseo-skills");
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: { ...fixture.deps.paths, bridgeDir: newDir },
+		};
+
+		// The migration captures the old links before the settings cutover. Fail
+		// the second unlink syscall after the first one succeeds, then assert the
+		// pre-cutover bridge, registration, and ledger are all restored.
+		let cleanupStarted = false;
+		let oldBridgeReadlinks = 0;
+		const originalReadlink = fs.readlink.bind(fs);
+		const readlink = spyOn(fs, "readlink").mockImplementation(async target => {
+			const value = await originalReadlink(target);
+			if (cleanupStarted && String(target).startsWith(`${oldDir}${path.sep}`)) {
+				oldBridgeReadlinks += 1;
+				if (oldBridgeReadlinks === SKILL_NAMES.length + 2) {
+					throw new Error("simulated old bridge unlink failure");
+				}
+			}
+			return value;
+		});
+		const realSettingsInit = Settings.init.bind(Settings);
+		let settingsCommit: { mockRestore(): void } | undefined;
+		const settingsInit = spyOn(Settings, "init").mockImplementation(async options => {
+			const settings = await realSettingsInit(options);
+			const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+			settingsCommit = spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async buildPatches => {
+				const receipt = await commit(buildPatches);
+				cleanupStarted = true;
+				return receipt;
+			});
+			return settings;
+		});
+		try {
+			const install = await runPaseoSetup({}, migratedDeps);
+			expect(install.kind).toBe("install");
+			if (install.kind !== "install") throw new Error("expected an install outcome");
+			expect(install.result.outcome).toBe("partial-install");
+			for (const name of SKILL_NAMES) {
+				expect(await fs.readlink(path.join(oldDir, name))).toBe(beforeLinks[name]);
+			}
+			const afterLedger = await readProvenance(fixture.paths.provenanceLedger);
+			// The provider step may retain its convergence marker for an identical
+			// existing entry; migration compensation is responsible for restoring
+			// the old bridge facts, not erasing unrelated provider provenance.
+			expect({
+				bridgePath: afterLedger.bridgePath,
+				bridgeSourceDir: afterLedger.bridgeSourceDir,
+				bridgeEntries: afterLedger.bridgeEntries,
+				bridgeEntryIdentities: afterLedger.bridgeEntryIdentities,
+				bridgeDirCreated: afterLedger.bridgeDirCreated,
+				bridgeDirIdentity: afterLedger.bridgeDirIdentity,
+			}).toEqual({
+				bridgePath: beforeLedger.bridgePath,
+				bridgeSourceDir: beforeLedger.bridgeSourceDir,
+				bridgeEntries: beforeLedger.bridgeEntries,
+				bridgeEntryIdentities: beforeLedger.bridgeEntryIdentities,
+				bridgeDirCreated: beforeLedger.bridgeDirCreated,
+				bridgeDirIdentity: beforeLedger.bridgeDirIdentity,
+			});
+			await expect(fs.stat(newDir)).rejects.toMatchObject({ code: "ENOENT" });
+			const settings = await fs.readFile(path.join(process.env.GJC_CODING_AGENT_DIR ?? "", "config.yml"), "utf8");
+			expect(settings).toContain(oldDir);
+			expect(settings).not.toContain(newDir);
+		} finally {
+			settingsCommit?.mockRestore();
+			settingsInit.mockRestore();
+			readlink.mockRestore();
+		}
+	});
+
 	test("a tampered ledger path refuses removal before any settings mutation (#4644 review r6)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
