@@ -46,7 +46,6 @@ const commandAuthorityPaths = new WeakMap<object, string[]>();
 /** Test-only injectable inputs for hostile evidence and platform grammar coverage. */
 export interface SdkInternalRuntimeDescriptorTestOptions {
 	execPath?: string;
-	argv0?: string;
 	environment?: NodeJS.ProcessEnv;
 	embeddedFiles?: readonly EmbeddedFile[];
 	markerPath?: string;
