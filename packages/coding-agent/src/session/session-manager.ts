@@ -14949,7 +14949,11 @@ export class SessionManager {
 	}
 
 	/** Capture one descriptor-bound digest for a future metadata-drift comparison. */
-	#captureManagedPersistIdentity(sessionFile: string, expected?: ManagedFileIdentity): ManagedFileIdentity {
+	#captureManagedPersistIdentity(
+		sessionFile: string,
+		expected?: ManagedFileIdentity,
+		expectedBytes?: Uint8Array,
+	): ManagedFileIdentity {
 		const store = this.#managedTranscriptStore(sessionFile);
 		const relativePath = path.basename(sessionFile);
 		const bounded = store.captureBoundedAppendExpectation(relativePath);
@@ -14966,6 +14970,11 @@ export class SessionManager {
 		)
 			throw new Error("managed_persist_identity_unavailable");
 		const captured = { ...identity, sha256: bounded.sha256 };
+		if (
+			expectedBytes &&
+			captured.sha256 !== crypto.createHash("sha256").update(expectedBytes).digest("hex")
+		)
+			throw new Error("managed_persist_identity_unavailable");
 		if (
 			expected &&
 			(captured.dev !== expected.dev ||
@@ -15012,6 +15021,7 @@ export class SessionManager {
 				const store = this.#managedTranscriptStore(sessionFile);
 				const relativePath = path.basename(sessionFile);
 				let noReplacePublication: ManagedFileIdentity | undefined;
+				let noReplacePublicationAttempted = false;
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
@@ -15022,9 +15032,11 @@ export class SessionManager {
 							// closed so a concurrent successor is never overwritten.
 							if (!isEnoent(err)) throw err;
 							this.#managedPersistExpectedIdentity = undefined;
+							noReplacePublicationAttempted = true;
 							noReplacePublication = store.publishNoReplaceSync(relativePath, bytes);
 						}
 					} else {
+						noReplacePublicationAttempted = true;
 						noReplacePublication = store.publishNoReplaceSync(relativePath, bytes);
 					}
 					const descriptor = store.descriptorExpected(relativePath);
@@ -15035,9 +15047,21 @@ export class SessionManager {
 					);
 					this.#publishCommitMarkerFromCurrentTranscriptSync();
 				} catch (error) {
+					if (noReplacePublicationAttempted && !noReplacePublication) {
+						try {
+							const recaptured = this.#captureManagedPersistIdentity(sessionFile, undefined, bytes);
+							this.#managedPersistExpectedIdentity = recaptured;
+							noReplacePublication = recaptured;
+						} catch {
+							// A failed recapture cannot authorize a successor or a retrying
+							// replacement; leave the expected identity unset and preserve the
+							// original committed/uncertain classification below.
+						}
+					}
 					// A no-replace publication may have committed before the subsequent
 					// descriptor/digest recapture. Preserve the resident entry in that
 					// case: rolling it back would create a durable ghost transcript row.
+					if (error instanceof ManagedCommittedMutationError) throw error;
 					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
 					throw error;
 				}
@@ -16877,6 +16901,14 @@ export class SessionManager {
 					});
 				}
 				return;
+			}
+			if (err instanceof ManagedCommittedMutationError) {
+				// The durable mutation is authoritative even when its receipt was
+				// interrupted. Keep the resident entry and permit a later, identity-bound
+				// rewrite to recapture it instead of poisoning same-process retries with a
+				// sticky persistence error.
+				this.#needsFullRewriteOnNextPersist = true;
+				throw err;
 			}
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);

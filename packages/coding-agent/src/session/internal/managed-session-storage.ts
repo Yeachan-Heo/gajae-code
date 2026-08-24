@@ -63,6 +63,7 @@ export class ManagedPublishError extends Error {
 		| "durability_failed";
 	readonly diagnostic: string;
 	readonly stagingCleanupSafe: boolean;
+	readonly mutationState: NativePublishOutcome["mutationState"];
 
 	constructor(classification: ManagedPublishError["classification"], outcome: NativePublishOutcome) {
 		super(classification);
@@ -70,6 +71,7 @@ export class ManagedPublishError extends Error {
 		this.classification = classification;
 		this.diagnostic = formatNativePublishDiagnostic(outcome);
 		this.stagingCleanupSafe = mayCleanCurrentStaging(outcome);
+		this.mutationState = outcome.mutationState;
 	}
 }
 export class ManagedReplaceError extends Error {
@@ -1512,15 +1514,24 @@ export class ManagedSessionDescendantStore {
 	publishNoReplaceSync(relativePath: string, bytes: Uint8Array): ManagedFileIdentity {
 		this.#beforeMutation();
 		const resolved = this.#resolve(relativePath);
-		if (!this.#authority) {
-			const published = publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
+		let publicationReturned = false;
+		try {
+			if (!this.#authority) {
+				const published = publishManagedFileNoReplaceSync(resolved, bytes, this.#root, this.#policy);
+				publicationReturned = true;
+				this.#assertBound();
+				return published;
+			}
+			this.#assertBound();
+			const published = this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
+			publicationReturned = true;
 			this.#assertBound();
 			return published;
+		} catch (error) {
+			if (publicationReturned || (error instanceof ManagedPublishError && error.mutationState === "committed"))
+				throw new ManagedCommittedMutationError("replace", error);
+			throw error;
 		}
-		this.#assertBound();
-		const published = this.#publishRetainedNoReplace(this.#relative(resolved), bytes);
-		this.#assertBound();
-		return published;
 	}
 	/**
 	 * Atomically publishes an already-written managed staging file without
@@ -1878,6 +1889,7 @@ export class ManagedSessionDescendantStore {
 		if (!created.identity) throw new Error("managed_publish_identity_unavailable");
 		let captured: ReturnType<RecoveryFsRoot["readManaged"]> | undefined;
 		let published: unknown;
+		let publicationCommitted = false;
 		try {
 			captured = this.#authority.readManaged(temporary);
 			if (!captured.ok || !captured.identity || !captured.data)
@@ -1914,7 +1926,9 @@ export class ManagedSessionDescendantStore {
 				digest,
 			);
 			const outcome = classifyNativePublishOutcome(published, "retained_file");
+			publicationCommitted = outcome.mutationState === "committed";
 			if (!outcome.ok) throw publishFailure(outcome);
+			publicationCommitted = true;
 			return managedFileIdentityFromNative(captured.identity);
 		} catch (error) {
 			// A committed or unknown native outcome is evidence, not authorization to
@@ -1943,6 +1957,7 @@ export class ManagedSessionDescendantStore {
 						throw new Error(removed.code ?? "managed_publish_reconcile_failed");
 				}
 			}
+			if (publicationCommitted) throw new ManagedCommittedMutationError("replace", error);
 			throw error;
 		}
 	}
@@ -3004,6 +3019,7 @@ export function publishManagedFileNoReplaceSync(
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
 	let linkPublished = false;
+	let publicationCommitted = false;
 
 	try {
 		fd = fs.openSync(
@@ -3027,7 +3043,9 @@ export function publishManagedFileNoReplaceSync(
 			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
+		publicationCommitted = outcome.mutationState === "committed";
 		if (!outcome.ok) throw publishFailure(outcome);
+		publicationCommitted = true;
 
 		const named = fs.lstatSync(destination, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || named.dev !== staged.dev || named.ino !== staged.ino) {
@@ -3053,7 +3071,10 @@ export function publishManagedFileNoReplaceSync(
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
 		}
 	}
-	if (failure !== undefined) throw failure;
+	if (failure !== undefined) {
+		if (publicationCommitted) throw new ManagedCommittedMutationError("replace", failure);
+		throw failure;
+	}
 	if (!publishedIdentity) throw new Error("managed_publish_identity_unavailable");
 	return publishedIdentity;
 }

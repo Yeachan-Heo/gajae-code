@@ -120,6 +120,41 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("recaptures a committed no-replace publication that throws before returning its identity", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		fs.rmSync(sessionFile);
+		const publishNoReplace = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
+		let throwAfterCommit = true;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+			bytes,
+		) {
+			const receipt = publishNoReplace.call(this, relativePath, bytes);
+			if (throwAfterCommit) {
+				throwAfterCommit = false;
+				throw new Error("publish_return_interrupted");
+			}
+			return receipt;
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "durable-after-publish-error", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-publish-error"))).toBe(true);
+
+		await manager.ensureOnDisk();
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
+		await manager.close();
+	});
+
 	it("accepts byte-identical metadata drift before appending", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
