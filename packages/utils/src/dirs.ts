@@ -647,6 +647,18 @@ export function setAgentDir(dir: string): void {
 	process.env.GJC_CODING_AGENT_DIR = dir;
 }
 
+/**
+ * Rebuild the resolver from the current trusted environment. Callers that
+ * temporarily used {@link setAgentDir} must first restore the original
+ * GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR values, then call this function;
+ * an originally absent override remains absent and keeps following HOME.
+ */
+export function resetAgentDirFromEnvironment(): void {
+	const snapshot = dirs.trustSnapshot;
+	const override = trustedValue("GJC_CODING_AGENT_DIR", snapshot) ?? trustedValue("PI_CODING_AGENT_DIR", snapshot);
+	dirs = new DirResolver(override, snapshot);
+}
+
 /** Get the agent config directory (~/.gjc/agent). */
 export function getAgentDir(): string {
 	dirs.refreshConfigDirOverride();

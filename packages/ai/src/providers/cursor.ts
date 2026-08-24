@@ -1179,13 +1179,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						if (!isExecServerMessage && messageQueue.pending() >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
 							processingPausedForQueue = true;
 							h2Request!.pause();
-							void queued.finally(() => {
+							const resumeAfterDrain = () => {
 								processingPausedForQueue = false;
 								if (!processingPausedForExec && !transportWatchdogClosed && !callerAbortError) {
 									h2Request!.resume();
 									processPendingBuffer?.();
 								}
-							});
+							};
+							// Consume both outcomes: `finally()` would create a second rejected
+							// promise when the boundary handler fails, even though the queue's
+							// normal error path already consumed the original rejection.
+							void queued.then(resumeAfterDrain, resumeAfterDrain);
 							break;
 						}
 

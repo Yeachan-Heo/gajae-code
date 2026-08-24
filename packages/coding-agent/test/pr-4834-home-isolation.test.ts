@@ -13,14 +13,15 @@ import { type Skill, skillCapability } from "@gajae-code/coding-agent/capability
 import { type SlashCommand, slashCommandCapability } from "@gajae-code/coding-agent/capability/slash-command";
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 // Register all discovery providers as a side effect.
 import "@gajae-code/coding-agent/discovery";
 
 let tempDir: string;
 let home: string;
 let project: string;
-let originalAgentDir: string;
+let originalGjcAgentDir: string | undefined;
+let originalPiAgentDir: string | undefined;
 
 async function writeFile(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -81,17 +82,37 @@ beforeEach(async () => {
 	await fs.mkdir(home, { recursive: true });
 	await fs.mkdir(project, { recursive: true });
 	await fs.mkdir(path.join(project, ".git"), { recursive: true });
-	originalAgentDir = getAgentDir();
+	originalGjcAgentDir = process.env.GJC_CODING_AGENT_DIR;
+	originalPiAgentDir = process.env.PI_CODING_AGENT_DIR;
 });
 
 afterEach(async () => {
 	clearCache();
 	vi.restoreAllMocks();
-	setAgentDir(originalAgentDir);
+	if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+	else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
+	if (originalPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = originalPiAgentDir;
+	resetAgentDirFromEnvironment();
 	await fs.rm(tempDir, { recursive: true, force: true });
 });
 
 describe("PR #4834: loadCapabilityForHome never falls back to the process profile", () => {
+	test("restoring an absent agent-dir override returns the resolver to the home-relative profile", () => {
+		delete process.env.GJC_CODING_AGENT_DIR;
+		delete process.env.PI_CODING_AGENT_DIR;
+		resetAgentDirFromEnvironment();
+		const homeRelativeAgentDir = getAgentDir();
+
+		setAgentDir(path.join(tempDir, "temporary-profile"));
+		expect(getAgentDir()).not.toBe(homeRelativeAgentDir);
+		delete process.env.GJC_CODING_AGENT_DIR;
+		resetAgentDirFromEnvironment();
+
+		expect(process.env.GJC_CODING_AGENT_DIR).toBeUndefined();
+		expect(getAgentDir()).toBe(homeRelativeAgentDir);
+	});
+
 	test("explicit home performs zero reads of the decoy process profile across every user-scope surface", async () => {
 		const homeAgentDir = path.join(home, ".gjc", "agent");
 		const decoyAgentDir = path.join(tempDir, "process-decoy", ".gjc", "agent");
