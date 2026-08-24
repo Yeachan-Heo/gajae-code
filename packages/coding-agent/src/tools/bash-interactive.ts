@@ -10,7 +10,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
-import { sanitizeText } from "@gajae-code/utils";
+import { logger, sanitizeText } from "@gajae-code/utils";
 import type { Terminal as XtermTerminalType } from "@xterm/headless";
 import { Settings } from "../config/settings";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
@@ -293,6 +293,15 @@ class BashInteractiveOverlayComponent implements Component {
 	}
 }
 
+/** Live controls handed to the caller once the PTY run owns its session. */
+export interface InteractivePtyControls {
+	/**
+	 * Detach the overlay and settle the foreground call with `foldResult`, leaving
+	 * the process running and still writing into the sink. Idempotent.
+	 */
+	detachObserver: (foldResult: BashInteractiveResult) => "resolved" | "already-settled";
+}
+
 export async function runInteractiveBashPty(
 	ui: NonNullable<AgentToolContext["ui"]>,
 	options: {
@@ -307,6 +316,8 @@ export async function runInteractiveBashPty(
 		spillThreshold?: number;
 		headBytes?: number;
 		settings?: Settings;
+		/** Receives live controls once the session is running; used to register a fold. */
+		onControls?: (controls: InteractivePtyControls) => void;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = options.settings ?? (await Settings.init());
@@ -322,89 +333,125 @@ export async function runInteractiveBashPty(
 	const { default: xterm } = await import("@xterm/headless");
 	const XtermTerminal = xterm.Terminal;
 	const PtySession = await ptySessionNative();
-	const result = await ui.custom<BashInteractiveResult>(
-		(tui, uiTheme, _keybindings, done) => {
-			const session = new PtySession();
-			const component = new BashInteractiveOverlayComponent(
-				options.command,
-				uiTheme,
-				() => tui.terminal.rows,
-				XtermTerminal,
-			);
-			component.setSession(session);
-			let finished = false;
-			const finalize = (run: PtyRunResult) => {
-				if (finished) return;
-				finished = true;
-				component.setComplete({ exitCode: run.exitCode, cancelled: run.cancelled, timedOut: run.timedOut });
-				tui.requestRender();
-				void (async () => {
-					await component.flushOutput();
-					const summary = await sink.dump();
-					done({
-						exitCode: run.exitCode,
-						cancelled: run.cancelled,
-						timedOut: run.timedOut,
-						...summary,
-					});
-				})();
-			};
-			const cols = Math.max(20, tui.terminal.columns - 2);
-			const rows = Math.max(5, tui.terminal.rows - 4);
-			component.setHandlers(
-				data => {
-					try {
-						session.write(data);
-					} catch {
-						// ignore writes after command exits
-					}
-				},
-				() => {
-					try {
-						session.kill();
-					} catch {
-						// ignore
-					}
-				},
-				() => {
-					try {
-						session.kill();
-					} catch {
-						// ignore
-					}
-				},
-			);
-			void session
-				.start(
-					{
-						command: options.command,
-						cwd: options.cwd,
-						timeoutMs: options.timeoutMs,
-						env: {
-							...NON_INTERACTIVE_ENV,
-							...options.env,
-						},
-						signal: options.signal,
-						cols,
-						rows,
-						shell: resolvedShell,
-					},
-					(err, chunk) => {
-						if (finished || err || !chunk) return;
-						component.appendOutput(chunk);
-						const normalizedChunk = normalizeCaptureChunk(chunk);
-						sink.push(normalizedChunk);
-						tui.requestRender();
-					},
-				)
-				.then(finalize)
-				.catch(error => {
-					sink.push(`PTY error: ${error instanceof Error ? error.message : String(error)}\n`);
-					finalize({ exitCode: undefined, cancelled: false, timedOut: false });
-				});
-			return component;
+
+	// Ownership inversion: this runner owns the session and the sink from t0,
+	// started OUTSIDE ui.custom. The overlay is only an observer view, so
+	// dismissing it — or never creating it — can never kill the process.
+	const session = new PtySession();
+	let observer: BashInteractiveOverlayComponent | undefined;
+	let settleForeground: ((result: BashInteractiveResult) => void) | undefined;
+	let settled = false;
+	const foreground = Promise.withResolvers<BashInteractiveResult>();
+
+	const settle = (result: BashInteractiveResult): "resolved" | "already-settled" => {
+		if (settled) return "already-settled";
+		settled = true;
+		// Prefer ui.custom's own `done` so the overlay tears down through its normal
+		// path; fall back to the outer promise when no overlay was ever attached.
+		if (settleForeground) settleForeground(result);
+		else foreground.resolve(result);
+		return "resolved";
+	};
+
+	let finished = false;
+	const finalize = (run: PtyRunResult): void => {
+		if (finished) return;
+		finished = true;
+		observer?.setComplete({ exitCode: run.exitCode, cancelled: run.cancelled, timedOut: run.timedOut });
+		void (async () => {
+			await observer?.flushOutput();
+			const summary = await sink.dump();
+			settle({
+				exitCode: run.exitCode,
+				cancelled: run.cancelled,
+				timedOut: run.timedOut,
+				...summary,
+			});
+		})();
+	};
+
+	// The original deadline rides on the run itself, so a folded command expires
+	// exactly when it would have in the foreground.
+	void session
+		.start(
+			{
+				command: options.command,
+				cwd: options.cwd,
+				timeoutMs: options.timeoutMs,
+				env: { ...NON_INTERACTIVE_ENV, ...options.env },
+				signal: options.signal,
+				cols: 120,
+				rows: 40,
+				shell: resolvedShell,
+			},
+			(err, chunk) => {
+				if (finished || err || !chunk) return;
+				// The sink is fed unconditionally: output stays continuous across a
+				// fold, when no overlay exists, and after the overlay is disposed.
+				sink.push(normalizeCaptureChunk(chunk));
+				observer?.appendOutput(chunk);
+			},
+		)
+		.then(finalize)
+		.catch(error => {
+			sink.push(`PTY error: ${error instanceof Error ? error.message : String(error)}\n`);
+			finalize({ exitCode: undefined, cancelled: false, timedOut: false });
+		});
+
+	options.onControls?.({
+		detachObserver: (foldResult: BashInteractiveResult) => {
+			const outcome = settle(foldResult);
+			if (outcome === "resolved") observer = undefined;
+			return outcome;
 		},
-		{ overlay: true },
-	);
-	return result;
+	});
+
+	// Folded (or already finished) before any view existed: there is nothing to
+	// attach an observer to, so never await an overlay that will never be settled.
+	if (settled) return await foreground.promise;
+
+	try {
+		const overlayResult = await Promise.race([
+			foreground.promise,
+			ui.custom<BashInteractiveResult>(
+			(tui, uiTheme, _keybindings, done) => {
+				settleForeground = done;
+				const component = new BashInteractiveOverlayComponent(
+					options.command,
+					uiTheme,
+					() => tui.terminal.rows,
+					XtermTerminal,
+				);
+				component.setSession(session);
+				// Observer view only: stdin still reaches the process while attached,
+				// but dismiss and dispose no longer kill it.
+				component.setHandlers(
+					data => {
+						try {
+							session.write(data);
+						} catch {
+							// ignore writes after the command exits
+						}
+					},
+					() => {},
+					() => {},
+				);
+				observer = component;
+				return component;
+			},
+			{ overlay: true },
+			),
+		]);
+		return overlayResult;
+	} catch (error) {
+		// Overlay creation or view init failed. The process is already running and
+		// owned here, so surface the failure without orphaning it: the run keeps
+		// writing to the sink and settles the foreground on its own.
+		logger.warn("Interactive PTY overlay unavailable; continuing without the view", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		observer = undefined;
+		settleForeground = undefined;
+		return await foreground.promise;
+	}
 }
