@@ -4716,12 +4716,33 @@ pub(crate) mod platform {
 			return Err("identity_mismatch");
 		}
 		if unsafe { libc::renameat(parent_fd, private_name.as_ptr(), parent_fd, final_name.as_ptr()) }
-			== 0
+			!= 0
 		{
-			Ok(())
-		} else {
-			Err(skill_write_error(&std::io::Error::last_os_error()))
+			return Err(skill_write_error(&std::io::Error::last_os_error()));
 		}
+		let mut published: libc::stat = unsafe { std::mem::zeroed() };
+		let valid = unsafe { libc::fstat(private_fd, &mut opened) } == 0
+			&& unsafe {
+				libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
+			} == 0
+			&& opened.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& opened.st_nlink == 1
+			&& published.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& published.st_nlink == 1
+			&& opened.st_dev == published.st_dev
+			&& opened.st_ino == published.st_ino;
+		if valid {
+			return Ok(());
+		}
+		if unsafe {
+			libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
+		} == 0
+			&& opened.st_dev == published.st_dev
+			&& opened.st_ino == published.st_ino
+		{
+			unsafe { libc::unlinkat(parent_fd, final_name.as_ptr(), 0) };
+		}
+		Err("identity_mismatch")
 	}
 
 	#[expect(
