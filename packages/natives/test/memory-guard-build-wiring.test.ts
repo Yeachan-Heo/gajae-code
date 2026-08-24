@@ -28,8 +28,8 @@ describe("memory-guard native build wiring", () => {
 		expect(missingRequiredAddonExports({ nativeBuildInfo: () => ({}), probeWindowsJobMemory: () => ({}) })).toEqual([
 			"currentExecutablePath",
 		]);
-		expect(() => assertRequiredSymbols("export function probeWindowsJobMemory(): unknown;", ["currentExecutablePath"])).toThrow(
-			"currentExecutablePath",
-		);
+		expect(() =>
+			assertRequiredSymbols("export function probeWindowsJobMemory(): unknown;", ["currentExecutablePath"]),
+		).toThrow("currentExecutablePath");
 	});
 });
