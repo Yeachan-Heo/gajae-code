@@ -1053,8 +1053,6 @@ export async function reapDeadLifecycleMarkers(
 				continue;
 			}
 		}
-		const parent = lifecycleParentIdentity(directory);
-		if (!parent) continue;
 		try {
 			const currentPrimary = captureLifecycleFile(markerPath, true, true)?.identity;
 			const currentReady = ready ? captureLifecycleFile(readyPath, true, true)?.identity : undefined;
@@ -1074,21 +1072,17 @@ export async function reapDeadLifecycleMarkers(
 				continue;
 			if (
 				ready &&
-				!exactUnlinkLifecycleFile(
-					readyPath,
-					ready.identity,
-					path.join(directory, `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`),
-					{ dev: BigInt(parent.dev), ino: BigInt(parent.ino) },
-				).ok
+				!nativeLifecycle().exactUnlinkDirect(readyPath, {
+					...ready.identity,
+					quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
+				}).ok
 			)
 				continue;
 			if (
-				!exactUnlinkLifecycleFile(
-					markerPath,
-					primary.identity,
-					path.join(directory, `.gjc-reap-${randomUUID()}-${name}`),
-					{ dev: BigInt(parent.dev), ino: BigInt(parent.ino) },
-				).ok
+				!nativeLifecycle().exactUnlinkDirect(markerPath, {
+					...primary.identity,
+					quarantineName: `.gjc-reap-${randomUUID()}-${name}`,
+				}).ok
 			)
 				continue;
 		} catch {
@@ -4134,11 +4128,12 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
-			const spawnOutcome = Promise.withResolvers<void>();
-			spawned.once("error", error => spawnOutcome.reject(error));
-			spawned.once("spawn", () => spawnOutcome.resolve());
-			await spawnOutcome.promise;
+			let childSpawnError: Error | undefined;
+			spawned.once("error", error => {
+				childSpawnError = error;
+			});
 			const pid = spawned.pid;
+			if (childSpawnError) throw childSpawnError;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
 			if (!incarnation) throw new Error("spawned session has no readable OS incarnation");

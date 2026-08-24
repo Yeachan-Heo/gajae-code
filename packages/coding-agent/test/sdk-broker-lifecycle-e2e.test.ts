@@ -2469,6 +2469,33 @@ test("reaps only lifecycle markers whose exact owner is proven dead", async () =
 	}
 });
 
+test("does not follow lifecycle sdk symlinks or partially reap an unsafe ready sibling", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-safety-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const redirectedSdk = path.join(root, "redirected-sdk");
+	const dead = { pid: 999_999_999, effectMarker: "dead", incarnation: "linux:1" };
+	try {
+		await fs.mkdir(redirectedSdk, { recursive: true });
+		await fs.mkdir(stateRoot, { recursive: true });
+		await fs.symlink(redirectedSdk, path.join(stateRoot, "sdk"));
+		await Bun.write(path.join(redirectedSdk, "redirected.lifecycle.json"), JSON.stringify(dead));
+		expect(await reapDeadLifecycleMarkers(stateRoot)).toBe(0);
+		await expect(Bun.file(path.join(redirectedSdk, "redirected.lifecycle.json")).exists()).resolves.toBe(true);
+
+		await fs.rm(path.join(stateRoot, "sdk"));
+		await fs.mkdir(path.join(stateRoot, "sdk"));
+		const markerPath = path.join(stateRoot, "sdk", "unsafe-ready.lifecycle.json");
+		await Bun.write(markerPath, JSON.stringify(dead));
+		await Bun.write(path.join(stateRoot, "sdk", "unsafe-ready.lifecycle.ready.json"), "unsafe ready sibling");
+		const expiredAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		await fs.utimes(markerPath, expiredAt, expiredAt);
+		expect(await reapDeadLifecycleMarkers(stateRoot)).toBe(0);
+		await expect(Bun.file(markerPath).exists()).resolves.toBe(true);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("retains the concrete spawn failure when cleanup proof is unavailable", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-spawn-failure-cause-"));
 	const agentDir = path.join(root, "agent");
