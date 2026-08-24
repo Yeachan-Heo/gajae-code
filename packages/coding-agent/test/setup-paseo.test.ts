@@ -889,6 +889,54 @@ describe("skills bridge", () => {
 		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
 	});
 
+	test("source-relocation adoption refuses a replaced matching-target symlink (#4644 Codex P2)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		const name = "paseo";
+		const oldSource = await fs.realpath(fixture.paths.agentsSkillsDir as string);
+		const relocatedSource = path.join(fixture.root, "relocated-skills");
+		await fs.mkdir(path.join(relocatedSource, name), { recursive: true });
+		await fs.writeFile(path.join(relocatedSource, name, "SKILL.md"), `# ${name}\n`);
+
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		const bridgeName = path.join(fixture.paths.bridgeDir, name);
+		const oldTarget = path.join(oldSource, name);
+		await fs.symlink(oldTarget, bridgeName);
+		const original = await fs.lstat(bridgeName, { bigint: true });
+		const recordedIdentity = {
+			dev: original.dev.toString(),
+			ino: original.ino.toString(),
+			size: original.size.toString(),
+			mtimeNs: original.mtimeNs.toString(),
+		};
+		// Atomically replace the original link with a user-created link carrying
+		// the same old-source target text but a different no-follow identity.
+		const replacement = `${bridgeName}.replacement`;
+		await fs.symlink(oldTarget, replacement);
+		await fs.rename(replacement, bridgeName);
+
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeSourceDir: oldSource,
+			bridgeEntries: [name],
+			bridgeEntryIdentities: { [name]: recordedIdentity },
+			bridgeDirCreated: false,
+		});
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => ({ dir: relocatedSource, origin: "app-bundle" }),
+		};
+
+		await expect(preflightSkillsBridge(deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
+	});
+
 	test("a corrupt provenance ledger is an explicit error, never an empty one (#4644 review r3)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
@@ -977,12 +1025,23 @@ describe("skills bridge", () => {
 		}
 		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
 		const originalLinkTexts: Record<string, string> = {};
+		const legacyIdentities: Record<
+			string,
+			{ readonly dev: string; readonly ino: string; readonly size: string; readonly mtimeNs: string }
+		> = {};
 		for (const name of SKILL_NAMES) {
 			const bridgeName = path.join(fixture.paths.bridgeDir, name);
 			const legacyTarget = path.join(legacySource, name);
 			const original = path.relative(path.dirname(bridgeName), legacyTarget);
 			originalLinkTexts[name] = original;
 			await fs.symlink(original, bridgeName);
+			const stat = await fs.lstat(bridgeName, { bigint: true });
+			legacyIdentities[name] = {
+				dev: stat.dev.toString(),
+				ino: stat.ino.toString(),
+				size: stat.size.toString(),
+				mtimeNs: stat.mtimeNs.toString(),
+			};
 		}
 		await writeProvenance(fixture.paths.provenanceLedger, {
 			version: 1,
@@ -990,6 +1049,7 @@ describe("skills bridge", () => {
 			seededOrchestrationKeys: {},
 			bridgePath: fixture.paths.bridgeDir,
 			bridgeEntries: [...SKILL_NAMES],
+			bridgeEntryIdentities: legacyIdentities,
 			bridgeDirCreated: false,
 		});
 		const before = await readProvenance(fixture.paths.provenanceLedger);

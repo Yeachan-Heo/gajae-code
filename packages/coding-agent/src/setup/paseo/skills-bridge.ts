@@ -447,6 +447,10 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 				conflicts.push(destination);
 				continue;
 			}
+			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], legacyState.identity)) {
+				conflicts.push(destination);
+				continue;
+			}
 			adopts.push({
 				name,
 				linkPath: destination,
