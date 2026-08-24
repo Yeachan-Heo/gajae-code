@@ -16,12 +16,47 @@ import type { AsyncJob, AsyncJobManager } from "../async";
 import { deleteCronJobById, listCronSnapshots, onCronChange } from "../tools/cron";
 
 export type JobsWorstState = "none" | "running" | "failed";
+export type JobDeliveryState = "pending" | "delivered" | "failed-visible";
+
+/** The manager-owned, one-pass job projection consumed by this observer. */
+export interface AsyncJobSnapshotEntry {
+	id: string;
+	kind: string;
+	label: string;
+	status: AsyncJob["status"];
+	generation: string;
+	backgrounded: boolean;
+	deliveryState: JobDeliveryState;
+}
+
+/** Scalar delivery failure evidence that may outlive the AsyncJob record. */
+export interface DeadLetteredJobSnapshotEntry {
+	jobId: string;
+	generation: string;
+	ownerId?: string;
+	attempt: number;
+	lastError?: string;
+	recordedAt: number;
+}
+
+export interface AsyncJobsSnapshot {
+	jobs: AsyncJobSnapshotEntry[];
+	deadLettered: DeadLetteredJobSnapshotEntry[];
+}
 
 export interface MonitorJobView {
 	id: string;
 	label: string;
 	status: AsyncJob["status"];
 	startTime: number;
+	generation?: string;
+	backgrounded?: boolean;
+	deliveryState?: JobDeliveryState;
+}
+
+export interface FoldedJobView extends AsyncJobSnapshotEntry {
+	/** Safe diagnostic retained for a dead-lettered delivery, when available. */
+	errorText?: string;
 }
 
 export interface CronJobView {
@@ -39,6 +74,10 @@ export interface CronJobView {
 export interface JobsSnapshot {
 	monitors: MonitorJobView[];
 	crons: CronJobView[];
+	/** Backgrounded work and undeliverable terminal work that must stay visible. */
+	foldedJobs?: FoldedJobView[];
+	/** Scalar dead-letter evidence retained for diagnostics and red-drill-in. */
+	deadLettered?: DeadLetteredJobSnapshotEntry[];
 	activeMonitorCount: number;
 	activeCronCount: number;
 	worstState: JobsWorstState;
@@ -48,11 +87,21 @@ export interface JobsSnapshot {
 export const EMPTY_JOBS_SNAPSHOT: JobsSnapshot = {
 	monitors: [],
 	crons: [],
+	foldedJobs: [],
+	deadLettered: [],
 	activeMonitorCount: 0,
 	activeCronCount: 0,
 	worstState: "none",
 	failedUnacknowledged: false,
 };
+
+function jobKey(id: string, generation: string): string {
+	return `${id}\u0000${generation}`;
+}
+
+interface AsyncJobSnapshotSource {
+	getJobsSnapshot?: (filter?: { ownerId?: string }) => AsyncJobsSnapshot;
+}
 
 export class JobsObserver {
 	readonly #manager: AsyncJobManager;
@@ -103,7 +152,14 @@ export class JobsObserver {
 		}
 	}
 
+	#readAsyncJobsSnapshot(): AsyncJobsSnapshot {
+		const source = this.#manager as AsyncJobSnapshotSource;
+		if (typeof source.getJobsSnapshot !== "function") return { jobs: [], deadLettered: [] };
+		return source.getJobsSnapshot(this.#ownerId ? { ownerId: this.#ownerId } : undefined);
+	}
+
 	#listMonitorJobs(): AsyncJob[] {
+		if (typeof this.#manager.getAllJobs !== "function") return [];
 		const filter = this.#ownerId ? { ownerId: this.#ownerId } : undefined;
 		return this.#manager.getAllJobs(filter).filter(job => job.type === "bash" && job.metadata?.monitor === true);
 	}
@@ -114,25 +170,76 @@ export class JobsObserver {
 	 * snapshot (never scans the manager/cron stores).
 	 */
 	#recompute(): void {
+		const asyncSnapshot = this.#readAsyncJobsSnapshot();
+		const snapshotEntries = new Map<string, AsyncJobSnapshotEntry>();
+		for (const entry of asyncSnapshot.jobs) snapshotEntries.set(jobKey(entry.id, entry.generation), entry);
+
 		const monitorJobs = this.#listMonitorJobs();
-		const presentIds = new Set(monitorJobs.map(job => job.id));
-		// Prune acknowledged ids whose jobs have been evicted.
-		for (const id of this.#acknowledgedFailedIds) {
-			if (!presentIds.has(id)) this.#acknowledgedFailedIds.delete(id);
+		const presentKeys = new Set<string>([
+			...asyncSnapshot.jobs.map(entry => jobKey(entry.id, entry.generation)),
+			...asyncSnapshot.deadLettered.map(entry => jobKey(entry.jobId, entry.generation)),
+		]);
+		// Prune acknowledged keys whose jobs and scalar dead letters have been evicted.
+		for (const key of this.#acknowledgedFailedIds) {
+			if (!presentKeys.has(key)) this.#acknowledgedFailedIds.delete(key);
 		}
-		// Sticky failure latch: set when an unacknowledged failed monitor is seen
-		// (including at construction); stays set even after the failed job evicts,
-		// until acknowledgeFailures() clears it.
-		const hasUnacknowledgedFailure = monitorJobs.some(
-			job => job.status === "failed" && !this.#acknowledgedFailedIds.has(job.id),
-		);
+
+		// Sticky failure latch: the manager's terminal status and delivery
+		// classification are authoritative; neither is reconstructed from getters.
+		const hasUnacknowledgedFailure =
+			asyncSnapshot.jobs.some(
+				entry =>
+					(entry.status === "failed" || entry.deliveryState === "failed-visible") &&
+					!this.#acknowledgedFailedIds.has(jobKey(entry.id, entry.generation)),
+			) ||
+			asyncSnapshot.deadLettered.some(
+				entry => !this.#acknowledgedFailedIds.has(jobKey(entry.jobId, entry.generation)),
+			);
 		if (hasUnacknowledgedFailure) this.#failedUnacknowledged = true;
 
-		const activeMonitors = monitorJobs.filter(job => job.status === "running");
-		const cronSnapshots = listCronSnapshots(this.#ownerId);
 		const monitors: MonitorJobView[] = monitorJobs
-			.map(job => ({ id: job.id, label: job.label, status: job.status, startTime: job.startTime }))
+			.flatMap(job => {
+				const entry = snapshotEntries.get(jobKey(job.id, job.generation));
+				if (!entry) return [];
+				return [
+					{
+						id: entry.id,
+						label: entry.label,
+						status: entry.status,
+						startTime: job.startTime,
+						generation: entry.generation,
+						backgrounded: entry.backgrounded,
+						deliveryState: entry.deliveryState,
+					},
+				];
+			})
 			.sort((a, b) => b.startTime - a.startTime);
+
+		// Keep every backgrounded job visible. A non-delivered terminal entry is
+		// also retained here so pending/failed delivery can never disappear merely
+		// because it was not marked backgrounded by its producer.
+		const foldedJobs: FoldedJobView[] = asyncSnapshot.jobs
+			.filter(entry => entry.backgrounded || entry.status === "failed" || entry.deliveryState !== "delivered")
+			.map(entry => ({ ...entry }));
+		const foldedKeys = new Set(foldedJobs.map(entry => jobKey(entry.id, entry.generation)));
+		for (const entry of asyncSnapshot.deadLettered) {
+			const key = jobKey(entry.jobId, entry.generation);
+			if (foldedKeys.has(key)) continue;
+			foldedKeys.add(key);
+			foldedJobs.push({
+				id: entry.jobId,
+				kind: "dead-letter",
+				label: entry.jobId,
+				status: "failed",
+				generation: entry.generation,
+				backgrounded: true,
+				deliveryState: "failed-visible",
+				errorText: entry.lastError,
+			});
+		}
+
+		const activeMonitors = monitors.filter(monitor => monitor.status === "running");
+		const cronSnapshots = listCronSnapshots(this.#ownerId);
 		const crons: CronJobView[] = cronSnapshots
 			.map(snapshot => ({
 				id: snapshot.id,
@@ -145,14 +252,17 @@ export class JobsObserver {
 				firing: snapshot.firing,
 			}))
 			.sort((a, b) => b.createdAt - a.createdAt);
+		const hasRunningFoldedJob = foldedJobs.some(job => job.status === "running");
 		const worstState: JobsWorstState = this.#failedUnacknowledged
 			? "failed"
-			: activeMonitors.length > 0 || crons.length > 0
+			: activeMonitors.length > 0 || crons.length > 0 || hasRunningFoldedJob
 				? "running"
 				: "none";
 		this.#snapshot = {
 			monitors,
 			crons,
+			foldedJobs,
+			deadLettered: asyncSnapshot.deadLettered.map(entry => ({ ...entry })),
 			activeMonitorCount: activeMonitors.length,
 			activeCronCount: crons.length,
 			worstState,
@@ -167,8 +277,14 @@ export class JobsObserver {
 
 	/** Clear the failure latch (called when the user opens the jobs overlay). */
 	acknowledgeFailures(): void {
-		for (const job of this.#listMonitorJobs()) {
-			if (job.status === "failed") this.#acknowledgedFailedIds.add(job.id);
+		const asyncSnapshot = this.#readAsyncJobsSnapshot();
+		for (const entry of asyncSnapshot.jobs) {
+			if (entry.status === "failed" || entry.deliveryState === "failed-visible") {
+				this.#acknowledgedFailedIds.add(jobKey(entry.id, entry.generation));
+			}
+		}
+		for (const entry of asyncSnapshot.deadLettered) {
+			this.#acknowledgedFailedIds.add(jobKey(entry.jobId, entry.generation));
 		}
 		if (!this.#failedUnacknowledged) return;
 		this.#failedUnacknowledged = false;
