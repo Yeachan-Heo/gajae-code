@@ -21,7 +21,7 @@ import { getTrustedHomeDir } from "@gajae-code/utils";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
 import type { RawSettings, Settings } from "../../config/settings";
 import type { SettingPath } from "../../config/settings-schema";
-import { type BridgeEntryIdentity, readProvenance } from "./paseo-ownership";
+import { type BridgeEntryIdentity, type ProvenanceLedger, readProvenance } from "./paseo-ownership";
 import type { DriftReason } from "./result-types";
 import {
 	PASEO_SKILL_PREFIX,
@@ -34,7 +34,7 @@ import {
  * Resolve the skills source through the injectable seam, so tests never touch a
  * real `~/.agents/skills` or app bundle.
  */
-function resolveSource(deps: PaseoSetupDependencies): Promise<PaseoSkillSource | undefined> {
+export function resolveSkillsBridgeSource(deps: PaseoSetupDependencies): Promise<PaseoSkillSource | undefined> {
 	// Migration-safe default (#4644 reviews r13/r17): an omitted resolver uses
 	// the real discovery order — and honors a caller-supplied
 	// `paths.agentsSkillsDir` exactly as the pre-#4638 seam did when discovery
@@ -84,6 +84,58 @@ function matchesRecordedIdentity(recorded: BridgeEntryIdentity | undefined, obse
 		recorded.size === observed.size.toString() &&
 		recorded.mtimeNs === observed.mtimeNs.toString()
 	);
+}
+
+/**
+ * Validate recorded links at an old bridge path before a migration can move
+ * ownership to the current path. A destination-path change must not make an
+ * identityless old link disappear from the migration decision: the old link
+ * is still destructive cleanup authority, so its durable identity is required
+ * even when the new bridge has no matching entry.
+ */
+async function assertRecordedMigrationIdentities(
+	deps: PaseoSetupDependencies,
+	ledger: ProvenanceLedger,
+): Promise<void> {
+	const recordedBridgeDir = ledger.bridgePath;
+	if (
+		recordedBridgeDir === undefined ||
+		path.resolve(recordedBridgeDir) === path.resolve(deps.paths.bridgeDir) ||
+		(ledger.bridgeEntries?.length ?? 0) === 0
+	)
+		return;
+	if (!path.isAbsolute(recordedBridgeDir) || path.resolve(recordedBridgeDir) !== recordedBridgeDir) {
+		throw new SkillsBridgeError(
+			`Refusing to migrate Paseo skills bridge: ledger-recorded path is not absolute (${recordedBridgeDir})`,
+		);
+	}
+	for (const name of ledger.bridgeEntries ?? []) {
+		if (path.basename(name) !== name || name.includes("/") || name.includes("\\") || name === "." || name === "..") {
+			throw new SkillsBridgeError(`Refusing to migrate an unsafe Paseo skill bridge entry name: ${name}`);
+		}
+		const destination = path.join(recordedBridgeDir, name);
+		const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw new SkillsBridgeError(`Cannot inspect old Paseo skill bridge entry: ${destination}`);
+		});
+		if (stat === undefined) continue;
+		if (!stat.isSymbolicLink()) {
+			throw new SkillsBridgeError(`Refusing to migrate a non-symlink old Paseo skill bridge entry: ${destination}`);
+		}
+		const link = await fs.readlink(destination);
+		const expected = path.resolve(ledger.bridgeSourceDir ?? legacySourceDirFor(deps), name);
+		if (resolvedLinkTarget(link, destination) !== expected) {
+			throw new SkillsBridgeError(
+				`Refusing to migrate an old Paseo skill bridge entry with a foreign target: ${destination}`,
+			);
+		}
+		const observed = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
+		if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], observed)) {
+			throw new SkillsBridgeError(
+				`Refusing to migrate an old Paseo skill bridge entry without a durable recorded identity: ${destination}`,
+			);
+		}
+	}
 }
 
 type BridgeEntryPlan = {
@@ -364,7 +416,7 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	const entries: Record<string, BridgeEntryPlan> = {};
 	const prunes: BridgePrunePlan[] = [];
 	const adopts: BridgeAdoptPlan[] = [];
-	const source = await resolveSource(deps);
+	const source = await resolveSkillsBridgeSource(deps);
 	const ledger = await readProvenance(deps.paths.provenanceLedger);
 	const recordedEntries = new Set(ledger.bridgeEntries ?? []);
 	// The recorded source decides ownership everywhere in this preflight: a name
@@ -374,6 +426,7 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	const ledgerSourceDir = ledger.bridgeSourceDir;
 	const legacySourceDir = legacySourceDirFor(deps);
 	const ownershipSourceDir = ledgerSourceDir ?? legacySourceDir;
+	if (source !== undefined) await assertRecordedMigrationIdentities(deps, ledger);
 	if (source === undefined) {
 		// No source directory anywhere: the bridge is skipped entirely. Creating
 		// links into a directory that does not exist is worse than not bridging.
@@ -460,6 +513,18 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 				linkIdentity: legacyState.identity,
 			});
 			continue;
+		}
+		const recordedAtCurrentBridge =
+			recordedEntries.has(name) &&
+			(ledger.bridgePath === undefined || path.resolve(ledger.bridgePath) === path.resolve(deps.paths.bridgeDir));
+		if (state.kind === "expected" && recordedAtCurrentBridge) {
+			// A same-target noop is ownership-preserving only when the live
+			// symlink is the exact object GJC recorded. Matching link text alone
+			// cannot distinguish that link from a user-created replacement.
+			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], state.identity)) {
+				conflicts.push(destination);
+				continue;
+			}
 		}
 		entries[name] = {
 			name,
@@ -914,7 +979,7 @@ export async function scanSkillsBridgeDrift(
 	// comparing expected targets against the resolver's lexical spelling would
 	// report a perfectly valid bridge as foreign drift. A source that cannot
 	// be resolved anymore keeps its lexical form for the structural checks.
-	const resolvedSource = await resolveSource(deps);
+	const resolvedSource = await resolveSkillsBridgeSource(deps);
 	const source =
 		resolvedSource !== undefined
 			? {

@@ -492,6 +492,13 @@ describe("four-state check (AC-16, AC-17, AC-18)", () => {
 		expect(result.reasons).toContainEqual(expect.objectContaining({ code: "missing-skills-directory" }));
 	});
 
+	test("check uses the custom agents skills path when skillsSource is omitted (#4644 Codex P2)", async () => {
+		const fixture = await cleanL1(lsOk("gjc"));
+		const result = await checkPaseoSetup({ ...fixture.deps, skillsSource: undefined });
+		expect(result.status).toBe("pass");
+		expect(result.status).not.toBe("drift");
+	});
+
 	test("clean L1 plus a daemon omitting the provider is stale with guidance", async () => {
 		const fixture = await cleanL1(lsOk("claude"));
 		const result = await checkPaseoSetup(fixture.deps);
@@ -830,6 +837,26 @@ describe("skills bridge", () => {
 		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
 	});
 
+	test("a recorded same-target link with a replaced identity refuses convergence (#4644 Codex P2)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await installWithLedger(fixture.deps);
+		const name = "paseo";
+		const bridgeName = path.join(fixture.paths.bridgeDir, name);
+		const target = path.join(fixture.paths.agentsSkillsDir as string, name);
+		// Replace the recorded symlink atomically with a user-created link that
+		// carries the same target text but a different no-follow identity.
+		const replacement = `${bridgeName}.replacement`;
+		await fs.symlink(target, replacement);
+		await fs.rename(replacement, bridgeName);
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+
+		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
+	});
+
 	test("a prewritten bridge plan never adopts a user-created exact-target link (#4644 Codex P2)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
@@ -852,14 +879,13 @@ describe("skills bridge", () => {
 			path.join(fixture.paths.bridgeDir, "paseo"),
 		);
 
-		const retried = await runPaseoSetup({}, fixture.deps);
-		expect(retried.kind).toBe("install");
-		const after = await readProvenance(fixture.paths.provenanceLedger);
-		expect(after.bridgeEntryIdentities?.paseo).toBeUndefined();
-
-		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
-		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
-		expect(remove.result.outcome).toBe("partial-removal");
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+		await expect(runPaseoSetup({}, fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		// The matching target does not authorize the identityless user link, and
+		// preflight refuses before the saga can mutate anything.
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
 		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
 	});
 
@@ -1451,10 +1477,7 @@ describe("skills bridge", () => {
 			paths: { ...fixture.deps.paths, bridgeDir: newBridge },
 		};
 
-		const install = await runPaseoSetup({}, migratedDeps);
-		expect(install.kind).toBe("install");
-		if (install.kind !== "install") throw new Error("expected an install outcome");
-		expect(install.result.outcome).toBe("partial-install");
+		await expect(runPaseoSetup({}, migratedDeps)).rejects.toThrow(/unsafe Paseo skill bridge entry name/);
 		// The old directory's real links are untouched by the refusal.
 		for (const name of ["paseo", "paseo-advisor"]) {
 			await expect(fs.lstat(path.join(fixture.paths.bridgeDir, name))).resolves.toBeDefined();
@@ -2786,15 +2809,16 @@ describe("skills bridge", () => {
 		const newBridge = path.join(path.dirname(oldDir), "identityless-migrated-paseo-skills");
 		const migratedDeps: PaseoSetupDependencies = {
 			...fixture.deps,
-			paths: { ...fixture.deps.paths, bridgeDir: newBridge },
+			paths: { ...fixture.paths, bridgeDir: newBridge },
 		};
 
-		const install = await runPaseoSetup({}, migratedDeps);
-		expect(install.kind).toBe("install");
-		if (install.kind !== "install") throw new Error("expected an install outcome");
-		expect(install.result.outcome).toBe("partial-install");
-		if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
-		expect(install.result.evidence.detail).toContain("without a durable recorded identity");
+		const before = await snapshotTree(oldDir);
+		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+		await expect(runPaseoSetup({}, migratedDeps)).rejects.toThrow(/without a durable recorded identity/);
+		// The identityless user link cannot authenticate migration cleanup, so
+		// setup refuses before changing either bridge path or its ledger.
+		expect(await snapshotTree(oldDir)).toBe(before);
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
 		expect(await fs.readlink(path.join(oldDir, name))).toBe(path.join(sourceDir, name));
 		await expect(fs.stat(newBridge)).rejects.toMatchObject({ code: "ENOENT" });
 	});

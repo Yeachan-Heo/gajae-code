@@ -24,8 +24,8 @@ import { createOrchestrationSeed } from "./orchestration-preferences";
 import { readIntent, readProvenance } from "./paseo-ownership";
 import { buildProviderEntry, hasProviderConflict, providerKeyFor, resolveGjcCommand } from "./provider-config";
 import type { DriftReason, SetupCheckResult } from "./result-types";
-import { type PaseoSetupDependencies, resolvePaseoSkillsSource } from "./setup-deps";
-import { scanSkillsBridgeDrift } from "./skills-bridge";
+import type { PaseoSetupDependencies } from "./setup-deps";
+import { resolveSkillsBridgeSource, scanSkillsBridgeDrift } from "./skills-bridge";
 
 const PROBE_TIMEOUT_MS = 5_000;
 
@@ -148,10 +148,10 @@ async function collectL1(deps: PaseoSetupDependencies, options: CheckOptions): P
 		}
 	}
 
-	// An injected resolver is authoritative, including when it deliberately
-	// reports no source. Falling back after an injected `undefined` leaks this
-	// hermetic check into the caller's real home/app filesystem.
-	const source = deps.skillsSource === undefined ? await resolvePaseoSkillsSource() : await deps.skillsSource();
+	// Keep check mode on the exact same source resolver as bridge install and
+	// drift scanning, including the legacy custom `paths.agentsSkillsDir`
+	// fallback when callers omit `skillsSource`.
+	const source = await resolveSkillsBridgeSource(deps);
 	if (source === undefined) {
 		reasons.push({
 			code: "missing-skills-directory",
