@@ -234,6 +234,9 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
 async function ownerStartTime(pid: number, deadline: number): Promise<string> {
 	const linuxStartTime = readLinuxProcStartTimeSync(pid);
 	if (linuxStartTime !== null) return linuxStartTime;
+	// Windows has no portable `ps` utility. An unavailable incarnation timestamp is
+	// deliberately recorded as unknown, which liveness recovery treats as indeterminate.
+	if (process.platform === "win32") return "unknown";
 	const remaining = deadline - performance.now();
 	if (remaining <= 0) throw new SessionStateLockUnavailableError();
 	const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
@@ -651,11 +654,21 @@ function ownerCreateFlags(): number | undefined {
 }
 
 async function newLockOwner(deadline: number): Promise<SessionStateLockOwner> {
+	const hostIdPromise = currentOwnerHostId();
+	let ownerHostId: string;
+	try {
+		ownerHostId = await withinLockAcquireDeadline(deadline, () => hostIdPromise);
+	} catch (error) {
+		// The caller gave up on this generation. Retaining its pending promise would
+		// make every later acquisition inherit the same expired deadline.
+		ownerHostIdPromise = undefined;
+		throw error;
+	}
 	return {
 		pid: process.pid,
 		start_time: await ownerStartTime(process.pid, deadline),
 		token: randomUUID(),
-		owner_host_id: await currentOwnerHostId(),
+		owner_host_id: ownerHostId,
 	};
 }
 
@@ -1019,7 +1032,12 @@ async function withLockPathTransition<T>(
 	const owner = await withinLockAcquireDeadline(deadline, () => newLockOwner(deadline));
 	for (;;) {
 		try {
-			await withinLockAcquireDeadline(deadline, () => fs.mkdir(transitionDir));
+			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
+			await fs.mkdir(transitionDir);
+			if (performance.now() >= deadline) {
+				await fs.rmdir(transitionDir).catch(() => undefined);
+				throw new SessionStateLockUnavailableError();
+			}
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
