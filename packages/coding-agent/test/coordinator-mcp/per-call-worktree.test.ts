@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
-import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
 import { coordinatorFixtureRoot } from "../helpers/coordinator-session-fixture";
 
@@ -21,19 +21,21 @@ type BrokerCall = { operation: string; input: Record<string, unknown> };
  */
 async function createServer(root: string, sessionCommand: string | null, requireWorktree = false) {
 	const agentDir = path.join(root, "agent-global");
-	await writeBrokerDiscovery(agentDir, {
+	const discovery: BrokerDiscovery = {
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
 		ownerId: "test",
 		pid: process.pid,
+		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
 		port: 1,
 		url: "ws://sdk.example.test",
 		token: "test-token",
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
-	});
+	};
+	await writeBrokerDiscovery(agentDir, discovery);
 	const calls: BrokerCall[] = [];
 	const server = createCoordinatorMcpServer({
 		env: {
@@ -47,6 +49,10 @@ async function createServer(root: string, sessionCommand: string | null, require
 		},
 		services: {
 			getAgentDir: () => agentDir,
+			// Pin both discovery seams to the fixture so ambient broker startup and
+			// package-generation authority cannot change the lifecycle assertions.
+			ensureBroker: async () => discovery,
+			readSdkBrokerDiscovery: async () => discovery,
 			connectBroker: async () =>
 				({
 					global: async (operation: string, input: Record<string, unknown>) => {

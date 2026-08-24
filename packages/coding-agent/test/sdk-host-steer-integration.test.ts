@@ -78,7 +78,13 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 		on: (event: string, handler: (event: unknown, context: ExtensionContext) => unknown) =>
 			handlers.set(event, handler),
 		registerCommand: () => {},
-		sendUserMessage: async () => {
+		sendUserMessage: async (
+			_content: unknown,
+			options?: {
+				onPreflightAccepted?: () => void;
+				onPreflightAcceptCommit?: () => void | Promise<void>;
+			},
+		) => {
 			dispatches++;
 			persistedAtDispatch = await fs.readFile(
 				path.join(
@@ -88,6 +94,8 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 				),
 				"utf8",
 			);
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			else options?.onPreflightAccepted?.();
 		},
 	} as unknown as ExtensionAPI;
 	createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: () => transport });
