@@ -118,9 +118,7 @@ function managedReplacementFailure(value: unknown): Error {
 			? (value as { code: string }).code
 			: undefined;
 	const cause = new Error(rawCode ?? outcome.code ?? "managed_replace_failed");
-	return outcome.mutationState === "not_committed"
-		? cause
-		: new ManagedCommittedMutationError("replace", cause);
+	return outcome.mutationState === "not_committed" ? cause : new ManagedCommittedMutationError("replace", cause);
 }
 
 function managedAppendFailure(code: string | undefined): Error {

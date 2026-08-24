@@ -261,9 +261,9 @@ export function classifyNativePublishOutcome(
 	const retainedPrimitiveValid =
 		operation === "retained_file"
 			? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "linkat_noreplace"
-		: operation === "retained_tree"
-			? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace"
-			: outcome.primitive === "renameat2_exchange" || outcome.primitive === "linkat_exchange";
+			: operation === "retained_tree"
+				? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace"
+				: outcome.primitive === "renameat2_exchange" || outcome.primitive === "linkat_exchange";
 	if (
 		!retainedPrimitiveValid ||
 		(outcome.ok && (!outcome.identity || outcome.durabilityState !== "proven" || outcome.phase !== "complete"))
