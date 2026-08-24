@@ -7002,6 +7002,24 @@ mod platform {
 		{
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
+		if !identity.directory && !identity.detach_only {
+			if let Some((expected_parent_dev, expected_parent_ino)) =
+				identity.parent_dev.zip(identity.parent_ino)
+			{
+				let Some(parent_handle) = handle.parent() else {
+					return NativeExactUnlinkResult::failure("io_error");
+				};
+				let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+				if unsafe { GetFileInformationByHandle(parent_handle, &mut parent_information) } == 0
+					|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent_dev
+					|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+						| u64::from(parent_information.nFileIndexLow))
+						!= expected_parent_ino
+				{
+					return NativeExactUnlinkResult::failure("parent_mismatch");
+				}
+			}
+		}
 		if identity.directory || identity.detach_only {
 			let Some(quarantine_name) = identity.quarantine_name.as_deref() else {
 				return NativeExactUnlinkResult::failure("quarantine_destination_required");
