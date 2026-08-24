@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getTrustedHomeDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { parseSetupArgs } from "../src/cli/setup-cli";
 import { checkPaseoSetup, STALE_GUIDANCE } from "../src/setup/paseo/check";
 import {
@@ -89,7 +90,7 @@ const tempRoots: string[] = [];
 
 afterEach(async () => {
 	for (const root of tempRoots.splice(0)) {
-		await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
+		await safeRm(root, { recursive: true, force: true }).catch(() => undefined);
 	}
 });
 
@@ -645,7 +646,7 @@ describe("skills bridge", () => {
 		await installWithLedger(fixture.deps);
 
 		// Paseo 0.4.0: paseo-loop is gone, paseo-help is new.
-		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
 		await fs.mkdir(path.join(fixture.paths.agentsSkillsDir as string, "paseo-help"), { recursive: true });
 		await fs.writeFile(
 			path.join(fixture.paths.agentsSkillsDir as string, "paseo-help", "SKILL.md"),
@@ -668,7 +669,7 @@ describe("skills bridge", () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
 		await installWithLedger(fixture.deps);
-		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-committee"), { recursive: true });
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-committee"), { recursive: true });
 
 		const result = await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
 		expect(result.prunedEntries).toEqual(["paseo-committee"]);
@@ -702,9 +703,9 @@ describe("skills bridge", () => {
 		// Paseo release drops that name from the source. Setup must apply the
 		// same exact-target predicate remove does: the recorded NAME is not
 		// ownership once the link no longer points where the ledger recorded.
-		await fs.rm(path.join(fixture.paths.bridgeDir, "paseo-loop"));
+		await safeRm(path.join(fixture.paths.bridgeDir, "paseo-loop"));
 		await fs.symlink(path.join(fixture.root, "user-own-tree"), path.join(fixture.paths.bridgeDir, "paseo-loop"));
-		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
 		const before = await snapshotTree(fixture.paths.bridgeDir);
 
 		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
@@ -777,7 +778,7 @@ describe("skills bridge", () => {
 		// ledger is unchanged (the failed write rolls back to the old record).
 		await runPaseoSetup({}, fixture.deps);
 		const before = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
-		await fs.rm(fixture.paths.bridgeDir, { recursive: true });
+		await safeRm(fixture.paths.bridgeDir, { recursive: true });
 		const ledgerParent = path.dirname(fixture.paths.provenanceLedger);
 		await fs.chmod(ledgerParent, 0o555);
 		let outcome: Awaited<ReturnType<typeof runPaseoSetup>> | undefined;
@@ -844,7 +845,7 @@ describe("skills bridge", () => {
 		await seedConfig(fixture.paths);
 		await runPaseoSetup({}, fixture.deps);
 		// A Paseo release drops a skill; the next install prunes it.
-		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
 		const rerun = await runPaseoSetup({}, fixture.deps);
 		expect(rerun.kind).toBe("install");
 		// After the prune completes the name is no longer owned...
@@ -894,7 +895,7 @@ describe("skills bridge", () => {
 			},
 		};
 		// Occupy the bridge name so the replacement publish hits EEXIST.
-		await fs.rm(bridgeName);
+		await safeRm(bridgeName);
 		await Bun.write(bridgeName, "occupant\n");
 		const { adoptLegacyLink } = await import("../src/setup/paseo/skills-bridge");
 		await expect(adoptLegacyLink(plan, plan.legacySourceDir)).rejects.toThrow();
@@ -1325,7 +1326,7 @@ describe("skills bridge", () => {
 		const deps: PaseoSetupDependencies = {
 			...fixture.deps,
 			skillsSource: async () => {
-				await fs.rm(vanishable, { recursive: true, force: true });
+				await safeRm(vanishable, { recursive: true, force: true });
 				return { dir: vanishable, origin: "user" };
 			},
 		};
@@ -1340,7 +1341,7 @@ describe("skills bridge", () => {
 		await seedSkills(fixture.paths);
 		await seedConfig(fixture.paths);
 		const preflight = await preflightSkillsBridge(fixture.deps);
-		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
 
 		await expect(installSkillsBridge(preflight)).rejects.toBeInstanceOf(SkillsBridgePartialError);
 		await expect(fs.stat(path.join(fixture.paths.bridgeDir, "paseo-loop"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -1354,7 +1355,7 @@ describe("skills bridge", () => {
 
 		// Every skill disappears but the directory itself remains valid.
 		for (const name of SKILL_NAMES) {
-			await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
 		}
 		const converged = await runPaseoSetup({}, fixture.deps);
 		expect(converged.kind).toBe("install");
@@ -1420,7 +1421,7 @@ describe("skills bridge", () => {
 		// The private sidecar is lost (deleted, restored from a partial backup):
 		// removal must not fall back to deleting content it cannot restore.
 		const ledger = await readProvenance(fixture.paths.provenanceLedger);
-		await fs.rm(ledger.providerReplacedEntries?.gjc?.backupPath ?? "", { force: true });
+		await safeRm(ledger.providerReplacedEntries?.gjc?.backupPath ?? "", { force: true });
 
 		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
 		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
@@ -1651,7 +1652,7 @@ describe("skills bridge", () => {
 		const ref = await writeReplacedProviderBackup(fixture.paths.configJson, "gjc", { real: "value" });
 		// Swap the sidecar for a symlink at the same path: the read must fail
 		// closed (never follow), so restoration can never be redirected.
-		await fs.rm(ref.backupPath);
+		await safeRm(ref.backupPath);
 		await fs.symlink(real, ref.backupPath);
 		const read = await readReplacedProviderBackup(ref.backupPath, "gjc", ref.valueSha256);
 		expect(read).toEqual({ found: false });
@@ -1665,7 +1666,7 @@ describe("skills bridge", () => {
 		// The recorded link is retargeted at a deleted foreign path: dangling
 		// AND off-source at once. Before r9 both scan loops reported it.
 		const foreign = path.join(fixture.root, "gone", "paseo");
-		await fs.rm(path.join(fixture.paths.bridgeDir, "paseo"));
+		await safeRm(path.join(fixture.paths.bridgeDir, "paseo"));
 		await fs.symlink(foreign, path.join(fixture.paths.bridgeDir, "paseo"));
 		const check = await runPaseoSetup({ check: true }, fixture.deps);
 		if (check.kind !== "check") throw new Error("expected a check outcome");
@@ -1711,7 +1712,7 @@ describe("skills bridge", () => {
 				},
 				unpersist: async () => {
 					persisted = false;
-					await fs.rm(sidecarPath, { force: true });
+					await safeRm(sidecarPath, { force: true });
 				},
 				now: new Date("2026-01-01T00:00:00.000Z"),
 			}),
@@ -1869,7 +1870,7 @@ describe("skills bridge", () => {
 		// link through the quarantine path: the prune succeeds when the
 		// quarantined object keeps its identity (the normal case the inode
 		// guard must not break).
-		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
 		const result = await installSkillsBridge(await preflightSkillsBridge(fixture.deps));
 		expect(result.prunedEntries).toContain("paseo-loop");
 		await expect(fs.lstat(path.join(fixture.paths.bridgeDir, "paseo-loop"))).rejects.toMatchObject({
@@ -2073,7 +2074,7 @@ describe("skills bridge", () => {
 		const before = await snapshotTree(fixture.paths.bridgeDir);
 
 		// An app update replaces the skills directory with a file.
-		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true, force: true });
+		await safeRm(fixture.paths.agentsSkillsDir as string, { recursive: true, force: true });
 		await fs.writeFile(fixture.paths.agentsSkillsDir as string, "not a directory\n");
 		const deps: PaseoSetupDependencies = {
 			...fixture.deps,
@@ -2090,7 +2091,7 @@ describe("skills bridge", () => {
 		await seedConfig(fixture.paths);
 		await runPaseoSetup({}, fixture.deps);
 		for (const name of [...SKILL_NAMES]) {
-			await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
 		}
 		// First convergence: entries pruned, directory GJC-created and owned.
 		await runPaseoSetup({}, fixture.deps);
@@ -2117,7 +2118,7 @@ describe("skills bridge", () => {
 		// A Paseo release drops EVERY skill: convergence prunes the final entry
 		// and leaves `bridgeEntries: []` with `bridgeDirCreated: true`.
 		for (const name of [...SKILL_NAMES]) {
-			await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
 		}
 		const converged = await runPaseoSetup({}, fixture.deps);
 		expect(converged.kind).toBe("install");
@@ -2202,7 +2203,7 @@ describe("skills bridge", () => {
 		await seedSkills(fixture.paths);
 		await installWithLedger(fixture.deps);
 		// The user replaces a bridged name with their own regular file.
-		await fs.rm(path.join(fixture.paths.bridgeDir, "paseo"));
+		await safeRm(path.join(fixture.paths.bridgeDir, "paseo"));
 		await fs.writeFile(path.join(fixture.paths.bridgeDir, "paseo"), "user data\n");
 
 		const result = await removePaseoSetup(fixture.deps, { now: new Date() });
@@ -2427,7 +2428,7 @@ describe("skills bridge", () => {
 		// ~/.agents/skills that never existed, a desktop app now present, and a
 		// legacy ledger without bridgeSourceDir.
 		const fixture = await makeFixture(lsOk("gjc"));
-		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true });
+		await safeRm(fixture.paths.agentsSkillsDir as string, { recursive: true });
 		const legacySource = fixture.paths.agentsSkillsDir as string;
 		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
 		for (const name of ["paseo", "paseo-help"]) {
@@ -2651,7 +2652,7 @@ describe("desktop app install (#4638)", () => {
 	/** The reported machine: Paseo.app 0.4.0 ships paseo-help, not paseo-loop, and there is no ~/.agents/skills. */
 	async function appFixture(skillNames: readonly string[]): Promise<Fixture> {
 		const fixture = await makeFixture(lsOk("gjc"));
-		await fs.rm(fixture.paths.agentsSkillsDir as string, { recursive: true });
+		await safeRm(fixture.paths.agentsSkillsDir as string, { recursive: true });
 		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
 		for (const name of skillNames) {
 			await fs.mkdir(path.join(bundle, name), { recursive: true });
@@ -2710,7 +2711,7 @@ describe("desktop app install (#4638)", () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		const source = path.join(fixture.root, "paseo-skills-source");
 		await fs.mkdir(source, { recursive: true });
-		await fs.rm(source, { recursive: true });
+		await safeRm(source, { recursive: true });
 
 		await expect(sourceBridgeEntries(source)).rejects.toMatchObject({ code: "ENOENT" });
 
@@ -2723,7 +2724,7 @@ describe("desktop app install (#4638)", () => {
 		const fixture = await appFixture(SKILL_NAMES);
 		await seedConfig(fixture.paths);
 		await runPaseoSetup({}, fixture.deps);
-		await fs.rm(path.join(fixture.paths.bridgeDir, "paseo-advisor"));
+		await safeRm(path.join(fixture.paths.bridgeDir, "paseo-advisor"));
 
 		const drifted = await check(fixture.deps);
 		expect(drifted.status).toBe("drift");
@@ -2786,7 +2787,7 @@ describe("desktop app install (#4638)", () => {
 
 		// Paseo disappears entirely: the app bundle is gone, so every bridge link
 		// dangles and no source can be discovered anymore.
-		await fs.rm(path.join(fixture.root, "Applications"), { recursive: true });
+		await safeRm(path.join(fixture.root, "Applications"), { recursive: true });
 		const deps: PaseoSetupDependencies = {
 			...fixture.deps,
 			skillsSource: async () => undefined,
