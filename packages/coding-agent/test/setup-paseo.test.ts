@@ -1600,6 +1600,51 @@ describe("skills bridge", () => {
 		await expect(fs.stat(ref?.backupPath ?? "")).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	test("a repeated --force later failure restores pre-step provider provenance and keeps its sidecar", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const firstUserEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "FIRST USER EDIT" };
+		await seedConfig(fixture.paths, { gjc: firstUserEntry });
+
+		const firstInstall = await runPaseoSetup({ force: true }, fixture.deps);
+		expect(firstInstall.kind).toBe("install");
+		const beforeRetry = await readProvenance(fixture.paths.provenanceLedger);
+		const originalRef = beforeRetry.providerReplacedEntries?.gjc;
+		if (originalRef === undefined) throw new Error("expected the first force install to preserve a sidecar");
+
+		// A user edit after the first install is the value the repeated force step
+		// must restore if a later step fails. The original sidecar remains the
+		// removal authority for the first value and must stay referenced.
+		const secondUserEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "SECOND USER EDIT" };
+		const current = await readTarget(fixture.paths.configJson);
+		const edit = planPublish(current, draft => {
+			providersOf(draft).gjc = secondUserEntry;
+		});
+		await publishPlan(fixture.paths.configJson, edit, {
+			expectedIdentity: current.identity,
+			backup: false,
+			now: fixture.deps.now(),
+		});
+
+		const settingsInit = spyOn(Settings, "init").mockRejectedValue(new Error("simulated later Paseo failure"));
+		try {
+			const retry = await runPaseoSetup({ force: true }, fixture.deps);
+			expect(retry.kind).toBe("install");
+			if (retry.kind === "install") expect(retry.result.outcome).toBe("partial-install");
+		} finally {
+			settingsInit.mockRestore();
+		}
+
+		const restored = await readTarget(fixture.paths.configJson);
+		expect(providersOf(restored.parsed).gjc).toEqual(secondUserEntry);
+		const afterRetry = await readProvenance(fixture.paths.provenanceLedger);
+		expect(afterRetry.providerKeys).toEqual(beforeRetry.providerKeys);
+		expect(afterRetry.providerPreexistingKeys).toEqual(beforeRetry.providerPreexistingKeys);
+		expect(afterRetry.providerReplacedEntries).toEqual(beforeRetry.providerReplacedEntries);
+		expect(afterRetry.providerReplacedEntries?.gjc).toEqual(originalRef);
+		await expect(fs.stat(originalRef.backupPath)).resolves.toBeDefined();
+	});
+
 	test("a migration with a tampered ledger name or path refuses instead of cleaning (#4644 review r5)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);

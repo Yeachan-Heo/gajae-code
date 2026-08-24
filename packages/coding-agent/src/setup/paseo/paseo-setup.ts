@@ -263,10 +263,12 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// step's `persist` hook only after the CAS publish succeeded: a refused
 		// or conflicting publish (#4644 review r8) must not strand an
 		// unreferenced credential-bearing sidecar beside Paseo's config.
+		const providerLedgerBefore = await readProvenance(deps.paths.provenanceLedger);
 		const priorReplacedRef =
-			replacedEntry !== undefined
-				? (await readProvenance(deps.paths.provenanceLedger)).providerReplacedEntries?.[providerKey]
-				: undefined;
+			replacedEntry !== undefined ? providerLedgerBefore.providerReplacedEntries?.[providerKey] : undefined;
+		const preStepProviderKeys = { ...providerLedgerBefore.providerKeys };
+		const preStepProviderPreexistingKeys = { ...providerLedgerBefore.providerPreexistingKeys };
+		const preStepProviderReplacedEntries = { ...providerLedgerBefore.providerReplacedEntries };
 		const createdReplacedRef =
 			replacedEntry !== undefined && priorReplacedRef === undefined
 				? {
@@ -326,14 +328,16 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				if (!existingMatches) restoreProviderKey(draft, providerKey, replacedEntry);
 			},
 			revertLedger: ledger => {
-				if (existingMatches) return ledger;
-				const providerKeys = { ...ledger.providerKeys };
-				delete providerKeys[providerKey];
-				const providerPreexistingKeys = { ...ledger.providerPreexistingKeys };
-				delete providerPreexistingKeys[providerKey];
-				const providerReplacedEntries = { ...ledger.providerReplacedEntries };
-				delete providerReplacedEntries[providerKey];
-				return { ...ledger, providerKeys, providerPreexistingKeys, providerReplacedEntries };
+				// A repeated --force may replace a user edit while GJC already owns
+				// this provider. Restore the exact provider provenance from before this
+				// step, including the original replacement sidecar pointer, rather
+				// than deleting the current key and orphaning its sidecar.
+				return {
+					...ledger,
+					providerKeys: preStepProviderKeys,
+					providerPreexistingKeys: preStepProviderPreexistingKeys,
+					providerReplacedEntries: preStepProviderReplacedEntries,
+				};
 			},
 			discardSidecar,
 			persist:
