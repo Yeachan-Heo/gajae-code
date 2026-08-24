@@ -27,9 +27,21 @@ import { readLinuxProcStartTimeSync } from "./linux-proc";
  * socket, or device at this path is not a lock this code wrote, and reading or removing
  * it would follow an attacker-chosen target.
  */
-const LOCK_ACQUIRE_ATTEMPTS = 12_000;
+const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const LOCK_ACQUIRE_RETRY_MS = 5;
 const LOCK_STALE_MS = 30_000;
+
+const LOCAL_FILE_SYSTEM_TYPES: Partial<Record<NodeJS.Platform, ReadonlySet<number>>> = {
+	darwin: new Set([26]), // APFS
+	linux: new Set([
+		0x0102_1994, // tmpfs
+		0x2fc1_2fc1, // ZFS
+		0x5846_5342, // XFS
+		0x9123_683e, // Btrfs
+		0xef53, // ext2/3/4
+		0xf2f5_2010, // F2FS
+	]),
+};
 
 /**
  * The claim that serializes PATHNAME TRANSITIONS of `<file>.lock` among current writers.
@@ -141,6 +153,8 @@ export const SessionStateLockTestHooks: {
 	legacyOwnerHostId?: () => string | Promise<string>;
 	/** @internal Lets legacy same-host fixtures exercise their pre-qualification paths. */
 	unqualifiedOwnerIsLocal?: boolean;
+	/** @internal Shortens acquisition deadlines without changing production timing. */
+	lockAcquireTimeoutMs?: number;
 	/** @internal Runs after final live-owner validation and before descriptor rewrite. */
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
 	/**
@@ -339,11 +353,37 @@ function probeOwnerProcess(pid: number): OwnerProcessLiveness {
  * record still is the record that was judged, so the compare-and-delete matches and a live
  * holder loses its lock.
  */
-async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
+export function detectedSessionStateLockFileSystemIsLocal(platform: NodeJS.Platform, type: number): boolean {
+	return LOCAL_FILE_SYSTEM_TYPES[platform]?.has(type) === true;
+}
+
+async function unqualifiedOwnerIsLocal(file: string): Promise<boolean> {
+	const override = SessionStateLockTestHooks.unqualifiedOwnerIsLocal;
+	if (override !== undefined) return override;
+	try {
+		const volume = await fs.statfs(file);
+		return detectedSessionStateLockFileSystemIsLocal(process.platform, volume.type);
+	} catch {
+		return false;
+	}
+}
+
+function lockAcquireDeadline(): number {
+	return performance.now() + (SessionStateLockTestHooks.lockAcquireTimeoutMs ?? LOCK_ACQUIRE_TIMEOUT_MS);
+}
+
+async function waitForLockRetry(deadline: number): Promise<boolean> {
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) return false;
+	await Bun.sleep(Math.min(LOCK_ACQUIRE_RETRY_MS, remaining));
+	return performance.now() < deadline;
+}
+
+async function lockOwnerIsAlive(file: string, value: unknown): Promise<boolean> {
 	if (!validLockOwner(value)) return false;
 	const owner = value;
 	if (owner.owner_host_id === undefined) {
-		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
+		if (!(await unqualifiedOwnerIsLocal(file))) return true;
 	} else if (owner.owner_host_id !== (await currentOwnerHostId())) {
 		if (owner.owner_host_id !== (await currentLegacyOwnerHostId())) return true;
 	}
@@ -917,10 +957,10 @@ async function reclaimStaleOwnerRecord(
 		owner = null;
 	}
 	if (!validLockOwner(owner)) {
-		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
+		if (!(await unqualifiedOwnerIsLocal(file))) return;
 		// The mtime of the very inode the bytes were read from, not a fresh path `stat`.
 		if (Date.now() - Number(snapshot.mtimeNs / 1_000_000n) < LOCK_STALE_MS) return;
-	} else if (await lockOwnerIsAlive(owner)) return;
+	} else if (await lockOwnerIsAlive(file, owner)) return;
 	await hooks.afterInspection?.(file);
 	const current = await captureRegularLockOwner(file);
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
@@ -965,19 +1005,23 @@ async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void>
 }
 
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
-async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
+async function withLockPathTransition<T>(
+	lockFile: string,
+	transition: () => Promise<T>,
+	deadline = lockAcquireDeadline(),
+): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
 	const owner = await newLockOwner();
-	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+	for (;;) {
 		try {
 			await fs.mkdir(transitionDir);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
 			await reclaimStaleTransitionClaim(transitionDir);
-			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
-			continue;
+			if (await waitForLockRetry(deadline)) continue;
+			break;
 		}
 		let held: LockOwnerSnapshot;
 		try {
@@ -1014,7 +1058,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
  * window, and the identity-bound delete keeps a BASE writer — which takes no claim and
  * just creates the pathname — from having its brand-new lock unlinked.
  */
-async function reclaimStaleRegularLock(lockFile: string): Promise<void> {
+async function reclaimStaleRegularLock(lockFile: string, deadline: number): Promise<void> {
 	await withLockPathTransition(
 		lockFile,
 		async () =>
@@ -1022,6 +1066,7 @@ async function reclaimStaleRegularLock(lockFile: string): Promise<void> {
 				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
 				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
 			}),
+		deadline,
 	);
 }
 
@@ -1105,63 +1150,66 @@ function captureLegacyDirectoryTree(
  *
  * Nothing creates such a directory at this path anymore.
  */
-async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
-	await withLockPathTransition(lockFile, async () => {
-		const native = nativeSessionStateLock();
-		const before = captureLegacyDirectoryTree(native, lockFile);
-		if (!before) return;
-		const ownerHostId =
-			SessionStateLockTestHooks.unqualifiedOwnerIsLocal === true ? undefined : await currentOwnerHostId();
-		let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
-		if (!stale && ownerHostId !== undefined)
-			stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
-		if (!stale) return;
-		await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
-		const authorized = captureLegacyDirectoryTree(native, lockFile);
-		// The verdict spoke for `before`; only an unchanged tree carries that authority.
-		if (!authorized || !sameDirectoryTreeSnapshot(before, authorized)) return;
-		await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
-		let removed: NativeExactUnlinkResult;
-		try {
-			// The SAME verified capture the verdict was bound to, so a replacement that
-			// lands after this point is still refused by the primitive itself.
-			removed = native.exactRemoveDirectoryTree(lockFile, authorized);
-		} catch (error) {
-			throw new SessionStateLockUnavailableError(error);
-		}
-		if (removed.ok || removed.code === "not_found") return;
-		// Current natives may finish the security-critical phase by durably scrubbing the
-		// authorized tree and detaching it to the one replayable `.removing` name. That
-		// retained cleanup authority is not a live lock: acquisition may continue only when
-		// the typed receipt names exactly that sibling and the original namespace is still
-		// absent. A successor already at the lock path remains authoritative and fails closed.
-		if (
-			removed.code === "cleanup_pending" &&
-			removed.payloadDurable === true &&
-			removed.detachedPath === `${lockFile}.removing`
-		) {
+async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Promise<void> {
+	await withLockPathTransition(
+		lockFile,
+		async () => {
+			const native = nativeSessionStateLock();
+			const before = captureLegacyDirectoryTree(native, lockFile);
+			if (!before) return;
+			const ownerHostId = (await unqualifiedOwnerIsLocal(lockFile)) ? undefined : await currentOwnerHostId();
+			let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
+			if (!stale && ownerHostId !== undefined)
+				stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
+			if (!stale) return;
+			await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
+			const authorized = captureLegacyDirectoryTree(native, lockFile);
+			// The verdict spoke for `before`; only an unchanged tree carries that authority.
+			if (!authorized || !sameDirectoryTreeSnapshot(before, authorized)) return;
+			await SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile);
+			let removed: NativeExactUnlinkResult;
 			try {
-				await fs.lstat(lockFile);
+				// The SAME verified capture the verdict was bound to, so a replacement that
+				// lands after this point is still refused by the primitive itself.
+				removed = native.exactRemoveDirectoryTree(lockFile, authorized);
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 				throw new SessionStateLockUnavailableError(error);
 			}
-		}
-		// The tree changed after it was captured, so it belongs to a successor now.
-		if (removed.code === "identity_mismatch") return;
-		throw new SessionStateLockUnavailableError(
-			new Error(`Legacy lock directory could not be removed: ${removed.code ?? "unknown"}.`),
-		);
-	});
+			if (removed.ok || removed.code === "not_found") return;
+			// Current natives may finish the security-critical phase by durably scrubbing the
+			// authorized tree and detaching it to the one replayable `.removing` name. That
+			// retained cleanup authority is not a live lock: acquisition may continue only when
+			// the typed receipt names exactly that sibling and the original namespace is still
+			// absent. A successor already at the lock path remains authoritative and fails closed.
+			if (
+				removed.code === "cleanup_pending" &&
+				removed.payloadDurable === true &&
+				removed.detachedPath === `${lockFile}.removing`
+			) {
+				try {
+					await fs.lstat(lockFile);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+					throw new SessionStateLockUnavailableError(error);
+				}
+			}
+			// The tree changed after it was captured, so it belongs to a successor now.
+			if (removed.code === "identity_mismatch") return;
+			throw new SessionStateLockUnavailableError(
+				new Error(`Legacy lock directory could not be removed: ${removed.code ?? "unknown"}.`),
+			);
+		},
+		deadline,
+	);
 }
 
 /**
  * Decide what actually occupies the lock path, without following it.
  *
- * @internal exported as the seam these decisions are tested through: a live legacy
+ * The exported wrapper below is the seam these decisions are tested through: a live legacy
  * directory owner must be provably left alone without waiting out a real stale window.
  */
-export async function reclaimStaleSessionStateLock(lockFile: string): Promise<void> {
+async function reclaimStaleSessionStateLockUntil(lockFile: string, deadline: number): Promise<void> {
 	let stat: fsSync.Stats;
 	try {
 		stat = await fs.lstat(lockFile);
@@ -1170,7 +1218,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 		throw error;
 	}
 	if (stat.isDirectory()) {
-		await reclaimStaleDirectoryLock(lockFile);
+		await reclaimStaleDirectoryLock(lockFile, deadline);
 		return;
 	}
 	// A symlink, FIFO, socket, or device is not a shape either lock protocol writes.
@@ -1178,7 +1226,11 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 	// path is refused outright rather than inspected or removed.
 	if (!stat.isFile()) throw new SessionStateLockUnavailableError();
 	await SessionStateLockTestHooks.afterLockTypeDecision?.(lockFile);
-	await reclaimStaleRegularLock(lockFile);
+	await reclaimStaleRegularLock(lockFile, deadline);
+}
+
+export async function reclaimStaleSessionStateLock(lockFile: string): Promise<void> {
+	await reclaimStaleSessionStateLockUntil(lockFile, lockAcquireDeadline());
 }
 
 /**
@@ -1193,13 +1245,14 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 	const lockFile = `${stateFile}.lock`;
 	const owner = await newLockOwner();
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
-	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+	const deadline = lockAcquireDeadline();
+	for (;;) {
 		let held: LockOwnerSnapshot | undefined;
 		try {
 			// Contention (`EEXIST`, or `EISDIR`/`EPERM` for a legacy directory owner)
 			// propagates out of the claim to the evaluation below; the claim is released
 			// first, so the reclaim that follows can take it.
-			held = await withLockPathTransition(lockFile, () => acquireOwnerLock(lockFile, owner));
+			held = await withLockPathTransition(lockFile, () => acquireOwnerLock(lockFile, owner), deadline);
 			let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 			try {
 				outcome = { ok: true, value: await operation() };
@@ -1235,8 +1288,9 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 				throw error instanceof SessionStateLockUnavailableError
 					? error
 					: new SessionStateLockUnavailableError(error);
-			await reclaimStaleSessionStateLock(lockFile);
-			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+			await reclaimStaleSessionStateLockUntil(lockFile, deadline);
+			if (await waitForLockRetry(deadline)) continue;
+			break;
 		}
 	}
 	throw new SessionStateLockUnavailableError();

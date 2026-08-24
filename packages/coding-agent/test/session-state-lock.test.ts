@@ -53,6 +53,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.loadInstallationHostId = undefined;
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
+	SessionStateLockTestHooks.lockAcquireTimeoutMs = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	installExactIdentityNatives();
@@ -204,6 +205,36 @@ function ageWorldPastAnyStaleWindow(): () => void {
 }
 
 describe("coordinator session state lock", () => {
+	it("recognizes only known local filesystems for legacy owner recovery", () => {
+		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("darwin", 26)).toBe(true);
+		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0xef53)).toBe(true);
+		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0x5846_5342)).toBe(true);
+		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0x00c3_6400)).toBe(false);
+		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0x6969)).toBe(false);
+		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("win32", 26)).toBe(false);
+	});
+
+	it("bounds nested acquisition retries by one wall-clock deadline", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-bounded-deadline.json");
+		const lockFile = `${stateFile}.lock`;
+		const record = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "live-owner",
+			owner_host_id: "local-host",
+		});
+		await fs.writeFile(lockFile, record);
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 40;
+		const startedAt = performance.now();
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+	});
 	it("serializes a concurrent writer behind the current lock holder", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-current");
 		// System time is frozen in these tests, so order is recorded explicitly.
