@@ -112,6 +112,7 @@ export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 	snapshotDirectoryTree,
 	snapshotDirectoryTreeAsync: async root => snapshotDirectoryTree(root),
 	exactRemoveDirectoryTree,
+	exactRemoveDirectoryTreeAsync: async (root, snapshot) => exactRemoveDirectoryTree(root, snapshot),
 };
 
 /** Whether the compiled addon actually loads in this environment. */

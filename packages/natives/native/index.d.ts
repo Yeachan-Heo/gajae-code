@@ -898,6 +898,13 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
 
 /**
+ * Async variant of `exactRemoveDirectoryTree` on a dedicated native thread.
+ * A wedged filesystem cannot consume the JS thread or shared libuv pool after
+ * the caller's deadline expires.
+ */
+export declare function exactRemoveDirectoryTreeAsync(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): Promise<NativeExactUnlinkResult>
+
+/**
  * Atomically replace a staged regular file only after validating the exact
  * staged source and expected destination.
  *

@@ -11,8 +11,8 @@ use std::{
 };
 
 use napi::{
-	JsString,
-	bindgen_prelude::{BigInt, Either, Uint8Array},
+	Env, JsString,
+	bindgen_prelude::{BigInt, Either, PromiseRaw, Uint8Array},
 };
 use napi_derive::napi;
 use parking_lot::Mutex;
@@ -1384,16 +1384,17 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 	platform::snapshot_directory_tree(Path::new(&path))
 }
 
-/// Async variant of [`snapshot_directory_tree`] scheduled on the libuv blocking
-/// pool. A recursive legacy lock directory can contain an unbounded number of
-/// entries and every entry may require a blocking metadata read and file digest;
-/// running that walk on the JS thread would let it outlive the lock acquisition
-/// deadline and freeze the event loop that is supposed to enforce the deadline.
+/// Async variant of [`snapshot_directory_tree`] on a dedicated native thread.
+/// A recursive legacy lock directory can contain an unbounded number of entries
+/// and every entry may require a blocking metadata read and file digest; a
+/// wedged mount must not consume a shared libuv worker after the lock deadline
+/// expires.
 #[napi]
-pub fn snapshot_directory_tree_async(path: String) -> task::Promise<NativeDirectoryTreeResult> {
-	task::blocking("snapshot_directory_tree", (), move |_| {
-		Ok(snapshot_directory_tree(path))
-	})
+pub fn snapshot_directory_tree_async<'env>(
+	env: &'env Env,
+	path: String,
+) -> napi::Result<PromiseRaw<'env, NativeDirectoryTreeResult>> {
+	task::isolated(env, "snapshot_directory_tree", move || Ok(snapshot_directory_tree(path)))
 }
 
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
@@ -1423,6 +1424,42 @@ pub fn exact_remove_directory_tree(
 		None => None,
 	};
 	platform::exact_remove_directory_tree(Path::new(&path), &snapshot, parent_identity)
+}
+
+/// Async variant of [`exact_remove_directory_tree`] on a dedicated native
+/// thread. Directory removal re-reads and scrubs every authorized entry and
+/// may block indefinitely in a filesystem syscall; it must not run on the JS
+/// thread or consume a shared libuv worker after the caller's deadline expires.
+/// The synchronous boundary remains available for consumers that explicitly
+/// need a blocking call.
+#[napi]
+pub fn exact_remove_directory_tree_async<'env>(
+	env: &'env Env,
+	path: String,
+	snapshot: NativeDirectoryTreeSnapshot,
+	parent_identity: Option<NativeDirectoryParentIdentity>,
+) -> napi::Result<PromiseRaw<'env, NativeExactUnlinkResult>> {
+	if path.contains('\0') {
+		return task::future(env, "exact_remove_directory_tree", async {
+			Ok(NativeExactUnlinkResult::failure("io_error"))
+		});
+	}
+	let parent_identity = match parent_identity {
+		Some(identity) => {
+			let (dev_negative, dev, dev_lossless) = identity.dev.get_u64();
+			let (ino_negative, ino, ino_lossless) = identity.ino.get_u64();
+			if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+				return task::future(env, "exact_remove_directory_tree", async {
+					Ok(NativeExactUnlinkResult::failure("identity_mismatch"))
+				});
+			}
+			Some((dev, ino))
+		},
+		None => None,
+	};
+	task::isolated(env, "exact_remove_directory_tree", move || {
+		Ok(platform::exact_remove_directory_tree(Path::new(&path), &snapshot, parent_identity))
+	})
 }
 
 #[cfg(unix)]

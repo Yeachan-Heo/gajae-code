@@ -137,6 +137,13 @@ function installCleanupPendingNative(lockFile: string, result: NativeExactUnlink
 			if (detachOriginal) fsSync.renameSync(target, `${lockFile}.removing`);
 			return result;
 		},
+		exactRemoveDirectoryTreeAsync(target, snapshot) {
+			const observed = exactIdentityNativeBindings.snapshotDirectoryTree(target);
+			if (!observed.ok || JSON.stringify(observed.snapshot) !== JSON.stringify(snapshot))
+				return Promise.resolve({ ok: false, code: "identity_mismatch" });
+			if (detachOriginal) fsSync.renameSync(target, `${lockFile}.removing`);
+			return Promise.resolve(result);
+		},
 	}));
 }
 
@@ -1042,6 +1049,9 @@ describe("coordinator session state lock", () => {
 			exactRemoveDirectoryTree() {
 				throw new Error("unexpected directory removal");
 			},
+			exactRemoveDirectoryTreeAsync() {
+				throw new Error("unexpected directory removal");
+			},
 		}));
 
 		const observed = await withSessionStateFileLock(stateFile, async () => "unreachable").catch(error => error);
@@ -1095,6 +1105,9 @@ describe("coordinator session state lock", () => {
 				throw new Error("unexpected directory snapshot");
 			},
 			exactRemoveDirectoryTree() {
+				throw new Error("unexpected directory removal");
+			},
+			exactRemoveDirectoryTreeAsync() {
 				throw new Error("unexpected directory removal");
 			},
 		}));
@@ -1199,6 +1212,9 @@ describe("coordinator session state lock", () => {
 			exactRemoveDirectoryTree() {
 				throw new Error("unexpected directory removal");
 			},
+			exactRemoveDirectoryTreeAsync() {
+				throw new Error("unexpected directory removal");
+			},
 		}));
 
 		const entered: string[] = [];
@@ -1263,6 +1279,9 @@ describe("coordinator session state lock", () => {
 					throw new Error("unexpected directory snapshot");
 				},
 				exactRemoveDirectoryTree() {
+					throw new Error("unexpected directory removal");
+				},
+				exactRemoveDirectoryTreeAsync() {
 					throw new Error("unexpected directory removal");
 				},
 			}));
@@ -1508,6 +1527,43 @@ describe("coordinator session state lock", () => {
 			snapshotDirectoryTreeAsync() {
 				asynchronousCalls++;
 				return new Promise(resolve => setTimeout(() => resolve(captured), 100));
+			},
+		}));
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+		let timerFired = false;
+		setTimeout(() => {
+			timerFired = true;
+		}, 5);
+		const startedAt = performance.now();
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+
+		expect(asynchronousCalls).toBe(1);
+		expect(synchronousCalls).toBe(0);
+		expect(timerFired).toBe(true);
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+	});
+
+	it("bounds legacy identity-bound removal without a synchronous filesystem call", async () => {
+		const { stateFile } = await seededRunningSession("lock-legacy-async-removal-deadline");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		const captured = exactIdentityNativeBindings.snapshotDirectoryTree(lockFile);
+		if (!captured.ok || !captured.snapshot) throw new Error("missing legacy tree fixture snapshot");
+
+		let synchronousCalls = 0;
+		let asynchronousCalls = 0;
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			snapshotDirectoryTreeAsync: async () => captured,
+			exactRemoveDirectoryTree() {
+				synchronousCalls++;
+				throw new Error("synchronous directory removal must not run during lock acquisition");
+			},
+			exactRemoveDirectoryTreeAsync() {
+				asynchronousCalls++;
+				return new Promise<NativeExactUnlinkResult>(() => undefined);
 			},
 		}));
 		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;

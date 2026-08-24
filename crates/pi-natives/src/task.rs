@@ -289,6 +289,48 @@ where
 	})
 }
 
+/// Run one uncooperative blocking operation on its own native thread and await
+/// its result from the N-API async runtime.
+///
+/// This is deliberately different from [`blocking`]. A syscall against a
+/// wedged filesystem cannot observe a cancellation token while it is in the
+/// kernel, so putting it on libuv's shared blocking pool would let one expired
+/// request consume a worker forever. The worker is detached immediately after
+/// it starts; it never holds a libuv worker, and process shutdown does not wait
+/// for it. Callers must still enforce their own deadline and treat an
+/// unresolved result as a refusal.
+pub fn isolated<'env, T, F>(
+	env: &'env Env,
+	tag: &'static str,
+	work: F,
+) -> Result<PromiseRaw<'env, T>>
+where
+	F: FnOnce() -> Result<T> + Send + 'static,
+	T: ToNapiValue + Send + 'static,
+{
+	let (sender, receiver) = tokio::sync::oneshot::channel::<Result<T>>();
+	std::thread::Builder::new()
+		.name(format!("pi-natives-{tag}"))
+		.spawn(move || {
+			let _guard = profile_region(tag);
+			let result = match catch_unwind(AssertUnwindSafe(work)) {
+				Ok(result) => result,
+				Err(payload) => Err(Error::from_reason(format!(
+					"IsolatedTask panic: {}",
+					panic_payload_message(payload.as_ref())
+				))),
+			};
+			let _ = sender.send(result);
+		})
+		.map_err(|error| Error::from_reason(format!("IsolatedTask spawn failed: {error}")))?;
+
+	future(env, tag, async move {
+		receiver
+			.await
+			.map_err(|_| Error::from_reason("IsolatedTask worker exited without a result"))?
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::{

@@ -176,7 +176,11 @@ export class SessionStateLockUnavailableError extends Error {
  */
 export type SessionStateLockNativeBindings = Pick<
 	typeof import("@gajae-code/natives"),
-	"exactRemoveDirectoryTree" | "exactUnlink" | "snapshotDirectoryTree" | "snapshotDirectoryTreeAsync"
+	| "exactRemoveDirectoryTree"
+	| "exactRemoveDirectoryTreeAsync"
+	| "exactUnlink"
+	| "snapshotDirectoryTree"
+	| "snapshotDirectoryTreeAsync"
 >;
 
 /** How the deletion primitives are obtained. Throwing means they are unavailable. */
@@ -1381,7 +1385,10 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			try {
 				// The SAME verified capture the verdict was bound to, so a replacement that
 				// lands after this point is still refused by the primitive itself.
-				removed = native.exactRemoveDirectoryTree(lockFile, authorized);
+				removed = await withinLockAcquireDeadline(
+					deadline,
+					() => native.exactRemoveDirectoryTreeAsync(lockFile, authorized),
+				);
 			} catch (error) {
 				throw new SessionStateLockUnavailableError(error);
 			}
