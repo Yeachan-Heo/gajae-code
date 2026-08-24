@@ -368,10 +368,20 @@ export async function removePaseoSetup(
 			// handed to the inverse, which reports it as a divergence instead of
 			// being silently skipped and reported as success.
 			const presentEntries: string[] = [];
+			const ambiguousEntries: string[] = [];
 			for (const name of safeBridgeEntryNames(ledger.bridgeEntries ?? [])) {
 				const destination = path.join(bridgeDir, name);
 				const stat = await lstatAllowingAbsent(destination);
-				if (stat !== undefined) presentEntries.push(name);
+				if (stat === undefined) continue;
+				// A recorded name without an install-time identity is only a plan or
+				// legacy evidence, never destructive authority. Preserve the live
+				// pathname and its ledger evidence while independently owned links and
+				// JSON state continue through removal.
+				if (ledger.bridgeEntryIdentities?.[name] === undefined) {
+					ambiguousEntries.push(name);
+					continue;
+				}
+				presentEntries.push(name);
 			}
 			// A recorded source directory is trusted even after it disappears
 			// (Paseo uninstalled): link-text verification does not need it on
@@ -389,7 +399,10 @@ export async function removePaseoSetup(
 					prunedEntries: [],
 					adoptedEntries: [],
 					entryIdentities: ledger.bridgeEntryIdentities ?? {},
-					bridgeDirCreated: ledger.bridgeDirCreated ?? false,
+					// An ambiguous live entry keeps the directory user-relevant; never
+					// remove the directory around it even when the ledger says GJC
+					// created the directory originally.
+					bridgeDirCreated: ambiguousEntries.length === 0 && (ledger.bridgeDirCreated ?? false),
 					bridgeDirIdentity: ledger.bridgeDirIdentity,
 					sourceDir,
 				},
@@ -397,14 +410,29 @@ export async function removePaseoSetup(
 				// ledger-recorded directory the entries above were validated in.
 				{ bridgeDir },
 			);
-			removed.push(bridgeDir);
-			nextLedger = {
-				...nextLedger,
-				bridgeEntries: [],
-				bridgeEntryIdentities: {},
-				bridgeDirCreated: false,
-				bridgeSourceDir: undefined,
-			};
+			if (presentEntries.length > 0 || (ambiguousEntries.length === 0 && ledger.bridgeDirCreated === true)) {
+				removed.push(bridgeDir);
+			}
+			if (ambiguousEntries.length === 0) {
+				nextLedger = {
+					...nextLedger,
+					bridgeEntries: [],
+					bridgeEntryIdentities: {},
+					bridgeDirCreated: false,
+					bridgeSourceDir: undefined,
+				};
+			} else {
+				const ambiguous = new Set(ambiguousEntries);
+				const retainedIdentities = Object.fromEntries(
+					Object.entries(nextLedger.bridgeEntryIdentities ?? {}).filter(([name]) => ambiguous.has(name)),
+				);
+				nextLedger = {
+					...nextLedger,
+					bridgeEntries: (nextLedger.bridgeEntries ?? []).filter(name => ambiguous.has(name)),
+					...(nextLedger.bridgeEntryIdentities !== undefined ? { bridgeEntryIdentities: retainedIdentities } : {}),
+				};
+				remaining.push(bridgeDir);
+			}
 		} catch (error) {
 			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
 			remaining.push(ledger.bridgePath ?? deps.paths.bridgeDir);
@@ -583,8 +611,20 @@ export async function removePaseoSetup(
 	}
 
 	const stillOwns =
-		Object.keys(nextLedger.providerKeys).length > 0 || Object.keys(nextLedger.seededOrchestrationKeys).length > 0;
+		Object.keys(nextLedger.providerKeys).length > 0 ||
+		Object.keys(nextLedger.seededOrchestrationKeys).length > 0 ||
+		(nextLedger.bridgeEntries?.length ?? 0) > 0 ||
+		nextLedger.bridgeDirCreated === true;
 	await writeProvenance(deps.paths.provenanceLedger, stillOwns ? nextLedger : EMPTY_LEDGER);
+	if (remaining.length > 0) {
+		return partial(removed, remaining, {
+			failedStep: remaining.includes(ledger.bridgePath ?? deps.paths.bridgeDir)
+				? (ledger.bridgePath ?? deps.paths.bridgeDir)
+				: remaining[0]!,
+			detail: `preserved identityless Paseo bridge entries: ${remaining.includes(ledger.bridgePath ?? deps.paths.bridgeDir) ? (ledger.bridgeEntries ?? []).filter(name => ledger.bridgeEntryIdentities?.[name] === undefined).join(", ") : remaining.join(", ")}`,
+			retained: [deps.paths.provenanceLedger, ...remaining],
+		});
+	}
 	return { outcome: "removed", removed };
 }
 

@@ -31,7 +31,9 @@ import {
 	classifyIntent,
 	INTENT_VERSION,
 	type IntentRecord,
+	IntentRecordCorruptError,
 	isProvenancedProvider,
+	type ProvenanceLedger,
 	ProvenanceLedgerCorruptError,
 	provenancedProviderKeys,
 	provenanceLedgerIdentity,
@@ -966,7 +968,9 @@ describe("skills bridge", () => {
 					const preflight = await preflightSkillsBridge(fixture.deps);
 					expect(preflight.entries[name]?.action).toBe("prune-and-recreate");
 				} else {
-					await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+					const preflight = await preflightSkillsBridge(fixture.deps);
+					expect(preflight.entries[name]).toBeUndefined();
+					expect(preflight.ambiguities?.map(ambiguity => ambiguity.name)).toContain(name);
 					expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
 					expect(await fs.readlink(bridgeName)).toBe(sourceSkill);
 				}
@@ -1002,11 +1006,26 @@ describe("skills bridge", () => {
 
 		const before = await snapshotTree(fixture.paths.bridgeDir);
 		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
-		await expect(runPaseoSetup({}, fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
-		// The matching target does not authorize the identityless user link, and
-		// preflight refuses before the saga can mutate anything.
-		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
-		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
+		const install = await runPaseoSetup({}, fixture.deps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("partial-install");
+		if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
+		expect(install.result.evidence.detail).toContain("identityless");
+		// The matching target does not authorize the identityless user link. It
+		// survives unchanged while unrelated bridge entries and setup state proceed.
+		expect(await fs.readlink(path.join(fixture.paths.bridgeDir, "paseo"))).toBe(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
+		);
+		const beforeProvenance = JSON.parse(recordedLedger) as ProvenanceLedger;
+		const afterProvenance = await readProvenance(fixture.paths.provenanceLedger);
+		expect(afterProvenance.bridgePath).toBe(beforeProvenance.bridgePath);
+		expect(afterProvenance.bridgeEntries).toContain("paseo");
+		expect(afterProvenance.bridgeEntryIdentities?.paseo).toBeUndefined();
+		expect(await snapshotTree(fixture.paths.bridgeDir)).not.toBe(before);
+		expect(
+			providersOf(JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>).gjc,
+		).toBeDefined();
 		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
 	});
 
@@ -1032,7 +1051,9 @@ describe("skills bridge", () => {
 		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
 		const before = await snapshotTree(fixture.paths.bridgeDir);
 
-		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		const preflight = await preflightSkillsBridge(fixture.deps);
+		expect(preflight.entries[name]).toBeUndefined();
+		expect(preflight.ambiguities?.map(ambiguity => ambiguity.name)).toContain(name);
 		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
 	});
 
@@ -2939,11 +2960,21 @@ describe("skills bridge", () => {
 
 		const before = await snapshotTree(oldDir);
 		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
-		await expect(runPaseoSetup({}, migratedDeps)).rejects.toThrow(/without a durable recorded identity/);
+		const install = await runPaseoSetup({}, migratedDeps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("partial-install");
+		if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
+		expect(install.result.evidence.detail).toContain("identityless");
 		// The identityless user link cannot authenticate migration cleanup, so
-		// setup refuses before changing either bridge path or its ledger.
+		// setup keeps the old bridge path and its bridge provenance unchanged while
+		// independently owned JSON state converges.
 		expect(await snapshotTree(oldDir)).toBe(before);
-		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
+		const beforeProvenance = JSON.parse(recordedLedger) as ProvenanceLedger;
+		const afterProvenance = await readProvenance(fixture.paths.provenanceLedger);
+		expect(afterProvenance.bridgePath).toBe(beforeProvenance.bridgePath);
+		expect(afterProvenance.bridgeEntries).toEqual(beforeProvenance.bridgeEntries);
+		expect(afterProvenance.bridgeEntryIdentities).toEqual(beforeProvenance.bridgeEntryIdentities);
 		expect(await fs.readlink(path.join(oldDir, name))).toBe(path.join(sourceDir, name));
 		await expect(fs.stat(newBridge)).rejects.toMatchObject({ code: "ENOENT" });
 	});
@@ -3058,13 +3089,22 @@ describe("skills bridge", () => {
 		expect(drifted.status).toBe("drift");
 
 		// Without durable per-entry identities, matching legacy targets cannot
-		// prove GJC created these links. Setup refuses before any adoption or
-		// prune, preserving both the user-visible links and the ledger.
-		await expect(runPaseoSetup({}, deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		// prove GJC created these links. Setup reports a partial reconciliation,
+		// preserving the user-visible links and the bridge portion of the ledger.
+		const install = await runPaseoSetup({}, deps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("partial-install");
+		if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
+		expect(install.result.evidence.detail).toContain("identityless");
 		for (const name of SKILL_NAMES) {
 			expect(await fs.readlink(path.join(fixture.paths.bridgeDir, name))).toBe(beforeLinks[name]);
 		}
-		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
+		const beforeProvenance = JSON.parse(recordedLedger) as ProvenanceLedger;
+		const afterProvenance = await readProvenance(fixture.paths.provenanceLedger);
+		expect(afterProvenance.bridgePath).toBe(beforeProvenance.bridgePath);
+		expect(afterProvenance.bridgeEntries).toEqual(beforeProvenance.bridgeEntries);
+		expect(afterProvenance.bridgeEntryIdentities).toEqual(beforeProvenance.bridgeEntryIdentities);
 	});
 
 	test("remove rolls back a legacy ledger with no recorded source directory (#4644 review)", async () => {
@@ -3085,9 +3125,12 @@ describe("skills bridge", () => {
 			bridgeEntries: [...SKILL_NAMES],
 			bridgeDirCreated: true,
 		});
+		const beforeBridge = await snapshotTree(fixture.paths.bridgeDir);
+		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
 		// No source can be discovered anymore (the app is gone). A legacy ledger
-		// also lacks install-time link identities, so removal must fail closed
-		// rather than treat a same-target successor as GJC-owned.
+		// also lacks install-time link identities, so removal preserves every
+		// ambiguous link and reports a partial result rather than treating a
+		// same-target successor as GJC-owned.
 		const deps: PaseoSetupDependencies = {
 			...fixture.deps,
 			skillsSource: async () => undefined,
@@ -3095,6 +3138,14 @@ describe("skills bridge", () => {
 
 		const result = await removePaseoSetup(deps, { now: new Date() });
 		expect(result.outcome).toBe("partial-removal");
+		if (result.outcome !== "partial-removal") throw new Error("expected a partial removal outcome");
+		expect(result.evidence.detail).toContain("identityless");
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(beforeBridge);
+		const beforeProvenance = JSON.parse(recordedLedger) as ProvenanceLedger;
+		const afterProvenance = await readProvenance(fixture.paths.provenanceLedger);
+		expect(afterProvenance.bridgePath).toBe(beforeProvenance.bridgePath);
+		expect(afterProvenance.bridgeEntries).toEqual(beforeProvenance.bridgeEntries);
+		expect(afterProvenance.bridgeEntryIdentities).toEqual(beforeProvenance.bridgeEntryIdentities);
 		expect((await fs.lstat(path.join(deps.paths.bridgeDir, SKILL_NAMES[0]))).isSymbolicLink()).toBe(true);
 	});
 
@@ -3673,9 +3724,63 @@ describe("intent recovery", () => {
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
 	});
 
+	test("discard repair treats a sidecar deleted after authentication as success", async () => {
+		const { fixture, intent } = await intentFixture();
+		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
+		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
+		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+		});
+
+		const realStat = fs.stat.bind(fs);
+		let raced = false;
+		const statImpl = async (target: any, options?: any) => {
+			const observed = await realStat(target, options);
+			if (!raced && String(target) === path.dirname(sidecarPath)) {
+				raced = true;
+				await fs.rm(sidecarPath);
+			}
+			return observed;
+		};
+		const statSpy = spyOn(fs, "stat").mockImplementation(statImpl as typeof fs.stat);
+		try {
+			const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+			expect(recovery?.recovered).toBe(true);
+		} finally {
+			statSpy.mockRestore();
+		}
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+		await expect(fs.stat(sidecarPath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("discard intent refuses a sidecar outside the target config namespace", async () => {
+		const { fixture, intent } = await intentFixture();
+		const canonicalName = path.basename(replacedProviderBackupPath(fixture.paths.configJson, "gjc"));
+		const sidecarPath = path.join(fixture.root, canonicalName);
+		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
+		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		await Bun.write(
+			fixture.paths.intentRecord,
+			serializeJson({
+				...intent,
+				discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+			}),
+		);
+		const intentBytes = await fs.readFile(fixture.paths.intentRecord, "utf8");
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(false);
+		expect(recovery?.detail).toContain("corrupt");
+		await expect(readIntent(fixture.paths.intentRecord)).rejects.toBeInstanceOf(IntentRecordCorruptError);
+		expect(await fs.readFile(fixture.paths.intentRecord, "utf8")).toBe(intentBytes);
+		expect(await fs.readFile(sidecarPath, "utf8")).toBe(sidecarBytes);
+	});
+
 	test("discard repair removes the authenticated sidecar before clearing the intent", async () => {
 		const { fixture, intent } = await intentFixture();
-		const sidecarPath = path.join(fixture.root, "discard-sidecar.json");
+		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
 		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
 		await writeIntent(fixture.paths.intentRecord, {
@@ -3691,7 +3796,7 @@ describe("intent recovery", () => {
 
 	test("discard repair retains the intent and sidecar on a digest mismatch", async () => {
 		const { fixture, intent } = await intentFixture();
-		const sidecarPath = path.join(fixture.root, "discard-sidecar.json");
+		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
 		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
 		await writeIntent(fixture.paths.intentRecord, {
@@ -3708,7 +3813,7 @@ describe("intent recovery", () => {
 
 	test("discard repair retains the intent when the authenticated sidecar unlink loses its race", async () => {
 		const { fixture, intent } = await intentFixture();
-		const sidecarPath = path.join(fixture.root, "discard-sidecar.json");
+		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
 		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
 		await writeIntent(fixture.paths.intentRecord, {

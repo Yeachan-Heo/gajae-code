@@ -288,6 +288,28 @@ export function replacedProviderBackupPath(configJsonPath: string, providerKey: 
 }
 
 /**
+ * True only for a deterministic replaced-provider sidecar beside the target
+ * config. Discard intents do not carry the provider key, so the suffix is
+ * checked structurally against the same safe-key and truncated-digest shape
+ * produced by {@link replacedProviderBackupPath}; arbitrary sibling files are
+ * not accepted as cleanup authority.
+ */
+export function isCanonicalReplacedProviderBackupPath(
+	configJsonPath: unknown,
+	backupPath: unknown,
+): backupPath is string {
+	if (typeof configJsonPath !== "string" || typeof backupPath !== "string") return false;
+	if (!path.isAbsolute(configJsonPath) || !path.isAbsolute(backupPath)) return false;
+	const target = path.resolve(configJsonPath);
+	const candidate = path.resolve(backupPath);
+	if (path.dirname(candidate) !== path.dirname(target)) return false;
+	const prefix = `${path.basename(target)}.gjc-replaced-`;
+	const name = path.basename(candidate);
+	if (!name.startsWith(prefix)) return false;
+	return /^[a-zA-Z0-9_-]*-[a-f0-9]{16}\.json$/u.test(name.slice(prefix.length));
+}
+
+/**
  * Write the pre-`--force` value of one provider key into its private sidecar.
  *
  * Publication is no-clobber: the staged bytes are linked into place, so an
@@ -446,9 +468,17 @@ export async function removeReplacedProviderBackup(
  * symlink-rejecting, and the native exact-unlink protocol rechecks the captured
  * identity before detaching the pathname.
  */
-export async function removeDiscardSidecar(backupPath: string, expectedSha256: string): Promise<boolean> {
+export async function removeDiscardSidecar(
+	configJsonPath: string,
+	backupPath: string,
+	expectedSha256: string,
+): Promise<boolean> {
 	try {
-		if (!path.isAbsolute(backupPath) || !/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
+		// Validate the namespace before opening, hashing, or unlinking anything.
+		// The intent's target config is the only authority for where a discarded
+		// replaced-provider sidecar may live.
+		if (!isCanonicalReplacedProviderBackupPath(configJsonPath, backupPath)) return false;
+		if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
 		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
 		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
 		let bytes: Buffer;
@@ -475,7 +505,12 @@ export async function removeDiscardSidecar(backupPath: string, expectedSha256: s
 			sha256: digest,
 			quarantineName: `.gjc-paseo-discard-${process.pid}-${nodeCrypto.randomUUID()}`,
 		};
-		return exactUnlinkDirect(backupPath, identity).ok;
+		const result = exactUnlinkDirect(backupPath, identity);
+		// The sidecar was authenticated from the open handle above. If another
+		// actor removed that exact file before native cleanup reached the path,
+		// ENOENT is already-cleaned success; an initially missing path never gets
+		// this far and remains a failed cleanup.
+		return result.ok || result.code === "not_found";
 	} catch {
 		return false;
 	}

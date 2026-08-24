@@ -17,7 +17,13 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { ABSENT_IDENTITY, currentIdentity, hashBytes, serializeJson } from "./json-publisher";
+import {
+	ABSENT_IDENTITY,
+	currentIdentity,
+	hashBytes,
+	isCanonicalReplacedProviderBackupPath,
+	serializeJson,
+} from "./json-publisher";
 
 export const PROVENANCE_VERSION = 1;
 export const INTENT_VERSION = 1;
@@ -329,19 +335,22 @@ export interface IntentRecord {
 	readonly startedAt: string;
 }
 
-function isIntentDiscardSidecar(value: unknown): value is IntentDiscardSidecar {
+function isIntentDiscardSidecar(value: unknown, targetPath: unknown): value is IntentDiscardSidecar {
 	return (
 		isRecord(value) &&
 		typeof value.backupPath === "string" &&
-		path.isAbsolute(value.backupPath) &&
 		typeof value.valueSha256 === "string" &&
-		/^[a-f0-9]{64}$/u.test(value.valueSha256)
+		/^[a-f0-9]{64}$/u.test(value.valueSha256) &&
+		isCanonicalReplacedProviderBackupPath(targetPath, value.backupPath)
 	);
 }
 
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
-	if (intent.discardSidecar !== undefined && !isIntentDiscardSidecar(intent.discardSidecar)) {
-		throw new IntentRecordCorruptError(intentPath, "discardSidecar is not an authenticated sidecar reference");
+	if (intent.discardSidecar !== undefined && !isIntentDiscardSidecar(intent.discardSidecar, intent.targetPath)) {
+		throw new IntentRecordCorruptError(
+			intentPath,
+			"discardSidecar is not an authenticated sidecar reference beside the target config",
+		);
 	}
 	validateIntentPayload(intentPath, intent);
 	await fs.mkdir(path.dirname(intentPath), { recursive: true, mode: 0o700 });
@@ -511,8 +520,11 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 		if (parsed?.provenancePayload !== undefined) {
 			validateIntentPayload(intentPath, parsed);
 		}
-		if (parsed?.discardSidecar !== undefined && !isIntentDiscardSidecar(parsed.discardSidecar)) {
-			throw new IntentRecordCorruptError(intentPath, "discardSidecar is not an authenticated sidecar reference");
+		if (parsed?.discardSidecar !== undefined && !isIntentDiscardSidecar(parsed.discardSidecar, parsed.targetPath)) {
+			throw new IntentRecordCorruptError(
+				intentPath,
+				"discardSidecar is not an authenticated sidecar reference beside the target config",
+			);
 		}
 		return parsed;
 	} catch (error) {

@@ -384,6 +384,7 @@ export async function recoverIntent(
 			}
 			if (targetState === "before" && ledgerState === "before") {
 				const removed = await removeDiscardSidecar(
+					intent.targetPath,
 					intent.discardSidecar.backupPath,
 					intent.discardSidecar.valueSha256,
 				);

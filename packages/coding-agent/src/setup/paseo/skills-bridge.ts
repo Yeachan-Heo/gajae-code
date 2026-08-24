@@ -93,17 +93,26 @@ function matchesRecordedIdentity(recorded: BridgeEntryIdentity | undefined, obse
  * is still destructive cleanup authority, so its durable identity is required
  * even when the new bridge has no matching entry.
  */
+export interface SkillsBridgeAmbiguity {
+	readonly name: string;
+	readonly linkPath: string;
+	readonly detail: string;
+	/** True when changing the bridge path/source would strand this evidence. */
+	readonly blocksBridgeCutover: boolean;
+}
+
 async function assertRecordedMigrationIdentities(
 	deps: PaseoSetupDependencies,
 	ledger: ProvenanceLedger,
-): Promise<void> {
+): Promise<readonly SkillsBridgeAmbiguity[]> {
+	const ambiguities: SkillsBridgeAmbiguity[] = [];
 	const recordedBridgeDir = ledger.bridgePath;
 	if (
 		recordedBridgeDir === undefined ||
 		path.resolve(recordedBridgeDir) === path.resolve(deps.paths.bridgeDir) ||
 		(ledger.bridgeEntries?.length ?? 0) === 0
 	)
-		return;
+		return ambiguities;
 	if (!path.isAbsolute(recordedBridgeDir) || path.resolve(recordedBridgeDir) !== recordedBridgeDir) {
 		throw new SkillsBridgeError(
 			`Refusing to migrate Paseo skills bridge: ledger-recorded path is not absolute (${recordedBridgeDir})`,
@@ -130,12 +139,27 @@ async function assertRecordedMigrationIdentities(
 			);
 		}
 		const observed = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
-		if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], observed)) {
+		const recorded = ledger.bridgeEntryIdentities?.[name];
+		// Historical ledgers did not persist per-entry identities. A matching
+		// legacy link is ambiguous, so leave it in place and drop it from the new
+		// ownership set instead of deleting a user-created successor or wedging
+		// every future setup run. Durable identities retain the strict check.
+		if (recorded === undefined) {
+			ambiguities.push({
+				name,
+				linkPath: destination,
+				detail: `preserving an identityless recorded Paseo bridge link; its ownership cannot be authenticated (${destination})`,
+				blocksBridgeCutover: true,
+			});
+			continue;
+		}
+		if (!matchesRecordedIdentity(recorded, observed)) {
 			throw new SkillsBridgeError(
 				`Refusing to migrate an old Paseo skill bridge entry without a durable recorded identity: ${destination}`,
 			);
 		}
 	}
+	return ambiguities;
 }
 
 type BridgeEntryPlan = {
@@ -179,6 +203,8 @@ export interface SkillsBridgePreflight {
 	readonly prunes: readonly BridgePrunePlan[];
 	/** Recorded legacy links to re-point at the discovered source (pre-#4638 migration). */
 	readonly adopts: readonly BridgeAdoptPlan[];
+	/** Existing bridge links whose ownership cannot be authenticated safely. */
+	readonly ambiguities?: readonly SkillsBridgeAmbiguity[];
 }
 
 /** What the forward operation actually did, rather than what preflight intended to do. */
@@ -416,6 +442,7 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	const entries: Record<string, BridgeEntryPlan> = {};
 	const prunes: BridgePrunePlan[] = [];
 	const adopts: BridgeAdoptPlan[] = [];
+	const ambiguities: SkillsBridgeAmbiguity[] = [];
 	const source = await resolveSkillsBridgeSource(deps);
 	const ledger = await readProvenance(deps.paths.provenanceLedger);
 	const recordedEntries = new Set(ledger.bridgeEntries ?? []);
@@ -426,11 +453,18 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	const ledgerSourceDir = ledger.bridgeSourceDir;
 	const legacySourceDir = legacySourceDirFor(deps);
 	const ownershipSourceDir = ledgerSourceDir ?? legacySourceDir;
-	if (source !== undefined) await assertRecordedMigrationIdentities(deps, ledger);
+	if (source !== undefined) ambiguities.push(...(await assertRecordedMigrationIdentities(deps, ledger)));
 	if (source === undefined) {
 		// No source directory anywhere: the bridge is skipped entirely. Creating
 		// links into a directory that does not exist is worse than not bridging.
-		return { bridgeDir: deps.paths.bridgeDir, bridgeDirCreated: directory === "absent", entries, prunes, adopts };
+		return {
+			bridgeDir: deps.paths.bridgeDir,
+			bridgeDirCreated: directory === "absent",
+			entries,
+			prunes,
+			adopts,
+			ambiguities,
+		};
 	}
 	// Record the CANONICAL source (#4644 review r11): the resolver may follow
 	// a symlinked skills directory, and removal's trust check canonicalizes
@@ -468,6 +502,10 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 		);
 	});
 	const wanted = new Set(names);
+	const sourceChanged = path.resolve(sourceDir) !== path.resolve(ownershipSourceDir);
+	const ambiguity = (name: string, destination: string, detail: string, blocksBridgeCutover = sourceChanged) => {
+		ambiguities.push({ name, linkPath: destination, detail, blocksBridgeCutover });
+	};
 
 	for (const name of names) {
 		const destination = linkPath(deps, name);
@@ -503,7 +541,19 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 				conflicts.push(destination);
 				continue;
 			}
-			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], legacyState.identity)) {
+			if (ledger.bridgeEntryIdentities?.[name] === undefined) {
+				// A pre-identity legacy link is not safe to adopt. Preserve it as an
+				// explicit ambiguity; migration is blocked so the old ledger and path
+				// remain authoritative until ownership can be proven.
+				ambiguity(
+					name,
+					destination,
+					`preserving an identityless legacy Paseo bridge link; adoption cannot authenticate ownership (${destination})`,
+					true,
+				);
+				continue;
+			}
+			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities[name], legacyState.identity)) {
 				conflicts.push(destination);
 				continue;
 			}
@@ -517,11 +567,30 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 			});
 			continue;
 		}
-		if (state.kind === "expected" && recordedAtCurrentBridge) {
+		if (state.kind === "expected") {
+			if (!recordedAtCurrentBridge) {
+				ambiguity(
+					name,
+					destination,
+					`preserving an unowned exact-target Paseo bridge link; matching text does not prove GJC ownership (${destination})`,
+				);
+				continue;
+			}
+			if (ledger.bridgeEntryIdentities?.[name] === undefined) {
+				ambiguity(
+					name,
+					destination,
+					`preserving an identityless Paseo bridge link; matching text does not prove GJC ownership (${destination})`,
+				);
+				continue;
+			}
 			// A same-target noop is ownership-preserving only when the live
 			// symlink is the exact object GJC recorded. Matching link text alone
 			// cannot distinguish that link from a user-created replacement.
-			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], state.identity)) {
+			if (
+				ledger.bridgeEntryIdentities?.[name] !== undefined &&
+				!matchesRecordedIdentity(ledger.bridgeEntryIdentities[name], state.identity)
+			) {
 				conflicts.push(destination);
 				continue;
 			}
@@ -530,10 +599,23 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 			// A dangling exact-target link is still an existing user object when
 			// provenance does not authenticate it. Never prune-and-recreate (or
 			// adopt through a migration) from matching target text alone.
-			if (
-				!recordedAtCurrentBridge ||
-				!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], state.identity)
-			) {
+			if (!recordedAtCurrentBridge) {
+				ambiguity(
+					name,
+					destination,
+					`preserving an unowned dangling Paseo bridge link; matching text does not prove GJC ownership (${destination})`,
+				);
+				continue;
+			}
+			if (ledger.bridgeEntryIdentities?.[name] === undefined) {
+				ambiguity(
+					name,
+					destination,
+					`preserving an identityless dangling Paseo bridge link; it cannot be safely pruned or recreated (${destination})`,
+				);
+				continue;
+			}
+			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities[name], state.identity)) {
 				conflicts.push(destination);
 				continue;
 			}
@@ -579,7 +661,15 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 				conflicts.push(destination);
 				continue;
 			}
-			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[entry.name], state.identity)) {
+			if (ledger.bridgeEntryIdentities?.[entry.name] === undefined) {
+				ambiguity(
+					entry.name,
+					destination,
+					`preserving an identityless stale Paseo bridge link; it cannot be safely pruned (${destination})`,
+				);
+				continue;
+			}
+			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities[entry.name], state.identity)) {
 				conflicts.push(destination);
 				continue;
 			}
@@ -599,6 +689,7 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 		entries,
 		prunes,
 		adopts,
+		ambiguities,
 	};
 }
 

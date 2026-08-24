@@ -421,6 +421,27 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// entry GJC did not previously record is deliberately NOT added: an
 		// exact-target link the user created themselves must never become
 		// GJC-owned just because a re-run observed it.
+		const bridgeAmbiguities = bridgePreflight.ambiguities ?? [];
+		const bridgeAmbiguityDetail = bridgeAmbiguities.map(ambiguity => ambiguity.detail).join("; ");
+		const bridgeAmbiguityRetained = [
+			...new Set([...bridgeAmbiguities.map(ambiguity => ambiguity.linkPath), deps.paths.provenanceLedger]),
+		];
+		// A source/path cutover would have to rewrite the ledger and retire the
+		// old bridge. An identityless old link is not destructive authority, so
+		// leave the entire bridge cutover untouched while still keeping the
+		// provider and orchestration steps already committed above.
+		if (bridgeAmbiguities.some(ambiguity => ambiguity.blocksBridgeCutover)) {
+			return {
+				outcome: "partial-install",
+				compensated: [],
+				uncompensated: bridgeAmbiguityRetained,
+				evidence: {
+					failedStep: "paseo skills bridge",
+					detail: bridgeAmbiguityDetail,
+					retained: bridgeAmbiguityRetained,
+				},
+			};
+		}
 		const bridgeLedger = await readProvenance(deps.paths.provenanceLedger);
 		// Migration binding: recorded ownership belongs to the recorded bridge
 		// PATH, not to the skill names alone. When the agent/profile path moved,
@@ -459,7 +480,15 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// that GJC created the live symlink, so preserve the missing receipt and let
 		// removal fail closed until a durable per-entry identity exists.
 		const bridgeEntryIdentities = bridgeLedger.bridgeEntryIdentities;
+		const retainedAmbiguousNames = bridgeAmbiguities
+			.filter(ambiguity => !ambiguity.blocksBridgeCutover)
+			.map(ambiguity => ambiguity.name);
 		const ownedAfterRun = [
+			// Keep identityless recorded names in the ledger as evidence, but never
+			// manufacture identities or let them become newly owned at another path.
+			...(isMigration
+				? []
+				: (bridgeLedger.bridgeEntries ?? []).filter(name => retainedAmbiguousNames.includes(name))),
 			// Entries this run or an earlier run actually creates/recreates.
 			...Object.values(bridgePreflight.entries)
 				.filter(entry => entry.action !== "noop" || (previouslyRecorded.has(entry.name) && entry.action === "noop"))
@@ -482,6 +511,18 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			!ledgerOwnsBridge(bridgeLedger) &&
 			bridgePreflight.bridgeDirCreated
 		) {
+			if (bridgeAmbiguities.length > 0) {
+				return {
+					outcome: "partial-install",
+					compensated: [],
+					uncompensated: bridgeAmbiguityRetained,
+					evidence: {
+						failedStep: "paseo skills bridge",
+						detail: bridgeAmbiguityDetail,
+						retained: bridgeAmbiguityRetained,
+					},
+				};
+			}
 			return { outcome: "installed", changed: [...changed, "paseo skills bridge (no source)"] };
 		}
 		// A resolved source containing no `paseo*` skills is an intentional
@@ -501,7 +542,8 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			// strand an owned directory and its registration. The no-bridge state
 			// applies only when the ledger owns no bridge at all.
 			bridgeLedger.bridgeDirCreated !== true &&
-			bridgeLedger.bridgePath === undefined;
+			bridgeLedger.bridgePath === undefined &&
+			bridgeAmbiguities.length === 0;
 		if (intentionalNoBridge) {
 			await writeProvenance(deps.paths.provenanceLedger, {
 				...bridgeLedger,
@@ -512,6 +554,27 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				bridgeSourceDir: undefined,
 			});
 			return { outcome: "installed", changed: [...changed, "paseo skills bridge (empty source)"] };
+		}
+		// Nothing provably owned needs a bridge mutation. Keep the existing ledger,
+		// registration, and ambiguous link byte-for-byte intact while reporting the
+		// partial reconciliation after the independent JSON steps succeeded.
+		if (
+			bridgeAmbiguities.length > 0 &&
+			Object.keys(bridgePreflight.entries).length === 0 &&
+			bridgePreflight.prunes.length === 0 &&
+			bridgePreflight.adopts.length === 0 &&
+			!bridgePreflight.bridgeDirCreated
+		) {
+			return {
+				outcome: "partial-install",
+				compensated: [],
+				uncompensated: bridgeAmbiguityRetained,
+				evidence: {
+					failedStep: "paseo skills bridge",
+					detail: bridgeAmbiguityDetail,
+					retained: bridgeAmbiguityRetained,
+				},
+			};
 		}
 		if (hasBridgeWork || bridgePreflight.sourceDir !== undefined) {
 			await writeProvenance(deps.paths.provenanceLedger, {
@@ -676,6 +739,18 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			}
 			changed.push(migratedOldBridgeDir);
 		}
+		if (bridgeAmbiguities.length > 0) {
+			return {
+				outcome: "partial-install",
+				compensated: [],
+				uncompensated: bridgeAmbiguityRetained,
+				evidence: {
+					failedStep: "paseo skills bridge",
+					detail: bridgeAmbiguityDetail,
+					retained: bridgeAmbiguityRetained,
+				},
+			};
+		}
 	} catch (error) {
 		const failure =
 			error instanceof SagaStepError
@@ -733,9 +808,11 @@ async function captureMigratedOldBridgeEntries(
 		};
 		const recorded = recordedIdentities?.[name];
 		if (recorded === undefined) {
-			throw new SkillsBridgeError(
-				`Refusing to migrate an old Paseo skill bridge entry without a durable recorded identity: ${destination}`,
-			);
+			// Pre-identity ledgers cannot prove that this matching link is still
+			// the object GJC created. Preserve the ambiguous pathname and leave it
+			// out of the migrated ownership set instead of wedging setup or deleting
+			// a user-created successor.
+			continue;
 		}
 		if (!sameBridgeEntryIdentity(recorded, observed)) {
 			throw new SkillsBridgeError(`Refusing to migrate a changed old Paseo skill bridge entry: ${destination}`);
