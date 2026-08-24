@@ -106,6 +106,30 @@ describe("Cursor raw transport watchdog", () => {
 		expect(cursorExecDeadlineMsForTest(120_000)).toBe(480_000);
 	});
 
+	it("starts the first-event budget before large request-context rule construction", async () => {
+		let requestCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			requestCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		});
+		const largeContext: Context = {
+			...baseContext,
+			systemPrompt: ["context-rule".repeat(500_000)],
+		};
+		const stream = streamModel({ ...cursorModel, baseUrl }, largeContext, {
+			apiKey: "test-token",
+			streamFirstEventTimeoutMs: 1,
+		});
+		const events: unknown[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(requestCount).toBe(0);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("first transport event");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("does not open a credential-bearing request for a pre-aborted signal", async () => {
 		let requestCount = 0;
 		const baseUrl = await createCursorServer(stream => {

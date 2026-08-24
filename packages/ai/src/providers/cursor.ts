@@ -715,6 +715,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	options?: CursorOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	// Cursor owns this watchdog, so the budget begins at streamCursor()
+	// invocation—before system-prompt normalization/rule protobuf construction
+	// as well as history/blob/request serialization.
+	const firstEventStartedAt = Date.now();
+	const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+	const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+	const endpointClass = model.baseUrl ? "custom" : "canonical";
 	const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
 	(async () => {
@@ -825,7 +832,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				throw new Error("Cursor API key (access token) is required");
 			}
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+<<<<<<< HEAD
 
+=======
+			// Cursor owns the first-event watchdog, so its budget starts before
+			// history/blob/protobuf serialization. Synchronous setup cannot be
+			// interrupted by a timer; the remaining-budget check below prevents a
+			// credential-bearing request after serialization already exhausted it.
+>>>>>>> 98979fdd28 (fix(cursor): start first-event clock at stream invocation)
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
@@ -886,7 +900,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2RequestErrorHandler = error => settleH2(error);
 			h2Request.on("error", h2RequestErrorHandler);
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
-
+			// Cursor owns the first-event watchdog, so its budget starts before
+			// history/blob/protobuf serialization. Synchronous setup cannot be
+			// interrupted by a timer; the remaining-budget check below prevents a
+			// credential-bearing request after serialization already exhausted it.
 			stream.push({ type: "start", partial: output });
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
