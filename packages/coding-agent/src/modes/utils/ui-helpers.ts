@@ -1146,7 +1146,7 @@ export class UiHelpers {
 				subskillActivation: activationResult.activation,
 				subskillActivationSet: activationResult.activeSubskillsToPersist,
 				cwd: this.ctx.sessionManager.getCwd(),
-					agentDir: this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.(),
+				agentDir: this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.(),
 				sessionId: this.ctx.session.sessionId,
 			});
 			const details: SkillPromptDetails = built.details;
