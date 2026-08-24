@@ -3,8 +3,8 @@ import * as path from "node:path";
 import { getAgentDir, pathIsWithin } from "@gajae-code/utils";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
-export function gjcPluginUserRoot(): string {
-	return path.join(getAgentDir(), "gjc-plugins");
+export function gjcPluginUserRoot(agentDir?: string): string {
+	return path.join(agentDir ?? getAgentDir(), "gjc-plugins");
 }
 
 export function gjcPluginProjectRoot(cwd: string): string {
@@ -48,9 +48,16 @@ async function discoverGjcPluginRootsIn(baseDir: string): Promise<string[]> {
 	return roots.filter((root): root is string => root !== null).sort((a, b) => a.localeCompare(b));
 }
 
-export async function discoverGjcPluginRoots({ cwd }: { cwd: string; home?: string }): Promise<string[]> {
+export async function discoverGjcPluginRoots({
+	cwd,
+	agentDir,
+}: {
+	cwd: string;
+	home?: string;
+	agentDir?: string;
+}): Promise<string[]> {
 	const roots = await Promise.all([
-		discoverGjcPluginRootsIn(gjcPluginUserRoot()),
+		discoverGjcPluginRootsIn(gjcPluginUserRoot(agentDir)),
 		discoverGjcPluginRootsIn(gjcPluginProjectRoot(cwd)),
 	]);
 	return roots.flat();

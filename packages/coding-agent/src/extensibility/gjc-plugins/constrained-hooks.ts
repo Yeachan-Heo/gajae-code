@@ -178,9 +178,11 @@ async function loadOneHook(
  * `cwd`, applying hash-drift + collision quarantine first. Returns empty when
  * no plugins are installed.
  */
-export async function loadConstrainedPluginHooks(input: { cwd: string }): Promise<ConstrainedHookLoadResult> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd);
-	if (effective.length === 0) return { hooks: [], quarantine: [] };
+export async function loadConstrainedPluginHooks(input: {
+	cwd: string;
+	agentDir?: string;
+}): Promise<ConstrainedHookLoadResult> {
+	const effective = await loadEffectiveGjcPluginRegistry(input.cwd, { agentDir: input.agentDir });
 	const preQuarantine: SessionQuarantine[] = [];
 	const invalidHookIds = new Set<string>();
 	for (const entry of effective) {

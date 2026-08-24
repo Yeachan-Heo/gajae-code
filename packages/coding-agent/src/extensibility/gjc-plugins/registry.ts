@@ -11,12 +11,12 @@ const LOCK_FILENAME = "registry.lock";
 const LOCK_TIMEOUT_MS = 5000;
 const LOCK_RETRY_MS = 50;
 
-export function registryRootForScope(scope: GjcPluginScope, cwd: string): string {
-	return scope === "user" ? gjcPluginUserRoot() : gjcPluginProjectRoot(cwd);
+export function registryRootForScope(scope: GjcPluginScope, cwd: string, agentDir?: string): string {
+	return scope === "user" ? gjcPluginUserRoot(agentDir) : gjcPluginProjectRoot(cwd);
 }
 
-export function registryPathForScope(scope: GjcPluginScope, cwd: string): string {
-	return path.join(registryRootForScope(scope, cwd), REGISTRY_FILENAME);
+export function registryPathForScope(scope: GjcPluginScope, cwd: string, agentDir?: string): string {
+	return path.join(registryRootForScope(scope, cwd, agentDir), REGISTRY_FILENAME);
 }
 
 function emptyRegistry(scope: GjcPluginScope): GjcPluginRegistry {
@@ -41,8 +41,8 @@ export function sortRegistryEntries(entries: GjcPluginRegistryEntry[]): GjcPlugi
 	});
 }
 
-async function readRegistryRaw(scope: GjcPluginScope, cwd: string): Promise<GjcPluginRegistry> {
-	const registryPath = registryPathForScope(scope, cwd);
+async function readRegistryRaw(scope: GjcPluginScope, cwd: string, agentDir?: string): Promise<GjcPluginRegistry> {
+	const registryPath = registryPathForScope(scope, cwd, agentDir);
 	let text: string;
 	try {
 		text = await fs.readFile(registryPath, "utf8");
@@ -93,8 +93,9 @@ async function discoverLegacyEntries(
 	scope: GjcPluginScope,
 	cwd: string,
 	existing: readonly GjcPluginRegistryEntry[],
+	agentDir?: string,
 ): Promise<GjcPluginRegistryEntry[]> {
-	const root = registryRootForScope(scope, cwd);
+	const root = registryRootForScope(scope, cwd, agentDir);
 	let dirents: import("node:fs").Dirent[];
 	try {
 		dirents = await fs.readdir(root, { withFileTypes: true });
@@ -191,9 +192,13 @@ async function discoverLegacyEntries(
  * on disk without a registry entry, so a preview built on it would disagree
  * with the uninstall it is previewing.
  */
-export async function readEffectiveRegistryUnpersisted(scope: GjcPluginScope, cwd: string): Promise<GjcPluginRegistry> {
-	const registry = await readRegistryRaw(scope, cwd);
-	const discovered = await discoverLegacyEntries(scope, cwd, registry.plugins);
+export async function readEffectiveRegistryUnpersisted(
+	scope: GjcPluginScope,
+	cwd: string,
+	agentDir?: string,
+): Promise<GjcPluginRegistry> {
+	const registry = await readRegistryRaw(scope, cwd, agentDir);
+	const discovered = await discoverLegacyEntries(scope, cwd, registry.plugins, agentDir);
 	const migrated = await migrateGjcPluginEntries([...registry.plugins, ...discovered]);
 	if (!migrated.changed && discovered.length === 0) return registry;
 	return { ...registry, plugins: sortRegistryEntries(migrated.entries) };
@@ -202,26 +207,32 @@ export async function readEffectiveRegistryUnpersisted(scope: GjcPluginScope, cw
 export async function readRegistry(
 	scope: GjcPluginScope,
 	cwd: string,
-	options: { migrate?: boolean } = {},
+	options: { migrate?: boolean; agentDir?: string } = {},
 ): Promise<GjcPluginRegistry> {
-	const registry = await readRegistryRaw(scope, cwd);
+	const agentDir = options.agentDir;
+	const registry = await readRegistryRaw(scope, cwd, agentDir);
 	if (options.migrate === false) return registry;
-	const discovered = await discoverLegacyEntries(scope, cwd, registry.plugins);
+	const discovered = await discoverLegacyEntries(scope, cwd, registry.plugins, agentDir);
 	const migrated = await migrateGjcPluginEntries([...registry.plugins, ...discovered]);
 	if (!migrated.changed && discovered.length === 0) return registry;
 	// Re-check under the lock before persisting. Migration and legacy-root
 	// discovery are one transaction, never a normal runtime loader path.
-	return await withRegistryLock(scope, cwd, async () => {
-		const latest = await readRegistryRaw(scope, cwd);
-		const latestDiscovered = await discoverLegacyEntries(scope, cwd, latest.plugins);
-		const latestMigrated = await migrateGjcPluginEntries([...latest.plugins, ...latestDiscovered]);
-		if (latestMigrated.changed || latestDiscovered.length > 0) {
-			const next: GjcPluginRegistry = { ...latest, plugins: sortRegistryEntries(latestMigrated.entries) };
-			await writeRegistryUnlocked(next, cwd, scope);
-			return next;
-		}
-		return latest;
-	});
+	return await withRegistryLock(
+		scope,
+		cwd,
+		async () => {
+			const latest = await readRegistryRaw(scope, cwd, agentDir);
+			const latestDiscovered = await discoverLegacyEntries(scope, cwd, latest.plugins, agentDir);
+			const latestMigrated = await migrateGjcPluginEntries([...latest.plugins, ...latestDiscovered]);
+			if (latestMigrated.changed || latestDiscovered.length > 0) {
+				const next: GjcPluginRegistry = { ...latest, plugins: sortRegistryEntries(latestMigrated.entries) };
+				await writeRegistryUnlocked(next, cwd, scope, agentDir);
+				return next;
+			}
+			return latest;
+		},
+		agentDir,
+	);
 }
 
 async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
@@ -265,8 +276,13 @@ async function acquireLock(lockPath: string): Promise<() => Promise<void>> {
 	}
 }
 
-export async function withRegistryLock<T>(scope: GjcPluginScope, cwd: string, fn: () => Promise<T>): Promise<T> {
-	const lockPath = path.join(registryRootForScope(scope, cwd), LOCK_FILENAME);
+export async function withRegistryLock<T>(
+	scope: GjcPluginScope,
+	cwd: string,
+	fn: () => Promise<T>,
+	agentDir?: string,
+): Promise<T> {
+	const lockPath = path.join(registryRootForScope(scope, cwd, agentDir), LOCK_FILENAME);
 	const release = await acquireLock(lockPath);
 	try {
 		return await fn();
@@ -283,6 +299,7 @@ export async function writeRegistryUnlocked(
 	registry: GjcPluginRegistry,
 	cwd: string,
 	ownerScope: GjcPluginScope = registry.scope,
+	agentDir?: string,
 ): Promise<void> {
 	if (registry.scope !== ownerScope)
 		throw new GjcPluginLoadError(
@@ -291,7 +308,7 @@ export async function writeRegistryUnlocked(
 		);
 	if (registry.plugins.some(entry => entry.scope !== ownerScope))
 		throw new GjcPluginLoadError("invalid_manifest", `GJC plugin entry scope mismatch: caller owns ${ownerScope}`);
-	const registryPath = registryPathForScope(ownerScope, cwd);
+	const registryPath = registryPathForScope(ownerScope, cwd, agentDir);
 	await fs.mkdir(path.dirname(registryPath), { recursive: true });
 	const sorted: GjcPluginRegistry = { ...registry, scope: ownerScope, plugins: sortRegistryEntries(registry.plugins) };
 	const text = `${JSON.stringify(sorted, null, 2)}\n`;
@@ -314,8 +331,9 @@ export async function writeRegistry(
 	registry: GjcPluginRegistry,
 	cwd: string,
 	ownerScope: GjcPluginScope = registry.scope,
+	agentDir?: string,
 ): Promise<void> {
-	await withRegistryLock(ownerScope, cwd, () => writeRegistryUnlocked(registry, cwd, ownerScope));
+	await withRegistryLock(ownerScope, cwd, () => writeRegistryUnlocked(registry, cwd, ownerScope, agentDir), agentDir);
 }
 
 /**
@@ -347,11 +365,11 @@ export async function updateRegistry(
  */
 export async function loadEffectiveGjcPluginRegistry(
 	cwd: string,
-	options: { migrate?: boolean } = {},
+	options: { migrate?: boolean; agentDir?: string } = {},
 ): Promise<GjcPluginRegistryEntry[]> {
 	const [user, project] = await Promise.all([
 		readRegistry("user", cwd, options),
-		readRegistry("project", cwd, options),
+		readRegistry("project", cwd, { migrate: options.migrate }),
 	]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
 }

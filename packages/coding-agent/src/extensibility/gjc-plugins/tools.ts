@@ -15,13 +15,21 @@ export async function loadActiveSubskillTools(input: {
 	parent: string;
 	phase: string;
 	reservedToolNames?: string[];
+	agentDir?: string;
 	/** Test seam runs before the security guard; the guard remains adjacent to import. */
 	beforeImport?: (resolvedPath: string) => Promise<void>;
 }): Promise<CustomTool[]> {
 	const entries = await readActiveSubskillsForParent(input);
 	const validated = (
 		await Promise.all(
-			entries.map(entry => resolveValidatedActiveSubskill({ cwd: input.cwd, reference: entry, persisted: true })),
+			entries.map(entry =>
+				resolveValidatedActiveSubskill({
+					cwd: input.cwd,
+					reference: entry,
+					persisted: true,
+					agentDir: input.agentDir,
+				}),
+			),
 		)
 	).filter((item): item is NonNullable<typeof item> => item !== null);
 	const toolRefs = validated.flatMap(item =>

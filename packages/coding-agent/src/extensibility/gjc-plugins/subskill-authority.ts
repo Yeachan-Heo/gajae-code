@@ -155,10 +155,11 @@ export async function resolveValidatedActiveSubskill(input: {
 	cwd: string;
 	reference: SubskillReference | ActiveSubskillEntry;
 	persisted?: boolean;
+	agentDir?: string;
 }): Promise<ValidatedActiveSubskill | null> {
 	const reference = input.reference as SubskillReference;
 	if (!reference.scope || !reference.extensionId || !reference.expectedDigest) return null;
-	const entries = await loadEffectiveGjcPluginRegistry(input.cwd);
+	const entries = await loadEffectiveGjcPluginRegistry(input.cwd, { agentDir: input.agentDir });
 	const entry = entryForReference(entries, reference);
 	if (!entry?.enabled || entry.migration?.status === "failed") return null;
 	const surface = surfaceForReference(entry, reference);

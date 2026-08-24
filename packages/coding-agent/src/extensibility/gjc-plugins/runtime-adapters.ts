@@ -38,8 +38,11 @@ async function resolveRuntimeFile(root: string, relativePath: string): Promise<s
  * Return v2 tool declarations without reading or importing implementation
  * modules. This is the schema-serving path used by discovery and diagnostics.
  */
-export async function getGjcPluginToolDeclarations(cwd: string): Promise<GjcPluginToolDeclaration[]> {
-	const entries = await loadEffectiveGjcPluginRegistry(cwd);
+export async function getGjcPluginToolDeclarations(
+	cwd: string,
+	agentDir?: string,
+): Promise<GjcPluginToolDeclaration[]> {
+	const entries = await loadEffectiveGjcPluginRegistry(cwd, { agentDir });
 	const declarations: GjcPluginToolDeclaration[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled || entry.migration?.status === "failed") continue;
@@ -52,8 +55,8 @@ export async function getGjcPluginToolDeclarations(cwd: string): Promise<GjcPlug
 }
 
 /** Serve the canonical schemas keyed by their stable tool surface id. */
-export async function serveGjcPluginSchemas(cwd: string): Promise<Record<string, JsonSchema202012>> {
-	const declarations = await getGjcPluginToolDeclarations(cwd);
+export async function serveGjcPluginSchemas(cwd: string, agentDir?: string): Promise<Record<string, JsonSchema202012>> {
+	const declarations = await getGjcPluginToolDeclarations(cwd, agentDir);
 	return Object.fromEntries(declarations.map(declaration => [declaration.extensionId, declaration.schema]));
 }
 
@@ -100,9 +103,9 @@ function snapshotsKey(snapshots: readonly FileSnapshot[]): string {
 	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.ctimeMs}:${s.size}:${s.ino}`).join("|");
 }
 
-async function snapshotRegistryFiles(cwd: string): Promise<FileSnapshot[]> {
+async function snapshotRegistryFiles(cwd: string, agentDir?: string): Promise<FileSnapshot[]> {
 	const snapshots = await Promise.all(
-		registryScopes.map(scope => snapshotExistingFile(registryPathForScope(scope, cwd))),
+		registryScopes.map(scope => snapshotExistingFile(registryPathForScope(scope, cwd, agentDir))),
 	);
 	return snapshots.filter((s): s is FileSnapshot => s !== null);
 }
@@ -180,18 +183,19 @@ async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<S
 	return null;
 }
 
-async function loadValidatedPluginRegistry(cwd: string): Promise<ValidatedPluginRegistry> {
-	const registryFiles = await snapshotRegistryFiles(cwd);
+async function loadValidatedPluginRegistry(cwd: string, agentDir?: string): Promise<ValidatedPluginRegistry> {
+	const cacheKey = JSON.stringify([cwd, agentDir ?? null]);
+	const registryFiles = await snapshotRegistryFiles(cwd, agentDir);
 	const registryKey = snapshotsKey(registryFiles);
-	const cached = validatedRegistryCache.get(cwd);
+	const cached = validatedRegistryCache.get(cacheKey);
 	if (cached && cached.registryKey === registryKey) {
 		const pluginFiles = await snapshotPluginFiles(cached.effective);
 		const pluginKey = snapshotsKey(pluginFiles);
 		if (cached.pluginKey === pluginKey) return cached;
 	}
 
-	const effective = await loadEffectiveGjcPluginRegistry(cwd);
-	const currentRegistryFiles = await snapshotRegistryFiles(cwd);
+	const effective = await loadEffectiveGjcPluginRegistry(cwd, { agentDir });
+	const currentRegistryFiles = await snapshotRegistryFiles(cwd, agentDir);
 	const preQuarantine: SessionQuarantine[] = [];
 	for (const entry of effective) {
 		if (!entry.enabled) continue;
@@ -210,7 +214,7 @@ async function loadValidatedPluginRegistry(cwd: string): Promise<ValidatedPlugin
 		registryKey: snapshotsKey(currentRegistryFiles),
 		pluginKey: snapshotsKey(pluginFiles),
 	};
-	validatedRegistryCache.set(cwd, next);
+	validatedRegistryCache.set(cacheKey, next);
 	return next;
 }
 
@@ -231,10 +235,11 @@ export async function loadAlwaysOnPluginTools(input: {
 	cwd: string;
 	reservedToolNames: string[];
 	declarations?: readonly GjcPluginToolDeclaration[];
+	agentDir?: string;
 	/** Test seam runs before the final per-import integrity guard. */
 	beforeImport?: (resolvedPath: string) => Promise<void>;
 }): Promise<AlwaysOnPluginTools> {
-	const validated = await loadValidatedPluginRegistry(input.cwd);
+	const validated = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
 	const { effective } = validated;
 	if (effective.length === 0) return { tools: [], quarantine: [] };
 

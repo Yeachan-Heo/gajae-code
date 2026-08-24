@@ -8,6 +8,7 @@ import {
 	compileGjcPluginBundle,
 	GjcPluginLoadError,
 	getGjcPluginMigrationStatuses,
+	getGjcPluginToolDeclarations,
 	loadAlwaysOnPluginTools,
 	PluginImplementationHashMismatchError,
 	readRegistry,
@@ -174,6 +175,39 @@ describe("GJC plugin registry v2 cutover", () => {
 		} finally {
 			delete process.env.GJC_TEST_IMPORT_SENTINEL;
 		}
+	});
+	test("resolves the user-scope registry from the session agent directory", async () => {
+		const cwd = await makeCwd();
+		const root = path.join(cwd, "plugin");
+		await fs.cp(fixture, root, { recursive: true });
+		const bundle = await compileGjcPluginBundle(root);
+		const sessionAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-registry-v2-session-agent-"));
+		tempRoots.push(sessionAgentDir);
+		const entry: GjcPluginRegistryEntry = {
+			name: bundle.name,
+			version: bundle.version,
+			scope: "user",
+			enabled: true,
+			pluginRoot: root,
+			manifestPath: bundle.manifestPath,
+			manifestHash: bundle.manifestHash,
+			source: { kind: "path", uri: root, resolvedAt: new Date().toISOString() },
+			installedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+			copiedFiles: bundle.files,
+			surfaces: bundle.surfaces,
+			disabledSurfaceIds: [],
+		};
+		await writeRegistry({ version: 1, scope: "user", plugins: [entry] }, cwd, "user", sessionAgentDir);
+
+		const sessionScoped = await readRegistry("user", cwd, { agentDir: sessionAgentDir, migrate: false });
+		expect(sessionScoped.plugins[0]?.name).toBe(bundle.name);
+		const processScoped = await readRegistry("user", cwd, { migrate: false });
+		expect(processScoped.plugins).toHaveLength(0);
+		const declarations = await getGjcPluginToolDeclarations(cwd, sessionAgentDir);
+		expect(declarations[0]?.plugin).toBe(bundle.name);
+		const processDeclarations = await getGjcPluginToolDeclarations(cwd);
+		expect(processDeclarations).toHaveLength(0);
 	});
 
 	test("implementation hash mismatch refuses the single v2 import path", async () => {
