@@ -4656,7 +4656,10 @@ pub(crate) mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained skill-directory descriptor owns the unique private file name"
 	)]
-	fn create_private_skill_file(parent_fd: libc::c_int, file_mode: u32) -> Result<(File, CString), &'static str> {
+	fn create_private_skill_file(
+		parent_fd: libc::c_int,
+		file_mode: u32,
+	) -> Result<(File, CString), &'static str> {
 		for _ in 0..16 {
 			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
 			let name = CString::new(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence))
@@ -4733,8 +4736,7 @@ pub(crate) mod platform {
 		let valid = unsafe { libc::fstat(private_fd, &mut opened) } == 0
 			&& unsafe {
 				libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
-			} == 0
-			&& opened.st_mode & libc::S_IFMT == libc::S_IFREG
+			} == 0 && opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& opened.st_nlink == 1
 			&& published.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& published.st_nlink == 1
@@ -4745,8 +4747,7 @@ pub(crate) mod platform {
 		}
 		if unsafe {
 			libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
-		} == 0
-			&& opened.st_dev == published.st_dev
+		} == 0 && opened.st_dev == published.st_dev
 			&& opened.st_ino == published.st_ino
 		{
 			unsafe { libc::unlinkat(parent_fd, final_name.as_ptr(), 0) };
