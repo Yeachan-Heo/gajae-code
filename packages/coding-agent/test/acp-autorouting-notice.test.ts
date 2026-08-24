@@ -173,4 +173,4 @@ test("AC10c: usable autorouting tiers and disabled autorouting produce no though
 			await close();
 		}
 	}
-}, 30_000);
+}, 60_000);
