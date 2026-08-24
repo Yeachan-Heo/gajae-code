@@ -231,8 +231,20 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
  * portable `ps` value is used instead of giving up and writing `unknown`, which would
  * make PID reuse undetectable.
  */
-function ownerStartTime(pid: number): string {
-	return readLinuxProcStartTimeSync(pid) ?? portableProcessStartTime(pid) ?? "unknown";
+async function ownerStartTime(pid: number, deadline: number): Promise<string> {
+	const linuxStartTime = readLinuxProcStartTimeSync(pid);
+	if (linuxStartTime !== null) return linuxStartTime;
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) throw new SessionStateLockUnavailableError();
+	const child = Bun.spawn(["ps", "-o", "lstart=", "-p", String(pid)], {
+		stdout: "pipe",
+		stderr: "ignore",
+		timeout: Math.max(1, Math.ceil(remaining)),
+	});
+	const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+	if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
+	const startTime = exitCode === 0 ? output.trim() : "";
+	return startTime || "unknown";
 }
 
 function validLockOwner(value: unknown): value is SessionStateLockOwner {
@@ -357,11 +369,11 @@ async function waitForLockRetry(deadline: number): Promise<boolean> {
 }
 
 /** Run acquisition preflight without allowing it to outlive the shared deadline. */
-async function withinLockAcquireDeadline<T>(deadline: number, operation: Promise<T>): Promise<T> {
+async function withinLockAcquireDeadline<T>(deadline: number, operation: () => Promise<T>): Promise<T> {
 	const remaining = deadline - performance.now();
 	if (remaining <= 0) throw new SessionStateLockUnavailableError();
 	const outcome = await Promise.race([
-		operation.then(value => ({ timedOut: false as const, value })),
+		operation().then(value => ({ timedOut: false as const, value })),
 		Bun.sleep(remaining).then(() => ({ timedOut: true as const })),
 	]);
 	if (outcome.timedOut) throw new SessionStateLockUnavailableError();
@@ -638,10 +650,10 @@ function ownerCreateFlags(): number | undefined {
 	return strategy === "posix-nofollow" ? POSIX_OWNER_CREATE_FLAGS : undefined;
 }
 
-async function newLockOwner(): Promise<SessionStateLockOwner> {
+async function newLockOwner(deadline: number): Promise<SessionStateLockOwner> {
 	return {
 		pid: process.pid,
-		start_time: ownerStartTime(process.pid),
+		start_time: await ownerStartTime(process.pid, deadline),
 		token: randomUUID(),
 		owner_host_id: await currentOwnerHostId(),
 	};
@@ -1004,10 +1016,10 @@ async function withLockPathTransition<T>(
 ): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
-	const owner = await newLockOwner();
+	const owner = await withinLockAcquireDeadline(deadline, () => newLockOwner(deadline));
 	for (;;) {
 		try {
-			await fs.mkdir(transitionDir);
+			await withinLockAcquireDeadline(deadline, () => fs.mkdir(transitionDir));
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
@@ -1238,8 +1250,8 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
 	const deadline = lockAcquireDeadline();
-	const owner = await withinLockAcquireDeadline(deadline, newLockOwner());
-	await withinLockAcquireDeadline(deadline, fs.mkdir(path.dirname(stateFile), { recursive: true }));
+	const owner = await withinLockAcquireDeadline(deadline, () => newLockOwner(deadline));
+	await withinLockAcquireDeadline(deadline, () => fs.mkdir(path.dirname(stateFile), { recursive: true }));
 	for (;;) {
 		let held: LockOwnerSnapshot | undefined;
 		try {
