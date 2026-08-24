@@ -22,6 +22,8 @@ import {
 	publishPlan,
 	readReplacedProviderBackup,
 	readTarget,
+	removeDiscardSidecar,
+	removeReplacedProviderBackup,
 	replacedProviderBackupPath,
 	serializeJson,
 	writeReplacedProviderBackup,
@@ -340,6 +342,24 @@ describe("backup safety", () => {
 });
 
 describe("replaced-provider sidecar cleanup", () => {
+	test("canonicalizes supported symlinked config ancestors before native unlink", async () => {
+		const fixture = await makeFixture();
+		const realConfigDir = path.join(fixture.root, "real-paseo");
+		const linkedConfigDir = path.join(fixture.root, "linked-paseo");
+		await fs.mkdir(realConfigDir, { recursive: true });
+		await fs.symlink(realConfigDir, linkedConfigDir);
+		const configPath = path.join(linkedConfigDir, "config.json");
+		const sidecar = await writeReplacedProviderBackup(configPath, "gjc", { preserved: true });
+
+		expect(await removeReplacedProviderBackup(sidecar.backupPath, "gjc", sidecar.valueSha256)).toBe(true);
+		await expect(fs.stat(sidecar.backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+
+		const discardBytes = serializeJson({ key: "gjc", value: { discarded: true } });
+		await fs.writeFile(sidecar.backupPath, discardBytes, { mode: 0o600 });
+		expect(await removeDiscardSidecar(configPath, sidecar.backupPath, hashBytes(discardBytes))).toBe(true);
+		await expect(fs.stat(sidecar.backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("removes the staged sidecar after every temporary publication failure", async () => {
 		for (const phase of ["open", "write", "sync", "chmod", "link"] as const) {
 			const fixture = await makeFixture();

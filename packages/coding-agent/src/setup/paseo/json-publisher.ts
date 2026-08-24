@@ -252,6 +252,20 @@ async function sourceMode(targetPath: string): Promise<number> {
  */
 const BACKUP_MODE = 0o600;
 
+/**
+ * Canonicalize the existing parent of a sidecar for native path walking.
+ *
+ * Native exact-unlink rejects intermediate symlinks and junctions by design,
+ * while supported config roots may themselves be reached through one. Keep
+ * the final basename lexical so the native no-follow check still guards the
+ * sidecar pathname at the mutation boundary.
+ */
+async function canonicalSidecarPathForNativeUnlink(sidecarPath: string): Promise<string> {
+	const absolute = path.resolve(sidecarPath);
+	const canonicalParent = await fs.realpath(path.dirname(absolute));
+	return path.join(canonicalParent, path.basename(absolute));
+}
+
 async function copyPrivately(from: string, to: string): Promise<void> {
 	const bytes = await Bun.file(from).text();
 	const mode = BACKUP_MODE;
@@ -452,7 +466,8 @@ export async function removeReplacedProviderBackup(
 			sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
 			quarantineName: `.gjc-paseo-sidecar-${process.pid}-${nodeCrypto.randomUUID()}`,
 		};
-		return exactUnlinkDirect(backupPath, identity).ok;
+		const canonicalBackupPath = await canonicalSidecarPathForNativeUnlink(backupPath);
+		return exactUnlinkDirect(canonicalBackupPath, identity).ok;
 	} catch {
 		return false;
 	}
@@ -505,7 +520,12 @@ export async function removeDiscardSidecar(
 			sha256: digest,
 			quarantineName: `.gjc-paseo-discard-${process.pid}-${nodeCrypto.randomUUID()}`,
 		};
-		const result = exactUnlinkDirect(backupPath, identity);
+		// Keep the namespace and fd-bound identity checks above on the lexical
+		// intent path, then canonicalize only its existing parent for the strict
+		// native walk. Rejoining the basename preserves final-component
+		// no-follow behavior, including a replacement symlink after this read.
+		const canonicalBackupPath = await canonicalSidecarPathForNativeUnlink(backupPath);
+		const result = exactUnlinkDirect(canonicalBackupPath, identity);
 		// The sidecar was authenticated from the open handle above. If another
 		// actor removed that exact file before native cleanup reached the path,
 		// ENOENT is already-cleaned success; an initially missing path never gets
