@@ -30,6 +30,7 @@
 use std::{
 	future::Future,
 	panic::{AssertUnwindSafe, catch_unwind},
+	time::Duration,
 };
 
 use napi::{Env, Error, Result, Task, bindgen_prelude::*};
@@ -308,6 +309,26 @@ where
 	F: FnOnce() -> Result<T> + Send + 'static,
 	T: ToNapiValue + Send + 'static,
 {
+	isolated_with_timeout(env, tag, None, work, None)
+}
+
+/// As [`isolated`], but settle the JavaScript promise with `timeout_value` when
+/// the dedicated worker has not produced a result by `timeout_ms`. The worker
+/// itself remains detached because a blocked kernel syscall cannot be safely
+/// cancelled; dropping its receiver prevents a late result from crossing the
+/// N-API boundary. The timeout value must be a typed refusal, never a partial
+/// success.
+pub fn isolated_with_timeout<'env, T, F>(
+	env: &'env Env,
+	tag: &'static str,
+	timeout_ms: Option<u32>,
+	work: F,
+	timeout_value: Option<T>,
+) -> Result<PromiseRaw<'env, T>>
+where
+	F: FnOnce() -> Result<T> + Send + 'static,
+	T: ToNapiValue + Send + 'static,
+{
 	let (sender, receiver) = tokio::sync::oneshot::channel::<Result<T>>();
 	std::thread::Builder::new()
 		.name(format!("pi-natives-{tag}"))
@@ -325,9 +346,20 @@ where
 		.map_err(|error| Error::from_reason(format!("IsolatedTask spawn failed: {error}")))?;
 
 	future(env, tag, async move {
-		receiver
-			.await
-			.map_err(|_| Error::from_reason("IsolatedTask worker exited without a result"))?
+		let received = async move {
+			receiver
+				.await
+				.map_err(|_| Error::from_reason("IsolatedTask worker exited without a result"))?
+		};
+		if let Some(timeout_ms) = timeout_ms {
+			match tokio::time::timeout(Duration::from_millis(u64::from(timeout_ms)), received).await {
+				Ok(result) => result,
+				Err(_) => timeout_value
+					.ok_or_else(|| Error::from_reason("IsolatedTask timeout value is unavailable")),
+			}
+		} else {
+			received.await
+		}
 	})
 }
 

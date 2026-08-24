@@ -900,9 +900,10 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
 /**
  * Async variant of `exactRemoveDirectoryTree` on a dedicated native thread.
  * A wedged filesystem cannot consume the JS thread or shared libuv pool after
- * the caller's deadline expires.
+ * the caller's deadline expires. `timeoutMs` settles with a typed refusal;
+ * it never reports a partial or successful removal.
  */
-export declare function exactRemoveDirectoryTreeAsync(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): Promise<NativeExactUnlinkResult>
+export declare function exactRemoveDirectoryTreeAsync(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null, timeoutMs?: number | undefined | null): Promise<NativeExactUnlinkResult>
 
 /**
  * Atomically replace a staged regular file only after validating the exact
@@ -2349,10 +2350,11 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
 /**
- * Async variant of `snapshotDirectoryTree` scheduled on the native blocking
- * pool so recursive legacy lock capture cannot block the JS event loop.
+ * Async variant of `snapshotDirectoryTree` on a dedicated native thread so
+ * recursive legacy lock capture cannot block the JS event loop or shared libuv
+ * pool. `timeoutMs` settles with a typed refusal, never an incomplete capture.
  */
-export declare function snapshotDirectoryTreeAsync(path: string): Promise<NativeDirectoryTreeResult>
+export declare function snapshotDirectoryTreeAsync(path: string, timeoutMs?: number | undefined | null): Promise<NativeDirectoryTreeResult>
 
 export declare function summarizeCode(options: SummaryOptions): Promise<SummaryResult>
 

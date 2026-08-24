@@ -1518,14 +1518,16 @@ describe("coordinator session state lock", () => {
 
 		let synchronousCalls = 0;
 		let asynchronousCalls = 0;
+		let timeoutMs = 0;
 		setSessionStateLockNativeBindings(() => ({
 			...exactIdentityNativeBindings,
 			snapshotDirectoryTree() {
 				synchronousCalls++;
 				throw new Error("synchronous directory snapshot must not run during lock acquisition");
 			},
-			snapshotDirectoryTreeAsync() {
+			snapshotDirectoryTreeAsync(_path, timeout) {
 				asynchronousCalls++;
+				timeoutMs = timeout ?? 0;
 				return new Promise(resolve => setTimeout(() => resolve(captured), 100));
 			},
 		}));
@@ -1539,6 +1541,7 @@ describe("coordinator session state lock", () => {
 		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
 
 		expect(asynchronousCalls).toBe(1);
+		expect(timeoutMs).toBeGreaterThan(0);
 		expect(synchronousCalls).toBe(0);
 		expect(timerFired).toBe(true);
 		expect(performance.now() - startedAt).toBeLessThan(500);
@@ -1554,6 +1557,7 @@ describe("coordinator session state lock", () => {
 
 		let synchronousCalls = 0;
 		let asynchronousCalls = 0;
+		let timeoutMs = 0;
 		setSessionStateLockNativeBindings(() => ({
 			...exactIdentityNativeBindings,
 			snapshotDirectoryTreeAsync: async () => captured,
@@ -1561,8 +1565,9 @@ describe("coordinator session state lock", () => {
 				synchronousCalls++;
 				throw new Error("synchronous directory removal must not run during lock acquisition");
 			},
-			exactRemoveDirectoryTreeAsync() {
+			exactRemoveDirectoryTreeAsync(_path, _snapshot, _parentIdentity, timeout) {
 				asynchronousCalls++;
+				timeoutMs = timeout ?? 0;
 				return new Promise<NativeExactUnlinkResult>(() => undefined);
 			},
 		}));
@@ -1576,6 +1581,7 @@ describe("coordinator session state lock", () => {
 		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
 
 		expect(asynchronousCalls).toBe(1);
+		expect(timeoutMs).toBeGreaterThan(0);
 		expect(synchronousCalls).toBe(0);
 		expect(timerFired).toBe(true);
 		expect(performance.now() - startedAt).toBeLessThan(500);

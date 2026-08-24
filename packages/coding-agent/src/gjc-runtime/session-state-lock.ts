@@ -1269,7 +1269,9 @@ async function captureLegacyDirectoryTree(
 		throw new SessionStateLockUnavailableError(new Error("Async directory snapshot is unavailable."));
 	let captured: NativeDirectoryTreeResult;
 	try {
-		captured = await withinLockAcquireDeadline(deadline, () => native.snapshotDirectoryTreeAsync(lockDir));
+		captured = await withinLockAcquireDeadline(deadline, () =>
+			native.snapshotDirectoryTreeAsync(lockDir, Math.max(1, Math.ceil(deadline - performance.now()))),
+		);
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
 	}
@@ -1381,13 +1383,21 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 				SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile),
 			);
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
+			if (typeof native.exactRemoveDirectoryTreeAsync !== "function")
+				throw new SessionStateLockUnavailableError(new Error("Async directory removal is unavailable."));
 			let removed: NativeExactUnlinkResult;
 			try {
 				// The SAME verified capture the verdict was bound to, so a replacement that
 				// lands after this point is still refused by the primitive itself.
 				removed = await withinLockAcquireDeadline(
 					deadline,
-					() => native.exactRemoveDirectoryTreeAsync(lockFile, authorized),
+					() =>
+						native.exactRemoveDirectoryTreeAsync(
+							lockFile,
+							authorized,
+							undefined,
+							Math.max(1, Math.ceil(deadline - performance.now())),
+						),
 				);
 			} catch (error) {
 				throw new SessionStateLockUnavailableError(error);
