@@ -423,6 +423,68 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("fails closed before a later resident mutation after an identity-less committed append", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const appendManaged = native.RecoveryFsRoot.prototype.appendManaged;
+		let failOnce = true;
+		let appendCalls = 0;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			appendCalls += 1;
+			const committed = appendManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return committed;
+			failOnce = false;
+			return {
+				...committed,
+				ok: false,
+				code: "io_error",
+				identity: undefined,
+				mutationState: "committed",
+				durabilityState: "not_provable",
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "identity-less-committed", timestamp: Date.now() }),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
+		const residentCount = manager.getBranch().length;
+		const persisted = fs.readFileSync(sessionFile, "utf8");
+		expect(persisted).toContain("identity-less-committed");
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "must-not-retry-stale-predecessor", timestamp: Date.now() }),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
+		expect(appendCalls).toBe(1);
+		expect(manager.getBranch()).toHaveLength(residentCount);
+		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-not-retry-stale-predecessor");
+		await manager.close().catch(() => {});
+	});
+
 	it("keeps a pre-write append identity mismatch non-committed", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);

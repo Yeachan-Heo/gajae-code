@@ -110,6 +110,7 @@ import {
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	managedDirectoryRoot,
+	isDescriptorBoundManagedIdentity,
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
@@ -11267,11 +11268,16 @@ export class SessionManager {
 
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
-		if (normalized instanceof ManagedCommittedMutationError) {
+		if (
+			normalized instanceof ManagedCommittedMutationError &&
+			isDescriptorBoundManagedIdentity(normalized.identity)
+		) {
 			// A managed rewrite can publish the complete resident transcript and then
-			// lose its post-publication receipt. The transcript is authoritative, but
-			// later entries still need a fresh rewrite; never turn that committed
-			// outcome into a sticky same-process persistence error.
+			// lose its post-publication receipt. A descriptor-bound terminal identity
+			// makes the successor authoritative, so later entries may retry through a
+			// complete rewrite without recapturing the pathname. Identity-less committed
+			// outcomes deliberately fall through and become sticky below: retrying the
+			// stale predecessor could overwrite an exchanged-out successor.
 			return normalized;
 		}
 		if (!this.#persistError) this.#persistError = normalized;
@@ -15114,8 +15120,10 @@ export class SessionManager {
 						}
 					}
 					if (error instanceof ManagedCommittedMutationError) throw error;
-					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
-					if (replacementPublicationCommitted) throw new ManagedCommittedMutationError("replace", error);
+					if (noReplacePublication)
+						throw new ManagedCommittedMutationError("replace", error, noReplacePublication);
+					if (replacementPublicationCommitted)
+						throw new ManagedCommittedMutationError("replace", error, replacementPublication);
 					if (
 						recaptureObserved &&
 						!(error instanceof ManagedPublishError && error.mutationState === "not_committed")
@@ -16700,6 +16708,7 @@ export class SessionManager {
 	}
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
+		if (this.#persistError) throw this.#persistError;
 		// User-set names take permanent precedence over auto-generated ones.
 		if (this.#titleSource === "user" && source === "auto") return false;
 
@@ -16713,6 +16722,7 @@ export class SessionManager {
 	}
 
 	async #appendHeaderPatch(patch: HeaderPatchRecord["patch"]): Promise<void> {
+		if (this.#persistError) throw this.#persistError;
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		if (!header) return;
 		applyHeaderPatch(header, patch);
@@ -16987,11 +16997,15 @@ export class SessionManager {
 				return;
 			}
 			if (err instanceof ManagedCommittedMutationError) {
-				// The durable mutation is authoritative even when its receipt was
-				// interrupted. Keep the resident entry and permit a later, identity-bound
-				// rewrite to recapture it instead of poisoning same-process retries with a
-				// sticky persistence error.
+				// The durable mutation is authoritative only when its receipt carries a
+				// descriptor-bound terminal successor. An identity-less committed outcome
+				// cannot authorize a pathname retry: make it sticky before any later
+				// resident mutation can proceed.
 				this.#needsFullRewriteOnNextPersist = true;
+				if (!isDescriptorBoundManagedIdentity(err.identity)) {
+					this.#recordPersistError(err);
+					throw this.#persistError ?? err;
+				}
 				throw err;
 			}
 			this.#recordPersistError(err);
@@ -17037,7 +17051,15 @@ export class SessionManager {
 	}
 
 	#appendEntry(entry: SessionEntry): void {
-		this.#withSessionPersistenceFenceSync(() => this.#appendEntryWithinPersistenceFence(entry));
+		this.#withSessionPersistenceFenceSync(() => {
+			// A committed managed mutation without a descriptor-bound terminal
+			// successor is not retryable. Stop before touching resident state so a
+			// later append cannot make the stale predecessor canonical by accident.
+			if (this.#persistError) {
+				throw new SessionAppendPersistenceError("prior_failure", entry.id, this.#persistError);
+			}
+			this.#appendEntryWithinPersistenceFence(entry);
+		});
 	}
 
 	#appendEntryWithinPersistenceFence(entry: SessionEntry): void {

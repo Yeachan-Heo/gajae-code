@@ -122,6 +122,9 @@ static REPLACEMENT_BEFORE_EXCHANGE_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static REPLACEMENT_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 fn set_replacement_before_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 	*REPLACEMENT_BEFORE_EXCHANGE_HOOK
 		.get_or_init(|| std::sync::Mutex::new(None))
@@ -246,6 +249,44 @@ fn lock_destination(parent: &File, name: &CString) -> std::io::Result<File> {
 	// and serializes every managed replacement that uses this helper.
 	if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
 		return Err(std::io::Error::last_os_error());
+	}
+	Ok(lock)
+}
+
+#[cfg(target_os = "linux")]
+/// Acquire the one advisory lock shared by every managed mutation rooted at a
+/// retained recovery directory. Locking the destination inode alone is not
+/// sufficient: an exchange changes the inode at the canonical name, so an
+/// append could otherwise enter between destination verification and the
+/// exchange (or immediately after it) through a different inode. A stable
+/// lock entry in the retained recovery directory serializes the whole
+/// mutation transaction across all retained root handles and processes.
+fn lock_managed_mutation(recovery: &File) -> Result<File, &'static str> {
+	use std::os::fd::FromRawFd;
+	let name = c".gjc-managed-mutation-lock";
+	// SAFETY: `recovery` owns a valid directory descriptor and `name` is a
+	// static NUL-terminated leaf. O_NOFOLLOW prevents a substituted symlink from
+	// becoming the lock authority.
+	let fd = unsafe {
+		libc::openat(
+			recovery.as_raw_fd(),
+			name.as_ptr(),
+			libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			0o600,
+		)
+	};
+	if fd < 0 {
+		return Err("lock_failed");
+	}
+	// SAFETY: successful openat returned a uniquely owned descriptor.
+	let lock = unsafe { File::from_raw_fd(fd) };
+	if crate::path_identity::platform::verify_created_owner_only_file(&lock).is_err() {
+		return Err("lock_failed");
+	}
+	// SAFETY: `lock` owns a regular lock descriptor. `flock` serializes every
+	// managed mutation that uses this retained recovery directory.
+	if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+		return Err("lock_failed");
 	}
 	Ok(lock)
 }
@@ -1512,9 +1553,10 @@ impl RecoveryFsRoot {
 	) -> RecoveryFsResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root(&self.root, |root| {
+			with_root_and_recovery(&self.root, &self.recovery, |root, recovery| {
 				Ok(append_managed(
 					root,
+					recovery,
 					&relative_path,
 					data.as_ref(),
 					&expected_dev,
@@ -1999,6 +2041,20 @@ fn with_root(
 		|| RecoveryFsResult::failure("closed"),
 		|root| operation(root).unwrap_or_else(RecoveryFsResult::failure),
 	)
+}
+
+#[cfg(target_os = "linux")]
+fn with_root_and_recovery(
+	root: &Mutex<Option<File>>,
+	recovery: &Mutex<Option<File>>,
+	operation: impl FnOnce(&File, Option<&File>) -> Result<RecoveryFsResult, &'static str>,
+) -> RecoveryFsResult {
+	let root_guard = root.lock();
+	let Some(root) = root_guard.as_ref() else {
+		return RecoveryFsResult::failure("closed");
+	};
+	let recovery_guard = recovery.lock();
+	operation(root, recovery_guard.as_ref()).unwrap_or_else(RecoveryFsResult::failure)
 }
 
 #[cfg(target_os = "linux")]
@@ -2872,6 +2928,7 @@ fn append_post_identity(file: &File) -> Option<RecoveryFsIdentity> {
 #[cfg(target_os = "linux")]
 fn append_managed(
 	root: &File,
+	recovery: Option<&File>,
 	relative_path: &str,
 	data: &[u8],
 	expected_dev: &str,
@@ -2905,6 +2962,18 @@ fn append_managed(
 			None,
 		);
 	}
+	let recovery_parent = match recovery_directory(root, recovery) {
+		Ok(parent) => parent,
+		Err(code) => {
+			return RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None);
+		},
+	};
+	let _mutation_lock = match lock_managed_mutation(&recovery_parent) {
+		Ok(lock) => lock,
+		Err(code) => {
+			return RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None);
+		},
+	};
 	let (parent, name) = match open_parent(root, relative_path) {
 		Ok(value) => value,
 		Err(code) => {
@@ -3155,6 +3224,7 @@ fn replace_managed_inner(
 	expected_sha256: &str,
 ) -> Result<(RecoveryFsIdentity, NoReplacePrimitive), ReplacementExchangeError> {
 	let recovery_parent = recovery_directory(root, recovery).map_err(replace_managed_failure)?;
+	let _mutation_lock = lock_managed_mutation(&recovery_parent).map_err(replace_managed_failure)?;
 	let authorized = open_existing(root, relative_path, false).map_err(replace_managed_failure)?;
 	if !same_expected(
 		&authorized,
@@ -4150,6 +4220,7 @@ mod tests {
 		let identity = managed_file(&root, "transcript", original);
 		let result = append_managed(
 			&root,
+			None,
 			"transcript",
 			b"append",
 			&identity.dev,
@@ -4995,6 +5066,10 @@ mod tests {
 
 	#[test]
 	fn managed_replace_rechecks_destination_at_exchange_boundary() {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let temporary = TempDir::new();
 		let root = temporary.root();
 		let original = b"authorized-transcript";
@@ -5041,6 +5116,91 @@ mod tests {
 			b"concurrent-successor"
 		);
 		assert_eq!(fs::read(temporary.0.join("authorized")).expect("predecessor"), original);
+	}
+
+	#[test]
+	fn managed_append_waits_for_replacement_exchange_boundary() {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"authorized-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replacement_before_exchange_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_replace = root.try_clone().expect("clone retained root");
+		let replace_dev = identity.dev.clone();
+		let replace_ino = identity.ino.clone();
+		let replace_size = identity.size.clone();
+		let replace_mtime_ns = identity.mtime_ns.clone();
+		let replace_ctime_ns = identity.ctime_ns.clone();
+		let replace = std::thread::spawn(move || {
+			replace_managed(
+				&root_for_replace,
+				None,
+				"transcript",
+				b"replacement",
+				&replace_dev,
+				&replace_ino,
+				&replace_size,
+				&replace_mtime_ns,
+				&replace_ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx.recv().expect("wait for exchange boundary");
+
+		let (append_started_tx, append_started_rx) = mpsc::channel();
+		let (append_result_tx, append_result_rx) = mpsc::channel();
+		let root_for_append = root.try_clone().expect("clone retained root");
+		let append_dev = identity.dev.clone();
+		let append_ino = identity.ino.clone();
+		let append_size = identity.size.clone();
+		let append_mtime_ns = identity.mtime_ns.clone();
+		let append_ctime_ns = identity.ctime_ns.clone();
+		std::thread::spawn(move || {
+			append_started_tx.send(()).expect("append start receiver");
+			let result = append_managed(
+				&root_for_append,
+				None,
+				"transcript",
+				b"append-that-must-not-be-exchanged-out",
+				&append_dev,
+				&append_ino,
+				&append_size,
+				&append_mtime_ns,
+				&append_ctime_ns,
+				&file_digest(original),
+			);
+			append_result_tx
+				.send(result)
+				.expect("append result receiver");
+		});
+		append_started_rx.recv().expect("append started");
+		assert!(
+			append_result_rx
+				.recv_timeout(std::time::Duration::from_millis(100))
+				.is_err(),
+			"append must remain behind the replacement mutation lock"
+		);
+
+		resume_tx.send(()).expect("resume exchange boundary");
+		let replacement = replace.join().expect("replacement thread");
+		let append = append_result_rx.recv().expect("append result");
+		set_replacement_before_exchange_hook(None);
+
+		assert!(replacement.ok, "replacement must publish: {:?}", replacement.code);
+		assert!(!append.ok);
+		assert_eq!(append.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(append.mutation_state.as_deref(), Some("not_committed"));
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("replacement transcript"),
+			b"replacement"
+		);
 	}
 
 	#[test]

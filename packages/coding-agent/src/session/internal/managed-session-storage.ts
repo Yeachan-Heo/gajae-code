@@ -119,12 +119,13 @@ function managedReplacementFailure(value: unknown): Error {
 			? (value as { code: string }).code
 			: undefined;
 	const cause = new Error(rawCode ?? outcome.code ?? "managed_replace_failed");
+	const identity = outcome.identity ? managedFileIdentityFromUnknown(outcome.identity) : undefined;
 	return outcome.mutationState === "not_committed"
 		? cause
 		: new ManagedCommittedMutationError(
 				"replace",
 				cause,
-				outcome.identity ? managedFileIdentityFromUnknown(outcome.identity) : undefined,
+				isDescriptorBoundManagedIdentity(identity) ? identity : undefined,
 			);
 }
 
@@ -139,7 +140,11 @@ function managedAppendFailure(value: unknown): Error {
 	if (code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed") {
 		return error;
 	}
-	return new ManagedCommittedMutationError("append", error, identity);
+	return new ManagedCommittedMutationError(
+		"append",
+		error,
+		isDescriptorBoundManagedIdentity(identity) ? identity : undefined,
+	);
 }
 
 function publishFailure(outcome: NativePublishOutcome): ManagedPublishError {
@@ -353,6 +358,18 @@ function managedFileIdentityFromUnknown(value: unknown): ManagedFileIdentity | u
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * A committed native mutation may only authorize a later retry when the
+ * terminal object is bound by both descriptor identity and its exact bytes.
+ * Without the digest, a pathname recapture could silently adopt a successor
+ * that displaced the committed object.
+ */
+export function isDescriptorBoundManagedIdentity(
+	identity: ManagedFileIdentity | undefined,
+): identity is ManagedFileIdentity & { sha256: string } {
+	return identity !== undefined && typeof identity.sha256 === "string" && /^[0-9a-f]{64}$/i.test(identity.sha256);
 }
 
 function managedAppendReceiptFromIdentity(identity: ManagedFileIdentity): ManagedAppendReceipt {
@@ -1722,7 +1739,10 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		if (!replaced.identity)
 			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
-		return managedFileIdentityFromNative(replaced.identity);
+		const receipt = managedFileIdentityFromNative(replaced.identity);
+		if (!isDescriptorBoundManagedIdentity(receipt))
+			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
+		return receipt;
 	}
 
 	replaceExpected(relativePath: string, bytes: Uint8Array, expected: ManagedFileSnapshot): void {
@@ -1831,7 +1851,10 @@ export class ManagedSessionDescendantStore {
 		if (!appended.identity)
 			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
 		this.#assertBound();
-		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
+		const receipt = managedFileIdentityFromNative(appended.identity);
+		if (!isDescriptorBoundManagedIdentity(receipt))
+			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
+		return managedAppendReceiptFromIdentity(receipt);
 	}
 
 	appendExpectedIdentitySync(
@@ -1898,7 +1921,10 @@ export class ManagedSessionDescendantStore {
 			if (!appended.ok) throw managedAppendFailure(appended);
 			if (!appended.identity)
 				throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
-			const receipt = managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
+			const identity = managedFileIdentityFromNative(appended.identity);
+			if (!isDescriptorBoundManagedIdentity(identity))
+				throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
+			const receipt = managedAppendReceiptFromIdentity(identity);
 			this.#assertBound();
 			return receipt;
 		}
@@ -2047,6 +2073,8 @@ export class ManagedSessionDescendantStore {
 		if (!replaced.identity)
 			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
 		const receipt = managedFileIdentityFromNative(replaced.identity);
+		if (!isDescriptorBoundManagedIdentity(receipt))
+			throw new ManagedCommittedMutationError("replace", new Error("managed_replace_identity_unavailable"));
 		this.#assertBound();
 		return receipt;
 	}
@@ -3142,7 +3170,12 @@ export function publishManagedFileNoReplaceSync(
 		}
 	}
 	if (failure !== undefined) {
-		if (publicationCommitted) throw new ManagedCommittedMutationError("replace", failure);
+		if (publicationCommitted)
+			throw new ManagedCommittedMutationError(
+				"replace",
+				failure,
+				isDescriptorBoundManagedIdentity(publishedIdentity) ? publishedIdentity : undefined,
+			);
 		throw failure;
 	}
 	if (!publishedIdentity) throw new Error("managed_publish_identity_unavailable");
@@ -3343,7 +3376,13 @@ function replaceManagedFileGeneratedSync(
 		}
 	} catch (error) {
 		failure =
-			publicationCommitted && !publishedIdentity ? new ManagedCommittedMutationError(operation, error) : error;
+			publicationCommitted && !publishedIdentity
+				? new ManagedCommittedMutationError(
+						operation,
+						error,
+						isDescriptorBoundManagedIdentity(expectedSuccessor) ? expectedSuccessor : undefined,
+					)
+				: error;
 	} finally {
 		if (fd !== undefined) {
 			try {
@@ -3354,7 +3393,11 @@ function replaceManagedFileGeneratedSync(
 						failure === undefined
 							? error
 							: new AggregateError([failure, error], "Managed replacement and descriptor close both failed.");
-					failure = new ManagedCommittedMutationError(operation, cause);
+					failure = new ManagedCommittedMutationError(
+						operation,
+						cause,
+						isDescriptorBoundManagedIdentity(expectedSuccessor) ? expectedSuccessor : undefined,
+					);
 				} else {
 					failure =
 						failure === undefined
