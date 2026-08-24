@@ -17,6 +17,12 @@ const tempDirs: string[] = [];
 const originalAgentDir = getAgentDir();
 let agentDir: string;
 
+function makeFixtureCwd(prefix: string): string {
+	const cwd = fs.mkdtempSync(path.join(import.meta.dir, `.${prefix}`));
+	tempDirs.push(cwd);
+	return cwd;
+}
+
 beforeEach(() => {
 	agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-agent-"));
 	setAgentDir(agentDir);
@@ -30,8 +36,7 @@ afterEach(() => {
 
 describe("always-on plugin-bundle MCP in a live session", () => {
 	test("connects an installed bundle MCP server and surfaces its tools as always-on", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-"));
-		tempDirs.push(cwd);
+		const cwd = makeFixtureCwd("gjc-mcp-session-");
 		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
 		expect(r.ok).toBe(true);
 
@@ -41,7 +46,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		sessionSettings.set("tools.discoveryMode", "all");
 		const { session, mcpManager } = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager,
 			settings: sessionSettings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -52,7 +57,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			promptTemplates: [],
 			slashCommands: [],
 			// Generic discovery is fully enabled; plugin-bundle MCP remains mandatory rather than selectable.
-			enableMCP: false,
+			enableMcpAutoload: false,
 			enableLsp: false,
 		});
 
@@ -92,8 +97,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	}, 30_000);
 
 	test("keeps always-on plugin MCP tools active across newSession and switchSession resume", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-resume-"));
-		tempDirs.push(cwd);
+		const cwd = makeFixtureCwd("gjc-mcp-session-resume-");
 		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
 		expect(r.ok).toBe(true);
 
@@ -104,7 +108,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		sessionSettings.set("tools.discoveryMode", "all");
 		const { session, mcpManager } = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager,
 			settings: sessionSettings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -114,7 +118,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
-			enableMCP: false,
+			enableMcpAutoload: false,
 			enableLsp: false,
 		});
 
@@ -151,8 +155,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	}, 30_000);
 
 	test("filters an explicitly requested mandatory plugin tool from persisted selection authority", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-explicit-"));
-		tempDirs.push(cwd);
+		const cwd = makeFixtureCwd("gjc-mcp-session-explicit-");
 		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
 		expect(r.ok).toBe(true);
 		const sessionManager = SessionManager.inMemory(cwd);
@@ -160,7 +163,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		sessionSettings.set("tools.discoveryMode", "all");
 		const { session } = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager,
 			settings: sessionSettings,
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -171,7 +174,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
-			enableMCP: false,
+			enableMcpAutoload: false,
 			enableLsp: false,
 		});
 		try {
@@ -187,12 +190,11 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	}, 30_000);
 
 	test("does not connect any MCP server when no plugin bundle is installed", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-empty-"));
-		tempDirs.push(cwd);
+		const cwd = makeFixtureCwd("gjc-mcp-session-empty-");
 
 		const { session, mcpManager } = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager: SessionManager.inMemory(cwd),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -202,7 +204,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
-			enableMCP: false,
+			enableMcpAutoload: false,
 			enableLsp: false,
 		});
 
@@ -216,15 +218,14 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 	}, 30_000);
 
 	test("subagent inherits the parent's always-on MCP tools and never tears down the parent manager", async () => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-sub-"));
-		tempDirs.push(cwd);
+		const cwd = makeFixtureCwd("gjc-mcp-session-sub-");
 		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
 		expect(r.ok).toBe(true);
 
 		// Top-level session owns the manager and installs it as the global instance.
 		const parent = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager: SessionManager.inMemory(cwd),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -234,7 +235,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
-			enableMCP: false,
+			enableMcpAutoload: false,
 			enableLsp: false,
 		});
 		const parentManager = parent.mcpManager;
@@ -246,7 +247,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		// production subagent path forwards as `parentMcpManager`.
 		const child = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager: SessionManager.inMemory(cwd),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -256,7 +257,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
-			enableMCP: false,
+			enableMcpAutoload: false,
 			inheritedMcpManager: parentManager,
 			enableLsp: false,
 			parentTaskPrefix: "0-Sub",
@@ -283,11 +284,10 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 		"gjc-plugins",
 		"custom",
 	])("does not inherit caller-owned MCP tools with %s source metadata as mandatory", async provider => {
-		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mcp-session-forged-"));
-		tempDirs.push(cwd);
+		const cwd = makeFixtureCwd("gjc-mcp-session-forged-");
 		const r = await installGjcBundle({ cwd }, "project", mcpBundle);
 		expect(r.ok).toBe(true);
-		const { configs } = await buildPluginMcpConfigs({ cwd });
+		const { configs } = await buildPluginMcpConfigs({ cwd, agentDir });
 		const callerManager = new MCPManager(cwd);
 		const sources = {
 			domain_docs: { provider, providerName: "Caller-owned manager", level: "project" as const },
@@ -298,7 +298,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 
 		const child = await createAgentSession({
 			cwd,
-			agentDir: cwd,
+			agentDir,
 			sessionManager: SessionManager.inMemory(cwd),
 			settings: Settings.isolated(),
 			model: getBundledModel("openai", "gpt-4o-mini"),
@@ -308,7 +308,7 @@ describe("always-on plugin-bundle MCP in a live session", () => {
 			contextFiles: [],
 			promptTemplates: [],
 			slashCommands: [],
-			enableMCP: false,
+			enableMcpAutoload: false,
 			enableLsp: false,
 			parentTaskPrefix: "0-Forged",
 			mcpManager: callerManager,
