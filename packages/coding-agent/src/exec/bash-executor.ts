@@ -246,7 +246,7 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 }
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
-	const settings = options?.settings ?? (await Settings.init());
+	const settings = options?.settings ?? (await Settings.currentOrInit());
 	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =

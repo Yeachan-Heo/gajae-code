@@ -247,6 +247,21 @@ function summarizeSettingsOptions(options: SettingsOptions | null): {
 	};
 }
 
+function isBlankSettingsOptions(options: SettingsOptions): boolean {
+	return (
+		options.cwd === undefined &&
+		options.agentDir === undefined &&
+		options.inMemory === undefined &&
+		options.readonly === undefined &&
+		(options.overrides === undefined || Object.keys(options.overrides).length === 0)
+	);
+}
+
+function settingsReinitIsMaterial(requested: SettingsOptions, initial: SettingsOptions | null): boolean {
+	if (isBlankSettingsOptions(requested)) return false;
+	return JSON.stringify(requested) !== JSON.stringify(initial);
+}
+
 /** Additional layer setup for {@link Settings.isolated}. */
 export interface IsolatedSettingsOptions {
 	/** Initial runtime overrides. Notification paths are rejected. */
@@ -607,6 +622,29 @@ export class Settings implements NotificationSettingsReader {
 				throw error;
 			},
 		);
+	}
+
+	/**
+	 * Return the process singleton, initializing it only when none exists.
+	 *
+	 * Tool/executor hot paths that previously called {@link Settings.init} with
+	 * empty options after startup logged a reinit warning on every invocation.
+	 * Blank requests and omitted cwd/agentDir reuse the existing instance
+	 * silently. A request that actually changes cwd, agentDir, inMemory,
+	 * readonly, or overrides still warns and still returns the original
+	 * singleton — same reuse contract as {@link Settings.init}.
+	 */
+	static currentOrInit(options: SettingsOptions = {}): Promise<Settings> {
+		if (globalInstancePromise) {
+			if (settingsReinitIsMaterial(options, globalInitOptions)) {
+				logger.warn("Settings.init called again with different options; reusing existing settings instance", {
+					initialOptions: summarizeSettingsOptions(globalInitOptions),
+					requestedOptions: summarizeSettingsOptions(options),
+				});
+			}
+			return globalInstancePromise;
+		}
+		return Settings.init(options);
 	}
 
 	/**

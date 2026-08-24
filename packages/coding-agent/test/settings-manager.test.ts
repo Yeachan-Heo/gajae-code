@@ -96,6 +96,40 @@ describe("Settings", () => {
 		}
 	});
 
+	it("currentOrInit reuses a cwd-initialized singleton without warning on blank options", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const first = await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
+			const reused = await Settings.currentOrInit();
+			expect(reused).toBe(first);
+			expect(warning).not.toHaveBeenCalled();
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("currentOrInit initializes the singleton when none exists", async () => {
+		const created = await Settings.currentOrInit({ inMemory: true, cwd: projectDir, agentDir });
+		expect(created).toBe(Settings.instance);
+	});
+
+	it("currentOrInit still warns when a later request changes overrides", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
+			await Settings.currentOrInit({
+				inMemory: true,
+				cwd: projectDir,
+				agentDir,
+				overrides: { "auth.broker.token": "later-token" },
+			});
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(String(warning.mock.calls[0]?.[0])).toContain("called again with different options");
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
 	it("loads SDK settings per scope instead of reusing the global singleton", async () => {
 		await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
 		const secondProjectDir = path.join(testDir, "second-project");
