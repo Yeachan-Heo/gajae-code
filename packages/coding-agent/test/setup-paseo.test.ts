@@ -1335,6 +1335,17 @@ describe("skills bridge", () => {
 		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
 	});
 
+	test("a source skill removed after preflight cannot produce a successful dangling bridge", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		const preflight = await preflightSkillsBridge(fixture.deps);
+		await fs.rm(path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop"), { recursive: true });
+
+		await expect(installSkillsBridge(preflight)).rejects.toBeInstanceOf(SkillsBridgePartialError);
+		await expect(fs.stat(path.join(fixture.paths.bridgeDir, "paseo-loop"))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("a resolved source that becomes empty prunes to a recorded-created empty bridge, and remove cleans it (#4644 review r5)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
