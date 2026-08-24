@@ -106,6 +106,7 @@ import {
 	type ManagedDirectoryRoot,
 	type ManagedFileIdentity,
 	type ManagedFileSnapshot,
+	ManagedPublishError,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	managedDirectoryRoot,
@@ -15044,15 +15045,17 @@ export class SessionManager {
 					);
 					this.#publishCommitMarkerFromCurrentTranscriptSync();
 				} catch (error) {
+					let recaptureObserved = false;
 					if (noReplacePublicationAttempted && !noReplacePublication) {
 						try {
-							const recaptured = this.#captureManagedPersistIdentity(sessionFile, undefined, bytes);
-							this.#managedPersistExpectedIdentity = recaptured;
-							noReplacePublication = recaptured;
+							// A pathname recapture is only evidence that the bytes are present; it
+							// cannot identify which inode survived an unknown no-replace outcome.
+							this.#captureManagedPersistIdentity(sessionFile, undefined, bytes);
+							recaptureObserved = true;
 						} catch {
-							// A failed recapture cannot authorize a successor or a retrying
-							// replacement; leave the expected identity unset and preserve the
-							// original committed/uncertain classification below.
+							// A failed recapture leaves the managed persistence identity
+							// unresolved; preserve the original committed/uncertain
+							// classification below.
 						}
 					}
 					// A no-replace publication may have committed before the subsequent
@@ -15077,6 +15080,11 @@ export class SessionManager {
 					}
 					if (error instanceof ManagedCommittedMutationError) throw error;
 					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
+					if (
+						recaptureObserved &&
+						!(error instanceof ManagedPublishError && error.mutationState === "not_committed")
+					)
+						throw new ManagedCommittedMutationError("replace", error);
 					throw error;
 				}
 				return;

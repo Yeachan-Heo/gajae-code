@@ -133,7 +133,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
-	it("recaptures a committed no-replace publication that throws before returning its identity", async () => {
+	it("keeps resident state when committed no-replace publication throws before returning its identity", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
 		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
@@ -143,6 +143,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		const sessionFile = manager.getSessionFile()!;
 		fs.rmSync(sessionFile);
 		const publishNoReplace = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
+		const replaceExpected = vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync");
 		let throwAfterCommit = true;
 		vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(function (
 			this: ManagedSessionDescendantStore,
@@ -165,9 +166,12 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			true,
 		);
 
-		await manager.ensureOnDisk();
+		await expect(manager.ensureOnDisk()).rejects.toThrow(
+			/managed_replace_committed_outcome_uncertain|destination_conflict/,
+		);
+		expect(replaceExpected).not.toHaveBeenCalled();
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
-		await manager.close();
+		await manager.close().catch(() => {});
 	});
 
 	it("keeps resident state after an unknown no-replace outcome and failed exact-byte recapture", async () => {
@@ -227,6 +231,95 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(unknownOutcome).toBe(true);
 		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("must-remain-resident"))).toBe(true);
+		await manager.close().catch(() => {});
+	});
+
+	it("does not adopt a byte-identical successor after an unknown no-replace outcome", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		fs.rmSync(sessionFile);
+		const realRenameManagedFileNoReplace = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
+		const replaceExpected = vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync");
+		let unknownOutcome = false;
+		let successorBytes: Uint8Array | undefined;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			sourcePath,
+			destinationPath,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			if (unknownOutcome || destinationPath !== path.basename(sessionFile))
+				return realRenameManagedFileNoReplace.call(
+					this,
+					sourcePath,
+					destinationPath,
+					expectedDev,
+					expectedIno,
+					expectedSize,
+					expectedMtimeNs,
+					expectedCtimeNs,
+					expectedSha256,
+				);
+			const result = realRenameManagedFileNoReplace.call(
+				this,
+				sourcePath,
+				destinationPath,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!result.ok) {
+				return result;
+			}
+			const successorPath = `${sessionFile}.byte-identical-successor`;
+			const intendedBytes = fs.readFileSync(sessionFile);
+			fs.writeFileSync(successorPath, intendedBytes);
+			const publishedIno = fs.statSync(sessionFile).ino;
+			fs.rmSync(sessionFile);
+			fs.renameSync(successorPath, sessionFile);
+			const successorIno = fs.statSync(sessionFile).ino;
+			expect(successorIno).not.toBe(publishedIno);
+			successorBytes = intendedBytes;
+			unknownOutcome = true;
+			return {
+				...result,
+				ok: false,
+				code: "publish_unknown",
+				mutationState: "unknown",
+				durabilityState: "not_provable",
+				reason: "unknown",
+				primitive: "renameat2_noreplace",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "complete" },
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "must-remain-resident", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(unknownOutcome).toBe(true);
+		expect(successorBytes).toBeDefined();
+		expect(fs.readFileSync(sessionFile).equals(Buffer.from(successorBytes!))).toBe(true);
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("must-remain-resident"))).toBe(true);
+
+		await expect(manager.ensureOnDisk()).rejects.toThrow(
+			/managed_replace_committed_outcome_uncertain|destination_conflict/,
+		);
+		expect(replaceExpected).not.toHaveBeenCalled();
+		expect(fs.readFileSync(sessionFile).equals(Buffer.from(successorBytes!))).toBe(true);
 		await manager.close().catch(() => {});
 	});
 
