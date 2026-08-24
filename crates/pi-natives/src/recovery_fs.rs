@@ -122,6 +122,11 @@ static REPLACEMENT_BEFORE_EXCHANGE_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static REPLACEMENT_AFTER_FINAL_VERIFY_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 static REPLACEMENT_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
@@ -144,6 +149,29 @@ fn pause_replacement_before_exchange_for_test() {
 			.send(())
 			.expect("replacement exchange hook receiver");
 		resume.recv().expect("replacement exchange hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_replacement_after_final_verify_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*REPLACEMENT_AFTER_FINAL_VERIFY_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_replacement_after_final_verify_for_test() {
+	if let Some((entered, resume)) = REPLACEMENT_AFTER_FINAL_VERIFY_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered
+			.send(())
+			.expect("replacement final-verify hook receiver");
+		resume.recv().expect("replacement final-verify hook resume");
 	}
 }
 
@@ -502,10 +530,11 @@ fn rename_tree_no_replace(
 /// destination-parent and final candidate-parent sync failures are classified
 /// as committed-but-unproven by their phase.
 ///
-/// `release_destination_authority` runs after the rollback-link sync and before
-/// the first rename. By then the displaced object is durably reachable through
-/// the temporary name, and releasing before the rename avoids NFS
-/// silly-renaming a still-open name.
+/// `release_destination_authority` runs after the first destructive rename.
+/// Releasing earlier would leave an uncoordinated successor window in which a
+/// successor could claim the canonical name and then be overwritten by this
+/// fallback's unconditional rename. The displaced object is already durably
+/// reachable through the temporary name at that point.
 fn exchange_through_link(
 	candidate_parent: &File,
 	candidate_name: &CString,
@@ -576,9 +605,6 @@ fn exchange_through_link(
 			phase: "preflight",
 		});
 	}
-	// The displaced object is now durably reachable; release authority before the
-	// rename so NFS does not silly-rename the still-open destination name.
-	release_destination_authority();
 	// SAFETY: both parents own valid fds and both names are live NUL-terminated
 	// strings for this syscall.
 	if unsafe {
@@ -597,6 +623,13 @@ fn exchange_through_link(
 		unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), temporary.as_ptr(), 0) };
 		return Err(ReplacementExchangeError::PreMutation { code: "io_error", phase: "rename" });
 	}
+	// The destructive rename is complete before releasing the caller's
+	// destination authority. Releasing it earlier creates an uncoordinated
+	// release-to-rename window: a successor can claim the canonical name and be
+	// overwritten by this unconditional rename. A successor that arrives after
+	// publication remains canonical and is rejected by the terminal identity
+	// proof instead.
+	release_destination_authority();
 	// Publication has committed. Persist the destination-parent mutation before
 	// moving the rollback name; a sync failure is committed-but-unproven.
 	if sync_parent(destination_parent).is_err() {
@@ -3228,19 +3261,43 @@ fn replacement_post_failure(
 	code: &'static str,
 	phase: &'static str,
 	primitive: NoReplacePrimitive,
-	candidate_file: &File,
-	replacement_sha256: &str,
+	_candidate_file: &File,
+	_replacement_sha256: &str,
 ) -> ReplacementExchangeError {
-	let identity = regular_identity(candidate_file).ok().map(|mut identity| {
-		identity.sha256 = Some(replacement_sha256.to_owned());
-		identity
-	});
 	ReplacementExchangeError::PostMutation {
 		code,
 		phase,
 		primitive,
-		identity: identity.map(Box::new),
+		// A descriptor for the staged replacement is not a terminal receipt. The
+		// canonical name may have been replaced or removed after the exchange, so
+		// post-mutation failures must not authorize a retry against an unreachable
+		// inode. Only a fresh canonical-path proof may populate this field.
+		identity: None,
 	}
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_replacement_identity(
+	root: &File,
+	relative_path: &str,
+	expected: &RecoveryFsIdentity,
+	replacement_sha256: &str,
+) -> Option<RecoveryFsIdentity> {
+	let replacement = open_existing(root, relative_path, false).ok()?;
+	let mut identity = regular_identity(&replacement).ok()?;
+	if identity.dev != expected.dev || identity.ino != expected.ino {
+		return None;
+	}
+	if digest_hex(&replacement).ok()?.as_str() != replacement_sha256 {
+		return None;
+	}
+	let (parent, name) = open_parent(root, relative_path).ok()?;
+	let named = statat(&parent, &name).ok()?;
+	if !stat_matches_regular_identity(&named, &identity) {
+		return None;
+	}
+	identity.sha256 = Some(replacement_sha256.to_owned());
+	Some(identity)
 }
 
 #[cfg(target_os = "linux")]
@@ -3387,25 +3444,22 @@ fn replace_managed_inner(
 		Err(ReplacementExchangeError::PreMutation { code, phase }) => {
 			return Err(ReplacementExchangeError::PreMutation { code, phase });
 		},
-		Err(ReplacementExchangeError::PostMutation { code, phase, primitive, .. }) => {
-			return Err(replacement_post_failure(
-				code,
-				phase,
-				primitive,
-				&candidate_file,
-				&replacement_sha256,
-			));
-		},
+		Err(error @ ReplacementExchangeError::PostMutation { .. }) => return Err(error),
 	};
 	#[cfg(test)]
 	if let Some(code) = take_post_exchange_fault() {
-		return Err(replacement_post_failure(
-			code,
-			"terminal_identity",
-			primitive,
-			&candidate_file,
+		let identity = canonical_replacement_identity(
+			root,
+			relative_path,
+			&candidate_identity,
 			&replacement_sha256,
-		));
+		);
+		return Err(ReplacementExchangeError::PostMutation {
+			code,
+			phase: "terminal_identity",
+			primitive,
+			identity: identity.map(Box::new),
+		});
 	}
 	let verified =
 		(|| -> Result<(RecoveryFsIdentity, RecoveryFsIdentity, File, File), &'static str> {
@@ -3567,8 +3621,28 @@ fn replace_managed_inner(
 			&replacement_sha256,
 		));
 	}
-	let mut replacement_identity = replacement_identity;
-	replacement_identity.sha256 = Some(replacement_sha256);
+	// The checks above prove one terminal observation. Keep a deterministic seam
+	// immediately after that proof and then repeat the canonical-path check before
+	// issuing a receipt. A successor can replace the canonical name after the
+	// first proof; in that case the replacement descriptor remains valid but its
+	// inode is no longer reachable through the canonical object and must never be
+	// returned as a retry identity.
+	#[cfg(test)]
+	pause_replacement_after_final_verify_for_test();
+	let Some(replacement_identity) = canonical_replacement_identity(
+		root,
+		relative_path,
+		&replacement_identity,
+		&replacement_sha256,
+	) else {
+		return Err(replacement_post_failure(
+			"identity_mismatch",
+			"terminal_identity",
+			primitive,
+			&candidate_file,
+			&replacement_sha256,
+		));
+	};
 	Ok((replacement_identity, primitive))
 }
 
@@ -5525,12 +5599,83 @@ mod tests {
 		);
 	}
 
-	/// The ordering that makes the fallback safe on NFS, pinned
-	/// deterministically on any filesystem: the displaced object must already
-	/// be reachable through the rollback link when authority is released, and
-	/// the destination must not yet have been replaced.
+	fn assert_post_final_verify_successor_is_not_receipted(force_fallback: bool) {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		if force_fallback {
+			set_retained_publish_faults([RetainedPublishFault::Rename(libc::EINVAL)]);
+		}
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replacement_after_final_verify_hook(Some((entered_tx, resume_rx)));
+		let successor_root = temporary.0.clone();
+		let racer = std::thread::spawn(move || {
+			entered_rx.recv().expect("wait for final terminal proof");
+			fs::rename(
+				successor_root.join("transcript"),
+				successor_root.join("unreachable-replacement"),
+			)
+			.expect("retain replacement inode");
+			fs::write(successor_root.join("transcript"), b"concurrent-successor")
+				.expect("publish canonical successor");
+			resume_tx.send(()).expect("resume final terminal proof");
+		});
+		let result = replace_managed(
+			&root,
+			None,
+			"transcript",
+			b"rewritten-transcript",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		racer.join().expect("successor race thread");
+		set_replacement_after_final_verify_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.phase, "terminal_identity");
+		assert!(
+			result.identity.is_none(),
+			"the replaced inode is no longer canonical and must not be returned as a retry receipt",
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("canonical successor"),
+			b"concurrent-successor"
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("unreachable-replacement")).expect("retained replacement"),
+			b"rewritten-transcript"
+		);
+	}
+
 	#[test]
-	fn replacement_fallback_releases_authority_between_rollback_link_and_rename() {
+	fn managed_replace_exchange_rechecks_after_final_verify_before_receipt() {
+		assert_post_final_verify_successor_is_not_receipted(false);
+	}
+
+	#[test]
+	fn managed_replace_fallback_rechecks_after_final_verify_before_receipt() {
+		assert_post_final_verify_successor_is_not_receipted(true);
+	}
+
+	/// The ordering that closes the fallback successor window, pinned
+	/// deterministically on any filesystem: authority is released only after the
+	/// destructive rename, so a successor published from the release hook cannot
+	/// be overwritten by this exchange.
+	#[test]
+	fn replacement_fallback_releases_authority_after_rename() {
 		let temporary = TempDir::new();
 		let parent = temporary.root();
 		fs::write(temporary.0.join("destination"), b"old").expect("seed destination");
@@ -5555,8 +5700,8 @@ mod tests {
 							.starts_with(".gjc-managed-exchange-")
 					});
 				let destination =
-					fs::read(temporary.0.join("destination")).expect("destination still present");
-				observed.set(Some((rollback, destination == b"old")));
+					fs::read(temporary.0.join("destination")).expect("destination present");
+				observed.set(Some((rollback, destination == b"new")));
 			},
 			|| Ok(()),
 		)
@@ -5565,8 +5710,7 @@ mod tests {
 		assert_eq!(
 			observed.get(),
 			Some((true, true)),
-			"authority must be released once the displaced object has a rollback link and before the \
-			 destination is replaced"
+			"authority must be released only after the destination has been replaced"
 		);
 		assert_eq!(fs::read(temporary.0.join("destination")).expect("destination"), b"new");
 		assert_eq!(fs::read(temporary.0.join("candidate")).expect("candidate"), b"old");
