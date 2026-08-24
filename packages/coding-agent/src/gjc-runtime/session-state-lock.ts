@@ -419,10 +419,14 @@ async function withinLockAcquireDeadline<T>(
 		value => ({ ok: true as const, value }),
 		error => ({ ok: false as const, error }),
 	);
+	const timeout = Promise.withResolvers<{ timedOut: true }>();
+	const timer = setTimeout(() => timeout.resolve({ timedOut: true }), remaining);
+	timer.unref();
 	const outcome = await Promise.race([
 		settled.then(result => ({ timedOut: false as const, result })),
-		Bun.sleep(remaining).then(() => ({ timedOut: true as const })),
+		timeout.promise,
 	]);
+	if (!outcome.timedOut) clearTimeout(timer);
 	if (outcome.timedOut) {
 		if (onTimeout) void settled.then(result => onTimeout(result)).catch(() => undefined);
 		throw new SessionStateLockUnavailableError();
