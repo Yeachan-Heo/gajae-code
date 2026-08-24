@@ -891,10 +891,46 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (proxyUrl) {
 				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
 				firstEventWatchdogArmed = true;
-				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
+				// The watchdog settles the h2 promise but cannot interrupt the
+				// handshake await below: race the tunnel connect against the same
+				// first-event deadline so setup is actually bounded, and destroy the
+				// socket if it materializes after the deadline already fired.
+				const tunnel = connectProxiedSocket(proxyUrl, baseUrl, {
 					signal: options?.signal,
 					timeoutMs: 30_000,
 				});
+				let tunnelDeadline: NodeJS.Timeout | undefined;
+				const boundedTunnel =
+					firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
+						? Promise.race([
+								tunnel,
+								new Promise<never>((_, reject) => {
+									tunnelDeadline = setTimeout(
+										() => reject(createFirstEventTimeoutError()),
+										firstEventTimeoutMs,
+									);
+								}),
+							])
+						: tunnel;
+				try {
+					proxiedSocket = await boundedTunnel;
+				} catch (error) {
+					// If the real tunnel still completes after the deadline won the
+					// race, it must not leak: destroy it as soon as it lands.
+					void tunnel.then(
+						socket => socket.destroy(),
+						() => {},
+					);
+					throw error;
+				} finally {
+					if (tunnelDeadline) clearTimeout(tunnelDeadline);
+				}
+				// The handshake may have outlived the first-event watchdog: never
+				// create the authenticated request once the stream already failed.
+				if (h2Settled) {
+					proxiedSocket.destroy();
+					await h2Completion.promise;
+				}
 				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
 			} else {
 				h2Client = http2.connect(baseUrl);

@@ -122,6 +122,29 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		});
 		expect(marked).toBe(true);
 	});
+	it("withholds the abort signal from a non-abortable tool so its promise is true settlement", async () => {
+		const controller = new AbortController();
+		const seen: Array<AbortSignal | undefined> = [];
+		const writeTool = {
+			...makeTool("write"),
+			nonAbortable: true,
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				seen.push(signal);
+				return { content: [{ type: "text" as const, text: "done" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		await handlers.piWrite({
+			args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+			toolCallId: "archive-write-nosignal",
+			signal: controller.signal,
+			markNonAbortable: () => {},
+		});
+		// The per-exec signal reaches the bridge, but a non-abortable tool must
+		// receive undefined: untilAborted(signal, ...) would reject early and let
+		// the settlement fence publish the terminal while the mutation still runs.
+		expect(seen).toEqual([undefined]);
+	});
 
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();

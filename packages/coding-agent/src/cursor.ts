@@ -115,7 +115,11 @@ async function executeTool(
 		result = await tool.execute(
 			toolCallId,
 			args as Record<string, unknown>,
-			execSignal ?? undefined,
+			// Non-abortable tools receive NO signal, matching agent-loop.ts: their
+			// returned promise must represent actual mutation settlement, so an
+			// untilAborted(signal, ...) rejection cannot make the settlement fence
+			// publish the terminal while the mutation is still running.
+			tool.nonAbortable ? undefined : (execSignal ?? undefined),
 			onUpdate,
 			options.getToolContext?.(),
 		);

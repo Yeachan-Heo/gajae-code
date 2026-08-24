@@ -1057,9 +1057,9 @@ export class Agent {
 		}
 		const write = source.write?.bind(source);
 		if (write) {
-			guarded.write = async (args, signal) => {
+			guarded.write = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await write(args, signal);
+				const result = await write(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};

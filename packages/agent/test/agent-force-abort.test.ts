@@ -355,6 +355,7 @@ describe("Agent.forceAbort", () => {
 		let capturedHandlers: CursorExecHandlers | undefined;
 		const nativeSignals: AbortSignal[] = [];
 		const piSignals: AbortSignal[] = [];
+		let nativeMarkerForwarded = false;
 		const streamFn: StreamFn = (_selectedModel, _context, options?: SimpleStreamOptions) => {
 			capturedHandlers = options?.cursorExecHandlers;
 			return stream;
@@ -362,8 +363,9 @@ describe("Agent.forceAbort", () => {
 		const agent = new Agent({
 			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
 			cursorExecHandlers: {
-				write: async (args, signal) => {
+				write: async (args, signal, markNonAbortable) => {
 					if (signal) nativeSignals.push(signal);
+					if (markNonAbortable) nativeMarkerForwarded = true;
 					return {
 						role: "toolResult",
 						toolCallId: args.toolCallId,
@@ -397,11 +399,15 @@ describe("Agent.forceAbort", () => {
 				NonNullable<CursorExecHandlers["write"]>
 			>[0],
 			controller.signal,
+			() => {},
 		);
 		await handlers.piWrite?.({ args: {} as never, toolCallId: "pi", signal: controller.signal });
 
 		expect(nativeSignals).toEqual([controller.signal]);
 		expect(piSignals).toEqual([controller.signal]);
+		// The Agent run guard must forward the third markNonAbortable argument
+		// so the native write path can activate the settlement fence.
+		expect(nativeMarkerForwarded).toBe(true);
 
 		stream.push({ type: "done", reason: "stop", message: createAssistantMessage([{ type: "text", text: "done" }]) });
 		await expect(prompt).resolves.toBeUndefined();
