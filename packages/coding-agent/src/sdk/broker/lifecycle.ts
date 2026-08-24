@@ -58,6 +58,7 @@ import {
 } from "../session-directory";
 import {
 	normalizeSdkStartupFailure,
+	sanitizeSdkStartupMessage,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
 } from "../startup-capability";
@@ -112,6 +113,17 @@ function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerRespon
 	// prove arbitrary child output free of that material; its stderr is discarded
 	// by the OS and never captured (#4712 review).
 	return fail("ready_then_exited", parts.join(" "));
+}
+
+const STARTUP_CLEANUP_UNCERTAIN_MESSAGE =
+	"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.";
+
+export function terminalUncertainStartupMessage(response: BrokerResponse): string {
+	if (response.ok || response.error.code !== "spawn_failed") return STARTUP_CLEANUP_UNCERTAIN_MESSAGE;
+	logger.warn("sdk broker retained a sanitized launch failure after uncertain startup cleanup", {
+		message: sanitizeSdkStartupMessage(response.error.message),
+	});
+	return `${STARTUP_CLEANUP_UNCERTAIN_MESSAGE} Original launch failure: SDK internal process could not be started.`;
 }
 
 export interface LifecycleDeadlines {
@@ -5575,11 +5587,7 @@ export async function executeLifecycle(
 										ok: false,
 										error: {
 											code: "terminal_uncertain",
-											message:
-												"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation." +
-												(response.error.code === "spawn_failed"
-													? ` Original launch failure: ${response.error.message}`
-													: ""),
+											message: terminalUncertainStartupMessage(response),
 										},
 										...(durableEffects ? { durableEffects } : {}),
 										...(startupFailure ? { startupFailure } : {}),

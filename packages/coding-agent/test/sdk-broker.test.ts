@@ -33,6 +33,7 @@ import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
+	terminalUncertainStartupMessage,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
@@ -46,6 +47,18 @@ import {
 } from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
+
+it("does not disclose launch paths when cleanup remains uncertain", () => {
+	const executable = "/private/runtime/gjc-secret";
+	const message = terminalUncertainStartupMessage({
+		ok: false,
+		error: { code: "spawn_failed", message: `spawn ${executable} ENOENT` },
+	});
+	expect(message).toBe(
+		"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation. Original launch failure: SDK internal process could not be started.",
+	);
+	expect(message).not.toContain(executable);
+});
 async function managedSessionPath(agentDir: string, cwd: string, sessionId: string): Promise<string> {
 	await fs.mkdir(cwd, { recursive: true });
 	const sessionsRoot = getSessionsDir(agentDir);
