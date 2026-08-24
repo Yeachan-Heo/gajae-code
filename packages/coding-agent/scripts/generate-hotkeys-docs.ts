@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import {
 	defaultClipboardPasteImageKeysForPlatform,
+	defaultForegroundFoldKeysForPlatform,
 	defaultMessageQueueKeysForPlatform,
 	KEYBINDINGS,
 } from "../src/config/keybindings";
@@ -26,6 +27,9 @@ function defaultKeys(
 				break;
 			case "app.clipboard.pasteImage":
 				keys = defaultClipboardPasteImageKeysForPlatform(platform);
+				break;
+			case "app.tool.backgroundFold":
+				keys = defaultForegroundFoldKeysForPlatform(platform);
 				break;
 			default:
 				keys = value.defaultKeys;

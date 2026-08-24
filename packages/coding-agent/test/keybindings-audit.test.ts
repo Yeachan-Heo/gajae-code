@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { parseKeyId } from "@gajae-code/tui";
 import {
 	defaultClipboardPasteImageKeysForPlatform,
+	defaultForegroundFoldKeysForPlatform,
 	defaultMessageQueueKeysForPlatform,
 	formatAccessibleKeyHint,
 	formatKeyHint,
@@ -20,7 +21,9 @@ function keysForPlatform(id: Keybinding, platform: NodeJS.Platform): KeyId[] {
 			? defaultMessageQueueKeysForPlatform(platform)
 			: id === "app.clipboard.pasteImage"
 				? defaultClipboardPasteImageKeysForPlatform(platform)
-				: KEYBINDINGS[id].defaultKeys;
+				: id === "app.tool.backgroundFold"
+					? defaultForegroundFoldKeysForPlatform(platform)
+					: KEYBINDINGS[id].defaultKeys;
 	return typeof defaults === "string" ? [defaults] : [...defaults];
 }
 
@@ -66,13 +69,25 @@ describe("Windows-to-Darwin declared default parity", () => {
 			windows: ["ctrl+v", "alt+v"],
 			darwin: ["ctrl+v", "super+v"],
 		});
+		expect(WINDOWS_RUNTIME_SHORTCUTS.find(({ id }) => id === "app.tool.backgroundFold")).toEqual({
+			id: "app.tool.backgroundFold",
+			windows: ["alt+shift+b"],
+			darwin: ["alt+shift+b", "super+b"],
+		});
 		expect(formatKeyHint("alt+q", { platform: "darwin" })).toBe("⌥Q");
 		expect(formatAccessibleKeyHint("alt+q", { platform: "darwin" })).toBe("⌥Q (Option+Q)");
 		expect(formatKeyHint("super+v", { platform: "darwin" })).toBe("⌘V");
 		expect(formatAccessibleKeyHint("super+v", { platform: "darwin" })).toBe("⌘V (Command+V)");
+		expect(formatKeyHint("super+b", { platform: "darwin" })).toBe("⌘B");
+		expect(formatAccessibleKeyHint("super+b", { platform: "darwin" })).toBe("⌘B (Command+B)");
 		expect(formatKeyHint("ctrl+v", { platform: "darwin" })).toBe("⌃V");
 		expect(formatAccessibleKeyHint("ctrl+v", { platform: "darwin" })).toBe("⌃V (Control+V)");
 		expect(WINDOWS_RUNTIME_SHORTCUTS.filter(({ windows, darwin }) => windows.join() !== darwin.join())).toEqual([
+			{
+				id: "app.tool.backgroundFold",
+				windows: ["alt+shift+b"],
+				darwin: ["alt+shift+b", "super+b"],
+			},
 			{
 				id: "app.clipboard.pasteImage",
 				windows: ["ctrl+v", "alt+v"],
