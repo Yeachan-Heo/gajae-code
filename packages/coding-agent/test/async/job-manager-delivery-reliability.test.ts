@@ -84,4 +84,76 @@ describe("AsyncJobManager delivery reliability", () => {
 			await manager.dispose({ timeoutMs: 250 });
 		}
 	});
+
+	// T-R5. The requeue branch used to require a live record with a matching
+	// generation, so after a zero-retention eviction a failed callback was never
+	// retried and the result vanished with no dead letter.
+	test("post-eviction delivery failure retries and delivers the receipt exactly once", async () => {
+		const delivered: string[] = [];
+		let attempts = 0;
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async (_jobId, text) => {
+				attempts += 1;
+				if (attempts === 1) throw new Error("delivery failed once");
+				delivered.push(text);
+			},
+		});
+
+		try {
+			const jobId = manager.register("bash", "retried", async () => "receipt-payload");
+			await waitFor(() => attempts >= 1);
+			expect(manager.getJob(jobId)).toBeUndefined();
+
+			await waitFor(() => delivered.length === 1);
+			expect(delivered).toEqual(["receipt-payload"]);
+
+			// Exactly once: no duplicate redelivery after the successful retry.
+			await Bun.sleep(150);
+			expect(delivered).toEqual(["receipt-payload"]);
+		} finally {
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
+
+	// T-R5. At the retry cap in that same window the failure must become visible
+	// rather than silent, and it must retire the exact owned tuple because this
+	// terminal route never injects a message and has no later settlement point.
+	test("post-eviction retry-cap failure becomes visible and retires the owned tuple", async () => {
+		resetTerminalAbortRegistriesForTests();
+		let attempts = 0;
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async () => {
+				attempts += 1;
+				throw new Error("delivery always fails");
+			},
+		});
+
+		try {
+			const endpointId = AsyncJobManager.endpointIdOf(manager);
+			const jobId = manager.register("bash", "dead-lettered", async () => "lost-payload");
+			const generation = manager.getJob(jobId)?.generation ?? jobId;
+			registerOwnedRegistration({
+				endpointId,
+				lineageIdHash: "lineage-hash",
+				promptAttemptEpoch: 1,
+				endpointGeneration: 1,
+				jobId,
+				jobGeneration: generation,
+			});
+			expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeDefined();
+
+			// Three attempts: ~500ms then ~1000ms of backoff before the cap.
+			await waitFor(() => attempts >= 3, 8_000);
+			await waitFor(() => manager.getDeliveryState().deadLettered > 0, 2_000);
+
+			expect(manager.getDeliveryState().deadLettered).toBe(1);
+			expect(manager.getDeliveryState().queued).toBe(0);
+			expect(lookupOwnedRegistration(jobId, generation, endpointId)).toBeUndefined();
+		} finally {
+			await manager.dispose({ timeoutMs: 250 });
+			resetTerminalAbortRegistriesForTests();
+		}
+	});
 });
