@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import * as native from "@gajae-code/natives";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -167,6 +168,66 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.ensureOnDisk();
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
 		await manager.close();
+	});
+
+	it("keeps resident state after an unknown no-replace outcome and failed exact-byte recapture", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		fs.rmSync(sessionFile);
+		const successor = `${JSON.stringify({ type: "session", id: "successor", timestamp: new Date().toISOString(), cwd })}\n`;
+		const realRenameManagedFileNoReplace = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
+		let unknownOutcome = false;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "renameManagedFileNoReplace").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			sourcePath,
+			destinationPath,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const result = realRenameManagedFileNoReplace.call(
+				this,
+				sourcePath,
+				destinationPath,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (destinationPath !== path.basename(sessionFile) || !result.ok) return result;
+			fs.rmSync(sessionFile);
+			fs.writeFileSync(sessionFile, successor);
+			unknownOutcome = true;
+			return {
+				...result,
+				ok: false,
+				code: "publish_unknown",
+				mutationState: "unknown",
+				durabilityState: "not_provable",
+				reason: "unknown",
+				primitive: "renameat2_noreplace",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "complete" },
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "must-remain-resident", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(unknownOutcome).toBe(true);
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("must-remain-resident"))).toBe(true);
+		await manager.close().catch(() => {});
 	});
 
 	it("accepts byte-identical metadata drift before appending", async () => {

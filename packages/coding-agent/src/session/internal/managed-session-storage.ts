@@ -1528,7 +1528,7 @@ export class ManagedSessionDescendantStore {
 			this.#assertBound();
 			return published;
 		} catch (error) {
-			if (publicationReturned || (error instanceof ManagedPublishError && error.mutationState === "committed"))
+			if (publicationReturned || (error instanceof ManagedPublishError && error.mutationState !== "not_committed"))
 				throw new ManagedCommittedMutationError("replace", error);
 			throw error;
 		}
@@ -1928,7 +1928,7 @@ export class ManagedSessionDescendantStore {
 				digest,
 			);
 			const outcome = classifyNativePublishOutcome(published, "retained_file");
-			publicationCommitted = outcome.mutationState === "committed";
+			publicationCommitted = outcome.mutationState !== "not_committed";
 			if (!outcome.ok) throw publishFailure(outcome);
 			publicationCommitted = true;
 			return managedFileIdentityFromNative(captured.identity);
@@ -3045,7 +3045,7 @@ export function publishManagedFileNoReplaceSync(
 			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
 			linkPublished = outcome.ok;
 		}
-		publicationCommitted = outcome.mutationState === "committed";
+		publicationCommitted = outcome.mutationState !== "not_committed";
 		if (!outcome.ok) throw publishFailure(outcome);
 		publicationCommitted = true;
 
