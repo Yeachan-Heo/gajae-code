@@ -4162,18 +4162,19 @@ async function executeLifecycleResponse(
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
 		} catch (error) {
-			const terminated = child
-				? await terminateSpawnedChild(
-						child,
-						broker,
-						launch.id,
-						launch.root,
-						lifecycleDeadline,
-						terminationStartDeadline,
-						spawnedAuthority,
-						timing,
-					)
-				: true;
+			const terminated =
+				child && spawnedAuthority
+					? await terminateSpawnedChild(
+							child,
+							broker,
+							launch.id,
+							launch.root,
+							lifecycleDeadline,
+							terminationStartDeadline,
+							spawnedAuthority,
+							timing,
+						)
+					: true;
 
 			return terminated
 				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)

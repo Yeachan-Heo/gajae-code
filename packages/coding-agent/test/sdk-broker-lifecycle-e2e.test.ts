@@ -2442,6 +2442,25 @@ test("broker terminalizes default command resolver failures", async () => {
 	}
 });
 
+test("broker preserves spawn_failed when the ChildProcess emits an error before PID ownership", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-child-error-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(root, "missing-gjc"), args: [] }));
+		await broker.start();
+		await expect(
+			broker.handleRequest("session.create", { cwd: root }, "child-error-before-pid"),
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "spawn_failed" },
+		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("reaps only lifecycle markers whose exact owner is proven dead", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-reap-"));
 	const sdk = path.join(root, ".gjc", "state", "sdk");
