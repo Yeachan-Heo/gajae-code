@@ -2569,6 +2569,10 @@ async function terminateSpawnedChild(
 	if (!pid || (expected && pid !== expected.pid)) return false;
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
 	await broker.index.refresh();
+	const terminationDeadline =
+		expected && !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker)
+			? deadline
+			: terminationStartDeadlineAt;
 	const observe = (): ProcessObservation =>
 		child.exitCode !== null
 			? "exited"
@@ -2591,7 +2595,7 @@ async function terminateSpawnedChild(
 		observation = await waitForExit(deadline);
 	};
 	if (observation === "alive") {
-		await waitUntil(timing, terminationStartDeadlineAt);
+		await waitUntil(timing, terminationDeadline);
 		observation = observe();
 	}
 	if (observation === "alive") {
