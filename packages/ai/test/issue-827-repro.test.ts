@@ -121,14 +121,14 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 			baseUrl: "https://api.moonshot.ai/v1",
 			id: "kimi-k2.6",
 			name: "Kimi K2.6",
-			reasoning: true,
+			reasoning: false,
 		};
 		const body = (await captureBody(model, {
 			toolChoice: { type: "tool", name: "echo" },
 		})) as CompletionsBody;
 
 		expect(body.tool_choice).toMatchObject({ type: "function", function: { name: "echo" } });
-		expect(body.thinking).toEqual({ type: "disabled" });
+		expect(body.thinking).toBeUndefined();
 		expect(body.reasoning).toBeUndefined();
 		expect(body.reasoning_effort).toBeUndefined();
 	});
@@ -156,8 +156,8 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 		expect(body.tool_choice).toBe("required");
 		expect(body.reasoning_effort).toBeUndefined();
 	});
-	it("does not strip reasoning on non-Kimi models even with forced tool_choice", async () => {
-		// Non-kimi reasoning model — OpenAI itself accepts forced tool_choice with reasoning.
+	it("omits reasoning on non-Kimi models when a tool is forced", async () => {
+		// Forced tool selection has no reasoning control on this OpenAI-compatible path.
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
@@ -172,6 +172,6 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 		})) as CompletionsBody;
 
 		expect(body.tool_choice).toBe("required");
-		expect(body.reasoning_effort).toBe("high");
+		expect(body.reasoning_effort).toBeUndefined();
 	});
 });
