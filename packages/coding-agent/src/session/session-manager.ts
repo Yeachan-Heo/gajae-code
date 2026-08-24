@@ -15064,6 +15064,16 @@ export class SessionManager {
 						// recapture failed. This prevents a retry from publishing a second
 						// successor and keeps any divergent occupant fail-closed.
 						this.#managedPersistExpectedIdentity = noReplacePublication;
+						try {
+							this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
+								sessionFile,
+								undefined,
+								bytes,
+							);
+						} catch {
+							// Keep the publication receipt when the retry descriptor cannot yet
+							// be recaptured; it remains the only safe precondition.
+						}
 					}
 					if (error instanceof ManagedCommittedMutationError) throw error;
 					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
