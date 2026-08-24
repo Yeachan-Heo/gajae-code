@@ -307,7 +307,9 @@ const jobsSegment: StatusLineSegment = {
 	id: "jobs",
 	render(ctx) {
 		const { jobs } = ctx;
-		const visible = jobs.activeMonitorCount > 0 || jobs.activeCronCount > 0 || jobs.worstState === "failed";
+		const foldedJobCount = jobs.foldedJobs?.length ?? 0;
+		const visible =
+			jobs.activeMonitorCount > 0 || jobs.activeCronCount > 0 || foldedJobCount > 0 || jobs.worstState === "failed";
 		if (!visible) {
 			return { content: "", visible: false };
 		}
@@ -317,6 +319,9 @@ const jobsSegment: StatusLineSegment = {
 		}
 		if (jobs.activeCronCount > 0) {
 			parts.push(withIcon(theme.icon.time, `${jobs.activeCronCount}`));
+		}
+		if (foldedJobCount > 0) {
+			parts.push(withIcon(theme.icon.pause || theme.icon.agents, `${foldedJobCount} folded`));
 		}
 		if (parts.length === 0) {
 			// Nothing active but a failure is unacknowledged — keep a drill-in marker.

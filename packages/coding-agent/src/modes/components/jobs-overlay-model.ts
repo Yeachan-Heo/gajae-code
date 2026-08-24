@@ -6,7 +6,9 @@
  * SelectItem lists into nested SelectLists (list -> detail -> confirm).
  */
 import type { SelectItem } from "@gajae-code/tui";
+import { sanitizeStatusText } from "../shared";
 import type { JobsSnapshot } from "../jobs-observer";
+import { replaceTabs, shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../tools/render-utils";
 
 export type JobRefKind = "monitor" | "cron";
 
@@ -15,11 +17,17 @@ export interface JobRef {
 	id: string;
 }
 
-const PROMPT_PREVIEW_MAX = 60;
+function displayText(text: string, max: number = TRUNCATE_LENGTHS.CONTENT): string {
+	const sanitized = shortenPath(replaceTabs(sanitizeStatusText(text)));
+	return truncateToWidth(sanitized, max);
+}
 
-function preview(text: string, max = PROMPT_PREVIEW_MAX): string {
-	const oneLine = text.replace(/\s+/g, " ").trim();
-	return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+function preview(text: string, max: number = TRUNCATE_LENGTHS.TITLE): string {
+	return displayText(text, max);
+}
+
+function snapshotJobKey(id: string, generation: string | undefined): string {
+	return `${id}\u0000${generation ?? ""}`;
 }
 
 /** Compact relative time, e.g. "in 5m", "2m ago", "now". */
@@ -47,23 +55,40 @@ export function parseJobRef(value: string): JobRef | null {
 
 /**
  * Build the grouped jobs list: monitors first (newest-first), then crons
- * (newest-first). The snapshot arrays are already sorted newest-first.
+ * (newest-first), then read-only folded jobs. The snapshot arrays are already
+ * sorted newest-first where a source has a timestamp.
  */
 export function buildJobsListItems(snapshot: JobsSnapshot): SelectItem[] {
 	const items: SelectItem[] = [];
+	const foldedJobs = snapshot.foldedJobs ?? [];
+	const foldedKeys = new Set(foldedJobs.map(job => snapshotJobKey(job.id, job.generation)));
 	for (const monitor of snapshot.monitors) {
+		// A monitor can also be backgrounded; render it only in the folded section
+		// so a public job state has exactly one row.
+		if (monitor.backgrounded || foldedKeys.has(snapshotJobKey(monitor.id, monitor.generation))) continue;
 		items.push({
 			value: `monitor:${monitor.id}`,
-			label: `monitor · ${preview(monitor.label, 40)}`,
-			description: monitor.status,
-			hint: monitor.status === "failed" ? "failed" : undefined,
+			label: `monitor · ${preview(monitor.label, TRUNCATE_LENGTHS.SHORT)}`,
+			description: displayText(monitor.status, TRUNCATE_LENGTHS.SHORT),
+			hint: monitor.status === "failed" || monitor.deliveryState === "failed-visible" ? "failed" : undefined,
 		});
 	}
 	for (const cron of snapshot.crons) {
 		items.push({
 			value: `cron:${cron.id}`,
-			label: `cron · ${cron.humanSchedule}`,
+			label: `cron · ${preview(cron.humanSchedule, TRUNCATE_LENGTHS.SHORT)}`,
 			description: preview(cron.prompt),
+		});
+	}
+	for (const job of foldedJobs) {
+		const state = displayText(job.deliveryState, TRUNCATE_LENGTHS.SHORT);
+		const kind = preview(job.kind, TRUNCATE_LENGTHS.SHORT);
+		items.push({
+			value: `folded:${job.id}:${job.generation}`,
+			label: `${kind} · ${preview(job.label, TRUNCATE_LENGTHS.SHORT)}`,
+			description: state,
+			hint: job.status === "failed" || job.deliveryState === "failed-visible" ? "failed" : "read-only",
+			disabled: true,
 		});
 	}
 	return items;
@@ -80,10 +105,10 @@ export function buildJobDetailItems(snapshot: JobsSnapshot, ref: JobRef, output 
 		if (!monitor) return [{ value: "back", label: "Back (job no longer present)" }];
 		const lastOutput = output.trim().split("\n").filter(Boolean).slice(-1)[0] ?? "(no output captured)";
 		return [
-			{ value: "noop", label: "Status", description: monitor.status },
+			{ value: "noop", label: "Status", description: displayText(monitor.status, TRUNCATE_LENGTHS.SHORT) },
 			{ value: "noop", label: "Label", description: preview(monitor.label) },
 			{ value: "noop", label: "Started", description: formatRelative(monitor.startTime) },
-			{ value: "noop", label: "Output", description: preview(lastOutput, 80) },
+			{ value: "noop", label: "Output", description: preview(lastOutput, TRUNCATE_LENGTHS.CONTENT) },
 			{ value: "action:cancel", label: "Cancel this monitor", hint: "stops the running job" },
 			{ value: "back", label: "Back" },
 		];
@@ -91,10 +116,14 @@ export function buildJobDetailItems(snapshot: JobsSnapshot, ref: JobRef, output 
 	const cron = snapshot.crons.find(c => c.id === ref.id);
 	if (!cron) return [{ value: "back", label: "Back (job no longer present)" }];
 	return [
-		{ value: "noop", label: "Schedule", description: `${cron.humanSchedule} (${cron.cronExpression})` },
+		{
+			value: "noop",
+			label: "Schedule",
+			description: `${preview(cron.humanSchedule, TRUNCATE_LENGTHS.SHORT)} (${preview(cron.cronExpression, TRUNCATE_LENGTHS.SHORT)})`,
+		},
 		{ value: "noop", label: "Recurring", description: cron.recurring ? "yes" : "no" },
 		{ value: "noop", label: "Next fire", description: formatRelative(cron.nextFireAt) },
-		{ value: "noop", label: "Prompt", description: preview(cron.prompt, 80) },
+		{ value: "noop", label: "Prompt", description: preview(cron.prompt, TRUNCATE_LENGTHS.CONTENT) },
 		{ value: "action:delete", label: "Delete this cron", hint: "removes the schedule" },
 		{ value: "back", label: "Back" },
 	];
@@ -102,8 +131,9 @@ export function buildJobDetailItems(snapshot: JobsSnapshot, ref: JobRef, output 
 
 /** Yes/No confirm items for a destructive action. */
 export function buildConfirmItems(actionLabel: string): SelectItem[] {
+	const safeActionLabel = displayText(actionLabel, TRUNCATE_LENGTHS.TITLE);
 	return [
-		{ value: "no", label: `No, keep it` },
-		{ value: "yes", label: `Yes, ${actionLabel}` },
+		{ value: "no", label: "No, keep it" },
+		{ value: "yes", label: `Yes, ${safeActionLabel}` },
 	];
 }
