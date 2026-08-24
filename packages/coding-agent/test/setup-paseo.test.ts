@@ -2188,6 +2188,40 @@ describe("skills bridge", () => {
 		expect(await fs.readFile(newBridge, "utf8")).toBe("foreign destination\n");
 	});
 
+	test("an empty resolved source refuses migration to an absent bridge path (#4644 exact-head P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+		const settingsPath = path.join(process.env.GJC_CODING_AGENT_DIR ?? "", "config.yml");
+		const beforeBridge = await snapshotTree(oldDir);
+		const beforeLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+		const beforeSettings = await fs.readFile(settingsPath, "utf8");
+		for (const name of SKILL_NAMES) {
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		const newBridge = path.join(path.dirname(oldDir), "empty-relocated-paseo-skills");
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: { ...fixture.paths, bridgeDir: newBridge },
+			skillsSource: async () => ({ dir: fixture.paths.agentsSkillsDir as string, origin: "user" }),
+		};
+
+		const install = await runPaseoSetup({}, migratedDeps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("partial-install");
+		if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
+		expect(install.result.evidence.detail).toContain("contains no bridgeable skills");
+		expect(install.result.evidence.retained).toContain(oldDir);
+
+		expect(await snapshotTree(oldDir)).toBe(beforeBridge);
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(beforeLedger);
+		expect(await fs.readFile(settingsPath, "utf8")).toBe(beforeSettings);
+		await expect(fs.stat(newBridge)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("a partial old-bridge cleanup restores completed removals before saga rollback (#4644 Codex P2)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);

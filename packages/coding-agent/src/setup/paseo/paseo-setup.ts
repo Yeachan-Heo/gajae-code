@@ -208,6 +208,27 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		...deps,
 		skillsSource: async () => bridgeSource,
 	});
+	// An empty resolved source cannot authenticate moving an existing bridge to
+	// an absent destination: there are no links to establish at the new path,
+	// so cutover would strand the recorded bridge and registration. An already
+	// established destination remains eligible for normal convergence.
+	const emptyResolvedSourceMigration =
+		bridgeSource !== undefined &&
+		recordedBridgePathBeforeInstall !== undefined &&
+		path.resolve(recordedBridgePathBeforeInstall) !== path.resolve(deps.paths.bridgeDir) &&
+		bridgePreflight.bridgeDirCreated &&
+		Object.keys(bridgePreflight.entries).length === 0 &&
+		bridgePreflight.prunes.length === 0 &&
+		bridgePreflight.adopts.length === 0;
+	if (emptyResolvedSourceMigration) {
+		const failure = new SagaStepError(
+			"install",
+			`Refusing Paseo skills bridge path migration from ${recordedBridgePathBeforeInstall} to ${deps.paths.bridgeDir}: the resolved Paseo skills source contains no bridgeable skills; retaining the recorded bridge at ${recordedBridgePathBeforeInstall} and its registration`,
+			[recordedBridgePathBeforeInstall!, deps.paths.provenanceLedger],
+		);
+		const outcome = await compensate([], failure);
+		return { outcome: "partial-install", ...outcome };
+	}
 
 	const completed: CompletedStep[] = [];
 	const changed: string[] = [];
