@@ -15010,9 +15010,9 @@ export class SessionManager {
 						// closed so a concurrent successor is never overwritten.
 						if (!isEnoent(err)) throw err;
 						this.#managedPersistExpectedIdentity = undefined;
-						store.replaceSync(relativePath, bytes);
+						store.publishNoReplaceSync(relativePath, bytes);
 					}
-				} else store.replaceSync(relativePath, bytes);
+				} else store.publishNoReplaceSync(relativePath, bytes);
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
 				this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);

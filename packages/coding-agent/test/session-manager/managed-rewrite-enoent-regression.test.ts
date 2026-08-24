@@ -1,7 +1,8 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { makeAssistantMessage } from "./helpers";
 
@@ -23,6 +24,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
 		fs.rmSync(root, { recursive: true, force: true });
 	});
 
@@ -52,6 +54,33 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(fs.readFileSync(sessionFile!, "utf8")).toContain("after-delete");
 
 		await manager.close();
+	});
+
+	it("does not overwrite a successor installed after missing-predecessor confirmation", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		fs.rmSync(sessionFile);
+		const successor = `${JSON.stringify({ type: "session", id: "successor", timestamp: new Date().toISOString(), cwd })}\n`;
+		const publishNoReplace = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+			bytes,
+		) {
+			fs.writeFileSync(sessionFile, successor);
+			return publishNoReplace.call(this, relativePath, bytes);
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "must-not-overwrite-successor", timestamp: Date.now() }),
+		).toThrow();
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		await manager.close().catch(() => {});
 	});
 
 	it("accepts byte-identical metadata drift before appending", async () => {
