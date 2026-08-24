@@ -1469,15 +1469,14 @@ describe("skills bridge", () => {
 		expect(again.backupPath).toBe(first.backupPath);
 		expect(again.valueSha256).toBe(first.valueSha256);
 	});
-	test("a sidecar conflict during the provider step rolls the published entry back instead of stranding an unowned overwrite (#4644 review r8)", async () => {
+	test("a sidecar conflict during the provider step refuses before publication instead of stranding an unowned overwrite (#4644 review r8)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
 		const userEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "USER EDIT" };
 		await seedConfig(fixture.paths, { gjc: userEntry });
 		// An attacker pre-plants a sidecar at the deterministic injective path
-		// holding different content for the same key: `--force` must fail, the
-		// already-published provider entry must be rolled back to the user's
-		// value, and the tampered sidecar must not be overwritten.
+		// holding different content for the same key: `--force` must fail before
+		// publication, and the tampered sidecar must not be overwritten.
 		const plantedPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		await Bun.write(plantedPath, serializeJson({ key: "gjc", value: { evil: true } }));
 
@@ -1493,6 +1492,68 @@ describe("skills bridge", () => {
 		// remove. The user's config entry is still restored and no NEW sidecar
 		// was created, which is the fail-closed contract.
 		expect(await fs.readFile(plantedPath, "utf8")).toContain("evil");
+	});
+
+	test("persists the replaced-provider sidecar before publication and recovers a pre-publication interruption (#4644 Codex P1)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const userEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "USER EDIT" };
+		await seedConfig(fixture.paths, { gjc: userEntry });
+		const before = await readTarget(fixture.paths.configJson);
+		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
+		const sidecarRef = {
+			backupPath: sidecarPath,
+			valueSha256: hashBytes(serializeJson(userEntry)),
+		};
+		let valueAtPersist: unknown;
+
+		await expect(
+			runJsonStep({
+				label: fixture.paths.configJson,
+				step: "provider-config",
+				targetPath: fixture.paths.configJson,
+				provenancePath: fixture.paths.provenanceLedger,
+				intentPath: fixture.paths.intentRecord,
+				ownedKeys: ["agents.providers.gjc"],
+				expectedPreflightIdentity: before.identity,
+				mutate: draft => {
+					(draft.agents as { providers: Record<string, unknown> }).providers.gjc = { replaced: true };
+				},
+				nextLedger: ledger => ({
+					...ledger,
+					providerKeys: { ...ledger.providerKeys, gjc: "new-provider-entry" },
+					providerReplacedEntries: { ...ledger.providerReplacedEntries, gjc: sidecarRef },
+				}),
+				revert: draft => {
+					(draft.agents as { providers: Record<string, unknown> }).providers.gjc = userEntry;
+				},
+				revertLedger: ledger => ledger,
+				persist: async () => {
+					const observed = await readTarget(fixture.paths.configJson);
+					valueAtPersist = providersOf(observed.parsed).gjc;
+					await writeReplacedProviderBackup(fixture.paths.configJson, "gjc", userEntry);
+					// Model an interruption immediately after the sidecar is made
+					// durable: publication must not have happened yet.
+					throw new Error("simulated interruption after sidecar persistence");
+				},
+				now: new Date("2026-01-01T00:00:00.000Z"),
+			}),
+		).rejects.toBeInstanceOf(SagaStepError);
+
+		expect(valueAtPersist).toEqual(userEntry);
+		expect(providersOf((await readTarget(fixture.paths.configJson)).parsed).gjc).toEqual(userEntry);
+		expect(await readReplacedProviderBackup(sidecarPath, "gjc", sidecarRef.valueSha256)).toEqual({
+			found: true,
+			value: userEntry,
+		});
+		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(true);
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+		// The target never published, so recovery discards only the intent; the
+		// preserved user value remains available for the next install attempt.
+		expect((await readProvenance(fixture.paths.provenanceLedger)).providerReplacedEntries?.gjc).toBeUndefined();
 	});
 
 	test("a refused provider publish leaves no replaced-provider sidecar behind (#4644 review r8)", async () => {

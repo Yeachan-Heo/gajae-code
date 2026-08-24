@@ -124,7 +124,7 @@ export interface JsonStepInput {
 	readonly revert: (draft: Record<string, unknown>) => void;
 	/** Produces the ledger that must exist once this step is undone. */
 	readonly revertLedger: (ledger: ProvenanceLedger) => ProvenanceLedger;
-	/** Durable artifacts this step's ledger references. Runs only after the target's CAS publish succeeded and before the ledger commit, so a refused or conflicting publish leaves no orphaned artifact. */
+	/** Durable artifacts this step's ledger references. Runs before the target publish, so a crash after publication cannot leave the ledger (or intent) pointing at a missing artifact. */
 	readonly persist?: () => Promise<void>;
 	/** Removes what {@link persist} created; runs after a successful undo. */
 	readonly unpersist?: () => Promise<void>;
@@ -138,7 +138,8 @@ export interface JsonStepOutput {
 }
 
 /**
- * Run one JSON step: intent, target publish, ledger commit, intent clear.
+ * Run one JSON step: intent, durable artifact, target publish, ledger commit,
+ * intent clear.
  *
  * The intent is written first and cleared last. Between those points a crash is
  * recoverable because the record alone identifies whether the target carries
@@ -186,13 +187,20 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 
 	let backupPath: string | undefined;
 	let publishSucceeded = false;
-	// #4644 review r14: track whether the persist hook was ATTEMPTED, not
-	// only whether it resolved. `persist` can create the durable artifact and
-	// then throw (a post-creation validation failure); cleanup must remove
-	// the artifact on every post-publish failure, so "attempted" is the
-	// condition — an unattempted persist created nothing to remove.
+	// Track whether the persist hook was ATTEMPTED, not only whether it
+	// resolved. `persist` can create the durable artifact and then throw; a
+	// successful publication followed by a ledger failure must still clean it
+	// up during rollback.
 	let persistAttempted = false;
 	try {
+		// Durable artifacts the ledger is about to reference must exist before the
+		// destructive target replacement (#4644 Codex P1). If the process dies
+		// after publication, intent recovery can now safely commit the ledger
+		// pointer instead of recording a sidecar that was never written.
+		if (input.persist) {
+			persistAttempted = true;
+			await input.persist();
+		}
 		const published = await publishPlan(input.targetPath, plan, {
 			expectedIdentity: current.identity,
 			backup: true,
@@ -200,22 +208,15 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		});
 		backupPath = published.backupPath;
 		publishSucceeded = published.published;
-		// Durable artifacts the ledger is about to reference are created only
-		// now, inside the same CAS boundary: a refused or conflicting publish
-		// (#4644 review r8) must leave no orphaned artifact behind.
-		if (input.persist) {
-			persistAttempted = true;
-			await input.persist();
-		}
 		await writeProvenance(input.provenancePath, ledgerAfter);
 	} catch (error) {
-		// The publish already succeeded, so any failure before the ledger
-		// commit must undo the publication AND remove the artifact this step
-		// created (#4644 reviews r8/r10): leaving the target carrying this
-		// step's write with no provenance would strand an unowned overwrite,
-		// and leaving a persisted sidecar behind would orphan a
-		// credential-bearing file nothing references. When the rollback itself
-		// fails, the intent record deliberately stays for recovery instead.
+		// Once publication succeeds, any failure before the ledger commit must
+		// undo the publication AND remove the artifact this step created (#4644
+		// reviews r8/r10): leaving the target carrying this step's write with no
+		// provenance would strand an unowned overwrite, and leaving a persisted
+		// sidecar behind would orphan a credential-bearing file nothing references.
+		// When publication never happened, the intent deliberately stays for
+		// recovery so a durable sidecar is not discarded as if the step committed.
 		if (publishSucceeded) {
 			let reverted = false;
 			try {
