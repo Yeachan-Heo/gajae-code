@@ -666,10 +666,7 @@ async function directoryIdentity(directory: string): Promise<BridgeEntryIdentity
  * mutation boundary, and POSIX cleanup remains retained authority rather than
  * being removed through a second pathname race.
  */
-async function removeOwnedEmptyBridgeDirectory(
-	bridgeDir: string,
-	expected: BridgeEntryIdentity,
-): Promise<void> {
+async function removeOwnedEmptyBridgeDirectory(bridgeDir: string, expected: BridgeEntryIdentity): Promise<void> {
 	const parent = await fs.lstat(path.dirname(bridgeDir), { bigint: true }).catch(error => {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw new SkillsBridgeError(`Paseo skills bridge parent became unavailable before removal: ${bridgeDir}`);
@@ -687,12 +684,7 @@ async function removeOwnedEmptyBridgeDirectory(
 		);
 	}
 	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
-	if (
-		root === undefined ||
-		root.kind !== "directory" ||
-		root.dev !== expected.dev ||
-		root.ino !== expected.ino
-	) {
+	if (root === undefined || root.kind !== "directory" || root.dev !== expected.dev || root.ino !== expected.ino) {
 		throw new SkillsBridgeError(`Paseo skills bridge directory diverged before removal: ${bridgeDir}`);
 	}
 	// The directory was proven empty before handing the snapshot to the native
