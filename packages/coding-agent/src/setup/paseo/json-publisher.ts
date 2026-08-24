@@ -305,30 +305,36 @@ export async function writeReplacedProviderBackup(
 	const valueSha256 = hashBytes(serializeJson(value));
 	const payload = serializeJson({ key: providerKey, value });
 	const temporary = `${backupPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
-	const handle = await fs.open(temporary, "w", BACKUP_MODE);
 	try {
-		await handle.writeFile(payload, "utf8");
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	// `fs.open` honors the mode only on creation, so set it explicitly.
-	await fs.chmod(temporary, BACKUP_MODE);
-	try {
+		// Keep the entire temporary-file lifecycle inside this cleanup boundary.
+		// Opening can create the path before surfacing an error, and chmod can
+		// fail after the bytes are durable; either failure must not strand a
+		// credential-bearing temporary sidecar.
+		const handle = await fs.open(temporary, "w", BACKUP_MODE);
+		try {
+			await handle.writeFile(payload, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		// `fs.open` honors the mode only on creation, so set it explicitly.
+		await fs.chmod(temporary, BACKUP_MODE);
 		// `link` fails with EEXIST when the sidecar already exists: a rename
 		// would silently replace it, and the FIRST preserved value is the
 		// user's by contract.
-		await fs.link(temporary, backupPath);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
-		if (!existing.found) {
-			throw new PaseoPublishError(backupPath, {
-				reason: "sidecar-conflict",
-				detail: `a replaced-provider sidecar already exists at this path with different content for key ${providerKey}`,
-			});
+		try {
+			await fs.link(temporary, backupPath);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
+			if (!existing.found) {
+				throw new PaseoPublishError(backupPath, {
+					reason: "sidecar-conflict",
+					detail: `a replaced-provider sidecar already exists at this path with different content for key ${providerKey}`,
+				});
+			}
+			// Idempotent: the existing sidecar already preserves exactly this value.
 		}
-		// Idempotent: the existing sidecar already preserves exactly this value.
 	} finally {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 	}

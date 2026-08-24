@@ -334,6 +334,71 @@ describe("backup safety", () => {
 	});
 });
 
+describe("replaced-provider sidecar cleanup", () => {
+	test("removes the staged sidecar after every temporary publication failure", async () => {
+		for (const phase of ["open", "write", "sync", "chmod", "link"] as const) {
+			const fixture = await makeFixture();
+			const backupPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
+			const temporaryPrefix = `${backupPath}.${process.pid}.`;
+			const failure = new Error(`${phase} failed`);
+			const spies: Array<{ mockRestore(): void }> = [];
+			const isTemporary = (target: unknown): boolean => {
+				const value = String(target);
+				return value.startsWith(temporaryPrefix) && value.endsWith(".tmp");
+			};
+
+			try {
+				if (phase === "open" || phase === "write" || phase === "sync") {
+					const realOpen = fs.open.bind(fs);
+					spies.push(
+						spyOn(fs, "open").mockImplementation(async (...args) => {
+							if (phase === "open" && isTemporary(args[0])) {
+								const handle = await realOpen(...args);
+								await handle.close();
+								throw failure;
+							}
+							const handle = await realOpen(...args);
+							if (isTemporary(args[0])) {
+								if (phase === "write") spyOn(handle, "writeFile").mockRejectedValue(failure);
+								if (phase === "sync") spyOn(handle, "sync").mockRejectedValue(failure);
+							}
+							return handle;
+						}),
+					);
+				}
+				if (phase === "chmod") {
+					const realChmod = fs.chmod.bind(fs);
+					spies.push(
+						spyOn(fs, "chmod").mockImplementation(async (target, mode) => {
+							if (isTemporary(target)) throw failure;
+							return realChmod(target, mode);
+						}),
+					);
+				}
+				if (phase === "link") {
+					const realLink = fs.link.bind(fs);
+					spies.push(
+						spyOn(fs, "link").mockImplementation(async (existingPath, newPath) => {
+							if (isTemporary(existingPath)) throw failure;
+							return realLink(existingPath, newPath);
+						}),
+					);
+				}
+
+				await expect(
+					writeReplacedProviderBackup(fixture.paths.configJson, "gjc", { preserved: phase }),
+				).rejects.toBe(failure);
+				const entries = await fs.readdir(path.dirname(backupPath));
+				expect(
+					entries.filter(entry => entry.startsWith(path.basename(backupPath)) && entry.endsWith(".tmp")),
+				).toEqual([]);
+			} finally {
+				for (const spy of spies.reverse()) spy.mockRestore();
+			}
+		}
+	});
+});
+
 describe("executable resolution", () => {
 	function withChannel<T>(channel: string | undefined, compiled: boolean, fn: () => T): T {
 		const priorChannel = process.env.GJC_BUILD_CHANNEL;
