@@ -127,6 +127,30 @@ export interface FoldCoordinatorDeps {
 /** Why a slot is being retired, which decides whether retiring is safe. */
 export type FoldRetireReason = "cancel" | "evict";
 
+/**
+ * Render a fold receipt for the wake turn.
+ *
+ * Carries the job id, a real retrieval handle, and the captured remaining
+ * intent, so the wake turn can finish the ORIGINAL task instead of only
+ * reporting that a command ended. The cwd caveat is included only for wait
+ * kinds that can actually change directory.
+ */
+export function describeFoldReceipt(receipt: FoldReceipt): string {
+	const lines = [
+		`This result came from a folded ${receipt.kind} wait (job ${receipt.jobId}).`,
+		`Output reference: ${receipt.outputRef.instruction}`,
+	];
+	if (receipt.cwdSensitive) {
+		lines.push(
+			"Session cwd is unchanged; any directory change made by the folded command does not apply to later commands.",
+		);
+	}
+	if (receipt.remainingIntent) {
+		lines.push(`Complete the original request, which was: ${receipt.remainingIntent}`);
+	}
+	return lines.join("\n");
+}
+
 export class FoldCoordinator {
 	/**
 	 * Slots and receipt carriers are keyed by the `AsyncJob` INSTANCE, so two
