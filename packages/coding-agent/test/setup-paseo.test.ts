@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { parseSetupArgs } from "../src/cli/setup-cli";
+import { Settings } from "../src/config/settings";
 import { checkPaseoSetup, STALE_GUIDANCE } from "../src/setup/paseo/check";
 import {
 	type CompletedStep,
@@ -903,6 +904,55 @@ describe("skills bridge", () => {
 		// (nothing foreign is deleted); the legacy link is recoverable in the
 		// quarantine. With a VACANT name the original link comes back exactly.
 		expect(await fs.readFile(bridgeName, "utf8")).toBe("occupant\n");
+	});
+
+	test("register compensation restores adopted legacy link text and ledger facts (#4644 Codex P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		const legacySource = fixture.paths.agentsSkillsDir as string;
+		const bundle = path.join(fixture.root, "Applications", "Paseo.app", "Contents", "Resources", "skills");
+		for (const name of SKILL_NAMES) {
+			await fs.mkdir(path.join(bundle, name), { recursive: true });
+			await fs.writeFile(path.join(bundle, name, "SKILL.md"), `# ${name}\n`);
+		}
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		const originalLinkTexts: Record<string, string> = {};
+		for (const name of SKILL_NAMES) {
+			const bridgeName = path.join(fixture.paths.bridgeDir, name);
+			const legacyTarget = path.join(legacySource, name);
+			const original = path.relative(path.dirname(bridgeName), legacyTarget);
+			originalLinkTexts[name] = original;
+			await fs.symlink(original, bridgeName);
+		}
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeEntries: [...SKILL_NAMES],
+			bridgeDirCreated: false,
+		});
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const deps: PaseoSetupDependencies = {
+			...fixture.deps,
+			skillsSource: async () => ({ dir: bundle, origin: "app-bundle" }),
+		};
+		const settingsInit = spyOn(Settings, "init").mockImplementation(() =>
+			Promise.reject(new Error("simulated skills registration failure")),
+		);
+		try {
+			const install = await runPaseoSetup({}, deps);
+			expect(install.kind).toBe("install");
+			if (install.kind !== "install") throw new Error("unreachable");
+			expect(install.result.outcome).toBe("partial-install");
+			for (const name of SKILL_NAMES) {
+				expect(await fs.readlink(path.join(fixture.paths.bridgeDir, name))).toBe(originalLinkTexts[name]);
+			}
+			expect(await readProvenance(fixture.paths.provenanceLedger)).toEqual(before);
+		} finally {
+			settingsInit.mockRestore();
+		}
 	});
 
 	test("quarantine restoration never clobbers an entry claiming the bridge name (#4644 review r15)", async () => {

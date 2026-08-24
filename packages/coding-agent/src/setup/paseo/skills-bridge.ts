@@ -125,6 +125,8 @@ export interface SkillsBridgeInstallResult {
 	readonly prunedEntries: readonly string[];
 	/** Recorded legacy links this run re-pointed at the discovered source. */
 	readonly adoptedEntries: readonly string[];
+	/** Original link text for adopted entries, retained for saga compensation. */
+	readonly adoptedLinkTexts?: Readonly<Record<string, string>>;
 	/** Install-time no-follow identities for entries this run created or adopted. */
 	readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>>;
 	readonly bridgeDirCreated: boolean;
@@ -568,11 +570,13 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	const createdEntries: string[] = [];
 	const prunedEntries: string[] = [];
 	const adoptedEntries: string[] = [];
+	const adoptedLinkTexts: Record<string, string> = {};
 	const entryIdentities: Record<string, BridgeEntryIdentity> = {};
 	const partial = (): SkillsBridgeInstallResult => ({
 		createdEntries: [...createdEntries],
 		prunedEntries: [...prunedEntries],
 		adoptedEntries: [...adoptedEntries],
+		adoptedLinkTexts: { ...adoptedLinkTexts },
 		entryIdentities: { ...entryIdentities },
 		bridgeDirCreated,
 		...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
@@ -609,6 +613,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		for (const adopt of preflight.adopts) {
 			await adoptLegacyLink(adopt, adopt.legacySourceDir);
 			adoptedEntries.push(adopt.name);
+			adoptedLinkTexts[adopt.name] = adopt.linkTarget;
 			entryIdentities[adopt.name] = await captureInstalledEntryIdentity(
 				preflight.bridgeDir,
 				adopt.name,
@@ -624,6 +629,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				createdEntries,
 				prunedEntries,
 				adoptedEntries,
+				adoptedLinkTexts,
 				entryIdentities,
 				bridgeDirCreated,
 				...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
@@ -633,6 +639,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				createdEntries,
 				prunedEntries,
 				adoptedEntries,
+				adoptedLinkTexts,
 				entryIdentities,
 				bridgeDirCreated,
 				...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
@@ -778,6 +785,8 @@ async function assertInstalledEntryTarget(bridgeDir: string, name: string): Prom
  * Undo exactly the links this run created. A changed link is reported as a
  * conflict rather than being deleted; this makes compensation safe after edits.
  * Pruned stale links are deliberately not restored: their target is gone.
+ * Adopted links are restored to their captured legacy link text after the new
+ * target is removed.
  */
 export async function inverseSkillsBridge(
 	deps: PaseoSetupDependencies,
@@ -786,6 +795,12 @@ export async function inverseSkillsBridge(
 ): Promise<void> {
 	if (result.sourceDir === undefined) {
 		throw new SkillsBridgeError("Refusing to undo Paseo skill bridge entries without a recorded source directory");
+	}
+	const adoptedLinkTexts = result.adoptedLinkTexts ?? {};
+	for (const name of result.adoptedEntries) {
+		if (typeof adoptedLinkTexts[name] !== "string") {
+			throw new SkillsBridgeError(`Missing original link text for adopted Paseo skill bridge entry: ${name}`);
+		}
 	}
 	// Removal must operate on the SAME directory it validated. The ledger
 	// records the directory GJC actually created links in; a later profile or
@@ -831,6 +846,26 @@ export async function inverseSkillsBridge(
 	}
 	for (const removal of removals) {
 		await quarantineUnlinkVerified(removal.destination, removal.target, removal.identity);
+	}
+	// Adoption replaces a pre-#4638 legacy link rather than creating a new
+	// pathname. Once the replacement is removed with its recorded identity,
+	// publish the captured legacy text without replacement so a concurrent
+	// successor is preserved and compensation fails closed if restoration is
+	// not proven.
+	for (const name of result.adoptedEntries) {
+		const destination = path.join(bridgeDir, name);
+		const original = adoptedLinkTexts[name]!;
+		try {
+			await fs.symlink(original, destination);
+		} catch (error) {
+			throw new SkillsBridgeError(
+				`Refusing to restore adopted Paseo skill bridge entry ${destination}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+		const observed = await fs.readlink(destination).catch(() => undefined);
+		if (observed !== original) {
+			throw new SkillsBridgeError(`Adopted Paseo skill bridge restoration diverged: ${destination}`);
+		}
 	}
 	if (!result.bridgeDirCreated) return;
 	const directory = result.bridgeDirIdentity;
