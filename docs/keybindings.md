@@ -98,7 +98,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | --- | --- | --- |
 | `tui.editor.cursorUp` | `up` | |
 | `tui.editor.cursorDown` | `down` | |
-| `tui.editor.cursorLeft` | `left`, `ctrl+b` | `ctrl+b` also `app.tool.backgroundFold` (other context) |
+| `tui.editor.cursorLeft` | `left`, `ctrl+b` | |
 | `tui.editor.cursorRight` | `right`, `ctrl+f` | |
 | `tui.editor.cursorWordLeft` | `alt+left`, `ctrl+left`, `alt+b` | `ctrl+left` also `app.tree.foldOrUp` |
 | `tui.editor.cursorWordRight` | `alt+right`, `ctrl+right`, `alt+f` | `ctrl+right` also `app.tree.unfoldOrDown` |
@@ -155,7 +155,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.model.select` | ctrl+l | composer |
 | `app.model.selectTemporary` | alt+p | composer |
 | `app.tools.expand` | ctrl+o | composer |
-| `app.tool.backgroundFold` | alt+shift+b, super+b | composer |
+| `app.tool.backgroundFold` | alt+shift+b, super+b (darwin) / alt+shift+b (win32/linux) | composer |
 | `app.editor.external` | ctrl+g | composer |
 | `app.message.followUp` | _(none)_ | composer |
 | `app.message.queue` | alt+q (darwin/win32) / alt+enter (linux) | composer |
@@ -198,7 +198,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | --- | --- | --- |
 | `tui.global.debug` | `shift+ctrl+d` | Toggle debug overlay; resolved through the registry in `tui.ts` |
 
-Cross-context default reuse (`ctrl+s`, `ctrl+r`, `ctrl+d`, `ctrl+b`, `ctrl+left`/`ctrl+right`, `enter`, `escape`, `ctrl+c`) is intentional: each pair is active in a different focused context and is disambiguated at dispatch time. Use `detectDefaultKeyCollisions()` (above) to re-derive this list from the registry.
+Cross-context default reuse (`ctrl+s`, `ctrl+r`, `ctrl+d`, `ctrl+left`/`ctrl+right`, `enter`, `escape`, `ctrl+c`) is intentional: each pair is active in a different focused context and is disambiguated at dispatch time. Use `detectDefaultKeyCollisions()` (above) to re-derive this list from the registry.
 
 ### Not yet registry-managed
 
