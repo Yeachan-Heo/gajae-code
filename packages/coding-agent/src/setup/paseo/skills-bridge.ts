@@ -473,6 +473,9 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 		const destination = linkPath(deps, name);
 		const target = path.resolve(sourceDir, name);
 		const state = directory === "absent" ? { kind: "absent" as const } : await entryState(destination, target);
+		const recordedAtCurrentBridge =
+			recordedEntries.has(name) &&
+			(ledger.bridgePath === undefined || path.resolve(ledger.bridgePath) === path.resolve(deps.paths.bridgeDir));
 		if (state.kind === "conflict") {
 			// A recorded link whose text still resolves into the ownership source
 			// (the ledger's own record, or the legacy location for a legacy
@@ -514,14 +517,23 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 			});
 			continue;
 		}
-		const recordedAtCurrentBridge =
-			recordedEntries.has(name) &&
-			(ledger.bridgePath === undefined || path.resolve(ledger.bridgePath) === path.resolve(deps.paths.bridgeDir));
 		if (state.kind === "expected" && recordedAtCurrentBridge) {
 			// A same-target noop is ownership-preserving only when the live
 			// symlink is the exact object GJC recorded. Matching link text alone
 			// cannot distinguish that link from a user-created replacement.
 			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], state.identity)) {
+				conflicts.push(destination);
+				continue;
+			}
+		}
+		if (state.kind === "dangling") {
+			// A dangling exact-target link is still an existing user object when
+			// provenance does not authenticate it. Never prune-and-recreate (or
+			// adopt through a migration) from matching target text alone.
+			if (
+				!recordedAtCurrentBridge ||
+				!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[name], state.identity)
+			) {
 				conflicts.push(destination);
 				continue;
 			}

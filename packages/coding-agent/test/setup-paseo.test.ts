@@ -857,6 +857,61 @@ describe("skills bridge", () => {
 		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
 	});
 
+	test("exact-target dangling links require recorded identity before prune-and-recreate (#4644 Codex P2)", async () => {
+		for (const mode of ["unrecorded", "identityless", "durable"] as const) {
+			const fixture = await makeFixture();
+			await seedSkills(fixture.paths);
+			const name = "paseo";
+			const sourceDir = await fs.realpath(fixture.paths.agentsSkillsDir as string);
+			const sourceSkill = path.join(sourceDir, name);
+			const bridgeName = path.join(fixture.paths.bridgeDir, name);
+
+			if (mode === "durable") {
+				await installWithLedger(fixture.deps);
+			} else {
+				await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+				await fs.symlink(sourceSkill, bridgeName);
+				if (mode === "identityless") {
+					await writeProvenance(fixture.paths.provenanceLedger, {
+						version: 1,
+						providerKeys: {},
+						seededOrchestrationKeys: {},
+						bridgePath: fixture.paths.bridgeDir,
+						bridgeSourceDir: sourceDir,
+						bridgeEntries: [name],
+						bridgeEntryIdentities: {},
+						bridgeDirCreated: false,
+					});
+				}
+			}
+
+			const before = await snapshotTree(fixture.paths.bridgeDir);
+			const originalLstat = fs.lstat.bind(fs);
+			let raced = false;
+			const lstat = spyOn(fs, "lstat").mockImplementation(async (target, ...rest) => {
+				if (!raced && path.resolve(String(target)) === path.resolve(bridgeName)) {
+					raced = true;
+					await safeRm(sourceSkill, { recursive: true });
+				}
+				return (await originalLstat(target, ...rest)) as never;
+			});
+			try {
+				if (mode === "durable") {
+					const preflight = await preflightSkillsBridge(fixture.deps);
+					expect(preflight.entries[name]?.action).toBe("prune-and-recreate");
+				} else {
+					await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+					expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+					expect(await fs.readlink(bridgeName)).toBe(sourceSkill);
+				}
+				expect(raced).toBe(true);
+				await expect(fs.stat(bridgeName)).rejects.toMatchObject({ code: "ENOENT" });
+			} finally {
+				lstat.mockRestore();
+			}
+		}
+	});
+
 	test("a prewritten bridge plan never adopts a user-created exact-target link (#4644 Codex P2)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
