@@ -66,6 +66,8 @@ export function jobElapsedMs(job: Pick<AsyncJob, "startTime" | "endTime">, now: 
 }
 
 export interface AsyncJobMetadata {
+	/** Set once a foreground wait has been folded, so surfacing can show folded work. */
+	backgrounded?: boolean;
 	subagent?: {
 		id: string;
 		agent: string;
@@ -289,6 +291,43 @@ interface EvictedDeadLetteredDelivery {
 	attempt: number;
 	lastError?: string;
 	recordedAt: number;
+}
+
+/** Per-job public delivery classification. Exactly one value per terminal job. */
+export type JobDeliveryState = "pending" | "delivered" | "failed-visible";
+
+/** One job as projected by {@link AsyncJobManager.getJobsSnapshot}. */
+export interface AsyncJobSnapshotEntry {
+	id: string;
+	kind: string;
+	label: string;
+	status: AsyncJob["status"];
+	generation: string;
+	backgrounded: boolean;
+	deliveryState: JobDeliveryState;
+}
+
+/** Scalar delivery-failure evidence that may outlive its AsyncJob record. */
+export interface DeadLetteredJobSnapshotEntry {
+	jobId: string;
+	generation: string;
+	ownerId?: string;
+	attempt: number;
+	lastError?: string;
+	recordedAt: number;
+}
+
+/**
+ * One atomic projection of job + delivery state.
+ *
+ * Computed in a single synchronous pass with no interleaved awaits so it cannot
+ * tear, and consumed verbatim: a UI that re-derives delivery classification from
+ * separate getters can disagree with this and produce a job that is in no public
+ * state at all.
+ */
+export interface AsyncJobsSnapshot {
+	jobs: AsyncJobSnapshotEntry[];
+	deadLettered: DeadLetteredJobSnapshotEntry[];
 }
 
 export interface AsyncJobDeliveryState {
@@ -2121,6 +2160,69 @@ export class AsyncJobManager {
 			pendingJobIds: deliveries.concat(inFlightDeliveries).map(delivery => delivery.jobId),
 			deadLettered,
 		};
+	}
+
+	/**
+	 * One synchronous pass over jobs plus delivery state.
+	 *
+	 * Every returned job carries exactly one {@link JobDeliveryState}, and
+	 * dead-lettered evidence is included even when its record is already gone, so
+	 * no terminal job can end up invisible to the UI.
+	 */
+	getJobsSnapshot(filter?: AsyncJobFilter): AsyncJobsSnapshot {
+		this.#expireMonitorTombstones();
+		this.#pruneEvictedDeadLetters();
+
+		const pending = new Set<string>();
+		for (const delivery of this.#deliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
+		for (const delivery of this.#inFlightDeliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
+
+		const failedVisible = new Set<string>();
+		for (const entry of this.#deadLetteredDeliveries.values()) {
+			failedVisible.add(`${entry.jobId}:${entry.generation}`);
+		}
+		for (const entry of this.#evictedDeadLetters.values()) {
+			failedVisible.add(`${entry.jobId}:${entry.generation}`);
+		}
+
+		const jobs = this.#filterJobs(this.#jobs.values(), filter).map<AsyncJobSnapshotEntry>(job => {
+			const key = `${job.id}:${job.generation}`;
+			const deliveryState: JobDeliveryState = failedVisible.has(key)
+				? "failed-visible"
+				: pending.has(key) || job.status === "running" || job.status === "paused"
+					? "pending"
+					: "delivered";
+			return {
+				id: job.id,
+				kind: job.type,
+				label: job.label,
+				status: job.status,
+				generation: job.generation,
+				backgrounded: job.metadata?.backgrounded === true,
+				deliveryState,
+			};
+		});
+
+		const ownerId = filter?.ownerId;
+		const deadLettered: DeadLetteredJobSnapshotEntry[] = [];
+		for (const entry of this.#deadLetteredDeliveries.values()) {
+			const entryOwner = this.#deadLetteredDeliveryOwners.get(entry.jobId);
+			if (ownerId && entryOwner !== ownerId) continue;
+			deadLettered.push({
+				jobId: entry.jobId,
+				generation: entry.generation,
+				ownerId: entryOwner,
+				attempt: entry.attempt,
+				lastError: entry.lastError,
+				recordedAt: Date.now(),
+			});
+		}
+		for (const entry of this.#evictedDeadLetters.values()) {
+			if (ownerId && entry.ownerId !== ownerId) continue;
+			deadLettered.push({ ...entry });
+		}
+
+		return { jobs, deadLettered };
 	}
 
 	hasPendingDeliveries(filter?: AsyncJobFilter): boolean {
