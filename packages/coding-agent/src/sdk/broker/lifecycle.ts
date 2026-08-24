@@ -58,9 +58,9 @@ import {
 } from "../session-directory";
 import {
 	normalizeSdkStartupFailure,
-	sanitizeSdkStartupMessage,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
+	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
@@ -124,6 +124,28 @@ export function terminalUncertainStartupMessage(response: BrokerResponse): strin
 		message: sanitizeSdkStartupMessage(response.error.message),
 	});
 	return `${STARTUP_CLEANUP_UNCERTAIN_MESSAGE} Original launch failure: SDK internal process could not be started.`;
+}
+
+export async function waitForChildSpawn(
+	spawned: Pick<ChildProcess, "off" | "on" | "once">,
+	onPostSpawnError: (error: Error) => void = error =>
+		logger.warn("sdk session child emitted an error after successful spawn", {
+			message: sanitizeSdkStartupMessage(error),
+		}),
+): Promise<void> {
+	const spawnOutcome = Promise.withResolvers<void>();
+	const onSpawn = () => {
+		spawned.off("error", onError);
+		spawned.on("error", onPostSpawnError);
+		spawnOutcome.resolve();
+	};
+	const onError = (error: Error) => {
+		spawned.off("spawn", onSpawn);
+		spawnOutcome.reject(error);
+	};
+	spawned.once("spawn", onSpawn);
+	spawned.once("error", onError);
+	await spawnOutcome.promise;
 }
 
 export interface LifecycleDeadlines {
@@ -4264,19 +4286,8 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
-			const spawnOutcome = Promise.withResolvers<void>();
-			const onSpawn = () => {
-				spawned.off("error", onError);
-				childSpawned = true;
-				spawnOutcome.resolve();
-			};
-			const onError = (error: Error) => {
-				spawned.off("spawn", onSpawn);
-				spawnOutcome.reject(error);
-			};
-			spawned.once("spawn", onSpawn);
-			spawned.once("error", onError);
-			await spawnOutcome.promise;
+			await waitForChildSpawn(spawned);
+			childSpawned = true;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
@@ -5531,12 +5542,7 @@ export async function executeLifecycle(
 	const provenRoot = root;
 	const provenId = entry?.intendedSessionId;
 	let provenDeadCleanup = false;
-	if (
-		Boolean(provenExpected) &&
-		Boolean(provenRoot) &&
-		Boolean(provenId) &&
-		lifecycleProofWithinDeadline(proofBudget)
-	) {
+	if (provenExpected && provenRoot && provenId && lifecycleProofWithinDeadline(proofBudget)) {
 		const processExited =
 			observeProcess(provenExpected!.pid, provenExpected!.incarnation, value =>
 				processIncarnationForBroker(broker, value),

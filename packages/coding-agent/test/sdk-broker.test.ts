@@ -34,6 +34,7 @@ import {
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
 	terminalUncertainStartupMessage,
+	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
@@ -58,6 +59,19 @@ it("does not disclose launch paths when cleanup remains uncertain", () => {
 		"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation. Original launch failure: SDK internal process could not be started.",
 	);
 	expect(message).not.toContain(executable);
+});
+
+it("retains an error handler after a child reports successful spawn", async () => {
+	const child = new EventEmitter();
+	const postSpawnErrors: string[] = [];
+	const spawned = waitForChildSpawn(child as unknown as Pick<ChildProcess, "off" | "on" | "once">, error =>
+		postSpawnErrors.push(error.message),
+	);
+	child.emit("spawn");
+	await spawned;
+	expect(child.listenerCount("error")).toBe(1);
+	child.emit("error", new Error("late child failure"));
+	expect(postSpawnErrors).toEqual(["late child failure"]);
 });
 async function managedSessionPath(agentDir: string, cwd: string, sessionId: string): Promise<string> {
 	await fs.mkdir(cwd, { recursive: true });
