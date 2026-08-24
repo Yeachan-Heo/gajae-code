@@ -643,6 +643,10 @@ export class AsyncJobManager {
 	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
 	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
 	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
+	/** Generations settled by failNow, so the runner's later terminal path is a no-op. */
+	readonly #externallySettled = new Set<string>();
+	/** Closed before #disposed so owner cleanups can settle work but cannot register more. */
+	#registrationClosed = false;
 	readonly #ownerSubagentShutdownLeases = new Map<string, OwnerSubagentShutdownLeaseState>();
 	#ownerSubagentShutdownSeq = 0;
 	#lastDisposeDiagnostics: AsyncJobDisposeDiagnostics = { stuckJobIds: [], deliveriesDrained: true };
@@ -974,6 +978,7 @@ export class AsyncJobManager {
 		if (options?.ownerId && this.#isOwnerSubagentShutdownFenced(options.ownerId)) {
 			throw new OwnerSubagentShutdownError();
 		}
+		if (this.#registrationClosed) throw new Error("Async job manager is shutting down");
 		const runningCount = this.getRunningJobs().length;
 		if (runningCount >= this.#maxRunningJobs) {
 			throw new Error(
@@ -1018,6 +1023,13 @@ export class AsyncJobManager {
 				const outcome: SubagentRunOutcome =
 					typeof result === "string" ? { kind: "completed", text: result } : result;
 
+				// failNow already published a terminal state AND enqueued its delivery
+				// for this generation; re-running the terminal path here would publish
+				// twice and deliver twice.
+				if (this.#externallySettled.has(job.generation)) {
+					this.#drainResumeQueue();
+					return;
+				}
 				if (job.status === "cancelled") {
 					job.resultText = outcome.kind === "paused" ? outcome.note : outcome.text;
 					this.#markRecordTerminal(id, "cancelled", job.generation);
@@ -2303,6 +2315,35 @@ export class AsyncJobManager {
 	 * matching agent registered; with no filter, cancels every running job
 	 * (used by `dispose()` to nuke the manager's state).
 	 */
+	/**
+	 * Synchronously fail a running job AND enqueue its delivery, exactly once.
+	 *
+	 * An externally owned wait -- an ACP client terminal, say -- can fail while its
+	 * owner is being torn down. `cancel()` is the wrong tool there: it marks the job
+	 * cancelled, and the cancelled path deliberately enqueues NO delivery, so the
+	 * failure would never become visible to anyone. This is the single transition
+	 * that both fails the job and delivers that failure in one synchronous block, so
+	 * it cannot lose the race against disposal.
+	 */
+	failNow(jobId: string, generation: string, errorText: string): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job || job.generation !== generation) return false;
+		if (job.status !== "running") return false;
+		if (this.#externallySettled.has(generation)) return false;
+		this.#externallySettled.add(generation);
+		job.status = "failed";
+		this.#freezeEndTime(job);
+		job.errorText = errorText;
+		this.#markRecordTerminal(jobId, "failed", generation);
+		this.#publishTerminal(job);
+		this.#enqueueDelivery(jobId, errorText);
+		this.#runLifecycle(jobId, "terminal", job);
+		this.#scheduleEviction(jobId);
+		this.#drainResumeQueue();
+		this.#notifyChange();
+		return true;
+	}
+
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
 			if (this.cancel(job.id, filter)) this.#scheduleEviction(job.id);
@@ -2423,12 +2464,17 @@ export class AsyncJobManager {
 	}
 
 	async dispose(options?: { timeoutMs?: number }): Promise<boolean> {
-		this.#disposed = true;
+		// Close registration FIRST, then run owner cleanups, and only then mark the
+		// manager disposed. Setting #disposed before the cleanups made
+		// #ensureDeliveryLoop a no-op, so a failure an owner cleanup settled through
+		// failNow could never be drained -- it sat in the queue and vanished. Closing
+		// registration keeps the original protection (cleanups cannot register fresh
+		// work) without disabling delivery. Errors in cleanups are logged, never
+		// escalated.
+		this.#registrationClosed = true;
 		this.#clearEvictionTimers();
-		// Run-and-clear any remaining owner cleanups before tearing down jobs so
-		// late-arriving timers cannot register fresh work against a disposed
-		// manager. Errors in cleanup callbacks are logged but never escalated.
 		this.runOwnerCleanups();
+		this.#disposed = true;
 		this.cancelAll();
 		for (const tombstone of this.#monitorTombstones.values()) {
 			try {
@@ -2454,6 +2500,7 @@ export class AsyncJobManager {
 		this.#inFlightDeliveries.length = 0;
 		this.#deadLetteredDeliveries.clear();
 		this.#evictedDeadLetters.clear();
+		this.#externallySettled.clear();
 		this.#deadLetteredDeliveryOwners.clear();
 		this.#suppressedDeliveries.clear();
 		this.#deliveryAckOwners.clear();
