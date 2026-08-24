@@ -460,7 +460,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		let migratedOldEntries: readonly MigratedOldBridgeEntry[] = [];
 		let migratedOldBridgeDir: string | undefined;
 		let migratedOldSourceDir: string | undefined;
-		if (isMigration && (bridgeLedger.bridgeEntries?.length ?? 0) > 0) {
+		// An owned empty bridge still carries a settings registration and must
+		// participate in the path cutover. `validatedBridgeDir` authenticates its
+		// recorded directory identity before this branch can replace that
+		// registration or hand the path to identity-bound cleanup.
+		if (isMigration && ((bridgeLedger.bridgeEntries?.length ?? 0) > 0 || bridgeLedger.bridgeDirCreated === true)) {
 			// The migration branch composes destructive cleanup paths from the
 			// ledger's own bytes, so it must fail closed exactly like `--remove`
 			// does: a tampered or malformed record (a `..` entry, a relative or
@@ -733,7 +737,10 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// links are restored to the old directory (the registration receipt above
 		// already reverts the swap), instead of stranding a ledger that points at
 		// links that no longer exist.
-		if (migratedOldBridgeDir !== undefined && migratedOldEntries.length > 0) {
+		if (
+			migratedOldBridgeDir !== undefined &&
+			(migratedOldEntries.length > 0 || bridgeLedger.bridgeDirCreated === true)
+		) {
 			const oldSourceDir = migratedOldSourceDir ?? bridgeLedger.bridgeSourceDir ?? legacySourceDirFor(deps);
 			const oldCleanup = {
 				createdEntries: migratedOldEntries.map(entry => entry.name),

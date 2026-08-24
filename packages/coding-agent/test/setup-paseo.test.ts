@@ -75,6 +75,7 @@ import {
 	resolvePaseoSkillsSource,
 } from "../src/setup/paseo/setup-deps";
 import {
+	adoptLegacyLink,
 	installSkillsBridge,
 	preflightSkillsBridge,
 	SkillsBridgeError,
@@ -1175,7 +1176,6 @@ describe("skills bridge", () => {
 		// Occupy the bridge name so the replacement publish hits EEXIST.
 		await safeRm(bridgeName);
 		await Bun.write(bridgeName, "occupant\n");
-		const { adoptLegacyLink } = await import("../src/setup/paseo/skills-bridge");
 		await expect(adoptLegacyLink(plan, plan.legacySourceDir)).rejects.toThrow();
 		// The occupant was never destroyed and the bridge name still holds it
 		// (nothing foreign is deleted); the legacy link is recoverable in the
@@ -2516,6 +2516,52 @@ describe("skills bridge", () => {
 		for (const name of ["paseo", "paseo-advisor"]) {
 			await expect(fs.lstat(path.join(oldDir, name))).rejects.toMatchObject({ code: "ENOENT" });
 		}
+	});
+
+	test("an owned empty bridge migrates only with its recorded directory identity (#4644 P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+		const beforeEmpty = await readProvenance(fixture.paths.provenanceLedger);
+		expect(beforeEmpty.bridgeDirCreated).toBe(true);
+		expect(beforeEmpty.bridgeDirIdentity).toBeDefined();
+
+		// Convergence prunes the final links but retains ownership of the
+		// directory itself. The next migration must use that directory identity
+		// to replace the old settings registration and remove only this directory.
+		for (const name of SKILL_NAMES) {
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		const emptied = await runPaseoSetup({}, fixture.deps);
+		expect(emptied.kind).toBe("install");
+		if (emptied.kind !== "install") throw new Error("expected an install outcome");
+		expect(emptied.result.outcome).toBe("installed");
+		const emptyLedger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(emptyLedger.bridgePath).toBe(oldDir);
+		expect(emptyLedger.bridgeEntries).toEqual([]);
+		expect(emptyLedger.bridgeDirCreated).toBe(true);
+		expect(emptyLedger.bridgeDirIdentity).toEqual(beforeEmpty.bridgeDirIdentity);
+
+		await seedSkills(fixture.paths);
+		const newBridge = path.join(path.dirname(oldDir), "owned-empty-relocated-paseo-skills");
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: { ...fixture.deps.paths, bridgeDir: newBridge },
+		};
+		const install = await runPaseoSetup({}, migratedDeps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("installed");
+
+		const settings = await fs.readFile(path.join(process.env.GJC_CODING_AGENT_DIR ?? "", "config.yml"), "utf8");
+		expect(settings).toContain(newBridge);
+		expect(settings).not.toContain(oldDir);
+		await expect(fs.stat(oldDir)).rejects.toMatchObject({ code: "ENOENT" });
+		const ledger = await readProvenance(fixture.paths.provenanceLedger);
+		expect(ledger.bridgePath).toBe(newBridge);
+		expect(ledger.bridgeEntries).toEqual(SKILL_NAMES);
 	});
 
 	test("a source-less bridge-path migration preserves the current bridge and registration before an occupied destination (#4644 exact-head P2)", async () => {
