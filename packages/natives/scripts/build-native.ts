@@ -183,6 +183,7 @@ const requiredGeneratedBindingSymbols = [
 	"repairOwnerOnlyPathSecurityExpected",
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
+	"currentExecutablePath",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

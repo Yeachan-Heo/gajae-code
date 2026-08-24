@@ -750,6 +750,9 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.probeWindowsJobMemory !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required memory probe capability \`probeWindowsJobMemory\`.`);
 	}
+	if (typeof bindings.currentExecutablePath !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required executable identity capability \`currentExecutablePath\`.`);
+	}
 }
 
 function buildHelpMessage(ctx) {
