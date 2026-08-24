@@ -73,7 +73,12 @@ async function waitForPluginMcpConnections(manager: MCPManager, names: string[])
 
 function synchronizePluginMcpStartup(): void {
 	const connectServers = MCPManager.prototype.connectServers;
-	vi.spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (configs, sources, onConnecting) {
+	vi.spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (
+		this: MCPManager,
+		configs: Parameters<MCPManager["connectServers"]>[0],
+		sources: Parameters<MCPManager["connectServers"]>[1],
+		onConnecting: Parameters<MCPManager["connectServers"]>[2],
+	) {
 		// Plugin manifests intentionally omit a timeout. Give this test fixture a
 		// bounded connection window so CI scheduler variance cannot turn a valid
 		// plugin authority into a startup-timeout teardown.
