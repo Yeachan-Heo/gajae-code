@@ -50,6 +50,20 @@ gjc setup hermes \
 ```
 
 The runtime accepts only the literal selectors `gjc` and `gjc --worktree [name]`. It rejects local wrappers, shell syntax, tmux flags, and model/provider flags before creating a session. Existing setup configs that contain a legacy explicit `--session-command` must be changed to one of those selectors; provider and model resolution remains normal GJC configuration, not coordinator command injection.
+### Custom or wrapper launch command
+
+`--gjc-command` accepts the full command the controller execs (#4877). It is tokenized, never evaluated by a shell:
+
+- Omitted, or a single token, names the executable only: `--gjc-command gjc` (the default) or `--gjc-command /opt/gjc` renders `command: gjc` / `command: /opt/gjc` with GJC-owned `args: [mcp-serve, coordinator]`.
+- Multiple tokens are the full server command, split quote-aware (single/double quotes, backslash escapes) into controller argv and rendered verbatim with nothing appended: `--gjc-command "python3 /tmp/gjc-wrapper.py"` renders `command: python3`, `args: [/tmp/gjc-wrapper.py]`. A wrapper that already execs `gjc mcp-serve coordinator` — the historical workaround target — is emitted exactly as given, so it never receives a doubled argv tail. Spell the whole invocation to keep the tail: `--gjc-command "env WRAPPER=1 gjc mcp-serve coordinator"`.
+- Unbalanced quotes are rejected with an explicit error.
+
+```
+mcp_servers:
+  gjc_coordinator:
+    command: python3
+    args: [/tmp/gjc-wrapper.py]
+```
 
 ## Agent directory override
 

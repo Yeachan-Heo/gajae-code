@@ -44,7 +44,7 @@ export interface CoordinatorSetupSpec {
 	serverName: typeof COORDINATOR_MCP_SERVER_NAME;
 	protocolVersion: typeof COORDINATOR_MCP_PROTOCOL_VERSION;
 	gjcCommand: string;
-	args: ["mcp-serve", "coordinator"];
+	args: string[];
 	roots: string[];
 	namespace: {
 		profile?: string;
@@ -263,6 +263,76 @@ function resolveHermesSessionCommand(flags: HermesSetupFlags): string {
 	if (!worktree.enabled) return DEFAULT_GJC_COMMAND;
 	return worktree.name ? `${DEFAULT_GJC_COMMAND} --worktree ${worktree.name}` : `${DEFAULT_GJC_COMMAND} --worktree`;
 }
+/**
+ * Quote-aware argv tokenizer for `--gjc-command`. Mirrors the SDK
+ * lifecycle-command tokenizer: single/double quotes group one token and
+ * backslash escapes `\\`, quotes, and whitespace. Returns undefined for an
+ * unbalanced quote. The value is never evaluated by a shell.
+ */
+function parseHermesCommandTokens(value: string): string[] | undefined {
+	const tokens: string[] = [];
+	let token = "";
+	let quote: '"' | "'" | undefined;
+	let started = false;
+	for (let index = 0; index < value.length; index++) {
+		const character = value[index]!;
+		if (character === "\\") {
+			const next = value[index + 1];
+			if (next !== undefined && (next === "\\" || next === '"' || next === "'" || /\s/u.test(next))) {
+				token += next;
+				index++;
+			} else token += character;
+			started = true;
+			continue;
+		}
+		if (quote) {
+			if (character === quote) quote = undefined;
+			else token += character;
+			started = true;
+			continue;
+		}
+		if (character === '"' || character === "'") {
+			quote = character;
+			started = true;
+			continue;
+		}
+		if (/\s/u.test(character)) {
+			if (started) {
+				tokens.push(token);
+				token = "";
+				started = false;
+			}
+			continue;
+		}
+		token += character;
+		started = true;
+	}
+	if (quote) return undefined;
+	if (started) tokens.push(token);
+	return tokens;
+}
+
+/**
+ * `--gjc-command` accepts the full command the controller execs (#4877):
+ * - omitted → the default `gjc` + GJC-owned `mcp-serve coordinator` args;
+ * - a single token → executable-only substitute for `gjc` (`/opt/gjc`), still
+ *   followed by GJC-owned `mcp-serve coordinator` args (byte-identical to the
+ *   historical render);
+ * - multiple tokens → the full server command, split quote-aware into
+ *   controller argv and rendered verbatim with nothing appended, so a wrapper
+ *   that already starts the coordinator never receives doubled argv.
+ * The value is tokenized, never evaluated by a shell.
+ */
+function resolveHermesLaunchCommand(flags: HermesSetupFlags): { command: string; args: string[] } {
+	const explicit = optionalTrim(flags.gjcCommand);
+	if (!explicit) return { command: DEFAULT_GJC_COMMAND, args: ["mcp-serve", "coordinator"] };
+	const tokens = parseHermesCommandTokens(explicit);
+	if (!tokens) {
+		throw new HermesSetupError("--gjc-command has an unbalanced quote; it is tokenized, never shell-evaluated.", 2);
+	}
+	if (tokens.length === 1) return { command: tokens[0]!, args: ["mcp-serve", "coordinator"] };
+	return { command: tokens[0]!, args: tokens.slice(1) };
+}
 
 function normalizeInstallTarget(flags: HermesSetupFlags): CoordinatorSetupSpec["installTarget"] {
 	if (flags.target && flags.profileDir) {
@@ -276,7 +346,7 @@ function normalizeInstallTarget(flags: HermesSetupFlags): CoordinatorSetupSpec["
 
 export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupSpec {
 	const roots = normalizeRoots(flags.root);
-	const gjcCommand = optionalTrim(flags.gjcCommand) ?? DEFAULT_GJC_COMMAND;
+	const launch = resolveHermesLaunchCommand(flags);
 	const sessionCommand = resolveHermesSessionCommand(flags);
 	return {
 		schemaVersion: 1,
@@ -284,8 +354,8 @@ export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupS
 		serverKey: optionalTrim(flags.serverKey) ?? DEFAULT_SERVER_KEY,
 		serverName: COORDINATOR_MCP_SERVER_NAME,
 		protocolVersion: COORDINATOR_MCP_PROTOCOL_VERSION,
-		gjcCommand,
-		args: ["mcp-serve", "coordinator"],
+		gjcCommand: launch.command,
+		args: launch.args,
 		roots,
 		namespace: {
 			...(optionalTrim(flags.profile) ? { profile: optionalTrim(flags.profile) } : {}),

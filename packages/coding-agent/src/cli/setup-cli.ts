@@ -932,6 +932,8 @@ ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom"
   ${APP_NAME} setup hermes --root /path/to/repo --session-command gjc
   ${APP_NAME} setup hermes --root /path/to/repo --coding-agent-dir /var/lib/gjc/hermes-agent
+  ${APP_NAME} setup hermes --root /path/to/repo --gjc-command "python3 /tmp/gjc-wrapper.py"
+  ${APP_NAME} setup hermes --root /path/to/repo --gjc-command /opt/gjc
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
@@ -949,6 +951,7 @@ ${chalk.bold("Options:")}
   --root            Allowed Hermes MCP workdir/artifact root (repeatable)
   --profile         Hermes MCP profile namespace
   --repo            Hermes MCP repo namespace
+  --gjc-command     Full command the controller execs: one token = executable (mcp-serve coordinator still appended); multiple tokens = complete server command verbatim, nothing appended; quote-aware, never shell-evaluated
   --session-command Typed GJC lifecycle selector: gjc | gjc --worktree [name]; disables generated worktree flags
   --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
   --worktree-name   Named GJC --worktree branch for Hermes sessions
