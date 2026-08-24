@@ -3495,6 +3495,8 @@ fn retire_replacement_predecessor(
 	}
 	// The detached identity is now immutable with respect to the recovery name;
 	// delete only the private detached pathname, never the mutable candidate.
+	// SAFETY: candidate_parent is a valid directory fd and retired_name is a
+	// NUL-free relative C path created within that directory.
 	if unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), retired_name.as_ptr(), 0) } != 0 {
 		return Err(ReplacementExchangeError::PostMutation {
 			code: "rollback_unavailable",
