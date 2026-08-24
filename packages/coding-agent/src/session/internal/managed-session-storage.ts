@@ -1650,8 +1650,7 @@ export class ManagedSessionDescendantStore {
 				? observed.identity.sha256.toLowerCase()
 				: this.readExpected(relativePath)?.identity.sha256;
 		if (!expectedSha256) throw new Error("managed_replace_identity_unavailable");
-		if (!expected.sha256 || expectedSha256 !== expected.sha256)
-			throw new Error("managed_replace_identity_mismatch");
+		if (!expected.sha256 || expectedSha256 !== expected.sha256) throw new Error("managed_replace_identity_mismatch");
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
 			relative,
 			bytes,
