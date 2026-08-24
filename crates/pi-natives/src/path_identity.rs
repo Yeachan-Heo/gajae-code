@@ -1471,7 +1471,9 @@ pub fn exact_remove_directory_tree_async<'env>(
 		env,
 		"exact_remove_directory_tree",
 		timeout_ms,
-		move || Ok(platform::exact_remove_directory_tree(Path::new(&path), &snapshot, parent_identity)),
+		move || {
+			Ok(platform::exact_remove_directory_tree(Path::new(&path), &snapshot, parent_identity))
+		},
 		Some(NativeExactUnlinkResult::failure("timed_out")),
 	)
 }

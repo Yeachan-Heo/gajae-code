@@ -1389,15 +1389,13 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			try {
 				// The SAME verified capture the verdict was bound to, so a replacement that
 				// lands after this point is still refused by the primitive itself.
-				removed = await withinLockAcquireDeadline(
-					deadline,
-					() =>
-						native.exactRemoveDirectoryTreeAsync(
-							lockFile,
-							authorized,
-							undefined,
-							Math.max(1, Math.ceil(deadline - performance.now())),
-						),
+				removed = await withinLockAcquireDeadline(deadline, () =>
+					native.exactRemoveDirectoryTreeAsync(
+						lockFile,
+						authorized,
+						undefined,
+						Math.max(1, Math.ceil(deadline - performance.now())),
+					),
 				);
 			} catch (error) {
 				throw new SessionStateLockUnavailableError(error);
