@@ -110,6 +110,7 @@ type SecureWriteSkillFile = (
 	rootPath: string,
 	skillName: string,
 	content: string,
+	fileMode: number,
 ) => { ok: boolean; path?: string; code?: string };
 let secureWriteSkillFileNative: SecureWriteSkillFile | undefined;
 
@@ -311,7 +312,12 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const secureWriteSkillFile = getSecureWriteSkillFileNative();
-	const result = secureWriteSkillFile(directory, effectiveName, `${input.content.trimEnd()}\n`);
+	const result = secureWriteSkillFile(
+		directory,
+		effectiveName,
+		`${input.content.trimEnd()}\n`,
+		input.scope === "project" ? 0o644 : 0o600,
+	);
 	if (!result.ok) {
 		if (result.code === "unsupported_platform" || result.code === "native_unavailable")
 			throw new SkillNativeWriteUnavailableError();

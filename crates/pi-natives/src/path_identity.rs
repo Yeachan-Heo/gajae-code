@@ -1460,6 +1460,7 @@ pub fn secure_write_skill_file(
 	root_path: String,
 	skill_name: String,
 	content: String,
+	file_mode: Option<u32>,
 ) -> NativeSecureSkillWriteResult {
 	if root_path.contains('\0') || skill_name.contains('\0') || !Path::new(&root_path).is_absolute()
 	{
@@ -1488,7 +1489,11 @@ pub fn secure_write_skill_file(
 	{
 		return NativeSecureSkillWriteResult::failure("invalid_request");
 	}
-	platform::secure_write_skill_file(Path::new(&root_path), &skill_name, &content)
+	let file_mode = file_mode.unwrap_or(0o600);
+	if !matches!(file_mode, 0o600 | 0o644) {
+		return NativeSecureSkillWriteResult::failure("invalid_request");
+	}
+	platform::secure_write_skill_file(Path::new(&root_path), &skill_name, &content, file_mode)
 }
 
 /// Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking
@@ -4651,7 +4656,7 @@ pub(crate) mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained skill-directory descriptor owns the unique private file name"
 	)]
-	fn create_private_skill_file(parent_fd: libc::c_int) -> Result<(File, CString), &'static str> {
+	fn create_private_skill_file(parent_fd: libc::c_int, file_mode: u32) -> Result<(File, CString), &'static str> {
 		for _ in 0..16 {
 			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
 			let name = CString::new(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence))
@@ -4666,7 +4671,7 @@ pub(crate) mod platform {
 						| libc::O_CLOEXEC
 						| libc::O_NOFOLLOW
 						| libc::O_NONBLOCK,
-					0o600,
+					file_mode,
 				)
 			};
 			if fd < 0 {
@@ -4675,6 +4680,10 @@ pub(crate) mod platform {
 					continue;
 				}
 				return Err(skill_write_error(&error));
+			}
+			if unsafe { libc::fchmod(fd, file_mode) } != 0 {
+				unsafe { libc::close(fd) };
+				return Err(skill_write_error(&std::io::Error::last_os_error()));
 			}
 			let mut information: libc::stat = unsafe { std::mem::zeroed() };
 			let valid = unsafe { libc::fstat(fd, &mut information) } == 0
@@ -4798,6 +4807,7 @@ pub(crate) mod platform {
 		root_path: &Path,
 		skill_name: &str,
 		content: &str,
+		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
 		let (skills_fd, _canonical_root) = match open_or_create_skill_root(root_path) {
 			Ok(value) => value,
@@ -4828,7 +4838,7 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		let (mut file, private_name) = match create_private_skill_file(skill_fd) {
+		let (mut file, private_name) = match create_private_skill_file(skill_fd, file_mode) {
 			Ok(value) => value,
 			Err(code) => {
 				unsafe {
@@ -9534,6 +9544,7 @@ mod platform {
 		root_path: &Path,
 		skill_name: &str,
 		content: &str,
+		_file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
 		let (mut skills, canonical_volume) = match open_or_create_skill_root(root_path) {
 			Ok(value) => value,
@@ -9593,6 +9604,7 @@ mod platform {
 		_: &Path,
 		_: &str,
 		_: &str,
+		_: u32,
 	) -> NativeSecureSkillWriteResult {
 		NativeSecureSkillWriteResult::failure("unsupported_platform")
 	}

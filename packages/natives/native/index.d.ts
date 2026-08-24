@@ -2297,7 +2297,7 @@ export interface SearchResult {
  * Other platforms return `unsupported_platform` so callers cannot silently
  * fall back to a path-based write.
  */
-export declare function secureWriteSkillFile(rootPath: string, skillName: string, content: string): NativeSecureSkillWriteResult
+export declare function secureWriteSkillFile(rootPath: string, skillName: string, content: string, fileMode?: number | undefined | null): NativeSecureSkillWriteResult
 
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
