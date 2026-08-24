@@ -146,7 +146,7 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		expect(seen).toEqual([undefined]);
 	});
 
-	it("settles one archive mutation after caller abort without a late second mutation", async () => {
+	it("prevents signal-aware archive execution from settling before its detached mutation", async () => {
 		const controller = new AbortController();
 		const started = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
@@ -158,29 +158,51 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
 				dispatchedSignal = signal;
 				started.resolve();
-				await release.promise;
-				archiveMutationCount += 1;
+				const detachedMutation = release.promise.then(() => {
+					archiveMutationCount += 1;
+				});
+				if (signal) {
+					const aborted = Promise.withResolvers<never>();
+					const rejectOnAbort = () => aborted.reject(signal.reason);
+					if (signal.aborted) rejectOnAbort();
+					else signal.addEventListener("abort", rejectOnAbort, { once: true });
+					// This models the production failure mode: an abort-aware wrapper can
+					// reject while its underlying archive mutation remains detached.
+					await Promise.race([detachedMutation, aborted.promise]);
+				} else {
+					await detachedMutation;
+				}
 				return { content: [{ type: "text" as const, text: "done" }], details: {} };
 			},
 		} as unknown as AgentTool;
 		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
-		const pending = handlers.piWrite({
-			args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
-			toolCallId: "archive-write-cancelled",
-			signal: controller.signal,
-			markNonAbortable: () => {},
-		});
+		let bridgeSettled = false;
+		const pending = handlers
+			.piWrite({
+				args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+				toolCallId: "archive-write-cancelled",
+				signal: controller.signal,
+				markNonAbortable: () => {},
+			})
+			.then(
+				() => ({ ok: true as const }),
+				error => ({ ok: false as const, error }),
+			)
+			.then(outcome => {
+				bridgeSettled = true;
+				return outcome;
+			});
 
 		await started.promise;
 		controller.abort(new Error("caller cancelled archive mutation"));
 		await Bun.sleep(10);
+		const settledBeforeMutation = bridgeSettled;
 		expect(dispatchedSignal).toBeUndefined();
-		expect(archiveMutationCount).toBe(0);
 
 		release.resolve();
-		await pending;
-		expect(archiveMutationCount).toBe(1);
-		await Bun.sleep(10);
+		const outcome = await pending;
+		expect(settledBeforeMutation).toBe(false);
+		expect(outcome).toEqual({ ok: true });
 		expect(archiveMutationCount).toBe(1);
 	});
 
