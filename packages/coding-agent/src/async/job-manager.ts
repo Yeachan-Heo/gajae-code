@@ -20,6 +20,7 @@ const DELIVERY_PREVIEW_HEAD_BYTES = 32 * 1024;
 const DELIVERY_PREVIEW_TAIL_BYTES = 32 * 1024;
 const DELIVERY_MAX_ATTEMPTS = 3;
 const MAX_DEAD_LETTERED_DELIVERIES = 50;
+const MAX_EVICTED_DEAD_LETTERS = 64;
 
 export interface AsyncJob {
 	id: string;
@@ -270,6 +271,24 @@ interface DeadLetteredDelivery {
 	generation: string;
 	attempt: number;
 	lastError?: string;
+}
+
+/**
+ * A retry-cap delivery failure recorded AFTER its job record was evicted.
+ *
+ * The ordinary dead-letter map is pruned by record existence
+ * ({@link AsyncJobManager.prototype constructor}'s `#pruneEvictedDeadLetters`),
+ * so a failure in that window would otherwise leave no visible terminal state
+ * and breach the no-silent-starvation contract. Scalar-only by design: nothing
+ * here retains an `AsyncJob`.
+ */
+interface EvictedDeadLetteredDelivery {
+	jobId: string;
+	generation: string;
+	ownerId?: string;
+	attempt: number;
+	lastError?: string;
+	recordedAt: number;
 }
 
 export interface AsyncJobDeliveryState {
@@ -583,6 +602,8 @@ export class AsyncJobManager {
 	readonly #descriptorResumeRunners = new Map<string, ResumeRunner>();
 	readonly #deadLetteredDeliveries = new Map<string, DeadLetteredDelivery>();
 	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
+	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
+	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
 	readonly #ownerSubagentShutdownLeases = new Map<string, OwnerSubagentShutdownLeaseState>();
 	#ownerSubagentShutdownSeq = 0;
 	#lastDisposeDiagnostics: AsyncJobDisposeDiagnostics = { stuckJobIds: [], deliveriesDrained: true };
@@ -2079,11 +2100,15 @@ export class AsyncJobManager {
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
 		const ownerId = filter?.ownerId;
-		const deadLettered = ownerId
-			? Array.from(this.#deadLetteredDeliveries.keys()).filter(
-					jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
-				).length
-			: this.#deadLetteredDeliveries.size;
+		const evictedDeadLettered = ownerId
+			? Array.from(this.#evictedDeadLetters.values()).filter(entry => entry.ownerId === ownerId).length
+			: this.#evictedDeadLetters.size;
+		const deadLettered =
+			(ownerId
+				? Array.from(this.#deadLetteredDeliveries.keys()).filter(
+						jobId => this.#deadLetteredDeliveryOwners.get(jobId) === ownerId,
+					).length
+				: this.#deadLetteredDeliveries.size) + evictedDeadLettered;
 		const nextRetryAt = deliveries.reduce<number | undefined>((next, delivery) => {
 			if (next === undefined) return delivery.nextAttemptAt;
 			return Math.min(next, delivery.nextAttemptAt);
@@ -2326,6 +2351,7 @@ export class AsyncJobManager {
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#deadLetteredDeliveries.clear();
+		this.#evictedDeadLetters.clear();
 		this.#deadLetteredDeliveryOwners.clear();
 		this.#suppressedDeliveries.clear();
 		this.#deliveryAckOwners.clear();
@@ -2516,6 +2542,31 @@ export class AsyncJobManager {
 		);
 	}
 
+	/**
+	 * Record a retry-cap failure whose job record is already gone.
+	 *
+	 * Ordering mirrors {@link AsyncJobManager.prototype} `#recordDeadLetter`:
+	 * insert, retire the exact owned tuple, then trim. Retiring before the trim
+	 * means a later trimmed entry can never strand registry authority.
+	 */
+	#recordEvictedDeadLetter(delivery: AsyncJobDelivery): void {
+		this.#evictedDeadLetters.delete(delivery.generation);
+		this.#evictedDeadLetters.set(delivery.generation, {
+			jobId: delivery.jobId,
+			generation: delivery.generation,
+			ownerId: delivery.ownerId,
+			attempt: delivery.attempt,
+			lastError: delivery.lastError,
+			recordedAt: Date.now(),
+		});
+		retireOwnedRegistrationForDeadLetter(AsyncJobManager.endpointIdOf(this), delivery.jobId, delivery.generation);
+		while (this.#evictedDeadLetters.size > MAX_EVICTED_DEAD_LETTERS) {
+			const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
+			if (oldestGeneration === undefined) return;
+			this.#evictedDeadLetters.delete(oldestGeneration);
+		}
+	}
+
 	#recordDeadLetter(delivery: AsyncJobDelivery): void {
 		this.#pruneEvictedDeadLetters();
 		const currentJob = this.#jobs.get(delivery.jobId);
@@ -2629,7 +2680,13 @@ export class AsyncJobManager {
 				delivery.attempt += 1;
 				delivery.lastError = error instanceof Error ? error.message : String(error);
 				if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
-					this.#recordDeadLetter(delivery);
+					// The retry cap is the only route that may outlive its record here:
+					// #recordDeadLetter is pruned by record existence, so an
+					// already-evicted job's cap failure would leave no visible terminal
+					// state at all. The queue-overflow drop path keeps its existing
+					// behavior and is deliberately unchanged.
+					if (this.#jobs.has(delivery.jobId)) this.#recordDeadLetter(delivery);
+					else this.#recordEvictedDeadLetter(delivery);
 					logger.warn("Async job completion delivery reached retry cap", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,
@@ -2638,8 +2695,11 @@ export class AsyncJobManager {
 				} else {
 					delivery.nextAttemptAt = Date.now() + this.#getRetryDelay(delivery.attempt);
 					const currentJob = this.#jobs.get(delivery.jobId);
+					// An evicted record must not end retry eligibility: dispatch already
+					// uses the retained delivery.job when #jobs no longer holds the record,
+					// so only a PRESENT superseding generation discards.
 					if (
-						currentJob?.generation === delivery.generation &&
+						(currentJob === undefined || currentJob.generation === delivery.generation) &&
 						!this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)
 					) {
 						this.#deliveries.push(delivery);
