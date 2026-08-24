@@ -825,6 +825,12 @@ export interface ContextLine {
 export declare function copyToClipboard(text: string): void
 
 /**
+ * Returns the operating system's canonical path for the running executable.
+ * Unlike argv, this is not supplied by the process caller.
+ */
+export declare function currentExecutablePath(): string | null
+
+/**
  * Detect macOS system appearance via CoreFoundation.
  * Returns `"dark"` or `"light"` on macOS, `null` on other platforms.
  */

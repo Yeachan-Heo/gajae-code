@@ -180,41 +180,17 @@ it("isolates source SDK children and preserves compiled self-spawn", () => {
 	});
 });
 
-it("uses a verified physical argv0 for exact compiled-marker-authorized Bun virtual executable paths", async () => {
-	const directory = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-compiled-runtime-"));
-	const executable = path.join(directory, "gjc");
+it("uses the native current executable for exact compiled-marker-authorized Bun virtual executable paths", () => {
 	const markerPath = "/$bunfs/root/internal-source-marker-2178-abcd.txt";
-	try {
-		await fs.writeFile(executable, "compiled fixture");
-		await fs.chmod(executable, 0o700);
-		const canonicalExecutable = await fs.realpath(executable);
-		expect(
-			resolveSdkInternalSpawnCommandForTest("session-host-internal", {
-				execPath: "/$bunfs/root/gjc",
-				argv0: executable,
-				markerPath,
-				embeddedFiles: [{ name: path.basename(markerPath) }],
-			}),
-		).toMatchObject({ kind: "compiled", file: canonicalExecutable });
-		expect(() =>
-			resolveSdkInternalSpawnCommandForTest("session-host-internal", {
-				execPath: "/$bunfs/root/gjc",
-				argv0: path.join(directory, "missing"),
-				markerPath,
-				embeddedFiles: [{ name: path.basename(markerPath) }],
-			}),
-		).toThrow("compiled executable is not a readable regular file");
-		expect(() =>
-			resolveSdkInternalSpawnCommandForTest("session-host-internal", {
-				execPath: "/not/a/runtime",
-				argv0: executable,
-				markerPath,
-				embeddedFiles: [{ name: path.basename(markerPath) }],
-			}),
-		).toThrow("compiled executable is not a readable regular file");
-	} finally {
-		await fs.rm(directory, { recursive: true, force: true });
-	}
+	const executable = native.currentExecutablePath();
+	if (!executable) throw new Error("Expected native current executable identity.");
+	expect(
+		resolveSdkInternalSpawnCommandForTest("session-host-internal", {
+			execPath: "/$bunfs/root/gjc",
+			markerPath,
+			embeddedFiles: [{ name: path.basename(markerPath) }],
+		}),
+	).toMatchObject({ kind: "compiled", file: executable });
 });
 
 it("treats explicit broker env as a complete allowlist and still scrubs runtime options", () => {

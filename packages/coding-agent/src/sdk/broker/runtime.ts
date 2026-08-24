@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { currentExecutablePath } from "@gajae-code/natives";
 import packageJson from "../../../package.json" with { type: "json" };
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
 
@@ -105,10 +106,9 @@ function isBunVirtualExecutablePath(file: string): boolean {
 /**
  * Bun normally exposes the compiled application's on-disk path through
  * `process.execPath`. Some single-file builds instead expose their virtual
- * bundle entry there while `argv[0]` retains the kernel-provided launch file.
- * Exact compiled-marker evidence proves this is the bundled GJC process; the
- * candidate still has to be an on-disk readable regular file. PATH is never
- * consulted.
+ * bundle entry there. Exact compiled-marker evidence proves this is the
+ * bundled GJC process; the fallback comes from the OS current-image query,
+ * never argv or PATH.
  */
 function compiledExecutable(options: SdkInternalRuntimeDescriptorTestOptions): string {
 	const execPath = options.execPath ?? process.execPath;
@@ -116,7 +116,9 @@ function compiledExecutable(options: SdkInternalRuntimeDescriptorTestOptions): s
 		return regularExecutablePath(path.resolve(execPath), "compiled executable");
 	} catch (error) {
 		if (!isBunVirtualExecutablePath(execPath)) throw error;
-		return regularExecutablePath(path.resolve(options.argv0 ?? process.argv[0] ?? ""), "compiled executable");
+		const currentExecutable = currentExecutablePath();
+		if (!currentExecutable) throw error;
+		return regularExecutablePath(currentExecutable, "compiled executable");
 	}
 }
 
