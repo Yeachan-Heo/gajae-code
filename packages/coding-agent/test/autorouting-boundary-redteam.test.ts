@@ -2400,7 +2400,9 @@ describe("autorouting boundary red-team generation 4 delta re-attacks", () => {
 		vi.spyOn(modelRegistry, "getAll").mockReturnValue(models);
 		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => "key");
-		const postFenceFailure = new Error("post-fence failure evidence");
+		const postFenceFailure = Object.assign(new Error("post-fence failure evidence"), {
+			transportFailure: { kind: "transport" as const, status: 503 },
+		});
 		const originalCreate = sdkModule.createAgentSession;
 		let createCalls = 0;
 		const createErrors: string[] = [];

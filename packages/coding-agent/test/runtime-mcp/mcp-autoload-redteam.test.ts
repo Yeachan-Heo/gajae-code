@@ -276,6 +276,17 @@ describe("red-team: conventional MCP autoload", () => {
 				cwd: projectDir,
 			});
 
+			// Mixed plugin/conventional sessions may publish a conventional server
+			// after createAgentSession returns. Observe the manager's authoritative
+			// seal transition instead of racing that late publication with a
+			// synchronous assertion.
+			const sealObserved = Promise.withResolvers<void>();
+			const sealConnectionSet = MCPManager.prototype.sealConnectionSet;
+			vi.spyOn(MCPManager.prototype, "sealConnectionSet").mockImplementation(function (this: MCPManager) {
+				sealConnectionSet.call(this);
+				sealObserved.resolve();
+			});
+
 			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 			try {
 				expect(mcpManager).toBeDefined();
@@ -293,7 +304,7 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
 				expect(session.getAllToolNames()).toContain("mcp__solo_hello");
 				// Plugin presence seals the connection set (fixed session lifetime).
-				for (let attempt = 0; attempt < 50 && !mcpManager?.isConnectionSetSealed(); attempt++) await Bun.sleep(10);
+await sealObserved.promise;
 				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
 			} finally {
 				await session.dispose();
