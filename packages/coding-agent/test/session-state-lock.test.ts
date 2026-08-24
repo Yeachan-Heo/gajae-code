@@ -1036,6 +1036,9 @@ describe("coordinator session state lock", () => {
 			snapshotDirectoryTree() {
 				throw new Error("unexpected directory snapshot");
 			},
+			snapshotDirectoryTreeAsync() {
+				throw new Error("unexpected directory snapshot");
+			},
 			exactRemoveDirectoryTree() {
 				throw new Error("unexpected directory removal");
 			},
@@ -1086,6 +1089,9 @@ describe("coordinator session state lock", () => {
 				return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${lockFile}.quarantine` };
 			},
 			snapshotDirectoryTree() {
+				throw new Error("unexpected directory snapshot");
+			},
+			snapshotDirectoryTreeAsync() {
 				throw new Error("unexpected directory snapshot");
 			},
 			exactRemoveDirectoryTree() {
@@ -1187,6 +1193,9 @@ describe("coordinator session state lock", () => {
 			snapshotDirectoryTree() {
 				throw new Error("unexpected directory snapshot");
 			},
+			snapshotDirectoryTreeAsync() {
+				throw new Error("unexpected directory snapshot");
+			},
 			exactRemoveDirectoryTree() {
 				throw new Error("unexpected directory removal");
 			},
@@ -1248,6 +1257,9 @@ describe("coordinator session state lock", () => {
 					return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${ownerFile}.quarantine` };
 				},
 				snapshotDirectoryTree() {
+					throw new Error("unexpected directory snapshot");
+				},
+				snapshotDirectoryTreeAsync() {
 					throw new Error("unexpected directory snapshot");
 				},
 				exactRemoveDirectoryTree() {
@@ -1476,6 +1488,42 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
 		expect(await Bun.file(path.join(lockFile, "successor-payload")).text()).toBe("successor");
 		expect(await readJson(path.join(lockFile, "info"))).toMatchObject({ pid: DEAD_PID });
+	});
+
+	it("bounds legacy directory capture by the shared deadline without a synchronous walk", async () => {
+		const { stateFile } = await seededRunningSession("lock-legacy-async-capture-deadline");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		const captured = exactIdentityNativeBindings.snapshotDirectoryTree(lockFile);
+		if (!captured.ok || !captured.snapshot) throw new Error("missing legacy tree fixture snapshot");
+
+		let synchronousCalls = 0;
+		let asynchronousCalls = 0;
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			snapshotDirectoryTree() {
+				synchronousCalls++;
+				throw new Error("synchronous directory snapshot must not run during lock acquisition");
+			},
+			snapshotDirectoryTreeAsync() {
+				asynchronousCalls++;
+				return new Promise(resolve => setTimeout(() => resolve(captured), 100));
+			},
+		}));
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+		let timerFired = false;
+		setTimeout(() => {
+			timerFired = true;
+		}, 5);
+		const startedAt = performance.now();
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+
+		expect(asynchronousCalls).toBe(1);
+		expect(synchronousCalls).toBe(0);
+		expect(timerFired).toBe(true);
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
 	});
 
 	/**

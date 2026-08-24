@@ -2341,6 +2341,12 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
  */
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
+/**
+ * Async variant of `snapshotDirectoryTree` scheduled on the native blocking
+ * pool so recursive legacy lock capture cannot block the JS event loop.
+ */
+export declare function snapshotDirectoryTreeAsync(path: string): Promise<NativeDirectoryTreeResult>
+
 export declare function summarizeCode(options: SummaryOptions): Promise<SummaryResult>
 
 export interface SummaryOptions {

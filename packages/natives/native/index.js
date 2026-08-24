@@ -90,6 +90,7 @@ export const retainBrokerPublication = nativeBindings.retainBrokerPublication;
 export const search = nativeBindings.search;
 export const sliceWithWidth = nativeBindings.sliceWithWidth;
 export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
+export const snapshotDirectoryTreeAsync = nativeBindings.snapshotDirectoryTreeAsync;
 export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
 export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;

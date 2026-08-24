@@ -110,6 +110,7 @@ function exactRemoveDirectoryTree(root: string, snapshot: NativeDirectoryTreeSna
 export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 	exactUnlink,
 	snapshotDirectoryTree,
+	snapshotDirectoryTreeAsync: async root => snapshotDirectoryTree(root),
 	exactRemoveDirectoryTree,
 };
 

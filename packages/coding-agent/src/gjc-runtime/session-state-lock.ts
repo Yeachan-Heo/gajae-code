@@ -176,7 +176,7 @@ export class SessionStateLockUnavailableError extends Error {
  */
 export type SessionStateLockNativeBindings = Pick<
 	typeof import("@gajae-code/natives"),
-	"exactRemoveDirectoryTree" | "exactUnlink" | "snapshotDirectoryTree"
+	"exactRemoveDirectoryTree" | "exactUnlink" | "snapshotDirectoryTree" | "snapshotDirectoryTreeAsync"
 >;
 
 /** How the deletion primitives are obtained. Throwing means they are unavailable. */
@@ -1256,13 +1256,16 @@ function sameDirectoryTreeSnapshot(left: NativeDirectoryTreeSnapshot, right: Nat
  * exactly. A tree that cannot be described exactly cannot be removed exactly, so its bytes
  * stay where they are and the caller is told the lock is unusable.
  */
-function captureLegacyDirectoryTree(
+async function captureLegacyDirectoryTree(
 	native: SessionStateLockNativeBindings,
 	lockDir: string,
-): NativeDirectoryTreeSnapshot | null {
+	deadline: number,
+): Promise<NativeDirectoryTreeSnapshot | null> {
+	if (typeof native.snapshotDirectoryTreeAsync !== "function")
+		throw new SessionStateLockUnavailableError(new Error("Async directory snapshot is unavailable."));
 	let captured: NativeDirectoryTreeResult;
 	try {
-		captured = native.snapshotDirectoryTree(lockDir);
+		captured = await withinLockAcquireDeadline(deadline, () => native.snapshotDirectoryTreeAsync(lockDir));
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
 	}
@@ -1347,7 +1350,7 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 		lockFile,
 		async () => {
 			const native = nativeSessionStateLock();
-			const before = captureLegacyDirectoryTree(native, lockFile);
+			const before = await captureLegacyDirectoryTree(native, lockFile, deadline);
 			if (!before) return;
 			const owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockFile));
 			if (!owner?.owner_host_id && SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
@@ -1367,7 +1370,7 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			await withinLockAcquireDeadline(deadline, () =>
 				SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile),
 			);
-			const authorized = captureLegacyDirectoryTree(native, lockFile);
+			const authorized = await captureLegacyDirectoryTree(native, lockFile, deadline);
 			// The verdict spoke for `before`; only an unchanged tree carries that authority.
 			if (!authorized || !sameDirectoryTreeSnapshot(before, authorized)) return;
 			await withinLockAcquireDeadline(deadline, () =>

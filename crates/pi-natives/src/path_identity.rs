@@ -1384,6 +1384,18 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 	platform::snapshot_directory_tree(Path::new(&path))
 }
 
+/// Async variant of [`snapshot_directory_tree`] scheduled on the libuv blocking
+/// pool. A recursive legacy lock directory can contain an unbounded number of
+/// entries and every entry may require a blocking metadata read and file digest;
+/// running that walk on the JS thread would let it outlive the lock acquisition
+/// deadline and freeze the event loop that is supposed to enforce the deadline.
+#[napi]
+pub fn snapshot_directory_tree_async(path: String) -> task::Promise<NativeDirectoryTreeResult> {
+	task::blocking("snapshot_directory_tree", (), move |_| {
+		Ok(snapshot_directory_tree(path))
+	})
+}
+
 /// Remove a directory tree only when a fresh descriptor-relative snapshot
 #[cfg_attr(clippy, doc = "")]
 /// exactly equals the persisted snapshot. POSIX first no-replace detaches the
