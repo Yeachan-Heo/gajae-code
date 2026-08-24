@@ -284,6 +284,43 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("records turnEnded when it lands exactly on the coalesced queue boundary", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const frames: Buffer[] = [];
+				for (let index = 0; index < 255; index += 1) {
+					frames.push(
+						buildServerMessageFrame({
+							case: "interactionUpdate",
+							value: create(InteractionUpdateSchema, {
+								message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+							}),
+						}),
+					);
+				}
+				frames.push(
+					buildServerMessageFrame({
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+						}),
+					}),
+				);
+				stream.end(Buffer.concat(frames));
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("preserves accumulated Cursor content and usage in exactly one terminal on a silent transport timeout", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
