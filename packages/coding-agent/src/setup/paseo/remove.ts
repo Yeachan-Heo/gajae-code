@@ -24,6 +24,7 @@ import {
 } from "./json-publisher";
 import { removeSeededRoles } from "./orchestration-preferences";
 import {
+	type BridgeCleanupAuthority,
 	EMPTY_LEDGER,
 	isProvenancedOrchestrationKey,
 	isProvenancedProvider,
@@ -36,7 +37,7 @@ import {
 import { type PaseoProviderEntry, providerEntryHash } from "./provider-config";
 import type { PartialRemovalEvidence, PaseoRemoveResult } from "./result-types";
 import { isTrustedRecordedSkillsSource, type PaseoSetupDependencies } from "./setup-deps";
-import { inverseSkillsBridge, legacySourceDirFor, SkillsBridgeError } from "./skills-bridge";
+import { inverseSkillsBridge, legacySourceDirFor, replayBridgeCleanup, SkillsBridgeError } from "./skills-bridge";
 
 export interface RemoveOptions {
 	readonly now: Date;
@@ -291,6 +292,7 @@ export async function removePaseoSetup(
 		Object.keys(ledger.providerReplacedEntries ?? {}).length > 0 ||
 		Object.keys(ledger.seededOrchestrationKeys).length > 0 ||
 		(ledger.bridgeEntries?.length ?? 0) > 0 ||
+		ledger.bridgeCleanupPending !== undefined ||
 		// An owned empty bridge is still GJC-owned state: a convergence run that
 		// pruned the final entry leaves `bridgeEntries: []` with
 		// `bridgeDirCreated: true`, and the directory plus its registration must
@@ -346,6 +348,37 @@ export async function removePaseoSetup(
 				failedStep: "provenance ledger validation",
 				detail: sourceTrust.detail,
 				retained: [deps.paths.provenanceLedger],
+			});
+		}
+	}
+	// A POSIX native tree removal first detaches the empty bridge to the exact
+	// `<bridge>.removing` sibling and returns `cleanup_pending`. Replay that
+	// authority before touching settings or clearing any bridge provenance. The
+	// detached path is persisted before the first native call, so this also
+	// settles a process crash between namespace detach and the final cleanup.
+	if (ledger.bridgeCleanupPending !== undefined) {
+		const authority = ledger.bridgeCleanupPending;
+		if (
+			validatedBridge === undefined ||
+			path.resolve(authority.originalPath) !== validatedBridge ||
+			path.resolve(`${validatedBridge}.removing`) !== path.resolve(authority.detachedPath)
+		) {
+			remaining.push(authority.detachedPath);
+			return partial([], remaining, {
+				failedStep: "provenance ledger validation",
+				detail: `the persisted Paseo bridge cleanup authority does not match the recorded bridge path (${authority.detachedPath})`,
+				retained: [deps.paths.provenanceLedger, authority.detachedPath],
+			});
+		}
+		try {
+			await replayBridgeCleanup(authority);
+			nextLedger = { ...nextLedger, bridgeCleanupPending: undefined };
+		} catch (error) {
+			remaining.push(authority.detachedPath);
+			return partial([], remaining, {
+				failedStep: authority.detachedPath,
+				detail: error instanceof Error ? error.message : String(error),
+				retained: [deps.paths.provenanceLedger, authority.detachedPath],
 			});
 		}
 	}
@@ -425,7 +458,15 @@ export async function removePaseoSetup(
 				},
 				// Unlink, directory cleanup, and diagnostics all operate on the
 				// ledger-recorded directory the entries above were validated in.
-				{ bridgeDir },
+				{
+					bridgeDir,
+					onCleanupPending: async (authority: BridgeCleanupAuthority) => {
+						nextLedger = { ...nextLedger, bridgeCleanupPending: authority };
+						// Persist BEFORE native detaches the directory. If the process dies
+						// after the rename, the next remove replays this exact sibling.
+						await writeProvenance(deps.paths.provenanceLedger, nextLedger);
+					},
+				},
 			);
 			if (presentEntries.length > 0 || (ambiguousEntries.length === 0 && ledger.bridgeDirCreated === true)) {
 				removed.push(bridgeDir);
@@ -437,6 +478,7 @@ export async function removePaseoSetup(
 					bridgeEntryIdentities: {},
 					bridgeDirCreated: false,
 					bridgeSourceDir: undefined,
+					bridgeCleanupPending: undefined,
 				};
 			} else {
 				const ambiguous = new Set(ambiguousEntries);
@@ -686,6 +728,7 @@ export async function removePaseoSetup(
 		Object.keys(nextLedger.providerReplacedEntries ?? {}).length > 0 ||
 		Object.keys(nextLedger.seededOrchestrationKeys).length > 0 ||
 		(nextLedger.bridgeEntries?.length ?? 0) > 0 ||
+		nextLedger.bridgeCleanupPending !== undefined ||
 		nextLedger.bridgeDirCreated === true;
 	await writeProvenance(deps.paths.provenanceLedger, stillOwns ? nextLedger : EMPTY_LEDGER);
 	if (remaining.length > 0) {

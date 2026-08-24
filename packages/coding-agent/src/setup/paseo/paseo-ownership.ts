@@ -17,6 +17,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import {
 	ABSENT_IDENTITY,
 	currentIdentity,
@@ -45,6 +46,22 @@ export interface BridgeEntryIdentity {
 	readonly ino: string;
 	readonly size: string;
 	readonly mtimeNs: string;
+}
+
+/**
+ * Exact authority retained when POSIX bridge-directory cleanup detaches the
+ * empty root to its deterministic `.removing` sibling. The snapshot and
+ * parent identity are persisted with the pathname so a later process can
+ * replay the native check without treating a successor as the old root.
+ */
+export interface BridgeCleanupAuthority {
+	readonly originalPath: string;
+	readonly detachedPath: string;
+	readonly parentIdentity: {
+		readonly dev: string;
+		readonly ino: string;
+	};
+	readonly snapshot: NativeDirectoryTreeSnapshot;
 }
 
 export interface ProvenanceLedger {
@@ -83,6 +100,8 @@ export interface ProvenanceLedger {
 	readonly bridgeDirCreated?: boolean;
 	/** No-follow identity of the bridge directory GJC created. */
 	readonly bridgeDirIdentity?: BridgeEntryIdentity;
+	/** Exact detached `.removing` authority awaiting inert cleanup. */
+	readonly bridgeCleanupPending?: BridgeCleanupAuthority;
 }
 
 export const EMPTY_LEDGER: ProvenanceLedger = {
@@ -105,6 +124,7 @@ const PROVENANCE_PAYLOAD_FIELDS = new Set([
 	"bridgeEntryIdentities",
 	"bridgeDirCreated",
 	"bridgeDirIdentity",
+	"bridgeCleanupPending",
 ]);
 
 export class ProvenanceLedgerCorruptError extends Error {
@@ -161,6 +181,9 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 		if (parsed.bridgeDirIdentity !== undefined && !isBridgeEntryIdentity(parsed.bridgeDirIdentity)) {
 			throw new Error("bridgeDirIdentity is present but not an identity");
 		}
+		if (parsed.bridgeCleanupPending !== undefined && !isBridgeCleanupAuthority(parsed.bridgeCleanupPending)) {
+			throw new Error("bridgeCleanupPending is present but not exact cleanup authority");
+		}
 		if (parsed.bridgeEntries !== undefined) {
 			if (!Array.isArray(parsed.bridgeEntries)) throw new Error("bridgeEntries is present but not an array");
 			if (!parsed.bridgeEntries.every(entry => typeof entry === "string")) {
@@ -186,6 +209,9 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 				: {}),
 			...(typeof parsed.bridgeDirCreated === "boolean" ? { bridgeDirCreated: parsed.bridgeDirCreated } : {}),
 			...(isBridgeEntryIdentity(parsed.bridgeDirIdentity) ? { bridgeDirIdentity: parsed.bridgeDirIdentity } : {}),
+			...(isBridgeCleanupAuthority(parsed.bridgeCleanupPending)
+				? { bridgeCleanupPending: parsed.bridgeCleanupPending }
+				: {}),
 		};
 	} catch (error) {
 		// A corrupt GJC-side ledger is an explicit recovery error, not an empty
@@ -227,6 +253,66 @@ function isBridgeEntryIdentity(value: unknown): value is BridgeEntryIdentity {
 		/^\d+$/u.test(value.size) &&
 		/^-?\d+$/u.test(value.mtimeNs)
 	);
+}
+
+function isDirectoryTreeSnapshot(value: unknown): value is NativeDirectoryTreeSnapshot {
+	if (!isRecord(value) || typeof value.rootDev !== "string" || typeof value.rootIno !== "string") return false;
+	if (!/^\d+$/u.test(value.rootDev) || !/^\d+$/u.test(value.rootIno)) return false;
+	if (!Array.isArray(value.entries)) return false;
+	return value.entries.every(entry => {
+		if (!isRecord(entry)) return false;
+		if (
+			typeof entry.relativePath !== "string" ||
+			typeof entry.kind !== "string" ||
+			typeof entry.dev !== "string" ||
+			typeof entry.ino !== "string" ||
+			typeof entry.nlink !== "string" ||
+			typeof entry.size !== "string" ||
+			typeof entry.mtimeNs !== "string" ||
+			typeof entry.ctimeNs !== "string"
+		)
+			return false;
+		if (
+			!/^[0-9]+$/u.test(entry.dev) ||
+			!/^[0-9]+$/u.test(entry.ino) ||
+			!/^[0-9]+$/u.test(entry.nlink) ||
+			!/^[0-9]+$/u.test(entry.size) ||
+			!/^-?[0-9]+$/u.test(entry.mtimeNs) ||
+			!/^-?[0-9]+$/u.test(entry.ctimeNs)
+		)
+			return false;
+		return entry.sha256 === undefined || (typeof entry.sha256 === "string" && /^[a-f0-9]{64}$/u.test(entry.sha256));
+	});
+}
+
+function isEmptyDirectoryTreeSnapshot(value: unknown): value is NativeDirectoryTreeSnapshot {
+	if (!isDirectoryTreeSnapshot(value) || value.entries.length !== 1) return false;
+	const [root] = value.entries;
+	return (
+		root !== undefined &&
+		root.relativePath === "" &&
+		root.kind === "directory" &&
+		root.dev === value.rootDev &&
+		root.ino === value.rootIno
+	);
+}
+
+function isBridgeCleanupAuthority(value: unknown): value is BridgeCleanupAuthority {
+	if (!isRecord(value)) return false;
+	if (
+		typeof value.originalPath !== "string" ||
+		!path.isAbsolute(value.originalPath) ||
+		typeof value.detachedPath !== "string" ||
+		!path.isAbsolute(value.detachedPath) ||
+		!isRecord(value.parentIdentity) ||
+		typeof value.parentIdentity.dev !== "string" ||
+		typeof value.parentIdentity.ino !== "string" ||
+		!/^[0-9]+$/u.test(value.parentIdentity.dev) ||
+		!/^[0-9]+$/u.test(value.parentIdentity.ino) ||
+		!isEmptyDirectoryTreeSnapshot(value.snapshot)
+	)
+		return false;
+	return path.resolve(`${value.originalPath}.removing`) === path.resolve(value.detachedPath);
 }
 function isStringRecord(value: unknown): value is Record<string, string> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -404,13 +490,10 @@ export function validateProvenanceLedger(value: unknown): ProvenanceLedger {
 	if (value.version !== PROVENANCE_VERSION) {
 		throw new Error(`provenancePayload.version is not ${PROVENANCE_VERSION}`);
 	}
-	if (!Object.prototype.hasOwnProperty.call(value, "providerKeys") || !isStringRecord(value.providerKeys)) {
+	if (!Object.hasOwn(value, "providerKeys") || !isStringRecord(value.providerKeys)) {
 		throw new Error("provenancePayload.providerKeys is not a string record");
 	}
-	if (
-		!Object.prototype.hasOwnProperty.call(value, "seededOrchestrationKeys") ||
-		!isStringRecord(value.seededOrchestrationKeys)
-	) {
+	if (!Object.hasOwn(value, "seededOrchestrationKeys") || !isStringRecord(value.seededOrchestrationKeys)) {
 		throw new Error("provenancePayload.seededOrchestrationKeys is not a string record");
 	}
 	if (value.providerPreexistingKeys !== undefined && !isTrueRecord(value.providerPreexistingKeys)) {
@@ -430,6 +513,9 @@ export function validateProvenanceLedger(value: unknown): ProvenanceLedger {
 	}
 	if (value.bridgeDirIdentity !== undefined && !isBridgeEntryIdentity(value.bridgeDirIdentity)) {
 		throw new Error("provenancePayload.bridgeDirIdentity is not an identity");
+	}
+	if (value.bridgeCleanupPending !== undefined && !isBridgeCleanupAuthority(value.bridgeCleanupPending)) {
+		throw new Error("provenancePayload.bridgeCleanupPending is not exact cleanup authority");
 	}
 	if (value.bridgeEntries !== undefined) {
 		if (!Array.isArray(value.bridgeEntries)) throw new Error("provenancePayload.bridgeEntries is not an array");

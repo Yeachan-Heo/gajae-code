@@ -962,7 +962,10 @@ function sameBridgeEntryIdentity(left: BridgeEntryIdentity, right: BridgeEntryId
 /** True when the ledger proves GJC owns the current bridge directory and its entries. */
 function ledgerOwnsBridge(ledger: ProvenanceLedger): boolean {
 	return (
-		ledger.bridgePath !== undefined && ((ledger.bridgeEntries?.length ?? 0) > 0 || ledger.bridgeDirCreated === true)
+		ledger.bridgePath !== undefined &&
+		((ledger.bridgeEntries?.length ?? 0) > 0 ||
+			ledger.bridgeDirCreated === true ||
+			ledger.bridgeCleanupPending !== undefined)
 	);
 }
 /**

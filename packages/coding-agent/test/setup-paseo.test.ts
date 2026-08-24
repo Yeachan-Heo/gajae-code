@@ -2854,6 +2854,69 @@ describe("skills bridge", () => {
 		}
 	});
 
+	test("remove-reinstall-remove replays a persisted .removing bridge authority", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		for (const name of [...SKILL_NAMES]) {
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		await runPaseoSetup({}, fixture.deps);
+
+		const removingPath = `${fixture.paths.bridgeDir}.removing`;
+		const realRmdir = fs.rmdir.bind(fs);
+		let failOnce = true;
+		const rmdir = spyOn(fs, "rmdir").mockImplementation(async target => {
+			if (target === removingPath && failOnce) {
+				failOnce = false;
+				const error = new Error("simulated detached cleanup failure") as NodeJS.ErrnoException;
+				error.code = "EACCES";
+				throw error;
+			}
+			return realRmdir(target);
+		});
+		try {
+			const first = await runPaseoSetup({ remove: true }, fixture.deps);
+			expect(first.kind).toBe("remove");
+			if (first.kind !== "remove") throw new Error("expected a remove outcome");
+			expect(first.result.outcome).toBe("partial-removal");
+			const pending = (await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending;
+			expect(pending?.originalPath).toBe(fixture.paths.bridgeDir);
+			expect(pending?.detachedPath).toBe(removingPath);
+			await expect(fs.stat(removingPath)).resolves.toBeDefined();
+			await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+
+			// Reinstall while the old detached root is still pending. The new bridge
+			// is allowed to publish, but the old authority must remain in provenance
+			// for the next remove to replay and settle.
+			await seedSkills(fixture.paths);
+			const reinstall = await runPaseoSetup({}, fixture.deps);
+			expect(reinstall.kind).toBe("install");
+			if (reinstall.kind !== "install") throw new Error("expected an install outcome");
+			expect(reinstall.result.outcome).toBe("installed");
+			expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending?.detachedPath).toBe(
+				removingPath,
+			);
+
+			const second = await runPaseoSetup({ remove: true }, fixture.deps);
+			expect(second.kind).toBe("remove");
+			if (second.kind !== "remove") throw new Error("expected a remove outcome");
+			expect(second.result.outcome).toBe("removed");
+			await expect(fs.stat(removingPath)).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await readProvenance(fixture.paths.provenanceLedger)).toEqual({
+				version: 1,
+				providerKeys: {},
+				providerPreexistingKeys: {},
+				providerReplacedEntries: {},
+				seededOrchestrationKeys: {},
+			});
+		} finally {
+			rmdir.mockRestore();
+		}
+	});
+
 	test("a tampered ledger bridge path never drives destructive removal (#4644 review r4)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
