@@ -17,7 +17,7 @@ Executes bash command in shell session for terminal operations like git, bun, ca
 - Use `async: true` for long-running commands when you don't need immediate output; the call returns a background job ID and the result is delivered automatically as a follow-up.
 {{/if}}
 {{#if autoBackgroundEnabled}}
-- In the interactive TUI, the user can press `Ctrl+B` twice while a supported managed foreground bash command is still running to fold it into a quiet background job. Do not instruct users to use raw shell `Ctrl+Z`/`bg` inside the GJC TUI; ownership and output routing are not safe there.
+- In the interactive TUI, the user can press the fold chord twice (default `Alt+Shift+B`, plus `Cmd+B` on macOS; remappable via the `app.tool.backgroundFold` keybinding) while a supported managed foreground bash command is still running to fold it into a background job. The turn then ends cleanly and a later turn resumes automatically with the command's result, so the interrupted task is finished rather than abandoned. Folding is not available for `task`/`subagent` waits. Do not instruct users to use raw shell `Ctrl+Z`/`bg` inside the GJC TUI; ownership and output routing are not safe there.
 {{/if}}
 </instruction>
 {{#if restrictedAllowedPrefixes}}
