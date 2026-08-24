@@ -118,6 +118,33 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close();
 	});
 
+	it("fails closed when content evidence differs despite equal descriptor fields", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const capture = ManagedSessionDescendantStore.prototype.captureBoundedAppendExpectation;
+		let tampered = false;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "captureBoundedAppendExpectation").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+		) {
+			const captured = capture.call(this, relativePath);
+			if (!captured || tampered) return captured;
+			tampered = true;
+			return { ...captured, sha256: "0".repeat(64) };
+		});
+
+		expect(() => manager.appendMessage({ role: "user", content: "must-fail-closed", timestamp: Date.now() })).toThrow(
+			/managed_append_identity_mismatch/,
+		);
+		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-fail-closed");
+		await manager.close().catch(() => {});
+	});
+
 	it("still fails closed on identity_mismatch (concurrent successor not overwritten)", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);

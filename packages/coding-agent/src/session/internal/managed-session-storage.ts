@@ -1774,20 +1774,20 @@ export class ManagedSessionDescendantStore {
 			bounded.size === String(expected.size) &&
 			bounded.mtimeNs === expected.mtimeNs.toString() &&
 			bounded.ctimeNs === expected.ctimeNs.toString();
-		if (!descriptorMatches) {
-			// Metadata-only drift is safe only when the same unlinked file object and
-			// byte-exact predecessor are independently proven. Never accept a changed
-			// object, length, link count, or digest as a benign touch.
-			if (
-				!expected.sha256 ||
-				bounded.dev !== expected.dev.toString() ||
-				bounded.ino !== expected.ino.toString() ||
-				bounded.nlink !== expected.nlink.toString() ||
-				bounded.size !== String(expected.size) ||
-				bounded.sha256 !== expected.sha256
-			)
-				throw new Error("managed_append_identity_mismatch");
-		}
+		// Metadata-only drift is safe only when the same unlinked file object and
+		// byte-exact predecessor are independently proven. The digest also binds an
+		// otherwise descriptor-identical file: a malicious or racing writer can
+		// restore timestamps and length, so descriptor equality never waives it.
+		if (
+			!expected.sha256 ||
+			bounded.sha256 !== expected.sha256 ||
+			(!descriptorMatches &&
+				(bounded.dev !== expected.dev.toString() ||
+					bounded.ino !== expected.ino.toString() ||
+					bounded.nlink !== expected.nlink.toString() ||
+					bounded.size !== String(expected.size)))
+		)
+			throw new Error("managed_append_identity_mismatch");
 		return this.appendExpectedSync(relativePath, bytes, bounded);
 	}
 
