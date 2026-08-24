@@ -18,7 +18,7 @@
  * each file independently and refuses whenever the ledger diverged.
  */
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
-import { currentIdentity, hashBytes, planPublish, publishPlan, readTarget } from "./json-publisher";
+import { currentIdentity, planPublish, publishPlan, readTarget } from "./json-publisher";
 import {
 	classifyIntent,
 	clearIntent,
@@ -27,8 +27,10 @@ import {
 	type IntentStep,
 	type ProvenanceLedger,
 	pendingLedgerOf,
+	provenanceLedgerIdentity,
 	readIntent,
 	readProvenance,
+	validateProvenanceLedger,
 	writeIntent,
 	writeProvenance,
 } from "./paseo-ownership";
@@ -164,7 +166,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 	const ledgerBefore = await readProvenance(input.provenancePath);
 	const ledgerAfter = input.nextLedger(ledgerBefore);
 	const provenancePreflightIdentity = await currentIdentity(input.provenancePath);
-	const provenanceExpectedIdentity = ledgerIdentity(ledgerAfter);
+	const provenanceExpectedIdentity = provenanceLedgerIdentity(ledgerAfter);
 
 	if (plan.unchanged && provenancePreflightIdentity === provenanceExpectedIdentity) {
 		return { completed: { label: input.label, undo: async () => ({ status: "reverted" }) }, changed: false };
@@ -288,11 +290,6 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 	};
 }
 
-/** Hash a ledger exactly as it will be serialized, so the expected identity is computable up front. */
-function ledgerIdentity(ledger: ProvenanceLedger): string {
-	return hashBytes(`${JSON.stringify(ledger, null, 2)}\n`);
-}
-
 /** Wrap a `CasReceipt` as a compensable step. */
 export function receiptStep(label: string, receipt: CasReceipt): CompletedStep {
 	return {
@@ -369,7 +366,23 @@ export async function recoverIntent(
 			detail: `${recovery.detail}, but the interrupted step recorded no ledger payload to finish`,
 		};
 	}
-	await writeProvenance(intent.provenancePath, pending);
+	let validatedPending: ProvenanceLedger;
+	try {
+		validatedPending = validateProvenanceLedger(pending);
+	} catch (error) {
+		const detail = error instanceof Error ? error.message : String(error);
+		return {
+			recovered: false,
+			detail: `${recovery.detail}, but the interrupted provenance payload is invalid: ${detail}`,
+		};
+	}
+	if (provenanceLedgerIdentity(validatedPending) !== intent.provenanceExpectedIdentity) {
+		return {
+			recovered: false,
+			detail: `${recovery.detail}, but the interrupted provenance payload digest does not match provenanceExpectedIdentity`,
+		};
+	}
+	await writeProvenance(intent.provenancePath, validatedPending);
 	await clearIntent(intentPath);
 	return { recovered: true, detail: `${recovery.detail}; provenance recorded` };
 }

@@ -17,7 +17,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { ABSENT_IDENTITY, currentIdentity, serializeJson } from "./json-publisher";
+import { ABSENT_IDENTITY, currentIdentity, hashBytes, serializeJson } from "./json-publisher";
 
 export const PROVENANCE_VERSION = 1;
 export const INTENT_VERSION = 1;
@@ -86,6 +86,20 @@ export const EMPTY_LEDGER: ProvenanceLedger = {
 	providerReplacedEntries: {},
 	seededOrchestrationKeys: {},
 };
+
+const PROVENANCE_PAYLOAD_FIELDS = new Set([
+	"version",
+	"providerKeys",
+	"providerPreexistingKeys",
+	"providerReplacedEntries",
+	"seededOrchestrationKeys",
+	"bridgePath",
+	"bridgeSourceDir",
+	"bridgeEntries",
+	"bridgeEntryIdentities",
+	"bridgeDirCreated",
+	"bridgeDirIdentity",
+]);
 
 export class ProvenanceLedgerCorruptError extends Error {
 	constructor(provenancePath: string, detail: string) {
@@ -302,6 +316,7 @@ export interface IntentRecord {
 }
 
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
+	validateIntentPayload(intentPath, intent);
 	await fs.mkdir(path.dirname(intentPath), { recursive: true, mode: 0o700 });
 	// Write-then-rename with fsync (#4644 review r10), exactly like the
 	// provenance ledger: a truncated intent would read back as absent and
@@ -331,6 +346,77 @@ export class IntentRecordCorruptError extends Error {
 			`Paseo intent record is corrupt (${intentPath}): ${detail}. Delete it only after confirming no Paseo setup step was interrupted; GJC will not guess recovery from a damaged record.`,
 		);
 		this.name = "IntentRecordCorruptError";
+	}
+}
+
+/** Hash the exact canonical bytes that {@link writeProvenance} publishes. */
+export function provenanceLedgerIdentity(ledger: ProvenanceLedger): string {
+	return hashBytes(serializeJson(ledger));
+}
+
+/**
+ * Validate a ledger embedded in an intent record without applying legacy
+ * defaults. The payload is the exact object recovery will publish, so accepting
+ * a partial or unknown-shaped object here would make the digest bind different
+ * bytes from the ledger writer.
+ */
+export function validateProvenanceLedger(value: unknown): ProvenanceLedger {
+	if (!isRecord(value)) throw new Error("provenancePayload is not an object");
+	for (const key of Object.keys(value)) {
+		if (!PROVENANCE_PAYLOAD_FIELDS.has(key)) throw new Error(`provenancePayload has an unknown field: ${key}`);
+	}
+	if (value.version !== PROVENANCE_VERSION) {
+		throw new Error(`provenancePayload.version is not ${PROVENANCE_VERSION}`);
+	}
+	if (!Object.prototype.hasOwnProperty.call(value, "providerKeys") || !isStringRecord(value.providerKeys)) {
+		throw new Error("provenancePayload.providerKeys is not a string record");
+	}
+	if (
+		!Object.prototype.hasOwnProperty.call(value, "seededOrchestrationKeys") ||
+		!isStringRecord(value.seededOrchestrationKeys)
+	) {
+		throw new Error("provenancePayload.seededOrchestrationKeys is not a string record");
+	}
+	if (value.providerPreexistingKeys !== undefined && !isTrueRecord(value.providerPreexistingKeys)) {
+		throw new Error("provenancePayload.providerPreexistingKeys is not a boolean record");
+	}
+	if (value.providerReplacedEntries !== undefined && !isProviderReplacedRefRecord(value.providerReplacedEntries)) {
+		throw new Error("provenancePayload.providerReplacedEntries is not a replaced-ref record");
+	}
+	if (value.bridgePath !== undefined && typeof value.bridgePath !== "string") {
+		throw new Error("provenancePayload.bridgePath is not a string");
+	}
+	if (value.bridgeSourceDir !== undefined && typeof value.bridgeSourceDir !== "string") {
+		throw new Error("provenancePayload.bridgeSourceDir is not a string");
+	}
+	if (value.bridgeDirCreated !== undefined && typeof value.bridgeDirCreated !== "boolean") {
+		throw new Error("provenancePayload.bridgeDirCreated is not a boolean");
+	}
+	if (value.bridgeDirIdentity !== undefined && !isBridgeEntryIdentity(value.bridgeDirIdentity)) {
+		throw new Error("provenancePayload.bridgeDirIdentity is not an identity");
+	}
+	if (value.bridgeEntries !== undefined) {
+		if (!Array.isArray(value.bridgeEntries)) throw new Error("provenancePayload.bridgeEntries is not an array");
+		if (!value.bridgeEntries.every(entry => typeof entry === "string")) {
+			throw new Error("provenancePayload.bridgeEntries contains a non-string entry");
+		}
+	}
+	if (value.bridgeEntryIdentities !== undefined && !isBridgeEntryIdentityRecord(value.bridgeEntryIdentities)) {
+		throw new Error("provenancePayload.bridgeEntryIdentities is not an identity record");
+	}
+	return value as unknown as ProvenanceLedger;
+}
+
+function validateIntentPayload(intentPath: string, intent: IntentRecord): void {
+	if (intent.provenancePayload === undefined) return;
+	try {
+		const payload = validateProvenanceLedger(intent.provenancePayload);
+		if (provenanceLedgerIdentity(payload) !== intent.provenanceExpectedIdentity) {
+			throw new Error("provenancePayload canonical digest does not match provenanceExpectedIdentity");
+		}
+	} catch (error) {
+		if (error instanceof IntentRecordCorruptError) throw error;
+		throw new IntentRecordCorruptError(intentPath, error instanceof Error ? error.message : String(error));
 	}
 }
 
@@ -396,11 +482,7 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 			);
 		}
 		if (parsed?.provenancePayload !== undefined) {
-			// Shape-only validation; readProvenance's own strict validation runs
-			// before any payload is ever written.
-			if (typeof parsed.provenancePayload !== "object" || parsed.provenancePayload === null) {
-				throw new IntentRecordCorruptError(intentPath, "provenancePayload is not an object");
-			}
+			validateIntentPayload(intentPath, parsed);
 		}
 		return parsed;
 	} catch (error) {

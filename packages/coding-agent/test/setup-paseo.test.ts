@@ -34,6 +34,7 @@ import {
 	isProvenancedProvider,
 	ProvenanceLedgerCorruptError,
 	provenancedProviderKeys,
+	provenanceLedgerIdentity,
 	readIntent,
 	readProvenance,
 	writeIntent,
@@ -3536,15 +3537,62 @@ describe("intent recovery", () => {
 	test("complete-ledger commits the recorded payload instead of relying on a retry", async () => {
 		const { fixture, intent } = await intentFixture();
 		await fs.writeFile(fixture.paths.configJson, serializeJson({ after: true }));
+		const pending = { version: 1, providerKeys: {}, seededOrchestrationKeys: { ui: "gjc" } };
 		await writeIntent(fixture.paths.intentRecord, {
 			...intent,
-			provenancePayload: { version: 1, providerKeys: {}, seededOrchestrationKeys: { ui: "gjc" } },
+			provenanceExpectedIdentity: provenanceLedgerIdentity(pending),
+			provenancePayload: pending,
 		});
 
 		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
 		expect(recovery?.recovered).toBe(true);
 		expect((await readProvenance(fixture.paths.provenanceLedger)).seededOrchestrationKeys.ui).toBe("gjc");
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+	});
+
+	test("complete-ledger rejects an invalid payload without writing or clearing", async () => {
+		const { fixture, intent } = await intentFixture();
+		const pending = { version: 1, providerKeys: {}, seededOrchestrationKeys: { ui: "gjc" } };
+		const validIntent = {
+			...intent,
+			provenanceExpectedIdentity: provenanceLedgerIdentity(pending),
+			provenancePayload: pending,
+		};
+		await writeIntent(fixture.paths.intentRecord, validIntent);
+		await fs.writeFile(fixture.paths.configJson, serializeJson({ after: true }));
+		const tampered = serializeJson({
+			...validIntent,
+			provenancePayload: { ...pending, providerKeys: "not-a-record" },
+		});
+		await Bun.write(fixture.paths.intentRecord, tampered);
+		const ledgerBefore = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(false);
+		expect(recovery?.detail).toContain("corrupt");
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(ledgerBefore);
+		expect(await fs.readFile(fixture.paths.intentRecord, "utf8")).toBe(tampered);
+	});
+
+	test("complete-ledger rejects a payload digest mismatch without writing or clearing", async () => {
+		const { fixture, intent } = await intentFixture();
+		const pending = { version: 1, providerKeys: {}, seededOrchestrationKeys: { ui: "gjc" } };
+		const validIntent = {
+			...intent,
+			provenanceExpectedIdentity: provenanceLedgerIdentity(pending),
+			provenancePayload: pending,
+		};
+		await writeIntent(fixture.paths.intentRecord, validIntent);
+		await fs.writeFile(fixture.paths.configJson, serializeJson({ after: true }));
+		const tampered = serializeJson({ ...validIntent, provenanceExpectedIdentity: "0".repeat(64) });
+		await Bun.write(fixture.paths.intentRecord, tampered);
+		const ledgerBefore = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(false);
+		expect(recovery?.detail).toContain("canonical digest");
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(ledgerBefore);
+		expect(await fs.readFile(fixture.paths.intentRecord, "utf8")).toBe(tampered);
 	});
 
 	test("a discardable intent is cleared under repair", async () => {
