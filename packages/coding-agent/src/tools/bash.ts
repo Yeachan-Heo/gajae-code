@@ -1372,9 +1372,42 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				});
 			}
 			const backgroundRequest = Promise.withResolvers<void>();
-			const unregisterBackgroundRequest = this.session.registerForegroundBashBackgroundRequestHandler?.(() => {
-				job.setBackgrounded(true);
-				backgroundRequest.resolve();
+			// Exactly one party may settle the foreground caller. detachObserver (the
+			// fold won) and resolveForegroundObserver (a completion was handed back
+			// after a failed fold) share this flag, so a race cannot double-settle.
+			let foregroundSettled = false;
+			const settleForeground = (): "resolved" | "already-settled" => {
+				if (foregroundSettled) return "already-settled";
+				foregroundSettled = true;
+				return "resolved";
+			};
+			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
+			const unregisterBackgroundRequest = this.session.registerForegroundFoldParticipant?.({
+				kind: "bash-managed",
+				jobId: job.jobId,
+				jobGeneration,
+				label: job.label,
+				cwdSensitive: true,
+				outputRef: {
+					jobId: job.jobId,
+					generation: jobGeneration,
+					instruction: `Use the job tool's tail operation for ${job.jobId} to read this command's output.`,
+				},
+				// Bound at registration over the manager that registered THIS job, so
+				// identity can never resolve to another manager's identically-named job.
+				getJob: () => {
+					const current = ownedManager.getJob(job.jobId);
+					return current?.generation === jobGeneration ? current : undefined;
+				},
+				detachObserver: () => {
+					const outcome = settleForeground();
+					if (outcome === "resolved") {
+						job.setBackgrounded(true);
+						backgroundRequest.resolve();
+					}
+					return outcome;
+				},
+				resolveForegroundObserver: () => settleForeground(),
 			});
 			let waitResult: ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" };
 			try {

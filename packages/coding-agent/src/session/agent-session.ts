@@ -499,6 +499,7 @@ import {
 
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
+import { FoldCoordinator, type FoldAdapter } from "./fold-coordinator";
 import { YieldQueue } from "./yield-queue";
 
 /**
@@ -2608,7 +2609,25 @@ export class AgentSession {
 		onPersisted?: () => void;
 		appendedToAgent: boolean;
 	}> = [];
-	#foregroundBashBackgroundRequestHandler: (() => void) | undefined;
+	/**
+	 * Set by a fold and consumed once by the pause checkpoint, so a fold ends its
+	 * own turn without pausing any later turn.
+	 */
+	#foldStopRequested = false;
+	/**
+	 * The single linearization point for folding a foreground wait. Arrow deps
+	 * capture `this` but are only invoked after construction.
+	 */
+	readonly #foldCoordinator = new FoldCoordinator({
+		armSteeringFence: () => {
+			this.agent.setSteeringAdmissionFence(() => true);
+			return () => this.agent.setSteeringAdmissionFence(undefined);
+		},
+		requestStop: () => {
+			this.#foldStopRequested = true;
+		},
+		captureRemainingIntent: () => this.#captureRemainingIntentForFold(),
+	});
 
 	// Python execution state
 	#evalAbortControllers = new Set<AbortController>();
@@ -3920,6 +3939,14 @@ export class AgentSession {
 			},
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Stop-after-result, never abort: a fold arms this once and the loop ends the
+		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
+		// to the folded turn instead of pausing everything that follows.
+		this.agent.setShouldPause(() => {
+			if (!this.#foldStopRequested) return false;
+			this.#foldStopRequested = false;
+			return true;
+		});
 		this.agent.setMaintainContext((context, lifecycle) =>
 			this.#trackMidRunMaintenance(
 				this.awaitPendingContextTransformations().then(() => this.#runMidRunMaintenance(context, lifecycle)),
@@ -8463,13 +8490,39 @@ export class AgentSession {
 	 * handler, so Ctrl+B-style folding fails closed instead of aborting or
 	 * shell-suspending arbitrary work.
 	 */
-	registerForegroundBashBackgroundRequestHandler(handler: () => void): () => void {
-		this.#foregroundBashBackgroundRequestHandler = handler;
-		return () => {
-			if (this.#foregroundBashBackgroundRequestHandler === handler) {
-				this.#foregroundBashBackgroundRequestHandler = undefined;
-			}
-		};
+	registerForegroundFoldParticipant(adapter: FoldAdapter): () => void {
+		return this.#foldCoordinator.registerParticipant(adapter);
+	}
+
+	/** The session-owned fold coordinator, for delivery-side receipt lookup. */
+	get foldCoordinator(): FoldCoordinator {
+		return this.#foldCoordinator;
+	}
+
+	/**
+	 * Best-effort capture of what the interrupted turn still intended to do, so
+	 * the wake turn can finish the original task instead of only reporting output.
+	 */
+	#captureRemainingIntentForFold(): string | undefined {
+		const messages = this.agent.state.messages;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index];
+			if (message?.role !== "user") continue;
+			const content = message.content;
+			const text =
+				typeof content === "string"
+					? content
+					: Array.isArray(content)
+						? content
+								.map(block => (typeof block === "object" && block && "text" in block ? String(block.text) : ""))
+								.filter(Boolean)
+								.join("\n")
+						: "";
+			const trimmed = text.trim();
+			if (trimmed.length === 0) return undefined;
+			return trimmed.length > 2000 ? `${trimmed.slice(0, 2000)}…` : trimmed;
+		}
+		return undefined;
 	}
 
 	/**
@@ -8478,7 +8531,7 @@ export class AgentSession {
 	 * no fold target exists.
 	 */
 	hasForegroundBashBackgroundRequestHandler(): boolean {
-		return this.#foregroundBashBackgroundRequestHandler !== undefined;
+		return this.#foldCoordinator.hasFoldableParticipant();
 	}
 
 	/** Set the SDK permission policy used by guarded ACP tool execution. */
@@ -8515,9 +8568,15 @@ export class AgentSession {
 	 * Returns false when no supported foreground tool is currently backgroundable.
 	 */
 	requestForegroundBashBackground(): boolean {
-		const handler = this.#foregroundBashBackgroundRequestHandler;
-		if (!handler) return false;
-		handler();
+		if (!this.#foldCoordinator.hasFoldableParticipant()) return false;
+		// The fold transaction is async (it captures and persists a receipt before
+		// arming the stop), but the key handler needs a synchronous answer about
+		// whether a fold was initiated.
+		void this.#foldCoordinator.requestFold().catch(error => {
+			logger.warn("Foreground fold request failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 		return true;
 	}
 

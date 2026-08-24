@@ -163,4 +163,55 @@ describe("folded jobs surfacing", () => {
 
 		observer.dispose();
 	});
+
+	// AC6 asserted as a partition PROPERTY rather than case by case: every
+	// terminal job must land in exactly one public delivery state, and the silent
+	// set -- terminal work surfaced in no state at all -- must be empty. A
+	// case-by-case test can pass while some status/deliveryState combination
+	// still falls through.
+	test("partitions every terminal job into exactly one public delivery state", () => {
+		const terminalStatuses = ["completed", "failed", "cancelled"] as const;
+		const deliveryStates = ["pending", "delivered", "failed-visible"] as const;
+		const jobs = terminalStatuses.flatMap(status =>
+			deliveryStates.map(deliveryState => ({
+				id: `${status}-${deliveryState}`,
+				kind: "bash",
+				label: `${status} job with ${deliveryState} delivery`,
+				status,
+				generation: `generation-${status}-${deliveryState}`,
+				backgrounded: true,
+				deliveryState,
+			})),
+		);
+		const sourceSnapshot: AsyncJobsSnapshot = { jobs, deadLettered: [] };
+
+		const observer = new JobsObserver(fakeManager(sourceSnapshot), "owner-1");
+		const observed = observer.getSnapshot();
+		const folded = observed.foldedJobs ?? [];
+
+		// Exactly one row per terminal job: no duplication, no omission.
+		expect(folded).toHaveLength(jobs.length);
+		expect(new Set(folded.map(job => job.id)).size).toBe(jobs.length);
+
+		// Classification is copied verbatim, so the observer cannot disagree with
+		// the manager about which single state a job is in.
+		for (const job of jobs) {
+			const row = folded.find(candidate => candidate.id === job.id);
+			expect(row).toMatchObject({ status: job.status, deliveryState: job.deliveryState });
+		}
+
+		// The silent set is empty: every terminal job that has not been delivered
+		// is visible as pending or failed, never absent.
+		const undelivered = jobs.filter(job => job.deliveryState !== "delivered");
+		const visibleUndelivered = folded.filter(job => job.deliveryState !== "delivered");
+		expect(visibleUndelivered.map(job => job.id).sort()).toEqual(undelivered.map(job => job.id).sort());
+
+		// And the buckets are mutually exclusive.
+		for (const row of folded) {
+			const matches = deliveryStates.filter(state => row.deliveryState === state);
+			expect(matches).toHaveLength(1);
+		}
+
+		observer.dispose();
+	});
 });
