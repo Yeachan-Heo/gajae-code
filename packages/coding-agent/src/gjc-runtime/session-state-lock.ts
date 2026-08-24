@@ -440,7 +440,8 @@ async function lockOwnerIsAlive(value: unknown, deadline: number): Promise<boole
 		// Keep production recovery fail-closed until the legacy owner is qualified.
 		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
 	} else if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentOwnerHostId()))) {
-		if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentLegacyOwnerHostId()))) return true;
+		if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentLegacyOwnerHostId())))
+			return true;
 	}
 	// PID and process-start values are host-local. A current writer on a shared
 	// volume must never classify a foreign owner from a local ESRCH result.
@@ -1088,10 +1089,14 @@ async function reclaimStaleTransitionClaim(transitionDir: string, deadline: numb
 	// exact-identity stale path; released PID-1 tombstones deliberately require
 	// explicit cleanup before this atomic-directory protocol can take over.
 	if (stat.isFile()) {
-		await reclaimStaleOwnerRecord(transitionDir, {
-			afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
-			beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
-		}, deadline);
+		await reclaimStaleOwnerRecord(
+			transitionDir,
+			{
+				afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
+				beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
+			},
+			deadline,
+		);
 		return;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
@@ -1112,9 +1117,13 @@ async function withLockPathTransition<T>(
 	for (;;) {
 		try {
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
-			await withinLockAcquireDeadline(deadline, () => fs.mkdir(transitionDir), result => {
-				if (result.ok) return fs.rmdir(transitionDir).catch(() => undefined);
-			});
+			await withinLockAcquireDeadline(
+				deadline,
+				() => fs.mkdir(transitionDir),
+				result => {
+					if (result.ok) return fs.rmdir(transitionDir).catch(() => undefined);
+				},
+			);
 			if (performance.now() >= deadline) {
 				void fs.rmdir(transitionDir).catch(() => undefined);
 				throw new SessionStateLockUnavailableError();
@@ -1128,9 +1137,13 @@ async function withLockPathTransition<T>(
 		}
 		let held: LockOwnerSnapshot;
 		try {
-			held = await withinLockAcquireDeadline(deadline, () => acquireOwnerLock(ownerFile, owner), result => {
-				void cleanupTransitionClaim(transitionDir, ownerFile, result.ok ? result.value : undefined);
-			});
+			held = await withinLockAcquireDeadline(
+				deadline,
+				() => acquireOwnerLock(ownerFile, owner),
+				result => {
+					void cleanupTransitionClaim(transitionDir, ownerFile, result.ok ? result.value : undefined);
+				},
+			);
 		} catch (error) {
 			if (performance.now() < deadline) await cleanupTransitionClaim(transitionDir, ownerFile);
 			else void cleanupTransitionClaim(transitionDir, ownerFile);
@@ -1140,9 +1153,13 @@ async function withLockPathTransition<T>(
 		try {
 			outcome = {
 				ok: true,
-				value: await withinLockAcquireDeadline(deadline, () => transition(), result => {
-					void cleanupTransitionClaim(transitionDir, ownerFile, held);
-				}),
+				value: await withinLockAcquireDeadline(
+					deadline,
+					() => transition(),
+					result => {
+						void cleanupTransitionClaim(transitionDir, ownerFile, held);
+					},
+				),
 			};
 		} catch (error) {
 			if (performance.now() >= deadline) {
@@ -1152,9 +1169,13 @@ async function withLockPathTransition<T>(
 			outcome = { ok: false, error };
 		}
 		try {
-			await withinLockAcquireDeadline(deadline, () => releaseTransitionClaim(transitionDir, ownerFile, held), () => {
-				void cleanupTransitionClaim(transitionDir, ownerFile, held);
-			});
+			await withinLockAcquireDeadline(
+				deadline,
+				() => releaseTransitionClaim(transitionDir, ownerFile, held),
+				() => {
+					void cleanupTransitionClaim(transitionDir, ownerFile, held);
+				},
+			);
 		} catch (releaseError) {
 			if (performance.now() >= deadline) void cleanupTransitionClaim(transitionDir, ownerFile, held);
 			if (!outcome.ok)
@@ -1182,10 +1203,14 @@ async function reclaimStaleRegularLock(lockFile: string, deadline: number): Prom
 	await withLockPathTransition(
 		lockFile,
 		async () =>
-			await reclaimStaleOwnerRecord(lockFile, {
-				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
-				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
-			}, deadline),
+			await reclaimStaleOwnerRecord(
+				lockFile,
+				{
+					afterInspection: SessionStateLockTestHooks.afterStaleInspection,
+					beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
+				},
+				deadline,
+			),
 		deadline,
 	);
 }
@@ -1262,10 +1287,7 @@ async function legacyDirectoryIsStale(
 			throw error;
 		}
 	}
-	if (
-		ownerHostId !== undefined &&
-		owner.owner_host_id !== ownerHostId
-	) {
+	if (ownerHostId !== undefined && owner.owner_host_id !== ownerHostId) {
 		return false;
 	}
 	const liveness = probeOwnerProcess(owner.pid);
@@ -1330,11 +1352,15 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 					deadline,
 				);
 			if (!stale) return;
-			await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile));
+			await withinLockAcquireDeadline(deadline, () =>
+				SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile),
+			);
 			const authorized = captureLegacyDirectoryTree(native, lockFile);
 			// The verdict spoke for `before`; only an unchanged tree carries that authority.
 			if (!authorized || !sameDirectoryTreeSnapshot(before, authorized)) return;
-			await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile));
+			await withinLockAcquireDeadline(deadline, () =>
+				SessionStateLockTestHooks.beforeLegacyDirectoryRemoval?.(lockFile),
+			);
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
 			let removed: NativeExactUnlinkResult;
 			try {
