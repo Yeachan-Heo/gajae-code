@@ -240,11 +240,15 @@ function cursorAbortError(signal: AbortSignal): Error {
 	return new Error("Request was aborted");
 }
 
-function cursorExecDeadlineMs(idleTimeoutMs: number | undefined): number {
+/** Exported for deterministic coverage of the Cursor exec-budget derivation. */
+export function cursorExecDeadlineMsForTest(idleTimeoutMs: number | undefined): number {
 	// A non-positive idle override explicitly DISABLES the transport watchdog;
 	// it must not collapse the exec deadline to the minimum clamp. Treat it
-	// like an undefined input so ordinary tool calls keep the normal budget.
-	if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) return 120_000;
+	// like the normal 120-second input so disabling transport watching cannot
+	// make local tools stricter than the default (for example, bash's 300s).
+	if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) {
+		return 120_000 * CURSOR_EXEC_DEADLINE_MULTIPLIER;
+	}
 	return Math.max(CURSOR_MIN_EXEC_DEADLINE_MS, idleTimeoutMs * CURSOR_EXEC_DEADLINE_MULTIPLIER);
 }
 
@@ -1149,7 +1153,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 									await runWithCursorExecDeadline(
 										run,
 										options?.signal,
-										cursorExecDeadlineMs(idleTimeoutMs),
+										cursorExecDeadlineMsForTest(idleTimeoutMs),
 										settled => {
 											pendingNonAbortableExec = settled;
 										},

@@ -14,6 +14,7 @@ import {
 	TokenDeltaUpdateSchema,
 	TurnEndedUpdateSchema,
 } from "../src/providers/cursor/gen/agent_pb";
+import { cursorExecDeadlineMsForTest } from "../src/providers/cursor";
 import { stream as streamModel } from "../src/stream";
 import type { AssistantMessage, Context, CursorExecHandlers, Model } from "../src/types";
 
@@ -99,6 +100,12 @@ function isTerminalEvent(event: unknown): boolean {
 }
 
 describe("Cursor raw transport watchdog", () => {
+	it("keeps the normal exec budget when transport idle watching is disabled", () => {
+		expect(cursorExecDeadlineMsForTest(undefined)).toBe(480_000);
+		expect(cursorExecDeadlineMsForTest(0)).toBe(480_000);
+		expect(cursorExecDeadlineMsForTest(120_000)).toBe(480_000);
+	});
+
 	it("does not open a credential-bearing request for a pre-aborted signal", async () => {
 		let requestCount = 0;
 		const baseUrl = await createCursorServer(stream => {

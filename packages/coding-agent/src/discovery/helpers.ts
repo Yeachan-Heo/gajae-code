@@ -801,8 +801,15 @@ export async function resolveActiveProjectRegistryPath(
 	// Stop before the caller's authoritative home — its .gjc/ is the user-level
 	// config dir, not a project root. Explicit-home capability loading passes
 	// that supplied home instead of leaking the process-global trusted home.
-	homeDir = path.resolve(homeDir);
-	let dir = path.resolve(cwd);
+	const canonicalize = async (value: string): Promise<string> => {
+		try {
+			return await fs.promises.realpath(value);
+		} catch {
+			return path.resolve(value);
+		}
+	};
+	homeDir = await canonicalize(homeDir);
+	let dir = await canonicalize(cwd);
 	while (dir !== homeDir) {
 		try {
 			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
