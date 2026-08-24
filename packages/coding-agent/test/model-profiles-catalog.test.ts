@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { ThinkingLevel } from "@gajae-code/agent-core/thinking";
 import {
 	BUILTIN_MODEL_PROFILES,
 	formatAvailableProfileNames,
@@ -1124,5 +1125,40 @@ describe("built-in model profile catalog", () => {
 			modelRoles: {},
 			agentModelOverrides: {},
 		});
+	});
+
+	test("macOS oMLX presets keep the documented single-effort ladder and single-model contract", () => {
+		const ladder: Record<Role, ThinkingLevel> = {
+			default: ThinkingLevel.Low,
+			executor: ThinkingLevel.Low,
+			architect: ThinkingLevel.High,
+			planner: ThinkingLevel.Medium,
+			critic: ThinkingLevel.High,
+		};
+		for (const name of [
+			"macos-omlx-fast",
+			"macos-omlx-balanced",
+			"macos-omlx-quality",
+			"macos-omlx-abliterated-fast",
+			"macos-omlx-abliterated-balanced",
+		]) {
+			const mapping = builtinMapping(name);
+			for (const role of roles) {
+				const suffix = splitSelectorThinkingSuffix(mapping[role]);
+				// Every oMLX role selector carries an explicit effort within the
+				// low..high envelope discovery assigns to served oMLX models.
+				expect(suffix.thinkingLevel, `${name}.${role} effort`).toBe(ladder[role]);
+			}
+			const servedIds = new Set(roles.map(role => splitSelectorThinkingSuffix(mapping[role]).selector));
+			if (name === "macos-omlx-quality") {
+				// Quality is the documented two-model preset: MoE core plus the
+				// dense critic checkpoint.
+				expect(servedIds).toEqual(new Set(["omlx/Qwen3.6-35B-A3B-8bit", "omlx/Qwen3.8-27B-8bit"]));
+			} else {
+				// All other oMLX presets stay single-model so role switches never
+				// trigger a local model unload/reload.
+				expect(servedIds.size, `${name} must serve exactly one model`).toBe(1);
+			}
+		}
 	});
 });
