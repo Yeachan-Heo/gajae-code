@@ -356,6 +356,18 @@ async function waitForLockRetry(deadline: number): Promise<boolean> {
 	return performance.now() < deadline;
 }
 
+/** Run acquisition preflight without allowing it to outlive the shared deadline. */
+async function withinLockAcquireDeadline<T>(deadline: number, operation: Promise<T>): Promise<T> {
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) throw new SessionStateLockUnavailableError();
+	const outcome = await Promise.race([
+		operation.then(value => ({ timedOut: false as const, value })),
+		Bun.sleep(remaining).then(() => ({ timedOut: true as const })),
+	]);
+	if (outcome.timedOut) throw new SessionStateLockUnavailableError();
+	return outcome.value;
+}
+
 async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
 	if (!validLockOwner(value)) return false;
 	const owner = value;
@@ -1225,9 +1237,9 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
  */
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
-	const owner = await newLockOwner();
-	await fs.mkdir(path.dirname(stateFile), { recursive: true });
 	const deadline = lockAcquireDeadline();
+	const owner = await withinLockAcquireDeadline(deadline, newLockOwner());
+	await withinLockAcquireDeadline(deadline, fs.mkdir(path.dirname(stateFile), { recursive: true }));
 	for (;;) {
 		let held: LockOwnerSnapshot | undefined;
 		try {

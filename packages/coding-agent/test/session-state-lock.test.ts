@@ -241,6 +241,24 @@ describe("coordinator session state lock", () => {
 		expect(performance.now() - startedAt).toBeLessThan(500);
 		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
 	});
+
+	it("bounds owner identity preflight by the acquisition deadline", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-preflight-deadline.json");
+		const ownerHostId = Promise.withResolvers<string>();
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+		SessionStateLockTestHooks.ownerHostId = () => ownerHostId.promise;
+		const startedAt = performance.now();
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		expect(performance.now() - startedAt).toBeLessThan(500);
+		expect(fsSync.existsSync(`${stateFile}.lock`)).toBe(false);
+		ownerHostId.resolve("local-host");
+	});
+
 	it("serializes a concurrent writer behind the current lock holder", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-current");
 		// System time is frozen in these tests, so order is recorded explicitly.
