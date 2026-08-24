@@ -58,8 +58,12 @@ function sendInteractionUpdate(stream: http2.ServerHttp2Stream, message: Interac
 }
 
 function sendServerMessage(stream: http2.ServerHttp2Stream, message: AgentServerMessage["message"]): void {
+	stream.write(buildServerMessageFrame(message));
+}
+
+function buildServerMessageFrame(message: AgentServerMessage["message"]): Buffer {
 	const serverMessage = create(AgentServerMessageSchema, { message });
-	stream.write(frameConnectMessage(toBinary(AgentServerMessageSchema, serverMessage)));
+	return frameConnectMessage(toBinary(AgentServerMessageSchema, serverMessage));
 }
 
 async function createCursorServer(onStream: (stream: http2.ServerHttp2Stream) => void): Promise<string> {
@@ -236,6 +240,50 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.errorMessage).toBeUndefined();
 	});
 
+	it("applies backpressure to a coalesced burst without dropping raw progress or partial usage", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const frames: Buffer[] = [];
+				for (let index = 0; index < 300; index += 1) {
+					const message =
+						index === 150
+							? ({
+									case: "interactionUpdate",
+									value: create(InteractionUpdateSchema, {
+										message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 11 }) },
+									}),
+								} satisfies AgentServerMessage["message"])
+							: ({
+									case: "interactionUpdate",
+									value: create(InteractionUpdateSchema, {
+										message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+									}),
+								} satisfies AgentServerMessage["message"]);
+					frames.push(buildServerMessageFrame(message));
+				}
+				frames.push(
+					buildServerMessageFrame({
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+						}),
+					}),
+				);
+				stream.end(Buffer.concat(frames));
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage.output).toBe(11);
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("preserves accumulated Cursor content and usage in exactly one terminal on a silent transport timeout", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
@@ -263,7 +311,7 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for transport progress");
+		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for the next event");
 		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }));
 		expect(result.usage.output).toBe(9);
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
@@ -489,7 +537,7 @@ describe("Cursor raw transport watchdog", () => {
 			execHandlers: {
 				piRead: call => {
 					observed.resolve(call.signal);
-					return new Promise<never>(() => {});
+					return Promise.withResolvers<never>().promise;
 				},
 			},
 		});
@@ -609,6 +657,63 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("waits for a started non-abortable write before publishing a gRPC trailer failure", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
+			stream.on("wantTrailers", () => {
+				stream.sendTrailers({ "grpc-status": "13", "grpc-message": "transport%20reset" });
+			});
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					}),
+				10,
+			);
+			setTimeout(() => stream.end(), 20);
+		});
+		const started = Promise.withResolvers<void>();
+		const settleWrite = Promise.withResolvers<void>();
+		let terminalPublished = false;
+		const pending = collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 100,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await settleWrite.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		}).then(value => {
+			terminalPublished = true;
+			return value;
+		});
+
+		await started.promise;
+		await Bun.sleep(40);
+		expect(terminalPublished).toBe(false);
+		settleWrite.resolve();
+		const { events, result } = await pending;
+		expect(result.errorMessage).toContain("gRPC error 13: transport reset");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("aborts the per-exec signal when the caller aborts mid-exec", async () => {
 		const controller = new AbortController();
 		const baseUrl = await createCursorServer(stream => {
@@ -637,7 +742,7 @@ describe("Cursor raw transport watchdog", () => {
 			execHandlers: {
 				piRead: call => {
 					observed.resolve(call.signal);
-					return new Promise<never>(() => {});
+					return Promise.withResolvers<never>().promise;
 				},
 			},
 		});
