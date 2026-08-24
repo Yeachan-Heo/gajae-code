@@ -139,51 +139,6 @@ async function resolveSkillsBridgeSource(deps: PaseoSetupDependencies): Promise<
 }
 
 /**
- * Recover no-follow identities for legacy bridge entries that are still exact
- * no-op links. The name is already recorded as GJC-owned; the source target
- * and the live symlink are the only additional evidence accepted here.
- */
-async function backfillBridgeEntryIdentities(
-	bridgeDir: string,
-	sourceDir: string | undefined,
-	names: readonly string[],
-	recorded: Readonly<Record<string, BridgeEntryIdentity>> | undefined,
-): Promise<Readonly<Record<string, BridgeEntryIdentity>>> {
-	const identities: Record<string, BridgeEntryIdentity> = { ...(recorded ?? {}) };
-	if (sourceDir === undefined) return identities;
-	for (const name of names) {
-		if (identities[name] !== undefined) continue;
-		const destination = path.join(bridgeDir, name);
-		const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-			throw new SkillsBridgeError(`Cannot inspect recorded Paseo skill bridge entry: ${destination}`);
-		});
-		if (stat === undefined) {
-			throw new SkillsBridgeError(
-				`Missing recorded Paseo skill bridge entry during identity recovery: ${destination}`,
-			);
-		}
-		if (!stat.isSymbolicLink()) {
-			throw new SkillsBridgeError(
-				`Refusing to recover identity for a non-symlink Paseo skill bridge entry: ${destination}`,
-			);
-		}
-		const linkText = await fs.readlink(destination);
-		const expectedTarget = path.resolve(sourceDir, name);
-		if (path.resolve(path.dirname(destination), linkText) !== expectedTarget) {
-			throw new SkillsBridgeError(`Refusing to recover a diverged Paseo skill bridge entry: ${destination}`);
-		}
-		identities[name] = {
-			dev: stat.dev.toString(),
-			ino: stat.ino.toString(),
-			size: stat.size.toString(),
-			mtimeNs: stat.mtimeNs.toString(),
-		};
-	}
-	return identities;
-}
-
-/**
  * Run the four-step install saga.
  *
  * Bridge preflight follows the source-less migration guard and is entirely
@@ -487,20 +442,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			migratedOldBridgeDir = oldBridgeDir;
 		}
 		const previouslyRecorded = isMigration ? new Set<string>() : new Set(bridgeLedger.bridgeEntries ?? []);
-		const missingBridgeIdentityNames = Object.values(bridgePreflight.entries)
-			.filter(
-				entry =>
-					entry.action === "noop" &&
-					previouslyRecorded.has(entry.name) &&
-					bridgeLedger.bridgeEntryIdentities?.[entry.name] === undefined,
-			)
-			.map(entry => entry.name);
-		const bridgeEntryIdentities = await backfillBridgeEntryIdentities(
-			deps.paths.bridgeDir,
-			bridgePreflight.sourceDir,
-			missingBridgeIdentityNames,
-			bridgeLedger.bridgeEntryIdentities,
-		);
+		// An identity-less entry may be a name written by the pre-mutation ledger
+		// plan before link creation. An exact-target noop is not independent proof
+		// that GJC created the live symlink, so preserve the missing receipt and let
+		// removal fail closed until a durable per-entry identity exists.
+		const bridgeEntryIdentities = bridgeLedger.bridgeEntryIdentities;
 		const ownedAfterRun = [
 			// Entries this run or an earlier run actually creates/recreates.
 			...Object.values(bridgePreflight.entries)

@@ -830,29 +830,37 @@ describe("skills bridge", () => {
 		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
 	});
 
-	test("a later install backfills an identity-less recorded link for removal (#4644 Codex P2)", async () => {
+	test("a prewritten bridge plan never adopts a user-created exact-target link (#4644 Codex P2)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
 		await seedConfig(fixture.paths);
-		await runPaseoSetup({}, fixture.deps);
+		// Model the durable pre-mutation ledger write: the planned name is recorded
+		// before `installSkillsBridge` creates it, but no per-entry identity exists.
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeSourceDir: await fs.realpath(fixture.paths.agentsSkillsDir as string),
+			bridgeEntries: ["paseo"],
+			bridgeEntryIdentities: {},
+			bridgeDirCreated: false,
+		});
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		await fs.symlink(
+			path.join(fixture.paths.agentsSkillsDir as string, "paseo"),
+			path.join(fixture.paths.bridgeDir, "paseo"),
+		);
 
-		// Model a ledger written by an older install that recorded bridge names
-		// but did not yet persist their no-follow identities.
-		const prior = await readProvenance(fixture.paths.provenanceLedger);
-		const { bridgeEntryIdentities: _identities, ...identityless } = prior;
-		await writeProvenance(fixture.paths.provenanceLedger, identityless);
-
-		const recovered = await runPaseoSetup({}, fixture.deps);
-		expect(recovered.kind).toBe("install");
+		const retried = await runPaseoSetup({}, fixture.deps);
+		expect(retried.kind).toBe("install");
 		const after = await readProvenance(fixture.paths.provenanceLedger);
-		for (const name of after.bridgeEntries ?? []) {
-			expect(after.bridgeEntryIdentities?.[name]).toBeDefined();
-		}
+		expect(after.bridgeEntryIdentities?.paseo).toBeUndefined();
 
-		const removed = await runPaseoSetup({ remove: true }, fixture.deps);
-		if (removed.kind !== "remove") throw new Error("expected a remove outcome");
-		expect(removed.result.outcome).toBe("removed");
-		await expect(fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).rejects.toMatchObject({ code: "ENOENT" });
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("partial-removal");
+		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
 	});
 
 	test("a corrupt provenance ledger is an explicit error, never an empty one (#4644 review r3)", async () => {
