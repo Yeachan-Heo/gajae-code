@@ -98,13 +98,26 @@ async function readsRecordedBridgeDir(oldAgentDir: string, recordedBridgeDir: st
 /**
  * Whether a directory actually holds the bridge the ledger describes: every
  * PRESENT recorded entry must be a symlink pointing into the ledger's
- * recorded source (#4644 review r19). This is the content authentication that
- * distinguishes a genuine migration (the old bridge with GJC's links) from a
- * tampered ledger aiming at an in-root sibling holding foreign content.
+ * recorded source (#4644 review r19). An empty bridge has no link target to
+ * inspect, so its recorded creator bit and directory identity authenticate the
+ * object instead. This is the content authentication that distinguishes a
+ * genuine migration (the old bridge with GJC's links) from a tampered ledger
+ * aiming at an in-root sibling holding foreign content.
  */
 async function directoryHoldsRecordedBridge(ledger: ProvenanceLedger, dir: string): Promise<boolean> {
 	const entries = ledger.bridgeEntries ?? [];
-	if (entries.length === 0) return false;
+	if (entries.length === 0) {
+		// An empty bridge has no link targets to authenticate. The only durable
+		// ownership proof is that GJC recorded creating this directory and its
+		// no-follow object identity still matches the live directory. This keeps
+		// an empty path migration eligible without allowing a replacement
+		// directory to inherit the old registration or cleanup authority.
+		const recorded = ledger.bridgeDirIdentity;
+		if (ledger.bridgeDirCreated !== true || recorded === undefined) return false;
+		const stat = await fs.lstat(dir, { bigint: true }).catch(() => undefined);
+		if (stat === undefined || !stat.isDirectory() || stat.isSymbolicLink()) return false;
+		return stat.dev.toString() === recorded.dev && stat.ino.toString() === recorded.ino;
+	}
 	const sourceDir = ledger.bridgeSourceDir;
 	if (sourceDir === undefined) return false;
 	let present = 0;
@@ -175,15 +188,18 @@ export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSe
 	// AND by its CONTENT (#4644 review r19): a same-ledger claim on an in-root
 	// sibling is self-referential, so the recorded directory must actually
 	// hold the bridge links the ledger describes — every present recorded
-	// entry a symlink pointing into the ledger's recorded source. A foreign
-	// sibling with user content fails that check regardless of what a
-	// tampered ledger claims.
+	// entry a symlink pointing into the ledger's recorded source. An owned empty
+	// bridge has no link target, so that shape requires its recorded directory
+	// identity instead of accepting a foreign ledger alone. A foreign sibling
+	// with user content fails that check regardless of what a tampered ledger
+	// claims.
 	const oldLedgerPath = path.join(oldAgentDir, "paseo", "provenance.json");
 	const foreignLedgerRecord = path.resolve(oldLedgerPath) !== path.resolve(deps.paths.provenanceLedger);
 	const holdsDescribedBridge = await directoryHoldsRecordedBridge(ledger, resolved);
+	const emptyOwnedBridge = (ledger.bridgeEntries?.length ?? 0) === 0 && ledger.bridgeDirCreated === true;
 	const genuineMigration =
 		!isCurrentBridge &&
-		(foreignLedgerRecord || holdsDescribedBridge) &&
+		(emptyOwnedBridge ? holdsDescribedBridge : foreignLedgerRecord || holdsDescribedBridge) &&
 		isBridgeBasename(path.basename(resolved)) &&
 		(await isGenuinePaseoLedgerDir(oldAgentDir)) &&
 		(await readsRecordedBridgeDir(oldAgentDir, resolved));
