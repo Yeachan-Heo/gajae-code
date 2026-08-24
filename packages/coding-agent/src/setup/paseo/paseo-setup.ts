@@ -601,7 +601,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 
 /** True when the ledger proves GJC owns the current bridge directory and its entries. */
 function ledgerOwnsBridge(ledger: ProvenanceLedger): boolean {
-	return (ledger.bridgeEntries?.length ?? 0) > 0 && ledger.bridgePath !== undefined;
+	return ledger.bridgePath !== undefined && ((ledger.bridgeEntries?.length ?? 0) > 0 || ledger.bridgeDirCreated === true);
 }
 /**
  * Correct the provenance ledger to what a FAILED bridge install actually
