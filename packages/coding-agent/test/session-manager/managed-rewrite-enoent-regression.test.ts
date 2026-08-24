@@ -2,8 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
 import { makeAssistantMessage } from "./helpers";
 
 function tempDir(prefix: string): string {
