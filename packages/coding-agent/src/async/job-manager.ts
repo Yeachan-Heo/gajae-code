@@ -2352,7 +2352,11 @@ export class AsyncJobManager {
 			let candidate = 1;
 			while (true) {
 				const id = `bg_${candidate}`;
-				if (!this.#jobs.has(id)) {
+				// Never recycle an id that still has a queued or in-flight delivery: the
+				// recycled record would give the pending old delivery a mismatched
+				// generation and #deliverDelivery would silently discard it before
+				// onJobComplete ever ran.
+				if (!this.#jobs.has(id) && !this.#hasPendingDeliveryForJobId(id)) {
 					return id;
 				}
 				candidate += 1;
@@ -2502,6 +2506,14 @@ export class AsyncJobManager {
 			this.#deadLetteredDeliveries.delete(jobId);
 			this.#deadLetteredDeliveryOwners.delete(jobId);
 		}
+	}
+
+	/** Whether any queued or in-flight delivery still targets `jobId`. */
+	#hasPendingDeliveryForJobId(jobId: string): boolean {
+		return (
+			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
+			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId)
+		);
 	}
 
 	#recordDeadLetter(delivery: AsyncJobDelivery): void {
