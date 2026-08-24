@@ -148,7 +148,9 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			manager.appendMessage({ role: "user", content: "durable-after-publish-error", timestamp: Date.now() }),
 		).toThrow(/managed_replace_committed_outcome_uncertain/);
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
-		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-publish-error"))).toBe(true);
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-publish-error"))).toBe(
+			true,
+		);
 
 		await manager.ensureOnDisk();
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");

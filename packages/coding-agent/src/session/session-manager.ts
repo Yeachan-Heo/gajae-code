@@ -14970,10 +14970,7 @@ export class SessionManager {
 		)
 			throw new Error("managed_persist_identity_unavailable");
 		const captured = { ...identity, sha256: bounded.sha256 };
-		if (
-			expectedBytes &&
-			captured.sha256 !== crypto.createHash("sha256").update(expectedBytes).digest("hex")
-		)
+		if (expectedBytes && captured.sha256 !== crypto.createHash("sha256").update(expectedBytes).digest("hex"))
 			throw new Error("managed_persist_identity_unavailable");
 		if (
 			expected &&
