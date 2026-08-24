@@ -99,6 +99,7 @@ import {
 	assertManagedDirectoryRoot,
 	captureManagedFileNoFollow,
 	fsyncManagedArtifactTree,
+	isDescriptorBoundManagedIdentity,
 	MANAGED_ARTIFACT_MAX_FILE_BYTES,
 	type ManagedAppendReceipt,
 	type ManagedBoundedAppendExpectation,
@@ -110,7 +111,6 @@ import {
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
 	managedDirectoryRoot,
-	isDescriptorBoundManagedIdentity,
 	mayCleanManagedTreeStaging,
 	retainManagedDirectoryAuthority,
 } from "./internal/managed-session-storage";
