@@ -1,10 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	exactReplacePath,
+	exactReplacePathAsync,
+	type NativeExactFileIdentity,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
 
@@ -95,5 +99,71 @@ describe("native path identity", () => {
 		await fs.writeFile(file, "{}");
 
 		expect(applyOwnerOnlyPathSecurity(file, "directory")).toMatchObject({ ok: false, code: "not_directory" });
+	});
+});
+
+describe("exactReplacePathAsync", () => {
+	function sha256(contents: string): string {
+		return createHash("sha256").update(contents).digest("hex");
+	}
+
+	async function exactIdentity(pathname: string, contents: string): Promise<NativeExactFileIdentity> {
+		const stat = await fs.stat(pathname, { bigint: true });
+		const parent = await fs.stat(path.dirname(pathname), { bigint: true });
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: sha256(contents),
+		};
+	}
+
+	it("matches exactReplacePath on success and identity_mismatch", async () => {
+		const root = await temporaryDirectory();
+		const source = path.join(root, "staged.json");
+		const destination = path.join(root, "state.json");
+		await fs.writeFile(source, "new-state");
+		await fs.writeFile(destination, "old-state");
+		const expectedSource = await exactIdentity(source, "new-state");
+		const expectedDestination = await exactIdentity(destination, "old-state");
+		expect(await exactReplacePathAsync(source, destination, expectedSource, expectedDestination)).toEqual({
+			ok: true,
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("new-state");
+
+		const refusedSource = path.join(root, "staged-refused.json");
+		const refusedDestination = path.join(root, "state-refused.json");
+		await fs.writeFile(refusedSource, "new-state");
+		await fs.writeFile(refusedDestination, "old-state");
+		const refusedExpectedSource = await exactIdentity(refusedSource, "new-state");
+		const refusedExpectedDestination = await exactIdentity(refusedDestination, "old-state");
+		refusedExpectedDestination.sha256 = sha256("not-old-state");
+		const syncRefused = exactReplacePath(
+			refusedSource,
+			refusedDestination,
+			refusedExpectedSource,
+			refusedExpectedDestination,
+		);
+		const asyncSource = path.join(root, "staged-refused-async.json");
+		const asyncDestination = path.join(root, "state-refused-async.json");
+		await fs.writeFile(asyncSource, "new-state");
+		await fs.writeFile(asyncDestination, "old-state");
+		const asyncExpectedSource = await exactIdentity(asyncSource, "new-state");
+		const asyncExpectedDestination = await exactIdentity(asyncDestination, "old-state");
+		asyncExpectedDestination.sha256 = sha256("not-old-state");
+		const asyncRefused = await exactReplacePathAsync(
+			asyncSource,
+			asyncDestination,
+			asyncExpectedSource,
+			asyncExpectedDestination,
+		);
+		expect(asyncRefused).toEqual(syncRefused);
+		expect(syncRefused).toMatchObject({ ok: false, code: "identity_mismatch" });
+		expect(await fs.readFile(refusedDestination, "utf8")).toBe("old-state");
+		expect(await fs.readFile(asyncDestination, "utf8")).toBe("old-state");
 	});
 });

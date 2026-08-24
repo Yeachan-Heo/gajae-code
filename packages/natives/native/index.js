@@ -45,6 +45,7 @@ export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;
 export const exactRemoveDirectoryTree = nativeBindings.exactRemoveDirectoryTree;
 export const exactReplacePath = nativeBindings.exactReplacePath;
+export const exactReplacePathAsync = nativeBindings.exactReplacePathAsync;
 export const exactRestore = nativeBindings.exactRestore;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const exactUnlinkDirect = nativeBindings.exactUnlinkDirect;

@@ -1256,13 +1256,53 @@ pub fn exact_replace_path(
 	expected_source: NativeExactFileIdentity,
 	expected_destination: NativeExactFileIdentity,
 ) -> NativeExactUnlinkResult {
+	dispatch_exact_replace_path(
+		source_path,
+		destination_path,
+		exact_file_identity(&expected_source),
+		exact_file_identity(&expected_destination),
+	)
+}
+
+/// Async variant of [`exact_replace_path`] scheduled on the libuv blocking
+/// pool.
+///
+/// Managed session replacement awaits this boundary so identity hashing and
+/// the checked namespace exchange block one pool thread instead of the agent's
+/// event loop: await timeouts, sibling subagents, and watchdogs keep running.
+/// Same rationale as [`rename_no_replace_path_async`] (issue #4394).
+#[napi]
+pub fn exact_replace_path_async(
+	source_path: String,
+	destination_path: String,
+	expected_source: NativeExactFileIdentity,
+	expected_destination: NativeExactFileIdentity,
+) -> task::Promise<NativeExactUnlinkResult> {
+	let expected_source = exact_file_identity(&expected_source);
+	let expected_destination = exact_file_identity(&expected_destination);
+	task::blocking("exact_replace_path", (), move |_| {
+		Ok(dispatch_exact_replace_path(
+			source_path,
+			destination_path,
+			expected_source,
+			expected_destination,
+		))
+	})
+}
+
+fn dispatch_exact_replace_path(
+	source_path: String,
+	destination_path: String,
+	expected_source: Option<ExactFileIdentity>,
+	expected_destination: Option<ExactFileIdentity>,
+) -> NativeExactUnlinkResult {
 	if source_path.contains('\0') || destination_path.contains('\0') {
 		return NativeExactUnlinkResult::failure("invalid_request");
 	}
-	let Some(expected_source) = exact_file_identity(&expected_source) else {
+	let Some(expected_source) = expected_source else {
 		return NativeExactUnlinkResult::failure("identity_mismatch");
 	};
-	let Some(expected_destination) = exact_file_identity(&expected_destination) else {
+	let Some(expected_destination) = expected_destination else {
 		return NativeExactUnlinkResult::failure("identity_mismatch");
 	};
 	#[cfg(any(unix, windows))]

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -8,11 +9,13 @@ import { ArtifactManager } from "../src/session/artifacts";
 import {
 	MANAGED_ARTIFACT_MAX_FILES,
 	ManagedSessionDescendantStore,
+	captureManagedFileNoFollow,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
 	reapScrubbedProtocolRemnants,
 	reapScrubbedProtocolRemnantsSync,
+	replaceManagedFile,
 } from "../src/session/internal/managed-session-storage";
 
 const REMNANT_PREFIX = ".gjc-exact-unlink-placeholder-";
@@ -46,6 +49,25 @@ async function waitFor(condition: () => Promise<boolean>, timeoutMs = 10_000): P
 		await Bun.sleep(25);
 	}
 	throw new Error("condition not met before timeout");
+}
+
+function sha256(contents: string): string {
+	return createHash("sha256").update(contents).digest("hex");
+}
+
+async function exactIdentity(pathname: string, contents: string): Promise<native.NativeExactFileIdentity> {
+	const stat = await fsp.stat(pathname, { bigint: true });
+	const parent = await fsp.stat(path.dirname(pathname), { bigint: true });
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: sha256(contents),
+	};
 }
 
 describe("async native no-replace publication boundary (issue #4394)", () => {
@@ -142,6 +164,142 @@ describe("async native no-replace publication boundary (issue #4394)", () => {
 			await Bun.sleep(0);
 			await Promise.all(publications);
 			expect(settled).toBe(8);
+		});
+	});
+});
+
+describe("async native exact-replace boundary", () => {
+	it("exactReplacePathAsync commits and never settles from a microtask", async () => {
+		await withTempDir("gjc-async-exact-replace-", async dir => {
+			const source = path.join(dir, "staging");
+			const destination = path.join(dir, "published");
+			await fsp.writeFile(source, "successor");
+			await fsp.writeFile(destination, "predecessor");
+			const expectedSource = await exactIdentity(source, "successor");
+			const expectedDestination = await exactIdentity(destination, "predecessor");
+
+			let settled = false;
+			const pending = native.exactReplacePathAsync(source, destination, expectedSource, expectedDestination).then(
+				result => {
+					settled = true;
+					return result;
+				},
+			);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+
+			const result = await pending;
+			expect(result.ok).toBe(true);
+			expect(await fsp.readFile(destination, "utf8")).toBe("successor");
+			expect(fs.existsSync(source)).toBe(false);
+		});
+	});
+
+	it("exactReplacePathAsync refuses a mismatched destination without replacing it", async () => {
+		await withTempDir("gjc-async-exact-replace-mismatch-", async dir => {
+			const source = path.join(dir, "staging");
+			const destination = path.join(dir, "published");
+			await fsp.writeFile(source, "successor");
+			await fsp.writeFile(destination, "predecessor");
+			const expectedSource = await exactIdentity(source, "successor");
+			const expectedDestination = await exactIdentity(destination, "predecessor");
+			expectedDestination.sha256 = sha256("not-the-predecessor");
+
+			const result = await native.exactReplacePathAsync(source, destination, expectedSource, expectedDestination);
+			expect(result.ok).toBe(false);
+			expect(result.code).toBe("identity_mismatch");
+			expect(await fsp.readFile(destination, "utf8")).toBe("predecessor");
+			expect(await fsp.readFile(source, "utf8")).toBe("successor");
+		});
+	});
+
+	it("exactReplacePathAsync matches exactReplacePath success and refusal codes", async () => {
+		await withTempDir("gjc-async-exact-replace-parity-", async dir => {
+			const source = path.join(dir, "staging-ok");
+			const destination = path.join(dir, "published-ok");
+			await fsp.writeFile(source, "successor");
+			await fsp.writeFile(destination, "predecessor");
+			const expectedSource = await exactIdentity(source, "successor");
+			const expectedDestination = await exactIdentity(destination, "predecessor");
+			expect(await native.exactReplacePathAsync(source, destination, expectedSource, expectedDestination)).toEqual({
+				ok: true,
+			});
+
+			const refusedSource = path.join(dir, "staging-refused");
+			const refusedDestination = path.join(dir, "published-refused");
+			await fsp.writeFile(refusedSource, "successor");
+			await fsp.writeFile(refusedDestination, "predecessor");
+			const refusedExpectedSource = await exactIdentity(refusedSource, "successor");
+			const refusedExpectedDestination = await exactIdentity(refusedDestination, "predecessor");
+			refusedExpectedDestination.sha256 = sha256("not-the-predecessor");
+			const syncRefused = native.exactReplacePath(
+				refusedSource,
+				refusedDestination,
+				refusedExpectedSource,
+				refusedExpectedDestination,
+			);
+			const asyncSource = path.join(dir, "staging-refused-async");
+			const asyncDestination = path.join(dir, "published-refused-async");
+			await fsp.writeFile(asyncSource, "successor");
+			await fsp.writeFile(asyncDestination, "predecessor");
+			const asyncExpectedSource = await exactIdentity(asyncSource, "successor");
+			const asyncExpectedDestination = await exactIdentity(asyncDestination, "predecessor");
+			asyncExpectedDestination.sha256 = sha256("not-the-predecessor");
+			const asyncRefused = await native.exactReplacePathAsync(
+				asyncSource,
+				asyncDestination,
+				asyncExpectedSource,
+				asyncExpectedDestination,
+			);
+			expect(asyncRefused.ok).toBe(false);
+			expect(asyncRefused.code).toBe(syncRefused.code);
+			expect(syncRefused.code).toBe("identity_mismatch");
+		});
+	});
+
+	it("replaceManagedFile crosses the threadpool boundary and matches the sync twin", async () => {
+		await withTempDir("gjc-async-managed-replace-", async dir => {
+			const destination = path.join(dir, "session.jsonl");
+			const root = managedDirectoryRoot(dir);
+			publishManagedFileNoReplaceSync(destination, new TextEncoder().encode("predecessor\n"));
+			const expected = captureManagedFileNoFollow(destination);
+
+			let settled = false;
+			const pending = replaceManagedFile(
+				destination,
+				new TextEncoder().encode("successor\n"),
+				root,
+				"default",
+				undefined,
+				expected.identity,
+			).then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			await pending;
+			expect(await fsp.readFile(destination, "utf8")).toBe("successor\n");
+		});
+	});
+
+	it("store.replace never settles from a microtask", async () => {
+		await withTempDir("gjc-async-store-replace-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("predecessor\n"));
+
+			let settled = false;
+			const pending = store.replace("session.jsonl", Buffer.from("successor\n")).then(() => {
+				settled = true;
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+			await pending;
+			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("successor\n");
 		});
 	});
 });

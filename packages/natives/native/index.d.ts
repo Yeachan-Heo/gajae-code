@@ -909,6 +909,17 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
 export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
+ * Async variant of [`exact_replace_path`] scheduled on the libuv blocking
+ * pool.
+ *
+ * Managed session replacement awaits this boundary so identity hashing and
+ * the checked namespace exchange block one pool thread instead of the agent's
+ * event loop: await timeouts, sibling subagents, and watchdogs keep running.
+ * Same rationale as [`rename_no_replace_path_async`] (issue #4394).
+ */
+export declare function exactReplacePathAsync(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): Promise<NativeExactUnlinkResult>
+
+/**
  * Restore only the detached object that still has the supplied platform
  * identity. The detached and original paths must retain the same validated
  * parent, and restoration never replaces an existing original path.
