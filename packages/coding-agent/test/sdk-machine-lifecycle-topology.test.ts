@@ -197,7 +197,7 @@ test("shipped ACP rejects raw generic lifecycle ingress in favor of typed sessio
 test("shipped mcp-serve sdk stdio drives authenticated G03-G07 lifecycle topology with durable effects", async () => {
 	const life = await fixture();
 	await life.invokeScenario((operation, input, idempotencyKey) =>
-		mcpGlobal(life.repo, life.agentDir, operation, input, idempotencyKey),
+		mcpGlobal(life.repo, life.agentDir, operation, input, idempotencyKey, life.environment),
 	);
 }, 240_000);
 

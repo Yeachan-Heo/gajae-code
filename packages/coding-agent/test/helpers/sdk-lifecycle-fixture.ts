@@ -22,6 +22,7 @@ export type LifecycleGlobal = (
 export type LifecycleFixture = {
 	repo: string;
 	agentDir: string;
+	environment: NodeJS.ProcessEnv;
 	stateRoot: string;
 	invokeScenario: (global: LifecycleGlobal) => Promise<void>;
 	cleanup: () => Promise<void>;
@@ -241,6 +242,7 @@ export async function createLifecycleFixture(): Promise<LifecycleFixture> {
 	return {
 		repo,
 		agentDir,
+		environment,
 		stateRoot,
 		async invokeScenario(global) {
 			const created = success(
