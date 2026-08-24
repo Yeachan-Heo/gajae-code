@@ -726,7 +726,25 @@ async function createNoReplace(entry: BridgeEntryPlan): Promise<void> {
 	}
 }
 
-async function pruneStale(plan: BridgePrunePlan): Promise<void> {
+async function pruneStale(plan: BridgePrunePlan, sourceDir: string): Promise<void> {
+	// The source snapshot was taken during preflight, but a Paseo update can
+	// recreate a skill before the destructive unlink. Revalidate immediately
+	// before pruning so a link that is live again is preserved and remains
+	// covered by the prewritten provenance record.
+	const sourceSkill = path.join(sourceDir, plan.name);
+	try {
+		await fs.stat(sourceSkill);
+		throw new SkillsBridgeError(
+			`Refusing to prune Paseo skill bridge entry because the source skill reappeared: ${sourceSkill}; preserving ${plan.linkPath}`,
+		);
+	} catch (error) {
+		if (error instanceof SkillsBridgeError) throw error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			throw new SkillsBridgeError(
+				`Refusing to prune Paseo skill bridge entry because the source skill could not be revalidated (${sourceSkill}): ${error instanceof Error ? error.message : String(error)}; preserving ${plan.linkPath}`,
+			);
+		}
+	}
 	await quarantineUnlinkVerified(plan.linkPath, resolvedLinkTarget(plan.linkTarget, plan.linkPath), plan.linkIdentity);
 }
 
@@ -784,7 +802,10 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 			bridgeDirIdentity = await directoryIdentity(preflight.bridgeDir);
 		}
 		for (const plan of preflight.prunes) {
-			await pruneStale(plan);
+			if (preflight.sourceDir === undefined) {
+				throw new SkillsBridgeError(`Missing Paseo skill source during prune: ${plan.linkPath}`);
+			}
+			await pruneStale(plan, preflight.sourceDir);
 			prunedEntries.push(plan.name);
 		}
 		for (const entry of Object.values(preflight.entries)) {

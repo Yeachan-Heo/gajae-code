@@ -443,6 +443,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			};
 		}
 		const bridgeLedger = await readProvenance(deps.paths.provenanceLedger);
+		// A migration rollback may recreate old symlinks with fresh no-follow
+		// identities. Compensation runs newest-first, so the old-link restoration
+		// records those identities here for the later bridge inverse to carry into
+		// the restored provenance instead of writing stale pre-cutover inodes.
+		let compensatedOldBridgeEntryIdentities: Readonly<Record<string, BridgeEntryIdentity>> | undefined;
 		// Migration binding: recorded ownership belongs to the recorded bridge
 		// PATH, not to the skill names alone. When the agent/profile path moved,
 		// the names are not carried over silently -- a user-owned exact-target
@@ -685,7 +690,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							bridgePath: bridgeLedger.bridgePath,
 							bridgeSourceDir: bridgeLedger.bridgeSourceDir,
 							bridgeEntries: bridgeLedger.bridgeEntries,
-							bridgeEntryIdentities: bridgeLedger.bridgeEntryIdentities,
+							bridgeEntryIdentities: compensatedOldBridgeEntryIdentities ?? bridgeLedger.bridgeEntryIdentities,
 							bridgeDirCreated: bridgeLedger.bridgeDirCreated,
 							bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
 						});
@@ -746,7 +751,16 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			// replacing a successor that claimed the pathname.
 			completed.push({
 				label: migratedOldBridgeDir,
-				undo: () => restoreMigratedOldBridgeEntries(migratedOldBridgeDir!, migratedOldEntries),
+				undo: async () => {
+					const restored = await restoreMigratedOldBridgeEntries(migratedOldBridgeDir!, migratedOldEntries);
+					if (restored.status === "reverted") {
+						compensatedOldBridgeEntryIdentities = {
+							...(bridgeLedger.bridgeEntryIdentities ?? {}),
+							...restored.entryIdentities,
+						};
+					}
+					return restored;
+				},
 			});
 			try {
 				await inverseSkillsBridge(deps, oldCleanup, { bridgeDir: migratedOldBridgeDir });
@@ -857,10 +871,13 @@ async function restoreMigratedOldBridgeEntries(
 	bridgeDir: string,
 	entries: readonly MigratedOldBridgeEntry[],
 ): Promise<
-	| { readonly status: "reverted" }
+	| { readonly status: "reverted"; readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>> }
 	| { readonly status: "conflict"; readonly detail: string; readonly retained: readonly string[] }
 > {
 	const missing: MigratedOldBridgeEntry[] = [];
+	const entryIdentities: Record<string, BridgeEntryIdentity> = Object.fromEntries(
+		entries.map(entry => [entry.name, entry.identity]),
+	);
 	try {
 		for (const entry of entries) {
 			const destination = path.join(bridgeDir, entry.name);
@@ -912,8 +929,14 @@ async function restoreMigratedOldBridgeEntries(
 					retained: [bridgeDir],
 				};
 			}
+			entryIdentities[entry.name] = {
+				dev: restored.dev.toString(),
+				ino: restored.ino.toString(),
+				size: restored.size.toString(),
+				mtimeNs: restored.mtimeNs.toString(),
+			};
 		}
-		return { status: "reverted" };
+		return { status: "reverted", entryIdentities };
 	} catch (error) {
 		return {
 			status: "conflict",

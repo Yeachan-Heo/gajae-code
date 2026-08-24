@@ -14,6 +14,7 @@ import {
 	runJsonStep,
 	SagaStepError,
 } from "../src/setup/paseo/install-saga";
+import * as paseoJsonPublisher from "../src/setup/paseo/json-publisher";
 import {
 	currentIdentity,
 	hashBytes,
@@ -27,6 +28,7 @@ import {
 } from "../src/setup/paseo/json-publisher";
 import { createOrchestrationSeed } from "../src/setup/paseo/orchestration-preferences";
 import {
+	type BridgeEntryIdentity,
 	classifyIdentity,
 	classifyIntent,
 	INTENT_VERSION,
@@ -1681,6 +1683,41 @@ describe("skills bridge", () => {
 		await expect(fs.stat(path.join(fixture.paths.bridgeDir, "paseo-loop"))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	test("a source skill reappearing immediately before prune is preserved with provenance", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const sourceSkill = path.join(fixture.paths.agentsSkillsDir as string, "paseo-loop");
+		const bridgeSkill = path.join(fixture.paths.bridgeDir, "paseo-loop");
+		await safeRm(sourceSkill, { recursive: true });
+
+		const originalStat = fs.stat.bind(fs);
+		let reappeared = false;
+		const statImpl = async (target: any, options?: any) => {
+			if (!reappeared && path.resolve(String(target)) === path.resolve(sourceSkill)) {
+				reappeared = true;
+				await fs.mkdir(sourceSkill, { recursive: true });
+			}
+			return originalStat(target, options);
+		};
+		const stat = spyOn(fs, "stat").mockImplementation(statImpl as typeof fs.stat);
+		try {
+			const install = await runPaseoSetup({}, fixture.deps);
+			expect(install.kind).toBe("install");
+			if (install.kind !== "install") throw new Error("expected an install outcome");
+			expect(install.result.outcome).toBe("partial-install");
+			if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
+			expect(install.result.evidence.detail).toContain("source skill reappeared");
+		} finally {
+			stat.mockRestore();
+		}
+
+		expect(reappeared).toBe(true);
+		expect((await fs.lstat(bridgeSkill)).isSymbolicLink()).toBe(true);
+		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeEntries).toContain("paseo-loop");
+	});
+
 	test("a resolved source that becomes empty prunes to a recorded-created empty bridge, and remove cleans it (#4644 review r5)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
@@ -1766,6 +1803,46 @@ describe("skills bridge", () => {
 		// GJC's entry survives: the restore never happened, so neither may the delete.
 		const after = JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>;
 		expect(providersOf(after).gjc).toBeDefined();
+	});
+
+	test("a failed sidecar deletion retries after restoring the user provider value", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const userEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "USER EDIT", enabled: false };
+		await seedConfig(fixture.paths, { gjc: userEntry });
+		await runPaseoSetup({ force: true }, fixture.deps);
+		const ledgerBefore = await readProvenance(fixture.paths.provenanceLedger);
+		const sidecarPath = ledgerBefore.providerReplacedEntries?.gjc?.backupPath;
+		if (sidecarPath === undefined) throw new Error("expected a replaced-provider sidecar");
+
+		const realRemove = paseoJsonPublisher.removeReplacedProviderBackup.bind(paseoJsonPublisher);
+		let attempts = 0;
+		const removeSidecar = spyOn(paseoJsonPublisher, "removeReplacedProviderBackup").mockImplementation(
+			async (...args) => {
+				attempts += 1;
+				if (attempts === 1) return false;
+				return realRemove(...args);
+			},
+		);
+		try {
+			const first = await runPaseoSetup({ remove: true }, fixture.deps);
+			expect(first.kind).toBe("remove");
+			if (first.kind !== "remove") throw new Error("expected a remove outcome");
+			expect(first.result.outcome).toBe("partial-removal");
+			const restored = JSON.parse(await fs.readFile(fixture.paths.configJson, "utf8")) as Record<string, unknown>;
+			expect(providersOf(restored).gjc).toEqual(userEntry);
+			expect((await readProvenance(fixture.paths.provenanceLedger)).providerReplacedEntries?.gjc).toBeDefined();
+			await expect(fs.stat(sidecarPath)).resolves.toBeDefined();
+		} finally {
+			removeSidecar.mockRestore();
+		}
+
+		const second = await runPaseoSetup({ remove: true }, fixture.deps);
+		expect(second.kind).toBe("remove");
+		if (second.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(second.result.outcome).toBe("removed");
+		expect((await readProvenance(fixture.paths.provenanceLedger)).providerReplacedEntries?.gjc).toBeUndefined();
+		await expect(fs.stat(sidecarPath)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	test("replaced-provider sidecar names are injective across colliding sanitized keys (#4644 review r8)", async () => {
@@ -2563,9 +2640,27 @@ describe("skills bridge", () => {
 				expect(await fs.readlink(path.join(oldDir, name))).toBe(beforeLinks[name]);
 			}
 			const afterLedger = await readProvenance(fixture.paths.provenanceLedger);
+			const restoredIdentities = Object.fromEntries(
+				await Promise.all(
+					SKILL_NAMES.map(async name => {
+						const stat = await fs.lstat(path.join(oldDir, name), { bigint: true });
+						return [
+							name,
+							{
+								dev: stat.dev.toString(),
+								ino: stat.ino.toString(),
+								size: stat.size.toString(),
+								mtimeNs: stat.mtimeNs.toString(),
+							},
+						];
+					}),
+				),
+			) as Record<string, BridgeEntryIdentity>;
 			// The provider step may retain its convergence marker for an identical
 			// existing entry; migration compensation is responsible for restoring
-			// the old bridge facts, not erasing unrelated provider provenance.
+			// the old bridge facts, not erasing unrelated provider provenance. A
+			// recreated link carries a fresh inode identity, so the restored ledger
+			// must match the live links rather than the stale pre-cutover identities.
 			expect({
 				bridgePath: afterLedger.bridgePath,
 				bridgeSourceDir: afterLedger.bridgeSourceDir,
@@ -2577,7 +2672,7 @@ describe("skills bridge", () => {
 				bridgePath: beforeLedger.bridgePath,
 				bridgeSourceDir: beforeLedger.bridgeSourceDir,
 				bridgeEntries: beforeLedger.bridgeEntries,
-				bridgeEntryIdentities: beforeLedger.bridgeEntryIdentities,
+				bridgeEntryIdentities: restoredIdentities,
 				bridgeDirCreated: beforeLedger.bridgeDirCreated,
 				bridgeDirIdentity: beforeLedger.bridgeDirIdentity,
 			});

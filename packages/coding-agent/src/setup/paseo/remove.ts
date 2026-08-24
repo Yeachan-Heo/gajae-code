@@ -272,6 +272,7 @@ export async function removePaseoSetup(
 	const ledger = await readProvenance(deps.paths.provenanceLedger);
 	const ownsAnything =
 		provenancedProviderKeys(ledger).length > 0 ||
+		Object.keys(ledger.providerReplacedEntries ?? {}).length > 0 ||
 		Object.keys(ledger.seededOrchestrationKeys).length > 0 ||
 		(ledger.bridgeEntries?.length ?? 0) > 0 ||
 		// An owned empty bridge is still GJC-owned state: a convergence run that
@@ -475,7 +476,9 @@ export async function removePaseoSetup(
 	// that entry instead of deleting the key, because the replaced content was
 	// never GJC's to take. Keys marked pre-existing (a matching entry that
 	// existed before any GJC run) are not in providerKeys and are untouched.
-	const providerKeys = provenancedProviderKeys(nextLedger);
+	const providerKeys = [
+		...new Set([...provenancedProviderKeys(nextLedger), ...Object.keys(nextLedger.providerReplacedEntries ?? {})]),
+	].sort();
 	if (providerKeys.length > 0) {
 		const survivors: Record<string, string> = {};
 		// A `--force` overwrite preserved the replaced value in a private sidecar
@@ -523,6 +526,33 @@ export async function removePaseoSetup(
 				restores.set(key, backup.value);
 			}
 		}
+		const pendingSidecarKeys = new Set<string>();
+		const restoredContinuations = new Set<string>();
+		const providersBefore = providersOf(configNow?.parsed ?? {});
+		// A prior removal may have restored the user's value successfully but
+		// failed while deleting its authenticated sidecar. On retry the value no
+		// longer hashes as GJC-owned, so recognize the exact sidecar value as a
+		// cleanup continuation rather than treating it as an unrelated edit.
+		for (const [key, ref] of Object.entries(nextLedger.providerReplacedEntries ?? {})) {
+			const entry = providersBefore?.[key];
+			if (entry === undefined) continue;
+			if (isProvenancedProvider(nextLedger, key, providerEntryHash(entry as PaseoProviderEntry))) continue;
+			if (ref.backupPath !== replacedProviderBackupPath(deps.paths.configJson, key)) {
+				remaining.push(deps.paths.configJson);
+				await writeProvenance(deps.paths.provenanceLedger, nextLedger);
+				return partial(removed, remaining, {
+					failedStep: deps.paths.configJson,
+					detail: `the replaced-provider backup for ${key} is recorded at an unexpected path (${ref.backupPath}); refusing to authenticate pending cleanup`,
+					retained: [deps.paths.provenanceLedger],
+				});
+			}
+			const backup = await readReplacedProviderBackup(ref.backupPath, key, ref.valueSha256);
+			if (backup.found && JSON.stringify(entry) === JSON.stringify(backup.value)) {
+				restoredContinuations.add(key);
+			} else {
+				pendingSidecarKeys.add(key);
+			}
+		}
 		const outcome = await revertJson(deps.paths.configJson, options.now, draft => {
 			const providers = providersOf(draft);
 			if (!providers) return;
@@ -531,6 +561,7 @@ export async function removePaseoSetup(
 				if (entry === undefined) continue;
 				const hash = providerEntryHash(entry as PaseoProviderEntry);
 				if (!isProvenancedProvider(nextLedger, key, hash)) {
+					if (restoredContinuations.has(key)) continue;
 					survivors[key] = nextLedger.providerKeys[key] ?? hash;
 					continue;
 				}
@@ -560,13 +591,12 @@ export async function removePaseoSetup(
 		// keeping the sidecar would strand a credential file nothing references.
 		const orphaned: string[] = [];
 		const relevantRefs: { readonly key: string; readonly ref: ProviderReplacedRef }[] = [];
+		const providersAfter = providersOf(
+			(await readTarget(deps.paths.configJson).catch(() => undefined))?.parsed ?? {},
+		);
 		for (const [key, ref] of Object.entries(nextLedger.providerReplacedEntries ?? {})) {
 			if (survivors[key] !== undefined) continue;
-			if (
-				restores.has(key) ||
-				providersOf((await readTarget(deps.paths.configJson).catch(() => undefined))?.parsed ?? {})?.[key] ===
-					undefined
-			) {
+			if (restores.has(key) || restoredContinuations.has(key) || providersAfter?.[key] === undefined) {
 				// EVERY reference is validated against the deterministic sidecar
 				// path GJC itself derives (#4644 review r16) — the same rule the
 				// restore loop applies — before any deletion: a tampered ledger
@@ -581,18 +611,30 @@ export async function removePaseoSetup(
 					});
 				}
 				relevantRefs.push({ key, ref });
+			} else {
+				pendingSidecarKeys.add(key);
 			}
 		}
+		const cleanedKeys = new Set<string>();
 		for (const {
 			key,
 			ref: { backupPath, valueSha256 },
 		} of relevantRefs) {
 			// Authenticate and delete under one inode-bound protocol. A pathname
 			// replacement after authentication is retained, never removed.
-			if (!(await removeReplacedProviderBackup(backupPath, key, valueSha256))) {
+			if (await removeReplacedProviderBackup(backupPath, key, valueSha256)) {
+				cleanedKeys.add(key);
+			} else {
 				orphaned.push(backupPath);
 			}
 		}
+		const keptRefs: Record<string, ProviderReplacedRef> = { ...(nextLedger.providerReplacedEntries ?? {}) };
+		const keptProviderKeys: Record<string, string> = { ...nextLedger.providerKeys };
+		for (const key of cleanedKeys) {
+			delete keptRefs[key];
+			delete keptProviderKeys[key];
+		}
+		nextLedger = { ...nextLedger, providerKeys: keptProviderKeys, providerReplacedEntries: keptRefs };
 		if (orphaned.length > 0) {
 			remaining.push(deps.paths.configJson);
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
@@ -602,16 +644,26 @@ export async function removePaseoSetup(
 				retained: [deps.paths.provenanceLedger],
 			});
 		}
-		removed.push(deps.paths.configJson);
-		const keptRefs: Record<string, ProviderReplacedRef> = {};
-		for (const [key, ref] of Object.entries(nextLedger.providerReplacedEntries ?? {})) {
-			if (survivors[key] !== undefined) keptRefs[key] = ref;
+		if (pendingSidecarKeys.size > 0) {
+			remaining.push(deps.paths.configJson);
+			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
+			return partial(removed, remaining, {
+				failedStep: deps.paths.configJson,
+				detail: `replaced-provider sidecar cleanup remains pending for ${[...pendingSidecarKeys].join(", ")}; the preserved value or sidecar changed, so GJC will not clear its reference`,
+				retained: [deps.paths.provenanceLedger, ...Object.values(keptRefs).map(ref => ref.backupPath)],
+			});
 		}
-		nextLedger = { ...nextLedger, providerKeys: survivors, providerReplacedEntries: keptRefs };
+		removed.push(deps.paths.configJson);
+		nextLedger = {
+			...nextLedger,
+			providerKeys: { ...survivors, ...keptProviderKeys },
+			providerReplacedEntries: keptRefs,
+		};
 	}
 
 	const stillOwns =
 		Object.keys(nextLedger.providerKeys).length > 0 ||
+		Object.keys(nextLedger.providerReplacedEntries ?? {}).length > 0 ||
 		Object.keys(nextLedger.seededOrchestrationKeys).length > 0 ||
 		(nextLedger.bridgeEntries?.length ?? 0) > 0 ||
 		nextLedger.bridgeDirCreated === true;
