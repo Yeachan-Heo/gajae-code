@@ -9,6 +9,16 @@ export const DEFAULT_TEST_TIMEOUT_MS = 30_000;
 export const DEFAULT_FILE_TIMEOUT_MS = 5 * 60_000;
 export const DEFAULT_CONCURRENCY = 1;
 export const TEST_PRELOAD = "./scripts/test-preload.ts";
+export const ACP_ADAPTER_DISPOSITIONS_TEST_FILE =
+	"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts";
+export const ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS = 15 * 60_000;
+
+// The ACP cohort's 97 production adapter cases measure ~151s per 20 cases,
+// implying ~732s for the full file after its ~8–9s fixture startup. Keep the
+// measured headroom local to this file instead of widening the harness default.
+const FILE_TIMEOUT_OVERRIDES = new Map<string, number>([
+	[ACP_ADAPTER_DISPOSITIONS_TEST_FILE, ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS],
+]);
 
 export interface HarnessOptions {
 	root: string;
@@ -39,6 +49,10 @@ export interface LinuxProcessIdentity {
 	processGroup: number;
 	startTime: string;
 	state: string;
+}
+
+export function resolveFileTimeout(file: string, defaultFileTimeoutMs: number): number {
+	return FILE_TIMEOUT_OVERRIDES.get(file) ?? defaultFileTimeoutMs;
 }
 
 const repoRoot = path.join(import.meta.dir, "..");
@@ -380,7 +394,7 @@ export async function runHarness(
 			process.stdout.write(`\n[${index + 1}/${files.length}] START ${file}\n`);
 			let result: TestProcessResult;
 			try {
-				result = await runner(spec, options.fileTimeoutMs);
+				result = await runner(spec, resolveFileTimeout(file, options.fileTimeoutMs));
 			} catch (error) {
 				process.stderr.write(`${file}: harness runner failed: ${error instanceof Error ? error.message : String(error)}\n`);
 				result = { exitCode: 1, timedOut: false };
