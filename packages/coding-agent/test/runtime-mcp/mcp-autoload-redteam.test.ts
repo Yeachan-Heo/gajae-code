@@ -50,6 +50,48 @@ function demoConfig(overrides: Partial<MCPStdioServerConfig> = {}): MCPStdioServ
 	};
 }
 
+const PLUGIN_MCP_STARTUP_TIMEOUT_MS = 5_000;
+
+async function waitForPluginMcpConnections(manager: MCPManager, names: string[]): Promise<void> {
+	if (names.every(name => manager.getConnectionStatus(name) !== "connecting")) return;
+
+	const settled = Promise.withResolvers<void>();
+	const timer = setTimeout(
+		() => settled.reject(new Error(`Timed out waiting for plugin MCP connections: ${names.join(", ")}`)),
+		PLUGIN_MCP_STARTUP_TIMEOUT_MS,
+	);
+	manager.setOnToolsChanged(() => {
+		if (names.every(name => manager.getConnectionStatus(name) !== "connecting")) settled.resolve();
+	});
+	if (names.every(name => manager.getConnectionStatus(name) !== "connecting")) settled.resolve();
+	try {
+		await settled.promise;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function synchronizePluginMcpStartup(): void {
+	const connectServers = MCPManager.prototype.connectServers;
+	vi.spyOn(MCPManager.prototype, "connectServers").mockImplementation(async function (configs, sources, onConnecting) {
+		// Plugin manifests intentionally omit a timeout. Give this test fixture a
+		// bounded connection window so CI scheduler variance cannot turn a valid
+		// plugin authority into a startup-timeout teardown.
+		const boundedConfigs = Object.fromEntries(
+			Object.entries(configs).map(([name, config]) => [
+				name,
+				config.timeout === undefined ? { ...config, timeout: PLUGIN_MCP_STARTUP_TIMEOUT_MS } : config,
+			]),
+		);
+		const result = await connectServers.call(this, boundedConfigs, sources, onConnecting);
+		await waitForPluginMcpConnections(this, Object.keys(boundedConfigs));
+		return {
+			...result,
+			connectedServers: this.getConnectedServers(),
+			tools: this.getTools(),
+		};
+	});
+}
 const originalAgentDir = getAgentDir();
 
 describe("red-team: conventional MCP autoload", () => {
@@ -237,6 +279,7 @@ describe("red-team: conventional MCP autoload", () => {
 				cwd: projectDir,
 			});
 
+			synchronizePluginMcpStartup();
 			const { session, mcpManager } = await createAgentSession({
 				...isolatedSessionOptions(),
 				enableMcpAutoload: false,
@@ -286,6 +329,7 @@ describe("red-team: conventional MCP autoload", () => {
 				sealConnectionSet.call(this);
 				sealObserved.resolve();
 			});
+			synchronizePluginMcpStartup();
 
 			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 			try {
@@ -404,6 +448,7 @@ await sealObserved.promise;
 			const r = await installGjcBundle({ cwd: projectDir }, "project", path.join(fixturesRoot, "valid-mcp-bundle"));
 			expect(r.ok).toBe(true);
 
+			synchronizePluginMcpStartup();
 			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 			try {
 				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
