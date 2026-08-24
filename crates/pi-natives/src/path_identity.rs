@@ -1385,17 +1385,18 @@ pub fn snapshot_directory_tree(path: String) -> NativeDirectoryTreeResult {
 }
 
 /// Async variant of [`snapshot_directory_tree`] on a dedicated native thread.
+///
 /// A recursive legacy lock directory can contain an unbounded number of entries
 /// and every entry may require a blocking metadata read and file digest; a
 /// wedged mount must not consume a shared libuv worker after the lock deadline
 /// expires. `timeout_ms`, when supplied, settles with a typed refusal rather
 /// than publishing an incomplete capture.
 #[napi]
-pub fn snapshot_directory_tree_async<'env>(
-	env: &'env Env,
+pub fn snapshot_directory_tree_async(
+	env: &Env,
 	path: String,
 	timeout_ms: Option<u32>,
-) -> napi::Result<PromiseRaw<'env, NativeDirectoryTreeResult>> {
+) -> napi::Result<PromiseRaw<'_, NativeDirectoryTreeResult>> {
 	task::isolated_with_timeout(
 		env,
 		"snapshot_directory_tree",
@@ -1435,20 +1436,23 @@ pub fn exact_remove_directory_tree(
 }
 
 /// Async variant of [`exact_remove_directory_tree`] on a dedicated native
-/// thread. Directory removal re-reads and scrubs every authorized entry and
+/// thread.
+///
+/// Directory removal re-reads and scrubs every authorized entry and
 /// may block indefinitely in a filesystem syscall; it must not run on the JS
 /// thread or consume a shared libuv worker after the caller's deadline expires.
+///
 /// `timeout_ms`, when supplied, settles with a typed refusal rather than
 /// reporting a partial or successful removal. The synchronous boundary remains
 /// available for consumers that explicitly need a blocking call.
 #[napi]
-pub fn exact_remove_directory_tree_async<'env>(
-	env: &'env Env,
+pub fn exact_remove_directory_tree_async(
+	env: &Env,
 	path: String,
 	snapshot: NativeDirectoryTreeSnapshot,
 	parent_identity: Option<NativeDirectoryParentIdentity>,
 	timeout_ms: Option<u32>,
-) -> napi::Result<PromiseRaw<'env, NativeExactUnlinkResult>> {
+) -> napi::Result<PromiseRaw<'_, NativeExactUnlinkResult>> {
 	if path.contains('\0') {
 		return task::future(env, "exact_remove_directory_tree", async {
 			Ok(NativeExactUnlinkResult::failure("io_error"))

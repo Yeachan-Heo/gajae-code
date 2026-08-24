@@ -312,12 +312,13 @@ where
 	isolated_with_timeout(env, tag, None, work, None)
 }
 
-/// As [`isolated`], but settle the JavaScript promise with `timeout_value` when
-/// the dedicated worker has not produced a result by `timeout_ms`. The worker
-/// itself remains detached because a blocked kernel syscall cannot be safely
-/// cancelled; dropping its receiver prevents a late result from crossing the
-/// N-API boundary. The timeout value must be a typed refusal, never a partial
-/// success.
+/// As [`isolated`], but settle the JavaScript promise with `timeout_value`.
+///
+/// The promise settles when the dedicated worker has not produced a result by
+/// `timeout_ms`. The worker itself remains detached because a blocked kernel
+/// syscall cannot be safely cancelled; dropping its receiver prevents a late
+/// result from crossing the N-API boundary. The timeout value must be a typed
+/// refusal, never a partial success.
 pub fn isolated_with_timeout<'env, T, F>(
 	env: &'env Env,
 	tag: &'static str,
