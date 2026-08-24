@@ -1545,7 +1545,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 }, 20_000);
 
 test("a frame the surface refused stays above the cursor and is re-served by the next replay", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, awaitFrameSettlement }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1573,8 +1573,7 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 			]);
 
 			// The refused frame is re-served and published, once, in sequence.
-			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			await awaitFrameSettlement(GENERATION, 2, 2);
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 			expect(warnings.filter(line => line.includes("publication failed at seq 2"))).toHaveLength(1);
 		});
