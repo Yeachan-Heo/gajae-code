@@ -33,7 +33,7 @@ import {
 import { removePaseoSetup, safeBridgeEntryNames, validatedBridgeDir } from "./remove";
 import type { PaseoInstallResult, PaseoRemoveResult, SetupCheckResult } from "./result-types";
 import { type PaseoSetupDependencies, type PaseoSkillSource, resolvePaseoSkillsSource } from "./setup-deps";
-import type { SkillsBridgeInstallResult } from "./skills-bridge";
+import type { SkillsBridgeAmbiguity, SkillsBridgeInstallResult } from "./skills-bridge";
 import {
 	installSkillsBridge,
 	inverseSkillsBridge,
@@ -466,12 +466,31 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			// pointing at missing links.
 			const oldBridgeDir = await validatedBridgeDir(bridgeLedger, deps);
 			migratedOldSourceDir = bridgeLedger.bridgeSourceDir ?? legacySourceDirFor(deps);
-			migratedOldEntries = await captureMigratedOldBridgeEntries(
+			const capturedOldBridge = await captureMigratedOldBridgeEntries(
 				oldBridgeDir,
 				safeBridgeEntryNames(bridgeLedger.bridgeEntries ?? []),
 				migratedOldSourceDir,
 				bridgeLedger.bridgeEntryIdentities,
 			);
+			if (capturedOldBridge.ambiguities.length > 0) {
+				const retained = [
+					...new Set([
+						...capturedOldBridge.ambiguities.map(ambiguity => ambiguity.linkPath),
+						deps.paths.provenanceLedger,
+					]),
+				];
+				return {
+					outcome: "partial-install",
+					compensated: [],
+					uncompensated: retained,
+					evidence: {
+						failedStep: "paseo skills bridge",
+						detail: capturedOldBridge.ambiguities.map(ambiguity => ambiguity.detail).join("; "),
+						retained,
+					},
+				};
+			}
+			migratedOldEntries = capturedOldBridge.entries;
 			migratedOldBridgeDir = oldBridgeDir;
 		}
 		const previouslyRecorded = isMigration ? new Set<string>() : new Set(bridgeLedger.bridgeEntries ?? []);
@@ -772,6 +791,11 @@ type MigratedOldBridgeEntry = {
 	readonly identity: BridgeEntryIdentity;
 };
 
+type MigratedOldBridgeCapture = {
+	readonly entries: readonly MigratedOldBridgeEntry[];
+	readonly ambiguities: readonly SkillsBridgeAmbiguity[];
+};
+
 /**
  * Capture the exact old links before migration cutover. A durable per-entry
  * identity is required before migration may remove a link: a prewritten name
@@ -782,8 +806,9 @@ async function captureMigratedOldBridgeEntries(
 	names: readonly string[],
 	sourceDir: string,
 	recordedIdentities: Readonly<Record<string, BridgeEntryIdentity>> | undefined,
-): Promise<readonly MigratedOldBridgeEntry[]> {
+): Promise<MigratedOldBridgeCapture> {
 	const captured: MigratedOldBridgeEntry[] = [];
+	const ambiguities: SkillsBridgeAmbiguity[] = [];
 	for (const name of names) {
 		const destination = path.join(bridgeDir, name);
 		const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
@@ -809,9 +834,14 @@ async function captureMigratedOldBridgeEntries(
 		const recorded = recordedIdentities?.[name];
 		if (recorded === undefined) {
 			// Pre-identity ledgers cannot prove that this matching link is still
-			// the object GJC created. Preserve the ambiguous pathname and leave it
-			// out of the migrated ownership set instead of wedging setup or deleting
-			// a user-created successor.
+			// the object GJC created. Preserve the ambiguous pathname and stop the
+			// migration before it can rewrite the bridge path or registration.
+			ambiguities.push({
+				name,
+				linkPath: destination,
+				detail: `preserving an identityless recorded Paseo bridge link; its ownership cannot be authenticated (${destination})`,
+				blocksBridgeCutover: true,
+			});
 			continue;
 		}
 		if (!sameBridgeEntryIdentity(recorded, observed)) {
@@ -819,7 +849,7 @@ async function captureMigratedOldBridgeEntries(
 		}
 		captured.push({ name, linkText, identity: recorded });
 	}
-	return captured;
+	return { entries: captured, ambiguities };
 }
 
 /** Restore only old links that the migration inverse actually removed. */
