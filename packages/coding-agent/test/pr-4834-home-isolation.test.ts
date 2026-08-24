@@ -215,6 +215,28 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			expect(itemPath.startsWith(decoyAgentDir)).toBe(false);
 		}
 	});
+	test("explicit agent directory redirects native user-scope surfaces, not only MCP", async () => {
+		const explicitAgentDir = path.join(tempDir, "explicit-agent-2");
+		const homeAgentDir = path.join(home, ".gjc", "agent");
+		await seedProfile(explicitAgentDir, "explicit");
+		await seedProfile(homeAgentDir, "home");
+		clearCache();
+
+		const options = { cwd: project, agentDir: explicitAgentDir, providers: ["native"] as string[] };
+		const system = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, options);
+		const skills = await loadCapabilityForHome<Skill>(skillCapability.id, home, options);
+
+		// Native user-scope surfaces must resolve from the explicit agent directory
+		// (ctx.userAgentDir), not from the supplied home's default profile and not
+		// from the process profile.
+		expect(system.items.map(item => item.content)).toEqual(["# explicit system"]);
+		expect(skills.items.map(item => item.name)).toEqual(["explicit-skill"]);
+		for (const item of [...system.items, ...skills.items]) {
+			const itemPath = (item as { path?: string }).path ?? "";
+			expect(itemPath.startsWith(homeAgentDir)).toBe(false);
+			expect(itemPath.startsWith(explicitAgentDir)).toBe(true);
+		}
+	});
 
 	test("non-absolute home fails closed instead of using the process profile", async () => {
 		const decoyAgentDir = path.join(tempDir, "process-decoy", ".gjc", "agent");

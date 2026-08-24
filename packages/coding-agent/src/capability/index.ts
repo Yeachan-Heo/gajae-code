@@ -7,7 +7,7 @@
  * - Loading items for a capability across all providers
  */
 import * as path from "node:path";
-import { getAgentDir, getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -242,7 +242,12 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 
 	const cwd = options.cwd ?? getProjectDir();
 	const home = getTrustedHomeDir();
-	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
+	// Only an EXPLICIT agentDir redirect sets the context's user scope: the
+	// process-default getAgentDir() is left undefined so native user-scope
+	// loaders keep their historical <home>/<configDir>/agent layout (and the
+	// MCP loader's `ctx.userAgentDir ?? getAgentDir()` fallback is unchanged).
+	// Explicit redirection then applies uniformly to every native surface.
+	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : undefined;
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);

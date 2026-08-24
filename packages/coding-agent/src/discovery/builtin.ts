@@ -44,6 +44,18 @@ const PATHS = SOURCE_PATHS.native;
 function getUserAgentDirs(): string[] {
 	return [PATHS.userAgent];
 }
+/**
+ * Absolute user-scope directories for native loaders. An explicit
+ * `ctx.userAgentDir` — `loadCapability` always sets one, and
+ * `loadCapabilityForHome` derives it from the supplied home or honors
+ * `options.agentDir` — redirects every native user-scope read, so an explicit
+ * agent directory is honored uniformly instead of only by the MCP loader.
+ * Without one (ad-hoc scanning contexts), the historical
+ * `<home>/<configDir>/agent` layout is used.
+ */
+function getUserScopeDirs(ctx: LoadContext): string[] {
+	return [resolveUserAgentDir(ctx)];
+}
 
 /**
  * GJC's user-scope config directory.
@@ -280,8 +292,8 @@ registerProvider<MCPServer>(mcpCapability.id, {
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
 
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userPath = path.join(ctx.home, userAgentDir, "SYSTEM.md");
+	for (const userScopeDir of getUserScopeDirs(ctx)) {
+		const userPath = path.join(userScopeDir, "SYSTEM.md");
 		const userContent = await readFile(userPath);
 		if (userContent) {
 			items.push({
@@ -424,7 +436,6 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
 	if (userRule) items.push(userRule);
-
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
@@ -938,7 +949,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = path.join(ctx.home, PATHS.userAgent, "AGENTS.md");
+	const userPath = path.join(getUserScopeDirs(ctx)[0]!, "AGENTS.md");
 	const userContent = await readFile(userPath);
 	if (userContent) {
 		items.push({
