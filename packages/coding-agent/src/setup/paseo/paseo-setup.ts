@@ -275,6 +275,17 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 					}
 				: undefined;
 		const replacedBackup = priorReplacedRef ?? createdReplacedRef;
+		// The intent carries a digest of the complete sidecar bytes before the
+		// persist hook creates it. Recovery can therefore authenticate and remove
+		// only the artifact this interrupted step intended to create, without
+		// storing the credential-bearing value or consulting the ledger.
+		const discardSidecar =
+			createdReplacedRef !== undefined && replacedEntry !== undefined
+				? {
+						backupPath: createdReplacedRef.backupPath,
+						valueSha256: hashBytes(serializeJson({ key: providerKey, value: replacedEntry })),
+					}
+				: undefined;
 		// The exact sidecar payload this run would create ({key,value} serialized);
 		// unpersist deletes the file only when its CONTENT still hashes to these
 		// authenticated bytes (#4644 reviews r16/r17 — size alone is spoofable and
@@ -324,6 +335,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				delete providerReplacedEntries[providerKey];
 				return { ...ledger, providerKeys, providerPreexistingKeys, providerReplacedEntries };
 			},
+			discardSidecar,
 			persist:
 				createdReplacedRef !== undefined
 					? () =>

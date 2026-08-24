@@ -435,3 +435,48 @@ export async function removeReplacedProviderBackup(
 		return false;
 	}
 }
+
+/**
+ * Authenticate and remove a sidecar named by a discard intent.
+ *
+ * Discard intents carry the digest of the complete sidecar bytes rather than
+ * the digest of the value wrapped inside the provider-backup envelope. That
+ * keeps this recovery path independent of provider keys and prevents it from
+ * inferring cleanup targets from a provenance ledger. The read is fd-bound and
+ * symlink-rejecting, and the native exact-unlink protocol rechecks the captured
+ * identity before detaching the pathname.
+ */
+export async function removeDiscardSidecar(backupPath: string, expectedSha256: string): Promise<boolean> {
+	try {
+		if (!path.isAbsolute(backupPath) || !/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
+		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
+		let bytes: Buffer;
+		let stat: BigIntStats;
+		try {
+			stat = await handle.stat({ bigint: true });
+			if (!stat.isFile()) return false;
+			bytes = await handle.readFile();
+		} finally {
+			await handle.close();
+		}
+		const digest = nodeCrypto.createHash("sha256").update(bytes).digest("hex");
+		if (digest !== expectedSha256) return false;
+		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
+		if (!parent.isDirectory()) return false;
+		const identity: NativeExactFileIdentity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: digest,
+			quarantineName: `.gjc-paseo-discard-${process.pid}-${nodeCrypto.randomUUID()}`,
+		};
+		return exactUnlinkDirect(backupPath, identity).ok;
+	} catch {
+		return false;
+	}
+}

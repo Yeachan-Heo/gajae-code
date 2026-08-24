@@ -1818,6 +1818,8 @@ describe("skills bridge", () => {
 			backupPath: sidecarPath,
 			valueSha256: hashBytes(serializeJson(userEntry)),
 		};
+		const sidecarBytes = serializeJson({ key: "gjc", value: userEntry });
+		const discardSidecar = { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) };
 		let valueAtPersist: unknown;
 
 		await expect(
@@ -1841,6 +1843,7 @@ describe("skills bridge", () => {
 					(draft.agents as { providers: Record<string, unknown> }).providers.gjc = userEntry;
 				},
 				revertLedger: ledger => ledger,
+				discardSidecar,
 				persist: async () => {
 					const observed = await readTarget(fixture.paths.configJson);
 					valueAtPersist = providersOf(observed.parsed).gjc;
@@ -1864,8 +1867,9 @@ describe("skills bridge", () => {
 		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
-		// The target never published, so recovery discards only the intent; the
-		// preserved user value remains available for the next install attempt.
+		// The target never published, so recovery discards the intent and the
+		// authenticated sidecar this interrupted step created.
+		await expect(fs.stat(sidecarPath)).rejects.toMatchObject({ code: "ENOENT" });
 		expect((await readProvenance(fixture.paths.provenanceLedger)).providerReplacedEntries?.gjc).toBeUndefined();
 	});
 
@@ -3667,6 +3671,71 @@ describe("intent recovery", () => {
 		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+	});
+
+	test("discard repair removes the authenticated sidecar before clearing the intent", async () => {
+		const { fixture, intent } = await intentFixture();
+		const sidecarPath = path.join(fixture.root, "discard-sidecar.json");
+		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
+		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(true);
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+		await expect(fs.stat(sidecarPath)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("discard repair retains the intent and sidecar on a digest mismatch", async () => {
+		const { fixture, intent } = await intentFixture();
+		const sidecarPath = path.join(fixture.root, "discard-sidecar.json");
+		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
+		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			discardSidecar: { backupPath: sidecarPath, valueSha256: "0".repeat(64) },
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(false);
+		expect(recovery?.detail).toContain("discard sidecar cleanup failed");
+		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
+		expect(await fs.readFile(sidecarPath, "utf8")).toBe(sidecarBytes);
+	});
+
+	test("discard repair retains the intent when the authenticated sidecar unlink loses its race", async () => {
+		const { fixture, intent } = await intentFixture();
+		const sidecarPath = path.join(fixture.root, "discard-sidecar.json");
+		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
+		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+		});
+
+		const realStat = fs.stat.bind(fs);
+		let raced = false;
+		const statImpl = async (target: any, options?: any) => {
+			const observed = await realStat(target, options);
+			if (!raced && String(target) === path.dirname(sidecarPath)) {
+				raced = true;
+				await fs.writeFile(sidecarPath, "successor", { mode: 0o600 });
+			}
+			return observed;
+		};
+		const statSpy = spyOn(fs, "stat").mockImplementation(statImpl as typeof fs.stat);
+		try {
+			const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+			expect(recovery?.recovered).toBe(false);
+			expect(recovery?.detail).toContain("discard sidecar cleanup failed");
+		} finally {
+			statSpy.mockRestore();
+		}
+		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
+		expect(await fs.readFile(sidecarPath, "utf8")).toBe("successor");
 	});
 
 	test("check-mode recovery never mutates the intent", async () => {

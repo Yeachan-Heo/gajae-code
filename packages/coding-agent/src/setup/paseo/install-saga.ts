@@ -18,11 +18,13 @@
  * each file independently and refuses whenever the ledger diverged.
  */
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
-import { currentIdentity, planPublish, publishPlan, readTarget } from "./json-publisher";
+import { currentIdentity, planPublish, publishPlan, readTarget, removeDiscardSidecar } from "./json-publisher";
 import {
+	classifyIdentity,
 	classifyIntent,
 	clearIntent,
 	INTENT_VERSION,
+	type IntentDiscardSidecar,
 	type IntentRecord,
 	type IntentStep,
 	type ProvenanceLedger,
@@ -130,6 +132,8 @@ export interface JsonStepInput {
 	readonly persist?: () => Promise<void>;
 	/** Removes what {@link persist} created; runs after a successful undo. */
 	readonly unpersist?: () => Promise<void>;
+	/** Sidecar proof written into the intent before {@link persist} creates it. */
+	readonly discardSidecar?: IntentDiscardSidecar;
 	readonly now: Date;
 }
 
@@ -183,6 +187,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		provenancePreflightIdentity,
 		provenanceExpectedIdentity,
 		provenancePayload: ledgerAfter,
+		...(input.discardSidecar !== undefined ? { discardSidecar: input.discardSidecar } : {}),
 		startedAt: input.now.toISOString(),
 	};
 	await writeIntent(input.intentPath, intent);
@@ -351,6 +356,45 @@ export async function recoverIntent(
 	if (recovery.action === "refuse") return { recovered: false, detail: recovery.detail };
 	if (!options.repair) return { recovered: false, detail: recovery.detail };
 	if (recovery.action === "discard") {
+		// A sidecar is disposable only when the target never reached its intended
+		// identity. If both target and ledger writes landed, the ledger now owns
+		// the sidecar and it must survive for `--remove` restoration. Re-read the
+		// target state before cleanup so a stale intent never deletes a committed
+		// recovery artifact.
+		if (intent.discardSidecar !== undefined) {
+			const [targetObserved, ledgerObserved] = await Promise.all([
+				currentIdentity(intent.targetPath),
+				currentIdentity(intent.provenancePath),
+			]);
+			const targetState = classifyIdentity(
+				targetObserved,
+				intent.targetPreflightIdentity,
+				intent.targetExpectedIdentity,
+			);
+			const ledgerState = classifyIdentity(
+				ledgerObserved,
+				intent.provenancePreflightIdentity,
+				intent.provenanceExpectedIdentity,
+			);
+			if (targetState === "divergent" || ledgerState === "divergent") {
+				return {
+					recovered: false,
+					detail: `${recovery.detail}; recovery state changed while authenticating discard cleanup; retaining the intent`,
+				};
+			}
+			if (targetState === "before" && ledgerState === "before") {
+				const removed = await removeDiscardSidecar(
+					intent.discardSidecar.backupPath,
+					intent.discardSidecar.valueSha256,
+				);
+				if (!removed) {
+					return {
+						recovered: false,
+						detail: `${recovery.detail}; authenticated discard sidecar cleanup failed (${intent.discardSidecar.backupPath}); retaining the intent`,
+					};
+				}
+			}
+		}
 		await clearIntent(intentPath);
 		return { recovered: true, detail: recovery.detail };
 	}

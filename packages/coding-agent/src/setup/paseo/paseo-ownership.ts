@@ -284,6 +284,18 @@ export function provenancedProviderKeys(ledger: ProvenanceLedger): readonly stri
 export type IntentStep = "provider-config" | "orchestration-preferences";
 
 /**
+ * Credential-free cleanup proof for a sidecar created by an interrupted step.
+ *
+ * The digest covers the complete sidecar bytes, not the value nested inside
+ * the provider-backup envelope. Recovery therefore needs no provider key and
+ * cannot infer an unrelated cleanup target from the provenance ledger.
+ */
+export interface IntentDiscardSidecar {
+	readonly backupPath: string;
+	readonly valueSha256: string;
+}
+
+/**
  * Durable, credential-free intent record.
  *
  * Written before either the target publish or the ledger commit, and carrying
@@ -312,10 +324,25 @@ export interface IntentRecord {
 	 * user's files, so the record stays credential-free.
 	 */
 	readonly provenancePayload?: ProvenanceLedger;
+	/** Authenticated sidecar to remove only when this intent is discarded before publication. */
+	readonly discardSidecar?: IntentDiscardSidecar;
 	readonly startedAt: string;
 }
 
+function isIntentDiscardSidecar(value: unknown): value is IntentDiscardSidecar {
+	return (
+		isRecord(value) &&
+		typeof value.backupPath === "string" &&
+		path.isAbsolute(value.backupPath) &&
+		typeof value.valueSha256 === "string" &&
+		/^[a-f0-9]{64}$/u.test(value.valueSha256)
+	);
+}
+
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
+	if (intent.discardSidecar !== undefined && !isIntentDiscardSidecar(intent.discardSidecar)) {
+		throw new IntentRecordCorruptError(intentPath, "discardSidecar is not an authenticated sidecar reference");
+	}
 	validateIntentPayload(intentPath, intent);
 	await fs.mkdir(path.dirname(intentPath), { recursive: true, mode: 0o700 });
 	// Write-then-rename with fsync (#4644 review r10), exactly like the
@@ -483,6 +510,9 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 		}
 		if (parsed?.provenancePayload !== undefined) {
 			validateIntentPayload(intentPath, parsed);
+		}
+		if (parsed?.discardSidecar !== undefined && !isIntentDiscardSidecar(parsed.discardSidecar)) {
+			throw new IntentRecordCorruptError(intentPath, "discardSidecar is not an authenticated sidecar reference");
 		}
 		return parsed;
 	} catch (error) {
