@@ -4671,7 +4671,7 @@ pub(crate) mod platform {
 						| libc::O_CLOEXEC
 						| libc::O_NOFOLLOW
 						| libc::O_NONBLOCK,
-					file_mode,
+					file_mode as libc::mode_t,
 				)
 			};
 			if fd < 0 {
@@ -4681,7 +4681,7 @@ pub(crate) mod platform {
 				}
 				return Err(skill_write_error(&error));
 			}
-			if unsafe { libc::fchmod(fd, file_mode) } != 0 {
+			if unsafe { libc::fchmod(fd, file_mode as libc::mode_t) } != 0 {
 				unsafe { libc::close(fd) };
 				return Err(skill_write_error(&std::io::Error::last_os_error()));
 			}
