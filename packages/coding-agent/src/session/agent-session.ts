@@ -7495,6 +7495,15 @@ export class AgentSession {
 			// becomes deliverable again, so rearm here rather than waiting for an
 			// unrelated enqueue.
 			this.yieldQueue.rearmIdle();
+			// A folded turn can end WITHOUT reaching a shouldPause checkpoint (a
+			// provider/tool error return, or an aborted-steer break). Drain the
+			// armed stop and release the fence HERE so they cannot leak onto the
+			// next unrelated turn, which would otherwise spuriously pause and stay
+			// fenced across the gap.
+			if (this.#foldStopRequested) {
+				this.#foldStopRequested = false;
+				this.agent.setSteeringAdmissionFence(undefined);
+			}
 			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
 			this.#activeLogicalRunId = undefined;
 		};
