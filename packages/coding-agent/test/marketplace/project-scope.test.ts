@@ -102,6 +102,20 @@ describe("resolveActiveProjectRegistryPath", () => {
 		expect(result).toBeNull();
 	});
 
+	it("reuses the canonical cwd for the .git fallback boundary", async () => {
+		if (process.platform === "win32") return;
+		const suppliedHome = path.join(tmpDir, "real-home-git");
+		const linkedHome = path.join(tmpDir, "linked-home-git");
+		const realCwd = path.join(suppliedHome, "nested", "project");
+		fs.mkdirSync(realCwd, { recursive: true });
+		fs.symlinkSync(suppliedHome, linkedHome, "dir");
+		fs.mkdirSync(path.join(tmpDir, ".git"), { recursive: true });
+
+		const result = await resolveActiveProjectRegistryPath(path.join(linkedHome, "nested", "project"), suppliedHome);
+
+		expect(result).toBeNull();
+	});
+
 	it("falls back to .git root when no .gjc/ exists", async () => {
 		// Layout: tmpDir/.git/   +   tmpDir/sub/  (cwd)
 		// No .gjc/ anywhere → second pass finds .git/ at tmpDir.
