@@ -1,4 +1,5 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
+import type { FoldAdapter } from "../session/fold-coordinator";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { $env, logger } from "@gajae-code/utils";
 import type { AsyncJobManager } from "../async";
@@ -235,11 +236,11 @@ export interface ToolSession {
 	assertEvalExecutionAllowed?: () => void;
 	/** Track tool-owned eval work so session disposal can await/abort it like direct session eval runs. */
 	trackEvalExecution?<T>(execution: Promise<T>, abortController: AbortController): Promise<T>;
-	/** Register a safe request handler that asks a managed foreground bash call to fold into a background job. */
-	registerForegroundBashBackgroundRequestHandler?: (handler: () => void) => () => void;
-	/** Whether a managed foreground bash call is currently foldable into a background job. */
+	/** Register a foldable foreground wait so the fold chord can move it into a background job. */
+	registerForegroundFoldParticipant?: (adapter: FoldAdapter) => () => void;
+	/** Whether a foreground wait is currently foldable into a background job. */
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
-	/** Request that the active managed foreground bash call fold into a background job, if supported. */
+	/** Request that the active foreground wait fold into a background job, if supported. */
 	requestForegroundBashBackground?: () => boolean;
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
