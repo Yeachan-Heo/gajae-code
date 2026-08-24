@@ -1,10 +1,41 @@
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
+import { startFixtureBrokerWithLeaseForTest } from "../src/sdk/broker/ensure";
 import { createSdkSessionRuntimeExtension, type SessionSdkTransport } from "../src/sdk/host/session-runtime";
+import {
+	cleanupFixtureRoot,
+	createFixtureBrokerEnvironment,
+	createFixtureRootCleanup,
+	withFixtureBrokerEnvironment,
+} from "./helpers/fixture-broker-cleanup";
 
+/**
+ * Safety bound for a single emission to resolve. Far above any real host
+ * dispatch time, but finite so a lost response fails the test instead of
+ * hanging the file to the harness timeout.
+ */
+const RESPONSE_TIMEOUT_MS = 5_000;
+
+const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-broker-"));
+const fixtureAgentDir = path.join(fixtureRoot, "agent");
+const fixtureEnv = createFixtureBrokerEnvironment(fixtureRoot, fixtureAgentDir);
+const fixtureBroker = await withFixtureBrokerEnvironment(() =>
+	startFixtureBrokerWithLeaseForTest({ agentDir: fixtureAgentDir, env: fixtureEnv }),
+);
+const fixtureCleanup = createFixtureRootCleanup(fixtureRoot, fixtureAgentDir, fixtureBroker.lease);
+afterAll(async () => {
+	await cleanupFixtureRoot(fixtureCleanup);
+});
+
+interface HarnessOptions {
+	/** Artificial transport delivery delay; models a host that responds slowly. */
+	responseDelayMs?: number;
+	/** Safety timeout for one emission; small values are for race-contract tests. */
+	responseTimeoutMs?: number;
+}
 interface Harness {
 	emit(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
 	/** Response frames observed after the emission they belong to already ended. */
@@ -98,7 +129,7 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 			else options?.onPreflightAccepted?.();
 		},
 	} as unknown as ExtensionAPI;
-	createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: () => transport });
+	createSdkSessionRuntimeExtension(api, { agentDir: fixtureAgentDir, createTransport: () => transport });
 	const base = {
 		cwd,
 		sessionMetadata: { kind: "main" },
