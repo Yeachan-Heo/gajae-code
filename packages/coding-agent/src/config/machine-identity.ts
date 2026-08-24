@@ -7,9 +7,10 @@ import { getConfigRootDir } from "@gajae-code/utils";
 export interface MachineIdentityDeps {
 	platform?: NodeJS.Platform;
 	readFile?: (file: string) => Promise<string>;
-	runCommand?: (command: string, args: readonly string[]) =>
-		| { exitCode: number; stdout: Uint8Array }
-		| Promise<{ exitCode: number; stdout: Uint8Array }>;
+	runCommand?: (
+		command: string,
+		args: readonly string[],
+	) => { exitCode: number; stdout: Uint8Array } | Promise<{ exitCode: number; stdout: Uint8Array }>;
 	installationSecret?: string;
 	configRootDir?: string;
 	link?: (existingPath: string, newPath: string) => Promise<void>;
