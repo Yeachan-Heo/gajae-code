@@ -75,6 +75,8 @@ export interface ProvenanceLedger {
 	readonly bridgeEntryIdentities?: Record<string, BridgeEntryIdentity>;
 	/** True when GJC created the bridge directory itself (as opposed to populating an existing one). */
 	readonly bridgeDirCreated?: boolean;
+	/** No-follow identity of the bridge directory GJC created. */
+	readonly bridgeDirIdentity?: BridgeEntryIdentity;
 }
 
 export const EMPTY_LEDGER: ProvenanceLedger = {
@@ -136,6 +138,9 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 		if (parsed.bridgeDirCreated !== undefined && typeof parsed.bridgeDirCreated !== "boolean") {
 			throw new Error("bridgeDirCreated is present but not a boolean");
 		}
+		if (parsed.bridgeDirIdentity !== undefined && !isBridgeEntryIdentity(parsed.bridgeDirIdentity)) {
+			throw new Error("bridgeDirIdentity is present but not an identity");
+		}
 		if (parsed.bridgeEntries !== undefined) {
 			if (!Array.isArray(parsed.bridgeEntries)) throw new Error("bridgeEntries is present but not an array");
 			if (!parsed.bridgeEntries.every(entry => typeof entry === "string")) {
@@ -160,6 +165,7 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 				? { bridgeEntryIdentities: parsed.bridgeEntryIdentities }
 				: {}),
 			...(typeof parsed.bridgeDirCreated === "boolean" ? { bridgeDirCreated: parsed.bridgeDirCreated } : {}),
+			...(isBridgeEntryIdentity(parsed.bridgeDirIdentity) ? { bridgeDirIdentity: parsed.bridgeDirIdentity } : {}),
 		};
 	} catch (error) {
 		// A corrupt GJC-side ledger is an explicit recovery error, not an empty
@@ -187,17 +193,19 @@ function isProviderReplacedRefRecord(value: unknown): value is Record<string, Pr
 
 function isBridgeEntryIdentityRecord(value: unknown): value is Record<string, BridgeEntryIdentity> {
 	if (!isRecord(value)) return false;
-	return Object.values(value).every(
-		identity =>
-			isRecord(identity) &&
-			typeof identity.dev === "string" &&
-			typeof identity.ino === "string" &&
-			typeof identity.size === "string" &&
-			typeof identity.mtimeNs === "string" &&
-			/^\d+$/u.test(identity.dev) &&
-			/^\d+$/u.test(identity.ino) &&
-			/^\d+$/u.test(identity.size) &&
-			/^-?\d+$/u.test(identity.mtimeNs),
+	return Object.values(value).every(isBridgeEntryIdentity);
+}
+function isBridgeEntryIdentity(value: unknown): value is BridgeEntryIdentity {
+	return (
+		isRecord(value) &&
+		typeof value.dev === "string" &&
+		typeof value.ino === "string" &&
+		typeof value.size === "string" &&
+		typeof value.mtimeNs === "string" &&
+		/^\d+$/u.test(value.dev) &&
+		/^\d+$/u.test(value.ino) &&
+		/^\d+$/u.test(value.size) &&
+		/^-?\d+$/u.test(value.mtimeNs)
 	);
 }
 function isStringRecord(value: unknown): value is Record<string, string> {

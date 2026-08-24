@@ -243,7 +243,12 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			// created is removed, a key that carried ANY prior value (including a
 			// scalar, array, or null) gets that exact value back, and an
 			// identical pre-existing entry was never written and keeps its value.
-			revert: draft => restoreProviderKey(draft, providerKey, replacedEntry),
+			// An identical provider entry is explicitly pre-existing: the forward
+			// step only records that fact and must not turn later compensation into
+			// a deletion of the user's (or an earlier install's) unchanged value.
+			revert: draft => {
+				if (!existingMatches) restoreProviderKey(draft, providerKey, replacedEntry);
+			},
 			revertLedger: ledger => {
 				const providerKeys = { ...ledger.providerKeys };
 				delete providerKeys[providerKey];
@@ -456,9 +461,13 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// The directory was exclusively created a moment ago: directory ownership
 		// is persisted only now that the creation actually succeeded (#4644
 		// review r8), never from the preflight's plan.
-		if (bridge.bridgeDirCreated) {
+		if (bridge.bridgeDirCreated && bridge.bridgeDirIdentity !== undefined) {
 			const afterCreate = await readProvenance(deps.paths.provenanceLedger);
-			await writeProvenance(deps.paths.provenanceLedger, { ...afterCreate, bridgeDirCreated: true });
+			await writeProvenance(deps.paths.provenanceLedger, {
+				...afterCreate,
+				bridgeDirCreated: true,
+				bridgeDirIdentity: bridge.bridgeDirIdentity,
+			});
 		}
 		if (Object.keys(bridge.entryIdentities).length > 0) {
 			const afterBridge = await readProvenance(deps.paths.provenanceLedger);
@@ -543,6 +552,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						adoptedEntries: [],
 						entryIdentities: bridgeLedger.bridgeEntryIdentities ?? {},
 						bridgeDirCreated: bridgeLedger.bridgeDirCreated ?? false,
+						bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
 						sourceDir: oldSourceDir,
 					},
 					{ bridgeDir: migratedOldBridgeDir },
@@ -622,6 +632,7 @@ export async function correctBridgeOwnershipAfterFailure(
 			...partial.entryIdentities,
 		},
 		bridgeDirCreated: corrected.bridgeDirCreated === true || partial.bridgeDirCreated,
+		...(partial.bridgeDirIdentity ? { bridgeDirIdentity: partial.bridgeDirIdentity } : {}),
 	});
 }
 /** The RAW value a Paseo config carries at `agents.providers.<key>`, of any shape. */

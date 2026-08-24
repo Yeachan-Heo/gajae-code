@@ -375,6 +375,7 @@ export async function removePaseoSetup(
 					adoptedEntries: [],
 					entryIdentities: ledger.bridgeEntryIdentities ?? {},
 					bridgeDirCreated: ledger.bridgeDirCreated ?? false,
+					bridgeDirIdentity: ledger.bridgeDirIdentity,
 					sourceDir,
 				},
 				// Unlink, directory cleanup, and diagnostics all operate on the

@@ -128,6 +128,7 @@ export interface SkillsBridgeInstallResult {
 	/** Install-time no-follow identities for entries this run created or adopted. */
 	readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>>;
 	readonly bridgeDirCreated: boolean;
+	readonly bridgeDirIdentity?: BridgeEntryIdentity;
 	/** Directory the created links point at; absent when nothing was created. */
 	readonly sourceDir?: string;
 }
@@ -563,6 +564,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	const hasWork =
 		Object.keys(preflight.entries).length > 0 || preflight.prunes.length > 0 || preflight.adopts.length > 0;
 	let bridgeDirCreated = false;
+	let bridgeDirIdentity: BridgeEntryIdentity | undefined;
 	const createdEntries: string[] = [];
 	const prunedEntries: string[] = [];
 	const adoptedEntries: string[] = [];
@@ -573,6 +575,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		adoptedEntries: [...adoptedEntries],
 		entryIdentities: { ...entryIdentities },
 		bridgeDirCreated,
+		...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
 		...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
 	});
 	const fail = (error: unknown): never => {
@@ -585,6 +588,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		if (preflight.bridgeDirCreated && hasWork) {
 			await createBridgeDirectory(preflight);
 			bridgeDirCreated = true;
+			bridgeDirIdentity = await directoryIdentity(preflight.bridgeDir);
 		}
 		for (const plan of preflight.prunes) {
 			await pruneStale(plan);
@@ -595,20 +599,22 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 			if (entry.action === "prune-and-recreate") await pruneRecordedDangling(entry);
 			await createNoReplace(entry);
 			createdEntries.push(entry.name);
-			entryIdentities[entry.name] = await installedEntryIdentity(
+			entryIdentities[entry.name] = await captureInstalledEntryIdentity(
 				preflight.bridgeDir,
 				entry.name,
 				preflight.sourceDir,
 			);
+			await assertInstalledEntryTarget(preflight.bridgeDir, entry.name);
 		}
 		for (const adopt of preflight.adopts) {
 			await adoptLegacyLink(adopt, adopt.legacySourceDir);
 			adoptedEntries.push(adopt.name);
-			entryIdentities[adopt.name] = await installedEntryIdentity(
+			entryIdentities[adopt.name] = await captureInstalledEntryIdentity(
 				preflight.bridgeDir,
 				adopt.name,
 				preflight.sourceDir,
 			);
+			await assertInstalledEntryTarget(preflight.bridgeDir, adopt.name);
 		}
 	} catch (error) {
 		fail(error);
@@ -620,12 +626,32 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				adoptedEntries,
 				entryIdentities,
 				bridgeDirCreated,
+				...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
 				...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
 			}
-		: { createdEntries, prunedEntries, adoptedEntries, entryIdentities, bridgeDirCreated };
+		: {
+				createdEntries,
+				prunedEntries,
+				adoptedEntries,
+				entryIdentities,
+				bridgeDirCreated,
+				...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
+			};
 }
 
-async function installedEntryIdentity(
+async function directoryIdentity(directory: string): Promise<BridgeEntryIdentity> {
+	const stat = await fs.lstat(directory, { bigint: true });
+	if (!stat.isDirectory() || stat.isSymbolicLink())
+		throw new SkillsBridgeError(`Paseo skills bridge directory diverged: ${directory}`);
+	return {
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: stat.size.toString(),
+		mtimeNs: stat.mtimeNs.toString(),
+	};
+}
+
+async function captureInstalledEntryIdentity(
 	bridgeDir: string,
 	name: string,
 	sourceDir: string | undefined,
@@ -638,18 +664,22 @@ async function installedEntryIdentity(
 	if (!stat.isSymbolicLink() || link === undefined || resolvedLinkTarget(link, destination) !== expectedTarget) {
 		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before identity capture: ${destination}`);
 	}
-	// Enumeration is only a preflight snapshot. Follow the link after publication
-	// so a source update cannot turn a successful setup into a known dangling bridge.
-	const target = await fs.stat(destination).catch(() => undefined);
-	if (target === undefined || !target.isDirectory()) {
-		throw new SkillsBridgeError(`Paseo skill source disappeared during bridge publication: ${destination}`);
-	}
 	return {
 		dev: stat.dev.toString(),
 		ino: stat.ino.toString(),
 		size: stat.size.toString(),
 		mtimeNs: stat.mtimeNs.toString(),
 	};
+}
+
+async function assertInstalledEntryTarget(bridgeDir: string, name: string): Promise<void> {
+	const destination = path.join(bridgeDir, name);
+	// Enumeration is only a preflight snapshot. Follow the link after publication
+	// so a source update cannot turn a successful setup into a known dangling bridge.
+	const target = await fs.stat(destination).catch(() => undefined);
+	if (target === undefined || !target.isDirectory()) {
+		throw new SkillsBridgeError(`Paseo skill source disappeared during bridge publication: ${destination}`);
+	}
 }
 
 /**
@@ -711,6 +741,16 @@ export async function inverseSkillsBridge(
 		await quarantineUnlinkVerified(removal.destination, removal.target, removal.identity);
 	}
 	if (!result.bridgeDirCreated) return;
+	const directory = result.bridgeDirIdentity;
+	if (directory === undefined) throw new SkillsBridgeError(`Missing owned bridge directory identity: ${bridgeDir}`);
+	const currentDirectory = await directoryIdentity(bridgeDir).catch(() => undefined);
+	if (
+		currentDirectory === undefined ||
+		currentDirectory.dev !== directory.dev ||
+		currentDirectory.ino !== directory.ino
+	) {
+		throw new SkillsBridgeError(`Paseo skills bridge directory diverged before removal: ${bridgeDir}`);
+	}
 	try {
 		await fs.rmdir(bridgeDir);
 	} catch (error) {
