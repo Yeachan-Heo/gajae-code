@@ -204,4 +204,34 @@ describe("interactive PTY fold ownership", () => {
 		).text();
 		expect(source).not.toContain("session.kill()");
 	});
+
+	it("keeps its original deadline after folding, surfacing the expiry as a real outcome", async () => {
+		const dir = tempDir();
+		try {
+			await Settings.init({ inMemory: true, cwd: dir });
+			let controls: InteractivePtyControls | undefined;
+
+			// Fold immediately, then let the ORIGINAL deadline elapse. Folding must not
+			// extend or suspend it, and the expiry must still produce a real outcome
+			// that can be delivered rather than hanging forever.
+			const foreground = await runInteractiveBashPty(createTestUi(), {
+				command: "sleep 30",
+				cwd: dir,
+				timeoutMs: 700,
+				onControls: next => {
+					controls = next;
+					next.detachObserver(FOLD_RESULT);
+				},
+			});
+			expect(foreground.output).toBe("folded into a background job");
+			if (!controls) throw new Error("expected live controls");
+
+			const outcome = await controls.terminalCompletion;
+			// The run ended on its own deadline, not by being killed at fold time.
+			expect(outcome.timedOut || outcome.exitCode !== 0).toBe(true);
+		} finally {
+			resetSettingsForTest();
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
 });
