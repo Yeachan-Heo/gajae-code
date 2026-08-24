@@ -31,17 +31,14 @@ const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const LOCK_ACQUIRE_RETRY_MS = 5;
 const LOCK_STALE_MS = 30_000;
 
-const LOCAL_FILE_SYSTEM_TYPES: Partial<Record<NodeJS.Platform, ReadonlySet<number>>> = {
-	darwin: new Set([26]), // APFS
-	linux: new Set([
-		0x0102_1994, // tmpfs
-		0x2fc1_2fc1, // ZFS
-		0x5846_5342, // XFS
-		0x9123_683e, // Btrfs
-		0xef53, // ext2/3/4
-		0xf2f5_2010, // F2FS
-	]),
-};
+const LOCAL_LINUX_FILE_SYSTEM_TYPES = new Set([
+	0x0102_1994, // tmpfs
+	0x2fc1_2fc1, // ZFS
+	0x5846_5342, // XFS
+	0x9123_683e, // Btrfs
+	0xef53, // ext2/3/4
+	0xf2f5_2010, // F2FS
+]);
 
 /**
  * The claim that serializes PATHNAME TRANSITIONS of `<file>.lock` among current writers.
@@ -353,16 +350,26 @@ function probeOwnerProcess(pid: number): OwnerProcessLiveness {
  * record still is the record that was judged, so the compare-and-delete matches and a live
  * holder loses its lock.
  */
-export function detectedSessionStateLockFileSystemIsLocal(platform: NodeJS.Platform, type: number): boolean {
-	return LOCAL_FILE_SYSTEM_TYPES[platform]?.has(type) === true;
+export function detectedLinuxSessionStateLockFileSystemIsLocal(type: number): boolean {
+	return LOCAL_LINUX_FILE_SYSTEM_TYPES.has(type);
+}
+
+export function detectedDarwinSessionStateLockFileSystemIsLocal(typeName: string): boolean {
+	return typeName === "apfs";
 }
 
 async function unqualifiedOwnerIsLocal(file: string): Promise<boolean> {
 	const override = SessionStateLockTestHooks.unqualifiedOwnerIsLocal;
 	if (override !== undefined) return override;
 	try {
+		if (process.platform === "darwin") {
+			const child = Bun.spawn(["stat", "-f", "%T", path.resolve(file)], { stdout: "pipe", stderr: "ignore" });
+			const [typeName, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+			return exitCode === 0 && detectedDarwinSessionStateLockFileSystemIsLocal(typeName.trim());
+		}
+		if (process.platform !== "linux") return false;
 		const volume = await fs.statfs(file);
-		return detectedSessionStateLockFileSystemIsLocal(process.platform, volume.type);
+		return detectedLinuxSessionStateLockFileSystemIsLocal(volume.type);
 	} catch {
 		return false;
 	}

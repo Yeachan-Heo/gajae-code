@@ -206,12 +206,13 @@ function ageWorldPastAnyStaleWindow(): () => void {
 
 describe("coordinator session state lock", () => {
 	it("recognizes only known local filesystems for legacy owner recovery", () => {
-		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("darwin", 26)).toBe(true);
-		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0xef53)).toBe(true);
-		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0x5846_5342)).toBe(true);
-		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0x00c3_6400)).toBe(false);
-		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("linux", 0x6969)).toBe(false);
-		expect(sessionStateLock.detectedSessionStateLockFileSystemIsLocal("win32", 26)).toBe(false);
+		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("apfs")).toBe(true);
+		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("nfs")).toBe(false);
+		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("smbfs")).toBe(false);
+		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0xef53)).toBe(true);
+		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x5846_5342)).toBe(true);
+		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x00c3_6400)).toBe(false);
+		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x6969)).toBe(false);
 	});
 
 	it("bounds nested acquisition retries by one wall-clock deadline", async () => {
