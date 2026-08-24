@@ -186,6 +186,7 @@ it("uses a verified physical argv0 for exact compiled-marker-authorized Bun virt
 	const markerPath = "/$bunfs/root/internal-source-marker-2178-abcd.txt";
 	try {
 		await fs.writeFile(executable, "compiled fixture");
+		await fs.chmod(executable, 0o700);
 		const canonicalExecutable = await fs.realpath(executable);
 		expect(
 			resolveSdkInternalSpawnCommandForTest("session-host-internal", {

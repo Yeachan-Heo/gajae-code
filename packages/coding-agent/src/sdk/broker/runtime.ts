@@ -85,6 +85,16 @@ function regularReadablePath(file: string, label: string): string {
 	return canonical;
 }
 
+function regularExecutablePath(file: string, label: string): string {
+	const canonical = regularReadablePath(file, label);
+	try {
+		fs.accessSync(canonical, fs.constants.X_OK);
+	} catch {
+		throw new Error(`SDK internal launch refused: ${label} is not an executable regular file.`);
+	}
+	return canonical;
+}
+
 function isBunVirtualExecutablePath(file: string): boolean {
 	const normalized = file.replaceAll("\\", "/").toLowerCase();
 	return (
@@ -103,10 +113,10 @@ function isBunVirtualExecutablePath(file: string): boolean {
 function compiledExecutable(options: SdkInternalRuntimeDescriptorTestOptions): string {
 	const execPath = options.execPath ?? process.execPath;
 	try {
-		return regularReadablePath(path.resolve(execPath), "compiled executable");
+		return regularExecutablePath(path.resolve(execPath), "compiled executable");
 	} catch (error) {
 		if (!isBunVirtualExecutablePath(execPath)) throw error;
-		return regularReadablePath(path.resolve(options.argv0 ?? process.argv[0] ?? ""), "compiled executable");
+		return regularExecutablePath(path.resolve(options.argv0 ?? process.argv[0] ?? ""), "compiled executable");
 	}
 }
 

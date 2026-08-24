@@ -4084,6 +4084,7 @@ async function executeLifecycleResponse(
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
+		let childSpawned = false;
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
@@ -4146,6 +4147,7 @@ async function executeLifecycleResponse(
 			const spawnOutcome = Promise.withResolvers<void>();
 			const onSpawn = () => {
 				spawned.off("error", onError);
+				childSpawned = true;
 				spawnOutcome.resolve();
 			};
 			const onError = (error: Error) => {
@@ -4167,7 +4169,7 @@ async function executeLifecycleResponse(
 			spawned.unref();
 		} catch (error) {
 			const terminated =
-				child && spawnedAuthority
+				child && childSpawned
 					? await terminateSpawnedChild(
 							child,
 							broker,
