@@ -261,7 +261,7 @@ enum ReplacementExchangeError {
 		code:      &'static str,
 		phase:     &'static str,
 		primitive: NoReplacePrimitive,
-		identity:  Option<RecoveryFsIdentity>,
+		identity:  Option<Box<RecoveryFsIdentity>>,
 	},
 }
 
@@ -1513,7 +1513,7 @@ impl RecoveryFsRoot {
 		#[cfg(target_os = "linux")]
 		{
 			with_root(&self.root, |root| {
-				append_managed(
+				Ok(append_managed(
 					root,
 					&relative_path,
 					data.as_ref(),
@@ -1523,7 +1523,7 @@ impl RecoveryFsRoot {
 					&expected_mtime_ns,
 					&expected_ctime_ns,
 					&expected_sha256,
-				)
+				))
 			})
 		}
 		#[cfg(not(target_os = "linux"))]
@@ -2880,38 +2880,35 @@ fn append_managed(
 	expected_mtime_ns: &str,
 	expected_ctime_ns: &str,
 	expected_sha256: &str,
-) -> Result<RecoveryFsResult, &'static str> {
-	let expected_size_value = match expected_size.parse::<u64>() {
-		Ok(value) => value,
-		Err(_) => {
-			return Ok(RecoveryFsResult::append_failure(
-				"identity_mismatch",
-				"not_committed",
-				"not_attempted",
-				None,
-			));
-		},
+) -> RecoveryFsResult {
+	let Ok(expected_size_value) = expected_size.parse::<u64>() else {
+		return RecoveryFsResult::append_failure(
+			"identity_mismatch",
+			"not_committed",
+			"not_attempted",
+			None,
+		);
 	};
 	let Some(appended_size) = expected_size_value.checked_add(data.len() as u64) else {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"content_too_large",
 			"not_committed",
 			"not_attempted",
 			None,
-		));
+		);
 	};
 	if appended_size > MAX_MANAGED_CONTENT_BYTES {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"content_too_large",
 			"not_committed",
 			"not_attempted",
 			None,
-		));
+		);
 	}
 	let (parent, name) = match open_parent(root, relative_path) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None));
+			return RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None);
 		},
 	};
 	// SAFETY: the retained parent fd and validated leaf name remain live for
@@ -2928,17 +2925,17 @@ fn append_managed(
 			Some(libc::ENOENT) => "not_found",
 			_ => "io_error",
 		};
-		return Ok(RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None));
+		return RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None);
 	}
 	// SAFETY: successful openat returned a uniquely owned fd.
 	let mut file = unsafe { File::from_raw_fd(fd) };
 	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"permission_denied",
 			"not_committed",
 			"not_attempted",
 			None,
-		));
+		);
 	}
 	let matches = match same_expected(
 		&file,
@@ -2951,71 +2948,71 @@ fn append_managed(
 	) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None));
+			return RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None);
 		},
 	};
 	if !matches {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"identity_mismatch",
 			"not_committed",
 			"not_attempted",
 			None,
-		));
+		);
 	}
 	if file.write_all(data).is_err() {
-		return Ok(RecoveryFsResult::append_failure("io_error", "unknown", "not_provable", None));
+		return RecoveryFsResult::append_failure("io_error", "unknown", "not_provable", None);
 	}
 	if file.sync_all().is_err() {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"fsync_failed",
 			"committed",
 			"not_provable",
 			append_post_identity(&file),
-		));
+		);
 	}
 	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"permission_denied",
 			"committed",
 			"not_provable",
 			append_post_identity(&file),
-		));
+		);
 	}
 	let mut identity = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(code, "committed", "not_provable", None));
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
 		},
 	};
 	if identity.dev != expected_dev
 		|| identity.ino != expected_ino
 		|| identity.size != appended_size.to_string()
 	{
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
 			append_post_identity(&file),
-		));
+		);
 	}
 	let named = match statat(&parent, &name) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(
+			return RecoveryFsResult::append_failure(
 				code,
 				"committed",
 				"not_provable",
 				append_post_identity(&file),
-			));
+			);
 		},
 	};
 	if !stat_matches_regular_identity(&named, &identity) {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
 			append_post_identity(&file),
-		));
+		);
 	}
 	// The digest is retained for the next append expectation. Recheck both the
 	// descriptor and name after reading so a concurrent successor cannot be
@@ -3023,54 +3020,54 @@ fn append_managed(
 	let sha256 = match digest_hex(&file) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(
+			return RecoveryFsResult::append_failure(
 				code,
 				"committed",
 				"not_provable",
 				append_post_identity(&file),
-			));
+			);
 		},
 	};
 	let descriptor_after = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(
+			return RecoveryFsResult::append_failure(
 				code,
 				"committed",
 				"not_provable",
 				append_post_identity(&file),
-			));
+			);
 		},
 	};
 	let named_after = match statat(&parent, &name) {
 		Ok(value) => value,
 		Err(code) => {
-			return Ok(RecoveryFsResult::append_failure(
+			return RecoveryFsResult::append_failure(
 				code,
 				"committed",
 				"not_provable",
 				append_post_identity(&file),
-			));
+			);
 		},
 	};
 	if descriptor_after != identity || !stat_matches_regular_identity(&named_after, &identity) {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
 			append_post_identity(&file),
-		));
+		);
 	}
 	identity.sha256 = Some(sha256);
 	if parent.sync_all().is_err() {
-		return Ok(RecoveryFsResult::append_failure(
+		return RecoveryFsResult::append_failure(
 			"fsync_failed",
 			"committed",
 			"not_provable",
 			Some(identity),
-		));
+		);
 	}
-	Ok(RecoveryFsResult::append_success(identity))
+	RecoveryFsResult::append_success(identity)
 }
 #[cfg(target_os = "linux")]
 const fn replace_managed_failure(code: &'static str) -> ReplacementExchangeError {
@@ -3089,7 +3086,12 @@ fn replacement_post_failure(
 		identity.sha256 = Some(replacement_sha256.to_owned());
 		identity
 	});
-	ReplacementExchangeError::PostMutation { code, phase, primitive, identity }
+	ReplacementExchangeError::PostMutation {
+		code,
+		phase,
+		primitive,
+		identity: identity.map(Box::new),
+	}
 }
 
 #[cfg(target_os = "linux")]
@@ -3129,7 +3131,11 @@ fn replace_managed(
 		},
 		Err(ReplacementExchangeError::PostMutation { code, phase, primitive, identity }) => {
 			publish_post_mutation_failure_with_primitive_and_identity(
-				code, phase, primitive, identity, None,
+				code,
+				phase,
+				primitive,
+				identity.map(|identity| *identity),
+				None,
 			)
 		},
 	}
@@ -4152,8 +4158,7 @@ mod tests {
 			&identity.mtime_ns,
 			&identity.ctime_ns,
 			&file_digest(original),
-		)
-		.expect("append result");
+		);
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
