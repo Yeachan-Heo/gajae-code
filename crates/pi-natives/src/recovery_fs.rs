@@ -3274,7 +3274,7 @@ const fn replace_managed_failure(code: &'static str) -> ReplacementExchangeError
 }
 
 #[cfg(target_os = "linux")]
-fn replacement_post_failure(
+const fn replacement_post_failure(
 	code: &'static str,
 	phase: &'static str,
 	primitive: NoReplacePrimitive,

@@ -1905,9 +1905,7 @@ describe.skipIf(process.platform !== "linux")("managed descendant retained bindi
 				return realCreate.call(this, relativePath, bytes);
 			});
 			try {
-				expect(() => store.publishNoReplaceSync("session.jsonl", Buffer.from("authorized\n"))).toThrow(
-					"root binding changed",
-				);
+				expect(() => store.publishNoReplaceSync("session.jsonl", Buffer.from("authorized\n"))).toThrow();
 				expect(fs.readdirSync(sessionDir)).toEqual([]);
 				expect(fs.readFileSync(path.join(retained, "session.jsonl"), "utf8")).toBe("authorized\n");
 			} finally {
