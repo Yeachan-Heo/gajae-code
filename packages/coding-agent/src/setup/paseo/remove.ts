@@ -569,6 +569,7 @@ export async function removePaseoSetup(
 				pendingSidecarKeys.add(key);
 			}
 		}
+		const revertedOrdinaryKeys = new Set<string>();
 		const outcome = await revertJson(deps.paths.configJson, options.now, draft => {
 			const providers = providersOf(draft);
 			if (!providers) return;
@@ -583,7 +584,10 @@ export async function removePaseoSetup(
 				}
 				const replaced = restores.get(key);
 				if (replaced !== undefined) providers[key] = replaced;
-				else delete providers[key];
+				else {
+					delete providers[key];
+					revertedOrdinaryKeys.add(key);
+				}
 			}
 		});
 		if (!outcome.ok) {
@@ -646,7 +650,7 @@ export async function removePaseoSetup(
 		}
 		const keptRefs: Record<string, ProviderReplacedRef> = { ...(nextLedger.providerReplacedEntries ?? {}) };
 		const keptProviderKeys: Record<string, string> = { ...nextLedger.providerKeys };
-		for (const key of cleanedKeys) {
+		for (const key of [...cleanedKeys, ...revertedOrdinaryKeys]) {
 			delete keptRefs[key];
 			delete keptProviderKeys[key];
 		}
