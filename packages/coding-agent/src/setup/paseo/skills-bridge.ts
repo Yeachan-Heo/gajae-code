@@ -76,6 +76,16 @@ type SymlinkIdentity = {
 	readonly mtimeNs: bigint;
 };
 
+function matchesRecordedIdentity(recorded: BridgeEntryIdentity | undefined, observed: SymlinkIdentity): boolean {
+	return (
+		recorded !== undefined &&
+		recorded.dev === observed.dev.toString() &&
+		recorded.ino === observed.ino.toString() &&
+		recorded.size === observed.size.toString() &&
+		recorded.mtimeNs === observed.mtimeNs.toString()
+	);
+}
+
 type BridgeEntryPlan = {
 	readonly name: string;
 	readonly action: BridgeEntryAction;
@@ -480,8 +490,15 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 			// The same exact-target predicate `--remove` applies: a recorded
 			// name is only ours while the link still points under the source the
 			// ledger recorded. A user who retargeted the link at their own tree
-			// keeps it -- it is reported as a conflict instead of pruned.
+			// keeps it -- it is reported as a conflict instead of pruned. The
+			// durable no-follow identity is required as a second ownership proof;
+			// a prewritten name plus a matching target can still describe a user
+			// symlink that existed before GJC created anything.
 			if (resolvedLinkTarget(state.link, destination) !== path.resolve(ownershipSourceDir, entry.name)) {
+				conflicts.push(destination);
+				continue;
+			}
+			if (!matchesRecordedIdentity(ledger.bridgeEntryIdentities?.[entry.name], state.identity)) {
 				conflicts.push(destination);
 				continue;
 			}

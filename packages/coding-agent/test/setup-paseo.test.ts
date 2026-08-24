@@ -863,6 +863,32 @@ describe("skills bridge", () => {
 		expect((await fs.lstat(path.join(fixture.paths.bridgeDir, "paseo"))).isSymbolicLink()).toBe(true);
 	});
 
+	test("an identityless prewritten stale link is preserved even when its target matches (#4644 Codex P2)", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		const retiredSource = path.join(fixture.root, "retired-skills");
+		const name = "paseo-loop";
+		await fs.mkdir(path.join(retiredSource, name), { recursive: true });
+		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeSourceDir: retiredSource,
+			bridgeEntries: [name],
+			bridgeEntryIdentities: {},
+			bridgeDirCreated: false,
+		});
+		// The user writes the exact target after the durable prewritten plan.
+		await fs.symlink(path.join(retiredSource, name), path.join(fixture.paths.bridgeDir, name));
+		await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		const before = await snapshotTree(fixture.paths.bridgeDir);
+
+		await expect(preflightSkillsBridge(fixture.deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		expect(await snapshotTree(fixture.paths.bridgeDir)).toBe(before);
+	});
+
 	test("a corrupt provenance ledger is an explicit error, never an empty one (#4644 review r3)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
@@ -2677,6 +2703,42 @@ describe("skills bridge", () => {
 		expect(ledger.bridgeEntries).toContain("paseo-advisor");
 	});
 
+	test("an identityless prewritten migration link is preserved even when its target matches (#4644 Codex P2)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		const oldDir = fixture.paths.bridgeDir;
+		const name = "paseo";
+		const sourceDir = await fs.realpath(fixture.paths.agentsSkillsDir as string);
+		await fs.mkdir(oldDir, { recursive: true });
+		await writeProvenance(fixture.paths.provenanceLedger, {
+			version: 1,
+			providerKeys: {},
+			seededOrchestrationKeys: {},
+			bridgePath: oldDir,
+			bridgeSourceDir: sourceDir,
+			bridgeEntries: [name],
+			bridgeEntryIdentities: {},
+			bridgeDirCreated: false,
+		});
+		// The user writes the exact target after the durable prewritten plan.
+		await fs.symlink(path.join(sourceDir, name), path.join(oldDir, name));
+		const newBridge = path.join(path.dirname(oldDir), "identityless-migrated-paseo-skills");
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: { ...fixture.deps.paths, bridgeDir: newBridge },
+		};
+
+		const install = await runPaseoSetup({}, migratedDeps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("partial-install");
+		if (install.result.outcome !== "partial-install") throw new Error("expected a partial install outcome");
+		expect(install.result.evidence.detail).toContain("without a durable recorded identity");
+		expect(await fs.readlink(path.join(oldDir, name))).toBe(path.join(sourceDir, name));
+		await expect(fs.stat(newBridge)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test(".env.local and NODE_ENV variants are rejected for PASEO_SKILLS_DIR (#4644 review r4)", async () => {
 		const root = await makeRoot();
 		const home = path.join(root, "home");
@@ -2749,7 +2811,7 @@ describe("skills bridge", () => {
 		expect(preflight.adopts).toEqual([]);
 	});
 
-	test("a legacy ledger with links into a retired ~/.agents/skills converges onto the app bundle (#4644 review)", async () => {
+	test("a legacy ledger without entry identities refuses retired-source convergence (#4644 review)", async () => {
 		// The exact wedged state from #4638: five allowlist links into a
 		// ~/.agents/skills that never existed, a desktop app now present, and a
 		// legacy ledger without bridgeSourceDir.
@@ -2762,8 +2824,11 @@ describe("skills bridge", () => {
 			await fs.writeFile(path.join(bundle, name, "SKILL.md"), `# ${name}\n`);
 		}
 		await fs.mkdir(fixture.paths.bridgeDir, { recursive: true });
+		const beforeLinks: Record<string, string> = {};
 		for (const name of SKILL_NAMES) {
-			await fs.symlink(path.join(legacySource, name), path.join(fixture.paths.bridgeDir, name));
+			const destination = path.join(fixture.paths.bridgeDir, name);
+			beforeLinks[name] = path.join(legacySource, name);
+			await fs.symlink(beforeLinks[name], destination);
 		}
 		await writeProvenance(fixture.paths.provenanceLedger, {
 			version: 1,
@@ -2773,6 +2838,7 @@ describe("skills bridge", () => {
 			bridgeEntries: [...SKILL_NAMES],
 			bridgeDirCreated: false,
 		});
+		const recordedLedger = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
 		const deps: PaseoSetupDependencies = {
 			...fixture.deps,
 			skillsSource: async () => ({ dir: bundle, origin: "app-bundle" }),
@@ -2782,22 +2848,14 @@ describe("skills bridge", () => {
 		const drifted = await checkPaseoSetup(deps);
 		expect(drifted.status).toBe("drift");
 
-		// Re-running setup converges: adopt paseo, prune the retired names,
-		// create paseo-help, and record the discovered source directory.
-		const install = await runPaseoSetup({}, deps);
-		expect(install.kind).toBe("install");
-		const ledger = await readProvenance(fixture.paths.provenanceLedger);
-		expect([...(ledger.bridgeEntries ?? [])].sort()).toEqual(["paseo", "paseo-help"]);
-		expect(ledger.bridgeSourceDir).toBe(bundle);
-		const linked = (await fs.readdir(fixture.paths.bridgeDir)).sort();
-		expect(linked).toEqual(["paseo", "paseo-help"]);
-		for (const name of linked) {
-			expect(await fs.readlink(path.join(fixture.paths.bridgeDir, name))).toBe(path.join(bundle, name));
+		// Without durable per-entry identities, matching legacy targets cannot
+		// prove GJC created these links. Setup refuses before any adoption or
+		// prune, preserving both the user-visible links and the ledger.
+		await expect(runPaseoSetup({}, deps)).rejects.toBeInstanceOf(SkillsBridgeError);
+		for (const name of SKILL_NAMES) {
+			expect(await fs.readlink(path.join(fixture.paths.bridgeDir, name))).toBe(beforeLinks[name]);
 		}
-
-		const result = await checkPaseoSetup(deps);
-		expect(result.status).toBe("pass");
-		expect(checkExitCode(result)).toBe(0);
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(recordedLedger);
 	});
 
 	test("remove rolls back a legacy ledger with no recorded source directory (#4644 review)", async () => {

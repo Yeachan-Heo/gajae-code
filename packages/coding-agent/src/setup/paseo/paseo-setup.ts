@@ -686,9 +686,9 @@ type MigratedOldBridgeEntry = {
 };
 
 /**
- * Capture the exact old links before migration cutover. Historical ledgers
- * may predate entry identities, so a missing identity is filled from this
- * no-follow snapshot; an identity that IS recorded must still match it.
+ * Capture the exact old links before migration cutover. A durable per-entry
+ * identity is required before migration may remove a link: a prewritten name
+ * and matching target can still describe a user-created symlink.
  */
 async function captureMigratedOldBridgeEntries(
 	bridgeDir: string,
@@ -720,10 +720,15 @@ async function captureMigratedOldBridgeEntries(
 			mtimeNs: stat.mtimeNs.toString(),
 		};
 		const recorded = recordedIdentities?.[name];
-		if (recorded !== undefined && !sameBridgeEntryIdentity(recorded, observed)) {
+		if (recorded === undefined) {
+			throw new SkillsBridgeError(
+				`Refusing to migrate an old Paseo skill bridge entry without a durable recorded identity: ${destination}`,
+			);
+		}
+		if (!sameBridgeEntryIdentity(recorded, observed)) {
 			throw new SkillsBridgeError(`Refusing to migrate a changed old Paseo skill bridge entry: ${destination}`);
 		}
-		captured.push({ name, linkText, identity: recorded ?? observed });
+		captured.push({ name, linkText, identity: recorded });
 	}
 	return captured;
 }
