@@ -2116,6 +2116,11 @@ export interface RecoveryFsPublishResult {
   ok: boolean
   code?: string
   identity?: RecoveryFsIdentity
+  /**
+   * Relative recovery evidence only; it grants no replay or deletion
+   * authority.
+   */
+  recoveryPath?: string
   mutationState: string
   durabilityState: string
   reason: string

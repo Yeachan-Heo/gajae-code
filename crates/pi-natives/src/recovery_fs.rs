@@ -333,11 +333,21 @@ enum ReplacementExchangeError {
 		phase: &'static str,
 	},
 	PostMutation {
-		code:      &'static str,
-		phase:     &'static str,
-		primitive: NoReplacePrimitive,
-		identity:  Option<Box<RecoveryFsIdentity>>,
+		code:          &'static str,
+		phase:         &'static str,
+		primitive:     NoReplacePrimitive,
+		identity:      Option<Box<RecoveryFsIdentity>>,
+		recovery_path: Option<String>,
 	},
+}
+
+#[cfg(target_os = "linux")]
+fn recovery_evidence_path(name: &CString) -> Option<String> {
+	let name = name.to_str().ok()?;
+	if !(name.starts_with(".gjc-managed-exchange-") || name.starts_with(".gjc-managed-replace-")) {
+		return None;
+	}
+	Some(format!(".gjc-recovery/{name}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -634,10 +644,11 @@ fn exchange_through_link(
 	// moving the rollback name; a sync failure is committed-but-unproven.
 	if sync_parent(destination_parent).is_err() {
 		return Err(ReplacementExchangeError::PostMutation {
-			code:      "fsync_failed",
-			phase:     "destination_parent_sync",
-			primitive: NoReplacePrimitive::LinkatExchange,
-			identity:  None,
+			code:          "fsync_failed",
+			phase:         "destination_parent_sync",
+			primitive:     NoReplacePrimitive::LinkatExchange,
+			identity:      None,
+			recovery_path: recovery_evidence_path(&temporary),
 		});
 	}
 	// SAFETY: the candidate parent fd and both names remain valid for this syscall.
@@ -653,19 +664,21 @@ fn exchange_through_link(
 		// The replacement committed. The displaced object remains reachable under
 		// the durable temporary name, so do not delete it.
 		return Err(ReplacementExchangeError::PostMutation {
-			code:      "rollback_unavailable",
-			phase:     "terminal_identity",
-			primitive: NoReplacePrimitive::LinkatExchange,
-			identity:  None,
+			code:          "rollback_unavailable",
+			phase:         "terminal_identity",
+			primitive:     NoReplacePrimitive::LinkatExchange,
+			identity:      None,
+			recovery_path: recovery_evidence_path(&temporary),
 		});
 	}
 	// Settle the final rollback name's parent so the terminal namespace is durable.
 	if sync_parent(candidate_parent).is_err() {
 		return Err(ReplacementExchangeError::PostMutation {
-			code:      "fsync_failed",
-			phase:     "source_parent_sync",
-			primitive: NoReplacePrimitive::LinkatExchange,
-			identity:  None,
+			code:          "fsync_failed",
+			phase:         "source_parent_sync",
+			primitive:     NoReplacePrimitive::LinkatExchange,
+			identity:      None,
+			recovery_path: recovery_evidence_path(candidate_name),
 		});
 	}
 	Ok(NoReplacePrimitive::LinkatExchange)
@@ -1025,6 +1038,9 @@ pub struct RecoveryFsPublishResult {
 	pub ok:               bool,
 	pub code:             Option<String>,
 	pub identity:         Option<RecoveryFsIdentity>,
+	/// Relative recovery evidence only; it grants no replay or deletion
+	/// authority.
+	pub recovery_path:    Option<String>,
 	pub mutation_state:   String,
 	pub durability_state: String,
 	pub reason:           String,
@@ -1076,6 +1092,7 @@ impl RecoveryFsPublishResult {
 			ok,
 			code,
 			identity,
+			recovery_path: None,
 			mutation_state: mutation_state.to_owned(),
 			durability_state: durability_state.to_owned(),
 			reason: reason.to_owned(),
@@ -3273,6 +3290,7 @@ fn replacement_post_failure(
 		// post-mutation failures must not authorize a retry against an unreachable
 		// inode. Only a fresh canonical-path proof may populate this field.
 		identity: None,
+		recovery_path: None,
 	}
 }
 
@@ -3335,14 +3353,22 @@ fn replace_managed(
 			"renameat2_exchange".clone_into(&mut result.primitive);
 			result
 		},
-		Err(ReplacementExchangeError::PostMutation { code, phase, primitive, identity }) => {
-			publish_post_mutation_failure_with_primitive_and_identity(
+		Err(ReplacementExchangeError::PostMutation {
+			code,
+			phase,
+			primitive,
+			identity,
+			recovery_path,
+		}) => {
+			let mut result = publish_post_mutation_failure_with_primitive_and_identity(
 				code,
 				phase,
 				primitive,
 				identity.map(|identity| *identity),
 				None,
-			)
+			);
+			result.recovery_path = recovery_path;
+			result
 		},
 	}
 }
@@ -3459,6 +3485,7 @@ fn replace_managed_inner(
 			phase: "terminal_identity",
 			primitive,
 			identity: identity.map(Box::new),
+			recovery_path: None,
 		});
 	}
 	let verified =
@@ -5668,6 +5695,51 @@ mod tests {
 	#[test]
 	fn managed_replace_fallback_rechecks_after_final_verify_before_receipt() {
 		assert_post_final_verify_successor_is_not_receipted(true);
+	}
+
+	#[test]
+	fn managed_replace_fallback_reports_relative_recovery_evidence() {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		set_retained_publish_faults([
+			RetainedPublishFault::Rename(libc::EINVAL),
+			RetainedPublishFault::Sync(None),
+			RetainedPublishFault::Sync(Some(libc::EIO)),
+		]);
+
+		let result = replace_managed(
+			&root,
+			None,
+			"transcript",
+			b"rewritten-transcript",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("fsync_failed"));
+		assert_eq!(result.mutation_state, "committed");
+		let recovery_path = result
+			.recovery_path
+			.expect("fallback rollback evidence path");
+		assert!(recovery_path.starts_with(".gjc-recovery/.gjc-managed-exchange-"));
+		assert!(!recovery_path.starts_with('/'));
+		assert!(!recovery_path.contains(".."));
+		assert!(
+			temporary.0.join(&recovery_path).is_file(),
+			"reported rollback evidence must remain reachable",
+		);
+		assert_eq!(fs::read(temporary.0.join(&recovery_path)).expect("rollback evidence"), original,);
 	}
 
 	/// The ordering that closes the fallback successor window, pinned

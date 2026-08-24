@@ -165,6 +165,28 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 		});
 	});
 
+	it("reaps inert fallback exchange debris under the approved recovery directory", async () => {
+		await withTempDir("gjc-exchange-remnant-reap-", async dir => {
+			const recovery = path.join(dir, ".gjc-recovery");
+			await fsp.mkdir(recovery, { mode: 0o700 });
+			const aged = await seedRemnant(recovery, ".gjc-managed-exchange-123-456", 60 * 60 * 1000);
+			const fresh = await seedRemnant(recovery, ".gjc-managed-exchange-123-457", 0);
+			const payload = await seedRemnant(
+				recovery,
+				".gjc-managed-exchange-123-458",
+				60 * 60 * 1000,
+				new Uint8Array([1]),
+			);
+
+			const result = await reapScrubbedProtocolRemnants(dir);
+
+			expect(result).toEqual({ reaped: 1, failures: 0 });
+			expect(fs.existsSync(aged)).toBe(false);
+			expect(fs.existsSync(fresh)).toBe(true);
+			expect(fs.existsSync(payload)).toBe(true);
+		});
+	});
+
 	it("matches the sync reaper's result on the same directory shape", async () => {
 		await withTempDir("gjc-remnant-parity-", async dir => {
 			for (let index = 0; index < 4; index++) {

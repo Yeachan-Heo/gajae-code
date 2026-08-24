@@ -214,6 +214,68 @@ describe("native publish outcome classification", () => {
 		expect(retained.ok).toBe(true);
 	});
 
+	it("accepts only bounded fallback recovery evidence", () => {
+		const committed = classifyNativePublishOutcome(
+			{
+				...preMutation,
+				code: "fsync_failed",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+				reason: "durability_not_provable",
+				primitive: "linkat_exchange",
+				phase: "destination_parent_sync",
+				recoveryPath: ".gjc-recovery/.gjc-managed-exchange-123-456",
+				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 5 },
+			},
+			"retained_replace",
+		);
+		expect(committed.recoveryPath).toBe(".gjc-recovery/.gjc-managed-exchange-123-456");
+
+		for (const recoveryPath of [
+			"/tmp/unsafe",
+			".gjc-recovery/../outside",
+			".gjc-recovery/.gjc-managed-exchange-123",
+		]) {
+			expect(classifyNativePublishOutcome({ ...committed, recoveryPath }, "retained_replace").mutationState).toBe(
+				"unknown",
+			);
+		}
+	});
+
+	it("preserves bounded fallback recovery evidence on committed replacement errors", () => {
+		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-recovery-evidence-")));
+		let replace: Mock<typeof native.RecoveryFsRoot.prototype.replaceManaged> | undefined;
+		try {
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("predecessor\n"));
+			replace = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockReturnValue({
+				ok: false,
+				code: "fsync_failed",
+				recoveryPath: ".gjc-recovery/.gjc-managed-exchange-123-456",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+				reason: "durability_not_provable",
+				primitive: "linkat_exchange",
+				phase: "destination_parent_sync",
+				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 5 },
+			});
+
+			let error: unknown;
+			try {
+				store.replaceSync("session.jsonl", Buffer.from("successor\n"));
+			} catch (caught) {
+				error = caught;
+			}
+			expect(error).toBeInstanceOf(ManagedCommittedMutationError);
+			expect((error as ManagedCommittedMutationError).recoveryPath).toBe(
+				".gjc-recovery/.gjc-managed-exchange-123-456",
+			);
+		} finally {
+			replace?.mockRestore();
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts only the fallback primitive for each retained publish shape", () => {
 		const success = {
 			...preMutation,

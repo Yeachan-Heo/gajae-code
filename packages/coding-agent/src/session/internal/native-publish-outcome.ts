@@ -63,6 +63,8 @@ export type NativePublishOutcome = {
 	readonly ok: boolean;
 	readonly code?: string;
 	readonly identity?: NativePublishIdentity;
+	/** Relative fallback recovery evidence; never a filesystem authority. */
+	readonly recoveryPath?: string;
 	readonly mutationState: NativePublishMutationState;
 	readonly durabilityState: NativePublishDurabilityState;
 	readonly reason: NativePublishReason;
@@ -152,6 +154,14 @@ function validIdentity(value: unknown): boolean {
 	);
 }
 
+function validRecoveryPath(value: unknown): boolean {
+	return (
+		value === undefined ||
+		(typeof value === "string" &&
+			/^\.gjc-recovery\/\.gjc-managed-(?:exchange|replace)-[0-9]{1,20}-[0-9]{1,20}$/.test(value))
+	);
+}
+
 function validDiagnostic(value: unknown): value is PublishDiagnostic {
 	if (!ownPlainRecord(value) || !exactKeys(value, ["schemaVersion", "collectionState", "osCode", "syncFailures"]))
 		return false;
@@ -234,6 +244,7 @@ export function classifyNativePublishOutcome(
 			"ok",
 			"code",
 			"identity",
+			"recoveryPath",
 			"mutationState",
 			"durabilityState",
 			"reason",
@@ -252,11 +263,19 @@ export function classifyNativePublishOutcome(
 		!primitives.has(value.primitive as NativePublishPrimitive) ||
 		!phases.has(value.phase as NativePublishPhase) ||
 		!validIdentity(value.identity) ||
+		!validRecoveryPath(value.recoveryPath) ||
 		!validDiagnostic(value.diagnostic)
 	)
 		return malformed;
 	const outcome = value as unknown as NativePublishOutcome;
 	if (!legalOutcome(outcome)) return malformed;
+	if (
+		outcome.recoveryPath !== undefined &&
+		(outcome.mutationState !== "committed" ||
+			outcome.primitive !== "linkat_exchange" ||
+			!(["source_parent_sync", "destination_parent_sync", "terminal_identity"] as string[]).includes(outcome.phase))
+	)
+		return malformed;
 	if (operation === "direct_rename") return outcome;
 	const retainedPrimitiveValid =
 		operation === "retained_file"

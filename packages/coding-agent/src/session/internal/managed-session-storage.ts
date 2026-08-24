@@ -106,6 +106,8 @@ export class ManagedCommittedMutationError extends Error {
 		readonly operation: "replace" | "append",
 		cause: unknown,
 		readonly identity?: ManagedFileIdentity,
+		/** Relative fallback recovery evidence; never a filesystem authority. */
+		readonly recoveryPath?: string,
 	) {
 		super(`managed_${operation}_committed_outcome_uncertain`, { cause });
 		this.name = "ManagedCommittedMutationError";
@@ -126,6 +128,7 @@ function managedReplacementFailure(value: unknown): Error {
 				"replace",
 				cause,
 				isDescriptorBoundManagedIdentity(identity) ? identity : undefined,
+				outcome.recoveryPath,
 			);
 }
 
@@ -587,7 +590,13 @@ const SCRUBBED_REMNANT_PREFIXES = [
 	".gjc-receipt-remove-",
 	".gjc-receipt-placeholder-remove-",
 	".gjc-replace-retry-",
+	// A fallback exchange retains the displaced inode under this name until the
+	// post-mutation receipt is proven. Only zero-byte terminal debris is inert;
+	// non-zero entries remain recovery evidence and are never reaped.
+	".gjc-managed-exchange-",
 ] as const;
+
+const MANAGED_RECOVERY_DIRECTORY = ".gjc-recovery";
 
 /** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
 const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
@@ -609,6 +618,32 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
 	return { reaped, failures };
 }
 
+function approvedRemnantDirectoriesSync(directory: string): { directories: string[]; failures: number } {
+	const directories = [directory];
+	let failures = 0;
+	const recovery = path.join(directory, MANAGED_RECOVERY_DIRECTORY);
+	try {
+		const named = fs.lstatSync(recovery);
+		if (named.isDirectory() && !named.isSymbolicLink()) directories.push(recovery);
+	} catch (error) {
+		if (!isEnoent(error)) failures += 1;
+	}
+	return { directories, failures };
+}
+
+async function approvedRemnantDirectories(directory: string): Promise<{ directories: string[]; failures: number }> {
+	const directories = [directory];
+	let failures = 0;
+	const recovery = path.join(directory, MANAGED_RECOVERY_DIRECTORY);
+	try {
+		const named = await fsp.lstat(recovery);
+		if (named.isDirectory() && !named.isSymbolicLink()) directories.push(recovery);
+	} catch (error) {
+		if (!isEnoent(error)) failures += 1;
+	}
+	return { directories, failures };
+}
+
 /**
  * Best-effort removal of scrubbed write-protocol remnants from one managed
  * directory. Only zero-length, single-link, non-symlink regular files whose
@@ -623,26 +658,30 @@ export function reapScrubbedProtocolRemnantsSync(
 	directory: string,
 	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
 ): ScrubbedProtocolRemnantReapResult {
-	let names: string[];
-	try {
-		names = fs.readdirSync(directory);
-	} catch (error) {
-		return reportScrubbedProtocolRemnantReap(0, isEnoent(error) ? 0 : 1);
-	}
+	const approved = approvedRemnantDirectoriesSync(directory);
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
-	let failures = 0;
-	for (const name of names) {
-		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
-		const pathname = path.join(directory, name);
+	let failures = approved.failures;
+	for (const scanDirectory of approved.directories) {
+		let names: string[];
 		try {
-			const named = fs.lstatSync(pathname);
-			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
-			if (named.mtimeMs > cutoff) continue;
-			fs.unlinkSync(pathname);
-			reaped += 1;
+			names = fs.readdirSync(scanDirectory);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
+			continue;
+		}
+		for (const name of names) {
+			if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+			const pathname = path.join(scanDirectory, name);
+			try {
+				const named = fs.lstatSync(pathname);
+				if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+				if (named.mtimeMs > cutoff) continue;
+				fs.unlinkSync(pathname);
+				reaped += 1;
+			} catch (error) {
+				if (!isEnoent(error)) failures += 1;
+			}
 		}
 	}
 	return reportScrubbedProtocolRemnantReap(reaped, failures);
@@ -663,28 +702,32 @@ export async function reapScrubbedProtocolRemnants(
 	directory: string,
 	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
 ): Promise<ScrubbedProtocolRemnantReapResult> {
-	let names: string[];
-	try {
-		names = await fsp.readdir(directory);
-	} catch (error) {
-		return reportScrubbedProtocolRemnantReap(0, isEnoent(error) ? 0 : 1);
-	}
+	const approved = await approvedRemnantDirectories(directory);
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
-	let failures = 0;
+	let failures = approved.failures;
 	let scanned = 0;
-	for (const name of names) {
-		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
-		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
-		const pathname = path.join(directory, name);
+	for (const scanDirectory of approved.directories) {
+		let names: string[];
 		try {
-			const named = await fsp.lstat(pathname);
-			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
-			if (named.mtimeMs > cutoff) continue;
-			await fsp.unlink(pathname);
-			reaped += 1;
+			names = await fsp.readdir(scanDirectory);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
+			continue;
+		}
+		for (const name of names) {
+			if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+			if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
+			const pathname = path.join(scanDirectory, name);
+			try {
+				const named = await fsp.lstat(pathname);
+				if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+				if (named.mtimeMs > cutoff) continue;
+				await fsp.unlink(pathname);
+				reaped += 1;
+			} catch (error) {
+				if (!isEnoent(error)) failures += 1;
+			}
 		}
 	}
 	return reportScrubbedProtocolRemnantReap(reaped, failures);
