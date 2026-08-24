@@ -77,6 +77,17 @@ describe("resolveActiveProjectRegistryPath", () => {
 		expect(result).toBe(path.join(tmpDir, "sub", ".gjc", "plugins", "installed_plugins.json"));
 	});
 
+	it("stops at an explicitly supplied home before an unrelated ancestor registry", async () => {
+		const suppliedHome = path.join(tmpDir, "alternate-home");
+		const cwd = path.join(suppliedHome, "nested", "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(path.join(tmpDir, ".gjc"), { recursive: true });
+
+		const result = await resolveActiveProjectRegistryPath(cwd, suppliedHome);
+
+		expect(result).toBeNull();
+	});
+
 	it("falls back to .git root when no .gjc/ exists", async () => {
 		// Layout: tmpDir/.git/   +   tmpDir/sub/  (cwd)
 		// No .gjc/ anywhere → second pass finds .git/ at tmpDir.

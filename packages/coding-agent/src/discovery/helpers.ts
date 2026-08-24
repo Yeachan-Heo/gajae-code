@@ -793,10 +793,15 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  * This is the single source of truth for "active project root" used by install,
  * uninstall, list, upgrade, discovery, and doctor. Deterministic for a given `cwd`.
  */
-export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
+export async function resolveActiveProjectRegistryPath(
+	cwd: string,
+	homeDir: string = getTrustedHomeDir(),
+): Promise<string | null> {
 	// Pass 1: walk up looking for an existing .gjc/ directory (nearest wins).
-	// Stop before the provenance-checked home — ~/.gjc/ is the user-level config dir, not a project root.
-	const homeDir = getTrustedHomeDir();
+	// Stop before the caller's authoritative home — its .gjc/ is the user-level
+	// config dir, not a project root. Explicit-home capability loading passes
+	// that supplied home instead of leaking the process-global trusted home.
+	homeDir = path.resolve(homeDir);
 	let dir = path.resolve(cwd);
 	while (dir !== homeDir) {
 		try {
@@ -871,7 +876,7 @@ export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
-	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
+	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home) : null;
 	const cacheKey = `${home}:${resolvedProjectPath ?? ""}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
