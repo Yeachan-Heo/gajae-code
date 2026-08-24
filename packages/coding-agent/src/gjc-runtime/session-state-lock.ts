@@ -7,7 +7,11 @@ import type {
 	NativeDirectoryTreeSnapshot,
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
-import { genericFileLockDirIsStale, processStartTime as portableProcessStartTime } from "../config/file-lock";
+import {
+	genericFileLockDirIsStale,
+	processStartTime as portableProcessStartTime,
+	readFileLockInfoForGc,
+} from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 
@@ -30,15 +34,6 @@ import { readLinuxProcStartTimeSync } from "./linux-proc";
 const LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
 const LOCK_ACQUIRE_RETRY_MS = 5;
 const LOCK_STALE_MS = 30_000;
-
-const LOCAL_LINUX_FILE_SYSTEM_TYPES = new Set([
-	0x0102_1994, // tmpfs
-	0x2fc1_2fc1, // ZFS
-	0x5846_5342, // XFS
-	0x9123_683e, // Btrfs
-	0xef53, // ext2/3/4
-	0xf2f5_2010, // F2FS
-]);
 
 /**
  * The claim that serializes PATHNAME TRANSITIONS of `<file>.lock` among current writers.
@@ -148,12 +143,10 @@ export const SessionStateLockTestHooks: {
 	loadInstallationHostId?: () => Promise<string>;
 	/** @internal Previous identity seam for upgrade recovery tests. */
 	legacyOwnerHostId?: () => string | Promise<string>;
-	/** @internal Lets legacy same-host fixtures exercise their pre-qualification paths. */
+	/** @internal Lets fixtures simulate a separately authenticated legacy-local owner. */
 	unqualifiedOwnerIsLocal?: boolean;
 	/** @internal Shortens acquisition deadlines without changing production timing. */
 	lockAcquireTimeoutMs?: number;
-	/** @internal Replaces Darwin volume commands for timeout and parser tests. */
-	darwinVolumeCommand?: (argv: readonly string[]) => Promise<{ output: string; exitCode: number }>;
 	/** @internal Runs after final live-owner validation and before descriptor rewrite. */
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
 	/**
@@ -352,87 +345,6 @@ function probeOwnerProcess(pid: number): OwnerProcessLiveness {
  * record still is the record that was judged, so the compare-and-delete matches and a live
  * holder loses its lock.
  */
-export function detectedLinuxSessionStateLockFileSystemIsLocal(type: number): boolean {
-	return LOCAL_LINUX_FILE_SYSTEM_TYPES.has(type);
-}
-
-export function detectedDarwinLocalApfsDevices(mountOutput: string): string[] {
-	const devices: string[] = [];
-	for (const line of mountOutput.split(/\r?\n/u)) {
-		const separator = line.indexOf(" on ");
-		const optionsStart = line.lastIndexOf(" (");
-		if (separator <= 0 || optionsStart <= separator || !line.endsWith(")")) continue;
-		const device = line.slice(0, separator);
-		if (!device.startsWith("/dev/")) continue;
-		const options = line
-			.slice(optionsStart + 2, -1)
-			.split(",")
-			.map(option => option.trim());
-		if (options.includes("apfs") && options.includes("local")) devices.push(device);
-	}
-	return devices;
-}
-
-async function darwinOwnerVolumeIsLocal(ownerDev: bigint, mountOutput: string): Promise<boolean> {
-	for (const device of detectedDarwinLocalApfsDevices(mountOutput)) {
-		const stat = await fs.stat(device, { bigint: true }).catch(() => null);
-		if (stat?.isBlockDevice() && stat.rdev === ownerDev) return true;
-	}
-	return false;
-}
-
-async function commandOutput(argv: string[], deadline: number): Promise<string | undefined> {
-	const remaining = deadline - performance.now();
-	if (remaining <= 0) return undefined;
-	const hook = SessionStateLockTestHooks.darwinVolumeCommand;
-	if (hook) {
-		const outcome = await Promise.race([hook(argv), Bun.sleep(remaining).then(() => undefined)]);
-		return outcome !== undefined && outcome.exitCode === 0 && performance.now() < deadline
-			? outcome.output
-			: undefined;
-	}
-	const child = Bun.spawn(argv, {
-		stdout: "pipe",
-		stderr: "ignore",
-		timeout: Math.max(1, Math.ceil(remaining)),
-	});
-	const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-	return exitCode === 0 && performance.now() < deadline ? output : undefined;
-}
-
-async function unqualifiedOwnerIsLocal(file: string, ownerDev: bigint, deadline: number): Promise<boolean> {
-	const override = SessionStateLockTestHooks.unqualifiedOwnerIsLocal;
-	if (override !== undefined) return override;
-	try {
-		if (performance.now() >= deadline) return false;
-		if (process.platform === "darwin") {
-			const mountOutput = await commandOutput(["/sbin/mount", "-t", "apfs"], deadline);
-			return (
-				mountOutput !== undefined &&
-				performance.now() < deadline &&
-				(await darwinOwnerVolumeIsLocal(ownerDev, mountOutput)) &&
-				performance.now() < deadline
-			);
-		}
-		if (process.platform !== "linux") return false;
-		const directoryFlags = fsSync.constants.O_RDONLY | fsSync.constants.O_DIRECTORY | fsSync.constants.O_NOFOLLOW;
-		const parent = await fs.open(path.dirname(file), directoryFlags);
-		try {
-			const before = await parent.stat({ bigint: true });
-			if (!before.isDirectory() || before.dev !== ownerDev || performance.now() >= deadline) return false;
-			const volume = await fs.statfs(`/proc/self/fd/${parent.fd}`);
-			if (!detectedLinuxSessionStateLockFileSystemIsLocal(volume.type) || performance.now() >= deadline)
-				return false;
-			const after = await parent.stat({ bigint: true });
-			return after.isDirectory() && after.dev === before.dev && after.ino === before.ino;
-		} finally {
-			await parent.close().catch(() => undefined);
-		}
-	} catch {
-		return false;
-	}
-}
-
 function lockAcquireDeadline(): number {
 	return performance.now() + (SessionStateLockTestHooks.lockAcquireTimeoutMs ?? LOCK_ACQUIRE_TIMEOUT_MS);
 }
@@ -444,11 +356,14 @@ async function waitForLockRetry(deadline: number): Promise<boolean> {
 	return performance.now() < deadline;
 }
 
-async function lockOwnerIsAlive(file: string, value: unknown, ownerDev: bigint, deadline: number): Promise<boolean> {
+async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
 	if (!validLockOwner(value)) return false;
 	const owner = value;
 	if (owner.owner_host_id === undefined) {
-		if (!(await unqualifiedOwnerIsLocal(file, ownerDev, deadline))) return true;
+		// Filesystem type cannot prove that a PID is visible in the owner's PID
+		// namespace: a local ext/tmpfs/APFS mount can be shared with a container.
+		// Keep production recovery fail-closed until the legacy owner is qualified.
+		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
 	} else if (owner.owner_host_id !== (await currentOwnerHostId())) {
 		if (owner.owner_host_id !== (await currentLegacyOwnerHostId())) return true;
 	}
@@ -1008,7 +923,6 @@ async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<
  */
 async function reclaimStaleOwnerRecord(
 	file: string,
-	deadline: number,
 	hooks: {
 		afterInspection?: (file: string) => void | Promise<void>;
 		beforeRemoval?: (file: string) => void | Promise<void>;
@@ -1023,10 +937,10 @@ async function reclaimStaleOwnerRecord(
 		owner = null;
 	}
 	if (!validLockOwner(owner)) {
-		if (!(await unqualifiedOwnerIsLocal(file, snapshot.dev, deadline))) return;
+		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
 		// The mtime of the very inode the bytes were read from, not a fresh path `stat`.
 		if (Date.now() - Number(snapshot.mtimeNs / 1_000_000n) < LOCK_STALE_MS) return;
-	} else if (await lockOwnerIsAlive(file, owner, snapshot.dev, deadline)) return;
+	} else if (await lockOwnerIsAlive(owner)) return;
 	await hooks.afterInspection?.(file);
 	const current = await captureRegularLockOwner(file);
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
@@ -1051,14 +965,14 @@ async function releaseTransitionClaim(
 	await fs.rmdir(transitionDir);
 }
 
-async function reclaimStaleTransitionClaim(transitionDir: string, deadline: number): Promise<void> {
+async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void> {
 	const stat = await fs.lstat(transitionDir).catch(() => null);
 	if (!stat) return;
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
 	// explicit cleanup before this atomic-directory protocol can take over.
 	if (stat.isFile()) {
-		await reclaimStaleOwnerRecord(transitionDir, deadline, {
+		await reclaimStaleOwnerRecord(transitionDir, {
 			afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
 			beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
 		});
@@ -1085,7 +999,7 @@ async function withLockPathTransition<T>(
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
-			await reclaimStaleTransitionClaim(transitionDir, deadline);
+			await reclaimStaleTransitionClaim(transitionDir);
 			if (await waitForLockRetry(deadline)) continue;
 			break;
 		}
@@ -1128,7 +1042,7 @@ async function reclaimStaleRegularLock(lockFile: string, deadline: number): Prom
 	await withLockPathTransition(
 		lockFile,
 		async () =>
-			await reclaimStaleOwnerRecord(lockFile, deadline, {
+			await reclaimStaleOwnerRecord(lockFile, {
 				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
 				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
 			}),
@@ -1223,9 +1137,9 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			const native = nativeSessionStateLock();
 			const before = captureLegacyDirectoryTree(native, lockFile);
 			if (!before) return;
-			const ownerHostId = (await unqualifiedOwnerIsLocal(lockFile, BigInt(before.rootDev), deadline))
-				? undefined
-				: await currentOwnerHostId();
+			const owner = await readFileLockInfoForGc(lockFile);
+			if (!owner?.owner_host_id && SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
+			const ownerHostId = owner?.owner_host_id === undefined ? undefined : await currentOwnerHostId();
 			let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
 			if (!stale && ownerHostId !== undefined)
 				stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());

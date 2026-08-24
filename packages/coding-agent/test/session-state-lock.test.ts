@@ -54,7 +54,6 @@ afterEach(async () => {
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.lockAcquireTimeoutMs = undefined;
-	SessionStateLockTestHooks.darwinVolumeCommand = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	installExactIdentityNatives();
@@ -206,59 +205,20 @@ function ageWorldPastAnyStaleWindow(): () => void {
 }
 
 describe("coordinator session state lock", () => {
-	it("recognizes only local APFS device mounts for legacy owner recovery", () => {
-		const mountOutput = [
-			"/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)",
-			"/dev/disk4s1 on /Volumes/External (apfs, journaled)",
-			"server:/state on /state (nfs, local)",
-			"malformed",
-		].join("\n");
-		expect(sessionStateLock.detectedDarwinLocalApfsDevices(mountOutput)).toEqual(["/dev/disk3s5"]);
-		expect(sessionStateLock.detectedDarwinLocalApfsDevices("server:/state on /state (nfs, local)\n")).toEqual([]);
-		expect(sessionStateLock.detectedDarwinLocalApfsDevices("/dev/disk3s5 on /data (apfs)\n")).toEqual([]);
-		expect(sessionStateLock.detectedDarwinLocalApfsDevices("malformed")).toEqual([]);
-		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0xef53)).toBe(true);
-		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x5846_5342)).toBe(true);
-		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x00c3_6400)).toBe(false);
-		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x6969)).toBe(false);
+	it("fails closed for an unqualified regular owner without test-only locality authentication", async () => {
+		const { stateFile } = await seededRunningSession("lock-unqualified-namespace-owner");
+		const lockFile = `${stateFile}.lock`;
+		const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "unqualified-namespace-owner" });
+		await fs.writeFile(lockFile, record);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("missing"), { code: "ESRCH" });
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
 	});
-
-	if (process.platform === "darwin") {
-		it("reclaims an unqualified dead owner from a positively identified APFS volume", async () => {
-			const root = await tempRoot();
-			const lockFile = path.join(root, "lock-apfs-owner.json.lock");
-			await fs.writeFile(
-				lockFile,
-				JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "apfs-unqualified-owner" }),
-			);
-			SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
-			SessionStateLockTestHooks.probeProcessSignal = () => {
-				throw Object.assign(new Error("missing"), { code: "ESRCH" });
-			};
-
-			await reclaimStaleSessionStateLock(lockFile);
-
-			expect(fsSync.existsSync(lockFile)).toBe(false);
-		});
-
-		it("fails closed within the acquisition deadline when the APFS mount probe stalls", async () => {
-			const root = await tempRoot();
-			const lockFile = path.join(root, "lock-apfs-probe-timeout.json.lock");
-			const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "stalled-probe-owner" });
-			await fs.writeFile(lockFile, record);
-			SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
-			SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
-			const stalled = Promise.withResolvers<{ output: string; exitCode: number }>();
-			SessionStateLockTestHooks.darwinVolumeCommand = () => stalled.promise;
-			const startedAt = performance.now();
-
-			await reclaimStaleSessionStateLock(lockFile);
-
-			expect(performance.now() - startedAt).toBeLessThan(500);
-			expect(await fs.readFile(lockFile, "utf8")).toBe(record);
-			stalled.resolve({ output: "", exitCode: 0 });
-		});
-	}
 
 	it("bounds nested acquisition retries by one wall-clock deadline", async () => {
 		const root = await tempRoot();
