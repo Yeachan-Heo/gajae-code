@@ -9,7 +9,6 @@ const MAX_BROKER_JSON_FRAME_BYTES = 4 * 1024 * 1024;
 const BROKER_OPERATIONS = new Set([
 	"session.list",
 	"session.get_endpoint",
-	"model.resolve",
 	"session.create",
 	"session.fork",
 	"session.resume",

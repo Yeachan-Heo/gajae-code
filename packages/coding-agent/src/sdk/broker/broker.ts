@@ -851,7 +851,6 @@ export class Broker {
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
 	readonly #resolveModelPin: SdkHostModelResolver;
-
 	constructor(settings: BrokerSettings) {
 		const authority =
 			settings.packageGeneration === undefined ||
@@ -868,7 +867,6 @@ export class Broker {
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
 		};
-		this.#resolveModelPin = createDefaultSdkHostModelResolver(settings.agentDir);
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);

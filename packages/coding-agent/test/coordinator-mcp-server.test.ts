@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Model } from "@gajae-code/ai";
 import {
 	type CodexHandoffOriginV1,
 	readCodexHandoff,
