@@ -1626,7 +1626,8 @@ export class ManagedSessionDescendantStore {
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
 			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
-			if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
+			if (!sameManagedIdentity(current, expected) || !expected.sha256 || current.sha256 !== expected.sha256)
+				throw new Error("managed_replace_identity_mismatch");
 			replaceManagedFileSync(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
 			this.#assertBound();
 			return;
@@ -1649,6 +1650,8 @@ export class ManagedSessionDescendantStore {
 				? observed.identity.sha256.toLowerCase()
 				: this.readExpected(relativePath)?.identity.sha256;
 		if (!expectedSha256) throw new Error("managed_replace_identity_unavailable");
+		if (!expected.sha256 || expectedSha256 !== expected.sha256)
+			throw new Error("managed_replace_identity_mismatch");
 		const replaced = (this.#authority as RecoveryFsRoot & RetainedManagedReplacer).replaceManaged(
 			relative,
 			bytes,

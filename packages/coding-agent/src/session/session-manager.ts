@@ -15058,6 +15058,13 @@ export class SessionManager {
 					// A no-replace publication may have committed before the subsequent
 					// descriptor/digest recapture. Preserve the resident entry in that
 					// case: rolling it back would create a durable ghost transcript row.
+					if (noReplacePublication) {
+						// The publication receipt is independently bound to the exact bytes;
+						// keep it as the next replace precondition even when post-publication
+						// recapture failed. This prevents a retry from publishing a second
+						// successor and keeps any divergent occupant fail-closed.
+						this.#managedPersistExpectedIdentity = noReplacePublication;
+					}
 					if (error instanceof ManagedCommittedMutationError) throw error;
 					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
 					throw error;

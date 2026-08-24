@@ -3,7 +3,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { ManagedSessionDescendantStore } from "../../src/session/internal/managed-session-storage";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
 import { makeAssistantMessage } from "./helpers";
 
 function tempDir(prefix: string): string {
@@ -95,6 +98,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		const publishNoReplace = ManagedSessionDescendantStore.prototype.publishNoReplaceSync;
 		const captureExpectation = ManagedSessionDescendantStore.prototype.captureBoundedAppendExpectation;
 		let published = false;
+		let recaptureFailed = false;
 		vi.spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(function (
 			this: ManagedSessionDescendantStore,
 			relativePath,
@@ -108,15 +112,23 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			this: ManagedSessionDescendantStore,
 			relativePath,
 		) {
-			if (published) throw new Error("recapture_failed");
+			if (published && !recaptureFailed) {
+				recaptureFailed = true;
+				throw new Error("recapture_failed");
+			}
 			return captureExpectation.call(this, relativePath);
 		});
+		const replaceExpected = vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync");
 
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "durable-after-delete", timestamp: Date.now() }),
 		).toThrow(/managed_replace_committed_outcome_uncertain/);
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-delete"))).toBe(true);
+
+		await manager.ensureOnDisk();
+		expect(replaceExpected).toHaveBeenCalledTimes(1);
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
 		await manager.close().catch(() => {});
 	});
 
@@ -217,6 +229,39 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		);
 		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-fail-closed");
 		await manager.close().catch(() => {});
+	});
+
+	it("fails closed before replacement when the expected digest differs", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const relativePath = path.basename(sessionFile);
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(agentDir), path.dirname(sessionFile));
+		try {
+			const bounded = store.captureBoundedAppendExpectation(relativePath);
+			if (!bounded) throw new Error("Expected managed transcript identity");
+			const expected = {
+				dev: BigInt(bounded.dev),
+				ino: BigInt(bounded.ino),
+				nlink: BigInt(bounded.nlink),
+				size: Number(bounded.size),
+				mtimeNs: BigInt(bounded.mtimeNs),
+				ctimeNs: BigInt(bounded.ctimeNs),
+				sha256: "0".repeat(64),
+			};
+			const original = fs.readFileSync(sessionFile);
+			expect(() =>
+				store.replaceExpectedIdentitySync(relativePath, Buffer.from("must-not-replace\n"), expected),
+			).toThrow("managed_replace_identity_mismatch");
+			expect(fs.readFileSync(sessionFile).equals(original)).toBe(true);
+		} finally {
+			store.close();
+			await manager.close().catch(() => {});
+		}
 	});
 
 	it("still fails closed on identity_mismatch (concurrent successor not overwritten)", async () => {
