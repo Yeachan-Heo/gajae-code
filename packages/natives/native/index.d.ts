@@ -436,7 +436,7 @@ export declare class RecoveryFsRoot {
    * artifact. The destination must retain the supplied identity throughout
    * authorization.
    */
-  replaceManaged(relativePath: string, data: Uint8Array, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsResult
+  replaceManaged(relativePath: string, data: Uint8Array, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsPublishResult
   /**
    * Synchronously append one record to an exact retained managed file without
    * replacing its inode or creating recovery copies.

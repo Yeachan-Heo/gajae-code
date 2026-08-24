@@ -111,6 +111,18 @@ export class ManagedCommittedMutationError extends Error {
 	}
 }
 
+function managedReplacementFailure(value: unknown): Error {
+	const outcome = classifyNativePublishOutcome(value, "retained_replace");
+	const rawCode =
+		value !== null && typeof value === "object" && typeof (value as { code?: unknown }).code === "string"
+			? (value as { code: string }).code
+			: undefined;
+	const cause = new Error(rawCode ?? outcome.code ?? "managed_replace_failed");
+	return outcome.mutationState === "not_committed"
+		? cause
+		: new ManagedCommittedMutationError("replace", cause);
+}
+
 function managedAppendFailure(code: string | undefined): Error {
 	const error = new Error(code ?? "managed_append_failed");
 	return code === "content_too_large" || code === "too_large" || code === "header_patch_write_failed"
@@ -724,7 +736,7 @@ type RetainedManagedReplacer = {
 		expectedMtimeNs: string,
 		expectedCtimeNs: string,
 		expectedSha256: string,
-	): { ok: boolean; code?: string };
+	): NativePublishOutcome;
 	removeManaged(
 		relativePath: string,
 		expectedDev: string,
@@ -1661,7 +1673,7 @@ export class ManagedSessionDescendantStore {
 			observed.identity.ctimeNs,
 			expectedSha256,
 		);
-		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		if (!replaced.ok) throw managedReplacementFailure(replaced);
 		this.#assertBound();
 	}
 
@@ -1686,7 +1698,7 @@ export class ManagedSessionDescendantStore {
 			expected.identity.ctimeNs.toString(),
 			expected.identity.sha256,
 		);
-		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		if (!replaced.ok) throw managedReplacementFailure(replaced);
 		this.#assertBound();
 	}
 	replaceSync(relativePath: string, bytes: Uint8Array): void {
@@ -1984,7 +1996,7 @@ export class ManagedSessionDescendantStore {
 			existing.identity.ctimeNs,
 			existing.identity.sha256 ?? createHash("sha256").update(existing.data).digest("hex"),
 		);
-		if (!replaced.ok) throw new Error(replaced.code ?? "managed_replace_failed");
+		if (!replaced.ok) throw managedReplacementFailure(replaced);
 	}
 
 	/** Capture descriptor identity without copying file bytes when retained authority is available. */

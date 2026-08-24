@@ -5,7 +5,11 @@
 //! time without following symlinks, and regular files must be single-linked.
 
 #[cfg(all(test, target_os = "linux"))]
-use std::{cell::RefCell, collections::VecDeque};
+use std::{
+	cell::RefCell,
+	collections::VecDeque,
+	sync::{OnceLock, mpsc},
+};
 #[cfg(target_os = "linux")]
 use std::{
 	ffi::CString,
@@ -52,6 +56,7 @@ enum RetainedPublishFault {
 	Unlink(i32),
 	Sync(Option<i32>),
 	PostRenameSnapshot(&'static str),
+	PostExchange(&'static str),
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -111,6 +116,48 @@ fn take_post_rename_snapshot_fault() -> Option<&'static str> {
 	})
 }
 
+#[cfg(all(test, target_os = "linux"))]
+static REPLACEMENT_BEFORE_EXCHANGE_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_replacement_before_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*REPLACEMENT_BEFORE_EXCHANGE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_replacement_before_exchange_for_test() {
+	if let Some((entered, resume)) = REPLACEMENT_BEFORE_EXCHANGE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered
+			.send(())
+			.expect("replacement exchange hook receiver");
+		resume.recv().expect("replacement exchange hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn take_post_exchange_fault() -> Option<&'static str> {
+	RETAINED_PUBLISH_FAULTS.with(|configured| {
+		let mut configured = configured.borrow_mut();
+		match configured.front().copied() {
+			Some(RetainedPublishFault::PostExchange(code)) => {
+				configured.pop_front();
+				Some(code)
+			},
+			_ => None,
+		}
+	})
+}
+
 #[cfg(target_os = "linux")]
 fn renameat2_no_replace(
 	source_parent: &File,
@@ -154,11 +201,13 @@ const fn rename_flags_unsupported(errno: Option<i32>) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoReplacePrimitive {
 	Renameat2,
 	Linkat,
 	MkdiratRenameat,
+	Renameat2Exchange,
+	LinkatExchange,
 }
 
 #[cfg(target_os = "linux")]
@@ -168,8 +217,28 @@ impl NoReplacePrimitive {
 			Self::Renameat2 => "renameat2_noreplace",
 			Self::Linkat => "linkat_noreplace",
 			Self::MkdiratRenameat => "mkdirat_renameat_noreplace",
+			Self::Renameat2Exchange => "renameat2_exchange",
+			Self::LinkatExchange => "linkat_exchange",
 		}
 	}
+}
+
+#[cfg(target_os = "linux")]
+fn lock_parent(parent: &File) -> std::io::Result<File> {
+	let lock = parent.try_clone()?;
+	// SAFETY: `lock` owns a valid directory descriptor. `flock` is advisory and
+	// serializes every managed namespace mutation that uses this helper.
+	if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(lock)
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum ReplacementExchangeError {
+	PreMutation { code: &'static str, phase: &'static str },
+	PostMutation { code: &'static str, phase: &'static str, primitive: NoReplacePrimitive },
 }
 
 #[cfg(target_os = "linux")]
@@ -372,13 +441,19 @@ fn exchange_through_link(
 	destination_parent: &File,
 	destination_name: &CString,
 	release_destination_authority: impl FnOnce(),
-) -> Result<(), &'static str> {
+	verify_destination: impl Fn() -> Result<(), &'static str>,
+) -> Result<NoReplacePrimitive, ReplacementExchangeError> {
+	let _destination_lock = lock_parent(destination_parent).map_err(|_| {
+		ReplacementExchangeError::PreMutation { code: "lock_failed", phase: "preflight" }
+	})?;
+	verify_destination()
+		.map_err(|code| ReplacementExchangeError::PreMutation { code, phase: "preflight" })?;
 	let temporary = CString::new(format!(
 		".gjc-managed-exchange-{}-{}",
 		std::process::id(),
 		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
 	))
-	.map_err(|_| "io_error")?;
+	.map_err(|_| ReplacementExchangeError::PreMutation { code: "io_error", phase: "preflight" })?;
 	// SAFETY: both parents own valid fds and all names are live NUL-terminated
 	// strings for this syscall; flags are 0, so the destination is linked as-is.
 	if unsafe {
@@ -391,7 +466,7 @@ fn exchange_through_link(
 		)
 	} != 0
 	{
-		return Err("io_error");
+		return Err(ReplacementExchangeError::PreMutation { code: "io_error", phase: "rename" });
 	}
 	// Persist the rollback name before anything is displaced. If durability is
 	// unprovable, remove the link and fail before publication.
@@ -399,7 +474,10 @@ fn exchange_through_link(
 		// SAFETY: the candidate parent fd and temporary name remain valid; this
 		// removes only the link created above.
 		unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), temporary.as_ptr(), 0) };
-		return Err("durability_not_provable");
+		return Err(ReplacementExchangeError::PreMutation {
+			code:  "durability_not_provable",
+			phase: "preflight",
+		});
 	}
 	// The displaced object is now durably reachable; release authority before the
 	// rename so NFS does not silly-rename the still-open destination name.
@@ -418,14 +496,18 @@ fn exchange_through_link(
 		// Nothing was published. Drop the rollback link so the namespace is left
 		// exactly as it was found.
 		// SAFETY: the candidate parent fd and temporary name remain valid; this
-		// removes only the link created above.
+		// removes only the rollback link created above.
 		unsafe { libc::unlinkat(candidate_parent.as_raw_fd(), temporary.as_ptr(), 0) };
-		return Err("io_error");
+		return Err(ReplacementExchangeError::PreMutation { code: "io_error", phase: "rename" });
 	}
 	// Publication has committed. Persist the destination-parent mutation before
 	// moving the rollback name; a sync failure is committed-but-unproven.
 	if sync_parent(destination_parent).is_err() {
-		return Err("destination_parent_sync_failed");
+		return Err(ReplacementExchangeError::PostMutation {
+			code:      "fsync_failed",
+			phase:     "destination_parent_sync",
+			primitive: NoReplacePrimitive::LinkatExchange,
+		});
 	}
 	// SAFETY: the candidate parent fd and both names remain valid for this syscall.
 	if unsafe {
@@ -439,13 +521,21 @@ fn exchange_through_link(
 	{
 		// The replacement committed. The displaced object remains reachable under
 		// the durable temporary name, so do not delete it.
-		return Err("rollback_unavailable");
+		return Err(ReplacementExchangeError::PostMutation {
+			code:      "rollback_unavailable",
+			phase:     "terminal_identity",
+			primitive: NoReplacePrimitive::LinkatExchange,
+		});
 	}
 	// Settle the final rollback name's parent so the terminal namespace is durable.
 	if sync_parent(candidate_parent).is_err() {
-		return Err("candidate_parent_sync_failed");
+		return Err(ReplacementExchangeError::PostMutation {
+			code:      "fsync_failed",
+			phase:     "source_parent_sync",
+			primitive: NoReplacePrimitive::LinkatExchange,
+		});
 	}
-	Ok(())
+	Ok(NoReplacePrimitive::LinkatExchange)
 }
 
 #[cfg(target_os = "linux")]
@@ -459,7 +549,15 @@ fn exchange_managed_replacement(
 	destination_parent: &File,
 	destination_name: &CString,
 	release_destination_authority: impl FnOnce(),
-) -> Result<(), &'static str> {
+	verify_destination: impl Fn() -> Result<(), &'static str>,
+) -> Result<NoReplacePrimitive, ReplacementExchangeError> {
+	let _destination_lock = lock_parent(destination_parent).map_err(|_| {
+		ReplacementExchangeError::PreMutation { code: "lock_failed", phase: "preflight" }
+	})?;
+	#[cfg(test)]
+	pause_replacement_before_exchange_for_test();
+	verify_destination()
+		.map_err(|code| ReplacementExchangeError::PreMutation { code, phase: "preflight" })?;
 	#[cfg(test)]
 	if let Some(Some(code)) = take_retained_publish_fault(true) {
 		return if rename_flags_unsupported(Some(code)) {
@@ -469,9 +567,10 @@ fn exchange_managed_replacement(
 				destination_parent,
 				destination_name,
 				release_destination_authority,
+				verify_destination,
 			)
 		} else {
-			Err("io_error")
+			Err(ReplacementExchangeError::PreMutation { code: "io_error", phase: "rename" })
 		};
 	}
 	// SAFETY: retained parents and validated names make exchange atomic.
@@ -486,10 +585,10 @@ fn exchange_managed_replacement(
 		)
 	} == 0
 	{
-		return Ok(());
+		return Ok(NoReplacePrimitive::Renameat2Exchange);
 	}
 	if !rename_flags_unsupported(std::io::Error::last_os_error().raw_os_error()) {
-		return Err("io_error");
+		return Err(ReplacementExchangeError::PreMutation { code: "io_error", phase: "rename" });
 	}
 	exchange_through_link(
 		candidate_parent,
@@ -497,6 +596,7 @@ fn exchange_managed_replacement(
 		destination_parent,
 		destination_name,
 		release_destination_authority,
+		verify_destination,
 	)
 }
 
@@ -812,6 +912,7 @@ fn publish_preflight_failure(code: &'static str) -> RecoveryFsPublishResult {
 		"cross_device" => ("cross_device", "rename"),
 		"permission_denied" => ("permission_denied", "preflight"),
 		"invalid_request" => ("invalid_request", "preflight"),
+		"durability_not_provable" => ("durability_not_provable", "preflight"),
 		"identity_mismatch" => ("identity_violation", "preflight"),
 		_ => ("io_failure", "preflight"),
 	};
@@ -1247,10 +1348,10 @@ impl RecoveryFsRoot {
 		expected_mtime_ns: String,
 		expected_ctime_ns: String,
 		expected_sha256: String,
-	) -> RecoveryFsResult {
+	) -> RecoveryFsPublishResult {
 		#[cfg(target_os = "linux")]
 		{
-			with_root_and_recovery(&self.root, &self.recovery, |root, recovery| {
+			with_root_and_recovery_publish(&self.root, &self.recovery, |root, recovery| {
 				replace_managed(
 					root,
 					recovery,
@@ -1277,7 +1378,14 @@ impl RecoveryFsRoot {
 				expected_ctime_ns,
 				expected_sha256,
 			);
-			RecoveryFsResult::failure("unsupported_platform")
+			RecoveryFsPublishResult::failure(
+				"not_committed",
+				"not_attempted",
+				"atomic_unavailable",
+				"preflight",
+				"unsupported_platform",
+				None,
+			)
 		}
 	}
 
@@ -1822,17 +1930,24 @@ fn with_root_and_recovery_cleanup(
 }
 
 #[cfg(target_os = "linux")]
-fn with_root_and_recovery(
+fn with_root_and_recovery_publish(
 	root: &Mutex<Option<File>>,
 	recovery: &Mutex<Option<File>>,
-	operation: impl FnOnce(&File, Option<&File>) -> Result<RecoveryFsResult, &'static str>,
-) -> RecoveryFsResult {
+	operation: impl FnOnce(&File, Option<&File>) -> RecoveryFsPublishResult,
+) -> RecoveryFsPublishResult {
 	let root_guard = root.lock();
 	let Some(root) = root_guard.as_ref() else {
-		return RecoveryFsResult::failure("closed");
+		return RecoveryFsPublishResult::failure(
+			"not_committed",
+			"not_attempted",
+			"io_failure",
+			"preflight",
+			"closed",
+			None,
+		);
 	};
 	let recovery_guard = recovery.lock();
-	operation(root, recovery_guard.as_ref()).unwrap_or_else(RecoveryFsResult::failure)
+	operation(root, recovery_guard.as_ref())
 }
 
 #[cfg(target_os = "linux")]
@@ -2719,6 +2834,11 @@ fn append_managed(
 	Ok(RecoveryFsResult::success(identity))
 }
 #[cfg(target_os = "linux")]
+fn replace_managed_failure(code: &'static str) -> ReplacementExchangeError {
+	ReplacementExchangeError::PreMutation { code, phase: "preflight" }
+}
+
+#[cfg(target_os = "linux")]
 fn replace_managed(
 	root: &File,
 	recovery: Option<&File>,
@@ -2730,9 +2850,50 @@ fn replace_managed(
 	expected_mtime_ns: &str,
 	expected_ctime_ns: &str,
 	expected_sha256: &str,
-) -> Result<RecoveryFsResult, &'static str> {
-	let recovery_parent = recovery_directory(root, recovery)?;
-	let authorized = open_existing(root, relative_path, false)?;
+) -> RecoveryFsPublishResult {
+	match replace_managed_inner(
+		root,
+		recovery,
+		relative_path,
+		data,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_mtime_ns,
+		expected_ctime_ns,
+		expected_sha256,
+	) {
+		Ok((identity, primitive)) => RecoveryFsPublishResult::success(identity, primitive),
+		Err(ReplacementExchangeError::PreMutation { code, phase }) => {
+			let mut result = publish_preflight_failure(code);
+			phase.clone_into(&mut result.phase);
+			if code == "lock_failed" {
+				"io_failure".clone_into(&mut result.reason);
+			}
+			"renameat2_exchange".clone_into(&mut result.primitive);
+			result
+		},
+		Err(ReplacementExchangeError::PostMutation { code, phase, primitive }) => {
+			publish_post_mutation_failure_with_primitive(code, phase, primitive, None)
+		},
+	}
+}
+
+#[cfg(target_os = "linux")]
+fn replace_managed_inner(
+	root: &File,
+	recovery: Option<&File>,
+	relative_path: &str,
+	data: &[u8],
+	expected_dev: &str,
+	expected_ino: &str,
+	expected_size: &str,
+	expected_mtime_ns: &str,
+	expected_ctime_ns: &str,
+	expected_sha256: &str,
+) -> Result<(RecoveryFsIdentity, NoReplacePrimitive), ReplacementExchangeError> {
+	let recovery_parent = recovery_directory(root, recovery).map_err(replace_managed_failure)?;
+	let authorized = open_existing(root, relative_path, false).map_err(replace_managed_failure)?;
 	if !same_expected(
 		&authorized,
 		expected_dev,
@@ -2741,8 +2902,10 @@ fn replace_managed(
 		expected_mtime_ns,
 		expected_ctime_ns,
 		expected_sha256,
-	)? {
-		return Err("identity_mismatch");
+	)
+	.map_err(replace_managed_failure)?
+	{
+		return Err(replace_managed_failure("identity_mismatch"));
 	}
 	let candidate = (0..16)
 		.find_map(|_| {
@@ -2757,35 +2920,68 @@ fn replace_managed(
 				Err(error) => Some(Err(error)),
 			}
 		})
-		.transpose()?
-		.ok_or("io_error")?;
-	let candidate_file = open_existing(&recovery_parent, &candidate, false)?;
-	let candidate_identity = regular_identity(&candidate_file)?;
-	crate::path_identity::platform::verify_created_owner_only_file(&candidate_file)?;
-	if digest_hex(&candidate_file)? != hex_digest(Sha256::digest(data).into()) {
-		return Err("identity_mismatch");
+		.transpose()
+		.map_err(replace_managed_failure)?
+		.ok_or_else(|| replace_managed_failure("io_error"))?;
+	let candidate_file =
+		open_existing(&recovery_parent, &candidate, false).map_err(replace_managed_failure)?;
+	let candidate_identity = regular_identity(&candidate_file).map_err(replace_managed_failure)?;
+	crate::path_identity::platform::verify_created_owner_only_file(&candidate_file)
+		.map_err(replace_managed_failure)?;
+	if digest_hex(&candidate_file).map_err(replace_managed_failure)?
+		!= hex_digest(Sha256::digest(data).into())
+	{
+		return Err(replace_managed_failure("identity_mismatch"));
 	}
 	let candidate_parent = recovery_parent;
-	let candidate_name = CString::new(candidate).map_err(|_| "io_error")?;
-	let (destination_parent, destination_name) = open_parent(root, relative_path)?;
+	let candidate_name = CString::new(candidate).map_err(|_| replace_managed_failure("io_error"))?;
+	let (destination_parent, destination_name) =
+		open_parent(root, relative_path).map_err(replace_managed_failure)?;
+	let _destination_lock =
+		lock_parent(&destination_parent).map_err(|_| replace_managed_failure("lock_failed"))?;
+	let destination_name_text = destination_name
+		.to_str()
+		.map_err(|_| replace_managed_failure("io_error"))?
+		.to_owned();
+	let verify_destination = || -> Result<(), &'static str> {
+		let current = open_existing(&destination_parent, &destination_name_text, false)
+			.map_err(|_| "identity_mismatch")?;
+		if same_expected(
+			&current,
+			expected_dev,
+			expected_ino,
+			expected_size,
+			expected_mtime_ns,
+			expected_ctime_ns,
+			expected_sha256,
+		)
+		.map_err(|_| "io_error")?
+		{
+			Ok(())
+		} else {
+			Err("identity_mismatch")
+		}
+	};
 	// The descriptor proving the destination's identity is held across the
-	// exchange, matching the authority `renameat2` would have carried. On the
-	// link fallback it is released between the rollback link and the rename that
-	// displaces the destination: NFS silly-renames a still-open name that a
-	// rename displaces, which would leave the displaced object double-linked and
-	// fail the `st_nlink == 1` proof re-run against it below. Releasing there
-	// costs no provability, because the object is already reachable through the
-	// fallback's temporary name, and the checks below re-prove it from the
-	// candidate name against the identity verified before publication.
-	exchange_managed_replacement(
+	// exchange. On the link fallback it is released between the rollback link
+	// and the rename that displaces the destination, while the parent lock stays
+	// held so a managed successor cannot enter the mutation boundary.
+	let primitive = exchange_managed_replacement(
 		&candidate_parent,
 		&candidate_name,
 		&destination_parent,
 		&destination_name,
-		move || {
-			drop(authorized);
-		},
+		move || drop(authorized),
+		verify_destination,
 	)?;
+	#[cfg(test)]
+	if let Some(code) = take_post_exchange_fault() {
+		return Err(ReplacementExchangeError::PostMutation {
+			code,
+			phase: "terminal_identity",
+			primitive,
+		});
+	}
 	let verified =
 		(|| -> Result<(RecoveryFsIdentity, RecoveryFsIdentity, File, File), &'static str> {
 			let displaced = open_existing(
@@ -2822,32 +3018,97 @@ fn replace_managed(
 			Ok((replacement_identity, displaced_identity, displaced, replacement))
 		})();
 	let Ok((replacement_identity, displaced_identity, displaced, replacement)) = verified else {
-		return Err("rollback_unavailable");
+		return Err(ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		});
 	};
-	if candidate_parent.sync_all().is_err() || destination_parent.sync_all().is_err() {
-		return Err("rollback_unavailable");
+	if primitive == NoReplacePrimitive::Renameat2Exchange {
+		if sync_parent(&candidate_parent).is_err() {
+			return Err(ReplacementExchangeError::PostMutation {
+				code: "fsync_failed",
+				phase: "source_parent_sync",
+				primitive,
+			});
+		}
+		if sync_parent(&destination_parent).is_err() {
+			return Err(ReplacementExchangeError::PostMutation {
+				code: "fsync_failed",
+				phase: "destination_parent_sync",
+				primitive,
+			});
+		}
 	}
-	crate::path_identity::platform::verify_created_owner_only_file(&candidate_file)?;
-	crate::path_identity::platform::verify_created_owner_only_file(&displaced)?;
-	crate::path_identity::platform::verify_created_owner_only_file(&replacement)?;
-	let terminal_replacement_identity = regular_identity(&replacement)?;
-	let terminal_displaced_identity = regular_identity(&displaced)?;
-	let terminal_replacement =
-		statat(&destination_parent, &destination_name).map_err(|_| "identity_mismatch")?;
-	let terminal_displaced =
-		statat(&candidate_parent, &candidate_name).map_err(|_| "identity_mismatch")?;
+	crate::path_identity::platform::verify_created_owner_only_file(&candidate_file).map_err(
+		|_| ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		},
+	)?;
+	crate::path_identity::platform::verify_created_owner_only_file(&displaced).map_err(|_| {
+		ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		}
+	})?;
+	crate::path_identity::platform::verify_created_owner_only_file(&replacement).map_err(|_| {
+		ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		}
+	})?;
+	let terminal_replacement_identity =
+		regular_identity(&replacement).map_err(|_| ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		})?;
+	let terminal_displaced_identity =
+		regular_identity(&displaced).map_err(|_| ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		})?;
+	let terminal_replacement = statat(&destination_parent, &destination_name).map_err(|_| {
+		ReplacementExchangeError::PostMutation {
+			code: "identity_mismatch",
+			phase: "terminal_identity",
+			primitive,
+		}
+	})?;
+	let terminal_displaced = statat(&candidate_parent, &candidate_name).map_err(|_| {
+		ReplacementExchangeError::PostMutation {
+			code: "identity_mismatch",
+			phase: "terminal_identity",
+			primitive,
+		}
+	})?;
 	if terminal_replacement_identity != replacement_identity
 		|| terminal_displaced_identity != displaced_identity
-		|| digest_hex(&replacement)? != hex_digest(Sha256::digest(data).into())
-		|| digest_hex(&displaced)? != expected_sha256
+		|| digest_hex(&replacement).map_err(|_| ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		})? != hex_digest(Sha256::digest(data).into())
+		|| digest_hex(&displaced).map_err(|_| ReplacementExchangeError::PostMutation {
+			code: "rollback_unavailable",
+			phase: "terminal_identity",
+			primitive,
+		})? != expected_sha256
 		|| !stat_matches_regular_identity(&terminal_replacement, &terminal_replacement_identity)
 		|| !stat_matches_regular_identity(&terminal_displaced, &terminal_displaced_identity)
 	{
-		return Err("identity_mismatch");
+		return Err(ReplacementExchangeError::PostMutation {
+			code: "identity_mismatch",
+			phase: "terminal_identity",
+			primitive,
+		});
 	}
-	// Publication is committed. The verified displaced object remains recoverable
-	// evidence; deleting it would reopen an unprovable name race.
-	Ok(RecoveryFsResult::success(replacement_identity))
+	Ok((replacement_identity, primitive))
 }
 
 #[cfg(target_os = "linux")]
@@ -4342,8 +4603,7 @@ mod tests {
 				&identity.mtime_ns,
 				&identity.ctime_ns,
 				&file_digest(original),
-			)
-			.expect("replacement must not fail on a filesystem without rename flags");
+			);
 
 			assert!(result.ok, "link fallback must publish (errno {unsupported}): {:?}", result.code);
 			assert_eq!(
@@ -4397,6 +4657,89 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn managed_replace_rechecks_destination_at_exchange_boundary() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"authorized-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replacement_before_exchange_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_replace = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let replace = std::thread::spawn(move || {
+			replace_managed(
+				&root_for_replace,
+				None,
+				"transcript",
+				b"replacement",
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx.recv().expect("wait for exchange boundary");
+		fs::rename(temporary.0.join("transcript"), temporary.0.join("authorized"))
+			.expect("retain predecessor");
+		fs::write(temporary.0.join("transcript"), b"concurrent-successor")
+			.expect("publish successor");
+		resume_tx.send(()).expect("resume exchange boundary");
+		let result = replace.join().expect("replacement thread");
+		set_replacement_before_exchange_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state, "not_committed");
+		assert_eq!(result.durability_state, "not_attempted");
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("successor"),
+			b"concurrent-successor"
+		);
+		assert_eq!(fs::read(temporary.0.join("authorized")).expect("predecessor"), original);
+	}
+
+	#[test]
+	fn managed_replace_reports_post_exchange_failure_as_committed() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		set_retained_publish_faults([RetainedPublishFault::PostExchange("io_error")]);
+
+		let result = replace_managed(
+			&root,
+			None,
+			"transcript",
+			b"rewritten-transcript",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("io_error"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.reason, "io_failure");
+		assert_eq!(result.phase, "terminal_identity");
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("replacement"),
+			b"rewritten-transcript"
+		);
+	}
+
 	/// The ordering that makes the fallback safe on NFS, pinned
 	/// deterministically on any filesystem: the displaced object must already
 	/// be reachable through the rollback link when authority is released, and
@@ -4411,20 +4754,27 @@ mod tests {
 		let destination_name = CString::new("destination").expect("destination name");
 
 		let observed = Cell::new(None);
-		exchange_through_link(&parent, &candidate_name, &parent, &destination_name, || {
-			let rollback = fs::read_dir(&temporary.0)
-				.expect("read parent")
-				.filter_map(Result::ok)
-				.any(|entry| {
-					entry
-						.file_name()
-						.to_string_lossy()
-						.starts_with(".gjc-managed-exchange-")
-				});
-			let destination =
-				fs::read(temporary.0.join("destination")).expect("destination still present");
-			observed.set(Some((rollback, destination == b"old")));
-		})
+		exchange_through_link(
+			&parent,
+			&candidate_name,
+			&parent,
+			&destination_name,
+			|| {
+				let rollback = fs::read_dir(&temporary.0)
+					.expect("read parent")
+					.filter_map(Result::ok)
+					.any(|entry| {
+						entry
+							.file_name()
+							.to_string_lossy()
+							.starts_with(".gjc-managed-exchange-")
+					});
+				let destination =
+					fs::read(temporary.0.join("destination")).expect("destination still present");
+				observed.set(Some((rollback, destination == b"old")));
+			},
+			|| Ok(()),
+		)
 		.expect("link exchange");
 
 		assert_eq!(
@@ -4457,7 +4807,7 @@ mod tests {
 			RetainedPublishFault::Rename(libc::EINVAL),
 			RetainedPublishFault::Sync(Some(libc::EIO)),
 		]);
-		let failure = match replace_managed(
+		let failure = replace_managed(
 			&root,
 			None,
 			"transcript",
@@ -4468,12 +4818,11 @@ mod tests {
 			&identity.mtime_ns,
 			&identity.ctime_ns,
 			&file_digest(original),
-		) {
-			Ok(_) => panic!("an unprovable rollback link must not publish"),
-			Err(code) => code,
-		};
+		);
 
-		assert_eq!(failure, "durability_not_provable");
+		assert!(!failure.ok);
+		assert_eq!(failure.code.as_deref(), Some("durability_not_provable"));
+		assert_eq!(failure.mutation_state, "not_committed");
 		assert_eq!(
 			fs::read(temporary.0.join("transcript")).expect("destination"),
 			original,
@@ -4518,9 +4867,14 @@ mod tests {
 			&destination_parent,
 			&destination_name,
 			|| {},
+			|| Ok(()),
 		)
 		.expect_err("destination-parent sync failure must be reported");
-		assert_eq!(destination_error, "destination_parent_sync_failed");
+		assert!(matches!(destination_error, ReplacementExchangeError::PostMutation {
+			code: "fsync_failed",
+			phase: "destination_parent_sync",
+			..
+		}));
 		assert_eq!(fs::read(destination_parent_path.join("destination")).unwrap(), b"new");
 		assert!(
 			fs::read_dir(&source_parent_path)
@@ -4547,9 +4901,14 @@ mod tests {
 			&destination_parent,
 			&destination_name,
 			|| {},
+			|| Ok(()),
 		)
 		.expect_err("candidate-parent sync failure must be reported");
-		assert_eq!(candidate_error, "candidate_parent_sync_failed");
+		assert!(matches!(candidate_error, ReplacementExchangeError::PostMutation {
+			code: "fsync_failed",
+			phase: "source_parent_sync",
+			..
+		}));
 		assert_eq!(fs::read(destination_parent_path.join("destination")).unwrap(), b"new");
 		assert_eq!(fs::read(source_parent_path.join("candidate")).unwrap(), b"old");
 	}
@@ -4564,7 +4923,7 @@ mod tests {
 		let candidate_name = CString::new("absent-candidate").expect("candidate name");
 		let destination_name = CString::new("destination").expect("destination name");
 
-		exchange_through_link(&parent, &candidate_name, &parent, &destination_name, || {})
+		exchange_through_link(&parent, &candidate_name, &parent, &destination_name, || {}, || Ok(()))
 			.expect_err("replacing from an absent candidate must fail");
 
 		assert_eq!(

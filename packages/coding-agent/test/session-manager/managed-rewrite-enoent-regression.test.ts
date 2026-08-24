@@ -199,6 +199,112 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("fails closed when a successor wins the native replacement boundary", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const assistant = manager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (assistant?.type !== "message") throw new Error("Expected assistant entry");
+		manager.applyEntryMessageUpdates([assistant]);
+
+		const sessionFile = manager.getSessionFile()!;
+		const predecessor = path.join(root, "retained-predecessor.jsonl");
+		const successor = `${JSON.stringify({ type: "session", id: "successor", timestamp: new Date().toISOString(), cwd })}\n`;
+		const replaceManaged = native.RecoveryFsRoot.prototype.replaceManaged;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			fs.renameSync(sessionFile, predecessor);
+			fs.writeFileSync(sessionFile, successor);
+			return replaceManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "must-not-overwrite-successor", timestamp: Date.now() }),
+		).toThrow(/identity_mismatch/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		expect(fs.readFileSync(predecessor, "utf8")).not.toContain("must-not-overwrite-successor");
+		await manager.close().catch(() => {});
+	});
+
+	it("keeps resident state when native replacement commits then reports failure", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const assistant = manager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (assistant?.type !== "message") throw new Error("Expected assistant entry");
+		manager.applyEntryMessageUpdates([assistant]);
+
+		const sessionFile = manager.getSessionFile()!;
+		const replaceManaged = native.RecoveryFsRoot.prototype.replaceManaged;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const committed = replaceManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			return {
+				...committed,
+				ok: false,
+				code: "io_error",
+				identity: undefined,
+				mutationState: "committed",
+				durabilityState: "not_provable",
+				reason: "io_failure",
+				phase: "terminal_identity",
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "post-exchange-failure", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("post-exchange-failure");
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("post-exchange-failure"))).toBe(true);
+		await manager.close().catch(() => {});
+	});
+
 	it("keeps resident state when committed no-replace publication throws before returning its identity", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
