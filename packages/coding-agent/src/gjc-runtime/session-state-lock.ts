@@ -354,8 +354,30 @@ export function detectedLinuxSessionStateLockFileSystemIsLocal(type: number): bo
 	return LOCAL_LINUX_FILE_SYSTEM_TYPES.has(type);
 }
 
-export function detectedDarwinSessionStateLockFileSystemIsLocal(typeName: string): boolean {
-	return typeName === "apfs";
+export function detectedDarwinSessionStateLockFileSystemIsLocal(dfOutput: string, mountOutput: string): boolean {
+	const records = dfOutput
+		.split(/\r?\n/u)
+		.map(line => line.trim())
+		.filter(Boolean);
+	if (records.length < 2) return false;
+	const device = records.at(-1)?.split(/\s+/u, 1)[0];
+	if (!device?.startsWith("/dev/")) return false;
+	return mountOutput.split(/\r?\n/u).some(line => {
+		if (!line.startsWith(`${device} on `) || !line.endsWith(")")) return false;
+		const optionsStart = line.lastIndexOf(" (");
+		if (optionsStart < 0) return false;
+		const options = line
+			.slice(optionsStart + 2, -1)
+			.split(",")
+			.map(option => option.trim());
+		return options.includes("apfs") && options.includes("local");
+	});
+}
+
+async function commandOutput(argv: string[]): Promise<string | undefined> {
+	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "ignore" });
+	const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+	return exitCode === 0 ? output : undefined;
 }
 
 async function unqualifiedOwnerIsLocal(file: string): Promise<boolean> {
@@ -363,9 +385,16 @@ async function unqualifiedOwnerIsLocal(file: string): Promise<boolean> {
 	if (override !== undefined) return override;
 	try {
 		if (process.platform === "darwin") {
-			const child = Bun.spawn(["stat", "-f", "%T", path.resolve(file)], { stdout: "pipe", stderr: "ignore" });
-			const [typeName, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-			return exitCode === 0 && detectedDarwinSessionStateLockFileSystemIsLocal(typeName.trim());
+			const target = path.resolve(file);
+			const [dfOutput, mountOutput] = await Promise.all([
+				commandOutput(["/bin/df", "-P", target]),
+				commandOutput(["/sbin/mount", "-t", "apfs"]),
+			]);
+			return (
+				dfOutput !== undefined &&
+				mountOutput !== undefined &&
+				detectedDarwinSessionStateLockFileSystemIsLocal(dfOutput, mountOutput)
+			);
 		}
 		if (process.platform !== "linux") return false;
 		const volume = await fs.statfs(file);

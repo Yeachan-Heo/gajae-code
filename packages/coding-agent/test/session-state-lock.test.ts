@@ -206,14 +206,49 @@ function ageWorldPastAnyStaleWindow(): () => void {
 
 describe("coordinator session state lock", () => {
 	it("recognizes only known local filesystems for legacy owner recovery", () => {
-		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("apfs")).toBe(true);
-		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("nfs")).toBe(false);
-		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("smbfs")).toBe(false);
+		const apfsDf = [
+			"Filesystem 512-blocks Used Available Capacity Mounted on",
+			"/dev/disk3s5 100 25 75 25% /System/Volumes/Data",
+		].join("\n");
+		const apfsMount = "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n";
+		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal(apfsDf, apfsMount)).toBe(true);
+		expect(
+			sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal(
+				"Filesystem 512-blocks Used Available Capacity Mounted on\nserver:/state 100 25 75 25% /state\n",
+				apfsMount,
+			),
+		).toBe(false);
+		expect(
+			sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal(
+				apfsDf,
+				"/dev/disk3s5 on /System/Volumes/Data (apfs, journaled)\n",
+			),
+		).toBe(false);
+		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("malformed", apfsMount)).toBe(false);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0xef53)).toBe(true);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x5846_5342)).toBe(true);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x00c3_6400)).toBe(false);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x6969)).toBe(false);
 	});
+
+	if (process.platform === "darwin") {
+		it("reclaims an unqualified dead owner from a positively identified APFS volume", async () => {
+			const root = await tempRoot();
+			const lockFile = path.join(root, "lock-apfs-owner.json.lock");
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "apfs-unqualified-owner" }),
+			);
+			SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
+			SessionStateLockTestHooks.probeProcessSignal = () => {
+				throw Object.assign(new Error("missing"), { code: "ESRCH" });
+			};
+
+			await reclaimStaleSessionStateLock(lockFile);
+
+			expect(fsSync.existsSync(lockFile)).toBe(false);
+		});
+	}
 
 	it("bounds nested acquisition retries by one wall-clock deadline", async () => {
 		const root = await tempRoot();
