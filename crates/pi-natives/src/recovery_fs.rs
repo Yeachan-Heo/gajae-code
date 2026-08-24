@@ -2705,7 +2705,16 @@ fn append_managed(
 	if !stat_matches_regular_identity(&named, &identity) {
 		return Err("identity_mismatch");
 	}
-	identity.sha256 = Some(digest_hex(&file)?);
+	// The digest is retained for the next append expectation. Recheck both the
+	// descriptor and name after reading so a concurrent successor cannot be
+	// adopted merely because it raced after the post-append identity check.
+	let sha256 = digest_hex(&file)?;
+	if regular_identity(&file)? != identity
+		|| !stat_matches_regular_identity(&statat(&parent, &name)?, &identity)
+	{
+		return Err("identity_mismatch");
+	}
+	identity.sha256 = Some(sha256);
 	parent.sync_all().map_err(|_| "fsync_failed")?;
 	Ok(RecoveryFsResult::success(identity))
 }
