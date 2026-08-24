@@ -3528,21 +3528,21 @@ export class AgentSession {
 		};
 		const publish = async () => {
 			// Worker integration is first-party lifecycle persistence, not an extension
-			// hook. Make it durable before publishing the terminal boundary while user
-			// extension delivery remains asynchronous.
+			// hook. Settle it before publishing the terminal boundary while user extension
+			// delivery and coordinator sidecar persistence remain asynchronous.
 			await this.#flushWorkerIntegrationForAgentEnd();
-			// Persist before notifying synchronous subscribers: a subscriber may start a
-			// successor prompt from agent_end, whose running state must serialize after
-			// this terminal boundary rather than be overwritten by it.
+			// Reserve persistence before notifying synchronous subscribers: a subscriber
+			// may start a successor prompt from agent_end, whose running state must
+			// serialize after this terminal boundary rather than be overwritten by it.
 			//
-			// Awaited, not fire-and-forget: this is the terminal boundary, and the write
-			// runs under the native identity-bound state-file lock. A detached write
-			// outlives the session that owns it — under `bun test --isolate` the pending
-			// unlink lands after the runtime has torn down the context it was scheduled in
-			// and segfaults the process, and in production it lets a settled session's
-			// last write race whatever reclaims its lock next.
-			await this.#queueCoordinatorRuntimeStatePersist(pending);
+			// Reserve the write before notifying subscribers so a successor still queues
+			// behind this terminal transition, but do not make the interactive terminal
+			// wait for the filesystem-backed lock/write to settle. On slow or lock-hostile
+			// mounts such as WSL drvfs, waiting here leaves the foreground activity loader
+			// and busy input state visible after the model has already finished.
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending);
 			this.#emit(pending);
+			await terminalPersistence;
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
 				undefined,

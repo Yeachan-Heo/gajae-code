@@ -16,6 +16,7 @@
 ### Fixed
 
 - Gajae Pet now treats forwarded `LC_TERMINAL=iTerm2` and `TERM_PROGRAM=iTerm.app` values as probe hints over SSH, enabling iTerm2 only after an active OSC 1337 File-capability reply. Generic SSH, spoofed/noninteractive/CI environments, and unmanaged tmux/screen/zellij nesting remain on the text fallback; verified Kitty and Sixel keep precedence. (#4911)
+- Interactive terminal completion now publishes the local `agent_end` boundary before waiting for the ordered coordinator sidecar write, so slow or lock-hostile WSL drvfs mounts cannot leave the foreground activity indicator and composer busy after a turn has completed. Coordinator persistence ordering and extension delivery remain unchanged. (#4741)
 
 - Telegram polling no longer wedges behind a deleted private-chat `forum_topic_created` update. Definitive missing-topic `400` responses from the adoption picker now consume the stale update, remove only its matching pending-topic sidecar, and let the ordered poll offset advance; rate limits, network/server failures, authentication failures, and ambiguous responses remain retryable. (#4904)
 

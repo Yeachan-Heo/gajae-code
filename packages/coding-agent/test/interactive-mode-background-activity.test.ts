@@ -13,6 +13,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, Loader } from "@gajae-code/tui";
 import { logger, TempDir } from "@gajae-code/utils";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 
@@ -92,6 +93,29 @@ describe("interactive background activity indicator", () => {
 
 		expect(mode.loadingAnimation).toBeUndefined();
 		expect(renderStatus(mode)).toBe("");
+	});
+
+	it("publishes terminal activity cleanup before a slow coordinator sidecar write", async () => {
+		mode.ensureLoadingAnimation();
+		const lockEntered = Promise.withResolvers<void>();
+		const releaseLock = Promise.withResolvers<void>();
+		let gated = true;
+		const previousHook = FileLockTestHooks.afterParentMkdir;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (!gated || !lockPath.endsWith("mutation.lock.lock")) return;
+			gated = false;
+			lockEntered.resolve();
+			await releaseLock.promise;
+		};
+
+		try {
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
+			await lockEntered.promise;
+			await waitFor(() => mode.loadingAnimation === undefined);
+		} finally {
+			releaseLock.resolve();
+			FileLockTestHooks.afterParentMkdir = previousHook;
+		}
 	});
 
 	it("retires stale foreground activity across maintenance stop boundaries", async () => {
