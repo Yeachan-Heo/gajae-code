@@ -4671,7 +4671,7 @@ pub(crate) mod platform {
 						| libc::O_CLOEXEC
 						| libc::O_NOFOLLOW
 						| libc::O_NONBLOCK,
-					file_mode as libc::mode_t,
+					file_mode as libc::c_uint,
 				)
 			};
 			if fd < 0 {
