@@ -514,11 +514,10 @@ fn exchange_through_link(
 	release_destination_authority: impl FnOnce(),
 	verify_destination: impl Fn() -> Result<(), &'static str>,
 ) -> Result<NoReplacePrimitive, ReplacementExchangeError> {
-	let _destination_lock =
-		lock_destination(destination_parent, destination_name).map_err(|_| {
-			ReplacementExchangeError::PreMutation { code: "lock_failed", phase: "preflight" }
-		})?;
-	let destination_identity = identity(&_destination_lock)
+	let destination_lock = lock_destination(destination_parent, destination_name).map_err(|_| {
+		ReplacementExchangeError::PreMutation { code: "lock_failed", phase: "preflight" }
+	})?;
+	let destination_identity = identity(&destination_lock)
 		.map_err(|code| ReplacementExchangeError::PreMutation { code, phase: "preflight" })?;
 	verify_destination()
 		.map_err(|code| ReplacementExchangeError::PreMutation { code, phase: "preflight" })?;
@@ -2720,7 +2719,7 @@ fn recovery_directory(root: &File, external: Option<&File>) -> Result<File, &'st
 	open_existing_directory(root, ".gjc-recovery")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn rename_managed_file_no_replace(
 	root: &File,
 	source: &str,
@@ -3573,7 +3572,7 @@ fn replace_managed_inner(
 	Ok((replacement_identity, primitive))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn install(root: &File, source: &str, destination: &str) -> RecoveryFsPublishResult {
 	install_with_recovery(root, None, source, destination)
 }
@@ -4035,7 +4034,7 @@ fn tree_matches_after_rename(
 			})
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn rename_managed_tree_no_replace(
 	root: &File,
 	source: &str,
