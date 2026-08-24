@@ -15070,7 +15070,7 @@ export class SessionManager {
 						try {
 							this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
 								sessionFile,
-								undefined,
+								noReplacePublication,
 								bytes,
 							);
 						} catch {
