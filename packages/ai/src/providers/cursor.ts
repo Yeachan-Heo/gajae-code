@@ -1063,14 +1063,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					);
 				}
 			});
-			h2Request.on("end", () => {
-				responseEnded = true;
-				processPendingBuffer?.();
-				if (!processingPausedForExec && !processingPausedForQueue && pendingBuffer.length === 0) {
-					drainMessageQueue();
-				}
-			});
-
 
 			let processingPausedForExec = false;
 			let processingPausedForQueue = false;
@@ -1078,6 +1070,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
 			let execInFlight = false;
 			let processPendingBuffer: (() => void) | undefined;
+			const finishResponseAfterParsing = (): void => {
+				if (!responseEnded || processingPausedForExec || processingPausedForQueue) return;
+				if (pendingBuffer.length > 0) {
+					endStreamError = new Error("Cursor HTTP/2 stream ended with a truncated Connect frame");
+				}
+				drainMessageQueue();
+			};
 			processPendingBuffer = () => {
 				if (processingPausedForExec || processingPausedForQueue) return;
 				while (pendingBuffer.length >= 5) {
@@ -1209,10 +1208,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				// HTTP/2 can emit `end` while a coalesced chunk still has frames
 				// parked behind queue backpressure. Drain only after every buffered
 				// frame has been parsed into the ordered queue.
-				if (responseEnded && !processingPausedForExec && !processingPausedForQueue && pendingBuffer.length === 0) {
-					drainMessageQueue();
-				}
+				finishResponseAfterParsing();
 			};
+
+			h2Request.on("end", () => {
+				responseEnded = true;
+				processPendingBuffer?.();
+				finishResponseAfterParsing();
+			});
 
 			h2Request.on("data", (chunk: Buffer) => {
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);

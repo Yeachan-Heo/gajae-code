@@ -321,6 +321,38 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("rejects a truncated final Connect frame instead of waiting for the idle watchdog", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendInteractionUpdate(stream, {
+						case: "heartbeat",
+						value: create(HeartbeatUpdateSchema, {}),
+					}),
+				10,
+			);
+			setTimeout(() => {
+				const completeFrame = buildServerMessageFrame({
+					case: "interactionUpdate",
+					value: create(InteractionUpdateSchema, {
+						message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+					}),
+				});
+				stream.end(completeFrame.subarray(0, 3));
+			}, 20);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Cursor HTTP/2 stream ended with a truncated Connect frame");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("preserves accumulated Cursor content and usage in exactly one terminal on a silent transport timeout", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
