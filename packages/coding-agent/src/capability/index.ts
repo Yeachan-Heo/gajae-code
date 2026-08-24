@@ -287,7 +287,7 @@ export async function loadCapabilityForHome<T>(
 
 	const cwd = options.cwd ?? getProjectDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot };
+	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);

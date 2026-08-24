@@ -228,4 +228,41 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			}),
 		).rejects.toThrow(/absolute home directory/);
 	});
+	test("session settings propagate into explicit-home loads instead of defaulting provider toggles", async () => {
+		const homeAgentDir = path.join(home, ".gjc", "agent");
+		await seedProfile(homeAgentDir, "home");
+		// Seed an opencode project command so the toggle under test has a real payload.
+		await fs.mkdir(path.join(project, ".opencode", "commands"), { recursive: true });
+		await writeFile(
+			path.join(project, ".opencode", "commands", "oc-command.md"),
+			["---", "description: opencode command", "---", "", "oc body"].join("\n"),
+		);
+		const enabledSettings = { get: () => undefined } as never;
+		const disabledSettings = {
+			get: (key: string) => {
+				if (key === "commands.enableOpencodeUser") return false;
+				if (key === "commands.enableOpencodeProject") return false;
+				return undefined;
+			},
+		} as never;
+
+		// Baseline: without disabling settings the opencode command is discovered
+		// from the explicit-home load, proving the provider actually runs here.
+		const enabled = await loadCapabilityForHome<SlashCommand>(slashCommandCapability.id, home, {
+			cwd: project,
+			providers: ["opencode"],
+			settings: enabledSettings,
+		});
+		expect(enabled.items.map(item => item.name)).toContain("oc-command");
+
+		// With the toggles disabled through the same options.settings, the load must
+		// honor them. If loadCapabilityForHome drops options.settings from the context,
+		// readOpencodeCommandToggles defaults both to enabled and the command leaks in.
+		const disabled = await loadCapabilityForHome<SlashCommand>(slashCommandCapability.id, home, {
+			cwd: project,
+			providers: ["opencode"],
+			settings: disabledSettings,
+		});
+		expect(disabled.items.map(item => item.name)).toEqual([]);
+	});
 });

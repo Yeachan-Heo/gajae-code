@@ -92,6 +92,36 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		});
 		expect(marked).toBe(true);
 	});
+	it("marks a production non-abortable native write before dispatch", async () => {
+		const writeTool = { ...makeTool("write"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		let marked = false;
+		await handlers.write(
+			create(WriteArgsSchema, { path: "native.txt", fileText: "body", toolCallId: "native-write" }),
+			undefined,
+			() => {
+				marked = true;
+			},
+		);
+		expect(marked).toBe(true);
+	});
+
+	it("marks a production non-abortable Pi edit before dispatch", async () => {
+		const editTool = { ...makeTool("edit"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["edit", editTool]]) } as never);
+		let marked = false;
+		await handlers.piEdit({
+			args: create(PiEditExecArgsSchema, {
+				path: "edited.txt",
+				edits: [{ oldText: "a", newText: "b" }],
+			}),
+			toolCallId: "pi-edit",
+			markNonAbortable: () => {
+				marked = true;
+			},
+		});
+		expect(marked).toBe(true);
+	});
 
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();

@@ -311,7 +311,11 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		return toolResultMessage;
 	}
 
-	async write(args: Parameters<NonNullable<ICursorExecHandlers["write"]>>[0], signal?: AbortSignal) {
+	async write(
+		args: Parameters<NonNullable<ICursorExecHandlers["write"]>>[0],
+		signal?: AbortSignal,
+		markNonAbortable?: () => void,
+	) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const content = args.fileText ?? new TextDecoder().decode(args.fileBytes ?? new Uint8Array());
 		const toolResultMessage = await executeTool(
@@ -324,6 +328,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			},
 			undefined,
 			signal,
+			markNonAbortable,
 		);
 		return toolResultMessage;
 	}
@@ -490,6 +495,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			{ path: call.args.path, edits },
 			this.options.getEditReplaceTool?.(),
 			call.signal,
+			call.markNonAbortable,
 		);
 	}
 

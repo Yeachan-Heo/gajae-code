@@ -1689,6 +1689,7 @@ async function handleExecServerMessage(
 				reason => buildWriteRejectedResult(args.path, reason),
 				error => buildWriteErrorResult(args.path, error),
 				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1863,7 +1864,7 @@ async function handleExecServerMessage(
 				path: args.path,
 				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
 			});
-			const call = { args, toolCallId, signal: execSignal };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piEdit?.bind(execHandlers),
@@ -2076,19 +2077,26 @@ function sendExecClientStreamClose(h2Request: CursorRequestWriter, execMsg: Exec
 /** Exported for tests: verifies handler is invoked with correct `this` when passed as bound. */
 export async function resolveExecHandler<TArgs, TResult>(
 	args: TArgs,
-	handler: ((args: TArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
+	handler:
+		| ((
+				args: TArgs,
+				signal?: AbortSignal,
+				markNonAbortable?: () => void,
+		  ) => Promise<CursorExecHandlerResult<TResult>>)
+		| undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	buildFromToolResult: (toolResult: ToolResultMessage) => TResult,
 	buildRejected: (reason: string) => TResult,
 	buildError: (error: string) => TResult,
 	signal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<{ execResult: TResult; toolResult?: ToolResultMessage }> {
 	if (!handler) {
 		return { execResult: buildRejected("Tool not available") };
 	}
 
 	try {
-		const handlerResult = await handler(args, signal);
+		const handlerResult = await handler(args, signal, markNonAbortable);
 		const { execResult, toolResult } = splitExecHandlerResult(handlerResult);
 		const finalToolResult = await applyToolResultHandler(toolResult, onToolResult);
 
