@@ -2,7 +2,7 @@ Inspects, waits, or cancels async jobs.
 
 Background job results are delivered automatically when complete. Jobs that back task subagents should be controlled via the `subagent` tool when it is available; use `job` for non-subagent jobs (async bash, monitors) and as a compatibility fallback. Running job output stays quiet by default to avoid flooding the conversation; use `tail` when you explicitly want to show/reopen retained output. Reach for this tool only when you need to inspect or intervene.
 
-In the interactive TUI, supported managed foreground bash can be folded into a background job by pressing `Ctrl+B` twice while it is running. Raw shell `Ctrl+Z`/`bg` is not the supported path inside GJC because it bypasses job ownership and output-routing contracts.
+In the interactive TUI, supported managed foreground bash can be folded into a background job by pressing the fold chord twice while it is running (default `Alt+Shift+B`, plus `Cmd+B` on macOS; remappable via `app.tool.backgroundFold`). A folded job keeps its original deadline, and its result wakes a later turn automatically. `task`/`subagent` waits are not foldable. Raw shell `Ctrl+Z`/`bg` is not the supported path inside GJC because it bypasses job ownership and output-routing contracts.
 
 # Operations
 
