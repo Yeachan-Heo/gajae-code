@@ -11267,6 +11267,13 @@ export class SessionManager {
 
 	#recordPersistError(err: unknown): Error {
 		const normalized = toError(err);
+		if (normalized instanceof ManagedCommittedMutationError) {
+			// A managed rewrite can publish the complete resident transcript and then
+			// lose its post-publication receipt. The transcript is authoritative, but
+			// later entries still need a fresh rewrite; never turn that committed
+			// outcome into a sticky same-process persistence error.
+			return normalized;
+		}
 		if (!this.#persistError) this.#persistError = normalized;
 		if (!this.#persistErrorReported) {
 			this.#persistErrorReported = true;
@@ -15020,10 +15027,13 @@ export class SessionManager {
 				const relativePath = path.basename(sessionFile);
 				let noReplacePublication: ManagedFileIdentity | undefined;
 				let noReplacePublicationAttempted = false;
+				let replacementPublicationCommitted = false;
+				let replacementPublication: ManagedFileIdentity | undefined;
 				try {
 					if (this.#managedPersistExpectedIdentity) {
 						try {
 							store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+							replacementPublicationCommitted = true;
 						} catch (err) {
 							// A confirmed missing predecessor can be recreated from the complete
 							// resident transcript. Any present-but-different identity still fails
@@ -15039,9 +15049,15 @@ export class SessionManager {
 					}
 					const descriptor = store.descriptorExpected(relativePath);
 					if (!descriptor) throw new Error("managed_replace_identity_unavailable");
+					if (replacementPublicationCommitted) {
+						replacementPublication = {
+							...managedIdentityFromDescriptor(descriptor),
+							sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+						};
+					}
 					this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
 						sessionFile,
-						noReplacePublication,
+						noReplacePublication ?? replacementPublication,
 					);
 					this.#publishCommitMarkerFromCurrentTranscriptSync();
 				} catch (error) {
@@ -15078,8 +15094,26 @@ export class SessionManager {
 							// be recaptured; it remains the only safe precondition.
 						}
 					}
+					if (replacementPublication) {
+						// A successful expected-identity replacement gives us a descriptor-bound
+						// receipt even when the subsequent recapture is interrupted. Retain that
+						// exact inode as the next precondition; pathname-only adoption could
+						// overwrite a successor that appeared during the failed recapture.
+						this.#managedPersistExpectedIdentity = replacementPublication;
+						try {
+							this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
+								sessionFile,
+								replacementPublication,
+								bytes,
+							);
+						} catch {
+							// Keep the publication receipt when the retry descriptor cannot yet
+							// be recaptured; it remains the only safe precondition.
+						}
+					}
 					if (error instanceof ManagedCommittedMutationError) throw error;
 					if (noReplacePublication) throw new ManagedCommittedMutationError("replace", error);
+					if (replacementPublicationCommitted) throw new ManagedCommittedMutationError("replace", error);
 					if (
 						recaptureObserved &&
 						!(error instanceof ManagedPublishError && error.mutationState === "not_committed")

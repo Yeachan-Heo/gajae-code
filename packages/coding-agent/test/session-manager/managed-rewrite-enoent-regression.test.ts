@@ -133,6 +133,72 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("does not poison retries after a committed full rewrite loses post-publication recapture", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const assistant = manager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (assistant?.type !== "message") throw new Error("Expected assistant entry");
+		// Force the next append through the cold/full-rewrite path without changing
+		// the resident branch shape; this mirrors pruning/metadata rewrite callers.
+		manager.applyEntryMessageUpdates([assistant]);
+
+		const sessionFile = manager.getSessionFile()!;
+		const replaceExpected = ManagedSessionDescendantStore.prototype.replaceExpectedIdentitySync;
+		const captureExpectation = ManagedSessionDescendantStore.prototype.captureBoundedAppendExpectation;
+		let published = false;
+		let recaptureFailed = false;
+		const replace = vi
+			.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync")
+			.mockImplementation(function (this: ManagedSessionDescendantStore, relativePath, bytes, expected) {
+				const result = replaceExpected.call(this, relativePath, bytes, expected);
+				published = true;
+				return result;
+			});
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "captureBoundedAppendExpectation").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+		) {
+			if (published && !recaptureFailed) {
+				recaptureFailed = true;
+				throw new Error("recapture_failed");
+			}
+			return captureExpectation.call(this, relativePath);
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "cold-committed-rewrite", timestamp: Date.now() }),
+		).toThrow(/managed_replace_committed_outcome_uncertain/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("cold-committed-rewrite");
+		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("cold-committed-rewrite"))).toBe(true);
+
+		// The committed rewrite must not leave a sticky #persistError. A later entry
+		// is not part of the first publication, but must land exactly once on retry.
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "after-cold-rewrite-retry", timestamp: Date.now() }),
+		).not.toThrow();
+		expect(replace).toHaveBeenCalledTimes(2);
+		const persistedLines = fs.readFileSync(sessionFile, "utf8").split("\n").filter(Boolean);
+		expect(persistedLines.filter(line => line.includes("cold-committed-rewrite"))).toHaveLength(1);
+		expect(persistedLines.filter(line => line.includes("after-cold-rewrite-retry"))).toHaveLength(1);
+
+		// A later successor must still fail closed against the receipt retained by
+		// the committed rewrite; it is never a license to replace by pathname.
+		manager.applyEntryMessageUpdates([assistant]);
+		const successor = `${JSON.stringify({ type: "session", id: "successor", timestamp: new Date().toISOString(), cwd })}\n`;
+		fs.writeFileSync(sessionFile, successor);
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "must-not-overwrite-successor", timestamp: Date.now() }),
+		).toThrow(/identity_mismatch|destination_conflict/);
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		await manager.close().catch(() => {});
+	});
+
 	it("keeps resident state when committed no-replace publication throws before returning its identity", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
