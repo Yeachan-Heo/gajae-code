@@ -2570,8 +2570,12 @@ async function terminateSpawnedChild(
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
 	await broker.index.refresh();
 	const registered = expected ? broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) : false;
+	// Keep one poll interval inside the lifecycle deadline for the final exact
+	// cleanup proof. Registered sessions retain the original deadline partition;
+	// only an unregistered child needs this extra bounded margin.
+	const processExitDeadlineAt = expected && !registered ? deadline - POLL_MS : deadline;
 	const unregisteredTerminationDeadlineAt =
-		deadline - Math.max(POLL_MS, Math.floor((deadline - terminationStartDeadlineAt) / 2));
+		processExitDeadlineAt - Math.max(POLL_MS, Math.floor((processExitDeadlineAt - terminationStartDeadlineAt) / 2));
 	const observe = (): ProcessObservation =>
 		child.exitCode !== null
 			? "exited"
@@ -2591,7 +2595,7 @@ async function terminateSpawnedChild(
 		if (observation !== "uncertain") return;
 		// This direct ChildProcess is owned by this broker invocation. A process-incarnation
 		// read can briefly lag its exit event, so recheck only this owned child before failing.
-		observation = await waitForExit(deadline);
+		observation = await waitForExit(processExitDeadlineAt);
 	};
 	if (observation === "alive") {
 		if (expected && !registered) {
@@ -2618,7 +2622,7 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			const remaining = Math.max(0, deadline - timing.now());
+			const remaining = Math.max(0, processExitDeadlineAt - timing.now());
 			const gracefulDeadline = timing.now() + Math.min(CLOSE_TIMEOUT_MS, Math.floor(remaining / 2));
 			observation = await waitForExit(gracefulDeadline);
 		}
@@ -2632,7 +2636,7 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			observation = await waitForExit(deadline);
+			observation = await waitForExit(processExitDeadlineAt);
 		}
 	}
 	await recheckOwnedExitObservation();
