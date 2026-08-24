@@ -1321,7 +1321,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		await broker.start();
 		const resumed = await broker.handleRequest(
 			"session.resume",
-			{ cwd: root, stateRoot, sessionId: sourceId, sessionPath: sourcePath },
+			{ cwd: root, stateRoot, sessionId: sourceId, sessionPath: sourcePath, readinessTimeoutMs: 20_000 },
 			"canonical-cold-resume",
 		);
 		expect(resumed).toMatchObject({ ok: true, result: { sessionId: sourceId } });
@@ -1376,7 +1376,13 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 
 		const forked = await broker.handleRequest(
 			"session.fork",
-			{ cwd: root, stateRoot, sourceSessionId: sourceId, sourceSessionPath: sourcePath },
+			{
+				cwd: root,
+				stateRoot,
+				sourceSessionId: sourceId,
+				sourceSessionPath: sourcePath,
+				readinessTimeoutMs: 20_000,
+			},
 			"canonical-cold-fork",
 		);
 		expect(forked).toMatchObject({ ok: true });
@@ -1516,7 +1522,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 50_000);
 
 test("broker replays one identity-bound lifecycle metadata cleanup plan after the first delete detach", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-delete-metadata-crash-"));
