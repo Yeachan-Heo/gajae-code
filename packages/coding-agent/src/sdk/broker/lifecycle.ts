@@ -4140,11 +4140,16 @@ async function executeLifecycleResponse(
 			const spawned = authorizedSpawn.value;
 			child = spawned;
 			const spawnOutcome = Promise.withResolvers<void>();
-			spawned.once("error", error => spawnOutcome.reject(error));
-			spawned.once("spawn", () => spawnOutcome.resolve());
-			queueMicrotask(() => {
-				if (spawned.pid) spawnOutcome.resolve();
-			});
+			const onSpawn = () => {
+				spawned.off("error", onError);
+				spawnOutcome.resolve();
+			};
+			const onError = (error: Error) => {
+				spawned.off("spawn", onSpawn);
+				spawnOutcome.reject(error);
+			};
+			spawned.once("spawn", onSpawn);
+			spawned.once("error", onError);
 			await spawnOutcome.promise;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
