@@ -165,12 +165,28 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	const preferences = await readTarget(deps.paths.orchestrationPreferences);
 	const seed = createOrchestrationSeed(preferences.parsed);
 	const bridgePreflight = await preflightSkillsBridge(deps);
+	const bridgeLedgerBeforeInstall = await readProvenance(deps.paths.provenanceLedger);
+	const recordedBridgePathBeforeInstall = bridgeLedgerBeforeInstall.bridgePath;
+	// A path cutover cannot be authenticated without a live source. Refuse it
+	// before any saga step so the existing bridge, registration, and complete
+	// provenance ledger remain byte-for-byte unchanged.
+	const sourceLessMigration =
+		bridgePreflight.sourceDir === undefined &&
+		recordedBridgePathBeforeInstall !== undefined &&
+		path.resolve(recordedBridgePathBeforeInstall) !== path.resolve(deps.paths.bridgeDir);
 
 	const completed: CompletedStep[] = [];
 	const changed: string[] = [];
 	const entryHash = providerEntryHash(entry);
 
 	try {
+		if (sourceLessMigration) {
+			throw new SagaStepError(
+				"install",
+				`Refusing Paseo skills bridge path migration from ${recordedBridgePathBeforeInstall} to ${deps.paths.bridgeDir}: no resolved Paseo skills source is available; retaining the recorded bridge at ${recordedBridgePathBeforeInstall} and its registration`,
+				[recordedBridgePathBeforeInstall!, deps.paths.provenanceLedger],
+			);
+		}
 		// Step 1: provider entry + provider-key provenance.
 		//
 		// Ownership is decided by what existed BEFORE this run, not by value
