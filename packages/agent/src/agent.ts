@@ -505,6 +505,8 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#shouldPause?: AgentLoopConfig["shouldPause"];
+	/** While set and returning true, steering is neither admitted nor dequeued. */
+	#steeringAdmissionFence?: () => boolean;
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
 	#appendOnlyContext?: AppendOnlyContextManager;
@@ -889,6 +891,19 @@ export class Agent {
 
 	setShouldPause(fn: AgentLoopConfig["shouldPause"] | undefined): void {
 		this.#shouldPause = fn;
+	}
+
+	/**
+	 * Fence old-turn steering admission.
+	 *
+	 * The loop polls steering UPSTREAM of its pause checkpoint (and again on the
+	 * immediate-interrupt path), so a cooperative stop alone cannot prevent one
+	 * more old-turn model call once a steering message has already been dequeued.
+	 * While the fence returns true the poll yields no messages AND does not
+	 * dequeue, so the queue survives intact for the next turn.
+	 */
+	setSteeringAdmissionFence(fn: (() => boolean) | undefined): void {
+		this.#steeringAdmissionFence = fn;
 	}
 
 	setMaintainContext(fn: AgentLoopConfig["maintainContext"] | undefined): void {
@@ -1909,6 +1924,12 @@ export class Agent {
 				}
 				if (skipInitialSteeringPoll) {
 					skipInitialSteeringPoll = false;
+					return [];
+				}
+				// Fenced: yield nothing and dequeue nothing, so a steer submitted while a
+				// fold is being claimed is neither consumed by the run being wound down
+				// nor lost.
+				if (this.#steeringAdmissionFence?.() === true) {
 					return [];
 				}
 				const queued = this.#dequeueSteeringMessages();
