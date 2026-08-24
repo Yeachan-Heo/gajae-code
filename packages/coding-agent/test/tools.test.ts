@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import type { FoldAdapter } from "@gajae-code/coding-agent/session/fold-coordinator";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -241,6 +242,23 @@ function createTestToolContext(toolNames: string[]): AgentToolContext {
 		abort: () => {},
 		toolNames,
 	} as AgentToolContext;
+}
+
+/**
+ * Drive a fold the way the coordinator does: hand the adapter the receipt it
+ * would have captured, which settles the foreground caller exactly once.
+ */
+function foldViaAdapter(adapter: FoldAdapter): void {
+	adapter.detachObserver({
+		jobId: adapter.jobId,
+		jobGeneration: adapter.jobGeneration,
+		kind: adapter.kind,
+		label: adapter.label,
+		outputRef: adapter.outputRef,
+		remainingIntent: undefined,
+		foldedAt: Date.now(),
+		cwdSensitive: adapter.cwdSensitive,
+	});
 }
 
 describe("Coding Agent Tools", () => {
@@ -1622,7 +1640,7 @@ function b() {
 				},
 			});
 			AsyncJobManager.setInstance(asyncJobManager);
-			let backgroundRequestHandler: (() => void) | undefined;
+			let foldAdapter: FoldAdapter | undefined;
 			const autoBackgroundBashTool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(
@@ -1633,10 +1651,10 @@ function b() {
 						}),
 						{
 							getSessionId: () => "test-session",
-							registerForegroundBashBackgroundRequestHandler: handler => {
-								backgroundRequestHandler = handler;
+							registerForegroundFoldParticipant: adapter => {
+								foldAdapter = adapter;
 								return () => {
-									if (backgroundRequestHandler === handler) backgroundRequestHandler = undefined;
+									if (foldAdapter === adapter) foldAdapter = undefined;
 								};
 							},
 						},
@@ -1658,18 +1676,18 @@ function b() {
 				},
 			);
 
-			for (let i = 0; i < 50 && !backgroundRequestHandler; i++) {
+			for (let i = 0; i < 50 && !foldAdapter; i++) {
 				await Bun.sleep(10);
 			}
-			expect(backgroundRequestHandler).toBeDefined();
-			backgroundRequestHandler?.();
+			expect(foldAdapter).toBeDefined();
+			if (foldAdapter) foldViaAdapter(foldAdapter);
 
 			const result = await resultPromise;
 			expect(result.details?.async?.state).toBe("running");
 			expect(result.details?.async?.type).toBe("bash");
 			expect(getTextOutput(result)).toContain("Background job");
 			expect(getTextOutput(result)).toContain("start");
-			expect(backgroundRequestHandler).toBeUndefined();
+			expect(foldAdapter).toBeUndefined();
 
 			const jobId = result.details?.async?.jobId;
 			if (!jobId) {
@@ -1696,7 +1714,7 @@ function b() {
 				},
 			});
 			AsyncJobManager.setInstance(asyncJobManager);
-			let backgroundRequestHandler: (() => void) | undefined;
+			let foldAdapter: FoldAdapter | undefined;
 			const foregroundBashTool = wrapToolWithMetaNotice(
 				new BashTool(
 					createTestToolSession(
@@ -1706,10 +1724,10 @@ function b() {
 						}),
 						{
 							getSessionId: () => "test-session",
-							registerForegroundBashBackgroundRequestHandler: handler => {
-								backgroundRequestHandler = handler;
+							registerForegroundFoldParticipant: adapter => {
+								foldAdapter = adapter;
 								return () => {
-									if (backgroundRequestHandler === handler) backgroundRequestHandler = undefined;
+									if (foldAdapter === adapter) foldAdapter = undefined;
 								};
 							},
 						},
@@ -1725,11 +1743,11 @@ function b() {
 				undefined,
 			);
 
-			for (let i = 0; i < 50 && !backgroundRequestHandler; i++) {
+			for (let i = 0; i < 50 && !foldAdapter; i++) {
 				await Bun.sleep(10);
 			}
-			expect(backgroundRequestHandler).toBeDefined();
-			backgroundRequestHandler?.();
+			expect(foldAdapter).toBeDefined();
+			if (foldAdapter) foldViaAdapter(foldAdapter);
 
 			const result = await resultPromise;
 			expect(result.details?.async?.state).toBe("running");
