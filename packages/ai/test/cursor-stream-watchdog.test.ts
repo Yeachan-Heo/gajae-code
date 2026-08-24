@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
 import { create, toBinary } from "@bufbuild/protobuf";
+import { cursorExecDeadlineMsForTest } from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
 import {
 	AgentServerMessageSchema,
@@ -14,7 +15,6 @@ import {
 	TokenDeltaUpdateSchema,
 	TurnEndedUpdateSchema,
 } from "../src/providers/cursor/gen/agent_pb";
-import { cursorExecDeadlineMsForTest } from "../src/providers/cursor";
 import { stream as streamModel } from "../src/stream";
 import type { AssistantMessage, Context, CursorExecHandlers, Model } from "../src/types";
 
