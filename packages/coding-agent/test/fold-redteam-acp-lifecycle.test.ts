@@ -85,7 +85,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 	throw new Error("waitFor timed out");
 }
 
-function makeHandle(terminalId: string, opts: { poisoned?: () => boolean } = {}): {
+function makeHandle(
+	terminalId: string,
+	opts: { poisoned?: () => boolean } = {},
+): {
 	handle: ClientBridgeTerminalHandle;
 	exit: PromiseWithResolvers<{ exitCode: number; signal: null }>;
 } {

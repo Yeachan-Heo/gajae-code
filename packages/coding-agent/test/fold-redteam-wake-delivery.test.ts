@@ -11,10 +11,9 @@
  * most one fresh turn per merge window.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import type { AgentMessage } from "@gajae-code/agent-core";
-import type { AsyncJob } from "../src/async/job-manager";
 import { AsyncJobManager } from "../src/async";
-import { FoldCoordinator, type FoldAdapter } from "../src/session/fold-coordinator";
+import type { AsyncJob } from "../src/async/job-manager";
+import { type FoldAdapter, FoldCoordinator } from "../src/session/fold-coordinator";
 
 function job(id: string, generation: string, status: AsyncJob["status"] = "running"): AsyncJob {
 	return {
@@ -68,6 +67,7 @@ function coordinatorHarness() {
 			stops += 1;
 		},
 		captureRemainingIntent: () => "finish the original task",
+		deliverParked: () => {},
 	});
 	return { coordinator, fenceArmed, fenceReleased, stops };
 }

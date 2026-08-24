@@ -893,6 +893,11 @@ export class Agent {
 		this.#shouldPause = fn;
 	}
 
+	/** The currently installed cooperative pause checkpoint, if any. */
+	get shouldPause(): AgentLoopConfig["shouldPause"] | undefined {
+		return this.#shouldPause;
+	}
+
 	/**
 	 * Fence old-turn steering admission.
 	 *

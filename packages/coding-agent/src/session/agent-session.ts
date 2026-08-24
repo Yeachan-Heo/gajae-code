@@ -443,7 +443,7 @@ import {
 } from "./contribution-prep";
 import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
-import { FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter, FoldCoordinator } from "./fold-coordinator";
+import { describeFoldReceipt, FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter, FoldCoordinator } from "./fold-coordinator";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -2625,6 +2625,16 @@ export class AgentSession {
 			this.#foldStopRequested = true;
 		},
 		captureRemainingIntent: () => this.#captureRemainingIntentForFold(),
+		// A parked completion replayed after the fold must schedule its own wake.
+		// This mirrors exactly what the sdk delivery seam does for a live receipt
+		// delivery, so the parked path cannot rely on an unrelated idle rearm.
+		deliverParked: (_job, disposition) => {
+			this.yieldQueue.enqueue("fold-parked-replay", {
+				jobId: disposition.receipt.jobId,
+				generation: disposition.receipt.jobGeneration,
+				text: describeFoldReceipt(disposition.receipt),
+			});
+		},
 	});
 
 	// Python execution state
@@ -3939,12 +3949,33 @@ export class AgentSession {
 			},
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
+		// Wake path for a completion parked during a fold's receipt capture: the
+		// delivery seam deliberately returned early on it, so the fold's replay is
+		// the only delivery it will ever get.
+		this.yieldQueue.register<{ jobId: string; generation: string; text: string }>("fold-parked-replay", {
+			build: entries => {
+				if (entries.length === 0) return null;
+				const text = entries.map(entry => entry.text).join("\n\n");
+				return { role: "user", content: text, timestamp: Date.now() } as never;
+			},
+		});
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
-		// to the folded turn instead of pausing everything that follows.
+		// to the folded turn instead of pausing everything that follows. The
+		// config-provided checkpoint (subagent requestPause, RLM research) is OR-ed
+		// in, never replaced.
+		// sdk/session.ts threads the config's shouldPause into new Agent, so the
+		// Agent's current checkpoint IS the config-provided one (subagent
+		// requestPause, RLM research). Capture and OR it rather than replace it.
+		const configuredShouldPause = this.agent.shouldPause;
 		this.agent.setShouldPause(() => {
+			if (configuredShouldPause?.() === true) return true;
 			if (!this.#foldStopRequested) return false;
 			this.#foldStopRequested = false;
+			// The folded turn has now actually stopped: steering admission must be
+			// restored so later turns drain their queues normally (the fence stays
+			// armed from the fold until exactly this point).
+			this.agent.setSteeringAdmissionFence(undefined);
 			return true;
 		});
 		this.agent.setMaintainContext((context, lifecycle) =>

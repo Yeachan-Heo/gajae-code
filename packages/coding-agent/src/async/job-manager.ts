@@ -2415,6 +2415,18 @@ export class AsyncJobManager {
 		};
 	}
 
+	/**
+	 * Mark a running job as backgrounded (folded out of its foreground call).
+	 * Read by getJobsSnapshot so folded work stays visible; safe to call twice.
+	 */
+	markBackgrounded(jobId: string, generation: string): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job || job.generation !== generation) return false;
+		job.metadata = { ...job.metadata, backgrounded: true };
+		this.#notifyChange();
+		return true;
+	}
+
 	async waitForAll(): Promise<void> {
 		await Promise.all(Array.from(this.#jobs.values()).map(job => job.promise));
 	}

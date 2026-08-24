@@ -133,6 +133,13 @@ export interface FoldCoordinatorDeps {
 	requestStop: () => void;
 	/** Capture what the interrupted turn still intended to accomplish. */
 	captureRemainingIntent: () => Promise<string | undefined> | string | undefined;
+	/**
+	 * Push a parked completion into the wake path. The delivery seam parks a
+	 * completion that arrives before the receipt exists; when the fold later
+	 * replays it (A6), THIS is what makes the wake happen rather than relying on
+	 * an unrelated idle rearm to rescue it.
+	 */
+	deliverParked: (job: AsyncJob, disposition: { kind: "receipt"; receipt: FoldReceipt }) => void;
 }
 
 /** Why a slot is being retired, which decides whether retiring is safe. */
@@ -267,8 +274,13 @@ export class FoldCoordinator {
 		this.#folding.delete(job);
 
 		// A6 flush: replay a parked completion through the same T2 branch so it
-		// takes the receipt exactly once instead of being handled specially.
-		if (parked) this.onDelivery(job, parked.text);
+		// takes the receipt exactly once instead of being handled specially — and
+		// push it into the wake path, because the delivery seam already returned
+		// early on it and will not retry.
+		if (parked) {
+			const replayed = this.onDelivery(job, parked.text);
+			if (replayed.kind === "receipt") this.#deps.deliverParked(job, replayed);
+		}
 
 		// A7 the fence stays armed until the turn actually stops; releasing here
 		// would readmit old-turn steering into the run being wound down.
