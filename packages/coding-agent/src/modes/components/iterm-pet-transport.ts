@@ -120,8 +120,13 @@ export function isItermCandidate(
 	env: NodeJS.ProcessEnv = Bun.env,
 	tty = Boolean(process.stdin.isTTY && process.stdout.isTTY),
 ): boolean {
+	if (!tty) return false;
+	// OpenSSH forwards TERM automatically, but TERM_PROGRAM is not normally
+	// forwarded. iTerm2's LC_TERMINAL marker is part of the locale environment
+	// and is forwarded by the standard LANG/LC_* SSH rules.
+	if (env.LC_TERMINAL === "iTerm2") return true;
 	const v = env.TERM_PROGRAM_VERSION?.split(".").map(Number);
-	return env.TERM_PROGRAM === "iTerm.app" && tty && !!v && v[0] >= 3 && (v[0] > 3 || (v[1] ?? 0) >= 5);
+	return env.TERM_PROGRAM === "iTerm.app" && !!v && v[0] >= 3 && (v[0] > 3 || (v[1] ?? 0) >= 5);
 }
 export function createNativePetTransport(o: {
 	ui: NativePetUi;

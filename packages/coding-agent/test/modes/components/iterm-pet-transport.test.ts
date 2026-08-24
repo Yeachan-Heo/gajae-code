@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	consumeCapabilityInput,
+	isItermCandidate,
 	ItermPetTransport,
 	type PetTransportClock,
 } from "@gajae-code/coding-agent/modes/components/iterm-pet-transport";
@@ -134,5 +135,17 @@ describe("capability input fragmentation", () => {
 		const consume = consumeCapabilityInput(data => captured.push(String(data)));
 		expect(consume("\x1b]1337;Capabilities=F\x07xy\x1b]1337;Capabilities=x\x07")?.data).toBe("xy");
 		expect(captured).toEqual(["\x1b]1337;Capabilities=F\x07", "\x1b]1337;Capabilities=x\x07"]);
+	});
+});
+
+
+describe("iTerm2 SSH candidate detection", () => {
+	it("accepts the forwarded LC_TERMINAL marker without manual TERM_PROGRAM forwarding", () => {
+		expect(isItermCandidate({ LC_TERMINAL: "iTerm2" }, true)).toBe(true);
+	});
+
+	it("still rejects non-iTerm2 terminals and non-TTY sessions", () => {
+		expect(isItermCandidate({ TERM: "xterm-256color" }, true)).toBe(false);
+		expect(isItermCandidate({ LC_TERMINAL: "iTerm2" }, false)).toBe(false);
 	});
 });
