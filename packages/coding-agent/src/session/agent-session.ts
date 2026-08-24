@@ -497,7 +497,7 @@ import {
 
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
-import { FoldCoordinator, type FoldAdapter } from "./fold-coordinator";
+import { FoldCoordinator, FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter } from "./fold-coordinator";
 import { YieldQueue } from "./yield-queue";
 
 /**
@@ -3826,7 +3826,9 @@ export class AgentSession {
 					async () => {
 						await run();
 					},
-					{ delayMs: 1 },
+					// One merge window, so staggered completions share a single wake
+					// turn instead of each buying its own.
+					{ delayMs: FOLD_WAKE_MERGE_WINDOW_MS },
 				);
 			},
 		});
@@ -7459,6 +7461,11 @@ export class AgentSession {
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
 			if (!isTerminalAgentEnd) return;
+			// A merged wake batch whose flush fired while still streaming cleared its
+			// pending flag without rescheduling. Returning to idle is exactly when it
+			// becomes deliverable again, so rearm here rather than waiting for an
+			// unrelated enqueue.
+			this.yieldQueue.rearmIdle();
 			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
 			this.#activeLogicalRunId = undefined;
 		};

@@ -25,6 +25,17 @@
  */
 import type { AsyncJob } from "../async/job-manager";
 
+/**
+ * Idle-flush merge window.
+ *
+ * Completions that land within this window coalesce into ONE wake turn. The
+ * previous 1ms debounce meant staggered completions each bought their own full
+ * LLM turn. Deliberately a fixed internal constant, not a setting: the contract
+ * is one merge window, and a per-user knob would let wake behavior differ
+ * between sessions.
+ */
+export const FOLD_WAKE_MERGE_WINDOW_MS = 800;
+
 /** The wait kinds that can be folded. `task`/`subagent` awaits are a non-goal. */
 export type FoldWaitKind = "bash-managed" | "client-terminal" | "bash-pty";
 
