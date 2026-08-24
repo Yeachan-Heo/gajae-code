@@ -152,6 +152,8 @@ export const SessionStateLockTestHooks: {
 	unqualifiedOwnerIsLocal?: boolean;
 	/** @internal Shortens acquisition deadlines without changing production timing. */
 	lockAcquireTimeoutMs?: number;
+	/** @internal Replaces Darwin volume commands for timeout and parser tests. */
+	darwinVolumeCommand?: (argv: readonly string[]) => Promise<{ output: string; exitCode: number }>;
 	/** @internal Runs after final live-owner validation and before descriptor rewrite. */
 	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
 	/**
@@ -354,51 +356,78 @@ export function detectedLinuxSessionStateLockFileSystemIsLocal(type: number): bo
 	return LOCAL_LINUX_FILE_SYSTEM_TYPES.has(type);
 }
 
-export function detectedDarwinSessionStateLockFileSystemIsLocal(dfOutput: string, mountOutput: string): boolean {
-	const records = dfOutput
-		.split(/\r?\n/u)
-		.map(line => line.trim())
-		.filter(Boolean);
-	if (records.length < 2) return false;
-	const device = records.at(-1)?.split(/\s+/u, 1)[0];
-	if (!device?.startsWith("/dev/")) return false;
-	return mountOutput.split(/\r?\n/u).some(line => {
-		if (!line.startsWith(`${device} on `) || !line.endsWith(")")) return false;
+export function detectedDarwinLocalApfsDevices(mountOutput: string): string[] {
+	const devices: string[] = [];
+	for (const line of mountOutput.split(/\r?\n/u)) {
+		const separator = line.indexOf(" on ");
 		const optionsStart = line.lastIndexOf(" (");
-		if (optionsStart < 0) return false;
+		if (separator <= 0 || optionsStart <= separator || !line.endsWith(")")) continue;
+		const device = line.slice(0, separator);
+		if (!device.startsWith("/dev/")) continue;
 		const options = line
 			.slice(optionsStart + 2, -1)
 			.split(",")
 			.map(option => option.trim());
-		return options.includes("apfs") && options.includes("local");
+		if (options.includes("apfs") && options.includes("local")) devices.push(device);
+	}
+	return devices;
+}
+
+async function darwinOwnerVolumeIsLocal(ownerDev: bigint, mountOutput: string): Promise<boolean> {
+	for (const device of detectedDarwinLocalApfsDevices(mountOutput)) {
+		const stat = await fs.stat(device, { bigint: true }).catch(() => null);
+		if (stat?.isBlockDevice() && stat.rdev === ownerDev) return true;
+	}
+	return false;
+}
+
+async function commandOutput(argv: string[], deadline: number): Promise<string | undefined> {
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) return undefined;
+	const hook = SessionStateLockTestHooks.darwinVolumeCommand;
+	if (hook) {
+		const outcome = await Promise.race([hook(argv), Bun.sleep(remaining).then(() => undefined)]);
+		return outcome !== undefined && outcome.exitCode === 0 && performance.now() < deadline
+			? outcome.output
+			: undefined;
+	}
+	const child = Bun.spawn(argv, {
+		stdout: "pipe",
+		stderr: "ignore",
+		timeout: Math.max(1, Math.ceil(remaining)),
 	});
-}
-
-async function commandOutput(argv: string[]): Promise<string | undefined> {
-	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "ignore" });
 	const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
-	return exitCode === 0 ? output : undefined;
+	return exitCode === 0 && performance.now() < deadline ? output : undefined;
 }
 
-async function unqualifiedOwnerIsLocal(file: string): Promise<boolean> {
+async function unqualifiedOwnerIsLocal(file: string, ownerDev: bigint, deadline: number): Promise<boolean> {
 	const override = SessionStateLockTestHooks.unqualifiedOwnerIsLocal;
 	if (override !== undefined) return override;
 	try {
+		if (performance.now() >= deadline) return false;
 		if (process.platform === "darwin") {
-			const target = path.resolve(file);
-			const [dfOutput, mountOutput] = await Promise.all([
-				commandOutput(["/bin/df", "-P", target]),
-				commandOutput(["/sbin/mount", "-t", "apfs"]),
-			]);
+			const mountOutput = await commandOutput(["/sbin/mount", "-t", "apfs"], deadline);
 			return (
-				dfOutput !== undefined &&
 				mountOutput !== undefined &&
-				detectedDarwinSessionStateLockFileSystemIsLocal(dfOutput, mountOutput)
+				performance.now() < deadline &&
+				(await darwinOwnerVolumeIsLocal(ownerDev, mountOutput)) &&
+				performance.now() < deadline
 			);
 		}
 		if (process.platform !== "linux") return false;
-		const volume = await fs.statfs(file);
-		return detectedLinuxSessionStateLockFileSystemIsLocal(volume.type);
+		const directoryFlags = fsSync.constants.O_RDONLY | fsSync.constants.O_DIRECTORY | fsSync.constants.O_NOFOLLOW;
+		const parent = await fs.open(path.dirname(file), directoryFlags);
+		try {
+			const before = await parent.stat({ bigint: true });
+			if (!before.isDirectory() || before.dev !== ownerDev || performance.now() >= deadline) return false;
+			const volume = await fs.statfs(`/proc/self/fd/${parent.fd}`);
+			if (!detectedLinuxSessionStateLockFileSystemIsLocal(volume.type) || performance.now() >= deadline)
+				return false;
+			const after = await parent.stat({ bigint: true });
+			return after.isDirectory() && after.dev === before.dev && after.ino === before.ino;
+		} finally {
+			await parent.close().catch(() => undefined);
+		}
 	} catch {
 		return false;
 	}
@@ -415,11 +444,11 @@ async function waitForLockRetry(deadline: number): Promise<boolean> {
 	return performance.now() < deadline;
 }
 
-async function lockOwnerIsAlive(file: string, value: unknown): Promise<boolean> {
+async function lockOwnerIsAlive(file: string, value: unknown, ownerDev: bigint, deadline: number): Promise<boolean> {
 	if (!validLockOwner(value)) return false;
 	const owner = value;
 	if (owner.owner_host_id === undefined) {
-		if (!(await unqualifiedOwnerIsLocal(file))) return true;
+		if (!(await unqualifiedOwnerIsLocal(file, ownerDev, deadline))) return true;
 	} else if (owner.owner_host_id !== (await currentOwnerHostId())) {
 		if (owner.owner_host_id !== (await currentLegacyOwnerHostId())) return true;
 	}
@@ -979,6 +1008,7 @@ async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<
  */
 async function reclaimStaleOwnerRecord(
 	file: string,
+	deadline: number,
 	hooks: {
 		afterInspection?: (file: string) => void | Promise<void>;
 		beforeRemoval?: (file: string) => void | Promise<void>;
@@ -993,10 +1023,10 @@ async function reclaimStaleOwnerRecord(
 		owner = null;
 	}
 	if (!validLockOwner(owner)) {
-		if (!(await unqualifiedOwnerIsLocal(file))) return;
+		if (!(await unqualifiedOwnerIsLocal(file, snapshot.dev, deadline))) return;
 		// The mtime of the very inode the bytes were read from, not a fresh path `stat`.
 		if (Date.now() - Number(snapshot.mtimeNs / 1_000_000n) < LOCK_STALE_MS) return;
-	} else if (await lockOwnerIsAlive(file, owner)) return;
+	} else if (await lockOwnerIsAlive(file, owner, snapshot.dev, deadline)) return;
 	await hooks.afterInspection?.(file);
 	const current = await captureRegularLockOwner(file);
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
@@ -1021,14 +1051,14 @@ async function releaseTransitionClaim(
 	await fs.rmdir(transitionDir);
 }
 
-async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void> {
+async function reclaimStaleTransitionClaim(transitionDir: string, deadline: number): Promise<void> {
 	const stat = await fs.lstat(transitionDir).catch(() => null);
 	if (!stat) return;
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
 	// explicit cleanup before this atomic-directory protocol can take over.
 	if (stat.isFile()) {
-		await reclaimStaleOwnerRecord(transitionDir, {
+		await reclaimStaleOwnerRecord(transitionDir, deadline, {
 			afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
 			beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
 		});
@@ -1055,7 +1085,7 @@ async function withLockPathTransition<T>(
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
-			await reclaimStaleTransitionClaim(transitionDir);
+			await reclaimStaleTransitionClaim(transitionDir, deadline);
 			if (await waitForLockRetry(deadline)) continue;
 			break;
 		}
@@ -1098,7 +1128,7 @@ async function reclaimStaleRegularLock(lockFile: string, deadline: number): Prom
 	await withLockPathTransition(
 		lockFile,
 		async () =>
-			await reclaimStaleOwnerRecord(lockFile, {
+			await reclaimStaleOwnerRecord(lockFile, deadline, {
 				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
 				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
 			}),
@@ -1193,7 +1223,9 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			const native = nativeSessionStateLock();
 			const before = captureLegacyDirectoryTree(native, lockFile);
 			if (!before) return;
-			const ownerHostId = (await unqualifiedOwnerIsLocal(lockFile)) ? undefined : await currentOwnerHostId();
+			const ownerHostId = (await unqualifiedOwnerIsLocal(lockFile, BigInt(before.rootDev), deadline))
+				? undefined
+				: await currentOwnerHostId();
 			let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
 			if (!stale && ownerHostId !== undefined)
 				stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());

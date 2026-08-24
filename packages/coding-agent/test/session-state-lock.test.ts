@@ -54,6 +54,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.lockAcquireTimeoutMs = undefined;
+	SessionStateLockTestHooks.darwinVolumeCommand = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	installExactIdentityNatives();
@@ -205,26 +206,17 @@ function ageWorldPastAnyStaleWindow(): () => void {
 }
 
 describe("coordinator session state lock", () => {
-	it("recognizes only known local filesystems for legacy owner recovery", () => {
-		const apfsDf = [
-			"Filesystem 512-blocks Used Available Capacity Mounted on",
-			"/dev/disk3s5 100 25 75 25% /System/Volumes/Data",
+	it("recognizes only local APFS device mounts for legacy owner recovery", () => {
+		const mountOutput = [
+			"/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)",
+			"/dev/disk4s1 on /Volumes/External (apfs, journaled)",
+			"server:/state on /state (nfs, local)",
+			"malformed",
 		].join("\n");
-		const apfsMount = "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)\n";
-		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal(apfsDf, apfsMount)).toBe(true);
-		expect(
-			sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal(
-				"Filesystem 512-blocks Used Available Capacity Mounted on\nserver:/state 100 25 75 25% /state\n",
-				apfsMount,
-			),
-		).toBe(false);
-		expect(
-			sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal(
-				apfsDf,
-				"/dev/disk3s5 on /System/Volumes/Data (apfs, journaled)\n",
-			),
-		).toBe(false);
-		expect(sessionStateLock.detectedDarwinSessionStateLockFileSystemIsLocal("malformed", apfsMount)).toBe(false);
+		expect(sessionStateLock.detectedDarwinLocalApfsDevices(mountOutput)).toEqual(["/dev/disk3s5"]);
+		expect(sessionStateLock.detectedDarwinLocalApfsDevices("server:/state on /state (nfs, local)\n")).toEqual([]);
+		expect(sessionStateLock.detectedDarwinLocalApfsDevices("/dev/disk3s5 on /data (apfs)\n")).toEqual([]);
+		expect(sessionStateLock.detectedDarwinLocalApfsDevices("malformed")).toEqual([]);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0xef53)).toBe(true);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x5846_5342)).toBe(true);
 		expect(sessionStateLock.detectedLinuxSessionStateLockFileSystemIsLocal(0x00c3_6400)).toBe(false);
@@ -247,6 +239,24 @@ describe("coordinator session state lock", () => {
 			await reclaimStaleSessionStateLock(lockFile);
 
 			expect(fsSync.existsSync(lockFile)).toBe(false);
+		});
+
+		it("fails closed within the acquisition deadline when the APFS mount probe stalls", async () => {
+			const root = await tempRoot();
+			const lockFile = path.join(root, "lock-apfs-probe-timeout.json.lock");
+			const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "stalled-probe-owner" });
+			await fs.writeFile(lockFile, record);
+			SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
+			SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+			const stalled = Promise.withResolvers<{ output: string; exitCode: number }>();
+			SessionStateLockTestHooks.darwinVolumeCommand = () => stalled.promise;
+			const startedAt = performance.now();
+
+			await reclaimStaleSessionStateLock(lockFile);
+
+			expect(performance.now() - startedAt).toBeLessThan(500);
+			expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+			stalled.resolve({ output: "", exitCode: 0 });
 		});
 	}
 
