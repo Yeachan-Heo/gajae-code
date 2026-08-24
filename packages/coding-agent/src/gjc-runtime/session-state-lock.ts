@@ -7,7 +7,7 @@ import type {
 	NativeDirectoryTreeSnapshot,
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
-import { readFileLockInfoForGc } from "../config/file-lock";
+import { type FileLockOwnerToken, readFileLockInfoForGc } from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTime } from "./linux-proc";
 
@@ -1276,7 +1276,15 @@ async function legacyDirectoryIsStale(
 	ownerHostId: string | undefined,
 	deadline: number,
 ): Promise<boolean> {
-	const owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockDir));
+	let owner: FileLockOwnerToken | null;
+	try {
+		owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockDir));
+	} catch (error) {
+		// A just-published Windows legacy owner can transiently deny metadata reads.
+		// That is active contention, never stale authority or an acquisition failure.
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return false;
+		throw error;
+	}
 	if (!owner && ownerHostId !== undefined) return false;
 	if (!owner) {
 		try {
