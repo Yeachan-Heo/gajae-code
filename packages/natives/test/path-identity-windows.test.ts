@@ -727,6 +727,28 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 		await expect(fs.stat(path.join(root, directQuarantine))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
+	it("retains a regular file when direct cleanup parent authority changes", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "parent-bound-debris");
+		await fs.writeFile(file, "stale");
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await parentIdentity(file);
+
+		expect(
+			exactUnlinkDirect(file, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("stale"),
+				parentDev: parent.parentDev + 1n,
+				parentIno: parent.parentIno,
+				quarantineName: ".gjc-parent-mismatch",
+			}),
+		).toEqual({ ok: false, code: "parent_mismatch" });
+		await expect(fs.readFile(file, "utf8")).resolves.toBe("stale");
+	});
+
 	it("atomically detaches only the identified directory to its preauthorized destination", async () => {
 		const root = await temporaryDirectory();
 		const directory = path.join(root, "artifact");
