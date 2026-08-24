@@ -115,6 +115,46 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("normalizes only Bun's default AbortError diagnostic", async () => {
+		let requestCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			requestCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		});
+		const controller = new AbortController();
+		controller.abort();
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 20,
+		});
+
+		expect(requestCount).toBe(0);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request was aborted");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("preserves a caller-supplied AbortError diagnostic", async () => {
+		let requestCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			requestCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		});
+		const controller = new AbortController();
+		controller.abort(new DOMException("session closed by broker", "AbortError"));
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 20,
+		});
+
+		expect(requestCount).toBe(0);
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("session closed by broker");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("closes the request when abort wins during request setup", async () => {
 		const controller = new AbortController();
 		let requestCount = 0;

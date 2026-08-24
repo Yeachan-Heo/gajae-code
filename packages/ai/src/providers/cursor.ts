@@ -226,8 +226,15 @@ function cursorAbortError(signal: AbortSignal): Error {
 	if (reason instanceof Error) {
 		// Normalize the default AbortError DOMException Bun supplies when abort()
 		// runs without a custom reason: Cursor's established terminal text is
-		// "Request was aborted", and the generic-abort matcher keys on it.
-		if (reason.name === "AbortError") return new Error("Request was aborted");
+		// "Request was aborted", and the generic-abort matcher keys on it. Keep
+		// custom AbortError diagnostics intact; the name alone does not prove the
+		// caller omitted a reason.
+		if (
+			reason.name === "AbortError" &&
+			(reason.message === "The operation was aborted." || reason.message === "This operation was aborted")
+		) {
+			return new Error("Request was aborted");
+		}
 		return reason;
 	}
 	return new Error("Request was aborted");

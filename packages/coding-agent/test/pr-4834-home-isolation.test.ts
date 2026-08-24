@@ -24,7 +24,7 @@ let originalAgentDir: string;
 
 async function writeFile(filePath: string, content: string): Promise<void> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true });
-	await fs.writeFile(filePath, content);
+	await Bun.write(filePath, content);
 }
 
 async function makeSkill(root: string, name: string): Promise<void> {
