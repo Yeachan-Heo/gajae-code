@@ -1681,7 +1681,8 @@ function isLifecycleCleanupEvidence(cleanup: CleanupEvidence): boolean {
 	]);
 	const parentIdentity = record.lifecycleParentIdentity as Record<string, unknown> | undefined;
 	const filesValid = Array.isArray(record.lifecycleFiles) && record.lifecycleFiles.every(isLifecycleCleanupFile);
-	const receiptValid = record.uncertainRetirement === undefined || isLifecycleRetirementReceipt(record.uncertainRetirement);
+	const receiptValid =
+		record.uncertainRetirement === undefined || isLifecycleRetirementReceipt(record.uncertainRetirement);
 	return (
 		Object.keys(record).every(key => allowed.has(key)) &&
 		record.phase === "lifecycle" &&
@@ -1755,7 +1756,8 @@ function exactLifecycleRootIdentity(root: string): { dev: string; ino: string } 
 	try {
 		const rootStat = fsSync.lstatSync(root, { bigint: true });
 		const sdk = fsSync.lstatSync(path.join(root, "sdk"), { bigint: true });
-		if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !sdk.isDirectory() || sdk.isSymbolicLink()) return undefined;
+		if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !sdk.isDirectory() || sdk.isSymbolicLink())
+			return undefined;
 		return { dev: sdk.dev.toString(), ino: sdk.ino.toString() };
 	} catch {
 		return undefined;
@@ -1805,7 +1807,10 @@ function retirementMarkerCapture(
 		!sameEffectMarker(parsed, expected) ||
 		canonicalJson(parsed) !== decodeLifecycleUtf8(capture.bytes) ||
 		path.dirname(path.resolve(pathName)) !== path.join(path.resolve(root), "sdk") ||
-		path.basename(pathName) !== path.basename(pathName === lifecycleMarkerPath(root, id) ? lifecycleMarkerPath(root, id) : lifecycleReadyPath(root, id))
+		path.basename(pathName) !==
+			path.basename(
+				pathName === lifecycleMarkerPath(root, id) ? lifecycleMarkerPath(root, id) : lifecycleReadyPath(root, id),
+			)
 	)
 		throw new Error("Lifecycle retirement marker identity is incomplete.");
 	return capture;
@@ -1969,7 +1974,12 @@ function retirementProof(identity: LifecycleRetirementIdentity, indexSeq?: numbe
 }
 
 function isLifecycleBrokerResponse(value: unknown): value is BrokerResponse {
-	return typeof value === "object" && value !== null && "ok" in value && typeof (value as { ok?: unknown }).ok === "boolean";
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"ok" in value &&
+		typeof (value as { ok?: unknown }).ok === "boolean"
+	);
 }
 
 async function executeUncertainRetirement(
@@ -1990,7 +2000,8 @@ async function executeUncertainRetirement(
 	if (receipt) {
 		if (
 			receipt.identity.sessionId !== id ||
-			(receipt.identity.remoteCreateKey !== undefined && text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey) ||
+			(receipt.identity.remoteCreateKey !== undefined &&
+				text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey) ||
 			!sameRetirementIdentityAsRecord(receipt.identity, record)
 		)
 			return fail("endpoint_stale", "Staged retirement identity no longer matches the indexed session authority.");
@@ -2006,7 +2017,8 @@ async function executeUncertainRetirement(
 		if (input.remoteCreateKey !== undefined && remoteCreateKey === undefined)
 			return fail("invalid_input", "remoteCreateKey must be a bounded non-empty string.");
 		const matches = broker.ledger.listUncertainCreatesBySessionId(id, lifecycleRequestId, remoteCreateKey);
-		if (matches.length === 0) return fail("not_found", "No complete terminal_uncertain create identity matches this session.");
+		if (matches.length === 0)
+			return fail("not_found", "No complete terminal_uncertain create identity matches this session.");
 		if (matches.length !== 1)
 			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
 		create = matches[0]!;
@@ -2045,10 +2057,7 @@ async function executeUncertainRetirement(
 	}
 
 	if (!create || !receipt || !cleanup) return fail("terminal_uncertain", "Retirement receipt is incomplete.");
-	if (
-		create.state !== "terminal_uncertain" &&
-		!(create.state === "terminal_error" && receipt.stage === "ledger")
-	)
+	if (create.state !== "terminal_uncertain" && !(create.state === "terminal_error" && receipt.stage === "ledger"))
 		return fail("terminal_uncertain", "Create ledger identity is no longer an uncertain retirement candidate.");
 	if (receipt.stage === "cleanup") {
 		if (cleanup.lifecycleFiles?.length) {
@@ -2059,21 +2068,42 @@ async function executeUncertainRetirement(
 				fail("cleanup_pending", "Uncertain session retirement cleanup remains staged.", cleanup),
 			);
 			if (!cleanupResponse.ok && cleanupResponse.error.code !== "cleanup_pending") return cleanupResponse;
-			const persisted = retirementCleanupFromResponse(cleanupResponse) ?? retirementCleanupFromResponse(broker.ledger.get(identity)?.response);
+			const persisted =
+				retirementCleanupFromResponse(cleanupResponse) ??
+				retirementCleanupFromResponse(broker.ledger.get(identity)?.response);
 			if (!persisted || !retirementCleanupSettled(persisted)) return cleanupResponse;
 			cleanup = persisted;
 		}
 		if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
-			return fail("cleanup_pending", "Uncertain session retirement is pending because the endpoint reappeared.", cleanup);
-		for (const candidate of [lifecycleMarkerPath(retirementIdentity.stateRoot, id), lifecycleReadyPath(retirementIdentity.stateRoot, id)]) {
+			return fail(
+				"cleanup_pending",
+				"Uncertain session retirement is pending because the endpoint reappeared.",
+				cleanup,
+			);
+		for (const candidate of [
+			lifecycleMarkerPath(retirementIdentity.stateRoot, id),
+			lifecycleReadyPath(retirementIdentity.stateRoot, id),
+		]) {
 			if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
-				return fail("cleanup_pending", "Uncertain session retirement is pending because lifecycle authority reappeared.", cleanup);
+				return fail(
+					"cleanup_pending",
+					"Uncertain session retirement is pending because lifecycle authority reappeared.",
+					cleanup,
+				);
 			try {
 				if (fsSync.lstatSync(candidate))
-					return fail("cleanup_pending", "Uncertain session retirement is pending because lifecycle authority reappeared.", cleanup);
+					return fail(
+						"cleanup_pending",
+						"Uncertain session retirement is pending because lifecycle authority reappeared.",
+						cleanup,
+					);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-					return fail("cleanup_pending", "Uncertain session retirement could not prove lifecycle authority absence.", cleanup);
+					return fail(
+						"cleanup_pending",
+						"Uncertain session retirement could not prove lifecycle authority absence.",
+						cleanup,
+					);
 			}
 		}
 		const staged: LifecycleRetirementCleanup = {
@@ -2093,7 +2123,11 @@ async function executeUncertainRetirement(
 	if (!record || !sameRetirementIdentityAsRecord(retirementIdentity, record))
 		return fail("endpoint_stale", "Session authority changed before retirement index closure.");
 	if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
-		return fail("cleanup_pending", "Uncertain session retirement is pending because the endpoint reappeared.", cleanup);
+		return fail(
+			"cleanup_pending",
+			"Uncertain session retirement is pending because the endpoint reappeared.",
+			cleanup,
+		);
 	if (receipt.stage === "index") {
 		let indexSeq = receipt.indexSeq;
 		if (!record.terminal) {
@@ -2940,10 +2974,12 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 	) {
 		return false;
 	}
+	const stateRoot = identity.stateRoot;
+	if (typeof stateRoot !== "string" || !boundedRetirementString(stateRoot, 4096) || !path.isAbsolute(stateRoot))
+		return false;
 	return (
+		typeof identity.sessionId === "string" &&
 		isCanonicalSessionId(identity.sessionId) &&
-		boundedRetirementString(identity.stateRoot, 4096) &&
-		path.isAbsolute(identity.stateRoot) &&
 		typeof identity.endpointGeneration === "number" &&
 		Number.isSafeInteger(identity.endpointGeneration) &&
 		identity.endpointGeneration > 0 &&
@@ -2956,6 +2992,7 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 		boundedRetirementString(identity.processIncarnation, MAX_PROCESS_INCARNATION_LENGTH) &&
 		boundedRetirementString(identity.hostIncarnation, MAX_PROCESS_INCARNATION_LENGTH) &&
 		boundedRetirementString(identity.lifecycleRequestId, MAX_EFFECT_MARKER_LENGTH) &&
+		typeof identity.lifecycleRequestId === "string" &&
 		/^[A-Za-z0-9._-]+$/.test(identity.lifecycleRequestId) &&
 		boundedRetirementString(identity.createIdentity, 256) &&
 		(identity.remoteCreateKey === undefined || boundedRetirementString(identity.remoteCreateKey, 256))

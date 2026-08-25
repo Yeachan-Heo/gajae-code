@@ -3908,6 +3908,24 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		child.kill("SIGKILL");
 		await child.exited;
 		const deadResponse = await broker.handleRequest(
+			"session.reconcile_uncertain",
+			{
+				sessionId,
+				cwd: agentDir,
+				stateRoot,
+				endpointGeneration: 4,
+				endpointMtimeMs: 1,
+				processIncarnation: processIdentity,
+				hostIncarnation: processIdentity,
+				lifecycleRequestId: "reconcile-effect",
+				remoteCreateKey: "reconcile-create-key",
+			},
+			"reconcile-dead",
+		);
+		let retiredResponse = deadResponse;
+		for (let attempt = 0; attempt < 4 && !retiredResponse.ok; attempt++) {
+			if (retiredResponse.error.code !== "cleanup_pending") break;
+			retiredResponse = await broker.handleRequest(
 				"session.reconcile_uncertain",
 				{
 					sessionId,
@@ -3922,26 +3940,11 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 				},
 				"reconcile-dead",
 			);
-		let retiredResponse = deadResponse;
-		for (let attempt = 0; attempt < 4 && !retiredResponse.ok; attempt++) {
-			if (retiredResponse.error.code !== "cleanup_pending") break;
-			retiredResponse = await broker.handleRequest(
-						"session.reconcile_uncertain",
-						{
-							sessionId,
-							cwd: agentDir,
-							stateRoot,
-							endpointGeneration: 4,
-							endpointMtimeMs: 1,
-							processIncarnation: processIdentity,
-							hostIncarnation: processIdentity,
-							lifecycleRequestId: "reconcile-effect",
-							remoteCreateKey: "reconcile-create-key",
-						},
-						"reconcile-dead",
-					);
 		}
-		expect(retiredResponse).toMatchObject({ ok: true, result: { sessionId, retired: true, indexType: "session_closed" } });
+		expect(retiredResponse).toMatchObject({
+			ok: true,
+			result: { sessionId, retired: true, indexType: "session_closed" },
+		});
 		expect(broker.ledger.get(createIdentity)).toMatchObject({
 			state: "terminal_error",
 			intendedSessionId: sessionId,

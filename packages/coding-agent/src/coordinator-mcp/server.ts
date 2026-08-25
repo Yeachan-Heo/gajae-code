@@ -98,21 +98,21 @@ import {
 } from "./question-gate-codec";
 import {
 	acknowledgePublicDelivery,
-	assertCreationRetirementIdentity,
 	admitSessionClose,
 	advanceCreationReceipt,
 	advanceDeletion,
 	advanceDeliveryDiscoveryCursor,
 	advanceSchedulerCursor,
+	assertCreationRetirementIdentity,
 	bindCreationRequest,
 	type CanonicalCreateIntentV1,
 	type CanonicalReportSnapshotV1,
 	type CanonicalSessionSnapshotV1,
 	COORDINATOR_REPORT_ID_PATTERN,
 	COORDINATOR_SESSION_ID_PATTERN,
+	type CoordinatorSessionTransactionV1,
 	type CreationRetirementBrokerProofV1,
 	type CreationRetirementProofV1,
-	type CoordinatorSessionTransactionV1,
 	claimCreationRequest,
 	claimPublicDelivery,
 	commitCreationWal,
@@ -131,9 +131,9 @@ import {
 	readDeliveryDiscoveryCursor,
 	readSchedulerRoster,
 	readSessionTransaction,
+	reconcileCreationRemoteVerifier,
 	recordCreationRetirementBrokerProof,
 	recordCreationRetirementIntent,
-	reconcileCreationRemoteVerifier,
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
@@ -5324,18 +5324,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (response?.ok === false) brokerResult(response);
 		const result = response?.ok === true ? asRecord(response.result) : null;
 		if (!result)
-			throw new SdkClientError(
-				"protocol_error",
-				"SDK broker returned a malformed retirement acknowledgement.",
-			);
+			throw new SdkClientError("protocol_error", "SDK broker returned a malformed retirement acknowledgement.");
 		const broker = {
 			session_id: typeof result.sessionId === "string" ? result.sessionId : "",
 			retired: result.retired,
 			ledger_state: result.ledgerState,
 			index_type: result.indexType,
 			state_root: typeof result.stateRoot === "string" ? result.stateRoot : "",
-			endpoint_generation:
-				typeof result.endpointGeneration === "number" ? result.endpointGeneration : Number.NaN,
+			endpoint_generation: typeof result.endpointGeneration === "number" ? result.endpointGeneration : Number.NaN,
 			endpoint_mtime_ms: typeof result.endpointMtimeMs === "number" ? result.endpointMtimeMs : Number.NaN,
 			process_incarnation: typeof result.processIncarnation === "string" ? result.processIncarnation : "",
 			host_incarnation: typeof result.hostIncarnation === "string" ? result.hostIncarnation : "",
@@ -5355,10 +5351,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			broker.lifecycle_request_id !== expected.lifecycle_request_id ||
 			broker.remote_create_key !== expected.remote_create_key
 		)
-			throw new SdkClientError(
-				"protocol_error",
-				"SDK broker returned an unbound retirement proof.",
-			);
+			throw new SdkClientError("protocol_error", "SDK broker returned an unbound retirement proof.");
 		return {
 			broker,
 			public: {
@@ -5377,10 +5370,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		};
 	}
 
-	function coordinatorRetiredResponse(
-		sessionId: string,
-		lifecycle: Record<string, unknown>,
-	): Record<string, unknown> {
+	function coordinatorRetiredResponse(sessionId: string, lifecycle: Record<string, unknown>): Record<string, unknown> {
 		return { ok: true, session_id: sessionId, retired: true, lifecycle };
 	}
 
@@ -8802,139 +8792,160 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						code === "live_session"
 					);
 				};
-				return await withSessionStateLock(idempotencyLockFile(creationKey), async () =>
-					await withToolIdempotency(
-						name,
-						retirementKey,
-						canonicalArgs,
-						async () => {
-							const originalFile = idempotencyFile(creationKey);
-							const originalFileState = await readCoordinatorIdempotencyFile(originalFile);
-							if (originalFileState.kind !== "record")
-								return {
-									ok: false,
-									error: { code: "not_found", message: "The stranded coordinator start intent was not found." },
-								};
-							const original = originalFileState.value;
-							if (
-								original.schema_version !== 1 ||
-								original.tool !== "gjc_coordinator_start_session" ||
-								original.key_digest !== createHash("sha256").update(creationKey).digest("hex") ||
-								original.request_digest !== requestDigest
-							)
-								return {
-									ok: false,
-									error: { code: "idempotency_conflict", message: "The start intent identity does not match." },
-								};
-							if (original.state !== "in_progress")
-								return {
-									ok: false,
-									error: {
-										code: "retire_not_allowed",
-										message: "The coordinator start intent is not stranded in progress.",
-									},
-								};
-							const creation = await assertCreationRetirementIdentity(questionPaths, creationKeyDigest, proof);
-							if (
-								creation.retirement_intent &&
-								creation.retirement_intent.retirement_key_digest !== retirementKeyDigest
-							)
-								return {
-									ok: false,
-									error: {
-										code: "retire_not_allowed",
-										message: "The coordinator start intent was already retired by another retirement request.",
-									},
-								};
-							let lifecycle: Record<string, unknown>;
-							if (creation.retirement_intent?.phase === "broker_retired") {
-								const staged = creation.retirement_intent.broker_proof;
-								if (!staged)
-									throw new SdkClientError(
-										"terminal_uncertain",
-										"Retirement intent is staged without a bounded broker proof.",
-									);
+				return await withSessionStateLock(
+					idempotencyLockFile(creationKey),
+					async () =>
+						await withToolIdempotency(
+							name,
+							retirementKey,
+							canonicalArgs,
+							async () => {
+								const originalFile = idempotencyFile(creationKey);
+								const originalFileState = await readCoordinatorIdempotencyFile(originalFile);
+								if (originalFileState.kind !== "record")
+									return {
+										ok: false,
+										error: {
+											code: "not_found",
+											message: "The stranded coordinator start intent was not found.",
+										},
+									};
+								const original = originalFileState.value;
 								if (
-									staged.session_id !== proof.session_id ||
-									staged.state_root !== proof.state_root ||
-									staged.endpoint_generation !== proof.endpoint_generation ||
-									staged.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
-									staged.process_incarnation !== proof.process_incarnation ||
-									staged.host_incarnation !== proof.host_incarnation ||
-									staged.lifecycle_request_id !== proof.lifecycle_request_id ||
-									staged.remote_create_key !== proof.remote_create_key ||
-									staged.retired !== true ||
-									staged.ledger_state !== "terminal_error" ||
-									staged.index_type !== "session_closed"
+									original.schema_version !== 1 ||
+									original.tool !== "gjc_coordinator_start_session" ||
+									original.key_digest !== createHash("sha256").update(creationKey).digest("hex") ||
+									original.request_digest !== requestDigest
 								)
-									throw new SdkClientError("state_corrupt", "Retirement intent proof does not match its creation identity.");
-								lifecycle = publicRetirementProof(staged);
-							} else {
-								await recordCreationRetirementIntent(
+									return {
+										ok: false,
+										error: {
+											code: "idempotency_conflict",
+											message: "The start intent identity does not match.",
+										},
+									};
+								if (original.state !== "in_progress")
+									return {
+										ok: false,
+										error: {
+											code: "retire_not_allowed",
+											message: "The coordinator start intent is not stranded in progress.",
+										},
+									};
+								const creation = await assertCreationRetirementIdentity(
 									questionPaths,
 									creationKeyDigest,
 									proof,
-									retirementKeyDigest,
 								);
-								const acknowledgement = await brokerSession(
-									cwd,
-									"session.reconcile_uncertain",
-									{
-										sessionId,
+								if (
+									creation.retirement_intent &&
+									creation.retirement_intent.retirement_key_digest !== retirementKeyDigest
+								)
+									return {
+										ok: false,
+										error: {
+											code: "retire_not_allowed",
+											message:
+												"The coordinator start intent was already retired by another retirement request.",
+										},
+									};
+								let lifecycle: Record<string, unknown>;
+								if (creation.retirement_intent?.phase === "broker_retired") {
+									const staged = creation.retirement_intent.broker_proof;
+									if (!staged)
+										throw new SdkClientError(
+											"terminal_uncertain",
+											"Retirement intent is staged without a bounded broker proof.",
+										);
+									if (
+										staged.session_id !== proof.session_id ||
+										staged.state_root !== proof.state_root ||
+										staged.endpoint_generation !== proof.endpoint_generation ||
+										staged.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
+										staged.process_incarnation !== proof.process_incarnation ||
+										staged.host_incarnation !== proof.host_incarnation ||
+										staged.lifecycle_request_id !== proof.lifecycle_request_id ||
+										staged.remote_create_key !== proof.remote_create_key ||
+										staged.retired !== true ||
+										staged.ledger_state !== "terminal_error" ||
+										staged.index_type !== "session_closed"
+									)
+										throw new SdkClientError(
+											"state_corrupt",
+											"Retirement intent proof does not match its creation identity.",
+										);
+									lifecycle = publicRetirementProof(staged);
+								} else {
+									await recordCreationRetirementIntent(
+										questionPaths,
+										creationKeyDigest,
+										proof,
+										retirementKeyDigest,
+									);
+									const acknowledgement = await brokerSession(
 										cwd,
-										stateRoot,
-										endpointGeneration,
-										endpointMtimeMs,
-										processIncarnation,
-										hostIncarnation,
-										lifecycleRequestId,
-										remoteCreateKey,
+										"session.reconcile_uncertain",
+										{
+											sessionId,
+											cwd,
+											stateRoot,
+											endpointGeneration,
+											endpointMtimeMs,
+											processIncarnation,
+											hostIncarnation,
+											lifecycleRequestId,
+											remoteCreateKey,
+										},
+										`coordinator-retire:${creationKey}`,
+									);
+									const parsed = strictBrokerRetirementProof(acknowledgement, proof);
+									await recordCreationRetirementBrokerProof(
+										questionPaths,
+										creationKeyDigest,
+										proof,
+										parsed.broker,
+									);
+									lifecycle = parsed.public;
+								}
+								const retiredResponse = {
+									ok: false,
+									error: {
+										code: "retired",
+										message:
+											"The stranded coordinator start intent was retired after exact session identity proof.",
 									},
-									`coordinator-retire:${creationKey}`,
-								);
-								const parsed = strictBrokerRetirementProof(acknowledgement, proof);
-								await recordCreationRetirementBrokerProof(
+								};
+								await advanceCreationReceipt(
 									questionPaths,
 									creationKeyDigest,
+									"retired",
+									retiredResponse,
 									proof,
-									parsed.broker,
 								);
-								lifecycle = parsed.public;
-							}
-							const retiredResponse = {
-								ok: false,
-								error: {
-									code: "retired",
-									message: "The stranded coordinator start intent was retired after exact session identity proof.",
-								},
-							};
-							await advanceCreationReceipt(
-								questionPaths,
-								creationKeyDigest,
-								"retired",
-								retiredResponse,
-								proof,
-							);
-							const latestOriginal = await readCoordinatorIdempotencyFile(originalFile);
-							if (latestOriginal.kind !== "record") throw new SdkClientError("state_corrupt", "Start intent disappeared during retirement.");
-							if (latestOriginal.value.state === "completed") {
-								if (asRecord(asRecord(latestOriginal.value.response)?.error)?.code !== "retired")
+								const latestOriginal = await readCoordinatorIdempotencyFile(originalFile);
+								if (latestOriginal.kind !== "record")
+									throw new SdkClientError("state_corrupt", "Start intent disappeared during retirement.");
+								if (latestOriginal.value.state === "completed") {
+									if (asRecord(asRecord(latestOriginal.value.response)?.error)?.code !== "retired")
+										throw new SdkClientError(
+											"idempotency_conflict",
+											"Start intent changed during retirement.",
+										);
+								} else if (latestOriginal.value.state !== "in_progress") {
 									throw new SdkClientError("idempotency_conflict", "Start intent changed during retirement.");
-							} else if (latestOriginal.value.state !== "in_progress") {
-								throw new SdkClientError("idempotency_conflict", "Start intent changed during retirement.");
-							} else {
-								await writeCoordinatorIdempotencyFile(originalFile, {
-									...(latestOriginal.value as unknown as CoordinatorToolIdempotencyRecord),
-									state: "completed",
-									response: retiredResponse,
-									completed_at: new Date().toISOString(),
-								});
-							}
-							return coordinatorRetiredResponse(sessionId, lifecycle);
-						},
-						true,
-						isRetirementRetryable,
-					),
+								} else {
+									await writeCoordinatorIdempotencyFile(originalFile, {
+										...(latestOriginal.value as unknown as CoordinatorToolIdempotencyRecord),
+										state: "completed",
+										response: retiredResponse,
+										completed_at: new Date().toISOString(),
+									});
+								}
+								return coordinatorRetiredResponse(sessionId, lifecycle);
+							},
+							true,
+							isRetirementRetryable,
+						),
 				);
 			}
 			if (name === "gjc_coordinator_activate_session") {
