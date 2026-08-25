@@ -1217,6 +1217,55 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
 	});
 
+	it("retires a stranded start intent only after the indexed retirement proof is supplied", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const creationKey = "stranded-start-to-retire";
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation =>
+				operation === "session.create"
+					? { ok: true, result: { cwd: root } }
+					: operation === "session.reconcile_uncertain"
+						? { ok: true, result: { sessionId: "retired-session", retired: true } }
+						: undefined,
+		});
+		const startArgs = { cwd: root, idempotency_key: creationKey, allow_mutation: true };
+		await expect(server.callTool("gjc_coordinator_start_session", startArgs)).resolves.toMatchObject({ ok: false });
+		const originalPath = path.join(
+			coordinatorNamespace(root),
+			"idempotency",
+			`${createHash("sha256").update(creationKey).digest("hex")}.json`,
+		);
+		const original = JSON.parse(await fs.readFile(originalPath, "utf8")) as { request_digest: string; state: string };
+		expect(original.state).toBe("in_progress");
+
+		const retired = await server.callTool("gjc_coordinator_retire_start_session", {
+			cwd: root,
+			session_id: "retired-session",
+			state_root: path.join(root, ".gjc", "state"),
+			endpoint_generation: 2,
+			endpoint_mtime_ms: 1,
+			process_incarnation: "linux:123",
+			lifecycle_request_id: "retire-effect",
+			creation_idempotency_key: creationKey,
+			request_digest: original.request_digest,
+			idempotency_key: "retire-start-intent",
+			allow_mutation: true,
+		});
+		expect(retired).toMatchObject({ ok: true, session_id: "retired-session", retired: true });
+		expect(JSON.parse(await fs.readFile(originalPath, "utf8"))).toMatchObject({
+			state: "completed",
+			response: { ok: false, error: { code: "retired" } },
+		});
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
+		await expect(server.callTool("gjc_coordinator_start_session", startArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "retired" },
+		});
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+	});
+
 	it("keeps compensation unobserved when broker close is rejected", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

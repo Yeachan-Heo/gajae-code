@@ -5283,8 +5283,11 @@ async function executeLifecycleResponse(
 			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
 		const create = matches[0]!;
 		const root = record.locator.stateRoot;
+		if (!(await endpointRemoved(root, id)))
+			return fail("terminal_uncertain", "The indexed session endpoint still exists.");
 		const marker = lifecycleMarkerPath(root, id);
 		const ready = lifecycleReadyPath(root, id);
+		const leftovers: string[] = [];
 		for (const candidate of [marker, ready]) {
 			let stat: fsSync.BigIntStats;
 			try {
@@ -5307,12 +5310,16 @@ async function executeLifecycleResponse(
 			}
 			if (parsed.pid !== record.pid)
 				return fail("terminal_uncertain", "Lifecycle leftover pid does not match the indexed host.");
-			const leftoverIncarnation =
-				typeof parsed.incarnation === "string" ? parsed.incarnation : undefined;
+			if (parsed.effectMarker !== undefined && parsed.effectMarker !== create.effectMarker)
+				return fail("terminal_uncertain", "Lifecycle leftover effect marker does not match the uncertain create.");
+			const leftoverIncarnation = typeof parsed.incarnation === "string" ? parsed.incarnation : undefined;
 			if (leftoverIncarnation && incarnation && leftoverIncarnation !== incarnation)
 				return fail("terminal_uncertain", "Lifecycle leftover incarnation does not match the indexed host.");
 			if (observeProcess(record.pid, leftoverIncarnation ?? incarnation) === "alive")
 				return fail("live_session", "Lifecycle leftover still names a live host.");
+			leftovers.push(candidate);
+		}
+		for (const candidate of leftovers) {
 			await fs.unlink(candidate);
 			try {
 				await fs.lstat(candidate);
@@ -5324,10 +5331,7 @@ async function executeLifecycleResponse(
 		}
 		await broker.ledger.transition(create.identity, "terminal_error", {
 			intendedSessionId: id,
-			response: fail(
-				"terminal_uncertain",
-				"Uncertain create retired after dead-host and absent-marker proof.",
-			),
+			response: fail("terminal_uncertain", "Uncertain create retired after dead-host and absent-marker proof."),
 		});
 		await broker.index.append({
 			type: "session_closed",

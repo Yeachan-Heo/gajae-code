@@ -816,12 +816,12 @@ class SdkServeHelp extends Command {
 
 class SdkSessionHelp extends Command {
 	static description =
-		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
+		"Manage SDK sessions: `gjc sdk session list|inspect|send|status|tail|retire`, or the explicit raw hatch `gjc sdk session raw control|query|global`. The session CLI is broker-bound and credential-free.";
 	static args = {
 		verb: Args.string({
 			description: "Session verb",
 			required: false,
-			options: ["list", "inspect", "send", "status", "tail", "raw"],
+			options: ["list", "inspect", "send", "status", "tail", "retire", "raw"],
 		}),
 		target: Args.string({
 			description: "Session id (or the raw kind control|query|global for `raw`)",

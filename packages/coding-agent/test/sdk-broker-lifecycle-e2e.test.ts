@@ -3851,6 +3851,60 @@ test("broker records terminal uncertainty when SIGKILL re-verification fails aft
 	}
 }, 10_000);
 
+test("reconcile_uncertain retires one dead create identity and refuses live hosts", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-reconcile-"));
+	const stateRoot = path.join(agentDir, "state");
+	const sessionId = "reconcile-proof";
+	const child = spawnDisposableHost();
+	const broker = new Broker({ agentDir });
+	try {
+		const processIdentity = await incarnation(child.pid!);
+		await broker.start();
+		await broker.index.append({
+			type: "lifecycle_terminal",
+			sessionId,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: 4,
+			pid: child.pid!,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "reconcile-effect",
+			processIncarnation: processIdentity,
+			hostIncarnation: processIdentity,
+			terminalUncertain: true,
+		});
+		const createIdentity = "reconcile-create-identity";
+		await broker.ledger.begin(createIdentity, "reconcile-create-request");
+		await broker.ledger.transition(createIdentity, "terminal_uncertain", {
+			intendedSessionId: sessionId,
+			effectMarker: "reconcile-effect",
+			response: { ok: false, error: { code: "terminal_uncertain", message: "fixture" } },
+		});
+		await expect(
+			broker.handleRequest("session.reconcile_uncertain", { sessionId }, "reconcile-live"),
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "live_session" },
+		});
+		child.kill("SIGKILL");
+		await child.exited;
+		await expect(
+			broker.handleRequest("session.reconcile_uncertain", { sessionId }, "reconcile-dead"),
+		).resolves.toMatchObject({ ok: true, result: { sessionId, retired: true, indexType: "session_closed" } });
+		expect(broker.ledger.get(createIdentity)).toMatchObject({
+			state: "terminal_error",
+			intendedSessionId: sessionId,
+		});
+		expect(broker.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId, terminal: true, terminalUncertain: false, live: false }),
+		]);
+	} finally {
+		if (child.exitCode === null) child.kill("SIGKILL");
+		await child.exited;
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 if (process.platform === "darwin") {
 	test("broker records terminal uncertainty when a spawned child incarnation is unreadable", async () => {
 		const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-incarnation-"));

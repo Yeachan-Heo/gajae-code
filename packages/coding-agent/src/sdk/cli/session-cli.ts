@@ -36,6 +36,7 @@ export type SdkSessionCliAction =
 	| "send"
 	| "status"
 	| "tail"
+	| "retire"
 	| "raw"
 	| "control"
 	| "query"
@@ -1295,12 +1296,9 @@ function lifecycleMutationRequest(
 			2,
 		);
 	const target = input as JsonRecord & { sessionId: string };
-	if (
-		operation === "session.resume" ||
-		operation === "session.close" ||
-		operation === "session.reconcile_uncertain"
-	)
-		return { ...base, operation, capability: operation, target };
+	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
+	if (operation === "session.close") return { ...base, operation, capability: operation, target };
+	if (operation === "session.reconcile_uncertain") return { ...base, operation, capability: operation, target };
 	return { ...base, operation, capability: "session.delete", target };
 }
 
@@ -1349,6 +1347,7 @@ export async function runSdkSessionCli(
 			action !== "send" &&
 			action !== "status" &&
 			action !== "tail" &&
+			action !== "retire" &&
 			action !== "raw" &&
 			action !== "control" &&
 			action !== "query" &&
@@ -1356,7 +1355,7 @@ export async function runSdkSessionCli(
 		)
 			throw new SdkSessionCliError(
 				"usage",
-				"Expected one of: list, inspect, send, status, tail, raw (control|query|global).",
+				"Expected one of: list, inspect, send, status, tail, retire, raw (control|query|global).",
 				2,
 			);
 		const agentDir = args.agentDir ?? getAgentDir();
@@ -1389,6 +1388,24 @@ export async function runSdkSessionCli(
 			writeOutput(
 				stripSecretFields(
 					await runTail(args.repo ?? process.cwd(), agentDir, requireValue(args.sessionId, "<sessionId>"), args),
+				),
+			);
+			return;
+		}
+		if (action === "retire") {
+			const sessionId = requireValue(args.sessionId, "<sessionId>");
+			const input = await inputFromArgs(args);
+			if (input.sessionId !== undefined && input.sessionId !== sessionId)
+				throw new SdkSessionCliError(
+					"invalid_input",
+					"Retirement sessionId does not match the selected session.",
+					2,
+				);
+			const secretError = validateAdapterSecretFields("session.reconcile_uncertain", input);
+			if (secretError) throw new SdkSessionCliError(secretError.code, secretError.message, 2);
+			writeOutput(
+				stripSecretFields(
+					await runRawGlobal(agentDir, "session.reconcile_uncertain", { ...input, sessionId }, args),
 				),
 			);
 			return;

@@ -219,6 +219,11 @@ export interface SessionDeleteResult {
 	readonly operation: "session.delete";
 	readonly result: SessionLifecycleSessionResult;
 }
+export interface SessionReconcileUncertainResult {
+	readonly ok: true;
+	readonly operation: "session.reconcile_uncertain";
+	readonly result: SessionLifecycleSessionResult;
+}
 export interface SessionListSuccessResult {
 	readonly ok: true;
 	readonly operation: "session.list";
@@ -260,6 +265,12 @@ export type SessionDeleteFailure = {
 	readonly certainty: SessionLifecycleCertainty;
 	readonly error: SessionLifecycleError;
 };
+export type SessionReconcileUncertainFailure = {
+	readonly ok: false;
+	readonly operation: "session.reconcile_uncertain";
+	readonly certainty: SessionLifecycleCertainty;
+	readonly error: SessionLifecycleError;
+};
 export type SessionListFailure = {
 	readonly ok: false;
 	readonly operation: "session.list";
@@ -272,6 +283,7 @@ export type SessionForkOutcome = SessionForkResult | SessionForkFailure;
 export type SessionResumeOutcome = SessionResumeResult | SessionResumeFailure;
 export type SessionCloseOutcome = SessionCloseResult | SessionCloseFailure;
 export type SessionDeleteOutcome = SessionDeleteResult | SessionDeleteFailure;
+export type SessionReconcileUncertainOutcome = SessionReconcileUncertainResult | SessionReconcileUncertainFailure;
 export type SessionListOutcome = SessionListSuccessResult | SessionListFailure;
 export type SessionLifecycleResult =
 	| SessionCreateOutcome
@@ -279,6 +291,7 @@ export type SessionLifecycleResult =
 	| SessionResumeOutcome
 	| SessionCloseOutcome
 	| SessionDeleteOutcome
+	| SessionReconcileUncertainOutcome
 	| SessionListOutcome;
 
 /** Shared, side-effect-free validation for lifecycle mutation requests. */
@@ -294,7 +307,8 @@ export type SessionLifecycleMutationValidation =
 	| SessionForkFailure
 	| SessionResumeFailure
 	| SessionCloseFailure
-	| SessionDeleteFailure;
+	| SessionDeleteFailure
+	| SessionReconcileUncertainFailure;
 
 const RETRYABLE_BROKER_ERRORS = new Set([
 	"unavailable",
@@ -598,7 +612,12 @@ export class SessionLifecycleService {
 	async execute(
 		request: SessionLifecycleMutationRequest,
 	): Promise<
-		SessionCreateOutcome | SessionForkOutcome | SessionResumeOutcome | SessionCloseOutcome | SessionDeleteOutcome
+		| SessionCreateOutcome
+		| SessionForkOutcome
+		| SessionResumeOutcome
+		| SessionCloseOutcome
+		| SessionDeleteOutcome
+		| SessionReconcileUncertainOutcome
 	> {
 		const validation = validateSessionLifecycleMutationRequest(request);
 		if (!validation.ok) return validation;
@@ -647,7 +666,8 @@ export class SessionLifecycleService {
 			| SessionForkOutcome
 			| SessionResumeOutcome
 			| SessionCloseOutcome
-			| SessionDeleteOutcome;
+			| SessionDeleteOutcome
+			| SessionReconcileUncertainOutcome;
 	}
 
 	async create(request: Omit<SessionCreateRequest, "operation">): Promise<SessionCreateOutcome> {
@@ -668,6 +688,15 @@ export class SessionLifecycleService {
 
 	async delete(request: Omit<SessionDeleteRequest, "operation">): Promise<SessionDeleteOutcome> {
 		return (await this.execute({ ...request, operation: "session.delete" })) as SessionDeleteOutcome;
+	}
+
+	async reconcileUncertain(
+		request: Omit<SessionReconcileUncertainRequest, "operation">,
+	): Promise<SessionReconcileUncertainOutcome> {
+		return (await this.execute({
+			...request,
+			operation: "session.reconcile_uncertain",
+		})) as SessionReconcileUncertainOutcome;
 	}
 
 	async list(request: Omit<SessionListRequest, "operation">): Promise<SessionListOutcome> {

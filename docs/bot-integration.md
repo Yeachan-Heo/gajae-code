@@ -105,6 +105,7 @@ Read-only tools:
 Mutating tools:
 
 - `gjc_coordinator_start_session`
+- `gjc_coordinator_retire_start_session` — retires a stranded start intent only after exact indexed terminal-uncertain session proof; it never signals a live process.
 - `gjc_coordinator_activate_session`
 - `gjc_coordinator_register_session`
 - `gjc_coordinator_send_prompt`
@@ -115,6 +116,13 @@ Mutating tools:
 - `gjc_coordinator_ack_codex_handoff` — acknowledges a Codex resume wake by durable `wake_key`; wake prompts never include GJC final responses.
 
 `gjc_coordinator_stop_session` closes a coordinator delegate-created (ephemeral) session through canonical SDK broker lifecycle control, then removes its coordinator metadata only after the broker reports success. It refuses sessions with an active turn. User-registered sessions require both `force: true` and the `GJC_COORDINATOR_MCP_FORCE_STOP` capability; the same SDK lifecycle path reaps abandoned ephemeral delegate sessions after the configured idle TTL.
+
+`gjc_coordinator_retire_start_session` is the recovery terminal for a
+`gjc_coordinator_start_session` receipt stranded in `in_progress` after an
+unobserved compensation. It requires the original creation key and request
+digest plus the indexed session identity. The broker must prove the recorded
+host is exited, the endpoint is absent, and any lifecycle leftovers are
+identity-bound before the coordinator receipt is sealed as `retired`.
 
 High-level delegation tools:
 

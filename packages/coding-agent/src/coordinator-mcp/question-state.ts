@@ -287,7 +287,7 @@ export interface CreationRequestV1 {
 	key_digest: string;
 	request_digest: string;
 	tool: string;
-	phase: "claimed" | "remote_started" | "wal_committed" | "projected" | "completed" | "uncertain";
+	phase: "claimed" | "remote_started" | "wal_committed" | "projected" | "completed" | "uncertain" | "retired";
 	canonical_create_intent: CanonicalCreateIntentV1 | null;
 	remote_create_key: string;
 	session_id: string | null;
@@ -2399,14 +2399,24 @@ export async function repairProjections(
 export async function advanceCreationReceipt(
 	paths: CoordinatorStatePaths,
 	keyDigest: string,
-	phase: "projected" | "completed" | "uncertain",
+	phase: "projected" | "completed" | "uncertain" | "retired",
 	safeResponse?: Record<string, unknown>,
 ): Promise<void> {
 	await withNamespaceRegistry(paths, async registry => {
 		const request = registry.creations[keyDigest];
 		if (!request) throw new Error("state_corrupt");
 		if (request.phase === phase) return;
-		if (phase !== "uncertain" && request.phase !== "wal_committed" && request.phase !== "projected")
+		if (
+			phase === "retired" &&
+			(request.phase === "completed" || request.phase === "retired" || request.phase === "claimed")
+		)
+			throw new Error("state_corrupt");
+		if (
+			phase !== "uncertain" &&
+			phase !== "retired" &&
+			request.phase !== "wal_committed" &&
+			request.phase !== "projected"
+		)
 			throw new Error("state_corrupt");
 		request.phase = phase;
 		request.safe_response = safeResponse;

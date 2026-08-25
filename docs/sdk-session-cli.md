@@ -2,8 +2,8 @@
 
 `gjc sdk session` is the broker-bound command family for operating live GJC SDK
 sessions from the terminal. It replaces the removed `gjc daemon session` route
-(no alias is kept). The command family has five semantic verbs — `list`, `inspect`,
-`send`, `status`, and `tail` — plus the explicit `raw` hatch that dispatches one
+The command family has six semantic verbs — `list`, `inspect`,
+`send`, `status`, `tail`, and `retire` — plus the explicit `raw` hatch that dispatches one
 SDK operation as `control`, `query`, or `global`.
 
 The session CLI is advisory tooling over the SDK: every semantic verb resolves
@@ -118,6 +118,20 @@ A deleted session has no tail (`session_deleted`). A stopped session replays
 its retained transcript without an endpoint (offline source), bounded to the
 most recent retained entries.
 
+### retire
+
+`gjc sdk session retire <sessionId>` is the official semantic wrapper for the
+`session.reconcile_uncertain` broker global. It retires an indexed
+`terminalUncertain` create effect only when exactly one matching uncertain
+create identity exists, the recorded host is proven exited, the endpoint is
+absent, and any lifecycle marker/readiness leftovers are regular files bound to
+that same PID and incarnation. The broker removes only those verified
+leftovers, appends terminal `session_closed` evidence, and converts the
+matching lifecycle receipt to a terminal error. Ambiguous identity, live or
+unverifiable hosts, endpoint presence, malformed leftovers, and mismatches
+refuse without signalling a process. Supply `--idempotency-key`; the JSON
+input is read from a `0600` file or stdin when it contains proof material.
+
 ## Raw hatch
 
 `gjc sdk session raw <control|query|global>` dispatches exactly one SDK
@@ -129,7 +143,7 @@ operation and returns the broker/host response:
   continuation cursor.
 - `raw global --op <operation>` — one broker global. Lifecycle globals
   (`session.create`, `session.fork`, `session.resume`, `session.close`,
-  `session.delete`) require `--idempotency-key`.
+  `session.delete`, `session.reconcile_uncertain`) require `--idempotency-key`.
 
 `session.get_endpoint` is refused unconditionally: endpoint credentials remain
 an SDK-core implementation detail. The raw hatch validates operation names and

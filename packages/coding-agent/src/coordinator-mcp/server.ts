@@ -594,6 +594,43 @@ function toolSchema(name: CoordinatorToolName): {
 			},
 		};
 	}
+	if (name === "gjc_coordinator_retire_start_session") {
+		return {
+			name,
+			description:
+				"Retire a stranded start_session idempotency intent only after the exact indexed terminal-uncertain session identity has been proven exited and its endpoint is absent. This never signals or deletes a live process.",
+			inputSchema: {
+				type: "object",
+				properties: {
+					cwd,
+					session_id: sessionId,
+					state_root: { type: "string", description: "Exact indexed SDK state root." },
+					endpoint_generation: { type: "number" },
+					endpoint_mtime_ms: { type: "number" },
+					process_incarnation: { type: "string" },
+					host_incarnation: { type: "string" },
+					lifecycle_request_id: { type: "string" },
+					creation_idempotency_key: { type: "string" },
+					request_digest: { type: "string", description: "SHA-256 of the original canonical start request." },
+					idempotency_key: idempotencyKey,
+					allow_mutation: allowMutation,
+				},
+				required: [
+					"cwd",
+					"session_id",
+					"state_root",
+					"endpoint_generation",
+					"endpoint_mtime_ms",
+					"process_incarnation",
+					"lifecycle_request_id",
+					"creation_idempotency_key",
+					"request_digest",
+					"idempotency_key",
+					"allow_mutation",
+				],
+			},
+		};
+	}
 	if (name === "gjc_coordinator_activate_session") {
 		return {
 			name,
@@ -1154,6 +1191,8 @@ const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	endpoint_stale: "Coordinator session endpoint is stale.",
 	ambiguous: "Coordinator request outcome is ambiguous.",
 	terminal_uncertain: "Coordinator state is uncertain.",
+	retired: "The coordinator intent was retired after exact identity proof.",
+	retire_not_allowed: "The coordinator intent is not eligible for retirement.",
 	idempotency_conflict: "Idempotency key conflicts with a different request.",
 	idempotency_in_progress: "A previous coordinator mutation is still in progress.",
 	protocol_error: "Coordinator protocol response is invalid.",
@@ -4979,6 +5018,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return key;
 	}
 
+	function requiredString(value: unknown, field: string): string {
+		if (typeof value !== "string" || value.length === 0)
+			throw new SdkClientError("invalid_request", `${field} is required.`);
+		return value;
+	}
+
 	/**
 	 * Path for the lock owner file that serializes idempotency mutations.
 	 *
@@ -8571,6 +8616,89 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					response =>
 						isUnobservedCompensation(response) || creationRemoteStarted || isRouterRequestAmbiguous(response),
 				);
+			}
+			if (name === "gjc_coordinator_retire_start_session") {
+				requireCoordinatorMutation(config, "sessions", args);
+				const retirementKey = requiredIdempotencyKey(args);
+				const creationKey = requiredString(args.creation_idempotency_key, "creation_idempotency_key");
+				const requestDigest = requiredString(args.request_digest, "request_digest");
+				if (!/^[a-f0-9]{64}$/.test(requestDigest))
+					return {
+						ok: false,
+						error: { code: "invalid_input", message: "request_digest must be a SHA-256 hash." },
+					};
+				const sessionId = safeExternalId("session", args.session_id);
+				const cwd = await canonicalBrokerWorkspace(await assertCoordinatorWorkdir(config, args.cwd));
+				const canonicalArgs = {
+					cwd,
+					session_id: sessionId,
+					state_root: args.state_root,
+					endpoint_generation: args.endpoint_generation,
+					endpoint_mtime_ms: args.endpoint_mtime_ms,
+					process_incarnation: args.process_incarnation,
+					...(args.host_incarnation === undefined ? {} : { host_incarnation: args.host_incarnation }),
+					lifecycle_request_id: args.lifecycle_request_id,
+					creation_idempotency_key: creationKey,
+					request_digest: requestDigest,
+					allow_mutation: true,
+				};
+				return await withToolIdempotency(name, retirementKey, canonicalArgs, async () => {
+					const originalFile = idempotencyFile(creationKey);
+					const originalFileState = await readCoordinatorIdempotencyFile(originalFile);
+					if (originalFileState.kind !== "record")
+						return {
+							ok: false,
+							error: { code: "not_found", message: "The stranded coordinator start intent was not found." },
+						};
+					const original = originalFileState.value;
+					if (
+						original.schema_version !== 1 ||
+						original.tool !== "gjc_coordinator_start_session" ||
+						original.key_digest !== createHash("sha256").update(creationKey).digest("hex") ||
+						original.request_digest !== requestDigest
+					)
+						return {
+							ok: false,
+							error: { code: "idempotency_conflict", message: "The start intent identity does not match." },
+						};
+					if (original.state !== "in_progress")
+						return {
+							ok: false,
+							error: {
+								code: "retire_not_allowed",
+								message: "The coordinator start intent is not stranded in progress.",
+							},
+						};
+					const retired = strictBrokerResult(
+						await brokerSession(
+							cwd,
+							"session.reconcile_uncertain",
+							{ sessionId },
+							`coordinator-retire:${retirementKey}`,
+						),
+						"session.reconcile_uncertain",
+					);
+					const retiredResponse = {
+						ok: false,
+						error: {
+							code: "retired",
+							message: "The stranded coordinator start intent was retired after exact session identity proof.",
+						},
+					};
+					await advanceCreationReceipt(
+						questionPaths,
+						creationDigests("gjc_coordinator_start_session", creationKey, {}).keyDigest,
+						"retired",
+						retiredResponse,
+					);
+					await writeCoordinatorIdempotencyFile(originalFile, {
+						...(original as unknown as CoordinatorToolIdempotencyRecord),
+						state: "completed",
+						response: retiredResponse,
+						completed_at: new Date().toISOString(),
+					});
+					return { ok: true, session_id: sessionId, retired: true, lifecycle: retired };
+				});
 			}
 			if (name === "gjc_coordinator_activate_session") {
 				requireCoordinatorMutation(config, "sessions", args);
