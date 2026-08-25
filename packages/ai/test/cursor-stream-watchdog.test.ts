@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { cursorExecDeadlineMsForTest } from "../src/providers/cursor";
+import { cursorExecDeadlineMsForTest, streamCursor } from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
 import {
 	AgentServerMessageSchema,
@@ -1014,11 +1014,19 @@ describe("Cursor raw transport watchdog", () => {
 		await started.promise;
 		await first;
 
-		const second = await collectTerminal(baseUrl, { conversationId, streamFirstEventTimeoutMs: 40 });
-		expect(second.result.stopReason).toBe("error");
-		expect(second.result.errorMessage).toContain(
+		const directStream = streamCursor({ ...cursorModel, baseUrl }, baseContext, {
+			apiKey: "test-token",
+			conversationId,
+			streamFirstEventTimeoutMs: 40,
+		});
+		const directEvents: unknown[] = [];
+		for await (const event of directStream) directEvents.push(event);
+		const directResult = await directStream.result();
+		expect(directResult.stopReason).toBe("error");
+		expect(directResult.errorMessage).toContain(
 			"Cursor stream timed out while waiting for the first transport event",
 		);
+		expect(directEvents.filter(isTerminalEvent)).toHaveLength(1);
 		expect(streamCount).toBe(1);
 	}, 9_000);
 

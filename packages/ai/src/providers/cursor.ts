@@ -203,25 +203,23 @@ async function waitForCursorMutationLock(
 ): Promise<void> {
 	const lock = conversationMutationLocks.get(conversationId);
 	if (!lock) return;
-	if (!signal) {
-		await lock;
-		return;
-	}
-	if (signal.aborted) throw cursorAbortError(signal);
-	const aborted = Promise.withResolvers<never>();
-	aborted.promise.catch(() => {});
-	const onAbort = () => aborted.reject(cursorAbortError(signal));
-	signal.addEventListener("abort", onAbort, { once: true });
 	const deadline = Promise.withResolvers<never>();
 	deadline.promise.catch(() => {});
 	const deadlineTimer =
 		timeoutMs !== undefined && timeoutMs > 0
 			? setTimeout(() => deadline.reject(timeoutError()), timeoutMs)
 			: undefined;
+	const aborted = Promise.withResolvers<never>();
+	aborted.promise.catch(() => {});
+	const onAbort = () => aborted.reject(cursorAbortError(signal!));
+	if (signal?.aborted) throw cursorAbortError(signal);
+	if (signal) signal.addEventListener("abort", onAbort, { once: true });
 	try {
-		await Promise.race([lock, aborted.promise, deadline.promise]);
+		const racers: Promise<never>[] = [deadline.promise];
+		if (signal) racers.push(aborted.promise);
+		await Promise.race([lock, ...racers]);
 	} finally {
-		signal.removeEventListener("abort", onAbort);
+		if (signal) signal.removeEventListener("abort", onAbort);
 		if (deadlineTimer) clearTimeout(deadlineTimer);
 	}
 }
