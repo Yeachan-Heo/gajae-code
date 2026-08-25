@@ -969,7 +969,9 @@ async function handleCredentialsCheck(
 			...(row.accountId ? { accountId: row.accountId } : {}),
 			...(row.remoteRefresh ? { remoteRefresh: true as const } : {}),
 			ok: row.ok,
-			...(row.reason ? { reason: cleanReason(row.reason) } : {}),
+			...(row.reason
+				? { reason: row.ok === false ? "Credential check failed." : "Credential status unavailable." }
+				: {}),
 		}));
 	return json(200, { generatedAt: Date.now(), credentials });
 }
