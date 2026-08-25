@@ -1,7 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import {
+	AuthBrokerClient,
+	AuthStorage,
+	RemoteAuthCredentialStore,
+	SqliteAuthCredentialStore,
+	startAuthBroker,
+} from "../src";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
 import { createAuthGatewayModelCatalog, startAuthGateway } from "../src/auth-gateway/server";
-import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import type {
 	Api,
 	AssistantMessage,
@@ -265,6 +271,35 @@ describe("provider-scoped auth-gateway catalogs", () => {
 			await gateway.close();
 		}
 	});
+
+	it("does not turn broker reload failures into false-zero diagnostics", async () => {
+		const provider = "scope-reload-failure-provider";
+		const scopedModel = model("scope-reload-failure-model", provider, "openai-codex-responses");
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: [],
+			version: "test",
+			hasProviderCredential: () => true,
+			reloadProviderCredentials: async () => {
+				throw new Error("broker bearer token=secret must not escape");
+			},
+			storage: { exportSnapshot: () => ({ credentials: [{ provider }] }) } as unknown as AuthStorage,
+			resolveModel: () => scopedModel,
+			listModels: () => [scopedModel],
+		});
+		try {
+			const usage = await fetch(`${gateway.url}/v1/usage`);
+			expect(usage.status).toBe(503);
+			expect(await usage.text()).not.toContain("secret");
+
+			const checks = await fetch(`${gateway.url}/v1/credentials/check`);
+			expect(checks.status).toBe(503);
+			expect(await checks.text()).not.toContain("secret");
+		} finally {
+			await gateway.close();
+		}
+	});
 });
 
 describe("provider-scoped auth-gateway credential dispatch", () => {
@@ -393,6 +428,112 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 		} finally {
 			await gateway.close();
 			store.close();
+			await Bun.$`rm -rf ${root}`;
+			unregisterCustomApis(source);
+		}
+	});
+
+	it("follows broker live removal across A+B and never reports revoked A", async () => {
+		const source = "auth-gateway-provider-scope-broker-revoke-test";
+		const api = "auth-gateway-provider-scope-broker-revoke-test" as Api;
+		const provider = "gateway-broker-revoke-provider";
+		const scopedModel = model("broker-revoke-model", provider, api);
+		const keys: string[] = [];
+		registerCustomApi(
+			api,
+			(modelForRequest, _context, options) => {
+				keys.push(`${modelForRequest.provider}:${options?.apiKey ?? ""}`);
+				return makeEventStream({
+					role: "assistant",
+					api,
+					provider,
+					model: scopedModel.id,
+					content: [{ type: "text", text: "ok" }],
+					usage: ZERO_USAGE,
+					stopReason: "stop",
+					timestamp: 0,
+				});
+			},
+			source,
+		);
+		const root = (await Bun.$`mktemp -d /tmp/gjc-auth-gateway-broker-revoke.XXXXXX`.text()).trim();
+		const brokerStore = await SqliteAuthCredentialStore.open(`${root}/broker.db`);
+		const brokerStorage = new AuthStorage(brokerStore);
+		brokerStore.upsertAuthCredentialForProvider(provider, { type: "api_key", key: "credential-a" });
+		brokerStore.upsertAuthCredentialForProvider(provider, { type: "api_key", key: "credential-b" });
+		await brokerStorage.reload();
+		const broker = startAuthBroker({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["broker-token"],
+			disableRefresher: true,
+			storage: brokerStorage,
+		});
+		const client = new AuthBrokerClient({ url: broker.url, token: "broker-token" });
+		const initial = await client.fetchSnapshot();
+		if (initial.status !== 200) throw new Error("expected broker snapshot");
+		if (initial.snapshot.credentials.length !== 2) {
+			throw new Error(`expected two broker credentials, got ${initial.snapshot.credentials.length}`);
+		}
+		const remote = new RemoteAuthCredentialStore({ client, initialSnapshot: initial.snapshot });
+		const storage = new AuthStorage(remote);
+		await storage.reload();
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: [],
+			version: "test",
+			storage,
+			hasProviderCredential: () => remote.snapshot.credentials.some(entry => entry.provider === provider),
+			reloadProviderCredentials: async () => {
+				await remote.refreshSnapshot();
+				await storage.reload();
+			},
+			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
+			listModels: () => [scopedModel],
+		});
+		try {
+			const first = await fetch(`${gateway.url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: scopedModel.id,
+					messages: [{ role: "user", content: "hello" }],
+					stream: false,
+				}),
+			});
+			if (first.status !== 200)
+				throw new Error(`initial gateway request failed: ${first.status} ${await first.text()}`);
+			const revokedId = remote.snapshot.credentials.find(
+				entry => entry.credential.type === "api_key" && entry.credential.key === "credential-a",
+			)?.id;
+			expect(revokedId).toBeDefined();
+			if (revokedId === undefined) throw new Error("expected credential A");
+			expect(brokerStorage.disableCredentialById(revokedId, "revoked in live test")).toBe(true);
+			for (
+				let attempt = 0;
+				attempt < 50 && remote.snapshot.credentials.some(entry => entry.id === revokedId);
+				attempt++
+			) {
+				await Bun.sleep(10);
+			}
+
+			const second = await fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+			expect(second.status).toBe(200);
+			const checks = await fetch(`${gateway.url}/v1/credentials/check`);
+			const checkBody = (await checks.json()) as { credentials: Array<{ id: number }> };
+			expect(checkBody.credentials).toHaveLength(1);
+			expect(checkBody.credentials[0]?.id).not.toBe(revokedId);
+			expect(keys).toEqual([`${provider}:credential-a`, `${provider}:credential-b`]);
+		} finally {
+			await gateway.close();
+			remote.close();
+			await broker.close();
+			brokerStorage.close();
+			brokerStore.close();
 			await Bun.$`rm -rf ${root}`;
 			unregisterCustomApis(source);
 		}

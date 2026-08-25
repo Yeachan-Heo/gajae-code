@@ -149,7 +149,9 @@ function hasProviderCredential(opts: AuthGatewayBootOptions): boolean {
 	);
 }
 
-async function providerScopeAvailable(opts: AuthGatewayBootOptions): Promise<boolean> {
+type ProviderScopeAvailability = "available" | "absent" | "reload_failed";
+
+async function providerScopeAvailability(opts: AuthGatewayBootOptions): Promise<ProviderScopeAvailability> {
 	try {
 		await opts.reloadProviderCredentials?.();
 	} catch (error) {
@@ -157,9 +159,9 @@ async function providerScopeAvailable(opts: AuthGatewayBootOptions): Promise<boo
 			provider: opts.providerScope.provider,
 			error: cleanReason(error) ?? "snapshot reload failed",
 		});
-		return false;
+		return "reload_failed";
 	}
-	return hasProviderCredential(opts);
+	return hasProviderCredential(opts) ? "available" : "absent";
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -554,7 +556,11 @@ async function handleFormatEndpoint(
 	// For OAuth providers this returns the access token (refreshed via the
 	// broker override on AuthStorage when needed).
 	let apiKey: string | undefined;
-	if (!(await providerScopeAvailable(bootOpts))) {
+	const scopeAvailability = await providerScopeAvailability(bootOpts);
+	if (scopeAvailability !== "available") {
+		if (scopeAvailability === "reload_failed") {
+			return route.module.formatError(503, "upstream_error", "Auth broker unavailable");
+		}
 		return route.module.formatError(
 			401,
 			"authentication_error",
@@ -769,8 +775,13 @@ async function handlePiNative(
 	}
 
 	let apiKey: string | undefined;
-	if (!(await providerScopeAvailable(bootOpts)))
+	const scopeAvailability = await providerScopeAvailability(bootOpts);
+	if (scopeAvailability !== "available") {
+		if (scopeAvailability === "reload_failed") {
+			return piNative.formatError(503, "upstream_error", "Auth broker unavailable");
+		}
 		return piNative.formatError(401, "authentication_error", "No credential available");
+	}
 	try {
 		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
 			modelId: model.id,
@@ -1014,7 +1025,14 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 				// same client struct.
 				if (req.method === "GET" && pathname === "/v1/usage") {
-					if (!(await providerScopeAvailable(opts)))
+					const scopeAvailability = await providerScopeAvailability(opts);
+					if (scopeAvailability === "reload_failed") {
+						return withCors(
+							json(503, { error: { code: "broker_unavailable", message: "Auth broker unavailable." } }),
+							req,
+						);
+					}
+					if (scopeAvailability === "absent")
 						return withCors(json(200, { generatedAt: Date.now(), reports: [] }), req);
 					return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
 				}
@@ -1023,7 +1041,14 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 				// credentials, so we need a separate endpoint that captures errors.
 				if (req.method === "GET" && pathname === "/v1/credentials/check") {
-					if (!(await providerScopeAvailable(opts))) return withCors(emptyScopedCredentialsResponse(), req);
+					const scopeAvailability = await providerScopeAvailability(opts);
+					if (scopeAvailability === "reload_failed") {
+						return withCors(
+							json(503, { error: { code: "broker_unavailable", message: "Auth broker unavailable." } }),
+							req,
+						);
+					}
+					if (scopeAvailability === "absent") return withCors(emptyScopedCredentialsResponse(), req);
 					return withCors(
 						await handleCredentialsCheck(opts.storage, opts.providerScope.provider, req.signal),
 						req,
