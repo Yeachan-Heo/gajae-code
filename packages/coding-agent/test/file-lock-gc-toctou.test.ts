@@ -521,7 +521,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const realpath = fs.realpath;
-		let failLockPathCanonicalization = true;
+		let failLockPathCanonicalization = false;
 		vi.spyOn(fs, "realpath").mockImplementation((async target => {
 			if (failLockPathCanonicalization && String(target).endsWith(".lock")) {
 				failLockPathCanonicalization = false;
@@ -533,6 +533,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		let contenderEntered = false;
 		let contender: Promise<void> | undefined;
 		await withFileLock(lockedFile, async () => {
+			failLockPathCanonicalization = true;
 			contender = withFileLock(
 				lockedFile,
 				async () => {
