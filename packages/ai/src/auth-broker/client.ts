@@ -141,6 +141,7 @@ export class AuthBrokerClient {
 		try {
 			return (await this.#request("GET", "/v1/credentials/metadata", {
 				schema: credentialMetadataResponseSchema,
+				headers: { [AUTH_BROKER_EPOCH_HEADER]: "1" },
 				signal,
 			})) as CredentialMetadataResponse;
 		} catch (error) {
@@ -337,7 +338,13 @@ export class AuthBrokerClient {
 	async #request<TSchema extends ZodType>(
 		method: "GET" | "POST",
 		path: string,
-		opts: { schema: TSchema; auth?: boolean; body?: unknown; signal?: AbortSignal },
+		opts: {
+			schema: TSchema;
+			auth?: boolean;
+			body?: unknown;
+			signal?: AbortSignal;
+			headers?: Record<string, string>;
+		},
 	): Promise<zInfer<TSchema>> {
 		const response = await this.#fetchRaw(method, path, opts);
 		const text = await response.text();

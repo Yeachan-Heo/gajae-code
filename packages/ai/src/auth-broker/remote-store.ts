@@ -523,6 +523,20 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		for (let attempt = 0; attempt < 2; attempt += 1) {
 			try {
 				const metadata = await this.#client.fetchCredentialMetadata();
+				if (metadata.epoch !== undefined && metadata.epoch !== this.#epoch) {
+					if (attempt === 0) {
+						await this.refreshSnapshot().catch(() => {});
+						continue;
+					}
+					this.#inventoryMetadata.clear();
+					this.#inventoryMetadataGeneration = -1;
+					this.#setInventoryState("mismatch", this.#generation, {
+						status: "mismatch",
+						reason: "credential metadata epoch mismatch",
+						generation: this.#generation,
+					});
+					return this.getInventoryMetadataState();
+				}
 				if (metadata.generation !== this.#generation) {
 					if (attempt === 0) {
 						await this.refreshSnapshot().catch(() => {});

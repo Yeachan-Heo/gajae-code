@@ -315,7 +315,11 @@ function buildSnapshot(
 }
 
 /** Build the payload-free credential inventory projection for the metadata route. */
-function buildCredentialMetadata(storage: AuthStorage): CredentialMetadataResponse {
+function buildCredentialMetadata(
+	storage: AuthStorage,
+	epoch: string,
+	includeEpoch: boolean,
+): CredentialMetadataResponse {
 	const credentials = storage.listCredentialInventory().map(record => ({
 		id: record.id,
 		provider: record.provider,
@@ -324,6 +328,7 @@ function buildCredentialMetadata(storage: AuthStorage): CredentialMetadataRespon
 		disabledCause: record.disabledCause,
 	}));
 	return {
+		...(includeEpoch ? { epoch } : {}),
 		generation: storage.getGeneration(),
 		generatedAt: Date.now(),
 		credentials,
@@ -610,7 +615,11 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				}
 				if (req.method === "GET" && pathname === "/v1/credentials/metadata") {
 					await opts.storage.reload();
-					const body = buildCredentialMetadata(opts.storage);
+					const body = buildCredentialMetadata(
+						opts.storage,
+						epoch,
+						req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1",
+					);
 					logger.info("auth-broker credential metadata served", {
 						generation: body.generation,
 						status: "ok",

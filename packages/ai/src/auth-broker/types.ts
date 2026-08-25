@@ -26,6 +26,7 @@ export interface CredentialMetadataRecord {
 
 /** GET /v1/credentials/metadata response body. */
 export interface CredentialMetadataResponse {
+	epoch?: string;
 	generation: number;
 	generatedAt: number;
 	credentials: CredentialMetadataRecord[];

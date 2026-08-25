@@ -125,6 +125,7 @@ export const credentialMetadataRecordSchema = z
 
 export const credentialMetadataResponseSchema = z
 	.object({
+		epoch: z.string().min(1).optional(),
 		generation: z.number().int().nonnegative(),
 		generatedAt: z.number().finite().nonnegative(),
 		credentials: z.array(credentialMetadataRecordSchema),
