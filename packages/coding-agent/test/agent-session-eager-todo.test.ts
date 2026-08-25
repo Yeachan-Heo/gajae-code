@@ -536,7 +536,7 @@ describe("AgentSession eager todo enforcement", () => {
 				deliveredToolResults.push(event.message);
 			}
 		});
-		const replace = spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(() => {
+		const replace = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(() => {
 			throw new Error("cold managed rewrite failed");
 		});
 		try {
@@ -1036,7 +1036,7 @@ describe("AgentSession eager todo enforcement", () => {
 		if (!sessionFile) throw new Error("Expected managed session file path");
 		manager.appendMessage({ role: "user", content: "first append is lazy", timestamp: 1 });
 
-		const replace = spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(() => {
+		const replace = spyOn(ManagedSessionDescendantStore.prototype, "publishNoReplaceSync").mockImplementation(() => {
 			throw new Error("first managed persist failed");
 		});
 		let assistantFailure: unknown;

@@ -140,7 +140,23 @@ describe("SessionManager draft", () => {
 			const replaceManaged = native.RecoveryFsRoot.prototype as unknown as {
 				replaceManaged: (...args: unknown[]) => unknown;
 			};
-			const replace = vi.spyOn(replaceManaged, "replaceManaged").mockReturnValue({ ok: false, code: "io_error" });
+			const replace = vi.spyOn(replaceManaged, "replaceManaged").mockReturnValue({
+				ok: false,
+				code: "io_error",
+				identity: undefined,
+				recoveryPath: undefined,
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "io_failure",
+				primitive: "in_place_descriptor",
+				phase: "preflight",
+				diagnostic: {
+					schemaVersion: 1,
+					collectionState: "unavailable",
+					osCode: undefined,
+					syncFailures: undefined,
+				},
+			});
 			try {
 				await expect(session.saveDraft("replacement draft")).rejects.toThrow("io_error");
 			} finally {

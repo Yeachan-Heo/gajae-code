@@ -8387,7 +8387,8 @@ export class SessionManager {
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
-			this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+			this.#managedPersistExpectedIdentity =
+				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
 			this.#lazyReopenSucceeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
@@ -8574,7 +8575,8 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
-			this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(sessionFile);
+			this.#managedPersistExpectedIdentity =
+				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
 			this.#sessionId = discovery.header.id;
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
@@ -20159,7 +20161,8 @@ export class SessionManager {
 				const returnManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
 				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
 					throw new Error("Could not open session: unstable");
-				manager.#managedPersistExpectedIdentity = manager.#captureManagedPersistIdentity(filePath);
+				manager.#managedPersistExpectedIdentity =
+					manager.destination.kind === "managed" ? manager.#captureManagedPersistIdentity(filePath) : undefined;
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
@@ -20277,7 +20280,10 @@ export class SessionManager {
 					const finalDescriptor = store.descriptorExpected(path.basename(resolved));
 					if (!finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
 						throw new Error("source_changed");
-					boundedManager.#managedPersistExpectedIdentity = boundedManager.#captureManagedPersistIdentity(resolved);
+					boundedManager.#managedPersistExpectedIdentity =
+						boundedManager.destination.kind === "managed"
+							? boundedManager.#captureManagedPersistIdentity(resolved)
+							: undefined;
 					boundedManager.buildSessionContext();
 					return boundedManager;
 				}
@@ -20726,6 +20732,15 @@ export class SessionManager {
 					throw error;
 				}
 			}
+			// The transcript was published and verified above. Mark the captured fork as
+			// durable before handing it to the lifecycle host; otherwise ensureOnDisk()
+			// will attempt a second no-replace publication and fail on the already-live
+			// destination. Re-adopt the exact managed identity only after the final
+			// destination path is settled.
+			manager.#flushed = true;
+			manager.#ensuredOnDisk = true;
+			manager.#needsFullRewriteOnNextPersist = false;
+			if (manager.#sessionFile) manager.#adoptManagedPersistIdentity(manager.#sessionFile);
 			const finalSource = snapshot.revalidate();
 			if (finalSource.kind !== "valid") {
 				authorityFailure = finalSource;
