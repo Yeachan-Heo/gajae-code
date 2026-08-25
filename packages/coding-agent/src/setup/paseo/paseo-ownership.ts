@@ -173,6 +173,9 @@ export async function readProvenance(provenancePath: string): Promise<Provenance
 		if (parsed.version !== undefined && typeof parsed.version !== "number") {
 			throw new Error("version is present but not a number");
 		}
+		if (parsed.version !== undefined && parsed.version !== PROVENANCE_VERSION) {
+			throw new Error(`version is not ${PROVENANCE_VERSION}`);
+		}
 		if (parsed.providerPreexistingKeys !== undefined && !isTrueRecord(parsed.providerPreexistingKeys)) {
 			throw new Error("providerPreexistingKeys is present but not a boolean record");
 		}

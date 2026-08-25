@@ -46,7 +46,12 @@ import {
 } from "./provider-config";
 import { removePaseoSetup, safeBridgeEntryNames, validatedBridgeDir } from "./remove";
 import type { PaseoInstallResult, PaseoRemoveResult, SetupCheckResult } from "./result-types";
-import { type PaseoSetupDependencies, type PaseoSkillSource, resolvePaseoSkillsSource } from "./setup-deps";
+import {
+	isTrustedRecordedSkillsSource,
+	type PaseoSetupDependencies,
+	type PaseoSkillSource,
+	resolvePaseoSkillsSource,
+} from "./setup-deps";
 import type { SkillsBridgeAmbiguity, SkillsBridgeInstallResult } from "./skills-bridge";
 import {
 	installSkillsBridge,
@@ -247,14 +252,20 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	const seed = createOrchestrationSeed(preferences.parsed);
 	const bridgeLedgerBeforeInstall = await readProvenance(deps.paths.provenanceLedger);
 	const recordedBridgePathBeforeInstall = bridgeLedgerBeforeInstall.bridgePath;
+	const configuredBridgeCanonicalPath = await canonicalPathForComparison(deps.paths.bridgeDir);
+	const recordedBridgeCanonicalPathBeforeInstall =
+		recordedBridgePathBeforeInstall === undefined
+			? undefined
+			: await canonicalPathForComparison(recordedBridgePathBeforeInstall);
+	const recordedBridgeIsMigration =
+		recordedBridgePathBeforeInstall !== undefined &&
+		recordedBridgeCanonicalPathBeforeInstall !== configuredBridgeCanonicalPath;
 	const bridgeSource = await resolveSkillsBridgeSource(deps);
 	// A path cutover cannot be authenticated without a live source. Refuse it
 	// before any saga step so the existing bridge, registration, and complete
 	// provenance ledger remain byte-for-byte unchanged.
 	const sourceLessMigration =
-		bridgeSource === undefined &&
-		recordedBridgePathBeforeInstall !== undefined &&
-		path.resolve(recordedBridgePathBeforeInstall) !== path.resolve(deps.paths.bridgeDir);
+		bridgeSource === undefined && recordedBridgePathBeforeInstall !== undefined && recordedBridgeIsMigration;
 	// Refuse before bridge preflight can inspect the proposed destination. A
 	// source-less cutover has no authenticated basis for changing the bridge
 	// path, so the old registration, links, and ledger stay untouched.
@@ -278,7 +289,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	const emptyResolvedSourceMigration =
 		bridgeSource !== undefined &&
 		recordedBridgePathBeforeInstall !== undefined &&
-		path.resolve(recordedBridgePathBeforeInstall) !== path.resolve(deps.paths.bridgeDir) &&
+		recordedBridgeIsMigration &&
 		bridgePreflight.bridgeDirCreated &&
 		Object.keys(bridgePreflight.entries).length === 0 &&
 		bridgePreflight.prunes.length === 0 &&
@@ -565,6 +576,17 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			// pointing at missing links.
 			const oldBridgeDir = await validatedBridgeDir(bridgeLedger, deps);
 			migratedOldSourceDir = bridgeLedger.bridgeSourceDir ?? legacySourceDirFor(deps);
+			if (bridgeLedger.bridgeSourceDir !== undefined) {
+				const sourceTrust = deps.trustedSkillsSource
+					? await deps.trustedSkillsSource(migratedOldSourceDir)
+					: await isTrustedRecordedSkillsSource(migratedOldSourceDir);
+				if (!sourceTrust.ok) {
+					throw new SagaStepError("paseo skills bridge", sourceTrust.detail, [
+						migratedOldSourceDir,
+						deps.paths.provenanceLedger,
+					]);
+				}
+			}
 			const capturedOldBridge = await captureMigratedOldBridgeEntries(
 				oldBridgeDir,
 				safeBridgeEntryNames(bridgeLedger.bridgeEntries ?? []),
@@ -1192,8 +1214,12 @@ export async function correctBridgeOwnershipAfterFailure(
 		...partial.adoptedEntries,
 	].filter((name, index, all) => all.indexOf(name) === index);
 	const corrected = await readProvenance(deps.paths.provenanceLedger);
-	await writeProvenance(deps.paths.provenanceLedger, {
+	const correctedPath =
+		isMigration && (actual.length > 0 || partial.bridgeDirCreated) ? deps.paths.bridgeDir : corrected.bridgePath;
+	const correctedLedger: ProvenanceLedger = {
 		...corrected,
+		...(correctedPath === undefined ? { bridgePath: undefined } : { bridgePath: correctedPath }),
+		...(partial.sourceDir !== undefined ? { bridgeSourceDir: partial.sourceDir } : {}),
 		bridgeEntries: actual,
 		bridgeEntryIdentities: {
 			...Object.fromEntries(
@@ -1203,7 +1229,16 @@ export async function correctBridgeOwnershipAfterFailure(
 		},
 		bridgeDirCreated: corrected.bridgeDirCreated === true || partial.bridgeDirCreated,
 		...(partial.bridgeDirIdentity ? { bridgeDirIdentity: partial.bridgeDirIdentity } : {}),
-	});
+	};
+	const intent = await readIntent(deps.paths.intentRecord);
+	if (intent?.step === "skills-bridge" && intent.provenancePath === deps.paths.provenanceLedger) {
+		await writeIntent(deps.paths.intentRecord, {
+			...intent,
+			provenanceExpectedIdentity: provenanceLedgerIdentity(correctedLedger),
+			provenancePayload: correctedLedger,
+		});
+	}
+	await writeProvenance(deps.paths.provenanceLedger, correctedLedger);
 }
 /** The RAW value a Paseo config carries at `agents.providers.<key>`, of any shape. */
 function readRawProviderValue(config: Record<string, unknown>, providerKey: string): unknown {

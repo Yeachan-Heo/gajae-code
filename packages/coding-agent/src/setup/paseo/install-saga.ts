@@ -592,6 +592,7 @@ export async function recoverIntent(
 	if (recovery.action === "refuse") return { recovered: false, detail: recovery.detail };
 	if (!options.repair) return { recovered: false, detail: recovery.detail };
 	if (recovery.action === "discard") {
+		let discardSidecarRemoved = false;
 		// A sidecar is disposable only when the target never reached its intended
 		// identity. If both target and ledger writes landed, the ledger now owns
 		// the sidecar and it must survive for `--remove` restoration. Re-read the
@@ -630,9 +631,20 @@ export async function recoverIntent(
 						detail: `${recovery.detail}; authenticated discard sidecar cleanup failed (${intent.discardSidecar.backupPath}); retaining the intent`,
 					};
 				}
+				discardSidecarRemoved = true;
 			}
 		}
-		await clearIntent(intentPath);
+		try {
+			await clearIntent(intentPath);
+		} catch (error) {
+			if (!discardSidecarRemoved || intent.discardSidecar === undefined) throw error;
+			// The authenticated artifact is already gone. Remove its cleanup
+			// authority from the durable intent before retrying the clear, so a
+			// later recovery cannot fail forever on an intentionally absent file.
+			const { discardSidecar: _discardSidecar, ...safeIntent } = intent;
+			await writeIntent(intentPath, safeIntent);
+			await clearIntent(intentPath);
+		}
 		return { recovered: true, detail: recovery.detail };
 	}
 

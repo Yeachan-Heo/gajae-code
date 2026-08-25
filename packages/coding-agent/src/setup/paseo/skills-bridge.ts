@@ -1009,6 +1009,7 @@ async function finishBridgeCleanup(
 	if (retainedAuthority !== undefined) {
 		throw new SkillsBridgeError(
 			`Refusing to remove Paseo skills bridge directory with retained native authority: ${authority.originalPath}`,
+			[retainedAuthority],
 		);
 	}
 	if (removal.ok) {

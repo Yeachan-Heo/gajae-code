@@ -369,12 +369,21 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
  * Decide whether a previously extracted embedded addon may be reused. A cached
  * extraction from an earlier build of the same version carries the same version
  * sentinel yet can expose a different native surface, so it is fresh only when
- * its byte size matches the embedded payload. `sizeOf` returns the byte size of
- * a path, or `null` when it cannot be inspected.
- * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null }} input
+ * its content digest matches the embedded payload. `hashOf` returns a content
+ * digest, or `null` when it cannot be inspected. `sizeOf` remains as a pure
+ * helper fallback for callers that only model size evidence.
+ * @param {{ targetPath: string; embeddedPath: string; hashOf?: (path: string) => string | null; sizeOf?: (path: string) => number | null }} input
  * @returns {boolean}
  */
-export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf }) {
+	export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, hashOf, sizeOf }) {
+	if (hashOf) {
+		const cachedHash = hashOf(targetPath);
+		if (cachedHash === null) return false;
+		const embeddedHash = hashOf(embeddedPath);
+		if (embeddedHash === null) return false;
+		return cachedHash === embeddedHash;
+	}
+	if (!sizeOf) return false;
 	const cachedSize = sizeOf(targetPath);
 	if (cachedSize === null) return false;
 	const embeddedSize = sizeOf(embeddedPath);
@@ -558,7 +567,14 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 					return null;
 				}
 			};
-			if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: embeddedFile.filePath, sizeOf })) {
+			const hashOf = candidate => {
+				try {
+					return createHash("sha256").update(fs.readFileSync(candidate)).digest("hex");
+				} catch {
+					return null;
+				}
+			};
+			if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: embeddedFile.filePath, hashOf, sizeOf })) {
 				extracted.push(targetPath);
 				continue;
 			}

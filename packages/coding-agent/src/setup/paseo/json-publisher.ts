@@ -279,10 +279,70 @@ async function canonicalSidecarPathForNativeUnlink(sidecarPath: string): Promise
 	return path.join(canonicalParent, path.basename(absolute));
 }
 
+async function openRegularSidecar(
+	backupPath: string,
+	flags: number,
+): Promise<{ readonly handle: fs.FileHandle; readonly stat: BigIntStats } | undefined> {
+	const initial = await fs.lstat(backupPath, { bigint: true });
+	if (!initial.isFile()) return undefined;
+	const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+	const handle = await fs.open(backupPath, flags | nofollow);
+	try {
+		const opened = await handle.stat({ bigint: true });
+		const current = await fs.lstat(backupPath, { bigint: true });
+		if (
+			!opened.isFile() ||
+			opened.dev !== initial.dev ||
+			opened.ino !== initial.ino ||
+			current.dev !== opened.dev ||
+			current.ino !== opened.ino ||
+			!current.isFile()
+		) {
+			await handle.close();
+			return undefined;
+		}
+		return { handle, stat: opened };
+	} catch (error) {
+		await handle.close().catch(() => undefined);
+		throw error;
+	}
+}
+
 async function copyPrivately(from: string, to: string): Promise<void> {
 	const bytes = await Bun.file(from).text();
 	const mode = BACKUP_MODE;
-	const handle = await fs.open(to, "w", mode);
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(to, "wx", mode);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const existing = await openRegularSidecar(to, fs.constants.O_RDONLY);
+		if (existing === undefined) throw new Error(`backup path exists but is not an authenticated regular file: ${to}`);
+		let existingBytes: Buffer;
+		try {
+			existingBytes = await existing.handle.readFile();
+		} finally {
+			await existing.handle.close();
+		}
+		if (existingBytes.toString("utf8") === bytes) return;
+		const parent = await fs.stat(path.dirname(to), { bigint: true });
+		const identity: NativeExactFileIdentity = {
+			dev: existing.stat.dev,
+			ino: existing.stat.ino,
+			nlink: existing.stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: existing.stat.size,
+			mtimeNs: existing.stat.mtimeNs,
+			sha256: nodeCrypto.createHash("sha256").update(existingBytes).digest("hex"),
+			quarantineName: `.gjc-paseo-backup-${process.pid}-${nodeCrypto.randomUUID()}`,
+		};
+		const canonical = await canonicalSidecarPathForNativeUnlink(to);
+		if (!exactUnlinkDirect(canonical, identity).ok) {
+			throw new Error(`backup path changed while replacing its authenticated regular file: ${to}`);
+		}
+		handle = await fs.open(to, "wx", mode);
+	}
 	try {
 		await handle.writeFile(bytes, "utf8");
 		await handle.sync();
@@ -426,12 +486,11 @@ export async function readReplacedProviderBackup(
 		// redirecting restoration at attacker-controlled JSON; the regular-file
 		// check and the bytes then share one handle identity. Platforms without
 		// O_NOFOLLOW keep the fstat regular-file check on the same fd.
-		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
+		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
+		if (opened === undefined) return { found: false };
+		const { handle } = opened;
 		let bytes: string;
 		try {
-			const stat = await handle.stat();
-			if (!stat.isFile()) return { found: false };
 			bytes = await new Response(await handle.readFile()).text();
 		} finally {
 			await handle.close();
@@ -459,13 +518,11 @@ export async function removeReplacedProviderBackup(
 	expectedSha256: string,
 ): Promise<boolean> {
 	try {
-		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
+		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
+		if (opened === undefined) return false;
+		const { handle, stat } = opened;
 		let bytes: Buffer;
-		let stat: BigIntStats;
 		try {
-			stat = await handle.stat({ bigint: true });
-			if (!stat.isFile()) return false;
 			bytes = await handle.readFile();
 		} finally {
 			await handle.close();
@@ -513,13 +570,11 @@ export async function removeDiscardSidecar(
 		// replaced-provider sidecar may live.
 		if (!isCanonicalReplacedProviderBackupPath(configJsonPath, backupPath)) return false;
 		if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
-		const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
-		const handle = await fs.open(backupPath, fs.constants.O_RDONLY | nofollow);
+		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
+		if (opened === undefined) return false;
+		const { handle, stat } = opened;
 		let bytes: Buffer;
-		let stat: BigIntStats;
 		try {
-			stat = await handle.stat({ bigint: true });
-			if (!stat.isFile()) return false;
 			bytes = await handle.readFile();
 		} finally {
 			await handle.close();
