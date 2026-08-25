@@ -3821,7 +3821,7 @@ export class AuthStorage {
 		if (scopedStoreFetch && options?.provider) {
 			return raceUsageWithSignal(scopedStoreFetch(options.provider), options.signal);
 		}
-		if (options?.provider && this.#fetchUsageReportsOverride) {
+		if (options?.provider && (this.#fetchUsageReportsOverride || this.#store.fetchUsageReports)) {
 			throw new Error("Provider-scoped usage fetch is unavailable");
 		}
 		const override = this.#fetchUsageReportsOverride ?? this.#store.fetchUsageReports?.bind(this.#store);
