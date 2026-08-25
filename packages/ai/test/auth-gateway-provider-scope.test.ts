@@ -300,6 +300,42 @@ describe("provider-scoped auth-gateway catalogs", () => {
 			await gateway.close();
 		}
 	});
+
+	it("projects credential check failures without upstream secrets or reports", async () => {
+		const provider = "scope-diagnostic-redaction-provider";
+		const scopedModel = model("scope-diagnostic-redaction-model", provider, "openai-codex-responses");
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: [],
+			version: "test",
+			storage: {
+				exportSnapshot: () => ({ credentials: [{ provider }] }),
+				checkCredentials: async () => [
+					{
+						id: 7,
+						provider,
+						type: "api_key",
+						ok: false,
+						reason: "password=secret access=token refresh=refresh cookie=cookie Authorization: Basic dGVzdA==",
+						report: { raw: "secret-report" },
+					},
+				],
+			} as unknown as AuthStorage,
+			resolveModel: () => scopedModel,
+			listModels: () => [scopedModel],
+		});
+		try {
+			const response = await fetch(`${gateway.url}/v1/credentials/check`);
+			expect(response.status).toBe(200);
+			expect(await response.json()).toEqual({
+				generatedAt: expect.any(Number),
+				credentials: [{ id: 7, provider, type: "api_key", ok: false, reason: "Credential check failed." }],
+			});
+		} finally {
+			await gateway.close();
+		}
+	});
 });
 
 describe("provider-scoped auth-gateway credential dispatch", () => {
