@@ -281,7 +281,7 @@ async function staleLockSnapshot(
 		// metadata path exists: an unreadable live holder must never be reclaimed by
 		// elapsed mtime alone.
 		try {
-			await fs.stat(path.join(lockPath, "info"));
+			await fs.lstat(path.join(lockPath, "info"));
 			return { stale: false };
 		} catch (error) {
 			if (!isEnoent(error)) throw error;

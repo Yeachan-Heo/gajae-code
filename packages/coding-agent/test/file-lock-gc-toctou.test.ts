@@ -203,6 +203,19 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		}
 	});
 
+	test("fails closed when lock metadata is a dangling symlink", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.symlink(path.join(base, "missing-info"), path.join(lockDir, "info"));
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
+		expect((await fs.lstat(path.join(lockDir, "info"))).isSymbolicLink()).toBe(true);
+	});
+
 	test("rejects after successful protected work when ownership is lost during release", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
