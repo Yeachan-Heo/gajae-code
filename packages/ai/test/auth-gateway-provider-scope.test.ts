@@ -49,7 +49,9 @@ function makeHangingEventStream(
 ): AssistantMessageEventStream {
 	async function waitForAbort(): Promise<void> {
 		if (!signal || signal.aborted) return;
-		await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+		const { promise, resolve } = Promise.withResolvers<void>();
+		signal.addEventListener("abort", () => resolve(), { once: true });
+		await promise;
 	}
 	async function* events(): AsyncGenerator<AssistantMessageEvent> {
 		yield { type: "start", partial };
