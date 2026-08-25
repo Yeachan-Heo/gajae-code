@@ -911,4 +911,112 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	}, 9000);
+
+	it("caps the fence on caller abort without an unhandled rejection", async () => {
+		const controller = new AbortController();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const started = Promise.withResolvers<void>();
+		try {
+			const pending = collectTerminal(baseUrl, {
+				signal: controller.signal,
+				streamIdleTimeoutMs: 40,
+				streamFirstEventTimeoutMs: 500,
+				execHandlers: {
+					piWrite: async call => {
+						call.markNonAbortable?.();
+						started.resolve();
+						await Promise.withResolvers<never>().promise;
+						return {
+							role: "toolResult",
+							toolCallId: call.toolCallId,
+							toolName: "write",
+							content: [],
+							isError: false,
+							timestamp: Date.now(),
+						};
+					},
+				},
+			});
+			await started.promise;
+			// Deadline (160ms) + grace cap (5s) fire while the caller abort
+			// defers behind the fence: the terminal must still publish and the
+			// race's `exceeded` rejection must never escape as unhandled.
+			controller.abort(new Error("caller cancelled stuck mutation"));
+			const { events, result } = await pending;
+			expect(result.stopReason).toBe("aborted");
+			expect(events.filter(isTerminalEvent)).toHaveLength(1);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	}, 9000);
+
+	it("clears the settlement grace timer when a marked mutation settles in time", async () => {
+		const controller = new AbortController();
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const pending = collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await release.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		controller.abort(new Error("caller cancelled quick write"));
+		// Settle inside the grace window: no cap rejection, terminal after settle.
+		release.resolve();
+		const { events, result } = await pending;
+		expect(result.errorMessage).toBe("caller cancelled quick write");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
 });

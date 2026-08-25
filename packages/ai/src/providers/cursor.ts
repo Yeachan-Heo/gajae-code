@@ -848,7 +848,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		// transport) open forever.
 		const settleBehindFence = (publish: () => void): void => {
 			if (pendingNonAbortableExec) {
-				void Promise.race([pendingNonAbortableExec.settled, pendingNonAbortableExec.exceeded]).finally(publish);
+				void Promise.race([pendingNonAbortableExec.settled, pendingNonAbortableExec.exceeded])
+					.finally(publish)
+					.catch(() => {
+						// The `exceeded` branch is the fence cap firing: publish already
+						// ran through .finally; swallow so the race rejection cannot
+						// surface as an unhandled rejection after the terminal.
+					});
 				return;
 			}
 			publish();
