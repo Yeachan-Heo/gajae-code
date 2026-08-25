@@ -134,6 +134,7 @@ import {
 	reconcileCreationRemoteVerifier,
 	recordCreationRetirementBrokerProof,
 	recordCreationRetirementIntent,
+	replaceCreationRetirementIntent,
 	recoverExpiredPublicDelivery,
 	releasePublicDeliveryClaim,
 	removeSessionTransaction,
@@ -8731,6 +8732,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					!/^[A-Za-z0-9._-]+$/u.test(lifecycleRequestId) ||
 					processIncarnation === null ||
 					hostIncarnation === null ||
+					!/^[A-Za-z0-9._-]+$/.test(lifecycleRequestId) ||
 					!path.isAbsolute(stateRoot) ||
 					typeof endpointGeneration !== "number" ||
 					!Number.isSafeInteger(endpointGeneration) ||
@@ -8747,13 +8749,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const canonicalArgs = {
 					cwd,
 					session_id: sessionId,
-					state_root: stateRoot,
-					endpoint_generation: endpointGeneration,
-					endpoint_mtime_ms: endpointMtimeMs,
-					process_incarnation: processIncarnation,
-					host_incarnation: hostIncarnation,
-					lifecycle_request_id: lifecycleRequestId,
-					remote_create_key: remoteCreateKey,
 					creation_idempotency_key: creationKey,
 					request_digest: requestDigest,
 					allow_mutation: true,
@@ -8911,6 +8906,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										},
 										`coordinator-retire:${creationKey}`,
 									);
+									const brokerResponse = asRecord(acknowledgement);
+									if (brokerResponse?.ok === false) {
+										const brokerError = asRecord(brokerResponse.error);
+										if (brokerError?.code === "endpoint_stale" && brokerError.cleanup === undefined)
+											await replaceCreationRetirementIntent(
+												questionPaths,
+												creationKeyDigest,
+												proof,
+												retirementKeyDigest,
+											);
+									}
 									const parsed = strictBrokerRetirementProof(acknowledgement, proof);
 									await recordCreationRetirementBrokerProof(
 										questionPaths,

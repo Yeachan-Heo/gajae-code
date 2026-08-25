@@ -18,6 +18,7 @@ class FakeSdkClient {
 	listeners = new Set<(frame: Record<string, unknown>) => void>();
 	reconnectFailedListeners = new Set<(error: Error) => void>();
 	reconnectListeners = new Set<() => void>();
+	globalResponse: unknown = { ok: true };
 	async control(
 		operation: string,
 		input: Record<string, unknown>,
@@ -531,6 +532,50 @@ test("ACP SDK adapter forwards terminal reconnect failures to its session owner"
 	sdk.emitReconnectFailure(new Error("token rejected"));
 	await waitFor(() => failures.length === 1, "reconnect failure callback");
 	expect(failures[0]).toMatchObject({ code: "reconnect_exhausted", message: "token rejected" });
+	await adapter.close();
+});
+
+test("ACP retirement receipts are proof-bound and opaque", async () => {
+	const sdk = new FakeSdkClient();
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	const target = {
+		sessionId: "retired-session",
+		cwd: "/workspace",
+		stateRoot: "/workspace/.gjc/state",
+		endpointGeneration: 2,
+		endpointMtimeMs: 1,
+		processIncarnation: "linux:123",
+		hostIncarnation: "host:123",
+		lifecycleRequestId: "retire-effect",
+		remoteCreateKey: "remote-create-key",
+	};
+	sdk.globalResponse = {
+		ok: true,
+		result: {
+			...target,
+			retired: true,
+			ledgerState: "terminal_error",
+			indexType: "session_closed",
+		},
+	};
+	await adapter.start();
+	const response = await adapter.global("session.reconcile_uncertain", target, "retire-proof");
+	expect(response).toEqual({
+		ok: true,
+		result: {
+			sessionId: target.sessionId,
+			retired: true,
+			ledgerState: "terminal_error",
+			indexType: "session_closed",
+		},
+	});
+	expect(JSON.stringify(response)).not.toContain(target.stateRoot);
+	expect(JSON.stringify(response)).not.toContain(target.processIncarnation);
+	expect(JSON.stringify(response)).not.toContain(target.hostIncarnation);
+	sdk.globalResponse = { ok: true, result: { sessionId: target.sessionId, retired: true } };
+	await expect(adapter.global("session.reconcile_uncertain", target, "retire-proofless")).rejects.toMatchObject({
+		code: "protocol_error",
+	});
 	await adapter.close();
 });
 test("ACP lifecycle aliases forward caller idempotency keys outside operation input", async () => {

@@ -3897,6 +3897,22 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 					processIncarnation: processIdentity,
 					hostIncarnation: processIdentity,
 					lifecycleRequestId: "reconcile-effect",
+				},
+				"reconcile-missing-remote-key",
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		await expect(
+			broker.handleRequest(
+				"session.reconcile_uncertain",
+				{
+					sessionId,
+					cwd: agentDir,
+					stateRoot,
+					endpointGeneration: 4,
+					endpointMtimeMs: 1,
+					processIncarnation: processIdentity,
+					hostIncarnation: processIdentity,
+					lifecycleRequestId: "reconcile-effect",
 					remoteCreateKey: "reconcile-create-key",
 				},
 				"reconcile-live",

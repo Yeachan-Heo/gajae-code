@@ -71,6 +71,37 @@ function credentialFreeLifecycleResult(value: unknown): unknown {
 	return output;
 }
 
+function publicLifecycleResult(operation: string, input: JsonObject, value: unknown): unknown {
+	if (operation !== "session.reconcile_uncertain") return credentialFreeLifecycleResult(value);
+	const response = object(value);
+	if (!response || response.ok !== true) return credentialFreeLifecycleResult(value);
+	const result = object(response.result);
+	if (
+		!result ||
+		result.sessionId !== input.sessionId ||
+		result.retired !== true ||
+		result.ledgerState !== "terminal_error" ||
+		result.indexType !== "session_closed" ||
+		result.stateRoot !== input.stateRoot ||
+		result.endpointGeneration !== input.endpointGeneration ||
+		result.endpointMtimeMs !== input.endpointMtimeMs ||
+		result.processIncarnation !== input.processIncarnation ||
+		result.hostIncarnation !== input.hostIncarnation ||
+		result.lifecycleRequestId !== input.lifecycleRequestId ||
+		result.remoteCreateKey !== input.remoteCreateKey
+	)
+		throw new AcpSdkAdapterError("protocol_error", "Broker returned an unbound session retirement receipt.");
+	return {
+		...response,
+		result: {
+			sessionId: result.sessionId,
+			retired: true,
+			ledgerState: result.ledgerState,
+			indexType: result.indexType,
+		},
+	};
+}
+
 /**
  * Lifecycle failures the ACP MCP launch wrapper must report verbatim. Everything else
  * is re-attributed to the configured MCP servers, which is the useful answer for a
@@ -442,7 +473,7 @@ export class AcpSdkAdapter {
 	}
 	async global(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
 		const result = await this.#lifecycleRequest(operation, input, idempotencyKey);
-		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
+		return isLifecycleOperation(operation) ? publicLifecycleResult(operation, input, result) : result;
 	}
 	/** Uses lifecycle endpoint credentials only inside the ACP session owner. */
 	async lifecycle(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {

@@ -326,7 +326,7 @@ export interface CreationRetirementBrokerProofV1 {
 	remote_create_key: string;
 }
 export interface CreationRetirementIntentV1 {
-	phase: "intent" | "broker_retired";
+	phase: "intent" | "pre_effect_rejected" | "broker_retired";
 	proof: CreationRetirementProofV1;
 	retirement_key_digest?: string;
 	broker_proof?: CreationRetirementBrokerProofV1;
@@ -2432,7 +2432,11 @@ function sameCreationRetirementProof(left: CreationRetirementProofV1, right: Cre
 	return canonicalJson(left) === canonicalJson(right);
 }
 
-function assertCreationRetirementProofMatches(request: CreationRequestV1, proof: CreationRetirementProofV1): void {
+function assertCreationRetirementProofMatches(
+	request: CreationRequestV1,
+	proof: CreationRetirementProofV1,
+	includeStaged = true,
+): void {
 	if (
 		!proof.session_id ||
 		!proof.cwd ||
@@ -2462,7 +2466,7 @@ function assertCreationRetirementProofMatches(request: CreationRequestV1, proof:
 		)
 			throw new Error("idempotency_conflict");
 	}
-	const staged = request.retirement_intent;
+	const staged = includeStaged ? request.retirement_intent : undefined;
 	if (staged && !sameCreationRetirementProof(staged.proof, proof)) throw new Error("idempotency_conflict");
 }
 
@@ -2478,8 +2482,9 @@ export async function recordCreationRetirementIntent(
 		if (!request) throw new Error("state_corrupt");
 		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
 			throw new Error("retire_not_allowed");
-		assertCreationRetirementProofMatches(request, proof);
+		assertCreationRetirementProofMatches(request, proof, request.retirement_intent?.phase !== "pre_effect_rejected");
 		if (
+			request.retirement_intent?.phase !== "pre_effect_rejected" &&
 			retirementKeyDigest &&
 			request.retirement_intent?.retirement_key_digest &&
 			request.retirement_intent.retirement_key_digest !== retirementKeyDigest
@@ -2493,11 +2498,40 @@ export async function recordCreationRetirementIntent(
 				updated_at: new Date().toISOString(),
 			};
 			request.updated_at = new Date().toISOString();
+		} else if (request.retirement_intent.phase === "pre_effect_rejected") {
+			request.retirement_intent.phase = "intent";
+			request.retirement_intent.proof = proof;
+			if (retirementKeyDigest) request.retirement_intent.retirement_key_digest = retirementKeyDigest;
+			request.retirement_intent.updated_at = new Date().toISOString();
+			request.updated_at = request.retirement_intent.updated_at;
 		} else if (retirementKeyDigest && !request.retirement_intent.retirement_key_digest) {
 			request.retirement_intent.retirement_key_digest = retirementKeyDigest;
 			request.retirement_intent.updated_at = new Date().toISOString();
 			request.updated_at = new Date().toISOString();
 		}
+		return request;
+	});
+}
+
+/** Replaces only a pre-effect retirement proof after an explicit broker rejection. */
+export async function replaceCreationRetirementIntent(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	proof: CreationRetirementProofV1,
+	retirementKeyDigest: string,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
+			throw new Error("retire_not_allowed");
+		const staged = request.retirement_intent;
+		if (!staged || staged.phase !== "intent" || staged.broker_proof) throw new Error("state_corrupt");
+		if (staged.retirement_key_digest !== retirementKeyDigest) throw new Error("idempotency_conflict");
+		assertCreationRetirementProofMatches(request, proof, false);
+		staged.phase = "pre_effect_rejected";
+		staged.updated_at = new Date().toISOString();
+		request.updated_at = staged.updated_at;
 		return request;
 	});
 }
@@ -2562,7 +2596,7 @@ export async function assertCreationRetirementIdentity(
 		if (!request) throw new Error("state_corrupt");
 		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
 			throw new Error("retire_not_allowed");
-		assertCreationRetirementProofMatches(request, proof);
+		assertCreationRetirementProofMatches(request, proof, request.retirement_intent?.phase !== "pre_effect_rejected");
 		return request;
 	});
 }

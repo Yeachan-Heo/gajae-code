@@ -1821,7 +1821,6 @@ function retirementCleanupPlan(
 	id: string,
 	create: { identity: string; effectMarker?: string },
 	identity: LifecycleRetirementIdentity,
-	remoteCreateKey?: string,
 ): LifecycleRetirementCleanup | BrokerResponse {
 	const parentIdentity = exactLifecycleRootIdentity(root);
 	if (!parentIdentity) return fail("terminal_uncertain", "Lifecycle metadata root or parent identity is unavailable.");
@@ -1871,7 +1870,7 @@ function retirementCleanupPlan(
 		uncertainRetirement: {
 			version: 1,
 			stage: "cleanup",
-			identity: { ...identity, ...(remoteCreateKey === undefined ? {} : { remoteCreateKey }) },
+			identity,
 		},
 	};
 }
@@ -1912,12 +1911,12 @@ function retirementIdentityFromInput(
 	input: Input,
 	record: IndexedSession,
 	createIdentity: string,
-	remoteCreateKey?: string,
 ): LifecycleRetirementIdentity | BrokerResponse {
 	const stateRoot = text(input.stateRoot);
 	const lifecycleRequestId = text(input.lifecycleRequestId);
 	const processIdentity = text(input.processIncarnation);
 	const hostIdentity = text(input.hostIncarnation);
+	const remoteCreateKey = text(input.remoteCreateKey);
 	const endpointGeneration = input.endpointGeneration;
 	const endpointMtimeMs = input.endpointMtimeMs;
 	if (
@@ -1926,6 +1925,7 @@ function retirementIdentityFromInput(
 		!lifecycleRequestId ||
 		!processIdentity ||
 		!hostIdentity ||
+		!remoteCreateKey ||
 		typeof endpointGeneration !== "number" ||
 		!Number.isSafeInteger(endpointGeneration) ||
 		endpointGeneration <= 0 ||
@@ -1948,7 +1948,7 @@ function retirementIdentityFromInput(
 		hostIncarnation: hostIdentity,
 		lifecycleRequestId,
 		createIdentity,
-		...(remoteCreateKey === undefined ? {} : { remoteCreateKey }),
+		remoteCreateKey,
 	};
 	if (!isLifecycleRetirementIdentity(identity))
 		return fail("invalid_input", "Retirement identity is malformed or exceeds the bounded proof schema.");
@@ -1978,7 +1978,7 @@ function retirementProof(identity: LifecycleRetirementIdentity, indexSeq?: numbe
 			processIncarnation: identity.processIncarnation,
 			hostIncarnation: identity.hostIncarnation,
 			lifecycleRequestId: identity.lifecycleRequestId,
-			...(identity.remoteCreateKey === undefined ? {} : { remoteCreateKey: identity.remoteCreateKey }),
+			remoteCreateKey: identity.remoteCreateKey,
 			...(indexSeq === undefined ? {} : { indexSeq }),
 		},
 	};
@@ -2011,8 +2011,7 @@ async function executeUncertainRetirement(
 	if (receipt) {
 		if (
 			receipt.identity.sessionId !== id ||
-			(receipt.identity.remoteCreateKey !== undefined &&
-				text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey) ||
+			text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey ||
 			!sameRetirementIdentityAsRecord(receipt.identity, record)
 		)
 			return fail("endpoint_stale", "Staged retirement identity no longer matches the indexed session authority.");
@@ -2024,8 +2023,8 @@ async function executeUncertainRetirement(
 		if (record.terminalUncertain !== true)
 			return fail("invalid_input", "session.reconcile_uncertain only accepts terminalUncertain create rows.");
 		const lifecycleRequestId = text(input.lifecycleRequestId);
-		const remoteCreateKey = input.remoteCreateKey === undefined ? undefined : text(input.remoteCreateKey);
-		if (input.remoteCreateKey !== undefined && remoteCreateKey === undefined)
+		const remoteCreateKey = text(input.remoteCreateKey);
+		if (remoteCreateKey === undefined)
 			return fail("invalid_input", "remoteCreateKey must be a bounded non-empty string.");
 		const matches = broker.ledger.listUncertainCreatesBySessionId(id, lifecycleRequestId, remoteCreateKey);
 		if (matches.length === 0)
@@ -2033,7 +2032,7 @@ async function executeUncertainRetirement(
 		if (matches.length !== 1)
 			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
 		create = matches[0]!;
-		const proof = retirementIdentityFromInput(input, record, create.identity, remoteCreateKey);
+		const proof = retirementIdentityFromInput(input, record, create.identity);
 		if (isLifecycleBrokerResponse(proof)) return proof;
 		retirementIdentity = proof;
 		if (
@@ -2046,13 +2045,7 @@ async function executeUncertainRetirement(
 			return fail("terminal_uncertain", "Session host exit could not be proven.");
 		if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
 			return fail("terminal_uncertain", "The indexed session endpoint still exists or is unsafe to inspect.");
-		const planned = retirementCleanupPlan(
-			retirementIdentity.stateRoot,
-			id,
-			create,
-			retirementIdentity,
-			remoteCreateKey,
-		);
+		const planned = retirementCleanupPlan(retirementIdentity.stateRoot, id, create, retirementIdentity);
 		if (isLifecycleBrokerResponse(planned)) return planned;
 		cleanup = planned;
 		await broker.ledger.transition(identity, "effect_started", {
@@ -2134,6 +2127,12 @@ async function executeUncertainRetirement(
 		cleanup = staged;
 		receipt = staged.uncertainRetirement;
 	}
+	if (!retirementCleanupSettled(cleanup))
+		return fail(
+			"cleanup_pending",
+			"Uncertain session retirement is pending because lifecycle cleanup is not durably settled.",
+			cleanup,
+		);
 
 	await broker.index.refresh();
 	record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
@@ -2149,6 +2148,12 @@ async function executeUncertainRetirement(
 		return fail(
 			"cleanup_pending",
 			"Uncertain session retirement is pending because the lifecycle parent identity changed.",
+			cleanup,
+		);
+	if (receipt.stage === "ledger" && (!receipt.indexSeq || !record.terminal || record.indexSeq !== receipt.indexSeq))
+		return fail(
+			"terminal_uncertain",
+			"Uncertain session retirement ledger replay lacks the durable session_closed index proof.",
 			cleanup,
 		);
 	if (receipt.stage === "index") {
@@ -3018,7 +3023,7 @@ function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetire
 		typeof identity.lifecycleRequestId === "string" &&
 		/^[A-Za-z0-9._-]+$/.test(identity.lifecycleRequestId) &&
 		boundedRetirementString(identity.createIdentity, 256) &&
-		(identity.remoteCreateKey === undefined || boundedRetirementString(identity.remoteCreateKey, 256))
+		boundedRetirementString(identity.remoteCreateKey, 256)
 	);
 }
 
@@ -5986,8 +5991,11 @@ export async function executeLifecycle(
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)
 		proofBudget = lifecycleProofBudgetFromEffectIntent(broker, broker.ledger.get(identity)?.effectIntent);
-	if (operation === "session.reconcile_uncertain" && cleanup && isLifecycleRetirementCleanup(cleanup))
+	if (operation === "session.reconcile_uncertain" && cleanup && isLifecycleRetirementCleanup(cleanup)) {
+		const shapeValidation = validateLifecycleCleanupShape(cleanup);
+		if (shapeValidation) return { response: shapeValidation };
 		return { response: await executeUncertainRetirement(broker, input, identity, cleanup) };
+	}
 	if (cleanup?.phase === "metadata") {
 		if (operation !== "session.delete")
 			return {

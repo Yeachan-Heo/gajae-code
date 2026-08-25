@@ -1334,6 +1334,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			globalResult: (operation, input) => {
 				if (operation === "session.create") return { ok: true, result: { cwd: root } };
 				if (operation !== "session.reconcile_uncertain") return undefined;
+
 				if (!validAcknowledgement) return { ok: true, result: { sessionId: "wrong-session", retired: true } };
 				return {
 					ok: true,
@@ -1458,6 +1459,13 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				...base,
 				idempotency_key: "missing-proof-key",
 				remote_create_key: undefined,
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		await expect(
+			server.callTool("gjc_coordinator_retire_start_session", {
+				...base,
+				idempotency_key: "malformed-marker-key",
+				lifecycle_request_id: "retire/effect",
 			}),
 		).resolves.toMatchObject({ ok: false, error: { code: "invalid_input" } });
 		await expect(
