@@ -59,6 +59,10 @@
 - Notification adapters can now opt into one live representation per native effect: adapters that accept a positioned event are excluded from its matching raw fan-out, while ordinary direct SDK and raw-only legacy subscribers retain their existing delivery. Telegram opts in, preventing turn output, tool activity, and reasoning summaries from rendering twice after #4570; acknowledged terminal shutdown delivery is unchanged.
 - Lean notifications no longer replay a retained completion receipt at idle when identical text was already delivered immediately before an autonomous `ask`; distinct receipts and other settlement windows remain preserved.
 - SDK prompts now publish a bounded structured terminal failure when a provider immediately returns HTTP 402 or 429. The accepted receipt remains non-terminal until the correlated `agent_end`, while `turn.result`/`turn.prompt_status` no longer strand the prompt as `in_flight`; replacement turns remain independently abortable and recoverable. (#4941)
+
+### Added
+
+- `gjc auth-gateway serve` now requires `--provider`, verifies an enabled broker credential before binding, and reports only redacted provider-scoped status/check information.
 ## [0.15.2] - 2026-08-25
 
 ### Changed
@@ -67,8 +71,6 @@
 
 ## [0.15.1] - 2026-08-25
 ### Added
-- `gjc auth-gateway serve` now requires `--provider`, verifies an enabled broker credential before binding, and reports only redacted provider-scoped status/check information.
-
 - Added `/language [en|ko]`, the interactive slash command for the persisted `ui.language` selection. Without arguments it reports the current language; with a canonical code, locale tag (`en-US`, `ko-KR`), endonym (`한국어`), English name, or common aliases (`eng`, `kr`, `kor`) it persists the canonical `en`/`ko` value through settings and confirms in the selected language. An unsupported value is rejected with the available list and changes nothing. See `docs/ui-language.md`.
 - Added a persisted, owner-directed `ui.language` selector for human-facing settings chrome, with deterministic English fallback and an independently authored initial Korean catalog. Commands, flags, environment variables, canonical values, JSON, and other protocol output remain unchanged. Localization-boundary guidance was informed by the unofficial, unaffiliated MIT-licensed community patch [`yazzang-homelab/gajae-code-ko@aff1bfa`](https://github.com/yazzang-homelab/gajae-code-ko/commit/aff1bfa097789a8e2f13349da3c7f99b008d93b6). (#4919)
 - Added frictionless interactive onboarding for unresolved users and `/tutorial`. GJC now performs bounded, local metadata discovery across known coding-agent roots, requires corroborating activity within 90 days before inferring a workflow, falls back to manual guidance when evidence is insufficient, persists only a derived profile and completion decision, discloses unavailable sources, and previews the guided migration result before a single explicit apply or experienced-user skip.
