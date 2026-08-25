@@ -8728,6 +8728,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					stateRoot === null ||
 					remoteCreateKey === null ||
 					lifecycleRequestId === null ||
+					!/^[A-Za-z0-9._-]+$/u.test(lifecycleRequestId) ||
 					processIncarnation === null ||
 					hostIncarnation === null ||
 					!path.isAbsolute(stateRoot) ||

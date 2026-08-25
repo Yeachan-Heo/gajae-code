@@ -799,4 +799,45 @@ describe("SessionLifecycleService", () => {
 		});
 		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "malformed_response" } });
 	});
+
+	it("canonicalizes equivalent proof paths before transport", async () => {
+		const client = new FakeLifecycleClient();
+		client.response = {
+			ok: true,
+			result: {
+				sessionId: "retired-session",
+				retired: true,
+				ledgerState: "terminal_error",
+				indexType: "session_closed",
+				stateRoot: "/tmp/workspace/.gjc/state",
+				endpointGeneration: 2,
+				endpointMtimeMs: 1,
+				processIncarnation: "linux:123",
+				hostIncarnation: "host:123",
+				lifecycleRequestId: "retire-effect",
+				remoteCreateKey: "remote-create-key",
+			},
+		};
+		const result = await new SessionLifecycleService(client).reconcileUncertain({
+			actor,
+			capability: "session.reconcile_uncertain",
+			requestKey: "retire-canonicalize",
+			target: {
+				sessionId: "retired-session",
+				cwd: "/tmp/workspace/../workspace",
+				stateRoot: "/tmp/workspace/../workspace/.gjc/state",
+				endpointGeneration: 2,
+				endpointMtimeMs: 1,
+				processIncarnation: "linux:123",
+				hostIncarnation: "host:123",
+				lifecycleRequestId: "retire-effect",
+				remoteCreateKey: "remote-create-key",
+			},
+		});
+		expect(result).toMatchObject({ ok: true, result: { sessionId: "retired-session" } });
+		expect(client.calls[0]?.input).toMatchObject({
+			cwd: "/tmp/workspace",
+			stateRoot: "/tmp/workspace/.gjc/state",
+		});
+	});
 });

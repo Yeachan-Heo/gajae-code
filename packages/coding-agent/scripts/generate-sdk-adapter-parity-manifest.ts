@@ -44,7 +44,8 @@ const required = [...commandFiles];
 const excluded: Manifest["excluded"] = [];
 const adapters = ["telegram", "discord", "slack", "mcp", "acp", "daemonCli"] as const;
 
-function expectedOutcome(disposition: AdapterDisposition): ManifestAdapterRow["expected"] {
+function expectedOutcome(disposition: AdapterDisposition, sdkId?: string): ManifestAdapterRow["expected"] {
+	if (sdkId === "session.reconcile_uncertain") return "rejected_before_send";
 	return disposition === "prohibited"
 		? "rejected_before_send"
 		: disposition === "machine_only" || disposition === "provider_only"
@@ -88,7 +89,9 @@ function row(adapter: Adapter, operation: (typeof OPERATIONS)[number], secret = 
 			"--test-name-pattern",
 			`^AD-${adapterTestPrefix(adapter)}-${operation.id}${suffix}:`,
 		],
-		expected: secret ? "rejected_before_send" : expectedOutcome(operation.adapterDispositions[adapter]),
+		expected: secret
+			? "rejected_before_send"
+			: expectedOutcome(operation.adapterDispositions[adapter], operation.sdkId),
 	};
 }
 

@@ -1449,6 +1449,13 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		await expect(
 			server.callTool("gjc_coordinator_retire_start_session", {
 				...base,
+				lifecycle_request_id: "bad/id",
+				idempotency_key: "invalid-marker-key",
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "invalid_input" } });
+		await expect(
+			server.callTool("gjc_coordinator_retire_start_session", {
+				...base,
 				idempotency_key: "missing-proof-key",
 				remote_create_key: undefined,
 			}),

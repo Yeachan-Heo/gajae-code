@@ -417,10 +417,12 @@ export function validateSessionReconcileUncertainTarget(value: unknown): value i
 		typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
 	return (
 		bounded(target.sessionId, 256) &&
+		/^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(target.sessionId) &&
 		bounded(target.cwd, 4096) &&
 		path.isAbsolute(target.cwd) &&
 		bounded(target.stateRoot, 4096) &&
 		path.isAbsolute(target.stateRoot) &&
+		path.resolve(target.stateRoot) === path.join(path.resolve(target.cwd), ".gjc", "state") &&
 		typeof target.endpointGeneration === "number" &&
 		Number.isSafeInteger(target.endpointGeneration) &&
 		target.endpointGeneration > 0 &&
@@ -690,13 +692,25 @@ export class SessionLifecycleService {
 		const validation = validateSessionLifecycleMutationRequest(request);
 		if (!validation.ok) return validation;
 		const { operation, actor, requestKey, target } = validation;
+		const normalizedTarget =
+			operation === "session.reconcile_uncertain"
+				? {
+						...target,
+						cwd: path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
+						stateRoot: path.join(
+							path.resolve((target as unknown as SessionReconcileUncertainTarget).cwd),
+							".gjc",
+							"state",
+						),
+					}
+				: target;
 		const idempotencyKey =
 			idempotencyKeyOverride ?? deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation);
 		let response: unknown;
 		try {
 			response = await this.#client.global(
 				operation,
-				{ ...target },
+				{ ...normalizedTarget },
 				{
 					idempotencyKey,
 					...(request.timeoutMs === undefined ? {} : { timeoutMs: request.timeoutMs }),
@@ -718,13 +732,16 @@ export class SessionLifecycleService {
 			operation === "session.close" ||
 			operation === "session.delete" ||
 			operation === "session.reconcile_uncertain"
-				? typeof target.sessionId === "string"
-					? target.sessionId
+				? typeof normalizedTarget.sessionId === "string"
+					? normalizedTarget.sessionId
 					: undefined
 				: undefined;
 		const parsed =
 			operation === "session.reconcile_uncertain"
-				? reconcileUncertainResult(brokerSuccess(response), target as unknown as SessionReconcileUncertainTarget)
+				? reconcileUncertainResult(
+						brokerSuccess(response),
+						normalizedTarget as unknown as SessionReconcileUncertainTarget,
+					)
 				: sessionResult(brokerSuccess(response), expectedSessionId);
 		if (!parsed)
 			return failure(

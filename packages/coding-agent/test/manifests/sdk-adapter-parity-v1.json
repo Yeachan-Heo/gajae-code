@@ -6022,7 +6022,7 @@
 				"--test-name-pattern",
 				"^AD-M-G08:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-G08",
@@ -6038,7 +6038,7 @@
 				"--test-name-pattern",
 				"^AD-A-G08:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-G08",
@@ -6054,7 +6054,7 @@
 				"--test-name-pattern",
 				"^AD-L-G08:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-Q01",
