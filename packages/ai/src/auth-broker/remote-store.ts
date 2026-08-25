@@ -170,6 +170,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#generation = 0;
 	#epoch?: string;
 	#retiredEpochs = new Set<string>();
+	#snapshotRefreshTail: Promise<void> = Promise.resolve();
 	#backgroundAbort = new AbortController();
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
@@ -380,17 +381,23 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		// A lower generation from a newer server timestamp is therefore a new
 		// broker epoch, while an older timestamp is an out-of-order response from
 		// the current epoch and must be discarded.
-		if (this.#epoch && snapshot.epoch && snapshot.epoch !== this.#epoch) {
-			if (this.#retiredEpochs.has(snapshot.epoch)) return;
-			this.#retiredEpochs.add(this.#epoch);
-			if (this.#retiredEpochs.size > 16) {
-				const oldest = this.#retiredEpochs.values().next().value;
-				if (typeof oldest === "string") this.#retiredEpochs.delete(oldest);
+		if (this.#epoch) {
+			if (!snapshot.epoch) return;
+			if (snapshot.epoch === this.#epoch) {
+				if (generation < this.#generation) return;
+			} else {
+				if (this.#retiredEpochs.has(snapshot.epoch)) return;
+				this.#retiredEpochs.add(this.#epoch);
 			}
-		} else if (generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) {
+		} else if (snapshot.epoch) {
+			// First epoch-bearing response establishes the authority namespace.
+		} else if (generation < this.#generation) {
 			return;
 		}
-		const generationChanged = generation !== this.#generation || this.#inventoryMetadataGeneration !== generation;
+		const generationChanged =
+			generation !== this.#generation ||
+			snapshot.epoch !== this.#epoch ||
+			this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
 		this.#epoch = snapshot.epoch ?? this.#epoch;
@@ -645,8 +652,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
 	async refreshSnapshot(): Promise<SnapshotResponse> {
-		const result = await this.#client.fetchSnapshot();
-		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+		const previous = this.#snapshotRefreshTail;
+		const refresh = previous.then(async () => {
+			const result = await this.#client.fetchSnapshot();
+			if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+		});
+		this.#snapshotRefreshTail = refresh.catch(() => {});
+		await refresh;
 		return this.#snapshot;
 	}
 
