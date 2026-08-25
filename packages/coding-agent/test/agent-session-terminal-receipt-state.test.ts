@@ -1,10 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as sidecar from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -21,6 +22,7 @@ let authStorage: AuthStorage | undefined;
 let tempDir: TempDir | undefined;
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await session?.dispose();
 	session = undefined;
 	authStorage?.close();
@@ -71,6 +73,37 @@ async function runResponse(content: string) {
 }
 
 describe("AgentSession terminal receipt state", () => {
+	it("publishes agent_end when terminal sidecar persistence fails", async () => {
+		tempDir = TempDir.createSync("@gjc-terminal-persistence-failure-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const terminal = Promise.withResolvers<void>();
+		const persist = vi
+			.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent")
+			.mockRejectedValue(new Error("simulated persistence failure"));
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+
+		await session.prompt("respond");
+		await terminal.promise;
+		expect(persist).toHaveBeenCalled();
+	});
+
 	it("writes present receipt truth through the real AgentSession event consumer", async () => {
 		expect(await runResponse("done")).toMatchObject({
 			state: "completed",

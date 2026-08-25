@@ -12,7 +12,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, Loader } from "@gajae-code/tui";
-import { logger, TempDir } from "@gajae-code/utils";
+import { logger, postmortem, TempDir } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
@@ -131,6 +131,22 @@ describe("interactive background activity indicator", () => {
 			releaseLock.resolve();
 			FileLockTestHooks.afterParentMkdir = previousHook;
 		}
+	});
+
+	it("escalates a second exit while graceful shutdown is blocked", async () => {
+		const flush = Promise.withResolvers<void>();
+		vi.spyOn(session.sessionManager, "flush").mockReturnValue(flush.promise);
+		const quit = vi.spyOn(postmortem, "quit").mockResolvedValue(undefined);
+
+		const firstShutdown = mode.shutdown();
+		await Bun.sleep(0);
+		await mode.shutdown();
+
+		expect(quit).toHaveBeenCalledWith(1);
+
+		flush.resolve();
+		await firstShutdown;
+		expect(quit).toHaveBeenCalledWith(0);
 	});
 
 	it("retires stale foreground activity across maintenance stop boundaries", async () => {

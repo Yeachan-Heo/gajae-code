@@ -3589,10 +3589,14 @@ export class AgentSession {
 			// behind this terminal transition, but do not make the interactive terminal
 			// wait for the filesystem-backed lock/write to settle. On slow or lock-hostile
 			// mounts such as WSL drvfs, waiting here leaves the foreground activity loader
-			// and busy input state visible after the model has already finished.
+			// and busy input state visible after the model has already finished. The queue
+			// preserves transaction order; terminal publication is the user-visible
+			// authority and must not be suppressed by a secondary persistence failure.
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending);
 			this.#emit(pending);
-			await terminalPersistence;
+			void terminalPersistence.catch(error => {
+				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+			});
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
 				undefined,
@@ -5058,7 +5062,8 @@ export class AgentSession {
 	 *
 	 * Called immediately BEFORE local delivery so a synchronous subscriber that re-enters
 	 * the session cannot get its own, later event persisted first. The returned promise is
-	 * only awaited where durability must precede delivery (terminal `agent_end`).
+	 * awaited only by callers that explicitly require a durable handoff; interactive
+	 * terminal delivery remains independent of this secondary sink.
 	 *
 	 * A pairing-only tool event takes no place in that order at all — neither its start nor
 	 * its end. It describes a call that was never dispatched, and this file is read as the
@@ -5134,8 +5139,12 @@ export class AgentSession {
 		if (event.type === "agent_end") {
 			// Start the durable terminal write before synchronous subscribers can
 			// re-enter prompt(), so a successor's running transition serializes after it.
-			await this.#queueCoordinatorRuntimeStatePersist(event);
+			// Do not let a lock-hostile sidecar suppress the terminal event itself.
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(event);
 			this.#emit(event);
+			void terminalPersistence.catch(error => {
+				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+			});
 			await this.#emitExtensionEvent(event);
 			return;
 		}

@@ -25,6 +25,23 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
+/** Release retries cover transient Windows/Dropbox handle denial without extending the lock indefinitely. */
+export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 5;
+export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 10;
+
+type LocalLockState = {
+	owner: FileLockOwnerToken;
+	status: "held" | "release_pending" | "releasing";
+	releasePromise?: Promise<void>;
+};
+
+/**
+ * Process-local ownership is deliberately separate from PID liveness. A PID only says
+ * that a process exists; this table says which exact acquisition generation this process
+ * created, so a nested contender cannot steal a lock from a still-running holder.
+ */
+const localLockStates = new Map<string, LocalLockState>();
+
 type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
@@ -51,6 +68,21 @@ export function processStartTime(pid: number): string | null {
 		}
 	}
 	try {
+		if (process.platform === "win32") {
+			const result = Bun.spawnSync(
+				[
+					"powershell.exe",
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					`$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -ne $p) { $p.StartTime.ToUniversalTime().ToString('o') }`,
+				],
+				{ stdout: "pipe", stderr: "ignore" },
+			);
+			if (result.exitCode !== 0) return null;
+			const startTime = new TextDecoder().decode(result.stdout).trim();
+			return startTime || null;
+		}
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
 		if (result.exitCode !== 0) return null;
 		const startTime = new TextDecoder().decode(result.stdout).trim();
@@ -84,11 +116,12 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 	return currentStartTime === null || currentStartTime === owner.start_time;
 }
 
-function lockInfo(ownerHostId?: string): LockInfo {
+function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo {
 	return {
 		pid: process.pid,
 		start_time: currentProcessStartTime(),
 		timestamp: Date.now(),
+		owner_token: ownerToken,
 		...(ownerHostId === undefined ? {} : { owner_host_id: ownerHostId }),
 	};
 }
@@ -107,7 +140,7 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, timestamp, owner_host_id } = parsed as Partial<LockInfo>;
+	const { pid, start_time, timestamp, owner_host_id, owner_token } = parsed as Partial<LockInfo>;
 	if (
 		typeof pid !== "number" ||
 		!Number.isInteger(pid) ||
@@ -115,10 +148,11 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 		typeof timestamp !== "number" ||
 		!Number.isFinite(timestamp) ||
 		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
-		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id))
+		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id)) ||
+		(owner_token !== undefined && (typeof owner_token !== "string" || !owner_token))
 	)
 		return null;
-	return { pid, start_time, timestamp, owner_host_id };
+	return { pid, start_time, timestamp, owner_host_id, owner_token };
 }
 
 /** @internal */
@@ -131,6 +165,8 @@ export interface FileLockOwnerToken {
 	pid: number;
 	start_time?: string;
 	owner_host_id?: string;
+	/** Unique acquisition generation, present on locks created by this runtime. */
+	owner_token?: string;
 	timestamp: number;
 }
 
@@ -180,6 +216,7 @@ export async function removeFileLockDirForGc(
 		current.pid !== expected.pid ||
 		(expected.start_time !== undefined && current.start_time !== expected.start_time) ||
 		current.owner_host_id !== expected.owner_host_id ||
+		(expected.owner_token !== undefined && current.owner_token !== expected.owner_token) ||
 		current.timestamp !== expected.timestamp
 	) {
 		return "owner_changed";
@@ -312,6 +349,7 @@ export async function genericFileLockDirIsStale(
 async function tryAcquireLock(
 	lockPath: string,
 	ownerHostId?: string,
+	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
 ): Promise<LockInfo | null> {
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
@@ -321,7 +359,7 @@ async function tryAcquireLock(
 		try {
 			await fs.mkdir(lockPath);
 			onAcquired?.();
-			return await writeLockInfo(lockPath, lockInfo());
+			return await writeLockInfo(lockPath, lockInfo(undefined, ownerToken));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
 			throw error;
@@ -329,7 +367,7 @@ async function tryAcquireLock(
 	}
 
 	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
-	const owner = lockInfo(ownerHostId);
+	const owner = lockInfo(ownerHostId, ownerToken);
 	try {
 		await fs.mkdir(pendingPath);
 		await writeLockInfo(pendingPath, owner);
@@ -355,9 +393,97 @@ async function tryAcquireLock(
 	}
 }
 
+function isTransientReleaseError(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException).code;
+	return code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY";
+}
+
+async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToken): Promise<boolean> {
+	const current = await readLockInfo(lockPath);
+	if (!current || current.owner_token !== owner.owner_token) return false;
+	const quarantinePath = `${lockPath}.quarantine.${process.pid}.${owner.owner_token ?? crypto.randomUUID()}`;
+	try {
+		await fs.rename(lockPath, quarantinePath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	const quarantined = await readLockInfo(quarantinePath);
+	if (!quarantined || quarantined.owner_token !== owner.owner_token) return false;
+	// The canonical lock path is free. Cleanup is best effort: retaining the quarantined
+	// record is safe and gives operators evidence when a filesystem refuses deletion.
+	void fs.rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
+	return true;
+}
+
+async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
+	let lastTransientError: unknown;
+	for (let attempt = 0; attempt < FILE_LOCK_RELEASE_RETRY_ATTEMPTS; attempt++) {
+		try {
+			const outcome = await removeFileLockDirForGc(lockPath, owner);
+			if (outcome === "removed" || outcome === "missing") {
+				if (outcome === "missing") throw new Error("Failed to release file lock: missing.");
+				return;
+			}
+			throw new Error(`Failed to release file lock: ${outcome}.`);
+		} catch (error) {
+			if (!isTransientReleaseError(error)) throw error;
+			lastTransientError = error;
+			if (attempt + 1 < FILE_LOCK_RELEASE_RETRY_ATTEMPTS) await Bun.sleep(FILE_LOCK_RELEASE_RETRY_DELAY_MS);
+		}
+	}
+	if (await quarantineReleasedLock(lockPath, owner)) return;
+	throw lastTransientError ?? new Error("Failed to release file lock: transient removal failure.");
+}
+
+async function retryPendingLocalRelease(lockPath: string): Promise<void> {
+	const key = path.resolve(lockPath);
+	const state = localLockStates.get(key);
+	if (!state || state.status === "held") return;
+	if (state.releasePromise) {
+		await state.releasePromise.catch(() => undefined);
+		return;
+	}
+	state.status = "releasing";
+	const releasePromise = releaseOwnedLock(lockPath, state.owner);
+	state.releasePromise = releasePromise;
+	try {
+		await releasePromise;
+		localLockStates.delete(key);
+	} catch (error) {
+		state.status = "release_pending";
+		throw error;
+	} finally {
+		if (state.releasePromise === releasePromise) state.releasePromise = undefined;
+	}
+}
+
 async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
-	const outcome = await removeFileLockDirForGc(lockPath, owner);
-	if (outcome !== "removed") throw new Error(`Failed to release file lock: ${outcome}.`);
+	const key = path.resolve(lockPath);
+	const state = localLockStates.get(key);
+	if (!state || state.owner.owner_token !== owner.owner_token) {
+		throw new Error("Failed to release file lock: local owner generation is unknown.");
+	}
+	if (state.status === "release_pending") {
+		await retryPendingLocalRelease(lockPath);
+		return;
+	}
+	if (state.releasePromise) {
+		await state.releasePromise;
+		return;
+	}
+	state.status = "releasing";
+	const releasePromise = releaseOwnedLock(lockPath, owner);
+	state.releasePromise = releasePromise;
+	try {
+		await releasePromise;
+		localLockStates.delete(key);
+	} catch (error) {
+		state.status = "release_pending";
+		throw error;
+	} finally {
+		if (state.releasePromise === releasePromise) state.releasePromise = undefined;
+	}
 }
 /**
  * Bounded, actionable description of who holds `lockPath` at exhaustion time.
@@ -410,11 +536,26 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
+	const localKey = path.resolve(lockPath);
+	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
-		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, opts.onAcquired);
-		if (owner) return () => releaseLock(lockPath, owner);
+		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, ownerToken, opts.onAcquired);
+		if (owner) {
+			localLockStates.set(localKey, { owner, status: "held" });
+			return () => releaseLock(lockPath, owner);
+		}
+		const localState = localLockStates.get(localKey);
+		if (localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
+			try {
+				await retryPendingLocalRelease(lockPath);
+				continue;
+			} catch {
+				// Keep contending below. A failed local retry is not authority to steal a
+				// lock; the owner generation remains fenced until release succeeds.
+			}
+		}
 		const stale = await staleLockSnapshot(
 			lockPath,
 			opts.staleMs,

@@ -426,6 +426,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	lastComposerClearEscapeTime = 0;
 	shutdownRequested = false;
 	#isShuttingDown = false;
+	#shutdownEscalated = false;
 	hookSelector: HookSelectorComponent | undefined = undefined;
 	hookInput: HookInputComponent | undefined = undefined;
 	hookEditor: HookEditorComponent | undefined = undefined;
@@ -1682,7 +1683,19 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async shutdown(): Promise<void> {
-		if (this.#isShuttingDown) return;
+		if (this.#isShuttingDown) {
+			// A second explicit exit is an escalation, not another silent no-op. The
+			// graceful path may be waiting on a lock-hostile filesystem; postmortem.quit
+			// has its own bounded cleanup deadline and will force the process out even
+			// when the first shutdown cannot finish.
+			if (!this.#shutdownEscalated) {
+				this.#shutdownEscalated = true;
+				logger.warn("Escalating repeated interactive shutdown request");
+				this.session.abort();
+				void postmortem.quit(1);
+			}
+			return;
+		}
 		this.#isShuttingDown = true;
 
 		// `/btw` owns the shared composer while its panel is open. Never persist a

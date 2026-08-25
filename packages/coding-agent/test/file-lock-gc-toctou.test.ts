@@ -213,6 +213,65 @@ describe("host-qualified file lock publication", () => {
 	});
 });
 describe("file lock cleanup failure handling (#2478)", () => {
+	test("retries transient Windows release denial before reporting success", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realRm = fs.rm;
+		let denied = true;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (denied && String(target) === lockDir) {
+				denied = false;
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			}
+			return await realRm(target, options);
+		}) as typeof fs.rm);
+
+		await withFileLock(lockedFile, async () => {});
+
+		expect(await fs.exists(lockDir)).toBe(false);
+		expect(denied).toBe(false);
+	});
+
+	test("quarantines a self-owned lock when transient release denial persists", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (String(target) === lockDir) throw Object.assign(new Error("sharing violation"), { code: "EBUSY" });
+			return await realRm(target, options);
+		}) as typeof fs.rm);
+
+		await withFileLock(lockedFile, async () => {});
+
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("reclaims a self-owned release leak on the next same-process acquisition", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (String(target) === lockDir) throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			return await realRm(target, options);
+		}) as typeof fs.rm);
+		vi.spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("sharing violation"), { code: "EPERM" }));
+
+		await expect(withFileLock(lockedFile, async () => {})).rejects.toThrow("sharing violation");
+		expect(await fs.exists(lockDir)).toBe(true);
+
+		vi.restoreAllMocks();
+		let entered = false;
+		await withFileLock(lockedFile, async () => {
+			entered = true;
+		});
+
+		expect(entered).toBe(true);
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
 	test("does not reap a stale lock when its metadata read fails unexpectedly", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
