@@ -348,7 +348,7 @@ async function serveSnapshot(
 
 	if (
 		clientGeneration === undefined ||
-		clientTag?.epoch !== epoch ||
+		(includeEpoch && clientTag?.epoch !== epoch) ||
 		currentGeneration !== clientGeneration ||
 		waitMs <= 0
 	) {

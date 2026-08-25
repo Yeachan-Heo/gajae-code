@@ -273,6 +273,13 @@ describe("auth-broker wire surface", () => {
 		const legacyBody = (await legacy.json()) as { epoch?: string; generation: number };
 		expect(legacyBody.epoch).toBeUndefined();
 		expect(legacy.headers.get("etag")).toBe(`"${legacyBody.generation}"`);
+		const legacyUnchanged = await fetch(`${handle!.url}/v1/snapshot?wait=10`, {
+			headers: {
+				Authorization: `Bearer ${token}`,
+				"If-None-Match": `"${legacyBody.generation}"`,
+			},
+		});
+		expect(legacyUnchanged.status).toBe(304);
 
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const unchanged = await client.fetchSnapshot({
