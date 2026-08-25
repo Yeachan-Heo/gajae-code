@@ -741,6 +741,22 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				},
 			});
 		}
+		if (bridgeIntentWritten && bridgeLedgerAfter !== undefined) {
+			await writeIntent(deps.paths.intentRecord, {
+				version: INTENT_VERSION,
+				step: "skills-bridge",
+				targetPath: deps.paths.bridgeDir,
+				ownedKeys: ["paseo.skills-bridge"],
+				targetPreflightIdentity: provenanceLedgerIdentity(bridgeLedger),
+				targetExpectedIdentity: provenanceLedgerIdentity(bridgeLedger),
+				provenancePath: deps.paths.provenanceLedger,
+				provenancePreflightIdentity: await currentIdentity(deps.paths.provenanceLedger),
+				provenanceExpectedIdentity: provenanceLedgerIdentity(bridgeLedgerAfter),
+				provenancePayload: bridgeLedgerAfter,
+				bridgePreflightPayload: bridgeLedger,
+				startedAt: now.toISOString(),
+			});
+		}
 
 		// Step 4: register the bridge with GJC skill discovery -- only when the
 		// bridge was validated against a real source this run. Registering an
