@@ -207,6 +207,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#streamingActive = false;
 	/** Latched once the broker has answered 404 — never try the stream again. */
 	#streamingUnsupported = false;
+	#loadingInitialSnapshot = true;
+	#snapshotAuthoritative = false;
 
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
@@ -214,6 +216,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#presentationPath = opts.presentationPath ?? defaultPresentationSidecarPath();
 		this.#presentationAuthority = createHash("sha256").update(this.#client.baseUrl).digest("hex");
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0, false);
+		this.#loadingInitialSnapshot = false;
+		this.#snapshotAuthoritative = opts.initialSnapshot !== undefined;
 		this.#setInventoryState("pending", this.#generation, {
 			status: "pending",
 			reason: "credential metadata sync pending",
@@ -275,9 +279,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (!record.health && !record.usage) continue;
 				this.#persistedPresentations.set(key, record);
 			}
-			this.#reconcilePersistedPresentations();
-			this.#hydratePresentations();
-			this.#queuePresentationWrite();
+			if (this.#snapshotAuthoritative) {
+				this.#reconcilePersistedPresentations();
+				this.#hydratePresentations();
+				this.#queuePresentationWrite();
+			}
 		} catch (error) {
 			logger.debug("auth-broker presentation sidecar invalid", { error: String(error) });
 		}
@@ -418,6 +424,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
+		if (!this.#loadingInitialSnapshot) this.#snapshotAuthoritative = true;
 		this.#epoch = snapshot.epoch ?? this.#epoch;
 		this.#snapshotReceivedAt = Date.now();
 		if (generationChanged) {
@@ -440,8 +447,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (scheduleMetadata) this.#scheduleInventoryMetadataSync();
 			}
 		}
-		this.#reconcilePersistedPresentations();
-		this.#hydratePresentations();
+		if (this.#snapshotAuthoritative) {
+			this.#reconcilePersistedPresentations();
+			this.#hydratePresentations();
+		}
 		for (const listener of this.#snapshotListeners) listener();
 		return true;
 	}
