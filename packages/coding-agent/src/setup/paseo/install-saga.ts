@@ -360,6 +360,8 @@ export interface RecoverIntentOptions {
 	readonly expectedProvenancePath?: string;
 	/** Replays a detached bridge authority before clearing a repaired intent. */
 	readonly replayBridgeCleanup?: (authority: BridgeCleanupAuthority) => Promise<void>;
+	/** Bridge roots authenticated by the active setup caller. */
+	readonly trustedBridgePaths?: readonly string[];
 }
 
 async function bridgeLedgerMatchesFilesystem(
@@ -596,17 +598,20 @@ export async function recoverIntent(
 		if (after?.bridgeCleanupPending !== undefined && options.replayBridgeCleanup !== undefined) {
 			const currentLedger = await readProvenance(intent.provenancePath);
 			const currentPending = currentLedger.bridgeCleanupPending;
-			if (currentPending === undefined || JSON.stringify(currentPending) !== JSON.stringify(after.bridgeCleanupPending)) {
+			if (currentPending === undefined && settledAfter !== undefined && ledgerObserved === settledAfter) {
+				await clearIntent(intentPath);
+				return { recovered: true, detail: "the pending bridge cleanup already settled before intent clearance" };
+			}
+			if (
+				currentPending === undefined ||
+				JSON.stringify(currentPending) !== JSON.stringify(after.bridgeCleanupPending)
+			) {
 				return {
 					recovered: false,
 					detail: `the durable pending bridge cleanup authority changed before replay; refusing to overwrite it`,
 				};
 			}
-			const allowedPaths = [
-				intent.targetPath,
-				currentLedger.bridgePath,
-				currentPending.originalPath,
-			].filter((value): value is string => value !== undefined);
+			const allowedPaths = options.trustedBridgePaths ?? [intent.targetPath];
 			if (
 				!allowedPaths.some(value => path.resolve(value) === path.resolve(after.bridgeCleanupPending!.originalPath))
 			) {

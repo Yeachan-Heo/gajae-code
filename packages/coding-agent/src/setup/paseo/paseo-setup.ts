@@ -112,6 +112,20 @@ async function canonicalPathForComparison(value: string): Promise<string> {
 	}
 }
 
+async function trustedBridgePathsForRecovery(deps: PaseoSetupDependencies): Promise<readonly string[]> {
+	const paths = [deps.paths.bridgeDir];
+	const ledger = await readProvenance(deps.paths.provenanceLedger);
+	if (ledger.bridgePath !== undefined) {
+		try {
+			paths.push(await validatedBridgeDir(ledger, deps));
+		} catch {
+			// The active recovery path will report malformed ownership; do not add
+			// an unauthenticated ledger path to the replay allow-list.
+		}
+	}
+	return [...new Set(await Promise.all(paths.map(value => canonicalPathForComparison(value))))];
+}
+
 /**
  * Reject flag combinations that have no coherent meaning.
  *
@@ -149,6 +163,7 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 				expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 				expectedProvenancePath: deps.paths.provenanceLedger,
 				replayBridgeCleanup: authority => replayBridgeCleanup(authority),
+				trustedBridgePaths: await trustedBridgePathsForRecovery(deps),
 			});
 			if (recovery && !recovery.recovered) {
 				return {
@@ -225,6 +240,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 		expectedProvenancePath: deps.paths.provenanceLedger,
 		replayBridgeCleanup: authority => replayBridgeCleanup(authority),
+		trustedBridgePaths: await trustedBridgePathsForRecovery(deps),
 	});
 	if (recovery && !recovery.recovered) {
 		return {
