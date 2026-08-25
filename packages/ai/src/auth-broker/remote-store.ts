@@ -1346,9 +1346,7 @@ function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
 	const sanitize = (value: string): string =>
-		value
-			.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
-			.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
+		(cleanReason(value) ?? "Usage unavailable.")
 			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
 			.replace(/\s+/g, " ")
 			.trim()
