@@ -384,6 +384,16 @@ async function bridgeLedgerMatchesFilesystem(
 		return (original === undefined && detached !== undefined) || (original === undefined && detached === undefined);
 	};
 	const bridgePath = ledger.bridgePath;
+	if (ledger.bridgeCleanupPending !== undefined) {
+		const pendingMatches = await cleanupPendingMatches();
+		if (
+			pendingMatches &&
+			(bridgePath === undefined ||
+				path.resolve(bridgePath) === path.resolve(ledger.bridgeCleanupPending.originalPath))
+		) {
+			return true;
+		}
+	}
 	if (bridgePath === undefined) {
 		if ((ledger.bridgeEntries?.length ?? 0) !== 0) return false;
 		if (targetPath !== undefined) {

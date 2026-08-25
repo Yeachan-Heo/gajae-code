@@ -58,6 +58,7 @@ import {
 	inverseSkillsBridge,
 	legacySourceDirFor,
 	preflightSkillsBridge,
+	replayBridgeCleanup,
 	registerSkillsBridgeDirectory,
 	SkillsBridgeError,
 	SkillsBridgePartialError,
@@ -919,6 +920,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						migratedOldBridgeDir!,
 						migratedOldEntries,
 						bridgeLedger.bridgeDirCreated === true,
+						bridgeLedger.bridgeCleanupPending,
 					);
 					if (restored.status === "reverted") {
 						compensatedOldBridgeEntryIdentities = {
@@ -1072,6 +1074,7 @@ async function restoreMigratedOldBridgeEntries(
 	bridgeDir: string,
 	entries: readonly MigratedOldBridgeEntry[],
 	bridgeDirCreated: boolean,
+	pendingAuthority: BridgeCleanupAuthority | undefined,
 ): Promise<
 	| {
 			readonly status: "reverted";
@@ -1085,6 +1088,17 @@ async function restoreMigratedOldBridgeEntries(
 		entries.map(entry => [entry.name, entry.identity]),
 	);
 	try {
+		if (pendingAuthority !== undefined) {
+			try {
+				await replayBridgeCleanup(pendingAuthority);
+			} catch (error) {
+				return {
+					status: "conflict",
+					detail: `old Paseo bridge cleanup authority could not be replayed during compensation: ${error instanceof Error ? error.message : String(error)}`,
+					retained: [bridgeDir, pendingAuthority.detachedPath],
+				};
+			}
+		}
 		const existingDirectory = await fs.lstat(bridgeDir, { bigint: true }).catch(error => {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;

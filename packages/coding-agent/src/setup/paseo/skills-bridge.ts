@@ -117,9 +117,13 @@ async function assertRecordedMigrationIdentities(
 ): Promise<readonly SkillsBridgeAmbiguity[]> {
 	const ambiguities: SkillsBridgeAmbiguity[] = [];
 	const recordedBridgeDir = ledger.bridgePath;
+	const [recordedCanonical, configuredCanonical] = await Promise.all([
+		recordedBridgeDir === undefined ? undefined : canonicalPathForComparison(recordedBridgeDir),
+		canonicalPathForComparison(deps.paths.bridgeDir),
+	]);
 	if (
 		recordedBridgeDir === undefined ||
-		path.resolve(recordedBridgeDir) === path.resolve(deps.paths.bridgeDir) ||
+		recordedCanonical === configuredCanonical ||
 		(ledger.bridgeEntries?.length ?? 0) === 0
 	)
 		return ambiguities;
@@ -379,6 +383,17 @@ function resolvedLinkTarget(link: string, destination: string): string {
 	return path.resolve(path.dirname(destination), link);
 }
 
+async function canonicalPathForComparison(value: string): Promise<string> {
+	const absolute = path.resolve(value);
+	try {
+		return await fs.realpath(absolute);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		const parent = await fs.realpath(path.dirname(absolute)).catch(() => path.dirname(absolute));
+		return path.join(parent, path.basename(absolute));
+	}
+}
+
 async function entryState(
 	destination: string,
 	expected: string,
@@ -533,6 +548,10 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	});
 	const wanted = new Set(names);
 	const sourceChanged = path.resolve(sourceDir) !== path.resolve(ownershipSourceDir);
+	const [recordedBridgeCanonical, configuredBridgeCanonical] = await Promise.all([
+		ledger.bridgePath === undefined ? undefined : canonicalPathForComparison(ledger.bridgePath),
+		canonicalPathForComparison(deps.paths.bridgeDir),
+	]);
 	const ambiguity = (name: string, destination: string, detail: string, blocksBridgeCutover = sourceChanged) => {
 		ambiguities.push({ name, linkPath: destination, detail, blocksBridgeCutover });
 	};
@@ -543,7 +562,7 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 		const state = directory === "absent" ? { kind: "absent" as const } : await entryState(destination, target);
 		const recordedAtCurrentBridge =
 			recordedEntries.has(name) &&
-			(ledger.bridgePath === undefined || path.resolve(ledger.bridgePath) === path.resolve(deps.paths.bridgeDir));
+			(ledger.bridgePath === undefined || recordedBridgeCanonical === configuredBridgeCanonical);
 		if (state.kind === "conflict") {
 			// A recorded link whose text still resolves into the ownership source
 			// (the ledger's own record, or the legacy location for a legacy
