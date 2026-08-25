@@ -664,5 +664,6 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		expect(cleanReason('{"\\u0061ccess_token":"unicode-escaped-secret"}')).toBe("Credential diagnostic unavailable.");
 		expect(cleanReason("authorization_header=header-secret")).not.toContain("header-secret");
 		expect(cleanReason("Authorization: Token multi-token-secret")).toBe("Credential diagnostic unavailable.");
+		expect(cleanReason('{"Authorization": Token multi-token-secret}')).toBe("Credential diagnostic unavailable.");
 	});
 });
