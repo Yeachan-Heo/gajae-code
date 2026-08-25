@@ -649,23 +649,21 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
 	});
 
-	it("reclaims a legacy directory lock with no readable owner only once it is stale", async () => {
-		const { root, stateFile } = await seededRunningSession("lock-malformed-directory");
+	it("fails closed on a legacy directory lock with no readable owner", async () => {
+		const { stateFile } = await seededRunningSession("lock-malformed-directory");
 		const lockFile = `${stateFile}.lock`;
 		await fs.mkdir(lockFile, { recursive: true });
 		await Bun.write(path.join(lockFile, "info"), "not-json");
 
-		// Fresh: nothing proves the owner is gone, so the directory stays.
+		// Neither freshness nor staleness proves that an unreadable owner is gone.
 		await reclaimStaleSessionStateLock(lockFile);
 		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
 
 		const stale = new Date(Date.now() - 60_000);
 		await fs.utimes(lockFile, stale, stale);
-		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
-
-		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-		await expectReleasedOwner(lockFile);
-		expectReleasedTransition(lockFile);
+		await reclaimStaleSessionStateLock(lockFile);
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+		expect((await readJson(stateFile)).activity).toBeUndefined();
 	});
 
 	it("refuses to delete a legacy directory whose owner token changed", async () => {
