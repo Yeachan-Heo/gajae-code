@@ -1,7 +1,9 @@
 import * as crypto from "node:crypto";
+import { createHash } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NativeDirectoryTreeResult, NativeExactUnlinkResult } from "@gajae-code/natives";
 import { hasFsCode, isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
@@ -46,6 +48,7 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
+	nativeQuarantineBindings?: () => NativeFileLockBindings;
 } = {};
 
 /**
@@ -111,7 +114,7 @@ function cachedProcessStartTime(owner: FileLockOwnerToken, cache?: Map<string, s
 
 function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
 	if (ownerLiveness(owner.pid) !== "alive") return false;
-	if (!owner.start_time) return true;
+	if (!owner.start_time || owner.start_time === "unknown") return true;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
 	return currentStartTime === null || currentStartTime === owner.start_time;
 }
@@ -398,22 +401,58 @@ function isTransientReleaseError(error: unknown): boolean {
 	return code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY";
 }
 
-async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToken): Promise<boolean> {
-	const current = await readLockInfo(lockPath);
-	if (!current || current.owner_token !== owner.owner_token) return false;
-	const quarantinePath = `${lockPath}.quarantine.${process.pid}.${owner.owner_token ?? crypto.randomUUID()}`;
+type NativeFileLockBindings = {
+	snapshotDirectoryTree(lockPath: string): NativeDirectoryTreeResult;
+	exactRemoveDirectoryTree(
+		lockPath: string,
+		snapshot: NonNullable<NativeDirectoryTreeResult["snapshot"]>,
+	): NativeExactUnlinkResult;
+};
+
+let nativeFileLockBindingCache: NativeFileLockBindings | undefined;
+
+function nativeFileLockBindings(): NativeFileLockBindings {
+	if (FileLockTestHooks.nativeQuarantineBindings) return FileLockTestHooks.nativeQuarantineBindings();
+	if (nativeFileLockBindingCache) return nativeFileLockBindingCache;
 	try {
-		await fs.rename(lockPath, quarantinePath);
+		nativeFileLockBindingCache = require("@gajae-code/natives") as NativeFileLockBindings;
+		return nativeFileLockBindingCache;
+	} catch (error) {
+		throw Object.assign(new Error("Native identity-bound lock quarantine is unavailable."), { cause: error });
+	}
+}
+
+async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToken): Promise<boolean> {
+	let captured: NativeDirectoryTreeResult;
+	try {
+		captured = nativeFileLockBindings().snapshotDirectoryTree(lockPath);
 	} catch (error) {
 		if (isTransientReleaseError(error)) return false;
 		throw error;
 	}
-	const quarantined = await readLockInfo(quarantinePath);
-	if (!quarantined || quarantined.owner_token !== owner.owner_token) return false;
-	// The canonical lock path is free. Cleanup is best effort: retaining the quarantined
-	// record is safe and gives operators evidence when a filesystem refuses deletion.
-	void fs.rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
-	return true;
+	if (!captured.ok || !captured.snapshot) return false;
+	const infoEntry = captured.snapshot.entries.find(entry => entry.relativePath === "info");
+	if (!infoEntry?.sha256) return false;
+	// Bind the owner generation to the snapshot before exact removal. A successor
+	// installed after this snapshot is rejected by the native identity check instead of
+	// being moved into quarantine by a pathname-only rename.
+	const expectedDigest = createHash("sha256").update(JSON.stringify(owner)).digest("hex");
+	if (infoEntry.sha256 !== expectedDigest) return false;
+	let removed: NativeExactUnlinkResult;
+	try {
+		removed = nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, captured.snapshot);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
+	if (removed.ok || removed.code === "not_found") return true;
+	return (
+		removed.code === "cleanup_pending" &&
+		removed.payloadDurable === true &&
+		removed.detachedPath !== undefined &&
+		removed.retainedSuccessorPath === undefined &&
+		removed.retainedUnknownPath === undefined
+	);
 }
 
 async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {

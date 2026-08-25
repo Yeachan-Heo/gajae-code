@@ -3,7 +3,8 @@ import { writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { removeFileLockDirForGc, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
+import { snapshotDirectoryTree } from "@gajae-code/natives";
+import { FileLockTestHooks, removeFileLockDirForGc, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 
@@ -14,6 +15,7 @@ const tempDirs: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
 	}
@@ -163,6 +165,22 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
+	test("preserves a live holder whose start time is explicitly unknown", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir, { recursive: true });
+		await fs.writeFile(
+			path.join(lockDir, "info"),
+			JSON.stringify({ pid: process.pid, start_time: "unknown", timestamp: Date.now() - 10_000 }),
+		);
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
 	test("rejects after successful protected work when ownership is lost during release", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
@@ -257,7 +275,12 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			if (String(target) === lockDir) throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
 			return await realRm(target, options);
 		}) as typeof fs.rm);
-		vi.spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("sharing violation"), { code: "EPERM" }));
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			},
+		});
 
 		await expect(withFileLock(lockedFile, async () => {})).rejects.toThrow("sharing violation");
 		expect(await fs.exists(lockDir)).toBe(true);
