@@ -291,7 +291,7 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 			previousResponseId: options.previousResponseId,
 			seed: options.seed,
 			hasLogitBias: options.logitBias !== undefined,
-			user: options.user,
+			hasUser: options.user !== undefined,
 			hasResponseFormat: options.responseFormat !== undefined,
 		});
 	}
