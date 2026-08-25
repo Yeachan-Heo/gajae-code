@@ -959,7 +959,18 @@ async function handleCredentialsCheck(
 	provider: Provider,
 	signal: AbortSignal,
 ): Promise<Response> {
-	const credentials = (await storage.checkCredentials({ provider, signal })).filter(row => row.provider === provider);
+	const credentials = (await storage.checkCredentials({ provider, signal }))
+		.filter(row => row.provider === provider)
+		.map(row => ({
+			id: row.id,
+			provider: row.provider,
+			type: row.type,
+			...(row.email ? { email: row.email } : {}),
+			...(row.accountId ? { accountId: row.accountId } : {}),
+			...(row.remoteRefresh ? { remoteRefresh: true as const } : {}),
+			ok: row.ok,
+			...(row.reason ? { reason: cleanReason(row.reason) } : {}),
+		}));
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 

@@ -655,7 +655,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			index === -1
 				? [...this.#snapshot.credentials, entry]
 				: this.#snapshot.credentials.map((candidate, i) => (i === index ? entry : candidate));
-		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
+		this.#applySnapshot(
+			{ ...this.#snapshot, epoch: epoch ?? this.#snapshot.epoch, generation, serverNowMs, refresher, credentials },
+			generation,
+		);
 	}
 
 	#removeStreamCredential(
@@ -666,7 +669,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		epoch?: string,
 	): void {
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
+		this.#applySnapshot(
+			{ ...this.#snapshot, epoch: epoch ?? this.#snapshot.epoch, generation, serverNowMs, refresher, credentials },
+			generation,
+		);
 	}
 
 	/**
