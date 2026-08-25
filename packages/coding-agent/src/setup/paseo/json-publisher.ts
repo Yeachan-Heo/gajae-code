@@ -245,6 +245,7 @@ export async function publishPlan(
 	const tempPath = path.join(directory, `.${path.basename(targetPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
 	const mode = await sourceMode(targetPath);
 	let tempRetained = false;
+	let tempConsumed = false;
 	try {
 		const handle = await fs.open(tempPath, "wx+", mode);
 		let sourceIdentity: NativeExactFileIdentity | undefined;
@@ -278,6 +279,7 @@ export async function publishPlan(
 					tempRetained ? [tempPath] : [],
 				);
 			}
+			tempConsumed = true;
 		} else {
 			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, expectedDestinationIdentity);
 			if (!replaced.ok) {
@@ -302,6 +304,7 @@ export async function publishPlan(
 					],
 				);
 			}
+			tempConsumed = true;
 		}
 		await syncParentDirectory(directory);
 	} catch (error) {
@@ -321,7 +324,7 @@ export async function publishPlan(
 		}
 		throw error;
 	} finally {
-		if (!tempRetained) await fs.rm(tempPath, { force: true }).catch(() => undefined);
+		if (!tempRetained && !tempConsumed) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
 
 	return { published: true, backupPath, identity: plan.expectedIdentity };
@@ -459,13 +462,12 @@ async function copyPrivately(from: string, to: string, sourceBytes?: string): Pr
 		await syncParentDirectory(path.dirname(to));
 	} catch (error) {
 		if (ownsBackup) {
-			const removed =
-				(capturedIdentity !== undefined && (await removePrivateBackupByIdentity(to, capturedIdentity))) ||
-				(await removePrivateBackupIfExact(to, Buffer.from(bytes, "utf8")));
+			const removed = capturedIdentity !== undefined && (await removePrivateBackupByIdentity(to, capturedIdentity));
 			if (!removed) {
-				throw new AggregateError(
-					[error],
-					`private backup publication failed and the credential-bearing backup remains retained at ${to}`,
+				throw new PaseoPublishError(
+					from,
+					{ reason: "cas-conflict", expected: hashBytes(bytes), actual: await currentIdentity(from) },
+					[to],
 				);
 			}
 		}
