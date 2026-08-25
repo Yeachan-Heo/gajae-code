@@ -965,8 +965,6 @@ async function handleCredentialsCheck(
 			id: row.id,
 			provider: row.provider,
 			type: row.type,
-			...(row.email ? { email: row.email } : {}),
-			...(row.accountId ? { accountId: row.accountId } : {}),
 			...(row.remoteRefresh ? { remoteRefresh: true as const } : {}),
 			ok: row.ok,
 			...(row.reason
