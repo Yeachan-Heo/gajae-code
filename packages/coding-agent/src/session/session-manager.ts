@@ -16706,6 +16706,16 @@ export class SessionManager {
 	#assertRecoveryHydrationWritable(): void {
 		if (this.#recoveryHydrationContext) throw new Error("recovery_hydration_not_promoted");
 	}
+	/**
+	 * Identity-less committed managed mutations are sticky: the canonical file may
+	 * already contain bytes that cannot be bound to a descriptor. Do not alter the
+	 * resident graph while that outcome is unresolved, because a later rewrite
+	 * could make the stale predecessor authoritative again.
+	 */
+	#assertResidentMutationWritable(): void {
+		this.#assertRecoveryHydrationWritable();
+		if (this.#persistError) throw this.#persistError;
+	}
 	async setSessionName(name: string, source: "auto" | "user" = "auto"): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
 		if (this.#persistError) throw this.#persistError;
@@ -17470,7 +17480,7 @@ export class SessionManager {
 	 * the canonical store. This applies such mutations for real.
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
-		this.#assertRecoveryHydrationWritable();
+		this.#assertResidentMutationWritable();
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
@@ -17491,7 +17501,7 @@ export class SessionManager {
 		entries: readonly CustomMessageEntry[],
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
-		this.#assertRecoveryHydrationWritable();
+		this.#assertResidentMutationWritable();
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
@@ -17750,7 +17760,7 @@ export class SessionManager {
 	}
 
 	evictCompactedContent(firstKeptEntryId: string, compactionEntryId: string): EvictCompactedContentResult {
-		this.#assertRecoveryHydrationWritable();
+		this.#assertResidentMutationWritable();
 		if (this.#coldSidecarActive()) this.#deactivateColdForBranchMutation();
 		const firstKept = this.#byId.get(firstKeptEntryId);
 		const compaction = this.#byId.get(compactionEntryId);

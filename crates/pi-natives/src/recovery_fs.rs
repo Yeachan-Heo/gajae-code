@@ -126,6 +126,14 @@ static REPLACE_BEFORE_IN_PLACE_WRITE_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static REPLACE_AFTER_FINAL_NAME_CHECK_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+static REPLACE_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 fn set_append_after_final_sync_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 	*APPEND_AFTER_FINAL_SYNC_HOOK
 		.get_or_init(|| std::sync::Mutex::new(None))
@@ -164,6 +172,27 @@ fn pause_replace_before_in_place_write_for_test() {
 	{
 		entered.send(()).expect("replace in-place hook receiver");
 		resume.recv().expect("replace in-place hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_replace_after_final_name_check_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*REPLACE_AFTER_FINAL_NAME_CHECK_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_replace_after_final_name_check_for_test() {
+	if let Some((entered, resume)) = REPLACE_AFTER_FINAL_NAME_CHECK_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered.send(()).expect("replace final-name hook receiver");
+		resume.recv().expect("replace final-name hook resume");
 	}
 }
 
@@ -3066,10 +3095,30 @@ fn replace_managed(
 	}
 	#[cfg(test)]
 	pause_replace_before_in_place_write_for_test();
+	// Re-authenticate the retained descriptor immediately before the destructive
+	// truncate. The first check above protects the open/name binding; this second
+	// digest check closes the stale same-inode content window where an
+	// uncoordinated writer changes the object without changing its inode.
+	let expected_matches_before_truncate = match same_expected(
+		&file,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_mtime_ns,
+		expected_ctime_ns,
+		expected_sha256,
+	) {
+		Ok(matches) => matches,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	if !expected_matches_before_truncate {
+		return publish_preflight_failure_with_primitive("identity_mismatch", primitive);
+	}
 
 	let committed_failure = |code: &'static str, phase: &'static str| {
 		publish_post_mutation_failure_with_primitive(code, phase, primitive, None)
 	};
+	let expected_digest = hex_digest(Sha256::digest(data).into());
 	// SAFETY: file is a validated regular file descriptor opened by this routine.
 	if unsafe { libc::ftruncate(file.as_raw_fd(), 0) } != 0 {
 		return committed_failure("io_error", "file_sync");
@@ -3080,7 +3129,7 @@ fn replace_managed(
 	if file.sync_all().is_err() {
 		return committed_failure("fsync_failed", "file_sync");
 	}
-	let mut terminal = match regular_identity(&file) {
+	let terminal = match regular_identity(&file) {
 		Ok(identity) => identity,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
@@ -3092,15 +3141,59 @@ fn replace_managed(
 		Ok(named) => named,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	if digest != hex_digest(Sha256::digest(data).into())
-		|| !stat_matches_regular_identity(&named_after, &terminal)
+	if digest != expected_digest || !stat_matches_regular_identity(&named_after, &terminal) {
+		return committed_failure("identity_mismatch", "terminal_identity");
+	}
+	// A canonical successor can replace the name after the first terminal check.
+	// Keep this seam deterministic in tests, then repeat the descriptor/digest/name
+	// proof before any success receipt is constructed; the retained predecessor is
+	// evidence only once it is no longer canonical.
+	#[cfg(test)]
+	pause_replace_after_final_name_check_for_test();
+	let terminal_after = match regular_identity(&file) {
+		Ok(identity) => identity,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	let digest_after = match digest_hex(&file) {
+		Ok(digest) => digest,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	let named_after_final = match statat(&parent, &name) {
+		Ok(named) => named,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	if terminal_after != terminal
+		|| digest_after != expected_digest
+		|| !stat_matches_regular_identity(&named_after_final, &terminal_after)
 	{
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
-	terminal.sha256 = Some(digest);
 	if sync_parent(&parent).is_err() {
 		return committed_failure("fsync_failed", "destination_parent_sync");
 	}
+	// The parent sync is the durability boundary, not an identity proof. Recheck
+	// once more after it so a successor that wins during the sync cannot receive a
+	// stale predecessor receipt.
+	let terminal_final = match regular_identity(&file) {
+		Ok(identity) => identity,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	let digest_final = match digest_hex(&file) {
+		Ok(digest) => digest,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	let named_final = match statat(&parent, &name) {
+		Ok(named) => named,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	if terminal_final != terminal_after
+		|| digest_final != expected_digest
+		|| !stat_matches_regular_identity(&named_final, &terminal_final)
+	{
+		return committed_failure("identity_mismatch", "terminal_identity");
+	}
+	let mut terminal = terminal_final;
+	terminal.sha256 = Some(digest_final);
 	RecoveryFsPublishResult::success(terminal, primitive)
 }
 
@@ -3961,6 +4054,10 @@ mod tests {
 
 	#[test]
 	fn managed_replace_updates_in_place_without_overwriting_a_raced_successor() {
+		let _serial = REPLACE_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let temporary = TempDir::new();
 		let root = temporary.root();
 		let original = b"original-selector";
@@ -4010,6 +4107,122 @@ mod tests {
 		assert_eq!(
 			fs::read(temporary.0.join("retained-predecessor")).expect("predecessor"),
 			b"replacement-selector"
+		);
+	}
+
+	#[test]
+	fn managed_replace_rejects_stale_same_inode_content_before_truncate() {
+		let _serial = REPLACE_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-content";
+		let identity = managed_file(&root, "content.json", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replace_before_in_place_write_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_replace = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let replace = std::thread::spawn(move || {
+			replace_managed(
+				&root_for_replace,
+				None,
+				"content.json",
+				b"replacement-content",
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx.recv().expect("wait for digest recheck boundary");
+		// Keep the same inode but change its bytes after the initial proof. The
+		// retained descriptor must reject this stale expected digest before truncate.
+		fs::write(temporary.0.join("content.json"), b"concurrent-content-change")
+			.expect("mutate same inode");
+		resume_tx.send(()).expect("resume digest recheck boundary");
+		let result = replace.join().expect("replacement thread");
+		set_replace_before_in_place_write_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state, "not_committed");
+		assert_eq!(result.durability_state, "not_attempted");
+		assert_eq!(result.reason, "identity_violation");
+		assert_eq!(result.primitive, "in_place_descriptor");
+		assert_eq!(
+			fs::read(temporary.0.join("content.json")).expect("concurrent content"),
+			b"concurrent-content-change"
+		);
+	}
+
+	#[test]
+	fn managed_replace_rechecks_canonical_name_before_receipting_successor_race() {
+		let _serial = REPLACE_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-final-check";
+		let identity = managed_file(&root, "final-check.json", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replace_after_final_name_check_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_replace = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let replace = std::thread::spawn(move || {
+			replace_managed(
+				&root_for_replace,
+				None,
+				"final-check.json",
+				b"replacement-final-check",
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx.recv().expect("wait for final name check");
+		fs::rename(temporary.0.join("final-check.json"), temporary.0.join("retained-predecessor"))
+			.expect("retain rewritten predecessor");
+		fs::write(temporary.0.join("final-check.json"), b"canonical-successor")
+			.expect("publish canonical successor");
+		resume_tx.send(()).expect("resume final name check");
+		let result = replace.join().expect("replacement thread");
+		set_replace_after_final_name_check_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.reason, "identity_violation");
+		assert_eq!(result.phase, "terminal_identity");
+		assert_eq!(result.primitive, "in_place_descriptor");
+		assert!(result.identity.is_none(), "successor race must not return a stale receipt");
+		assert_eq!(
+			fs::read(temporary.0.join("final-check.json")).expect("canonical successor"),
+			b"canonical-successor"
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("retained-predecessor")).expect("retained predecessor"),
+			b"replacement-final-check"
 		);
 	}
 

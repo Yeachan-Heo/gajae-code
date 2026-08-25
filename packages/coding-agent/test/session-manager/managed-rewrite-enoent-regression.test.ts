@@ -188,6 +188,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		const manager = SessionManager.create(cwd, destination);
 		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
 		manager.appendMessage(makeAssistantMessage() as never);
+		manager.appendCustomMessageEntry("barrier-test", "resident custom", false);
 		await manager.flush();
 
 		const sessionFile = manager.getSessionFile()!;
@@ -235,6 +236,20 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		const residentCount = manager.getBranch().length;
 		const persisted = fs.readFileSync(sessionFile, "utf8");
 		expect(persisted).toContain("identity-less-committed");
+		const residentAssistant = manager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (residentAssistant?.type !== "message") throw new Error("Expected resident assistant entry");
+		const residentCustom = manager.getBranch().find(entry => entry.type === "custom_message");
+		if (residentCustom?.type !== "custom_message") throw new Error("Expected resident custom entry");
+		expect(() =>
+			manager.applyEntryMessageUpdates([
+				{ ...residentAssistant, message: { ...residentAssistant.message } } as never,
+			]),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
+		expect(() =>
+			manager.applyCustomMessageEntryUpdates([{ ...residentCustom, content: residentCustom.content } as never]),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
 
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "must-not-retry-stale-predecessor", timestamp: Date.now() }),
@@ -242,6 +257,71 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(appendCalls).toBe(1);
 		expect(manager.getBranch()).toHaveLength(residentCount);
 		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-not-retry-stale-predecessor");
+		await manager.close().catch(() => {});
+	});
+
+	it("blocks compaction eviction after an identity-less committed append", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "old", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		const oldCustomId = manager.appendCustomMessageEntry(
+			"eviction-barrier-test",
+			[{ type: "text", text: `evictable-content-${"x".repeat(5_000)}` }],
+			false,
+		);
+		const firstKeptEntryId = manager.appendMessage({ role: "user", content: "kept", timestamp: Date.now() });
+		const compactionEntryId = manager.appendCompaction("summary", "short", firstKeptEntryId, 123);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const appendManaged = native.RecoveryFsRoot.prototype.appendManaged;
+		let failOnce = true;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const committed = appendManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return committed;
+			failOnce = false;
+			return {
+				...committed,
+				ok: false,
+				code: "io_error",
+				identity: undefined,
+				mutationState: "committed",
+				durabilityState: "not_provable",
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "identity-less-eviction-barrier", timestamp: Date.now() }),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
+		const beforeEntry = JSON.stringify(manager.getEntryForFidelity(oldCustomId));
+		const beforeStats = manager.getObservabilityStatsForTests();
+		expect(() => manager.evictCompactedContent(firstKeptEntryId, compactionEntryId)).toThrow(
+			/managed_append_committed_outcome_uncertain/,
+		);
+		expect(JSON.stringify(manager.getEntryForFidelity(oldCustomId))).toBe(beforeEntry);
+		expect(manager.getObservabilityStatsForTests().coldSpillWriteCount).toBe(beforeStats.coldSpillWriteCount);
+		expect(fs.readFileSync(sessionFile, "utf8")).toContain("identity-less-eviction-barrier");
 		await manager.close().catch(() => {});
 	});
 
