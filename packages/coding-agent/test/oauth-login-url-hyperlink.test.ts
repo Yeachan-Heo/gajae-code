@@ -1,4 +1,5 @@
-import { beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import {
 	buildOAuthLoginAnchor,
 	SelectorController,
@@ -48,14 +49,14 @@ function fragment(row: string): string {
 
 describe("OAuth login URL hyperlink anchor", () => {
 	it("anchors the URL to itself so the visible text stays the URL", () => {
-		const anchor = buildOAuthLoginAnchor(URL);
+		const anchor = buildOAuthLoginAnchor(URL, URL, true);
 
 		expect(plainText(anchor)).toBe(URL);
 		expect(urisIn(anchor)).toEqual([URL]);
 	});
 
 	it("anchors a custom label to the same target", () => {
-		const anchor = buildOAuthLoginAnchor(URL, "Click here to login");
+		const anchor = buildOAuthLoginAnchor(URL, "Click here to login", true);
 
 		expect(plainText(anchor)).toBe("Click here to login");
 		expect(urisIn(anchor)).toEqual([URL]);
@@ -63,7 +64,7 @@ describe("OAuth login URL hyperlink anchor", () => {
 
 	it("keeps every fragment of the wrapped URL row clickable in a narrow pane", () => {
 		// 100 columns is a routine tmux split; the URL is far longer than that.
-		const rows = rowsAt(buildOAuthLoginAnchor(URL), 100);
+		const rows = rowsAt(buildOAuthLoginAnchor(URL, URL, true), 100);
 
 		expect(rows.length).toBeGreaterThan(1);
 		for (const row of rows) expect(urisIn(row)).toEqual([URL]);
@@ -71,7 +72,7 @@ describe("OAuth login URL hyperlink anchor", () => {
 	});
 
 	it("survives the SGR styling the login row applies around the anchor", () => {
-		const styled = `\x1b[2m${buildOAuthLoginAnchor(URL)}\x1b[0m`;
+		const styled = `\x1b[2m${buildOAuthLoginAnchor(URL, URL, true)}\x1b[0m`;
 
 		for (const width of [120, 100, 60, 40]) {
 			const rows = rowsAt(styled, width);
@@ -81,11 +82,16 @@ describe("OAuth login URL hyperlink anchor", () => {
 	});
 
 	it("leaves a URL that fits on one row as a single anchored fragment", () => {
-		const rows = rowsAt(buildOAuthLoginAnchor(URL), URL.length + 8);
+		const rows = rowsAt(buildOAuthLoginAnchor(URL, URL, true), URL.length + 8);
 
 		expect(rows).toHaveLength(1);
 		expect(urisIn(rows[0]!)).toEqual([URL]);
 		expect(fragment(rows[0]!)).toBe(URL);
+	});
+
+	it("omits OSC 8 when terminal hyperlink policy disables it", () => {
+		expect(buildOAuthLoginAnchor(URL, URL, false)).toBe(URL);
+		expect(buildOAuthLoginAnchor(URL, "Click here to login", false)).toBe("Click here to login");
 	});
 });
 
@@ -120,9 +126,16 @@ async function renderLoginRows(url: string): Promise<Component[]> {
 
 describe("OAuth login row emission", () => {
 	beforeAll(async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		settings.override("tui.hyperlinks", "always");
 		const theme = await getThemeByName("red-claw");
 		if (!theme) throw new Error("Failed to load test theme");
 		setThemeInstance(theme);
+	});
+
+	afterAll(() => {
+		resetSettingsForTest();
 	});
 
 	it("renders the login URL as an anchored row whose every narrow-pane fragment is clickable", async () => {

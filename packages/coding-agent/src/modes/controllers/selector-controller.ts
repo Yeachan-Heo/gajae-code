@@ -152,6 +152,7 @@ import {
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
 } from "../../tools/implementations";
+import { isHyperlinkEnabled } from "../../tui/hyperlink";
 import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -265,8 +266,8 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
  * only for text that carries an anchor to begin with — a bare URL wrapped into
  * fragments leaves every fragment as dead, unclickable text.
  */
-export function buildOAuthLoginAnchor(url: string, label: string = url): string {
-	return `\x1b]8;;${url}\x07${label}\x1b]8;;\x07`;
+export function buildOAuthLoginAnchor(url: string, label: string = url, hyperlinks = isHyperlinkEnabled()): string {
+	return hyperlinks ? `\x1b]8;;${url}\x07${label}\x1b]8;;\x07` : label;
 }
 
 function formatProviderOnboardingCommandGuide(): string {
