@@ -10,6 +10,7 @@ import {
 	RemoteAuthCredentialStore,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
+	type SnapshotResponse,
 } from "../src";
 import * as oauthUtils from "../src/utils/oauth";
 
@@ -151,6 +152,39 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		expect(() =>
 			remoteStore.upsertAuthCredentialForProviderIfAbsent("anthropic", { type: "api_key", key: "x" }),
 		).toThrow(/read-only/);
+		remoteStore.close();
+	});
+
+	test("accepts a lower generation from a restarted broker epoch", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const initialSnapshot: SnapshotResponse = {
+			generation: 99,
+			generatedAt: Date.now() - 1_000,
+			serverNowMs: Date.now() - 1_000,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [
+				{
+					id: 999,
+					provider: "anthropic",
+					credential: {
+						type: "oauth",
+						access: "stale-access",
+						refresh: REMOTE_REFRESH_SENTINEL,
+						expires: Date.now() + 60_000,
+					},
+					identityKey: "stale@example.com",
+					rotatesInMs: null,
+				},
+			],
+		};
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot,
+			streamSnapshots: false,
+		});
+		await remoteStore.refreshSnapshot();
+		expect(remoteStore.snapshot.generation).toBeLessThan(99);
+		expect(remoteStore.snapshot.credentials[0]?.credential).toMatchObject({ access: "server-access-1" });
 		remoteStore.close();
 	});
 

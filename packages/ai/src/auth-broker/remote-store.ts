@@ -375,7 +375,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): void {
-		if (generation < this.#generation) return;
+		// Broker generations are process-local and reset when the broker restarts.
+		// A lower generation from a newer server timestamp is therefore a new
+		// broker epoch, while an older timestamp is an out-of-order response from
+		// the current epoch and must be discarded.
+		if (generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) return;
 		const generationChanged = generation !== this.#generation || this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
