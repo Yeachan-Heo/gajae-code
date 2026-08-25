@@ -214,6 +214,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		const gatewayToken = flags.noAuth ? null : await ensureToken();
 		const handle = startAuthGateway({
 			storage,
+			hasProviderCredential: () => store.snapshot.credentials.some(entry => entry.provider === provider),
 			bind,
 			providerScope: { provider },
 			bearerTokens: gatewayToken ? [gatewayToken] : [],
@@ -466,6 +467,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		const scopedCredentialCount = provider
 			? initialSnapshot.credentials.filter(entry => entry.provider === provider).length
 			: initialSnapshot.credentials.length;
+		const failed = results.filter(row => row.ok === false).length;
 
 		if (flags.json) {
 			const credentials = results.map(row => ({
@@ -518,14 +520,13 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 					);
 				}
 			}
-			const failed = results.filter(row => row.ok === false).length;
 			const unverifiable = results.filter(row => row.ok === null).length;
 			const passing = results.filter(row => row.ok === true).length;
 			process.stdout.write(
 				`\n${chalk.green(`${passing} ok`)}, ${chalk.red(`${failed} failed`)}, ${chalk.yellow(`${unverifiable} unverifiable`)}, ${results.length} total\n`,
 			);
-			if (failed > 0) process.exitCode = 1;
 		}
+		if (failed > 0) process.exitCode = 1;
 		if (provider && scopedCredentialCount === 0) process.exitCode = 1;
 	} finally {
 		storage.close();

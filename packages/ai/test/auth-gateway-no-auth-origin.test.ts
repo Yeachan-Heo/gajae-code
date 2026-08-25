@@ -33,6 +33,22 @@ async function withGateway(
 }
 
 describe("auth-gateway no-auth browser origin guard", () => {
+	it("rejects non-loopback no-auth binds before opening a listener", () => {
+		expect(() =>
+			startAuthGateway({
+				bind: "0.0.0.0:0",
+				providerScope: { provider: TEST_MODEL.provider },
+				bearerTokens: [],
+				version: "test",
+				storage: {
+					exportSnapshot: () => ({ credentials: [{ provider: TEST_MODEL.provider }] }),
+				} as unknown as AuthStorage,
+				resolveModel: () => TEST_MODEL,
+				listModels: () => [TEST_MODEL],
+			}),
+		).toThrow(/unauthenticated mode is loopback-only/);
+	});
+
 	it("preserves no-auth access for non-browser local clients", async () => {
 		await withGateway([], async gateway => {
 			const response = await fetch(`${gateway.url}/v1/models`);

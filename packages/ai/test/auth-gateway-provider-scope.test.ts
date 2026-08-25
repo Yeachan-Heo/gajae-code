@@ -155,6 +155,24 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		);
 	});
 
+	it("rejects a same-scope resolver replacement from another origin", async () => {
+		const catalogModel = model("origin-guard-model", "openai-codex", "openai-codex-responses");
+		const redirected = { ...catalogModel, baseUrl: "https://attacker.example/v1" };
+		await withGateway(
+			"openai-codex",
+			[catalogModel],
+			() => redirected,
+			async url => {
+				const response = await fetch(`${url}/v1/pi/stream`, {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ modelId: catalogModel.id, context: baseContext, stream: false }),
+				});
+				expect(response.status).toBe(404);
+			},
+		);
+	});
+
 	it("fails closed before binding when the broker snapshot lacks the scoped credential", () => {
 		const scopedModel = model("gpt-5.6-luna", "openai-codex", "openai-codex-responses");
 
@@ -171,6 +189,77 @@ describe("provider-scoped auth-gateway catalogs", () => {
 				listModels: () => [scopedModel],
 			}),
 		).toThrow(/has no enabled broker credential/);
+	});
+
+	it("fails closed after the live broker scope loses its credential", async () => {
+		const provider = "live-scope-provider";
+		const scopedModel = model("live-scope-model", provider, "openai-codex-responses");
+		let credentialAvailable = true;
+		let getApiKeyCalls = 0;
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: [],
+			version: "test",
+			hasProviderCredential: () => credentialAvailable,
+			storage: {
+				exportSnapshot: () => ({ credentials: [{ provider }] }),
+				getApiKey: async () => {
+					getApiKeyCalls += 1;
+					return "must-not-be-used";
+				},
+			} as unknown as AuthStorage,
+			resolveModel: () => scopedModel,
+			listModels: () => [scopedModel],
+		});
+		try {
+			credentialAvailable = false;
+			const response = await fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+			expect(response.status).toBe(401);
+			expect(getApiKeyCalls).toBe(0);
+		} finally {
+			await gateway.close();
+		}
+	});
+
+	it("keeps usage and credential checks inside the selected provider scope", async () => {
+		const provider = "scope-diagnostics-provider";
+		const otherProvider = "scope-diagnostics-other";
+		const scopedModel = model("scope-diagnostics-model", provider, "openai-codex-responses");
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: [],
+			version: "test",
+			storage: {
+				exportSnapshot: () => ({ credentials: [{ provider }] }),
+				fetchUsageReports: async () => [
+					{ provider, limits: [], metadata: {} },
+					{ provider: otherProvider, limits: [], metadata: {} },
+				],
+				checkCredentials: async () => [
+					{ id: 1, provider, type: "api_key", ok: true },
+					{ id: 2, provider: otherProvider, type: "api_key", ok: true },
+				],
+			} as unknown as AuthStorage,
+			resolveModel: () => scopedModel,
+			listModels: () => [scopedModel],
+		});
+		try {
+			const usage = await fetch(`${gateway.url}/v1/usage`);
+			expect(usage.status).toBe(200);
+			expect((await usage.json()).reports).toEqual([{ provider, limits: [], metadata: {} }]);
+
+			const checks = await fetch(`${gateway.url}/v1/credentials/check`);
+			expect(checks.status).toBe(200);
+			expect((await checks.json()).credentials).toEqual([{ id: 1, provider, type: "api_key", ok: true }]);
+		} finally {
+			await gateway.close();
+		}
 	});
 });
 

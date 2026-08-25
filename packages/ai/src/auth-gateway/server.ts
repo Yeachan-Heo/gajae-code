@@ -64,6 +64,11 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	/** Source of credentials. Caller wires this to a broker-backed AuthStorage. */
 	storage: AuthStorage;
 	/**
+	 * Current broker-backed scope authority. When supplied, this is checked on
+	 * every request so a live broker snapshot removal immediately fails closed.
+	 */
+	hasProviderCredential?: () => boolean;
+	/**
 	 * Resolve a client-requested model id to a pi-ai Model. Caller supplies
 	 * this from a ModelRegistry (lives in `coding-agent` to avoid an inverse
 	 * dependency in `pi-ai`).
@@ -125,13 +130,21 @@ function resolveScopedModel(
 	const resolved = opts.resolveModel(modelId);
 	if (
 		!resolved ||
+		resolved !== catalogModel ||
 		resolved.id !== catalogModel.id ||
 		resolved.api !== catalogModel.api ||
 		!isModelInProviderScope(resolved, opts.providerScope.provider)
 	) {
 		return undefined;
 	}
-	return resolved;
+	return catalogModel;
+}
+
+function hasProviderCredential(opts: AuthGatewayBootOptions): boolean {
+	return (
+		opts.hasProviderCredential?.() ??
+		opts.storage.exportSnapshot().credentials.some(entry => entry.provider === opts.providerScope.provider)
+	);
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -526,6 +539,13 @@ async function handleFormatEndpoint(
 	// For OAuth providers this returns the access token (refreshed via the
 	// broker override on AuthStorage when needed).
 	let apiKey: string | undefined;
+	if (!hasProviderCredential(bootOpts)) {
+		return route.module.formatError(
+			401,
+			"authentication_error",
+			`No credential available for provider ${model.provider}`,
+		);
+	}
 	try {
 		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
 			modelId: model.id,
@@ -734,6 +754,8 @@ async function handlePiNative(
 	}
 
 	let apiKey: string | undefined;
+	if (!hasProviderCredential(bootOpts))
+		return piNative.formatError(401, "authentication_error", "No credential available");
 	try {
 		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
 			modelId: model.id,
@@ -891,6 +913,10 @@ async function handleUsage(storage: AuthStorage, provider: Provider, signal: Abo
 	return json(200, { generatedAt: Date.now(), reports: trimmed });
 }
 
+function emptyScopedCredentialsResponse(): Response {
+	return json(200, { generatedAt: Date.now(), credentials: [] });
+}
+
 /**
  * Per-credential health probe surfaced on `GET /v1/credentials/check`. Tells
  * the caller exactly which row in their broker is producing 401s — the
@@ -907,7 +933,7 @@ async function handleCredentialsCheck(
 	provider: Provider,
 	signal: AbortSignal,
 ): Promise<Response> {
-	const credentials = await storage.checkCredentials({ provider, signal });
+	const credentials = (await storage.checkCredentials({ provider, signal })).filter(row => row.provider === provider);
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
@@ -927,7 +953,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		throw new Error("Auth gateway requires a non-empty provider scope");
 	}
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
-	if (!opts.storage.exportSnapshot().credentials.some(entry => entry.provider === provider)) {
+	if (!hasProviderCredential(opts)) {
 		throw new Error(`Auth gateway scope ${provider} has no enabled broker credential`);
 	}
 	const catalog = createAuthGatewayModelCatalog(provider, opts.listModels());
@@ -970,6 +996,8 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 				// same client struct.
 				if (req.method === "GET" && pathname === "/v1/usage") {
+					if (!hasProviderCredential(opts))
+						return withCors(json(200, { generatedAt: Date.now(), reports: [] }), req);
 					return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
 				}
 
@@ -977,6 +1005,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 				// credentials, so we need a separate endpoint that captures errors.
 				if (req.method === "GET" && pathname === "/v1/credentials/check") {
+					if (!hasProviderCredential(opts)) return withCors(emptyScopedCredentialsResponse(), req);
 					return withCors(
 						await handleCredentialsCheck(opts.storage, opts.providerScope.provider, req.signal),
 						req,
