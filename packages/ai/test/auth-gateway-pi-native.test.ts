@@ -54,6 +54,18 @@ const ZERO_USAGE: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
+const testAuthority = (storage: AuthStorage, provider: string) => ({
+	hasProviderCredential: () => storage.exportSnapshot().credentials.some(entry => entry.provider === provider),
+	reloadProviderCredentials: () => storage.reload(),
+	validateProviderCredential: (candidateProvider: string, apiKey: string) =>
+		storage.exportSnapshot().credentials.some(entry => {
+			if (entry.provider !== candidateProvider) return false;
+			return entry.credential.type === "api_key"
+				? entry.credential.key === apiKey
+				: entry.credential.access === apiKey;
+		}),
+});
+
 function baseAssistant(overrides?: Partial<AssistantMessage>): AssistantMessage {
 	return {
 		role: "assistant",
@@ -574,6 +586,7 @@ describe("pi-native managed gateway credential failure marking", () => {
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
+			...testAuthority(storage, provider),
 			resolveModel: id => (id === model.id ? model : undefined),
 			listModels: () => [model],
 		});
@@ -658,6 +671,7 @@ describe("pi-native managed gateway credential failure marking", () => {
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
+			...testAuthority(storage, provider),
 			resolveModel: id => (id === model.id ? model : undefined),
 			listModels: () => [model],
 		});
@@ -714,6 +728,7 @@ describe("pi-native managed gateway credential failure marking", () => {
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
+			...testAuthority(storage, provider),
 			resolveModel: id => (id === model.id ? model : undefined),
 			listModels: () => [model],
 		});

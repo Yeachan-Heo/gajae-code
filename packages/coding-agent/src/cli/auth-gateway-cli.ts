@@ -248,6 +248,12 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 				await store.refreshSnapshot();
 				await storage.reload();
 			},
+			validateProviderCredential: (candidateProvider, apiKey) =>
+				store.snapshot.credentials.some(entry => {
+					if (entry.provider !== candidateProvider) return false;
+					if (entry.credential.type === "api_key") return entry.credential.key === apiKey;
+					return entry.credential.access === apiKey;
+				}),
 			bind,
 			providerScope: { provider },
 			bearerTokens: gatewayToken ? [gatewayToken] : [],

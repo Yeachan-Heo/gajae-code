@@ -67,9 +67,11 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	 * Current broker-backed scope authority. When supplied, this is checked on
 	 * every request so a live broker snapshot removal immediately fails closed.
 	 */
-	hasProviderCredential?: () => boolean;
+	hasProviderCredential: () => boolean;
 	/** Refresh the dispatch cache from the current broker snapshot before use. */
-	reloadProviderCredentials?: () => Promise<void>;
+	reloadProviderCredentials: () => Promise<void>;
+	/** Confirm that the selected key is still present in the current authority snapshot. */
+	validateProviderCredential: (provider: string, apiKey: string) => boolean;
 	/**
 	 * Resolve a client-requested model id to a pi-ai Model. Caller supplies
 	 * this from a ModelRegistry (lives in `coding-agent` to avoid an inverse
@@ -143,17 +145,14 @@ function resolveScopedModel(
 }
 
 function hasProviderCredential(opts: AuthGatewayBootOptions): boolean {
-	return (
-		opts.hasProviderCredential?.() ??
-		opts.storage.exportSnapshot().credentials.some(entry => entry.provider === opts.providerScope.provider)
-	);
+	return opts.hasProviderCredential();
 }
 
 type ProviderScopeAvailability = "available" | "absent" | "reload_failed";
 
 async function providerScopeAvailability(opts: AuthGatewayBootOptions): Promise<ProviderScopeAvailability> {
 	try {
-		await opts.reloadProviderCredentials?.();
+		await opts.reloadProviderCredentials();
 	} catch (error) {
 		logger.warn("auth-gateway provider snapshot reload failed", {
 			provider: opts.providerScope.provider,
@@ -178,27 +177,30 @@ class GatewayCredentialError extends Error {
 
 const credentialAuthorityTails = new WeakMap<AuthGatewayBootOptions, Promise<void>>();
 
-async function withCredentialAuthority<T>(opts: AuthGatewayBootOptions, operation: () => Promise<T>): Promise<T> {
+interface GatewayCredentialLease {
+	apiKey: string;
+	release(): void;
+}
+
+async function acquireGatewayApiKey(
+	opts: AuthGatewayBootOptions,
+	model: Model<Api>,
+	peer: string,
+	signal: AbortSignal,
+): Promise<GatewayCredentialLease> {
 	const previous = credentialAuthorityTails.get(opts) ?? Promise.resolve();
 	const deferred = Promise.withResolvers<void>();
 	credentialAuthorityTails.set(opts, deferred.promise);
 	await previous;
-	try {
-		return await operation();
-	} finally {
+	let released = false;
+	const release = (): void => {
+		if (released) return;
+		released = true;
 		deferred.resolve();
 		if (credentialAuthorityTails.get(opts) === deferred.promise) credentialAuthorityTails.delete(opts);
-	}
-}
-
-async function resolveGatewayApiKey(
-	bootOpts: AuthGatewayBootOptions,
-	model: Model<Api>,
-	peer: string,
-	signal: AbortSignal,
-): Promise<string> {
-	return withCredentialAuthority(bootOpts, async () => {
-		const scopeAvailability = await providerScopeAvailability(bootOpts);
+	};
+	try {
+		const scopeAvailability = await providerScopeAvailability(opts);
 		if (scopeAvailability === "reload_failed") {
 			throw new GatewayCredentialError(503, "upstream_error", "Auth broker unavailable");
 		}
@@ -209,30 +211,26 @@ async function resolveGatewayApiKey(
 				`No credential available for provider ${model.provider}`,
 			);
 		}
-		try {
-			const apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
-				modelId: model.id,
-				signal,
-			});
-			if (!apiKey) {
-				throw new GatewayCredentialError(
-					401,
-					"authentication_error",
-					`No credential available for provider ${model.provider}`,
-				);
-			}
-			return apiKey;
-		} catch (error) {
-			if (error instanceof GatewayCredentialError) throw error;
-			const classified = classifyGatewayError(error);
-			logger.warn("auth-gateway getApiKey threw", {
-				provider: model.provider,
-				peer,
-				error: classified.message,
-			});
-			throw new GatewayCredentialError(classified.status, classified.type, classified.message);
+		const apiKey = await opts.storage.getApiKey(model.provider, undefined, { modelId: model.id, signal });
+		if (!apiKey || !opts.validateProviderCredential(model.provider, apiKey) || !hasProviderCredential(opts)) {
+			throw new GatewayCredentialError(
+				401,
+				"authentication_error",
+				`No credential available for provider ${model.provider}`,
+			);
 		}
-	});
+		return { apiKey, release };
+	} catch (error) {
+		release();
+		if (error instanceof GatewayCredentialError) throw error;
+		const classified = classifyGatewayError(error);
+		logger.warn("auth-gateway getApiKey threw", {
+			provider: model.provider,
+			peer,
+			error: classified.message,
+		});
+		throw new GatewayCredentialError(classified.status, classified.type, classified.message);
+	}
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -622,22 +620,6 @@ async function handleFormatEndpoint(
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	}
 
-	// pi-ai's stream() does NOT consult AuthStorage — the caller (us) is
-	// expected to resolve the credential and pass it as `options.apiKey`.
-	// For OAuth providers this returns the access token (refreshed via the
-	// broker override on AuthStorage when needed).
-	let apiKey: string;
-	try {
-		apiKey = await resolveGatewayApiKey(bootOpts, model, peer, controller.signal);
-	} catch (error) {
-		if (controller.signal.aborted) return clientClosedResponse(route);
-		if (error instanceof GatewayCredentialError) {
-			return route.module.formatError(error.status, error.type, error.message);
-		}
-		throw error;
-	}
-	if (controller.signal.aborted) return clientClosedResponse(route);
-
 	// Parse + validate against the strict format schema, rebuild as gjc's
 	// canonical Context, dispatch through pi-ai's streamSimple, encode the
 	// canonical event stream back to the inbound format. There is no
@@ -663,7 +645,6 @@ async function handleFormatEndpoint(
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
 	const streamOpts = buildStreamOptions(parsed, model.api, controller.signal);
-	streamOpts.apiKey = apiKey;
 	if (streamOpts.fallbackManaged) {
 		streamOpts.fallbackAttempt = beginAttempt(model.id, "auth-gateway");
 	} else {
@@ -689,11 +670,29 @@ async function handleFormatEndpoint(
 		peer,
 	});
 
+	let apiKey: string;
+	let credentialLease: GatewayCredentialLease;
+	try {
+		credentialLease = await acquireGatewayApiKey(bootOpts, model, peer, controller.signal);
+		apiKey = credentialLease.apiKey;
+		streamOpts.apiKey = apiKey;
+	} catch (error) {
+		if (controller.signal.aborted) return clientClosedResponse(route);
+		if (error instanceof GatewayCredentialError) {
+			return route.module.formatError(error.status, error.type, error.message);
+		}
+		throw error;
+	}
+
 	let events: AssistantMessageEventStream;
 	try {
-		if (controller.signal.aborted) return clientClosedResponse(route);
+		if (controller.signal.aborted) {
+			credentialLease.release();
+			return clientClosedResponse(route);
+		}
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
+		credentialLease.release();
 		if (streamOpts.fallbackManaged) {
 			await markManagedGatewayCredentialFailure(
 				bootOpts.storage,
@@ -709,6 +708,7 @@ async function handleFormatEndpoint(
 		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
+	credentialLease.release();
 	if (streamOpts.fallbackManaged) {
 		events = observeManagedGatewayFailure(events, error =>
 			markManagedGatewayCredentialFailure(
@@ -825,23 +825,11 @@ async function handlePiNative(
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
 
-	let apiKey: string;
-	try {
-		apiKey = await resolveGatewayApiKey(bootOpts, model, peer, controller.signal);
-	} catch (error) {
-		if (controller.signal.aborted) return aborted();
-		if (error instanceof GatewayCredentialError) {
-			return piNative.formatError(error.status, error.type, error.message);
-		}
-		throw error;
-	}
-	if (controller.signal.aborted) return aborted();
-
 	// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 	// trust the client's options (already allow-listed by `parseRequest`) and
 	// only inject server-controlled fields. The OpenAI code backend temperature/topP strip
 	// matches `buildStreamOptions` — OpenAI code backend rejects them with a 400.
-	const streamOpts: SimpleStreamOptions = { ...parsed.options, apiKey, signal: controller.signal };
+	const streamOpts: SimpleStreamOptions = { ...parsed.options, signal: controller.signal };
 	if (streamOpts.fallbackManaged) {
 		streamOpts.fallbackAttempt = beginAttempt(model.id, "auth-gateway-pi-native");
 	} else {
@@ -879,11 +867,29 @@ async function handlePiNative(
 		peer,
 	});
 
+	let apiKey: string;
+	let credentialLease: GatewayCredentialLease;
+	try {
+		credentialLease = await acquireGatewayApiKey(bootOpts, model, peer, controller.signal);
+		apiKey = credentialLease.apiKey;
+		streamOpts.apiKey = apiKey;
+	} catch (error) {
+		if (controller.signal.aborted) return aborted();
+		if (error instanceof GatewayCredentialError) {
+			return piNative.formatError(error.status, error.type, error.message);
+		}
+		throw error;
+	}
+
 	let events: AssistantMessageEventStream;
 	try {
-		if (controller.signal.aborted) return aborted();
+		if (controller.signal.aborted) {
+			credentialLease.release();
+			return aborted();
+		}
 		events = streamSimple(model, parsed.context, streamOpts);
 	} catch (error) {
+		credentialLease.release();
 		if (streamOpts.fallbackManaged) {
 			await markManagedGatewayCredentialFailure(
 				bootOpts.storage,
@@ -899,6 +905,7 @@ async function handlePiNative(
 		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
+	credentialLease.release();
 	if (streamOpts.fallbackManaged) {
 		events = observeManagedGatewayFailure(events, error =>
 			markManagedGatewayCredentialFailure(
@@ -1023,6 +1030,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 	const provider = opts.providerScope.provider;
 	if (!isSafeProviderScope(provider)) {
 		throw new Error("Auth gateway requires a valid provider scope");
+	}
+	if (!opts.reloadProviderCredentials || !opts.hasProviderCredential || !opts.validateProviderCredential) {
+		throw new Error("Auth gateway requires live provider authority callbacks");
 	}
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	if (!hasProviderCredential(opts)) {

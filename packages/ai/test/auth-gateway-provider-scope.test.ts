@@ -76,6 +76,12 @@ const baseContext: Context = {
 	messages: [{ role: "user", content: "hello", timestamp: 0 }],
 };
 
+const testAuthority = (_provider: string) => ({
+	hasProviderCredential: () => true,
+	reloadProviderCredentials: async () => {},
+	validateProviderCredential: () => true,
+});
+
 async function withGateway(
 	provider: string,
 	models: readonly Model<Api>[],
@@ -85,6 +91,7 @@ async function withGateway(
 	const gateway = startAuthGateway({
 		bind: "127.0.0.1:0",
 		providerScope: { provider },
+		...testAuthority(provider),
 		bearerTokens: [],
 		version: "test",
 		storage: {
@@ -189,8 +196,11 @@ describe("provider-scoped auth-gateway catalogs", () => {
 			startAuthGateway({
 				bind: "127.0.0.1:0",
 				providerScope: { provider: "openai-codex" },
+				...testAuthority("openai-codex"),
 				bearerTokens: [],
 				version: "test",
+				hasProviderCredential: () => false,
+				validateProviderCredential: () => false,
 				storage: {
 					exportSnapshot: () => ({ credentials: [] }),
 				} as unknown as AuthStorage,
@@ -208,9 +218,11 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			hasProviderCredential: () => credentialAvailable,
+			validateProviderCredential: () => credentialAvailable,
 			storage: {
 				exportSnapshot: () => ({ credentials: [{ provider }] }),
 				getApiKey: async () => {
@@ -235,6 +247,82 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		}
 	});
 
+	it("rejects a credential revoked while selection is in flight", async () => {
+		const source = "auth-gateway-provider-scope-toctou-test";
+		const api = "auth-gateway-provider-scope-toctou-test" as Api;
+		const provider = "gateway-toctou-provider";
+		const scopedModel = model("gateway-toctou-model", provider, api);
+		const selectionStarted = Promise.withResolvers<void>();
+		const releaseSelection = Promise.withResolvers<void>();
+		let credentialAvailable = true;
+		let dispatched = false;
+		registerCustomApi(
+			api,
+			(_model, _context, _options) => {
+				dispatched = true;
+				return makeEventStream({
+					role: "assistant",
+					api,
+					provider,
+					model: scopedModel.id,
+					content: [{ type: "text", text: "must not dispatch" }],
+					usage: ZERO_USAGE,
+					stopReason: "stop",
+					timestamp: 0,
+				});
+			},
+			source,
+		);
+		const storage = {
+			exportSnapshot: () => ({
+				generation: 1,
+				generatedAt: 1,
+				credentials: [
+					{
+						id: 1,
+						provider,
+						credential: { type: "api_key" as const, key: "stale-key" },
+						identityKey: null,
+					},
+				],
+			}),
+			getApiKey: async () => {
+				selectionStarted.resolve();
+				await releaseSelection.promise;
+				return "stale-key";
+			},
+		} as unknown as AuthStorage;
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			...testAuthority(provider),
+			bearerTokens: [],
+			version: "test",
+			hasProviderCredential: () => credentialAvailable,
+			reloadProviderCredentials: async () => {},
+			validateProviderCredential: () => credentialAvailable,
+			storage,
+			resolveModel: () => scopedModel,
+			listModels: () => [scopedModel],
+		});
+		try {
+			const responsePromise = fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+			await selectionStarted.promise;
+			credentialAvailable = false;
+			releaseSelection.resolve();
+			const response = await responsePromise;
+			expect(response.status).toBe(401);
+			expect(dispatched).toBe(false);
+		} finally {
+			await gateway.close();
+			unregisterCustomApis(source);
+		}
+	});
+
 	it("keeps usage and credential checks inside the selected provider scope", async () => {
 		const provider = "scope-diagnostics-provider";
 		const otherProvider = "scope-diagnostics-other";
@@ -242,6 +330,7 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			storage: {
@@ -279,12 +368,14 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			hasProviderCredential: () => true,
 			reloadProviderCredentials: async () => {
 				throw new Error("broker bearer token=secret must not escape");
 			},
+			validateProviderCredential: () => true,
 			storage: { exportSnapshot: () => ({ credentials: [{ provider }] }) } as unknown as AuthStorage,
 			resolveModel: () => scopedModel,
 			listModels: () => [scopedModel],
@@ -308,6 +399,7 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			storage: {
@@ -374,6 +466,7 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			storage,
@@ -430,10 +523,18 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			hasProviderCredential: () => storage.exportSnapshot().credentials.some(entry => entry.provider === provider),
 			reloadProviderCredentials: () => storage.reload(),
+			validateProviderCredential: (candidateProvider, apiKey) =>
+				storage.exportSnapshot().credentials.some(entry => {
+					if (entry.provider !== candidateProvider) return false;
+					return entry.credential.type === "api_key"
+						? entry.credential.key === apiKey
+						: entry.credential.access === apiKey;
+				}),
 			storage,
 			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
 			listModels: () => [scopedModel],
@@ -517,6 +618,7 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			storage,
@@ -525,6 +627,13 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 				await remote.refreshSnapshot();
 				await storage.reload();
 			},
+			validateProviderCredential: (candidateProvider, apiKey) =>
+				remote.snapshot.credentials.some(entry => {
+					if (entry.provider !== candidateProvider) return false;
+					return entry.credential.type === "api_key"
+						? entry.credential.key === apiKey
+						: entry.credential.access === apiKey;
+				}),
 			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
 			listModels: () => [scopedModel],
 		});
@@ -604,6 +713,7 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
 			providerScope: { provider },
+			...testAuthority(provider),
 			bearerTokens: [],
 			version: "test",
 			storage: {

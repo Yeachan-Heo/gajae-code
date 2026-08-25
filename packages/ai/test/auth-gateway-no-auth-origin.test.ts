@@ -10,6 +10,12 @@ const TEST_MODEL = {
 	api: "anthropic-messages",
 } as Model<Api>;
 
+const testAuthority = () => ({
+	hasProviderCredential: () => true,
+	reloadProviderCredentials: async () => {},
+	validateProviderCredential: () => true,
+});
+
 async function withGateway(
 	bearerTokens: string[],
 	fn: (handle: AuthGatewayServerHandle) => Promise<void>,
@@ -17,6 +23,7 @@ async function withGateway(
 	const handle = startAuthGateway({
 		bind: "127.0.0.1:0",
 		providerScope: { provider: TEST_MODEL.provider },
+		...testAuthority(),
 		bearerTokens,
 		version: "test",
 		storage: {
@@ -38,6 +45,7 @@ describe("auth-gateway no-auth browser origin guard", () => {
 			startAuthGateway({
 				bind: "0.0.0.0:0",
 				providerScope: { provider: TEST_MODEL.provider },
+				...testAuthority(),
 				bearerTokens: [],
 				version: "test",
 				storage: {
