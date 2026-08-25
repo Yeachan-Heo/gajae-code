@@ -176,6 +176,11 @@ export { CURSOR_CLIENT_VERSION };
 
 const conversationStateCache = new Map<string, ConversationStateStructure>();
 const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+// A capped non-abortable mutation may outlive the provider turn. Keep a
+// conversation-scoped lock until the actual handler settles so a retry or a
+// later turn cannot start another request while the detached mutation is still
+// changing local state.
+const conversationMutationLocks = new Map<string, Promise<void>>();
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -188,6 +193,25 @@ export function disposeCursorConversation(conversationId: string): void {
 	conversationStateCache.delete(conversationId);
 	conversationBlobStores.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
+}
+
+async function waitForCursorMutationLock(conversationId: string, signal: AbortSignal | undefined): Promise<void> {
+	const lock = conversationMutationLocks.get(conversationId);
+	if (!lock) return;
+	if (!signal) {
+		await lock;
+		return;
+	}
+	if (signal.aborted) throw cursorAbortError(signal);
+	const aborted = Promise.withResolvers<never>();
+	aborted.promise.catch(() => {});
+	const onAbort = () => aborted.reject(cursorAbortError(signal));
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		await Promise.race([lock, aborted.promise]);
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
 }
 
 /** Refresh recency for a conversation and evict TTL-stale / LRU-overflow entries (F15). */
@@ -273,6 +297,8 @@ function runWithCursorExecDeadline<T>(
 	onNonAbortableStarted?: (settlement: CursorNonAbortableSettlement) => void,
 ): Promise<T> {
 	const result = Promise.withResolvers<T>();
+	const operationCompletion = Promise.withResolvers<void>();
+	operationCompletion.promise.catch(() => {});
 	const controller = new AbortController();
 	const settlementExceeded = Promise.withResolvers<never>();
 	// The fence observes `exceeded` through Promise.race; keep this branch silent.
@@ -346,15 +372,21 @@ function runWithCursorExecDeadline<T>(
 		// window immediately instead of escaping the cap.
 		if (abortError !== undefined) armSettlementGrace();
 		onNonAbortableStarted?.({
-			settled: result.promise.then(
-				() => undefined,
-				() => undefined,
-			),
+			// `result` may reject at the bounded fence cap while the actual
+			// mutation is still running. Settlement ownership must follow the
+			// operation, not the wrapper, or a retry can overlap the mutation.
+			settled: operationCompletion.promise,
 			exceeded: settlementExceeded.promise,
 		});
 	}).then(
-		value => settle(() => (abortError ? result.reject(abortError) : result.resolve(value))),
-		error => settle(() => result.reject(abortError ?? error)),
+		value => {
+			operationCompletion.resolve();
+			settle(() => (abortError ? result.reject(abortError) : result.resolve(value)));
+		},
+		error => {
+			operationCompletion.resolve();
+			settle(() => result.reject(abortError ?? error));
+		},
 	);
 	return result.promise;
 }
@@ -896,6 +928,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// credential-bearing request after serialization already exhausted it.
 >>>>>>> 98979fdd28 (fix(cursor): start first-event clock at stream invocation)
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			// A previous bounded non-abortable exec may still be mutating local state
+			// after its provider wrapper published a capped terminal. Do not admit a
+			// retry or later turn for this conversation until that actual operation
+			// settles.
+			await waitForCursorMutationLock(conversationId, options?.signal);
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
@@ -1228,6 +1265,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										cursorExecDeadlineMsForTest(idleTimeoutMs),
 										settlement => {
 											pendingNonAbortableExec = settlement;
+											const lock = settlement.settled.then(
+												() => undefined,
+												() => undefined,
+											);
+											conversationMutationLocks.set(conversationId, lock);
+											void lock.then(() => {
+												if (conversationMutationLocks.get(conversationId) === lock) {
+													conversationMutationLocks.delete(conversationId);
+												}
+											});
 										},
 									);
 								} else {

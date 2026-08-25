@@ -85,6 +85,7 @@ async function collectTerminal(
 		streamIdleTimeoutMs?: number;
 		execHandlers?: CursorExecHandlers;
 		signal?: AbortSignal;
+		conversationId?: string;
 	},
 ): Promise<{ events: unknown[]; result: AssistantMessage }> {
 	const stream = streamModel({ ...cursorModel, baseUrl }, baseContext, { apiKey: "test-token", ...options });
@@ -911,6 +912,64 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	}, 9000);
+
+	it("keeps later turns behind a capped mutation until the actual handler settles", async () => {
+		let streamCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			streamCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				if (streamCount === 1) {
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					});
+					return;
+				}
+				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
+				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+			}, 10);
+		});
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const conversationId = "capped-mutation-lock";
+		const first = collectTerminal(baseUrl, {
+			conversationId,
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await release.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		const firstResult = await first;
+		expect(firstResult.result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+
+		const second = collectTerminal(baseUrl, { conversationId, streamFirstEventTimeoutMs: 500 });
+		await Bun.sleep(50);
+		expect(streamCount).toBe(1);
+		release.resolve();
+		await second;
+		expect(streamCount).toBe(2);
+	}, 12_000);
 
 	it("caps the fence on caller abort without an unhandled rejection", async () => {
 		const controller = new AbortController();
