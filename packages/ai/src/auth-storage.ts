@@ -432,6 +432,7 @@ export type OAuthRefreshLeaseClaim =
 
 export interface AuthCredentialStore {
 	close(): void;
+	refreshSnapshot?(): Promise<unknown>;
 	onSnapshotChanged?(listener: () => void): () => void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
 	/** Payload-free account inventory; active and soft-disabled rows are included. */
@@ -4802,6 +4803,9 @@ export class AuthStorage {
 		}
 		try {
 			const refreshed = await Promise.race([refreshPromise, cancellation.promise]);
+			if (this.#refreshOAuthCredentialOverride && this.#store.refreshSnapshot) {
+				await this.#store.refreshSnapshot();
+			}
 			// Return the FULL authority of the effective credential: rotated
 			// tokens from upstream plus the identity metadata and MCP binding of
 			// the (possibly guard-adopted) credential that was actually

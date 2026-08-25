@@ -102,6 +102,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		const apiKey = await clientStorage.getApiKey("anthropic");
 		expect(apiKey).toBe("server-access-rotated");
 		expect(overrideCalls).toBe(1);
+		expect(remoteStore.snapshot.credentials[0]?.credential).toMatchObject({
+			access: "server-access-rotated",
+			refresh: REMOTE_REFRESH_SENTINEL,
+		});
 		// The local oauth refresh helper was used exactly once — by the broker server.
 		expect(refreshSpy).toHaveBeenCalledTimes(1);
 		clientStorage.close();
