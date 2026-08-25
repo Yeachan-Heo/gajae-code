@@ -351,6 +351,20 @@ export function receiptStep(label: string, receipt: CasReceipt): CompletedStep {
 	};
 }
 
+function nonBridgeLedgerShape(ledger: ProvenanceLedger): unknown {
+	const {
+		bridgePath: _bridgePath,
+		bridgeSourceDir: _bridgeSourceDir,
+		bridgeEntries: _bridgeEntries,
+		bridgeEntryIdentities: _bridgeEntryIdentities,
+		bridgeDirCreated: _bridgeDirCreated,
+		bridgeDirIdentity: _bridgeDirIdentity,
+		bridgeCleanupPending: _bridgeCleanupPending,
+		...nonBridge
+	} = ledger;
+	return nonBridge;
+}
+
 export interface RecoverIntentOptions {
 	/**
 	 * Act on the classification rather than only reporting it.
@@ -590,6 +604,9 @@ export async function recoverIntent(
 				ledgerObserved === intent.provenancePreflightIdentity);
 		const safeCompensationPending =
 			before?.bridgeCleanupPending !== undefined &&
+			before !== undefined &&
+			after !== undefined &&
+			JSON.stringify(nonBridgeLedgerShape(before)) === JSON.stringify(nonBridgeLedgerShape(after)) &&
 			beforeMatches &&
 			afterMatches &&
 			ledgerObserved === intent.provenancePreflightIdentity &&

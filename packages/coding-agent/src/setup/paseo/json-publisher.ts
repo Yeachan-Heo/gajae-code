@@ -246,6 +246,7 @@ export async function publishPlan(
 	const mode = await sourceMode(targetPath);
 	let tempRetained = false;
 	let tempConsumed = false;
+	let tempIdentity: NativeExactFileIdentity | undefined;
 	try {
 		const handle = await fs.open(tempPath, "wx+", mode);
 		let sourceIdentity: NativeExactFileIdentity | undefined;
@@ -253,6 +254,7 @@ export async function publishPlan(
 			await handle.writeFile(plan.nextRaw, "utf8");
 			await handle.sync();
 			sourceIdentity = await capturePrivateBackupIdentity(handle, tempPath);
+			tempIdentity = sourceIdentity;
 		} finally {
 			await handle.close();
 		}
@@ -324,7 +326,9 @@ export async function publishPlan(
 		}
 		throw error;
 	} finally {
-		if (!tempRetained && !tempConsumed) await fs.rm(tempPath, { force: true }).catch(() => undefined);
+		if (!tempRetained && !tempConsumed && tempIdentity !== undefined) {
+			await removePrivateBackupByIdentity(tempPath, tempIdentity);
+		}
 	}
 
 	return { published: true, backupPath, identity: plan.expectedIdentity };
