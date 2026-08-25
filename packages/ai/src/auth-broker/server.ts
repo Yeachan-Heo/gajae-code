@@ -326,7 +326,7 @@ function buildCredentialMetadata(
 		provider: record.provider,
 		type: record.credentialKind,
 		identity: record.identityLabel,
-		disabledCause: record.disabledCause,
+		disabledCause: record.disabledCause === null ? null : "disabled via auth-broker",
 	}));
 	return {
 		...(includeEpoch ? { epoch } : {}),

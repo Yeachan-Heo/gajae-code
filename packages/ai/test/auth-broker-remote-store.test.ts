@@ -128,7 +128,7 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.listCredentialInventory("anthropic")).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ id: activeId, disabled: false }),
-				expect.objectContaining({ id: disabledId, disabled: true, disabledCause: "revoked in test" }),
+				expect.objectContaining({ id: disabledId, disabled: true, disabledCause: "disabled via auth-broker" }),
 			]),
 		);
 		for (const row of remote.listCredentialInventory()) expect(row).not.toHaveProperty("credential");

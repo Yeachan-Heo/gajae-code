@@ -118,7 +118,7 @@ describe("auth-broker wire surface", () => {
 		const disabled = await client.fetchCredentialMetadata();
 		expect(disabled.credentials[0]).toMatchObject({
 			id: metadata.credentials[0]!.id,
-			disabledCause: "secret disabled reason",
+			disabledCause: "disabled via auth-broker",
 		});
 		expect(disabled.generation).toBeGreaterThan(metadata.generation);
 	});
