@@ -2,7 +2,7 @@
 
 The auth broker and auth gateway are two cooperating HTTP services that move OAuth refresh tokens and provider access tokens off developer laptops and into a single broker host.
 
-- **`gjc auth-broker serve`** holds the canonical SQLite credential vault, performs OAuth refreshes, and exposes a small REST API (`/v1/snapshot`, `/v1/credential/:id/refresh`, `/v1/credential/:id/disable`, `/v1/credential`, `/v1/usage`, `/v1/healthz`).
+- **`gjc auth-broker serve`** holds the canonical SQLite credential vault, performs OAuth refreshes, and exposes a small REST API (`/v1/snapshot`, `/v1/credential/:id/refresh`, `/v1/credential/:id/disable`, `/v1/credential`, `/v1/usage`, `/v1/usage/scoped?provider=<provider>`, `/v1/healthz`).
 - **`gjc auth-gateway serve --provider=<provider>`** is a provider-scoped forward-proxy. It accepts OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses requests, injects the broker-resolved access token, and dispatches only through the selected provider catalog. Clients (containerised gjc, llm-git, the macOS usage widget, …) never see the access token.
 
 Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token when bearer authentication is configured. The gateway's `--no-auth` mode disables inbound bearer checks only on a loopback bind; an unauthenticated non-loopback bind is rejected at startup.
@@ -72,7 +72,8 @@ gjc auth-broker status    [--json]
 | `POST` | `/v1/credential` | bearer | Upsert one OAuth or API-key credential |
 | `POST` | `/v1/credential/:id/refresh` | bearer | Force-refresh one OAuth credential |
 | `POST` | `/v1/credential/:id/disable` | bearer | Disable one credential with a recorded cause |
-| `GET`  | `/v1/usage` | bearer | Aggregate `UsageReport[]` across credentials |
+|| `GET`  | `/v1/usage` | bearer | Aggregate `UsageReport[]` across credentials |
+| `GET`  | `/v1/usage/scoped?provider=<provider>` | bearer | Provider-scoped `UsageReport[]`; unavailable on legacy brokers |
 
 Requests use `Authorization: Bearer <token>`. The server compares against an in-memory token allow-list; the gateway’s implementation uses a timing-safe comparison.
 
@@ -130,7 +131,7 @@ Constants: `USAGE_REPORT_TTL_MS = 5 * 60_000`, `USAGE_LAST_GOOD_RETENTION_MS = 2
 
 ### Client-side single-flight (`RemoteAuthCredentialStore`)
 
-When the gateway (or any other broker client) calls `fetchUsageReports()` / `getUsageReport(provider, credential)`, `RemoteAuthCredentialStore` coalesces concurrent calls into a single `GET /v1/usage` round-trip and caches the result for **15 s** in memory.
+When the gateway (or any other broker client) calls `fetchUsageReports()` / `getUsageReport(provider, credential)`, `RemoteAuthCredentialStore` uses the versioned `/v1/usage/scoped?provider=<provider>` route for provider-scoped calls and caches the result for **15 s** in memory. Legacy brokers that do not expose the scoped route fail closed instead of falling back to aggregate usage.
 
 - `USAGE_CACHE_TTL_MS = 15_000` (`packages/ai/src/auth-broker/remote-store.ts`).
 - A single `#usageInflight` promise is shared across all callers; a per-caller `AbortSignal` is **raced** against the shared promise, not threaded into it, so one caller’s abort never cascades into a peer’s in-flight request.

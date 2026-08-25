@@ -1048,7 +1048,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					try {
 						return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
 					} catch (error) {
-						logger.warn("auth-gateway scoped usage unavailable", { error: String(error) });
+						logger.warn("auth-gateway scoped usage unavailable", {
+							error: cleanReason(error) ?? "Usage unavailable.",
+						});
 						return withCors(
 							json(503, { error: { code: "usage_unavailable", message: "Usage unavailable." } }),
 							req,

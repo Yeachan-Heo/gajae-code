@@ -36,6 +36,7 @@ import {
 	AuthBrokerCredentialMetadataUnsupportedError,
 	AuthBrokerStreamUnsupportedError,
 } from "./client";
+import { cleanReason } from "./redact";
 import type {
 	CredentialMetadataRecord,
 	RefresherSchedule,
@@ -1274,7 +1275,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					return body.reports;
 				})
 				.catch(error => {
-					logger.warn("auth-broker scoped usage fetch failed", { provider, error: String(error) });
+					logger.warn("auth-broker scoped usage fetch failed", {
+						provider,
+						error: cleanReason(error) ?? "Usage unavailable.",
+					});
 					throw error;
 				})
 				.finally(() => this.#scopedUsageInflight.delete(provider));
