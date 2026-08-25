@@ -30,7 +30,7 @@ export default class AuthGateway extends Command {
 		regenerate: Flags.boolean({ description: "Regenerate the gateway bearer token (token)" }),
 		"no-auth": Flags.boolean({
 			description:
-				"Disable inbound bearer-token auth (serve). Useful when bound to loopback — any caller is allowed.",
+				"Disable inbound bearer-token auth (serve). Loopback non-browser clients without an Origin header are allowed.",
 		}),
 	};
 
@@ -39,7 +39,7 @@ export default class AuthGateway extends Command {
 		"# Boot on a non-default port\n  gjc auth-gateway serve --provider=openai-codex --bind=127.0.0.1:4000",
 		"# Print the gateway bearer token (creates one on first run)\n  gjc auth-gateway token",
 		"# Rotate the gateway bearer token\n  gjc auth-gateway token --regenerate",
-		"# Run the scoped gateway on loopback without any bearer (anyone on this host can call)\n  gjc auth-gateway serve --provider=openai-codex --no-auth",
+		"# Run the scoped gateway on loopback for non-browser local clients without a bearer\n  gjc auth-gateway serve --provider=openai-codex --no-auth",
 		"# Show scoped local gateway + broker config status\n  gjc auth-gateway status --provider=openai-codex",
 		"# Probe credentials for one gateway scope\n  gjc auth-gateway check --provider=openai-codex",
 		"# Same, machine-readable for scripts\n  gjc auth-gateway check --provider=openai-codex --json",

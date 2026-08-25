@@ -68,7 +68,7 @@ describe("auth-gateway no-auth browser origin guard", () => {
 			expect(response.status).toBe(403);
 			expect(response.headers.get("access-control-allow-origin")).toBeNull();
 			const body = (await response.json()) as { error?: string };
-			expect(body.error).toContain("bearer token");
+			expect(body.error).toBe("no-auth rejects requests carrying Origin");
 		});
 	});
 

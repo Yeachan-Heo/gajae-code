@@ -1015,7 +1015,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					peer,
 					origin: req.headers.get("origin"),
 				});
-				return json(403, { error: "browser origin requires bearer token" });
+				return json(403, { error: "no-auth rejects requests carrying Origin" });
 			}
 			// CORS preflight is always answered without auth — browsers send
 			// preflights pre-authentication and a 401 here breaks the actual

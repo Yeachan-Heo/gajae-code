@@ -6,6 +6,10 @@
 
 - The built-in `kiro` provider now accepts long-lived `KIRO_API_KEY` values (`ksk_…` from [app.kiro.dev](https://app.kiro.dev/settings/api-keys)) in addition to AWS Builder ID OAuth. API-key auth talks to the Kiro service root with `tokentype: API_KEY` and discovers the live model catalog via `ListAvailableModels`. Builder ID login (`gjc auth-broker login kiro` / `AWS_BEARER_TOKEN_KIRO`) is unchanged.
 
+### Breaking Changes
+
+- `AuthGatewayServerOptions` now requires `providerScope` and `listModels`; direct `@gajae-code/ai` callers must construct one gateway instance per provider and pass the provider-filtered source catalog. This matches the mandatory `--provider=<id>` CLI migration and prevents cross-provider model and credential ambiguity.
+
 ### Fixed
 
 - The generic OpenAI Responses transport now preserves the typed `server_is_overloaded` code from an HTTP 200 terminal envelope as transport facts (`openaiErrorCode` / `providerCode`), and that statusless code classifies as a `server` fallback trigger. Both terminal shapes that carry the structured failure are covered: `response.failed`, and `response.completed` whose response `status` is `failed` (including the nested `status_details.error` form). Previously the envelope became a plain `Error`, so the only structured evidence of a capacity rejection was lost and consumers had to read provider prose. The code is matched case-sensitively and exactly, so near misses (`server_is_overloaded_now`), case variants (`SERVER_IS_OVERLOADED`), padded variants, and a `cancelled` response carrying the same code all stay untyped and unclassified; the displayed error message is unchanged in every case. The shared Azure Responses path inherits the same parsing. (#5018)
