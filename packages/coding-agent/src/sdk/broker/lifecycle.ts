@@ -1677,8 +1677,11 @@ function isLifecycleCleanupEvidence(cleanup: CleanupEvidence): boolean {
 		"lifecycleDeleteMetadata",
 		"lifecycleParentIdentity",
 		"lifecycleFiles",
+		"uncertainRetirement",
 	]);
 	const parentIdentity = record.lifecycleParentIdentity as Record<string, unknown> | undefined;
+	const filesValid = Array.isArray(record.lifecycleFiles) && record.lifecycleFiles.every(isLifecycleCleanupFile);
+	const receiptValid = record.uncertainRetirement === undefined || isLifecycleRetirementReceipt(record.uncertainRetirement);
 	return (
 		Object.keys(record).every(key => allowed.has(key)) &&
 		record.phase === "lifecycle" &&
@@ -1692,18 +1695,23 @@ function isLifecycleCleanupEvidence(cleanup: CleanupEvidence): boolean {
 		typeof parentIdentity.ino === "string" &&
 		/^\d+$/.test(parentIdentity.ino) &&
 		Array.isArray(record.lifecycleFiles) &&
-		record.lifecycleFiles.length > 0 &&
+		(record.lifecycleFiles.length > 0 || isLifecycleRetirementCleanup(cleanup)) &&
 		record.lifecycleFiles.length <= 4 &&
 		(record.lifecycleDeleteMetadata === undefined || record.lifecycleDeleteMetadata === true) &&
-		record.lifecycleFiles.every(isLifecycleCleanupFile)
+		receiptValid &&
+		filesValid
 	);
 }
 
 function validateLifecycleCleanupShape(cleanup: CleanupEvidence): BrokerResponse | undefined {
+	const retirement = isLifecycleRetirementCleanup(cleanup) ? cleanup.uncertainRetirement : undefined;
 	if (
 		!isLifecycleCleanupEvidence(cleanup) ||
 		lifecycleCleanupHasMixedMetadataSchema(cleanup) ||
-		(cleanup.lifecycleDeleteMetadata === true && cleanup.lifecycleFiles!.length > 2)
+		(cleanup.lifecycleDeleteMetadata === true && cleanup.lifecycleFiles!.length > 2) ||
+		(retirement !== undefined && cleanup.lifecycleDeleteMetadata === true) ||
+		(retirement !== undefined && cleanup.sessionId !== retirement.identity.sessionId) ||
+		(retirement !== undefined && path.resolve(cleanup.metadataRoot!) !== path.resolve(retirement.identity.stateRoot))
 	)
 		return fail("terminal_uncertain", "Lifecycle cleanup replay lacks a complete unambiguous schema.");
 	const files = cleanup.lifecycleFiles!;
@@ -1735,6 +1743,404 @@ function validateLifecycleCleanupShape(cleanup: CleanupEvidence): BrokerResponse
 		}
 	}
 	return undefined;
+}
+
+function retirementCleanupFromResponse(value: unknown): LifecycleRetirementCleanup | undefined {
+	if (typeof value !== "object" || value === null || (value as { ok?: unknown }).ok !== false) return undefined;
+	const cleanup = (value as { error?: { cleanup?: unknown } }).error?.cleanup;
+	return isLifecycleRetirementCleanup(cleanup) ? cleanup : undefined;
+}
+
+function exactLifecycleRootIdentity(root: string): { dev: string; ino: string } | undefined {
+	try {
+		const rootStat = fsSync.lstatSync(root, { bigint: true });
+		const sdk = fsSync.lstatSync(path.join(root, "sdk"), { bigint: true });
+		if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || !sdk.isDirectory() || sdk.isSymbolicLink()) return undefined;
+		return { dev: sdk.dev.toString(), ino: sdk.ino.toString() };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Only ENOENT under the exact, non-symlinked sdk parent proves endpoint absence. */
+function exactLifecycleEndpointAbsent(root: string, id: string): boolean {
+	if (!exactLifecycleRootIdentity(root)) return false;
+	try {
+		fsSync.lstatSync(path.join(root, "sdk", `${id}.json`));
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT";
+	}
+}
+
+function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, record: IndexedSession): boolean {
+	return (
+		identity.sessionId === record.sessionId &&
+		path.resolve(identity.stateRoot) === path.resolve(record.locator.stateRoot) &&
+		identity.endpointGeneration === record.endpointGeneration &&
+		identity.endpointMtimeMs === record.endpointMtimeMs &&
+		identity.pid === record.pid &&
+		identity.processIncarnation === record.processIncarnation &&
+		identity.hostIncarnation === record.hostIncarnation &&
+		identity.lifecycleRequestId === record.lifecycleRequestId
+	);
+}
+
+function retirementMarkerCapture(
+	root: string,
+	id: string,
+	pathName: string,
+	expected: EffectMarker,
+): LifecycleFileCapture | undefined {
+	const capture = captureLifecycleFile(pathName, true, true);
+	if (!capture) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = parseLifecycleJson(capture.bytes);
+	} catch {
+		throw new Error("Lifecycle retirement marker is malformed.");
+	}
+	if (
+		!isExactEffectMarker(parsed) ||
+		!sameEffectMarker(parsed, expected) ||
+		canonicalJson(parsed) !== decodeLifecycleUtf8(capture.bytes) ||
+		path.dirname(path.resolve(pathName)) !== path.join(path.resolve(root), "sdk") ||
+		path.basename(pathName) !== path.basename(pathName === lifecycleMarkerPath(root, id) ? lifecycleMarkerPath(root, id) : lifecycleReadyPath(root, id))
+	)
+		throw new Error("Lifecycle retirement marker identity is incomplete.");
+	return capture;
+}
+
+function retirementCleanupPlan(
+	root: string,
+	id: string,
+	create: { identity: string; effectMarker?: string },
+	identity: LifecycleRetirementIdentity,
+	remoteCreateKey?: string,
+): LifecycleRetirementCleanup | BrokerResponse {
+	const parentIdentity = exactLifecycleRootIdentity(root);
+	if (!parentIdentity) return fail("terminal_uncertain", "Lifecycle metadata root or parent identity is unavailable.");
+	if (!create.effectMarker || create.effectMarker !== identity.lifecycleRequestId)
+		return fail("terminal_uncertain", "Create ledger identity lacks the indexed lifecycle request marker.");
+	const expected: EffectMarker = {
+		pid: identity.pid,
+		effectMarker: identity.lifecycleRequestId,
+		incarnation: identity.processIncarnation,
+	};
+	const markerPath = lifecycleMarkerPath(root, id);
+	const readyPath = lifecycleReadyPath(root, id);
+	let marker: LifecycleFileCapture | undefined;
+	let ready: LifecycleFileCapture | undefined;
+	try {
+		marker = retirementMarkerCapture(root, id, markerPath, expected);
+		ready = retirementMarkerCapture(root, id, readyPath, expected);
+	} catch {
+		return fail("terminal_uncertain", "Lifecycle marker or readiness evidence is malformed or replaced.");
+	}
+	// A readiness sibling without its canonical marker is never an authority. A
+	// fresh retirement must also retain both captures so the owner chain is
+	// complete; the staged replay receipt is the only path that may proceed with
+	// both siblings already detached.
+	if (!marker || !ready) return fail("terminal_uncertain", "Lifecycle marker and readiness evidence are incomplete.");
+	const directory = path.join(root, "sdk");
+	const files: LifecycleCleanupFile[] = [
+		{
+			path: markerPath,
+			identity: serializeCleanupIdentity({ ...marker.identity, size: Number(marker.identity.size) }),
+			attempt: 1,
+			plannedPath: path.join(directory, `.gjc-delete-${randomUUID()}-${path.basename(markerPath)}`),
+		},
+		{
+			path: readyPath,
+			identity: serializeCleanupIdentity({ ...ready.identity, size: Number(ready.identity.size) }),
+			attempt: 1,
+			plannedPath: path.join(directory, `.gjc-delete-${randomUUID()}-${path.basename(readyPath)}`),
+		},
+	];
+	return {
+		phase: "lifecycle",
+		sessionId: id,
+		metadataRoot: root,
+		lifecycleParentIdentity: parentIdentity,
+		lifecycleFiles: files,
+		uncertainRetirement: {
+			version: 1,
+			stage: "cleanup",
+			identity: { ...identity, ...(remoteCreateKey === undefined ? {} : { remoteCreateKey }) },
+		},
+	};
+}
+
+function retirementCleanupSettled(cleanup: LifecycleRetirementCleanup): boolean {
+	for (const file of cleanup.lifecycleFiles ?? []) {
+		try {
+			fsSync.lstatSync(file.path);
+			return false;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+		}
+		for (const candidate of [file.detachedPath, file.plannedPath]) {
+			if (!candidate) continue;
+			try {
+				const stat = fsSync.lstatSync(candidate, { bigint: true });
+				if (!stat.isFile() || stat.isSymbolicLink() || stat.size !== 0n) return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
+			}
+		}
+	}
+	return true;
+}
+
+function retirementIdentityFromInput(
+	input: Input,
+	record: IndexedSession,
+	createIdentity: string,
+	remoteCreateKey?: string,
+): LifecycleRetirementIdentity | BrokerResponse {
+	const stateRoot = text(input.stateRoot);
+	const lifecycleRequestId = text(input.lifecycleRequestId);
+	const processIdentity = text(input.processIncarnation);
+	const hostIdentity = text(input.hostIncarnation);
+	const endpointGeneration = input.endpointGeneration;
+	const endpointMtimeMs = input.endpointMtimeMs;
+	if (
+		!stateRoot ||
+		!path.isAbsolute(stateRoot) ||
+		!lifecycleRequestId ||
+		!processIdentity ||
+		!hostIdentity ||
+		typeof endpointGeneration !== "number" ||
+		!Number.isSafeInteger(endpointGeneration) ||
+		endpointGeneration <= 0 ||
+		typeof endpointMtimeMs !== "number" ||
+		!Number.isFinite(endpointMtimeMs) ||
+		endpointMtimeMs <= 0 ||
+		!boundedRetirementString(lifecycleRequestId, MAX_EFFECT_MARKER_LENGTH) ||
+		!/^[A-Za-z0-9._-]+$/.test(lifecycleRequestId) ||
+		!boundedRetirementString(processIdentity, MAX_PROCESS_INCARNATION_LENGTH) ||
+		!boundedRetirementString(hostIdentity, MAX_PROCESS_INCARNATION_LENGTH)
+	)
+		return fail("invalid_input", "Retirement requires the complete indexed identity proof.");
+	const identity: LifecycleRetirementIdentity = {
+		sessionId: record.sessionId,
+		stateRoot,
+		endpointGeneration,
+		endpointMtimeMs,
+		pid: record.pid,
+		processIncarnation: processIdentity,
+		hostIncarnation: hostIdentity,
+		lifecycleRequestId,
+		createIdentity,
+		...(remoteCreateKey === undefined ? {} : { remoteCreateKey }),
+	};
+	if (!isLifecycleRetirementIdentity(identity))
+		return fail("invalid_input", "Retirement identity is malformed or exceeds the bounded proof schema.");
+	if (
+		path.resolve(record.locator.stateRoot) !== path.resolve(stateRoot) ||
+		record.endpointGeneration !== endpointGeneration ||
+		record.endpointMtimeMs !== endpointMtimeMs ||
+		record.lifecycleRequestId !== lifecycleRequestId ||
+		(record.processIncarnation ?? record.hostIncarnation) !== processIdentity ||
+		(record.hostIncarnation ?? record.processIncarnation) !== hostIdentity
+	)
+		return fail("endpoint_stale", "Retirement identity does not match the indexed session authority.");
+	return identity;
+}
+
+function retirementProof(identity: LifecycleRetirementIdentity, indexSeq?: number): BrokerResponse {
+	return {
+		ok: true,
+		result: {
+			sessionId: identity.sessionId,
+			retired: true,
+			ledgerState: "terminal_error",
+			indexType: "session_closed",
+			stateRoot: identity.stateRoot,
+			endpointGeneration: identity.endpointGeneration,
+			endpointMtimeMs: identity.endpointMtimeMs,
+			processIncarnation: identity.processIncarnation,
+			hostIncarnation: identity.hostIncarnation,
+			lifecycleRequestId: identity.lifecycleRequestId,
+			...(identity.remoteCreateKey === undefined ? {} : { remoteCreateKey: identity.remoteCreateKey }),
+			...(indexSeq === undefined ? {} : { indexSeq }),
+		},
+	};
+}
+
+function isLifecycleBrokerResponse(value: unknown): value is BrokerResponse {
+	return typeof value === "object" && value !== null && "ok" in value && typeof (value as { ok?: unknown }).ok === "boolean";
+}
+
+async function executeUncertainRetirement(
+	broker: Broker,
+	input: Input,
+	identity: string,
+	cleanup?: LifecycleRetirementCleanup,
+): Promise<BrokerResponse> {
+	const id = sessionId(input);
+	if (!id) return fail("invalid_input", "sessionId is required.");
+	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+	await broker.index.refresh();
+	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (!record) return fail("not_found", "session is not indexed");
+	let receipt = cleanup?.uncertainRetirement;
+	let retirementIdentity: LifecycleRetirementIdentity;
+	let create = receipt ? broker.ledger.get(receipt.identity.createIdentity) : undefined;
+	if (receipt) {
+		if (
+			receipt.identity.sessionId !== id ||
+			(receipt.identity.remoteCreateKey !== undefined && text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey) ||
+			!sameRetirementIdentityAsRecord(receipt.identity, record)
+		)
+			return fail("endpoint_stale", "Staged retirement identity no longer matches the indexed session authority.");
+		retirementIdentity = receipt.identity;
+		if (!create) return fail("terminal_uncertain", "Staged retirement create identity is no longer present.");
+	} else {
+		if (record.ambiguous || !isSessionAuthorityEligible(record))
+			return fail("endpoint_stale", "Session authority is ambiguous and cannot be retired safely.");
+		if (record.terminalUncertain !== true)
+			return fail("invalid_input", "session.reconcile_uncertain only accepts terminalUncertain create rows.");
+		const lifecycleRequestId = text(input.lifecycleRequestId);
+		const remoteCreateKey = input.remoteCreateKey === undefined ? undefined : text(input.remoteCreateKey);
+		if (input.remoteCreateKey !== undefined && remoteCreateKey === undefined)
+			return fail("invalid_input", "remoteCreateKey must be a bounded non-empty string.");
+		const matches = broker.ledger.listUncertainCreatesBySessionId(id, lifecycleRequestId, remoteCreateKey);
+		if (matches.length === 0) return fail("not_found", "No complete terminal_uncertain create identity matches this session.");
+		if (matches.length !== 1)
+			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
+		create = matches[0]!;
+		const proof = retirementIdentityFromInput(input, record, create.identity, remoteCreateKey);
+		if (isLifecycleBrokerResponse(proof)) return proof;
+		retirementIdentity = proof;
+		if (
+			create.effectMarker !== retirementIdentity.lifecycleRequestId ||
+			create.effectIntent?.sessionId !== id ||
+			path.resolve(create.effectIntent.stateRoot) !== path.resolve(retirementIdentity.stateRoot)
+		)
+			return fail("terminal_uncertain", "Create ledger identity does not match the indexed lifecycle authority.");
+		if (observeProcess(record.pid, retirementIdentity.hostIncarnation) !== "exited")
+			return fail("terminal_uncertain", "Session host exit could not be proven.");
+		if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
+			return fail("terminal_uncertain", "The indexed session endpoint still exists or is unsafe to inspect.");
+		const planned = retirementCleanupPlan(
+			retirementIdentity.stateRoot,
+			id,
+			create,
+			retirementIdentity,
+			remoteCreateKey,
+		);
+		if (isLifecycleBrokerResponse(planned)) return planned;
+		cleanup = planned;
+		await broker.ledger.transition(identity, "effect_started", {
+			intendedSessionId: id,
+			effectMarker: retirementIdentity.lifecycleRequestId,
+			response: fail(
+				"cleanup_pending",
+				"Uncertain session retirement is staged for exact lifecycle cleanup.",
+				cleanup,
+			),
+		});
+		receipt = cleanup.uncertainRetirement;
+	}
+
+	if (!create || !receipt || !cleanup) return fail("terminal_uncertain", "Retirement receipt is incomplete.");
+	if (
+		create.state !== "terminal_uncertain" &&
+		!(create.state === "terminal_error" && receipt.stage === "ledger")
+	)
+		return fail("terminal_uncertain", "Create ledger identity is no longer an uncertain retirement candidate.");
+	if (receipt.stage === "cleanup") {
+		if (cleanup.lifecycleFiles?.length) {
+			const cleanupResponse = await reconcileLifecycleCleanup(
+				broker,
+				identity,
+				cleanup,
+				fail("cleanup_pending", "Uncertain session retirement cleanup remains staged.", cleanup),
+			);
+			if (!cleanupResponse.ok && cleanupResponse.error.code !== "cleanup_pending") return cleanupResponse;
+			const persisted = retirementCleanupFromResponse(cleanupResponse) ?? retirementCleanupFromResponse(broker.ledger.get(identity)?.response);
+			if (!persisted || !retirementCleanupSettled(persisted)) return cleanupResponse;
+			cleanup = persisted;
+		}
+		if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
+			return fail("cleanup_pending", "Uncertain session retirement is pending because the endpoint reappeared.", cleanup);
+		for (const candidate of [lifecycleMarkerPath(retirementIdentity.stateRoot, id), lifecycleReadyPath(retirementIdentity.stateRoot, id)]) {
+			if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
+				return fail("cleanup_pending", "Uncertain session retirement is pending because lifecycle authority reappeared.", cleanup);
+			try {
+				if (fsSync.lstatSync(candidate))
+					return fail("cleanup_pending", "Uncertain session retirement is pending because lifecycle authority reappeared.", cleanup);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+					return fail("cleanup_pending", "Uncertain session retirement could not prove lifecycle authority absence.", cleanup);
+			}
+		}
+		const staged: LifecycleRetirementCleanup = {
+			...cleanup,
+			uncertainRetirement: { ...receipt, stage: "index" },
+		};
+		await broker.ledger.transition(identity, "effect_started", {
+			intendedSessionId: id,
+			response: fail("cleanup_pending", "Uncertain session retirement is staged before index closure.", staged),
+		});
+		cleanup = staged;
+		receipt = staged.uncertainRetirement;
+	}
+
+	await broker.index.refresh();
+	record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (!record || !sameRetirementIdentityAsRecord(retirementIdentity, record))
+		return fail("endpoint_stale", "Session authority changed before retirement index closure.");
+	if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
+		return fail("cleanup_pending", "Uncertain session retirement is pending because the endpoint reappeared.", cleanup);
+	if (receipt.stage === "index") {
+		let indexSeq = receipt.indexSeq;
+		if (!record.terminal) {
+			try {
+				const event = await broker.index.append({
+					type: "session_closed",
+					sessionId: id,
+					locator: record.locator,
+					endpointGeneration: record.endpointGeneration,
+					pid: record.pid,
+					...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+					...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
+					...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+					...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
+				});
+				indexSeq = event.indexSeq;
+			} catch {
+				return fail("cleanup_pending", "Uncertain session retirement is staged before index closure.", cleanup);
+			}
+		} else indexSeq ??= record.indexSeq;
+		const staged: LifecycleRetirementCleanup = {
+			...cleanup,
+			uncertainRetirement: { ...receipt, stage: "ledger", ...(indexSeq === undefined ? {} : { indexSeq }) },
+		};
+		try {
+			await broker.ledger.transition(identity, "effect_started", {
+				intendedSessionId: id,
+				response: fail("cleanup_pending", "Uncertain session retirement is staged before ledger closure.", staged),
+			});
+		} catch {
+			return fail("cleanup_pending", "Uncertain session retirement remains staged after index closure.", staged);
+		}
+		cleanup = staged;
+		receipt = staged.uncertainRetirement;
+	}
+
+	if (create.state !== "terminal_error") {
+		try {
+			await broker.ledger.transition(create.identity, "terminal_error", {
+				intendedSessionId: id,
+				response: fail("terminal_uncertain", "Uncertain create retired after exact identity proof."),
+			});
+		} catch {
+			return fail("cleanup_pending", "Uncertain session retirement remains staged after index closure.", cleanup);
+		}
+	}
+	return retirementProof(retirementIdentity, receipt.indexSeq);
 }
 
 function validateLifecycleCleanupFile(root: string, id: string, file: LifecycleCleanupFile): boolean {
@@ -2187,6 +2593,14 @@ async function reconcileLifecycleCleanup(
 		let foundUnauthorized = false;
 		for (const candidate of candidates) {
 			if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
+			if (path.resolve(candidate) !== path.resolve(file.path)) {
+				try {
+					const quarantineStat = fsSync.lstatSync(candidate, { bigint: true });
+					if (quarantineStat.isFile() && quarantineStat.size === 0n) continue;
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				}
+			}
 			try {
 				const stat = fsSync.lstatSync(candidate);
 				if (stat.isSymbolicLink() || !stat.isFile()) {
@@ -2466,6 +2880,109 @@ type LifecycleFileCapture = {
 	digest: string;
 };
 
+/**
+ * Identity-bound receipt for the three durable retirement boundaries.  This is
+ * carried inside the ordinary lifecycle cleanup response so a broker restart
+ * enters the same replay path as every other identity-bound cleanup receipt.
+ * It is deliberately credential-free and bounded: it contains only the
+ * indexed process/session identity and the ledger/index stage.
+ */
+type LifecycleRetirementIdentity = {
+	sessionId: string;
+	stateRoot: string;
+	endpointGeneration: number;
+	endpointMtimeMs: number;
+	pid: number;
+	processIncarnation: string;
+	hostIncarnation: string;
+	lifecycleRequestId: string;
+	createIdentity: string;
+	remoteCreateKey?: string;
+};
+
+type LifecycleRetirementStage = "cleanup" | "index" | "ledger";
+
+type LifecycleRetirementReceipt = {
+	version: 1;
+	stage: LifecycleRetirementStage;
+	identity: LifecycleRetirementIdentity;
+	indexSeq?: number;
+};
+
+type LifecycleRetirementCleanup = CleanupEvidence & {
+	uncertainRetirement: LifecycleRetirementReceipt;
+};
+
+function boundedRetirementString(value: unknown, max: number): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/.test(value);
+}
+
+function isLifecycleRetirementIdentity(value: unknown): value is LifecycleRetirementIdentity {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const identity = value as Record<string, unknown>;
+	const keys = Object.keys(identity);
+	if (
+		keys.some(
+			key =>
+				!new Set([
+					"sessionId",
+					"stateRoot",
+					"endpointGeneration",
+					"endpointMtimeMs",
+					"pid",
+					"processIncarnation",
+					"hostIncarnation",
+					"lifecycleRequestId",
+					"createIdentity",
+					"remoteCreateKey",
+				]).has(key),
+		)
+	) {
+		return false;
+	}
+	return (
+		isCanonicalSessionId(identity.sessionId) &&
+		boundedRetirementString(identity.stateRoot, 4096) &&
+		path.isAbsolute(identity.stateRoot) &&
+		typeof identity.endpointGeneration === "number" &&
+		Number.isSafeInteger(identity.endpointGeneration) &&
+		identity.endpointGeneration > 0 &&
+		typeof identity.endpointMtimeMs === "number" &&
+		Number.isFinite(identity.endpointMtimeMs) &&
+		identity.endpointMtimeMs > 0 &&
+		typeof identity.pid === "number" &&
+		Number.isSafeInteger(identity.pid) &&
+		identity.pid > 0 &&
+		boundedRetirementString(identity.processIncarnation, MAX_PROCESS_INCARNATION_LENGTH) &&
+		boundedRetirementString(identity.hostIncarnation, MAX_PROCESS_INCARNATION_LENGTH) &&
+		boundedRetirementString(identity.lifecycleRequestId, MAX_EFFECT_MARKER_LENGTH) &&
+		/^[A-Za-z0-9._-]+$/.test(identity.lifecycleRequestId) &&
+		boundedRetirementString(identity.createIdentity, 256) &&
+		(identity.remoteCreateKey === undefined || boundedRetirementString(identity.remoteCreateKey, 256))
+	);
+}
+
+function isLifecycleRetirementReceipt(value: unknown): value is LifecycleRetirementReceipt {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const receipt = value as Record<string, unknown>;
+	if (
+		Object.keys(receipt).some(key => !new Set(["version", "stage", "identity", "indexSeq"]).has(key)) ||
+		receipt.version !== 1 ||
+		(receipt.stage !== "cleanup" && receipt.stage !== "index" && receipt.stage !== "ledger") ||
+		!isLifecycleRetirementIdentity(receipt.identity)
+	)
+		return false;
+	return (
+		receipt.indexSeq === undefined ||
+		(typeof receipt.indexSeq === "number" && Number.isSafeInteger(receipt.indexSeq) && receipt.indexSeq > 0)
+	);
+}
+
+function isLifecycleRetirementCleanup(value: unknown): value is LifecycleRetirementCleanup {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	return isLifecycleRetirementReceipt((value as Record<string, unknown>).uncertainRetirement);
+}
+
 function captureLifecycleFile(file: string, requireRegular = false, bounded = false): LifecycleFileCapture | undefined {
 	let descriptor: number | undefined;
 	try {
@@ -2656,7 +3173,13 @@ export async function removeOwnedLifecycleArtifactsForTest(
 	return removeOwnedLifecycleArtifacts(root, id, expected);
 }
 
-async function recordTerminalUncertain(broker: Broker, id: string, root: string, pid: number): Promise<void> {
+async function recordTerminalUncertain(
+	broker: Broker,
+	id: string,
+	root: string,
+	pid: number,
+	expected?: EffectMarker,
+): Promise<void> {
 	await broker.index.refresh();
 	const registered = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (registered)
@@ -2668,6 +3191,12 @@ async function recordTerminalUncertain(broker: Broker, id: string, root: string,
 			pid: registered.pid,
 			...(registered.processIncarnation === undefined ? {} : { processIncarnation: registered.processIncarnation }),
 			...(registered.hostIncarnation === undefined ? {} : { hostIncarnation: registered.hostIncarnation }),
+			...(registered.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: registered.endpointMtimeMs }),
+			...(registered.lifecycleRequestId === undefined
+				? expected?.effectMarker === undefined
+					? {}
+					: { lifecycleRequestId: expected.effectMarker }
+				: { lifecycleRequestId: registered.lifecycleRequestId }),
 			terminalUncertain: true,
 		});
 	else
@@ -2700,7 +3229,7 @@ async function terminateSpawnedChild(
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
 	const proofBudget: LifecycleProofBudget = { timing, deadlineAt: deadline };
 	const failClosed = async (): Promise<boolean> => {
-		await recordTerminalUncertain(broker, id, root, pid);
+		await recordTerminalUncertain(broker, id, root, pid, expected);
 		return false;
 	};
 	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
@@ -5263,91 +5792,7 @@ async function executeLifecycleResponse(
 		return completion;
 	}
 	if (operation === "session.reconcile_uncertain") {
-		const id = sessionId(input);
-		if (!id) return fail("invalid_input", "sessionId is required.");
-		if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
-		await broker.index.refresh();
-		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-		if (!record) return fail("not_found", "session is not indexed");
-		if (record.terminalUncertain !== true)
-			return fail("invalid_input", "session.reconcile_uncertain only accepts terminalUncertain index rows.");
-		if (record.live) return fail("live_session", "Session host is still live.");
-		const incarnation = record.hostIncarnation ?? record.processIncarnation;
-		if (observeProcess(record.pid, incarnation) === "alive")
-			return fail("live_session", "Session host incarnation is still alive.");
-		if (observeProcess(record.pid, incarnation) === "uncertain" && !hasObservedProcessExit(record.pid))
-			return fail("terminal_uncertain", "Session host liveness could not be proven.");
-		const matches = broker.ledger.listUncertainCreatesBySessionId(id);
-		if (matches.length === 0) return fail("not_found", "No terminal_uncertain create identity matches this session.");
-		if (matches.length !== 1)
-			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
-		const create = matches[0]!;
-		const root = record.locator.stateRoot;
-		if (!(await endpointRemoved(root, id)))
-			return fail("terminal_uncertain", "The indexed session endpoint still exists.");
-		const marker = lifecycleMarkerPath(root, id);
-		const ready = lifecycleReadyPath(root, id);
-		const leftovers: string[] = [];
-		for (const candidate of [marker, ready]) {
-			let stat: fsSync.BigIntStats;
-			try {
-				stat = await fs.lstat(candidate, { bigint: true });
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-				return fail("terminal_uncertain", "Lifecycle leftover path could not be inspected safely.");
-			}
-			if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1n)
-				return fail("terminal_uncertain", "Lifecycle leftover is not a regular unshared file.");
-			let parsed: { pid?: unknown; incarnation?: unknown; effectMarker?: unknown };
-			try {
-				parsed = JSON.parse(await fs.readFile(candidate, "utf8")) as {
-					pid?: unknown;
-					incarnation?: unknown;
-					effectMarker?: unknown;
-				};
-			} catch {
-				return fail("terminal_uncertain", "Lifecycle leftover is not valid JSON.");
-			}
-			if (parsed.pid !== record.pid)
-				return fail("terminal_uncertain", "Lifecycle leftover pid does not match the indexed host.");
-			if (parsed.effectMarker !== undefined && parsed.effectMarker !== create.effectMarker)
-				return fail("terminal_uncertain", "Lifecycle leftover effect marker does not match the uncertain create.");
-			const leftoverIncarnation = typeof parsed.incarnation === "string" ? parsed.incarnation : undefined;
-			if (leftoverIncarnation && incarnation && leftoverIncarnation !== incarnation)
-				return fail("terminal_uncertain", "Lifecycle leftover incarnation does not match the indexed host.");
-			if (observeProcess(record.pid, leftoverIncarnation ?? incarnation) === "alive")
-				return fail("live_session", "Lifecycle leftover still names a live host.");
-			leftovers.push(candidate);
-		}
-		for (const candidate of leftovers) {
-			await fs.unlink(candidate);
-			try {
-				await fs.lstat(candidate);
-				return fail("terminal_uncertain", "Lifecycle leftover remained after unlink.");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
-					return fail("terminal_uncertain", "Lifecycle leftover unlink could not be verified.");
-			}
-		}
-		await broker.ledger.transition(create.identity, "terminal_error", {
-			intendedSessionId: id,
-			response: fail("terminal_uncertain", "Uncertain create retired after dead-host and absent-marker proof."),
-		});
-		await broker.index.append({
-			type: "session_closed",
-			sessionId: id,
-			locator: record.locator,
-			endpointGeneration: record.endpointGeneration,
-			pid: record.pid,
-			...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
-			...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
-			...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
-			...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
-		});
-		return {
-			ok: true,
-			result: { sessionId: id, retired: true, ledgerState: "terminal_error", indexType: "session_closed" },
-		};
+		return await executeUncertainRetirement(broker, input, identity, undefined);
 	}
 	return fail("invalid_input", "Unknown lifecycle operation.");
 }
@@ -5481,6 +5926,8 @@ export async function executeLifecycle(
 	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
 	if (!proofBudget)
 		proofBudget = lifecycleProofBudgetFromEffectIntent(broker, broker.ledger.get(identity)?.effectIntent);
+	if (operation === "session.reconcile_uncertain" && cleanup && isLifecycleRetirementCleanup(cleanup))
+		return { response: await executeUncertainRetirement(broker, input, identity, cleanup) };
 	if (cleanup?.phase === "metadata") {
 		if (operation !== "session.delete")
 			return {

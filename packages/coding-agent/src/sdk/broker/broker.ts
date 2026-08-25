@@ -190,15 +190,27 @@ export type BrokerResponse =
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
 
 function isCleanupPending(response: BrokerResponse): boolean {
-	return !response.ok && response.error.code === "cleanup_pending" && response.error.cleanup !== undefined;
+	if (response.ok) return false;
+	const error = (response as { error?: unknown }).error;
+	if (typeof error !== "object" || error === null) return false;
+	const value = error as { code?: unknown; cleanup?: unknown };
+	return value.code === "cleanup_pending" && value.cleanup !== undefined;
 }
 
 function cleanupFromResponse(response: unknown): BrokerCleanupEvidence | undefined {
-	return isBrokerResponse(response) && !response.ok ? response.error.cleanup : undefined;
+	if (!isBrokerResponse(response) || response.ok) return undefined;
+	const error = (response as { error?: unknown }).error;
+	if (typeof error !== "object" || error === null) return undefined;
+	const cleanup = (error as { cleanup?: unknown }).cleanup;
+	return cleanup && typeof cleanup === "object" ? (cleanup as BrokerCleanupEvidence) : undefined;
 }
 function pendingCleanupSessionId(response: BrokerResponse): string | undefined {
-	if (response.ok || response.error.code !== "cleanup_pending") return undefined;
-	return typeof response.error.cleanup?.sessionId === "string" ? response.error.cleanup.sessionId : undefined;
+	if (response.ok) return undefined;
+	const error = (response as { error?: unknown }).error;
+	if (typeof error !== "object" || error === null) return undefined;
+	const value = error as { code?: unknown; cleanup?: { sessionId?: unknown } };
+	if (value.code !== "cleanup_pending") return undefined;
+	return typeof value.cleanup?.sessionId === "string" ? value.cleanup.sessionId : undefined;
 }
 
 const LIFECYCLE_OPERATIONS = new Set([
@@ -226,7 +238,10 @@ function lifecycleFingerprint(operation: string, input: Record<string, unknown>)
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
 	if (isCleanupPending(response)) return "effect_started";
-	return response.error.code === "terminal_uncertain" ? "terminal_uncertain" : "terminal_error";
+	const error = (response as { error?: unknown }).error;
+	return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "terminal_uncertain"
+		? "terminal_uncertain"
+		: "terminal_error";
 }
 
 type InputNormalization = { input: Record<string, unknown> } | BrokerResponse;

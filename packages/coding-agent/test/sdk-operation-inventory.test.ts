@@ -55,6 +55,11 @@ describe("SDK operation inventory", () => {
 			acp: "machine_only",
 			daemonCli: "machine_only",
 		});
+		expect(OPERATIONS.find(operation => operation.id === "G08")?.adapterDispositions).toMatchObject({
+			telegram: "prohibited",
+			discord: "prohibited",
+			slack: "prohibited",
+		});
 		for (const id of ["C39", "C40"])
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual({
 				telegram: "prohibited",

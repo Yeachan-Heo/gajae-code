@@ -293,10 +293,43 @@ export interface CreationRequestV1 {
 	session_id: string | null;
 	endpoint_incarnation: string | null;
 	sidecar_verifier: { key_id: string; public_key: string } | null;
+	/** Retirement is staged before the broker effect so a post-effect crash can replay safely. */
+	retirement_intent?: CreationRetirementIntentV1;
 	wal_revision?: number;
 	wal_digest?: string;
 	safe_response?: Record<string, unknown>;
 	created_at: string;
+	updated_at: string;
+}
+export interface CreationRetirementProofV1 {
+	session_id: string;
+	cwd: string;
+	state_root: string;
+	endpoint_generation: number;
+	endpoint_mtime_ms: number;
+	process_incarnation: string;
+	host_incarnation: string;
+	lifecycle_request_id: string;
+	remote_create_key: string;
+}
+export interface CreationRetirementBrokerProofV1 {
+	session_id: string;
+	retired: true;
+	ledger_state: "terminal_error";
+	index_type: "session_closed";
+	state_root: string;
+	endpoint_generation: number;
+	endpoint_mtime_ms: number;
+	process_incarnation: string;
+	host_incarnation: string;
+	lifecycle_request_id: string;
+	remote_create_key: string;
+}
+export interface CreationRetirementIntentV1 {
+	phase: "intent" | "broker_retired";
+	proof: CreationRetirementProofV1;
+	retirement_key_digest?: string;
+	broker_proof?: CreationRetirementBrokerProofV1;
 	updated_at: string;
 }
 export interface NamespaceDeletionEntryV1 {
@@ -2395,17 +2428,169 @@ export async function repairProjections(
 	});
 }
 
+function sameCreationRetirementProof(left: CreationRetirementProofV1, right: CreationRetirementProofV1): boolean {
+	return canonicalJson(left) === canonicalJson(right);
+}
+
+function assertCreationRetirementProofMatches(
+	request: CreationRequestV1,
+	proof: CreationRetirementProofV1,
+): void {
+	if (
+		!proof.session_id ||
+		!proof.cwd ||
+		!proof.state_root ||
+		!Number.isSafeInteger(proof.endpoint_generation) ||
+		proof.endpoint_generation <= 0 ||
+		!Number.isFinite(proof.endpoint_mtime_ms) ||
+		proof.endpoint_mtime_ms <= 0 ||
+		!proof.process_incarnation ||
+		!proof.host_incarnation ||
+		!proof.lifecycle_request_id ||
+		!proof.remote_create_key
+	)
+		throw new Error("invalid_input");
+	if (request.remote_create_key !== proof.remote_create_key)
+		throw new Error("idempotency_conflict");
+	if (request.session_id !== null && request.session_id !== proof.session_id)
+		throw new Error("idempotency_conflict");
+	const intent = request.canonical_create_intent;
+	if (intent) {
+		const session = intent.session;
+		if (
+			session.session_id !== proof.session_id ||
+			path.resolve(session.cwd) !== path.resolve(proof.cwd) ||
+			path.resolve(session.cwd, ".gjc", "state") !== path.resolve(proof.state_root) ||
+			session.broker.endpoint_generation !== proof.endpoint_generation ||
+			(intent.kind === "register" || intent.remote_create_key !== proof.remote_create_key)
+		)
+			throw new Error("idempotency_conflict");
+	}
+	const staged = request.retirement_intent;
+	if (staged && !sameCreationRetirementProof(staged.proof, proof))
+		throw new Error("idempotency_conflict");
+}
+
+/** Claims retirement under the creation receipt before any broker effect. */
+export async function recordCreationRetirementIntent(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	proof: CreationRetirementProofV1,
+	retirementKeyDigest?: string,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
+			throw new Error("retire_not_allowed");
+		assertCreationRetirementProofMatches(request, proof);
+		if (
+			retirementKeyDigest &&
+			request.retirement_intent?.retirement_key_digest &&
+			request.retirement_intent.retirement_key_digest !== retirementKeyDigest
+		)
+			throw new Error("idempotency_conflict");
+		if (!request.retirement_intent) {
+			request.retirement_intent = {
+				phase: "intent",
+				proof,
+				...(retirementKeyDigest ? { retirement_key_digest: retirementKeyDigest } : {}),
+				updated_at: new Date().toISOString(),
+			};
+			request.updated_at = new Date().toISOString();
+		} else if (retirementKeyDigest && !request.retirement_intent.retirement_key_digest) {
+			request.retirement_intent.retirement_key_digest = retirementKeyDigest;
+			request.retirement_intent.updated_at = new Date().toISOString();
+			request.updated_at = new Date().toISOString();
+		}
+		return request;
+	});
+}
+
+/** Records the bounded broker proof before receipt advancement or idempotency sealing. */
+export async function recordCreationRetirementBrokerProof(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	proof: CreationRetirementProofV1,
+	brokerProof: CreationRetirementBrokerProofV1,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
+			throw new Error("retire_not_allowed");
+		assertCreationRetirementProofMatches(request, proof);
+		if (
+			brokerProof.session_id !== proof.session_id ||
+			brokerProof.state_root !== proof.state_root ||
+			brokerProof.endpoint_generation !== proof.endpoint_generation ||
+			brokerProof.endpoint_mtime_ms !== proof.endpoint_mtime_ms ||
+			brokerProof.process_incarnation !== proof.process_incarnation ||
+			brokerProof.host_incarnation !== proof.host_incarnation ||
+			brokerProof.lifecycle_request_id !== proof.lifecycle_request_id ||
+			brokerProof.remote_create_key !== proof.remote_create_key ||
+			brokerProof.retired !== true ||
+			brokerProof.ledger_state !== "terminal_error" ||
+			brokerProof.index_type !== "session_closed"
+		)
+			throw new Error("protocol_error");
+		const staged = request.retirement_intent;
+		if (staged?.broker_proof) {
+			if (canonicalJson(staged.broker_proof) !== canonicalJson(brokerProof)) throw new Error("state_corrupt");
+			return request;
+		}
+		if (!staged) {
+			request.retirement_intent = {
+				phase: "broker_retired",
+				proof,
+				broker_proof: brokerProof,
+				updated_at: new Date().toISOString(),
+			};
+		} else {
+			staged.phase = "broker_retired";
+			staged.broker_proof = brokerProof;
+			staged.updated_at = new Date().toISOString();
+		}
+		request.updated_at = new Date().toISOString();
+		return request;
+	});
+}
+
 /** Advances a creation receipt only after its WAL or projection authority exists. */
+export async function assertCreationRetirementIdentity(
+	paths: CoordinatorStatePaths,
+	keyDigest: string,
+	proof: CreationRetirementProofV1,
+): Promise<CreationRequestV1> {
+	return await withNamespaceRegistry(paths, async registry => {
+		const request = registry.creations[keyDigest];
+		if (!request) throw new Error("state_corrupt");
+		if (request.phase !== "remote_started" && request.phase !== "uncertain" && request.phase !== "retired")
+			throw new Error("retire_not_allowed");
+		assertCreationRetirementProofMatches(request, proof);
+		return request;
+	});
+}
+
 export async function advanceCreationReceipt(
 	paths: CoordinatorStatePaths,
 	keyDigest: string,
 	phase: "projected" | "completed" | "uncertain" | "retired",
 	safeResponse?: Record<string, unknown>,
+	proof?: CreationRetirementProofV1,
 ): Promise<void> {
 	await withNamespaceRegistry(paths, async registry => {
 		const request = registry.creations[keyDigest];
 		if (!request) throw new Error("state_corrupt");
-		if (request.phase === phase) return;
+		if (proof) assertCreationRetirementProofMatches(request, proof);
+		if (request.phase === phase) {
+			if (phase === "retired" && safeResponse) {
+				request.safe_response = safeResponse;
+				if (request.retirement_intent) request.retirement_intent.updated_at = new Date().toISOString();
+				request.updated_at = new Date().toISOString();
+			}
+			return;
+		}
 		if (
 			phase === "retired" &&
 			(request.phase === "completed" || request.phase === "retired" || request.phase === "claimed")
@@ -2420,6 +2605,13 @@ export async function advanceCreationReceipt(
 			throw new Error("state_corrupt");
 		request.phase = phase;
 		request.safe_response = safeResponse;
+		if (phase === "retired" && proof && !request.retirement_intent) {
+			request.retirement_intent = {
+				phase: "intent",
+				proof,
+				updated_at: new Date().toISOString(),
+			};
+		}
 		request.updated_at = new Date().toISOString();
 	});
 }

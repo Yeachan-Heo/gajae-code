@@ -161,6 +161,7 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 	);
 }
 function canonicalJson(value: unknown): string {
+	if (typeof value === "bigint") return JSON.stringify(value.toString());
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
 	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
 	const record = value as Record<string, unknown>;
@@ -698,7 +699,9 @@ export class LifecycleLedger {
 		return this.#warnings;
 	}
 	async #append(entry: LifecycleLedgerEntry): Promise<LifecycleLedgerEntry> {
-		const line = Buffer.from(`${JSON.stringify(entry)}\n`);
+		const line = Buffer.from(
+			`${JSON.stringify(entry, (_key, value: unknown) => (typeof value === "bigint" ? value.toString() : value))}\n`,
+		);
 		if (line.length - 1 > this.#limits.maxLineBytes)
 			throw new Error("Lifecycle ledger row exceeds the maximum byte length.");
 		let replacementCompacted = false;
@@ -907,10 +910,26 @@ export class LifecycleLedger {
 		return this.#byIdentity.get(identity);
 	}
 
-	listUncertainCreatesBySessionId(sessionId: string): LifecycleLedgerEntry[] {
+	listUncertainCreatesBySessionId(
+		sessionId: string,
+		effectMarker?: string,
+		remoteCreateKey?: string,
+	): LifecycleLedgerEntry[] {
 		const matches: LifecycleLedgerEntry[] = [];
 		for (const current of this.#byIdentity.values()) {
-			if (current.state === "terminal_uncertain" && current.intendedSessionId === sessionId) matches.push(current);
+			const effectIntent = current.effectIntent;
+			if (
+				current.state === "terminal_uncertain" &&
+				current.intendedSessionId === sessionId &&
+				current.operationKey?.startsWith("session.create\u0000") &&
+				effectIntent?.sessionId === sessionId &&
+				typeof effectIntent.stateRoot === "string" &&
+				path.isAbsolute(effectIntent.stateRoot) &&
+				effectIntent.childOwnershipEstablished === true &&
+				(effectMarker === undefined || current.effectMarker === effectMarker) &&
+				(remoteCreateKey === undefined || current.operationKey === `session.create\u0000${remoteCreateKey}`)
+			)
+				matches.push(current);
 		}
 		return matches;
 	}
