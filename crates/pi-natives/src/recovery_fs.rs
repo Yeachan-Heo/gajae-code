@@ -3070,6 +3070,7 @@ fn replace_managed(
 	let committed_failure = |code: &'static str, phase: &'static str| {
 		publish_post_mutation_failure_with_primitive(code, phase, primitive, None)
 	};
+	// SAFETY: file is a validated regular file descriptor opened by this routine.
 	if unsafe { libc::ftruncate(file.as_raw_fd(), 0) } != 0 {
 		return committed_failure("io_error", "file_sync");
 	}
