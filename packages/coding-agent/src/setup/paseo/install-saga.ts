@@ -292,6 +292,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		throw new SagaStepError(input.label, error instanceof Error ? error.message : String(error), [
 			input.intentPath,
 			...(backupPath ? [backupPath] : []),
+			...(error instanceof PaseoPublishError ? error.retained : []),
 		]);
 	}
 	await clearIntent(input.intentPath);

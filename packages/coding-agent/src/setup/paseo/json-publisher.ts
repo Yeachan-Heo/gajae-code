@@ -21,7 +21,12 @@ import * as nodeCrypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { exactReplacePath, exactUnlinkDirect, type NativeExactFileIdentity } from "@gajae-code/natives";
+import {
+	exactReplacePath,
+	exactUnlinkDirect,
+	renameNoReplacePath,
+	type NativeExactFileIdentity,
+} from "@gajae-code/natives";
 
 /** Serialization Paseo itself produces. Verified byte-identical against the live config. */
 export function serializeJson(value: unknown): string {
@@ -44,12 +49,14 @@ export type PublishRefusal =
 export class PaseoPublishError extends Error {
 	readonly refusal: PublishRefusal;
 	readonly targetPath: string;
+	readonly retained: readonly string[];
 
-	constructor(targetPath: string, refusal: PublishRefusal) {
+	constructor(targetPath: string, refusal: PublishRefusal, retained: readonly string[] = []) {
 		super(describeRefusal(targetPath, refusal));
 		this.name = "PaseoPublishError";
 		this.refusal = refusal;
 		this.targetPath = targetPath;
+		this.retained = retained;
 	}
 }
 
@@ -195,12 +202,24 @@ export async function publishPlan(
 	let backupCreated = false;
 	let backupBytes: Buffer | undefined;
 	const expectedDestinationIdentity = await captureRegularIdentity(targetPath);
+	if (observed !== ABSENT_IDENTITY && expectedDestinationIdentity === undefined) {
+		throw new PaseoPublishError(targetPath, {
+			reason: "cas-conflict",
+			expected: options.expectedIdentity,
+			actual: observed,
+		});
+	}
 	if (options.backup && observed !== ABSENT_IDENTITY) {
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
 		backupCreated = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
 		if ((await currentIdentity(targetPath)) !== observed) {
-			if (backupCreated) await removePrivateBackupIfExact(backupPath, backupBytes);
+			if (backupCreated && !(await removePrivateBackupIfExact(backupPath, backupBytes))) {
+				throw new AggregateError(
+					[],
+					`the backup for ${targetPath} remains retained at ${backupPath} after a concurrent target change`,
+				);
+			}
 			throw new PaseoPublishError(targetPath, {
 				reason: "cas-conflict",
 				expected: options.expectedIdentity,
@@ -215,15 +234,16 @@ export async function publishPlan(
 	const mode = await sourceMode(targetPath);
 	let tempRetained = false;
 	try {
-		const handle = await fs.open(tempPath, "wx", mode);
+		const handle = await fs.open(tempPath, "wx+", mode);
+		let sourceIdentity: NativeExactFileIdentity | undefined;
 		try {
 			await handle.writeFile(plan.nextRaw, "utf8");
 			await handle.sync();
+			sourceIdentity = await capturePrivateBackupIdentity(handle, tempPath);
 		} finally {
 			await handle.close();
 		}
 		const destinationIdentity = await captureRegularIdentity(targetPath);
-		const sourceIdentity = await captureRegularIdentity(tempPath);
 		if (sourceIdentity === undefined) throw new Error(`staged Paseo publication is not a regular file: ${tempPath}`);
 		if (expectedDestinationIdentity === undefined) {
 			if (destinationIdentity !== undefined) {
@@ -233,8 +253,14 @@ export async function publishPlan(
 					actual: await currentIdentity(targetPath),
 				});
 			}
-			await fs.link(tempPath, targetPath);
-			await fs.rm(tempPath);
+			const linked = renameNoReplacePath(tempPath, targetPath);
+			if (!linked.ok) {
+				throw new PaseoPublishError(targetPath, {
+					reason: "cas-conflict",
+					expected: options.expectedIdentity,
+					actual: await currentIdentity(targetPath),
+				});
+			}
 		} else {
 			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, expectedDestinationIdentity);
 			if (!replaced.ok) {
@@ -243,11 +269,21 @@ export async function publishPlan(
 					replaced.retainedSuccessorPath !== undefined ||
 					replaced.retainedPlaceholderPath !== undefined ||
 					replaced.retainedUnknownPath !== undefined;
-				throw new PaseoPublishError(targetPath, {
-					reason: "cas-conflict",
-					expected: options.expectedIdentity,
-					actual: await currentIdentity(targetPath),
-				});
+				throw new PaseoPublishError(
+					targetPath,
+					{
+						reason: "cas-conflict",
+						expected: options.expectedIdentity,
+						actual: await currentIdentity(targetPath),
+					},
+					[
+						tempPath,
+						...(replaced.detachedPath ? [replaced.detachedPath] : []),
+						...(replaced.retainedSuccessorPath ? [replaced.retainedSuccessorPath] : []),
+						...(replaced.retainedPlaceholderPath ? [replaced.retainedPlaceholderPath] : []),
+						...(replaced.retainedUnknownPath ? [replaced.retainedUnknownPath] : []),
+					],
+				);
 			}
 		}
 		await syncParentDirectory(directory);
