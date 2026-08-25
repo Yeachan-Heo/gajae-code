@@ -3761,6 +3761,7 @@ pub(crate) mod platform {
 		result
 	}
 
+	#[allow(clippy::undocumented_unsafe_blocks)]
 	pub(super) fn exact_unlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -3960,6 +3961,7 @@ pub(crate) mod platform {
 	/// otherwise the detached authority is retained. The private directory keeps
 	/// the caller-supplied quarantine name occupied, so a replacement at that
 	/// name cannot become the unlink target.
+	#[allow(clippy::undocumented_unsafe_blocks)]
 	pub(super) fn exact_unlink_symlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -6140,7 +6142,7 @@ pub(crate) mod platform {
 		// protocol; callers must never repeat the identity check with a pathname-only
 		// `rmdir`, which can consume a successor swapped into `.removing`.
 		let quarantine_name =
-			CString::new(format!(".gjc-paseo-finalize-{}-{}", std::process::id(), root.st_ino,))
+			CString::new(format!(".gjc-paseo-finalize-{}-{}", std::process::id(), root.st_ino))
 				.expect("finalization quarantine name contains no NUL");
 		let captured_name = CString::new(".captured").expect("captured name contains no NUL");
 		let quarantine_created =
