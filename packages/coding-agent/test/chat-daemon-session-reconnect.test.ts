@@ -1285,7 +1285,9 @@ test("a replay answered from a rolled generation retires the attachment instead 
 			reconcile();
 			host.accept(await awaitSocket(3));
 			await awaitPosts(provider, 2);
-			await Bun.sleep(20);
+			// The replacement's replay request is the terminality signal for the cursor
+			// its live publication advanced; post delivery alone can precede that request.
+			await awaitReplayRequests(host, 3);
 			// The rebuilt attachment owns the new generation, so the event it fenced off is
 			// published there, exactly once.
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nafter the roll"]);
