@@ -923,9 +923,9 @@ test("a live frame delivered before the resume replay answers is published in se
 			host.emit("three");
 
 			await awaitPosts(provider, 3);
-			// Settle first: a late duplicate lands after the third publication, so asserting
-			// on the count alone would read the stream before it can go wrong.
-			await Bun.sleep(20);
+			// The follow-up replay is the authoritative terminality signal. Waiting on the
+			// publication count alone can observe the cursor before its next replay starts.
+			await awaitReplayRequests(host, 2);
 			// The socket carried "three" and the replay carried "two" and "three": ordering
 			// follows the sequence, not the arrival, and the frame both producers carried is
 			// published exactly once.
