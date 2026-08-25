@@ -449,7 +449,7 @@ async function retryPendingLocalRelease(lockPath: string): Promise<void> {
 	state.releasePromise = releasePromise;
 	try {
 		await releasePromise;
-		localLockStates.delete(key);
+		if (localLockStates.get(key) === state) localLockStates.delete(key);
 	} catch (error) {
 		state.status = "release_pending";
 		throw error;
@@ -477,7 +477,7 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 	state.releasePromise = releasePromise;
 	try {
 		await releasePromise;
-		localLockStates.delete(key);
+		if (localLockStates.get(key) === state) localLockStates.delete(key);
 	} catch (error) {
 		state.status = "release_pending";
 		throw error;

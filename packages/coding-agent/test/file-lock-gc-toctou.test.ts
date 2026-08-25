@@ -272,6 +272,32 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
+	test("preserves a successor generation acquired during release completion", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realRm = fs.rm;
+		const successorEntered = Promise.withResolvers<void>();
+		let successor: Promise<void> | undefined;
+		let oldRelease = true;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			const result = await realRm(target, options);
+			if (oldRelease && String(target) === lockDir) {
+				oldRelease = false;
+				successor = withFileLock(lockedFile, async () => {
+					successorEntered.resolve();
+				});
+				await successorEntered.promise;
+			}
+			return result;
+		}) as typeof fs.rm);
+
+		await withFileLock(lockedFile, async () => {});
+		await successor;
+
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
 	test("does not reap a stale lock when its metadata read fails unexpectedly", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
