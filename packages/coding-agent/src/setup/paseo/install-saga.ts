@@ -546,17 +546,22 @@ export async function recoverIntent(
 	}
 	if (intent.step === "skills-bridge") {
 		const ledgerObserved = await currentIdentity(intent.provenancePath);
+		const before = intent.bridgePreflightPayload;
+		const after = intent.provenancePayload;
+		const settledAfter =
+			after !== undefined && after.bridgeCleanupPending !== undefined
+				? provenanceLedgerIdentity({ ...after, bridgeCleanupPending: undefined })
+				: undefined;
 		if (
 			ledgerObserved !== intent.provenancePreflightIdentity &&
-			ledgerObserved !== intent.provenanceExpectedIdentity
+			ledgerObserved !== intent.provenanceExpectedIdentity &&
+			ledgerObserved !== settledAfter
 		) {
 			return {
 				recovered: false,
 				detail: `the provenance ledger at ${intent.provenancePath} diverged during an interrupted bridge migration; refusing to overwrite it`,
 			};
 		}
-		const before = intent.bridgePreflightPayload;
-		const after = intent.provenancePayload;
 		const beforeMatches =
 			before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined, intent.targetPath));
 		const afterMatches =
@@ -566,7 +571,8 @@ export async function recoverIntent(
 			after !== undefined &&
 			provenanceLedgerIdentity(before) === provenanceLedgerIdentity(after);
 		const safePreflight = beforeMatches && !afterMatches && ledgerObserved === intent.provenancePreflightIdentity;
-		const safeCompleted = afterMatches && ledgerObserved === intent.provenanceExpectedIdentity;
+		const safeCompleted =
+			afterMatches && (ledgerObserved === intent.provenanceExpectedIdentity || ledgerObserved === settledAfter);
 		const recoverableCutover =
 			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		if (
@@ -586,6 +592,17 @@ export async function recoverIntent(
 		}
 		let pendingReplayed = false;
 		if (after?.bridgeCleanupPending !== undefined && options.replayBridgeCleanup !== undefined) {
+			const allowedPaths = [intent.targetPath, before?.bridgePath, after.bridgePath].filter(
+				(value): value is string => value !== undefined,
+			);
+			if (
+				!allowedPaths.some(value => path.resolve(value) === path.resolve(after.bridgeCleanupPending!.originalPath))
+			) {
+				return {
+					recovered: false,
+					detail: `the pending bridge cleanup authority is outside the intent's trusted bridge paths: ${after.bridgeCleanupPending.originalPath}`,
+				};
+			}
 			await options.replayBridgeCleanup(after.bridgeCleanupPending);
 			const settled = { ...after, bridgeCleanupPending: undefined };
 			await writeProvenance(intent.provenancePath, settled);

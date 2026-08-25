@@ -158,7 +158,7 @@ export interface PublishResult {
 }
 
 function backupSuffix(now: Date): string {
-	return now.toISOString().replace(/[:.]/g, "-");
+	return `${now.toISOString().replace(/[:.]/g, "-")}-${nodeCrypto.randomUUID()}`;
 }
 
 /**
@@ -192,9 +192,12 @@ export async function publishPlan(
 	}
 
 	let backupPath: string | undefined;
+	let backupCreated = false;
+	let backupBytes: Buffer | undefined;
 	if (options.backup && observed !== ABSENT_IDENTITY) {
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
-		await copyPrivately(targetPath, backupPath);
+		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
+		backupCreated = await copyPrivately(targetPath, backupPath);
 	}
 
 	// Never write the final path directly: a crash mid-write would leave the
@@ -211,6 +214,17 @@ export async function publishPlan(
 		}
 		await fs.rename(tempPath, targetPath);
 		await syncParentDirectory(directory);
+	} catch (error) {
+		if (backupCreated && backupPath !== undefined && backupBytes !== undefined) {
+			const removed = await removePrivateBackupIfExact(backupPath, backupBytes);
+			if (!removed) {
+				throw new AggregateError(
+					[error],
+					`publication failed and the newly-created credential backup remains retained at ${backupPath}`,
+				);
+			}
+		}
+		throw error;
 	} finally {
 		await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
@@ -308,7 +322,7 @@ async function openRegularSidecar(
 	}
 }
 
-async function copyPrivately(from: string, to: string): Promise<void> {
+async function copyPrivately(from: string, to: string): Promise<boolean> {
 	const bytes = await Bun.file(from).text();
 	const mode = BACKUP_MODE;
 	let handle: fs.FileHandle;
@@ -327,30 +341,16 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 		} finally {
 			await existing.handle.close();
 		}
-		if (existingBytes.toString("utf8") === bytes) return;
-		const parent = await fs.stat(path.dirname(to), { bigint: true });
-		const identity: NativeExactFileIdentity = {
-			dev: existing.stat.dev,
-			ino: existing.stat.ino,
-			nlink: existing.stat.nlink,
-			parentDev: parent.dev,
-			parentIno: parent.ino,
-			size: existing.stat.size,
-			mtimeNs: existing.stat.mtimeNs,
-			sha256: nodeCrypto.createHash("sha256").update(existingBytes).digest("hex"),
-			quarantineName: `.gjc-paseo-backup-${process.pid}-${nodeCrypto.randomUUID()}`,
-		};
-		const canonical = await canonicalSidecarPathForNativeUnlink(to);
-		if (!exactUnlinkDirect(canonical, identity).ok) {
-			throw new Error(`backup path changed while replacing its authenticated regular file: ${to}`);
-		}
-		handle = await fs.open(to, "wx", mode);
-		ownsBackup = true;
+		if (existingBytes.toString("utf8") === bytes) return false;
+		throw new Error(`backup path already contains different content: ${to}`);
 	}
 	try {
-		await handle.writeFile(bytes, "utf8");
-		await handle.sync();
-		await handle.close();
+		try {
+			await handle.writeFile(bytes, "utf8");
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
 		await fs.chmod(to, mode);
 		await syncParentDirectory(path.dirname(to));
 	} catch (error) {
@@ -365,6 +365,7 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 		}
 		throw error;
 	}
+	return true;
 }
 
 async function removePrivateBackupIfExact(backupPath: string, expectedBytes: Buffer): Promise<boolean> {

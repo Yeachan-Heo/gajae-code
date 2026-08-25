@@ -838,6 +838,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							bridgeCleanupPending: undefined,
 						};
 						const intent = await readIntent(deps.paths.intentRecord);
+						await writeProvenance(deps.paths.provenanceLedger, restoredLedger);
 						if (intent?.step === "skills-bridge" && intent.provenancePath === deps.paths.provenanceLedger) {
 							await writeIntent(deps.paths.intentRecord, {
 								...intent,
@@ -845,7 +846,6 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 								provenancePayload: restoredLedger,
 							});
 						}
-						await writeProvenance(deps.paths.provenanceLedger, restoredLedger);
 						if (intent?.step === "skills-bridge") await clearIntent(deps.paths.intentRecord);
 						return { status: "reverted" as const };
 					} catch (error) {
@@ -929,6 +929,16 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				label: migratedOldBridgeDir,
 				undo: async () => {
 					const currentLedger = await readProvenance(deps.paths.provenanceLedger);
+					if (
+						currentLedger.bridgeCleanupPending !== undefined &&
+						path.resolve(currentLedger.bridgeCleanupPending.originalPath) !== path.resolve(migratedOldBridgeDir!)
+					) {
+						return {
+							status: "conflict" as const,
+							detail: `migration cleanup authority targets a different bridge: ${currentLedger.bridgeCleanupPending.originalPath}`,
+							retained: [migratedOldBridgeDir!, currentLedger.bridgeCleanupPending.detachedPath],
+						};
+					}
 					const restored = await restoreMigratedOldBridgeEntries(
 						migratedOldBridgeDir!,
 						migratedOldEntries,
@@ -941,6 +951,29 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							...restored.entryIdentities,
 						};
 						compensatedOldBridgeDirIdentity = restored.bridgeDirIdentity;
+						if (!completed.some(step => step.label === deps.paths.bridgeDir)) {
+							const current = await readProvenance(deps.paths.provenanceLedger);
+							const settled: ProvenanceLedger = {
+								...current,
+								bridgePath: bridgeLedger.bridgePath,
+								bridgeSourceDir: bridgeLedger.bridgeSourceDir,
+								bridgeEntries: bridgeLedger.bridgeEntries,
+								bridgeEntryIdentities: compensatedOldBridgeEntryIdentities,
+								bridgeDirCreated: bridgeLedger.bridgeDirCreated,
+								bridgeDirIdentity: compensatedOldBridgeDirIdentity ?? bridgeLedger.bridgeDirIdentity,
+								bridgeCleanupPending: undefined,
+							};
+							await writeProvenance(deps.paths.provenanceLedger, settled);
+							const intent = await readIntent(deps.paths.intentRecord);
+							if (intent?.step === "skills-bridge") {
+								await writeIntent(deps.paths.intentRecord, {
+									...intent,
+									provenanceExpectedIdentity: provenanceLedgerIdentity(settled),
+									provenancePayload: settled,
+								});
+								await clearIntent(deps.paths.intentRecord);
+							}
+						}
 					}
 					return restored;
 				},
