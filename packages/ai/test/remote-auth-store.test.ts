@@ -8,9 +8,9 @@ import {
 	AuthStorage,
 	REMOTE_REFRESH_SENTINEL,
 	RemoteAuthCredentialStore,
+	type SnapshotResponse,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
-	type SnapshotResponse,
 } from "../src";
 import * as oauthUtils from "../src/utils/oauth";
 
