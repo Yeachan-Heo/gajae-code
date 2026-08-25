@@ -17,7 +17,6 @@ import { getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
-	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	assertCanonicalMCPOAuthBinding,
 	type CachedCredentialHealth,
@@ -945,9 +944,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<OAuthCredentials> {
-		let entry: AuthCredentialSnapshotEntry;
 		try {
-			({ entry } = await this.#client.refreshCredential(credentialId, signal));
+			await this.#client.refreshCredential(credentialId, signal);
 		} catch (error) {
 			if (isErrorStatus(error, 404) && !this.#streamingActive) {
 				await this.refreshSnapshot().catch(refreshError => {
@@ -958,15 +956,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			}
 			throw error;
 		}
-		if (!this.#streamingActive) {
-			await this.refreshSnapshot().catch(error => {
-				logger.debug("auth-broker snapshot refresh after credential refresh failed", { error: String(error) });
-			});
+		await this.refreshSnapshot();
+		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (accepted?.credential.type !== "oauth") {
+			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
-		if (entry.credential.type !== "oauth") {
-			throw new Error(`Broker returned non-OAuth credential for id=${credentialId}`);
-		}
-		const refreshed = entry.credential;
+		const refreshed = accepted.credential;
 		return {
 			access: refreshed.access,
 			refresh: REMOTE_REFRESH_SENTINEL,
@@ -984,20 +979,21 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		client: MCPOAuthRefreshClient,
 		signal?: AbortSignal,
 	): Promise<OAuthCredential> {
-		const { entry } = await this.#client.refreshMCPCredential(credentialId, client, signal);
-		if (entry.credential.type !== "oauth") {
-			throw new Error(`Broker returned non-OAuth credential for id=${credentialId}`);
+		await this.#client.refreshMCPCredential(credentialId, client, signal);
+		await this.refreshSnapshot();
+		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (accepted?.credential.type !== "oauth") {
+			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
 		}
 		assertCanonicalMCPOAuthBinding(credential.mcpBinding);
-		assertCanonicalMCPOAuthBinding(entry.credential.mcpBinding);
+		assertCanonicalMCPOAuthBinding(accepted.credential.mcpBinding);
 		if (
-			entry.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
-			entry.credential.mcpBinding.tokenEndpoint !== credential.mcpBinding.tokenEndpoint
+			accepted.credential.mcpBinding.resourceOrigin !== credential.mcpBinding.resourceOrigin ||
+			accepted.credential.mcpBinding.tokenEndpoint !== credential.mcpBinding.tokenEndpoint
 		) {
 			throw new Error("Broker returned mismatched MCP OAuth credential binding");
 		}
-		await this.refreshSnapshot();
-		return entry.credential;
+		return accepted.credential;
 	}
 
 	/**
