@@ -505,12 +505,14 @@ export async function removePaseoSetup(
 			}
 		} catch (error) {
 			const detail = error instanceof SkillsBridgeError ? error.message : String(error);
+			const retained = error instanceof SkillsBridgeError ? error.retained : [];
 			remaining.push(ledger.bridgePath ?? deps.paths.bridgeDir);
+			remaining.push(...retained);
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
 			return partial(removed, remaining, {
 				failedStep: ledger.bridgePath ?? deps.paths.bridgeDir,
 				detail,
-				retained: [deps.paths.provenanceLedger],
+				retained: [deps.paths.provenanceLedger, ...retained],
 			});
 		}
 	}

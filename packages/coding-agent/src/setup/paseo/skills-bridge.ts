@@ -250,8 +250,8 @@ export class SkillsBridgeError extends Error {
  */
 export class SkillsBridgePartialError extends SkillsBridgeError {
 	readonly partial: SkillsBridgeInstallResult;
-	constructor(message: string, partial: SkillsBridgeInstallResult) {
-		super(message);
+	constructor(message: string, partial: SkillsBridgeInstallResult, retained: readonly string[] = []) {
+		super(message, retained);
 		this.name = "SkillsBridgePartialError";
 		this.partial = partial;
 	}
@@ -301,6 +301,7 @@ async function unlinkSymlinkExactly(
 	});
 	if (!result.ok) {
 		const retained = [
+			result.detachedPath,
 			result.retainedSuccessorPath,
 			result.retainedPlaceholderPath,
 			result.retainedUnknownPath,
@@ -822,7 +823,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		if (error instanceof SkillsBridgePartialError) throw error;
 		const message =
 			error instanceof SkillsBridgeError ? error.message : error instanceof Error ? error.message : String(error);
-		throw new SkillsBridgePartialError(message, partial());
+		throw new SkillsBridgePartialError(message, partial(), error instanceof SkillsBridgeError ? error.retained : []);
 	};
 	try {
 		if (preflight.bridgeDirCreated && hasWork) {

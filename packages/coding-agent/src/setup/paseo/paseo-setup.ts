@@ -23,12 +23,14 @@ import {
 import { createOrchestrationSeed, removeSeededRoles } from "./orchestration-preferences";
 import { withPaseoMutationLock } from "./paseo-mutation-lock";
 import {
+	type BridgeCleanupAuthority,
 	type BridgeEntryIdentity,
 	clearIntent,
 	INTENT_VERSION,
 	type IntentRecord,
 	type ProvenanceLedger,
 	provenanceLedgerIdentity,
+	readIntent,
 	readProvenance,
 	ProvenancePublicationUncertainError,
 	writeIntent,
@@ -75,6 +77,34 @@ export type PaseoSetupOutcome =
 	| { readonly kind: "check"; readonly result: SetupCheckResult }
 	| { readonly kind: "install"; readonly result: PaseoInstallResult }
 	| { readonly kind: "remove"; readonly result: PaseoRemoveResult };
+
+async function persistBridgeCleanupPending(
+	deps: PaseoSetupDependencies,
+	authority: BridgeCleanupAuthority,
+): Promise<void> {
+	const current = await readProvenance(deps.paths.provenanceLedger);
+	const pending = { ...current, bridgeCleanupPending: authority };
+	const intent = await readIntent(deps.paths.intentRecord);
+	if (intent?.step === "skills-bridge" && intent.provenancePath === deps.paths.provenanceLedger) {
+		await writeIntent(deps.paths.intentRecord, {
+			...intent,
+			provenanceExpectedIdentity: provenanceLedgerIdentity(pending),
+			provenancePayload: pending,
+		});
+	}
+	await writeProvenance(deps.paths.provenanceLedger, pending);
+}
+
+async function canonicalPathForComparison(value: string): Promise<string> {
+	const absolute = path.resolve(value);
+	try {
+		return await fs.realpath(absolute);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		const parent = await fs.realpath(path.dirname(absolute)).catch(() => path.dirname(absolute));
+		return path.join(parent, path.basename(absolute));
+	}
+}
 
 /**
  * Reject flag combinations that have no coherent meaning.
@@ -502,6 +532,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// records those identities here for the later bridge inverse to carry into
 		// the restored provenance instead of writing stale pre-cutover inodes.
 		let compensatedOldBridgeEntryIdentities: Readonly<Record<string, BridgeEntryIdentity>> | undefined;
+		let compensatedOldBridgeDirIdentity: BridgeEntryIdentity | undefined;
 		// Migration binding: recorded ownership belongs to the recorded bridge
 		// PATH, not to the skill names alone. When the agent/profile path moved,
 		// the names are not carried over silently -- a user-owned exact-target
@@ -509,8 +540,12 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// and the old path's links are cleaned up explicitly instead of being
 		// abandoned by the overwrite below.
 		const recordedBridgePath = bridgeLedger.bridgePath;
+		const [recordedBridgeCanonicalPath, configuredBridgeCanonicalPath] = await Promise.all([
+			recordedBridgePath === undefined ? undefined : canonicalPathForComparison(recordedBridgePath),
+			canonicalPathForComparison(deps.paths.bridgeDir),
+		]);
 		const isMigration =
-			recordedBridgePath !== undefined && path.resolve(recordedBridgePath) !== path.resolve(deps.paths.bridgeDir);
+			recordedBridgePath !== undefined && recordedBridgeCanonicalPath !== configuredBridgeCanonicalPath;
 		let migratedOldEntries: readonly MigratedOldBridgeEntry[] = [];
 		let migratedOldBridgeDir: string | undefined;
 		let migratedOldRegistrationPath: string | undefined;
@@ -760,13 +795,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				undo: async () => {
 					try {
 						await inverseSkillsBridge(deps, bridge, {
-							onCleanupPending: async authority => {
-								const current = await readProvenance(deps.paths.provenanceLedger);
-								await writeProvenance(deps.paths.provenanceLedger, {
-									...current,
-									bridgeCleanupPending: authority,
-								});
-							},
+							onCleanupPending: authority => persistBridgeCleanupPending(deps, authority),
 						});
 						// The bridge ledger was prewritten to make the forward mutation
 						// recoverable. The inverse also restores captured legacy link text
@@ -780,7 +809,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							bridgeEntries: bridgeLedger.bridgeEntries,
 							bridgeEntryIdentities: compensatedOldBridgeEntryIdentities ?? bridgeLedger.bridgeEntryIdentities,
 							bridgeDirCreated: bridgeLedger.bridgeDirCreated,
-							bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
+							bridgeDirIdentity: compensatedOldBridgeDirIdentity ?? bridgeLedger.bridgeDirIdentity,
 							bridgeCleanupPending: undefined,
 						});
 						return { status: "reverted" as const };
@@ -788,10 +817,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						return {
 							status: "conflict" as const,
 							detail: error instanceof Error ? error.message : String(error),
-							retained: [
-								deps.paths.bridgeDir,
-								...(error instanceof SkillsBridgeError ? error.retained : []),
-							],
+							retained: [deps.paths.bridgeDir, ...(error instanceof SkillsBridgeError ? error.retained : [])],
 						};
 					}
 				},
@@ -867,12 +893,17 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			completed.push({
 				label: migratedOldBridgeDir,
 				undo: async () => {
-					const restored = await restoreMigratedOldBridgeEntries(migratedOldBridgeDir!, migratedOldEntries);
+					const restored = await restoreMigratedOldBridgeEntries(
+						migratedOldBridgeDir!,
+						migratedOldEntries,
+						bridgeLedger.bridgeDirCreated === true,
+					);
 					if (restored.status === "reverted") {
 						compensatedOldBridgeEntryIdentities = {
 							...(bridgeLedger.bridgeEntryIdentities ?? {}),
 							...restored.entryIdentities,
 						};
+						compensatedOldBridgeDirIdentity = restored.bridgeDirIdentity;
 					}
 					return restored;
 				},
@@ -880,22 +911,13 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			try {
 				await inverseSkillsBridge(deps, oldCleanup, {
 					bridgeDir: migratedOldBridgeDir,
-					onCleanupPending: async authority => {
-						const current = await readProvenance(deps.paths.provenanceLedger);
-						await writeProvenance(deps.paths.provenanceLedger, {
-							...current,
-							bridgeCleanupPending: authority,
-						});
-					},
+					onCleanupPending: authority => persistBridgeCleanupPending(deps, authority),
 				});
 			} catch (error) {
 				throw new SagaStepError(
 					"install",
 					`bridge path migrated from ${recordedBridgePath} but the old bridge could not be cleaned: ${error instanceof Error ? error.message : String(error)}`,
-					[
-						migratedOldBridgeDir,
-						...(error instanceof SkillsBridgeError ? error.retained : []),
-					],
+					[migratedOldBridgeDir, ...(error instanceof SkillsBridgeError ? error.retained : [])],
 				);
 			}
 			changed.push(migratedOldBridgeDir);
@@ -939,6 +961,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				: new SagaStepError(
 						"install",
 						error instanceof PaseoPublishError || error instanceof Error ? error.message : String(error),
+						error instanceof SkillsBridgeError ? error.retained : [],
 					);
 		if (failure.preserveState) {
 			return {
@@ -1026,8 +1049,13 @@ async function captureMigratedOldBridgeEntries(
 async function restoreMigratedOldBridgeEntries(
 	bridgeDir: string,
 	entries: readonly MigratedOldBridgeEntry[],
+	bridgeDirCreated: boolean,
 ): Promise<
-	| { readonly status: "reverted"; readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>> }
+	| {
+			readonly status: "reverted";
+			readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>>;
+			readonly bridgeDirIdentity?: BridgeEntryIdentity;
+	  }
 	| { readonly status: "conflict"; readonly detail: string; readonly retained: readonly string[] }
 > {
 	const missing: MigratedOldBridgeEntry[] = [];
@@ -1035,6 +1063,22 @@ async function restoreMigratedOldBridgeEntries(
 		entries.map(entry => [entry.name, entry.identity]),
 	);
 	try {
+		const existingDirectory = await fs.lstat(bridgeDir, { bigint: true }).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (existingDirectory !== undefined && (!existingDirectory.isDirectory() || existingDirectory.isSymbolicLink())) {
+			return {
+				status: "conflict",
+				detail: `old Paseo bridge directory was replaced during compensation: ${bridgeDir}`,
+				retained: [bridgeDir],
+			};
+		}
+		let recreatedDirectory = false;
+		if (existingDirectory === undefined && bridgeDirCreated) {
+			await fs.mkdir(bridgeDir, { mode: 0o700 });
+			recreatedDirectory = true;
+		}
 		for (const entry of entries) {
 			const destination = path.join(bridgeDir, entry.name);
 			const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
@@ -1092,7 +1136,19 @@ async function restoreMigratedOldBridgeEntries(
 				mtimeNs: restored.mtimeNs.toString(),
 			};
 		}
-		return { status: "reverted", entryIdentities };
+		const restoredDirectory = recreatedDirectory
+			? await fs.lstat(bridgeDir, { bigint: true }).then(stat => ({
+					dev: stat.dev.toString(),
+					ino: stat.ino.toString(),
+					size: stat.size.toString(),
+					mtimeNs: stat.mtimeNs.toString(),
+				}))
+			: undefined;
+		return {
+			status: "reverted",
+			entryIdentities,
+			...(restoredDirectory ? { bridgeDirIdentity: restoredDirectory } : {}),
+		};
 	} catch (error) {
 		return {
 			status: "conflict",

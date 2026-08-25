@@ -364,6 +364,25 @@ async function bridgeLedgerMatchesFilesystem(
 	previous: ProvenanceLedger | undefined,
 	targetPath?: string,
 ): Promise<boolean> {
+	const cleanupPendingMatches = async (): Promise<boolean> => {
+		if (ledger.bridgeCleanupPending === undefined) return true;
+		const authority = ledger.bridgeCleanupPending;
+		const [original, detached] = await Promise.all([
+			fs.lstat(authority.originalPath, { bigint: true }).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			}),
+			fs.lstat(authority.detachedPath, { bigint: true }).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			}),
+		]);
+		// Pending authority is safe when the exact detached sibling remains, or
+		// when both names are gone and the native cleanup completed before the
+		// ledger clear. An original still present with no detached sibling means
+		// the detach did not commit and must not be guessed through.
+		return (original === undefined && detached !== undefined) || (original === undefined && detached === undefined);
+	};
 	const bridgePath = ledger.bridgePath;
 	if (bridgePath === undefined) {
 		if ((ledger.bridgeEntries?.length ?? 0) !== 0) return false;
@@ -380,14 +399,14 @@ async function bridgeLedgerMatchesFilesystem(
 			]);
 			if (target !== undefined || detached !== undefined) return false;
 		}
-		return true;
+		return cleanupPendingMatches();
 	}
 	const entries = ledger.bridgeEntries ?? [];
 	if (entries.length === 0) {
-		if (ledger.bridgeDirCreated !== true) return true;
+		if (ledger.bridgeDirCreated !== true) return cleanupPendingMatches();
 		const stat = await fs.lstat(bridgePath, { bigint: true }).catch(() => undefined);
 		if (stat === undefined) return false;
-		return stat.isDirectory() && !stat.isSymbolicLink();
+		return stat.isDirectory() && !stat.isSymbolicLink() && (await cleanupPendingMatches());
 	}
 	if (ledger.bridgeSourceDir === undefined) return false;
 	for (const name of entries) {
@@ -436,7 +455,7 @@ async function bridgeLedgerMatchesFilesystem(
 		)
 			return false;
 	}
-	return true;
+	return cleanupPendingMatches();
 }
 
 async function refreshBridgeLedgerIdentities(ledger: ProvenanceLedger): Promise<ProvenanceLedger> {
