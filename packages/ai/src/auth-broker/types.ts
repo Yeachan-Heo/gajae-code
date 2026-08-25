@@ -50,6 +50,8 @@ export type SnapshotEntry = AuthCredentialSnapshotEntry & {
 
 /** GET /v1/snapshot response body. */
 export interface SnapshotResponse extends Omit<AuthCredentialSnapshot, "credentials"> {
+	/** Stable for one broker process; changes when the broker restarts. */
+	epoch?: string;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
 	credentials: SnapshotEntry[];
@@ -115,6 +117,7 @@ export interface SnapshotStreamSnapshotEvent extends SnapshotResponse {
 /** Single credential added/changed (upsert or refresh). */
 export interface SnapshotStreamEntryEvent {
 	kind: "entry";
+	epoch?: string;
 	generation: number;
 	serverNowMs: number;
 	refresher: RefresherSchedule;
@@ -124,6 +127,7 @@ export interface SnapshotStreamEntryEvent {
 /** Single credential disabled/deleted. */
 export interface SnapshotStreamRemovedEvent {
 	kind: "removed";
+	epoch?: string;
 	generation: number;
 	serverNowMs: number;
 	refresher: RefresherSchedule;

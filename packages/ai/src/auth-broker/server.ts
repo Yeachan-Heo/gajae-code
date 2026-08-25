@@ -9,6 +9,7 @@
  * Transport security is delegated to the operator (Tailscale / Wireguard);
  * the server only checks a bearer token against an allow-list per request.
  */
+import * as crypto from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
@@ -286,7 +287,11 @@ function computeRotatesInMs(
 	return Math.max(0, rotatesAt - serverNowMs);
 }
 
-function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | undefined): SnapshotResponse {
+function buildSnapshot(
+	storage: AuthStorage,
+	refresher: AuthBrokerRefresher | undefined,
+	epoch: string,
+): SnapshotResponse {
 	const serverNowMs = Date.now();
 	const base = storage.exportSnapshot();
 	const { wire, nextSweepAt } = resolveRefresherSchedule(refresher, serverNowMs);
@@ -295,6 +300,7 @@ function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | un
 		rotatesInMs: computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs),
 	}));
 	return {
+		epoch,
 		generation: base.generation,
 		generatedAt: base.generatedAt,
 		serverNowMs,
@@ -325,6 +331,7 @@ async function serveSnapshot(
 	storage: AuthStorage,
 	gate: GenerationGate,
 	refresher: AuthBrokerRefresher | undefined,
+	epoch: string,
 	peer: string,
 ): Promise<Response> {
 	await storage.reload();
@@ -333,7 +340,7 @@ async function serveSnapshot(
 	const waitMs = parseWaitMs(url);
 
 	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
-		const body = buildSnapshot(storage, refresher);
+		const body = buildSnapshot(storage, refresher, epoch);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
@@ -353,7 +360,7 @@ async function serveSnapshot(
 	await storage.reload();
 	currentGeneration = storage.getGeneration();
 	if (currentGeneration !== clientGeneration) {
-		const body = buildSnapshot(storage, refresher);
+		const body = buildSnapshot(storage, refresher, epoch);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
@@ -387,6 +394,7 @@ function serveSnapshotStream(
 	req: Request,
 	storage: AuthStorage,
 	refresher: AuthBrokerRefresher | undefined,
+	epoch: string,
 	peer: string,
 	keepaliveMs: number,
 ): Response {
@@ -449,7 +457,7 @@ function serveSnapshotStream(
 				pendingBumps = 0;
 				await storage.reload();
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher);
+				const snapshot = buildSnapshot(storage, refresher, epoch);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -468,6 +476,7 @@ function serveSnapshotStream(
 					lastByCredId.set(entry.id, fp);
 					const payload: SnapshotStreamEntryEvent = {
 						kind: "entry",
+						epoch,
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
 						refresher: snapshot.refresher,
@@ -486,6 +495,7 @@ function serveSnapshotStream(
 					lastByCredId.delete(id);
 					const payload: SnapshotStreamRemovedEvent = {
 						kind: "removed",
+						epoch,
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
 						refresher: snapshot.refresher,
@@ -504,7 +514,7 @@ function serveSnapshotStream(
 		async start(c) {
 			controller = c;
 			await storage.reload();
-			const initial = buildSnapshot(storage, refresher);
+			const initial = buildSnapshot(storage, refresher, epoch);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
@@ -543,6 +553,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
+	const epoch = crypto.randomUUID();
 
 	const refresher = opts.disableRefresher
 		? undefined
@@ -582,10 +593,10 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					return json(200, body);
 				}
 				if (req.method === "GET" && pathname === "/v1/snapshot/stream") {
-					return serveSnapshotStream(req, opts.storage, refresher, peer, streamKeepaliveMs);
+					return serveSnapshotStream(req, opts.storage, refresher, epoch, peer, streamKeepaliveMs);
 				}
 				if (req.method === "GET" && pathname === "/v1/snapshot") {
-					return serveSnapshot(req, url, opts.storage, generationGate, refresher, peer);
+					return serveSnapshot(req, url, opts.storage, generationGate, refresher, epoch, peer);
 				}
 				if (req.method === "GET" && pathname === "/v1/usage") {
 					try {

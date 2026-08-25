@@ -168,6 +168,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#snapshot: SnapshotResponse = emptySnapshot();
 	#snapshotReceivedAt = Date.now();
 	#generation = 0;
+	#epoch?: string;
 	#backgroundAbort = new AbortController();
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
@@ -379,10 +380,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		// A lower generation from a newer server timestamp is therefore a new
 		// broker epoch, while an older timestamp is an out-of-order response from
 		// the current epoch and must be discarded.
-		if (generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) return;
+		if (this.#epoch && snapshot.epoch && snapshot.epoch !== this.#epoch) {
+			if (snapshot.serverNowMs <= this.#snapshot.serverNowMs) return;
+		} else if (generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) {
+			return;
+		}
 		const generationChanged = generation !== this.#generation || this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
+		this.#epoch = snapshot.epoch ?? this.#epoch;
 		this.#snapshotReceivedAt = Date.now();
 		if (generationChanged) {
 			this.#inventoryMetadata.clear();
@@ -580,24 +586,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			case "snapshot": {
 				// Strip the discriminator so we store the wire-shape SnapshotResponse.
 				const { kind: _kind, ...snapshot } = event;
-				if (snapshot.generation < this.#generation) {
-					logger.debug("auth-broker stream snapshot older than local; ignoring", {
-						local: this.#generation,
-						incoming: snapshot.generation,
-					});
-					return;
-				}
 				this.#applySnapshot(snapshot, snapshot.generation);
 				return;
 			}
 			case "entry": {
-				if (event.generation < this.#generation) return;
-				this.#applyStreamEntry(event.entry, event.refresher, event.generation, event.serverNowMs);
+				this.#applyStreamEntry(event.entry, event.refresher, event.generation, event.serverNowMs, event.epoch);
 				return;
 			}
 			case "removed": {
-				if (event.generation < this.#generation) return;
-				this.#removeStreamCredential(event.id, event.refresher, event.generation, event.serverNowMs);
+				this.#removeStreamCredential(event.id, event.refresher, event.generation, event.serverNowMs, event.epoch);
 				return;
 			}
 		}
@@ -608,18 +605,25 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		refresher: RefresherSchedule,
 		generation: number,
 		serverNowMs: number,
+		epoch?: string,
 	): void {
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
 		const credentials =
 			index === -1
 				? [...this.#snapshot.credentials, entry]
 				: this.#snapshot.credentials.map((candidate, i) => (i === index ? entry : candidate));
-		this.#applySnapshot({ ...this.#snapshot, generation, serverNowMs, refresher, credentials }, generation);
+		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
 	}
 
-	#removeStreamCredential(id: number, refresher: RefresherSchedule, generation: number, serverNowMs: number): void {
+	#removeStreamCredential(
+		id: number,
+		refresher: RefresherSchedule,
+		generation: number,
+		serverNowMs: number,
+		epoch?: string,
+	): void {
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#applySnapshot({ ...this.#snapshot, generation, serverNowMs, refresher, credentials }, generation);
+		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
 	}
 
 	/**
