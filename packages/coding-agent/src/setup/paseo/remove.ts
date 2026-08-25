@@ -232,9 +232,12 @@ export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSe
 	} catch (error) {
 		if (error instanceof SkillsBridgeError) throw error;
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-			// The recorded directory is gone: nothing to remove on disk, and the
-			// ledger cleanup below still runs.
-			return recorded;
+			// The recorded directory is gone, but a persisted `.removing` sibling may
+			// still be the exact replay authority. Canonicalize the surviving parent so
+			// replay below does not compare a lexical symlink-ancestor path with the
+			// native canonical authority.
+			const canonicalParent = await fs.realpath(path.dirname(recorded));
+			return path.join(canonicalParent, path.basename(recorded));
 		}
 		throw error;
 	}
