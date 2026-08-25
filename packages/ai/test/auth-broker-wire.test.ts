@@ -254,17 +254,36 @@ describe("auth-broker wire surface", () => {
 			headers: { Authorization: `Bearer ${token}` },
 		});
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as { generation: number; serverNowMs: number; refresher: { enabled: boolean } };
-		expect(res.headers.get("etag")).toBe(`"${body.generation}"`);
+		const body = (await res.json()) as {
+			epoch?: string;
+			generation: number;
+			serverNowMs: number;
+			refresher: { enabled: boolean };
+		};
+		expect(body.epoch).toBeTruthy();
+		expect(res.headers.get("etag")).toBe(`"${body.epoch}:${body.generation}"`);
 		expect(res.headers.get("cache-control")).toBe("no-store");
 		expect(body.generation).toBeGreaterThan(0);
 		expect(body.serverNowMs).toBeGreaterThan(0);
 		expect(body.refresher.enabled).toBe(false);
 
 		const client = new AuthBrokerClient({ url: handle!.url, token });
-		const unchanged = await client.fetchSnapshot({ ifGenerationGt: body.generation, waitMs: 10 });
+		const unchanged = await client.fetchSnapshot({
+			ifEpoch: body.epoch,
+			ifGenerationGt: body.generation,
+			waitMs: 10,
+		});
 		expect(unchanged.status).toBe(304);
+		if (unchanged.status !== 304) throw new Error("expected unchanged snapshot");
 		expect(unchanged.generation).toBe(body.generation);
+		expect(unchanged.epoch).toBe(body.epoch);
+
+		const restarted = await client.fetchSnapshot({
+			ifEpoch: "restarted-epoch",
+			ifGenerationGt: body.generation,
+			waitMs: 10,
+		});
+		expect(restarted.status).toBe(200);
 	});
 
 	test("GET /v1/snapshot long-poll wakes when generation changes", async () => {
@@ -272,7 +291,11 @@ describe("auth-broker wire surface", () => {
 		const initial = await client.fetchSnapshot();
 		if (initial.status !== 200) throw new Error("expected snapshot");
 
-		const pending = client.fetchSnapshot({ ifGenerationGt: initial.generation, waitMs: 1000 });
+		const pending = client.fetchSnapshot({
+			ifEpoch: initial.snapshot.epoch,
+			ifGenerationGt: initial.generation,
+			waitMs: 1000,
+		});
 		setTimeout(() => {
 			storage!.upsertCredential("anthropic", mintOAuthCredential("b", Date.now() + 120_000));
 		}, 10);
