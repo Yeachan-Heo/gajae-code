@@ -16,11 +16,11 @@ import {
 	assertAcpRow,
 	expectedOutcome,
 	type MachineAdapter,
-	OPERATIONS,
+	operationsForAcpCohort,
 } from "./helpers/sdk-adapter-dispositions-shared";
 
 const adapter: MachineAdapter = "acp";
-for (const operation of OPERATIONS) {
+for (const operation of operationsForAcpCohort(0)) {
 	const name = `AD-${adapterPrefix[adapter]}-${operation.id}: ${operation.sdkId} ${expectedOutcome(adapter, operation)}`;
 	test(name, async () => {
 		await assertAcpRow(operation, false);

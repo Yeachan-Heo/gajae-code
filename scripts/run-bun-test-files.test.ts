@@ -3,14 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS,
-	ACP_ADAPTER_DISPOSITIONS_TEST_FILE,
 	buildTestProcessSpec,
 	enumerateTestFiles,
 	parseHarnessOptions,
 	probeLinuxProcess,
 	processIdentityIsExecuting,
-	resolveFileTimeout,
 	runHarness,
 	selectShard,
 	type TestProcessRunner,
@@ -50,14 +47,6 @@ describe("fresh-process test harness contracts", () => {
 			fileTimeoutMs: 90_000,
 			concurrency: 3,
 		});
-	});
-
-	test("uses the measured ACP adapter file timeout without widening the default", () => {
-		expect(resolveFileTimeout(ACP_ADAPTER_DISPOSITIONS_TEST_FILE, 300_000)).toBe(
-			ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS,
-		);
-		expect(resolveFileTimeout("packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts", 300_000)).toBe(300_000);
-		expect(resolveFileTimeout("tests/other.test.ts", 90_000)).toBe(90_000);
 	});
 
 	test("enumerates deterministic test paths with spaces without shell parsing", async () => {

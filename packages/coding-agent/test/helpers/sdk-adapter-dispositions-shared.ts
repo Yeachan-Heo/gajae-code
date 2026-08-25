@@ -26,6 +26,16 @@ export type MachineAdapter = Extract<Adapter, "mcp" | "acp" | "daemonCli">;
 export type Expected = "forwarded" | "rejected_before_send" | "internal_only";
 export type ObservedRequest = { kind: "control" | "query" | "global"; operation: string };
 
+export const ACP_COHORT_COUNT = 4;
+
+export function operationsForAcpCohort(cohortIndex: number): readonly Operation[] {
+	if (!Number.isInteger(cohortIndex) || cohortIndex < 0 || cohortIndex >= ACP_COHORT_COUNT)
+		throw new Error(`Invalid ACP disposition cohort: ${cohortIndex}`);
+	const start = Math.floor((cohortIndex * OPERATIONS.length) / ACP_COHORT_COUNT);
+	const end = Math.floor(((cohortIndex + 1) * OPERATIONS.length) / ACP_COHORT_COUNT);
+	return OPERATIONS.slice(start, end);
+}
+
 export function currentHostIncarnation(): string {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Current process incarnation is unavailable.");

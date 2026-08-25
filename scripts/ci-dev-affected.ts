@@ -98,6 +98,9 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/test/helpers/sdk-adapter-dispositions-shared.ts": [
 		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 	],

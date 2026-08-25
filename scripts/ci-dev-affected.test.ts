@@ -1447,6 +1447,9 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts");
 	});

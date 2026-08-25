@@ -26,6 +26,27 @@
 			"argv": [
 				"bun",
 				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts"
+			]
+		},
+		{
+			"argv": [
+				"bun",
+				"test",
 				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts"
 			]
 		},
@@ -93,6 +114,9 @@
 		"packages/coding-agent/test/sdk-acp-adapter.test.ts",
 		"packages/coding-agent/test/sdk-acp-provider-reconnect.test.ts",
 		"packages/coding-agent/test/sdk-acp-two-client-race.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
 		"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
@@ -2477,12 +2501,12 @@
 			"sdkId": "bash.execute",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C25:"
 			],
@@ -2573,12 +2597,12 @@
 			"sdkId": "bash.abort",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C26:"
 			],
@@ -2669,12 +2693,12 @@
 			"sdkId": "session.new",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C27:"
 			],
@@ -2765,12 +2789,12 @@
 			"sdkId": "session.fork",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C28",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C28:"
 			],
@@ -2861,12 +2885,12 @@
 			"sdkId": "session.resume",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C29:"
 			],
@@ -2957,12 +2981,12 @@
 			"sdkId": "session.close",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C30:"
 			],
@@ -3053,12 +3077,12 @@
 			"sdkId": "session.switch",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C31",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C31:"
 			],
@@ -3149,12 +3173,12 @@
 			"sdkId": "session.branch",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C32",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C32:"
 			],
@@ -3245,12 +3269,12 @@
 			"sdkId": "session.rename",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C33",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C33:"
 			],
@@ -3341,12 +3365,12 @@
 			"sdkId": "session.handoff",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C34",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C34:"
 			],
@@ -3437,12 +3461,12 @@
 			"sdkId": "session.export_html",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C35",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C35:"
 			],
@@ -3597,12 +3621,12 @@
 			"sdkId": "config.patch",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C36",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C36:"
 			],
@@ -3613,12 +3637,12 @@
 			"sdkId": "config.patch",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C36-secret",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C36-secret:"
 			],
@@ -3725,12 +3749,12 @@
 			"sdkId": "runtime.reload",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C37",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C37:"
 			],
@@ -3821,12 +3845,12 @@
 			"sdkId": "auth.login",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C38",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C38:"
 			],
@@ -3917,12 +3941,12 @@
 			"sdkId": "host_tools.register",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C39",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C39:"
 			],
@@ -4013,12 +4037,12 @@
 			"sdkId": "host_uri.register",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C40",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C40:"
 			],
@@ -4109,12 +4133,12 @@
 			"sdkId": "service_tier.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C41",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C41:"
 			],
@@ -4205,12 +4229,12 @@
 			"sdkId": "tools.active.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C42",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C42:"
 			],
@@ -4301,12 +4325,12 @@
 			"sdkId": "queue.message.remove",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C43",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C43:"
 			],
@@ -4397,12 +4421,12 @@
 			"sdkId": "queue.message.move",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C44",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C44:"
 			],
@@ -4493,12 +4517,12 @@
 			"sdkId": "queue.message.update",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C45",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C45:"
 			],
@@ -4589,12 +4613,12 @@
 			"sdkId": "extension.set_enabled",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C46",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C46:"
 			],
@@ -4685,12 +4709,12 @@
 			"sdkId": "context.clear",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C47",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C47:"
 			],
@@ -4781,12 +4805,12 @@
 			"sdkId": "session.delete",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C48",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C48:"
 			],
@@ -4877,12 +4901,12 @@
 			"sdkId": "session.cwd.move",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-C49",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C49:"
 			],
@@ -4973,12 +4997,12 @@
 			"sdkId": "retry.last",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-C50",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C50:"
 			],
@@ -5069,12 +5093,12 @@
 			"sdkId": "retry.now",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-C51",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C51:"
 			],
@@ -5165,12 +5189,12 @@
 			"sdkId": "bash.background",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-C52",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C52:"
 			],
@@ -5261,12 +5285,12 @@
 			"sdkId": "model.profile.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-C53",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C53:"
 			],
@@ -5357,12 +5381,12 @@
 			"sdkId": "session.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G01:"
 			],
@@ -5453,12 +5477,12 @@
 			"sdkId": "session.get_endpoint",
 			"adapter": "acp",
 			"disposition": "machine_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G02:"
 			],
@@ -5549,12 +5573,12 @@
 			"sdkId": "session.create",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G03:"
 			],
@@ -5645,12 +5669,12 @@
 			"sdkId": "session.fork",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G04:"
 			],
@@ -5741,12 +5765,12 @@
 			"sdkId": "session.resume",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G05:"
 			],
@@ -5837,12 +5861,12 @@
 			"sdkId": "session.close",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G06:"
 			],
@@ -5933,12 +5957,12 @@
 			"sdkId": "session.delete",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G07:"
 			],
@@ -6221,12 +6245,12 @@
 			"sdkId": "transcript.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q01:"
 			],
@@ -6317,12 +6341,12 @@
 			"sdkId": "transcript.body",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q02:"
 			],
@@ -6413,12 +6437,12 @@
 			"sdkId": "context.get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q03:"
 			],
@@ -6509,12 +6533,12 @@
 			"sdkId": "goal.list/get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q04:"
 			],
@@ -6605,12 +6629,12 @@
 			"sdkId": "todo.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q05:"
 			],
@@ -6701,12 +6725,12 @@
 			"sdkId": "diff.list_files",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q06:"
 			],
@@ -6797,12 +6821,12 @@
 			"sdkId": "diff.list_hunks",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q07",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q07:"
 			],
@@ -6893,12 +6917,12 @@
 			"sdkId": "diff.read_hunk",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q08",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q08:"
 			],
@@ -6989,12 +7013,12 @@
 			"sdkId": "usage.get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q09:"
 			],
@@ -7085,12 +7109,12 @@
 			"sdkId": "models.list/current",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q10",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q10:"
 			],
@@ -7181,12 +7205,12 @@
 			"sdkId": "skill.list/state",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q11",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q11:"
 			],
@@ -7277,12 +7301,12 @@
 			"sdkId": "workflow.gates.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-Q12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q12:"
 			],
@@ -7373,12 +7397,12 @@
 			"sdkId": "config.list/get",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q13",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q13:"
 			],
@@ -7469,12 +7493,12 @@
 			"sdkId": "session.metadata",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q14",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q14:"
 			],
@@ -7565,12 +7589,12 @@
 			"sdkId": "session.stats",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q15",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q15:"
 			],
@@ -7661,12 +7685,12 @@
 			"sdkId": "session.branch_candidates",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q16",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q16:"
 			],
@@ -7757,12 +7781,12 @@
 			"sdkId": "session.last_assistant",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q17",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q17:"
 			],
@@ -7853,12 +7877,12 @@
 			"sdkId": "runtime.capabilities",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q18",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q18:"
 			],
@@ -7949,12 +7973,12 @@
 			"sdkId": "auth.providers",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q19",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q19:"
 			],
@@ -8045,12 +8069,12 @@
 			"sdkId": "tools.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q20",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q20:"
 			],
@@ -8141,12 +8165,12 @@
 			"sdkId": "queue.messages.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q21",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q21:"
 			],
@@ -8237,12 +8261,12 @@
 			"sdkId": "extensions.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q22",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q22:"
 			],
@@ -8333,12 +8357,12 @@
 			"sdkId": "resource.body",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q23",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q23:"
 			],
@@ -8429,12 +8453,12 @@
 			"sdkId": "artifact.read",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q24",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q24:"
 			],
@@ -8525,12 +8549,12 @@
 			"sdkId": "runtime.jobs.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q25:"
 			],
@@ -8621,12 +8645,12 @@
 			"sdkId": "turn.result",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q26",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q26:"
 			],
@@ -8717,12 +8741,12 @@
 			"sdkId": "models.profiles.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q27",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q27:"
 			],
@@ -8813,12 +8837,12 @@
 			"sdkId": "providers.list/active",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q29",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q29:"
 			],
@@ -8909,12 +8933,12 @@
 			"sdkId": "session.checkpoint",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q30",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q30:"
 			],
@@ -9005,12 +9029,12 @@
 			"sdkId": "turn.steer_status",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q31",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q31:"
 			],
@@ -9101,12 +9125,12 @@
 			"sdkId": "terminal.create/output/release/wait",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-R01",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R01:"
 			],
@@ -9197,12 +9221,12 @@
 			"sdkId": "filesystem.read/write",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-R02",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R02:"
 			],
@@ -9293,12 +9317,12 @@
 			"sdkId": "permission.request",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-R03",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R03:"
 			],
@@ -9389,12 +9413,12 @@
 			"sdkId": "ui.select/confirm/input/editor/open_url",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-R04",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R04:"
 			],
@@ -9485,12 +9509,12 @@
 			"sdkId": "host_tool.invoke/cancel/update/result",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-R05",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R05:"
 			],
@@ -9581,12 +9605,12 @@
 			"sdkId": "host_uri.read/write/cancel/result",
 			"adapter": "acp",
 			"disposition": "provider_only",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-R06",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-R06:"
 			],

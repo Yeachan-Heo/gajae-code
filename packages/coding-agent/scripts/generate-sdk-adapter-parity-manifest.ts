@@ -8,7 +8,12 @@ const repoRoot = path.resolve(import.meta.dir, "..", "..", "..");
 const manifestPath = path.join(repoRoot, "packages/coding-agent/test/manifests/sdk-adapter-parity-v1.json");
 const chatDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions.test.ts";
 const mcpDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts";
-const acpDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts";
+const acpDispositionFiles = [
+	"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+	"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
+	"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
+	"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
+];
 const daemonCliDispositionFile = "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts";
 const adapterTests: Record<Adapter, string[]> = {
 	telegram: [chatDispositionFile],
@@ -23,7 +28,7 @@ const adapterTests: Record<Adapter, string[]> = {
 		"packages/coding-agent/test/sdk-acp-adapter.test.ts",
 		"packages/coding-agent/test/sdk-acp-two-client-race.test.ts",
 		"packages/coding-agent/test/sdk-acp-provider-reconnect.test.ts",
-		acpDispositionFile,
+		...acpDispositionFiles,
 	],
 	daemonCli: [
 		"packages/coding-agent/test/sdk-daemon-cli-e2e.test.ts",
@@ -66,15 +71,20 @@ function adapterTestPrefix(adapter: Adapter): string {
 						? "M"
 						: "A";
 }
-function dispositionFileFor(adapter: Adapter): string {
+function acpDispositionFileFor(operation: (typeof OPERATIONS)[number]): string {
+	const index = OPERATIONS.indexOf(operation);
+	const cohort = Math.floor((index * acpDispositionFiles.length) / OPERATIONS.length);
+	return acpDispositionFiles[cohort]!;
+}
+function dispositionFileFor(adapter: Adapter, operation: (typeof OPERATIONS)[number]): string {
 	if (adapter === "mcp") return mcpDispositionFile;
-	if (adapter === "acp") return acpDispositionFile;
+	if (adapter === "acp") return acpDispositionFileFor(operation);
 	if (adapter === "daemonCli") return daemonCliDispositionFile;
 	return chatDispositionFile;
 }
 function row(adapter: Adapter, operation: (typeof OPERATIONS)[number], secret = false): ManifestAdapterRow {
 	const suffix = secret ? "-secret" : "";
-	const testFile = dispositionFileFor(adapter);
+	const testFile = dispositionFileFor(adapter, operation);
 	return {
 		adapterTestId: `AD-${adapterTestPrefix(adapter)}-${operation.id}${suffix}`,
 		sdkId: operation.sdkId,
