@@ -325,14 +325,33 @@ export interface RecoverIntentOptions {
 	 * to the next install.
 	 */
 	readonly repair: boolean;
+	/** Trusted target paths supplied by the active Paseo setup call. */
+	readonly expectedTargetPaths?: readonly string[];
 }
 
 async function bridgeLedgerMatchesFilesystem(
 	ledger: ProvenanceLedger,
 	previous: ProvenanceLedger | undefined,
+	targetPath?: string,
 ): Promise<boolean> {
 	const bridgePath = ledger.bridgePath;
-	if (bridgePath === undefined) return (ledger.bridgeEntries?.length ?? 0) === 0;
+	if (bridgePath === undefined) {
+		if ((ledger.bridgeEntries?.length ?? 0) !== 0) return false;
+		if (targetPath !== undefined) {
+			const [target, detached] = await Promise.all([
+				fs.lstat(targetPath, { bigint: true }).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}),
+				fs.lstat(`${targetPath}.removing`, { bigint: true }).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}),
+			]);
+			if (target !== undefined || detached !== undefined) return false;
+		}
+		return true;
+	}
 	const entries = ledger.bridgeEntries ?? [];
 	if (entries.length === 0) {
 		if (ledger.bridgeDirCreated !== true) return true;
@@ -367,8 +386,25 @@ async function bridgeLedgerMatchesFilesystem(
 	if (previous?.bridgePath !== undefined && path.resolve(previous.bridgePath) !== path.resolve(bridgePath)) {
 		for (const name of previous.bridgeEntries ?? []) {
 			const oldPath = path.join(previous.bridgePath, name);
-			if (await fs.lstat(oldPath).catch(() => undefined)) return false;
+			try {
+				await fs.lstat(oldPath);
+				return false;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
 		}
+	}
+	if (ledger.bridgeDirCreated === true) {
+		const directory = await fs.lstat(bridgePath, { bigint: true });
+		const expected = ledger.bridgeDirIdentity;
+		if (
+			!directory.isDirectory() ||
+			directory.isSymbolicLink() ||
+			expected === undefined ||
+			expected.dev !== directory.dev.toString() ||
+			expected.ino !== directory.ino.toString()
+		)
+			return false;
 	}
 	return true;
 }
@@ -426,6 +462,17 @@ export async function recoverIntent(
 		return { recovered: false, detail: error instanceof Error ? error.message : String(error) };
 	}
 	if (!intent) return undefined;
+	if (options.repair) {
+		if (options.expectedTargetPaths === undefined || options.expectedTargetPaths.length === 0) {
+			return { recovered: false, detail: "repair requires trusted Paseo target paths" };
+		}
+		if (!options.expectedTargetPaths.some(target => path.resolve(target) === path.resolve(intent.targetPath))) {
+			return {
+				recovered: false,
+				detail: `the intent target is outside the trusted Paseo target set: ${intent.targetPath}`,
+			};
+		}
+	}
 	if (intent.step === "skills-bridge") {
 		const ledgerObserved = await currentIdentity(intent.provenancePath);
 		if (
@@ -439,8 +486,10 @@ export async function recoverIntent(
 		}
 		const before = intent.bridgePreflightPayload;
 		const after = intent.provenancePayload;
-		const beforeMatches = before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined));
-		const afterMatches = after !== undefined && (await bridgeLedgerMatchesFilesystem(after, before));
+		const beforeMatches =
+			before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined, intent.targetPath));
+		const afterMatches =
+			after !== undefined && (await bridgeLedgerMatchesFilesystem(after, before, intent.targetPath));
 		const samePayload =
 			before !== undefined &&
 			after !== undefined &&

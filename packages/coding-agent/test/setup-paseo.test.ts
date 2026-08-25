@@ -654,6 +654,27 @@ describe("four-state check (AC-16, AC-17, AC-18)", () => {
 });
 
 describe("skills bridge", () => {
+	test("removes a bridge below a symlinked agent-directory ancestor", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		const trustedAgentRoot = path.dirname(path.dirname(fixture.paths.provenanceLedger));
+		const realAgentDir = path.join(trustedAgentRoot, "real-agent");
+		const aliasAgentDir = path.join(trustedAgentRoot, "alias-agent");
+		await fs.mkdir(realAgentDir, { recursive: true });
+		await fs.symlink(realAgentDir, aliasAgentDir);
+		const deps = {
+			...fixture.deps,
+			paths: { ...fixture.paths, bridgeDir: path.join(aliasAgentDir, "paseo-skills") },
+		};
+
+		const install = await runPaseoSetup({}, deps);
+		expect(install.kind).toBe("install");
+		const removal = await runPaseoSetup({ remove: true }, deps);
+		expect(removal.kind).toBe("remove");
+		if (removal.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(removal.result.outcome).toBe("removed");
+	});
+
 	test("links every paseo-prefixed source skill except the denylist (AC-6, #4638)", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths, ["context-search", "paseo-help", "unrelated-skill"]);
@@ -2027,7 +2048,14 @@ describe("skills bridge", () => {
 		});
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		if (!recovery?.recovered) throw new Error(JSON.stringify(recovery));
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
@@ -2290,7 +2318,14 @@ describe("skills bridge", () => {
 		await seedConfig(fixture.paths);
 		await fs.mkdir(path.dirname(fixture.paths.intentRecord), { recursive: true });
 		await Bun.write(fixture.paths.intentRecord, "{ this is not json");
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("corrupt");
 		const check = await runPaseoSetup({ check: true }, fixture.deps);
@@ -3869,7 +3904,14 @@ describe("intent recovery", () => {
 			startedAt: new Date().toISOString(),
 		});
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
 		const retry = await runPaseoSetup(
@@ -3907,7 +3949,15 @@ describe("intent recovery", () => {
 			startedAt: new Date().toISOString(),
 		});
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+				newBridge,
+			],
+		});
 		expect(recovery?.recovered).toBe(true);
 		const retry = await runPaseoSetup({}, { ...fixture.deps, paths: { ...fixture.paths, bridgeDir: newBridge } });
 		expect(retry.kind).toBe("install");
@@ -3965,10 +4015,58 @@ describe("intent recovery", () => {
 			startedAt: new Date().toISOString(),
 		});
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(true);
 		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeSourceDir).toBe(relocatedSource);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+	});
+
+	test("empty bridge preflight retains a foreign detached authority", async () => {
+		const fixture = await makeFixture();
+		await seedConfig(fixture.paths);
+		const before = { version: 1, providerKeys: {}, seededOrchestrationKeys: {} };
+		const planned = {
+			...before,
+			bridgePath: fixture.paths.bridgeDir,
+			bridgeSourceDir: fixture.paths.agentsSkillsDir,
+			bridgeEntries: [...SKILL_NAMES],
+		};
+		await fs.mkdir(`${fixture.paths.bridgeDir}.removing`, { recursive: true });
+		await fs.mkdir(path.dirname(fixture.paths.provenanceLedger), { recursive: true });
+		await fs.writeFile(fixture.paths.provenanceLedger, serializeJson(before));
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: fixture.paths.bridgeDir,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: "absent",
+			targetExpectedIdentity: "absent",
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(planned),
+			provenancePayload: planned,
+			bridgePreflightPayload: before,
+			startedAt: new Date().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
+		expect(recovery?.recovered).toBe(false);
+		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
+		await expect(fs.stat(`${fixture.paths.bridgeDir}.removing`)).resolves.toBeDefined();
 	});
 
 	async function intentFixture(): Promise<{ fixture: Fixture; intent: IntentRecord }> {
@@ -4029,7 +4127,14 @@ describe("intent recovery", () => {
 		await fs.writeFile(fixture.paths.configJson, serializeJson({ after: true }));
 		await writeIntent(fixture.paths.intentRecord, intent);
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("no ledger payload");
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
@@ -4047,7 +4152,14 @@ describe("intent recovery", () => {
 			provenancePayload: pending,
 		});
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(true);
 		expect((await readProvenance(fixture.paths.provenanceLedger)).seededOrchestrationKeys.ui).toBe("gjc");
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
@@ -4070,7 +4182,14 @@ describe("intent recovery", () => {
 		await Bun.write(fixture.paths.intentRecord, tampered);
 		const ledgerBefore = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("corrupt");
 		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(ledgerBefore);
@@ -4091,7 +4210,14 @@ describe("intent recovery", () => {
 		await Bun.write(fixture.paths.intentRecord, tampered);
 		const ledgerBefore = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("canonical digest");
 		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(ledgerBefore);
@@ -4102,9 +4228,55 @@ describe("intent recovery", () => {
 		const { fixture, intent } = await intentFixture();
 		await writeIntent(fixture.paths.intentRecord, intent);
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+	});
+
+	test("repair refuses an intent target outside the trusted Paseo paths", async () => {
+		const { fixture, intent } = await intentFixture();
+		const victimConfig = path.join(fixture.root, "victim", "config.json");
+		const victimSidecar = replacedProviderBackupPath(victimConfig, "gjc");
+		await fs.mkdir(path.dirname(victimConfig), { recursive: true });
+		await fs.writeFile(victimConfig, serializeJson({ victim: true }));
+		await fs.writeFile(victimSidecar, serializeJson({ key: "gjc", value: { victim: true } }), { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			targetPath: victimConfig,
+			targetPreflightIdentity: await currentIdentity(victimConfig),
+			discardSidecar: {
+				backupPath: victimSidecar,
+				valueSha256: hashBytes(serializeJson({ key: "gjc", value: { victim: true } })),
+			},
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
+		expect(recovery?.recovered).toBe(false);
+		await expect(fs.stat(victimSidecar)).resolves.toBeDefined();
+		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
+	});
+
+	test("readIntent rejects an unsupported numeric version", async () => {
+		const { fixture, intent } = await intentFixture();
+		await writeIntent(fixture.paths.intentRecord, intent);
+		const tampered = JSON.parse(await fs.readFile(fixture.paths.intentRecord, "utf8")) as Record<string, unknown>;
+		tampered.version = INTENT_VERSION + 1;
+		await fs.writeFile(fixture.paths.intentRecord, serializeJson(tampered));
+		await expect(readIntent(fixture.paths.intentRecord)).rejects.toBeInstanceOf(IntentRecordCorruptError);
 	});
 
 	test("discard repair treats a sidecar deleted after authentication as success", async () => {
@@ -4129,7 +4301,14 @@ describe("intent recovery", () => {
 		};
 		const statSpy = spyOn(fs, "stat").mockImplementation(statImpl as typeof fs.stat);
 		try {
-			const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+			const recovery = await recoverIntent(fixture.paths.intentRecord, {
+				repair: true,
+				expectedTargetPaths: [
+					fixture.paths.configJson,
+					fixture.paths.orchestrationPreferences,
+					fixture.paths.bridgeDir,
+				],
+			});
 			expect(recovery?.recovered).toBe(true);
 		} finally {
 			statSpy.mockRestore();
@@ -4153,7 +4332,14 @@ describe("intent recovery", () => {
 		);
 		const intentBytes = await fs.readFile(fixture.paths.intentRecord, "utf8");
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("corrupt");
 		await expect(readIntent(fixture.paths.intentRecord)).rejects.toBeInstanceOf(IntentRecordCorruptError);
@@ -4171,7 +4357,14 @@ describe("intent recovery", () => {
 			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
 		});
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
 		await expect(fs.stat(sidecarPath)).rejects.toMatchObject({ code: "ENOENT" });
@@ -4187,7 +4380,14 @@ describe("intent recovery", () => {
 			discardSidecar: { backupPath: sidecarPath, valueSha256: "0".repeat(64) },
 		});
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("discard sidecar cleanup failed");
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
@@ -4216,7 +4416,14 @@ describe("intent recovery", () => {
 		};
 		const statSpy = spyOn(fs, "stat").mockImplementation(statImpl as typeof fs.stat);
 		try {
-			const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+			const recovery = await recoverIntent(fixture.paths.intentRecord, {
+				repair: true,
+				expectedTargetPaths: [
+					fixture.paths.configJson,
+					fixture.paths.orchestrationPreferences,
+					fixture.paths.bridgeDir,
+				],
+			});
 			expect(recovery?.recovered).toBe(false);
 			expect(recovery?.detail).toContain("discard sidecar cleanup failed");
 		} finally {
@@ -4230,7 +4437,14 @@ describe("intent recovery", () => {
 		const { fixture, intent } = await intentFixture();
 		await writeIntent(fixture.paths.intentRecord, intent);
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: false });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: false,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
 	});
@@ -4240,7 +4454,14 @@ describe("intent recovery", () => {
 		await fs.writeFile(fixture.paths.provenanceLedger, serializeJson({ someone: "else" }));
 		await writeIntent(fixture.paths.intentRecord, intent);
 
-		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+		});
 		expect(recovery?.recovered).toBe(false);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
 	});

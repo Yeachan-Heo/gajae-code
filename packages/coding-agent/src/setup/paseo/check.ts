@@ -56,7 +56,10 @@ async function collectL1(deps: PaseoSetupDependencies, options: CheckOptions): P
 	});
 	if (intent) {
 		// `repair: false` keeps this read-only; the intent is reported, never settled.
-		const recovery = await recoverIntent(deps.paths.intentRecord, { repair: false });
+		const recovery = await recoverIntent(deps.paths.intentRecord, {
+			repair: false,
+			expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
+		});
 		if (recovery) {
 			reasons.push({
 				code: "partial-install",

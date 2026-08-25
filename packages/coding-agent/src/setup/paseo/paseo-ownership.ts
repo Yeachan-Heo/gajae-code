@@ -444,6 +444,9 @@ function isIntentDiscardSidecar(value: unknown, targetPath: unknown): value is I
 }
 
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
+	if (intent.version !== INTENT_VERSION) {
+		throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
+	}
 	if (intent.discardSidecar !== undefined && !isIntentDiscardSidecar(intent.discardSidecar, intent.targetPath)) {
 		throw new IntentRecordCorruptError(
 			intentPath,
@@ -596,8 +599,8 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 		) {
 			throw new IntentRecordCorruptError(intentPath, "step is not a known intent step");
 		}
-		if (typeof parsed?.version !== "number") {
-			throw new IntentRecordCorruptError(intentPath, "version is not a number");
+		if (parsed?.version !== INTENT_VERSION) {
+			throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
 		}
 		if (
 			!Array.isArray(parsed?.ownedKeys) ||

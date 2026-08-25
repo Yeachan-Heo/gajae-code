@@ -162,7 +162,10 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	// discardable intent is cleared here; a `complete-ledger` intent whose ledger
 	// contents are unknown to this run is reported rather than guessed at, and
 	// the steps below re-derive and commit the same provenance anyway.
-	const recovery = await recoverIntent(deps.paths.intentRecord, { repair: true });
+	const recovery = await recoverIntent(deps.paths.intentRecord, {
+		repair: true,
+		expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
+	});
 	if (recovery && !recovery.recovered) {
 		return {
 			outcome: "partial-install",

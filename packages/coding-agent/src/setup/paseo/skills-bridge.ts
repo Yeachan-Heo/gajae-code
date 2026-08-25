@@ -16,7 +16,12 @@ import * as nodeCrypto from "node:crypto";
 import type { Dirent, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { exactRemoveDirectoryTree, exactUnlinkSymlink, snapshotDirectoryTree } from "@gajae-code/natives";
+import {
+	canonicalExistingDirectoryIdentity,
+	exactRemoveDirectoryTree,
+	exactUnlinkSymlink,
+	snapshotDirectoryTree,
+} from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
 import type { RawSettings, Settings } from "../../config/settings";
@@ -278,9 +283,10 @@ async function unlinkSymlinkExactly(
 	if (text === undefined || resolvedLinkTarget(text, linkPath) !== expectedTarget) {
 		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
 	}
-	const parent = await fs.stat(path.dirname(linkPath), { bigint: true });
+	const nativeLinkPath = canonicalExistingPathForNative(linkPath);
+	const parent = await fs.stat(path.dirname(nativeLinkPath), { bigint: true });
 	if (!parent.isDirectory()) throw new SkillsBridgeError(`Paseo skill bridge parent is not a directory: ${linkPath}`);
-	const result = exactUnlinkSymlink(linkPath, {
+	const result = exactUnlinkSymlink(nativeLinkPath, {
 		dev: expectedIdentity.dev,
 		ino: expectedIdentity.ino,
 		nlink: 1n,
@@ -295,6 +301,15 @@ async function unlinkSymlinkExactly(
 			`Paseo skill bridge entry diverged before removal: ${linkPath} (${result.code ?? "unknown"})`,
 		);
 	}
+}
+
+function canonicalExistingPathForNative(targetPath: string): string {
+	const absolute = path.resolve(targetPath);
+	const parent = canonicalExistingDirectoryIdentity(path.dirname(absolute));
+	if (!parent.ok || parent.canonicalPath === undefined) {
+		throw new SkillsBridgeError(`Paseo bridge cleanup parent is not canonicalizable: ${targetPath}`);
+	}
+	return path.join(parent.canonicalPath, path.basename(absolute));
 }
 
 /**
@@ -887,7 +902,8 @@ async function removeOwnedEmptyBridgeDirectory(
 	expected: BridgeEntryIdentity,
 	onCleanupPending?: (authority: BridgeCleanupAuthority) => Promise<void>,
 ): Promise<void> {
-	const parent = await fs.lstat(path.dirname(bridgeDir), { bigint: true }).catch(error => {
+	const nativeBridgeDir = canonicalExistingPathForNative(bridgeDir);
+	const parent = await fs.lstat(path.dirname(nativeBridgeDir), { bigint: true }).catch(error => {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw new SkillsBridgeError(`Paseo skills bridge parent became unavailable before removal: ${bridgeDir}`);
 	});
@@ -896,7 +912,7 @@ async function removeOwnedEmptyBridgeDirectory(
 		throw new SkillsBridgeError(`Paseo skills bridge parent diverged before removal: ${bridgeDir}`);
 	}
 
-	const captured = snapshotDirectoryTree(bridgeDir);
+	const captured = snapshotDirectoryTree(nativeBridgeDir);
 	if (!captured.ok || captured.snapshot === undefined) {
 		if (captured.code === "not_found") return;
 		throw new SkillsBridgeError(
@@ -915,8 +931,8 @@ async function removeOwnedEmptyBridgeDirectory(
 		throw new SkillsBridgeError(`Refusing to remove non-empty Paseo skills bridge directory: ${bridgeDir}`);
 	}
 	const authority: BridgeCleanupAuthority = {
-		originalPath: path.resolve(bridgeDir),
-		detachedPath: path.resolve(`${bridgeDir}.removing`),
+		originalPath: path.resolve(nativeBridgeDir),
+		detachedPath: path.resolve(`${nativeBridgeDir}.removing`),
 		parentIdentity: { dev: parent.dev.toString(), ino: parent.ino.toString() },
 		snapshot: captured.snapshot,
 	};
@@ -927,7 +943,7 @@ async function removeOwnedEmptyBridgeDirectory(
 
 	let removal: ReturnType<typeof exactRemoveDirectoryTree>;
 	try {
-		removal = exactRemoveDirectoryTree(bridgeDir, captured.snapshot, {
+		removal = exactRemoveDirectoryTree(nativeBridgeDir, captured.snapshot, {
 			dev: parent.dev,
 			ino: parent.ino,
 		});
