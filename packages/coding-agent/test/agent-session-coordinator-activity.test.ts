@@ -722,6 +722,9 @@ describe("AgentSession coordinator activity labels", () => {
 		})();
 
 		await session.agent.prompt("run a tool, then fail the next turn");
+		// The completed prompt does not itself order the sidecar writer. Observe the
+		// real dispatch's terminal sequence before sampling the stable snapshot.
+		await activityAfterSeq(stateFile, 2);
 		const settled = await settledActivity(stateFile);
 		sampling = false;
 		await sampler;
