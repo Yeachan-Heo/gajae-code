@@ -1302,7 +1302,7 @@ export class AuthStorage {
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#store = store;
 		store.onSnapshotChanged?.(() => {
-			this.#data = new Map();
+			this.#reloadCredentialRowsFromStore();
 			void this.reload();
 		});
 		this.#configValueResolver = options.configValueResolver ?? defaultConfigValueResolver;
@@ -2004,6 +2004,10 @@ export class AuthStorage {
 	 */
 	async reload(): Promise<void> {
 		await this.#store.waitForReady?.();
+		this.#reloadCredentialRowsFromStore();
+	}
+
+	#reloadCredentialRowsFromStore(): void {
 		const records = this.#store.listAuthCredentials();
 		const grouped = new Map<string, StoredCredential[]>();
 		for (const record of records) {
