@@ -878,7 +878,12 @@ export interface CursorExecHandlers {
 		/** Marks a started non-abortable mutation so the exec terminal waits for settlement. */
 		markNonAbortable?: () => void,
 	) => Promise<CursorExecHandlerResult<WriteResult>>;
-	delete?: (args: DeleteArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<DeleteResult>>;
+	delete?: (
+		args: DeleteArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable mutation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<DeleteResult>>;
 	shell?: (args: ShellArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<ShellResult>>;
 	shellStream?: (
 		args: ShellArgs,

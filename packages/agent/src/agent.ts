@@ -1066,9 +1066,9 @@ export class Agent {
 		}
 		const deleteHandler = source.delete?.bind(source);
 		if (deleteHandler) {
-			guarded.delete = async (args, signal) => {
+			guarded.delete = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await deleteHandler(args, signal);
+				const result = await deleteHandler(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};

@@ -219,6 +219,12 @@ export interface CursorOptions extends StreamOptions {
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
+// A started non-abortable mutation must settle before the exec terminal is
+// published, but settlement cannot be allowed to hang the turn forever: once
+// the exec deadline has fired, a mutation that still has not settled is capped
+// by a grace window (deadline/4, min 5s) before the fence publishes anyway.
+const CURSOR_NON_ABORTABLE_GRACE_MIN_MS = 5_000;
+const CURSOR_NON_ABORTABLE_GRACE_DIVISOR = 4;
 const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
 
 function cursorAbortError(signal: AbortSignal): Error {
@@ -252,21 +258,38 @@ export function cursorExecDeadlineMsForTest(idleTimeoutMs: number | undefined): 
 	return Math.max(CURSOR_MIN_EXEC_DEADLINE_MS, idleTimeoutMs * CURSOR_EXEC_DEADLINE_MULTIPLIER);
 }
 
+/** Bounded settlement proof for a started non-abortable Cursor exec. */
+export interface CursorNonAbortableSettlement {
+	/** Resolves when the marked mutation settles; never rejects. */
+	settled: Promise<void>;
+	/** Rejects once the deadline fired and the mutation missed the settlement grace window; never resolves. */
+	exceeded: Promise<never>;
+}
+
 function runWithCursorExecDeadline<T>(
 	operation: (signal: AbortSignal, markNonAbortable: () => void) => Promise<T>,
 	signal: AbortSignal | undefined,
 	deadlineMs: number,
-	onNonAbortableStarted?: (settled: Promise<void>) => void,
+	onNonAbortableStarted?: (settlement: CursorNonAbortableSettlement) => void,
 ): Promise<T> {
 	const result = Promise.withResolvers<T>();
 	const controller = new AbortController();
+	const settlementExceeded = Promise.withResolvers<never>();
+	// The fence observes `exceeded` through Promise.race; keep this branch silent.
+	settlementExceeded.promise.catch(() => {});
 	let settled = false;
 	let nonAbortableStarted = false;
 	let abortError: Error | undefined;
 	let timer: NodeJS.Timeout | undefined;
+	let graceTimer: NodeJS.Timeout | undefined;
+	const graceMs = Math.max(
+		CURSOR_NON_ABORTABLE_GRACE_MIN_MS,
+		Math.round(deadlineMs / CURSOR_NON_ABORTABLE_GRACE_DIVISOR),
+	);
 
 	const cleanup = () => {
 		if (timer) clearTimeout(timer);
+		if (graceTimer) clearTimeout(graceTimer);
 		if (signal) signal.removeEventListener("abort", onAbort);
 	};
 	const settle = (settlement: () => void) => {
@@ -275,11 +298,30 @@ function runWithCursorExecDeadline<T>(
 		cleanup();
 		settlement();
 	};
+	// A started non-abortable mutation defers rejection until it settles, but not
+	// forever: once the deadline (or caller abort) has fired, a mutation that
+	// still has not settled within the grace window caps the settlement fence.
+	const armSettlementGrace = (): void => {
+		if (settled || graceTimer) return;
+		graceTimer = setTimeout(() => {
+			if (settled) return;
+			settlementExceeded.reject(
+				new Error(
+					`Cursor non-abortable exec exceeded its ${deadlineMs}ms deadline and did not settle within ${graceMs}ms`,
+				),
+			);
+			// Cap the wrapper itself: rejecting makes the queued handler throw, so
+			// the queue's error path runs settleBehindFence and the terminal is
+			// published even though the mutation may still be running detached.
+			settle(() => result.reject(abortError ?? new Error("Cursor non-abortable exec settlement timed out")));
+		}, graceMs);
+	};
 	const onAbort = () => {
 		if (signal) {
 			abortError = cursorAbortError(signal);
 			controller.abort(abortError);
-			if (!nonAbortableStarted) settle(() => result.reject(abortError!));
+			if (nonAbortableStarted) armSettlementGrace();
+			else settle(() => result.reject(abortError!));
 		}
 	};
 
@@ -295,16 +337,21 @@ function runWithCursorExecDeadline<T>(
 		// still bounds how long this turn waits for the handler promise.
 		abortError = new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`);
 		controller.abort(abortError);
-		if (!nonAbortableStarted) settle(() => result.reject(abortError!));
+		if (nonAbortableStarted) armSettlementGrace();
+		else settle(() => result.reject(abortError!));
 	}, deadlineMs);
 	void operation(controller.signal, () => {
 		nonAbortableStarted = true;
-		onNonAbortableStarted?.(
-			result.promise.then(
+		// A mutation marked after the deadline already fired starts its grace
+		// window immediately instead of escaping the cap.
+		if (abortError !== undefined) armSettlementGrace();
+		onNonAbortableStarted?.({
+			settled: result.promise.then(
 				() => undefined,
 				() => undefined,
 			),
-		);
+			exceeded: settlementExceeded.promise,
+		});
 	}).then(
 		value => settle(() => (abortError ? result.reject(abortError) : result.resolve(value))),
 		error => settle(() => result.reject(abortError ?? error)),
@@ -786,7 +833,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let transportWatchdog: NodeJS.Timeout | null = null;
 		let transportWatchdogClosed = false;
 		let callerAbortError: Error | undefined;
-		let pendingNonAbortableExec: Promise<void> | undefined;
+		let pendingNonAbortableExec: CursorNonAbortableSettlement | undefined;
 		const closeForCallerAbort = () => {
 			h2Request?.close();
 			h2Client?.close();
@@ -796,10 +843,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		// Terminal publication (caller abort, transport error, or stream end)
 		// must wait for any started non-abortable mutation to settle: a network
 		// reset mid-exec otherwise publishes the terminal and lets a retry start
-		// while the filesystem mutation is still running.
+		// while the filesystem mutation is still running. Settlement is bounded:
+		// a mutation that missed its grace window cannot hold the fence (and the
+		// transport) open forever.
 		const settleBehindFence = (publish: () => void): void => {
 			if (pendingNonAbortableExec) {
-				void pendingNonAbortableExec.finally(publish);
+				void Promise.race([pendingNonAbortableExec.settled, pendingNonAbortableExec.exceeded]).finally(publish);
 				return;
 			}
 			publish();
@@ -1171,8 +1220,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										run,
 										options?.signal,
 										cursorExecDeadlineMsForTest(idleTimeoutMs),
-										settled => {
-											pendingNonAbortableExec = settled;
+										settlement => {
+											pendingNonAbortableExec = settlement;
 										},
 									);
 								} else {
@@ -1894,6 +1943,7 @@ async function handleExecServerMessage(
 				reason => buildDeleteRejectedResult(args.path, reason),
 				error => buildDeleteErrorResult(args.path, error),
 				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;

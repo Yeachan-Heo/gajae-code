@@ -522,4 +522,24 @@ describe("CursorExecHandlers dispatched tool identity", () => {
 		expect(start).toBeDefined();
 		expect(dispatchedToolIdentity(start as object)).toBeUndefined();
 	});
+
+	it("marks Cursor delete as a non-abortable mutation in the settlement fence", async () => {
+		const target = `${__dirname}/delete-fence-target.tmp`;
+		await Bun.write(target, "stale");
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map<string, AgentTool>() } as never);
+		let marked = false;
+		const controller = new AbortController();
+
+		const result = await handlers.delete(
+			create(DeleteArgsSchema, { path: target, toolCallId: "delete-fence-1" }),
+			controller.signal,
+			() => {
+				marked = true;
+			},
+		);
+
+		expect(marked).toBe(true);
+		expect(result.isError ?? false).toBe(false);
+		await controller.abort(new Error("post-delete abort"));
+	});
 });

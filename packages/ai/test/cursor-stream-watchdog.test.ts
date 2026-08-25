@@ -864,4 +864,51 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("caller cancelled exec");
 	});
+
+	it("caps the settlement fence when a marked non-abortable mutation never settles", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					}),
+				10,
+			);
+		});
+		const started = Promise.withResolvers<void>();
+		const pending = collectTerminal(baseUrl, {
+			// Exec deadline = idle 40ms * 4 = 160ms; the fence grace cap is
+			// max(5s, 160/4) = 5s, so a mutation that never settles still gets
+			// a terminal within ~5.2s instead of hanging forever.
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await Promise.withResolvers<never>().promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		const { events, result } = await pending;
+		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	}, 9000);
 });

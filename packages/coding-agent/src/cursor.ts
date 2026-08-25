@@ -139,9 +139,20 @@ async function executeTool(
 	return createToolResultMessage(toolCallId, toolName, result, isError);
 }
 
-async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, toolCallId: string) {
+async function executeDelete(
+	options: CursorExecBridgeOptions,
+	pathArg: string,
+	toolCallId: string,
+	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
+) {
 	const toolName = "delete";
+	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
+	// Delete is a filesystem mutation with no cooperative cancellation point:
+	// mark it non-abortable so the settlement fence publishes the exec terminal
+	// only once the unlink is final, matching write/edit dispatch.
+	markNonAbortable?.();
 
 	const absolutePath = resolveToCwd(pathArg, options.cwd);
 	let isError = false;
@@ -347,10 +358,20 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		return toolResultMessage;
 	}
 
-	async delete(args: Parameters<NonNullable<ICursorExecHandlers["delete"]>>[0], signal?: AbortSignal) {
+	async delete(
+		args: Parameters<NonNullable<ICursorExecHandlers["delete"]>>[0],
+		signal?: AbortSignal,
+		markNonAbortable?: () => void,
+	) {
 		if (signal?.aborted) throw cursorAbortError(signal);
 		const toolCallId = decodeToolCallId(args.toolCallId);
-		const toolResultMessage = await executeDelete(this.#optionsForCall(), args.path, toolCallId);
+		const toolResultMessage = await executeDelete(
+			this.#optionsForCall(),
+			args.path,
+			toolCallId,
+			signal,
+			markNonAbortable,
+		);
 		return toolResultMessage;
 	}
 
