@@ -121,6 +121,11 @@ static APPEND_AFTER_FINAL_SYNC_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static REPLACE_BEFORE_IN_PLACE_WRITE_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 fn set_append_after_final_sync_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 	*APPEND_AFTER_FINAL_SYNC_HOOK
 		.get_or_init(|| std::sync::Mutex::new(None))
@@ -138,6 +143,27 @@ fn pause_append_after_final_sync_for_test() {
 	{
 		entered.send(()).expect("append final-sync hook receiver");
 		resume.recv().expect("append final-sync hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_replace_before_in_place_write_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*REPLACE_BEFORE_IN_PLACE_WRITE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_replace_before_in_place_write_for_test() {
+	if let Some((entered, resume)) = REPLACE_BEFORE_IN_PLACE_WRITE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered.send(()).expect("replace in-place hook receiver");
+		resume.recv().expect("replace in-place hook resume");
 	}
 }
 
@@ -189,6 +215,7 @@ enum NoReplacePrimitive {
 	Renameat2,
 	Linkat,
 	MkdiratRenameat,
+	InPlaceDescriptor,
 }
 
 #[cfg(target_os = "linux")]
@@ -198,6 +225,7 @@ impl NoReplacePrimitive {
 			Self::Renameat2 => "renameat2_noreplace",
 			Self::Linkat => "linkat_noreplace",
 			Self::MkdiratRenameat => "mkdirat_renameat_noreplace",
+			Self::InPlaceDescriptor => "in_place_descriptor",
 		}
 	}
 }
@@ -772,6 +800,16 @@ fn publish_preflight_failure(code: &'static str) -> RecoveryFsPublishResult {
 }
 
 #[cfg(target_os = "linux")]
+fn publish_preflight_failure_with_primitive(
+	code: &'static str,
+	primitive: NoReplacePrimitive,
+) -> RecoveryFsPublishResult {
+	let mut result = publish_preflight_failure(code);
+	primitive.as_str().clone_into(&mut result.primitive);
+	result
+}
+
+#[cfg(target_os = "linux")]
 fn publish_post_mutation_failure(code: &'static str, phase: &str) -> RecoveryFsPublishResult {
 	let reason = if code == "fsync_failed" {
 		"durability_not_provable"
@@ -1212,16 +1250,16 @@ impl RecoveryFsRoot {
 		}
 	}
 
-	/// Reject an existing-destination rewrite.
+	/// Rewrite one existing managed file through its retained descriptor.
 	///
-	/// Linux has no pathname mutation primitive that accepts an expected
-	/// destination inode as part of the same operation.
-	/// `renameat2(RENAME_EXCHANGE)` and a link/rename emulation can therefore
-	/// exchange away an uncoordinated successor that wins after the last
-	/// identity check. Existing managed files are consequently never rewritten
-	/// through this API; callers must retain the current object and retry only
-	/// after the conflicting owner has resolved the destination. This is
-	/// deliberately a pre-mutation, recoverable result.
+	/// A pathname exchange cannot bind an expected destination inode against an
+	/// uncoordinated writer, so existing destinations are never renamed,
+	/// exchanged, unlinked, or replaced by pathname. Instead, this operation
+	/// opens and verifies the expected inode, then mutates that inode in place.
+	/// If a writer replaces the canonical name after the last path check, the
+	/// write can affect only the already-open predecessor; the successor remains
+	/// authoritative at the canonical name and the result is reported as a
+	/// committed identity failure without a retry receipt.
 	#[napi]
 	pub fn replace_managed(
 		&self,
@@ -2967,31 +3005,102 @@ fn replace_managed(
 	expected_ctime_ns: &str,
 	expected_sha256: &str,
 ) -> RecoveryFsPublishResult {
-	let _ = (
-		root,
-		recovery,
-		relative_path,
-		data,
+	if data.len() as u64 > MAX_MANAGED_CONTENT_BYTES {
+		return publish_preflight_failure_with_primitive(
+			"content_too_large",
+			NoReplacePrimitive::InPlaceDescriptor,
+		);
+	}
+	let _mutation_lock = match managed_mutation_lock(root, recovery) {
+		Ok(lock) => lock,
+		Err(code) => {
+			return publish_preflight_failure_with_primitive(
+				code,
+				NoReplacePrimitive::InPlaceDescriptor,
+			);
+		},
+	};
+	let primitive = NoReplacePrimitive::InPlaceDescriptor;
+	let mut file = match open_existing(root, relative_path, true) {
+		Ok(file) => file,
+		Err(code) => {
+			return publish_preflight_failure_with_primitive(
+				if code == "not_found" {
+					"identity_mismatch"
+				} else {
+					code
+				},
+				primitive,
+			);
+		},
+	};
+	let expected_matches = match same_expected(
+		&file,
 		expected_dev,
 		expected_ino,
 		expected_size,
 		expected_mtime_ns,
 		expected_ctime_ns,
 		expected_sha256,
-	);
-	let mut result = RecoveryFsPublishResult::failure(
-		"not_committed",
-		"not_attempted",
-		"destination_exists",
-		"preflight",
-		"destination_conflict",
-		None,
-	);
-	// No existing-destination replacement primitive is safe against an
-	// uncoordinated writer. `unsupported` is an explicit statement that no
-	// mutation was attempted, not an advisory-lock safety claim.
-	"unsupported".clone_into(&mut result.primitive);
-	result
+	) {
+		Ok(matches) => matches,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	if !expected_matches {
+		return publish_preflight_failure_with_primitive("identity_mismatch", primitive);
+	}
+	let (parent, name) = match open_parent(root, relative_path) {
+		Ok(value) => value,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	let named = match statat(&parent, &name) {
+		Ok(named) => named,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	let before = match regular_identity(&file) {
+		Ok(identity) => identity,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	if !stat_matches_regular_identity(&named, &before) {
+		return publish_preflight_failure_with_primitive("identity_mismatch", primitive);
+	}
+	#[cfg(test)]
+	pause_replace_before_in_place_write_for_test();
+
+	let committed_failure = |code: &'static str, phase: &'static str| {
+		publish_post_mutation_failure_with_primitive(code, phase, primitive, None)
+	};
+	if unsafe { libc::ftruncate(file.as_raw_fd(), 0) } != 0 {
+		return committed_failure("io_error", "file_sync");
+	}
+	if file.seek(SeekFrom::Start(0)).is_err() || file.write_all(data).is_err() {
+		return committed_failure("io_error", "file_sync");
+	}
+	if file.sync_all().is_err() {
+		return committed_failure("fsync_failed", "file_sync");
+	}
+	let mut terminal = match regular_identity(&file) {
+		Ok(identity) => identity,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	let digest = match digest_hex(&file) {
+		Ok(digest) => digest,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	let named_after = match statat(&parent, &name) {
+		Ok(named) => named,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	if digest != hex_digest(Sha256::digest(data).into())
+		|| !stat_matches_regular_identity(&named_after, &terminal)
+	{
+		return committed_failure("identity_mismatch", "terminal_identity");
+	}
+	terminal.sha256 = Some(digest);
+	if sync_parent(&parent).is_err() {
+		return committed_failure("fsync_failed", "destination_parent_sync");
+	}
+	RecoveryFsPublishResult::success(terminal, primitive)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -3834,11 +3943,11 @@ mod tests {
 		);
 
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("destination_conflict"));
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
 		assert_eq!(result.mutation_state, "not_committed");
 		assert_eq!(result.durability_state, "not_attempted");
-		assert_eq!(result.reason, "destination_exists");
-		assert_eq!(result.primitive, "unsupported");
+		assert_eq!(result.reason, "identity_violation");
+		assert_eq!(result.primitive, "in_place_descriptor");
 		assert_eq!(
 			fs::read(temporary.0.join("transcript")).expect("successor"),
 			b"concurrent-successor"
@@ -3846,6 +3955,60 @@ mod tests {
 		assert_eq!(
 			fs::read(temporary.0.join("retained-predecessor")).expect("predecessor"),
 			original
+		);
+	}
+
+	#[test]
+	fn managed_replace_updates_in_place_without_overwriting_a_raced_successor() {
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-selector";
+		let identity = managed_file(&root, "selector.json", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_replace_before_in_place_write_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_replace = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let replace = std::thread::spawn(move || {
+			replace_managed(
+				&root_for_replace,
+				None,
+				"selector.json",
+				b"replacement-selector",
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx.recv().expect("wait for in-place write boundary");
+		fs::rename(temporary.0.join("selector.json"), temporary.0.join("retained-predecessor"))
+			.expect("retain predecessor");
+		fs::write(temporary.0.join("selector.json"), b"concurrent-successor")
+			.expect("publish successor");
+		resume_tx.send(()).expect("resume in-place write boundary");
+		let result = replace.join().expect("replacement thread");
+		set_replace_before_in_place_write_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.reason, "identity_violation");
+		assert_eq!(result.primitive, "in_place_descriptor");
+		assert_eq!(
+			fs::read(temporary.0.join("selector.json")).expect("successor"),
+			b"concurrent-successor"
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("retained-predecessor")).expect("predecessor"),
+			b"replacement-selector"
 		);
 	}
 

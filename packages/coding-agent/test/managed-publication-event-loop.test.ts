@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
@@ -469,6 +469,65 @@ describe("managed output generation publication over the async boundary", () => 
 			);
 			expect(fs.existsSync(path.join(artifactsDir, selector.outputFilename))).toBe(false);
 			expect(fs.existsSync(path.join(artifactsDir, selector.metadataFilename))).toBe(false);
+		});
+	});
+
+	it("keeps an uncoordinated selector successor when a later generation rewrites", async () => {
+		await withTempDir("gjc-managed-generation-successor-", async dir => {
+			const artifactsDir = path.join(dir, "artifacts");
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), artifactsDir);
+			const manager = new ArtifactManager(store);
+			const metadata = new TextEncoder().encode(JSON.stringify({ tool: "task", status: "complete" }));
+			await manager.publishManagedOutputGeneration(
+				"task-1.selector",
+				"task-1",
+				new TextEncoder().encode("first generation"),
+				metadata,
+			);
+
+			const selectorPath = path.join(artifactsDir, "task-1.selector");
+			const predecessorPath = path.join(artifactsDir, "selector-predecessor");
+			const successor = JSON.stringify({ outputFilename: "task-1.foreign.output" });
+			const realReplace = native.RecoveryFsRoot.prototype.replaceManaged;
+			const replace = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockImplementation(function (
+				this: native.RecoveryFsRoot,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			) {
+				fs.renameSync(selectorPath, predecessorPath);
+				fs.writeFileSync(selectorPath, successor);
+				return realReplace.call(
+					this,
+					relativePath,
+					bytes,
+					expectedDev,
+					expectedIno,
+					expectedSize,
+					expectedMtimeNs,
+					expectedCtimeNs,
+					expectedSha256,
+				);
+			});
+			try {
+				await expect(
+					manager.publishManagedOutputGeneration(
+						"task-1.selector",
+						"task-1",
+						new TextEncoder().encode("second generation"),
+						metadata,
+					),
+				).rejects.toThrow("identity_mismatch");
+				expect(await fsp.readFile(selectorPath, "utf8")).toBe(successor);
+				expect(await fsp.readFile(predecessorPath, "utf8")).not.toBe(successor);
+			} finally {
+				replace.mockRestore();
+			}
 		});
 	});
 });

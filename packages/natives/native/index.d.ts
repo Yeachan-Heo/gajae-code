@@ -432,16 +432,16 @@ export declare class RecoveryFsRoot {
   /** Create one managed artifact with the managed-storage size bound. */
   createManaged(relativePath: string, data: Uint8Array): RecoveryFsResult
   /**
-   * Reject an existing-destination rewrite.
+   * Rewrite one existing managed file through its retained descriptor.
    *
-   * Linux has no pathname mutation primitive that accepts an expected
-   * destination inode as part of the same operation.
-   * `renameat2(RENAME_EXCHANGE)` and a link/rename emulation can therefore
-   * exchange away an uncoordinated successor that wins after the last
-   * identity check. Existing managed files are consequently never rewritten
-   * through this API; callers must retain the current object and retry only
-   * after the conflicting owner has resolved the destination. This is
-   * deliberately a pre-mutation, recoverable result.
+   * A pathname exchange cannot bind an expected destination inode against an
+   * uncoordinated writer, so existing destinations are never renamed,
+   * exchanged, unlinked, or replaced by pathname. Instead, this operation
+   * opens and verifies the expected inode, then mutates that inode in place.
+   * If a writer replaces the canonical name after the last path check, the
+   * write can affect only the already-open predecessor; the successor remains
+   * authoritative at the canonical name and the result is reported as a
+   * committed identity failure without a retry receipt.
    */
   replaceManaged(relativePath: string, data: Uint8Array, expectedDev: string, expectedIno: string, expectedSize: string, expectedMtimeNs: string, expectedCtimeNs: string, expectedSha256: string): RecoveryFsPublishResult
   /**

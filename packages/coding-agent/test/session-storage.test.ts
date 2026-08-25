@@ -232,6 +232,15 @@ describe("native publish outcome classification", () => {
 			"retained_tree",
 		);
 		expect(retained.ok).toBe(true);
+		const inPlace = classifyNativePublishOutcome(
+			{
+				...retained,
+				primitive: "in_place_descriptor",
+			},
+			"retained_replace",
+		);
+		expect(inPlace.ok).toBe(true);
+		expect(inPlace.primitive).toBe("in_place_descriptor");
 	});
 
 	it("accepts only the fallback primitive for each retained publish shape", () => {
@@ -577,17 +586,14 @@ describe("managed descriptor reads", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
-	it("rejects an existing-destination rewrite without mutating the descriptor", () => {
+	it("updates an existing destination through its retained descriptor", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-generation-")));
 		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
 		try {
 			store.publishNoReplaceSync("session.jsonl", Buffer.from("generation-one\n"));
-			const expected = store.descriptorExpected("session.jsonl");
-			if (!expected) throw new Error("Expected managed transcript descriptor");
-			expect(() => store.replaceSync("session.jsonl", Buffer.from("generation-two\n"))).toThrow(
-				"destination_conflict",
-			);
-			expect(store.readRangeExpectedSync("session.jsonl", 0, 4, expected).bytes).toEqual(Buffer.from("gene"));
+			store.replaceSync("session.jsonl", Buffer.from("generation-two\n"));
+			expect(store.descriptorExpected("session.jsonl")?.size).toBe("generation-two\n".length);
+			expect(store.readExpected("session.jsonl")?.bytes).toEqual(Buffer.from("generation-two\n"));
 		} finally {
 			store.close();
 			fs.rmSync(root, { recursive: true, force: true });

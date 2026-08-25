@@ -18,6 +18,7 @@ export type NativePublishPrimitive =
 	| "renameat2_noreplace"
 	| "linkat_noreplace"
 	| "mkdirat_renameat_noreplace"
+	| "in_place_descriptor"
 	| "renameatx_np_excl"
 	| "windows_rename_noreplace"
 	| "unsupported"
@@ -90,6 +91,7 @@ const primitives = new Set<NativePublishPrimitive>([
 	"renameat2_noreplace",
 	"linkat_noreplace",
 	"mkdirat_renameat_noreplace",
+	"in_place_descriptor",
 	"renameatx_np_excl",
 	"windows_rename_noreplace",
 	"unsupported",
@@ -267,11 +269,12 @@ export function classifyNativePublishOutcome(
 			? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "linkat_noreplace"
 			: operation === "retained_tree"
 				? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace"
-				: outcome.primitive === "unsupported" &&
-					!outcome.ok &&
-					outcome.mutationState === "not_committed" &&
-					outcome.durabilityState === "not_attempted" &&
-					outcome.reason === "destination_exists";
+				: outcome.primitive === "in_place_descriptor" ||
+					(outcome.primitive === "unsupported" &&
+						!outcome.ok &&
+						outcome.mutationState === "not_committed" &&
+						outcome.durabilityState === "not_attempted" &&
+						outcome.reason === "destination_exists");
 	if (
 		!retainedPrimitiveValid ||
 		(outcome.ok && (!outcome.identity || outcome.durabilityState !== "proven" || outcome.phase !== "complete"))

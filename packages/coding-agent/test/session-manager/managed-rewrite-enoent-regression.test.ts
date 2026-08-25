@@ -127,7 +127,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-delete"))).toBe(true);
 
-		await expect(manager.ensureOnDisk()).rejects.toThrow("destination_conflict");
+		await manager.ensureOnDisk();
 		expect(replaceExpected).toHaveBeenCalledTimes(1);
 		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
 		await manager.close().catch(() => {});
@@ -177,7 +177,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "must-not-overwrite-successor", timestamp: Date.now() }),
-		).toThrow(/identity_mismatch|destination_conflict/);
+		).toThrow(/identity_mismatch/);
 		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
 		expect(fs.readFileSync(predecessor, "utf8")).not.toContain("must-not-overwrite-successor");
 		await manager.close().catch(() => {});

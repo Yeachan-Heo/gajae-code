@@ -71,7 +71,18 @@ describe.skipIf(process.platform !== "linux")("managed task descendant persisten
 		await persistence.publishOutput("old output", Buffer.from('{"generation":1}', "utf8"));
 		const spy = vi
 			.spyOn(native.RecoveryFsRoot.prototype as unknown as { replaceManaged: () => unknown }, "replaceManaged")
-			.mockReturnValueOnce({ ok: false, code: "io_error" });
+			.mockReturnValueOnce({
+				ok: false,
+				code: "io_error",
+				identity: undefined,
+				recoveryPath: undefined,
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "io_failure",
+				primitive: "in_place_descriptor",
+				phase: "preflight",
+				diagnostic: { schemaVersion: 1, collectionState: "complete", osCode: undefined, syncFailures: undefined },
+			});
 		try {
 			await expect(persistence.publishOutput("new output", Buffer.from('{"generation":2}', "utf8"))).rejects.toThrow(
 				"io_error",
