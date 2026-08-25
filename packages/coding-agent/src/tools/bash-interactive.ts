@@ -339,6 +339,7 @@ export async function runInteractiveBashPty(
 		/** Receives live controls once the session is running; used to register a fold. */
 		onControls?: (controls: InteractivePtyControls) => void;
 		onFoldKey?: () => boolean;
+		onDismiss?: () => void;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = options.settings ?? (await Settings.init());
@@ -460,7 +461,7 @@ export async function runInteractiveBashPty(
 					);
 					component.setSession(session);
 					// Observer view only: stdin still reaches the process while attached,
-					// but dismiss and dispose no longer kill it.
+					// Escape explicitly force-kills, while disposal never kills the work.
 					component.setHandlers(
 						data => {
 							try {
@@ -469,7 +470,7 @@ export async function runInteractiveBashPty(
 								// ignore writes after the command exits
 							}
 						},
-						() => {},
+						options.onDismiss ?? (() => session.kill()),
 						() => {},
 						options.onFoldKey ?? (() => false),
 					);
