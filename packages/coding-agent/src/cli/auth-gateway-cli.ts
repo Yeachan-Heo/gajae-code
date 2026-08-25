@@ -144,6 +144,19 @@ export function filterCredentialCheckResults(
 	return provider ? results.filter(row => row.provider === provider) : [...results];
 }
 
+function sanitizeCredentialCheckResult(row: CredentialHealthResult): Record<string, unknown> {
+	return {
+		id: row.id,
+		provider: row.provider,
+		type: row.type,
+		ok: row.ok,
+		...(row.remoteRefresh ? { remoteRefresh: true } : {}),
+		...(row.reason
+			? { reason: row.ok === false ? "Credential check failed." : "Credential status unavailable." }
+			: {}),
+	};
+}
+
 function requireProviderScope(provider: string | undefined, action: "serve"): string {
 	const normalized = normalizeProviderScope(provider);
 	if (!normalized) {
@@ -500,10 +513,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		const failed = results.filter(row => row.ok === false).length;
 
 		if (flags.json) {
-			const credentials = results.map(row => ({
-				...row,
-				...(row.reason ? { reason: safeDiagnostic(row.reason, "Credential check failed.") } : {}),
-			}));
+			const credentials = results.map(sanitizeCredentialCheckResult);
 			process.stdout.write(
 				`${JSON.stringify(
 					{
@@ -539,11 +549,10 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 							: row.ok === false
 								? chalk.red("FAIL    ")
 								: chalk.yellow("unknown ");
-					const identity =
-						row.email ?? row.accountId ?? (row.type === "api_key" ? "(api key)" : "(no identity on credential)");
+					const identity = row.type === "api_key" ? "(api key)" : "(identity hidden)";
 					const remote = row.remoteRefresh ? chalk.dim(" [remote-refresh]") : "";
 					const reason = row.reason
-						? chalk.dim(` — ${safeDiagnostic(row.reason, "Credential check failed.")}`)
+						? chalk.dim(` — ${row.ok === false ? "Credential check failed." : "Credential status unavailable."}`)
 						: "";
 					process.stdout.write(
 						`  ${status} id=${row.id.toString().padStart(3)} ${row.type.padEnd(7)} ${identity}${remote}${reason}\n`,

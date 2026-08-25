@@ -149,14 +149,14 @@ describe("auth CLI diagnostic redaction", () => {
 				runAuthGatewayCommand({ action: "check", flags: { json: true } }),
 			);
 			expect(jsonOutput.stdout).not.toContain(SECRET);
-			expect(jsonOutput.stdout).toContain("api_key=[redacted]");
+			expect(jsonOutput.stdout).toContain("Credential check failed.");
 
 			process.exitCode = 0;
 			const textOutput = await captureOutput(() =>
 				runAuthGatewayCommand({ action: "check", flags: { json: false } }),
 			);
 			expect(textOutput.stdout).not.toContain(SECRET);
-			expect(textOutput.stdout).toContain("api_key=[redacted]");
+			expect(textOutput.stdout).toContain("Credential check failed.");
 		} finally {
 			await handle?.close();
 			brokerStorage?.close();
