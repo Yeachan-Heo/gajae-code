@@ -8,7 +8,12 @@ import {
 } from "../src";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
 import { cleanReason } from "../src/auth-broker/redact";
-import { createAuthGatewayModelCatalog, isSafeProviderScope, startAuthGateway } from "../src/auth-gateway/server";
+import {
+	createAuthGatewayModelCatalog,
+	isSafeProviderScope,
+	releaseGatewayCredentialLeaseWhenComplete,
+	startAuthGateway,
+} from "../src/auth-gateway/server";
 import type {
 	Api,
 	AssistantMessage,
@@ -18,6 +23,7 @@ import type {
 	Model,
 	Usage,
 } from "../src/types";
+import { AssistantMessageEventStream as EventStream } from "../src/utils/event-stream";
 
 const ZERO_USAGE: Usage = {
 	input: 0,
@@ -49,6 +55,21 @@ function makeEventStream(message: AssistantMessage): AssistantMessageEventStream
 	stream.result = async () => message;
 	return stream;
 }
+
+describe("auth gateway credential lease", () => {
+	it("keeps the lease until a deferred provider stream settles", async () => {
+		const events = new EventStream();
+		let released = false;
+		releaseGatewayCredentialLeaseWhenComplete(events, () => {
+			released = true;
+		});
+
+		expect(released).toBe(false);
+		events.fail(new Error("deferred provider failed"));
+		await events.result().catch(() => undefined);
+		expect(released).toBe(true);
+	});
+});
 
 function makeHangingEventStream(
 	signal: AbortSignal | undefined,

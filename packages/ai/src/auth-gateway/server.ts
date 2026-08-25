@@ -182,6 +182,16 @@ interface GatewayCredentialLease {
 	release(): void;
 }
 
+export function releaseGatewayCredentialLeaseWhenComplete(
+	events: Pick<AssistantMessageEventStream, "result">,
+	release: () => void,
+): void {
+	// `streamSimple()` may return a lazy-import stream whose provider dispatch
+	// has not started yet. Keep the authority lease until the stream settles so
+	// revocation cannot race the deferred import window.
+	void events.result().then(release, release);
+}
+
 async function acquireGatewayApiKey(
 	opts: AuthGatewayBootOptions,
 	model: Model<Api>,
@@ -708,7 +718,7 @@ async function handleFormatEndpoint(
 		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
-	credentialLease.release();
+	releaseGatewayCredentialLeaseWhenComplete(events, credentialLease.release);
 	if (streamOpts.fallbackManaged) {
 		events = observeManagedGatewayFailure(events, error =>
 			markManagedGatewayCredentialFailure(
@@ -905,7 +915,7 @@ async function handlePiNative(
 		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
-	credentialLease.release();
+	releaseGatewayCredentialLeaseWhenComplete(events, credentialLease.release);
 	if (streamOpts.fallbackManaged) {
 		events = observeManagedGatewayFailure(events, error =>
 			markManagedGatewayCredentialFailure(
