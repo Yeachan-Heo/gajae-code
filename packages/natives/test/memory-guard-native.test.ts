@@ -92,4 +92,21 @@ describe("probeWindowsJobMemory", () => {
 			),
 		).toThrow("snapshotDirectoryTreeAsync");
 	});
+	it("rejects stale same-version bindings without async directory removal capability", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+			snapshotDirectoryTreeAsync: () => undefined,
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("exactRemoveDirectoryTreeAsync");
+	});
 });

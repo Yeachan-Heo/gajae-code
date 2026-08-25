@@ -454,7 +454,16 @@ async function withinLockAcquireDeadline<T>(
 	onTimeout?: (result: { ok: true; value: T } | { ok: false; error: unknown }) => void | Promise<void>,
 ): Promise<T> {
 	const remaining = deadline - performance.now();
-	if (remaining <= 0) throw new SessionStateLockUnavailableError();
+	if (remaining <= 0) {
+		// The operation never started, so nothing it would have mutated is in flight.
+		// Its caller may still hold state from EARLIER phases (a transition claim, a
+		// held owner record) that only this call's cleanup would have released, and
+		// no later phase runs once this throws — so `onTimeout` must still fire, with
+		// a no-value settlement, or that state strands with no owner left to free it.
+		const unavailable = new SessionStateLockUnavailableError();
+		if (onTimeout) void Promise.resolve(onTimeout({ ok: false, error: unavailable })).catch(() => undefined);
+		throw unavailable;
+	}
 	const pending = Promise.resolve().then(operation);
 	const settled = pending.then(
 		value => ({ ok: true as const, value }),
@@ -467,9 +476,21 @@ async function withinLockAcquireDeadline<T>(
 		settled.then(result => ({ timedOut: false as const, result })),
 		timeout.promise,
 	]);
-	if (!outcome.timedOut) clearTimeout(timer);
+	clearTimeout(timer);
 	if (outcome.timedOut) {
+		// Cleanup stays deferred until the mutating body settles, exactly because the
+		// body may still be mid-mutation; `settled` hands it the settled identity.
 		if (onTimeout) void settled.then(result => onTimeout(result)).catch(() => undefined);
+		throw new SessionStateLockUnavailableError();
+	}
+	if (performance.now() >= deadline) {
+		// A result observed AT/AFTER the deadline is a deadline miss, never a success:
+		// a synchronous stall can settle the body past the deadline while the overdue
+		// timer callback is still queued behind this microtask, and returning that
+		// value as timely is precisely how the next phase's exhausted pre-check threw
+		// with no cleanup armed and the claim stranded. The body HAS settled here, so
+		// `onTimeout` runs settled-safe cleanup with the result it produced.
+		if (onTimeout) void Promise.resolve(onTimeout(outcome.result)).catch(() => undefined);
 		throw new SessionStateLockUnavailableError();
 	}
 	if (!outcome.result.ok) throw outcome.result.error;
@@ -1200,10 +1221,6 @@ async function withLockPathTransition<T>(
 					if (result.ok) return cleanupTransitionClaim(transitionDir, ownerFile, undefined, result.value);
 				},
 			);
-			if (performance.now() >= deadline) {
-				void cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
-				throw new SessionStateLockUnavailableError();
-			}
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
@@ -1237,7 +1254,11 @@ async function withLockPathTransition<T>(
 				),
 			};
 		} catch (error) {
-			if (performance.now() >= deadline) throw error;
+			// A deadline miss is classified INSIDE `withinLockAcquireDeadline`, where the
+			// settled result is in hand and settled-safe cleanup was armed; treating it
+			// as an ordinary operation failure here would run the release phase — and its
+			// own cleanup — against a claim the timeout path already owns.
+			if (error instanceof SessionStateLockUnavailableError && performance.now() >= deadline) throw error;
 			outcome = { ok: false, error };
 		}
 		try {

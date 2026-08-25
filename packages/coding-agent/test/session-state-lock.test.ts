@@ -376,6 +376,10 @@ describe("coordinator session state lock", () => {
 
 		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
 		expect(attempts).toBe(1);
+		// The tight budget exists to force the first load to time out; the reload
+		// itself is what is under test, and a scheduler hiccup must not turn a full
+		// acquire/release cycle into a spurious deadline miss.
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 2_000;
 		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
 		expect(attempts).toBe(2);
 	});
@@ -417,6 +421,68 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(transitionDir)).toBe(true);
 		expect(transitionToken(transitionDir)).toBe(successor);
 		expect(await fs.readFile(path.join(transitionDir, "successor-token"), "utf8")).toBe("successor");
+	});
+	it("releases a transition claim when an event-loop stall settles work past the deadline", async () => {
+		const { stateFile } = await seededRunningSession("lock-late-settled-transition");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		// A dead regular owner makes the first acquisition run its reclaim body inside
+		// a pathname transition. The final step of that body is the synchronous
+		// identity-bound unlink; stalling THERE is what reproduces the wedge: the
+		// stall blocks the event loop past the deadline, the body then settles in the
+		// same synchronous turn, and the settling microtask wins the race against the
+		// still-queued overdue timer callback. Before the deadline-handoff fix that
+		// late result was classified as settled, the follow-on release phase's
+		// exhausted pre-check threw without timeout cleanup ever being armed, and the
+		// owned transition directory stayed fail-closed — stranding every later state
+		// writer until manual removal.
+		await fs.writeFile(
+			lockFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "late-settled-dead-owner",
+				owner_host_id: "local-host",
+			}),
+		);
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 40;
+		let stallsRemaining = 1;
+		const stalledExactUnlink = (
+			target: string,
+			identity: Parameters<typeof exactIdentityNativeBindings.exactUnlink>[1],
+		): NativeExactUnlinkResult => {
+			if (stallsRemaining > 0) {
+				stallsRemaining--;
+				// Monotonic, not `Date.now()`: this suite freezes wall time, and the
+				// stall must bound itself against real elapsed time. The stall is the
+				// LAST synchronous step before the body settles, which is what puts
+				// the settling microtask ahead of the overdue timer macrotask.
+				const start = performance.now();
+				while (performance.now() - start < 120) {
+					// Synchronous event-loop stall inside the mutating body.
+				}
+			}
+			return exactIdentityNativeBindings.exactUnlink(target, identity);
+		};
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactUnlink: stalledExactUnlink,
+		}));
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		// The claim must not be stranded. The settled timeout cleanup runs as a
+		// detached microtask chain, so give it a bounded window to finish removing
+		// the transition directory before a later writer must be able to proceed
+		// without manual removal. The recovery acquisition runs under a generous
+		// budget: the tight 40ms deadline existed to expose the wedge, not to test
+		// this half.
+		for (let i = 0; i < 50 && fsSync.existsSync(transitionDir); i++) await Bun.sleep(20);
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 2_000;
+		await expect(withSessionStateFileLock(stateFile, async () => "recovered")).resolves.toBe("recovered");
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
 	});
 
 	it("serializes a concurrent writer behind the current lock holder", async () => {

@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
-import * as path from "node:path";
 import type {
-	NativeDirectoryTreeEntry,
 	NativeDirectoryTreeResult,
 	NativeDirectoryTreeSnapshot,
 	NativeExactFileIdentity,
@@ -12,6 +10,7 @@ import {
 	type SessionStateLockNativeBindings,
 	setSessionStateLockNativeBindings,
 } from "../../src/gjc-runtime/session-state-lock";
+import { exactRemoveDirectoryTreeOp, snapshotDirectoryTreeOp } from "./exact-identity-tree-ops";
 
 /**
  * A faithful in-process stand-in for the identity-bound deletion primitives.
@@ -27,10 +26,6 @@ import {
  * descriptor-relative implementation.
  */
 
-function isEnoent(error: unknown): boolean {
-	return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
-}
-
 function sha256Of(bytes: Buffer): string {
 	return createHash("sha256").update(bytes).digest("hex");
 }
@@ -40,7 +35,9 @@ function exactUnlink(target: string, identity: NativeExactFileIdentity): NativeE
 	try {
 		stat = fs.lstatSync(target, { bigint: true });
 	} catch (error) {
-		return isEnoent(error) ? { ok: false, code: "not_found" } : { ok: false, code: "io_error" };
+		return (error as NodeJS.ErrnoException).code === "ENOENT"
+			? { ok: false, code: "not_found" }
+			: { ok: false, code: "io_error" };
 	}
 	if (stat.isSymbolicLink()) return { ok: false, code: "reparse_point" };
 	if (identity.directory === true ? !stat.isDirectory() : !stat.isFile())
@@ -59,60 +56,118 @@ function exactUnlink(target: string, identity: NativeExactFileIdentity): NativeE
 	return { ok: true };
 }
 
-function treeEntries(root: string, relativePath: string, into: NativeDirectoryTreeEntry[]): string | undefined {
-	const absolute = relativePath === "" ? root : path.join(root, relativePath);
-	const stat = fs.lstatSync(absolute, { bigint: true });
-	if (stat.isSymbolicLink()) return "reparse_point";
-	if (!stat.isDirectory() && !stat.isFile()) return "unsupported_entry";
-	const bytes = stat.isFile() ? fs.readFileSync(absolute) : undefined;
-	into.push({
-		relativePath,
-		kind: stat.isDirectory() ? "directory" : "file",
-		dev: String(stat.dev),
-		ino: String(stat.ino),
-		nlink: String(stat.nlink),
-		size: String(stat.size),
-		mtimeNs: String(stat.mtimeNs),
-		ctimeNs: String(stat.ctimeNs),
-		...(bytes ? { sha256: sha256Of(bytes) } : {}),
-	});
-	if (!stat.isDirectory()) return undefined;
-	for (const name of fs.readdirSync(absolute).sort()) {
-		const failure = treeEntries(root, relativePath === "" ? name : `${relativePath}/${name}`, into);
-		if (failure) return failure;
-	}
-	return undefined;
+/** Shared with the worker-thread doubles so the two shapes cannot drift. */
+const snapshotDirectoryTree = snapshotDirectoryTreeOp;
+const exactRemoveDirectoryTree = exactRemoveDirectoryTreeOp;
+
+/**
+ * A worker-thread stand-in for the addon's dedicated `pi-natives-*` threads.
+ *
+ * The reviewer's objection to the previous doubles was REAL: an async double that
+ * runs the whole recursive walk inline is synchronous in everything but name, so
+ * no test could ever observe JS-thread blocking or validate timeout behavior. This
+ * implementation runs the identical walk on a real worker thread with the same
+ * semantics the addon exposes: the JS thread returns immediately, a wedged walk
+ * cannot stall the event loop, and `timeoutMs` settles with the same typed
+ * `timed_out` refusal instead of a partial capture.
+ *
+ * A single worker is shared across calls, mirroring the addon's bounded
+ * outstanding-worker budget: concurrent calls queue behind one walk exactly as
+ * saturated admission does, so tests observe real queuing behavior.
+ */
+const exactDirectoryTreeWorker = new Worker(new URL("./exact-identity-tree-worker.ts", import.meta.url).href, {
+	type: "module",
+});
+
+interface ExactDirectoryTreeWorkerRequest {
+	id: number;
+	op: "snapshot" | "remove";
+	root: string;
+	snapshot?: NativeDirectoryTreeSnapshot;
 }
 
-function snapshotDirectoryTree(root: string): NativeDirectoryTreeResult {
-	const entries: NativeDirectoryTreeEntry[] = [];
+let exactDirectoryTreeWorkerNextId = 1;
+const exactDirectoryTreeWorkerPending = new Map<number, PromiseWithResolvers<unknown>>();
+
+exactDirectoryTreeWorker.onmessage = (event: MessageEvent<{ id: number; result: unknown }>) => {
+	const pending = exactDirectoryTreeWorkerPending.get(event.data.id);
+	if (!pending) return;
+	exactDirectoryTreeWorkerPending.delete(event.data.id);
+	pending.resolve(event.data.result);
+};
+
+exactDirectoryTreeWorker.onerror = () => {
+	// Every waiter fails closed as an I/O refusal; the lock protocol never deletes
+	// on an indeterminate answer.
+	for (const pending of exactDirectoryTreeWorkerPending.values()) {
+		pending.reject(new Error("exact identity tree worker failed"));
+	}
+	exactDirectoryTreeWorkerPending.clear();
+};
+
+function runOnExactDirectoryTreeWorker(request: Omit<ExactDirectoryTreeWorkerRequest, "id">): Promise<unknown> {
+	const id = exactDirectoryTreeWorkerNextId++;
+	const pending = Promise.withResolvers<unknown>();
+	exactDirectoryTreeWorkerPending.set(id, pending);
+	exactDirectoryTreeWorker.postMessage({ ...request, id });
+	return pending.promise;
+}
+
+/** Mirrors `snapshot_directory_tree_async` on a real worker thread with typed timeout refusal. */
+async function snapshotDirectoryTreeAsync(
+	root: string,
+	timeoutMs?: number | undefined | null,
+): Promise<NativeDirectoryTreeResult> {
+	const startedAt = performance.now();
+	const settled = runOnExactDirectoryTreeWorker({ op: "snapshot", root }) as Promise<NativeDirectoryTreeResult>;
+	return await settleWithTypedTimeout(settled, timeoutMs, startedAt, { ok: false, code: "timed_out" });
+}
+
+/** Mirrors `exact_remove_directory_tree_async` on a real worker thread with typed timeout refusal. */
+async function exactRemoveDirectoryTreeAsync(
+	root: string,
+	snapshot: NativeDirectoryTreeSnapshot,
+	_parentIdentity?: unknown,
+	timeoutMs?: number | undefined | null,
+): Promise<NativeExactUnlinkResult> {
+	const startedAt = performance.now();
+	const settled = runOnExactDirectoryTreeWorker({
+		op: "remove",
+		root,
+		snapshot,
+	}) as Promise<NativeExactUnlinkResult>;
+	return await settleWithTypedTimeout(settled, timeoutMs, startedAt, { ok: false, code: "timed_out" });
+}
+
+/**
+ * The addon settles `timeout_ms` with a typed refusal value while the worker keeps
+ * running; the JS side never blocks on the worker's completion. The double must do
+ * the same, or the deadline path under test would only ever see settled work.
+ */
+async function settleWithTypedTimeout<T>(
+	settled: Promise<T>,
+	timeoutMs: number | undefined | null,
+	startedAt: number,
+	timeoutValue: T,
+): Promise<T> {
+	if (timeoutMs === undefined || timeoutMs === null) return await settled;
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => timeout.resolve(), Math.max(1, timeoutMs - (performance.now() - startedAt)));
+	timer.unref();
 	try {
-		const failure = treeEntries(root, "", entries);
-		if (failure) return { ok: false, code: failure };
-	} catch (error) {
-		return isEnoent(error) ? { ok: false, code: "not_found" } : { ok: false, code: "io_error" };
+		return await Promise.race([settled, timeout.promise.then(() => timeoutValue)]);
+	} finally {
+		clearTimeout(timer);
 	}
-	const rootEntry = entries[0];
-	if (rootEntry?.kind !== "directory") return { ok: false, code: "not_a_directory" };
-	return { ok: true, snapshot: { rootDev: rootEntry.dev, rootIno: rootEntry.ino, entries } };
-}
-
-function exactRemoveDirectoryTree(root: string, snapshot: NativeDirectoryTreeSnapshot): NativeExactUnlinkResult {
-	const observed = snapshotDirectoryTree(root);
-	if (!observed.ok || !observed.snapshot) return { ok: false, code: observed.code ?? "io_error" };
-	// Byte-for-byte tree equality: a changed owner token, an added payload, a replaced
-	// inode, and a wholesale re-creation are all the same verdict — not ours to delete.
-	if (JSON.stringify(observed.snapshot) !== JSON.stringify(snapshot)) return { ok: false, code: "identity_mismatch" };
-	fs.rmSync(root, { recursive: true });
-	return { ok: true };
 }
 
 export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 	exactUnlink,
 	snapshotDirectoryTree,
-	snapshotDirectoryTreeAsync: async root => snapshotDirectoryTree(root),
+	snapshotDirectoryTreeAsync: (root, timeoutMs) => snapshotDirectoryTreeAsync(root, timeoutMs),
 	exactRemoveDirectoryTree,
-	exactRemoveDirectoryTreeAsync: async (root, snapshot) => exactRemoveDirectoryTree(root, snapshot),
+	exactRemoveDirectoryTreeAsync: (root, snapshot, parentIdentity, timeoutMs) =>
+		exactRemoveDirectoryTreeAsync(root, snapshot, parentIdentity, timeoutMs),
 };
 
 /** Whether the compiled addon actually loads in this environment. */
