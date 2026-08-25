@@ -676,8 +676,9 @@ export class SessionLifecycleService {
 		this.#client = client;
 	}
 
-	async execute(
+	async #execute(
 		request: SessionLifecycleMutationRequest,
+		idempotencyKeyOverride?: string,
 	): Promise<
 		| SessionCreateOutcome
 		| SessionForkOutcome
@@ -689,7 +690,8 @@ export class SessionLifecycleService {
 		const validation = validateSessionLifecycleMutationRequest(request);
 		if (!validation.ok) return validation;
 		const { operation, actor, requestKey, target } = validation;
-		const idempotencyKey = deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation);
+		const idempotencyKey =
+			idempotencyKeyOverride ?? deriveSessionLifecycleIdempotencyKey(actor, requestKey, operation);
 		let response: unknown;
 		try {
 			response = await this.#client.global(
@@ -738,6 +740,33 @@ export class SessionLifecycleService {
 			| SessionCloseOutcome
 			| SessionDeleteOutcome
 			| SessionReconcileUncertainOutcome;
+	}
+
+	async execute(
+		request: SessionLifecycleMutationRequest,
+	): Promise<
+		| SessionCreateOutcome
+		| SessionForkOutcome
+		| SessionResumeOutcome
+		| SessionCloseOutcome
+		| SessionDeleteOutcome
+		| SessionReconcileUncertainOutcome
+	> {
+		return this.#execute(request);
+	}
+
+	async executeWithIdempotencyKey(
+		request: SessionLifecycleMutationRequest,
+		idempotencyKey: string,
+	): Promise<
+		| SessionCreateOutcome
+		| SessionForkOutcome
+		| SessionResumeOutcome
+		| SessionCloseOutcome
+		| SessionDeleteOutcome
+		| SessionReconcileUncertainOutcome
+	> {
+		return this.#execute(request, idempotencyKey);
 	}
 
 	async create(request: Omit<SessionCreateRequest, "operation">): Promise<SessionCreateOutcome> {

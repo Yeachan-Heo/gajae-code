@@ -14,6 +14,7 @@ import { SESSION_ABORT_TIMEOUT_MS, SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk
 class FakeSdkClient {
 	connectionId = "acp-connection";
 	frames: Record<string, unknown>[] = [];
+	globalResponse: unknown = { ok: true };
 	listeners = new Set<(frame: Record<string, unknown>) => void>();
 	reconnectFailedListeners = new Set<(error: Error) => void>();
 	reconnectListeners = new Set<() => void>();
@@ -35,7 +36,7 @@ class FakeSdkClient {
 	}
 	async global(operation: string, input: Record<string, unknown>, options?: { idempotencyKey?: string }) {
 		this.frames.push({ type: "broker_request", operation, input, ...options });
-		return { ok: true };
+		return this.globalResponse;
 	}
 	async request(frame: Record<string, unknown>) {
 		this.frames.push(frame);
@@ -471,6 +472,53 @@ test("ACP SDK adapter exposes SDK event frames while rejecting raw lifecycle glo
 	});
 	expect(received).toContainEqual({ type: "event", payload: { type: "turn_end" } });
 	unsubscribe();
+	await adapter.close();
+});
+
+test("ACP reconcile_uncertain validates proof and projects an opaque result", async () => {
+	const sdk = new FakeSdkClient();
+	sdk.globalResponse = {
+		ok: true,
+		result: {
+			sessionId: "retired-session",
+			retired: true,
+			ledgerState: "terminal_error",
+			indexType: "session_closed",
+			stateRoot: "/workspace/.gjc/state",
+			endpointGeneration: 2,
+			endpointMtimeMs: 1,
+			processIncarnation: "linux:123",
+			hostIncarnation: "host:123",
+			lifecycleRequestId: "retire-effect",
+			remoteCreateKey: "remote-create-key",
+		},
+	};
+	const adapter = new AcpSdkAdapter({ client: sdk as never });
+	await adapter.start();
+	const result = await adapter.global(
+		"session.reconcile_uncertain",
+		{
+			sessionId: "retired-session",
+			cwd: "/workspace",
+			stateRoot: "/workspace/.gjc/state",
+			endpointGeneration: 2,
+			endpointMtimeMs: 1,
+			processIncarnation: "linux:123",
+			hostIncarnation: "host:123",
+			lifecycleRequestId: "retire-effect",
+			remoteCreateKey: "remote-create-key",
+		},
+		"acp-retire-key",
+	);
+	expect(result).toEqual({ ok: true, result: { sessionId: "retired-session", endpointGeneration: 2 } });
+	expect(JSON.stringify(result)).not.toContain("stateRoot");
+	expect(JSON.stringify(result)).not.toContain("processIncarnation");
+	expect(sdk.frames).toContainEqual({
+		type: "broker_request",
+		operation: "session.reconcile_uncertain",
+		input: expect.any(Object),
+		idempotencyKey: "acp-retire-key",
+	});
 	await adapter.close();
 });
 

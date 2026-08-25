@@ -4,7 +4,11 @@ import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { type SdkClient, SdkClientError } from "../client";
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
-import { validateSessionReconcileUncertainTarget } from "../lifecycle/service";
+import {
+	SessionLifecycleService,
+	validateSessionReconcileUncertainTarget,
+	type SessionReconcileUncertainTarget,
+} from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
@@ -457,6 +461,23 @@ export class AcpSdkAdapter {
 			);
 		if (!this.#client)
 			throw new AcpSdkAdapterError("operation_prohibited", "Lifecycle operations require the Broker connection.");
+		const client = this.#client;
+		if (operation === "session.reconcile_uncertain") {
+			const outcome = await new SessionLifecycleService({
+				global: (lifecycleOperation, lifecycleInput, options) =>
+					client.global(lifecycleOperation, lifecycleInput, options),
+			}).executeWithIdempotencyKey(
+				{
+					operation,
+					actor: { id: "acp", namespace: "sdk:acp" },
+					capability: operation,
+					requestKey: idempotencyKey!,
+					target: input as unknown as SessionReconcileUncertainTarget,
+				},
+				idempotencyKey!,
+			);
+			return outcome.ok ? { ok: true, result: outcome.result } : { ok: false, error: outcome.error };
+		}
 		// The broker may hold a startup in its admission queue before the readiness
 		// clock even starts, so the caller deadline covers the queue wait too; sizing
 		// it on readiness alone times out requests the broker is still running. A
