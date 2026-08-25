@@ -6135,9 +6135,60 @@ pub(crate) mod platform {
 		// the final namespace operation inside this native descriptor-relative
 		// protocol; callers must never repeat the identity check with a pathname-only
 		// `rmdir`, which can consume a successor swapped into `.removing`.
-		let removed =
-			unsafe { libc::unlinkat(parent, detached_name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
-		let synced = removed && fsync_root_parent(parent).is_ok();
+		let quarantine_name =
+			CString::new(format!(".gjc-paseo-finalize-{}-{}", std::process::id(), root.st_ino,))
+				.expect("finalization quarantine name contains no NUL");
+		let captured_name = CString::new(".captured").expect("captured name contains no NUL");
+		let quarantine_created =
+			unsafe { libc::mkdirat(parent, quarantine_name.as_ptr(), 0o700) } == 0;
+		let quarantine_fd = if quarantine_created {
+			unsafe {
+				libc::openat(
+					parent,
+					quarantine_name.as_ptr(),
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				)
+			}
+		} else {
+			-1
+		};
+		let moved = quarantine_fd >= 0
+			&& rename_no_replace(parent, quarantine_fd, detached_name, &captured_name).is_ok();
+		let captured_fd = if moved {
+			unsafe {
+				libc::openat(
+					quarantine_fd,
+					captured_name.as_ptr(),
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				)
+			}
+		} else {
+			-1
+		};
+		let captured_matches = if captured_fd >= 0 {
+			let mut captured_stat: libc::stat = unsafe { std::mem::zeroed() };
+			(unsafe { libc::fstat(captured_fd, &mut captured_stat) } == 0)
+				&& captured_stat.st_dev == root.st_dev
+				&& captured_stat.st_ino == root.st_ino
+		} else {
+			false
+		};
+		let removed = captured_matches
+			&& (unsafe { libc::unlinkat(quarantine_fd, captured_name.as_ptr(), libc::AT_REMOVEDIR) }
+				== 0);
+		let quarantine_removed = removed
+			&& (unsafe { libc::unlinkat(parent, quarantine_name.as_ptr(), libc::AT_REMOVEDIR) } == 0);
+		let synced = quarantine_removed && fsync_root_parent(parent).is_ok();
+		if moved && !removed {
+			let _ = rename_no_replace(quarantine_fd, parent, &captured_name, detached_name);
+			let _ = unsafe { libc::unlinkat(parent, quarantine_name.as_ptr(), libc::AT_REMOVEDIR) };
+		}
+		if quarantine_fd >= 0 {
+			unsafe { libc::close(quarantine_fd) };
+		}
+		if captured_fd >= 0 {
+			unsafe { libc::close(captured_fd) };
+		}
 		// SAFETY: this branch owns the live descriptors and closes each exactly once.
 		unsafe {
 			libc::close(detached_fd);
