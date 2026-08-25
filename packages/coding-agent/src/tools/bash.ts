@@ -18,7 +18,11 @@ import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type { ArtifactManager } from "../session/artifacts";
-import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
+import type {
+	ClientBridgeTerminalExitStatus,
+	ClientBridgeTerminalHandle,
+	ClientBridgeTerminalOutput,
+} from "../session/client-bridge";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
@@ -1488,16 +1492,23 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		}
 
 		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty) {
+			const clientAdmission = ownedManager?.reserveCapacity();
 			const clientHeadBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 			const clientTailBytes = resolveBashOutputSinkTailBytes(this.session.settings);
-			const handle = await clientBridge.createTerminal({
-				command,
-				cwd: commandCwd,
-				env: resolvedEnv
-					? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
-					: undefined,
-				outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
-			});
+			let handle: ClientBridgeTerminalHandle;
+			try {
+				handle = await clientBridge.createTerminal({
+					command,
+					cwd: commandCwd,
+					env: resolvedEnv
+						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
+						: undefined,
+					outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
+				});
+			} catch (error) {
+				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
+				throw error;
+			}
 
 			// Emit partial update so the editor can embed the live terminal card.
 			onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
@@ -1745,6 +1756,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const result = await runToCompletion(runSignal);
 							const finalText = this.#extractTextResult(result);
 							latestText = finalText;
+							bridgeManager.appendOutput(jobId, finalText);
 							bridgeCompletion.resolve({ kind: "completed", result });
 							await reportProgress(
 								finalText,
@@ -1754,6 +1766,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						} catch (error) {
 							const message = error instanceof Error ? error.message : String(error);
 							latestText = message;
+							bridgeManager.appendOutput(jobId, message);
 							bridgeCompletion.resolve({ kind: "failed", error });
 							await reportProgress(
 								message,
@@ -1766,6 +1779,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					},
 					{
 						ownerId: this.session.getAgentId?.() ?? undefined,
+						admissionToken: clientAdmission,
 						onProgress: async (text: string) => {
 							latestText = text;
 						},
@@ -1900,6 +1914,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: canUseInteractiveBashPty(pty, ctx)
 					? ctx?.ui
 					: undefined;
+		const ptyAdmission = interactiveUi && ownedManager ? ownedManager.reserveCapacity() : undefined;
 		// A PTY command is foldable too: the runner owns the session, so the fold
 		// registers a job that delivers the run's real outcome after the foreground
 		// has already returned.
@@ -1933,12 +1948,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								ptyLabel,
 								async () => {
 									const outcome = await controls.terminalCompletion;
+									const completed = this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec });
+									const text = this.#extractTextResult(completed);
+									ptyManager.appendOutput(ptyJobId, text);
 									if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
-									return this.#extractTextResult(
-										this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec }),
-									);
+									return text;
 								},
-								{ ownerId: this.session.getAgentId?.() ?? undefined },
+								{ ownerId: this.session.getAgentId?.() ?? undefined, admissionToken: ptyAdmission },
 							);
 						} catch (error) {
 							controls.kill();

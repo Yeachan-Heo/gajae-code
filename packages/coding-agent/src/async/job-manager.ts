@@ -249,6 +249,10 @@ export interface AsyncJobManagerOptions {
 	retentionMs?: number;
 }
 
+export interface AsyncJobAdmission {
+	readonly manager: AsyncJobManager;
+}
+
 export interface AsyncJobDisposeDiagnostics {
 	stuckJobIds: string[];
 	deliveriesDrained: boolean;
@@ -367,6 +371,8 @@ export interface AsyncJobRegisterOptions {
 	metadata?: AsyncJobMetadata;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
 	lifecycle?: AsyncJobLifecycleCleanup;
+	/** Reserved capacity consumed atomically by this registration. */
+	admissionToken?: AsyncJobAdmission;
 }
 
 /**
@@ -614,6 +620,8 @@ export class AsyncJobManager {
 	readonly #outputRetentionBytes = DEFAULT_JOB_OUTPUT_RETENTION_BYTES;
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
+	#pendingAdmissions = 0;
+	readonly #admissions = new WeakMap<AsyncJobAdmission, boolean>();
 	readonly #retentionMs: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
@@ -979,8 +987,10 @@ export class AsyncJobManager {
 			throw new OwnerSubagentShutdownError();
 		}
 		if (this.#registrationClosed) throw new Error("Async job manager is shutting down");
-		const runningCount = this.getRunningJobs().length;
-		if (runningCount >= this.#maxRunningJobs) {
+		const admissionToken = options?.admissionToken;
+		if (admissionToken) {
+			if (!this.#consumeAdmission(admissionToken)) throw new Error("Invalid or expired job admission token");
+		} else if (!this.hasCapacity()) {
 			throw new Error(
 				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -2002,7 +2012,24 @@ export class AsyncJobManager {
 
 	/** Whether a new running job can be admitted without starting side effects. */
 	hasCapacity(filter?: AsyncJobFilter): boolean {
-		return this.getRunningJobs(filter).length < this.#maxRunningJobs;
+		return this.getRunningJobs(filter).length + this.#pendingAdmissions < this.#maxRunningJobs;
+	}
+
+	reserveCapacity(): AsyncJobAdmission {
+		if (this.#disposed || this.#registrationClosed || !this.hasCapacity()) {
+			throw new Error(
+				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
+			);
+		}
+		const token: AsyncJobAdmission = { manager: this };
+		this.#admissions.set(token, true);
+		this.#pendingAdmissions += 1;
+		return token;
+	}
+
+	releaseCapacity(token: AsyncJobAdmission): void {
+		if (!this.#consumeAdmission(token)) return;
+		this.#notifyChange();
 	}
 
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
@@ -2570,6 +2597,13 @@ export class AsyncJobManager {
 			candidate = `${base}-${suffix}`;
 		}
 		return candidate;
+	}
+
+	#consumeAdmission(token: AsyncJobAdmission): boolean {
+		if (token.manager !== this || this.#admissions.get(token) !== true) return false;
+		this.#admissions.set(token, false);
+		this.#pendingAdmissions -= 1;
+		return true;
 	}
 
 	#scheduleEviction(jobId: string): void {

@@ -3953,6 +3953,7 @@ export class AgentSession {
 		// delivery seam deliberately returned early on it, so the fold's replay is
 		// the only delivery it will ever get.
 		this.yieldQueue.register<{ jobId: string; generation: string; text: string }>("fold-parked-replay", {
+			isStale: entry => this.#ownedAsyncJobManager?.isDeliverySuppressed(entry.jobId, entry.generation) ?? false,
 			build: entries => {
 				if (entries.length === 0) return null;
 				const text = entries.map(entry => entry.text).join("\n\n");

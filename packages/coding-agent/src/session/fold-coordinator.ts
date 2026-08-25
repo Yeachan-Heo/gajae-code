@@ -331,6 +331,8 @@ export class FoldCoordinator {
 			// Park: the receipt does not exist yet, so enqueue nothing. A6 replays it.
 			slot.parked = { jobId: slot.adapter.jobId, generation: slot.adapter.jobGeneration, text };
 			slot.parkedAt = Date.now();
+			const timer = setTimeout(() => this.retire(job, "evict"), FOLD_WAKE_MERGE_WINDOW_MS * 4);
+			timer.unref();
 			return { kind: "parked" };
 		}
 
