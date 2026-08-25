@@ -158,7 +158,7 @@ function validRecoveryPath(value: unknown): boolean {
 	return (
 		value === undefined ||
 		(typeof value === "string" &&
-			/^\.gjc-recovery\/\.gjc-managed-(?:exchange|replace)-[0-9]{1,20}-[0-9]{1,20}$/.test(value))
+			/^\.gjc-recovery\/\.gjc-managed-(?:exchange|replace(?:-retire)?)-[0-9]{1,20}-[0-9]{1,20}$/.test(value))
 	);
 }
 

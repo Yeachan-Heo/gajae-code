@@ -400,9 +400,28 @@ enum ReplacementExchangeError {
 }
 
 #[cfg(target_os = "linux")]
+fn valid_recovery_evidence_name(name: &str) -> bool {
+	let suffix = [".gjc-managed-replace-retire-", ".gjc-managed-exchange-", ".gjc-managed-replace-"]
+		.iter()
+		.find_map(|prefix| name.strip_prefix(prefix));
+	let Some(suffix) = suffix else {
+		return false;
+	};
+	let mut components = suffix.split('-');
+	let valid_component = |component: Option<&str>| {
+		component.is_some_and(|value| {
+			!value.is_empty() && value.len() <= 20 && value.bytes().all(|byte| byte.is_ascii_digit())
+		})
+	};
+	valid_component(components.next())
+		&& valid_component(components.next())
+		&& components.next().is_none()
+}
+
+#[cfg(target_os = "linux")]
 fn recovery_evidence_path(name: &CString) -> Option<String> {
 	let name = name.to_str().ok()?;
-	if !(name.starts_with(".gjc-managed-exchange-") || name.starts_with(".gjc-managed-replace-")) {
+	if !valid_recovery_evidence_name(name) {
 		return None;
 	}
 	Some(format!(".gjc-recovery/{name}"))
@@ -3419,6 +3438,7 @@ fn retire_replacement_predecessor(
 	displaced_identity: &RecoveryFsIdentity,
 	expected_sha256: &str,
 	primitive: NoReplacePrimitive,
+	release_source_authority: impl FnOnce(),
 ) -> Result<(), ReplacementExchangeError> {
 	#[cfg(test)]
 	pause_replacement_before_predecessor_retire_for_test();
@@ -3428,15 +3448,26 @@ fn retire_replacement_predecessor(
 		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
 	))
 	.expect("retirement name contains no NUL");
-	// Atomically detach the current recovery entry to a unique name. A successor
-	// that races before this syscall is either restored to the canonical recovery
-	// name or retained under the detached evidence name; neither case authorizes
-	// deleting it. The detached path is the only pathname ever passed to unlink.
-	if let Err(error) =
-		renameat2_no_replace(candidate_parent, candidate_name, candidate_parent, &retired_name)
-	{
+	// Detach the current recovery entry to a unique name. On filesystems without
+	// rename flags, `rename_file_no_replace` links the inode first, releases the
+	// descriptor that pins the source name, and only then unlinks that name. The
+	// release is required on NFS, where unlinking an open name creates a silly
+	// rename and leaves the predecessor double-linked.
+	let detached = rename_file_no_replace(
+		candidate_parent,
+		candidate_name,
+		candidate_parent,
+		&retired_name,
+		release_source_authority,
+	);
+	if let Err(error) = detached {
+		let recovery_path = if error.committed() {
+			recovery_evidence_path(&retired_name)
+		} else {
+			recovery_evidence_path(candidate_name)
+		};
 		return Err(ReplacementExchangeError::PostMutation {
-			code: if rename_flags_unsupported(error.raw_os_error()) {
+			code: if error.committed() || rename_flags_unsupported(error.raw_os_error()) {
 				"rollback_unavailable"
 			} else {
 				"io_error"
@@ -3444,7 +3475,7 @@ fn retire_replacement_predecessor(
 			phase: "terminal_identity",
 			primitive,
 			identity: None,
-			recovery_path: recovery_evidence_path(candidate_name),
+			recovery_path,
 		});
 	}
 	let detached = statat(candidate_parent, &retired_name);
@@ -3471,11 +3502,21 @@ fn retire_replacement_predecessor(
 	}) && detached_file
 		.as_ref()
 		.is_ok_and(|file| digest_hex(file).is_ok_and(|digest| digest == expected_sha256));
+	// The descriptor was needed only to verify the detached identity. Release it
+	// before either unlinking the detached path or using the linkat fallback to
+	// restore a raced successor; otherwise NFS can retain a second link.
+	drop(detached_file);
 	if !detached_matches {
 		// Restore a raced successor only when the recovery name is still free. A
 		// no-replace restore never overwrites a successor that claimed the name.
-		if renameat2_no_replace(candidate_parent, &retired_name, candidate_parent, candidate_name)
-			.is_ok()
+		if rename_file_no_replace(
+			candidate_parent,
+			&retired_name,
+			candidate_parent,
+			candidate_name,
+			|| (),
+		)
+		.is_ok()
 		{
 			return Err(ReplacementExchangeError::PostMutation {
 				code: "identity_mismatch",
@@ -3876,6 +3917,7 @@ fn replace_managed_inner(
 		&displaced_identity,
 		expected_sha256,
 		primitive,
+		move || drop(displaced),
 	)?;
 	// Retiring the predecessor mutates only the recovery namespace, but a
 	// successor may still have won the canonical name through an uncoordinated
@@ -5479,9 +5521,14 @@ mod tests {
 			let identity = managed_file(&root, "transcript", original);
 			let replacement = b"rewritten-transcript";
 
-			// Force the renameat2(RENAME_EXCHANGE) primitive to report the flag as
-			// unavailable, exactly as an NFS mount does with EINVAL.
-			set_retained_publish_faults([RetainedPublishFault::Rename(unsupported)]);
+			// Force both the exchange and predecessor-retirement renameat2 primitives
+			// to report the flags as unavailable, exactly as an NFS mount does with
+			// EINVAL. The second fault proves successful cleanup does not require a
+			// second renameat2 no-replace operation.
+			set_retained_publish_faults([
+				RetainedPublishFault::Rename(unsupported),
+				RetainedPublishFault::Rename(unsupported),
+			]);
 			let result = replace_managed(
 				&root,
 				None,
@@ -5532,6 +5579,61 @@ mod tests {
 				"no temporary exchange name may survive"
 			);
 		}
+	}
+
+	#[test]
+	fn managed_replace_fallback_retirement_failure_retains_bounded_evidence() {
+		let _serial = REPLACEMENT_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let identity = managed_file(&root, "transcript", original);
+		// Force both exchange and predecessor retirement through the linkat
+		// fallback, then fail the retirement unlink after its link committed. The
+		// committed replacement must retain the private retirement evidence rather
+		// than dropping the only bounded recovery path.
+		set_retained_publish_faults([
+			RetainedPublishFault::Rename(libc::EINVAL),
+			RetainedPublishFault::Rename(libc::EINVAL),
+			RetainedPublishFault::Unlink(libc::EACCES),
+		]);
+
+		let result = replace_managed(
+			&root,
+			None,
+			"transcript",
+			b"rewritten-transcript",
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("rollback_unavailable"));
+		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.durability_state, "not_provable");
+		assert_eq!(result.phase, "terminal_identity");
+		assert_eq!(result.primitive, "linkat_exchange");
+		let recovery_path = result.recovery_path.expect("retirement evidence path");
+		assert!(
+			recovery_path.starts_with(".gjc-recovery/.gjc-managed-replace-retire-"),
+			"retirement cleanup failures must report the detached evidence name"
+		);
+		assert!(temporary.0.join(&recovery_path).is_file());
+		assert_eq!(
+			fs::read(temporary.0.join(&recovery_path)).expect("retirement evidence"),
+			original
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("replacement"),
+			b"rewritten-transcript"
+		);
 	}
 
 	#[test]

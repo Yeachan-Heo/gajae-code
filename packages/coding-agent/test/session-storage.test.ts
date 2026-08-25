@@ -230,11 +230,23 @@ describe("native publish outcome classification", () => {
 			"retained_replace",
 		);
 		expect(committed.recoveryPath).toBe(".gjc-recovery/.gjc-managed-exchange-123-456");
+		const retirement = classifyNativePublishOutcome(
+			{
+				...committed,
+				code: "rollback_unavailable",
+				reason: "io_failure",
+				phase: "terminal_identity",
+				recoveryPath: ".gjc-recovery/.gjc-managed-replace-retire-123-456",
+			},
+			"retained_replace",
+		);
+		expect(retirement.recoveryPath).toBe(".gjc-recovery/.gjc-managed-replace-retire-123-456");
 
 		for (const recoveryPath of [
 			"/tmp/unsafe",
 			".gjc-recovery/../outside",
 			".gjc-recovery/.gjc-managed-exchange-123",
+			".gjc-recovery/.gjc-managed-replace-retire-123",
 		]) {
 			expect(classifyNativePublishOutcome({ ...committed, recoveryPath }, "retained_replace").mutationState).toBe(
 				"unknown",
@@ -250,13 +262,13 @@ describe("native publish outcome classification", () => {
 			store.publishNoReplaceSync("session.jsonl", Buffer.from("predecessor\n"));
 			replace = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockReturnValue({
 				ok: false,
-				code: "fsync_failed",
-				recoveryPath: ".gjc-recovery/.gjc-managed-exchange-123-456",
+				code: "rollback_unavailable",
+				recoveryPath: ".gjc-recovery/.gjc-managed-replace-retire-123-456",
 				mutationState: "committed",
 				durabilityState: "not_provable",
-				reason: "durability_not_provable",
+				reason: "io_failure",
 				primitive: "linkat_exchange",
-				phase: "destination_parent_sync",
+				phase: "terminal_identity",
 				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 5 },
 			});
 
@@ -268,7 +280,7 @@ describe("native publish outcome classification", () => {
 			}
 			expect(error).toBeInstanceOf(ManagedCommittedMutationError);
 			expect((error as ManagedCommittedMutationError).recoveryPath).toBe(
-				".gjc-recovery/.gjc-managed-exchange-123-456",
+				".gjc-recovery/.gjc-managed-replace-retire-123-456",
 			);
 		} finally {
 			replace?.mockRestore();
