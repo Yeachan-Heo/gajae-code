@@ -27,5 +27,5 @@ Detection rules:
 
 - An explicit `ui.language` selection outranks messages and locale.
 - Latin function words match on token boundaries, never substrings.
-- Korean / Japanese / Chinese are scored by script ranges. Japanese kana claims mixed kanji so Chinese does not win on han characters alone; a claimant script needs at least two characters before it can claim mixed han text, so one stray Hangul or kana glyph does not erase dominant han evidence.
+- Korean / Japanese / Chinese are scored by script ranges. Japanese kana claims mixed kanji so Chinese does not win on han characters alone; a Hangul claimant needs at least two characters before it can claim mixed han text, so one stray Hangul glyph (or an equal lone Hangul/kana pair) does not erase dominant han evidence. A lone kana still claims mixed kanji as Japanese.
 - Script counts and word hits share one ranking. A language needs at least two matches and must beat the runner-up outright; ties fall back to the OS locale, then English.
