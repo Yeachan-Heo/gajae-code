@@ -44,6 +44,8 @@ interface Harness {
 	waitForLateResponse(id: string): Promise<Record<string, unknown>>;
 	/** Adjust the artificial transport delivery delay between emissions. */
 	setResponseDelay(ms: number): void;
+	/** Adjust the handshake safety timeout between emissions. */
+	setResponseTimeout(ms: number): void;
 	start(): Promise<void>;
 	stop(): Promise<void>;
 	dispatches: number;
@@ -55,6 +57,8 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 	let receive: ((connectionId: string, frame: never) => void) | undefined;
 	let dispatches = 0;
 	let persistedAtDispatch: string | undefined;
+	let responseDelayMs = options.responseDelayMs ?? 0;
+	let responseTimeoutMs = options.responseTimeoutMs ?? RESPONSE_TIMEOUT_MS;
 	// Exactly one pending emission at a time (the tests emit sequentially). The
 	// handshake resolves with the frame correlated to the live emission only;
 	// any frame arriving before or after it is fenced as stale and recorded.
@@ -210,6 +214,9 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 			pending = undefined;
 			current.reject(new Error("host did not respond"));
 		},
+		setResponseTimeout: ms => {
+			responseTimeoutMs = ms;
+		},
 		get dispatches() {
 			return dispatches;
 		},
@@ -282,8 +289,12 @@ test("harness handshake times out, and a late response never satisfies a later e
 		await harness.waitForLateResponse("slow");
 		expect(harness.lateResponses.length).toBe(1);
 		expect(harness.lateResponses[0]).toMatchObject({ id: "slow", type: "control_response" });
-		await harness.deliverResponse("recovered");
-		expect(await accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "recovered-ref" } });
+		// A fresh emission under a different id resolves only against its own
+		// correlated response.
+		harness.setResponseDelay(0);
+		harness.setResponseTimeout(RESPONSE_TIMEOUT_MS);
+		const accepted = await control(harness, "recovered", "recovering steer", "recovered-ref");
+		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "recovered-ref" } });
 		expect(harness.dispatches).toBe(2);
 		expect(harness.lateResponses.length).toBe(1);
 		await harness.stop();
