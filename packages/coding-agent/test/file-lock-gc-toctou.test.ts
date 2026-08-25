@@ -517,6 +517,37 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(`${lockedFile}.lock`)).toBe(false);
 	});
 
+	test("retries an existing contender after transient lock-path canonicalization failure", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const realpath = fs.realpath;
+		let failLockPathCanonicalization = true;
+		vi.spyOn(fs, "realpath").mockImplementation((async target => {
+			if (failLockPathCanonicalization && String(target).endsWith(".lock")) {
+				failLockPathCanonicalization = false;
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			}
+			return await realpath(target);
+		}) as typeof fs.realpath);
+
+		let contenderEntered = false;
+		let contender: Promise<void> | undefined;
+		await withFileLock(lockedFile, async () => {
+			contender = withFileLock(
+				lockedFile,
+				async () => {
+					contenderEntered = true;
+				},
+				{ retries: 20, retryDelayMs: 1 },
+			);
+			await Bun.sleep(10);
+			expect(contenderEntered).toBe(false);
+		});
+
+		await contender;
+		expect(contenderEntered).toBe(true);
+	});
+
 	test("registers ownership before canonicalization can fail after publication", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

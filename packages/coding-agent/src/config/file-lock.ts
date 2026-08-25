@@ -309,14 +309,14 @@ async function localLockKey(lockPath: string): Promise<string> {
 	try {
 		return normalizeLockKey(await fs.realpath(lockPath));
 	} catch (error) {
-		if (!isEnoent(error)) throw error;
+		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
 	}
 	const parent = path.dirname(lockPath);
 	let canonicalParent: string;
 	try {
 		canonicalParent = await fs.realpath(parent);
 	} catch (error) {
-		if (!isEnoent(error)) throw error;
+		if (!isEnoent(error) && !isTransientReleaseError(error)) throw error;
 		canonicalParent = path.resolve(parent);
 	}
 	const key = path.join(canonicalParent, path.basename(lockPath));
