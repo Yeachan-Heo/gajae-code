@@ -16883,6 +16883,10 @@ export class SessionManager {
 				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
 			} catch (err) {
+				// Existing-destination rewrites are intentionally disabled in the retained
+				// authority. A destination conflict is pre-mutation and recoverable; do not
+				// turn it into a sticky committed-outcome error or authorize a pathname retry.
+				if (err instanceof Error && err.message === "destination_conflict") throw err;
 				this.#recordPersistError(err);
 				throw this.#persistError ?? toError(err);
 			}
@@ -17008,6 +17012,10 @@ export class SessionManager {
 				}
 				throw err;
 			}
+			// A retained existing-destination rewrite is fail-closed before mutation.
+			// Keep the conflict recoverable rather than recording it as a sticky
+			// persistence failure or treating it as a committed rewrite.
+			if (err instanceof Error && err.message === "destination_conflict") throw err;
 			this.#recordPersistError(err);
 			throw this.#persistError ?? toError(err);
 		}

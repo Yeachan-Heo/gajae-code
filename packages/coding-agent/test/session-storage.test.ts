@@ -181,6 +181,26 @@ describe("native publish outcome classification", () => {
 		).toBe("unknown");
 	});
 
+	it("accepts the retained replacement fail-closed conflict envelope", () => {
+		const outcome = classifyNativePublishOutcome(
+			{
+				...preMutation,
+				code: "destination_conflict",
+				primitive: "unsupported",
+				reason: "destination_exists",
+				phase: "preflight",
+				diagnostic: { schemaVersion: 1, collectionState: "complete" },
+			},
+			"retained_replace",
+		);
+		expect(outcome.ok).toBe(false);
+		expect(outcome.code).toBe("destination_conflict");
+		expect(outcome.primitive).toBe("unsupported");
+		expect(outcome.mutationState).toBe("not_committed");
+		expect(outcome.durabilityState).toBe("not_attempted");
+		expect(outcome.reason).toBe("destination_exists");
+	});
+
 	it("rejects a direct-rename success envelope when retained publication requires durability proof", () => {
 		const directSuccess = {
 			...preMutation,
@@ -212,80 +232,6 @@ describe("native publish outcome classification", () => {
 			"retained_tree",
 		);
 		expect(retained.ok).toBe(true);
-	});
-
-	it("accepts only bounded fallback recovery evidence", () => {
-		const committed = classifyNativePublishOutcome(
-			{
-				...preMutation,
-				code: "fsync_failed",
-				mutationState: "committed",
-				durabilityState: "not_provable",
-				reason: "durability_not_provable",
-				primitive: "linkat_exchange",
-				phase: "destination_parent_sync",
-				recoveryPath: ".gjc-recovery/.gjc-managed-exchange-123-456",
-				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 5 },
-			},
-			"retained_replace",
-		);
-		expect(committed.recoveryPath).toBe(".gjc-recovery/.gjc-managed-exchange-123-456");
-		const retirement = classifyNativePublishOutcome(
-			{
-				...committed,
-				code: "rollback_unavailable",
-				reason: "io_failure",
-				phase: "terminal_identity",
-				recoveryPath: ".gjc-recovery/.gjc-managed-replace-retire-123-456",
-			},
-			"retained_replace",
-		);
-		expect(retirement.recoveryPath).toBe(".gjc-recovery/.gjc-managed-replace-retire-123-456");
-
-		for (const recoveryPath of [
-			"/tmp/unsafe",
-			".gjc-recovery/../outside",
-			".gjc-recovery/.gjc-managed-exchange-123",
-			".gjc-recovery/.gjc-managed-replace-retire-123",
-		]) {
-			expect(classifyNativePublishOutcome({ ...committed, recoveryPath }, "retained_replace").mutationState).toBe(
-				"unknown",
-			);
-		}
-	});
-
-	it("preserves bounded fallback recovery evidence on committed replacement errors", () => {
-		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-recovery-evidence-")));
-		let replace: Mock<typeof native.RecoveryFsRoot.prototype.replaceManaged> | undefined;
-		try {
-			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
-			store.publishNoReplaceSync("session.jsonl", Buffer.from("predecessor\n"));
-			replace = vi.spyOn(native.RecoveryFsRoot.prototype, "replaceManaged").mockReturnValue({
-				ok: false,
-				code: "rollback_unavailable",
-				recoveryPath: ".gjc-recovery/.gjc-managed-replace-retire-123-456",
-				mutationState: "committed",
-				durabilityState: "not_provable",
-				reason: "io_failure",
-				primitive: "linkat_exchange",
-				phase: "terminal_identity",
-				diagnostic: { schemaVersion: 1, collectionState: "partial", osCode: 5 },
-			});
-
-			let error: unknown;
-			try {
-				store.replaceSync("session.jsonl", Buffer.from("successor\n"));
-			} catch (caught) {
-				error = caught;
-			}
-			expect(error).toBeInstanceOf(ManagedCommittedMutationError);
-			expect((error as ManagedCommittedMutationError).recoveryPath).toBe(
-				".gjc-recovery/.gjc-managed-replace-retire-123-456",
-			);
-		} finally {
-			replace?.mockRestore();
-			fs.rmSync(root, { recursive: true, force: true });
-		}
 	});
 
 	it("accepts only the fallback primitive for each retained publish shape", () => {
@@ -631,17 +577,17 @@ describe("managed descriptor reads", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
-	it("binds ranges to the caller's committed descriptor generation", () => {
+	it("rejects an existing-destination rewrite without mutating the descriptor", () => {
 		const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-managed-generation-")));
 		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), root);
 		try {
 			store.publishNoReplaceSync("session.jsonl", Buffer.from("generation-one\n"));
 			const expected = store.descriptorExpected("session.jsonl");
 			if (!expected) throw new Error("Expected managed transcript descriptor");
-			store.replaceSync("session.jsonl", Buffer.from("generation-two\n"));
-			expect(() => store.readRangeExpectedSync("session.jsonl", 0, 4, expected)).toThrow(
-				"managed_range_generation_mismatch",
+			expect(() => store.replaceSync("session.jsonl", Buffer.from("generation-two\n"))).toThrow(
+				"destination_conflict",
 			);
+			expect(store.readRangeExpectedSync("session.jsonl", 0, 4, expected).bytes).toEqual(Buffer.from("gene"));
 		} finally {
 			store.close();
 			fs.rmSync(root, { recursive: true, force: true });

@@ -18,8 +18,6 @@ export type NativePublishPrimitive =
 	| "renameat2_noreplace"
 	| "linkat_noreplace"
 	| "mkdirat_renameat_noreplace"
-	| "renameat2_exchange"
-	| "linkat_exchange"
 	| "renameatx_np_excl"
 	| "windows_rename_noreplace"
 	| "unsupported"
@@ -92,8 +90,6 @@ const primitives = new Set<NativePublishPrimitive>([
 	"renameat2_noreplace",
 	"linkat_noreplace",
 	"mkdirat_renameat_noreplace",
-	"renameat2_exchange",
-	"linkat_exchange",
 	"renameatx_np_excl",
 	"windows_rename_noreplace",
 	"unsupported",
@@ -155,11 +151,7 @@ function validIdentity(value: unknown): boolean {
 }
 
 function validRecoveryPath(value: unknown): boolean {
-	return (
-		value === undefined ||
-		(typeof value === "string" &&
-			/^\.gjc-recovery\/\.gjc-managed-(?:exchange|replace(?:-retire)?)-[0-9]{1,20}-[0-9]{1,20}$/.test(value))
-	);
+	return value === undefined;
 }
 
 function validDiagnostic(value: unknown): value is PublishDiagnostic {
@@ -269,20 +261,17 @@ export function classifyNativePublishOutcome(
 		return malformed;
 	const outcome = value as unknown as NativePublishOutcome;
 	if (!legalOutcome(outcome)) return malformed;
-	if (
-		outcome.recoveryPath !== undefined &&
-		(outcome.mutationState !== "committed" ||
-			outcome.primitive !== "linkat_exchange" ||
-			!(["source_parent_sync", "destination_parent_sync", "terminal_identity"] as string[]).includes(outcome.phase))
-	)
-		return malformed;
 	if (operation === "direct_rename") return outcome;
 	const retainedPrimitiveValid =
 		operation === "retained_file"
 			? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "linkat_noreplace"
 			: operation === "retained_tree"
 				? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace"
-				: outcome.primitive === "renameat2_exchange" || outcome.primitive === "linkat_exchange";
+				: outcome.primitive === "unsupported" &&
+					!outcome.ok &&
+					outcome.mutationState === "not_committed" &&
+					outcome.durabilityState === "not_attempted" &&
+					outcome.reason === "destination_exists";
 	if (
 		!retainedPrimitiveValid ||
 		(outcome.ok && (!outcome.identity || outcome.durabilityState !== "proven" || outcome.phase !== "complete"))
