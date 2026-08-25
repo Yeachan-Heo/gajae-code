@@ -2,10 +2,9 @@ import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { type SdkClient, SdkClientError } from "../client";
-import { validateSessionReconcileUncertainTarget } from "../lifecycle/service";
-
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
+import { validateSessionReconcileUncertainTarget } from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
