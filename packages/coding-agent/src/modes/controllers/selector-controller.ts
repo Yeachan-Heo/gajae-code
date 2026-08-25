@@ -256,6 +256,19 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
 	};
 }
 
+/**
+ * Build the OSC 8 anchor emitted for an OAuth login URL row.
+ *
+ * The URL row is itself an anchor, not bare text: a login URL is a single
+ * unbreakable token, so any pane narrower than the URL splits it across rows.
+ * The wrap layer re-opens the identical link on every fragment (#4711), but
+ * only for text that carries an anchor to begin with — a bare URL wrapped into
+ * fragments leaves every fragment as dead, unclickable text.
+ */
+export function buildOAuthLoginAnchor(url: string, label: string = url): string {
+	return `\x1b]8;;${url}\x07${label}\x1b]8;;\x07`;
+}
+
 function formatProviderOnboardingCommandGuide(): string {
 	return [
 		"Provider preset setup:",
@@ -3484,8 +3497,8 @@ export class SelectorController {
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
 						this.ctx.chatContainer.addChild(new Spacer(1));
-						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", info.url), 1, 0));
-						const hyperlink = `\x1b]8;;${info.url}\x07Click here to login\x1b]8;;\x07`;
+						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", buildOAuthLoginAnchor(info.url)), 1, 0));
+						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
 						this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
 						if (info.instructions) {
 							this.ctx.chatContainer.addChild(new Spacer(1));
