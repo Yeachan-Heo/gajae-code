@@ -219,7 +219,11 @@ export class JobsObserver {
 		// also retained here so pending/failed delivery can never disappear merely
 		// because it was not marked backgrounded by its producer.
 		const foldedJobs: FoldedJobView[] = asyncSnapshot.jobs
-			.filter(entry => entry.backgrounded || entry.status === "failed" || entry.deliveryState !== "delivered")
+			.filter(
+				entry =>
+					entry.backgrounded ||
+					(entry.status !== "running" && (entry.status === "failed" || entry.deliveryState !== "delivered")),
+			)
 			.map(entry => ({ ...entry }));
 		const foldedKeys = new Set(foldedJobs.map(entry => jobKey(entry.id, entry.generation)));
 		for (const entry of asyncSnapshot.deadLettered) {
