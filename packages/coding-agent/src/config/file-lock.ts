@@ -641,15 +641,7 @@ async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Pr
 		try {
 			const outcome = await removeFileLockDirForGc(lockPath, owner);
 			if (outcome === "removed" || outcome === "missing") {
-				if (outcome === "missing") {
-					try {
-						await fs.lstat(lockPath);
-						throw Object.assign(new Error("Failed to release file lock: metadata missing."), { code: "EBUSY" });
-					} catch (error) {
-						if (!isEnoent(error)) throw error;
-						throw new Error("Failed to release file lock: missing.");
-					}
-				}
+				if (outcome === "missing") throw new Error("Failed to release file lock: missing.");
 				return;
 			}
 			throw new Error(`Failed to release file lock: ${outcome}.`);
