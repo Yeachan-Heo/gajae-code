@@ -6,8 +6,8 @@ import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import {
 	SessionLifecycleService,
-	validateSessionReconcileUncertainTarget,
 	type SessionReconcileUncertainTarget,
+	validateSessionReconcileUncertainTarget,
 } from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
