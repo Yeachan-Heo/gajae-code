@@ -234,9 +234,12 @@ export interface SkillsBridgeInstallResult {
 }
 
 export class SkillsBridgeError extends Error {
-	constructor(message: string) {
+	readonly retained: readonly string[];
+
+	constructor(message: string, retained: readonly string[] = []) {
 		super(message);
 		this.name = "SkillsBridgeError";
+		this.retained = retained;
 	}
 }
 /**
@@ -297,8 +300,14 @@ async function unlinkSymlinkExactly(
 		quarantineName: `.gjc-paseo-quarantine-${process.pid}-${nodeCrypto.randomUUID()}`,
 	});
 	if (!result.ok) {
+		const retained = [
+			result.retainedSuccessorPath,
+			result.retainedPlaceholderPath,
+			result.retainedUnknownPath,
+		].filter((value): value is string => value !== undefined);
 		throw new SkillsBridgeError(
 			`Paseo skill bridge entry diverged before removal: ${linkPath} (${result.code ?? "unknown"})`,
+			retained,
 		);
 	}
 }

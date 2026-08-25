@@ -759,7 +759,15 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				label: deps.paths.bridgeDir,
 				undo: async () => {
 					try {
-						await inverseSkillsBridge(deps, bridge);
+						await inverseSkillsBridge(deps, bridge, {
+							onCleanupPending: async authority => {
+								const current = await readProvenance(deps.paths.provenanceLedger);
+								await writeProvenance(deps.paths.provenanceLedger, {
+									...current,
+									bridgeCleanupPending: authority,
+								});
+							},
+						});
 						// The bridge ledger was prewritten to make the forward mutation
 						// recoverable. The inverse also restores captured legacy link text
 						// for adopted entries before the pre-step bridge facts are restored,
@@ -773,13 +781,17 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							bridgeEntryIdentities: compensatedOldBridgeEntryIdentities ?? bridgeLedger.bridgeEntryIdentities,
 							bridgeDirCreated: bridgeLedger.bridgeDirCreated,
 							bridgeDirIdentity: bridgeLedger.bridgeDirIdentity,
+							bridgeCleanupPending: undefined,
 						});
 						return { status: "reverted" as const };
 					} catch (error) {
 						return {
 							status: "conflict" as const,
 							detail: error instanceof Error ? error.message : String(error),
-							retained: [deps.paths.bridgeDir],
+							retained: [
+								deps.paths.bridgeDir,
+								...(error instanceof SkillsBridgeError ? error.retained : []),
+							],
 						};
 					}
 				},
@@ -866,11 +878,24 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				},
 			});
 			try {
-				await inverseSkillsBridge(deps, oldCleanup, { bridgeDir: migratedOldBridgeDir });
+				await inverseSkillsBridge(deps, oldCleanup, {
+					bridgeDir: migratedOldBridgeDir,
+					onCleanupPending: async authority => {
+						const current = await readProvenance(deps.paths.provenanceLedger);
+						await writeProvenance(deps.paths.provenanceLedger, {
+							...current,
+							bridgeCleanupPending: authority,
+						});
+					},
+				});
 			} catch (error) {
 				throw new SagaStepError(
 					"install",
 					`bridge path migrated from ${recordedBridgePath} but the old bridge could not be cleaned: ${error instanceof Error ? error.message : String(error)}`,
+					[
+						migratedOldBridgeDir,
+						...(error instanceof SkillsBridgeError ? error.retained : []),
+					],
 				);
 			}
 			changed.push(migratedOldBridgeDir);

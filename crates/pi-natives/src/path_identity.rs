@@ -3761,10 +3761,6 @@ pub(crate) mod platform {
 		result
 	}
 
-	#[allow(
-		clippy::undocumented_unsafe_blocks,
-		reason = "descriptor-relative libc calls are audited in this helper"
-	)]
 	pub(super) fn exact_unlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -3964,10 +3960,6 @@ pub(crate) mod platform {
 	/// otherwise the detached authority is retained. The private directory keeps
 	/// the caller-supplied quarantine name occupied, so a replacement at that
 	/// name cannot become the unlink target.
-	#[allow(
-		clippy::undocumented_unsafe_blocks,
-		reason = "descriptor-relative libc calls are audited in this helper"
-	)]
 	pub(super) fn exact_unlink_symlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -4013,6 +4005,7 @@ pub(crate) mod platform {
 		// Keep the caller-supplied quarantine name occupied by a fresh owner-only
 		// directory. The captured symlink is moved below that directory, where the
 		// retained directory descriptor binds every later no-follow operation.
+		// SAFETY: parent_fd is live and quarantine is a NUL-terminated child name.
 		if unsafe { libc::mkdirat(parent_fd, quarantine.as_ptr(), 0o700) } != 0 {
 			let code = match std::io::Error::last_os_error().raw_os_error() {
 				Some(libc::EEXIST) => "quarantine_collision",
@@ -4021,6 +4014,8 @@ pub(crate) mod platform {
 			};
 			return close_parent(NativeExactUnlinkResult::failure(code));
 		}
+		// SAFETY: parent_fd is live, quarantine is NUL-terminated, and the flags
+		// request a no-follow directory descriptor owned by this function.
 		let quarantine_fd = unsafe {
 			libc::openat(
 				parent_fd,
@@ -4030,6 +4025,8 @@ pub(crate) mod platform {
 		};
 		if quarantine_fd < 0 {
 			let code = security_code(&std::io::Error::last_os_error());
+			// SAFETY: parent_fd remains live and quarantine names the directory just
+			// created.
 			let _ = unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) };
 			return close_parent(NativeExactUnlinkResult::failure(code));
 		}
@@ -4050,6 +4047,7 @@ pub(crate) mod platform {
 			.to_string_lossy()
 			.into_owned();
 		if let Err(code) = rename_no_replace(parent_fd, quarantine_fd, &name, &private_name) {
+			// SAFETY: parent_fd is live and quarantine is the owner-created directory.
 			let removed =
 				unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) } == 0;
 			return if removed {
@@ -4073,6 +4071,7 @@ pub(crate) mod platform {
 			}
 			match rename_no_replace(quarantine_fd, parent_fd, &private_name, &name) {
 				Ok(()) => {
+					// SAFETY: parent_fd remains live and quarantine is the owner-created directory.
 					let removed =
 						unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) }
 							== 0;
@@ -4112,7 +4111,10 @@ pub(crate) mod platform {
 			Ok(true) => {},
 			Ok(false) | Err(_) => return restore_or_retain("identity_mismatch"),
 		}
+		// SAFETY: quarantine_fd is the retained owner-created directory descriptor and
+		// private_name is the validated captured entry.
 		if unsafe { libc::unlinkat(quarantine_fd, private_name.as_ptr(), 0) } == 0 {
+			// SAFETY: parent_fd remains live and quarantine is the owner-created directory.
 			let removed =
 				unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) } == 0;
 			if removed && fsync_root_parent(parent_fd).is_ok() {
@@ -5840,10 +5842,6 @@ pub(crate) mod platform {
 		Ok(())
 	}
 
-	#[allow(
-		clippy::undocumented_unsafe_blocks,
-		reason = "descriptor-relative libc calls are audited in this helper"
-	)]
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
@@ -6155,9 +6153,13 @@ pub(crate) mod platform {
 			CString::new(format!(".gjc-paseo-finalize-{}-{}", std::process::id(), root.st_ino))
 				.expect("finalization quarantine name contains no NUL");
 		let captured_name = CString::new(".captured").expect("captured name contains no NUL");
+		// SAFETY: parent is the retained live parent directory and quarantine_name is
+		// a fresh NUL-terminated owner-created child name.
 		let quarantine_created =
 			unsafe { libc::mkdirat(parent, quarantine_name.as_ptr(), 0o700) } == 0;
 		let quarantine_fd = if quarantine_created {
+			// SAFETY: parent is live, the name is NUL-terminated, and no-follow opens
+			// the directory created immediately above.
 			unsafe {
 				libc::openat(
 					parent,
@@ -6171,6 +6173,8 @@ pub(crate) mod platform {
 		let moved = quarantine_fd >= 0
 			&& rename_no_replace(parent, quarantine_fd, detached_name, &captured_name).is_ok();
 		let captured_fd = if moved {
+			// SAFETY: quarantine_fd is the retained owner-created directory and the
+			// captured name is a validated NUL-terminated child.
 			unsafe {
 				libc::openat(
 					quarantine_fd,
@@ -6182,7 +6186,9 @@ pub(crate) mod platform {
 			-1
 		};
 		let captured_matches = if captured_fd >= 0 {
+			// SAFETY: zeroed storage is writable output for fstat.
 			let mut captured_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: captured_fd is live and captured_stat is writable storage.
 			(unsafe { libc::fstat(captured_fd, &mut captured_stat) } == 0)
 				&& captured_stat.st_dev == root.st_dev
 				&& captured_stat.st_ino == root.st_ino
@@ -6190,19 +6196,25 @@ pub(crate) mod platform {
 			false
 		};
 		let removed = captured_matches
+			// SAFETY: quarantine_fd retains the authenticated captured directory.
 			&& (unsafe { libc::unlinkat(quarantine_fd, captured_name.as_ptr(), libc::AT_REMOVEDIR) }
 				== 0);
 		let quarantine_removed = removed
+			// SAFETY: parent retains the namespace containing the owner-created quarantine.
 			&& (unsafe { libc::unlinkat(parent, quarantine_name.as_ptr(), libc::AT_REMOVEDIR) } == 0);
 		let synced = quarantine_removed && fsync_root_parent(parent).is_ok();
 		if moved && !removed {
 			let _ = rename_no_replace(quarantine_fd, parent, &captured_name, detached_name);
+			// SAFETY: parent remains live and quarantine_name is the owner-created
+			// directory.
 			let _ = unsafe { libc::unlinkat(parent, quarantine_name.as_ptr(), libc::AT_REMOVEDIR) };
 		}
 		if quarantine_fd >= 0 {
+			// SAFETY: this function owns quarantine_fd exactly once.
 			unsafe { libc::close(quarantine_fd) };
 		}
 		if captured_fd >= 0 {
+			// SAFETY: this function owns captured_fd exactly once.
 			unsafe { libc::close(captured_fd) };
 		}
 		// SAFETY: this branch owns the live descriptors and closes each exactly once.
