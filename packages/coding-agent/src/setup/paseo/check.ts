@@ -166,7 +166,7 @@ async function collectL1(deps: PaseoSetupDependencies, options: CheckOptions): P
 	}
 
 	const ledger = await readProvenance(deps.paths.provenanceLedger);
-	reasons.push(...(await scanSkillsBridgeDrift(deps, ledger.bridgeEntries)));
+	reasons.push(...(await scanSkillsBridgeDrift(deps, ledger.bridgeEntries, ledger.bridgeEntryIdentities)));
 	return reasons;
 }
 

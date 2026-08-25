@@ -245,6 +245,9 @@ async function sourceMode(targetPath: string): Promise<number> {
 }
 
 async function syncParentDirectory(directory: string): Promise<void> {
+	// Windows does not support fsync on directory handles; file contents are
+	// already synced before rename, so the renamed entry remains valid there.
+	if (process.platform === "win32") return;
 	const handle = await fs.open(directory, "r");
 	try {
 		await handle.sync();
@@ -352,6 +355,7 @@ export async function writeReplacedProviderBackup(
 	const valueSha256 = hashBytes(serializeJson(value));
 	const payload = serializeJson({ key: providerKey, value });
 	const temporary = `${backupPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
+	let createdByGjc = true;
 	try {
 		// Keep the entire temporary-file lifecycle inside this cleanup boundary.
 		// Opening can create the path before surfacing an error, and chmod can
@@ -373,6 +377,7 @@ export async function writeReplacedProviderBackup(
 			await fs.link(temporary, backupPath);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			createdByGjc = false;
 			const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
 			if (!existing.found) {
 				throw new PaseoPublishError(backupPath, {
@@ -386,7 +391,7 @@ export async function writeReplacedProviderBackup(
 	} finally {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 	}
-	return { backupPath, valueSha256 };
+	return { backupPath, valueSha256, createdByGjc };
 }
 
 /** Pointer + integrity digest for one preserved pre-`--force` provider value. */
@@ -394,6 +399,8 @@ export interface ReplacedProviderBackupRef {
 	readonly backupPath: string;
 	/** Hash of the preserved value exactly as serialized into the sidecar. */
 	readonly valueSha256: string;
+	/** Whether this invocation created the sidecar rather than adopting an exact pre-existing copy. */
+	readonly createdByGjc: boolean;
 }
 
 /** Outcome of reading a replaced-provider sidecar: a `null` prior is a value too. */

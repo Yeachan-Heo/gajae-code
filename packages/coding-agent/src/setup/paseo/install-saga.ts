@@ -30,6 +30,7 @@ import {
 	type IntentRecord,
 	type IntentStep,
 	type ProvenanceLedger,
+	ProvenancePublicationUncertainError,
 	pendingLedgerOf,
 	provenanceLedgerIdentity,
 	readIntent,
@@ -219,6 +220,16 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		publishSucceeded = published.published;
 		await writeProvenance(input.provenancePath, ledgerAfter);
 	} catch (error) {
+		if (error instanceof ProvenancePublicationUncertainError) {
+			// The ledger rename is already visible, so rolling the target back would
+			// create a newer target/ledger split. Keep the intent and let the next
+			// setup/remove invocation classify the committed ledger safely.
+			throw new SagaStepError(input.label, error.message, [
+				input.intentPath,
+				input.provenancePath,
+				input.targetPath,
+			]);
+		}
 		// Once publication succeeds, any failure before the ledger commit must
 		// undo the publication AND remove the artifact this step created (#4644
 		// reviews r8/r10): leaving the target carrying this step's write with no

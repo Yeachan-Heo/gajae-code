@@ -1966,6 +1966,27 @@ describe("skills bridge", () => {
 		expect(again.backupPath).toBe(first.backupPath);
 		expect(again.valueSha256).toBe(first.valueSha256);
 	});
+	test("an exact pre-existing sidecar remains user-owned through install and remove (#4644 review r19)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const userEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "USER EDIT" };
+		await seedConfig(fixture.paths, { gjc: userEntry });
+		const sidecar = await writeReplacedProviderBackup(fixture.paths.configJson, "gjc", userEntry);
+
+		const install = await runPaseoSetup({ force: true }, fixture.deps);
+		expect(install.kind).toBe("install");
+		if (install.kind !== "install") throw new Error("expected an install outcome");
+		expect(install.result.outcome).toBe("installed");
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		expect(remove.kind).toBe("remove");
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
+		expect(await readReplacedProviderBackup(sidecar.backupPath, "gjc", sidecar.valueSha256)).toEqual({
+			found: true,
+			value: userEntry,
+		});
+	});
 	test("a sidecar conflict during the provider step refuses before publication instead of stranding an unowned overwrite (#4644 review r8)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
@@ -4099,6 +4120,41 @@ describe("intent recovery", () => {
 		const { fixture, intent } = await intentFixture();
 		await fs.writeFile(fixture.paths.configJson, serializeJson({ after: true }));
 		expect((await classifyIntent(intent)).action).toBe("complete-ledger");
+	});
+
+	test("remove repairs a committed target before reading ownership (#4644 review r19)", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		const beforeTarget = await readTarget(fixture.paths.configJson);
+		const beforeLedger = await readProvenance(fixture.paths.provenanceLedger);
+		const entry = buildProviderEntry([process.execPath, "acp"]);
+		const afterParsed = JSON.parse(JSON.stringify(beforeTarget.parsed)) as Record<string, unknown>;
+		(afterParsed.agents as { providers: Record<string, unknown> }).providers.gjc = entry;
+		const afterTarget = serializeJson(afterParsed);
+		const afterLedger = {
+			...beforeLedger,
+			providerKeys: { ...beforeLedger.providerKeys, gjc: providerEntryHash(entry) },
+		};
+		await fs.writeFile(fixture.paths.configJson, afterTarget);
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "provider-config",
+			targetPath: fixture.paths.configJson,
+			ownedKeys: ["agents.providers.gjc"],
+			targetPreflightIdentity: beforeTarget.identity,
+			targetExpectedIdentity: hashBytes(afterTarget),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(afterLedger),
+			provenancePayload: afterLedger,
+			startedAt: new Date().toISOString(),
+		});
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		expect(remove.kind).toBe("remove");
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("removed");
 	});
 
 	test("both written means discard the stale intent", async () => {

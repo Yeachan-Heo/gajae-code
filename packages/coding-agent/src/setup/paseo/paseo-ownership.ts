@@ -35,6 +35,8 @@ export interface ProviderReplacedRef {
 	readonly backupPath: string;
 	/** Digest of the preserved value, binding the sidecar's bytes to this record. */
 	readonly valueSha256: string;
+	/** False when the sidecar predated this install and remains user-owned. */
+	readonly createdByGjc?: boolean;
 }
 
 /**
@@ -136,6 +138,17 @@ export class ProvenanceLedgerCorruptError extends Error {
 	}
 }
 
+/** The ledger rename succeeded but its parent-directory barrier failed. */
+export class ProvenancePublicationUncertainError extends Error {
+	constructor(
+		readonly provenancePath: string,
+		cause: unknown,
+	) {
+		super(`Paseo provenance publication is visible but its directory barrier failed (${provenancePath})`, { cause });
+		this.name = "ProvenancePublicationUncertainError";
+	}
+}
+
 export async function readProvenance(provenancePath: string): Promise<ProvenanceLedger> {
 	let raw: string;
 	try {
@@ -229,7 +242,8 @@ function isProviderReplacedRefRecord(value: unknown): value is Record<string, Pr
 			!isRecord(ref) ||
 			typeof ref.backupPath !== "string" ||
 			!path.isAbsolute(ref.backupPath) ||
-			typeof ref.valueSha256 !== "string"
+			typeof ref.valueSha256 !== "string" ||
+			(ref.createdByGjc !== undefined && typeof ref.createdByGjc !== "boolean")
 		) {
 			return false;
 		}
@@ -331,6 +345,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 async function syncParentDirectory(filePath: string): Promise<void> {
+	// Windows does not support fsync on directory handles; file contents are
+	// already synced before rename, so the renamed entry remains valid there.
+	if (process.platform === "win32") return;
 	const parent = await fs.open(path.dirname(filePath), "r");
 	try {
 		await parent.sync();
@@ -356,7 +373,11 @@ export async function writeProvenance(provenancePath: string, ledger: Provenance
 			await handle.close();
 		}
 		await fs.rename(temporary, provenancePath);
-		await syncParentDirectory(provenancePath);
+		try {
+			await syncParentDirectory(provenancePath);
+		} catch (error) {
+			throw new ProvenancePublicationUncertainError(provenancePath, error);
+		}
 	} catch (error) {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 		throw error;

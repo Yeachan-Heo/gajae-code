@@ -107,6 +107,26 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 		// clear the ledger while an install is still creating links and
 		// registering the bridge.
 		return await withPaseoMutationLock(deps, async () => {
+			const recovery = await recoverIntent(deps.paths.intentRecord, {
+				repair: true,
+				expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
+				expectedProvenancePath: deps.paths.provenanceLedger,
+			});
+			if (recovery && !recovery.recovered) {
+				return {
+					kind: "remove",
+					result: {
+						outcome: "partial-removal",
+						removed: [],
+						remaining: [deps.paths.intentRecord],
+						evidence: {
+							failedStep: "intent-recovery",
+							detail: recovery.detail,
+							retained: [deps.paths.intentRecord],
+						},
+					},
+				};
+			}
 			const settings = await Settings.init();
 			const ledger = await readProvenance(deps.paths.provenanceLedger);
 			// Unregister the LEDGER-RECORDED directory (the one GJC actually
@@ -281,14 +301,30 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		const preStepProviderKeys = { ...providerLedgerBefore.providerKeys };
 		const preStepProviderPreexistingKeys = { ...providerLedgerBefore.providerPreexistingKeys };
 		const preStepProviderReplacedEntries = { ...providerLedgerBefore.providerReplacedEntries };
-		const createdReplacedRef =
+		const preexistingSidecar =
 			replacedEntry !== undefined && priorReplacedRef === undefined
+				? await readReplacedProviderBackup(
+						replacedProviderBackupPath(deps.paths.configJson, providerKey),
+						providerKey,
+						hashBytes(serializeJson(replacedEntry)),
+					)
+				: undefined;
+		const createdReplacedRef =
+			replacedEntry !== undefined && priorReplacedRef === undefined && preexistingSidecar?.found !== true
 				? {
 						backupPath: replacedProviderBackupPath(deps.paths.configJson, providerKey),
 						valueSha256: hashBytes(serializeJson(replacedEntry)),
 					}
 				: undefined;
-		const replacedBackup = priorReplacedRef ?? createdReplacedRef;
+		const adoptedReplacedRef =
+			replacedEntry !== undefined && priorReplacedRef === undefined && preexistingSidecar?.found === true
+				? {
+						backupPath: replacedProviderBackupPath(deps.paths.configJson, providerKey),
+						valueSha256: hashBytes(serializeJson(replacedEntry)),
+						createdByGjc: false,
+					}
+				: undefined;
+		const replacedBackup = priorReplacedRef ?? createdReplacedRef ?? adoptedReplacedRef;
 		// The intent carries a digest of the complete sidecar bytes before the
 		// persist hook creates it. Recovery can therefore authenticate and remove
 		// only the artifact this interrupted step intended to create, without

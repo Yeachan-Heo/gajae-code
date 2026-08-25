@@ -1218,6 +1218,7 @@ export async function inverseSkillsBridge(
 export async function scanSkillsBridgeDrift(
 	deps: PaseoSetupDependencies,
 	recordedEntries?: readonly string[],
+	recordedIdentities?: Readonly<Record<string, BridgeEntryIdentity>>,
 ): Promise<readonly DriftReason[]> {
 	const reasons: DriftReason[] = [];
 	// One deterministic reason per bridge entry (#4644 review r9): the
@@ -1248,7 +1249,15 @@ export async function scanSkillsBridgeDrift(
 		const destination = path.join(deps.paths.bridgeDir, entry.name);
 		if (entry.isSymbolicLink()) {
 			try {
-				await fs.stat(destination);
+				const target = await fs.stat(destination);
+				if (!target.isDirectory()) {
+					reasons.push({
+						code: recordedEntries?.includes(entry.name) ? "foreign-skill-link" : "orphan-skill",
+						subject: destination,
+						detail: "bridge symlink target is not a directory",
+					});
+					reported.add(destination);
+				}
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 				reasons.push({
@@ -1283,6 +1292,18 @@ export async function scanSkillsBridgeDrift(
 				detail: recorded
 					? "a recorded bridge entry does not point into the source the ledger records"
 					: `bridge symlink does not point into Paseo's skills directory (${source.dir})`,
+			});
+			continue;
+		}
+		if (
+			state.kind === "symlink" &&
+			recordedIdentities?.[entry.name] !== undefined &&
+			!matchesRecordedIdentity(recordedIdentities[entry.name], state.identity)
+		) {
+			reasons.push({
+				code: "foreign-skill-link",
+				subject: destination,
+				detail: "a recorded bridge entry was replaced by a same-target successor",
 			});
 		}
 	}
@@ -1332,7 +1353,8 @@ export async function registerSkillsBridgeDirectory(
 		const directories = existingCustomDirectories(current);
 		let next = directories;
 		if (options.replaces !== undefined && options.replaces !== bridgeDir) {
-			next = next.filter(directory => directory !== options.replaces);
+			const replacedPath = path.resolve(options.replaces);
+			next = next.filter(directory => path.resolve(directory) !== replacedPath);
 		}
 		next = next.includes(bridgeDir) ? next : [...next, bridgeDir];
 		if (next.length === directories.length && next.every((directory, index) => directories[index] === directory)) {
