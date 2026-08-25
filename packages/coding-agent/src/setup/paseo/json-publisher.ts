@@ -210,6 +210,7 @@ export async function publishPlan(
 			await handle.close();
 		}
 		await fs.rename(tempPath, targetPath);
+		await syncParentDirectory(directory);
 	} finally {
 		await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
@@ -240,6 +241,15 @@ async function sourceMode(targetPath: string): Promise<number> {
 		return stat.mode & 0o777;
 	} catch {
 		return 0o600;
+	}
+}
+
+async function syncParentDirectory(directory: string): Promise<void> {
+	const handle = await fs.open(directory, "r");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -279,6 +289,7 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 	// `fs.open` honors the mode only on creation, so an existing backup path
 	// keeps its old permissions unless we set them explicitly.
 	await fs.chmod(to, mode);
+	await syncParentDirectory(path.dirname(to));
 }
 /**
  * Where a pre-`--force` provider value is preserved for a later restore.
@@ -371,6 +382,7 @@ export async function writeReplacedProviderBackup(
 			}
 			// Idempotent: the existing sidecar already preserves exactly this value.
 		}
+		await syncParentDirectory(path.dirname(backupPath));
 	} finally {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 	}
