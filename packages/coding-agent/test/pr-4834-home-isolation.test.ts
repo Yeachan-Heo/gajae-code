@@ -15,6 +15,8 @@ import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-ag
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
 // Register all discovery providers as a side effect.
+import { cleanupTempHome } from "./helpers/temp-home-cleanup";
+// Register all discovery providers as a side effect.
 import "@gajae-code/coding-agent/discovery";
 
 let tempDir: string;
@@ -111,6 +113,21 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 
 		expect(process.env.GJC_CODING_AGENT_DIR).toBeUndefined();
 		expect(getAgentDir()).toBe(homeRelativeAgentDir);
+	});
+
+	test("omitting originalAgentDir from temp-home cleanup leaves a pre-existing profile override in place", () => {
+		const marker = path.join(tempDir, "preexisting-profile");
+		process.env.GJC_CODING_AGENT_DIR = marker;
+		resetAgentDirFromEnvironment();
+
+		cleanupTempHome(() => ({
+			tempDir: "",
+			tempHomeDir: "",
+			originalHome: process.env.HOME,
+		}))();
+
+		expect(process.env.GJC_CODING_AGENT_DIR).toBe(marker);
+		expect(getAgentDir()).toBe(marker);
 	});
 
 	test("explicit home performs zero reads of the decoy process profile across every user-scope surface", async () => {
