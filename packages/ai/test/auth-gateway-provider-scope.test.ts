@@ -650,5 +650,11 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		expect(jsonSafe).not.toContain("json-access");
 		expect(jsonSafe).not.toContain("json-refresh");
 		expect(jsonSafe).not.toContain("json-secret");
+		const delimitedJsonSafe = cleanReason(
+			'{"client_secret":"prefix, secret-suffix", "refresh_token":"escaped \\" value"}',
+		);
+		expect(delimitedJsonSafe).not.toContain("prefix");
+		expect(delimitedJsonSafe).not.toContain("secret-suffix");
+		expect(delimitedJsonSafe).not.toContain("escaped");
 	});
 });
