@@ -1751,6 +1751,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const bridgeLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
 			const bridgeCompletion = Promise.withResolvers<ManagedBashJobCompletion>();
 			let bridgeBackgrounded = false;
+			let bridgeForegroundSettled = false;
+			const settleBridgeForeground = (): "resolved" | "already-settled" => {
+				if (bridgeForegroundSettled) return "already-settled";
+				bridgeForegroundSettled = true;
+				return "resolved";
+			};
 
 			let bridgeJobId: string;
 			try {
@@ -1763,6 +1769,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const finalText = this.#extractTextResult(result);
 							latestText = finalText;
 							bridgeManager.appendOutput(jobId, finalText);
+							if (!bridgeBackgrounded) settleBridgeForeground();
 							bridgeCompletion.resolve({ kind: "completed", result });
 							await reportProgress(
 								finalText,
@@ -1773,6 +1780,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const message = error instanceof Error ? error.message : String(error);
 							latestText = message;
 							bridgeManager.appendOutput(jobId, message);
+							if (!bridgeBackgrounded) settleBridgeForeground();
 							bridgeCompletion.resolve({ kind: "failed", error });
 							await reportProgress(
 								message,
@@ -1805,7 +1813,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const unregisterOwnerCleanup = bridgeManager.registerOwnerCleanup(
 				this.session.getAgentId?.() ?? "0-Main",
 				() => {
-					void handle.kill();
+					void handle.kill().catch(error => {
+						logger.warn("ACP terminal kill failed during owner teardown", {
+							terminalId: handle.terminalId,
+							error,
+						});
+					});
 					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.", {
 						abort: false,
 					});
@@ -1823,12 +1836,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 
 			const bridgeFoldRequest = Promise.withResolvers<void>();
-			let bridgeForegroundSettled = false;
-			const settleBridgeForeground = (): "resolved" | "already-settled" => {
-				if (bridgeForegroundSettled) return "already-settled";
-				bridgeForegroundSettled = true;
-				return "resolved";
-			};
 			const unregisterBridgeFold = this.session.registerForegroundFoldParticipant?.({
 				kind: "client-terminal",
 				jobId: bridgeJobId,
@@ -1996,8 +2003,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							detachObserver: () => {
 								// Output-only continuation: stdin forwarding ends here and the
 								// process is never killed or restarted by folding.
-								ptyBackgrounded = true;
-								ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
 								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
 									requestedTimeoutSec,
 									notices: pendingNotices,
@@ -2005,7 +2010,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								const outcome = controls.detachObserver(
 									interactiveResultFromText(this.#extractTextResult(started)),
 								);
-								if (outcome === "resolved") ptyFoldResult = started;
+								if (outcome === "resolved") {
+									ptyBackgrounded = true;
+									ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
+									ptyFoldResult = started;
+								}
 								return outcome;
 							},
 							resolveForegroundObserver: () => "already-settled",
