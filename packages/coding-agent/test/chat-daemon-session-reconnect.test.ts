@@ -517,7 +517,13 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			},
 		});
 	} finally {
-		await runtime?.stop();
+		// The router may still be finishing a reconcile started by the test's
+		// synchronous tick. Stop it under the serialized transport lease;
+		// otherwise its final client-close/replay work can run after the fake clock is
+		// restored and race the next test's transport scope.
+		await withSerializedFakeTransport(async () => {
+			await runtime?.stop();
+		});
 		warnSpy.mockRestore();
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
@@ -619,7 +625,13 @@ async function withAttachedDiscordRuntime(
 		);
 		await run({ runtime, provider, reconcile: () => reconcileTick?.(), awaitFrameSettlement });
 	} finally {
-		await runtime?.stop();
+		// Keep router teardown inside the serialized fake transport lease. A test can
+		// return immediately after an observable frame settles while its reconcile tail
+		// still owns the client; stopping outside the lease lets that tail cross into the
+		// next test and leave its settlement waiters unresolved.
+		await withSerializedFakeTransport(async () => {
+			await runtime?.stop();
+		});
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 }
@@ -651,6 +663,11 @@ async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: Fa
 	}
 	expect(provider.posts).toHaveLength(count);
 	await Bun.sleep(25);
+}
+
+async function awaitWarning(warnings: readonly string[], expected: string): Promise<void> {
+	for (let attempt = 0; attempt < 5_000 && !warnings.includes(expected); attempt++) await Bun.sleep(1);
+	expect(warnings).toContain(expected);
 }
 
 async function awaitPostAttempts(provider: FakeSlackProvider, text: string, count: number): Promise<void> {
@@ -1737,11 +1754,9 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 				await awaitReplayRequests(host, 3);
 				host.emit("new one");
 				await awaitRefusals(provider, 3);
-				await Bun.sleep(50);
+				const rebuiltAtNewGeneration = `chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`;
+				await awaitWarning(warnings, rebuiltAtNewGeneration);
 				expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
-				expect(warnings).toContain(
-					`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,
-				);
 
 				// Refused once, so it still sits above the cursor and the rebuild re-serves it.
 				reconcile();
