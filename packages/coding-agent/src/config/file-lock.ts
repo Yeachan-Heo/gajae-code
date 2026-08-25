@@ -322,11 +322,13 @@ async function staleLockSnapshot(
 		!previousOwnerHostIds.includes(info.owner_host_id ?? "")
 	)
 		return { stale: false };
+	if (ownerHostId === undefined && info.owner_host_id !== undefined) return { stale: false };
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
 	if (ownerIsAlive(info, startTimeCache)) return { stale: false };
-	if (ownerLiveness(info.pid) === "dead" || Date.now() - info.timestamp > staleMs) {
+	const liveness = ownerLiveness(info.pid);
+	if (liveness === "dead") {
 		return { stale: true, owner: info };
 	}
 	return { stale: false };

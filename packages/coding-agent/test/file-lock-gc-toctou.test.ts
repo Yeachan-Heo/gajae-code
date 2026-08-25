@@ -216,7 +216,38 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect((await fs.lstat(path.join(lockDir, "info"))).isSymbolicLink()).toBe(true);
 	});
 
-	test("rejects after successful protected work when ownership is lost during release", async () => {
+	test("preserves an aged owner when PID liveness is indeterminate", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await writeInfo(lockDir, { pid: process.pid, timestamp: Date.now() - 60_000 });
+		vi.spyOn(process, "kill").mockImplementation(() => {
+			throw Object.assign(new Error("liveness unavailable"), { code: "EIO" });
+		});
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("preserves a host-qualified lock for an unqualified contender", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await writeInfo(lockDir, {
+			pid: DEAD_PID,
+			timestamp: Date.now() - 60_000,
+			owner_host_id: "foreign-host",
+		});
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
+		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("rejects after successful protected work when the lock disappears during release", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
