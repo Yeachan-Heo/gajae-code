@@ -258,7 +258,7 @@ describe("Cursor raw transport watchdog", () => {
 					case: "turnEnded",
 					value: create(TurnEndedUpdateSchema, {}),
 				});
-				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+				stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG));
 			}, 120);
 		});
 
@@ -528,7 +528,7 @@ describe("Cursor raw transport watchdog", () => {
 			);
 			setTimeout(() => {
 				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
-				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+				stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG));
 			}, 80);
 		});
 
@@ -556,7 +556,7 @@ describe("Cursor raw transport watchdog", () => {
 			);
 			setTimeout(() => {
 				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
-				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+				stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG));
 			}, 20);
 		});
 
@@ -981,7 +981,7 @@ describe("Cursor raw transport watchdog", () => {
 					return;
 				}
 				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
-				stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG));
+				stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG));
 			}, 10);
 		});
 		const started = Promise.withResolvers<void>();
