@@ -139,6 +139,10 @@ export const SessionStateLockTestHooks: {
 	loadInstallationHostId?: () => Promise<string>;
 	/** @internal Previous identity seam for upgrade recovery tests. */
 	legacyOwnerHostId?: () => string | Promise<string>;
+	/** @internal Throws from the first legacy-directory owner metadata read. */
+	legacyOwnerReadFault?: (lockDir: string) => void | Promise<void>;
+	/** @internal Runs after exclusive transition mkdir and before identity capture. */
+	afterTransitionMkdir?: (transitionDir: string) => void | Promise<void>;
 	/** @internal Lets fixtures simulate a separately authenticated legacy-local owner. */
 	unqualifiedOwnerIsLocal?: boolean;
 	/** @internal Shortens acquisition deadlines without changing production timing. */
@@ -291,42 +295,75 @@ function validLockOwner(value: unknown): value is SessionStateLockOwner {
 	);
 }
 
-let ownerHostIdPromise: Promise<string> | undefined;
-let legacyOwnerHostIdPromise: Promise<string> | undefined;
+interface HostIdCache {
+	promise: Promise<string> | undefined;
+}
 
-async function currentOwnerHostId(): Promise<string> {
+const ownerHostIdCache: HostIdCache = { promise: undefined };
+const legacyOwnerHostIdCache: HostIdCache = { promise: undefined };
+export function resetSessionStateLockHostIdentityCache(): void {
+	ownerHostIdCache.promise = undefined;
+	legacyOwnerHostIdCache.promise = undefined;
+}
+
+async function hostIdWithinDeadline(
+	cache: HostIdCache,
+	load: () => Promise<string>,
+	deadline: number,
+): Promise<string> {
+	const promise = cache.promise ?? load();
+	cache.promise = promise;
+	const remaining = deadline - performance.now();
+	if (remaining <= 0) {
+		if (cache.promise === promise) cache.promise = undefined;
+		throw new SessionStateLockUnavailableError();
+	}
+	const timeout = Promise.withResolvers<never>();
+	const timer = setTimeout(() => {
+		if (cache.promise === promise) cache.promise = undefined;
+		timeout.reject(new SessionStateLockUnavailableError());
+	}, remaining);
+	timer.unref();
 	try {
-		let hostId: string;
-		if (SessionStateLockTestHooks.ownerHostId) {
-			hostId = await SessionStateLockTestHooks.ownerHostId();
-		} else {
-			const promise =
-				ownerHostIdPromise ?? (SessionStateLockTestHooks.loadInstallationHostId ?? loadInstallationHostId)();
-			ownerHostIdPromise = promise;
-			try {
-				hostId = await promise;
-			} catch (error) {
-				if (ownerHostIdPromise === promise) ownerHostIdPromise = undefined;
-				throw error;
-			}
-		}
+		const hostId = await Promise.race([promise, timeout.promise]);
 		if (!hostId) throw new Error("Host identity is unavailable.");
 		return hostId;
 	} catch (error) {
+		if (cache.promise === promise) cache.promise = undefined;
 		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
-async function currentLegacyOwnerHostId(): Promise<string> {
-	if (SessionStateLockTestHooks.legacyOwnerHostId) return await SessionStateLockTestHooks.legacyOwnerHostId();
-	const promise = legacyOwnerHostIdPromise ?? loadLegacyInstallationHostId();
-	legacyOwnerHostIdPromise = promise;
-	try {
-		return await promise;
-	} catch (error) {
-		if (legacyOwnerHostIdPromise === promise) legacyOwnerHostIdPromise = undefined;
-		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+async function currentOwnerHostId(deadline: number): Promise<string> {
+	if (SessionStateLockTestHooks.ownerHostId) {
+		try {
+			const hostId = await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.ownerHostId!());
+			if (!hostId) throw new Error("Host identity is unavailable.");
+			return hostId;
+		} catch (error) {
+			throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+		}
 	}
+	return await hostIdWithinDeadline(
+		ownerHostIdCache,
+		SessionStateLockTestHooks.loadInstallationHostId ?? loadInstallationHostId,
+		deadline,
+	);
+}
+
+async function currentLegacyOwnerHostId(deadline: number): Promise<string> {
+	if (SessionStateLockTestHooks.legacyOwnerHostId) {
+		try {
+			const hostId = await withinLockAcquireDeadline(deadline, () => SessionStateLockTestHooks.legacyOwnerHostId!());
+			if (!hostId) throw new Error("Host identity is unavailable.");
+			return hostId;
+		} catch (error) {
+			throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+		}
+	}
+	return await hostIdWithinDeadline(legacyOwnerHostIdCache, loadLegacyInstallationHostId, deadline);
 }
 
 /**
@@ -447,9 +484,8 @@ async function lockOwnerIsAlive(value: unknown, deadline: number): Promise<boole
 		// namespace: a local ext/tmpfs/APFS mount can be shared with a container.
 		// Keep production recovery fail-closed until the legacy owner is qualified.
 		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
-	} else if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentOwnerHostId()))) {
-		if (owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentLegacyOwnerHostId())))
-			return true;
+	} else if (owner.owner_host_id !== (await currentOwnerHostId(deadline))) {
+		if (owner.owner_host_id !== (await currentLegacyOwnerHostId(deadline))) return true;
 	}
 	// PID and process-start values are host-local. A current writer on a shared
 	// volume must never classify a foreign owner from a local ESRCH result.
@@ -711,21 +747,11 @@ function ownerCreateFlags(): number | undefined {
 }
 
 async function newLockOwner(deadline: number): Promise<SessionStateLockOwner> {
-	const hostIdPromise = currentOwnerHostId();
-	let ownerHostId: string;
-	try {
-		ownerHostId = await withinLockAcquireDeadline(deadline, () => hostIdPromise);
-	} catch (error) {
-		// The caller gave up on this generation. Retaining its pending promise would
-		// make every later acquisition inherit the same expired deadline.
-		ownerHostIdPromise = undefined;
-		throw error;
-	}
 	return {
 		pid: process.pid,
 		start_time: await ownerStartTime(process.pid, deadline),
 		token: randomUUID(),
-		owner_host_id: ownerHostId,
+		owner_host_id: await currentOwnerHostId(deadline),
 	};
 }
 
@@ -737,7 +763,7 @@ async function releasedLockOwner(): Promise<SessionStateLockOwner> {
 		pid: 1,
 		start_time: "unknown",
 		token: randomUUID(),
-		owner_host_id: await currentOwnerHostId(),
+		owner_host_id: await currentOwnerHostId(lockAcquireDeadline()),
 		released: true,
 	};
 }
@@ -983,7 +1009,7 @@ async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<
 	if (
 		!validLockOwner(owner) ||
 		owner.pid !== process.pid ||
-		owner.owner_host_id !== (await withinLockAcquireDeadline(deadline, () => currentOwnerHostId())) ||
+		owner.owner_host_id !== (await currentOwnerHostId(deadline)) ||
 		!(await sameOwnerIncarnation(owner, deadline))
 	) {
 		throw new SessionStateLockUnavailableError(new Error("Owner record is not held by this process incarnation."));
@@ -1081,15 +1107,24 @@ function releasedOwnerFromSnapshot(held: LockOwnerSnapshot): SessionStateLockOwn
 interface TransitionClaimIdentity {
 	dev: bigint;
 	ino: bigint;
+	mtimeNs: bigint;
 }
 
 async function transitionClaimIdentity(transitionDir: string): Promise<TransitionClaimIdentity | undefined> {
 	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
 	if (!stat?.isDirectory()) return undefined;
-	return { dev: stat.dev, ino: stat.ino };
+	return { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs };
 }
 
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
+async function createTransitionClaim(transitionDir: string): Promise<TransitionClaimIdentity> {
+	await fs.mkdir(transitionDir);
+	const claim = await transitionClaimIdentity(transitionDir);
+	if (!claim) throw new SessionStateLockUnavailableError();
+	await SessionStateLockTestHooks.afterTransitionMkdir?.(transitionDir);
+	return claim;
+}
+
 async function cleanupTransitionClaim(
 	transitionDir: string,
 	ownerFile: string,
@@ -1101,8 +1136,25 @@ async function cleanupTransitionClaim(
 	}
 	if (!claim) return;
 	const current = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
-	if (!current?.isDirectory() || current.dev !== claim.dev || current.ino !== claim.ino) return;
-	await fs.rmdir(transitionDir).catch(() => undefined);
+	if (
+		!current?.isDirectory() ||
+		current.dev !== claim.dev ||
+		current.ino !== claim.ino ||
+		current.mtimeNs !== claim.mtimeNs
+	)
+		return;
+	const staged = path.join(path.dirname(transitionDir), `.gjc-stale-transition-${randomUUID()}`);
+	try {
+		await fs.rename(transitionDir, staged);
+	} catch {
+		return;
+	}
+	const moved = await fs.lstat(staged, { bigint: true }).catch(() => null);
+	if (!moved?.isDirectory() || moved.dev !== claim.dev || moved.ino !== claim.ino || moved.mtimeNs !== claim.mtimeNs) {
+		await fs.rename(staged, transitionDir).catch(() => undefined);
+		return;
+	}
+	await fs.rmdir(staged).catch(() => undefined);
 }
 
 async function reclaimStaleTransitionClaim(transitionDir: string, deadline: number): Promise<void> {
@@ -1136,20 +1188,18 @@ async function withLockPathTransition<T>(
 ): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
-	const owner = await withinLockAcquireDeadline(deadline, () => newLockOwner(deadline));
+	const owner = await newLockOwner(deadline);
 	for (;;) {
 		let claim: TransitionClaimIdentity | undefined;
 		try {
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
-			await withinLockAcquireDeadline(
+			claim = await withinLockAcquireDeadline(
 				deadline,
-				() => fs.mkdir(transitionDir),
+				() => createTransitionClaim(transitionDir),
 				result => {
-					if (result.ok) return fs.rmdir(transitionDir).catch(() => undefined);
+					if (result.ok) return cleanupTransitionClaim(transitionDir, ownerFile, undefined, result.value);
 				},
 			);
-			claim = await transitionClaimIdentity(transitionDir);
-			if (!claim) throw new SessionStateLockUnavailableError();
 			if (performance.now() >= deadline) {
 				void cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
 				throw new SessionStateLockUnavailableError();
@@ -1300,6 +1350,21 @@ async function captureLegacyDirectoryTree(
 	);
 }
 
+async function readLegacyLockOwner(
+	lockDir: string,
+	deadline: number,
+): Promise<{ owner: FileLockOwnerToken | null } | { contention: true }> {
+	try {
+		await SessionStateLockTestHooks.legacyOwnerReadFault?.(lockDir);
+		return { owner: await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockDir)) };
+	} catch (error) {
+		// A just-published Windows legacy owner can transiently deny metadata reads.
+		// That is active contention, never stale authority or an acquisition failure.
+		if ((error as NodeJS.ErrnoException).code === "EPERM") return { contention: true };
+		throw error;
+	}
+}
+
 /** Async equivalent of the generic directory-lock stale verdict. */
 async function legacyDirectoryIsStale(
 	lockDir: string,
@@ -1307,15 +1372,9 @@ async function legacyDirectoryIsStale(
 	ownerHostId: string | undefined,
 	deadline: number,
 ): Promise<boolean> {
-	let owner: FileLockOwnerToken | null;
-	try {
-		owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockDir));
-	} catch (error) {
-		// A just-published Windows legacy owner can transiently deny metadata reads.
-		// That is active contention, never stale authority or an acquisition failure.
-		if ((error as NodeJS.ErrnoException).code === "EPERM") return false;
-		throw error;
-	}
+	const ownerRead = await readLegacyLockOwner(lockDir, deadline);
+	if ("contention" in ownerRead) return false;
+	const owner = ownerRead.owner;
 	if (!owner && ownerHostId !== undefined) return false;
 	if (!owner) {
 		try {
@@ -1376,18 +1435,17 @@ async function reclaimStaleDirectoryLock(lockFile: string, deadline: number): Pr
 			const native = nativeSessionStateLock();
 			const before = await captureLegacyDirectoryTree(native, lockFile, deadline);
 			if (!before) return;
-			const owner = await withinLockAcquireDeadline(deadline, () => readFileLockInfoForGc(lockFile));
+			const ownerRead = await readLegacyLockOwner(lockFile, deadline);
+			if ("contention" in ownerRead) return;
+			const owner = ownerRead.owner;
 			if (!owner?.owner_host_id && SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
-			const ownerHostId =
-				owner?.owner_host_id === undefined
-					? undefined
-					: await withinLockAcquireDeadline(deadline, () => currentOwnerHostId());
+			const ownerHostId = owner?.owner_host_id === undefined ? undefined : await currentOwnerHostId(deadline);
 			let stale = await legacyDirectoryIsStale(lockFile, LOCK_STALE_MS, ownerHostId, deadline);
 			if (!stale && ownerHostId !== undefined)
 				stale = await legacyDirectoryIsStale(
 					lockFile,
 					LOCK_STALE_MS,
-					await withinLockAcquireDeadline(deadline, () => currentLegacyOwnerHostId()),
+					await currentLegacyOwnerHostId(deadline),
 					deadline,
 				);
 			if (!stale) return;
@@ -1487,7 +1545,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
 	const deadline = lockAcquireDeadline();
-	const owner = await withinLockAcquireDeadline(deadline, () => newLockOwner(deadline));
+	const owner = await newLockOwner(deadline);
 	await withinLockAcquireDeadline(deadline, () => fs.mkdir(path.dirname(stateFile), { recursive: true }));
 	for (;;) {
 		let held: LockOwnerSnapshot | undefined;

@@ -8,6 +8,7 @@ import { processStartTime, removeFileLockDirForGc } from "../src/config/file-loc
 import * as sessionStateLock from "../src/gjc-runtime/session-state-lock";
 import {
 	reclaimStaleSessionStateLock,
+	resetSessionStateLockHostIdentityCache,
 	SessionStateLockTestHooks,
 	SessionStateLockUnavailableError,
 	setSessionStateLockNativeBindings,
@@ -52,10 +53,13 @@ afterEach(async () => {
 	SessionStateLockTestHooks.ownerHostId = undefined;
 	SessionStateLockTestHooks.loadInstallationHostId = undefined;
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
+	SessionStateLockTestHooks.legacyOwnerReadFault = undefined;
+	SessionStateLockTestHooks.afterTransitionMkdir = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.lockAcquireTimeoutMs = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+	resetSessionStateLockHostIdentityCache();
 	installExactIdentityNatives();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -335,6 +339,71 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(transitionDir)).toBe(true);
 		expect(transitionToken(transitionDir)).toBe(successor);
 		expect((await readJson(`${transitionDir}.owner`)).token).toBe("successor-claim");
+	});
+	it("evicts a timed-out production identity cache so later recovery can reload", async () => {
+		const { stateFile } = await seededRunningSession("lock-identity-cache-timeout");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(
+			lockFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "qualified-dead-owner",
+				owner_host_id: "local-host",
+			}),
+		);
+		SessionStateLockTestHooks.ownerHostId = undefined;
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 40;
+		let attempts = 0;
+		SessionStateLockTestHooks.loadInstallationHostId = () => {
+			attempts++;
+			if (attempts === 1) return new Promise<string>(() => undefined);
+			return Promise.resolve("local-host");
+		};
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(attempts).toBe(1);
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+		expect(attempts).toBe(2);
+	});
+
+	it("treats EPERM on the first legacy owner read as contention", async () => {
+		const { stateFile } = await seededRunningSession("lock-legacy-first-read-eperm");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "whenever", timestamp: Date.now() });
+		SessionStateLockTestHooks.legacyOwnerReadFault = () => {
+			throw Object.assign(new Error("denied"), { code: "EPERM" });
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(fsSync.existsSync(path.join(lockFile, "info"))).toBe(true);
+	});
+
+	it("does not reap a successor after a late mkdir success", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-late-mkdir-successor.json");
+		const lockFile = `${stateFile}.lock`;
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+		SessionStateLockTestHooks.afterTransitionMkdir = async () => {
+			await Bun.sleep(80);
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		const transitionDir = `${lockFile}.transition`;
+		if (fsSync.existsSync(transitionDir)) await fs.rmdir(transitionDir);
+		await Bun.sleep(20);
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(path.join(transitionDir, "successor-token"), "successor");
+		const successor = transitionToken(transitionDir);
+		await Bun.sleep(120);
+
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect(transitionToken(transitionDir)).toBe(successor);
+		expect(await fs.readFile(path.join(transitionDir, "successor-token"), "utf8")).toBe("successor");
 	});
 
 	it("serializes a concurrent writer behind the current lock holder", async () => {
