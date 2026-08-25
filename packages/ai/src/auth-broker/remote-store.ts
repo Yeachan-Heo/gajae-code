@@ -523,7 +523,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		for (let attempt = 0; attempt < 2; attempt += 1) {
 			try {
 				const metadata = await this.#client.fetchCredentialMetadata();
-				if (metadata.epoch !== undefined && metadata.epoch !== this.#epoch) {
+				if (metadata.epoch !== this.#epoch) {
 					if (attempt === 0) {
 						await this.refreshSnapshot().catch(() => {});
 						continue;
