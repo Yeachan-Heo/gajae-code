@@ -209,15 +209,27 @@ export async function publishPlan(
 			actual: observed,
 		});
 	}
+	if (expectedDestinationIdentity !== undefined && expectedDestinationIdentity.sha256 !== observed) {
+		throw new PaseoPublishError(targetPath, {
+			reason: "cas-conflict",
+			expected: options.expectedIdentity,
+			actual: observed,
+		});
+	}
 	if (options.backup && observed !== ABSENT_IDENTITY) {
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
 		backupCreated = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
 		if ((await currentIdentity(targetPath)) !== observed) {
 			if (backupCreated && !(await removePrivateBackupIfExact(backupPath, backupBytes))) {
-				throw new AggregateError(
-					[],
-					`the backup for ${targetPath} remains retained at ${backupPath} after a concurrent target change`,
+				throw new PaseoPublishError(
+					targetPath,
+					{
+						reason: "cas-conflict",
+						expected: options.expectedIdentity,
+						actual: await currentIdentity(targetPath),
+					},
+					[backupPath],
 				);
 			}
 			throw new PaseoPublishError(targetPath, {
@@ -291,9 +303,14 @@ export async function publishPlan(
 		if (backupCreated && backupPath !== undefined && backupBytes !== undefined) {
 			const removed = await removePrivateBackupIfExact(backupPath, backupBytes);
 			if (!removed) {
-				throw new AggregateError(
-					[error],
-					`publication failed and the newly-created credential backup remains retained at ${backupPath}`,
+				throw new PaseoPublishError(
+					targetPath,
+					{
+						reason: "cas-conflict",
+						expected: options.expectedIdentity,
+						actual: await currentIdentity(targetPath),
+					},
+					[backupPath, ...(error instanceof PaseoPublishError ? error.retained : [])],
 				);
 			}
 		}

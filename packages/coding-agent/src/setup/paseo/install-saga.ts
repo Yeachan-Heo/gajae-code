@@ -289,11 +289,16 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				await clearIntent(input.intentPath);
 			}
 		}
-		throw new SagaStepError(input.label, error instanceof Error ? error.message : String(error), [
-			input.intentPath,
-			...(backupPath ? [backupPath] : []),
-			...(error instanceof PaseoPublishError ? error.retained : []),
-		]);
+		throw new SagaStepError(
+			input.label,
+			error instanceof Error ? error.message : String(error),
+			[
+				input.intentPath,
+				...(backupPath ? [backupPath] : []),
+				...(error instanceof PaseoPublishError ? error.retained : []),
+			],
+			error instanceof PaseoPublishError && error.retained.length > 0,
+		);
 	}
 	await clearIntent(input.intentPath);
 
