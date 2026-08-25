@@ -181,6 +181,28 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
+	test("fails closed when present lock metadata is malformed", async () => {
+		const invalidMetadata = [
+			["empty", ""],
+			["null", "null"],
+			["bad pid", JSON.stringify({ pid: 0, start_time: "test-start", timestamp: Date.now() - 10_000 })],
+			["bad timestamp", JSON.stringify({ pid: process.pid, start_time: "test-start", timestamp: "old" })],
+		] as const;
+
+		for (const [label, contents] of invalidMetadata) {
+			const base = await makeTemp();
+			const lockedFile = path.join(base, `${label}.json`);
+			const lockDir = `${lockedFile}.lock`;
+			await fs.mkdir(lockDir, { recursive: true });
+			await fs.writeFile(path.join(lockDir, "info"), contents);
+
+			await expect(
+				withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+			).rejects.toThrow("Failed to acquire lock");
+			expect(await fs.exists(lockDir)).toBe(true);
+		}
+	});
+
 	test("rejects after successful protected work when ownership is lost during release", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

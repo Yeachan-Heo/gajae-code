@@ -276,6 +276,16 @@ async function staleLockSnapshot(
 	}
 	if (!info && ownerHostId !== undefined) return { stale: false };
 	if (!info) {
+		// A present but malformed owner record is not equivalent to a lock directory
+		// caught between mkdir and metadata publication. Refuse stale fallback when the
+		// metadata path exists: an unreadable live holder must never be reclaimed by
+		// elapsed mtime alone.
+		try {
+			await fs.stat(path.join(lockPath, "info"));
+			return { stale: false };
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
 		try {
 			const stats = await fs.stat(lockPath);
 			if (Date.now() - stats.mtimeMs <= staleMs) return { stale: false };
