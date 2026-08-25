@@ -670,5 +670,8 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		expect(cleanReason('Bearer "opaque secret"')).toBe("Credential diagnostic unavailable.");
 		expect(cleanReason('client_secret = "client secret"')).toBe("Credential diagnostic unavailable.");
 		expect(cleanReason('clientSecret: "client secret"')).toBe("Credential diagnostic unavailable.");
+		expect(cleanReason("https://login.example/callback?code=authorization-code&state=opaque#fragment")).toBe(
+			"https://login.example/callback",
+		);
 	});
 });

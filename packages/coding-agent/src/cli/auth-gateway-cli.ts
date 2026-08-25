@@ -133,9 +133,9 @@ function createBrokerClient(brokerConfig: AuthBrokerClientConfig): AuthBrokerCli
 	return new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 }
 
-function normalizeProviderScope(provider: string | undefined): string | undefined {
+export function normalizeProviderScope(provider: string | undefined): string | undefined {
 	const normalized = provider?.trim();
-	return normalized ? normalized : undefined;
+	return normalized && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(normalized) ? normalized : undefined;
 }
 
 export function filterCredentialCheckResults(

@@ -4,6 +4,7 @@ import {
 	assertEnabledProviderCredential,
 	filterCredentialCheckResults,
 	hasEnabledProviderCredential,
+	normalizeProviderScope,
 	redactBrokerUrl,
 } from "../src/cli/auth-gateway-cli";
 
@@ -58,6 +59,11 @@ describe("auth-gateway broker provider scope", () => {
 		expect(redacted).not.toContain("password");
 		expect(redacted).not.toContain("secret");
 		expect(redactBrokerUrl("https://broker.example.test/capability-secret/v1")).toBe("https://broker.example.test");
+	});
+
+	it("rejects provider scopes that can inject terminal controls", () => {
+		expect(normalizeProviderScope("openai-codex")).toBe("openai-codex");
+		expect(normalizeProviderScope("openai\u001b]52;c\u0007")).toBeUndefined();
 	});
 
 	it("filters cross-provider credential rows before JSON or text rendering", () => {
