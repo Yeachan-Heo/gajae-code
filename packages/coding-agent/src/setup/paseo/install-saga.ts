@@ -582,6 +582,12 @@ export async function recoverIntent(
 			beforeMatches &&
 			(ledgerObserved === intent.provenanceExpectedIdentity ||
 				ledgerObserved === intent.provenancePreflightIdentity);
+		const safeCompensationPending =
+			before?.bridgeCleanupPending !== undefined &&
+			beforeMatches &&
+			afterMatches &&
+			ledgerObserved === intent.provenancePreflightIdentity &&
+			!samePayload;
 		const recoverableCutover =
 			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		if (
@@ -589,9 +595,10 @@ export async function recoverIntent(
 				!safeCompleted &&
 				!safeSettled &&
 				!safePendingPreDetach &&
+				!safeCompensationPending &&
 				!recoverableCutover &&
 				!(samePayload && beforeMatches)) ||
-			(beforeMatches && afterMatches && !samePayload && !safePendingPreDetach)
+			(beforeMatches && afterMatches && !samePayload && !safePendingPreDetach && !safeCompensationPending)
 		) {
 			return {
 				recovered: false,
@@ -652,6 +659,12 @@ export async function recoverIntent(
 			const settled = { ...settleSource, bridgeCleanupPending: undefined };
 			await writeProvenance(intent.provenancePath, settled);
 			pendingReplayed = true;
+		}
+		if (safeCompensationPending) {
+			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
+				return { recovered: false, detail: "the provenance ledger changed during compensation recovery" };
+			}
+			await writeProvenance(intent.provenancePath, after!);
 		}
 		if (recoverableCutover && !pendingReplayed) {
 			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {

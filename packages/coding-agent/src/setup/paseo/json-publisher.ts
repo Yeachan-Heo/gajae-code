@@ -194,6 +194,7 @@ export async function publishPlan(
 	let backupPath: string | undefined;
 	let backupCreated = false;
 	let backupBytes: Buffer | undefined;
+	const expectedDestinationIdentity = await captureRegularIdentity(targetPath);
 	if (options.backup && observed !== ABSENT_IDENTITY) {
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
@@ -212,6 +213,7 @@ export async function publishPlan(
 	// user's config truncated. Stage beside the target, fsync, then rename.
 	const tempPath = path.join(directory, `.${path.basename(targetPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
 	const mode = await sourceMode(targetPath);
+	let tempRetained = false;
 	try {
 		const handle = await fs.open(tempPath, "wx", mode);
 		try {
@@ -223,17 +225,30 @@ export async function publishPlan(
 		const destinationIdentity = await captureRegularIdentity(targetPath);
 		const sourceIdentity = await captureRegularIdentity(tempPath);
 		if (sourceIdentity === undefined) throw new Error(`staged Paseo publication is not a regular file: ${tempPath}`);
-		if (destinationIdentity === undefined) {
-			await fs.link(tempPath, targetPath);
-			await fs.rm(tempPath);
-		} else {
-			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, destinationIdentity);
-			if (!replaced.ok)
+		if (expectedDestinationIdentity === undefined) {
+			if (destinationIdentity !== undefined) {
 				throw new PaseoPublishError(targetPath, {
 					reason: "cas-conflict",
 					expected: options.expectedIdentity,
 					actual: await currentIdentity(targetPath),
 				});
+			}
+			await fs.link(tempPath, targetPath);
+			await fs.rm(tempPath);
+		} else {
+			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, expectedDestinationIdentity);
+			if (!replaced.ok) {
+				tempRetained =
+					replaced.detachedPath !== undefined ||
+					replaced.retainedSuccessorPath !== undefined ||
+					replaced.retainedPlaceholderPath !== undefined ||
+					replaced.retainedUnknownPath !== undefined;
+				throw new PaseoPublishError(targetPath, {
+					reason: "cas-conflict",
+					expected: options.expectedIdentity,
+					actual: await currentIdentity(targetPath),
+				});
+			}
 		}
 		await syncParentDirectory(directory);
 	} catch (error) {
@@ -248,7 +263,7 @@ export async function publishPlan(
 		}
 		throw error;
 	} finally {
-		await fs.rm(tempPath, { force: true }).catch(() => undefined);
+		if (!tempRetained) await fs.rm(tempPath, { force: true }).catch(() => undefined);
 	}
 
 	return { published: true, backupPath, identity: plan.expectedIdentity };
