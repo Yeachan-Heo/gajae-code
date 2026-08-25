@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import type { NonSharedBuffer } from "node:buffer";
 import type * as nfs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -173,7 +174,15 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		const realStat = fs.stat;
 		const realLstat = fs.lstat;
 		const realAccess = fs.access;
-		const passthroughReaddir = realReaddir.bind(fs) as unknown as (t: nfs.PathLike) => Promise<string[]>;
+		type ReaddirOptions =
+			| (nfs.ObjectEncodingOptions & { withFileTypes?: boolean; recursive?: boolean })
+			| BufferEncoding
+			| null;
+		type ReaddirResult = string[] | NonSharedBuffer[] | nfs.Dirent[];
+		const passthroughReaddir = realReaddir.bind(fs) as unknown as (
+			t: nfs.PathLike,
+			options?: ReaddirOptions,
+		) => Promise<ReaddirResult>;
 		const passthroughReadFile = realReadFile.bind(fs) as unknown as (
 			f: nfs.PathLike | number,
 			e: string,
@@ -184,9 +193,9 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		// Spy implementations record the path then delegate to the captured real
 		// binding; the explicit signatures plus concrete-type casts keep the
 		// overloaded node types out of the way without ReturnType<> (repo rule).
-		vi.spyOn(fs, "readdir").mockImplementation(((target: nfs.PathLike) => {
+		vi.spyOn(fs, "readdir").mockImplementation(((target: nfs.PathLike, options?: ReaddirOptions) => {
 			reads.add(path.resolve(String(target)));
-			return passthroughReaddir(target);
+			return passthroughReaddir(target, options);
 		}) as unknown as typeof fs.readdir);
 		vi.spyOn(fs, "readFile").mockImplementation(((file: nfs.PathLike | number) => {
 			reads.add(path.resolve(String(file)));
@@ -206,8 +215,16 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		}) as unknown as typeof fs.access);
 		clearCache();
 
-		for (const capabilityId of ALL_CAPABILITIES) {
-			await loadCapabilityForHome(capabilityId, home, options);
+		const loadedCapabilities = await Promise.all(
+			ALL_CAPABILITIES.map(
+				async capabilityId => [capabilityId, await loadCapabilityForHome(capabilityId, home, options)] as const,
+			),
+		);
+		for (const [capabilityId, result] of loadedCapabilities) {
+			expect(Array.isArray(result.items), `${capabilityId} should return items`).toBe(true);
+			expect(Array.isArray(result.all), `${capabilityId} should return diagnostics`).toBe(true);
+			expect(Array.isArray(result.providers), `${capabilityId} should return providers`).toBe(true);
+			expect(result.warnings, `${capabilityId} should load without warnings`).toEqual([]);
 		}
 
 		const decoyReads = [...reads].filter(p => p.startsWith(decoyAgentDir));
