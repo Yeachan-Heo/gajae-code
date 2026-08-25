@@ -400,8 +400,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			}
 		} else if (snapshot.epoch) {
 			// First epoch-bearing response establishes the authority namespace.
-		} else if (generation < this.#generation) {
-			return false;
+		} else if (generation < this.#generation || snapshot.serverNowMs <= this.#snapshot.serverNowMs) {
+			// Epoch-less legacy brokers use serverNowMs as the restart discriminator:
+			// accept a reset generation only when the broker proves it is newer than
+			// the last accepted legacy snapshot, while delayed old responses fail closed.
+			if (snapshot.serverNowMs <= this.#snapshot.serverNowMs) return false;
 		}
 		const generationChanged =
 			generation !== this.#generation ||
