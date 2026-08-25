@@ -279,7 +279,7 @@ export class AuthBrokerClient {
 		// `metadata`) but leaves provider-specific extension fields permissive so
 		// the broker can ship new shapes ahead of the client. `raw` is accepted
 		// but normally stripped by the broker before send.
-		const path = provider ? `/v1/usage?provider=${encodeURIComponent(provider)}` : "/v1/usage";
+		const path = provider ? `/v1/usage/scoped?provider=${encodeURIComponent(provider)}` : "/v1/usage";
 		return this.#request("GET", path, { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
 	}
 

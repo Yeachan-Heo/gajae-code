@@ -633,7 +633,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				if (req.method === "GET" && pathname === "/v1/snapshot") {
 					return serveSnapshot(req, url, opts.storage, generationGate, refresher, epoch, peer);
 				}
-				if (req.method === "GET" && pathname === "/v1/usage") {
+				if (req.method === "GET" && (pathname === "/v1/usage" || pathname === "/v1/usage/scoped")) {
 					try {
 						// AuthStorage caches usage reports internally with a 5-minute per-credential
 						// TTL (USAGE_REPORT_TTL_MS) so back-to-back widget polls re-use the
@@ -641,6 +641,9 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						// `req.signal` propagates HTTP-client disconnects all the way to the
 						// per-caller cancel without touching the shared upstream fetch.
 						const scopedProvider = url.searchParams.get("provider") as Provider | null;
+						if (pathname === "/v1/usage/scoped" && !scopedProvider) {
+							return json(400, { error: "provider is required" });
+						}
 						const reports =
 							(await opts.storage.fetchUsageReports?.({
 								provider: scopedProvider ?? undefined,

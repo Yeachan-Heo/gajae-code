@@ -256,7 +256,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		if (gatewayToken) {
 			process.stdout.write(`bearer token: ${getTokenFilePath()} (chmod 0600)\n`);
 		} else {
-			process.stdout.write(`auth: disabled (--no-auth) — any client can call this gateway\n`);
+			process.stdout.write(`auth: disabled (--no-auth) — non-browser local clients can call this gateway\n`);
 		}
 		process.stdout.write(`upstream broker: ${redactBrokerUrl(brokerConfig.url)}\n`);
 

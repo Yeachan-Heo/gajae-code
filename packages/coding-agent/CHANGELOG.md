@@ -60,9 +60,13 @@
 - Lean notifications no longer replay a retained completion receipt at idle when identical text was already delivered immediately before an autonomous `ask`; distinct receipts and other settlement windows remain preserved.
 - SDK prompts now publish a bounded structured terminal failure when a provider immediately returns HTTP 402 or 429. The accepted receipt remains non-terminal until the correlated `agent_end`, while `turn.result`/`turn.prompt_status` no longer strand the prompt as `in_flight`; replacement turns remain independently abortable and recoverable. (#4941)
 
+### Breaking Changes
+
+- `gjc auth-gateway serve` now requires `--provider=<id>`; existing unscoped invocations must choose the provider whose source-backed model catalog and broker credential the gateway should expose.
+
 ### Added
 
-- `gjc auth-gateway serve` now requires `--provider`, verifies an enabled broker credential before binding, and reports only redacted provider-scoped status/check information.
+- `gjc auth-gateway serve` verifies an enabled broker credential before binding and reports only redacted provider-scoped status/check information.
 ## [0.15.2] - 2026-08-25
 
 ### Changed
