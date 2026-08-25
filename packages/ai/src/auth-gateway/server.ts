@@ -986,8 +986,8 @@ function handleModelsList(catalog: AuthGatewayModelCatalog): Response {
 
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
 	const provider = opts.providerScope.provider;
-	if (typeof provider !== "string" || provider.length === 0 || provider.trim() !== provider) {
-		throw new Error("Auth gateway requires a non-empty provider scope");
+	if (!isSafeProviderScope(provider)) {
+		throw new Error("Auth gateway requires a valid provider scope");
 	}
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	if (!hasProviderCredential(opts)) {
@@ -1121,4 +1121,8 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 			server.stop(true);
 		},
 	};
+}
+
+export function isSafeProviderScope(provider: unknown): provider is string {
+	return typeof provider === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(provider.trim());
 }

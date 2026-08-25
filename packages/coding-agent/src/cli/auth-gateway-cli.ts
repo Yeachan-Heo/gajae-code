@@ -15,7 +15,11 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
-import { createAuthGatewayModelCatalog, startAuthGateway } from "@gajae-code/ai/auth-gateway/server";
+import {
+	createAuthGatewayModelCatalog,
+	isSafeProviderScope,
+	startAuthGateway,
+} from "@gajae-code/ai/auth-gateway/server";
 import {
 	AuthBrokerClient,
 	type AuthCredentialSnapshot,
@@ -136,7 +140,7 @@ function createBrokerClient(brokerConfig: AuthBrokerClientConfig): AuthBrokerCli
 
 export function normalizeProviderScope(provider: string | undefined): string | undefined {
 	const normalized = provider?.trim();
-	return normalized && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(normalized) ? normalized : undefined;
+	return normalized && isSafeProviderScope(normalized) ? normalized : undefined;
 }
 
 export function filterCredentialCheckResults(

@@ -8,7 +8,7 @@ import {
 } from "../src";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
 import { cleanReason } from "../src/auth-broker/redact";
-import { createAuthGatewayModelCatalog, startAuthGateway } from "../src/auth-gateway/server";
+import { createAuthGatewayModelCatalog, isSafeProviderScope, startAuthGateway } from "../src/auth-gateway/server";
 import type {
 	Api,
 	AssistantMessage,
@@ -673,5 +673,7 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		expect(cleanReason("https://login.example/callback?code=authorization-code&state=opaque#fragment")).toBe(
 			"https://login.example/callback",
 		);
+		expect(isSafeProviderScope("openai-codex")).toBe(true);
+		expect(isSafeProviderScope("openai\u001b]52;c\u0007")).toBe(false);
 	});
 });
