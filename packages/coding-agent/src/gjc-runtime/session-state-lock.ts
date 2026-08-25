@@ -313,13 +313,13 @@ async function hostIdWithinDeadline(
 	load: () => Promise<string>,
 	deadline: number,
 ): Promise<string> {
-	const promise = cache.promise ?? load();
-	cache.promise = promise;
 	const remaining = deadline - performance.now();
 	if (remaining <= 0) {
-		if (cache.promise === promise) cache.promise = undefined;
+		cache.promise = undefined;
 		throw new SessionStateLockUnavailableError();
 	}
+	const promise = cache.promise ?? load();
+	cache.promise = promise;
 	const timeout = Promise.withResolvers<never>();
 	const timer = setTimeout(() => {
 		if (cache.promise === promise) cache.promise = undefined;
@@ -350,7 +350,8 @@ async function currentOwnerHostId(deadline: number): Promise<string> {
 	}
 	return await hostIdWithinDeadline(
 		ownerHostIdCache,
-		SessionStateLockTestHooks.loadInstallationHostId ?? loadInstallationHostId,
+		SessionStateLockTestHooks.loadInstallationHostId ??
+			(() => loadInstallationHostId({ timeoutMs: Math.max(0, deadline - performance.now()) })),
 		deadline,
 	);
 }
@@ -365,7 +366,11 @@ async function currentLegacyOwnerHostId(deadline: number): Promise<string> {
 			throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
 		}
 	}
-	return await hostIdWithinDeadline(legacyOwnerHostIdCache, loadLegacyInstallationHostId, deadline);
+	return await hostIdWithinDeadline(
+		legacyOwnerHostIdCache,
+		() => loadLegacyInstallationHostId({ timeoutMs: Math.max(0, deadline - performance.now()) }),
+		deadline,
+	);
 }
 
 /**

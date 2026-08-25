@@ -59,6 +59,7 @@ export {
 	type MachineIdentityDeps,
 	parseMacPlatformUuid,
 	parseWindowsMachineGuid,
+	runMachineIdentityCommand,
 } from "../../config/machine-identity";
 
 export {

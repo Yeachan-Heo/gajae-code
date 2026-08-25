@@ -7,6 +7,7 @@ import {
 	loadInstallationHostId,
 	parseMacPlatformUuid,
 	parseWindowsMachineGuid,
+	runMachineIdentityCommand,
 	type TelegramDaemonFs,
 	TopicRegistryDurabilityUnavailableError,
 } from "../src/sdk/bus/telegram-daemon";
@@ -80,6 +81,31 @@ test("machine-local identity parsing is strict and machine IDs are keyed per ins
 			runCommand: () => ({ exitCode: 1, stdout: new Uint8Array() }),
 		}),
 	).rejects.toThrow("unavailable or malformed");
+});
+
+test("machine identity probes kill and reap a child at the deadline", async () => {
+	if (process.platform === "win32") return;
+	const started = Date.now();
+	const result = await runMachineIdentityCommand("sleep", ["30"], 50);
+
+	expect(result.exitCode).toBe(124);
+	expect(Date.now() - started).toBeLessThan(1_000);
+});
+
+test("passes the acquisition budget to platform identity probes", async () => {
+	let receivedTimeoutMs: number | undefined;
+	await expect(
+		loadInstallationHostId({
+			platform: "win32",
+			installationSecret: "11".repeat(32),
+			timeoutMs: 37,
+			runCommand: (_command, _args, timeoutMs) => {
+				receivedTimeoutMs = timeoutMs;
+				return { exitCode: 1, stdout: new Uint8Array() };
+			},
+		}),
+	).rejects.toThrow("unavailable or malformed");
+	expect(receivedTimeoutMs).toBe(37);
 });
 
 test("machine identity secret creation falls back when hard links are unavailable", async () => {

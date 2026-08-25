@@ -3,7 +3,6 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir } from "@gajae-code/utils";
-import { $ } from "bun";
 
 export interface MachineIdentityDeps {
 	platform?: NodeJS.Platform;
@@ -11,7 +10,9 @@ export interface MachineIdentityDeps {
 	runCommand?: (
 		command: string,
 		args: readonly string[],
+		timeoutMs?: number,
 	) => { exitCode: number; stdout: Uint8Array } | Promise<{ exitCode: number; stdout: Uint8Array }>;
+	timeoutMs?: number;
 	installationSecret?: string;
 	configRootDir?: string;
 	link?: (existingPath: string, newPath: string) => Promise<void>;
@@ -136,12 +137,7 @@ function legacyMachineIdentity(rawId: string): string {
 async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string> {
 	const platform = deps.platform ?? process.platform;
 	const readFile = deps.readFile ?? (async (file: string) => await fs.readFile(file, "utf8"));
-	const runCommand =
-		deps.runCommand ??
-		(async (command: string, args: readonly string[]) => {
-			const result = await $`${command} ${[...args]}`.quiet().nothrow();
-			return { stdout: result.bytes(), exitCode: result.exitCode };
-		});
+	const runCommand = deps.runCommand ?? runMachineIdentityCommand;
 
 	let rawId: string | undefined;
 	if (platform === "linux") {
@@ -156,10 +152,14 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 			}
 		}
 	} else if (platform === "win32") {
-		const result = await runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
+		const result = await runCommand(
+			"reg",
+			["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
+			deps.timeoutMs,
+		);
 		if (result.exitCode === 0) rawId = parseWindowsMachineGuid(new TextDecoder().decode(result.stdout));
 	} else if (platform === "darwin") {
-		const result = await runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
+		const result = await runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], deps.timeoutMs);
 		if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
 	} else {
 		throw new Error(`machine-local identity is unsupported on ${platform}`);
@@ -167,6 +167,34 @@ async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string
 
 	if (!rawId) throw new Error("machine-local identity is unavailable or malformed");
 	return rawId;
+}
+
+/** @internal Runs a platform identity probe without leaving a child behind after timeout. */
+export async function runMachineIdentityCommand(
+	command: string,
+	args: readonly string[],
+	timeoutMs?: number,
+): Promise<{ exitCode: number; stdout: Uint8Array }> {
+	const child = Bun.spawn([command, ...args], { stdout: "pipe", stderr: "ignore" });
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let timedOut = false;
+	const exit = child.exited;
+	if (timeoutMs !== undefined) {
+		timer = setTimeout(
+			() => {
+				timedOut = true;
+				child.kill("SIGKILL");
+			},
+			Math.max(0, timeoutMs),
+		);
+		timer.unref();
+	}
+	try {
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).bytes(), exit]);
+		return { stdout, exitCode: timedOut ? 124 : exitCode };
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
 }
 
 /** Loads a verified machine-local identity without persisting the underlying machine ID. */
