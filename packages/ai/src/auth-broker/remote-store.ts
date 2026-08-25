@@ -394,6 +394,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (this.#retiredEpochs.has(snapshot.epoch)) return;
 				const currentRank = epochRank(this.#epoch);
 				const incomingRank = epochRank(snapshot.epoch);
+				if (currentRank !== undefined && incomingRank === undefined) return;
 				if (currentRank !== undefined && incomingRank !== undefined && incomingRank < currentRank) return;
 				this.#retiredEpochs.add(this.#epoch);
 			}
