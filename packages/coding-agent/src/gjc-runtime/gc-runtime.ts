@@ -33,6 +33,7 @@ import {
 import { FileSessionStorage, probeSessionRetirement, retireSessionTranscript } from "../session/session-storage";
 
 import { buildGcReportText } from "./gc-render";
+import { type EmptyDeleteGcReport, runEmptyDeleteGc } from "./empty-delete-gc";
 import { collectSessionScopeUsage, type GcSessionScopeUsage, shouldReportSessionScope } from "./gc-session-scope";
 
 export type GcStore = "harness_leases" | "file_locks" | "tmux_sessions" | "registry_entries" | "local_roots";
@@ -168,6 +169,7 @@ export interface GcReport {
 	 * PID-liveness axis above is unchanged by its absence or presence.
 	 */
 	disk?: GcDiskReport;
+	empty_delete_receipts?: EmptyDeleteGcReport;
 }
 
 export interface GcRunResult {
@@ -274,9 +276,11 @@ interface ParsedGcArgs {
 	json: boolean;
 	prune: boolean;
 	repairSessionIndex: boolean;
-	/** Opt-in second axis: report (and with `--prune`, reclaim) on-disk retention. */
 	disk: boolean;
 	help: boolean;
+	emptyDeleteReceipts: boolean;
+	emptyDeleteRoots: string[];
+	emptyDeleteManifest?: string;
 }
 
 class GcUsageError extends Error {}
@@ -286,10 +290,13 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 	let prune = false;
 	let repairSessionIndex = false;
 	let disk = false;
-
 	let dryRun = false;
 	let help = false;
-	for (const arg of argv) {
+	let emptyDeleteReceipts = false;
+	const emptyDeleteRoots: string[] = [];
+	let emptyDeleteManifest: string | undefined;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i]!;
 		switch (arg) {
 			case "--json":
 			case "-j":
@@ -305,7 +312,6 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 			case "--disk":
 				disk = true;
 				break;
-
 			case "--dry-run":
 				dryRun = true;
 				break;
@@ -313,15 +319,29 @@ function parseGcArgs(argv: string[]): ParsedGcArgs {
 			case "-h":
 				help = true;
 				break;
+			case "--empty-delete-receipts":
+				emptyDeleteReceipts = true;
+				break;
+			case "--root": {
+				const value = argv[++i];
+				if (!value) throw new GcUsageError("missing_root");
+				emptyDeleteRoots.push(value);
+				break;
+			}
+			case "--manifest": {
+				const value = argv[++i];
+				if (!value) throw new GcUsageError("missing_manifest");
+				emptyDeleteManifest = value;
+				break;
+			}
 			default:
 				throw new GcUsageError(`unknown_flag:${arg}`);
 		}
 	}
 	if (repairSessionIndex && prune) throw new GcUsageError("repair_session_index_cannot_combine_with_prune");
 	if (repairSessionIndex && dryRun) throw new GcUsageError("repair_session_index_cannot_combine_with_dry_run");
-	// Explicit --dry-run always wins over --prune/--force.
 	if (dryRun) prune = false;
-	return { json, prune, repairSessionIndex, disk, help };
+	return { json, prune, repairSessionIndex, disk, help, emptyDeleteReceipts, emptyDeleteRoots, emptyDeleteManifest };
 }
 
 /**
@@ -495,6 +515,26 @@ export async function runGjcGcCommand(
 			prune: parsed.prune,
 		});
 	}
+	if (parsed.emptyDeleteReceipts) {
+		const roots = [...parsed.emptyDeleteRoots];
+		if (parsed.emptyDeleteManifest) {
+			const raw = await fsp.readFile(parsed.emptyDeleteManifest, "utf8");
+			const parsedManifest = JSON.parse(raw) as { roots?: unknown };
+			if (!Array.isArray(parsedManifest.roots)) {
+				return { stdout: "", stderr: "gjc gc: manifest_roots_required\n", status: 2 };
+			}
+			for (const root of parsedManifest.roots) {
+				if (typeof root !== "string" || root.length === 0) {
+					return { stdout: "", stderr: "gjc gc: manifest_root_invalid\n", status: 2 };
+				}
+				roots.push(root);
+			}
+		}
+		if (roots.length === 0) {
+			return { stdout: "", stderr: "gjc gc: empty_delete_receipts_requires_root_or_manifest\n", status: 2 };
+		}
+		report.empty_delete_receipts = await runEmptyDeleteGc({ roots, prune: parsed.prune });
+	}
 	const scopeUsage = await collectGcSessionScope(cwd, resolveGcAgentDir(env));
 	if (scopeUsage && shouldReportSessionScope(scopeUsage)) report.session_scope = scopeUsage;
 	const sessionIndexFailed =
@@ -513,7 +553,7 @@ export function gcHelpText(): string {
 		"gjc gc - garbage-collect stale GJC session/PID records",
 		"",
 		"USAGE",
-		"  $ gjc gc [--prune|--force] [--disk] [--repair-session-index] [--json]",
+		"  $ gjc gc [--prune|--force] [--disk] [--repair-session-index] [--empty-delete-receipts --root <dir>] [--json]",
 
 		"",
 		"FLAGS",
@@ -522,6 +562,9 @@ export function gcHelpText(): string {
 		"  -j, --json        Emit machine-readable JSON",
 		"  --repair-session-index  Explicitly quarantine a corrupt session-index suffix and retain its valid prefix",
 		"  --disk            Also report on-disk retention (sessions, blobs, artifacts, natives, backups)",
+		"  --empty-delete-receipts  Report/prune empty .gjc-delete-* under --root / --manifest",
+		"  --root <dir>      Operand root for --empty-delete-receipts (repeatable)",
+		"  --manifest <file> JSON {\"roots\":[...]} for --empty-delete-receipts",
 		"",
 		"Liveness-only: a record is removed only when its owning process is dead",
 		"(ESRCH). Live / permission-denied / unknown processes are always kept.",

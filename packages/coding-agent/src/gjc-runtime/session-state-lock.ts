@@ -150,6 +150,12 @@ export const SessionStateLockTestHooks: {
 	 */
 	beforeCurrentOwnerRelease?: (file: string) => void | Promise<void>;
 	beforeLegacyDirectoryRemoval?: (lockDir: string) => void | Promise<void>;
+	/** @internal Last quarantine name minted in the current lock cycle (tests). */
+	lastQuarantineName?: string;
+	/** @internal Count of quarantine names minted in the current lock cycle (tests). */
+	quarantineMints?: number;
+	/** @internal Force the next mint to this name so leftover-collision tests can plant it. */
+	forcedQuarantineName?: string;
 } = {};
 
 /** Raised when the lock could not be acquired; callers map it to their own refusal. */
@@ -537,8 +543,16 @@ type ExactRemovalOutcome = "removed" | "absent" | "identity_mismatch" | "refused
  * A single-component quarantine destination, required by the native primitive so that
  * authority over a detached record survives a crash between detach and unlink.
  */
-function lockQuarantineName(): string {
-	return `.gjc-delete-session-state-lock-${randomUUID()}.json`;
+function lockQuarantineName(existing?: string): string {
+	const name =
+		existing ??
+		SessionStateLockTestHooks.forcedQuarantineName ??
+		`.gjc-delete-session-state-lock-${randomUUID()}.json`;
+	if (!existing) {
+		SessionStateLockTestHooks.lastQuarantineName = name;
+		SessionStateLockTestHooks.quarantineMints = (SessionStateLockTestHooks.quarantineMints ?? 0) + 1;
+	}
+	return name;
 }
 
 /**
@@ -548,7 +562,11 @@ function lockQuarantineName(): string {
  * never downgraded to `fs.rm`: not knowing what is at the pathname is precisely the state
  * in which deleting it destroys a successor's lock.
  */
-function exactUnlinkOwnerRecord(file: string, identity: LockOwnerSnapshot): ExactRemovalOutcome {
+function exactUnlinkOwnerRecord(
+	file: string,
+	identity: LockOwnerSnapshot,
+	quarantineName = lockQuarantineName(),
+): ExactRemovalOutcome {
 	let result: NativeExactUnlinkResult;
 	try {
 		result = nativeSessionStateLock().exactUnlink(file, {
@@ -558,7 +576,7 @@ function exactUnlinkOwnerRecord(file: string, identity: LockOwnerSnapshot): Exac
 			size: identity.size,
 			mtimeNs: identity.mtimeNs,
 			sha256: identity.sha256,
-			quarantineName: lockQuarantineName(),
+			quarantineName,
 		});
 	} catch (error) {
 		throw new SessionStateLockUnavailableError(error);
@@ -907,6 +925,7 @@ async function reclaimStaleOwnerRecord(
 		afterInspection?: (file: string) => void | Promise<void>;
 		beforeRemoval?: (file: string) => void | Promise<void>;
 	},
+	quarantineName?: string,
 ): Promise<void> {
 	const snapshot = await captureRegularLockOwner(file);
 	if (!snapshot) return;
@@ -925,10 +944,29 @@ async function reclaimStaleOwnerRecord(
 	const current = await captureRegularLockOwner(file);
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
 	await hooks.beforeRemoval?.(file);
-	const outcome = exactUnlinkOwnerRecord(file, current);
+	const reserved = quarantineName ?? lockQuarantineName();
+	await removeVerifiedEmptyQuarantine(path.dirname(file), reserved);
+	const outcome = exactUnlinkOwnerRecord(file, current, reserved);
 	// A successor that took the path in the final window keeps it; this call just loses.
 	if (outcome === "refused")
 		throw new SessionStateLockUnavailableError(new Error("Stale owner record could not be reclaimed."));
+}
+
+/** Verified empty leftover at a reserved quarantine name is incomplete debris, not in-progress cleanup. */
+export async function removeVerifiedEmptyQuarantine(directory: string, name: string): Promise<void> {
+	if (!name.startsWith(".gjc-delete-") || name.includes("/") || name.includes("\0")) return;
+	const target = path.join(directory, name);
+	let stat: fsSync.Stats;
+	try {
+		stat = await fs.lstat(target);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	if (stat.isSymbolicLink() || !stat.isFile() || stat.size !== 0 || stat.nlink !== 1) return;
+	await fs.unlink(target).catch(error => {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	});
 }
 
 async function releaseTransitionClaim(
@@ -1014,14 +1052,18 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
  * window, and the identity-bound delete keeps a BASE writer — which takes no claim and
  * just creates the pathname — from having its brand-new lock unlinked.
  */
-async function reclaimStaleRegularLock(lockFile: string): Promise<void> {
+async function reclaimStaleRegularLock(lockFile: string, quarantineName?: string): Promise<void> {
 	await withLockPathTransition(
 		lockFile,
 		async () =>
-			await reclaimStaleOwnerRecord(lockFile, {
-				afterInspection: SessionStateLockTestHooks.afterStaleInspection,
-				beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
-			}),
+			await reclaimStaleOwnerRecord(
+				lockFile,
+				{
+					afterInspection: SessionStateLockTestHooks.afterStaleInspection,
+					beforeRemoval: SessionStateLockTestHooks.beforeStaleRemoval,
+				},
+				quarantineName,
+			),
 	);
 }
 
@@ -1161,7 +1203,7 @@ async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
  * @internal exported as the seam these decisions are tested through: a live legacy
  * directory owner must be provably left alone without waiting out a real stale window.
  */
-export async function reclaimStaleSessionStateLock(lockFile: string): Promise<void> {
+export async function reclaimStaleSessionStateLock(lockFile: string, quarantineName?: string): Promise<void> {
 	let stat: fsSync.Stats;
 	try {
 		stat = await fs.lstat(lockFile);
@@ -1178,7 +1220,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
 	// path is refused outright rather than inspected or removed.
 	if (!stat.isFile()) throw new SessionStateLockUnavailableError();
 	await SessionStateLockTestHooks.afterLockTypeDecision?.(lockFile);
-	await reclaimStaleRegularLock(lockFile);
+	await reclaimStaleRegularLock(lockFile, quarantineName);
 }
 
 /**
@@ -1193,6 +1235,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 	const lockFile = `${stateFile}.lock`;
 	const owner = await newLockOwner();
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
+	const cycleQuarantine = lockQuarantineName();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
 		let held: LockOwnerSnapshot | undefined;
 		try {
@@ -1235,7 +1278,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 				throw error instanceof SessionStateLockUnavailableError
 					? error
 					: new SessionStateLockUnavailableError(error);
-			await reclaimStaleSessionStateLock(lockFile);
+			await reclaimStaleSessionStateLock(lockFile, cycleQuarantine);
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 		}
 	}

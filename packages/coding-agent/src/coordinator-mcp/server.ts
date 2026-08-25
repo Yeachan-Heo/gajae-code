@@ -60,6 +60,7 @@ import {
 	syncCoordinatorDirectory,
 	writeCoordinatorAtomic,
 } from "./durability";
+import { listCoordinatorJsonFiles } from "./projection-scan";
 import {
 	createDefaultEventWebhookDelivery,
 	deliverEventWebhook,
@@ -1448,26 +1449,17 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 }
 
 async function listJsonFiles(dir: string): Promise<unknown[]> {
-	try {
-		const entries = await fs.readdir(dir);
-		const values = await Promise.all(
-			entries
-				.filter(entry => entry.endsWith(".json") && !entry.startsWith(".gjc-"))
-				.map(async entry => {
-					try {
-						return await readJsonFile(path.join(dir, entry));
-					} catch (error) {
-						if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-						logger.warn("Coordinator projection read failed", { path: entry, error: String(error) });
-						throw error;
-					}
-				}),
-		);
-		return values.filter(value => value !== null);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw error;
+	const scan = await listCoordinatorJsonFiles(dir);
+	if (scan.capped || scan.skippedEmpty > 0) {
+		logger.warn("Coordinator projection scan skipped debris or hit the parse cap", {
+			dir,
+			parsed: scan.parsed,
+			capped: scan.capped,
+			skippedDebris: scan.skippedDebris,
+			skippedEmpty: scan.skippedEmpty,
+		});
 	}
+	return scan.values;
 }
 
 const COORDINATOR_STATUS_EVENT_LIMIT = 100;

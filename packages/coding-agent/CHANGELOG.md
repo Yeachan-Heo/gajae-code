@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Coordinator no longer treats native exact-unlink placeholders (empty `.gjc-delete-*.json`) as live projection JSON. Directory scans skip dotfiles and zero-byte files before open, apply the parse cap only after that filter, and never map scan exhaustion to `coordinator_state_unreadable`. Session-state lock reclaim reuses one quarantine name per acquire cycle and removes a verified-empty leftover at that name before exchange. `gjc gc --empty-delete-receipts --root/--manifest` reports or prunes only operator-supplied empty receipts (inode identity + symlink-root reject; no hardcoded host paths).
+
 - Foreground activity animation now uses layout-only TUI repaints, avoiding repeated reconstruction of unchanged transcript content during long sessions.
 
 ## [0.15.2] - 2026-08-25
