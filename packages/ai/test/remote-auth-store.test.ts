@@ -188,6 +188,44 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		remoteStore.close();
 	});
 
+	test("rejects delayed data from a retired broker epoch even with a newer timestamp", async () => {
+		let nextSnapshot: SnapshotResponse = {
+			generation: 1,
+			epoch: "new-epoch",
+			generatedAt: 100,
+			serverNowMs: 100,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [],
+		};
+		const fetchImpl = async (): Promise<Response> =>
+			new Response(JSON.stringify(nextSnapshot), {
+				status: 200,
+				headers: { "Content-Type": "application/json", ETag: `"${nextSnapshot.generation}"` },
+			});
+		const client = new AuthBrokerClient({
+			url: "http://broker.test",
+			token: "token",
+			fetchImpl: fetchImpl as unknown as typeof fetch,
+			maxRetries: 0,
+		});
+		const remoteStore = new RemoteAuthCredentialStore({
+			client,
+			streamSnapshots: false,
+			initialSnapshot: {
+				...nextSnapshot,
+				generation: 99,
+				epoch: "old-epoch",
+				serverNowMs: 200,
+			},
+		});
+		await remoteStore.refreshSnapshot();
+		nextSnapshot = { ...nextSnapshot, generation: 100, epoch: "old-epoch", serverNowMs: 300 };
+		await remoteStore.refreshSnapshot();
+		expect(remoteStore.snapshot.epoch).toBe("new-epoch");
+		expect(remoteStore.snapshot.generation).toBe(1);
+		remoteStore.close();
+	});
+
 	test("getUsageReport coalesces parallel callers and matches by identity", async () => {
 		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
 		const remoteStore = new RemoteAuthCredentialStore({

@@ -169,12 +169,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#snapshotReceivedAt = Date.now();
 	#generation = 0;
 	#epoch?: string;
+	#retiredEpochs = new Set<string>();
 	#backgroundAbort = new AbortController();
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
 	#usageCacheEpoch = 0;
-	#snapshotRefreshInflight?: Promise<SnapshotResponse>;
 	#inventoryMetadata = new Map<number, CredentialMetadataRecord>();
 	#inventoryMetadataGeneration = -1;
 	#inventoryState: CredentialInventoryMetadataState = {
@@ -381,7 +381,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		// broker epoch, while an older timestamp is an out-of-order response from
 		// the current epoch and must be discarded.
 		if (this.#epoch && snapshot.epoch && snapshot.epoch !== this.#epoch) {
-			if (snapshot.serverNowMs <= this.#snapshot.serverNowMs) return;
+			if (this.#retiredEpochs.has(snapshot.epoch)) return;
+			this.#retiredEpochs.add(this.#epoch);
+			if (this.#retiredEpochs.size > 16) {
+				const oldest = this.#retiredEpochs.values().next().value;
+				if (typeof oldest === "string") this.#retiredEpochs.delete(oldest);
+			}
 		} else if (generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) {
 			return;
 		}
@@ -639,19 +644,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
 	async refreshSnapshot(): Promise<SnapshotResponse> {
-		const inflight = this.#snapshotRefreshInflight;
-		if (inflight) return inflight;
-		const refresh = (async (): Promise<SnapshotResponse> => {
-			const result = await this.#client.fetchSnapshot();
-			if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
-			return this.#snapshot;
-		})();
-		this.#snapshotRefreshInflight = refresh;
-		try {
-			return await refresh;
-		} finally {
-			if (this.#snapshotRefreshInflight === refresh) this.#snapshotRefreshInflight = undefined;
-		}
+		const result = await this.#client.fetchSnapshot();
+		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+		return this.#snapshot;
 	}
 
 	listAuthCredentials(provider?: string): StoredAuthCredential[] {
