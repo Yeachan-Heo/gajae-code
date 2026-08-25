@@ -154,14 +154,14 @@ describe("boundary-review fold regressions", () => {
 	// BLOCK 2: a completion parked during receipt capture must schedule its own
 	// wake through the delivery path, not rely on an unrelated idle rearm.
 	test("a parked completion replay drives deliverParked with its receipt", async () => {
-		const parkedDeliveries: string[] = [];
+		const parkedDeliveries: Array<{ jobId: string; text: string }> = [];
 		const coordinator = new FoldCoordinator({
 			armSteeringFence: () => () => {},
 			requestStop: () => {},
 			captureRemainingIntent: () =>
 				new Promise<string | undefined>(resolve => setTimeout(() => resolve("intent"), 10)),
 			deliverParked: (_job, disposition) => {
-				parkedDeliveries.push(disposition.receipt.jobId);
+				parkedDeliveries.push({ jobId: disposition.receipt.jobId, text: disposition.text });
 			},
 		});
 		const target = fakeJob("bg_p", "job:p");
@@ -176,7 +176,7 @@ describe("boundary-review fold regressions", () => {
 		const folded = await folding;
 		expect(folded.status).toBe("folded");
 		// The replay carried the receipt INTO the wake path.
-		expect(parkedDeliveries).toEqual(["bg_p"]);
+		expect(parkedDeliveries).toEqual([{ jobId: "bg_p", text: "raced output" }]);
 		expect(coordinator.slotStateFor(target)).toBe("carried");
 	});
 

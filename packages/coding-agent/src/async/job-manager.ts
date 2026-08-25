@@ -1996,6 +1996,11 @@ export class AsyncJobManager {
 		return this.#filterJobs(this.#jobs.values(), filter).filter(job => job.status === "running");
 	}
 
+	/** Whether a new running job can be admitted without starting side effects. */
+	hasCapacity(filter?: AsyncJobFilter): boolean {
+		return this.getRunningJobs(filter).length < this.#maxRunningJobs;
+	}
+
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter)
 			.filter(job => job.status !== "running")
@@ -2551,11 +2556,11 @@ export class AsyncJobManager {
 		}
 
 		const base = preferredId.trim();
-		if (!this.#jobs.has(base)) return base;
+		if (!this.#jobs.has(base) && !this.#hasDeliveryCollisionForJobId(base)) return base;
 
 		let suffix = 2;
 		let candidate = `${base}-${suffix}`;
-		while (this.#jobs.has(candidate)) {
+		while (this.#jobs.has(candidate) || this.#hasDeliveryCollisionForJobId(candidate)) {
 			suffix += 1;
 			candidate = `${base}-${suffix}`;
 		}
@@ -2701,6 +2706,23 @@ export class AsyncJobManager {
 			this.#deliveries.some(delivery => delivery.jobId === jobId) ||
 			this.#inFlightDeliveries.some(delivery => delivery.jobId === jobId)
 		);
+	}
+
+	/** Whether a retained delivery generation already claims `jobId`. */
+	#hasDeliveryCollisionForJobId(jobId: string): boolean {
+		if (this.#hasPendingDeliveryForJobId(jobId)) return true;
+		if (this.#suppressedDeliveries.has(jobId)) return true;
+		if (this.#deadLetteredDeliveries.has(jobId)) return true;
+		for (const entry of this.#evictedDeadLetters.values()) {
+			if (entry.jobId === jobId) return true;
+		}
+		// Acknowledged deliveries are removed from #deliveries, so resolve their
+		// job id through the retained terminal event while the suppressed generation
+		// remains observable.
+		for (const event of this.#terminalEvents.values()) {
+			if (event.jobId === jobId && this.#suppressedDeliveries.has(event.generation)) return true;
+		}
+		return false;
 	}
 
 	/**

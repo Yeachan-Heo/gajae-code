@@ -2632,7 +2632,7 @@ export class AgentSession {
 			this.yieldQueue.enqueue("fold-parked-replay", {
 				jobId: disposition.receipt.jobId,
 				generation: disposition.receipt.jobGeneration,
-				text: describeFoldReceipt(disposition.receipt),
+				text: `${disposition.text}\n\n${describeFoldReceipt(disposition.receipt)}`,
 			});
 		},
 	});

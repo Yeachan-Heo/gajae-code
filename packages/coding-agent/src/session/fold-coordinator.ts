@@ -86,6 +86,8 @@ export interface FoldAdapter {
 	readonly jobGeneration: string;
 	readonly label: string;
 	readonly cwdSensitive: boolean;
+	/** Signal for the foreground wait; aborting capture must roll back the fold. */
+	readonly signal?: AbortSignal;
 	readonly outputRef: JobOutputRetrieval;
 	/** Registration-bound resolver: the job for this adapter, or undefined once evicted or reused. */
 	readonly getJob: () => AsyncJob | undefined;
@@ -105,12 +107,13 @@ export type FoldRequestResult =
 export type FoldDeliveryDisposition =
 	| { kind: "ordinary" }
 	| { kind: "parked" }
-	| { kind: "receipt"; receipt: FoldReceipt };
+	| { kind: "receipt"; receipt: FoldReceipt; text: string };
 
 interface ReservedSlot {
 	state: "reserved";
 	adapter: FoldAdapter;
 	parked: ForegroundTerminalPayload | undefined;
+	parkedAt: number | undefined;
 }
 
 interface PresentSlot {
@@ -139,7 +142,7 @@ export interface FoldCoordinatorDeps {
 	 * replays it (A6), THIS is what makes the wake happen rather than relying on
 	 * an unrelated idle rearm to rescue it.
 	 */
-	deliverParked: (job: AsyncJob, disposition: { kind: "receipt"; receipt: FoldReceipt }) => void;
+	deliverParked: (job: AsyncJob, disposition: { kind: "receipt"; receipt: FoldReceipt; text: string }) => void;
 }
 
 /** Why a slot is being retired, which decides whether retiring is safe. */
@@ -232,13 +235,27 @@ export class FoldCoordinator {
 
 		// S3 claim + reserve, S4 hand-off is the reservation itself, S5 arm the fence.
 		this.#folding.add(job);
-		this.#slots.set(job, { state: "reserved", adapter, parked: undefined });
+		this.#slots.set(job, { state: "reserved", adapter, parked: undefined, parkedAt: undefined });
 		const releaseFence = this.#deps.armSteeringFence();
 
 		let remainingIntent: string | undefined;
 		try {
 			// A1 capture.
-			remainingIntent = await this.#deps.captureRemainingIntent();
+			const signal = adapter.signal;
+			if (signal?.aborted) throw new Error("fold capture aborted");
+			const capture = Promise.resolve(this.#deps.captureRemainingIntent());
+			if (!signal) {
+				remainingIntent = await capture;
+			} else {
+				const aborted = Promise.withResolvers<never>();
+				const onAbort = () => aborted.reject(new Error("fold capture aborted"));
+				signal.addEventListener("abort", onAbort, { once: true });
+				try {
+					remainingIntent = await Promise.race([capture, aborted.promise]);
+				} finally {
+					signal.removeEventListener("abort", onAbort);
+				}
+			}
 		} catch (error) {
 			return this.#rollback(job, adapter, releaseFence, error instanceof Error ? error.message : String(error));
 		}
@@ -296,7 +313,7 @@ export class FoldCoordinator {
 	 */
 	onDelivery(job: AsyncJob, text: string): FoldDeliveryDisposition {
 		const carried = this.#carriers.get(job);
-		if (carried) return { kind: "receipt", receipt: carried };
+		if (carried) return { kind: "receipt", receipt: carried, text };
 
 		const slot = this.#slots.get(job);
 		if (!slot) return { kind: "ordinary" };
@@ -304,13 +321,14 @@ export class FoldCoordinator {
 		if (slot.state === "reserved") {
 			// Park: the receipt does not exist yet, so enqueue nothing. A6 replays it.
 			slot.parked = { jobId: slot.adapter.jobId, generation: slot.adapter.jobGeneration, text };
+			slot.parkedAt = Date.now();
 			return { kind: "parked" };
 		}
 
 		// Attach first, then release the slot: order matters for retries.
 		this.#carriers.set(job, slot.receipt);
 		this.#slots.delete(job);
-		return { kind: "receipt", receipt: slot.receipt };
+		return { kind: "receipt", receipt: slot.receipt, text };
 	}
 
 	/**
@@ -333,7 +351,15 @@ export class FoldCoordinator {
 			return true;
 		}
 
-		if (slot.state === "reserved" && slot.parked !== undefined) return false;
+		if (slot.state === "reserved" && slot.parked !== undefined) {
+			const parkedAt = slot.parkedAt ?? Date.now();
+			if (Date.now() - parkedAt <= FOLD_WAKE_MERGE_WINDOW_MS * 4) return false;
+			const parked = slot.parked;
+			this.#slots.delete(job);
+			this.#folding.delete(job);
+			slot.adapter.resolveForegroundObserver(parked);
+			return true;
+		}
 		if (job.status === "cancelled" || job.status === "paused") {
 			this.#slots.delete(job);
 			this.#folding.delete(job);

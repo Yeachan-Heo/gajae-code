@@ -50,6 +50,46 @@ describe("AsyncJobManager delivery reliability", () => {
 		}
 	});
 
+	// An explicit preferred id follows the same deterministic suffix policy as a
+	// live-id collision, but must also avoid a prior generation whose completion
+	// callback is still in flight after zero-retention eviction.
+	test("renames a preferred id while its prior delivery is still in flight", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		const delivered: string[] = [];
+		let first = "";
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+				if (jobId === first) {
+					deliveryStarted.resolve();
+					await releaseDelivery.promise;
+				}
+			},
+		});
+
+		try {
+			first = manager.register("bash", "first", async () => "first-output", { id: "preferred-delivery" });
+			await deliveryStarted.promise;
+
+			// The first record is gone, but its completion delivery still owns the id.
+			expect(manager.getJob(first)).toBeUndefined();
+			expect(manager.getDeliveryState().pendingJobIds).toContain(first);
+
+			const second = manager.register("bash", "second", async () => "second-output", { id: first });
+			expect(second).toBe(`${first}-2`);
+
+			releaseDelivery.resolve();
+			await manager.waitForAll();
+			await waitFor(() => delivered.length === 2);
+			expect(delivered).toEqual([first, second]);
+		} finally {
+			releaseDelivery.resolve();
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
+
 	// T-R4, unfolded counterpart: this is the plain `async: true` bash shape (a
 	// job whose result is delivered through `onJobComplete`), proving the fix is
 	// not specific to folded work.

@@ -199,10 +199,15 @@ describe("interactive PTY fold ownership", () => {
 
 	it("has no kill entry point left in the overlay lifecycle", async () => {
 		// Structural guard: the overlay's dismiss/dispose handlers used to call
-		// session.kill(), and the native session also kills on Drop. Re-introducing
-		// either would silently kill folded work.
+		// session.kill(). Owner teardown is allowed to kill the process, but the
+		// observer view must remain a non-owning lifecycle participant.
 		const source = await Bun.file(new URL("../src/tools/bash-interactive.ts", import.meta.url).pathname).text();
-		expect(source).not.toContain("session.kill()");
+		const overlayStart = source.indexOf("class BashInteractiveOverlayComponent");
+		const runnerStart = source.indexOf("export async function runInteractiveBashPty");
+		expect(overlayStart).toBeGreaterThanOrEqual(0);
+		expect(runnerStart).toBeGreaterThan(overlayStart);
+		expect(source.slice(overlayStart, runnerStart)).not.toContain(".kill(");
+		expect(source).toContain('getKeybindings().matches(data, "app.tool.backgroundFold")');
 	});
 
 	it("keeps its original deadline after folding, surfacing the expiry as a real outcome", async () => {

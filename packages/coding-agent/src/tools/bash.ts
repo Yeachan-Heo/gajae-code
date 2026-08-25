@@ -885,6 +885,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				},
 			},
 		);
+		const jobGeneration = manager.getJob(jobId)?.generation ?? jobId;
+		const unregisterOwnerCleanup = manager.registerOwnerCleanup(this.session.getAgentId?.() ?? "0-Main", () => {
+			manager.failNow(jobId, jobGeneration, "Bash job owner was torn down.");
+		});
+		void completion.promise.finally(unregisterOwnerCleanup);
 		registerOwnedIfLineaged(manager, options.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 
 		return {
@@ -1183,6 +1188,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (!manager) {
 			throw new ToolError("Async job manager unavailable for this session.");
 		}
+		if (!manager.hasCapacity()) {
+			throw new ToolError("Background job limit reached. Wait for running jobs to finish or cancel one.");
+		}
 		const prepared = await this.#prepareBashExecution(input, opts.ctx);
 		const label =
 			opts.label ?? (prepared.command.length > 120 ? `${prepared.command.slice(0, 117)}...` : prepared.command);
@@ -1307,6 +1315,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (this.session.bashRestrictionProfile === "read-only" && pty) {
 			throw new ToolError("Read-only bash does not allow PTY mode.");
 		}
+		const admissionManager = this.#resolveOwnedJobManager();
+		if (asyncRequested && !admissionManager) {
+			throw new ToolError("Async job manager unavailable for this session.");
+		}
+		if (admissionManager && !admissionManager.hasCapacity()) {
+			throw new ToolError("Background job limit reached. Wait for running jobs to finish or cancel one.");
+		}
 
 		const prepared = await this.#prepareBashExecution(
 			{ command: rawCommand, env: rawEnv, timeout: rawTimeout, cwd },
@@ -1409,6 +1424,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				jobGeneration,
 				label: job.label,
 				cwdSensitive: true,
+				signal,
 				outputRef: {
 					jobId: job.jobId,
 					generation: jobGeneration,
@@ -1789,6 +1805,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				jobGeneration: bridgeGeneration,
 				label: bridgeLabel,
 				cwdSensitive: true,
+				signal,
 				outputRef: {
 					jobId: bridgeJobId,
 					generation: bridgeGeneration,
@@ -1879,6 +1896,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// has already returned.
 		let ptyFoldUnregister: (() => void) | undefined;
 		let ptyFoldResult: AgentToolResult<BashToolDetails> | undefined;
+		let ptyBackgrounded = false;
+		let lastPtyFoldKeyTime = 0;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
@@ -1903,6 +1922,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							ptyLabel,
 							async () => {
 								const outcome = await controls.terminalCompletion;
+								if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
 								return this.#extractTextResult(
 									this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec }),
 								);
@@ -1910,12 +1930,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							{ ownerId: this.session.getAgentId?.() ?? undefined },
 						);
 						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
+						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(
+							this.session.getAgentId?.() ?? "0-Main",
+							() => {
+								controls.kill();
+								ptyManager.failNow(ptyJobId, ptyGeneration, "PTY job owner was torn down.");
+							},
+						);
+						void controls.terminalCompletion.finally(unregisterPtyOwnerCleanup);
 						ptyFoldUnregister = this.session.registerForegroundFoldParticipant?.({
 							kind: "bash-pty",
 							jobId: ptyJobId,
 							jobGeneration: ptyGeneration,
 							label: ptyLabel,
 							cwdSensitive: true,
+							signal,
 							outputRef: {
 								jobId: ptyJobId,
 								generation: ptyGeneration,
@@ -1928,6 +1957,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							detachObserver: () => {
 								// Output-only continuation: stdin forwarding ends here and the
 								// process is never killed or restarted by folding.
+								ptyBackgrounded = true;
 								ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
 								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
 									requestedTimeoutSec,
@@ -1941,6 +1971,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							},
 							resolveForegroundObserver: () => "already-settled",
 						});
+					},
+					onFoldKey: () => {
+						const now = Date.now();
+						if (now - lastPtyFoldKeyTime > 750) {
+							lastPtyFoldKeyTime = now;
+							return true;
+						}
+						lastPtyFoldKeyTime = 0;
+						return this.session.requestForegroundBashBackground?.() ?? false;
 					},
 				})
 			: await executeBash(command, {

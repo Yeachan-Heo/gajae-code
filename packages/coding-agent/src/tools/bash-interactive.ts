@@ -3,6 +3,7 @@ import type { PtySession as NativePtySession, PtyRunResult } from "@gajae-code/n
 import {
 	type Component,
 	extractPrintableText,
+	getKeybindings,
 	matchesKey,
 	padding,
 	parseKey,
@@ -115,6 +116,7 @@ class BashInteractiveOverlayComponent implements Component {
 	#writeOffset = 0;
 	#flushResolvers: Array<() => void> = [];
 	#writing = false;
+	#onFoldKey: () => boolean = () => false;
 
 	constructor(
 		private readonly command: string,
@@ -131,10 +133,16 @@ class BashInteractiveOverlayComponent implements Component {
 		});
 	}
 
-	setHandlers(onInput: (data: string) => void, onDismiss: () => void, onDispose: () => void): void {
+	setHandlers(
+		onInput: (data: string) => void,
+		onDismiss: () => void,
+		onDispose: () => void,
+		onFoldKey: () => boolean,
+	): void {
 		this.#onInput = onInput;
 		this.#onDismiss = onDismiss;
 		this.#onDispose = onDispose;
+		this.#onFoldKey = onFoldKey;
 	}
 
 	appendOutput(chunk: string): void {
@@ -199,6 +207,10 @@ class BashInteractiveOverlayComponent implements Component {
 	}
 
 	handleInput(data: string): void {
+		if (this.#state === "running" && getKeybindings().matches(data, "app.tool.backgroundFold")) {
+			this.#onFoldKey();
+			return;
+		}
 		if (this.#state === "running" && (matchesKey(data, "escape") || matchesKey(data, "esc"))) {
 			this.#onDismiss();
 			return;
@@ -306,6 +318,8 @@ export interface InteractivePtyControls {
 	 * from this, so its result can never be silently dropped.
 	 */
 	terminalCompletion: Promise<BashInteractiveResult>;
+	/** Kill the owned process during owner teardown; the observer never calls this. */
+	kill: () => void;
 }
 
 export async function runInteractiveBashPty(
@@ -324,6 +338,7 @@ export async function runInteractiveBashPty(
 		settings?: Settings;
 		/** Receives live controls once the session is running; used to register a fold. */
 		onControls?: (controls: InteractivePtyControls) => void;
+		onFoldKey?: () => boolean;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = options.settings ?? (await Settings.init());
@@ -419,6 +434,7 @@ export async function runInteractiveBashPty(
 
 	options.onControls?.({
 		terminalCompletion: terminal.promise,
+		kill: () => session.kill(),
 		detachObserver: (foldResult: BashInteractiveResult) => {
 			const outcome = settle(foldResult);
 			if (outcome === "resolved") observer = undefined;
@@ -455,6 +471,7 @@ export async function runInteractiveBashPty(
 						},
 						() => {},
 						() => {},
+						options.onFoldKey ?? (() => false),
 					);
 					observer = component;
 					return component;
