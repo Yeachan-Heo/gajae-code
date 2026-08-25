@@ -1514,8 +1514,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			try {
 				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
 			} catch (error) {
-				await handle.kill();
-				await handle.release();
+				await Promise.allSettled([handle.kill(), handle.release()]);
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
 			}
