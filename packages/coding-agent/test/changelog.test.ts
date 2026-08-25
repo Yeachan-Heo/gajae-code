@@ -139,7 +139,10 @@ describe("first-run changelog display", () => {
 		expect(olderVersion).toBeDefined();
 
 		expect(firstRunEntry!.content).toContain(`## [${VERSION}]`);
-		const olderHeading = `## [${olderVersion!.major}.${olderVersion!.minor}.${olderVersion!.patch}]`;
-		expect(firstRunEntry!.content.split("\n")).not.toContain(olderHeading);
+		// Current release notes may refer to an unpublished predecessor in prose; only
+		// another changelog heading would mean first-run display leaked an old entry.
+		expect(firstRunEntry!.content).not.toMatch(
+			new RegExp(`^## \\[${olderVersion!.major}.${olderVersion!.minor}.${olderVersion!.patch}\\]`, "m"),
+		);
 	});
 });
