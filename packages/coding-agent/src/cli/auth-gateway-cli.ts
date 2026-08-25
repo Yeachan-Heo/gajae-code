@@ -80,10 +80,11 @@ function safeDiagnostic(value: unknown, fallback: string): string {
 function writeCommandFailure(action: AuthGatewayAction, flags: AuthGatewayCommandArgs["flags"], error: unknown): void {
 	const stable = stableErrorForAction(action);
 	const scope = normalizeProviderScope(flags.provider);
+	const scopeLabel = flags.provider === undefined ? "(unscoped)" : (scope ?? "(invalid)");
 	if (flags.json) {
 		process.stdout.write(`${JSON.stringify({ ok: false, error: stable, scope })}\n`);
 	} else {
-		process.stderr.write(`scope: ${scope ?? "(unscoped)"}\n`);
+		process.stderr.write(`scope: ${scopeLabel}\n`);
 		const message = action === "check" ? stable.message : safeDiagnostic(error, stable.message);
 		process.stderr.write(`${chalk.red("FAILED")} ${message}\n`);
 	}
@@ -455,6 +456,9 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 
 export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promise<void> {
 	try {
+		if (cmd.flags.provider !== undefined && !normalizeProviderScope(cmd.flags.provider)) {
+			throw new Error("Invalid provider scope.");
+		}
 		switch (cmd.action) {
 			case "serve":
 				await runServe(cmd.flags);
