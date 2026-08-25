@@ -257,9 +257,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			limits: [],
 			metadata: { email: "b@example.com" },
 		};
-		const fetchSpy = vi
-			.spyOn(brokerClient, "fetchUsage")
-			.mockResolvedValue({ generatedAt: Date.now(), reports: [reportForA, reportForB] });
+		const fetchSpy = vi.spyOn(brokerClient, "fetchUsage").mockImplementation(async (_signal, provider) => ({
+			generatedAt: Date.now(),
+			reports: provider === "anthropic" ? [reportForA, reportForB] : [],
+		}));
 
 		const credA = {
 			type: "oauth" as const,
@@ -284,10 +285,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		expect(cached?.metadata?.email).toBe("a@example.com");
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
-		// Unknown provider → null, no extra fetch.
+		// Unknown provider is independently scoped and receives an empty response.
 		const miss = await remoteStore.getUsageReport("openai-codex", credA);
 		expect(miss).toBeNull();
-		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
 
 		remoteStore.close();
 	});

@@ -180,6 +180,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
+	#scopedUsageCache = new Map<Provider, UsageCacheEntry>();
+	#scopedUsageInflight = new Map<Provider, Promise<UsageReport[] | null>>();
 	#usageCacheEpoch = 0;
 	#inventoryMetadata = new Map<number, CredentialMetadataRecord>();
 	#inventoryMetadataGeneration = -1;
@@ -956,6 +958,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#invalidateUsageCache(): void {
 		this.#usageCache = undefined;
 		this.#usageInflight = undefined;
+		this.#scopedUsageCache.clear();
+		this.#scopedUsageInflight.clear();
 		this.#usageCacheEpoch += 1;
 	}
 
@@ -1168,7 +1172,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<UsageReport | null> {
-		const reports = await this.#raceWithSignal(this.#loadUsageReports(), signal);
+		const reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal);
 		if (!reports) return null;
 		return matchUsageReport(reports, provider, credential);
 	}
@@ -1255,13 +1259,27 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	#loadUsageReports(provider?: Provider): Promise<UsageReport[] | null> {
 		if (provider) {
-			return this.#client
+			const cached = this.#scopedUsageCache.get(provider);
+			if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) return Promise.resolve(cached.reports);
+			const existing = this.#scopedUsageInflight.get(provider);
+			if (existing) return existing;
+			const epoch = this.#usageCacheEpoch;
+			const inflight = this.#client
 				.fetchUsage(undefined, provider)
-				.then(body => body.reports)
+				.then(body => {
+					if (this.#usageCacheEpoch === epoch) {
+						this.#scopedUsageCache.set(provider, { reports: body.reports, fetchedAt: Date.now() });
+						this.#recordUsageReports(body.reports, epoch);
+					}
+					return body.reports;
+				})
 				.catch(error => {
 					logger.warn("auth-broker scoped usage fetch failed", { provider, error: String(error) });
 					return null;
-				});
+				})
+				.finally(() => this.#scopedUsageInflight.delete(provider));
+			this.#scopedUsageInflight.set(provider, inflight);
+			return inflight;
 		}
 		const cached = this.#usageCache;
 		if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
