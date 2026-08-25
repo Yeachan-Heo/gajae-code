@@ -30,6 +30,7 @@ import {
 	type ProvenanceLedger,
 	provenanceLedgerIdentity,
 	readProvenance,
+	ProvenancePublicationUncertainError,
 	writeIntent,
 	writeProvenance,
 } from "./paseo-ownership";
@@ -875,8 +876,24 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			changed.push(migratedOldBridgeDir);
 		}
 		if (bridgeIntentWritten && bridgeLedgerAfter !== undefined) {
-			await writeProvenance(deps.paths.provenanceLedger, bridgeLedgerAfter);
-			await clearIntent(deps.paths.intentRecord);
+			try {
+				await writeProvenance(deps.paths.provenanceLedger, bridgeLedgerAfter);
+				await clearIntent(deps.paths.intentRecord);
+			} catch (error) {
+				if (error instanceof ProvenancePublicationUncertainError) {
+					return {
+						outcome: "partial-install",
+						compensated: [],
+						uncompensated: [deps.paths.intentRecord, deps.paths.provenanceLedger, deps.paths.bridgeDir],
+						evidence: {
+							failedStep: "paseo skills bridge",
+							detail: error.message,
+							retained: [deps.paths.intentRecord, deps.paths.provenanceLedger, deps.paths.bridgeDir],
+						},
+					};
+				}
+				throw error;
+			}
 		}
 		if (bridgeAmbiguities.length > 0) {
 			return {

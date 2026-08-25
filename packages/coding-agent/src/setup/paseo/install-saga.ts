@@ -20,7 +20,14 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
-import { currentIdentity, planPublish, publishPlan, readTarget, removeDiscardSidecar } from "./json-publisher";
+import {
+	currentIdentity,
+	PaseoPublishError,
+	planPublish,
+	publishPlan,
+	readTarget,
+	removeDiscardSidecar,
+} from "./json-publisher";
 import {
 	classifyIdentity,
 	classifyIntent,
@@ -222,6 +229,13 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		publishSucceeded = published.published;
 		await writeProvenance(input.provenancePath, ledgerAfter);
 	} catch (error) {
+		if (!publishSucceeded && error instanceof PaseoPublishError && error.refusal.reason === "sidecar-conflict") {
+			// A same-content sidecar may have appeared after preflight. It is not
+			// ours, so remove the failed intent's discard authority before retry
+			// recovery can mistake it for an artifact created by this run.
+			const { discardSidecar: _discardSidecar, ...safeIntent } = intent;
+			await writeIntent(input.intentPath, safeIntent);
+		}
 		if (error instanceof ProvenancePublicationUncertainError) {
 			// The ledger rename is already visible, so rolling the target back would
 			// create a newer target/ledger split. Keep the intent and let the next
