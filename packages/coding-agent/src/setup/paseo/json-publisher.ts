@@ -392,6 +392,11 @@ async function openRegularSidecar(
 	backupPath: string,
 	flags: number,
 ): Promise<{ readonly handle: fs.FileHandle; readonly stat: BigIntStats } | undefined> {
+	// Node does not expose FILE_FLAG_OPEN_REPARSE_POINT through fs.open. A
+	// regular lstat followed by a Windows open can still traverse a reparse
+	// point, so sidecar authentication fails closed on Windows until the native
+	// no-reparse opener is available.
+	if (process.platform === "win32") return undefined;
 	const initial = await fs.lstat(backupPath, { bigint: true });
 	if (!initial.isFile()) return undefined;
 	const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
