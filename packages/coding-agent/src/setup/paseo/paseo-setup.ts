@@ -393,6 +393,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 					? () =>
 							writeReplacedProviderBackup(deps.paths.configJson, providerKey, replacedEntry).then(written => {
 								if (
+									!written.createdByGjc ||
 									written.backupPath !== createdReplacedRef.backupPath ||
 									written.valueSha256 !== createdReplacedRef.valueSha256
 								) {
@@ -511,6 +512,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			recordedBridgePath !== undefined && path.resolve(recordedBridgePath) !== path.resolve(deps.paths.bridgeDir);
 		let migratedOldEntries: readonly MigratedOldBridgeEntry[] = [];
 		let migratedOldBridgeDir: string | undefined;
+		let migratedOldRegistrationPath: string | undefined;
 		let migratedOldSourceDir: string | undefined;
 		// An owned empty bridge still carries a settings registration and must
 		// participate in the path cutover. `validatedBridgeDir` authenticates its
@@ -553,6 +555,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			}
 			migratedOldEntries = capturedOldBridge.entries;
 			migratedOldBridgeDir = oldBridgeDir;
+			migratedOldRegistrationPath = bridgeLedger.bridgePath;
 		}
 		const previouslyRecorded = isMigration ? new Set<string>() : new Set(bridgeLedger.bridgeEntries ?? []);
 		// An identity-less entry may be a name written by the pre-mutation ledger
@@ -815,7 +818,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		}
 		const settings = await Settings.init();
 		const receipt = await registerSkillsBridgeDirectory(settings, deps.paths.bridgeDir, {
-			...(migratedOldBridgeDir !== undefined ? { replaces: migratedOldBridgeDir } : {}),
+			...(migratedOldRegistrationPath !== undefined
+				? { replaces: migratedOldRegistrationPath }
+				: migratedOldBridgeDir !== undefined
+					? { replaces: migratedOldBridgeDir }
+					: {}),
 		});
 		completed.push(receiptStep("config.yml skills.customDirectories", receipt));
 		changed.push("config.yml skills.customDirectories");
@@ -891,6 +898,14 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						"install",
 						error instanceof PaseoPublishError || error instanceof Error ? error.message : String(error),
 					);
+		if (failure.preserveState) {
+			return {
+				outcome: "partial-install",
+				compensated: [],
+				uncompensated: failure.retained,
+				evidence: { failedStep: failure.label, detail: failure.message, retained: failure.retained },
+			};
+		}
 		const outcome = await compensate(completed, failure);
 		return { outcome: "partial-install", ...outcome };
 	}

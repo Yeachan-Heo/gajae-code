@@ -55,12 +55,14 @@ export type StepUndoResult =
 export class SagaStepError extends Error {
 	readonly label: string;
 	readonly retained: readonly string[];
+	readonly preserveState: boolean;
 
-	constructor(label: string, message: string, retained: readonly string[] = []) {
+	constructor(label: string, message: string, retained: readonly string[] = [], preserveState = false) {
 		super(message);
 		this.name = "SagaStepError";
 		this.label = label;
 		this.retained = retained;
+		this.preserveState = preserveState;
 	}
 }
 
@@ -224,11 +226,12 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			// The ledger rename is already visible, so rolling the target back would
 			// create a newer target/ledger split. Keep the intent and let the next
 			// setup/remove invocation classify the committed ledger safely.
-			throw new SagaStepError(input.label, error.message, [
-				input.intentPath,
-				input.provenancePath,
-				input.targetPath,
-			]);
+			throw new SagaStepError(
+				input.label,
+				error.message,
+				[input.intentPath, input.provenancePath, input.targetPath],
+				true,
+			);
 		}
 		// Once publication succeeds, any failure before the ledger commit must
 		// undo the publication AND remove the artifact this step created (#4644
