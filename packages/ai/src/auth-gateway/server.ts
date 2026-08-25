@@ -1045,7 +1045,15 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					}
 					if (scopeAvailability === "absent")
 						return withCors(json(200, { generatedAt: Date.now(), reports: [] }), req);
-					return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
+					try {
+						return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
+					} catch (error) {
+						logger.warn("auth-gateway scoped usage unavailable", { error: String(error) });
+						return withCors(
+							json(503, { error: { code: "usage_unavailable", message: "Usage unavailable." } }),
+							req,
+						);
+					}
 				}
 
 				// Per-credential auth probe — diagnoses which row in a multi-account

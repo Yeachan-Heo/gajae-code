@@ -679,6 +679,7 @@ export type AuthStorageOptions = {
 	 * AuthStorage caller surfaces that to its own consumer unchanged.
 	 */
 	fetchUsageReports?: (signal?: AbortSignal) => Promise<UsageReport[] | null>;
+	fetchUsageReportsForProvider?: (provider: Provider, signal?: AbortSignal) => Promise<UsageReport[] | null>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1274,6 +1275,7 @@ export class AuthStorage {
 	#storedApiKeyResolutionInFlight: Map<string, Map<string, Promise<string | undefined>>> = new Map();
 	#refreshOAuthCredentialOverride?: AuthStorageOptions["refreshOAuthCredential"];
 	#fetchUsageReportsOverride?: AuthStorageOptions["fetchUsageReports"];
+	#fetchUsageReportsForProviderOverride?: AuthStorageOptions["fetchUsageReportsForProvider"];
 	#sourceLabel?: string;
 	#credentialDisabledListeners: Set<(event: CredentialDisabledEvent) => void | Promise<void>> = new Set();
 	/**
@@ -1316,6 +1318,7 @@ export class AuthStorage {
 		this.#credentialRankingMode = options.credentialRankingMode ?? "balanced";
 		this.#refreshOAuthCredentialOverride = options.refreshOAuthCredential;
 		this.#fetchUsageReportsOverride = options.fetchUsageReports;
+		this.#fetchUsageReportsForProviderOverride = options.fetchUsageReportsForProvider;
 		this.#sourceLabel = options.sourceLabel;
 		if (options.onCredentialDisabled) {
 			// Constructor-registered subscribers are permanent for this AuthStorage's lifetime;
@@ -3813,10 +3816,13 @@ export class AuthStorage {
 		// backed by a broker automatically routes usage to the broker without
 		// needing the caller to wire it explicitly.
 		const scopedStoreFetch = options?.provider
-			? this.#store.fetchUsageReportsForProvider?.bind(this.#store)
+			? (this.#fetchUsageReportsForProviderOverride ?? this.#store.fetchUsageReportsForProvider?.bind(this.#store))
 			: undefined;
 		if (scopedStoreFetch && options?.provider) {
 			return raceUsageWithSignal(scopedStoreFetch(options.provider), options.signal);
+		}
+		if (options?.provider && this.#fetchUsageReportsOverride) {
+			throw new Error("Provider-scoped usage fetch is unavailable");
 		}
 		const override = this.#fetchUsageReportsOverride ?? this.#store.fetchUsageReports?.bind(this.#store);
 		if (override) {
