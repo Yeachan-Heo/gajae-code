@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import type { AuthCredentialSnapshot } from "@gajae-code/ai/core";
+import type { AuthCredentialSnapshot, CredentialHealthResult } from "@gajae-code/ai/core";
 import {
 	assertEnabledProviderCredential,
+	filterCredentialCheckResults,
 	hasEnabledProviderCredential,
 	redactBrokerUrl,
 } from "../src/cli/auth-gateway-cli";
@@ -56,5 +57,15 @@ describe("auth-gateway broker provider scope", () => {
 		expect(redacted).toBe("https://broker.example.test:8765/v1");
 		expect(redacted).not.toContain("password");
 		expect(redacted).not.toContain("secret");
+	});
+
+	it("filters cross-provider credential rows before JSON or text rendering", () => {
+		const results: CredentialHealthResult[] = [
+			{ id: 1, provider: "openai-codex", type: "oauth", ok: true },
+			{ id: 2, provider: "github-copilot", type: "oauth", ok: false, reason: "foreign-secret" },
+		];
+
+		expect(filterCredentialCheckResults(results, "openai-codex")).toEqual([results[0]]);
+		expect(filterCredentialCheckResults(results, undefined)).toEqual(results);
 	});
 });

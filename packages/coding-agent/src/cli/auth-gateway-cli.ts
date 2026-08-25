@@ -20,6 +20,7 @@ import {
 	AuthBrokerClient,
 	type AuthCredentialSnapshot,
 	AuthStorage,
+	type CredentialHealthResult,
 	DEFAULT_AUTH_GATEWAY_BIND,
 	type GeneratedProvider,
 	getBundledModels,
@@ -136,6 +137,13 @@ function normalizeProviderScope(provider: string | undefined): string | undefine
 	return normalized ? normalized : undefined;
 }
 
+export function filterCredentialCheckResults(
+	results: readonly CredentialHealthResult[],
+	provider: string | undefined,
+): CredentialHealthResult[] {
+	return provider ? results.filter(row => row.provider === provider) : [...results];
+}
+
 function requireProviderScope(provider: string | undefined, action: "serve"): string {
 	const normalized = normalizeProviderScope(provider);
 	if (!normalized) {
@@ -210,11 +218,15 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 
 		const models = getBundledModels(provider as GeneratedProvider);
 		const catalog = createAuthGatewayModelCatalog(provider, models);
+		if (catalog.models.length === 0) {
+			throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
+		}
 		const modelById = new Map(catalog.models.map(model => [model.id, model] as const));
 		const gatewayToken = flags.noAuth ? null : await ensureToken();
 		const handle = startAuthGateway({
 			storage,
 			hasProviderCredential: () => store.snapshot.credentials.some(entry => entry.provider === provider),
+			reloadProviderCredentials: () => storage.reload(),
 			bind,
 			providerScope: { provider },
 			bearerTokens: gatewayToken ? [gatewayToken] : [],
@@ -351,8 +363,16 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 		const snapshot = await fetchBrokerSnapshot(createBrokerClient(brokerConfig));
 		const tokenPresent = token !== null;
 		const credentialCount = snapshot.credentials.filter(entry => entry.provider === provider).length;
-		const ready = tokenPresent && credentialCount > 0;
-		const reason = !tokenPresent ? "token_missing" : credentialCount === 0 ? "provider_credential_missing" : null;
+		const catalog = createAuthGatewayModelCatalog(provider, getBundledModels(provider as GeneratedProvider));
+		const modelCount = catalog.models.length;
+		const ready = tokenPresent && credentialCount > 0 && modelCount > 0;
+		const reason = !tokenPresent
+			? "token_missing"
+			: credentialCount === 0
+				? "provider_credential_missing"
+				: modelCount === 0
+					? "provider_catalog_empty"
+					: null;
 		const status = {
 			ready,
 			reason,
@@ -363,6 +383,7 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			brokerAuthenticated: true,
 			scope: provider,
 			credentialCount,
+			modelCount,
 		};
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(status)}\n`);
@@ -382,6 +403,9 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			}
 			if (credentialCount === 0) {
 				process.stdout.write(`No enabled broker credential is available for scope ${provider}.\n`);
+			}
+			if (modelCount === 0) {
+				process.stdout.write(`No source-backed models are available for scope ${provider}.\n`);
 			}
 		}
 		if (!ready) process.exitCode = 1;
@@ -463,10 +487,13 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const storage = new AuthStorage(store, { sourceLabel: `broker ${redactBrokerUrl(brokerConfig.url)}` });
 	try {
 		await storage.reload();
-		const results = await storage.checkCredentials(provider ? { provider } : undefined);
+		const results = filterCredentialCheckResults(
+			await storage.checkCredentials(provider ? { provider } : undefined),
+			provider,
+		);
 		const scopedCredentialCount = provider
-			? initialSnapshot.credentials.filter(entry => entry.provider === provider).length
-			: initialSnapshot.credentials.length;
+			? store.snapshot.credentials.filter(entry => entry.provider === provider).length
+			: store.snapshot.credentials.length;
 		const failed = results.filter(row => row.ok === false).length;
 
 		if (flags.json) {

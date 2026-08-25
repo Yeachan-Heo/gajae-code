@@ -321,6 +321,80 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 			unregisterCustomApis(source);
 		}
 	});
+
+	it("reloads the current provider snapshot before format and pi-native dispatch", async () => {
+		const source = "auth-gateway-provider-scope-live-revoke-test";
+		const api = "auth-gateway-provider-scope-live-revoke-test" as Api;
+		const provider = "gateway-live-revoke-provider";
+		const scopedModel = model("live-revoke-model", provider, api);
+		const keys: string[] = [];
+		registerCustomApi(
+			api,
+			(modelForRequest, _context, options) => {
+				keys.push(`${modelForRequest.provider}:${options?.apiKey ?? ""}`);
+				return makeEventStream({
+					role: "assistant",
+					api,
+					provider,
+					model: scopedModel.id,
+					content: [{ type: "text", text: "ok" }],
+					usage: ZERO_USAGE,
+					stopReason: "stop",
+					timestamp: 0,
+				});
+			},
+			source,
+		);
+		const tempDir = await Bun.$`mktemp -d /tmp/gjc-auth-gateway-live-revoke.XXXXXX`.text();
+		const root = tempDir.trim();
+		const store = await SqliteAuthCredentialStore.open(`${root}/auth.db`);
+		const storage = new AuthStorage(store);
+		await storage.set(provider, [
+			{ type: "api_key", key: "credential-a" },
+			{ type: "api_key", key: "credential-b" },
+		]);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			bearerTokens: [],
+			version: "test",
+			hasProviderCredential: () => storage.exportSnapshot().credentials.some(entry => entry.provider === provider),
+			reloadProviderCredentials: () => storage.reload(),
+			storage,
+			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
+			listModels: () => [scopedModel],
+		});
+		try {
+			const formatResponse = await fetch(`${gateway.url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: scopedModel.id,
+					messages: [{ role: "user", content: "hello" }],
+					stream: false,
+				}),
+			});
+			expect(formatResponse.status).toBe(200);
+
+			const firstId = storage.exportSnapshot().credentials.find(entry => entry.credential.type === "api_key")?.id;
+			expect(firstId).toBeDefined();
+			if (firstId === undefined) throw new Error("expected first credential id");
+			store.deleteAuthCredential(firstId, "revoked in live snapshot");
+
+			const nativeResponse = await fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+			expect(nativeResponse.status).toBe(200);
+			expect(keys).toEqual([`${provider}:credential-a`, `${provider}:credential-b`]);
+		} finally {
+			await gateway.close();
+			store.close();
+			await Bun.$`rm -rf ${root}`;
+			unregisterCustomApis(source);
+		}
+	});
 });
 
 describe("provider-scoped auth-gateway cancellation", () => {

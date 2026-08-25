@@ -68,6 +68,8 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	 * every request so a live broker snapshot removal immediately fails closed.
 	 */
 	hasProviderCredential?: () => boolean;
+	/** Refresh the dispatch cache from the current broker snapshot before use. */
+	reloadProviderCredentials?: () => Promise<void>;
 	/**
 	 * Resolve a client-requested model id to a pi-ai Model. Caller supplies
 	 * this from a ModelRegistry (lives in `coding-agent` to avoid an inverse
@@ -145,6 +147,19 @@ function hasProviderCredential(opts: AuthGatewayBootOptions): boolean {
 		opts.hasProviderCredential?.() ??
 		opts.storage.exportSnapshot().credentials.some(entry => entry.provider === opts.providerScope.provider)
 	);
+}
+
+async function providerScopeAvailable(opts: AuthGatewayBootOptions): Promise<boolean> {
+	try {
+		await opts.reloadProviderCredentials?.();
+	} catch (error) {
+		logger.warn("auth-gateway provider snapshot reload failed", {
+			provider: opts.providerScope.provider,
+			error: cleanReason(error) ?? "snapshot reload failed",
+		});
+		return false;
+	}
+	return hasProviderCredential(opts);
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -539,7 +554,7 @@ async function handleFormatEndpoint(
 	// For OAuth providers this returns the access token (refreshed via the
 	// broker override on AuthStorage when needed).
 	let apiKey: string | undefined;
-	if (!hasProviderCredential(bootOpts)) {
+	if (!(await providerScopeAvailable(bootOpts))) {
 		return route.module.formatError(
 			401,
 			"authentication_error",
@@ -754,7 +769,7 @@ async function handlePiNative(
 	}
 
 	let apiKey: string | undefined;
-	if (!hasProviderCredential(bootOpts))
+	if (!(await providerScopeAvailable(bootOpts)))
 		return piNative.formatError(401, "authentication_error", "No credential available");
 	try {
 		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
@@ -957,6 +972,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 		throw new Error(`Auth gateway scope ${provider} has no enabled broker credential`);
 	}
 	const catalog = createAuthGatewayModelCatalog(provider, opts.listModels());
+	if (catalog.models.length === 0) {
+		throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
+	}
 	const tokens = new Set<string>(opts.bearerTokens);
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
 	const version = opts.version;
@@ -996,7 +1014,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 				// same client struct.
 				if (req.method === "GET" && pathname === "/v1/usage") {
-					if (!hasProviderCredential(opts))
+					if (!(await providerScopeAvailable(opts)))
 						return withCors(json(200, { generatedAt: Date.now(), reports: [] }), req);
 					return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
 				}
@@ -1005,7 +1023,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 				// credentials, so we need a separate endpoint that captures errors.
 				if (req.method === "GET" && pathname === "/v1/credentials/check") {
-					if (!hasProviderCredential(opts)) return withCors(emptyScopedCredentialsResponse(), req);
+					if (!(await providerScopeAvailable(opts))) return withCors(emptyScopedCredentialsResponse(), req);
 					return withCors(
 						await handleCredentialsCheck(opts.storage, opts.providerScope.provider, req.signal),
 						req,
