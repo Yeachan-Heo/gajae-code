@@ -788,7 +788,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (entry.credential.type !== "oauth") {
 			throw new Error(`Broker returned non-OAuth credential for id=${credentialId}`);
 		}
-		this.#applyCredentialEntry(entry);
+		await this.#applyCredentialEntry(entry);
 		this.#maybeRefreshSnapshot("suspect credential refresh");
 	}
 
@@ -823,7 +823,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	async deleteAuthCredentialsRemote(provider: string, disabledCause: string): Promise<void> {
 		const existing = this.listAuthCredentials(provider);
 		for (const entry of existing) await this.#client.disableCredential(entry.id, disabledCause);
-		this.#removeProviderEntries(provider);
+		await this.#removeProviderEntries(provider);
 		this.#maybeRefreshSnapshot("delete");
 	}
 
@@ -836,7 +836,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	 */
 	async upsertAuthCredentialRemote(provider: string, credential: AuthCredential): Promise<StoredAuthCredential[]> {
 		const { entries } = await this.#client.uploadCredential(provider, credential);
-		this.#applyProviderEntries(provider, entries);
+		await this.#applyProviderEntries(provider, entries);
 		this.#maybeRefreshSnapshot("upload");
 		return this.listAuthCredentials(provider);
 	}
@@ -846,7 +846,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credential: AuthCredential,
 	): Promise<AuthCredentialIfAbsentResult> {
 		const { inserted, reason, entries } = await this.#client.uploadCredentialIfAbsent(provider, credential);
-		this.#applyProviderEntries(provider, entries);
+		await this.#applyProviderEntries(provider, entries);
 		this.#maybeRefreshSnapshot("upload-if-absent");
 		return { inserted, reason, provider, entries: this.listAuthCredentials(provider) };
 	}
@@ -867,35 +867,41 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		await this.refreshSnapshot();
 		for (const credential of credentials) {
 			const { entries } = await this.#client.uploadCredential(provider, credential);
-			this.#applyProviderEntries(provider, entries);
+			await this.#applyProviderEntries(provider, entries);
 		}
 		this.#maybeRefreshSnapshot("replace");
 		return this.listAuthCredentials(provider);
 	}
 
-	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {
+	async #applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): Promise<void> {
 		// `entries` is the broker's authoritative post-upsert list of rows for
 		// `provider`. Drop our existing rows for the same provider and splice in
 		// the fresh set — preserving every other provider's rows in place.
-		const others = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
 		const incoming = entries.map(entry => ({ ...entry, rotatesInMs: null }));
-		this.#snapshot = { ...this.#snapshot, credentials: [...others, ...incoming] };
+		await this.#withSnapshotAuthority(async () => {
+			const others = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
+			this.#snapshot = { ...this.#snapshot, credentials: [...others, ...incoming] };
+		});
 	}
 
-	#removeProviderEntries(provider: string): void {
-		const credentials = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
-		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
+	async #removeProviderEntries(provider: string): Promise<void> {
+		await this.#withSnapshotAuthority(async () => {
+			const credentials = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
+			this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
+		});
 	}
-	#applyCredentialEntry(entry: AuthCredentialSnapshotEntry): void {
+	async #applyCredentialEntry(entry: AuthCredentialSnapshotEntry): Promise<void> {
 		const incoming = { ...entry, rotatesInMs: null };
-		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
-		if (index === -1) {
-			this.#snapshot = { ...this.#snapshot, credentials: [...this.#snapshot.credentials, incoming] };
-			return;
-		}
-		const credentials = [...this.#snapshot.credentials];
-		credentials[index] = incoming;
-		this.#snapshot = { ...this.#snapshot, credentials };
+		await this.#withSnapshotAuthority(async () => {
+			const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
+			if (index === -1) {
+				this.#snapshot = { ...this.#snapshot, credentials: [...this.#snapshot.credentials, incoming] };
+				return;
+			}
+			const credentials = [...this.#snapshot.credentials];
+			credentials[index] = incoming;
+			this.#snapshot = { ...this.#snapshot, credentials };
+		});
 	}
 
 	/**
@@ -1024,7 +1030,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		) {
 			throw new Error("Broker returned mismatched MCP OAuth credential binding");
 		}
-		this.#applyCredentialEntry(entry);
+		await this.#applyCredentialEntry(entry);
 		this.#maybeRefreshSnapshot("MCP credential refresh");
 		return entry.credential;
 	}

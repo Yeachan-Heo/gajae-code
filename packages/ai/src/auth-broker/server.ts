@@ -416,6 +416,7 @@ function serveSnapshotStream(
 	let abortHandler: (() => void) | null = null;
 	let processing = false;
 	let pendingBumps = 0;
+	let initializing = true;
 	let closed = false;
 	let lastGeneration = -1;
 
@@ -522,19 +523,25 @@ function serveSnapshotStream(
 	const stream = new ReadableStream<Uint8Array>({
 		async start(c) {
 			controller = c;
+			unsubscribe = storage.onGenerationChanged(() => {
+				if (initializing) {
+					pendingBumps += 1;
+					return;
+				}
+				void processGenerationBump();
+			});
 			await storage.reload();
 			const initial = buildSnapshot(storage, refresher, epoch);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
 			if (!write(sseEvent("snapshot", initialEvent))) return;
+			initializing = false;
 			keepaliveTimer = setInterval(() => {
 				write(": keepalive\n\n");
 			}, keepaliveMs);
 			keepaliveTimer.unref?.();
-			unsubscribe = storage.onGenerationChanged(() => {
-				void processGenerationBump();
-			});
+			if (pendingBumps > 0) void processGenerationBump();
 			abortHandler = (): void => cleanup();
 			req.signal.addEventListener("abort", abortHandler);
 			logger.info("auth-broker stream opened", { peer, generation: initial.generation });
