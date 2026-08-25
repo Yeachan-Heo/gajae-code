@@ -848,6 +848,9 @@ test("an established chat attachment that loses its open socket resumes from its
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitPosts(provider, 2);
+			// Delivery can complete before the resumed attachment emits the replay that
+			// acknowledges its advanced cursor. Observe that host-side terminal signal.
+			await awaitReplayRequests(host, 2);
 
 			// The resume is a replay from the last acknowledged sequence, fenced on the
 			// attachment's own endpoint generation — not a fresh attach from zero.
