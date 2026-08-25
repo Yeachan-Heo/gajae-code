@@ -936,15 +936,17 @@ export declare function exactUnlink(path: string, identity: NativeExactFileIdent
 export declare function exactUnlinkDirect(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
- * Remove only the captured symbolic link at `path`.
+ * Remove or retain only the captured symbolic link at `path`.
  *
  * The caller must provide the link's no-follow identity and a private,
  * single-component `quarantineName` in that identity. The native protocol
- * first no-replace-renames the exact link into that quarantine name, verifies
- * the detached entry without following it, and then deletes the same
- * identity-bound handle/name. A successor published at the original path is
- * never touched; any post-detach uncertainty is returned as retained
- * authority instead of being treated as success.
+ * first no-replace-renames the exact link into that quarantine name and
+ * verifies the detached entry without following it. POSIX has no
+ * descriptor-bound unlink primitive, so a verified detached entry is
+ * returned as `cleanup_pending` authority instead of being deleted by a
+ * replaceable pathname. A successor published at the original path is never
+ * touched; any post-detach uncertainty is returned as retained authority
+ * instead of being treated as success.
  */
 export declare function exactUnlinkSymlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
