@@ -1,8 +1,7 @@
 # SDK session CLI
 
 `gjc sdk session` is the broker-bound command family for operating live GJC SDK
-sessions from the terminal. It replaces the removed `gjc daemon session` route
-.
+sessions from the terminal. It replaces the removed `gjc daemon session` route.
 
 The command family has six semantic verbs — `list`, `inspect`,
 `send`, `status`, `tail`, and `retire` — plus the explicit `raw` hatch that dispatches one
