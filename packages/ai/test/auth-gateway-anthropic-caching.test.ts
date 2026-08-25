@@ -10,7 +10,7 @@
  * `~/.gjc/auth-gateway.token`.
  *
  * To run: `bun --cwd packages/ai test test/auth-gateway-anthropic-caching.test.ts`
- * with the gateway live (`gjc auth-gateway serve` or pm2).
+ * with the gateway live (`gjc auth-gateway serve --provider=<provider>` or pm2).
  */
 import { describe, expect, it } from "bun:test";
 import { AUTH_GATEWAY_E2E_URL, checkAuthGatewayE2EAvailable } from "./helpers";

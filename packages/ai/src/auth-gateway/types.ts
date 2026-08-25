@@ -1,12 +1,21 @@
 import type { Effort } from "../model-thinking";
-import type { AssistantMessage, AssistantMessageEventStream, CacheRetention, Context, ServiceTier } from "../types";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEventStream,
+	CacheRetention,
+	Context,
+	Provider,
+	ServiceTier,
+} from "../types";
 
 /**
  * Wire types for the gjc auth-gateway.
  *
  * The gateway sits between unauthenticated clients (containerized gjc,
  * llm-git, …) and the broker. It accepts provider-format HTTP requests
- * (OpenAI chat-completions / Anthropic messages / OpenAI Responses),
+ * (OpenAI chat-completions / Anthropic messages / OpenAI Responses) within
+ * one explicit provider scope,
  * dispatches them through pi-ai's `streamSimple()`, and translates the
  * canonical event stream back to the matching wire format. The gateway
  * injects `Authorization` server-side so clients never see access tokens.
@@ -14,6 +23,21 @@ import type { AssistantMessage, AssistantMessageEventStream, CacheRetention, Con
 
 /** Default bind. Loopback-only — front with reverse proxy for remote access. */
 export const DEFAULT_AUTH_GATEWAY_BIND = "127.0.0.1:4000";
+
+/**
+ * Provider APIs whose gateway identity is part of the provider contract.
+ *
+ * OpenAI Codex is backed by the Codex OAuth authority and must never be
+ * projected as a generic OpenAI Responses model. Other providers may expose
+ * more than one API and therefore remain catalog-defined.
+ */
+export const AUTH_GATEWAY_PROVIDER_APIS: Readonly<Record<string, Api>> = {
+	"openai-codex": "openai-codex-responses",
+};
+
+export interface AuthGatewayProviderScope {
+	provider: Provider;
+}
 
 export type AuthGatewayToolChoice = "auto" | "none" | "required" | { name: string };
 
@@ -120,6 +144,8 @@ export interface AuthGatewayFormatModule {
 export interface AuthGatewayServerOptions {
 	/** Listen address. Default `127.0.0.1:4000`. */
 	bind?: string;
+	/** Required provider scope. An unscoped gateway is not supported. */
+	providerScope: AuthGatewayProviderScope;
 	/** Accept any of these bearer tokens. Empty allows unauthenticated calls. */
 	bearerTokens: string[];
 	/** Version surfaced on `/healthz`. */

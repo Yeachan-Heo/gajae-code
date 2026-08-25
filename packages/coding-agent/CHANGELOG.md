@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- `gjc auth-gateway serve` now requires `--provider`, verifies an enabled broker credential before binding, and reports only redacted provider-scoped status/check information.
+
 ## [0.15.0] - 2026-08-22
 
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Auth-gateway boot and dispatch are now provider-scoped: model catalogs reject cross-provider id ambiguity, Codex rows retain `openai-codex-responses`, and requests cannot borrow credentials from another provider.
+
 ## [0.15.0] - 2026-08-22
 - A failed dynamic-model refresh no longer blanks a legacy cache row in an unbound provider context. `resolveProviderModels` only reused the last-known rows when the latest cache row was provenance-bound to the current discovery context, so a provider that supplies no `cacheDynamicModelProvenance` (e.g. the Codex family) lost every cached model on a refresh failure AND had its row overwritten with an empty snapshot — the stale-while-error fallback the surrounding code documents never applied to it. Legacy rows now serve through a failed refresh whenever the request context is unbound; bound contexts still fail closed on foreign rows.
 - Added OpenRouter as an API-key login provider in `/login` (`openrouter`). Pasting an `sk-or-v1-...` key validates against `https://openrouter.ai/api/v1` (`openrouter/auto` chat completion probe) and stores a reusable `OPENROUTER_API_KEY` credential, closing the gap where OpenRouter had catalog/env support but no interactive login entry point.

@@ -570,6 +570,7 @@ describe("pi-native managed gateway credential failure marking", () => {
 		]);
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
+			providerScope: { provider },
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
@@ -653,10 +654,12 @@ describe("pi-native managed gateway credential failure marking", () => {
 		]);
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
+			providerScope: { provider },
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
 			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
 		});
 		try {
 			const response = await fetch(`${gateway.url}/v1/chat/completions`, {
@@ -707,10 +710,12 @@ describe("pi-native managed gateway credential failure marking", () => {
 		]);
 		const gateway = startAuthGateway({
 			bind: "127.0.0.1:0",
+			providerScope: { provider },
 			bearerTokens: ["gateway-test-token"],
 			version: "test",
 			storage,
 			resolveModel: id => (id === model.id ? model : undefined),
+			listModels: () => [model],
 		});
 		const request = () =>
 			fetch(`${gateway.url}/v1/pi/stream`, {
