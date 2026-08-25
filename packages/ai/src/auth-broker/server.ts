@@ -13,6 +13,7 @@ import * as crypto from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
+import type { Provider } from "../types";
 import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
 import { AUTH_BROKER_EPOCH_HEADER } from "./client";
 import { cleanReason } from "./redact";
@@ -639,7 +640,12 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						// last fetch instead of hitting provider endpoints repeatedly.
 						// `req.signal` propagates HTTP-client disconnects all the way to the
 						// per-caller cancel without touching the shared upstream fetch.
-						const reports = (await opts.storage.fetchUsageReports?.({ signal: req.signal })) ?? [];
+						const scopedProvider = url.searchParams.get("provider") as Provider | null;
+						const reports =
+							(await opts.storage.fetchUsageReports?.({
+								provider: scopedProvider ?? undefined,
+								signal: req.signal,
+							})) ?? [];
 						// Drop the `raw` field — it's the provider-specific upstream body,
 						// large and unstable. Everything UI-relevant lives in `limits` and
 						// `metadata`.

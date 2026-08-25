@@ -390,6 +390,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			if (!snapshot.epoch) return false;
 			if (snapshot.epoch === this.#epoch) {
 				if (generation < this.#generation) return false;
+				if (generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs) return false;
 			} else {
 				if (this.#retiredEpochs.has(snapshot.epoch)) return false;
 				const currentRank = epochRank(this.#epoch);
@@ -400,11 +401,18 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			}
 		} else if (snapshot.epoch) {
 			// First epoch-bearing response establishes the authority namespace.
-		} else if (generation < this.#generation || snapshot.serverNowMs <= this.#snapshot.serverNowMs) {
+		} else if (
+			(generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) ||
+			(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs)
+		) {
 			// Epoch-less legacy brokers use serverNowMs as the restart discriminator:
 			// accept a reset generation only when the broker proves it is newer than
 			// the last accepted legacy snapshot, while delayed old responses fail closed.
-			if (snapshot.serverNowMs <= this.#snapshot.serverNowMs) return false;
+			if (
+				(generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) ||
+				(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs)
+			)
+				return false;
 		}
 		const generationChanged =
 			generation !== this.#generation ||
@@ -763,6 +771,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	updateAuthCredential(id: number, credential: AuthCredential): void {
 		void id;
 		void credential;
+		throw new Error("Remote auth-broker credentials must be updated through broker authority");
 	}
 
 	deleteAuthCredential(_id: number, _disabledCause: string): void {
@@ -1024,6 +1033,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return this.#raceWithSignal(this.#loadUsageReports(), signal);
 	}
 
+	async fetchUsageReportsForProvider(provider: Provider, signal?: AbortSignal): Promise<UsageReport[] | null> {
+		return this.#raceWithSignal(this.#loadUsageReports(provider), signal);
+	}
+
 	/** Synchronous, zero-network usage presentation read. */
 	peekCachedUsagePresentation(provider: Provider, credentialId: number): CachedUsagePresentation | undefined {
 		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
@@ -1240,7 +1253,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
-	#loadUsageReports(): Promise<UsageReport[] | null> {
+	#loadUsageReports(provider?: Provider): Promise<UsageReport[] | null> {
+		if (provider) {
+			return this.#client
+				.fetchUsage(undefined, provider)
+				.then(body => body.reports)
+				.catch(error => {
+					logger.warn("auth-broker scoped usage fetch failed", { provider, error: String(error) });
+					return null;
+				});
+		}
 		const cached = this.#usageCache;
 		if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
 			return Promise.resolve(cached.reports);

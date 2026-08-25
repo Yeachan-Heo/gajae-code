@@ -517,6 +517,7 @@ export interface AuthCredentialStore {
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
 	fetchUsageReports?(signal?: AbortSignal): Promise<UsageReport[] | null>;
+	fetchUsageReportsForProvider?(provider: Provider, signal?: AbortSignal): Promise<UsageReport[] | null>;
 	/** Synchronous, zero-network usage presentation peek. */
 	peekCachedUsagePresentation?(provider: Provider, credentialId: number): CachedUsagePresentation | undefined;
 	/** Record a safe usage observation after an explicit fetch/check. */
@@ -2456,7 +2457,7 @@ export class AuthStorage {
 		if (expectedId !== undefined && target.id !== expectedId) {
 			throw new Error("Credential authority changed during refresh");
 		}
-		if (persist) this.#store.updateAuthCredential(target.id, credential);
+		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
 		const updated = [...entries];
 		updated[index] = { id: target.id, credential };
 		this.#setStoredCredentials(provider, updated);
@@ -3586,6 +3587,7 @@ export class AuthStorage {
 	}
 
 	#collectUsageRequests(options?: {
+		provider?: Provider;
 		baseUrlResolver?: (provider: Provider) => string | undefined;
 	}): UsageRequestDescriptor[] {
 		const resolver = this.#usageProviderResolver;
@@ -3599,6 +3601,7 @@ export class AuthStorage {
 
 		for (const providerId of providers) {
 			const provider = providerId as Provider;
+			if (options?.provider && options.provider !== provider) continue;
 			const providerImpl = resolver(provider);
 			if (!providerImpl) continue;
 			const baseUrl = options?.baseUrlResolver?.(provider);
@@ -3798,6 +3801,7 @@ export class AuthStorage {
 	}
 
 	async fetchUsageReports(options?: {
+		provider?: Provider;
 		baseUrlResolver?: (provider: Provider) => string | undefined;
 		/** Caller's cancel signal; only rejects this caller, never the shared upstream fetch. */
 		signal?: AbortSignal;
@@ -3808,6 +3812,12 @@ export class AuthStorage {
 		// `RemoteAuthCredentialStore` implements the store hook so a gateway
 		// backed by a broker automatically routes usage to the broker without
 		// needing the caller to wire it explicitly.
+		const scopedStoreFetch = options?.provider
+			? this.#store.fetchUsageReportsForProvider?.bind(this.#store)
+			: undefined;
+		if (scopedStoreFetch && options?.provider) {
+			return raceUsageWithSignal(scopedStoreFetch(options.provider), options.signal);
+		}
 		const override = this.#fetchUsageReportsOverride ?? this.#store.fetchUsageReports?.bind(this.#store);
 		if (override) {
 			// Reuse the in-flight map so concurrent callers (widget poll + format

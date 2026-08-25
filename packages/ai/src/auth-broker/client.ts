@@ -8,6 +8,7 @@
 import { readSseEvents } from "@gajae-code/utils";
 import type { ZodType, infer as zInfer } from "zod/v4";
 import type { AuthCredential } from "../auth-storage";
+import type { Provider } from "../types";
 import type {
 	CredentialDisableRequest,
 	CredentialDisableResponse,
@@ -273,12 +274,13 @@ export class AuthBrokerClient {
 		}
 	}
 
-	fetchUsage(signal?: AbortSignal): Promise<UsageResponse> {
+	fetchUsage(signal?: AbortSignal, provider?: Provider): Promise<UsageResponse> {
 		// Validates the envelope (`generatedAt`, `reports[].provider`, `limits`,
 		// `metadata`) but leaves provider-specific extension fields permissive so
 		// the broker can ship new shapes ahead of the client. `raw` is accepted
 		// but normally stripped by the broker before send.
-		return this.#request("GET", "/v1/usage", { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
+		const path = provider ? `/v1/usage?provider=${encodeURIComponent(provider)}` : "/v1/usage";
+		return this.#request("GET", path, { schema: usageResponseSchema, signal }) as Promise<UsageResponse>;
 	}
 
 	async refreshCredential(id: number, signal?: AbortSignal): Promise<CredentialRefreshResponse> {
