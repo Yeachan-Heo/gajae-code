@@ -197,7 +197,15 @@ export async function publishPlan(
 	if (options.backup && observed !== ABSENT_IDENTITY) {
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
-		backupCreated = await copyPrivately(targetPath, backupPath);
+		backupCreated = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
+		if ((await currentIdentity(targetPath)) !== observed) {
+			if (backupCreated) await removePrivateBackupIfExact(backupPath, backupBytes);
+			throw new PaseoPublishError(targetPath, {
+				reason: "cas-conflict",
+				expected: options.expectedIdentity,
+				actual: await currentIdentity(targetPath),
+			});
+		}
 	}
 
 	// Never write the final path directly: a crash mid-write would leave the
@@ -322,8 +330,8 @@ async function openRegularSidecar(
 	}
 }
 
-async function copyPrivately(from: string, to: string): Promise<boolean> {
-	const bytes = await Bun.file(from).text();
+async function copyPrivately(from: string, to: string, sourceBytes?: string): Promise<boolean> {
+	const bytes = sourceBytes ?? (await Bun.file(from).text());
 	const mode = BACKUP_MODE;
 	let handle: fs.FileHandle;
 	let ownsBackup = false;

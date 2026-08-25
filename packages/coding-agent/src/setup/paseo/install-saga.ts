@@ -590,7 +590,7 @@ export async function recoverIntent(
 				!safePendingPreDetach &&
 				!recoverableCutover &&
 				!(samePayload && beforeMatches)) ||
-			(beforeMatches && afterMatches && !samePayload)
+			(beforeMatches && afterMatches && !samePayload && !safePendingPreDetach)
 		) {
 			return {
 				recovered: false,

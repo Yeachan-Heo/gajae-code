@@ -123,7 +123,13 @@ async function trustedBridgePathsForRecovery(deps: PaseoSetupDependencies): Prom
 			// an unauthenticated ledger path to the replay allow-list.
 		}
 	}
-	if (ledger.bridgeCleanupPending !== undefined) paths.push(ledger.bridgeCleanupPending.originalPath);
+	if (
+		ledger.bridgePath !== undefined &&
+		ledger.bridgeCleanupPending !== undefined &&
+		path.resolve(ledger.bridgeCleanupPending.originalPath) === path.resolve(ledger.bridgePath)
+	) {
+		paths.push(ledger.bridgePath);
+	}
 	return [...new Set(await Promise.all(paths.map(value => canonicalPathForComparison(value))))];
 }
 
