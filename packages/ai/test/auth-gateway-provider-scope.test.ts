@@ -675,5 +675,6 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		);
 		expect(isSafeProviderScope("openai-codex")).toBe(true);
 		expect(isSafeProviderScope("openai\u001b]52;c\u0007")).toBe(false);
+		expect(isSafeProviderScope("openai-codex\n")).toBe(false);
 	});
 });

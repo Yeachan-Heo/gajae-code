@@ -1124,5 +1124,9 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 }
 
 export function isSafeProviderScope(provider: unknown): provider is string {
-	return typeof provider === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(provider.trim());
+	return (
+		typeof provider === "string" &&
+		provider === provider.trim() &&
+		/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(provider)
+	);
 }
