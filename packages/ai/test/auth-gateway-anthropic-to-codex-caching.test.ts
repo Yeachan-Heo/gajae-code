@@ -44,7 +44,7 @@ interface AnthropicResponse {
 
 const MODEL = Bun.env.GJC_E2E_CODEX_MODEL ?? "gpt-5.3-codex";
 
-const gateway = await checkAuthGatewayE2EAvailable();
+const gateway = await checkAuthGatewayE2EAvailable({ provider: "openai-codex", modelId: MODEL });
 
 // Long deterministic instructions, repeated to clear OpenAI code backend's 1024-token
 // cache floor with headroom.

@@ -75,19 +75,29 @@ export interface AuthGatewayE2EStatus {
 	reason?: string;
 }
 
+export interface AuthGatewayE2ERequirements {
+	provider: string;
+	modelId: string;
+}
+
 export const AUTH_GATEWAY_E2E_URL = Bun.env.GJC_E2E_GATEWAY_URL ?? "http://127.0.0.1:4000";
 
 const AUTH_GATEWAY_TOKEN_PATH = path.join(os.homedir(), ".gjc", "auth-gateway.token");
 const AUTH_GATEWAY_HEALTH_TIMEOUT_MS = 500;
 
-let authGatewayE2EStatus: Promise<AuthGatewayE2EStatus> | undefined;
+const authGatewayE2EStatus = new Map<string, Promise<AuthGatewayE2EStatus>>();
 
-export function checkAuthGatewayE2EAvailable(): Promise<AuthGatewayE2EStatus> {
-	authGatewayE2EStatus ??= readAuthGatewayE2EStatus();
-	return authGatewayE2EStatus;
+export function checkAuthGatewayE2EAvailable(requirements: AuthGatewayE2ERequirements): Promise<AuthGatewayE2EStatus> {
+	const key = `${requirements.provider}\u0000${requirements.modelId}`;
+	let status = authGatewayE2EStatus.get(key);
+	if (!status) {
+		status = readAuthGatewayE2EStatus(requirements);
+		authGatewayE2EStatus.set(key, status);
+	}
+	return status;
 }
 
-async function readAuthGatewayE2EStatus(): Promise<AuthGatewayE2EStatus> {
+async function readAuthGatewayE2EStatus(requirements: AuthGatewayE2ERequirements): Promise<AuthGatewayE2EStatus> {
 	if (!Bun.env.E2E) return { ok: false, reason: "E2E env not set" };
 	let token: string;
 	try {
@@ -106,6 +116,25 @@ async function readAuthGatewayE2EStatus(): Promise<AuthGatewayE2EStatus> {
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		return { ok: false, reason: `healthz unreachable: ${msg}` };
+	}
+	try {
+		const res = await fetch(`${AUTH_GATEWAY_E2E_URL}/v1/models`, {
+			headers: { Authorization: `Bearer ${token}` },
+			signal: AbortSignal.timeout(AUTH_GATEWAY_HEALTH_TIMEOUT_MS),
+		});
+		if (!res.ok) return { ok: false, reason: `models returned ${res.status}` };
+		const payload = (await res.json()) as { data?: Array<{ id?: unknown; owned_by?: unknown }> };
+		const rows = Array.isArray(payload.data) ? payload.data : [];
+		const scopedRows = rows.filter(row => row.owned_by === requirements.provider);
+		if (scopedRows.length === 0) {
+			return { ok: false, reason: `gateway scope ${requirements.provider} is unavailable` };
+		}
+		if (!scopedRows.some(row => row.id === requirements.modelId)) {
+			return { ok: false, reason: `model ${requirements.modelId} is unavailable in scope ${requirements.provider}` };
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { ok: false, reason: `models probe failed: ${msg}` };
 	}
 	return { ok: true, token };
 }

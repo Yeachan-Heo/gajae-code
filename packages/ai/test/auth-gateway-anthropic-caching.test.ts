@@ -32,7 +32,7 @@ interface AnthropicResponse {
 
 const MODEL = Bun.env.GJC_E2E_ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 
-const gateway = await checkAuthGatewayE2EAvailable();
+const gateway = await checkAuthGatewayE2EAvailable({ provider: "anthropic", modelId: MODEL });
 
 // Build a system prompt that comfortably exceeds Anthropic's 1024-token cache
 // floor for Sonnet. Using a deterministic repeated paragraph so cache keys are

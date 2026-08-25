@@ -17,6 +17,7 @@ import { describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isEnoent } from "@gajae-code/utils";
+import type { AuthGatewayE2ERequirements } from "./helpers";
 
 interface OpenAIResponsesUsage {
 	input_tokens: number;
@@ -42,7 +43,9 @@ const TOKEN_PATH = path.join(os.homedir(), ".gjc", "auth-gateway.token");
 // backend accepts; older or higher-tier ids 4xx with "model not supported".
 const MODEL = Bun.env.GJC_E2E_OPENAI_RESPONSES_MODEL ?? "gpt-5.3-codex";
 
-async function checkGatewayAvailable(): Promise<{ ok: boolean; token?: string; reason?: string }> {
+async function checkGatewayAvailable(
+	requirements: AuthGatewayE2ERequirements,
+): Promise<{ ok: boolean; token?: string; reason?: string }> {
 	let token: string;
 	try {
 		token = (await Bun.file(TOKEN_PATH).text()).trim();
@@ -58,10 +61,29 @@ async function checkGatewayAvailable(): Promise<{ ok: boolean; token?: string; r
 		const msg = err instanceof Error ? err.message : String(err);
 		return { ok: false, reason: `healthz unreachable: ${msg}` };
 	}
+	try {
+		const res = await fetch(`${GATEWAY_URL}/v1/models`, {
+			headers: { Authorization: `Bearer ${token}` },
+			signal: AbortSignal.timeout(2_000),
+		});
+		if (!res.ok) return { ok: false, reason: `models returned ${res.status}` };
+		const payload = (await res.json()) as { data?: Array<{ id?: unknown; owned_by?: unknown }> };
+		const rows = Array.isArray(payload.data) ? payload.data : [];
+		const scopedRows = rows.filter(row => row.owned_by === requirements.provider);
+		if (scopedRows.length === 0) {
+			return { ok: false, reason: `gateway scope ${requirements.provider} is unavailable` };
+		}
+		if (!scopedRows.some(row => row.id === requirements.modelId)) {
+			return { ok: false, reason: `model ${requirements.modelId} is unavailable in scope ${requirements.provider}` };
+		}
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		return { ok: false, reason: `models probe failed: ${msg}` };
+	}
 	return { ok: true, token };
 }
 
-const gateway = await checkGatewayAvailable();
+const gateway = await checkGatewayAvailable({ provider: "openai-codex", modelId: MODEL });
 
 // Long deterministic instructions, repeated to clear OpenAI's 1024-token
 // automatic-caching floor with plenty of headroom.

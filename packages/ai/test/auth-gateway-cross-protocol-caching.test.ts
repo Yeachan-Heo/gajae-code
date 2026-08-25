@@ -49,7 +49,7 @@ interface OpenAIResponse {
 
 const MODEL = Bun.env.GJC_E2E_ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
 
-const gateway = await checkAuthGatewayE2EAvailable();
+const gateway = await checkAuthGatewayE2EAvailable({ provider: "anthropic", modelId: MODEL });
 
 // Long deterministic instructions, repeated to clear Anthropic's 1024-token
 // cache floor for Sonnet.
