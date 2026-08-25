@@ -327,6 +327,8 @@ export interface RecoverIntentOptions {
 	readonly repair: boolean;
 	/** Trusted target paths supplied by the active Paseo setup call. */
 	readonly expectedTargetPaths?: readonly string[];
+	/** Trusted provenance ledger path supplied by the active Paseo setup call. */
+	readonly expectedProvenancePath?: string;
 }
 
 async function bridgeLedgerMatchesFilesystem(
@@ -470,6 +472,15 @@ export async function recoverIntent(
 			return {
 				recovered: false,
 				detail: `the intent target is outside the trusted Paseo target set: ${intent.targetPath}`,
+			};
+		}
+		if (
+			options.expectedProvenancePath === undefined ||
+			path.resolve(options.expectedProvenancePath) !== path.resolve(intent.provenancePath)
+		) {
+			return {
+				recovered: false,
+				detail: `the intent provenance path is outside the trusted Paseo ledger: ${intent.provenancePath}`,
 			};
 		}
 	}

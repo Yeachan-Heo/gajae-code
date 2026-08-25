@@ -256,7 +256,15 @@ export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSe
 			`Refusing to remove Paseo skills bridge: ledger-recorded path resolves outside the agent directory (${recorded})`,
 		);
 	}
-	return recorded;
+	return real;
+}
+
+async function canonicalCleanupAuthority(
+	authority: NonNullable<ProvenanceLedger["bridgeCleanupPending"]>,
+): Promise<NonNullable<ProvenanceLedger["bridgeCleanupPending"]>> {
+	const parent = await fs.realpath(path.dirname(authority.originalPath));
+	const originalPath = path.join(parent, path.basename(authority.originalPath));
+	return { ...authority, originalPath, detachedPath: `${originalPath}.removing` };
 }
 /**
  * Ledger entry names that are safe to compose cleanup paths from.
@@ -357,7 +365,7 @@ export async function removePaseoSetup(
 	// detached path is persisted before the first native call, so this also
 	// settles a process crash between namespace detach and the final cleanup.
 	if (ledger.bridgeCleanupPending !== undefined) {
-		const authority = ledger.bridgeCleanupPending;
+		const authority = await canonicalCleanupAuthority(ledger.bridgeCleanupPending);
 		if (
 			validatedBridge === undefined ||
 			path.resolve(authority.originalPath) !== validatedBridge ||

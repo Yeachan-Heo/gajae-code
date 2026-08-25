@@ -165,6 +165,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 	const recovery = await recoverIntent(deps.paths.intentRecord, {
 		repair: true,
 		expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
+		expectedProvenancePath: deps.paths.provenanceLedger,
 	});
 	if (recovery && !recovery.recovered) {
 		return {

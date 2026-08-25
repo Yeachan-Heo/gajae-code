@@ -2055,6 +2055,7 @@ describe("skills bridge", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		if (!recovery?.recovered) throw new Error(JSON.stringify(recovery));
 		expect(recovery?.recovered).toBe(true);
@@ -2325,6 +2326,7 @@ describe("skills bridge", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("corrupt");
@@ -3911,6 +3913,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
@@ -3957,6 +3960,7 @@ describe("intent recovery", () => {
 				fixture.paths.bridgeDir,
 				newBridge,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(true);
 		const retry = await runPaseoSetup({}, { ...fixture.deps, paths: { ...fixture.paths, bridgeDir: newBridge } });
@@ -4022,6 +4026,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(true);
 		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeSourceDir).toBe(relocatedSource);
@@ -4063,6 +4068,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
@@ -4134,6 +4140,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("no ledger payload");
@@ -4159,6 +4166,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(true);
 		expect((await readProvenance(fixture.paths.provenanceLedger)).seededOrchestrationKeys.ui).toBe("gjc");
@@ -4189,6 +4197,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("corrupt");
@@ -4217,6 +4226,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("canonical digest");
@@ -4235,6 +4245,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
@@ -4264,6 +4275,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		await expect(fs.stat(victimSidecar)).resolves.toBeDefined();
@@ -4308,6 +4320,7 @@ describe("intent recovery", () => {
 					fixture.paths.orchestrationPreferences,
 					fixture.paths.bridgeDir,
 				],
+				expectedProvenancePath: fixture.paths.provenanceLedger,
 			});
 			expect(recovery?.recovered).toBe(true);
 		} finally {
@@ -4339,6 +4352,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("corrupt");
@@ -4364,6 +4378,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
@@ -4387,6 +4402,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(recovery?.detail).toContain("discard sidecar cleanup failed");
@@ -4423,6 +4439,7 @@ describe("intent recovery", () => {
 					fixture.paths.orchestrationPreferences,
 					fixture.paths.bridgeDir,
 				],
+				expectedProvenancePath: fixture.paths.provenanceLedger,
 			});
 			expect(recovery?.recovered).toBe(false);
 			expect(recovery?.detail).toContain("discard sidecar cleanup failed");
@@ -4444,6 +4461,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
@@ -4461,6 +4479,7 @@ describe("intent recovery", () => {
 				fixture.paths.orchestrationPreferences,
 				fixture.paths.bridgeDir,
 			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
 		});
 		expect(recovery?.recovered).toBe(false);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();

@@ -59,6 +59,7 @@ async function collectL1(deps: PaseoSetupDependencies, options: CheckOptions): P
 		const recovery = await recoverIntent(deps.paths.intentRecord, {
 			repair: false,
 			expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
+			expectedProvenancePath: deps.paths.provenanceLedger,
 		});
 		if (recovery) {
 			reasons.push({
