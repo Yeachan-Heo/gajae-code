@@ -11,11 +11,12 @@ export const DEFAULT_CONCURRENCY = 1;
 export const TEST_PRELOAD = "./scripts/test-preload.ts";
 export const ACP_ADAPTER_DISPOSITIONS_TEST_FILE =
 	"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts";
-export const ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS = 15 * 60_000;
+export const ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS = 20 * 60_000;
 
 // The ACP cohort's 97 production adapter cases measure ~151s per 20 cases,
-// implying ~732s for the full file after its ~8–9s fixture startup. Keep the
-// measured headroom local to this file instead of widening the harness default.
+// implying ~732s for the full file after its ~8–9s fixture startup. Exact CI
+// exceeded the initial 15-minute file budget while its assertions continued to
+// run, so retain measured headroom locally rather than widening the harness default.
 const FILE_TIMEOUT_OVERRIDES = new Map<string, number>([
 	[ACP_ADAPTER_DISPOSITIONS_TEST_FILE, ACP_ADAPTER_DISPOSITIONS_FILE_TIMEOUT_MS],
 ]);
