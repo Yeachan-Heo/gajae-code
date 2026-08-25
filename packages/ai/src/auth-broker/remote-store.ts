@@ -381,27 +381,27 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		};
 	}
 
-	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): void {
+	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): boolean {
 		// Broker generations are process-local and reset when the broker restarts.
 		// A lower generation from a newer server timestamp is therefore a new
 		// broker epoch, while an older timestamp is an out-of-order response from
 		// the current epoch and must be discarded.
 		if (this.#epoch) {
-			if (!snapshot.epoch) return;
+			if (!snapshot.epoch) return false;
 			if (snapshot.epoch === this.#epoch) {
-				if (generation < this.#generation) return;
+				if (generation < this.#generation) return false;
 			} else {
-				if (this.#retiredEpochs.has(snapshot.epoch)) return;
+				if (this.#retiredEpochs.has(snapshot.epoch)) return false;
 				const currentRank = epochRank(this.#epoch);
 				const incomingRank = epochRank(snapshot.epoch);
-				if (currentRank !== undefined && incomingRank === undefined) return;
-				if (currentRank !== undefined && incomingRank !== undefined && incomingRank < currentRank) return;
+				if (currentRank !== undefined && incomingRank === undefined) return false;
+				if (currentRank !== undefined && incomingRank !== undefined && incomingRank < currentRank) return false;
 				this.#retiredEpochs.add(this.#epoch);
 			}
 		} else if (snapshot.epoch) {
 			// First epoch-bearing response establishes the authority namespace.
 		} else if (generation < this.#generation) {
-			return;
+			return false;
 		}
 		const generationChanged =
 			generation !== this.#generation ||
@@ -433,6 +433,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 		this.#reconcilePersistedPresentations();
 		this.#hydratePresentations();
+		return true;
 	}
 
 	#withSnapshotAuthority<T>(operation: () => Promise<T>): Promise<T> {
@@ -650,15 +651,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		serverNowMs: number,
 		epoch?: string,
 	): void {
+		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return;
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
 		const credentials =
 			index === -1
 				? [...this.#snapshot.credentials, entry]
 				: this.#snapshot.credentials.map((candidate, i) => (i === index ? entry : candidate));
-		this.#applySnapshot(
-			{ ...this.#snapshot, epoch: epoch ?? this.#snapshot.epoch, generation, serverNowMs, refresher, credentials },
-			generation,
-		);
+		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
 	}
 
 	#removeStreamCredential(
@@ -668,11 +667,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		serverNowMs: number,
 		epoch?: string,
 	): void {
+		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return;
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#applySnapshot(
-			{ ...this.#snapshot, epoch: epoch ?? this.#snapshot.epoch, generation, serverNowMs, refresher, credentials },
-			generation,
-		);
+		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
 	}
 
 	/**
@@ -691,7 +688,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const result = await this.#client.fetchSnapshot();
 		if (result.status === 200) {
 			await this.#withSnapshotAuthority(async () => {
-				this.#applySnapshot(result.snapshot, result.generation);
+				if (!this.#applySnapshot(result.snapshot, result.generation)) {
+					throw new Error("Auth broker snapshot authority was rejected");
+				}
 			});
 		}
 		return this.#snapshot;

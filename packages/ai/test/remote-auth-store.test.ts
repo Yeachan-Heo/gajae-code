@@ -197,11 +197,13 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
 			credentials: [],
 		};
-		const fetchImpl = async (): Promise<Response> =>
-			new Response(JSON.stringify(nextSnapshot), {
+		const fetchImpl = async (): Promise<Response> => {
+			await Bun.sleep(1);
+			return new Response(JSON.stringify(nextSnapshot), {
 				status: 200,
 				headers: { "Content-Type": "application/json", ETag: `"${nextSnapshot.generation}"` },
 			});
+		};
 		const client = new AuthBrokerClient({
 			url: "http://broker.test",
 			token: "token",
@@ -220,7 +222,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		});
 		await remoteStore.refreshSnapshot();
 		nextSnapshot = { ...nextSnapshot, generation: 100, epoch: "100-old-epoch", serverNowMs: 300 };
-		await remoteStore.refreshSnapshot();
+		await expect(remoteStore.refreshSnapshot()).rejects.toThrow("snapshot authority was rejected");
 		expect(remoteStore.snapshot.epoch).toBe("200-new-epoch");
 		expect(remoteStore.snapshot.generation).toBe(1);
 		remoteStore.close();
