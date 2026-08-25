@@ -5049,6 +5049,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
 	}
+	async function withOrderedSessionStateLocks<T>(
+		lockFiles: readonly string[],
+		operation: () => Promise<T>,
+	): Promise<T> {
+		const ordered = [...new Set(lockFiles)].sort();
+		const acquire = async (index: number): Promise<T> =>
+			index === ordered.length ? operation() : withSessionStateLock(ordered[index]!, () => acquire(index + 1));
+		return acquire(0);
+	}
 
 	/**
 	 * Run one mutation under its idempotency key, then seal its response as the
@@ -5070,6 +5079,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		operation: () => Promise<Record<string, unknown>>,
 		recoverInProgress = false,
 		isNonterminal: (response: Record<string, unknown>) => boolean = isRouterRequestAmbiguous,
+		lockAlreadyHeld = false,
 	): Promise<Record<string, unknown>> {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		const requestDigest = createHash("sha256")
@@ -5077,7 +5087,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			.digest("hex");
 		const file = idempotencyFile(idempotencyKey);
 		const lockFile = idempotencyLockFile(idempotencyKey);
-		return await withSessionStateLock(lockFile, async () => {
+		const execute = async (): Promise<Record<string, unknown>> => {
 			const existingFile = await readCoordinatorIdempotencyFile(file);
 			if (existingFile.kind === "corrupt")
 				return {
@@ -5173,7 +5183,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				completed_at: new Date().toISOString(),
 			});
 			return response;
-		});
+		};
+		return lockAlreadyHeld ? execute() : withSessionStateLock(lockFile, execute);
 	}
 
 	async function brokerSession(
@@ -5354,19 +5365,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			throw new SdkClientError("protocol_error", "SDK broker returned an unbound retirement proof.");
 		return {
 			broker,
-			public: {
-				sessionId: broker.session_id,
-				retired: true,
-				ledgerState: "terminal_error",
-				indexType: "session_closed",
-				stateRoot: broker.state_root,
-				endpointGeneration: broker.endpoint_generation,
-				endpointMtimeMs: broker.endpoint_mtime_ms,
-				processIncarnation: broker.process_incarnation,
-				hostIncarnation: broker.host_incarnation,
-				lifecycleRequestId: broker.lifecycle_request_id,
-				remoteCreateKey: broker.remote_create_key,
-			},
+			public: publicRetirementProof(broker),
 		};
 	}
 
@@ -5380,13 +5379,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			retired: true,
 			ledgerState: proof.ledger_state,
 			indexType: proof.index_type,
-			stateRoot: proof.state_root,
-			endpointGeneration: proof.endpoint_generation,
-			endpointMtimeMs: proof.endpoint_mtime_ms,
-			processIncarnation: proof.process_incarnation,
-			hostIncarnation: proof.host_incarnation,
-			lifecycleRequestId: proof.lifecycle_request_id,
-			remoteCreateKey: proof.remote_create_key,
 		};
 	}
 
@@ -8792,8 +8784,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						code === "live_session"
 					);
 				};
-				return await withSessionStateLock(
-					idempotencyLockFile(creationKey),
+				return await withOrderedSessionStateLocks(
+					[idempotencyLockFile(creationKey), idempotencyLockFile(retirementKey)],
 					async () =>
 						await withToolIdempotency(
 							name,
@@ -8845,6 +8837,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										"state_corrupt",
 										"A completed retired start intent lacks its durable broker retirement proof.",
 									);
+								if (
+									originalAlreadyRetired &&
+									creation.retirement_intent?.retirement_key_digest !== retirementKeyDigest
+								)
+									return {
+										ok: false,
+										error: {
+											code: "retire_not_allowed",
+											message: "The completed retired start intent is bound to a different retirement key.",
+										},
+									};
 								if (
 									creation.retirement_intent &&
 									creation.retirement_intent.retirement_key_digest !== retirementKeyDigest
@@ -8953,6 +8956,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 							},
 							true,
 							isRetirementRetryable,
+							true,
 						),
 				);
 			}

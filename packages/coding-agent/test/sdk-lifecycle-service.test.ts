@@ -13,6 +13,8 @@ import {
 	type SessionLifecycleClientRequestOptions,
 	type SessionLifecycleOperation,
 	SessionLifecycleService,
+	type SessionReconcileUncertainTarget,
+	validateSessionLifecycleMutationRequest,
 } from "../src/sdk/lifecycle";
 import { AgentDirSessionLifecycleClient } from "../src/sdk/lifecycle/broker-client";
 
@@ -718,5 +720,55 @@ describe("SessionLifecycleService", () => {
 			listSpy.mockRestore();
 			await fs.rm(root, { recursive: true, force: true });
 		}
+	});
+
+	it("requires complete identity-bound proof for uncertain retirement", () => {
+		const result = validateSessionLifecycleMutationRequest({
+			operation: "session.reconcile_uncertain",
+			actor,
+			capability: "session.reconcile_uncertain",
+			requestKey: "retire-request",
+			target: { sessionId: "retired-session" },
+		});
+		expect(result).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+	});
+
+	it("forwards typed proof and strips internal retirement identity from the result", async () => {
+		const target: SessionReconcileUncertainTarget = {
+			sessionId: "retired-session",
+			cwd: "/tmp/workspace",
+			stateRoot: "/tmp/workspace/.gjc/state",
+			endpointGeneration: 2,
+			endpointMtimeMs: 1,
+			processIncarnation: "linux:123",
+			hostIncarnation: "host:123",
+			lifecycleRequestId: "retire-effect",
+			remoteCreateKey: "remote-create-key",
+		};
+		const client = new FakeLifecycleClient();
+		client.response = {
+			ok: true,
+			result: {
+				sessionId: target.sessionId,
+				retired: true,
+				stateRoot: target.stateRoot,
+				processIncarnation: target.processIncarnation,
+				hostIncarnation: target.hostIncarnation,
+			},
+		};
+		const result = await new SessionLifecycleService(client).reconcileUncertain({
+			actor,
+			capability: "session.reconcile_uncertain",
+			requestKey: "retire-request",
+			target,
+		});
+		expect(result).toMatchObject({
+			ok: true,
+			operation: "session.reconcile_uncertain",
+			result: { sessionId: target.sessionId },
+		});
+		expect(result.ok && result.result).not.toHaveProperty("stateRoot");
+		expect(result.ok && result.result).not.toHaveProperty("processIncarnation");
+		expect(client.calls[0]?.input).toEqual({ ...target });
 	});
 });

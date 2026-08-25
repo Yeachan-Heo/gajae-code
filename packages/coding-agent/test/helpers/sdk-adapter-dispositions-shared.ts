@@ -44,7 +44,7 @@ const parityRowsCache: ParityRow[] = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRowsCache).toHaveLength(582);
+expect(parityRowsCache).toHaveLength(588);
 
 export const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
@@ -92,6 +92,7 @@ export const adapterPrefix: Record<MachineAdapter, string> = { mcp: "M", acp: "A
 
 export function expectedOutcome(adapter: MachineAdapter, operation: Operation, secret = false): Expected {
 	if (secret) return "rejected_before_send";
+	if (operation.sdkId === "session.reconcile_uncertain") return "rejected_before_send";
 	if (operation.sdkId === "session.get_endpoint" && (adapter === "mcp" || adapter === "daemonCli"))
 		return "rejected_before_send";
 	if (operation.kind === "reverse") return "internal_only";
@@ -167,6 +168,10 @@ export function expectSemanticResult(operation: Operation, result: unknown): voi
 }
 
 export function expectGlobalSemanticResult(operation: Operation, result: unknown): void {
+	if (operation.sdkId === "session.reconcile_uncertain") {
+		expect(result).toMatchObject({ ok: false, error: { code: expect.stringMatching(/^invalid_(input|request)$/) } });
+		return;
+	}
 	const code = expectedGlobalErrors[operation.sdkId];
 	if (code) expect(result).toMatchObject({ ok: false, error: { code } });
 	else expect(result).toMatchObject({ ok: true });
@@ -174,6 +179,7 @@ export function expectGlobalSemanticResult(operation: Operation, result: unknown
 
 export function expectedAcpRejection(operation: Operation, secret: boolean): string {
 	if (secret) return "secret_field_forbidden";
+	if (operation.sdkId === "session.reconcile_uncertain") return "invalid_input";
 	const disposition = operation.adapterDispositions.acp;
 	if (disposition === "provider_only") return "provider_required";
 	if (disposition === "machine_only") return operation.errorCodes[0] ?? "machine_only";
@@ -290,6 +296,8 @@ export function daemonCliLifecycleInput(host: AdapterFixture, operation: string)
 			return { sessionId: host.sessionId, endpointGeneration: 0 };
 		case "session.delete":
 			return { sessionId: "missing-session" };
+		case "session.reconcile_uncertain":
+			return { sessionId: host.sessionId };
 		default:
 			return undefined;
 	}

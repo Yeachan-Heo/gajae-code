@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import path from "node:path";
 import {
 	SessionListTraversalError,
 	type SessionListTraversalPage,
@@ -118,6 +119,18 @@ export interface SessionCloseTarget {
 	readonly endpointIncarnation?: string;
 }
 
+export interface SessionReconcileUncertainTarget {
+	readonly sessionId: string;
+	readonly cwd: string;
+	readonly stateRoot: string;
+	readonly endpointGeneration: number;
+	readonly endpointMtimeMs: number;
+	readonly processIncarnation: string;
+	readonly hostIncarnation: string;
+	readonly lifecycleRequestId: string;
+	readonly remoteCreateKey: string;
+}
+
 export interface SessionDeleteTarget {
 	readonly sessionId: string;
 	readonly cwd?: string;
@@ -149,7 +162,7 @@ export type SessionCloseRequest = SessionLifecycleMutationRequestBase<"session.c
 export type SessionDeleteRequest = SessionLifecycleMutationRequestBase<"session.delete", SessionDeleteTarget>;
 export type SessionReconcileUncertainRequest = SessionLifecycleMutationRequestBase<
 	"session.reconcile_uncertain",
-	SessionCloseTarget
+	SessionReconcileUncertainTarget
 >;
 export interface SessionListRequest {
 	readonly operation: "session.list";
@@ -397,6 +410,31 @@ function validTarget(target: unknown): target is Readonly<Record<string, unknown
 	return isRecord(target);
 }
 
+function validReconcileUncertainTarget(
+	target: Readonly<Record<string, unknown>>,
+): target is Readonly<Record<string, unknown>> & SessionReconcileUncertainTarget {
+	const bounded = (value: unknown, max: number): value is string =>
+		typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
+	return (
+		bounded(target.sessionId, 256) &&
+		bounded(target.cwd, 4096) &&
+		path.isAbsolute(target.cwd) &&
+		bounded(target.stateRoot, 4096) &&
+		path.isAbsolute(target.stateRoot) &&
+		typeof target.endpointGeneration === "number" &&
+		Number.isSafeInteger(target.endpointGeneration) &&
+		target.endpointGeneration > 0 &&
+		typeof target.endpointMtimeMs === "number" &&
+		Number.isFinite(target.endpointMtimeMs) &&
+		target.endpointMtimeMs > 0 &&
+		bounded(target.processIncarnation, 256) &&
+		bounded(target.hostIncarnation, 256) &&
+		bounded(target.lifecycleRequestId, 128) &&
+		/^[A-Za-z0-9._-]+$/u.test(target.lifecycleRequestId) &&
+		bounded(target.remoteCreateKey, 256)
+	);
+}
+
 /** Validates lifecycle authority and shape without contacting the Broker. */
 export function validateSessionLifecycleMutationRequest(request: unknown): SessionLifecycleMutationValidation {
 	const record = isRecord(request) ? request : {};
@@ -411,6 +449,13 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
 	if (!validTarget(record.target))
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
+	if (operation === "session.reconcile_uncertain" && !validReconcileUncertainTarget(record.target))
+		return failure(
+			operation,
+			"terminal",
+			"invalid_request",
+			"session.reconcile_uncertain target must carry complete identity-bound retirement proof",
+		);
 	return {
 		ok: true,
 		operation,

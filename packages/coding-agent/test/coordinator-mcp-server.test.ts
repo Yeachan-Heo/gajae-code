@@ -1273,6 +1273,17 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			allow_mutation: true,
 		});
 		expect(retired).toMatchObject({ ok: true, session_id: "retired-session", retired: true });
+		expect(retired).toMatchObject({
+			lifecycle: {
+				sessionId: "retired-session",
+				retired: true,
+				ledgerState: "terminal_error",
+				indexType: "session_closed",
+			},
+		});
+		expect(JSON.stringify(retired)).not.toContain("processIncarnation");
+		expect(JSON.stringify(retired)).not.toContain("hostIncarnation");
+		expect(JSON.stringify(retired)).not.toContain(path.join(root, ".gjc", "state"));
 		expect(JSON.parse(await fs.readFile(originalPath, "utf8"))).toMatchObject({
 			state: "completed",
 			response: { ok: false, error: { code: "retired" } },
@@ -1370,6 +1381,12 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			idempotency_key: "malformed-retirement-proof-key",
 			allow_mutation: true,
 		};
+		await expect(
+			server.callTool("gjc_coordinator_retire_start_session", {
+				...retirementArgs,
+				idempotency_key: creationKey,
+			}),
+		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 		const malformed = await server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
 		expect(malformed).toMatchObject({ ok: false, error: { code: "protocol_error" } });
 		expect(controls.at(-1)).toMatchObject({
@@ -1589,6 +1606,28 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			string,
 			unknown
 		>;
+		interruptedRetirementOnly.state = "in_progress";
+		delete interruptedRetirementOnly.response;
+		delete interruptedRetirementOnly.completed_at;
+		await fs.writeFile(retirementPath, `${JSON.stringify(interruptedRetirementOnly)}\n`);
+		const registryPath = coordinatorStatePaths(server.config.stateRoot, server.config.namespace.identity).registry;
+		const registry = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			creations: Record<string, { retirement_intent?: { retirement_key_digest?: string } }>;
+		};
+		const creationDigest = createHash("sha256").update(`gjc_coordinator_start_session\0${creationKey}`).digest("hex");
+		const retirementIntent = registry.creations[creationDigest]?.retirement_intent;
+		const originalRetirementDigest = retirementIntent?.retirement_key_digest;
+		expect(originalRetirementDigest).toBeDefined();
+		if (!retirementIntent || typeof originalRetirementDigest !== "string")
+			throw new Error("missing durable retirement intent");
+		retirementIntent.retirement_key_digest = "0".repeat(64);
+		await fs.writeFile(registryPath, `${JSON.stringify(registry)}\n`);
+		await expect(server.callTool("gjc_coordinator_retire_start_session", retirementArgs)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "retire_not_allowed" },
+		});
+		retirementIntent.retirement_key_digest = originalRetirementDigest;
+		await fs.writeFile(registryPath, `${JSON.stringify(registry)}\n`);
 		interruptedRetirementOnly.state = "in_progress";
 		delete interruptedRetirementOnly.response;
 		delete interruptedRetirementOnly.completed_at;

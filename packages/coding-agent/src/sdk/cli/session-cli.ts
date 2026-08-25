@@ -11,6 +11,7 @@ import type {
 	SessionLifecycleOperation,
 	SessionLifecycleSavedSession,
 	SessionLifecycleSavedSessionIdentity,
+	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
@@ -1298,7 +1299,13 @@ function lifecycleMutationRequest(
 	const target = input as JsonRecord & { sessionId: string };
 	if (operation === "session.resume") return { ...base, operation, capability: operation, target };
 	if (operation === "session.close") return { ...base, operation, capability: operation, target };
-	if (operation === "session.reconcile_uncertain") return { ...base, operation, capability: operation, target };
+	if (operation === "session.reconcile_uncertain")
+		return {
+			...base,
+			operation,
+			capability: operation,
+			target: input as unknown as SessionReconcileUncertainTarget,
+		};
 	return { ...base, operation, capability: "session.delete", target };
 }
 
