@@ -1214,6 +1214,7 @@ async function withLockPathTransition<T>(
 	lockFile: string,
 	transition: () => Promise<T>,
 	deadline = lockAcquireDeadline(),
+	onLateTransition?: (value: T) => void | Promise<void>,
 ): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
@@ -1256,8 +1257,17 @@ async function withLockPathTransition<T>(
 				value: await withinLockAcquireDeadline(
 					deadline,
 					() => transition(),
-					() => {
-						void cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
+					result => {
+						void (async () => {
+							try {
+								if (result.ok) await onLateTransition?.(result.value);
+							} catch {
+								// The transition result is already past the acquisition deadline;
+								// cleanup remains best-effort and identity-bound.
+							} finally {
+								await cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
+							}
+						})();
 					},
 				),
 			};
@@ -1577,7 +1587,12 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// Contention (`EEXIST`, or `EISDIR`/`EPERM` for a legacy directory owner)
 			// propagates out of the claim to the evaluation below; the claim is released
 			// first, so the reclaim that follows can take it.
-			held = await withLockPathTransition(lockFile, () => acquireOwnerLock(lockFile, owner), deadline);
+			held = await withLockPathTransition(
+				lockFile,
+				() => acquireOwnerLock(lockFile, owner),
+				deadline,
+				lateHeld => releaseOwnerLock(lockFile, lateHeld),
+			);
 			let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 			try {
 				outcome = { ok: true, value: await operation() };

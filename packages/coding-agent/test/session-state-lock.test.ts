@@ -321,6 +321,24 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
 		expect(fsSync.existsSync(ownerFile)).toBe(false);
 	});
+	it("releases a state lock created after the acquisition deadline", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-late-state-owner.json");
+		const lockFile = `${stateFile}.lock`;
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 25;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+			if (file === lockFile) await Bun.sleep(100);
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		await Bun.sleep(150);
+
+		expect((await readJson(lockFile)).released).toBe(true);
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 2_000;
+		expect(await withSessionStateFileLock(stateFile, async () => "recovered")).toBe("recovered");
+	});
 	it("does not reap a successor transition claim from late timeout cleanup", async () => {
 		const { stateFile } = await seededRunningSession("lock-late-cleanup-successor");
 		const lockFile = `${stateFile}.lock`;
