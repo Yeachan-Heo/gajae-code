@@ -283,6 +283,9 @@ fn lock_managed_mutation(recovery: &File) -> Result<File, &'static str> {
 	}
 	// SAFETY: successful openat returned a uniquely owned descriptor.
 	let lock = unsafe { File::from_raw_fd(fd) };
+	if crate::path_identity::platform::secure_created_owner_only_file(&lock).is_err() {
+		return Err("lock_failed");
+	}
 	if crate::path_identity::platform::verify_created_owner_only_file(&lock).is_err() {
 		return Err("lock_failed");
 	}
@@ -3905,7 +3908,9 @@ mod tests {
 	use std::{
 		cell::Cell,
 		fs,
+		os::unix::fs::PermissionsExt,
 		path::PathBuf,
+		process::Command,
 		time::{SystemTime, UNIX_EPOCH},
 	};
 
@@ -3941,6 +3946,38 @@ mod tests {
 			.expect("create managed source")
 			.identity
 			.expect("managed source identity")
+	}
+
+	#[test]
+	fn managed_mutation_lock_normalizes_restrictive_umask() {
+		if std::env::var_os("PI_NATIVES_LOCK_UMASK_CHILD").is_some() {
+			// Run the umask-sensitive portion in a child process so this process-wide
+			// setting cannot race unrelated tests in the parent harness.
+			let temporary = TempDir::new();
+			let root = temporary.root();
+			let previous = unsafe { libc::umask(0o277) };
+			let lock =
+				lock_managed_mutation(&root).expect("lock creation must survive restrictive umask");
+			drop(lock);
+			let mode = fs::metadata(temporary.0.join(".gjc-managed-mutation-lock"))
+				.expect("lock metadata")
+				.permissions()
+				.mode() & 0o777;
+			unsafe { libc::umask(previous) };
+			assert_eq!(mode, 0o600);
+			return;
+		}
+
+		let status = Command::new(std::env::current_exe().expect("test executable"))
+			.args([
+				"--exact",
+				"recovery_fs::tests::managed_mutation_lock_normalizes_restrictive_umask",
+				"--nocapture",
+			])
+			.env("PI_NATIVES_LOCK_UMASK_CHILD", "1")
+			.status()
+			.expect("spawn umask regression child");
+		assert!(status.success(), "umask regression child failed: {status}");
 	}
 
 	fn file_digest(contents: &[u8]) -> String {
