@@ -668,5 +668,7 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		expect(cleanReason('api_key="opaque secret"')).toBe("Credential diagnostic unavailable.");
 		expect(cleanReason("api_key = 'opaque secret'")).toBe("Credential diagnostic unavailable.");
 		expect(cleanReason('Bearer "opaque secret"')).toBe("Credential diagnostic unavailable.");
+		expect(cleanReason('client_secret = "client secret"')).toBe("Credential diagnostic unavailable.");
+		expect(cleanReason('clientSecret: "client secret"')).toBe("Credential diagnostic unavailable.");
 	});
 });
