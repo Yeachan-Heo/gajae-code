@@ -7,6 +7,7 @@
 - The built-in `kiro` provider now accepts long-lived `KIRO_API_KEY` values (`ksk_…` from [app.kiro.dev](https://app.kiro.dev/settings/api-keys)) in addition to AWS Builder ID OAuth. API-key auth talks to the Kiro service root with `tokentype: API_KEY` and discovers the live model catalog via `ListAvailableModels`. Builder ID login (`gjc auth-broker login kiro` / `AWS_BEARER_TOKEN_KIRO`) is unchanged.
 
 - `AuthGatewayServerOptions` now requires `providerScope` and `listModels`; direct `@gajae-code/ai` callers must construct one gateway instance per provider, pass the provider-filtered source catalog, and have `resolveModel` return the exact catalog object for the requested model. This matches the mandatory `--provider=<id>` CLI migration and prevents cross-provider model and credential ambiguity.
+- `auth-broker serve` now requires an `AuthCredentialStore` with atomic `allocateMonotonicSequence` support for durable broker incarnation epochs; unsupported custom stores fail closed before binding and must migrate to the durable cache-backed contract.
 
 ### Fixed
 

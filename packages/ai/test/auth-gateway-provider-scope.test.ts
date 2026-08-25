@@ -657,5 +657,6 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		expect(delimitedJsonSafe).not.toContain("secret-suffix");
 		expect(delimitedJsonSafe).not.toContain("escaped");
 		expect(cleanReason("https://gemini.example.test/v1?key=gemini-secret")).not.toContain("gemini-secret");
+		expect(cleanReason('{\\"access_token\\":\\"escaped-secret\\"}')).not.toContain("escaped-secret");
 	});
 });
