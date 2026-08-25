@@ -141,6 +141,8 @@ export const SessionStateLockTestHooks: {
 	legacyOwnerHostId?: () => string | Promise<string>;
 	/** @internal Throws from the first legacy-directory owner metadata read. */
 	legacyOwnerReadFault?: (lockDir: string) => void | Promise<void>;
+	/** @internal Fails the transition claim before post-mkdir identity capture. */
+	beforeTransitionIdentityCapture?: (transitionDir: string) => void | Promise<void>;
 	/** @internal Runs after exclusive transition mkdir and before identity capture. */
 	afterTransitionMkdir?: (transitionDir: string) => void | Promise<void>;
 	/** @internal Lets fixtures simulate a separately authenticated legacy-local owner. */
@@ -1140,10 +1142,16 @@ async function transitionClaimIdentity(transitionDir: string): Promise<Transitio
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
 async function createTransitionClaim(transitionDir: string): Promise<TransitionClaimIdentity> {
 	await fs.mkdir(transitionDir);
-	const claim = await transitionClaimIdentity(transitionDir);
-	if (!claim) throw new SessionStateLockUnavailableError();
-	await SessionStateLockTestHooks.afterTransitionMkdir?.(transitionDir);
-	return claim;
+	try {
+		await SessionStateLockTestHooks.beforeTransitionIdentityCapture?.(transitionDir);
+		const claim = await transitionClaimIdentity(transitionDir);
+		if (!claim) throw new SessionStateLockUnavailableError();
+		await SessionStateLockTestHooks.afterTransitionMkdir?.(transitionDir);
+		return claim;
+	} catch (error) {
+		await fs.rmdir(transitionDir).catch(() => undefined);
+		throw error;
+	}
 }
 
 async function cleanupTransitionClaim(

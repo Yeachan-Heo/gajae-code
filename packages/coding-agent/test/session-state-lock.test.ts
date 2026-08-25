@@ -54,6 +54,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.loadInstallationHostId = undefined;
 	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.legacyOwnerReadFault = undefined;
+	SessionStateLockTestHooks.beforeTransitionIdentityCapture = undefined;
 	SessionStateLockTestHooks.afterTransitionMkdir = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.lockAcquireTimeoutMs = undefined;
@@ -395,6 +396,21 @@ describe("coordinator session state lock", () => {
 		await reclaimStaleSessionStateLock(lockFile);
 
 		expect(fsSync.existsSync(path.join(lockFile, "info"))).toBe(true);
+	});
+
+	it("removes a transition claim when post-mkdir identity capture fails", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-transition-identity-failure.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		SessionStateLockTestHooks.beforeTransitionIdentityCapture = () => {
+			throw new Error("identity capture failed");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(Error);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+
+		SessionStateLockTestHooks.beforeTransitionIdentityCapture = undefined;
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
 	});
 
 	it("does not reap a successor after a late mkdir success", async () => {
