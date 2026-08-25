@@ -631,17 +631,29 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					return;
 				}
 				case "entry": {
-					this.#applyStreamEntry(event.entry, event.refresher, event.generation, event.serverNowMs, event.epoch);
+					const applied = this.#applyStreamEntry(
+						event.entry,
+						event.refresher,
+						event.generation,
+						event.serverNowMs,
+						event.epoch,
+					);
+					if (!applied) {
+						throw new Error("Auth broker stream entry authority was rejected");
+					}
 					return;
 				}
 				case "removed": {
-					this.#removeStreamCredential(
+					const applied = this.#removeStreamCredential(
 						event.id,
 						event.refresher,
 						event.generation,
 						event.serverNowMs,
 						event.epoch,
 					);
+					if (!applied) {
+						throw new Error("Auth broker stream removal authority was rejected");
+					}
 					return;
 				}
 			}
@@ -654,14 +666,17 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		generation: number,
 		serverNowMs: number,
 		epoch?: string,
-	): void {
-		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return;
+	): boolean {
+		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return false;
 		const index = this.#snapshot.credentials.findIndex(candidate => candidate.id === entry.id);
 		const credentials =
 			index === -1
 				? [...this.#snapshot.credentials, entry]
 				: this.#snapshot.credentials.map((candidate, i) => (i === index ? entry : candidate));
-		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
+		return this.#applySnapshot(
+			{ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials },
+			generation,
+		);
 	}
 
 	#removeStreamCredential(
@@ -670,10 +685,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		generation: number,
 		serverNowMs: number,
 		epoch?: string,
-	): void {
-		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return;
+	): boolean {
+		if (!epoch && this.#epoch && epochRank(this.#epoch) !== undefined) return false;
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#applySnapshot({ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials }, generation);
+		return this.#applySnapshot(
+			{ ...this.#snapshot, epoch, generation, serverNowMs, refresher, credentials },
+			generation,
+		);
 	}
 
 	/**
@@ -749,7 +767,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		});
 		if (result.status === 200) {
 			await this.#withSnapshotAuthority(async () => {
-				this.#applySnapshot(result.snapshot, result.generation);
+				if (!this.#applySnapshot(result.snapshot, result.generation)) {
+					throw new Error("Auth broker freshness snapshot authority was rejected");
+				}
 			});
 		}
 		return this.#generation !== previousGeneration;
