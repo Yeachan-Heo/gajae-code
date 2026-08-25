@@ -122,14 +122,14 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		await withFileLock(
 			lockedFile,
 			async () => {
-				const realReadFile = fs.readFile;
-				vi.spyOn(fs, "readFile").mockImplementation((async (target, options) => {
+				const realOpen = fs.open;
+				vi.spyOn(fs, "open").mockImplementation((async (target, flags, mode) => {
 					if (!deniedInfoRead && String(target) === lockInfoPath) {
 						deniedInfoRead = true;
 						throw Object.assign(new Error("metadata temporarily locked"), { code: "EPERM" });
 					}
-					return await realReadFile(target, options);
-				}) as typeof fs.readFile);
+					return await realOpen(target, flags, mode);
+				}) as typeof fs.open);
 				contender = withFileLock(
 					lockedFile,
 					async () => {
@@ -229,6 +229,21 @@ describe("withFileLock stale owner liveness (#652)", () => {
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
 		).rejects.toThrow("Failed to acquire lock");
 		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("reclaims an owner whose PID has been reused for a different incarnation", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		await writeInfo(lockDir, {
+			pid: process.pid,
+			start_time: "different-incarnation",
+			timestamp: Date.now() - 60_000,
+		});
+
+		await withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 });
+
+		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
 	test("preserves a host-qualified lock for an unqualified contender", async () => {
@@ -456,7 +471,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		const readError = Object.assign(new Error("metadata access denied"), { code: "EACCES" });
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 10_000 });
 
-		vi.spyOn(fs, "readFile").mockRejectedValueOnce(readError);
+		vi.spyOn(fs, "open").mockRejectedValueOnce(readError);
 
 		await expect(withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 1, retryDelayMs: 1 })).rejects.toBe(
 			readError,
@@ -480,6 +495,25 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		).rejects.toBe(releaseError);
 		expect(completed).toBe(true);
 		expect(await fs.exists(lockDir)).toBe(true);
+	});
+
+	test("releases with the acquisition key when canonicalization transiently fails", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const realpath = fs.realpath;
+		let failCanonicalization = false;
+		vi.spyOn(fs, "realpath").mockImplementation((async target => {
+			if (failCanonicalization && String(target).endsWith(".lock")) {
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			}
+			return await realpath(target);
+		}) as typeof fs.realpath);
+
+		await withFileLock(lockedFile, async () => {
+			failCanonicalization = true;
+		});
+
+		expect(await fs.exists(`${lockedFile}.lock`)).toBe(false);
 	});
 
 	test("preserves operation and ownership-loss release failures", async () => {

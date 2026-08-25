@@ -4,7 +4,6 @@ import { $ } from "bun";
 import { detectHostAvx2Support } from "../../../scripts/host-detect";
 import { assertRequiredSymbols } from "./embed-guard";
 import { generateEnumExports } from "./gen-enums";
-import { normalizeGeneratedBindings } from "./normalize-generated-bindings";
 import { resolveCargoToolchainPath } from "./rust-toolchain-path";
 
 const repoRoot = path.join(import.meta.dir, "../../..");
@@ -142,8 +141,7 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	const sourcePath = path.join(outputDir, "index.d.ts");
 	const destPath = path.join(nativeDir, "index.d.ts");
 	try {
-		const generated = await Bun.file(sourcePath).text();
-		await Bun.write(destPath, normalizeGeneratedBindings(generated));
+		await fs.copyFile(sourcePath, destPath);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to install generated index.d.ts: ${message}`);
