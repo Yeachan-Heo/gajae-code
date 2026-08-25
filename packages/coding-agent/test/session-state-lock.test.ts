@@ -303,6 +303,39 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
 		expect(fsSync.existsSync(ownerFile)).toBe(false);
 	});
+	it("does not reap a successor transition claim from late timeout cleanup", async () => {
+		const { stateFile } = await seededRunningSession("lock-late-cleanup-successor");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 40;
+		SessionStateLockTestHooks.afterStaleInspection = async () => {
+			await Bun.sleep(200);
+		};
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+
+		const transitionDir = `${lockFile}.transition`;
+		const deadline = performance.now() + 250;
+		while (fsSync.existsSync(transitionDir) && performance.now() < deadline) {
+			await Bun.sleep(5);
+		}
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			`${transitionDir}.owner`,
+			JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: "successor-claim",
+				owner_host_id: "local-host",
+			}),
+		);
+		const successor = transitionToken(transitionDir);
+		await Bun.sleep(220);
+
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect(transitionToken(transitionDir)).toBe(successor);
+		expect((await readJson(`${transitionDir}.owner`)).token).toBe("successor-claim");
+	});
 
 	it("serializes a concurrent writer behind the current lock holder", async () => {
 		const { root, stateFile } = await seededRunningSession("lock-current");

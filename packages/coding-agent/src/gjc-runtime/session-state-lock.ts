@@ -1078,15 +1078,30 @@ function releasedOwnerFromSnapshot(held: LockOwnerSnapshot): SessionStateLockOwn
 	};
 }
 
+interface TransitionClaimIdentity {
+	dev: bigint;
+	ino: bigint;
+}
+
+async function transitionClaimIdentity(transitionDir: string): Promise<TransitionClaimIdentity | undefined> {
+	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
+	if (!stat?.isDirectory()) return undefined;
+	return { dev: stat.dev, ino: stat.ino };
+}
+
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
 async function cleanupTransitionClaim(
 	transitionDir: string,
 	ownerFile: string,
-	held?: LockOwnerSnapshot,
+	held: LockOwnerSnapshot | undefined,
+	claim: TransitionClaimIdentity | undefined,
 ): Promise<void> {
 	if (held) {
 		await rewriteHeldOwnerRecord(ownerFile, held, releasedOwnerFromSnapshot(held)).catch(() => undefined);
 	}
+	if (!claim) return;
+	const current = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
+	if (!current?.isDirectory() || current.dev !== claim.dev || current.ino !== claim.ino) return;
 	await fs.rmdir(transitionDir).catch(() => undefined);
 }
 
@@ -1123,6 +1138,7 @@ async function withLockPathTransition<T>(
 	const ownerFile = `${transitionDir}.owner`;
 	const owner = await withinLockAcquireDeadline(deadline, () => newLockOwner(deadline));
 	for (;;) {
+		let claim: TransitionClaimIdentity | undefined;
 		try {
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
 			await withinLockAcquireDeadline(
@@ -1132,8 +1148,10 @@ async function withLockPathTransition<T>(
 					if (result.ok) return fs.rmdir(transitionDir).catch(() => undefined);
 				},
 			);
+			claim = await transitionClaimIdentity(transitionDir);
+			if (!claim) throw new SessionStateLockUnavailableError();
 			if (performance.now() >= deadline) {
-				void fs.rmdir(transitionDir).catch(() => undefined);
+				void cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
 				throw new SessionStateLockUnavailableError();
 			}
 		} catch (error) {
@@ -1149,12 +1167,12 @@ async function withLockPathTransition<T>(
 				deadline,
 				() => acquireOwnerLock(ownerFile, owner),
 				result => {
-					void cleanupTransitionClaim(transitionDir, ownerFile, result.ok ? result.value : undefined);
+					void cleanupTransitionClaim(transitionDir, ownerFile, result.ok ? result.value : undefined, claim);
 				},
 			);
 		} catch (error) {
-			if (performance.now() < deadline) await cleanupTransitionClaim(transitionDir, ownerFile);
-			else void cleanupTransitionClaim(transitionDir, ownerFile);
+			if (performance.now() < deadline) await cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
+			else void cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
 			throw error;
 		}
 		let outcome: { ok: true; value: T } | { ok: false; error: unknown };
@@ -1164,14 +1182,14 @@ async function withLockPathTransition<T>(
 				value: await withinLockAcquireDeadline(
 					deadline,
 					() => transition(),
-					result => {
-						void cleanupTransitionClaim(transitionDir, ownerFile, held);
+					() => {
+						void cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
 					},
 				),
 			};
 		} catch (error) {
 			if (performance.now() >= deadline) {
-				await cleanupTransitionClaim(transitionDir, ownerFile, held);
+				await cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
 				throw error;
 			}
 			outcome = { ok: false, error };
@@ -1181,11 +1199,11 @@ async function withLockPathTransition<T>(
 				deadline,
 				() => releaseTransitionClaim(transitionDir, ownerFile, held),
 				() => {
-					void cleanupTransitionClaim(transitionDir, ownerFile, held);
+					void cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
 				},
 			);
 		} catch (releaseError) {
-			if (performance.now() >= deadline) void cleanupTransitionClaim(transitionDir, ownerFile, held);
+			if (performance.now() >= deadline) void cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
 			if (!outcome.ok)
 				throw new SessionStateLockUnavailableError(
 					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),
