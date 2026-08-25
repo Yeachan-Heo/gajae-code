@@ -573,10 +573,12 @@ export async function recoverIntent(
 		const safePreflight = beforeMatches && !afterMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		const safeCompleted =
 			afterMatches && (ledgerObserved === intent.provenanceExpectedIdentity || ledgerObserved === settledAfter);
+		const safeSettled =
+			settledAfter !== undefined && beforeMatches && !afterMatches && ledgerObserved === settledAfter;
 		const recoverableCutover =
 			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		if (
-			(!safePreflight && !safeCompleted && !recoverableCutover && !(samePayload && beforeMatches)) ||
+			(!safePreflight && !safeCompleted && !safeSettled && !recoverableCutover && !(samePayload && beforeMatches)) ||
 			(beforeMatches && afterMatches && !samePayload)
 		) {
 			return {
@@ -592,9 +594,19 @@ export async function recoverIntent(
 		}
 		let pendingReplayed = false;
 		if (after?.bridgeCleanupPending !== undefined && options.replayBridgeCleanup !== undefined) {
-			const allowedPaths = [intent.targetPath, before?.bridgePath, after.bridgePath].filter(
-				(value): value is string => value !== undefined,
-			);
+			const currentLedger = await readProvenance(intent.provenancePath);
+			const currentPending = currentLedger.bridgeCleanupPending;
+			if (currentPending === undefined || JSON.stringify(currentPending) !== JSON.stringify(after.bridgeCleanupPending)) {
+				return {
+					recovered: false,
+					detail: `the durable pending bridge cleanup authority changed before replay; refusing to overwrite it`,
+				};
+			}
+			const allowedPaths = [
+				intent.targetPath,
+				currentLedger.bridgePath,
+				currentPending.originalPath,
+			].filter((value): value is string => value !== undefined);
 			if (
 				!allowedPaths.some(value => path.resolve(value) === path.resolve(after.bridgeCleanupPending!.originalPath))
 			) {
@@ -603,8 +615,20 @@ export async function recoverIntent(
 					detail: `the pending bridge cleanup authority is outside the intent's trusted bridge paths: ${after.bridgeCleanupPending.originalPath}`,
 				};
 			}
+			const observedBeforeReplay = await currentIdentity(intent.provenancePath);
+			if (observedBeforeReplay !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: `the provenance ledger changed before pending bridge replay; refusing to overwrite the newer record`,
+				};
+			}
 			await options.replayBridgeCleanup(after.bridgeCleanupPending);
-			const settled = { ...after, bridgeCleanupPending: undefined };
+			const authorityPath = path.resolve(after.bridgeCleanupPending.originalPath);
+			const beforeOwnsAuthority =
+				before?.bridgePath !== undefined && path.resolve(before.bridgePath) === authorityPath;
+			const afterOwnsAuthority = path.resolve(after.bridgePath ?? "") === authorityPath;
+			const settleSource = beforeOwnsAuthority && !afterOwnsAuthority ? after : (before ?? after);
+			const settled = { ...settleSource, bridgeCleanupPending: undefined };
 			await writeProvenance(intent.provenancePath, settled);
 			pendingReplayed = true;
 		}
