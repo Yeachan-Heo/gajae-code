@@ -164,6 +164,77 @@ async function providerScopeAvailability(opts: AuthGatewayBootOptions): Promise<
 	return hasProviderCredential(opts) ? "available" : "absent";
 }
 
+class GatewayCredentialError extends Error {
+	readonly status: number;
+	readonly type: string;
+
+	constructor(status: number, type: string, message: string) {
+		super(message);
+		this.name = "GatewayCredentialError";
+		this.status = status;
+		this.type = type;
+	}
+}
+
+const credentialAuthorityTails = new WeakMap<AuthGatewayBootOptions, Promise<void>>();
+
+async function withCredentialAuthority<T>(opts: AuthGatewayBootOptions, operation: () => Promise<T>): Promise<T> {
+	const previous = credentialAuthorityTails.get(opts) ?? Promise.resolve();
+	const deferred = Promise.withResolvers<void>();
+	credentialAuthorityTails.set(opts, deferred.promise);
+	await previous;
+	try {
+		return await operation();
+	} finally {
+		deferred.resolve();
+		if (credentialAuthorityTails.get(opts) === deferred.promise) credentialAuthorityTails.delete(opts);
+	}
+}
+
+async function resolveGatewayApiKey(
+	bootOpts: AuthGatewayBootOptions,
+	model: Model<Api>,
+	peer: string,
+	signal: AbortSignal,
+): Promise<string> {
+	return withCredentialAuthority(bootOpts, async () => {
+		const scopeAvailability = await providerScopeAvailability(bootOpts);
+		if (scopeAvailability === "reload_failed") {
+			throw new GatewayCredentialError(503, "upstream_error", "Auth broker unavailable");
+		}
+		if (scopeAvailability !== "available") {
+			throw new GatewayCredentialError(
+				401,
+				"authentication_error",
+				`No credential available for provider ${model.provider}`,
+			);
+		}
+		try {
+			const apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
+				modelId: model.id,
+				signal,
+			});
+			if (!apiKey) {
+				throw new GatewayCredentialError(
+					401,
+					"authentication_error",
+					`No credential available for provider ${model.provider}`,
+				);
+			}
+			return apiKey;
+		} catch (error) {
+			if (error instanceof GatewayCredentialError) throw error;
+			const classified = classifyGatewayError(error);
+			logger.warn("auth-gateway getApiKey threw", {
+				provider: model.provider,
+				peer,
+				error: classified.message,
+			});
+			throw new GatewayCredentialError(classified.status, classified.type, classified.message);
+		}
+	});
+}
+
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
 // drift on accepted inputs (e.g. empty hostname, IPv6 brackets).
 
@@ -555,37 +626,17 @@ async function handleFormatEndpoint(
 	// expected to resolve the credential and pass it as `options.apiKey`.
 	// For OAuth providers this returns the access token (refreshed via the
 	// broker override on AuthStorage when needed).
-	let apiKey: string | undefined;
-	const scopeAvailability = await providerScopeAvailability(bootOpts);
-	if (scopeAvailability !== "available") {
-		if (scopeAvailability === "reload_failed") {
-			return route.module.formatError(503, "upstream_error", "Auth broker unavailable");
-		}
-		return route.module.formatError(
-			401,
-			"authentication_error",
-			`No credential available for provider ${model.provider}`,
-		);
-	}
+	let apiKey: string;
 	try {
-		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
-			modelId: model.id,
-			signal: controller.signal,
-		});
+		apiKey = await resolveGatewayApiKey(bootOpts, model, peer, controller.signal);
 	} catch (error) {
 		if (controller.signal.aborted) return clientClosedResponse(route);
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-		return route.module.formatError(classified.status, classified.type, classified.message);
+		if (error instanceof GatewayCredentialError) {
+			return route.module.formatError(error.status, error.type, error.message);
+		}
+		throw error;
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
-	if (!apiKey) {
-		return route.module.formatError(
-			401,
-			"authentication_error",
-			`No credential available for provider ${model.provider}`,
-		);
-	}
 
 	// Parse + validate against the strict format schema, rebuild as gjc's
 	// canonical Context, dispatch through pi-ai's streamSimple, encode the
@@ -774,33 +825,17 @@ async function handlePiNative(
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
 
-	let apiKey: string | undefined;
-	const scopeAvailability = await providerScopeAvailability(bootOpts);
-	if (scopeAvailability !== "available") {
-		if (scopeAvailability === "reload_failed") {
-			return piNative.formatError(503, "upstream_error", "Auth broker unavailable");
-		}
-		return piNative.formatError(401, "authentication_error", "No credential available");
-	}
+	let apiKey: string;
 	try {
-		apiKey = await bootOpts.storage.getApiKey(model.provider, undefined, {
-			modelId: model.id,
-			signal: controller.signal,
-		});
+		apiKey = await resolveGatewayApiKey(bootOpts, model, peer, controller.signal);
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
-		const classified = classifyGatewayError(error);
-		logger.warn("auth-gateway getApiKey threw", { provider: model.provider, peer, error: classified.message });
-		return piNative.formatError(classified.status, classified.type, classified.message);
+		if (error instanceof GatewayCredentialError) {
+			return piNative.formatError(error.status, error.type, error.message);
+		}
+		throw error;
 	}
 	if (controller.signal.aborted) return aborted();
-	if (!apiKey) {
-		return piNative.formatError(
-			401,
-			"authentication_error",
-			`No credential available for provider ${model.provider}`,
-		);
-	}
 
 	// Build the SimpleStreamOptions actually handed to `streamSimple`. We
 	// trust the client's options (already allow-listed by `parseRequest`) and

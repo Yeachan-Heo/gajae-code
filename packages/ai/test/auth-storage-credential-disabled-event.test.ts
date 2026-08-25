@@ -100,6 +100,10 @@ class MemoryAuthCredentialStore implements AuthCredentialStore {
 
 	setCache(): void {}
 
+	allocateMonotonicSequence(): number {
+		return 1;
+	}
+
 	cleanExpiredCache(): void {}
 }
 

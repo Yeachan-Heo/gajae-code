@@ -75,6 +75,9 @@ class CountingStore implements AuthCredentialStore {
 		return null;
 	}
 	setCache(): void {}
+	allocateMonotonicSequence(): number {
+		return 1;
+	}
 	deleteCachePrefix(): void {}
 	cleanExpiredCache(): void {}
 }

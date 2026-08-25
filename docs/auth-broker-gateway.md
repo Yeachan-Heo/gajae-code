@@ -63,6 +63,11 @@ gjc auth-broker status    [--json]
 - `migrate --from-local` walks the local SQLite store + env-derived credentials and idempotently uploads them to the configured broker (`POST /v1/credential`).
 - `status` health-pings the configured remote broker.
 
+Broker startup allocates a durable monotonic sequence for its restart epoch. Any
+custom `AuthCredentialStore` integration must implement atomic
+`allocateMonotonicSequence(key, expiresAtSec)`; stores that cannot provide this
+durability are rejected before the listener binds.
+
 ### Endpoints
 
 | Method | Path | Auth | Purpose |

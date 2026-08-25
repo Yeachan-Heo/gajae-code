@@ -99,6 +99,9 @@ function makeStore(rows: StoredAuthCredential[]): ObservableStore {
 		setCache(key, value, expiresAtSec) {
 			cache.set(key, { value, expiresAtSec });
 		},
+		allocateMonotonicSequence() {
+			return 1;
+		},
 		cleanExpiredCache() {},
 	};
 }

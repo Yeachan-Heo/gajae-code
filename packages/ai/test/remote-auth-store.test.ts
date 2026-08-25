@@ -232,6 +232,36 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		remoteStore.close();
 	});
 
+	test("rejects unseen opaque broker epochs without authoritative ordering", async () => {
+		let nextSnapshot: SnapshotResponse = {
+			generation: 1,
+			epoch: "opaque-current",
+			generatedAt: 100,
+			serverNowMs: 100,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [],
+		};
+		const client = new AuthBrokerClient({
+			url: "http://broker.test",
+			token: "token",
+			fetchImpl: (async () =>
+				new Response(JSON.stringify(nextSnapshot), {
+					status: 200,
+					headers: { "Content-Type": "application/json", ETag: `"${nextSnapshot.generation}"` },
+				})) as unknown as typeof fetch,
+			maxRetries: 0,
+		});
+		const remoteStore = new RemoteAuthCredentialStore({
+			client,
+			streamSnapshots: false,
+			initialSnapshot: nextSnapshot,
+		});
+		nextSnapshot = { ...nextSnapshot, epoch: "opaque-delayed", generation: 2, serverNowMs: 200 };
+		await expect(remoteStore.refreshSnapshot()).rejects.toThrow("snapshot authority was rejected");
+		expect(remoteStore.snapshot.epoch).toBe("opaque-current");
+		remoteStore.close();
+	});
+
 	test("getUsageReport coalesces parallel callers and matches by identity", async () => {
 		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
 		const remoteStore = new RemoteAuthCredentialStore({

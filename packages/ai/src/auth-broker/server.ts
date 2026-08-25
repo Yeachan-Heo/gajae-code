@@ -351,8 +351,10 @@ async function serveSnapshot(
 	const includeEpoch = req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1";
 	const clientGeneration = clientTag?.generation;
 	const waitMs = parseWaitMs(url);
+	const legacyConditional = clientTag !== undefined && !includeEpoch;
 
 	if (
+		legacyConditional ||
 		clientGeneration === undefined ||
 		(includeEpoch && clientTag?.epoch !== epoch) ||
 		currentGeneration !== clientGeneration ||
@@ -580,10 +582,17 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
-	const epochSequence = opts.storage.allocateMonotonicSequence(
-		BROKER_EPOCH_SEQUENCE_CACHE_KEY,
-		Math.floor(Date.now() / 1000) + 315_360_000,
-	);
+	let epochSequence: number;
+	try {
+		epochSequence = opts.storage.allocateMonotonicSequence(
+			BROKER_EPOCH_SEQUENCE_CACHE_KEY,
+			Math.floor(Date.now() / 1000) + 315_360_000,
+		);
+	} catch (error) {
+		throw new Error(
+			`Auth broker storage must support atomic monotonic sequence allocation: ${cleanReason(error) ?? "unsupported storage"}`,
+		);
+	}
 	const epoch = `${epochSequence}-${crypto.randomUUID()}`;
 
 	const refresher = opts.disableRefresher

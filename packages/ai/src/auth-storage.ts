@@ -453,7 +453,8 @@ export interface AuthCredentialStore {
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
-	allocateMonotonicSequence?(key: string, expiresAtSec: number): number;
+	/** Atomically allocate a durable sequence for broker restart epochs. */
+	allocateMonotonicSequence(key: string, expiresAtSec: number): number;
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
 	/**
@@ -1370,9 +1371,7 @@ export class AuthStorage {
 		this.#store.setCache(key, value, expiresAtSec);
 	}
 	allocateMonotonicSequence(key: string, expiresAtSec: number): number {
-		const allocate = this.#store.allocateMonotonicSequence;
-		if (!allocate) throw new Error("Auth credential store lacks atomic sequence allocation");
-		return allocate.call(this.#store, key, expiresAtSec);
+		return this.#store.allocateMonotonicSequence(key, expiresAtSec);
 	}
 	getProviderConfigurationGeneration(provider: string): number {
 		return this.#getProviderConfigurationGeneration(provider);

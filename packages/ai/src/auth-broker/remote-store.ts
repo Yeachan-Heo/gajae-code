@@ -399,8 +399,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (this.#retiredEpochs.has(snapshot.epoch)) return false;
 				const currentRank = epochRank(this.#epoch);
 				const incomingRank = epochRank(snapshot.epoch);
-				if (currentRank !== undefined && incomingRank === undefined) return false;
-				if (currentRank !== undefined && incomingRank !== undefined && incomingRank <= currentRank) return false;
+				// An unseen epoch is only safe to accept when both broker epochs carry
+				// the authoritative monotonic sequence prefix. Opaque epoch strings
+				// cannot prove that a delayed response is newer, so fail closed rather
+				// than letting it replace the current credential snapshot.
+				if (currentRank === undefined || incomingRank === undefined || incomingRank <= currentRank) return false;
 				this.#retiredEpochs.add(this.#epoch);
 			}
 		} else if (snapshot.epoch) {

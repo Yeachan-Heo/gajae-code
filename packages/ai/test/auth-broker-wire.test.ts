@@ -249,7 +249,7 @@ describe("auth-broker wire surface", () => {
 		}
 	});
 
-	test("GET /v1/snapshot returns generation headers and 304 for unchanged long-poll", async () => {
+	test("GET /v1/snapshot rejects legacy conditional revalidation across restarts", async () => {
 		const res = await fetch(`${handle!.url}/v1/snapshot`, {
 			headers: { Authorization: `Bearer ${token}`, "X-GJC-Auth-Broker-Epoch": "1" },
 		});
@@ -279,7 +279,9 @@ describe("auth-broker wire surface", () => {
 				"If-None-Match": `"${legacyBody.generation}"`,
 			},
 		});
-		expect(legacyUnchanged.status).toBe(304);
+		expect(legacyUnchanged.status).toBe(200);
+		const legacyRefreshBody = (await legacyUnchanged.json()) as { generation: number };
+		expect(legacyRefreshBody.generation).toBe(legacyBody.generation);
 
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const unchanged = await client.fetchSnapshot({
