@@ -178,6 +178,11 @@ function getLockPath(filePath: string): string {
 }
 
 async function localLockKey(lockPath: string): Promise<string> {
+	try {
+		return await fs.realpath(lockPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
 	const parent = path.dirname(lockPath);
 	let canonicalParent: string;
 	try {
@@ -187,7 +192,7 @@ async function localLockKey(lockPath: string): Promise<string> {
 		canonicalParent = path.resolve(parent);
 	}
 	const key = path.join(canonicalParent, path.basename(lockPath));
-	return process.platform === "win32" ? key.toLowerCase() : key;
+	return key;
 }
 
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
@@ -612,16 +617,17 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 	await fs.mkdir(path.dirname(lockPath), { recursive: true });
-	const localKey = await localLockKey(lockPath);
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, ownerToken, opts.onAcquired);
 		if (owner) {
+			const localKey = await localLockKey(lockPath);
 			localLockStates.set(localKey, { owner, status: "held" });
 			return () => releaseLock(lockPath, owner);
 		}
+		const localKey = await localLockKey(lockPath);
 		const localState = localLockStates.get(localKey);
 		if (localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
 			try {
