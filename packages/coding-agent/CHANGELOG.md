@@ -260,6 +260,17 @@
 - Lean notifications no longer replay a retained completion receipt at idle when identical text was already delivered immediately before an autonomous `ask`; distinct receipts and other settlement windows remain preserved.
 - SDK prompts now publish a bounded structured terminal failure when a provider immediately returns HTTP 402 or 429. The accepted receipt remains non-terminal until the correlated `agent_end`, while `turn.result`/`turn.prompt_status` no longer strand the prompt as `in_flight`; replacement turns remain independently abortable and recoverable. (#4941)
 
+### Breaking Changes
+
+- `gjc auth-gateway serve` now requires `--provider=<id>`; existing unscoped invocations must choose the provider whose source-backed model catalog and broker credential the gateway should expose.
+
+### Added
+
+- `gjc auth-gateway serve` verifies an enabled broker credential before binding and reports only redacted provider-scoped status/check information.
+- `loadCapabilityForHome` no longer falls back to the process-global agent directory when an explicit home is supplied. The user agent directory is derived from the supplied home (`<home>/<configDir>/agent`) unless the caller passes an explicit `agentDir`, and a non-absolute home fails closed instead of silently resolving against the process profile. Explicit-home loads can no longer read another profile's SYSTEM.md/RULES.md/AGENTS.md, skills, commands, hooks, settings, or custom-tool descriptors; a decoy-process-profile test instruments every filesystem read across all eight surfaces to prove zero reads escape the supplied home (#4834).
+- An explicit `agentDir` redirect now applies uniformly to native user-scope surfaces instead of only to MCP: `loadCapability`/`loadCapabilityForHome` set the context user scope only for an explicit agent directory, and the native SYSTEM.md, RULES.md, skills, config-dir, and AGENTS.md loaders resolve user paths from it. The process-default (no explicit `agentDir`) layout is unchanged (#4834 review).
+- `loadCapability` keeps `getAgentDir()` as the DEFAULT context user scope for native surfaces, so a process-selected non-default profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / setAgentDir()) is never split across two directories: an explicit `options.agentDir` still wins, and `loadCapabilityForHome` still derives its scope from the supplied home (#4834 review).
+
 ## [0.15.2] - 2026-08-25
 
 ### Changed
@@ -306,7 +317,6 @@
 
 - Bumped Telegram daemon durable authority to generation 176 after the SDK lifecycle changes modified protected broker declarations. Older generation-175 daemons are now unattachable by this host, preserving fail-closed discovery and launch ownership across rolling upgrades (#4668).
 - Gajae Pet now stays reachable in tmux and image-protocol-free SSH clients through a bounded two-row text-cell rendering. The fallback derives conservative Block Elements from the active skin, uses truecolor when available and ANSI-256 otherwise, reserves no extra transcript rows, and retains the pixel renderer unchanged for supported Kitty, Sixel, and iTerm2 terminals (#4867).
-- An interactive `gjc --worktree` launch now refuses to enter a worktree another live session still holds, instead of silently joining its checkout. The guard existed only for broker-managed launches (#4862); the occupancy predicate and process observation now live in one shared module so both launch paths keep a single definition of "still running", and launch preparation is split into a planning stage that resolves the target before anything is created.
 - `gjc setup hermes --gjc-command` now accepts the full server command instead of always appending `mcp-serve coordinator` (#4877). Omitted or single-token values stay executable-only and render byte-identically to previous output (`gjc`, `/opt/gjc` + `args: [mcp-serve, coordinator]`); a multi-token value is the complete command, split quote-aware (single/double quotes, backslash escapes) into controller argv and rendered verbatim with nothing appended — `--gjc-command 'python3 /tmp/gjc-wrapper.py'` now emits `command: python3`, `args: [/tmp/gjc-wrapper.py]`, exactly the shape a wrapper that already execs `gjc mcp-serve coordinator` needs instead of the doubled argv tail it previously received. Unbalanced quotes are rejected with an explicit error; the value is tokenized, never shell-evaluated. Setup signatures are computed from the rendered block, so existing installs and idempotent re-installs remain valid.
 
 - Corrected the session-state lock recovery contract documented for 0.15.0: valid dead regular state owners are reclaimed automatically, while foreign, unqualified, malformed owners and post-crash atomic transition directories remain fail-closed for explicit operator recovery.
