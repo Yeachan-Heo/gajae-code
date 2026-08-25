@@ -2432,10 +2432,7 @@ function sameCreationRetirementProof(left: CreationRetirementProofV1, right: Cre
 	return canonicalJson(left) === canonicalJson(right);
 }
 
-function assertCreationRetirementProofMatches(
-	request: CreationRequestV1,
-	proof: CreationRetirementProofV1,
-): void {
+function assertCreationRetirementProofMatches(request: CreationRequestV1, proof: CreationRetirementProofV1): void {
 	if (
 		!proof.session_id ||
 		!proof.cwd ||
@@ -2450,10 +2447,8 @@ function assertCreationRetirementProofMatches(
 		!proof.remote_create_key
 	)
 		throw new Error("invalid_input");
-	if (request.remote_create_key !== proof.remote_create_key)
-		throw new Error("idempotency_conflict");
-	if (request.session_id !== null && request.session_id !== proof.session_id)
-		throw new Error("idempotency_conflict");
+	if (request.remote_create_key !== proof.remote_create_key) throw new Error("idempotency_conflict");
+	if (request.session_id !== null && request.session_id !== proof.session_id) throw new Error("idempotency_conflict");
 	const intent = request.canonical_create_intent;
 	if (intent) {
 		const session = intent.session;
@@ -2462,13 +2457,13 @@ function assertCreationRetirementProofMatches(
 			path.resolve(session.cwd) !== path.resolve(proof.cwd) ||
 			path.resolve(session.cwd, ".gjc", "state") !== path.resolve(proof.state_root) ||
 			session.broker.endpoint_generation !== proof.endpoint_generation ||
-			(intent.kind === "register" || intent.remote_create_key !== proof.remote_create_key)
+			intent.kind === "register" ||
+			intent.remote_create_key !== proof.remote_create_key
 		)
 			throw new Error("idempotency_conflict");
 	}
 	const staged = request.retirement_intent;
-	if (staged && !sameCreationRetirementProof(staged.proof, proof))
-		throw new Error("idempotency_conflict");
+	if (staged && !sameCreationRetirementProof(staged.proof, proof)) throw new Error("idempotency_conflict");
 }
 
 /** Claims retirement under the creation receipt before any broker effect. */

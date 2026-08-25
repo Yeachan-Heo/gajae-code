@@ -1344,10 +1344,10 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		});
 		await expect(
 			server.callTool("gjc_coordinator_start_session", {
-			cwd: root,
-			idempotency_key: creationKey,
-			allow_mutation: true,
-		}),
+				cwd: root,
+				idempotency_key: creationKey,
+				allow_mutation: true,
+			}),
 		).resolves.toMatchObject({ ok: false });
 		const originalPath = path.join(
 			coordinatorNamespace(root),
@@ -1400,8 +1400,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			.update(`gjc_coordinator_start_session\0${creationKey}`)
 			.digest("hex")}`;
 		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
-			globalResult: operation =>
-				operation === "session.create" ? { ok: true, result: { cwd: root } } : undefined,
+			globalResult: operation => (operation === "session.create" ? { ok: true, result: { cwd: root } } : undefined),
 		});
 		await expect(
 			server.callTool("gjc_coordinator_start_session", {
