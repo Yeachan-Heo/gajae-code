@@ -2014,7 +2014,11 @@ async function executeUncertainRetirement(
 			text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey ||
 			!sameRetirementIdentityAsRecord(receipt.identity, record)
 		)
-			return fail("endpoint_stale", "Staged retirement identity no longer matches the indexed session authority.");
+			return fail(
+				"endpoint_stale",
+				"Staged retirement identity no longer matches the indexed session authority.",
+				cleanup,
+			);
 		retirementIdentity = receipt.identity;
 		if (!create) return fail("terminal_uncertain", "Staged retirement create identity is no longer present.");
 	} else {
@@ -2137,7 +2141,7 @@ async function executeUncertainRetirement(
 	await broker.index.refresh();
 	record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
 	if (!record || !sameRetirementIdentityAsRecord(retirementIdentity, record))
-		return fail("endpoint_stale", "Session authority changed before retirement index closure.");
+		return fail("endpoint_stale", "Session authority changed before retirement index closure.", cleanup);
 	if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
 		return fail(
 			"cleanup_pending",

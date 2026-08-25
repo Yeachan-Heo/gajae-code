@@ -1593,6 +1593,8 @@ export class Broker {
 		}
 
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
+		if (idempotencyKey.length > 256 || /[\u0000-\u001f\u007f]/u.test(idempotencyKey))
+			return error("invalid_input", "idempotencyKey must be a bounded non-empty string");
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");

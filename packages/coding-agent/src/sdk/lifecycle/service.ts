@@ -417,7 +417,7 @@ export function validateSessionReconcileUncertainTarget(value: unknown): value i
 		typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
 	return (
 		bounded(target.sessionId, 256) &&
-		/^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/u.test(target.sessionId) &&
+		/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(target.sessionId) &&
 		bounded(target.cwd, 4096) &&
 		path.isAbsolute(target.cwd) &&
 		bounded(target.stateRoot, 4096) &&

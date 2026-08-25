@@ -329,6 +329,22 @@ test("ledger reopen bounds malformed persisted rows before they gain cleanup aut
 	}
 }, 30_000);
 
+test("rejects oversized lifecycle idempotency keys before create admission", async () => {
+	if (process.platform !== "linux") return;
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-key-bound-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		await broker.start();
+		await expect(broker.handleRequest("session.create", { cwd: root }, "x".repeat(257))).resolves.toMatchObject({
+			ok: false,
+			error: { code: "invalid_input" },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("legacy metadata cleanup rejects mixed lifecycle and arbitrary receipt keys before mutation", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-legacy-metadata-allowlist-"));
 	const stateRoot = path.join(root, ".gjc", "state");

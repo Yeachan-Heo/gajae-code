@@ -805,7 +805,7 @@ describe("SessionLifecycleService", () => {
 		client.response = {
 			ok: true,
 			result: {
-				sessionId: "retired-session",
+				sessionId: "retired.session",
 				retired: true,
 				ledgerState: "terminal_error",
 				indexType: "session_closed",
@@ -823,7 +823,7 @@ describe("SessionLifecycleService", () => {
 			capability: "session.reconcile_uncertain",
 			requestKey: "retire-canonicalize",
 			target: {
-				sessionId: "retired-session",
+				sessionId: "retired.session",
 				cwd: "/tmp/workspace/../workspace",
 				stateRoot: "/tmp/workspace/../workspace/.gjc/state",
 				endpointGeneration: 2,
@@ -834,7 +834,7 @@ describe("SessionLifecycleService", () => {
 				remoteCreateKey: "remote-create-key",
 			},
 		});
-		expect(result).toMatchObject({ ok: true, result: { sessionId: "retired-session" } });
+		expect(result).toMatchObject({ ok: true, result: { sessionId: "retired.session" } });
 		expect(client.calls[0]?.input).toMatchObject({
 			cwd: "/tmp/workspace",
 			stateRoot: "/tmp/workspace/.gjc/state",
