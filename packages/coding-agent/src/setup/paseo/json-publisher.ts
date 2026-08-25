@@ -267,11 +267,16 @@ export async function publishPlan(
 			}
 			const linked = renameNoReplacePath(tempPath, targetPath);
 			if (!linked.ok) {
-				throw new PaseoPublishError(targetPath, {
-					reason: "cas-conflict",
-					expected: options.expectedIdentity,
-					actual: await currentIdentity(targetPath),
-				});
+				tempRetained = linked.mutationState !== "not_committed";
+				throw new PaseoPublishError(
+					targetPath,
+					{
+						reason: "cas-conflict",
+						expected: options.expectedIdentity,
+						actual: await currentIdentity(targetPath),
+					},
+					tempRetained ? [tempPath] : [],
+				);
 			}
 		} else {
 			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, expectedDestinationIdentity);

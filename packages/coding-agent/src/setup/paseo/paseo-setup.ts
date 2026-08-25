@@ -981,16 +981,18 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 								bridgeDirIdentity: compensatedOldBridgeDirIdentity ?? bridgeLedger.bridgeDirIdentity,
 								bridgeCleanupPending: undefined,
 							};
-							await writeProvenance(deps.paths.provenanceLedger, settled);
 							const intent = await readIntent(deps.paths.intentRecord);
 							if (intent?.step === "skills-bridge") {
 								await writeIntent(deps.paths.intentRecord, {
 									...intent,
+									provenancePreflightIdentity: provenanceLedgerIdentity(current),
+									bridgePreflightPayload: current,
 									provenanceExpectedIdentity: provenanceLedgerIdentity(settled),
 									provenancePayload: settled,
 								});
-								await clearIntent(deps.paths.intentRecord);
 							}
+							await writeProvenance(deps.paths.provenanceLedger, settled);
+							if (intent?.step === "skills-bridge") await clearIntent(deps.paths.intentRecord);
 						}
 					}
 					return restored;

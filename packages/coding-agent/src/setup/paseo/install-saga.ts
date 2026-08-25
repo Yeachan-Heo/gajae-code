@@ -589,11 +589,7 @@ export async function recoverIntent(
 			(ledgerObserved === intent.provenanceExpectedIdentity ||
 				ledgerObserved === intent.provenancePreflightIdentity);
 		const safeCompensationPending =
-			before?.bridgeCleanupPending !== undefined &&
-			beforeMatches &&
-			afterMatches &&
-			ledgerObserved === intent.provenancePreflightIdentity &&
-			!samePayload;
+			beforeMatches && afterMatches && ledgerObserved === intent.provenancePreflightIdentity && !samePayload;
 		const recoverableCutover =
 			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		if (
