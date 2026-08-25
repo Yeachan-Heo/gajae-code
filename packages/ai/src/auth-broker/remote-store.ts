@@ -722,6 +722,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		throw new Error("Remote auth-broker credentials can only be disabled on the broker host");
 	}
 
+	allocateMonotonicSequence(_key: string, _expiresAtSec: number): number {
+		throw new Error("Remote auth-broker credentials cannot allocate broker incarnation sequences");
+	}
+
 	tryDisableAuthCredentialIfMatches(_id: number, _expectedData: string, _disabledCause: string): boolean {
 		return false;
 	}

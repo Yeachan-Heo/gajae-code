@@ -1360,12 +1360,9 @@ export class AuthStorage {
 		this.#store.setCache(key, value, expiresAtSec);
 	}
 	allocateMonotonicSequence(key: string, expiresAtSec: number): number {
-		const existing = this.#store.allocateMonotonicSequence?.(key, expiresAtSec);
-		if (existing !== undefined) return existing;
-		const current = Number(this.#store.getCache(key, { includeExpired: true }));
-		const next = Number.isSafeInteger(current) && current >= 0 ? current + 1 : 1;
-		this.#store.setCache(key, String(next), expiresAtSec);
-		return next;
+		const allocate = this.#store.allocateMonotonicSequence;
+		if (!allocate) throw new Error("Auth credential store lacks atomic sequence allocation");
+		return allocate.call(this.#store, key, expiresAtSec);
 	}
 	getProviderConfigurationGeneration(provider: string): number {
 		return this.#getProviderConfigurationGeneration(provider);
