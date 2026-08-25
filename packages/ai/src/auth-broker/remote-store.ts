@@ -591,7 +591,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				});
 				if (result.status === 200) {
 					await this.#withSnapshotAuthority(async () => {
-						this.#applySnapshot(result.snapshot, result.generation);
+						if (!this.#applySnapshot(result.snapshot, result.generation)) {
+							throw new Error("Auth broker background snapshot authority was rejected");
+						}
 					});
 				}
 				backoffMs = BACKGROUND_BACKOFF_INITIAL_MS;
@@ -623,7 +625,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				case "snapshot": {
 					// Strip the discriminator so we store the wire-shape SnapshotResponse.
 					const { kind: _kind, ...snapshot } = event;
-					this.#applySnapshot(snapshot, snapshot.generation);
+					if (!this.#applySnapshot(snapshot, snapshot.generation)) {
+						throw new Error("Auth broker stream snapshot authority was rejected");
+					}
 					return;
 				}
 				case "entry": {
