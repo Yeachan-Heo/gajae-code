@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import { createHash } from "node:crypto";
 import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -464,7 +463,7 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 	// Bind the owner generation to the snapshot before exact removal. A successor
 	// installed after this snapshot is rejected by the native identity check instead of
 	// being moved into quarantine by a pathname-only rename.
-	const expectedDigest = createHash("sha256").update(JSON.stringify(owner)).digest("hex");
+	const expectedDigest = crypto.createHash("sha256").update(JSON.stringify(owner)).digest("hex");
 	if (infoEntry.sha256 !== expectedDigest) return false;
 	let removed: NativeExactUnlinkResult;
 	try {
@@ -477,13 +476,24 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 	if (
 		removed.detachedPath !== undefined &&
 		removed.retainedSuccessorPath === undefined &&
+		removed.retainedPlaceholderPath === undefined &&
 		removed.retainedUnknownPath === undefined
 	) {
+		const detachedPath = path.resolve(removed.detachedPath);
+		if (path.dirname(detachedPath) !== path.dirname(path.resolve(lockPath))) return false;
 		try {
 			await fs.lstat(lockPath);
 			return false;
 		} catch (error) {
-			if (isEnoent(error)) return true;
+			if (isEnoent(error)) {
+				try {
+					await fs.rm(detachedPath, { recursive: true, force: true });
+					return true;
+				} catch (cleanupError) {
+					if (isEnoent(cleanupError)) return true;
+					return false;
+				}
+			}
 			throw error;
 		}
 	}
@@ -492,6 +502,7 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 		removed.payloadDurable === true &&
 		removed.detachedPath !== undefined &&
 		removed.retainedSuccessorPath === undefined &&
+		removed.retainedPlaceholderPath === undefined &&
 		removed.retainedUnknownPath === undefined
 	);
 }

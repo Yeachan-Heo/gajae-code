@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { normalizeGeneratedBindings } from "../scripts/normalize-generated-bindings";
 import {
 	prependPathEntry,
 	resolveCargoToolchainPath,
@@ -50,6 +51,20 @@ async function listNativeBuildDirs(): Promise<string[]> {
 }
 
 describe("native build Cargo profiles", () => {
+	it("normalizes the declaration boundary idempotently and rejects drift", () => {
+		const oneNewline = "class X {}\n/**\n * Long-lived macOS appearance observer.";
+		const normalized = normalizeGeneratedBindings(oneNewline);
+
+		expect(normalized).toBe("class X {}\n\n/**\n * Long-lived macOS appearance observer.");
+		expect(normalizeGeneratedBindings(normalized)).toBe(normalized);
+		expect(normalizeGeneratedBindings("class X {}\r\n/**\r\n * Long-lived macOS appearance observer.")).toBe(
+			"class X {}\n\n/**\n * Long-lived macOS appearance observer.",
+		);
+		expect(() => normalizeGeneratedBindings("class X {}\n/**\n * Different observer.")).toThrow(
+			"missing the Long-lived macOS appearance observer. boundary",
+		);
+	});
+
 	it("defines an unwind-safe dist profile that only inherits size settings from release", async () => {
 		const cargoToml = await Bun.file(path.join(repoRoot, "Cargo.toml")).text();
 		const sections = parseTomlSections(cargoToml);

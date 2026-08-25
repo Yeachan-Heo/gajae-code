@@ -104,6 +104,38 @@ describe("AgentSession terminal receipt state", () => {
 		expect(persist).toHaveBeenCalled();
 	});
 
+	it("publishes agent_end while terminal sidecar persistence remains pending", async () => {
+		tempDir = TempDir.createSync("@gjc-terminal-persistence-pending-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const pending = Promise.withResolvers<void>();
+		vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockReturnValue(pending.promise);
+		const terminal = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+
+		await session.prompt("respond");
+		await Promise.race([terminal.promise, Bun.sleep(250).then(() => "timed_out" as const)]).then(result => {
+			expect(result).not.toBe("timed_out");
+		});
+		pending.resolve();
+	});
+
 	it("writes present receipt truth through the real AgentSession event consumer", async () => {
 		expect(await runResponse("done")).toMatchObject({
 			state: "completed",

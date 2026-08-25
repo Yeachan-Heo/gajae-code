@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -314,6 +314,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 			snapshotDirectoryTree,
 			exactRemoveDirectoryTree: target => {
 				rmSync(target, { recursive: true, force: true });
+				mkdirSync(`${target}.removing`);
 				return {
 					ok: false,
 					code: "detached_failure",
@@ -325,6 +326,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		await withFileLock(lockedFile, async () => {});
 
 		expect(await fs.exists(lockDir)).toBe(false);
+		expect(await fs.exists(`${lockDir}.removing`)).toBe(false);
 	});
 
 	test("reclaims a self-owned release leak on the next same-process acquisition", async () => {
