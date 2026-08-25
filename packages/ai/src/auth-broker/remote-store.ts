@@ -1172,7 +1172,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<UsageReport | null> {
-		const reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal);
+		const reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal).catch(() => null);
 		if (!reports) return null;
 		return matchUsageReport(reports, provider, credential);
 	}
@@ -1275,7 +1275,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				})
 				.catch(error => {
 					logger.warn("auth-broker scoped usage fetch failed", { provider, error: String(error) });
-					return null;
+					throw error;
 				})
 				.finally(() => this.#scopedUsageInflight.delete(provider));
 			this.#scopedUsageInflight.set(provider, inflight);
