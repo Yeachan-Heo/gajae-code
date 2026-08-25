@@ -3761,7 +3761,10 @@ pub(crate) mod platform {
 		result
 	}
 
-	#[allow(clippy::undocumented_unsafe_blocks)]
+	#[allow(
+		clippy::undocumented_unsafe_blocks,
+		reason = "descriptor-relative libc calls are audited in this helper"
+	)]
 	pub(super) fn exact_unlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -3961,7 +3964,10 @@ pub(crate) mod platform {
 	/// otherwise the detached authority is retained. The private directory keeps
 	/// the caller-supplied quarantine name occupied, so a replacement at that
 	/// name cannot become the unlink target.
-	#[allow(clippy::undocumented_unsafe_blocks)]
+	#[allow(
+		clippy::undocumented_unsafe_blocks,
+		reason = "descriptor-relative libc calls are audited in this helper"
+	)]
 	pub(super) fn exact_unlink_symlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -5834,6 +5840,10 @@ pub(crate) mod platform {
 		Ok(())
 	}
 
+	#[allow(
+		clippy::undocumented_unsafe_blocks,
+		reason = "descriptor-relative libc calls are audited in this helper"
+	)]
 	pub(super) fn exact_remove_directory_tree(
 		path: &Path,
 		expected: &NativeDirectoryTreeSnapshot,
