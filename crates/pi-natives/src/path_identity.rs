@@ -1240,15 +1240,17 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	platform::exact_unlink(Path::new(&path), &identity)
 }
 
-/// Remove only the captured symbolic link at `path`.
+/// Remove or retain only the captured symbolic link at `path`.
 ///
 /// The caller must provide the link's no-follow identity and a private,
 /// single-component `quarantineName` in that identity. The native protocol
-/// first no-replace-renames the exact link into that quarantine name, verifies
-/// the detached entry without following it, and then deletes the same
-/// identity-bound handle/name. A successor published at the original path is
-/// never touched; any post-detach uncertainty is returned as retained
-/// authority instead of being treated as success.
+/// first no-replace-renames the exact link into that quarantine name and
+/// verifies the detached entry without following it. POSIX has no
+/// descriptor-bound unlink primitive, so a verified detached entry is
+/// returned as `cleanup_pending` authority instead of being deleted by a
+/// replaceable pathname. A successor published at the original path is never
+/// touched; any post-detach uncertainty is returned as retained authority
+/// instead of being treated as success.
 #[napi]
 pub fn exact_unlink_symlink(
 	path: String,
@@ -1934,6 +1936,10 @@ pub(crate) mod platform {
 	static AFTER_EXCHANGE_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
 		OnceLock::new();
 
+	#[cfg(all(test, target_os = "linux"))]
+	static AFTER_SYMLINK_IDENTITY_CHECK_HOOK:
+		OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> = OnceLock::new();
+
 	#[cfg(test)]
 	static BEFORE_EXCHANGE_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
 		OnceLock::new();
@@ -1987,6 +1993,16 @@ pub(crate) mod platform {
 	#[cfg(all(test, target_os = "linux"))]
 	pub(super) fn set_after_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*AFTER_EXCHANGE_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	pub(super) fn set_after_symlink_identity_check_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*AFTER_SYMLINK_IDENTITY_CHECK_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
@@ -2100,6 +2116,23 @@ pub(crate) mod platform {
 		{
 			entered.send(()).expect("exchange hook receiver");
 			resume.recv().expect("exchange hook resume");
+		}
+	}
+
+	#[cfg(all(test, target_os = "linux"))]
+	fn pause_after_symlink_identity_check_for_test() {
+		if let Some((entered, resume)) = AFTER_SYMLINK_IDENTITY_CHECK_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered
+				.send(())
+				.expect("symlink identity check hook receiver");
+			resume
+				.recv()
+				.expect("symlink identity check hook resume");
 		}
 	}
 
@@ -3916,11 +3949,14 @@ pub(crate) mod platform {
 		}
 	}
 
-	/// Remove one captured symlink through a private no-replace quarantine. The
-	/// public pathname is never used after the detach, so a successor published
-	/// there remains untouched. Every private-name mutation is revalidated with
-	/// `AT_SYMLINK_NOFOLLOW`; a failed validation is restored only with another
-	/// no-replace rename, otherwise the detached authority is retained.
+	/// Remove one captured symlink through a private no-replace quarantine
+	/// directory. The public pathname is never used after the detach, so a
+	/// successor published there remains untouched. The detached entry is
+	/// verified relative to the private directory descriptor before unlinking;
+	/// a failed validation is restored only with another no-replace rename,
+	/// otherwise the detached authority is retained. The private directory keeps
+	/// the caller-supplied quarantine name occupied, so a replacement at that
+	/// name cannot become the unlink target.
 	pub(super) fn exact_unlink_symlink(
 		path: &Path,
 		identity: &ExactFileIdentity,
@@ -3963,54 +3999,121 @@ pub(crate) mod platform {
 			Ok(false) => return close_parent(NativeExactUnlinkResult::failure("identity_mismatch")),
 			Err(code) => return close_parent(NativeExactUnlinkResult::failure(code)),
 		}
-		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &name, &quarantine) {
+		// Keep the caller-supplied quarantine name occupied by a fresh owner-only
+		// directory. The captured symlink is moved below that directory, where the
+		// retained directory descriptor binds every later no-follow operation.
+		if unsafe { libc::mkdirat(parent_fd, quarantine.as_ptr(), 0o700) } != 0 {
+			let code = match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::EEXIST) => "quarantine_collision",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				_ => "io_error",
+			};
 			return close_parent(NativeExactUnlinkResult::failure(code));
 		}
-		let detached_path = path
+		let quarantine_fd = unsafe {
+			libc::openat(
+				parent_fd,
+				quarantine.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if quarantine_fd < 0 {
+			let code = security_code(&std::io::Error::last_os_error());
+			let _ = unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) };
+			return close_parent(NativeExactUnlinkResult::failure(code));
+		}
+		let close_quarantine = |result: NativeExactUnlinkResult| {
+			// SAFETY: this operation owns the private quarantine descriptor exactly once.
+			unsafe { libc::close(quarantine_fd) };
+			close_parent(result)
+		};
+		let private_name = CString::new(".captured").expect("private symlink name contains no NUL");
+		let quarantine_path = path
 			.parent()
 			.unwrap_or_else(|| Path::new("."))
 			.join(quarantine_name)
 			.to_string_lossy()
 			.into_owned();
+		let detached_path = Path::new(&quarantine_path)
+			.join(private_name.to_string_lossy().as_ref())
+			.to_string_lossy()
+			.into_owned();
+		if let Err(code) = rename_no_replace(parent_fd, quarantine_fd, &name, &private_name) {
+			let removed = unsafe {
+				libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR)
+			} == 0;
+			return if removed {
+				close_quarantine(NativeExactUnlinkResult::failure(code))
+			} else {
+				close_quarantine(NativeExactUnlinkResult::retained_unknown_failure(
+					"cleanup_pending",
+					quarantine_path,
+				))
+			};
+		}
 		let restore_or_retain = |code: &'static str| {
-			// Never move an unverified replacement from the quarantine name. Only
+			// Never move an unverified replacement from the private directory. Only
 			// the captured symlink may be restored; a foreign occupant stays at its
 			// private name as retained authority.
-			if !matches!(exact_symlink_matches(parent_fd, &quarantine, identity), Ok(true)) {
-				return close_parent(NativeExactUnlinkResult::detached_failure(
+			if !matches!(exact_symlink_matches(quarantine_fd, &private_name, identity), Ok(true)) {
+				return close_quarantine(NativeExactUnlinkResult::detached_failure(
 					"identity_mismatch",
 					detached_path.clone(),
 				));
 			}
-			match rename_no_replace(parent_fd, parent_fd, &quarantine, &name) {
-				Ok(()) => close_parent(NativeExactUnlinkResult::failure(code)),
+			match rename_no_replace(quarantine_fd, parent_fd, &private_name, &name) {
+				Ok(()) => {
+					let removed = unsafe {
+						libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR)
+					} == 0;
+					if removed {
+						close_quarantine(NativeExactUnlinkResult::failure(code))
+					} else {
+						close_quarantine(NativeExactUnlinkResult::retained_unknown_failure(
+							"cleanup_pending",
+							quarantine_path.clone(),
+						))
+					}
+				},
 				Err("quarantine_collision") => {
 					let mut result =
 						NativeExactUnlinkResult::detached_failure(code, detached_path.clone());
 					result.retained_successor_path = Some(path.to_string_lossy().into_owned());
-					close_parent(result)
+					close_quarantine(result)
 				},
-				Err(_) => close_parent(NativeExactUnlinkResult::detached_failure(
+				Err(_) => close_quarantine(NativeExactUnlinkResult::detached_failure(
 					"cleanup_pending",
 					detached_path.clone(),
 				)),
 			}
 		};
-		match exact_symlink_matches(parent_fd, &quarantine, identity) {
+		match exact_symlink_matches(quarantine_fd, &private_name, identity) {
 			Ok(true) => {},
 			Ok(false) | Err(_) => return restore_or_retain("identity_mismatch"),
 		}
-		// Revalidate immediately before unlinking the private name. This is the
-		// POSIX no-follow boundary; any observed replacement is retained rather
-		// than consumed by cleanup.
-		match exact_symlink_matches(parent_fd, &quarantine, identity) {
+		// The quarantine directory is owner-only and remains bound by quarantine_fd;
+		// a replacement at the caller-visible quarantine name cannot be consumed by
+		// this descriptor-relative unlink.
+		#[cfg(all(test, target_os = "linux"))]
+		pause_after_symlink_identity_check_for_test();
+		// Revalidate after the caller-visible race seam as well. A replacement at
+		// the private name is retained rather than consumed by the unlink below.
+		match exact_symlink_matches(quarantine_fd, &private_name, identity) {
 			Ok(true) => {},
 			Ok(false) | Err(_) => return restore_or_retain("identity_mismatch"),
 		}
-		// SAFETY: parent_fd and the private quarantine name remain live; the
-		// detached entry was just revalidated as the captured symlink.
-		if unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0 {
-			close_parent(NativeExactUnlinkResult::success())
+		if unsafe { libc::unlinkat(quarantine_fd, private_name.as_ptr(), 0) } == 0 {
+			let removed = unsafe {
+				libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR)
+			} == 0;
+			if removed {
+				close_quarantine(NativeExactUnlinkResult::success())
+			} else {
+				close_quarantine(NativeExactUnlinkResult::retained_unknown_failure(
+					"cleanup_pending",
+					quarantine_path,
+				))
+			}
 		} else {
 			restore_or_retain(security_code(&std::io::Error::last_os_error()))
 		}
@@ -9363,6 +9466,7 @@ mod exact_unlink_placeholder_tests {
 	impl Drop for ExchangeHookTestGuard {
 		fn drop(&mut self) {
 			platform::set_after_exchange_hook(None);
+			platform::set_after_symlink_identity_check_hook(None);
 			platform::set_before_exchange_hook(None);
 			platform::set_after_placeholder_detach_hook(None);
 			platform::set_after_tree_validation_hook(None);
@@ -9379,6 +9483,67 @@ mod exact_unlink_placeholder_tests {
 				.lock()
 				.unwrap_or_else(|poisoned| poisoned.into_inner()),
 		}
+	}
+
+	#[test]
+	fn symlink_quarantine_replacement_is_retained_after_identity_check() {
+		let _guard = exchange_hook_test_guard();
+		let root = std::env::temp_dir().join(format!(
+			"gjc-exact-unlink-symlink-quarantine-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system time")
+				.as_nanos(),
+		));
+		fs::create_dir(&root).expect("create temporary directory");
+		let target = root.join("target-link");
+		let stale = root.join(".quarantine");
+		let captured = stale.join(".captured");
+		std::os::unix::fs::symlink("original-target", &target).expect("create captured symlink");
+		let metadata = fs::symlink_metadata(&target).expect("stat captured symlink");
+		let identity = ExactFileIdentity {
+			dev:             metadata.dev(),
+			ino:             metadata.ino(),
+			nlink:           Some(metadata.nlink()),
+			parent_dev:      None,
+			parent_ino:      None,
+			size:            metadata.size(),
+			mtime_ns:        metadata.mtime_nsec() + metadata.mtime() * 1_000_000_000,
+			directory:       false,
+			detach_only:     false,
+			quarantine_name: Some(".quarantine".to_owned()),
+			sha256:          None,
+			allow_hard_link: false,
+		};
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_symlink_identity_check_hook(Some((entered_tx, resume_rx)));
+		let target_for_unlink = target.clone();
+		let unlink = thread::spawn(move || {
+			platform::exact_unlink_symlink(&target_for_unlink, &identity)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for detached symlink identity check");
+
+		let replacement = root.join("replacement-source");
+		std::os::unix::fs::symlink("replacement-target", &replacement)
+			.expect("create quarantine replacement");
+		fs::remove_file(&captured).expect("remove captured quarantine symlink");
+		fs::rename(&replacement, &captured).expect("replace quarantine symlink");
+		resume_tx.send(()).expect("resume symlink unlink");
+		let result = unlink.join().expect("exact symlink unlink thread");
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(captured.to_string_lossy().as_ref()));
+		assert!(!target.exists(), "captured symlink remains detached");
+		assert_eq!(
+			fs::read_link(&captured).expect("read retained replacement"),
+			std::path::PathBuf::from("replacement-target")
+		);
+		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
 	#[test]

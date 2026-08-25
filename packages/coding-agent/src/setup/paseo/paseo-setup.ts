@@ -106,9 +106,6 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 				now: deps.now(),
 				unregisterBridgeDirectory: async () => {
 					await unregisterBridgeDirectory(settings, recordedBridgeDir);
-					if (recordedBridgeDir !== deps.paths.bridgeDir) {
-						await unregisterBridgeDirectory(settings, deps.paths.bridgeDir).catch(() => undefined);
-					}
 				},
 			});
 			return { kind: "remove", result };
