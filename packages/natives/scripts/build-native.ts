@@ -141,11 +141,18 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	const sourcePath = path.join(outputDir, "index.d.ts");
 	const destPath = path.join(nativeDir, "index.d.ts");
 	try {
-		await fs.copyFile(sourcePath, destPath);
+		const generated = await Bun.file(sourcePath).text();
+		await Bun.write(destPath, normalizeGeneratedBindings(generated));
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to install generated index.d.ts: ${message}`);
 	}
+}
+
+/** Keep the checked-in generated declaration boundary stable across napi-rs versions. */
+export function normalizeGeneratedBindings(bindings: string): string {
+	const appearanceDoc = "\n/**\n * Long-lived macOS appearance observer.";
+	return bindings.replace(appearanceDoc, `\n\n/**\n * Long-lived macOS appearance observer.`);
 }
 
 async function ensurePublishDiagnosticDeclaration(): Promise<void> {
