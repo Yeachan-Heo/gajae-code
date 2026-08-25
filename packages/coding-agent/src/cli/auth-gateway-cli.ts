@@ -84,7 +84,8 @@ function writeCommandFailure(action: AuthGatewayAction, flags: AuthGatewayComman
 		process.stdout.write(`${JSON.stringify({ ok: false, error: stable, scope })}\n`);
 	} else {
 		process.stderr.write(`scope: ${scope ?? "(unscoped)"}\n`);
-		process.stderr.write(`${chalk.red("FAILED")} ${safeDiagnostic(error, stable.message)}\n`);
+		const message = action === "check" ? stable.message : safeDiagnostic(error, stable.message);
+		process.stderr.write(`${chalk.red("FAILED")} ${message}\n`);
 	}
 	process.exitCode = 1;
 }

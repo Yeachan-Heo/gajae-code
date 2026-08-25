@@ -164,4 +164,27 @@ describe("auth CLI diagnostic redaction", () => {
 			await fs.rm(brokerDir, { recursive: true, force: true });
 		}
 	});
+
+	it("uses a stable generic message when credential checking fails at command level", async () => {
+		process.env.GJC_AUTH_BROKER_URL = "https://broker.example";
+		process.env.GJC_AUTH_BROKER_TOKEN = "operator-token";
+		vi.spyOn(AuthBrokerClient.prototype, "fetchSnapshot").mockResolvedValue({
+			status: 200,
+			generation: 1,
+			snapshot: {
+				generation: 1,
+				generatedAt: 1,
+				serverNowMs: 1,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [],
+			},
+		});
+		vi.spyOn(AuthStorage.prototype, "checkCredentials").mockRejectedValue(
+			new Error(`provider account=${SECRET} email=user@example.com`),
+		);
+		const output = await captureOutput(() => runAuthGatewayCommand({ action: "check", flags: { json: false } }));
+		expect(output.stderr).not.toContain(SECRET);
+		expect(output.stderr).not.toContain("user@example.com");
+		expect(output.stderr).toContain("Credential check failed.");
+	});
 });
