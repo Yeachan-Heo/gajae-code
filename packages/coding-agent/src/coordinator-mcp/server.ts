@@ -1198,6 +1198,7 @@ const PUBLIC_ERROR_MESSAGES: Record<string, string> = {
 	codex_authenticated_handoff_unavailable_windows:
 		"Authenticated Codex token-file handoff is unavailable on native Windows.",
 	endpoint_stale: "Coordinator session endpoint is stale.",
+	retirement_proof_stale: "Coordinator retirement proof is stale before effect start.",
 	ambiguous: "Coordinator request outcome is ambiguous.",
 	terminal_uncertain: "Coordinator state is uncertain.",
 	retired: "The coordinator intent was retired after exact identity proof.",
@@ -8732,7 +8733,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					!/^[A-Za-z0-9._-]+$/u.test(lifecycleRequestId) ||
 					processIncarnation === null ||
 					hostIncarnation === null ||
-					!/^[A-Za-z0-9._-]+$/.test(lifecycleRequestId) ||
 					!path.isAbsolute(stateRoot) ||
 					typeof endpointGeneration !== "number" ||
 					!Number.isSafeInteger(endpointGeneration) ||
@@ -8765,6 +8765,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					remote_create_key: remoteCreateKey,
 				};
 				const creationKeyDigest = creationDigests("gjc_coordinator_start_session", creationKey, {}).keyDigest;
+				const brokerRequestKey = `coordinator-retire:${creationKeyDigest}:${createHash("sha256")
+					.update(JSON.stringify(proof))
+					.digest("hex")}`;
 				const retirementKeyDigest = createHash("sha256").update(retirementKey).digest("hex");
 				const isRetirementRetryable = (response: Record<string, unknown>): boolean => {
 					const code = asRecord(response.error)?.code;
@@ -8777,6 +8780,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						code === "broker_request_unavailable" ||
 						code === "broker_transport_unavailable" ||
 						code === "endpoint_stale" ||
+						code === "retirement_proof_stale" ||
 						code === "not_found" ||
 						code === "live_session"
 					);
@@ -8904,12 +8908,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											lifecycleRequestId,
 											remoteCreateKey,
 										},
-										`coordinator-retire:${creationKey}`,
+										brokerRequestKey,
 									);
 									const brokerResponse = asRecord(acknowledgement);
 									if (brokerResponse?.ok === false) {
 										const brokerError = asRecord(brokerResponse.error);
-										if (brokerError?.code === "endpoint_stale" && brokerError.cleanup === undefined)
+										if (brokerError?.code === "retirement_proof_stale" && brokerError.cleanup === undefined)
 											await replaceCreationRetirementIntent(
 												questionPaths,
 												creationKeyDigest,

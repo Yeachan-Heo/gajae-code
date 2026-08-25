@@ -1334,6 +1334,8 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			globalResult: (operation, input) => {
 				if (operation === "session.create") return { ok: true, result: { cwd: root } };
 				if (operation !== "session.reconcile_uncertain") return undefined;
+				if (input.lifecycleRequestId === "stale-effect")
+					return { ok: false, error: { code: "retirement_proof_stale", message: "stale proof" } };
 
 				if (!validAcknowledgement) return { ok: true, result: { sessionId: "wrong-session", retired: true } };
 				return {
@@ -1388,6 +1390,11 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				idempotency_key: creationKey,
 			}),
 		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+		const staleResponse = await server.callTool("gjc_coordinator_retire_start_session", {
+			...retirementArgs,
+			lifecycle_request_id: "stale-effect",
+		});
+		expect(staleResponse).toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
 		const malformed = await server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
 		expect(malformed).toMatchObject({ ok: false, error: { code: "protocol_error" } });
 		expect(controls.at(-1)).toMatchObject({
@@ -1407,7 +1414,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		validAcknowledgement = true;
 		const retried = await server.callTool("gjc_coordinator_retire_start_session", retirementArgs);
 		expect(retried).toMatchObject({ ok: true, session_id: "retired-session", retired: true });
-		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(2);
+		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(3);
 	});
 
 	it("rejects missing or wrong retirement proof before broker mutation", async () => {

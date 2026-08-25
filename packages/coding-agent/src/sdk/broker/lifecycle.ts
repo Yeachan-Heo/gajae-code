@@ -1960,7 +1960,10 @@ function retirementIdentityFromInput(
 		(record.processIncarnation ?? record.hostIncarnation) !== processIdentity ||
 		(record.hostIncarnation ?? record.processIncarnation) !== hostIdentity
 	)
-		return fail("endpoint_stale", "Retirement identity does not match the indexed session authority.");
+		return fail(
+			"retirement_proof_stale",
+			"Retirement proof does not match the indexed session authority before effect start.",
+		);
 	return identity;
 }
 
