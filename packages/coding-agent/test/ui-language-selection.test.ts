@@ -8,7 +8,7 @@ import {
 } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { resolveUiLanguage, uiString } from "@gajae-code/coding-agent/modes/ui-language";
+import { parseUiLanguage, resolveUiLanguage, uiString } from "@gajae-code/coding-agent/modes/ui-language";
 import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
 
 beforeAll(async () => {
@@ -95,11 +95,16 @@ describe("interactive UI language selection", () => {
 });
 
 describe("/language slash command", () => {
-	function harness() {
+	function harness(options: { canWriteDurableConfig?: boolean } = {}) {
 		const status: string[] = [];
 		const errors: string[] = [];
 		const ctx = {
-			settings,
+			settings: {
+				get: (path: "ui.language") => settings.get(path),
+				has: (path: "ui.language") => settings.has(path),
+				set: (path: "ui.language", value: "en" | "ko") => settings.set(path, value),
+				canWriteDurableConfig: () => options.canWriteDurableConfig ?? settings.canWriteDurableConfig(),
+			},
 			editor: { setText: () => {} },
 			statusLine: { invalidate: () => {} },
 			ui: { invalidate: () => {} },
@@ -127,11 +132,29 @@ describe("/language slash command", () => {
 		expect(status[0]).toContain("한국어");
 	});
 
-	it("accepts endonym and English-name spellings", async () => {
+	it("accepts endonym, English-name, ISO, and locale-tag spellings", async () => {
+		expect(parseUiLanguage("한국어")).toBe("ko");
+		expect(parseUiLanguage("Korean")).toBe("ko");
+		expect(parseUiLanguage("kr")).toBe("ko");
+		expect(parseUiLanguage("kor")).toBe("ko");
+		expect(parseUiLanguage("ko-KR")).toBe("ko");
+		expect(parseUiLanguage("eng")).toBe("en");
+		expect(parseUiLanguage("en-US")).toBe("en");
+		expect(parseUiLanguage("fr")).toBeUndefined();
+		expect(parseUiLanguage("fr-FR")).toBeUndefined();
+
 		const korean = harness();
 		await executeBuiltinSlashCommand("/language 한국어", korean.runtime as never);
 		expect(settings.get("ui.language")).toBe("ko");
 
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const locale = harness();
+		await executeBuiltinSlashCommand("/language ko-KR", locale.runtime as never);
+		expect(settings.get("ui.language")).toBe("ko");
+
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
 		const english = harness();
 		await executeBuiltinSlashCommand("/language English", english.runtime as never);
 		expect(settings.get("ui.language")).toBe("en");
@@ -146,5 +169,14 @@ describe("/language slash command", () => {
 		expect(errors[0]).toContain("알 수 없는 언어");
 		expect(errors[0]).toContain("ko (한국어)");
 		expect(settings.get("ui.language")).toBe("ko");
+	});
+
+	it("refuses to persist when durable config cannot be written", async () => {
+		const { errors, runtime } = harness({ canWriteDurableConfig: false });
+
+		expect(await executeBuiltinSlashCommand("/language ko", runtime as never)).toBe(true);
+
+		expect(errors[0]).toContain("Cannot change settings while config.yml has invalid YAML syntax");
+		expect(settings.has("ui.language")).toBe(false);
 	});
 });

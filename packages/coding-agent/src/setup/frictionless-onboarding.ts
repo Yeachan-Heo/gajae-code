@@ -184,38 +184,50 @@ function localeLanguage(locale = Intl.DateTimeFormat().resolvedOptions().locale)
 	return code && SUPPORTED_LANGUAGES.has(code) ? code : "en";
 }
 
-function scriptLanguage(text: string): string | undefined {
+function addLanguageScore(scores: Map<string, number>, language: string, amount: number): void {
+	if (amount <= 0) return;
+	scores.set(language, (scores.get(language) ?? 0) + amount);
+}
+
+function scriptScores(text: string): Map<string, number> {
 	const counts = new Map<string, number>();
 	for (const entry of SCRIPT_LANGUAGES) counts.set(entry.language, text.match(entry.pattern)?.length ?? 0);
 	const hangul = counts.get("ko") ?? 0;
 	const kana = counts.get("ja") ?? 0;
 	const han = counts.get("zh") ?? 0;
-	// Japanese mixes kana with han characters; Korean text carries hangul and rarely han.
-	if (hangul >= LANGUAGE_EVIDENCE_MINIMUM && hangul >= kana) return "ko";
-	if (kana >= LANGUAGE_EVIDENCE_MINIMUM) return "ja";
-	if (han >= LANGUAGE_EVIDENCE_MINIMUM) return "zh";
-	return undefined;
+	const scores = new Map<string, number>();
+	// Korean hangul is decisive when it is at least as strong as kana.
+	if (hangul >= kana) addLanguageScore(scores, "ko", hangul);
+	// Japanese mixes kana with han; kana presence claims the han count so Chinese does not win on kanji.
+	if (kana > hangul) addLanguageScore(scores, "ja", kana + han);
+	else if (hangul === 0 && kana === 0) addLanguageScore(scores, "zh", han);
+	return scores;
 }
 
-function wordLanguage(text: string): string | undefined {
-	const counts = new Map<string, number>();
+function wordScores(text: string): Map<string, number> {
+	const scores = new Map<string, number>();
 	for (const token of text.split(/[^\p{L}\p{N}]+/u)) {
 		if (!token) continue;
 		for (const [language, words] of Object.entries(WORD_LANGUAGES)) {
-			if (words.includes(token)) counts.set(language, (counts.get(language) ?? 0) + 1);
+			if (words.includes(token)) addLanguageScore(scores, language, 1);
 		}
 	}
-	const ranked = [...counts.entries()].sort((left, right) => right[1] - left[1]);
+	return scores;
+}
+
+function leadingLanguage(scores: Map<string, number>): string | undefined {
+	const ranked = [...scores.entries()].sort((left, right) => right[1] - left[1]);
 	const winner = ranked[0];
-	// Function words shared across languages (`la` in both fr and es) must not win a coin flip.
+	// Shared words (`la` in both fr and es) and a tied script/word mix must not win a coin flip.
 	if (!winner || winner[1] < LANGUAGE_EVIDENCE_MINIMUM || winner[1] === ranked[1]?.[1]) return undefined;
 	return winner[0];
 }
 
 /**
- * Onboarding copy language. An explicit user preference always wins; message
- * evidence is trusted only when one language leads clearly, and everything else
- * falls back to the OS locale.
+ * Onboarding copy language. An explicit user preference always wins; script
+ * counts and Latin function-word hits share one ranking so two Hangul or Han
+ * characters cannot override a clearly English transcript. Evidence is trusted
+ * only when one language leads outright; everything else falls back to the OS locale.
  */
 export function detectOnboardingLanguage(
 	messages: readonly string[],
@@ -224,7 +236,9 @@ export function detectOnboardingLanguage(
 ): string {
 	if (preferredLanguage && SUPPORTED_LANGUAGES.has(preferredLanguage)) return preferredLanguage;
 	const sample = messages.slice(-MAX_ARRAY_ITEMS).join("\n").toLowerCase();
-	return scriptLanguage(sample) ?? wordLanguage(sample) ?? localeLanguage(osLocale);
+	const scores = wordScores(sample);
+	for (const [language, amount] of scriptScores(sample)) addLanguageScore(scores, language, amount);
+	return leadingLanguage(scores) ?? localeLanguage(osLocale);
 }
 
 function sourceIdentity(stat: nodeFs.BigIntStats): SessionImportSourceIdentity {

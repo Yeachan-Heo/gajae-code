@@ -84,5 +84,7 @@ const UI_LANGUAGE_ALIASES: Readonly<Record<string, UiLanguage>> = {
 };
 
 export function parseUiLanguage(value: string): UiLanguage | undefined {
-	return UI_LANGUAGE_ALIASES[value.trim().toLowerCase()];
+	const normalized = value.trim().toLowerCase();
+	if (!normalized) return undefined;
+	return UI_LANGUAGE_ALIASES[normalized] ?? UI_LANGUAGE_ALIASES[normalized.split(/[-_]/)[0] ?? ""];
 }

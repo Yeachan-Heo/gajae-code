@@ -119,6 +119,19 @@ describe("frictionless onboarding", () => {
 		expect(detectOnboardingLanguage(["请修改文件"], "en-US")).toBe("zh");
 		expect(detectOnboardingLanguage(["파일 변경해줘"], "en-US")).toBe("ko");
 	});
+	test("script counts compete with word hits instead of winning unconditionally", () => {
+		const englishWithQuotedKorean = [
+			"please handle the class in this file",
+			"change the parser and help me later",
+			"display the table, then modify the module",
+			"label: 한국어",
+		];
+		expect(detectOnboardingLanguage(englishWithQuotedKorean, "fr-FR")).toBe("en");
+		expect(detectOnboardingLanguage(["please change the file 文件"], "ko-KR")).toBe("en");
+		// Two Hangul syllables beat a single English article; equal scores fall back to locale.
+		expect(detectOnboardingLanguage(["the 한글"], "fr-FR")).toBe("ko");
+		expect(detectOnboardingLanguage(["the and 한글"], "fr-FR")).toBe("fr");
+	});
 
 	test("an explicit language preference outranks messages and locale", () => {
 		expect(detectOnboardingLanguage(["le fichier merci"], "fr-FR", "ko")).toBe("ko");
