@@ -252,11 +252,13 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		try {
 			const usage = await fetch(`${gateway.url}/v1/usage`);
 			expect(usage.status).toBe(200);
-			expect((await usage.json()).reports).toEqual([{ provider, limits: [], metadata: {} }]);
+			const usageBody = (await usage.json()) as { reports: unknown };
+			expect(usageBody.reports).toEqual([{ provider, limits: [], metadata: {} }]);
 
 			const checks = await fetch(`${gateway.url}/v1/credentials/check`);
 			expect(checks.status).toBe(200);
-			expect((await checks.json()).credentials).toEqual([{ id: 1, provider, type: "api_key", ok: true }]);
+			const checksBody = (await checks.json()) as { credentials: unknown };
+			expect(checksBody.credentials).toEqual([{ id: 1, provider, type: "api_key", ok: true }]);
 		} finally {
 			await gateway.close();
 		}
