@@ -330,6 +330,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+async function syncParentDirectory(filePath: string): Promise<void> {
+	const parent = await fs.open(path.dirname(filePath), "r");
+	try {
+		await parent.sync();
+	} finally {
+		await parent.close();
+	}
+}
+
 export async function writeProvenance(provenancePath: string, ledger: ProvenanceLedger): Promise<void> {
 	await fs.mkdir(path.dirname(provenancePath), { recursive: true, mode: 0o700 });
 	// Write-then-rename: an interrupted Bun.write can leave a truncated file,
@@ -347,6 +356,7 @@ export async function writeProvenance(provenancePath: string, ledger: Provenance
 			await handle.close();
 		}
 		await fs.rename(temporary, provenancePath);
+		await syncParentDirectory(provenancePath);
 	} catch (error) {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 		throw error;
@@ -457,6 +467,7 @@ export async function writeIntent(intentPath: string, intent: IntentRecord): Pro
 			await handle.close();
 		}
 		await fs.rename(temporary, intentPath);
+		await syncParentDirectory(intentPath);
 	} catch (error) {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 		throw error;

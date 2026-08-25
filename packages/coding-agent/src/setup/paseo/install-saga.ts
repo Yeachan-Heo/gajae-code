@@ -344,12 +344,22 @@ async function bridgeLedgerMatchesFilesystem(
 	for (const name of entries) {
 		if (path.basename(name) !== name || name.includes("/") || name.includes("\\")) return false;
 		const linkPath = path.join(bridgePath, name);
-		const stat = await fs.lstat(linkPath).catch(() => undefined);
+		const stat = await fs.lstat(linkPath, { bigint: true }).catch(() => undefined);
 		if (stat === undefined || !stat.isSymbolicLink()) return false;
 		const link = await fs.readlink(linkPath).catch(() => undefined);
 		if (
 			link === undefined ||
 			path.resolve(path.dirname(linkPath), link) !== path.resolve(ledger.bridgeSourceDir, name)
+		) {
+			return false;
+		}
+		const expectedIdentity = ledger.bridgeEntryIdentities?.[name];
+		if (
+			expectedIdentity === undefined ||
+			expectedIdentity.dev !== stat.dev.toString() ||
+			expectedIdentity.ino !== stat.ino.toString() ||
+			expectedIdentity.size !== stat.size.toString() ||
+			expectedIdentity.mtimeNs !== (stat as unknown as { mtimeNs: bigint }).mtimeNs.toString()
 		) {
 			return false;
 		}
@@ -374,7 +384,7 @@ async function refreshBridgeLedgerIdentities(ledger: ProvenanceLedger): Promise<
 			dev: stat.dev.toString(),
 			ino: stat.ino.toString(),
 			size: stat.size.toString(),
-			mtimeNs: stat.mtimeNs.toString(),
+			mtimeNs: (stat as unknown as { mtimeNs: bigint }).mtimeNs.toString(),
 		};
 	}
 	const bridgeDirIdentity =
@@ -383,7 +393,7 @@ async function refreshBridgeLedgerIdentities(ledger: ProvenanceLedger): Promise<
 					dev: stat.dev.toString(),
 					ino: stat.ino.toString(),
 					size: stat.size.toString(),
-					mtimeNs: stat.mtimeNs.toString(),
+					mtimeNs: (stat as unknown as { mtimeNs: bigint }).mtimeNs.toString(),
 				}))
 			: ledger.bridgeDirIdentity;
 	return { ...ledger, bridgeEntryIdentities, ...(bridgeDirIdentity === undefined ? {} : { bridgeDirIdentity }) };
@@ -431,10 +441,21 @@ export async function recoverIntent(
 		const after = intent.provenancePayload;
 		const beforeMatches = before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined));
 		const afterMatches = after !== undefined && (await bridgeLedgerMatchesFilesystem(after, before));
-		if (!beforeMatches && !afterMatches) {
+		const samePayload =
+			before !== undefined &&
+			after !== undefined &&
+			provenanceLedgerIdentity(before) === provenanceLedgerIdentity(after);
+		const safePreflight = beforeMatches && !afterMatches && ledgerObserved === intent.provenancePreflightIdentity;
+		const safeCompleted = afterMatches && ledgerObserved === intent.provenanceExpectedIdentity;
+		const recoverableCutover =
+			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
+		if (
+			(!safePreflight && !safeCompleted && !recoverableCutover && !(samePayload && beforeMatches)) ||
+			(beforeMatches && afterMatches && !samePayload)
+		) {
 			return {
 				recovered: false,
-				detail: `the live Paseo bridge at ${intent.targetPath} matches neither the preflight nor completed cutover state; refusing to guess recovery`,
+				detail: `the live Paseo bridge and provenance ledger at ${intent.targetPath} form an inconsistent interrupted state; refusing to guess recovery`,
 			};
 		}
 		if (!options.repair) {
@@ -443,7 +464,13 @@ export async function recoverIntent(
 				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
 			};
 		}
-		if (afterMatches) {
+		if (recoverableCutover) {
+			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: `the provenance ledger at ${intent.provenancePath} changed during bridge recovery; refusing to overwrite the newer record`,
+				};
+			}
 			await writeProvenance(intent.provenancePath, await refreshBridgeLedgerIdentities(after!));
 		}
 		await clearIntent(intentPath);

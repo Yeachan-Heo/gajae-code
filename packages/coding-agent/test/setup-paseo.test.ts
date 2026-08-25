@@ -3933,7 +3933,23 @@ describe("intent recovery", () => {
 			await fs.unlink(linkPath);
 			await fs.symlink(path.join(relocatedSource, name), linkPath);
 		}
-		const planned = { ...before, bridgeSourceDir: relocatedSource };
+		const bridgeEntryIdentities = Object.fromEntries(
+			await Promise.all(
+				SKILL_NAMES.map(async name => {
+					const stat = await fs.lstat(path.join(fixture.paths.bridgeDir, name), { bigint: true });
+					return [
+						name,
+						{
+							dev: stat.dev.toString(),
+							ino: stat.ino.toString(),
+							size: stat.size.toString(),
+							mtimeNs: stat.mtimeNs.toString(),
+						},
+					] as const;
+				}),
+			),
+		);
+		const planned = { ...before, bridgeSourceDir: relocatedSource, bridgeEntryIdentities };
 		await writeIntent(fixture.paths.intentRecord, {
 			version: INTENT_VERSION,
 			step: "skills-bridge",
