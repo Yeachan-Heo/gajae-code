@@ -195,6 +195,7 @@ export async function renderGjcBundleSettingsEntry(
 	await setTheme("red-claw");
 	const component = new GjcBundleSettingsComponent(
 		"/fixture/project",
+		undefined,
 		{ onClose: () => {} },
 		{
 			lifecycle: new FixtureLifecyclePort(fixture),

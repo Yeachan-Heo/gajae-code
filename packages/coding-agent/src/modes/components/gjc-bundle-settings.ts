@@ -96,11 +96,12 @@ export class GjcBundleSettingsComponent extends Container {
 
 	constructor(
 		cwd: string,
+		agentDir: string | undefined,
 		private readonly callbacks: GjcBundleSettingsCallbacks,
 		private readonly dependencies: GjcBundleSettingsDependencies = {},
 	) {
 		super();
-		this.#context = { cwd };
+		this.#context = { cwd, agentDir };
 		void this.#load();
 	}
 

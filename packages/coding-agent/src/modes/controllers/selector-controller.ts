@@ -1905,6 +1905,7 @@ export class SelectorController {
 						availableThemes,
 						availableModelProfiles: [...this.ctx.session.modelRegistry.getModelProfiles().keys()],
 						cwd: getProjectDir(),
+						agentDir: this.ctx.session.getSessionAgentDir(),
 						gjcRuntimeSnapshot: this.ctx.session.gjcRuntimeSnapshot,
 						gjcActivationGeneration: this.ctx.session.gjcActivationGeneration,
 					},

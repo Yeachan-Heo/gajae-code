@@ -78,6 +78,21 @@ async function summary(cwd: string, identity: GjcBundleIdentity) {
 }
 
 describe("GJC bundle lifecycle", () => {
+	test("binds user-scope lifecycle state to the selected agent directory", async () => {
+		const cwd = await mkProjectCwd();
+		const selectedAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-selected-agent-"));
+		tempDirs.push(selectedAgentDir);
+
+		const installed = await installGjcBundle({ cwd, agentDir: selectedAgentDir }, "user", sixSurface);
+		expect(installed).toMatchObject({ ok: true, value: { status: "installed" } });
+		if (!installed.ok) throw new Error(installed.error.code);
+
+		expect(await listGjcBundles({ cwd, agentDir: selectedAgentDir })).toHaveLength(1);
+		expect(await listGjcBundles({ cwd })).toHaveLength(0);
+		await expect(fs.stat(registryPathForScope("user", cwd, selectedAgentDir))).resolves.toBeDefined();
+		await expect(fs.stat(registryPathForScope("user", cwd))).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("installs a fresh bundle with an enabled, unquarantined six-surface summary", async () => {
 		const cwd = await mkProjectCwd();
 		const result = await installGjcBundle({ cwd }, "project", sixSurface);

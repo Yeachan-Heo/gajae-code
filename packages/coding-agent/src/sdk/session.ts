@@ -2968,7 +2968,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let gjcProducersComplete = true;
 		let gjcActivationGeneration = 0;
 		try {
-			gjcActivationGeneration = gjcActivationGenerationFor(await currentActivationFingerprint({ cwd }));
+			gjcActivationGeneration = gjcActivationGenerationFor(await currentActivationFingerprint({ cwd, agentDir }));
 		} catch (error) {
 			// Without a readable activation generation no snapshot can be proven
 			// current, so publish nothing rather than a snapshot consumers cannot

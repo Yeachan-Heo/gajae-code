@@ -744,6 +744,12 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			"`__piNativesPublishOutcomeV1`; trying the next compatible artifact.",
 		);
 	}
+	if (typeof bindings.secureWriteSkillFile !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required secure skill publication capability ` +
+			"`secureWriteSkillFile`; trying the next compatible artifact.",
+		);
+	}
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}

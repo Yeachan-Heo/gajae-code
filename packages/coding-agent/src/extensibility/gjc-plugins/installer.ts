@@ -22,6 +22,7 @@ import { validateInstallPlan } from "./validation";
 export interface GjcBundleTransactionOptions {
 	scope: GjcPluginScope;
 	cwd: string;
+	agentDir?: string;
 	/**
 	 * Policy hook evaluated while both scope locks are held. It decides whether
 	 * to commit the candidate, report an already-satisfied no-op, or abort with
@@ -60,8 +61,8 @@ const TAR_MAX_ARCHIVE_BYTES = TAR_MAX_TOTAL_BYTES + TAR_MAX_FILES * 1024 + 1024;
 // A gzip stream can be slightly larger than its incompressible TAR payload.
 const TAR_MAX_COMPRESSED_BYTES = TAR_MAX_ARCHIVE_BYTES + 1024 * 1024;
 
-function scopeRoot(scope: GjcPluginScope, cwd: string): string {
-	return scope === "user" ? gjcPluginUserRoot() : gjcPluginProjectRoot(cwd);
+function scopeRoot(scope: GjcPluginScope, cwd: string, agentDir?: string): string {
+	return scope === "user" ? gjcPluginUserRoot(agentDir) : gjcPluginProjectRoot(cwd);
 }
 
 function safeDirSegment(name: string): string {
@@ -439,20 +440,24 @@ export async function runGjcBundleTransaction(
 		const bundle = await compileGjcPluginBundle(resolved.dir);
 		validateInstallPlan(bundle, []);
 		const dirName = safeDirSegment(bundle.name);
-		const root = scopeRoot(options.scope, options.cwd);
+		const root = scopeRoot(options.scope, options.cwd, options.agentDir);
 		const finalDir = path.join(root, dirName);
 
 		// Lock-free refusal preflight. Acquiring a scope lock creates the scope
 		// root and mutates directory metadata, so a create-only refusal must be
 		// decided before any lock is taken; otherwise "zero mutation" is false.
 		// The locked decision below re-checks, so this is an early-out only.
-		const preflightTarget = await readRegistry(options.scope, options.cwd, { migrate: false });
+		const preflightTarget = await readRegistry(options.scope, options.cwd, {
+			migrate: false,
+			agentDir: options.agentDir,
+		});
 		const preexisting = preflightTarget.plugins.find(p => p.name === bundle.name);
 		if (preexisting) {
 			// The decision may compare a cross-scope fingerprint, so it must see the
 			// same complete universe the locked decision sees.
 			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd, {
 				migrate: false,
+				agentDir: options.agentDir,
 			});
 			const early = await options.decide({
 				targetRegistry: preflightTarget,
@@ -477,9 +482,15 @@ export async function runGjcBundleTransaction(
 			// the scope root or sweep orphans, so an existing-target refusal leaves
 			// the filesystem byte-for-byte untouched.
 
-			const targetRegistry = await readRegistry(options.scope, options.cwd, { migrate: false });
+			const targetRegistry = await readRegistry(options.scope, options.cwd, {
+				migrate: false,
+				agentDir: options.agentDir,
+			});
 			const otherScope: GjcPluginScope = options.scope === "user" ? "project" : "user";
-			const otherRegistry = await readRegistry(otherScope, options.cwd, { migrate: false });
+			const otherRegistry = await readRegistry(otherScope, options.cwd, {
+				migrate: false,
+				agentDir: options.agentDir,
+			});
 			const effective = sortRegistryEntries([...targetRegistry.plugins, ...otherRegistry.plugins]);
 			const existing = targetRegistry.plugins.find(p => p.name === bundle.name);
 			const candidate = bundleToRegistryEntry(
@@ -525,7 +536,12 @@ export async function runGjcBundleTransaction(
 						...targetRegistry.plugins.filter(p => p.name !== bundle.name),
 						decision.entry,
 					]);
-					await writeRegistryUnlocked({ version: 1, scope: options.scope, plugins: next }, options.cwd);
+					await writeRegistryUnlocked(
+						{ version: 1, scope: options.scope, plugins: next },
+						options.cwd,
+						options.scope,
+						options.agentDir,
+					);
 				} catch (error) {
 					await fs.rm(finalDir, { recursive: true, force: true });
 					if (hadFinal) await fs.rename(backupDir, finalDir);
@@ -550,7 +566,12 @@ export async function runGjcBundleTransaction(
 		// therefore held, in a fixed user->project order to avoid deadlock,
 		// regardless of which scope commits. Refusal purity is preserved by the
 		// pre-lock preflight above, which returns before any lock is acquired.
-		return await withRegistryLock("user", options.cwd, () => withRegistryLock("project", options.cwd, critical));
+		return await withRegistryLock(
+			"user",
+			options.cwd,
+			() => withRegistryLock("project", options.cwd, critical, options.agentDir),
+			options.agentDir,
+		);
 	} finally {
 		await resolved.cleanup();
 	}

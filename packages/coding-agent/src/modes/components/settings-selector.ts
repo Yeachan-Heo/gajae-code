@@ -682,6 +682,8 @@ export interface SettingsRuntimeContext {
 	availableModelProfiles: string[];
 	/** Working directory for plugins tab */
 	cwd: string;
+	/** User-scope settings/profile directory for this session. */
+	agentDir?: string;
 	/** Whether this terminal can render the pet overlay. */
 	petAvailable?: boolean;
 	/** Terminal environment used to select unavailable-pet guidance. Omitted in production to use Bun.env. */
@@ -1424,6 +1426,7 @@ export class SettingsSelectorComponent extends Container {
 	#showGjcBundlesTab(): void {
 		this.#gjcBundleComponent = new GjcBundleSettingsComponent(
 			this.context.cwd,
+			this.context.agentDir,
 			{
 				onClose: () => this.callbacks.onCancel(),
 				onBundlesChanged: () => this.callbacks.onPluginsChanged?.(),

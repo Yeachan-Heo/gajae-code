@@ -144,6 +144,7 @@ function componentFor(
 ): GjcBundleSettingsComponent {
 	return new GjcBundleSettingsComponent(
 		"/safe/project",
+		undefined,
 		{ onClose: options.onClose ?? (() => {}), onRenderRequested: options.onRenderRequested },
 		{
 			lifecycle:

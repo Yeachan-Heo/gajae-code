@@ -58,6 +58,8 @@ import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
 export interface GjcLifecycleContext {
 	cwd: string;
+	/** User-scope registry root for this session; never fall back to process-global state. */
+	agentDir?: string;
 }
 
 function fail(code: GjcLifecycleError["code"], message: string, recovery?: string): GjcLifecycleError {
@@ -220,14 +222,17 @@ export const storedSourceLocatorForTest = storedSourceLocator;
 /** Exposed so a test can pin parity with the installer's source predicates. */
 export const isLocalDirectorySourceForTest = isLocalDirectorySource;
 
-async function readEffective(cwd: string): Promise<GjcPluginRegistryEntry[]> {
-	const [user, project] = await Promise.all([readRegistry("user", cwd), readRegistry("project", cwd)]);
+async function readEffective(cwd: string, agentDir?: string): Promise<GjcPluginRegistryEntry[]> {
+	const [user, project] = await Promise.all([
+		readRegistry("user", cwd, { agentDir }),
+		readRegistry("project", cwd, { agentDir }),
+	]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
 }
 
 /** All installed bundles across both scopes, deterministically ordered. */
 export async function listGjcBundles(ctx: GjcLifecycleContext): Promise<GjcBundleSummary[]> {
-	return (await readEffective(ctx.cwd)).map(toBundleSummary);
+	return (await readEffective(ctx.cwd, ctx.agentDir)).map(toBundleSummary);
 }
 
 /** One bundle by exact (scope, name) identity. Opposite scope never matches. */
@@ -235,15 +240,15 @@ export async function getGjcBundle(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<GjcBundleSummary>> {
-	const registry = await readRegistry(identity.scope, ctx.cwd);
+	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	return { ok: true, value: toBundleSummary(entry) };
 }
 
-function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: string): string | null {
+function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: string, agentDir?: string): string | null {
 	const root = path.resolve(pluginRoot);
-	const scopeRoot = path.resolve(registryRootForScope(scope, cwd));
+	const scopeRoot = path.resolve(registryRootForScope(scope, cwd, agentDir));
 	const relative = path.relative(scopeRoot, root);
 	if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return null;
 	return root;
@@ -358,7 +363,7 @@ function resolveUninstallTarget(
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	if (!isUninstallableEntry(entry, identity)) return { ok: false, error: uninstallFailure(identity, "metadata") };
 
-	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot);
+	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot, ctx.agentDir);
 	if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
 	return { ok: true, value: { entry, root } };
 }
@@ -366,11 +371,11 @@ function resolveUninstallTarget(
 async function readUninstallRegistry(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
-	read: (scope: GjcPluginScope, cwd: string) => Promise<GjcPluginRegistry>,
+	read: (scope: GjcPluginScope, cwd: string, agentDir?: string) => Promise<GjcPluginRegistry>,
 	onMalformed: (identity: GjcBundleIdentity) => GjcLifecycleError,
 ): Promise<GjcLifecycleResult<GjcPluginRegistry>> {
 	try {
-		return { ok: true, value: await read(identity.scope, ctx.cwd) };
+		return { ok: true, value: await read(identity.scope, ctx.cwd, ctx.agentDir) };
 	} catch (error) {
 		if (isMalformedRegistryError(error)) return { ok: false, error: onMalformed(identity) };
 		throw error;
@@ -407,63 +412,68 @@ export async function uninstallGjcBundle(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<{ identity: GjcBundleIdentity; summary: GjcBundleSummary }>> {
-	return withRegistryLock(identity.scope, ctx.cwd, async () => {
-		// The mutating API's historical contract maps a malformed registry to the
-		// generic invalid_target metadata failure; only the read-only preview
-		// surfaces the internal registry_unreadable classification signal.
-		const read = await readUninstallRegistry(
-			ctx,
-			identity,
-			(scope, cwd) => readRegistry(scope, cwd, { migrate: false }),
-			failing => uninstallFailure(failing, "metadata"),
-		);
-		if (!read.ok) return read;
-		const registry = read.value;
+	return withRegistryLock(
+		identity.scope,
+		ctx.cwd,
+		async () => {
+			// The mutating API's historical contract maps a malformed registry to the
+			// generic invalid_target metadata failure; only the read-only preview
+			// surfaces the internal registry_unreadable classification signal.
+			const read = await readUninstallRegistry(
+				ctx,
+				identity,
+				(scope, cwd, agentDir) => readRegistry(scope, cwd, { migrate: false, agentDir }),
+				failing => uninstallFailure(failing, "metadata"),
+			);
+			if (!read.ok) return read;
+			const registry = read.value;
 
-		const target = resolveUninstallTarget(registry, ctx, identity);
-		if (!target.ok) return target;
-		const { entry, root } = target.value;
+			const target = resolveUninstallTarget(registry, ctx, identity);
+			if (!target.ok) return target;
+			const { entry, root } = target.value;
 
-		const summary = toBundleSummary(entry);
-		const nextRegistry = { ...registry, plugins: registry.plugins.filter(plugin => plugin !== entry) };
-		const backupRoot = `${root}.uninstalling-${process.pid}-${Date.now()}`;
-		let moved = false;
+			const summary = toBundleSummary(entry);
+			const nextRegistry = { ...registry, plugins: registry.plugins.filter(plugin => plugin !== entry) };
+			const backupRoot = `${root}.uninstalling-${process.pid}-${Date.now()}`;
+			let moved = false;
 
-		try {
-			await fs.rename(root, backupRoot);
-			moved = true;
-		} catch (error) {
-			if (!isEnoent(error)) return { ok: false, error: uninstallFailure(identity, "remove") };
-		}
+			try {
+				await fs.rename(root, backupRoot);
+				moved = true;
+			} catch (error) {
+				if (!isEnoent(error)) return { ok: false, error: uninstallFailure(identity, "remove") };
+			}
 
-		try {
-			await writeRegistryUnlocked(nextRegistry, ctx.cwd);
-		} catch {
+			try {
+				await writeRegistryUnlocked(nextRegistry, ctx.cwd, identity.scope, ctx.agentDir);
+			} catch {
+				if (moved) {
+					try {
+						await fs.rename(backupRoot, root);
+					} catch {
+						return { ok: false, error: uninstallFailure(identity, "restore") };
+					}
+				}
+				return { ok: false, error: uninstallFailure(identity, "write") };
+			}
+
 			if (moved) {
 				try {
-					await fs.rename(backupRoot, root);
+					await fs.rm(backupRoot, { recursive: true, force: true });
 				} catch {
-					return { ok: false, error: uninstallFailure(identity, "restore") };
+					try {
+						await writeRegistryUnlocked(registry, ctx.cwd, identity.scope, ctx.agentDir);
+						await fs.rename(backupRoot, root);
+					} catch {
+						return { ok: false, error: uninstallFailure(identity, "restore") };
+					}
+					return { ok: false, error: uninstallFailure(identity, "remove") };
 				}
 			}
-			return { ok: false, error: uninstallFailure(identity, "write") };
-		}
-
-		if (moved) {
-			try {
-				await fs.rm(backupRoot, { recursive: true, force: true });
-			} catch {
-				try {
-					await writeRegistryUnlocked(registry, ctx.cwd);
-					await fs.rename(backupRoot, root);
-				} catch {
-					return { ok: false, error: uninstallFailure(identity, "restore") };
-				}
-				return { ok: false, error: uninstallFailure(identity, "remove") };
-			}
-		}
-		return { ok: true, value: { identity, summary } };
-	});
+			return { ok: true, value: { identity, summary } };
+		},
+		ctx.agentDir,
+	);
 }
 
 function notInstalled(identity: GjcBundleIdentity): GjcLifecycleError {
@@ -623,7 +633,7 @@ export async function installGjcBundle(
 	// pre-lock preflight refuses after resolving.
 	const declared = await declaredBundleName(source);
 	if (declared) {
-		const registry = await readRegistry(scope, ctx.cwd, { migrate: false });
+		const registry = await readRegistry(scope, ctx.cwd, { migrate: false, agentDir: ctx.agentDir });
 		const existing = registry.plugins.find(p => p.name === declared);
 		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
 	}
@@ -633,6 +643,7 @@ export async function installGjcBundle(
 		result = await runGjcBundleTransaction(source, {
 			scope,
 			cwd: ctx.cwd,
+			agentDir: ctx.agentDir,
 			decide: async ({ existing, candidate }): Promise<GjcBundleTransactionDecision> => {
 				if (existing) {
 					return {
@@ -666,7 +677,7 @@ export async function previewGjcBundleUpdate(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<GjcUpdatePreview>> {
-	const registry = await readRegistry(identity.scope, ctx.cwd);
+	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	const safeSource = toSafeSource(entry.source);
@@ -680,7 +691,7 @@ export async function previewGjcBundleUpdate(
 		};
 	}
 
-	const effective = await readEffective(ctx.cwd);
+	const effective = await readEffective(ctx.cwd, ctx.agentDir);
 	// Re-resolution reaches the network and the filesystem, so it can throw with
 	// a cause carrying the raw locator. Convert that into the typed
 	// `source_unavailable` result the contract promises, rather than letting an
@@ -737,7 +748,7 @@ export async function applyGjcBundleUpdate(
 	token: GjcReviewedUpdateToken,
 ): Promise<GjcLifecycleResult<GjcUpdateApplyResult>> {
 	const identity = token.identity;
-	const registry = await readRegistry(identity.scope, ctx.cwd);
+	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	if (!toSafeSource(entry.source).updatable) {
@@ -754,6 +765,7 @@ export async function applyGjcBundleUpdate(
 		const result = await runGjcBundleTransaction(storedSourceLocator(entry.source), {
 			scope: identity.scope,
 			cwd: ctx.cwd,
+			agentDir: ctx.agentDir,
 			decide: async ({ existing, effective, bundle, candidate }): Promise<GjcBundleTransactionDecision> => {
 				if (!existing) return { kind: "abort", error: notInstalled(identity) };
 				if (
@@ -829,17 +841,27 @@ async function mutateEntry(
 	identity: GjcBundleIdentity,
 	mutate: (entry: GjcPluginRegistryEntry) => GjcLifecycleResult<GjcPluginRegistryEntry | null>,
 ): Promise<GjcLifecycleResult<GjcToggleResult>> {
-	return await withRegistryLock(identity.scope, ctx.cwd, async () => {
-		const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false });
-		const entry = registry.plugins.find(p => p.name === identity.name);
-		if (!entry) return { ok: false, error: notInstalled(identity) };
-		const outcome = mutate(entry);
-		if (!outcome.ok) return { ok: false, error: outcome.error };
-		if (outcome.value === null) return { ok: true, value: { summary: toBundleSummary(entry), mutated: false } };
-		const next = sortRegistryEntries([...registry.plugins.filter(p => p.name !== identity.name), outcome.value]);
-		await writeRegistryUnlocked({ version: 1, scope: identity.scope, plugins: next }, ctx.cwd);
-		return { ok: true, value: { summary: toBundleSummary(outcome.value), mutated: true } };
-	});
+	return await withRegistryLock(
+		identity.scope,
+		ctx.cwd,
+		async () => {
+			const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false, agentDir: ctx.agentDir });
+			const entry = registry.plugins.find(p => p.name === identity.name);
+			if (!entry) return { ok: false, error: notInstalled(identity) };
+			const outcome = mutate(entry);
+			if (!outcome.ok) return { ok: false, error: outcome.error };
+			if (outcome.value === null) return { ok: true, value: { summary: toBundleSummary(entry), mutated: false } };
+			const next = sortRegistryEntries([...registry.plugins.filter(p => p.name !== identity.name), outcome.value]);
+			await writeRegistryUnlocked(
+				{ version: 1, scope: identity.scope, plugins: next },
+				ctx.cwd,
+				identity.scope,
+				ctx.agentDir,
+			);
+			return { ok: true, value: { summary: toBundleSummary(outcome.value), mutated: true } };
+		},
+		ctx.agentDir,
+	);
 }
 
 /**
@@ -896,5 +918,5 @@ export async function setGjcBundleSurfaceEnabled(
 
 /** Deterministic activation generation for the current persisted state. */
 export async function currentActivationFingerprint(ctx: GjcLifecycleContext): Promise<string> {
-	return activationFingerprint(await readEffective(ctx.cwd));
+	return activationFingerprint(await readEffective(ctx.cwd, ctx.agentDir));
 }

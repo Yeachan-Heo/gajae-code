@@ -36,6 +36,7 @@ import {
 	loadNative,
 	resolveLoaderCandidates,
 	resolveOptionalPackageNativeDirs,
+	validateLoadedBindings,
 } from "../native/loader-state.js";
 
 function validateCurrentSentinel(bindings: Record<string, unknown>) {
@@ -43,6 +44,19 @@ function validateCurrentSentinel(bindings: Record<string, unknown>) {
 }
 
 describe("issue 823: standalone-binary native loader path resolution", () => {
+	it("rejects a same-version addon without secure skill publication", () => {
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "0.15.2" },
+				{
+					__piNativesVCurrent: (): void => undefined,
+					__piNativesPublishOutcomeV1: (): void => undefined,
+				},
+				"/native/pi_natives.node",
+			),
+		).toThrow(/secure skill publication capability/);
+	});
+
 	it("detects compiled-binary mode from embedded-addon presence when env and url markers are absent", () => {
 		// Mirrors what a Bun standalone binary actually sees on linux-x64 / WSL:
 		// - `process.env.PI_COMPILED` is undefined (the build flag does not substitute property accesses).
@@ -342,18 +356,25 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			candidates: [modern, baseline],
 			requireCandidate: candidate =>
 				candidate === baseline
-					? { __piNativesVCurrent: (): void => undefined, __piNativesPublishOutcomeV1: (): void => undefined }
+					? {
+							__piNativesVCurrent: (): void => undefined,
+							__piNativesPublishOutcomeV1: (): void => undefined,
+							secureWriteSkillFile: (): void => undefined,
+						}
 					: { __piNativesVCurrent: (): void => undefined },
 			validateCandidate: bindings => {
 				validateCurrentSentinel(bindings);
 				if (typeof bindings.__piNativesPublishOutcomeV1 !== "function")
 					throw new Error("missing publish outcome sentinel");
+				if (typeof bindings.secureWriteSkillFile !== "function")
+					throw new Error("missing secure skill publication capability");
 			},
 			describeCandidate: candidate => candidate,
 		});
 		expect(loaded.bindings).toEqual({
 			__piNativesVCurrent: expect.any(Function),
 			__piNativesPublishOutcomeV1: expect.any(Function),
+			secureWriteSkillFile: expect.any(Function),
 		});
 		expect(loaded.errors).toEqual([`${modern}: missing publish outcome sentinel`]);
 	});
