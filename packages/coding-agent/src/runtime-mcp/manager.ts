@@ -12,6 +12,7 @@ import { isCanonicalMCPOAuthBinding, resolveMCPOAuthResourceOrigin, type TSchema
 import { logger } from "@gajae-code/utils";
 import type { SourceMeta } from "../capability/types";
 import * as configValue from "../config/resolve-config-value";
+import type { Settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import {
@@ -281,6 +282,10 @@ export interface MCPDiscoverOptions {
 	configPath?: string;
 	/** Idle retention for shared MCP pool entries. */
 	sharedPoolIdleMs?: number;
+	/** Selected session profile for user-scope config discovery. */
+	agentDir?: string;
+	/** Selected session settings for capability policy. */
+	settings?: Settings;
 }
 
 export interface MCPManagerOptions {
@@ -303,6 +308,8 @@ export interface MCPManagerOptions {
 	sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 	/** Test seam for fencing the acquisition-to-registration replacement race. */
 	afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
+	agentDir?: string;
+	settings?: Settings;
 }
 
 /**
@@ -759,6 +766,8 @@ export class MCPManager {
 	readonly #maxStartupTimeoutMs: number | undefined;
 	readonly #sleep: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
 	readonly #afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
+	readonly #agentDir: string | undefined;
+	readonly #settings: Settings | undefined;
 
 	constructor(
 		private cwd: string,
@@ -769,6 +778,8 @@ export class MCPManager {
 		this.#maxStartupTimeoutMs = options.maxStartupTimeoutMs;
 		this.#sleep = options.sleep ?? delay;
 		this.#afterLeaseAcquiredForTests = options.afterLeaseAcquiredForTests;
+		this.#agentDir = options.agentDir;
+		this.#settings = options.settings;
 		this.cwd = canonicalMCPWorkingDirectory(this.cwd);
 		this.#pool = options.pool ?? new MCPConnectionPool({ sharedPoolIdleMs: options.sharedPoolIdleMs });
 		this.#sessionId = options.sessionId ?? crypto.randomUUID();
@@ -921,6 +932,8 @@ export class MCPManager {
 			autoloadOnly: options?.autoloadOnly,
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
+			agentDir: options?.agentDir ?? this.#agentDir,
+			settings: options?.settings ?? this.#settings,
 		});
 		const result = await this.#connectServers(configs, sources, options?.onConnecting);
 		if (configurationWarning) result.errors.set("$config", "MCP configuration unavailable");

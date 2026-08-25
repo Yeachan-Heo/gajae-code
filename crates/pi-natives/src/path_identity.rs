@@ -4858,6 +4858,17 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("write_failed"));
 		}
+		if file.sync_all().is_err() {
+			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure(
+				cleanup.err().unwrap_or("durability_failed"),
+			);
+		}
 		let private_fd = file.as_raw_fd();
 		if let Err(code) = replace_skill_file_name(skill_fd, &private_name, &final_name, private_fd) {
 			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
@@ -6680,9 +6691,10 @@ mod platform {
 			FILE_BASIC_INFO, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
 			FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
 			FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
-			FileBasicInfo, FileDispositionInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
-			OPEN_EXISTING, READ_CONTROL, ReadFile, SetEndOfFile, SetFileInformationByHandle,
-			SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER, WriteFile,
+			FileBasicInfo, FileDispositionInfo, FlushFileBuffers, GetFileInformationByHandle,
+			GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, ReadFile, SetEndOfFile,
+			SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID, WRITE_DAC, WRITE_OWNER,
+			WriteFile,
 		},
 		System::Threading::{GetCurrentProcess, OpenProcessToken},
 	};
@@ -9579,6 +9591,13 @@ mod platform {
 			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+		}
+		if unsafe { FlushFileBuffers(file) } == 0 {
+			let cleanup = cleanup_private_skill_file(file);
+			unsafe { CloseHandle(file) };
+			return NativeSecureSkillWriteResult::failure(
+				cleanup.err().unwrap_or("durability_failed"),
+			);
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
 		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {

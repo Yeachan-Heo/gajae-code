@@ -538,7 +538,12 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 	let connectableNames = new Set<string>();
 	const surfaceWarnings: string[] = [];
 	try {
-		connectableNames = new Set(Object.keys((await loadAllMCPConfigs(cwd)).configs));
+		connectableNames = new Set(
+			Object.keys(
+				(await loadAllMCPConfigs(cwd, { settings: activeSettings, agentDir: activeSettings.getAgentDir() }))
+					.configs,
+			),
+		);
 	} catch (error) {
 		surfaceWarnings.push(
 			`Startup MCP projection failed closed: ${error instanceof Error ? error.message : String(error)}. Sessions cannot connect any discovered server until this is fixed.`,

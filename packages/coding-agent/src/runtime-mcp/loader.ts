@@ -7,6 +7,7 @@ import { logger } from "@gajae-code/utils";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import { AgentStorage } from "../session/agent-storage";
 import type { AuthStorage } from "../session/auth-storage";
+import type { Settings } from "../config/settings";
 import { type MCPLoadResult, MCPManager } from "./manager";
 import { MCPToolCache } from "./tool-cache";
 
@@ -42,6 +43,8 @@ export interface MCPToolsLoadOptions {
 	authStorage?: AuthStorage;
 	/** Idle retention for shared MCP pool entries. */
 	sharedPoolIdleMs?: number;
+	agentDir?: string;
+	settings?: Settings;
 }
 
 async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
@@ -64,7 +67,11 @@ async function resolveToolCache(storage: AgentStorage | null | undefined): Promi
  */
 export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoadOptions): Promise<MCPToolsLoadResult> {
 	const toolCache = await resolveToolCache(options?.cacheStorage);
-	const manager = new MCPManager(cwd, toolCache, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
+	const manager = new MCPManager(cwd, toolCache, {
+		sharedPoolIdleMs: options?.sharedPoolIdleMs,
+		agentDir: options?.agentDir,
+		settings: options?.settings,
+	});
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);
 	}

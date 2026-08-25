@@ -607,10 +607,11 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 			}
 		}
 
+		let tempPath;
 		try {
 			fs.mkdirSync(ctx.versionedDir, { recursive: true });
 			const buffer = fs.readFileSync(embeddedFile.filePath);
-			const tempPath = `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
+			tempPath = `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
 			const noFollow = fs.constants.O_NOFOLLOW ?? 0;
 			const tempFd = fs.openSync(
 				tempPath,
@@ -626,6 +627,11 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 			fs.renameSync(tempPath, targetPath);
 			extracted.push(targetPath);
 		} catch (err) {
+			if (tempPath) {
+				try {
+					fs.unlinkSync(tempPath);
+				} catch {}
+			}
 			const message = err instanceof Error ? err.message : String(err);
 			errors.push(`embedded addon write (${embeddedFile.filename}): ${message}`);
 		}
@@ -926,9 +932,15 @@ export function loadNative(options = {}) {
 
 	const errors = [];
 	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
+	const verifiedEmbeddedCandidates = [];
 	for (const candidate of embeddedCandidates) {
+		if (options.requireCandidate) {
+			verifiedEmbeddedCandidates.push(candidate);
+			continue;
+		}
 		try {
 			recordStagedSnapshot(ctx, candidate, safeFileSnapshot(candidate));
+			verifiedEmbeddedCandidates.push(candidate);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			errors.push(`embedded addon snapshot (${candidate}): ${message}`);
@@ -936,7 +948,7 @@ export function loadNative(options = {}) {
 	}
 	const embeddedIsAuthoritative = embeddedAddonIsAuthoritative(ctx);
 	const stagedResult =
-		embeddedCandidates.length > 0 || embeddedIsAuthoritative
+		verifiedEmbeddedCandidates.length > 0 || embeddedIsAuthoritative
 			? []
 			: (options.stageNodeModulesAddon ?? maybeStageNodeModulesAddon)(ctx, errors);
 	const stagedCandidates = Array.isArray(stagedResult)
@@ -944,7 +956,7 @@ export function loadNative(options = {}) {
 		: typeof stagedResult === "string"
 			? [stagedResult]
 			: [];
-	const prepended = [...embeddedCandidates, ...stagedCandidates];
+	const prepended = [...verifiedEmbeddedCandidates, ...stagedCandidates];
 	const baseCandidates = Array.isArray(ctx.candidates) ? ctx.candidates : [];
 	const runtimeCandidates = embeddedIsAuthoritative
 		? prepended
