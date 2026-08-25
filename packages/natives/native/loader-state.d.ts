@@ -87,6 +87,7 @@ export interface CachedEmbeddedExtractionIsFreshInput {
 	targetPath: string;
 	embeddedPath: string;
 	sizeOf: (path: string) => number | null;
+	isSafe?: (path: string) => boolean;
 }
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;

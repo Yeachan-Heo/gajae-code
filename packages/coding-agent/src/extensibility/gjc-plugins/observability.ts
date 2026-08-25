@@ -71,7 +71,7 @@ function rowsForEntry(entry: GjcPluginRegistryEntry, quarantinedIds: Map<string,
  */
 export async function summarizeGjcPluginObservability(
 	cwd: string,
-	options: { migrate?: boolean } = {},
+	options: { migrate?: boolean; agentDir?: string } = {},
 ): Promise<PluginObservabilitySummary> {
 	const effective = await loadEffectiveGjcPluginRegistry(cwd, options);
 	const preQuarantine: SessionQuarantine[] = [];

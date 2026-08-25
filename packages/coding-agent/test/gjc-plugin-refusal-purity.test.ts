@@ -260,6 +260,7 @@ describe("GJC bundle refusal purity", () => {
 			{ cwd },
 			{
 				identity,
+				agentDir,
 				candidateFingerprint: "0".repeat(64),
 				baselineFingerprint: "0".repeat(64),
 				decisionContextFingerprint: "0".repeat(64),
@@ -286,6 +287,7 @@ describe("GJC bundle refusal purity", () => {
 			{ cwd },
 			{
 				identity,
+				agentDir,
 				candidateFingerprint: "0".repeat(64),
 				baselineFingerprint: "0".repeat(64),
 				decisionContextFingerprint: "0".repeat(64),

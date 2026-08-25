@@ -50,6 +50,7 @@ describe("probeWindowsJobMemory", () => {
 		const bindings = {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			secureWriteSkillFile: () => undefined,
 			renameNoReplacePath: () => undefined,
 		};
 		expect(() =>
@@ -65,6 +66,7 @@ describe("probeWindowsJobMemory", () => {
 		const bindings = {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
+			secureWriteSkillFile: () => undefined,
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 		};

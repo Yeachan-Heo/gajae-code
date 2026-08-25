@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import { createServer } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir } from "@gajae-code/utils";
 import {
 	applyGjcBundleUpdate,
 	bundleIdentity,
@@ -280,6 +281,7 @@ describe("GJC plugin installer", () => {
 	test("preview and apply agree on unavailable versus reachable malformed tar and git sources", async () => {
 		const applyToken = (identity: ReturnType<typeof bundleIdentity>) => ({
 			identity,
+			agentDir: getAgentDir(),
 			candidateFingerprint: "0".repeat(64),
 			baselineFingerprint: "0".repeat(64),
 			decisionContextFingerprint: "0".repeat(64),

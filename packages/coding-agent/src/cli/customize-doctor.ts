@@ -1076,7 +1076,7 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 	};
 }
 
-async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface> {
+async function collectPluginBundles(cwd: string, agentDir: string): Promise<CustomizeDoctorSurface> {
 	// npm plugin packages (convention "plugin") — the startup consumer is
 	// getEnabledPlugins(cwd); the lockfile provides the disabled set.
 	const enabledNames = new Set((await getEnabledPlugins(cwd)).map(p => p.name));
@@ -1140,8 +1140,8 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 	// observability; never raw locators or config values.
 	// Read-only: migrate:false keeps the doctor from persisting registry
 	// migrations/legacy discovery (startup activation owns those writes).
-	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false });
-	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false });
+	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false, agentDir });
+	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false, agentDir });
 	const items: CustomizeDoctorItem[] = [...npmItems];
 	for (const entry of bundleEntries) {
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
@@ -1425,7 +1425,7 @@ export async function runCustomizeDoctor(
 	await collect("tool", () => collectTools(projectDir, settings));
 	await collect("extension", () => collectExtensions(projectDir, settings));
 	await collect("command", () => collectCommands(projectDir, settings));
-	await collect("plugin-bundle", () => collectPluginBundles(projectDir));
+	await collect("plugin-bundle", () => collectPluginBundles(projectDir, settings.getAgentDir()));
 
 	// Foreign conventions (Claude Code / Codex project dirs) are never part of
 	// the load path; report them as import candidates for provenance.

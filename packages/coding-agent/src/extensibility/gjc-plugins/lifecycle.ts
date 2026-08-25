@@ -45,6 +45,7 @@ import type {
 	GjcUpdateApplyResult,
 	GjcUpdatePreview,
 } from "./types";
+import { getAgentDir } from "@gajae-code/utils";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
 /**
@@ -253,6 +254,16 @@ function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: strin
 	if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return null;
 	return root;
 }
+
+function expectedInstalledRoot(
+	scope: GjcPluginScope,
+	cwd: string,
+	entry: GjcPluginRegistryEntry,
+	agentDir?: string,
+): string {
+	const safeName = entry.name.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
+	return path.resolve(path.join(registryRootForScope(scope, cwd, agentDir), safeName));
+}
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
 }
@@ -365,6 +376,8 @@ function resolveUninstallTarget(
 
 	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot, ctx.agentDir);
 	if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
+	if (root !== expectedInstalledRoot(identity.scope, ctx.cwd, entry, ctx.agentDir))
+		return { ok: false, error: uninstallFailure(identity, "metadata") };
 	return { ok: true, value: { entry, root } };
 }
 
@@ -715,6 +728,7 @@ export async function previewGjcBundleUpdate(
 			const contextHash = decisionContextFingerprint(identity, effective);
 			const token: GjcReviewedUpdateToken = {
 				identity,
+				agentDir: path.resolve(ctx.agentDir ?? getAgentDir()),
 				candidateFingerprint: candidateHash,
 				baselineFingerprint: baselineHash,
 				decisionContextFingerprint: contextHash,
@@ -748,6 +762,12 @@ export async function applyGjcBundleUpdate(
 	token: GjcReviewedUpdateToken,
 ): Promise<GjcLifecycleResult<GjcUpdateApplyResult>> {
 	const identity = token.identity;
+	if (token.agentDir !== path.resolve(ctx.agentDir ?? getAgentDir())) {
+		return {
+			ok: false,
+			error: fail("stale_decision_context", "The reviewed update belongs to a different agent directory."),
+		};
+	}
 	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };

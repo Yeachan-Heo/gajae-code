@@ -371,10 +371,11 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
  * sentinel yet can expose a different native surface, so it is fresh only when
  * its byte size matches the embedded payload. `sizeOf` returns the byte size of
  * a path, or `null` when it cannot be inspected.
- * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null }} input
+ * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null; isSafe?: (path: string) => boolean }} input
  * @returns {boolean}
  */
-export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf }) {
+export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf, isSafe = () => true }) {
+	if (!isSafe(targetPath)) return false;
 	const cachedSize = sizeOf(targetPath);
 	if (cachedSize === null) return false;
 	const embeddedSize = sizeOf(embeddedPath);
@@ -546,6 +547,19 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 	for (const embeddedFile of embeddedAddonCandidates(ctx.selectedVariant)) {
 		const targetPath = path.join(ctx.versionedDir, embeddedFile.filename);
 		if (fs.existsSync(targetPath)) {
+			try {
+				const cachedIdentity = fs.lstatSync(targetPath);
+				const cachedStat = fs.statSync(targetPath);
+				if (cachedIdentity.isSymbolicLink() || !cachedIdentity.isFile() || cachedStat.nlink !== 1) {
+					fs.unlinkSync(targetPath);
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				errors.push(`embedded addon cache (${embeddedFile.filename}): ${message}`);
+				continue;
+			}
+		}
+		if (fs.existsSync(targetPath)) {
 			// Guard against intra-version drift: a cached extraction written by an earlier
 			// build of the same version carries the same version sentinel but can expose a
 			// different native surface (e.g. a symbol added mid-cycle). The embedded addon
@@ -553,7 +567,10 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 			// embedded payload size and re-extract otherwise.
 			const sizeOf = candidate => {
 				try {
-					return fs.statSync(candidate).size;
+					const identity = fs.lstatSync(candidate);
+					const stat = fs.statSync(candidate);
+					if (identity.isSymbolicLink() || !identity.isFile() || stat.nlink !== 1) return null;
+					return stat.size;
 				} catch {
 					return null;
 				}

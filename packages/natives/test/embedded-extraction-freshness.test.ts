@@ -45,4 +45,15 @@ describe("cachedEmbeddedExtractionIsFresh", () => {
 			}),
 		).toBe(false);
 	});
+
+	it("does not reuse a symlink or hard-link cache target", () => {
+		expect(
+			cachedEmbeddedExtractionIsFresh({
+				targetPath: "/cache/pi_natives.node",
+				embeddedPath: "/embedded/pi_natives.node",
+				sizeOf: sizes({ "/cache/pi_natives.node": 44_380_960, "/embedded/pi_natives.node": 44_380_960 }),
+				isSafe: () => false,
+			}),
+		).toBe(false);
+	});
 });

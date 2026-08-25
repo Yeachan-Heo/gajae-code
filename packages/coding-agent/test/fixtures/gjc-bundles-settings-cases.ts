@@ -94,6 +94,7 @@ const UPDATE_PREVIEW: GjcUpdatePreview = {
 	changed: true,
 	token: {
 		identity: STANDARD_BUNDLE.identity,
+		agentDir: "",
 		candidateFingerprint: "candidate-catalog-130",
 		baselineFingerprint: "baseline-catalog-120",
 		decisionContextFingerprint: "decision-catalog-120",

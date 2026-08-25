@@ -443,6 +443,7 @@ export interface GjcBundleSummary {
  */
 export interface GjcReviewedUpdateToken {
 	identity: GjcBundleIdentity;
+	agentDir: string;
 	candidateFingerprint: string;
 	baselineFingerprint: string;
 	decisionContextFingerprint: string;

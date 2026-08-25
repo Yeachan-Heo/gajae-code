@@ -229,18 +229,21 @@ export async function migrationStatusForEntry(entry: GjcPluginRegistryEntry): Pr
 
 export async function getGjcPluginMigrationStatuses(
 	cwd: string,
-	options: { migrate?: boolean } = {},
+	options: { migrate?: boolean; agentDir?: string } = {},
 ): Promise<GjcPluginMigrationStatus[]> {
 	const { readRegistry } = await import("./registry");
 	const [user, project] = await Promise.all([
-		readRegistry("user", cwd, { migrate: options.migrate !== false }),
-		readRegistry("project", cwd, { migrate: options.migrate !== false }),
+		readRegistry("user", cwd, { migrate: options.migrate !== false, agentDir: options.agentDir }),
+		readRegistry("project", cwd, { migrate: options.migrate !== false, agentDir: options.agentDir }),
 	]);
 	return await Promise.all([...user.plugins, ...project.plugins].map(migrationStatusForEntry));
 }
 
-export async function runGjcPluginMigrationPreflight(cwd: string): Promise<GjcPluginMigrationStatus[]> {
-	return getGjcPluginMigrationStatuses(cwd, { migrate: true });
+export async function runGjcPluginMigrationPreflight(
+	cwd: string,
+	agentDir?: string,
+): Promise<GjcPluginMigrationStatus[]> {
+	return getGjcPluginMigrationStatuses(cwd, { migrate: true, agentDir });
 }
 
 /**
