@@ -971,6 +971,57 @@ describe("Cursor raw transport watchdog", () => {
 		expect(streamCount).toBe(2);
 	}, 12_000);
 
+	it("bounds a later turn waiting on a never-settling mutation lock", async () => {
+		let streamCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			streamCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendServerMessage(stream, {
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: {
+							case: "piWriteArgs",
+							value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+						},
+					}),
+				});
+			}, 10);
+		});
+		const started = Promise.withResolvers<void>();
+		const conversationId = "never-settling-mutation-lock";
+		const first = collectTerminal(baseUrl, {
+			conversationId,
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await Promise.withResolvers<never>().promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		await first;
+
+		const second = await collectTerminal(baseUrl, { conversationId, streamFirstEventTimeoutMs: 40 });
+		expect(second.result.stopReason).toBe("error");
+		expect(second.result.errorMessage).toContain(
+			"Cursor stream timed out while waiting for the first transport event",
+		);
+		expect(streamCount).toBe(1);
+	}, 9_000);
+
 	it("caps the fence on caller abort without an unhandled rejection", async () => {
 		const controller = new AbortController();
 		const unhandled: unknown[] = [];
