@@ -208,8 +208,7 @@ class BashInteractiveOverlayComponent implements Component {
 
 	handleInput(data: string): void {
 		if (this.#state === "running" && getKeybindings().matches(data, "app.tool.backgroundFold")) {
-			this.#onFoldKey();
-			return;
+			if (this.#onFoldKey()) return;
 		}
 		if (this.#state === "running" && (matchesKey(data, "escape") || matchesKey(data, "esc"))) {
 			this.#onDismiss();

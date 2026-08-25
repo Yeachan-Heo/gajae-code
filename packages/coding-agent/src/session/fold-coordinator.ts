@@ -269,6 +269,9 @@ export class FoldCoordinator {
 			releaseFence();
 			return { status: "already-terminal", reason: "the wait settled while its receipt was being captured" };
 		}
+		if (adapter.signal?.aborted || job.status !== "running") {
+			return this.#rollback(job, adapter, releaseFence, "the wait settled while its receipt was being captured");
+		}
 
 		const receipt: FoldReceipt = {
 			jobId: adapter.jobId,
@@ -286,7 +289,13 @@ export class FoldCoordinator {
 		this.#slots.set(job, { state: "present", adapter, receipt });
 
 		// A3 detach the observer, A4 arm the cooperative stop, A5 leave folding.
-		adapter.detachObserver(receipt);
+		const detached = adapter.detachObserver(receipt);
+		if (detached === "already-settled") {
+			this.#slots.delete(job);
+			this.#folding.delete(job);
+			releaseFence();
+			return { status: "already-terminal", reason: "the foreground observer already settled" };
+		}
 		this.#deps.requestStop();
 		this.#folding.delete(job);
 

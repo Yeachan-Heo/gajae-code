@@ -1735,40 +1735,46 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const bridgeCompletion = Promise.withResolvers<ManagedBashJobCompletion>();
 			let bridgeBackgrounded = false;
 
-			const bridgeJobId = bridgeManager.register(
-				"bash",
-				bridgeLabel,
-				async ({ jobId, signal: runSignal, reportProgress }) => {
-					try {
-						const result = await runToCompletion(runSignal);
-						const finalText = this.#extractTextResult(result);
-						latestText = finalText;
-						bridgeCompletion.resolve({ kind: "completed", result });
-						await reportProgress(
-							finalText,
-							bridgeBackgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined,
-						);
-						return finalText;
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						latestText = message;
-						bridgeCompletion.resolve({ kind: "failed", error });
-						await reportProgress(
-							message,
-							bridgeBackgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined,
-						);
-						throw error;
-					} finally {
-						await releaseTerminalOnce();
-					}
-				},
-				{
-					ownerId: this.session.getAgentId?.() ?? undefined,
-					onProgress: async (text: string) => {
-						latestText = text;
+			let bridgeJobId: string;
+			try {
+				bridgeJobId = bridgeManager.register(
+					"bash",
+					bridgeLabel,
+					async ({ jobId, signal: runSignal, reportProgress }) => {
+						try {
+							const result = await runToCompletion(runSignal);
+							const finalText = this.#extractTextResult(result);
+							latestText = finalText;
+							bridgeCompletion.resolve({ kind: "completed", result });
+							await reportProgress(
+								finalText,
+								bridgeBackgrounded ? { async: { state: "completed", jobId, type: "bash" } } : undefined,
+							);
+							return finalText;
+						} catch (error) {
+							const message = error instanceof Error ? error.message : String(error);
+							latestText = message;
+							bridgeCompletion.resolve({ kind: "failed", error });
+							await reportProgress(
+								message,
+								bridgeBackgrounded ? { async: { state: "failed", jobId, type: "bash" } } : undefined,
+							);
+							throw error;
+						} finally {
+							await releaseTerminalOnce();
+						}
 					},
-				},
-			);
+					{
+						ownerId: this.session.getAgentId?.() ?? undefined,
+						onProgress: async (text: string) => {
+							latestText = text;
+						},
+					},
+				);
+			} catch (error) {
+				await releaseTerminalOnce();
+				throw error;
+			}
 
 			const bridgeGeneration = bridgeManager.getJob(bridgeJobId)?.generation ?? bridgeJobId;
 			// Owner teardown must not swallow a live remote command. failNow is the one
@@ -1778,6 +1784,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const unregisterOwnerCleanup = bridgeManager.registerOwnerCleanup(
 				this.session.getAgentId?.() ?? "0-Main",
 				() => {
+					void handle.kill();
 					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.");
 				},
 			);
@@ -1917,18 +1924,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						const ptyLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
 						// The job's runner simply awaits the run that is ALREADY executing,
 						// so registering never re-executes the command.
-						const ptyJobId = ptyManager.register(
-							"bash",
-							ptyLabel,
-							async () => {
-								const outcome = await controls.terminalCompletion;
-								if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
-								return this.#extractTextResult(
-									this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec }),
-								);
-							},
-							{ ownerId: this.session.getAgentId?.() ?? undefined },
-						);
+						let ptyJobId: string;
+						try {
+							ptyJobId = ptyManager.register(
+								"bash",
+								ptyLabel,
+								async () => {
+									const outcome = await controls.terminalCompletion;
+									if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
+									return this.#extractTextResult(
+										this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec }),
+									);
+								},
+								{ ownerId: this.session.getAgentId?.() ?? undefined },
+							);
+						} catch (error) {
+							controls.kill();
+							throw error;
+						}
 						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
 						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(
 							this.session.getAgentId?.() ?? "0-Main",

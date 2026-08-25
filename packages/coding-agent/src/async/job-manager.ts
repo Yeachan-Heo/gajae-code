@@ -1081,6 +1081,10 @@ export class AsyncJobManager {
 				this.#scheduleEviction(id);
 				this.#drainResumeQueue();
 			} catch (error) {
+				if (this.#externallySettled.has(job.generation)) {
+					this.#drainResumeQueue();
+					return;
+				}
 				if (job.status === "cancelled") {
 					job.errorText = error instanceof Error ? error.message : String(error);
 					this.#markRecordTerminal(id, "cancelled", job.generation);
@@ -2336,6 +2340,7 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		if (this.#externallySettled.has(generation)) return false;
 		this.#externallySettled.add(generation);
+		job.abortController.abort();
 		job.status = "failed";
 		this.#freezeEndTime(job);
 		job.errorText = errorText;
