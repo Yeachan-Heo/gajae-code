@@ -152,7 +152,7 @@ describe("SessionManager draft", () => {
 				phase: "preflight",
 				diagnostic: {
 					schemaVersion: 1,
-					collectionState: "unavailable",
+					collectionState: "complete",
 					osCode: undefined,
 					syncFailures: undefined,
 				},
