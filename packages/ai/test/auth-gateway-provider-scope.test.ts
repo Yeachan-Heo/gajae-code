@@ -7,6 +7,7 @@ import {
 	startAuthBroker,
 } from "../src";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
+import { cleanReason } from "../src/auth-broker/redact";
 import { createAuthGatewayModelCatalog, startAuthGateway } from "../src/auth-gateway/server";
 import type {
 	Api,
@@ -631,5 +632,17 @@ describe("provider-scoped auth-gateway cancellation", () => {
 			await gateway.close();
 			unregisterCustomApis(source);
 		}
+	});
+
+	it("scrubs credential-bearing scoped usage diagnostics", () => {
+		const safe = cleanReason(
+			"Authorization: Basic dXNlcjpwYXNz password=secret access=access-token refresh=refresh-token cookie=session https://alice:secret@example.test",
+		);
+		expect(safe).not.toContain("dXNlcjpwYXNz");
+		expect(safe).not.toContain("secret");
+		expect(safe).not.toContain("access-token");
+		expect(safe).not.toContain("refresh-token");
+		expect(safe).not.toContain("session");
+		expect(safe).not.toContain("alice:secret");
 	});
 });
