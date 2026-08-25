@@ -488,6 +488,7 @@ import {
 	bindToolLineage,
 	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelope,
+	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
 	type OwnedCompletionEnvelope,
@@ -2628,11 +2629,24 @@ export class AgentSession {
 		// A parked completion replayed after the fold must schedule its own wake.
 		// This mirrors exactly what the sdk delivery seam does for a live receipt
 		// delivery, so the parked path cannot rely on an unrelated idle rearm.
-		deliverParked: (_job, disposition) => {
-			this.yieldQueue.enqueue("fold-parked-replay", {
+		deliverParked: (job, disposition) => {
+			const endpointId = this.#ownedAsyncJobManager
+				? AsyncJobManager.endpointIdOf(this.#ownedAsyncJobManager)
+				: undefined;
+			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
+			this.yieldQueue.enqueue("async-result", {
 				jobId: disposition.receipt.jobId,
 				generation: disposition.receipt.jobGeneration,
-				text: `${disposition.text}\n\n${describeFoldReceipt(disposition.receipt)}`,
+				result: `${disposition.text}\n\n${describeFoldReceipt(disposition.receipt)}`,
+				job,
+				durationMs: undefined,
+				ownedCompletion: registration
+					? {
+							lineageIdHash: registration.lineageIdHash,
+							promptAttemptEpoch: registration.promptAttemptEpoch,
+							registration,
+						}
+					: undefined,
 			});
 		},
 	});
@@ -3949,17 +3963,6 @@ export class AgentSession {
 			},
 		});
 		this.agent.setOnBeforeYield(() => this.yieldQueue.flush("streaming"));
-		// Wake path for a completion parked during a fold's receipt capture: the
-		// delivery seam deliberately returned early on it, so the fold's replay is
-		// the only delivery it will ever get.
-		this.yieldQueue.register<{ jobId: string; generation: string; text: string }>("fold-parked-replay", {
-			isStale: entry => this.#ownedAsyncJobManager?.isDeliverySuppressed(entry.jobId, entry.generation) ?? false,
-			build: entries => {
-				if (entries.length === 0) return null;
-				const text = entries.map(entry => entry.text).join("\n\n");
-				return { role: "user", content: text, timestamp: Date.now() } as never;
-			},
-		});
 		// Stop-after-result, never abort: a fold arms this once and the loop ends the
 		// turn at its next checkpoint. Consuming the flag here keeps the pause scoped
 		// to the folded turn instead of pausing everything that follows. The

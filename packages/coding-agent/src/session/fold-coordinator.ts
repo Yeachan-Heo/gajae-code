@@ -364,7 +364,7 @@ export class FoldCoordinator {
 
 		if (slot.state === "reserved" && slot.parked !== undefined) {
 			const parkedAt = slot.parkedAt ?? Date.now();
-			if (Date.now() - parkedAt <= FOLD_WAKE_MERGE_WINDOW_MS * 4) return false;
+			if (Date.now() - parkedAt < FOLD_WAKE_MERGE_WINDOW_MS * 4) return false;
 			const parked = slot.parked;
 			this.#slots.delete(job);
 			this.#folding.delete(job);
