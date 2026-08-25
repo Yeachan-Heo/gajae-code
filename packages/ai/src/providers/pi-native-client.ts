@@ -37,6 +37,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream";
 const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"signal",
 	"apiKey",
+	"onStreamCreated",
 	"fetch",
 	"onPayload",
 	"onResponse",

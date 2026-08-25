@@ -182,33 +182,35 @@ interface GatewayCredentialLease {
 	release(): void;
 }
 
-export function releaseGatewayCredentialLeaseWhenComplete(
+export function releaseGatewayCredentialLeaseOnAdmission(
 	events: Pick<AssistantMessageEventStream, "result">,
 	release: () => void,
+	signal?: AbortSignal,
 ): void {
-	// `streamSimple()` may return a lazy-import stream whose provider dispatch
-	// has not started yet. Keep the authority lease until the stream settles so
-	// revocation cannot race the deferred import window.
-	void events.result().then(release, release);
+	let released = false;
+	const releaseOnce = (): void => {
+		if (released) return;
+		released = true;
+		signal?.removeEventListener("abort", releaseOnce);
+		release();
+	};
+	if (signal?.aborted) {
+		releaseOnce();
+		return;
+	}
+	signal?.addEventListener("abort", releaseOnce, { once: true });
+	// A deferred provider import can fail before the admission hook runs. Do
+	// not strand the authority lease in that case, but never wait for a
+	// successful stream's full response lifetime.
+	void events.result().catch(releaseOnce);
 }
 
-async function acquireGatewayApiKey(
+async function resolveGatewayApiKey(
 	opts: AuthGatewayBootOptions,
 	model: Model<Api>,
 	peer: string,
 	signal: AbortSignal,
-): Promise<GatewayCredentialLease> {
-	const previous = credentialAuthorityTails.get(opts) ?? Promise.resolve();
-	const deferred = Promise.withResolvers<void>();
-	credentialAuthorityTails.set(opts, deferred.promise);
-	await previous;
-	let released = false;
-	const release = (): void => {
-		if (released) return;
-		released = true;
-		deferred.resolve();
-		if (credentialAuthorityTails.get(opts) === deferred.promise) credentialAuthorityTails.delete(opts);
-	};
+): Promise<string> {
 	try {
 		const scopeAvailability = await providerScopeAvailability(opts);
 		if (scopeAvailability === "reload_failed") {
@@ -229,9 +231,8 @@ async function acquireGatewayApiKey(
 				`No credential available for provider ${model.provider}`,
 			);
 		}
-		return { apiKey, release };
+		return apiKey;
 	} catch (error) {
-		release();
 		if (error instanceof GatewayCredentialError) throw error;
 		const classified = classifyGatewayError(error);
 		logger.warn("auth-gateway getApiKey threw", {
@@ -240,6 +241,33 @@ async function acquireGatewayApiKey(
 			error: classified.message,
 		});
 		throw new GatewayCredentialError(classified.status, classified.type, classified.message);
+	}
+}
+
+async function acquireGatewayApiKey(
+	opts: AuthGatewayBootOptions,
+	model: Model<Api>,
+	peer: string,
+	signal: AbortSignal,
+): Promise<GatewayCredentialLease> {
+	const previous = credentialAuthorityTails.get(opts) ?? Promise.resolve();
+	const deferred = Promise.withResolvers<void>();
+	credentialAuthorityTails.set(opts, deferred.promise);
+	await previous;
+	let released = false;
+	const release = (): void => {
+		if (released) return;
+		released = true;
+		deferred.resolve();
+		if (credentialAuthorityTails.get(opts) === deferred.promise) credentialAuthorityTails.delete(opts);
+	};
+	try {
+		const apiKey = await resolveGatewayApiKey(opts, model, peer, signal);
+		return { apiKey, release };
+	} catch (error) {
+		release();
+		if (error instanceof GatewayCredentialError) throw error;
+		throw error;
 	}
 }
 
@@ -466,7 +494,7 @@ function redactGatewayStream(events: AssistantMessageEventStream): AssistantMess
 }
 
 async function refreshGatewayApiKeyAfterAuthError(
-	storage: AuthStorage,
+	opts: AuthGatewayBootOptions,
 	model: Model<Api>,
 	provider: string,
 	oldKey: string,
@@ -475,14 +503,27 @@ async function refreshGatewayApiKeyAfterAuthError(
 	format: string,
 	peer: string,
 ): Promise<string | undefined> {
-	await storage.invalidateCredentialMatching(provider, oldKey, signal);
+	await opts.storage.invalidateCredentialMatching(provider, oldKey, signal);
 	logger.debug("auth-gateway retrying provider request after credential invalidation", {
 		format,
 		provider,
 		peer,
 		error: cleanReason(error) ?? "Upstream request failed",
 	});
-	return storage.getApiKey(provider, undefined, { modelId: model.id, signal });
+	try {
+		return await resolveGatewayApiKey(opts, model, peer, signal);
+	} catch (resolutionError) {
+		if (resolutionError instanceof GatewayCredentialError) {
+			logger.debug("auth-gateway has no broker-authorized replacement credential", {
+				format,
+				provider,
+				peer,
+				status: resolutionError.status,
+			});
+			return undefined;
+		}
+		throw resolutionError;
+	}
 }
 
 /**
@@ -660,7 +701,7 @@ async function handleFormatEndpoint(
 	} else {
 		streamOpts.onAuthError = (provider, oldKey, error) =>
 			refreshGatewayApiKeyAfterAuthError(
-				bootOpts.storage,
+				bootOpts,
 				model,
 				provider,
 				oldKey,
@@ -695,6 +736,13 @@ async function handleFormatEndpoint(
 	}
 
 	let events: AssistantMessageEventStream;
+	let releasedAtAdmission = false;
+	const releaseAtAdmission = (): void => {
+		if (releasedAtAdmission) return;
+		releasedAtAdmission = true;
+		credentialLease.release();
+	};
+	streamOpts.onStreamCreated = releaseAtAdmission;
 	try {
 		if (controller.signal.aborted) {
 			credentialLease.release();
@@ -718,7 +766,7 @@ async function handleFormatEndpoint(
 		logger.warn("auth-gateway streamSimple threw", { format: route.label, error: classified.message, peer });
 		return route.module.formatError(classified.status, classified.type, classified.message);
 	}
-	releaseGatewayCredentialLeaseWhenComplete(events, credentialLease.release);
+	releaseGatewayCredentialLeaseOnAdmission(events, releaseAtAdmission, controller.signal);
 	if (streamOpts.fallbackManaged) {
 		events = observeManagedGatewayFailure(events, error =>
 			markManagedGatewayCredentialFailure(
@@ -845,7 +893,7 @@ async function handlePiNative(
 	} else {
 		streamOpts.onAuthError = (provider, oldKey, error) =>
 			refreshGatewayApiKeyAfterAuthError(
-				bootOpts.storage,
+				bootOpts,
 				model,
 				provider,
 				oldKey,
@@ -892,6 +940,13 @@ async function handlePiNative(
 	}
 
 	let events: AssistantMessageEventStream;
+	let releasedAtAdmission = false;
+	const releaseAtAdmission = (): void => {
+		if (releasedAtAdmission) return;
+		releasedAtAdmission = true;
+		credentialLease.release();
+	};
+	streamOpts.onStreamCreated = releaseAtAdmission;
 	try {
 		if (controller.signal.aborted) {
 			credentialLease.release();
@@ -915,7 +970,7 @@ async function handlePiNative(
 		logger.warn("auth-gateway streamSimple threw", { format: "pi-native", error: classified.message, peer });
 		return piNative.formatError(classified.status, classified.type, classified.message);
 	}
-	releaseGatewayCredentialLeaseWhenComplete(events, credentialLease.release);
+	releaseGatewayCredentialLeaseOnAdmission(events, releaseAtAdmission, controller.signal);
 	if (streamOpts.fallbackManaged) {
 		events = observeManagedGatewayFailure(events, error =>
 			markManagedGatewayCredentialFailure(

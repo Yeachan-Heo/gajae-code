@@ -11,9 +11,10 @@ import { cleanReason } from "../src/auth-broker/redact";
 import {
 	createAuthGatewayModelCatalog,
 	isSafeProviderScope,
-	releaseGatewayCredentialLeaseWhenComplete,
+	releaseGatewayCredentialLeaseOnAdmission,
 	startAuthGateway,
 } from "../src/auth-gateway/server";
+import { streamFromLazyImport } from "../src/stream";
 import type {
 	Api,
 	AssistantMessage,
@@ -56,18 +57,81 @@ function makeEventStream(message: AssistantMessage): AssistantMessageEventStream
 	return stream;
 }
 
-describe("auth gateway credential lease", () => {
-	it("keeps the lease until a deferred provider stream settles", async () => {
-		const events = new EventStream();
-		let released = false;
-		releaseGatewayCredentialLeaseWhenComplete(events, () => {
-			released = true;
-		});
+function authError(): Error & { status: number } {
+	return Object.assign(new Error("401 authentication_error"), { status: 401 });
+}
 
-		expect(released).toBe(false);
+describe("auth gateway credential lease", () => {
+	it("releases once at provider admission instead of response completion", async () => {
+		const events = new EventStream();
+		let releases = 0;
+		let released = false;
+		const release = (): void => {
+			if (released) return;
+			released = true;
+			releases += 1;
+		};
+		releaseGatewayCredentialLeaseOnAdmission(events, release);
+
+		expect(releases).toBe(0);
+		// Simulate the shared stream admission callback. Completion must not
+		// invoke the release a second time.
+		release();
+		expect(releases).toBe(1);
 		events.fail(new Error("deferred provider failed"));
 		await events.result().catch(() => undefined);
-		expect(released).toBe(true);
+		expect(releases).toBe(1);
+	});
+
+	it("keeps a lazy-import lease until the provider stream is created", async () => {
+		const inner = Promise.withResolvers<AssistantMessageEventStream>();
+		let admitted = 0;
+		let releases = 0;
+		let released = false;
+		const release = (): void => {
+			if (released) return;
+			released = true;
+			releases += 1;
+		};
+		const events = streamFromLazyImport(
+			() => inner.promise,
+			undefined,
+			() => {
+				admitted += 1;
+				release();
+			},
+		);
+		releaseGatewayCredentialLeaseOnAdmission(events, release);
+
+		expect(admitted).toBe(0);
+		expect(releases).toBe(0);
+		const providerEvents = new EventStream();
+		inner.resolve(providerEvents);
+		await Bun.sleep(0);
+		expect(admitted).toBe(1);
+		// The stream is intentionally still live: release happened at admission,
+		// not after the provider response completes.
+		expect(releases).toBe(1);
+		providerEvents.fail(new Error("provider stream stopped"));
+		await events.result().catch(() => undefined);
+		expect(releases).toBe(1);
+	});
+
+	it("does not double-release when abort and stream failure race", async () => {
+		const events = new EventStream();
+		const controller = new AbortController();
+		let releases = 0;
+		releaseGatewayCredentialLeaseOnAdmission(
+			events,
+			() => {
+				releases += 1;
+			},
+			controller.signal,
+		);
+		controller.abort();
+		events.fail(new Error("provider failed"));
+		await events.result().catch(() => undefined);
+		expect(releases).toBe(1);
 	});
 });
 
@@ -507,6 +571,136 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 			store.close();
 			await Bun.$`rm -rf ${root}`;
 			unregisterCustomApis(source);
+		}
+	});
+
+	it("does not retry with a host env fallback after the broker revokes the credential", async () => {
+		const testSource = "auth-gateway-provider-scope-env-fallback-retry-test";
+		const testApi = "auth-gateway-provider-scope-env-fallback-retry-test" as Api;
+		const provider = "openai";
+		const scopedModel = model("env-fallback-retry-model", provider, testApi);
+		const keys: string[] = [];
+		const previousEnv = process.env.OPENAI_API_KEY;
+		process.env.OPENAI_API_KEY = "host-env-fallback";
+		let credentialAvailable = true;
+		let getApiKeyCalls = 0;
+		registerCustomApi(
+			testApi,
+			(_model, _context, options) => {
+				keys.push(options?.apiKey ?? "");
+				const events = new EventStream();
+				queueMicrotask(() => events.fail(authError()));
+				return events;
+			},
+			testSource,
+		);
+		const storage = {
+			exportSnapshot: () => ({ credentials: credentialAvailable ? [{ provider, key: "broker-key" }] : [] }),
+			getApiKey: async () => {
+				getApiKeyCalls += 1;
+				return credentialAvailable ? "broker-key" : process.env.OPENAI_API_KEY;
+			},
+			invalidateCredentialMatching: async () => {
+				credentialAvailable = false;
+				return true;
+			},
+		} as unknown as AuthStorage;
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			hasProviderCredential: () => credentialAvailable,
+			reloadProviderCredentials: async () => {},
+			validateProviderCredential: (candidateProvider, apiKey) =>
+				credentialAvailable && candidateProvider === provider && apiKey === "broker-key",
+			bearerTokens: [],
+			version: "test",
+			storage,
+			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
+			listModels: () => [scopedModel],
+		});
+		try {
+			const response = await fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+			expect(response.status).toBe(401);
+			expect(keys).toEqual(["broker-key"]);
+			expect(getApiKeyCalls).toBe(1);
+		} finally {
+			await gateway.close();
+			unregisterCustomApis(testSource);
+			if (previousEnv === undefined) delete process.env.OPENAI_API_KEY;
+			else process.env.OPENAI_API_KEY = previousEnv;
+		}
+	});
+
+	it("admits concurrent long-lived streams without global response-lifetime serialization", async () => {
+		const testSource = "auth-gateway-provider-scope-concurrent-stream-test";
+		const testApi = "auth-gateway-provider-scope-concurrent-stream-test" as Api;
+		const provider = "gateway-concurrent-provider";
+		const scopedModel = model("concurrent-stream-model", provider, testApi);
+		const started = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		const pending = [new EventStream(), new EventStream()];
+		let calls = 0;
+		registerCustomApi(
+			testApi,
+			() => {
+				const index = calls++;
+				started[index]?.resolve();
+				return pending[index] as AssistantMessageEventStream;
+			},
+			testSource,
+		);
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			...testAuthority(provider),
+			bearerTokens: [],
+			version: "test",
+			storage: {
+				exportSnapshot: () => ({ credentials: [{ provider }] }),
+				getApiKey: async () => "scoped-key",
+			} as unknown as AuthStorage,
+			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
+			listModels: () => [scopedModel],
+		});
+		const request = () =>
+			fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+		try {
+			const firstResponse = request();
+			await started[0]!.promise;
+			const secondResponse = request();
+			await Promise.race([
+				started[1]!.promise,
+				Bun.sleep(500).then(() => {
+					throw new Error("second stream remained behind the first response lifetime");
+				}),
+			]);
+			expect(calls).toBe(2);
+			const message = (index: number): AssistantMessage => ({
+				role: "assistant",
+				api: testApi,
+				provider,
+				model: scopedModel.id,
+				content: [{ type: "text", text: `ok-${index}` }],
+				usage: ZERO_USAGE,
+				stopReason: "stop",
+				timestamp: 0,
+			});
+			pending[0]!.end(message(0));
+			pending[1]!.end(message(1));
+			expect((await firstResponse).status).toBe(200);
+			expect((await secondResponse).status).toBe(200);
+		} finally {
+			pending[0]!.fail(new Error("test cleanup"));
+			pending[1]!.fail(new Error("test cleanup"));
+			await gateway.close();
+			unregisterCustomApis(testSource);
 		}
 	});
 

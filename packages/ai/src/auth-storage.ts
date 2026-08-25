@@ -3595,7 +3595,9 @@ export class AuthStorage {
 			}
 			return lastGood;
 		})().finally(() => {
-			this.#usageRequestInFlight.delete(cacheKey);
+			if (this.#usageRequestInFlight.get(cacheKey) === promise) {
+				this.#usageRequestInFlight.delete(cacheKey);
+			}
 		});
 
 		this.#usageRequestInFlight.set(cacheKey, promise);
@@ -3849,7 +3851,9 @@ export class AuthStorage {
 				// Don't forward the caller signal into the shared fetch — first caller's
 				// abort would otherwise cancel the upstream for every peer.
 				shared = override().finally(() => {
-					this.#usageReportsInFlight.delete(OVERRIDE_KEY);
+					if (this.#usageReportsInFlight.get(OVERRIDE_KEY) === shared) {
+						this.#usageReportsInFlight.delete(OVERRIDE_KEY);
+					}
 				});
 				this.#usageReportsInFlight.set(OVERRIDE_KEY, shared);
 			}
@@ -3918,7 +3922,9 @@ export class AuthStorage {
 			}
 			return resolved;
 		})().finally(() => {
-			this.#usageReportsInFlight.delete(cacheKey);
+			if (this.#usageReportsInFlight.get(cacheKey) === promise) {
+				this.#usageReportsInFlight.delete(cacheKey);
+			}
 		});
 
 		this.#usageReportsInFlight.set(cacheKey, promise);
