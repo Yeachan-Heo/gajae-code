@@ -139,8 +139,7 @@ function createBrokerClient(brokerConfig: AuthBrokerClientConfig): AuthBrokerCli
 }
 
 export function normalizeProviderScope(provider: string | undefined): string | undefined {
-	const normalized = provider?.trim();
-	return normalized && isSafeProviderScope(normalized) ? normalized : undefined;
+	return provider && isSafeProviderScope(provider) ? provider : undefined;
 }
 
 export function filterCredentialCheckResults(

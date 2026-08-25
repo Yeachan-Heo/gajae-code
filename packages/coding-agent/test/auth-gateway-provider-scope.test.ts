@@ -64,6 +64,7 @@ describe("auth-gateway broker provider scope", () => {
 	it("rejects provider scopes that can inject terminal controls", () => {
 		expect(normalizeProviderScope("openai-codex")).toBe("openai-codex");
 		expect(normalizeProviderScope("openai\u001b]52;c\u0007")).toBeUndefined();
+		expect(normalizeProviderScope(" openai-codex")).toBeUndefined();
 	});
 
 	it("filters cross-provider credential rows before JSON or text rendering", () => {
