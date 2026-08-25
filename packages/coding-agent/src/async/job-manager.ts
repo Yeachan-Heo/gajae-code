@@ -2334,13 +2334,13 @@ export class AsyncJobManager {
 	 * that both fails the job and delivers that failure in one synchronous block, so
 	 * it cannot lose the race against disposal.
 	 */
-	failNow(jobId: string, generation: string, errorText: string): boolean {
+	failNow(jobId: string, generation: string, errorText: string, options?: { abort?: boolean }): boolean {
 		const job = this.#jobs.get(jobId);
 		if (!job || job.generation !== generation) return false;
 		if (job.status !== "running") return false;
 		if (this.#externallySettled.has(generation)) return false;
 		this.#externallySettled.add(generation);
-		job.abortController.abort();
+		if (options?.abort !== false) job.abortController.abort();
 		job.status = "failed";
 		this.#freezeEndTime(job);
 		job.errorText = errorText;

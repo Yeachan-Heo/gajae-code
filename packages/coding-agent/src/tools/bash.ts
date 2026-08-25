@@ -1785,7 +1785,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				this.session.getAgentId?.() ?? "0-Main",
 				() => {
 					void handle.kill();
-					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.");
+					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.", {
+						abort: false,
+					});
 				},
 			);
 
