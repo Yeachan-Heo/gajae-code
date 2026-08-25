@@ -173,6 +173,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
 	#usageCacheEpoch = 0;
+	#snapshotRefreshInflight?: Promise<SnapshotResponse>;
 	#inventoryMetadata = new Map<number, CredentialMetadataRecord>();
 	#inventoryMetadataGeneration = -1;
 	#inventoryState: CredentialInventoryMetadataState = {
@@ -374,6 +375,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): void {
+		if (generation < this.#generation) return;
 		const generationChanged = generation !== this.#generation || this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
@@ -629,9 +631,19 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
 	async refreshSnapshot(): Promise<SnapshotResponse> {
-		const result = await this.#client.fetchSnapshot();
-		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
-		return this.#snapshot;
+		const inflight = this.#snapshotRefreshInflight;
+		if (inflight) return inflight;
+		const refresh = (async (): Promise<SnapshotResponse> => {
+			const result = await this.#client.fetchSnapshot();
+			if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+			return this.#snapshot;
+		})();
+		this.#snapshotRefreshInflight = refresh;
+		try {
+			return await refresh;
+		} finally {
+			if (this.#snapshotRefreshInflight === refresh) this.#snapshotRefreshInflight = undefined;
+		}
 	}
 
 	listAuthCredentials(provider?: string): StoredAuthCredential[] {
