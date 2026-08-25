@@ -416,6 +416,8 @@ export interface IntentRecord {
 	 * user's files, so the record stays credential-free.
 	 */
 	readonly provenancePayload?: ProvenanceLedger;
+	/** Pre-mutation bridge ownership facts used to distinguish a completed cutover from a crash. */
+	readonly bridgePreflightPayload?: ProvenanceLedger;
 	/** Authenticated sidecar to remove only when this intent is discarded before publication. */
 	readonly discardSidecar?: IntentDiscardSidecar;
 	readonly startedAt: string;
@@ -530,12 +532,15 @@ export function validateProvenanceLedger(value: unknown): ProvenanceLedger {
 }
 
 function validateIntentPayload(intentPath: string, intent: IntentRecord): void {
-	if (intent.provenancePayload === undefined) return;
+	if (intent.provenancePayload === undefined && intent.bridgePreflightPayload === undefined) return;
 	try {
-		const payload = validateProvenanceLedger(intent.provenancePayload);
-		if (provenanceLedgerIdentity(payload) !== intent.provenanceExpectedIdentity) {
-			throw new Error("provenancePayload canonical digest does not match provenanceExpectedIdentity");
+		if (intent.provenancePayload !== undefined) {
+			const payload = validateProvenanceLedger(intent.provenancePayload);
+			if (provenanceLedgerIdentity(payload) !== intent.provenanceExpectedIdentity) {
+				throw new Error("provenancePayload canonical digest does not match provenanceExpectedIdentity");
+			}
 		}
+		if (intent.bridgePreflightPayload !== undefined) validateProvenanceLedger(intent.bridgePreflightPayload);
 	} catch (error) {
 		if (error instanceof IntentRecordCorruptError) throw error;
 		throw new IntentRecordCorruptError(intentPath, error instanceof Error ? error.message : String(error));
@@ -608,6 +613,9 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 			);
 		}
 		if (parsed?.provenancePayload !== undefined) {
+			validateIntentPayload(intentPath, parsed);
+		}
+		if (parsed?.bridgePreflightPayload !== undefined) {
 			validateIntentPayload(intentPath, parsed);
 		}
 		if (parsed?.discardSidecar !== undefined && !isIntentDiscardSidecar(parsed.discardSidecar, parsed.targetPath)) {

@@ -647,6 +647,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				provenancePreflightIdentity: await currentIdentity(deps.paths.provenanceLedger),
 				provenanceExpectedIdentity: provenanceLedgerIdentity(bridgeLedgerAfter),
 				provenancePayload: bridgeLedgerAfter,
+				bridgePreflightPayload: bridgeLedger,
 				startedAt: now.toISOString(),
 			};
 			await writeIntent(deps.paths.intentRecord, bridgeIntent);

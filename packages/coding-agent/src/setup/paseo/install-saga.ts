@@ -17,6 +17,8 @@
  * carrying preflight and expected-post identities for BOTH. Recovery classifies
  * each file independently and refuses whenever the ledger diverged.
  */
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
 import { currentIdentity, planPublish, publishPlan, readTarget, removeDiscardSidecar } from "./json-publisher";
 import {
@@ -325,6 +327,42 @@ export interface RecoverIntentOptions {
 	readonly repair: boolean;
 }
 
+async function bridgeLedgerMatchesFilesystem(
+	ledger: ProvenanceLedger,
+	previous: ProvenanceLedger | undefined,
+): Promise<boolean> {
+	const bridgePath = ledger.bridgePath;
+	if (bridgePath === undefined) return (ledger.bridgeEntries?.length ?? 0) === 0;
+	const entries = ledger.bridgeEntries ?? [];
+	if (entries.length === 0) {
+		if (ledger.bridgeDirCreated !== true) return true;
+		const stat = await fs.lstat(bridgePath, { bigint: true }).catch(() => undefined);
+		if (stat === undefined) return false;
+		return stat.isDirectory() && !stat.isSymbolicLink();
+	}
+	if (ledger.bridgeSourceDir === undefined) return false;
+	for (const name of entries) {
+		if (path.basename(name) !== name || name.includes("/") || name.includes("\\")) return false;
+		const linkPath = path.join(bridgePath, name);
+		const stat = await fs.lstat(linkPath).catch(() => undefined);
+		if (stat === undefined || !stat.isSymbolicLink()) return false;
+		const link = await fs.readlink(linkPath).catch(() => undefined);
+		if (
+			link === undefined ||
+			path.resolve(path.dirname(linkPath), link) !== path.resolve(ledger.bridgeSourceDir, name)
+		) {
+			return false;
+		}
+	}
+	if (previous?.bridgePath !== undefined && path.resolve(previous.bridgePath) !== path.resolve(bridgePath)) {
+		for (const name of previous.bridgeEntries ?? []) {
+			const oldPath = path.join(previous.bridgePath, name);
+			if (await fs.lstat(oldPath).catch(() => undefined)) return false;
+		}
+	}
+	return true;
+}
+
 /**
  * Classify a lingering intent left by an interrupted run, and optionally act.
  *
@@ -354,13 +392,14 @@ export async function recoverIntent(
 	if (!intent) return undefined;
 	if (intent.step === "skills-bridge") {
 		const ledgerObserved = await currentIdentity(intent.provenancePath);
-		if (
-			ledgerObserved !== intent.provenancePreflightIdentity &&
-			ledgerObserved !== intent.provenanceExpectedIdentity
-		) {
+		const before = intent.bridgePreflightPayload;
+		const after = intent.provenancePayload;
+		const beforeMatches = before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined));
+		const afterMatches = after !== undefined && (await bridgeLedgerMatchesFilesystem(after, before));
+		if (!beforeMatches && !afterMatches) {
 			return {
 				recovered: false,
-				detail: `the provenance ledger at ${intent.provenancePath} diverged during an interrupted bridge migration; refusing to guess recovery`,
+				detail: `the live Paseo bridge at ${intent.targetPath} matches neither the preflight nor completed cutover state; refusing to guess recovery`,
 			};
 		}
 		if (!options.repair) {
@@ -369,13 +408,15 @@ export async function recoverIntent(
 				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
 			};
 		}
+		if (afterMatches && ledgerObserved !== intent.provenanceExpectedIdentity) {
+			await writeProvenance(intent.provenancePath, after!);
+		}
 		await clearIntent(intentPath);
 		return {
 			recovered: true,
-			detail:
-				ledgerObserved === intent.provenanceExpectedIdentity
-					? "the interrupted bridge migration committed its provenance"
-					: "the interrupted bridge migration left its preflight provenance intact; retrying safely",
+			detail: afterMatches
+				? "the interrupted bridge migration committed its provenance"
+				: "the interrupted bridge migration left its preflight provenance intact; retrying safely",
 		};
 	}
 	const recovery = await classifyIntent(intent);

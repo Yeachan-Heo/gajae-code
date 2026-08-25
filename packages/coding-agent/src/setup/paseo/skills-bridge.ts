@@ -1003,27 +1003,9 @@ async function finishBridgeCleanup(
 			`Native Paseo skills bridge directory cleanup was not durably detached: ${authority.originalPath} (${removal.code ?? "unknown"})`,
 		);
 	}
-	const detached = await fs.lstat(authority.detachedPath, { bigint: true }).catch(error => {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-		throw error;
-	});
-	if (detached === undefined) return;
-	if (
-		!detached.isDirectory() ||
-		detached.isSymbolicLink() ||
-		detached.dev !== BigInt(authority.snapshot.rootDev) ||
-		detached.ino !== BigInt(authority.snapshot.rootIno)
-	) {
-		throw new SkillsBridgeError(`Paseo skills bridge detached authority diverged: ${authority.originalPath}`);
-	}
-	try {
-		await fs.rmdir(authority.detachedPath);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-		throw new SkillsBridgeError(
-			`Paseo skills bridge detached cleanup remains pending: ${authority.detachedPath} (${error instanceof Error ? error.message : String(error)})`,
-		);
-	}
+	throw new SkillsBridgeError(
+		`Paseo skills bridge detached cleanup remains pending after native identity-bound finalization: ${authority.detachedPath}`,
+	);
 }
 
 /**

@@ -2920,7 +2920,7 @@ describe("skills bridge", () => {
 		}
 	});
 
-	test("remove-reinstall-remove replays a persisted .removing bridge authority", async () => {
+	test("remove-reinstall-remove finalizes scrubbed roots in native code", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
 		await seedConfig(fixture.paths);
@@ -2931,40 +2931,23 @@ describe("skills bridge", () => {
 		await runPaseoSetup({}, fixture.deps);
 
 		const removingPath = `${fixture.paths.bridgeDir}.removing`;
-		const realRmdir = fs.rmdir.bind(fs);
-		let failOnce = true;
-		const rmdir = spyOn(fs, "rmdir").mockImplementation(async target => {
-			if (target === removingPath && failOnce) {
-				failOnce = false;
-				const error = new Error("simulated detached cleanup failure") as NodeJS.ErrnoException;
-				error.code = "EACCES";
-				throw error;
-			}
-			return realRmdir(target);
-		});
+		const rmdir = spyOn(fs, "rmdir");
 		try {
 			const first = await runPaseoSetup({ remove: true }, fixture.deps);
 			expect(first.kind).toBe("remove");
 			if (first.kind !== "remove") throw new Error("expected a remove outcome");
-			expect(first.result.outcome).toBe("partial-removal");
-			const pending = (await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending;
-			expect(pending?.originalPath).toBe(fixture.paths.bridgeDir);
-			expect(pending?.detachedPath).toBe(removingPath);
-			await expect(fs.stat(removingPath)).resolves.toBeDefined();
+			expect(first.result.outcome).toBe("removed");
+			expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending).toBeUndefined();
+			await expect(fs.stat(removingPath)).rejects.toMatchObject({ code: "ENOENT" });
 			await expect(fs.stat(fixture.paths.bridgeDir)).rejects.toMatchObject({ code: "ENOENT" });
 
-			// Reinstall while the old detached root is still pending. The new bridge
-			// is allowed to publish, but the old authority must remain in provenance
-			// for the next remove to replay and settle.
+			// Reinstall and remove again; the native finalizer never delegates the
+			// identity-bound detached-root deletion to pathname-only fs.rmdir.
 			await seedSkills(fixture.paths);
 			const reinstall = await runPaseoSetup({}, fixture.deps);
 			expect(reinstall.kind).toBe("install");
 			if (reinstall.kind !== "install") throw new Error("expected an install outcome");
 			expect(reinstall.result.outcome).toBe("installed");
-			expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending?.detachedPath).toBe(
-				removingPath,
-			);
-
 			const second = await runPaseoSetup({ remove: true }, fixture.deps);
 			expect(second.kind).toBe("remove");
 			if (second.kind !== "remove") throw new Error("expected a remove outcome");
@@ -2978,6 +2961,7 @@ describe("skills bridge", () => {
 				providerReplacedEntries: {},
 				seededOrchestrationKeys: {},
 			});
+			expect(rmdir).not.toHaveBeenCalled();
 		} finally {
 			rmdir.mockRestore();
 		}
@@ -3881,6 +3865,7 @@ describe("intent recovery", () => {
 			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
 			provenanceExpectedIdentity: provenanceLedgerIdentity(planned),
 			provenancePayload: planned,
+			bridgePreflightPayload: before,
 			startedAt: new Date().toISOString(),
 		});
 
@@ -3918,6 +3903,7 @@ describe("intent recovery", () => {
 			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
 			provenanceExpectedIdentity: provenanceLedgerIdentity(planned),
 			provenancePayload: planned,
+			bridgePreflightPayload: before,
 			startedAt: new Date().toISOString(),
 		});
 
@@ -3931,6 +3917,42 @@ describe("intent recovery", () => {
 			await expect(fs.lstat(path.join(fixture.paths.bridgeDir, name))).rejects.toMatchObject({ code: "ENOENT" });
 			expect(await fs.realpath(path.join(newBridge, name))).toBe(path.join(fixture.paths.agentsSkillsDir!, name));
 		}
+	});
+
+	test("bridge source recovery commits completed adoption instead of clearing it", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const relocatedSource = path.join(fixture.root, "adopted-skills");
+		for (const name of SKILL_NAMES) {
+			await fs.mkdir(path.join(relocatedSource, name), { recursive: true });
+			await fs.writeFile(path.join(relocatedSource, name, "SKILL.md"), `# ${name}\n`);
+			const linkPath = path.join(fixture.paths.bridgeDir, name);
+			await fs.unlink(linkPath);
+			await fs.symlink(path.join(relocatedSource, name), linkPath);
+		}
+		const planned = { ...before, bridgeSourceDir: relocatedSource };
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: fixture.paths.bridgeDir,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: provenanceLedgerIdentity(before),
+			targetExpectedIdentity: provenanceLedgerIdentity(before),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(planned),
+			provenancePayload: planned,
+			bridgePreflightPayload: before,
+			startedAt: new Date().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(true);
+		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeSourceDir).toBe(relocatedSource);
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
 	});
 
 	async function intentFixture(): Promise<{ fixture: Fixture; intent: IntentRecord }> {

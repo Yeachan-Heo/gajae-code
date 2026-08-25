@@ -1937,8 +1937,9 @@ pub(crate) mod platform {
 		OnceLock::new();
 
 	#[cfg(all(test, target_os = "linux"))]
-	static AFTER_SYMLINK_IDENTITY_CHECK_HOOK:
-		OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> = OnceLock::new();
+	static AFTER_SYMLINK_IDENTITY_CHECK_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
 
 	#[cfg(test)]
 	static BEFORE_EXCHANGE_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
@@ -2130,9 +2131,7 @@ pub(crate) mod platform {
 			entered
 				.send(())
 				.expect("symlink identity check hook receiver");
-			resume
-				.recv()
-				.expect("symlink identity check hook resume");
+			resume.recv().expect("symlink identity check hook resume");
 		}
 	}
 
@@ -4039,9 +4038,8 @@ pub(crate) mod platform {
 			.to_string_lossy()
 			.into_owned();
 		if let Err(code) = rename_no_replace(parent_fd, quarantine_fd, &name, &private_name) {
-			let removed = unsafe {
-				libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR)
-			} == 0;
+			let removed =
+				unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) } == 0;
 			return if removed {
 				close_quarantine(NativeExactUnlinkResult::failure(code))
 			} else {
@@ -4063,9 +4061,9 @@ pub(crate) mod platform {
 			}
 			match rename_no_replace(quarantine_fd, parent_fd, &private_name, &name) {
 				Ok(()) => {
-					let removed = unsafe {
-						libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR)
-					} == 0;
+					let removed =
+						unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) }
+							== 0;
 					if removed {
 						close_quarantine(NativeExactUnlinkResult::failure(code))
 					} else {
@@ -4103,9 +4101,8 @@ pub(crate) mod platform {
 			Ok(false) | Err(_) => return restore_or_retain("identity_mismatch"),
 		}
 		if unsafe { libc::unlinkat(quarantine_fd, private_name.as_ptr(), 0) } == 0 {
-			let removed = unsafe {
-				libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR)
-			} == 0;
+			let removed =
+				unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) } == 0;
 			if removed {
 				close_quarantine(NativeExactUnlinkResult::success())
 			} else {
@@ -6134,21 +6131,27 @@ pub(crate) mod platform {
 			}
 			return NativeExactUnlinkResult::detached_failure(code, detached_retained_path);
 		}
-		// POSIX cannot bind namespace unlink to a verified descriptor. The fallback
-		// therefore keeps the caller-authorized retained namespace and destroys every
-		// authorized file payload only after direct-name descriptor revalidation.
-		// Replays accept the same identities in original or scrubbed form; publisher
-		// successors are never renamed, unlinked, or truncated.
+		// The detached root has been scrubbed and rebound to the retained inode. Keep
+		// the final namespace operation inside this native descriptor-relative
+		// protocol; callers must never repeat the identity check with a pathname-only
+		// `rmdir`, which can consume a successor swapped into `.removing`.
+		let removed =
+			unsafe { libc::unlinkat(parent, detached_name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
+		let synced = removed && fsync_root_parent(parent).is_ok();
 		// SAFETY: this branch owns the live descriptors and closes each exactly once.
 		unsafe {
 			libc::close(detached_fd);
 			libc::close(fd);
 			libc::close(parent);
 		}
-		NativeExactUnlinkResult::detached_failure_with_durable_payload(
-			"cleanup_pending",
-			detached_retained_path,
-		)
+		if synced {
+			NativeExactUnlinkResult::success()
+		} else {
+			NativeExactUnlinkResult::detached_failure_with_durable_payload(
+				"cleanup_pending",
+				detached_retained_path,
+			)
+		}
 	}
 }
 
@@ -9520,9 +9523,8 @@ mod exact_unlink_placeholder_tests {
 		let (resume_tx, resume_rx) = mpsc::channel();
 		platform::set_after_symlink_identity_check_hook(Some((entered_tx, resume_rx)));
 		let target_for_unlink = target.clone();
-		let unlink = thread::spawn(move || {
-			platform::exact_unlink_symlink(&target_for_unlink, &identity)
-		});
+		let unlink =
+			thread::spawn(move || platform::exact_unlink_symlink(&target_for_unlink, &identity));
 		entered_rx
 			.recv()
 			.expect("wait for detached symlink identity check");
@@ -10109,24 +10111,28 @@ mod exact_unlink_placeholder_tests {
 		let snapshot = platform::snapshot_directory_tree(&target)
 			.snapshot
 			.expect("snapshot target");
-		let detached = std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy()));
-
 		let first = platform::exact_remove_directory_tree(&target, &snapshot, None);
-		assert_tree_replay_result(&first, &detached);
-		let first_snapshot = platform::snapshot_directory_tree(&detached)
-			.snapshot
-			.expect("snapshot detached");
-		assert!(
-			tree_is_descriptor_scrubbed(&first_snapshot, &snapshot),
-			"first retained tree contains no authorized payload",
-		);
+		if nested {
+			assert_tree_replay_result(
+				&first,
+				&std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy())),
+			);
+		} else {
+			assert!(first.ok, "native finalization should remove the scrubbed empty root");
+			assert!(first.detached_path.is_none());
+			assert!(!target.exists());
+		}
 
 		let second = platform::exact_remove_directory_tree(&target, &snapshot, None);
-		assert_tree_replay_result(&second, &detached);
-		let second_snapshot = platform::snapshot_directory_tree(&detached)
-			.snapshot
-			.expect("snapshot detached");
-		assert_eq!(second_snapshot, first_snapshot, "replay does not mutate the scrubbed tree");
+		if nested {
+			assert_tree_replay_result(
+				&second,
+				&std::path::PathBuf::from(format!("{}.removing", target.to_string_lossy())),
+			);
+		} else {
+			assert!(!second.ok);
+			assert_eq!(second.code.as_deref(), Some("not_found"));
+		}
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 
@@ -10588,10 +10594,9 @@ mod exact_unlink_placeholder_tests {
 		});
 		entered_rx.recv().expect("wait for next hook");
 		resume_tx.send(()).expect("resume next hook");
-		assert_eq!(
-			removal.join().expect("next removal thread").code.as_deref(),
-			Some("cleanup_pending"),
-		);
+		let next_result = removal.join().expect("next removal thread");
+		assert!(next_result.ok);
+		assert!(!next.exists());
 		fs::remove_dir_all(root).expect("remove temporary directory");
 	}
 }
