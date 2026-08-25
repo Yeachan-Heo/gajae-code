@@ -174,6 +174,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		const realStat = fs.stat;
 		const realLstat = fs.lstat;
 		const realAccess = fs.access;
+		const realBunFile = Bun.file;
 		type ReaddirOptions =
 			| (nfs.ObjectEncodingOptions & { withFileTypes?: boolean; recursive?: boolean })
 			| BufferEncoding
@@ -213,6 +214,30 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			reads.add(path.resolve(String(target)));
 			return passthroughAccess(target);
 		}) as unknown as typeof fs.access);
+		const passthroughBunFile = realBunFile.bind(Bun) as (target: string | URL | number) => Bun.BunFile;
+		vi.spyOn(Bun, "file").mockImplementation(((target: string | URL | number) => {
+			const file = passthroughBunFile(target);
+			const recordPath = () => {
+				if (typeof target !== "number") reads.add(path.resolve(String(target)));
+			};
+			return new Proxy(file, {
+				get(fileTarget, property, receiver) {
+					if (property === "text") {
+						return async () => {
+							recordPath();
+							return fileTarget.text();
+						};
+					}
+					if (property === "slice") {
+						return (start?: number, end?: number) => {
+							recordPath();
+							return fileTarget.slice(start, end);
+						};
+					}
+					return Reflect.get(fileTarget, property, receiver);
+				},
+			});
+		}) as unknown as typeof Bun.file);
 		clearCache();
 
 		const loadedCapabilities = await Promise.all(
