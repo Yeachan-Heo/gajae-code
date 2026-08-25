@@ -451,6 +451,7 @@ export interface AuthCredentialStore {
 	deleteAuthCredentialsForProvider(provider: string, disabledCause: string): void;
 	getCache(key: string, options?: { includeExpired?: boolean }): string | null;
 	setCache(key: string, value: string, expiresAtSec: number): void;
+	allocateMonotonicSequence?(key: string, expiresAtSec: number): number;
 	deleteCachePrefix?(prefix: string): void;
 	cleanExpiredCache(): void;
 	/**
@@ -1357,6 +1358,14 @@ export class AuthStorage {
 	}
 	setCache(key: string, value: string, expiresAtSec: number): void {
 		this.#store.setCache(key, value, expiresAtSec);
+	}
+	allocateMonotonicSequence(key: string, expiresAtSec: number): number {
+		const existing = this.#store.allocateMonotonicSequence?.(key, expiresAtSec);
+		if (existing !== undefined) return existing;
+		const current = Number(this.#store.getCache(key, { includeExpired: true }));
+		const next = Number.isSafeInteger(current) && current >= 0 ? current + 1 : 1;
+		this.#store.setCache(key, String(next), expiresAtSec);
+		return next;
 	}
 	getProviderConfigurationGeneration(provider: string): number {
 		return this.#getProviderConfigurationGeneration(provider);
@@ -6706,6 +6715,17 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		} catch {
 			// Ignore cache set failures
 		}
+	}
+
+	allocateMonotonicSequence(key: string, expiresAtSec: number): number {
+		const allocate = this.#db.transaction(() => {
+			const row = this.#getCacheIncludingExpiredStmt.get(key) as { value?: string } | undefined;
+			const current = Number(row?.value);
+			const next = Number.isSafeInteger(current) && current >= 0 ? current + 1 : 1;
+			this.#upsertCacheStmt.run(key, String(next), expiresAtSec);
+			return next;
+		});
+		return allocate();
 	}
 
 	deleteCachePrefix(prefix: string): void {

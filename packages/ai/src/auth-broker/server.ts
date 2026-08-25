@@ -562,14 +562,8 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
-	const previousEpochSequence = Number(
-		opts.storage.getCache(BROKER_EPOCH_SEQUENCE_CACHE_KEY, { includeExpired: true }),
-	);
-	const epochSequence =
-		Number.isSafeInteger(previousEpochSequence) && previousEpochSequence >= 0 ? previousEpochSequence + 1 : 1;
-	opts.storage.setCache(
+	const epochSequence = opts.storage.allocateMonotonicSequence(
 		BROKER_EPOCH_SEQUENCE_CACHE_KEY,
-		String(epochSequence),
 		Math.floor(Date.now() / 1000) + 315_360_000,
 	);
 	const epoch = `${epochSequence}-${crypto.randomUUID()}`;
