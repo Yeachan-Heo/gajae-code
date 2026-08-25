@@ -30,6 +30,7 @@
 use std::{
 	future::Future,
 	panic::{AssertUnwindSafe, catch_unwind},
+	sync::atomic::{AtomicUsize, Ordering},
 	time::Duration,
 };
 
@@ -37,6 +38,41 @@ use napi::{Env, Error, Result, Task, bindgen_prelude::*};
 use pi_shell::cancel as core_cancel;
 
 use crate::prof::profile_region;
+
+const MAX_ISOLATED_WORKERS: usize = 16;
+static ISOLATED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+enum IsolatedAdmission {
+	Admitted,
+	Saturated,
+}
+
+fn admit_isolated_worker() -> IsolatedAdmission {
+	loop {
+		let current = ISOLATED_WORKERS.load(Ordering::SeqCst);
+		if current >= MAX_ISOLATED_WORKERS {
+			return IsolatedAdmission::Saturated;
+		}
+		if ISOLATED_WORKERS
+			.compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+			.is_ok()
+		{
+			return IsolatedAdmission::Admitted;
+		}
+	}
+}
+
+fn release_isolated_worker() {
+	ISOLATED_WORKERS.fetch_sub(1, Ordering::SeqCst);
+}
+
+struct IsolatedWorkerGuard;
+
+impl Drop for IsolatedWorkerGuard {
+	fn drop(&mut self) {
+		release_isolated_worker();
+	}
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cancellation
@@ -299,7 +335,9 @@ where
 /// request consume a worker forever. The worker is detached immediately after
 /// it starts; it never holds a libuv worker, and process shutdown does not wait
 /// for it. Callers must still enforce their own deadline and treat an
-/// unresolved result as a refusal.
+/// unresolved result as a refusal. Outstanding workers are budgeted: a
+/// saturated process refuses new isolated work instead of creating unbounded
+/// native threads.
 pub fn isolated<'env, T, F>(
 	env: &'env Env,
 	tag: &'static str,
@@ -318,7 +356,8 @@ where
 /// `timeout_ms`. The worker itself remains detached because a blocked kernel
 /// syscall cannot be safely cancelled; dropping its receiver prevents a late
 /// result from crossing the N-API boundary. The timeout value must be a typed
-/// refusal, never a partial success.
+/// refusal, never a partial success. Admission is released only when the
+/// worker actually exits, and a full budget refuses new isolated work.
 pub fn isolated_with_timeout<'env, T, F>(
 	env: &'env Env,
 	tag: &'static str,
@@ -330,11 +369,19 @@ where
 	F: FnOnce() -> Result<T> + Send + 'static,
 	T: ToNapiValue + Send + 'static,
 {
+	if matches!(admit_isolated_worker(), IsolatedAdmission::Saturated) {
+		return match timeout_value {
+			Some(timeout_value) => future(env, tag, async move { Ok(timeout_value) }),
+			None => Err(Error::from_reason("IsolatedTask outstanding-worker budget is exhausted")),
+		};
+	}
+
 	let (sender, receiver) = tokio::sync::oneshot::channel::<Result<T>>();
-	std::thread::Builder::new()
+	if let Err(error) = std::thread::Builder::new()
 		.name(format!("pi-natives-{tag}"))
 		.spawn(move || {
-			let _guard = profile_region(tag);
+			let _guard = IsolatedWorkerGuard;
+			let _profile = profile_region(tag);
 			let result = match catch_unwind(AssertUnwindSafe(work)) {
 				Ok(result) => result,
 				Err(payload) => Err(Error::from_reason(format!(
@@ -343,8 +390,10 @@ where
 				))),
 			};
 			let _ = sender.send(result);
-		})
-		.map_err(|error| Error::from_reason(format!("IsolatedTask spawn failed: {error}")))?;
+		}) {
+		release_isolated_worker();
+		return Err(Error::from_reason(format!("IsolatedTask spawn failed: {error}")));
+	}
 
 	future(env, tag, async move {
 		let received = async move {
@@ -367,13 +416,15 @@ where
 #[cfg(test)]
 mod tests {
 	use std::sync::{
-		Arc,
+		Arc, Mutex,
 		atomic::{AtomicBool, Ordering},
 	};
 
 	use napi::Task;
 
 	use super::*;
+
+	static ISOLATED_WORKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 	#[test]
 	fn blocking_compute_catches_non_string_panic_as_error() {
@@ -492,5 +543,23 @@ mod tests {
 			"heartbeat cancellation reason should be preserved, got: {}",
 			err.reason
 		);
+	}
+	#[test]
+	fn isolated_worker_budget_refuses_when_saturated_and_releases_on_drop() {
+		let _lock = ISOLATED_WORKER_TEST_LOCK
+			.lock()
+			.expect("isolated worker test lock");
+		ISOLATED_WORKERS.store(0, Ordering::SeqCst);
+		for _ in 0..MAX_ISOLATED_WORKERS {
+			assert!(matches!(admit_isolated_worker(), IsolatedAdmission::Admitted));
+		}
+		assert!(matches!(admit_isolated_worker(), IsolatedAdmission::Saturated));
+		release_isolated_worker();
+		assert!(matches!(admit_isolated_worker(), IsolatedAdmission::Admitted));
+		{
+			let _guard = IsolatedWorkerGuard;
+		}
+		assert_eq!(ISOLATED_WORKERS.load(Ordering::SeqCst), MAX_ISOLATED_WORKERS - 1);
+		ISOLATED_WORKERS.store(0, Ordering::SeqCst);
 	}
 }

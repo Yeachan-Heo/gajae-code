@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+## [Unreleased]
+
+### Added
+
+- `snapshotDirectoryTreeAsync` and `exactRemoveDirectoryTreeAsync` run identity-bound directory snapshot and removal on dedicated native threads. Optional `timeoutMs` settles with a typed `timed_out` refusal rather than a partial tree or a successful removal; a wedged filesystem cannot occupy the JS thread or libuv's shared blocking pool after the caller gives up. Isolated workers are admission-budgeted (16 outstanding) and release that budget only when the worker actually exits.
 
 ### Fixed
 
