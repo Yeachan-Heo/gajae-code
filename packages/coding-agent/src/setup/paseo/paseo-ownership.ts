@@ -373,7 +373,7 @@ export function provenancedProviderKeys(ledger: ProvenanceLedger): readonly stri
 	return Object.keys(ledger.providerKeys).sort();
 }
 
-export type IntentStep = "provider-config" | "orchestration-preferences";
+export type IntentStep = "provider-config" | "orchestration-preferences" | "skills-bridge";
 
 /**
  * Credential-free cleanup proof for a sidecar created by an interrupted step.
@@ -573,7 +573,11 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 		stringField(parsed?.provenancePreflightIdentity, "provenancePreflightIdentity");
 		stringField(parsed?.provenanceExpectedIdentity, "provenanceExpectedIdentity");
 		stringField(parsed?.startedAt, "startedAt");
-		if (parsed?.step !== "provider-config" && parsed?.step !== "orchestration-preferences") {
+		if (
+			parsed?.step !== "provider-config" &&
+			parsed?.step !== "orchestration-preferences" &&
+			parsed?.step !== "skills-bridge"
+		) {
 			throw new IntentRecordCorruptError(intentPath, "step is not a known intent step");
 		}
 		if (typeof parsed?.version !== "number") {

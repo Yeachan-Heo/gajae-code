@@ -2028,6 +2028,7 @@ describe("skills bridge", () => {
 		expect(await readIntent(fixture.paths.intentRecord)).toBeDefined();
 
 		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		if (!recovery?.recovered) throw new Error(JSON.stringify(recovery));
 		expect(recovery?.recovered).toBe(true);
 		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
 		// The target never published, so recovery discards the intent and the
@@ -3857,6 +3858,81 @@ describe("provenance-gated removal (AC-19)", () => {
 });
 
 describe("intent recovery", () => {
+	test("bridge source relocation retries from preflight provenance after a crash", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const relocatedSource = path.join(fixture.root, "relocated-skills");
+		for (const name of SKILL_NAMES) {
+			await fs.mkdir(path.join(relocatedSource, name), { recursive: true });
+			await fs.writeFile(path.join(relocatedSource, name, "SKILL.md"), `# ${name}\n`);
+		}
+		const planned = { ...before, bridgeSourceDir: relocatedSource };
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: fixture.paths.bridgeDir,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: provenanceLedgerIdentity(before),
+			targetExpectedIdentity: provenanceLedgerIdentity(before),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(planned),
+			provenancePayload: planned,
+			startedAt: new Date().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(true);
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+		const retry = await runPaseoSetup(
+			{},
+			{ ...fixture.deps, skillsSource: async () => ({ dir: relocatedSource, origin: "app-bundle" }) },
+		);
+		expect(retry.kind).toBe("install");
+		const after = await readProvenance(fixture.paths.provenanceLedger);
+		expect(after.bridgeSourceDir).toBe(relocatedSource);
+		for (const name of SKILL_NAMES) {
+			expect(await fs.realpath(path.join(fixture.paths.bridgeDir, name))).toBe(path.join(relocatedSource, name));
+		}
+	});
+
+	test("bridge path migration retries from preflight provenance after a crash", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const newBridge = path.join(fixture.root, "relocated-paseo-skills");
+		const planned = { ...before, bridgePath: newBridge };
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: newBridge,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: provenanceLedgerIdentity(before),
+			targetExpectedIdentity: provenanceLedgerIdentity(before),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: await currentIdentity(fixture.paths.provenanceLedger),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(planned),
+			provenancePayload: planned,
+			startedAt: new Date().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, { repair: true });
+		expect(recovery?.recovered).toBe(true);
+		const retry = await runPaseoSetup({}, { ...fixture.deps, paths: { ...fixture.paths, bridgeDir: newBridge } });
+		expect(retry.kind).toBe("install");
+		const after = await readProvenance(fixture.paths.provenanceLedger);
+		expect(after.bridgePath).toBe(newBridge);
+		for (const name of SKILL_NAMES) {
+			await expect(fs.lstat(path.join(fixture.paths.bridgeDir, name))).rejects.toMatchObject({ code: "ENOENT" });
+			expect(await fs.realpath(path.join(newBridge, name))).toBe(path.join(fixture.paths.agentsSkillsDir!, name));
+		}
+	});
+
 	async function intentFixture(): Promise<{ fixture: Fixture; intent: IntentRecord }> {
 		const fixture = await makeFixture();
 		await fs.mkdir(path.dirname(fixture.paths.provenanceLedger), { recursive: true });

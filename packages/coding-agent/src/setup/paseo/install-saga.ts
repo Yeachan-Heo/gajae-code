@@ -352,6 +352,32 @@ export async function recoverIntent(
 		return { recovered: false, detail: error instanceof Error ? error.message : String(error) };
 	}
 	if (!intent) return undefined;
+	if (intent.step === "skills-bridge") {
+		const ledgerObserved = await currentIdentity(intent.provenancePath);
+		if (
+			ledgerObserved !== intent.provenancePreflightIdentity &&
+			ledgerObserved !== intent.provenanceExpectedIdentity
+		) {
+			return {
+				recovered: false,
+				detail: `the provenance ledger at ${intent.provenancePath} diverged during an interrupted bridge migration; refusing to guess recovery`,
+			};
+		}
+		if (!options.repair) {
+			return {
+				recovered: false,
+				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
+			};
+		}
+		await clearIntent(intentPath);
+		return {
+			recovered: true,
+			detail:
+				ledgerObserved === intent.provenanceExpectedIdentity
+					? "the interrupted bridge migration committed its provenance"
+					: "the interrupted bridge migration left its preflight provenance intact; retrying safely",
+		};
+	}
 	const recovery = await classifyIntent(intent);
 	if (recovery.action === "refuse") return { recovered: false, detail: recovery.detail };
 	if (!options.repair) return { recovered: false, detail: recovery.detail };

@@ -10,6 +10,7 @@ import { Settings } from "../../config/settings";
 import { checkPaseoSetup } from "./check";
 import { type CompletedStep, compensate, receiptStep, recoverIntent, runJsonStep, SagaStepError } from "./install-saga";
 import {
+	currentIdentity,
 	hashBytes,
 	PaseoPublishError,
 	readReplacedProviderBackup,
@@ -21,7 +22,17 @@ import {
 } from "./json-publisher";
 import { createOrchestrationSeed, removeSeededRoles } from "./orchestration-preferences";
 import { withPaseoMutationLock } from "./paseo-mutation-lock";
-import { type BridgeEntryIdentity, type ProvenanceLedger, readProvenance, writeProvenance } from "./paseo-ownership";
+import {
+	type BridgeEntryIdentity,
+	clearIntent,
+	INTENT_VERSION,
+	type IntentRecord,
+	type ProvenanceLedger,
+	provenanceLedgerIdentity,
+	readProvenance,
+	writeIntent,
+	writeProvenance,
+} from "./paseo-ownership";
 import {
 	buildProviderEntry,
 	createProviderMutation,
@@ -605,8 +616,10 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				},
 			};
 		}
+		let bridgeLedgerAfter: ProvenanceLedger | undefined;
+		let bridgeIntentWritten = false;
 		if (hasBridgeWork || bridgePreflight.sourceDir !== undefined) {
-			await writeProvenance(deps.paths.provenanceLedger, {
+			bridgeLedgerAfter = {
 				...bridgeLedger,
 				bridgePath: deps.paths.bridgeDir,
 				bridgeEntries: ownedAfterRun,
@@ -622,7 +635,22 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				// the `mkdir` fail EEXIST leaves an honest `false` too.
 				bridgeDirCreated: isMigration ? false : bridgeLedger.bridgeDirCreated === true,
 				...(bridgePreflight.sourceDir !== undefined ? { bridgeSourceDir: bridgePreflight.sourceDir } : {}),
-			});
+			};
+			const bridgeIntent: IntentRecord = {
+				version: INTENT_VERSION,
+				step: "skills-bridge",
+				targetPath: deps.paths.bridgeDir,
+				ownedKeys: ["paseo.skills-bridge"],
+				targetPreflightIdentity: provenanceLedgerIdentity(bridgeLedger),
+				targetExpectedIdentity: provenanceLedgerIdentity(bridgeLedger),
+				provenancePath: deps.paths.provenanceLedger,
+				provenancePreflightIdentity: await currentIdentity(deps.paths.provenanceLedger),
+				provenanceExpectedIdentity: provenanceLedgerIdentity(bridgeLedgerAfter),
+				provenancePayload: bridgeLedgerAfter,
+				startedAt: now.toISOString(),
+			};
+			await writeIntent(deps.paths.intentRecord, bridgeIntent);
+			bridgeIntentWritten = true;
 		}
 		let bridge: SkillsBridgeInstallResult;
 		try {
@@ -645,33 +673,35 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		// is persisted only now that the creation actually succeeded (#4644
 		// review r8), never from the preflight's plan.
 		if (bridge.bridgeDirCreated && bridge.bridgeDirIdentity !== undefined) {
-			const afterCreate = await readProvenance(deps.paths.provenanceLedger);
-			await writeProvenance(deps.paths.provenanceLedger, {
-				...afterCreate,
+			bridgeLedgerAfter = {
+				...(bridgeLedgerAfter ?? bridgeLedger),
 				bridgeDirCreated: true,
 				bridgeDirIdentity: bridge.bridgeDirIdentity,
-			});
+			};
 		}
 		if (Object.keys(bridge.entryIdentities).length > 0) {
-			const afterBridge = await readProvenance(deps.paths.provenanceLedger);
-			await writeProvenance(deps.paths.provenanceLedger, {
-				...afterBridge,
-				bridgeEntryIdentities: { ...afterBridge.bridgeEntryIdentities, ...bridge.entryIdentities },
-			});
+			bridgeLedgerAfter = {
+				...(bridgeLedgerAfter ?? bridgeLedger),
+				bridgeEntryIdentities: {
+					...(bridgeLedgerAfter?.bridgeEntryIdentities ?? bridgeLedger.bridgeEntryIdentities),
+					...bridge.entryIdentities,
+				},
+			};
 		}
 		// Prunes have completed: drop them from the ownership record so a later
 		// `--remove` does not treat the removed names as still owned.
 		if (bridgePreflight.prunes.length > 0) {
-			const afterPrunes = await readProvenance(deps.paths.provenanceLedger);
-			await writeProvenance(deps.paths.provenanceLedger, {
-				...afterPrunes,
-				bridgeEntries: (afterPrunes.bridgeEntries ?? []).filter(name => !bridge.prunedEntries.includes(name)),
-				bridgeEntryIdentities: Object.fromEntries(
-					Object.entries(afterPrunes.bridgeEntryIdentities ?? {}).filter(
-						([name]) => !bridge.prunedEntries.includes(name),
-					),
+			bridgeLedgerAfter = {
+				...(bridgeLedgerAfter ?? bridgeLedger),
+				bridgeEntries: (bridgeLedgerAfter?.bridgeEntries ?? bridgeLedger.bridgeEntries ?? []).filter(
+					name => !bridge.prunedEntries.includes(name),
 				),
-			});
+				bridgeEntryIdentities: Object.fromEntries(
+					Object.entries(
+						bridgeLedgerAfter?.bridgeEntryIdentities ?? bridgeLedger.bridgeEntryIdentities ?? {},
+					).filter(([name]) => !bridge.prunedEntries.includes(name)),
+				),
+			};
 		}
 		if (
 			bridge.createdEntries.length > 0 ||
@@ -779,6 +809,10 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				);
 			}
 			changed.push(migratedOldBridgeDir);
+		}
+		if (bridgeIntentWritten && bridgeLedgerAfter !== undefined) {
+			await writeProvenance(deps.paths.provenanceLedger, bridgeLedgerAfter);
+			await clearIntent(deps.paths.intentRecord);
 		}
 		if (bridgeAmbiguities.length > 0) {
 			return {
