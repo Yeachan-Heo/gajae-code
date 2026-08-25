@@ -33,6 +33,7 @@ import {
 	classifyIntent,
 	clearIntent,
 	INTENT_VERSION,
+	type BridgeCleanupAuthority,
 	type IntentDiscardSidecar,
 	type IntentRecord,
 	type IntentStep,
@@ -357,6 +358,8 @@ export interface RecoverIntentOptions {
 	readonly expectedTargetPaths?: readonly string[];
 	/** Trusted provenance ledger path supplied by the active Paseo setup call. */
 	readonly expectedProvenancePath?: string;
+	/** Replays a detached bridge authority before clearing a repaired intent. */
+	readonly replayBridgeCleanup?: (authority: BridgeCleanupAuthority) => Promise<void>;
 }
 
 async function bridgeLedgerMatchesFilesystem(
@@ -581,7 +584,14 @@ export async function recoverIntent(
 				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
 			};
 		}
-		if (recoverableCutover) {
+		let pendingReplayed = false;
+		if (after?.bridgeCleanupPending !== undefined && options.replayBridgeCleanup !== undefined) {
+			await options.replayBridgeCleanup(after.bridgeCleanupPending);
+			const settled = { ...after, bridgeCleanupPending: undefined };
+			await writeProvenance(intent.provenancePath, settled);
+			pendingReplayed = true;
+		}
+		if (recoverableCutover && !pendingReplayed) {
 			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
 				return {
 					recovered: false,

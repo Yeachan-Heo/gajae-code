@@ -148,6 +148,7 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 				repair: true,
 				expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 				expectedProvenancePath: deps.paths.provenanceLedger,
+				replayBridgeCleanup: authority => replayBridgeCleanup(authority),
 			});
 			if (recovery && !recovery.recovered) {
 				return {
@@ -223,6 +224,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		repair: true,
 		expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 		expectedProvenancePath: deps.paths.provenanceLedger,
+		replayBridgeCleanup: authority => replayBridgeCleanup(authority),
 	});
 	if (recovery && !recovery.recovered) {
 		return {
@@ -825,7 +827,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						// for adopted entries before the pre-step bridge facts are restored,
 						// so later checks cannot report phantom links or ownership.
 						const current = await readProvenance(deps.paths.provenanceLedger);
-						await writeProvenance(deps.paths.provenanceLedger, {
+						const restoredLedger: ProvenanceLedger = {
 							...current,
 							bridgePath: bridgeLedger.bridgePath,
 							bridgeSourceDir: bridgeLedger.bridgeSourceDir,
@@ -834,7 +836,17 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							bridgeDirCreated: bridgeLedger.bridgeDirCreated,
 							bridgeDirIdentity: compensatedOldBridgeDirIdentity ?? bridgeLedger.bridgeDirIdentity,
 							bridgeCleanupPending: undefined,
-						});
+						};
+						const intent = await readIntent(deps.paths.intentRecord);
+						if (intent?.step === "skills-bridge" && intent.provenancePath === deps.paths.provenanceLedger) {
+							await writeIntent(deps.paths.intentRecord, {
+								...intent,
+								provenanceExpectedIdentity: provenanceLedgerIdentity(restoredLedger),
+								provenancePayload: restoredLedger,
+							});
+						}
+						await writeProvenance(deps.paths.provenanceLedger, restoredLedger);
+						if (intent?.step === "skills-bridge") await clearIntent(deps.paths.intentRecord);
 						return { status: "reverted" as const };
 					} catch (error) {
 						return {

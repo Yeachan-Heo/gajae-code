@@ -312,8 +312,10 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 	const bytes = await Bun.file(from).text();
 	const mode = BACKUP_MODE;
 	let handle: fs.FileHandle;
+	let ownsBackup = false;
 	try {
 		handle = await fs.open(to, "wx", mode);
+		ownsBackup = true;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		const existing = await openRegularSidecar(to, fs.constants.O_RDONLY);
@@ -343,17 +345,56 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 			throw new Error(`backup path changed while replacing its authenticated regular file: ${to}`);
 		}
 		handle = await fs.open(to, "wx", mode);
+		ownsBackup = true;
 	}
 	try {
 		await handle.writeFile(bytes, "utf8");
 		await handle.sync();
-	} finally {
 		await handle.close();
+		await fs.chmod(to, mode);
+		await syncParentDirectory(path.dirname(to));
+	} catch (error) {
+		if (ownsBackup) {
+			const removed = await removePrivateBackupIfExact(to, Buffer.from(bytes, "utf8"));
+			if (!removed) {
+				throw new AggregateError(
+					[error],
+					`private backup publication failed and the credential-bearing backup remains retained at ${to}`,
+				);
+			}
+		}
+		throw error;
 	}
-	// `fs.open` honors the mode only on creation, so an existing backup path
-	// keeps its old permissions unless we set them explicitly.
-	await fs.chmod(to, mode);
-	await syncParentDirectory(path.dirname(to));
+}
+
+async function removePrivateBackupIfExact(backupPath: string, expectedBytes: Buffer): Promise<boolean> {
+	try {
+		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
+		if (opened === undefined) return false;
+		let bytes: Buffer;
+		try {
+			bytes = await opened.handle.readFile();
+		} finally {
+			await opened.handle.close();
+		}
+		if (!bytes.equals(expectedBytes)) return false;
+		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
+		const identity: NativeExactFileIdentity = {
+			dev: opened.stat.dev,
+			ino: opened.stat.ino,
+			nlink: opened.stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: opened.stat.size,
+			mtimeNs: opened.stat.mtimeNs,
+			sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+			quarantineName: `.gjc-paseo-backup-cleanup-${process.pid}-${nodeCrypto.randomUUID()}`,
+		};
+		const canonical = await canonicalSidecarPathForNativeUnlink(backupPath);
+		return exactUnlinkDirect(canonical, identity).ok;
+	} catch {
+		return false;
+	}
 }
 /**
  * Where a pre-`--force` provider value is preserved for a later restore.
