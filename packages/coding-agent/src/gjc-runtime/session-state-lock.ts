@@ -1222,7 +1222,6 @@ async function withLockPathTransition<T>(
 			);
 		} catch (error) {
 			if (performance.now() < deadline) await cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
-			else void cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
 			throw error;
 		}
 		let outcome: { ok: true; value: T } | { ok: false; error: unknown };
@@ -1238,10 +1237,7 @@ async function withLockPathTransition<T>(
 				),
 			};
 		} catch (error) {
-			if (performance.now() >= deadline) {
-				await cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
-				throw error;
-			}
+			if (performance.now() >= deadline) throw error;
 			outcome = { ok: false, error };
 		}
 		try {
@@ -1253,7 +1249,6 @@ async function withLockPathTransition<T>(
 				},
 			);
 		} catch (releaseError) {
-			if (performance.now() >= deadline) void cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
 			if (!outcome.ok)
 				throw new SessionStateLockUnavailableError(
 					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),

@@ -270,21 +270,34 @@ describe("coordinator session state lock", () => {
 		ownerHostId.resolve("local-host");
 	});
 
-	it("bounds stale-reclaim callbacks and removes the owned transition claim", async () => {
+	it("bounds stale-reclaim callbacks by the acquisition deadline", async () => {
 		const { stateFile } = await seededRunningSession("lock-transition-callback-deadline");
 		const lockFile = `${stateFile}.lock`;
 		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
-		SessionStateLockTestHooks.lockAcquireTimeoutMs = 30;
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 80;
 		SessionStateLockTestHooks.afterStaleInspection = () => new Promise<void>(() => undefined);
 		const startedAt = performance.now();
 
 		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
 
 		expect(performance.now() - startedAt).toBeLessThan(500);
-		await Bun.sleep(50);
-		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
-		expect(await readJson(`${lockFile}.transition.owner`)).toMatchObject({ released: true });
 		expect(await fs.readFile(lockFile, "utf8")).toContain("dead-owner-token");
+	});
+
+	it("cleans the retained transition claim after timed-out reclaim work settles", async () => {
+		const { stateFile } = await seededRunningSession("lock-transition-settled-cleanup");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+		SessionStateLockTestHooks.lockAcquireTimeoutMs = 80;
+		SessionStateLockTestHooks.afterStaleInspection = async () => {
+			await Bun.sleep(200);
+		};
+
+		await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(true);
+		await expect(fs.mkdir(`${lockFile}.transition`)).rejects.toMatchObject({ code: "EEXIST" });
+		await Bun.sleep(250);
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
 	});
 
 	it("cleans a transition owner created by work that finishes after the deadline", async () => {

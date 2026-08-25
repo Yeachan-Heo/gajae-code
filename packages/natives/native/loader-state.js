@@ -753,6 +753,16 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.currentExecutablePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required executable identity capability \`currentExecutablePath\`.`);
 	}
+	if (typeof bindings.snapshotDirectoryTreeAsync !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required async directory snapshot capability \`snapshotDirectoryTreeAsync\`.`,
+		);
+	}
+	if (typeof bindings.exactRemoveDirectoryTreeAsync !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required async directory removal capability \`exactRemoveDirectoryTreeAsync\`.`,
+		);
+	}
 }
 
 function buildHelpMessage(ctx) {

@@ -898,10 +898,16 @@ export declare function encodeSixel(bytes: Uint8Array, targetWidthPx: number, ta
 export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null): NativeExactUnlinkResult
 
 /**
- * Async variant of `exactRemoveDirectoryTree` on a dedicated native thread.
- * A wedged filesystem cannot consume the JS thread or shared libuv pool after
- * the caller's deadline expires. `timeoutMs` settles with a typed refusal;
- * it never reports a partial or successful removal.
+ * Async variant of [`exact_remove_directory_tree`] on a dedicated native
+ * thread.
+ *
+ * Directory removal re-reads and scrubs every authorized entry and
+ * may block indefinitely in a filesystem syscall; it must not run on the JS
+ * thread or consume a shared libuv worker after the caller's deadline expires.
+ *
+ * `timeout_ms`, when supplied, settles with a typed refusal rather than
+ * reporting a partial or successful removal. The synchronous boundary remains
+ * available for consumers that explicitly need a blocking call.
  */
 export declare function exactRemoveDirectoryTreeAsync(path: string, snapshot: NativeDirectoryTreeSnapshot, parentIdentity?: NativeDirectoryParentIdentity | undefined | null, timeoutMs?: number | undefined | null): Promise<NativeExactUnlinkResult>
 
@@ -2350,9 +2356,13 @@ export declare function sliceWithWidth(line: string, startCol: number, length: n
 export declare function snapshotDirectoryTree(path: string): NativeDirectoryTreeResult
 
 /**
- * Async variant of `snapshotDirectoryTree` on a dedicated native thread so
- * recursive legacy lock capture cannot block the JS event loop or shared libuv
- * pool. `timeoutMs` settles with a typed refusal, never an incomplete capture.
+ * Async variant of [`snapshot_directory_tree`] on a dedicated native thread.
+ *
+ * A recursive legacy lock directory can contain an unbounded number of entries
+ * and every entry may require a blocking metadata read and file digest; a
+ * wedged mount must not consume a shared libuv worker after the lock deadline
+ * expires. `timeout_ms`, when supplied, settles with a typed refusal rather
+ * than publishing an incomplete capture.
  */
 export declare function snapshotDirectoryTreeAsync(path: string, timeoutMs?: number | undefined | null): Promise<NativeDirectoryTreeResult>
 
