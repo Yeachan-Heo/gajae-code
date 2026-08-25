@@ -177,6 +177,19 @@ function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
 
+async function localLockKey(lockPath: string): Promise<string> {
+	const parent = path.dirname(lockPath);
+	let canonicalParent: string;
+	try {
+		canonicalParent = await fs.realpath(parent);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		canonicalParent = path.resolve(parent);
+	}
+	const key = path.join(canonicalParent, path.basename(lockPath));
+	return process.platform === "win32" ? key.toLowerCase() : key;
+}
+
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing";
 
@@ -456,6 +469,19 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 		throw error;
 	}
 	if (removed.ok || removed.code === "not_found") return true;
+	if (
+		removed.detachedPath !== undefined &&
+		removed.retainedSuccessorPath === undefined &&
+		removed.retainedUnknownPath === undefined
+	) {
+		try {
+			await fs.lstat(lockPath);
+			return false;
+		} catch (error) {
+			if (isEnoent(error)) return true;
+			throw error;
+		}
+	}
 	return (
 		removed.code === "cleanup_pending" &&
 		removed.payloadDurable === true &&
@@ -486,7 +512,7 @@ async function releaseOwnedLock(lockPath: string, owner: FileLockOwnerToken): Pr
 }
 
 async function retryPendingLocalRelease(lockPath: string): Promise<void> {
-	const key = path.resolve(lockPath);
+	const key = await localLockKey(lockPath);
 	const state = localLockStates.get(key);
 	if (!state || state.status === "held") return;
 	if (state.releasePromise) {
@@ -508,7 +534,7 @@ async function retryPendingLocalRelease(lockPath: string): Promise<void> {
 }
 
 async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise<void> {
-	const key = path.resolve(lockPath);
+	const key = await localLockKey(lockPath);
 	const state = localLockStates.get(key);
 	if (!state || state.owner.owner_token !== owner.owner_token) {
 		throw new Error("Failed to release file lock: local owner generation is unknown.");
@@ -585,7 +611,8 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
-	const localKey = path.resolve(lockPath);
+	await fs.mkdir(path.dirname(lockPath), { recursive: true });
+	const localKey = await localLockKey(lockPath);
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {

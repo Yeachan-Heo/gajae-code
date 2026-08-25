@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -301,6 +301,32 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
+	test("accepts a verified detach even when cleanup is not yet durable", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (String(target) === lockDir) throw Object.assign(new Error("sharing violation"), { code: "EBUSY" });
+			return await realRm(target, options);
+		}) as typeof fs.rm);
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: target => {
+				rmSync(target, { recursive: true, force: true });
+				return {
+					ok: false,
+					code: "detached_failure",
+					detachedPath: `${target}.removing`,
+				};
+			},
+		});
+
+		await withFileLock(lockedFile, async () => {});
+
+		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
 	test("reclaims a self-owned release leak on the next same-process acquisition", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
@@ -354,6 +380,40 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		await successor;
 
 		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("reclaims a pending generation through a symlinked parent alias", async () => {
+		const base = await makeTemp();
+		const realParent = path.join(base, "real");
+		const aliasParent = path.join(base, "alias");
+		await fs.mkdir(realParent);
+		await fs.symlink(realParent, aliasParent, "dir");
+		const realFile = path.join(realParent, "state.json");
+		const aliasFile = path.join(aliasParent, "state.json");
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (String(target).endsWith(".lock")) throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			return await realRm(target, options);
+		}) as typeof fs.rm);
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			},
+		});
+
+		await expect(withFileLock(realFile, async () => {})).rejects.toThrow("sharing violation");
+		expect(await fs.exists(`${realFile}.lock`)).toBe(true);
+
+		vi.restoreAllMocks();
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
+		let entered = false;
+		await withFileLock(aliasFile, async () => {
+			entered = true;
+		});
+
+		expect(entered).toBe(true);
+		expect(await fs.exists(`${realFile}.lock`)).toBe(false);
 	});
 
 	test("does not reap a stale lock when its metadata read fails unexpectedly", async () => {
