@@ -454,8 +454,14 @@ export async function assertAcpRow(operation: Operation, secret: boolean): Promi
 				if (code) await expectSdkRejection(adapter.global(operation.sdkId, input, `parity-${operation.id}`), code);
 				else
 					expectSemanticResult(operation, await adapter.global(operation.sdkId, input, `parity-${operation.id}`));
-			} else
-				await expectSdkRejection(adapter.global(operation.sdkId, input), expectedAcpRejection(operation, secret));
+			} else {
+				const rejectionKey =
+					operation.sdkId === "session.reconcile_uncertain" ? `parity-${operation.id}` : undefined;
+				await expectSdkRejection(
+					adapter.global(operation.sdkId, input, rejectionKey),
+					expectedAcpRejection(operation, secret),
+				);
+			}
 		} else if (operation.kind === "query") {
 			if (expected !== "forwarded")
 				throw new Error(`Query ${operation.sdkId} has no permitted machine-adapter semantic fixture.`);

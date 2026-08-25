@@ -410,9 +410,9 @@ function validTarget(target: unknown): target is Readonly<Record<string, unknown
 	return isRecord(target);
 }
 
-function validReconcileUncertainTarget(
-	target: Readonly<Record<string, unknown>>,
-): target is Readonly<Record<string, unknown>> & SessionReconcileUncertainTarget {
+export function validateSessionReconcileUncertainTarget(value: unknown): value is SessionReconcileUncertainTarget {
+	if (!isRecord(value)) return false;
+	const target = value;
 	const bounded = (value: unknown, max: number): value is string =>
 		typeof value === "string" && value.length > 0 && value.length <= max && !/[\u0000-\u001f\u007f]/u.test(value);
 	return (
@@ -449,7 +449,7 @@ export function validateSessionLifecycleMutationRequest(request: unknown): Sessi
 		return failure(operation, "terminal", "capability_denied", `capability does not authorize ${operation}`);
 	if (!validTarget(record.target))
 		return failure(operation, "terminal", "invalid_request", "target must be an object");
-	if (operation === "session.reconcile_uncertain" && !validReconcileUncertainTarget(record.target))
+	if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(record.target))
 		return failure(
 			operation,
 			"terminal",
@@ -503,6 +503,28 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	if (typeof record.reused === "boolean") result.reused = record.reused;
 	if (typeof record.note === "string") result.note = record.note;
 	return result;
+}
+
+function reconcileUncertainResult(
+	value: unknown,
+	target: SessionReconcileUncertainTarget,
+): SessionLifecycleSessionResult | undefined {
+	if (!isRecord(value)) return undefined;
+	if (
+		value.sessionId !== target.sessionId ||
+		value.retired !== true ||
+		value.ledgerState !== "terminal_error" ||
+		value.indexType !== "session_closed" ||
+		value.stateRoot !== target.stateRoot ||
+		value.endpointGeneration !== target.endpointGeneration ||
+		value.endpointMtimeMs !== target.endpointMtimeMs ||
+		value.processIncarnation !== target.processIncarnation ||
+		value.hostIncarnation !== target.hostIncarnation ||
+		value.lifecycleRequestId !== target.lifecycleRequestId ||
+		value.remoteCreateKey !== target.remoteCreateKey
+	)
+		return undefined;
+	return { sessionId: target.sessionId, endpointGeneration: target.endpointGeneration };
 }
 
 function savedSessionTranscriptIdentity(value: unknown): SessionLifecycleSavedSessionIdentity | undefined {
@@ -698,7 +720,10 @@ export class SessionLifecycleService {
 					? target.sessionId
 					: undefined
 				: undefined;
-		const parsed = sessionResult(brokerSuccess(response), expectedSessionId);
+		const parsed =
+			operation === "session.reconcile_uncertain"
+				? reconcileUncertainResult(brokerSuccess(response), target as unknown as SessionReconcileUncertainTarget)
+				: sessionResult(brokerSuccess(response), expectedSessionId);
 		if (!parsed)
 			return failure(
 				operation,

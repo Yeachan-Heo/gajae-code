@@ -628,6 +628,7 @@ function toolSchema(name: CoordinatorToolName): {
 					"endpoint_generation",
 					"endpoint_mtime_ms",
 					"process_incarnation",
+					"host_incarnation",
 					"lifecycle_request_id",
 					"remote_create_key",
 					"creation_idempotency_key",

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { type SdkClient, SdkClientError } from "../client";
+import { validateSessionReconcileUncertainTarget } from "../lifecycle/service";
 
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
@@ -450,6 +451,11 @@ export class AcpSdkAdapter {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
+		if (operation === "session.reconcile_uncertain" && !validateSessionReconcileUncertainTarget(input))
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				"session.reconcile_uncertain requires complete identity-bound retirement proof.",
+			);
 		if (!this.#client)
 			throw new AcpSdkAdapterError("operation_prohibited", "Lifecycle operations require the Broker connection.");
 		// The broker may hold a startup in its admission queue before the readiness
