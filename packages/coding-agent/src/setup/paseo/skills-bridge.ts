@@ -967,6 +967,7 @@ async function removeOwnedEmptyBridgeDirectory(
 	if (retainedAuthority !== undefined) {
 		throw new SkillsBridgeError(
 			`Refusing to remove Paseo skills bridge directory with retained native authority: ${bridgeDir}`,
+			[retainedAuthority],
 		);
 	}
 	if (removal.ok) {
