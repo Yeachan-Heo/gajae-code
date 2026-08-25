@@ -661,5 +661,6 @@ describe("provider-scoped auth-gateway cancellation", () => {
 		const escapedInterior = cleanReason('{\\"access_token\\":\\"prefix\\\\\\"suffix\\"}');
 		expect(escapedInterior).not.toContain("prefix");
 		expect(escapedInterior).not.toContain("suffix");
+		expect(cleanReason('{"\\u0061ccess_token":"unicode-escaped-secret"}')).toBe("Credential diagnostic unavailable.");
 	});
 });
