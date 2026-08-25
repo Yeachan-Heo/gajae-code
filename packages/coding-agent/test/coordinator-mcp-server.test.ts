@@ -1580,15 +1580,30 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(first).toMatchObject({ ok: true, retired: true });
 		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
 		const interruptedOriginal = JSON.parse(await fs.readFile(originalPath, "utf8")) as Record<string, unknown>;
-		interruptedOriginal.state = "in_progress";
-		delete interruptedOriginal.response;
-		delete interruptedOriginal.completed_at;
-		await fs.writeFile(originalPath, `${JSON.stringify(interruptedOriginal)}\n`);
 		const retirementPath = path.join(
 			coordinatorNamespace(root),
 			"idempotency",
 			`${createHash("sha256").update(retirementKey).digest("hex")}.json`,
 		);
+		const interruptedRetirementOnly = JSON.parse(await fs.readFile(retirementPath, "utf8")) as Record<
+			string,
+			unknown
+		>;
+		interruptedRetirementOnly.state = "in_progress";
+		delete interruptedRetirementOnly.response;
+		delete interruptedRetirementOnly.completed_at;
+		await fs.writeFile(retirementPath, `${JSON.stringify(interruptedRetirementOnly)}\n`);
+		const replayAfterRetirementSealCrash = await server.callTool(
+			"gjc_coordinator_retire_start_session",
+			retirementArgs,
+		);
+		expect(replayAfterRetirementSealCrash).toEqual(first);
+		expect(controls.filter(control => control.operation === "session.reconcile_uncertain")).toHaveLength(1);
+
+		interruptedOriginal.state = "in_progress";
+		delete interruptedOriginal.response;
+		delete interruptedOriginal.completed_at;
+		await fs.writeFile(originalPath, `${JSON.stringify(interruptedOriginal)}\n`);
 		const interruptedRetirement = JSON.parse(await fs.readFile(retirementPath, "utf8")) as Record<string, unknown>;
 		interruptedRetirement.state = "in_progress";
 		delete interruptedRetirement.response;

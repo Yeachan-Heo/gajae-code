@@ -8824,7 +8824,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											message: "The start intent identity does not match.",
 										},
 									};
-								if (original.state !== "in_progress")
+								const originalAlreadyRetired =
+									original.state === "completed" &&
+									asRecord(asRecord(original.response)?.error)?.code === "retired";
+								if (original.state !== "in_progress" && !originalAlreadyRetired)
 									return {
 										ok: false,
 										error: {
@@ -8837,6 +8840,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									creationKeyDigest,
 									proof,
 								);
+								if (originalAlreadyRetired && creation.retirement_intent?.phase !== "broker_retired")
+									throw new SdkClientError(
+										"state_corrupt",
+										"A completed retired start intent lacks its durable broker retirement proof.",
+									);
 								if (
 									creation.retirement_intent &&
 									creation.retirement_intent.retirement_key_digest !== retirementKeyDigest

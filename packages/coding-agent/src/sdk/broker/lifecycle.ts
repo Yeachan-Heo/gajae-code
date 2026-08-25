@@ -1877,6 +1877,10 @@ function retirementCleanupPlan(
 }
 
 function retirementCleanupSettled(cleanup: LifecycleRetirementCleanup): boolean {
+	const expectedParent = cleanup.lifecycleParentIdentity;
+	if (!expectedParent || !cleanup.metadataRoot) return false;
+	const parent = lifecycleParentIdentity(path.join(cleanup.metadataRoot, "sdk"));
+	if (!parent || parent.dev !== expectedParent.dev || parent.ino !== expectedParent.ino) return false;
 	for (const file of cleanup.lifecycleFiles ?? []) {
 		try {
 			fsSync.lstatSync(file.path);
@@ -1895,6 +1899,13 @@ function retirementCleanupSettled(cleanup: LifecycleRetirementCleanup): boolean 
 		}
 	}
 	return true;
+}
+
+function retirementCleanupParentMatches(cleanup: LifecycleRetirementCleanup): boolean {
+	const expectedParent = cleanup.lifecycleParentIdentity;
+	if (!expectedParent || !cleanup.metadataRoot) return false;
+	const parent = lifecycleParentIdentity(path.join(cleanup.metadataRoot, "sdk"));
+	return parent !== undefined && parent.dev === expectedParent.dev && parent.ino === expectedParent.ino;
 }
 
 function retirementIdentityFromInput(
@@ -2106,6 +2117,12 @@ async function executeUncertainRetirement(
 					);
 			}
 		}
+		if (!retirementCleanupParentMatches(cleanup))
+			return fail(
+				"cleanup_pending",
+				"Uncertain session retirement is pending because the lifecycle parent identity changed.",
+				cleanup,
+			);
 		const staged: LifecycleRetirementCleanup = {
 			...cleanup,
 			uncertainRetirement: { ...receipt, stage: "index" },
@@ -2126,6 +2143,12 @@ async function executeUncertainRetirement(
 		return fail(
 			"cleanup_pending",
 			"Uncertain session retirement is pending because the endpoint reappeared.",
+			cleanup,
+		);
+	if (!retirementCleanupParentMatches(cleanup))
+		return fail(
+			"cleanup_pending",
+			"Uncertain session retirement is pending because the lifecycle parent identity changed.",
 			cleanup,
 		);
 	if (receipt.stage === "index") {
