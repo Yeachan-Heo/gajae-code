@@ -854,7 +854,6 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							bridgeCleanupPending: undefined,
 						};
 						const intent = await readIntent(deps.paths.intentRecord);
-						await writeProvenance(deps.paths.provenanceLedger, restoredLedger);
 						if (intent?.step === "skills-bridge" && intent.provenancePath === deps.paths.provenanceLedger) {
 							await writeIntent(deps.paths.intentRecord, {
 								...intent,
@@ -862,6 +861,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 								provenancePayload: restoredLedger,
 							});
 						}
+						await writeProvenance(deps.paths.provenanceLedger, restoredLedger);
 						if (intent?.step === "skills-bridge") await clearIntent(deps.paths.intentRecord);
 						return { status: "reverted" as const };
 					} catch (error) {

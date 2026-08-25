@@ -327,6 +327,7 @@ async function copyPrivately(from: string, to: string): Promise<boolean> {
 	const mode = BACKUP_MODE;
 	let handle: fs.FileHandle;
 	let ownsBackup = false;
+	let capturedIdentity: NativeExactFileIdentity | undefined;
 	try {
 		handle = await fs.open(to, "wx", mode);
 		ownsBackup = true;
@@ -348,6 +349,9 @@ async function copyPrivately(from: string, to: string): Promise<boolean> {
 		try {
 			await handle.writeFile(bytes, "utf8");
 			await handle.sync();
+		} catch (error) {
+			capturedIdentity = await capturePrivateBackupIdentity(handle, to);
+			throw error;
 		} finally {
 			await handle.close();
 		}
@@ -355,7 +359,9 @@ async function copyPrivately(from: string, to: string): Promise<boolean> {
 		await syncParentDirectory(path.dirname(to));
 	} catch (error) {
 		if (ownsBackup) {
-			const removed = await removePrivateBackupIfExact(to, Buffer.from(bytes, "utf8"));
+			const removed =
+				(capturedIdentity !== undefined && (await removePrivateBackupByIdentity(to, capturedIdentity))) ||
+				(await removePrivateBackupIfExact(to, Buffer.from(bytes, "utf8")));
 			if (!removed) {
 				throw new AggregateError(
 					[error],
@@ -366,6 +372,42 @@ async function copyPrivately(from: string, to: string): Promise<boolean> {
 		throw error;
 	}
 	return true;
+}
+
+async function capturePrivateBackupIdentity(
+	handle: fs.FileHandle,
+	backupPath: string,
+): Promise<NativeExactFileIdentity | undefined> {
+	try {
+		const stat = await handle.stat({ bigint: true });
+		if (stat.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
+		const bytes = Buffer.alloc(Number(stat.size));
+		const read = await handle.read(bytes, 0, bytes.length, 0);
+		if (read.bytesRead !== bytes.length) return undefined;
+		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+			quarantineName: `.gjc-paseo-backup-captured-${process.pid}-${nodeCrypto.randomUUID()}`,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+async function removePrivateBackupByIdentity(backupPath: string, identity: NativeExactFileIdentity): Promise<boolean> {
+	try {
+		const canonical = await canonicalSidecarPathForNativeUnlink(backupPath);
+		return exactUnlinkDirect(canonical, identity).ok;
+	} catch {
+		return false;
+	}
 }
 
 async function removePrivateBackupIfExact(backupPath: string, expectedBytes: Buffer): Promise<boolean> {
