@@ -580,7 +580,8 @@ export async function recoverIntent(
 		const safePendingPreDetach =
 			after?.bridgeCleanupPending !== undefined &&
 			beforeMatches &&
-			ledgerObserved === intent.provenanceExpectedIdentity;
+			(ledgerObserved === intent.provenanceExpectedIdentity ||
+				ledgerObserved === intent.provenancePreflightIdentity);
 		const recoverableCutover =
 			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		if (

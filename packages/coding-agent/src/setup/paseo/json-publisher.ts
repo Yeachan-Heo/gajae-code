@@ -21,7 +21,7 @@ import * as nodeCrypto from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { exactUnlinkDirect, type NativeExactFileIdentity } from "@gajae-code/natives";
+import { exactReplacePath, exactUnlinkDirect, type NativeExactFileIdentity } from "@gajae-code/natives";
 
 /** Serialization Paseo itself produces. Verified byte-identical against the live config. */
 export function serializeJson(value: unknown): string {
@@ -220,7 +220,21 @@ export async function publishPlan(
 		} finally {
 			await handle.close();
 		}
-		await fs.rename(tempPath, targetPath);
+		const destinationIdentity = await captureRegularIdentity(targetPath);
+		const sourceIdentity = await captureRegularIdentity(tempPath);
+		if (sourceIdentity === undefined) throw new Error(`staged Paseo publication is not a regular file: ${tempPath}`);
+		if (destinationIdentity === undefined) {
+			await fs.link(tempPath, targetPath);
+			await fs.rm(tempPath);
+		} else {
+			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, destinationIdentity);
+			if (!replaced.ok)
+				throw new PaseoPublishError(targetPath, {
+					reason: "cas-conflict",
+					expected: options.expectedIdentity,
+					actual: await currentIdentity(targetPath),
+				});
+		}
 		await syncParentDirectory(directory);
 	} catch (error) {
 		if (backupCreated && backupPath !== undefined && backupBytes !== undefined) {
@@ -406,6 +420,35 @@ async function capturePrivateBackupIdentity(
 		};
 	} catch {
 		return undefined;
+	}
+}
+
+async function captureRegularIdentity(filePath: string): Promise<NativeExactFileIdentity | undefined> {
+	try {
+		const link = await fs.lstat(filePath, { bigint: true });
+		if (!link.isFile()) return undefined;
+		const handle = await fs.open(filePath, "r");
+		try {
+			const stat = await handle.stat({ bigint: true });
+			const bytes = await handle.readFile();
+			const parent = await fs.stat(path.dirname(filePath), { bigint: true });
+			return {
+				dev: stat.dev,
+				ino: stat.ino,
+				nlink: stat.nlink,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+				quarantineName: `.gjc-paseo-publish-${process.pid}-${nodeCrypto.randomUUID()}`,
+			};
+		} finally {
+			await handle.close();
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw error;
 	}
 }
 
