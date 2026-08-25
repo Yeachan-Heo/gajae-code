@@ -345,14 +345,20 @@ export async function updateRegistry(
 	scope: GjcPluginScope,
 	cwd: string,
 	mutator: (entries: GjcPluginRegistryEntry[]) => GjcPluginRegistryEntry[],
+	agentDir?: string,
 ): Promise<GjcPluginRegistry> {
-	return await withRegistryLock(scope, cwd, async () => {
-		const current = await readRegistry(scope, cwd, { migrate: false });
-		const nextEntries = mutator([...current.plugins]);
-		const next: GjcPluginRegistry = { version: 1, scope, plugins: sortRegistryEntries(nextEntries) };
-		await writeRegistryUnlocked(next, cwd);
-		return next;
-	});
+	return await withRegistryLock(
+		scope,
+		cwd,
+		async () => {
+			const current = await readRegistry(scope, cwd, { migrate: false, agentDir });
+			const nextEntries = mutator([...current.plugins]);
+			const next: GjcPluginRegistry = { version: 1, scope, plugins: sortRegistryEntries(nextEntries) };
+			await writeRegistryUnlocked(next, cwd, scope, agentDir);
+			return next;
+		},
+		agentDir,
+	);
 }
 
 /**
@@ -369,7 +375,7 @@ export async function loadEffectiveGjcPluginRegistry(
 ): Promise<GjcPluginRegistryEntry[]> {
 	const [user, project] = await Promise.all([
 		readRegistry("user", cwd, options),
-		readRegistry("project", cwd, { migrate: options.migrate }),
+		readRegistry("project", cwd, { migrate: options.migrate, agentDir: options.agentDir }),
 	]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
 }

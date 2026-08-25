@@ -9455,7 +9455,12 @@ mod platform {
 			let file = match open_relative_with_disposition_status(
 				parent,
 				&name,
-				FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | 0x0001_0000,
+				FILE_READ_ATTRIBUTES
+					| FILE_WRITE_ATTRIBUTES
+					| FILE_WRITE_DATA
+					| READ_CONTROL
+					| WRITE_DAC
+					| 0x0001_0000,
 				false,
 				0,
 				FILE_CREATE,
@@ -9545,7 +9550,7 @@ mod platform {
 		root_path: &Path,
 		skill_name: &str,
 		content: &str,
-		_file_mode: u32,
+		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
 		let (mut skills, canonical_volume) = match open_or_create_skill_root(root_path) {
 			Ok(value) => value,
@@ -9579,6 +9584,28 @@ mod platform {
 			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+		}
+		if file_mode == 0o600 {
+			let sid = match current_user_sid() {
+				Ok(sid) => sid,
+				Err(()) => {
+					let cleanup = cleanup_private_skill_file(file);
+					unsafe { CloseHandle(file) };
+					return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("acl_unavailable"));
+				}
+			};
+			let applied = set_owner_only_acl(file, "file", &sid, true);
+			if !applied.ok {
+				let cleanup = cleanup_private_skill_file(file);
+				unsafe { CloseHandle(file) };
+				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("acl_apply_failed"));
+			}
+			let verified = verify_owner_only_handle(file, "file");
+			if !verified.ok {
+				let cleanup = cleanup_private_skill_file(file);
+				unsafe { CloseHandle(file) };
+				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("acl_verify_failed"));
+			}
 		}
 		unsafe { CloseHandle(file) };
 		NativeSecureSkillWriteResult::success(

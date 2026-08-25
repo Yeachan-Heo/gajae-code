@@ -56,4 +56,15 @@ describe("cachedEmbeddedExtractionIsFresh", () => {
 			}),
 		).toBe(false);
 	});
+
+	it("does not reuse a same-size cache target with different bytes", () => {
+		expect(
+			cachedEmbeddedExtractionIsFresh({
+				targetPath: "/cache/pi_natives.node",
+				embeddedPath: "/embedded/pi_natives.node",
+				sizeOf: sizes({ "/cache/pi_natives.node": 44_380_960, "/embedded/pi_natives.node": 44_380_960 }),
+				hashOf: path => (path.includes("cache") ? "cached" : "embedded"),
+			}),
+		).toBe(false);
+	});
 });

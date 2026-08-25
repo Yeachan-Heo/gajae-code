@@ -598,8 +598,9 @@ export function candidateRegistryEntry(
 	cwd: string,
 	source: GjcPluginRegistrySource,
 	now: string,
+	agentDir?: string,
 ): GjcPluginRegistryEntry {
-	const finalDir = path.join(scopeRoot(scope, cwd), safeDirSegment(bundle.name));
+	const finalDir = path.join(scopeRoot(scope, cwd, agentDir), safeDirSegment(bundle.name));
 	return bundleToRegistryEntry(bundle, finalDir, scope, source, now);
 }
 

@@ -371,16 +371,20 @@ export function loadFromCandidates({ candidates, requireCandidate, validateCandi
  * sentinel yet can expose a different native surface, so it is fresh only when
  * its byte size matches the embedded payload. `sizeOf` returns the byte size of
  * a path, or `null` when it cannot be inspected.
- * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null; isSafe?: (path: string) => boolean }} input
+ * @param {{ targetPath: string; embeddedPath: string; sizeOf: (path: string) => number | null; isSafe?: (path: string) => boolean; hashOf?: (path: string) => string | null }} input
  * @returns {boolean}
  */
-export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf, isSafe = () => true }) {
+export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, sizeOf, isSafe = () => true, hashOf }) {
 	if (!isSafe(targetPath)) return false;
 	const cachedSize = sizeOf(targetPath);
 	if (cachedSize === null) return false;
 	const embeddedSize = sizeOf(embeddedPath);
 	if (embeddedSize === null) return false;
-	return cachedSize === embeddedSize;
+	if (cachedSize !== embeddedSize) return false;
+	if (!hashOf) return true;
+	const cachedHash = hashOf(targetPath);
+	const embeddedHash = hashOf(embeddedPath);
+	return cachedHash !== null && cachedHash === embeddedHash;
 }
 
 // =========================================================================
@@ -575,7 +579,29 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 					return null;
 				}
 			};
-			if (cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath: embeddedFile.filePath, sizeOf })) {
+			if (
+				cachedEmbeddedExtractionIsFresh({
+					targetPath,
+					embeddedPath: embeddedFile.filePath,
+					sizeOf,
+					isSafe: candidate => {
+						try {
+							const identity = fs.lstatSync(candidate);
+							const stat = fs.statSync(candidate);
+							return identity.isFile() && !identity.isSymbolicLink() && stat.nlink === 1;
+						} catch {
+							return false;
+						}
+					},
+					hashOf: candidate => {
+						try {
+							return safeFileSnapshot(candidate).hash;
+						} catch {
+							return null;
+						}
+					},
+				})
+			) {
 				extracted.push(targetPath);
 				continue;
 			}
