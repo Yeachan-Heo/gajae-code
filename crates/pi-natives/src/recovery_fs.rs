@@ -4097,7 +4097,7 @@ mod tests {
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
-		assert_eq!(result.mutation_state, "committed");
+		assert_eq!(result.mutation_state, "not_committed");
 		assert_eq!(result.reason, "identity_violation");
 		assert_eq!(result.primitive, "in_place_descriptor");
 		assert_eq!(
@@ -4106,7 +4106,7 @@ mod tests {
 		);
 		assert_eq!(
 			fs::read(temporary.0.join("retained-predecessor")).expect("predecessor"),
-			b"replacement-selector"
+			b"original-selector"
 		);
 	}
 
