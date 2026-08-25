@@ -8,6 +8,7 @@ export function cleanReason(value: unknown): string | undefined {
 	if (value === undefined || value === null) return undefined;
 	let reason = value instanceof Error ? value.message : String(value);
 	if (reason.includes("\\")) return "Credential diagnostic unavailable.";
+	if (/authorization(?:[_-]header)?\s*[:=]/i.test(reason)) return "Credential diagnostic unavailable.";
 	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
 	reason = reason.replace(/basic\s+[^\s,;]+/gi, "Basic [redacted]");
 	reason = reason.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
