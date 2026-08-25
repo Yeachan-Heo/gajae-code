@@ -559,6 +559,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			try {
 				const result = await this.#client.fetchSnapshot({
 					ifGenerationGt: this.#generation,
+					ifEpoch: this.#epoch,
 					waitMs: BACKGROUND_WAIT_MS,
 					signal: this.#backgroundAbort.signal,
 				});
@@ -688,6 +689,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const previousGeneration = this.#generation;
 		const result = await this.#client.fetchSnapshot({
 			ifGenerationGt: this.#generation,
+			ifEpoch: this.#epoch,
 			waitMs: maxWaitMs,
 			signal: opts.signal,
 		});

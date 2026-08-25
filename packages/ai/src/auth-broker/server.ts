@@ -149,23 +149,25 @@ const DISABLE_ROUTE = /^\/v1\/credential\/(\d+)\/disable$/;
 const MAX_SNAPSHOT_WAIT_MS = 30_000;
 const DISABLED_NEXT_SWEEP_IN_MS = Number.MAX_SAFE_INTEGER;
 
-function snapshotHeaders(generation: number): Record<string, string> {
+function snapshotHeaders(epoch: string, generation: number): Record<string, string> {
 	return {
-		ETag: `"${generation}"`,
+		ETag: `"${epoch}:${generation}"`,
 		"Cache-Control": "no-store",
 	};
 }
 
-function parseGenerationTag(header: string | null): number | undefined {
+function parseSnapshotTag(header: string | null): { epoch?: string; generation: number } | undefined {
 	if (!header) return undefined;
 	let value = header.trim();
 	if (value.startsWith("W/")) value = value.slice(2).trim();
 	if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
 		value = value.slice(1, -1);
 	}
-	const generation = Number(value);
+	const separator = value.lastIndexOf(":");
+	const epoch = separator > 0 ? value.slice(0, separator) : undefined;
+	const generation = Number(separator > 0 ? value.slice(separator + 1) : value);
 	if (!Number.isInteger(generation) || generation < 0) return undefined;
-	return generation;
+	return { epoch, generation };
 }
 
 function parseWaitMs(url: URL): number {
@@ -336,17 +338,23 @@ async function serveSnapshot(
 ): Promise<Response> {
 	await storage.reload();
 	let currentGeneration = storage.getGeneration();
-	const clientGeneration = parseGenerationTag(req.headers.get("if-none-match"));
+	const clientTag = parseSnapshotTag(req.headers.get("if-none-match"));
+	const clientGeneration = clientTag?.generation;
 	const waitMs = parseWaitMs(url);
 
-	if (clientGeneration === undefined || currentGeneration !== clientGeneration || waitMs <= 0) {
+	if (
+		clientGeneration === undefined ||
+		clientTag?.epoch !== epoch ||
+		currentGeneration !== clientGeneration ||
+		waitMs <= 0
+	) {
 		const body = buildSnapshot(storage, refresher, epoch);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
 			generation: body.generation,
 		});
-		return json(200, body, snapshotHeaders(body.generation));
+		return json(200, body, snapshotHeaders(epoch, body.generation));
 	}
 
 	const delay = delayResult(waitMs);
@@ -355,7 +363,7 @@ async function serveSnapshot(
 	const result = await Promise.race([gate.waitForChange(clientGeneration, waitSignal), delay.promise]);
 	delay.cancel();
 	waitController.abort();
-	if (result === "aborted" || req.signal.aborted) return empty(499, snapshotHeaders(currentGeneration));
+	if (result === "aborted" || req.signal.aborted) return empty(499, snapshotHeaders(epoch, currentGeneration));
 
 	await storage.reload();
 	currentGeneration = storage.getGeneration();
@@ -366,11 +374,11 @@ async function serveSnapshot(
 			credentials: body.credentials.length,
 			generation: body.generation,
 		});
-		return json(200, body, snapshotHeaders(body.generation));
+		return json(200, body, snapshotHeaders(epoch, body.generation));
 	}
 
 	logger.info("auth-broker snapshot long-poll unchanged", { peer, generation: currentGeneration });
-	return empty(304, snapshotHeaders(currentGeneration));
+	return empty(304, snapshotHeaders(epoch, currentGeneration));
 }
 
 /**

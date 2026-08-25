@@ -80,24 +80,27 @@ export class AuthBrokerCredentialMetadataUnsupportedError extends AuthBrokerErro
 
 export interface FetchSnapshotOptions {
 	ifGenerationGt?: number;
+	ifEpoch?: string;
 	waitMs?: number;
 	signal?: AbortSignal;
 }
 
 export type FetchSnapshotResult =
 	| { status: 200; snapshot: SnapshotResponse; generation: number }
-	| { status: 304; generation: number };
+	| { status: 304; generation: number; epoch?: string };
 
-function parseGenerationTag(header: string | null): number | undefined {
+function parseSnapshotTag(header: string | null): { epoch?: string; generation: number } | undefined {
 	if (!header) return undefined;
 	let value = header.trim();
 	if (value.startsWith("W/")) value = value.slice(2).trim();
 	if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) {
 		value = value.slice(1, -1);
 	}
-	const generation = Number(value);
+	const separator = value.lastIndexOf(":");
+	const epoch = separator > 0 ? value.slice(0, separator) : undefined;
+	const generation = Number(separator > 0 ? value.slice(separator + 1) : value);
 	if (!Number.isInteger(generation) || generation < 0) return undefined;
-	return generation;
+	return { epoch, generation };
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -150,7 +153,10 @@ export class AuthBrokerClient {
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
 		const headers: Record<string, string> = {};
-		if (opts.ifGenerationGt !== undefined) headers["If-None-Match"] = `"${opts.ifGenerationGt}"`;
+		if (opts.ifGenerationGt !== undefined) {
+			const validator = opts.ifEpoch ? `${opts.ifEpoch}:${opts.ifGenerationGt}` : String(opts.ifGenerationGt);
+			headers["If-None-Match"] = `"${validator}"`;
+		}
 		const timeoutMs =
 			opts.waitMs !== undefined && opts.waitMs > 0 ? Math.max(this.#timeoutMs, opts.waitMs + 1000) : undefined;
 		const response = await this.#fetchRaw("GET", path, {
@@ -159,9 +165,13 @@ export class AuthBrokerClient {
 			signal: opts.signal,
 			timeoutMs,
 		});
-		const etagGeneration = parseGenerationTag(response.headers.get("etag"));
+		const etag = parseSnapshotTag(response.headers.get("etag"));
 		if (response.status === 304) {
-			return { status: 304, generation: etagGeneration ?? opts.ifGenerationGt ?? 0 };
+			return {
+				status: 304,
+				generation: etag?.generation ?? opts.ifGenerationGt ?? 0,
+				...(etag?.epoch ? { epoch: etag.epoch } : {}),
+			};
 		}
 		const text = await response.text();
 		const raw = this.#parseJson(text, response.status);
@@ -173,7 +183,7 @@ export class AuthBrokerClient {
 			});
 		}
 		const snapshot = validated.data as SnapshotResponse;
-		return { status: 200, snapshot, generation: etagGeneration ?? snapshot.generation };
+		return { status: 200, snapshot, generation: etag?.generation ?? snapshot.generation };
 	}
 
 	/**
