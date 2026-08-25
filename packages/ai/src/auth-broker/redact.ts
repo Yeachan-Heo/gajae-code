@@ -12,11 +12,11 @@ export function cleanReason(value: unknown): string | undefined {
 	reason = reason.replace(/basic\s+[^\s,;]+/gi, "Basic [redacted]");
 	reason = reason.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@");
 	reason = reason.replace(
-		/((?:\\?["']?(?:key|api[_-]?key|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret))?\\?["']?)\s*:\s*)\\?(["'])(?:\\.|(?!\2)[^\\])*\2/gi,
+		/((?:\\?["']?(?:key|api[_-]?key|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret|header|headers))?\\?["']?)\s*:\s*)\\?(["'])(?:\\.|(?!\2)[^\\])*\2/gi,
 		"$1$2[redacted]$2",
 	);
 	reason = reason.replace(
-		/((?:key|api[_-]?key|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret))?)\s*[:=]\s*[^\s,;]+/gi,
+		/((?:key|api[_-]?key|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret|header|headers))?)\s*[:=]\s*[^\s,;]+/gi,
 		"$1=[redacted]",
 	);
 	reason = reason.replace(/[\r\n\t ]+/g, " ").trim();
