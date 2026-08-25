@@ -3938,7 +3938,11 @@ pub(crate) mod platform {
 		// SAFETY: parent_fd and the private quarantine name remain live; the
 		// detached entry was revalidated against the caller's exact identity.
 		if unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0 {
-			return close_parent(NativeExactUnlinkResult::success());
+			return if fsync_root_parent(parent_fd).is_ok() {
+				close_parent(NativeExactUnlinkResult::success())
+			} else {
+				close_parent(NativeExactUnlinkResult::detached_failure("io_error", detached_path))
+			};
 		}
 		let code = security_code(&std::io::Error::last_os_error());
 		if rename_no_replace(parent_fd, parent_fd, &quarantine, &name).is_ok() {
@@ -4103,7 +4107,7 @@ pub(crate) mod platform {
 		if unsafe { libc::unlinkat(quarantine_fd, private_name.as_ptr(), 0) } == 0 {
 			let removed =
 				unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), libc::AT_REMOVEDIR) } == 0;
-			if removed {
+			if removed && fsync_root_parent(parent_fd).is_ok() {
 				close_quarantine(NativeExactUnlinkResult::success())
 			} else {
 				close_quarantine(NativeExactUnlinkResult::retained_unknown_failure(
