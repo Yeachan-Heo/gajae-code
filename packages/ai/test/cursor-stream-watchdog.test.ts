@@ -353,6 +353,54 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("does not dispatch a coalesced exec frame after turnEnded", async () => {
+		let executions = 0;
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const turnEnded = buildServerMessageFrame({
+					case: "interactionUpdate",
+					value: create(InteractionUpdateSchema, {
+						message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+					}),
+				});
+				const lateExec = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: {
+							case: "piReadArgs",
+							value: create(PiReadExecArgsSchema, { path: "late.txt" }),
+						},
+					}),
+				});
+				stream.end(Buffer.concat([turnEnded, lateExec]));
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+			execHandlers: {
+				piRead: async call => {
+					executions += 1;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "read",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(executions).toBe(0);
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("rejects a truncated final Connect frame instead of waiting for the idle watchdog", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });

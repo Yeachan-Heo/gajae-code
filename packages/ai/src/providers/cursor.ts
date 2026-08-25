@@ -203,6 +203,7 @@ async function waitForCursorMutationLock(
 ): Promise<void> {
 	const lock = conversationMutationLocks.get(conversationId);
 	if (!lock) return;
+	if (signal?.aborted) throw cursorAbortError(signal);
 	const deadline = Promise.withResolvers<never>();
 	deadline.promise.catch(() => {});
 	const deadlineTimer =
@@ -212,7 +213,6 @@ async function waitForCursorMutationLock(
 	const aborted = Promise.withResolvers<never>();
 	aborted.promise.catch(() => {});
 	const onAbort = () => aborted.reject(cursorAbortError(signal!));
-	if (signal?.aborted) throw cursorAbortError(signal);
 	if (signal) signal.addEventListener("abort", onAbort, { once: true });
 	try {
 		const racers: Promise<never>[] = [deadline.promise];
@@ -1038,7 +1038,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				);
 			};
 			let firstEventWatchdogArmed = false;
-			const remainingFirstEventTimeoutMs =
+			let remainingFirstEventTimeoutMs =
 				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
 					? firstEventTimeoutMs
 					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
@@ -1061,6 +1061,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				remainingFirstEventTimeoutMs,
 				createFirstEventTimeoutError,
 			);
+			remainingFirstEventTimeoutMs =
+				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
+					? firstEventTimeoutMs
+					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
+			if (
+				remainingFirstEventTimeoutMs !== undefined &&
+				firstEventTimeoutMs !== undefined &&
+				firstEventTimeoutMs > 0 &&
+				remainingFirstEventTimeoutMs <= 0
+			) {
+				throw createFirstEventTimeoutError();
+			}
+			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
 			if (proxyUrl) {
 				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
 				firstEventWatchdogArmed = true;
@@ -1220,6 +1233,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			processPendingBuffer = () => {
 				if (processingPausedForExec || processingPausedForQueue) return;
 				while (pendingBuffer.length >= 5) {
+					if (sawTurnEnded) {
+						// A validated turnEnded closes admission. Drop coalesced bytes
+						// behind it so a late exec cannot reach the local handler after
+						// terminal bookkeeping has started.
+						pendingBuffer = Buffer.alloc(0);
+						h2Request?.pause();
+						break;
+					}
 					const flags = pendingBuffer[0];
 					const msgLen = pendingBuffer.readUInt32BE(1);
 					if (pendingBuffer.length < 5 + msgLen) break;
