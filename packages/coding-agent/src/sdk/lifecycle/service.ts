@@ -12,6 +12,7 @@ export type SessionLifecycleOperation =
 	| "session.resume"
 	| "session.close"
 	| "session.delete"
+	| "session.reconcile_uncertain"
 	| "session.list";
 
 export interface SessionLifecycleActor {
@@ -146,6 +147,10 @@ export type SessionForkRequest = SessionLifecycleMutationRequestBase<"session.fo
 export type SessionResumeRequest = SessionLifecycleMutationRequestBase<"session.resume", SessionResumeTarget>;
 export type SessionCloseRequest = SessionLifecycleMutationRequestBase<"session.close", SessionCloseTarget>;
 export type SessionDeleteRequest = SessionLifecycleMutationRequestBase<"session.delete", SessionDeleteTarget>;
+export type SessionReconcileUncertainRequest = SessionLifecycleMutationRequestBase<
+	"session.reconcile_uncertain",
+	SessionCloseTarget
+>;
 export interface SessionListRequest {
 	readonly operation: "session.list";
 	readonly actor: SessionLifecycleActor;
@@ -161,7 +166,8 @@ export type SessionLifecycleMutationRequest =
 	| SessionForkRequest
 	| SessionResumeRequest
 	| SessionCloseRequest
-	| SessionDeleteRequest;
+	| SessionDeleteRequest
+	| SessionReconcileUncertainRequest;
 
 export type SessionLifecycleCertainty = "terminal" | "retryable" | "cleanup_pending" | "uncertain";
 
@@ -338,6 +344,7 @@ function operationOf(value: unknown): SessionLifecycleOperation {
 		value === "session.resume" ||
 		value === "session.close" ||
 		value === "session.delete" ||
+		value === "session.reconcile_uncertain" ||
 		value === "session.list"
 	)
 		return value;
@@ -619,7 +626,10 @@ export class SessionLifecycleService {
 		if (!isRecord(response) || response.ok !== true)
 			return failure(operation, "uncertain", "malformed_response", "lifecycle broker returned a malformed response");
 		const expectedSessionId =
-			operation === "session.resume" || operation === "session.close" || operation === "session.delete"
+			operation === "session.resume" ||
+			operation === "session.close" ||
+			operation === "session.delete" ||
+			operation === "session.reconcile_uncertain"
 				? typeof target.sessionId === "string"
 					? target.sessionId
 					: undefined

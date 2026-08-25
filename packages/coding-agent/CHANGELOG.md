@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `gjc sdk session raw global --op session.reconcile_uncertain` retires an indexed `terminalUncertain` create effect after dead-host and absent-marker proof, appending `session_closed` and a ledger `terminal_error` successor. It does not weaken `session.close` / `session.delete`. Coordinator start-session `in_progress` projections are sealed separately to `completed` + `ok:false retired:true` (issue #4950).
+
 ### Fixed
 
 - Coordinator no longer treats native exact-unlink placeholders (empty `.gjc-delete-*.json`) as live projection JSON. Directory scans skip dotfiles and zero-byte files before open, apply the parse cap only after that filter, and never map scan exhaustion to `coordinator_state_unreadable`. Session-state lock reclaim reuses one quarantine name per acquire cycle and removes a verified-empty leftover at that name before exchange. `gjc gc --empty-delete-receipts --root/--manifest` reports or prunes only operator-supplied empty receipts (inode identity + symlink-root reject; no hardcoded host paths).
