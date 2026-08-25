@@ -1813,11 +1813,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const unregisterOwnerCleanup = bridgeManager.registerOwnerCleanup(
 				this.session.getAgentId?.() ?? "0-Main",
 				() => {
-					void handle.kill().catch(error => {
-						logger.warn("ACP terminal kill failed during owner teardown", {
-							terminalId: handle.terminalId,
-							error,
-						});
+					void Promise.allSettled([handle.kill(), handle.release()]).then(results => {
+						for (const result of results) {
+							if (result.status === "rejected") {
+								logger.warn("ACP terminal teardown RPC failed", {
+									terminalId: handle.terminalId,
+									error: result.reason,
+								});
+							}
+						}
 					});
 					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.", {
 						abort: false,
