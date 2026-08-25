@@ -768,13 +768,12 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
+		const localKey = await localLockKey(lockPath);
 		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, ownerToken, opts.onAcquired);
 		if (owner) {
-			const localKey = await localLockKey(lockPath);
 			localLockStates.set(localKey, { owner, status: "held" });
 			return () => releaseLock(lockPath, owner, localKey);
 		}
-		const localKey = await localLockKey(lockPath);
 		const localState = localLockStates.get(localKey);
 		if (localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
 			try {

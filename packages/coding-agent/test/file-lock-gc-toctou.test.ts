@@ -15,6 +15,7 @@ const tempDirs: string[] = [];
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	FileLockTestHooks.afterParentMkdir = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
@@ -514,6 +515,27 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		});
 
 		expect(await fs.exists(`${lockedFile}.lock`)).toBe(false);
+	});
+
+	test("registers ownership before canonicalization can fail after publication", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const realpath = fs.realpath;
+		let failCanonicalization = false;
+		vi.spyOn(fs, "realpath").mockImplementation((async target => {
+			if (failCanonicalization && String(target).endsWith(".lock")) {
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			}
+			return await realpath(target);
+		}) as typeof fs.realpath);
+		FileLockTestHooks.afterParentMkdir = target => {
+			if (target === lockDir) failCanonicalization = true;
+		};
+
+		await withFileLock(lockedFile, async () => {});
+
+		expect(await fs.exists(lockDir)).toBe(false);
 	});
 
 	test("preserves operation and ownership-loss release failures", async () => {
