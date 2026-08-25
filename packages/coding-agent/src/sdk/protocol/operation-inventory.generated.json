@@ -1080,6 +1080,24 @@
 		]
 	},
 	{
+		"sourceId": "registry:G08",
+		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
+		"sourceKind": "registry",
+		"decision": "include",
+		"sdkId": "session.reconcile_uncertain",
+		"adapterMappings": {
+			"telegram": "generic_safe",
+			"discord": "generic_safe",
+			"slack": "generic_safe",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
+	},
+	{
 		"sourceId": "registry:Q01",
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",

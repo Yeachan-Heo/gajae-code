@@ -907,6 +907,14 @@ export class LifecycleLedger {
 		return this.#byIdentity.get(identity);
 	}
 
+	listUncertainCreatesBySessionId(sessionId: string): LifecycleLedgerEntry[] {
+		const matches: LifecycleLedgerEntry[] = [];
+		for (const current of this.#byIdentity.values()) {
+			if (current.state === "terminal_uncertain" && current.intendedSessionId === sessionId) matches.push(current);
+		}
+		return matches;
+	}
+
 	findPendingCleanupByTarget(
 		sessionId: string,
 		cwd: string,

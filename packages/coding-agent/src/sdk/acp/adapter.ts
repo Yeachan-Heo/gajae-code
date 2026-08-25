@@ -132,7 +132,8 @@ function isLifecycleOperation(operation: string): boolean {
 		operation === "session.fork" ||
 		operation === "session.resume" ||
 		operation === "session.close" ||
-		operation === "session.delete"
+		operation === "session.delete" ||
+		operation === "session.reconcile_uncertain"
 	);
 }
 

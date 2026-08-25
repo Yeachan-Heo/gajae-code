@@ -135,6 +135,7 @@ const globals = [
 	["session.resume", "Resume a saved session."],
 	["session.close", "Close a saved session."],
 	["session.delete", "Delete a saved session."],
+	["session.reconcile_uncertain", "Retire an indexed terminalUncertain create effect after dead-host proof."],
 ] as const;
 
 const queries = [

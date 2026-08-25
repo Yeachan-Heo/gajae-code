@@ -207,6 +207,7 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.resume",
 	"session.close",
 	"session.delete",
+	"session.reconcile_uncertain",
 ]);
 
 /** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
@@ -307,7 +308,8 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 		operation !== "session.fork" &&
 		operation !== "session.resume" &&
 		operation !== "session.close" &&
-		operation !== "session.delete"
+		operation !== "session.delete" &&
+		operation !== "session.reconcile_uncertain"
 	)
 		return { input: normalized };
 
@@ -469,6 +471,7 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 		case "session.resume":
 		case "session.close":
 		case "session.delete":
+		case "session.reconcile_uncertain":
 			return { sessionId: id };
 		default:
 			return { operation, root, sessionId: id };

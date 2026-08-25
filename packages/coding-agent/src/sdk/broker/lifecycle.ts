@@ -5262,6 +5262,89 @@ async function executeLifecycleResponse(
 		if (record) await appendSessionDeletedEvidence(broker, record);
 		return completion;
 	}
+	if (operation === "session.reconcile_uncertain") {
+		const id = sessionId(input);
+		if (!id) return fail("invalid_input", "sessionId is required.");
+		if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
+		await broker.index.refresh();
+		const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+		if (!record) return fail("not_found", "session is not indexed");
+		if (record.terminalUncertain !== true)
+			return fail("invalid_input", "session.reconcile_uncertain only accepts terminalUncertain index rows.");
+		if (record.live) return fail("live_session", "Session host is still live.");
+		const incarnation = record.hostIncarnation ?? record.processIncarnation;
+		if (observeProcess(record.pid, incarnation) === "alive")
+			return fail("live_session", "Session host incarnation is still alive.");
+		if (observeProcess(record.pid, incarnation) === "uncertain" && !hasObservedProcessExit(record.pid))
+			return fail("terminal_uncertain", "Session host liveness could not be proven.");
+		const matches = broker.ledger.listUncertainCreatesBySessionId(id);
+		if (matches.length === 0) return fail("not_found", "No terminal_uncertain create identity matches this session.");
+		if (matches.length !== 1)
+			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
+		const create = matches[0]!;
+		const root = record.locator.stateRoot;
+		const marker = lifecycleMarkerPath(root, id);
+		const ready = lifecycleReadyPath(root, id);
+		for (const candidate of [marker, ready]) {
+			let stat: fsSync.BigIntStats;
+			try {
+				stat = await fs.lstat(candidate, { bigint: true });
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+				return fail("terminal_uncertain", "Lifecycle leftover path could not be inspected safely.");
+			}
+			if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1n)
+				return fail("terminal_uncertain", "Lifecycle leftover is not a regular unshared file.");
+			let parsed: { pid?: unknown; incarnation?: unknown; effectMarker?: unknown };
+			try {
+				parsed = JSON.parse(await fs.readFile(candidate, "utf8")) as {
+					pid?: unknown;
+					incarnation?: unknown;
+					effectMarker?: unknown;
+				};
+			} catch {
+				return fail("terminal_uncertain", "Lifecycle leftover is not valid JSON.");
+			}
+			if (parsed.pid !== record.pid)
+				return fail("terminal_uncertain", "Lifecycle leftover pid does not match the indexed host.");
+			const leftoverIncarnation =
+				typeof parsed.incarnation === "string" ? parsed.incarnation : undefined;
+			if (leftoverIncarnation && incarnation && leftoverIncarnation !== incarnation)
+				return fail("terminal_uncertain", "Lifecycle leftover incarnation does not match the indexed host.");
+			if (observeProcess(record.pid, leftoverIncarnation ?? incarnation) === "alive")
+				return fail("live_session", "Lifecycle leftover still names a live host.");
+			await fs.unlink(candidate);
+			try {
+				await fs.lstat(candidate);
+				return fail("terminal_uncertain", "Lifecycle leftover remained after unlink.");
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+					return fail("terminal_uncertain", "Lifecycle leftover unlink could not be verified.");
+			}
+		}
+		await broker.ledger.transition(create.identity, "terminal_error", {
+			intendedSessionId: id,
+			response: fail(
+				"terminal_uncertain",
+				"Uncertain create retired after dead-host and absent-marker proof.",
+			),
+		});
+		await broker.index.append({
+			type: "session_closed",
+			sessionId: id,
+			locator: record.locator,
+			endpointGeneration: record.endpointGeneration,
+			pid: record.pid,
+			...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+			...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
+			...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+			...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
+		});
+		return {
+			ok: true,
+			result: { sessionId: id, retired: true, ledgerState: "terminal_error", indexType: "session_closed" },
+		};
+	}
 	return fail("invalid_input", "Unknown lifecycle operation.");
 }
 

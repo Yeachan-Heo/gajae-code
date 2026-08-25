@@ -209,7 +209,8 @@ function isLifecycleOperation(operation: string): operation is LifecycleMutation
 		operation === "session.fork" ||
 		operation === "session.resume" ||
 		operation === "session.close" ||
-		operation === "session.delete"
+		operation === "session.delete" ||
+		operation === "session.reconcile_uncertain"
 	);
 }
 
@@ -1294,11 +1295,13 @@ function lifecycleMutationRequest(
 			2,
 		);
 	const target = input as JsonRecord & { sessionId: string };
-	return operation === "session.resume"
-		? { ...base, operation, capability: operation, target }
-		: operation === "session.close"
-			? { ...base, operation, capability: operation, target }
-			: { ...base, operation, capability: "session.delete", target };
+	if (
+		operation === "session.resume" ||
+		operation === "session.close" ||
+		operation === "session.reconcile_uncertain"
+	)
+		return { ...base, operation, capability: operation, target };
+	return { ...base, operation, capability: "session.delete", target };
 }
 
 async function runRawGlobal(
