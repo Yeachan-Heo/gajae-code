@@ -26,6 +26,7 @@ import {
 	AuthStorage,
 	type CredentialHealthResult,
 	DEFAULT_AUTH_GATEWAY_BIND,
+	extractStructuredApiKeyToken,
 	type GeneratedProvider,
 	getBundledModels,
 	RemoteAuthCredentialStore,
@@ -198,6 +199,14 @@ export function hasEnabledProviderCredential(
 	return snapshot.credentials.some(entry => entry.provider === provider);
 }
 
+export function matchesProviderCredential(
+	entry: AuthCredentialSnapshot["credentials"][number],
+	apiKey: string,
+): boolean {
+	if (entry.credential.type === "api_key") return entry.credential.key === apiKey;
+	return entry.credential.access === apiKey || extractStructuredApiKeyToken(apiKey) === entry.credential.access;
+}
+
 export function assertEnabledProviderCredential(
 	snapshot: Pick<AuthCredentialSnapshot, "credentials">,
 	provider: string,
@@ -249,11 +258,9 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 				await storage.reload();
 			},
 			validateProviderCredential: (candidateProvider, apiKey) =>
-				store.snapshot.credentials.some(entry => {
-					if (entry.provider !== candidateProvider) return false;
-					if (entry.credential.type === "api_key") return entry.credential.key === apiKey;
-					return entry.credential.access === apiKey;
-				}),
+				store.snapshot.credentials.some(
+					entry => entry.provider === candidateProvider && matchesProviderCredential(entry, apiKey),
+				),
 			bind,
 			providerScope: { provider },
 			bearerTokens: gatewayToken ? [gatewayToken] : [],

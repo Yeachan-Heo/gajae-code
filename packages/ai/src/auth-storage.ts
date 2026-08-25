@@ -47,6 +47,20 @@ export type ApiKeyCredential = {
 	key: string;
 };
 
+/**
+ * Extracts the bearer token from the structured API-key form used by OAuth
+ * providers that need to carry token metadata alongside the access token.
+ */
+export function extractStructuredApiKeyToken(apiKey: string): string | undefined {
+	if (!apiKey.startsWith("{")) return undefined;
+	try {
+		const parsed = JSON.parse(apiKey) as { token?: unknown };
+		return typeof parsed.token === "string" ? parsed.token : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export interface MCPOAuthBinding {
 	/** Exact HTTP(S) origin of the MCP resource endpoint. */
 	resourceOrigin: string;
@@ -5472,13 +5486,7 @@ export class AuthStorage {
 	}
 
 	#extractStructuredApiKeyToken(apiKey: string): string | undefined {
-		if (!apiKey.startsWith("{")) return undefined;
-		try {
-			const parsed = JSON.parse(apiKey) as { token?: unknown };
-			return typeof parsed.token === "string" ? parsed.token : undefined;
-		} catch {
-			return undefined;
-		}
+		return extractStructuredApiKeyToken(apiKey);
 	}
 
 	async #credentialMatchesApiKey(provider: string, credential: AuthCredential, apiKey: string): Promise<boolean> {

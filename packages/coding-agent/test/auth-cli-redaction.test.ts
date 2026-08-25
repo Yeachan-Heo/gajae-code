@@ -11,10 +11,31 @@ import {
 } from "@gajae-code/ai";
 import { setAgentDir } from "@gajae-code/utils";
 import { runAuthBrokerCommand } from "../src/cli/auth-broker-cli";
-import { runAuthGatewayCommand } from "../src/cli/auth-gateway-cli";
+import { matchesProviderCredential, runAuthGatewayCommand } from "../src/cli/auth-gateway-cli";
 
 const SECRET = "auth-cli-provider-secret";
 const ENV_KEYS = ["GJC_AUTH_BROKER_URL", "GJC_AUTH_BROKER_TOKEN"] as const;
+
+describe("auth gateway credential matching", () => {
+	it("accepts the token from a structured OAuth API key", () => {
+		expect(
+			matchesProviderCredential(
+				{
+					id: 1,
+					provider: "anthropic",
+					credential: {
+						type: "oauth",
+						access: "access-token",
+						refresh: "__remote__",
+						expires: Date.now() + 60_000,
+					},
+					identityKey: null,
+				},
+				'{"token":"access-token","enterpriseUrl":"https://example.test"}',
+			),
+		).toBe(true);
+	});
+});
 
 async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string; stderr: string }> {
 	const originalStdout = process.stdout.write.bind(process.stdout);

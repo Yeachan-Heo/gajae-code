@@ -21,6 +21,7 @@ import {
 	type AuthCredential,
 	type AuthCredentialStore,
 	AuthStorage,
+	extractStructuredApiKeyToken,
 	type StoredAuthCredential,
 } from "../src/auth-storage";
 import * as claudeUsage from "../src/usage/claude";
@@ -78,6 +79,20 @@ function makeStore(
 		...(refresh ? { refreshOAuthCredential: refresh } : {}),
 	};
 }
+
+describe("extractStructuredApiKeyToken", () => {
+	it("extracts the token field from structured OAuth API keys", () => {
+		expect(extractStructuredApiKeyToken('{"token":"access-token","enterpriseUrl":"https://example.test"}')).toBe(
+			"access-token",
+		);
+	});
+
+	it("rejects malformed or non-token API keys", () => {
+		expect(extractStructuredApiKeyToken("plain-token")).toBeUndefined();
+		expect(extractStructuredApiKeyToken('{"access":"wrong-field"}')).toBeUndefined();
+		expect(extractStructuredApiKeyToken("{not-json")).toBeUndefined();
+	});
+});
 
 describe("AuthStorage.checkCredentials", () => {
 	afterEach(() => {
