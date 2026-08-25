@@ -432,6 +432,7 @@ export type OAuthRefreshLeaseClaim =
 
 export interface AuthCredentialStore {
 	close(): void;
+	onSnapshotChanged?(listener: () => void): () => void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
 	/** Payload-free account inventory; active and soft-disabled rows are included. */
 	listCredentialInventory?(provider?: string): CredentialInventoryRecord[];
@@ -1300,6 +1301,9 @@ export class AuthStorage {
 
 	constructor(store: AuthCredentialStore, options: AuthStorageOptions = {}) {
 		this.#store = store;
+		store.onSnapshotChanged?.(() => {
+			void this.reload();
+		});
 		this.#configValueResolver = options.configValueResolver ?? defaultConfigValueResolver;
 		this.#usageProviderResolver = options.usageProviderResolver ?? resolveDefaultUsageProvider;
 		this.#rankingStrategyResolver = options.rankingStrategyResolver ?? resolveDefaultRankingStrategy;
