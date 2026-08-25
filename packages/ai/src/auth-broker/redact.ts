@@ -15,7 +15,7 @@ export function cleanReason(value: unknown): string | undefined {
 		"$1$2[redacted]$2",
 	);
 	reason = reason.replace(
-		/((?:api[_-]?key|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret))?)\s*=\s*[^\s,;]+/gi,
+		/((?:api[_-]?key|token|secret|authorization|password|access|refresh|cookie|credential)(?:[_-](?:token|key|secret))?)\s*[:=]\s*[^\s,;]+/gi,
 		"$1=[redacted]",
 	);
 	reason = reason.replace(/[\r\n\t ]+/g, " ").trim();

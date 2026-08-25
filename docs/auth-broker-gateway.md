@@ -72,7 +72,7 @@ gjc auth-broker status    [--json]
 | `POST` | `/v1/credential` | bearer | Upsert one OAuth or API-key credential |
 | `POST` | `/v1/credential/:id/refresh` | bearer | Force-refresh one OAuth credential |
 | `POST` | `/v1/credential/:id/disable` | bearer | Disable one credential with a recorded cause |
-|| `GET`  | `/v1/usage` | bearer | Aggregate `UsageReport[]` across credentials |
+| `GET`  | `/v1/usage` | bearer | Aggregate `UsageReport[]` across credentials |
 | `GET`  | `/v1/usage/scoped?provider=<provider>` | bearer | Provider-scoped `UsageReport[]`; unavailable on legacy brokers |
 
 Requests use `Authorization: Bearer <token>`. The server compares against an in-memory token allow-list; the gateway’s implementation uses a timing-safe comparison.

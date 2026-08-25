@@ -143,12 +143,7 @@ function presentationRecordKey(provider: string, identityDigest: string): string
 }
 
 function safePresentationReason(value: unknown): string | null {
-	if (value === null || value === undefined) return null;
-	let reason = value instanceof Error ? value.message : String(value);
-	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
-	reason = reason.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]");
-	reason = reason.replace(/[\r\n\t ]+/g, " ").trim();
-	return reason.length > 256 ? `${reason.slice(0, 253)}...` : reason || null;
+	return cleanReason(value) ?? null;
 }
 
 export interface RemoteAuthCredentialStoreOptions {
