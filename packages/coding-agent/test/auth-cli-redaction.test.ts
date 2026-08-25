@@ -115,7 +115,7 @@ describe("auth CLI diagnostic redaction", () => {
 		process.exitCode = 0;
 		const textOutput = await captureOutput(() => runAuthBrokerCommand({ action: "status", flags: { json: false } }));
 		expect(textOutput.stdout).not.toContain(SECRET);
-		expect(textOutput.stdout).toContain("api_key=[redacted]");
+		expect(textOutput.stdout).toContain("Credential diagnostic unavailable.");
 	});
 
 	it("redacts provider check reasons in gateway text and JSON output", async () => {

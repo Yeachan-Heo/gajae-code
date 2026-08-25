@@ -7,6 +7,7 @@
 export function cleanReason(value: unknown): string | undefined {
 	if (value === undefined || value === null) return undefined;
 	let reason = value instanceof Error ? value.message : String(value);
+	if (/[\u0000-\u001f\u007f-\u009f]/.test(reason)) return "Credential diagnostic unavailable.";
 	if (reason.includes("\\")) return "Credential diagnostic unavailable.";
 	if (/["']?authorization(?:[_-]header)?["']?\s*[:=]/i.test(reason)) return "Credential diagnostic unavailable.";
 	if (

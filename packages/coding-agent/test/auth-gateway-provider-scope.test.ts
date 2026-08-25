@@ -54,9 +54,10 @@ describe("auth-gateway broker provider scope", () => {
 	it("redacts broker URL credentials and query secrets", () => {
 		const redacted = redactBrokerUrl("https://user:password@broker.example.test:8765/v1?token=secret#fragment");
 
-		expect(redacted).toBe("https://broker.example.test:8765/v1");
+		expect(redacted).toBe("https://broker.example.test:8765");
 		expect(redacted).not.toContain("password");
 		expect(redacted).not.toContain("secret");
+		expect(redactBrokerUrl("https://broker.example.test/capability-secret/v1")).toBe("https://broker.example.test");
 	});
 
 	it("filters cross-provider credential rows before JSON or text rendering", () => {

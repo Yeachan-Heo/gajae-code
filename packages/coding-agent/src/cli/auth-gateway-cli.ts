@@ -175,7 +175,7 @@ export function redactBrokerUrl(rawUrl: string): string {
 		url.password = "";
 		url.search = "";
 		url.hash = "";
-		return url.toString();
+		return url.origin === "null" ? "<configured broker>" : url.origin;
 	} catch {
 		return "<configured broker>";
 	}
