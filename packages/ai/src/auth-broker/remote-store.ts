@@ -762,6 +762,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	async waitForFreshSnapshot(maxWaitMs: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
 		const previousGeneration = this.#generation;
+		const previousEpoch = this.#epoch;
 		const result = await this.#client.fetchSnapshot({
 			ifGenerationGt: this.#generation,
 			ifEpoch: this.#epoch,
@@ -775,7 +776,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				}
 			});
 		}
-		return this.#generation !== previousGeneration;
+		return this.#generation !== previousGeneration || this.#epoch !== previousEpoch;
 	}
 
 	async prepareForRequest(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {

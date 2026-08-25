@@ -34,6 +34,8 @@ import {
 	usageResponseSchema,
 } from "./wire-schemas";
 
+export const AUTH_BROKER_EPOCH_HEADER = "X-GJC-Auth-Broker-Epoch";
+
 export interface AuthBrokerClientOptions {
 	/** Base URL (e.g. `https://broker.tailnet:8765`). Trailing slashes are trimmed. */
 	url: string;
@@ -153,6 +155,7 @@ export class AuthBrokerClient {
 		if (opts.waitMs !== undefined) query.set("wait", String(opts.waitMs));
 		const path = `/v1/snapshot${query.size > 0 ? `?${query.toString()}` : ""}`;
 		const headers: Record<string, string> = {};
+		headers[AUTH_BROKER_EPOCH_HEADER] = "1";
 		if (opts.ifGenerationGt !== undefined) {
 			const validator = opts.ifEpoch ? `${opts.ifEpoch}:${opts.ifGenerationGt}` : String(opts.ifGenerationGt);
 			headers["If-None-Match"] = `"${validator}"`;
@@ -200,6 +203,7 @@ export class AuthBrokerClient {
 		const headers: Record<string, string> = {
 			Accept: "text/event-stream",
 			Authorization: `Bearer ${this.#token}`,
+			[AUTH_BROKER_EPOCH_HEADER]: "1",
 		};
 		if (opts.signal?.aborted) {
 			throw new AuthBrokerError("Auth broker request aborted", { cause: opts.signal.reason });

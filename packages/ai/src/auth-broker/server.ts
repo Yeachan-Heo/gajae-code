@@ -14,6 +14,7 @@ import { logger } from "@gajae-code/utils";
 import { timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
 import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { AUTH_BROKER_EPOCH_HEADER } from "./client";
 import { cleanReason } from "./redact";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
@@ -150,9 +151,9 @@ const MAX_SNAPSHOT_WAIT_MS = 30_000;
 const DISABLED_NEXT_SWEEP_IN_MS = Number.MAX_SAFE_INTEGER;
 const BROKER_EPOCH_SEQUENCE_CACHE_KEY = "auth-broker:epoch-sequence";
 
-function snapshotHeaders(epoch: string, generation: number): Record<string, string> {
+function snapshotHeaders(epoch: string, generation: number, includeEpoch: boolean): Record<string, string> {
 	return {
-		ETag: `"${epoch}:${generation}"`,
+		ETag: `"${includeEpoch ? `${epoch}:` : ""}${generation}"`,
 		"Cache-Control": "no-store",
 	};
 }
@@ -294,6 +295,7 @@ function buildSnapshot(
 	storage: AuthStorage,
 	refresher: AuthBrokerRefresher | undefined,
 	epoch: string,
+	includeEpoch: boolean,
 ): SnapshotResponse {
 	const serverNowMs = Date.now();
 	const base = storage.exportSnapshot();
@@ -303,7 +305,7 @@ function buildSnapshot(
 		rotatesInMs: computeRotatesInMs(entry, wire, nextSweepAt, serverNowMs),
 	}));
 	return {
-		epoch,
+		...(includeEpoch ? { epoch } : {}),
 		generation: base.generation,
 		generatedAt: base.generatedAt,
 		serverNowMs,
@@ -340,6 +342,7 @@ async function serveSnapshot(
 	await storage.reload();
 	let currentGeneration = storage.getGeneration();
 	const clientTag = parseSnapshotTag(req.headers.get("if-none-match"));
+	const includeEpoch = req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1";
 	const clientGeneration = clientTag?.generation;
 	const waitMs = parseWaitMs(url);
 
@@ -349,13 +352,13 @@ async function serveSnapshot(
 		currentGeneration !== clientGeneration ||
 		waitMs <= 0
 	) {
-		const body = buildSnapshot(storage, refresher, epoch);
+		const body = buildSnapshot(storage, refresher, epoch, includeEpoch);
 		logger.info("auth-broker snapshot served", {
 			peer,
 			credentials: body.credentials.length,
 			generation: body.generation,
 		});
-		return json(200, body, snapshotHeaders(epoch, body.generation));
+		return json(200, body, snapshotHeaders(epoch, body.generation, includeEpoch));
 	}
 
 	const delay = delayResult(waitMs);
@@ -364,22 +367,23 @@ async function serveSnapshot(
 	const result = await Promise.race([gate.waitForChange(clientGeneration, waitSignal), delay.promise]);
 	delay.cancel();
 	waitController.abort();
-	if (result === "aborted" || req.signal.aborted) return empty(499, snapshotHeaders(epoch, currentGeneration));
+	if (result === "aborted" || req.signal.aborted)
+		return empty(499, snapshotHeaders(epoch, currentGeneration, includeEpoch));
 
 	await storage.reload();
 	currentGeneration = storage.getGeneration();
-	if (currentGeneration !== clientGeneration || clientTag?.epoch !== epoch) {
-		const body = buildSnapshot(storage, refresher, epoch);
+	if (currentGeneration !== clientGeneration || (includeEpoch && clientTag?.epoch !== epoch)) {
+		const body = buildSnapshot(storage, refresher, epoch, includeEpoch);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
 			credentials: body.credentials.length,
 			generation: body.generation,
 		});
-		return json(200, body, snapshotHeaders(epoch, body.generation));
+		return json(200, body, snapshotHeaders(epoch, body.generation, includeEpoch));
 	}
 
 	logger.info("auth-broker snapshot long-poll unchanged", { peer, generation: currentGeneration });
-	return empty(304, snapshotHeaders(epoch, currentGeneration));
+	return empty(304, snapshotHeaders(epoch, currentGeneration, includeEpoch));
 }
 
 /**
@@ -408,6 +412,7 @@ function serveSnapshotStream(
 	keepaliveMs: number,
 ): Response {
 	const encoder = new TextEncoder();
+	const includeEpoch = req.headers.get(AUTH_BROKER_EPOCH_HEADER) === "1";
 	const openedAt = Date.now();
 	const lastByCredId = new Map<number, string>();
 	let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
@@ -467,7 +472,7 @@ function serveSnapshotStream(
 				pendingBumps = 0;
 				await storage.reload();
 				if (closed) return;
-				const snapshot = buildSnapshot(storage, refresher, epoch);
+				const snapshot = buildSnapshot(storage, refresher, epoch, includeEpoch);
 				// Generation must move forward; a duplicate listener firing without a
 				// real bump is a no-op below (fingerprints unchanged).
 				if (snapshot.generation < lastGeneration) {
@@ -486,7 +491,7 @@ function serveSnapshotStream(
 					lastByCredId.set(entry.id, fp);
 					const payload: SnapshotStreamEntryEvent = {
 						kind: "entry",
-						epoch,
+						...(includeEpoch ? { epoch } : {}),
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
 						refresher: snapshot.refresher,
@@ -505,7 +510,7 @@ function serveSnapshotStream(
 					lastByCredId.delete(id);
 					const payload: SnapshotStreamRemovedEvent = {
 						kind: "removed",
-						epoch,
+						...(includeEpoch ? { epoch } : {}),
 						generation: snapshot.generation,
 						serverNowMs: snapshot.serverNowMs,
 						refresher: snapshot.refresher,
@@ -531,7 +536,7 @@ function serveSnapshotStream(
 				void processGenerationBump();
 			});
 			await storage.reload();
-			const initial = buildSnapshot(storage, refresher, epoch);
+			const initial = buildSnapshot(storage, refresher, epoch, includeEpoch);
 			lastGeneration = initial.generation;
 			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
 			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };

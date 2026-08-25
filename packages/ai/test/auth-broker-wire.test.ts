@@ -251,7 +251,7 @@ describe("auth-broker wire surface", () => {
 
 	test("GET /v1/snapshot returns generation headers and 304 for unchanged long-poll", async () => {
 		const res = await fetch(`${handle!.url}/v1/snapshot`, {
-			headers: { Authorization: `Bearer ${token}` },
+			headers: { Authorization: `Bearer ${token}`, "X-GJC-Auth-Broker-Epoch": "1" },
 		});
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as {
@@ -266,6 +266,13 @@ describe("auth-broker wire surface", () => {
 		expect(body.generation).toBeGreaterThan(0);
 		expect(body.serverNowMs).toBeGreaterThan(0);
 		expect(body.refresher.enabled).toBe(false);
+		const legacy = await fetch(`${handle!.url}/v1/snapshot`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		expect(legacy.status).toBe(200);
+		const legacyBody = (await legacy.json()) as { epoch?: string; generation: number };
+		expect(legacyBody.epoch).toBeUndefined();
+		expect(legacy.headers.get("etag")).toBe(`"${legacyBody.generation}"`);
 
 		const client = new AuthBrokerClient({ url: handle!.url, token });
 		const unchanged = await client.fetchSnapshot({
