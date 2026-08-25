@@ -329,7 +329,7 @@ async function copyPrivately(from: string, to: string): Promise<boolean> {
 	let ownsBackup = false;
 	let capturedIdentity: NativeExactFileIdentity | undefined;
 	try {
-		handle = await fs.open(to, "wx", mode);
+		handle = await fs.open(to, "wx+", mode);
 		ownsBackup = true;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;

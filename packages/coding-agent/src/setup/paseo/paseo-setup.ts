@@ -123,6 +123,7 @@ async function trustedBridgePathsForRecovery(deps: PaseoSetupDependencies): Prom
 			// an unauthenticated ledger path to the replay allow-list.
 		}
 	}
+	if (ledger.bridgeCleanupPending !== undefined) paths.push(ledger.bridgeCleanupPending.originalPath);
 	return [...new Set(await Promise.all(paths.map(value => canonicalPathForComparison(value))))];
 }
 
@@ -857,6 +858,8 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						if (intent?.step === "skills-bridge" && intent.provenancePath === deps.paths.provenanceLedger) {
 							await writeIntent(deps.paths.intentRecord, {
 								...intent,
+								provenancePreflightIdentity: provenanceLedgerIdentity(current),
+								bridgePreflightPayload: current,
 								provenanceExpectedIdentity: provenanceLedgerIdentity(restoredLedger),
 								provenancePayload: restoredLedger,
 							});

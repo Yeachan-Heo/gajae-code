@@ -577,10 +577,19 @@ export async function recoverIntent(
 			afterMatches && (ledgerObserved === intent.provenanceExpectedIdentity || ledgerObserved === settledAfter);
 		const safeSettled =
 			settledAfter !== undefined && beforeMatches && !afterMatches && ledgerObserved === settledAfter;
+		const safePendingPreDetach =
+			after?.bridgeCleanupPending !== undefined &&
+			beforeMatches &&
+			ledgerObserved === intent.provenanceExpectedIdentity;
 		const recoverableCutover =
 			afterMatches && !beforeMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		if (
-			(!safePreflight && !safeCompleted && !safeSettled && !recoverableCutover && !(samePayload && beforeMatches)) ||
+			(!safePreflight &&
+				!safeCompleted &&
+				!safeSettled &&
+				!safePendingPreDetach &&
+				!recoverableCutover &&
+				!(samePayload && beforeMatches)) ||
 			(beforeMatches && afterMatches && !samePayload)
 		) {
 			return {
@@ -628,6 +637,12 @@ export async function recoverIntent(
 				};
 			}
 			await options.replayBridgeCleanup(after.bridgeCleanupPending);
+			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: `the provenance ledger changed during pending bridge replay; refusing to overwrite the newer record`,
+				};
+			}
 			const authorityPath = path.resolve(after.bridgeCleanupPending.originalPath);
 			const beforeOwnsAuthority =
 				before?.bridgePath !== undefined && path.resolve(before.bridgePath) === authorityPath;
