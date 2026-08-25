@@ -72,6 +72,11 @@ const MAX_WAIT_MS = 5_000;
 const BACKGROUND_WAIT_MS = 30_000;
 const BACKGROUND_BACKOFF_INITIAL_MS = 500;
 const BACKGROUND_BACKOFF_MAX_MS = 30_000;
+
+function epochRank(epoch: string): number | undefined {
+	const match = /^(\d+)-/.exec(epoch);
+	return match ? Number(match[1]) : undefined;
+}
 const PRESENTATION_FRESH_MS = 5 * 60_000;
 const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
 const PRESENTATION_SIDECAR_VERSION = 1;
@@ -387,6 +392,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (generation < this.#generation) return;
 			} else {
 				if (this.#retiredEpochs.has(snapshot.epoch)) return;
+				const currentRank = epochRank(this.#epoch);
+				const incomingRank = epochRank(snapshot.epoch);
+				if (currentRank !== undefined && incomingRank !== undefined && incomingRank < currentRank) return;
 				this.#retiredEpochs.add(this.#epoch);
 			}
 		} else if (snapshot.epoch) {

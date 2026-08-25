@@ -367,7 +367,7 @@ async function serveSnapshot(
 
 	await storage.reload();
 	currentGeneration = storage.getGeneration();
-	if (currentGeneration !== clientGeneration) {
+	if (currentGeneration !== clientGeneration || clientTag?.epoch !== epoch) {
 		const body = buildSnapshot(storage, refresher, epoch);
 		logger.info("auth-broker snapshot long-poll changed", {
 			peer,
@@ -561,7 +561,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
-	const epoch = crypto.randomUUID();
+	const epoch = `${Date.now()}-${crypto.randomUUID()}`;
 
 	const refresher = opts.disableRefresher
 		? undefined

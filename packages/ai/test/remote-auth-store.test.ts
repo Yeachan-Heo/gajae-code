@@ -191,7 +191,7 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 	test("rejects delayed data from a retired broker epoch even with a newer timestamp", async () => {
 		let nextSnapshot: SnapshotResponse = {
 			generation: 1,
-			epoch: "new-epoch",
+			epoch: "200-new-epoch",
 			generatedAt: 100,
 			serverNowMs: 100,
 			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
@@ -214,14 +214,14 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 			initialSnapshot: {
 				...nextSnapshot,
 				generation: 99,
-				epoch: "old-epoch",
+				epoch: "100-old-epoch",
 				serverNowMs: 200,
 			},
 		});
 		await remoteStore.refreshSnapshot();
-		nextSnapshot = { ...nextSnapshot, generation: 100, epoch: "old-epoch", serverNowMs: 300 };
+		nextSnapshot = { ...nextSnapshot, generation: 100, epoch: "100-old-epoch", serverNowMs: 300 };
 		await remoteStore.refreshSnapshot();
-		expect(remoteStore.snapshot.epoch).toBe("new-epoch");
+		expect(remoteStore.snapshot.epoch).toBe("200-new-epoch");
 		expect(remoteStore.snapshot.generation).toBe(1);
 		remoteStore.close();
 	});
