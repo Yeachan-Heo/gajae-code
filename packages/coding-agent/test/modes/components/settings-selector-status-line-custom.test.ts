@@ -59,7 +59,21 @@ function createSelector(options: SelectorOptions = {}) {
 	return { component, previews, changedSettings, previewWidths };
 }
 function selectCustomEditor(component: SettingsSelectorComponent): void {
-	for (let i = 0; i < 6; i++) component.handleInput("\x1b[B");
+	for (let i = 0; i < 80; i++) {
+		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		if (rendered.includes("❯ Status Line Custom Editor")) return;
+		component.handleInput("\x1b[B");
+	}
+	throw new Error("Status Line Custom Editor was not reachable");
+}
+
+function selectItem(component: SettingsSelectorComponent, label: string): void {
+	for (let i = 0; i < 80; i++) {
+		const rendered = Bun.stripANSI(component.render(120).join("\n"));
+		if (rendered.includes(`❯ ${label}`)) return;
+		component.handleInput("\x1b[B");
+	}
+	throw new Error(`${label} was not reachable`);
 }
 
 function openCustomEditor(component: SettingsSelectorComponent): void {
@@ -76,7 +90,7 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 	it("keeps Custom out of the generic preset selector", () => {
 		const { component } = createSelector();
 
-		for (let i = 0; i < 5; i++) component.handleInput("\x1b[B");
+		selectItem(component, "Status Line Preset");
 
 		component.handleInput("\n");
 
