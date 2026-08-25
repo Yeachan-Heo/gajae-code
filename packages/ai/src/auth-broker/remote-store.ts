@@ -170,7 +170,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#generation = 0;
 	#epoch?: string;
 	#retiredEpochs = new Set<string>();
-	#snapshotRefreshTail: Promise<void> = Promise.resolve();
+	#snapshotAuthorityTail: Promise<void> = Promise.resolve();
 	#backgroundAbort = new AbortController();
 	#cache: Map<string, CacheEntry> = new Map();
 	#usageCache?: UsageCacheEntry;
@@ -426,6 +426,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#hydratePresentations();
 	}
 
+	#withSnapshotAuthority<T>(operation: () => Promise<T>): Promise<T> {
+		const run = this.#snapshotAuthorityTail.then(operation);
+		this.#snapshotAuthorityTail = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
 	#setInventoryState(
 		capability: CredentialInventoryMetadataCapability,
 		generation: number,
@@ -570,7 +579,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					waitMs: BACKGROUND_WAIT_MS,
 					signal: this.#backgroundAbort.signal,
 				});
-				if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+				if (result.status === 200) {
+					await this.#withSnapshotAuthority(async () => {
+						this.#applySnapshot(result.snapshot, result.generation);
+					});
+				}
 				backoffMs = BACKGROUND_BACKOFF_INITIAL_MS;
 			} catch (error) {
 				if (this.#closed || this.#backgroundAbort.signal.aborted) break;
@@ -587,30 +600,38 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			for await (const event of iterator) {
 				if (this.#closed || this.#backgroundAbort.signal.aborted) break;
 				this.#streamingActive = true;
-				this.#applyStreamEvent(event);
+				await this.#applyStreamEvent(event);
 			}
 		} finally {
 			this.#streamingActive = false;
 		}
 	}
 
-	#applyStreamEvent(event: SnapshotStreamEvent): void {
-		switch (event.kind) {
-			case "snapshot": {
-				// Strip the discriminator so we store the wire-shape SnapshotResponse.
-				const { kind: _kind, ...snapshot } = event;
-				this.#applySnapshot(snapshot, snapshot.generation);
-				return;
+	async #applyStreamEvent(event: SnapshotStreamEvent): Promise<void> {
+		await this.#withSnapshotAuthority(async () => {
+			switch (event.kind) {
+				case "snapshot": {
+					// Strip the discriminator so we store the wire-shape SnapshotResponse.
+					const { kind: _kind, ...snapshot } = event;
+					this.#applySnapshot(snapshot, snapshot.generation);
+					return;
+				}
+				case "entry": {
+					this.#applyStreamEntry(event.entry, event.refresher, event.generation, event.serverNowMs, event.epoch);
+					return;
+				}
+				case "removed": {
+					this.#removeStreamCredential(
+						event.id,
+						event.refresher,
+						event.generation,
+						event.serverNowMs,
+						event.epoch,
+					);
+					return;
+				}
 			}
-			case "entry": {
-				this.#applyStreamEntry(event.entry, event.refresher, event.generation, event.serverNowMs, event.epoch);
-				return;
-			}
-			case "removed": {
-				this.#removeStreamCredential(event.id, event.refresher, event.generation, event.serverNowMs, event.epoch);
-				return;
-			}
-		}
+		});
 	}
 
 	#applyStreamEntry(
@@ -652,13 +673,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
 	async refreshSnapshot(): Promise<SnapshotResponse> {
-		const previous = this.#snapshotRefreshTail;
-		const refresh = previous.then(async () => {
-			const result = await this.#client.fetchSnapshot();
-			if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
-		});
-		this.#snapshotRefreshTail = refresh.catch(() => {});
-		await refresh;
+		const result = await this.#client.fetchSnapshot();
+		if (result.status === 200) {
+			await this.#withSnapshotAuthority(async () => {
+				this.#applySnapshot(result.snapshot, result.generation);
+			});
+		}
 		return this.#snapshot;
 	}
 
@@ -705,7 +725,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			waitMs: maxWaitMs,
 			signal: opts.signal,
 		});
-		if (result.status === 200) this.#applySnapshot(result.snapshot, result.generation);
+		if (result.status === 200) {
+			await this.#withSnapshotAuthority(async () => {
+				this.#applySnapshot(result.snapshot, result.generation);
+			});
+		}
 		return this.#generation !== previousGeneration;
 	}
 
