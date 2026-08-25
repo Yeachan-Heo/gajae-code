@@ -3,7 +3,7 @@
 The auth broker and auth gateway are two cooperating HTTP services that move OAuth refresh tokens and provider access tokens off developer laptops and into a single broker host.
 
 - **`gjc auth-broker serve`** holds the canonical SQLite credential vault, performs OAuth refreshes, and exposes a small REST API (`/v1/snapshot`, `/v1/credential/:id/refresh`, `/v1/credential/:id/disable`, `/v1/credential`, `/v1/usage`, `/v1/healthz`).
-- **`gjc auth-gateway serve`** is a forward-proxy. It accepts OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses requests, injects the broker-resolved access token, and forwards the bytes to the real provider. Clients (containerised gjc, llm-git, the macOS usage widget, …) never see the access token.
+- **`gjc auth-gateway serve --provider=<provider>`** is a provider-scoped forward-proxy. It accepts OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses requests, injects the broker-resolved access token, and dispatches only through the selected provider catalog. Clients (containerised gjc, llm-git, the macOS usage widget, …) never see the access token.
 
 Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token when bearer authentication is configured. The gateway's `--no-auth` mode disables inbound bearer checks only on a loopback bind; an unauthenticated non-loopback bind is rejected at startup.
 
@@ -88,29 +88,33 @@ Requests use `Authorization: Bearer <token>`. The server compares against an in-
 ### CLI
 
 ```
-gjc auth-gateway serve   [--bind=host:port] [--no-auth]
+gjc auth-gateway serve   --provider=<provider> [--bind=host:port] [--no-auth]
 gjc auth-gateway token   [--regenerate] [--json]
-gjc auth-gateway status  [--json]
+gjc auth-gateway status  [--provider=<provider>] [--json]
+gjc auth-gateway check   [--provider=<provider>] [--json]
 ```
 
-- `serve` requires a resolved broker URL — `GJC_AUTH_BROKER_URL` or nested `auth.broker.url` in the global `config.yml` — and a bearer token from `GJC_AUTH_BROKER_TOKEN`, nested `auth.broker.token`, or `<config-dir>/auth-broker.token`. The gateway is itself a broker client: it calls `AuthBrokerClient.fetchSnapshot()`, wraps it in `RemoteAuthCredentialStore`, and constructs an `AuthStorage` that resolves access tokens through the broker. Default bind is `127.0.0.1:4000`. The gateway token is stored at `<config-dir>/auth-gateway.token` (`0600`); `--no-auth` disables the inbound bearer check only on a loopback bind. A non-loopback unauthenticated bind is rejected at startup.
-- `token` / `status` mirror the broker’s equivalents.
+- `serve` requires an explicit `--provider`. It fetches the broker snapshot before binding and fails closed unless that snapshot contains an enabled credential for the selected provider. The gateway is itself a broker client: it calls `AuthBrokerClient.fetchSnapshot()`, wraps it in `RemoteAuthCredentialStore`, and constructs an `AuthStorage` that resolves access tokens through the broker. Default bind is `127.0.0.1:4000`. The gateway token is stored at `<config-dir>/auth-gateway.token` (`0600`); `--no-auth` disables the inbound bearer check only on a loopback bind. A non-loopback unauthenticated bind is rejected at startup.
+- The selected provider is the complete gateway scope. The bundled catalog is filtered to that provider before startup; model ids from other providers are never admitted, so duplicate ids cannot select a credential by enumeration order. An unscoped `serve` invocation is rejected rather than using first-write routing. Requests require exact membership in the scoped catalog and resolve credentials only for the scoped provider.
+- `status` and `check` accept `--provider` to report or probe one scope. Their JSON and text output includes the scope and redacts credential/token material; an unscoped `status` reports not-ready instead of claiming gateway readiness.
+- `token` manages only the inbound gateway bearer token.
 
 ### Endpoints
 
 | Method | Path | Auth | Purpose |
 | ------ | ---- | ---- | ------- |
 | `GET`  | `/healthz` | none | Liveness + version |
-| `GET`  | `/v1/usage` | bearer | Aggregate `UsageReport[]` (proxied through `AuthStorage`) |
-| `GET`  | `/v1/models` | bearer | Bundled-model catalog filtered to providers with credentials |
+| `GET`  | `/v1/usage` | bearer | Aggregate `UsageReport[]` for the selected provider scope |
+| `GET`  | `/v1/credentials/check` | bearer | Credential health for the selected provider scope |
+| `GET`  | `/v1/models` | bearer | Bundled-model catalog for the selected provider scope |
 | `POST` | `/v1/chat/completions` | bearer | OpenAI Chat Completions wire format |
 | `POST` | `/v1/messages` | bearer | Anthropic Messages wire format |
 | `POST` | `/v1/responses` | bearer | OpenAI Responses wire format |
+| `POST` | `/v1/pi/stream` | bearer | Native gjc stream format |
 
-The model id is read from the top-level `model` field. The gateway picks the first bundled `Model<Api>` matching that id and:
+The model id is read from the top-level `model` field and must be an exact member of the selected provider’s source-backed catalog. The gateway resolves the scoped model and obtains the credential for that model’s provider only; it never falls back to a credential from another provider. `/v1/models` emits the catalog model’s `owned_by` and `api` values. In particular, an `openai-codex` scope exposes Codex-owned rows with `owned_by: "openai-codex"` and `api: "openai-codex-responses"`; it cannot project the same id through GitHub Copilot or generic OpenAI Responses.
 
-- **Passthrough fast-path** — when the inbound wire format matches the model’s native API (`openai-chat → openai-completions`, `anthropic-messages → anthropic-messages`, `openai-responses → openai-responses`), the request body is forwarded byte-for-byte with the client `Authorization`/`x-api-key` stripped and replaced by `Authorization: Bearer <resolved-access-token>`. Provider-specific fields (`cache_control`, `service_tier`, tool-choice extensions, …) flow through unmodified. Hop-by-hop headers (RFC 7230) plus `Content-Encoding`/`Content-Length` are stripped from the upstream response.
-- **Translate path** — when the inbound format and the resolved model’s API differ (e.g. `/v1/chat/completions` targeting an Anthropic model, or `/v1/responses` targeting `openai-code-responses` which runs over a websocket transport), the request is parsed against the wire schema, rebuilt into an gjc `Context`, dispatched through `streamSimple()`, and re-encoded back to the inbound format (SSE for streamed responses).
+All provider-format routes parse into gjc’s canonical `Context`, dispatch through `streamSimple()`, and encode back to the inbound wire format. This keeps provider-specific OAuth shaping, headers, and transport selection on the source-backed model.
 
 `idleTimeout` on the underlying `Bun.serve` is set to `255 s` so long thinking-budget calls do not get killed by Bun’s default idle timeout.
 
@@ -142,7 +146,7 @@ The broker is **off** unless `GJC_AUTH_BROKER_URL` (or `auth.broker.url` in `con
 
 | Variable | Purpose | Required when |
 | -------- | ------- | ------------- |
-| `GJC_AUTH_BROKER_URL`   | Base URL of the remote auth-broker (e.g. `https://broker.tailnet:8765`). Selecting this puts the client in broker mode — local SQLite is bypassed. | Any time the gjc client should resolve credentials through a broker (and required by `gjc auth-gateway serve`). |
+| `GJC_AUTH_BROKER_URL`   | Base URL of the remote auth-broker (e.g. `https://broker.tailnet:8765`). Selecting this puts the client in broker mode — local SQLite is bypassed. | Any time the gjc client should resolve credentials through a broker (and required by `gjc auth-gateway serve --provider=<provider>`). |
 | `GJC_AUTH_BROKER_TOKEN` | Bearer token used for every broker endpoint except `/v1/healthz`. | When a broker URL is set and no token is available from nested config or `<config-dir>/auth-broker.token`. |
 
 ### Startup resolver and configuration

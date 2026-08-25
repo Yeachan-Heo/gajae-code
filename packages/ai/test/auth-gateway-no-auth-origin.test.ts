@@ -16,9 +16,12 @@ async function withGateway(
 ): Promise<void> {
 	const handle = startAuthGateway({
 		bind: "127.0.0.1:0",
+		providerScope: { provider: TEST_MODEL.provider },
 		bearerTokens,
 		version: "test",
-		storage: {} as AuthStorage,
+		storage: {
+			exportSnapshot: () => ({ credentials: [{ provider: TEST_MODEL.provider }] }),
+		} as unknown as AuthStorage,
 		resolveModel: () => TEST_MODEL,
 		listModels: () => [TEST_MODEL],
 	});

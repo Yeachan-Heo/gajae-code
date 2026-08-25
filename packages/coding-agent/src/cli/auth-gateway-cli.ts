@@ -8,23 +8,21 @@
  * `GJC_AUTH_BROKER_URL` / `auth.broker.url` precedence used elsewhere).
  *
  * Sub-verbs:
- *   - `serve [--bind=…]` — boots the gateway against the configured broker.
+ *   - `serve --provider=<id> [--bind=…]` — boots a provider-scoped gateway against the configured broker.
  *   - `token` / `token --regenerate` — manages the gateway bearer token file.
- *   - `status` — prints the locally-stored gateway token and bind hint.
+ *   - `status` — prints scoped gateway readiness without token material.
  */
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
-import { startAuthGateway } from "@gajae-code/ai/auth-gateway/server";
+import { createAuthGatewayModelCatalog, startAuthGateway } from "@gajae-code/ai/auth-gateway/server";
 import {
-	type Api,
 	AuthBrokerClient,
+	type AuthCredentialSnapshot,
 	AuthStorage,
 	DEFAULT_AUTH_GATEWAY_BIND,
 	type GeneratedProvider,
 	getBundledModels,
-	getBundledProviders,
-	type Model,
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@gajae-code/ai/core";
@@ -44,6 +42,7 @@ export interface AuthGatewayCommandArgs {
 	flags: {
 		json?: boolean;
 		bind?: string;
+		provider?: string;
 		regenerate?: boolean;
 		/**
 		 * Disable bearer-token auth on inbound requests. Useful when the gateway
@@ -79,9 +78,11 @@ function safeDiagnostic(value: unknown, fallback: string): string {
 
 function writeCommandFailure(action: AuthGatewayAction, flags: AuthGatewayCommandArgs["flags"], error: unknown): void {
 	const stable = stableErrorForAction(action);
+	const scope = normalizeProviderScope(flags.provider);
 	if (flags.json) {
-		process.stdout.write(`${JSON.stringify({ ok: false, error: stable })}\n`);
+		process.stdout.write(`${JSON.stringify({ ok: false, error: stable, scope })}\n`);
 	} else {
+		process.stderr.write(`scope: ${scope ?? "(unscoped)"}\n`);
 		process.stderr.write(`${chalk.red("FAILED")} ${safeDiagnostic(error, stable.message)}\n`);
 	}
 	process.exitCode = 1;
@@ -130,13 +131,58 @@ function createBrokerClient(brokerConfig: AuthBrokerClientConfig): AuthBrokerCli
 	return new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 }
 
+function normalizeProviderScope(provider: string | undefined): string | undefined {
+	const normalized = provider?.trim();
+	return normalized ? normalized : undefined;
+}
+
+function requireProviderScope(provider: string | undefined, action: "serve"): string {
+	const normalized = normalizeProviderScope(provider);
+	if (!normalized) {
+		throw new Error(
+			`gjc auth-gateway ${action} requires --provider=<id>; an unscoped gateway is disabled to prevent model-id ambiguity.`,
+		);
+	}
+	return normalized;
+}
+
+export function redactBrokerUrl(rawUrl: string): string {
+	try {
+		const url = new URL(rawUrl);
+		url.username = "";
+		url.password = "";
+		url.search = "";
+		url.hash = "";
+		return url.toString();
+	} catch {
+		return "<configured broker>";
+	}
+}
+
 async function fetchBrokerSnapshot(client: AuthBrokerClient): Promise<SnapshotResponse> {
 	const result = await client.fetchSnapshot();
 	if (result.status !== 200) throw new Error("Auth broker returned no initial snapshot");
 	return result.snapshot;
 }
 
+export function hasEnabledProviderCredential(
+	snapshot: Pick<AuthCredentialSnapshot, "credentials">,
+	provider: string,
+): boolean {
+	return snapshot.credentials.some(entry => entry.provider === provider);
+}
+
+export function assertEnabledProviderCredential(
+	snapshot: Pick<AuthCredentialSnapshot, "credentials">,
+	provider: string,
+): void {
+	if (!hasEnabledProviderCredential(snapshot, provider)) {
+		throw new Error(`Auth gateway scope ${provider} has no enabled broker credential`);
+	}
+}
+
 async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	const provider = requireProviderScope(flags.provider, "serve");
 	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (!brokerConfig) {
 		throw new Error(
@@ -144,89 +190,81 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		);
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
-	const gatewayToken = flags.noAuth ? null : await ensureToken();
 
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
 	// in sdk/session.ts. The gateway never touches local SQLite.
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
+	assertEnabledProviderCredential(initialSnapshot, provider);
 	const store = new RemoteAuthCredentialStore({ client, initialSnapshot });
 	// Refresh + usage both flow through the store's broker hooks automatically —
 	// `RemoteAuthCredentialStore.refreshOAuthCredential` and `.fetchUsageReports`.
 	// AuthStorage discovers them when no explicit option overrides them, so the
 	// gateway only needs to construct the store and pass it in.
 	const storage = new AuthStorage(store, {
-		sourceLabel: `broker ${brokerConfig.url}`,
+		sourceLabel: `broker ${redactBrokerUrl(brokerConfig.url)}`,
 	});
-	await storage.reload();
-
-	// Build the model resolver + catalog from pi-ai's bundled metadata, scoped
-	// to providers we hold credentials for. Format handlers ask `resolveModel`
-	// to translate a client-requested `model` field into a pi-ai `Model<Api>`
-	// before dispatch; `listModels` powers `/v1/models`.
-	const snapshot = storage.exportSnapshot();
-	const providersWithCreds = new Set<string>();
-	for (const entry of snapshot.credentials) providersWithCreds.add(entry.provider);
-	const modelById = new Map<string, Model<Api>>();
-	for (const provider of getBundledProviders()) {
-		if (!providersWithCreds.has(provider)) continue;
-		for (const model of getBundledModels(provider as GeneratedProvider)) {
-			// First-write-wins so a canonical model id collisions across providers
-			// stick to the provider listed first by getBundledProviders.
-			if (!modelById.has(model.id)) modelById.set(model.id, model);
-		}
-	}
-
-	const handle = startAuthGateway({
-		storage,
-		bind,
-		bearerTokens: gatewayToken ? [gatewayToken] : [],
-		version: VERSION,
-		resolveModel: (id: string) => modelById.get(id),
-		listModels: () => modelById.values(),
-	});
-	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
-	if (gatewayToken) {
-		process.stdout.write(`bearer token: ${getTokenFilePath()} (chmod 0600)\n`);
-	} else {
-		process.stdout.write(`auth: disabled (--no-auth) — any client can call this gateway\n`);
-	}
-	process.stdout.write(`upstream broker: ${brokerConfig.url}\n`);
-
-	const stopped = Promise.withResolvers<void>();
-	let shutdownStarted = false;
-	const stop = async (signal: NodeJS.Signals): Promise<void> => {
-		if (shutdownStarted) return;
-		shutdownStarted = true;
-		process.stdout.write(`\nReceived ${signal}, shutting down...\n`);
-		let closeError: unknown;
-		try {
-			await handle.close();
-		} catch (error) {
-			closeError = error;
-		} finally {
-			storage.close();
-		}
-		if (closeError) {
-			stopped.reject(closeError);
-		} else {
-			stopped.resolve();
-		}
-	};
-	const onSigint = (): void => {
-		void stop("SIGINT");
-	};
-	const onSigterm = (): void => {
-		void stop("SIGTERM");
-	};
-	process.once("SIGINT", onSigint);
-	process.once("SIGTERM", onSigterm);
-
 	try {
-		await stopped.promise;
+		await storage.reload();
+		assertEnabledProviderCredential(storage.exportSnapshot(), provider);
+
+		const models = getBundledModels(provider as GeneratedProvider);
+		const catalog = createAuthGatewayModelCatalog(provider, models);
+		const modelById = new Map(catalog.models.map(model => [model.id, model] as const));
+		const gatewayToken = flags.noAuth ? null : await ensureToken();
+		const handle = startAuthGateway({
+			storage,
+			bind,
+			providerScope: { provider },
+			bearerTokens: gatewayToken ? [gatewayToken] : [],
+			version: VERSION,
+			resolveModel: (id: string) => modelById.get(id),
+			listModels: () => catalog.models,
+		});
+		process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
+		process.stdout.write(`scope: ${provider}\n`);
+		if (gatewayToken) {
+			process.stdout.write(`bearer token: ${getTokenFilePath()} (chmod 0600)\n`);
+		} else {
+			process.stdout.write(`auth: disabled (--no-auth) — any client can call this gateway\n`);
+		}
+		process.stdout.write(`upstream broker: ${redactBrokerUrl(brokerConfig.url)}\n`);
+
+		const stopped = Promise.withResolvers<void>();
+		let shutdownStarted = false;
+		const stop = async (signal: NodeJS.Signals): Promise<void> => {
+			if (shutdownStarted) return;
+			shutdownStarted = true;
+			process.stdout.write(`\nReceived ${signal}, shutting down...\n`);
+			let closeError: unknown;
+			try {
+				await handle.close();
+			} catch (error) {
+				closeError = error;
+			}
+			if (closeError) {
+				stopped.reject(closeError);
+			} else {
+				stopped.resolve();
+			}
+		};
+		const onSigint = (): void => {
+			void stop("SIGINT");
+		};
+		const onSigterm = (): void => {
+			void stop("SIGTERM");
+		};
+		process.once("SIGINT", onSigint);
+		process.once("SIGTERM", onSigterm);
+
+		try {
+			await stopped.promise;
+		} finally {
+			process.off("SIGINT", onSigint);
+			process.off("SIGTERM", onSigterm);
+		}
 	} finally {
-		process.off("SIGINT", onSigint);
-		process.off("SIGTERM", onSigterm);
+		storage.close();
 	}
 }
 
@@ -253,21 +291,53 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 	const token = await readToken();
 	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	const tokenFile = getTokenFilePath();
+	const provider = normalizeProviderScope(flags.provider);
 	if (!brokerConfig) {
 		const status = {
 			ready: false,
 			reason: "broker_not_configured",
 			error: { code: "broker_not_configured", message: "Auth broker is not configured." },
+			scope: provider,
 			tokenFile,
 			tokenPresent: token !== null,
 			broker: null,
 			brokerConfigured: false,
 			brokerAuthenticated: false,
+			credentialCount: null,
 		};
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(status)}\n`);
 		} else {
+			process.stdout.write(`scope: ${provider ?? "(required: --provider=<id>)"}\n`);
 			process.stdout.write(`${chalk.yellow("No broker configured.")} Set GJC_AUTH_BROKER_URL.\n`);
+			process.stdout.write(
+				`token: ${status.tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
+			);
+		}
+		process.exitCode = 1;
+		return;
+	}
+	if (!provider) {
+		const status = {
+			ready: false,
+			reason: "provider_scope_required",
+			error: {
+				code: "provider_scope_required",
+				message: "A provider scope is required to report gateway readiness.",
+			},
+			scope: null,
+			tokenFile,
+			tokenPresent: token !== null,
+			broker: redactBrokerUrl(brokerConfig.url),
+			brokerConfigured: true,
+			brokerAuthenticated: false,
+			credentialCount: null,
+		};
+		if (flags.json) {
+			process.stdout.write(`${JSON.stringify(status)}\n`);
+		} else {
+			process.stdout.write(`scope: (required: --provider=<id>)\n`);
+			process.stdout.write(`${chalk.yellow("not ready")} provider scope is required\n`);
 			process.stdout.write(
 				`token: ${status.tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
@@ -279,23 +349,28 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 	try {
 		const snapshot = await fetchBrokerSnapshot(createBrokerClient(brokerConfig));
 		const tokenPresent = token !== null;
+		const credentialCount = snapshot.credentials.filter(entry => entry.provider === provider).length;
+		const ready = tokenPresent && credentialCount > 0;
+		const reason = !tokenPresent ? "token_missing" : credentialCount === 0 ? "provider_credential_missing" : null;
 		const status = {
-			ready: tokenPresent,
-			reason: tokenPresent ? null : "token_missing",
+			ready,
+			reason,
 			tokenFile,
 			tokenPresent,
-			broker: brokerConfig.url,
+			broker: redactBrokerUrl(brokerConfig.url),
 			brokerConfigured: true,
 			brokerAuthenticated: true,
-			credentialCount: snapshot.credentials.length,
+			scope: provider,
+			credentialCount,
 		};
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(status)}\n`);
 		} else {
-			const brokerLine = `upstream broker: ${brokerConfig.url} (${snapshot.credentials.length} credential${
-				snapshot.credentials.length === 1 ? "" : "s"
+			const brokerLine = `upstream broker: ${redactBrokerUrl(brokerConfig.url)} (${credentialCount} scoped credential${
+				credentialCount === 1 ? "" : "s"
 			})`;
-			process.stdout.write(`${tokenPresent ? chalk.green("ready") : chalk.yellow("not ready")} ${brokerLine}\n`);
+			process.stdout.write(`scope: ${provider}\n`);
+			process.stdout.write(`${ready ? chalk.green("ready") : chalk.yellow("not ready")} ${brokerLine}\n`);
 			process.stdout.write(
 				`token: ${tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
@@ -304,25 +379,30 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 					"Run `gjc auth-gateway token` or `gjc auth-gateway serve` to create a bearer token.\n",
 				);
 			}
+			if (credentialCount === 0) {
+				process.stdout.write(`No enabled broker credential is available for scope ${provider}.\n`);
+			}
 		}
-		if (!tokenPresent) process.exitCode = 1;
+		if (!ready) process.exitCode = 1;
 	} catch (error) {
 		const status = {
 			ready: false,
 			reason: "broker_unavailable",
 			tokenFile,
 			tokenPresent: token !== null,
-			broker: brokerConfig.url,
+			broker: redactBrokerUrl(brokerConfig.url),
 			brokerConfigured: true,
 			brokerAuthenticated: false,
+			scope: provider,
 			error: { code: "broker_unavailable", message: "Auth broker is unavailable." },
 		};
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(status)}\n`);
 		} else {
 			process.stdout.write(
-				`${chalk.red("FAILED")} upstream broker: ${brokerConfig.url}: ${safeDiagnostic(error, "Auth broker is unavailable.")}\n`,
+				`${chalk.red("FAILED")} upstream broker: ${redactBrokerUrl(brokerConfig.url)}: ${safeDiagnostic(error, "Auth broker is unavailable.")}\n`,
 			);
+			process.stdout.write(`scope: ${provider}\n`);
 			process.stdout.write(
 				`token: ${status.tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
@@ -368,6 +448,7 @@ export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promis
  * dedicated diagnostic is the only way to see which credentials failed.
  */
 async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+	const provider = normalizeProviderScope(flags.provider);
 	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (!brokerConfig) {
 		throw new Error(
@@ -378,17 +459,31 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const client = createBrokerClient(brokerConfig);
 	const initialSnapshot = await fetchBrokerSnapshot(client);
 	const store = new RemoteAuthCredentialStore({ client, initialSnapshot });
-	const storage = new AuthStorage(store, { sourceLabel: `broker ${brokerConfig.url}` });
+	const storage = new AuthStorage(store, { sourceLabel: `broker ${redactBrokerUrl(brokerConfig.url)}` });
 	try {
 		await storage.reload();
-		const results = await storage.checkCredentials();
+		const results = await storage.checkCredentials(provider ? { provider } : undefined);
+		const scopedCredentialCount = provider
+			? initialSnapshot.credentials.filter(entry => entry.provider === provider).length
+			: initialSnapshot.credentials.length;
 
 		if (flags.json) {
 			const credentials = results.map(row => ({
 				...row,
 				...(row.reason ? { reason: safeDiagnostic(row.reason, "Credential check failed.") } : {}),
 			}));
-			process.stdout.write(`${JSON.stringify({ broker: brokerConfig.url, credentials }, null, 2)}\n`);
+			process.stdout.write(
+				`${JSON.stringify(
+					{
+						broker: redactBrokerUrl(brokerConfig.url),
+						scope: provider,
+						credentialCount: scopedCredentialCount,
+						credentials,
+					},
+					null,
+					2,
+				)}\n`,
+			);
 		} else {
 			const grouped = new Map<string, typeof results>();
 			for (const row of results) {
@@ -397,7 +492,11 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 				grouped.set(row.provider, list);
 			}
 			const providers = [...grouped.keys()].sort();
-			process.stdout.write(`broker: ${brokerConfig.url}\n`);
+			process.stdout.write(`broker: ${redactBrokerUrl(brokerConfig.url)}\n`);
+			process.stdout.write(`scope: ${provider ?? "(all providers; diagnostic only)"}\n`);
+			if (provider && scopedCredentialCount === 0) {
+				process.stdout.write(`No enabled broker credential is available for scope ${provider}.\n`);
+			}
 			for (const provider of providers) {
 				const rows = grouped.get(provider) ?? [];
 				process.stdout.write(`\n${chalk.bold(provider)} (${rows.length})\n`);
@@ -427,6 +526,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 			);
 			if (failed > 0) process.exitCode = 1;
 		}
+		if (provider && scopedCredentialCount === 0) process.exitCode = 1;
 	} finally {
 		storage.close();
 	}

@@ -67,6 +67,7 @@
 
 ## [0.15.1] - 2026-08-25
 ### Added
+- `gjc auth-gateway serve` now requires `--provider`, verifies an enabled broker credential before binding, and reports only redacted provider-scoped status/check information.
 
 - Added `/language [en|ko]`, the interactive slash command for the persisted `ui.language` selection. Without arguments it reports the current language; with a canonical code, locale tag (`en-US`, `ko-KR`), endonym (`한국어`), English name, or common aliases (`eng`, `kr`, `kor`) it persists the canonical `en`/`ko` value through settings and confirms in the selected language. An unsupported value is rejected with the available list and changes nothing. See `docs/ui-language.md`.
 - Added a persisted, owner-directed `ui.language` selector for human-facing settings chrome, with deterministic English fallback and an independently authored initial Korean catalog. Commands, flags, environment variables, canonical values, JSON, and other protocol output remain unchanged. Localization-boundary guidance was informed by the unofficial, unaffiliated MIT-licensed community patch [`yazzang-homelab/gajae-code-ko@aff1bfa`](https://github.com/yazzang-homelab/gajae-code-ko/commit/aff1bfa097789a8e2f13349da3c7f99b008d93b6). (#4919)

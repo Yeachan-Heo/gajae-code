@@ -22,8 +22,11 @@ export default class AuthGateway extends Command {
 	};
 
 	static flags = {
-		json: Flags.boolean({ description: "Output JSON (token/status)" }),
+		json: Flags.boolean({ description: "Output JSON (token/status/check)" }),
 		bind: Flags.string({ description: "Bind address for `serve` (host:port)", char: "b" }),
+		provider: Flags.string({
+			description: "Required provider scope for `serve`; also filters `status` and `check`",
+		}),
 		regenerate: Flags.boolean({ description: "Regenerate the gateway bearer token (token)" }),
 		"no-auth": Flags.boolean({
 			description:
@@ -32,14 +35,14 @@ export default class AuthGateway extends Command {
 	};
 
 	static examples = [
-		"# Boot the gateway against the configured broker\n  gjc auth-gateway serve",
-		"# Boot on a non-default port\n  gjc auth-gateway serve --bind=127.0.0.1:4000",
+		"# Boot a provider-scoped gateway against the configured broker\n  gjc auth-gateway serve --provider=openai-codex",
+		"# Boot on a non-default port\n  gjc auth-gateway serve --provider=openai-codex --bind=127.0.0.1:4000",
 		"# Print the gateway bearer token (creates one on first run)\n  gjc auth-gateway token",
 		"# Rotate the gateway bearer token\n  gjc auth-gateway token --regenerate",
-		"# Run on loopback without any bearer (anyone on this host can call)\n  gjc auth-gateway serve --no-auth",
-		"# Show local gateway + broker config status\n  gjc auth-gateway status",
-		"# Probe each broker credential to see which one is producing 401s\n  gjc auth-gateway check",
-		"# Same, machine-readable for scripts\n  gjc auth-gateway check --json",
+		"# Run the scoped gateway on loopback without any bearer (anyone on this host can call)\n  gjc auth-gateway serve --provider=openai-codex --no-auth",
+		"# Show scoped local gateway + broker config status\n  gjc auth-gateway status --provider=openai-codex",
+		"# Probe credentials for one gateway scope\n  gjc auth-gateway check --provider=openai-codex",
+		"# Same, machine-readable for scripts\n  gjc auth-gateway check --provider=openai-codex --json",
 	];
 
 	async run(): Promise<void> {
@@ -53,6 +56,7 @@ export default class AuthGateway extends Command {
 			flags: {
 				json: flags.json,
 				bind: flags.bind,
+				provider: flags.provider,
 				regenerate: flags.regenerate,
 				noAuth: flags["no-auth"],
 			},

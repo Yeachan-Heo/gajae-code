@@ -1,7 +1,7 @@
 /**
  * gjc auth-gateway HTTP server.
  *
- * Accepts any provider-format request (OpenAI chat-completions, Anthropic
+ * Accepts a provider-scoped provider-format request (OpenAI chat-completions, Anthropic
  * messages, OpenAI Responses) and dispatches through pi-ai's `streamSimple()`
  * — which handles credential injection, anthropic-beta headers, OpenAI code backend
  * websocket transport, and all the per-provider intricacies. The gateway is
@@ -12,7 +12,7 @@
  *   GET  /healthz                          → unauth; ok + version
  *   GET  /v1/usage                         → aggregated provider usage (5-min per-credential cache via AuthStorage)
  *   GET  /v1/credentials/check             → per-credential auth probe (diagnose 401s in a multi-account pool)
- *   GET  /v1/models                        → list known models from the registry
+ *   GET  /v1/models                        → list models from the selected provider scope
  *   POST /v1/chat/completions              → OpenAI chat-completions in/out
  *   POST /v1/messages                      → Anthropic messages in/out
  *   POST /v1/responses                     → OpenAI Responses in/out
@@ -34,6 +34,7 @@ import type {
 	AssistantMessageEventStream,
 	Context,
 	Model,
+	Provider,
 	SimpleStreamOptions,
 } from "../types";
 import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
@@ -53,7 +54,7 @@ import type {
 	AuthGatewayFormatModule as FormatModule,
 	AuthGatewayParsedRequest as ParsedFormatRequest,
 } from "./types";
-import { DEFAULT_AUTH_GATEWAY_BIND } from "./types";
+import { AUTH_GATEWAY_PROVIDER_APIS, DEFAULT_AUTH_GATEWAY_BIND } from "./types";
 
 // ParsedFormatRequest / ParsedFormatOptions / FormatModule come from ./types.
 
@@ -68,8 +69,69 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	 * dependency in `pi-ai`).
 	 */
 	resolveModel: ModelResolver;
-	/** Optional supplier for `/v1/models` listing. Returns the full model array. */
-	listModels?: () => Iterable<Model<Api>>;
+	/** Supplier for the source-backed model catalog used by `/v1/models`. */
+	listModels: () => Iterable<Model<Api>>;
+}
+
+export interface AuthGatewayModelCatalog {
+	readonly models: readonly Model<Api>[];
+	resolve(modelId: string): Model<Api> | undefined;
+}
+
+function modelApiForProvider(provider: Provider): Api | undefined {
+	return AUTH_GATEWAY_PROVIDER_APIS[provider];
+}
+
+function isModelInProviderScope(model: Model<Api>, provider: Provider): boolean {
+	if (model.provider !== provider) return false;
+	const expectedApi = modelApiForProvider(provider);
+	return expectedApi === undefined || model.api === expectedApi;
+}
+
+/**
+ * Build an unambiguous, provider-scoped catalog.
+ *
+ * Models from other providers are intentionally ignored rather than allowed
+ * to compete for the same id. Duplicate ids within the selected provider are
+ * rejected because choosing either one would make request dispatch
+ * order-dependent.
+ */
+export function createAuthGatewayModelCatalog(
+	provider: Provider,
+	models: Iterable<Model<Api>>,
+): AuthGatewayModelCatalog {
+	const byId = new Map<string, Model<Api>>();
+	for (const model of models) {
+		if (!isModelInProviderScope(model, provider)) continue;
+		if (byId.has(model.id)) {
+			throw new Error(`Ambiguous auth-gateway model id ${model.id} for provider ${provider}`);
+		}
+		byId.set(model.id, model);
+	}
+	const scopedModels = [...byId.values()];
+	return {
+		models: scopedModels,
+		resolve: (modelId: string) => byId.get(modelId),
+	};
+}
+
+function resolveScopedModel(
+	opts: AuthGatewayBootOptions,
+	catalog: AuthGatewayModelCatalog,
+	modelId: string,
+): Model<Api> | undefined {
+	const catalogModel = catalog.resolve(modelId);
+	if (!catalogModel) return undefined;
+	const resolved = opts.resolveModel(modelId);
+	if (
+		!resolved ||
+		resolved.id !== catalogModel.id ||
+		resolved.api !== catalogModel.api ||
+		!isModelInProviderScope(resolved, opts.providerScope.provider)
+	) {
+		return undefined;
+	}
+	return resolved;
 }
 
 // `parseBind` lives in ../utils/parse-bind so the gateway and broker can't
@@ -423,6 +485,7 @@ function mirrorRequestAbort(req: Request): AbortController {
 async function handleFormatEndpoint(
 	route: { module: FormatModule; label: string },
 	bootOpts: AuthGatewayBootOptions,
+	catalog: AuthGatewayModelCatalog,
 	req: Request,
 	peer: string,
 ): Promise<Response> {
@@ -453,7 +516,7 @@ async function handleFormatEndpoint(
 		return route.module.formatError(400, "invalid_request_error", "Missing top-level `model` field");
 	}
 
-	const model = bootOpts.resolveModel(modelId);
+	const model = resolveScopedModel(bootOpts, catalog, modelId);
 	if (!model) {
 		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
 	}
@@ -633,7 +696,12 @@ async function handleFormatEndpoint(
  * `parseRequest`/`encodeResponse`/`encodeStream` differ from the format-endpoint
  * path.
  */
-async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, peer: string): Promise<Response> {
+async function handlePiNative(
+	bootOpts: AuthGatewayBootOptions,
+	catalog: AuthGatewayModelCatalog,
+	req: Request,
+	peer: string,
+): Promise<Response> {
 	const controller = mirrorRequestAbort(req);
 	const aborted = (): Response => piNative.formatError(499, "request_aborted", "client closed request");
 	if (controller.signal.aborted) return aborted();
@@ -660,7 +728,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		return piNative.formatError(400, "invalid_request_error", message);
 	}
 
-	const model = bootOpts.resolveModel(parsed.modelId);
+	const model = resolveScopedModel(bootOpts, catalog, parsed.modelId);
 	if (!model) {
 		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
 	}
@@ -812,8 +880,10 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
  * failure) inside `AuthStorage`, so this handler is a thin wrapper that
  * surfaces the same data to HTTP callers (notably the macOS usage widget).
  */
-async function handleUsage(storage: AuthStorage, signal: AbortSignal): Promise<Response> {
-	const reports = (await storage.fetchUsageReports?.({ signal })) ?? [];
+async function handleUsage(storage: AuthStorage, provider: Provider, signal: AbortSignal): Promise<Response> {
+	const reports = ((await storage.fetchUsageReports?.({ signal })) ?? []).filter(
+		report => report.provider === provider,
+	);
 	// Drop the heavy provider-specific `raw` payload — UI consumers only need
 	// `limits` + `metadata`. Match the broker's `/v1/usage` shape so a single
 	// client struct (Swift widget, llm-git, ...) works against either endpoint.
@@ -832,14 +902,17 @@ async function handleUsage(storage: AuthStorage, signal: AbortSignal): Promise<R
  * endpoints. For multi-account pools that's the difference between getting
  * a clean diagnosis and getting a 429 storm.
  */
-async function handleCredentialsCheck(storage: AuthStorage, signal: AbortSignal): Promise<Response> {
-	const credentials = await storage.checkCredentials({ signal });
+async function handleCredentialsCheck(
+	storage: AuthStorage,
+	provider: Provider,
+	signal: AbortSignal,
+): Promise<Response> {
+	const credentials = await storage.checkCredentials({ provider, signal });
 	return json(200, { generatedAt: Date.now(), credentials });
 }
 
-function handleModelsList(opts: AuthGatewayBootOptions): Response {
-	const list = opts.listModels ? Array.from(opts.listModels()) : [];
-	const data = list.map(model => ({
+function handleModelsList(catalog: AuthGatewayModelCatalog): Response {
+	const data = catalog.models.map(model => ({
 		id: model.id,
 		object: "model" as const,
 		owned_by: model.provider,
@@ -849,7 +922,15 @@ function handleModelsList(opts: AuthGatewayBootOptions): Response {
 }
 
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
+	const provider = opts.providerScope.provider;
+	if (typeof provider !== "string" || provider.length === 0 || provider.trim() !== provider) {
+		throw new Error("Auth gateway requires a non-empty provider scope");
+	}
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
+	if (!opts.storage.exportSnapshot().credentials.some(entry => entry.provider === provider)) {
+		throw new Error(`Auth gateway scope ${provider} has no enabled broker credential`);
+	}
+	const catalog = createAuthGatewayModelCatalog(provider, opts.listModels());
 	const tokens = new Set<string>(opts.bearerTokens);
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
 	const version = opts.version;
@@ -889,31 +970,34 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 				// same client struct.
 				if (req.method === "GET" && pathname === "/v1/usage") {
-					return withCors(await handleUsage(opts.storage, req.signal), req);
+					return withCors(await handleUsage(opts.storage, opts.providerScope.provider, req.signal), req);
 				}
 
 				// Per-credential auth probe — diagnoses which row in a multi-account
 				// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 				// credentials, so we need a separate endpoint that captures errors.
 				if (req.method === "GET" && pathname === "/v1/credentials/check") {
-					return withCors(await handleCredentialsCheck(opts.storage, req.signal), req);
+					return withCors(
+						await handleCredentialsCheck(opts.storage, opts.providerScope.provider, req.signal),
+						req,
+					);
 				}
 
 				// Provider-format dispatch.
 				const formatRoute = FORMAT_ROUTES[pathname];
 				if (formatRoute && req.method === "POST") {
-					return withCors(await handleFormatEndpoint(formatRoute, opts, req, peer), req);
+					return withCors(await handleFormatEndpoint(formatRoute, opts, catalog, req, peer), req);
 				}
 
 				// Pi-native fast path. Same auth + provider plumbing as the
 				// foreign-wire routes, just without the wire-format translation.
 				if (req.method === "POST" && pathname === "/v1/pi/stream") {
-					return withCors(await handlePiNative(opts, req, peer), req);
+					return withCors(await handlePiNative(opts, catalog, req, peer), req);
 				}
 
 				// Model catalog.
 				if (req.method === "GET" && pathname === "/v1/models") {
-					return withCors(handleModelsList(opts), req);
+					return withCors(handleModelsList(catalog), req);
 				}
 
 				// Route-table miss: no format module to defer to, so we emit a
