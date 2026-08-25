@@ -689,7 +689,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					const id = Number.parseInt(disableMatch[1], 10);
 					const parsed = await parseBody(req, credentialDisableRequestSchema, { allowEmpty: true });
 					if (!parsed.ok) return parsed.response;
-					const cause = cleanReason(parsed.data.cause) ?? "disabled via auth-broker";
+					const cause = "disabled via auth-broker";
 					const ok = opts.storage.disableCredentialById(id, cause);
 					if (!ok) {
 						logger.info("auth-broker disable miss", { id, peer });
