@@ -148,6 +148,7 @@ const DISABLE_ROUTE = /^\/v1\/credential\/(\d+)\/disable$/;
 
 const MAX_SNAPSHOT_WAIT_MS = 30_000;
 const DISABLED_NEXT_SWEEP_IN_MS = Number.MAX_SAFE_INTEGER;
+const BROKER_EPOCH_SEQUENCE_CACHE_KEY = "auth-broker:epoch-sequence";
 
 function snapshotHeaders(epoch: string, generation: number): Record<string, string> {
 	return {
@@ -561,7 +562,17 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
-	const epoch = `${Date.now()}-${crypto.randomUUID()}`;
+	const previousEpochSequence = Number(
+		opts.storage.getCache(BROKER_EPOCH_SEQUENCE_CACHE_KEY, { includeExpired: true }),
+	);
+	const epochSequence =
+		Number.isSafeInteger(previousEpochSequence) && previousEpochSequence >= 0 ? previousEpochSequence + 1 : 1;
+	opts.storage.setCache(
+		BROKER_EPOCH_SEQUENCE_CACHE_KEY,
+		String(epochSequence),
+		Math.floor(Date.now() / 1000) + 315_360_000,
+	);
+	const epoch = `${epochSequence}-${crypto.randomUUID()}`;
 
 	const refresher = opts.disableRefresher
 		? undefined

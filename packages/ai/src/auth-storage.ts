@@ -1352,6 +1352,12 @@ export class AuthStorage {
 	getGeneration(): number {
 		return this.#generation;
 	}
+	getCache(key: string, options?: { includeExpired?: boolean }): string | null {
+		return this.#store.getCache(key, options);
+	}
+	setCache(key: string, value: string, expiresAtSec: number): void {
+		this.#store.setCache(key, value, expiresAtSec);
+	}
 	getProviderConfigurationGeneration(provider: string): number {
 		return this.#getProviderConfigurationGeneration(provider);
 	}
