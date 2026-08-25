@@ -610,8 +610,19 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 		try {
 			fs.mkdirSync(ctx.versionedDir, { recursive: true });
 			const buffer = fs.readFileSync(embeddedFile.filePath);
-			const tempPath = `${targetPath}.tmp.${process.pid}`;
-			fs.writeFileSync(tempPath, buffer);
+			const tempPath = `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
+			const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+			const tempFd = fs.openSync(
+				tempPath,
+				fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
+				0o600,
+			);
+			try {
+				fs.writeFileSync(tempFd, buffer);
+				fs.fsyncSync(tempFd);
+			} finally {
+				fs.closeSync(tempFd);
+			}
 			fs.renameSync(tempPath, targetPath);
 			extracted.push(targetPath);
 		} catch (err) {
@@ -915,6 +926,14 @@ export function loadNative(options = {}) {
 
 	const errors = [];
 	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
+	for (const candidate of embeddedCandidates) {
+		try {
+			recordStagedSnapshot(ctx, candidate, safeFileSnapshot(candidate));
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			errors.push(`embedded addon snapshot (${candidate}): ${message}`);
+		}
+	}
 	const embeddedIsAuthoritative = embeddedAddonIsAuthoritative(ctx);
 	const stagedResult =
 		embeddedCandidates.length > 0 || embeddedIsAuthoritative

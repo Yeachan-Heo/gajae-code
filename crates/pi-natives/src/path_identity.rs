@@ -9457,9 +9457,10 @@ mod platform {
 				&name,
 				FILE_READ_ATTRIBUTES
 					| FILE_WRITE_ATTRIBUTES
-					| FILE_WRITE_DATA
+					| FILE_READ_DATA
 					| READ_CONTROL
 					| WRITE_DAC
+					| WRITE_OWNER
 					| 0x0001_0000,
 				false,
 				0,
@@ -9591,20 +9592,26 @@ mod platform {
 				Err(()) => {
 					let cleanup = cleanup_private_skill_file(file);
 					unsafe { CloseHandle(file) };
-					return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("acl_unavailable"));
-				}
+					return NativeSecureSkillWriteResult::failure(
+						cleanup.err().unwrap_or("acl_unavailable"),
+					);
+				},
 			};
 			let applied = set_owner_only_acl(file, "file", &sid, true);
 			if !applied.ok {
 				let cleanup = cleanup_private_skill_file(file);
 				unsafe { CloseHandle(file) };
-				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("acl_apply_failed"));
+				return NativeSecureSkillWriteResult::failure(
+					cleanup.err().unwrap_or("acl_apply_failed"),
+				);
 			}
 			let verified = verify_owner_only_handle(file, "file");
 			if !verified.ok {
 				let cleanup = cleanup_private_skill_file(file);
 				unsafe { CloseHandle(file) };
-				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("acl_verify_failed"));
+				return NativeSecureSkillWriteResult::failure(
+					cleanup.err().unwrap_or("acl_verify_failed"),
+				);
 			}
 		}
 		unsafe { CloseHandle(file) };
