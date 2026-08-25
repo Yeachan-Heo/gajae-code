@@ -363,6 +363,32 @@ async function bridgeLedgerMatchesFilesystem(
 	return true;
 }
 
+async function refreshBridgeLedgerIdentities(ledger: ProvenanceLedger): Promise<ProvenanceLedger> {
+	if (ledger.bridgePath === undefined) return ledger;
+	const bridgeEntryIdentities: Record<string, { dev: string; ino: string; size: string; mtimeNs: string }> = {};
+	for (const name of ledger.bridgeEntries ?? []) {
+		const stat = await fs.lstat(path.join(ledger.bridgePath, name), { bigint: true });
+		if (!stat.isSymbolicLink())
+			throw new Error(`bridge recovery found a non-link entry at ${path.join(ledger.bridgePath, name)}`);
+		bridgeEntryIdentities[name] = {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: stat.size.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+		};
+	}
+	const bridgeDirIdentity =
+		ledger.bridgeDirCreated === true
+			? await fs.lstat(ledger.bridgePath, { bigint: true }).then(stat => ({
+					dev: stat.dev.toString(),
+					ino: stat.ino.toString(),
+					size: stat.size.toString(),
+					mtimeNs: stat.mtimeNs.toString(),
+				}))
+			: ledger.bridgeDirIdentity;
+	return { ...ledger, bridgeEntryIdentities, ...(bridgeDirIdentity === undefined ? {} : { bridgeDirIdentity }) };
+}
+
 /**
  * Classify a lingering intent left by an interrupted run, and optionally act.
  *
@@ -392,6 +418,15 @@ export async function recoverIntent(
 	if (!intent) return undefined;
 	if (intent.step === "skills-bridge") {
 		const ledgerObserved = await currentIdentity(intent.provenancePath);
+		if (
+			ledgerObserved !== intent.provenancePreflightIdentity &&
+			ledgerObserved !== intent.provenanceExpectedIdentity
+		) {
+			return {
+				recovered: false,
+				detail: `the provenance ledger at ${intent.provenancePath} diverged during an interrupted bridge migration; refusing to overwrite it`,
+			};
+		}
 		const before = intent.bridgePreflightPayload;
 		const after = intent.provenancePayload;
 		const beforeMatches = before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined));
@@ -408,8 +443,8 @@ export async function recoverIntent(
 				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
 			};
 		}
-		if (afterMatches && ledgerObserved !== intent.provenanceExpectedIdentity) {
-			await writeProvenance(intent.provenancePath, after!);
+		if (afterMatches) {
+			await writeProvenance(intent.provenancePath, await refreshBridgeLedgerIdentities(after!));
 		}
 		await clearIntent(intentPath);
 		return {
