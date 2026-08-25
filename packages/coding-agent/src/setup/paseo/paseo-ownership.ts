@@ -670,7 +670,11 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 }
 
 export async function clearIntent(intentPath: string): Promise<void> {
-	await fs.rm(intentPath, { force: true }).catch(() => undefined);
+	try {
+		await fs.rm(intentPath, { force: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
 }
 
 /** Rebuild the ledger an interrupted step intended to commit, when it recorded one. */

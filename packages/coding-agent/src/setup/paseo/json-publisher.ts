@@ -321,6 +321,7 @@ async function copyPrivately(from: string, to: string): Promise<void> {
 		let existingBytes: Buffer;
 		try {
 			existingBytes = await existing.handle.readFile();
+			await existing.handle.chmod(BACKUP_MODE);
 		} finally {
 			await existing.handle.close();
 		}

@@ -86,7 +86,8 @@ export function loadFromCandidates<T>(input: LoadFromCandidatesInput<T>): LoadFr
 export interface CachedEmbeddedExtractionIsFreshInput {
 	targetPath: string;
 	embeddedPath: string;
-	sizeOf: (path: string) => number | null;
+	hashOf?: (path: string) => string | null;
+	sizeOf?: (path: string) => number | null;
 }
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;

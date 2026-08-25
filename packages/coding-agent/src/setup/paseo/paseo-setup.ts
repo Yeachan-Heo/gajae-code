@@ -916,11 +916,12 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			completed.push({
 				label: migratedOldBridgeDir,
 				undo: async () => {
+					const currentLedger = await readProvenance(deps.paths.provenanceLedger);
 					const restored = await restoreMigratedOldBridgeEntries(
 						migratedOldBridgeDir!,
 						migratedOldEntries,
 						bridgeLedger.bridgeDirCreated === true,
-						bridgeLedger.bridgeCleanupPending,
+						currentLedger.bridgeCleanupPending,
 					);
 					if (restored.status === "reverted") {
 						compensatedOldBridgeEntryIdentities = {
@@ -1241,7 +1242,9 @@ export async function correctBridgeOwnershipAfterFailure(
 			),
 			...partial.entryIdentities,
 		},
-		bridgeDirCreated: corrected.bridgeDirCreated === true || partial.bridgeDirCreated,
+		bridgeDirCreated: isMigration
+			? partial.bridgeDirCreated
+			: corrected.bridgeDirCreated === true || partial.bridgeDirCreated,
 		...(partial.bridgeDirIdentity ? { bridgeDirIdentity: partial.bridgeDirIdentity } : {}),
 	};
 	const intent = await readIntent(deps.paths.intentRecord);
@@ -1278,12 +1281,16 @@ function restoreProviderKey(draft: Record<string, unknown>, providerKey: string,
 }
 
 async function unregisterBridgeDirectory(settings: Settings, bridgeDir: string): Promise<void> {
-	await settings.commitAtomicBatchWithCurrent(current => {
+	await settings.commitAtomicBatchWithCurrent(async current => {
 		const skills = current.skills;
 		if (!skills || typeof skills !== "object" || Array.isArray(skills)) return [];
 		const directories = (skills as Record<string, unknown>).customDirectories;
 		if (!Array.isArray(directories)) return [];
-		const next = directories.filter(directory => directory !== bridgeDir);
+		const canonicalBridge = await canonicalPathForComparison(bridgeDir);
+		const canonicalDirectories = await Promise.all(
+			directories.map(directory => canonicalPathForComparison(directory)),
+		);
+		const next = directories.filter((directory, index) => canonicalDirectories[index] !== canonicalBridge);
 		if (next.length === directories.length) return [];
 		return [{ path: "skills.customDirectories", op: "set", value: next }];
 	});

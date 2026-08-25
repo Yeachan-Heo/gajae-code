@@ -1382,15 +1382,22 @@ export async function registerSkillsBridgeDirectory(
 ): Promise<CasReceipt> {
 	return settings.commitAtomicBatchWithCurrent(current => {
 		const directories = existingCustomDirectories(current);
-		let next = directories;
-		if (options.replaces !== undefined && options.replaces !== bridgeDir) {
-			const replacedPath = path.resolve(options.replaces);
-			next = next.filter(directory => path.resolve(directory) !== replacedPath);
-		}
-		next = next.includes(bridgeDir) ? next : [...next, bridgeDir];
-		if (next.length === directories.length && next.every((directory, index) => directories[index] === directory)) {
-			return [];
-		}
-		return [{ path: "skills.customDirectories" as SettingPath, op: "set", value: next }];
+		return Promise.all([
+			canonicalPathForComparison(bridgeDir),
+			...directories.map(directory => canonicalPathForComparison(directory)),
+			...(options.replaces !== undefined ? [canonicalPathForComparison(options.replaces)] : []),
+		]).then(([canonicalBridge, ...canonicalRest]) => {
+			const canonicalDirectories = canonicalRest.slice(0, directories.length);
+			const canonicalReplaces = options.replaces === undefined ? undefined : canonicalRest[directories.length];
+			const next = directories.filter((directory, index) => {
+				const canonical = canonicalDirectories[index];
+				return canonical !== canonicalBridge && canonical !== canonicalReplaces;
+			});
+			next.push(bridgeDir);
+			if (next.length === directories.length && next.every((directory, index) => directories[index] === directory)) {
+				return [];
+			}
+			return [{ path: "skills.customDirectories" as SettingPath, op: "set", value: next }];
+		});
 	});
 }
