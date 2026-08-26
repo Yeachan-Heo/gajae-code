@@ -9889,6 +9889,7 @@ export class AgentSession {
 	}
 
 	#attachAskTool(): void {
+		if (this.#explicitEmptyToolSelection) return;
 		const askTool = this.#toolRegistry.get("ask");
 		if (!askTool || this.getActiveToolNames().includes(askTool.name)) return;
 		this.#setGuardedAgentTools([...this.agent.state.tools, askTool]);
