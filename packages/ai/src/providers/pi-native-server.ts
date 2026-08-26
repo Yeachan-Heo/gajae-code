@@ -78,6 +78,21 @@ const ALLOWED_OPTION_KEYS: ReadonlySet<keyof SimpleStreamOptions> = new Set([
 	"preferWebsockets",
 ] as const satisfies readonly (keyof SimpleStreamOptions)[]);
 
+const CREDENTIAL_HEADER_NAMES = new Set([
+	"authorization",
+	"proxy-authorization",
+	"cookie",
+	"set-cookie",
+	"api-key",
+	"x-api-key",
+	"x-goog-api-key",
+	"anthropic-api-key",
+	"x-auth-token",
+	"x-access-token",
+	"x-api-token",
+	"x-client-secret",
+]);
+
 // ---------------------------------------------------------------------------
 // parseRequest
 // ---------------------------------------------------------------------------
@@ -132,6 +147,15 @@ export function parseRequest(body: unknown, _headers?: Headers): PiNativeParsedR
 		for (const [k, v] of Object.entries(rawOpts)) {
 			if (v === undefined || v === null) continue;
 			if (!ALLOWED_OPTION_KEYS.has(k as keyof SimpleStreamOptions)) continue;
+			if (k === "headers" && typeof v === "object" && v !== null && !Array.isArray(v)) {
+				const safeHeaders: Record<string, string> = {};
+				for (const [name, value] of Object.entries(v)) {
+					if (CREDENTIAL_HEADER_NAMES.has(name.toLowerCase())) continue;
+					if (typeof value === "string") safeHeaders[name] = value;
+				}
+				optsBag[k] = safeHeaders;
+				continue;
+			}
 			optsBag[k] = v;
 		}
 	}

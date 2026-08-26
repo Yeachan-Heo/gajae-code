@@ -354,9 +354,9 @@ function createLazyStream<TApi extends Api>(
 			.then(module => {
 				abortTracker = createAbortSourceTracker(streamOptions.signal);
 				const providerOptions = { ...streamOptions, signal: abortTracker.requestSignal } as OptionsForApi<TApi>;
-				onStreamCreated?.();
 				const inner = module.stream(model, context, providerOptions);
 				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
+				onStreamCreated?.();
 			})
 			.catch(error => {
 				const message = createLazyLoadErrorMessage(model, error);

@@ -77,7 +77,7 @@ describe("register-builtins lazy streams", () => {
 
 		setBedrockProviderModule({
 			streamBedrock: () => {
-				expect(admitted).toBe(true);
+				expect(admitted).toBe(false);
 				moduleStreamCalled = true;
 				return source;
 			},
@@ -85,7 +85,7 @@ describe("register-builtins lazy streams", () => {
 
 		const stream = streamSimple(createModel(), baseContext, {
 			onStreamCreated: () => {
-				expect(moduleStreamCalled).toBe(false);
+				expect(moduleStreamCalled).toBe(true);
 				admitted = true;
 			},
 		});

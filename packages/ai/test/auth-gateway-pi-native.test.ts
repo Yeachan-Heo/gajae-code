@@ -187,12 +187,12 @@ describe("pi-native parseRequest", () => {
 		expect("notARealField" in parsed.options).toBe(false);
 	});
 
-	it("preserves headers, metadata, sessionId, thinkingBudgets", () => {
+	it("preserves safe headers and strips credential-bearing headers", () => {
 		const parsed = parseRequest({
 			modelId: "x",
 			context: baseContext,
 			options: {
-				headers: { "x-foo": "bar" },
+				headers: { "x-foo": "bar", Authorization: "Bearer attacker", "X-API-Key": "attacker-key" },
 				metadata: { user_id: "u" },
 				sessionId: "explicit-session",
 				thinkingBudgets: { high: 8192 },

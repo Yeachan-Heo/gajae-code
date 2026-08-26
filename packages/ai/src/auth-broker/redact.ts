@@ -18,6 +18,9 @@ export function cleanReason(value: unknown): string | undefined {
 		return "Credential diagnostic unavailable.";
 	}
 	if (/\b(?:bearer|basic)\s+["']/i.test(reason)) return "Credential diagnostic unavailable.";
+	if (/^No credential with id=\d+$/i.test(reason)) return reason;
+	if (/\b(?:api\s*[-_]?key|access\s*[-_]?token|refresh\s*[-_]?token|credential)\b/i.test(reason))
+		return "Credential diagnostic unavailable.";
 	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
 	reason = reason.replace(/basic\s+[^\s,;]+/gi, "Basic [redacted]");
 	reason = reason.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1[redacted]@");

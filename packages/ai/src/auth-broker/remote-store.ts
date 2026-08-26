@@ -780,11 +780,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	async refreshSnapshot(signal?: AbortSignal): Promise<SnapshotResponse> {
 		const result = await this.#client.fetchSnapshot({ signal });
 		if (result.status === 200) {
-			await this.#withSnapshotAuthority(async () => {
-				if (!this.#applySnapshot(result.snapshot, result.generation)) {
-					throw new Error("Auth broker snapshot authority was rejected");
-				}
-			});
+			await this.#raceWithSignal(
+				this.#withSnapshotAuthority(async () => {
+					if (!this.#applySnapshot(result.snapshot, result.generation)) {
+						throw new Error("Auth broker snapshot authority was rejected");
+					}
+				}),
+				signal,
+			);
 		}
 		return this.#snapshot;
 	}
@@ -860,11 +863,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			// disappeared. A 401 means the broker may have rotated or removed the
 			// row; refresh the authoritative snapshot so the caller can reselect a
 			// live key instead of hitting the OAuth endpoint.
-			await this.refreshSnapshot();
+			await this.refreshSnapshot(opts.signal);
 			return;
 		}
 		await this.#client.refreshCredential(credentialId, opts.signal);
-		await this.refreshSnapshot();
+		await this.refreshSnapshot(opts.signal);
 	}
 
 	replaceAuthCredentialsForProvider(_provider: string, _credentials: AuthCredential[]): StoredAuthCredential[] {
@@ -1034,7 +1037,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			}
 			throw error;
 		}
-		await this.refreshSnapshot();
+		await this.refreshSnapshot(signal);
 		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		if (accepted?.credential.type !== "oauth") {
 			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
@@ -1058,7 +1061,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		signal?: AbortSignal,
 	): Promise<OAuthCredential> {
 		await this.#client.refreshMCPCredential(credentialId, client, signal);
-		await this.refreshSnapshot();
+		await this.refreshSnapshot(signal);
 		const accepted = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
 		if (accepted?.credential.type !== "oauth") {
 			throw new Error(`Broker snapshot no longer contains OAuth credential id=${credentialId}`);
