@@ -121,6 +121,14 @@ static APPEND_AFTER_FINAL_SYNC_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static APPEND_AFTER_WRITE_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
+static APPEND_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 static REPLACE_BEFORE_IN_PLACE_WRITE_HOOK: OnceLock<
 	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 > = OnceLock::new();
@@ -151,6 +159,27 @@ fn pause_append_after_final_sync_for_test() {
 	{
 		entered.send(()).expect("append final-sync hook receiver");
 		resume.recv().expect("append final-sync hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_append_after_write_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*APPEND_AFTER_WRITE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_append_after_write_for_test() {
+	if let Some((entered, resume)) = APPEND_AFTER_WRITE_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered.send(()).expect("append after-write hook receiver");
+		resume.recv().expect("append after-write hook resume");
 	}
 }
 
@@ -2771,14 +2800,70 @@ fn remove_managed(
 }
 
 #[cfg(target_os = "linux")]
-fn append_post_identity(file: &File, parent: &File, name: &CString) -> Option<RecoveryFsIdentity> {
+fn append_post_identity_if_exact(
+	file: &File,
+	parent: &File,
+	name: &CString,
+	expected_dev: &str,
+	expected_ino: &str,
+	expected_size: &str,
+	expected_sha256: &str,
+	data: &[u8],
+) -> Option<RecoveryFsIdentity> {
+	let expected_size = expected_size.parse::<u64>().ok()?;
+	let expected_total = expected_size.checked_add(data.len() as u64)?;
 	let mut identity = regular_identity(file).ok()?;
-	identity.sha256 = digest_hex(file).ok();
+	if identity.dev != expected_dev
+		|| identity.ino != expected_ino
+		|| identity.size != expected_total.to_string()
+	{
+		return None;
+	}
+	if !verify_exact_append_bytes(file, expected_size, expected_sha256, data).ok()? {
+		return None;
+	}
+	identity.sha256 = Some(digest_hex(file).ok()?);
 	let named = statat(parent, name).ok()?;
 	if !stat_matches_regular_identity(&named, &identity) {
 		return None;
 	}
 	Some(identity)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_exact_append_bytes(
+	file: &File,
+	expected_size: u64,
+	expected_sha256: &str,
+	data: &[u8],
+) -> Result<bool, &'static str> {
+	let mut reader = file.try_clone().map_err(|_| "io_error")?;
+	reader.seek(SeekFrom::Start(0)).map_err(|_| "io_error")?;
+	let mut hasher = Sha256::new();
+	let mut buffer = [0u8; 64 * 1024];
+	let mut remaining = expected_size;
+	while remaining > 0 {
+		let limit = remaining.min(buffer.len() as u64) as usize;
+		let read = reader.read(&mut buffer[..limit]).map_err(|_| "io_error")?;
+		if read == 0 {
+			return Ok(false);
+		}
+		hasher.update(&buffer[..read]);
+		remaining -= read as u64;
+	}
+	if hex_digest(hasher.finalize().into()) != expected_sha256 {
+		return Ok(false);
+	}
+	let mut offset = 0;
+	while offset < data.len() {
+		let limit = (data.len() - offset).min(buffer.len());
+		let read = reader.read(&mut buffer[..limit]).map_err(|_| "io_error")?;
+		if read != limit || buffer[..read] != data[offset..offset + read] {
+			return Ok(false);
+		}
+		offset += read;
+	}
+	Ok(true)
 }
 
 #[cfg(target_os = "linux")]
@@ -2887,20 +2972,17 @@ fn append_managed(
 	if file.write_all(data).is_err() {
 		return RecoveryFsResult::append_failure("io_error", "unknown", "not_provable", None);
 	}
+	#[cfg(test)]
+	pause_append_after_write_for_test();
 	if file.sync_all().is_err() {
-		return RecoveryFsResult::append_failure(
-			"fsync_failed",
-			"committed",
-			"not_provable",
-			append_post_identity(&file, &parent, &name),
-		);
+		return RecoveryFsResult::append_failure("fsync_failed", "committed", "not_provable", None);
 	}
 	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
 		return RecoveryFsResult::append_failure(
 			"permission_denied",
 			"committed",
 			"not_provable",
-			append_post_identity(&file, &parent, &name),
+			None,
 		);
 	}
 	let identity = match regular_identity(&file) {
@@ -2917,18 +2999,13 @@ fn append_managed(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
-			append_post_identity(&file, &parent, &name),
+			None,
 		);
 	}
 	let named = match statat(&parent, &name) {
 		Ok(value) => value,
 		Err(code) => {
-			return RecoveryFsResult::append_failure(
-				code,
-				"committed",
-				"not_provable",
-				append_post_identity(&file, &parent, &name),
-			);
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
 		},
 	};
 	if !stat_matches_regular_identity(&named, &identity) {
@@ -2936,7 +3013,7 @@ fn append_managed(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
-			append_post_identity(&file, &parent, &name),
+			None,
 		);
 	}
 	// The digest is retained for the next append expectation. Recheck both the
@@ -2945,34 +3022,19 @@ fn append_managed(
 	let sha256 = match digest_hex(&file) {
 		Ok(value) => value,
 		Err(code) => {
-			return RecoveryFsResult::append_failure(
-				code,
-				"committed",
-				"not_provable",
-				append_post_identity(&file, &parent, &name),
-			);
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
 		},
 	};
 	let descriptor_after = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
-			return RecoveryFsResult::append_failure(
-				code,
-				"committed",
-				"not_provable",
-				append_post_identity(&file, &parent, &name),
-			);
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
 		},
 	};
 	let named_after = match statat(&parent, &name) {
 		Ok(value) => value,
 		Err(code) => {
-			return RecoveryFsResult::append_failure(
-				code,
-				"committed",
-				"not_provable",
-				append_post_identity(&file, &parent, &name),
-			);
+			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
 		},
 	};
 	if descriptor_after != identity || !stat_matches_regular_identity(&named_after, &identity) {
@@ -2980,7 +3042,7 @@ fn append_managed(
 			"identity_mismatch",
 			"committed",
 			"not_provable",
-			append_post_identity(&file, &parent, &name),
+			None,
 		);
 	}
 	if parent.sync_all().is_err() {
@@ -2988,7 +3050,16 @@ fn append_managed(
 			"fsync_failed",
 			"committed",
 			"not_provable",
-			append_post_identity(&file, &parent, &name),
+			append_post_identity_if_exact(
+				&file,
+				&parent,
+				&name,
+				expected_dev,
+				expected_ino,
+				expected_size,
+				expected_sha256,
+				data,
+			),
 		);
 	}
 	// Directory fsync is the final durability boundary. Re-prove both the
@@ -4050,6 +4121,68 @@ mod tests {
 	}
 
 	#[test]
+	fn managed_append_withholds_receipt_when_foreign_append_grows_file() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let own_append = b"\nown";
+		let foreign_append = b"\nforeign";
+		let identity = managed_file(&root, "transcript", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_append_after_write_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_append = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let append = std::thread::spawn(move || {
+			append_managed(
+				&root_for_append,
+				None,
+				"transcript",
+				own_append,
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for append after-write boundary");
+		let mut foreign = fs::OpenOptions::new()
+			.append(true)
+			.open(temporary.0.join("transcript"))
+			.expect("open transcript for foreign append");
+		foreign.write_all(foreign_append).expect("foreign append");
+		foreign.sync_all().expect("foreign append sync");
+		resume_tx
+			.send(())
+			.expect("resume append after-write boundary");
+		let result = append.join().expect("append thread");
+		set_append_after_write_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
+		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
+		assert!(result.identity.is_none(), "foreign content must not authorize rewrite");
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("transcript"),
+			b"original-transcript\nown\nforeign"
+		);
+	}
+
+	#[test]
 	fn managed_replace_post_final_verify_successor_is_not_overwritten() {
 		let temporary = TempDir::new();
 		let root = temporary.root();
@@ -5022,6 +5155,10 @@ mod tests {
 
 	#[test]
 	fn managed_append_rechecks_canonical_name_after_final_sync() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let temporary = TempDir::new();
 		let root = temporary.root();
 		let original = b"original-transcript";

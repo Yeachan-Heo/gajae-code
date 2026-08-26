@@ -269,6 +269,62 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("does not rewrite over foreign bytes after an identity-less append outcome", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const appendManaged = native.RecoveryFsRoot.prototype.appendManaged;
+		let failOnce = true;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const result = appendManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return result;
+			failOnce = false;
+			fs.appendFileSync(sessionFile, "foreign-record\n");
+			return {
+				...result,
+				ok: false,
+				code: "identity_mismatch",
+				identity: undefined,
+				mutationState: "committed",
+				durabilityState: "not_provable",
+			};
+		});
+
+		expect(() => manager.appendMessage({ role: "user", content: "own-record", timestamp: Date.now() })).toThrow(
+			/managed_append_committed_outcome_uncertain/,
+		);
+		const beforeFlush = await readText(sessionFile);
+		await expect(manager.flush()).rejects.toThrow(/managed_append_committed_outcome_uncertain/);
+		expect(await readText(sessionFile)).toBe(beforeFlush);
+		expect(beforeFlush).toContain("own-record");
+		expect(beforeFlush).toContain("foreign-record");
+		await manager.close().catch(() => {});
+	});
+
 	it("blocks compaction eviction after an identity-less committed append", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
