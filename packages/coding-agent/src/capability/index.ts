@@ -274,7 +274,8 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
 	const processAgentDir = getAgentDir();
 	const customProcessProfile =
-		process.env.HOME === initialProcessHome && path.resolve(processAgentDir) !== path.resolve(ambientDefaultAgentDir);
+		(process.env.HOME === initialProcessHome || process.env.HOME === undefined) &&
+		path.resolve(processAgentDir) !== path.resolve(ambientDefaultAgentDir);
 	return await loadCapabilityWithContext(
 		capabilityId,
 		{

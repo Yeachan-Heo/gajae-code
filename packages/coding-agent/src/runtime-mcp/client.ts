@@ -587,6 +587,7 @@ export async function connectToServer(
 			return {
 				name,
 				config,
+				clientCwd: options?.cwd,
 				transport,
 				serverInfo,
 				capabilities,
