@@ -54,10 +54,13 @@ const LOCK_STALE_MS = 30_000;
  * `locks/mutation.lock` (whose generic directory semantics are unchanged).
  */
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
+const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
+const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
 
 interface SessionStateLockOwner {
 	pid: number;
 	start_time: string;
+	start_time_format?: string;
 	token: string;
 	owner_host_id?: string;
 	released?: true;
@@ -225,18 +228,28 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
  * portable `ps` value is used instead of giving up and writing `unknown`, which would
  * make PID reuse undetectable.
  */
-function ownerStartTime(pid: number): string {
-	return readLinuxProcStartTimeSync(pid) ?? portableProcessStartTime(pid) ?? "unknown";
+function ownerStartIdentity(pid: number): { start_time: string; start_time_format?: string } {
+	const procStartTime = readLinuxProcStartTimeSync(pid);
+	if (procStartTime !== null) return { start_time: procStartTime, start_time_format: LINUX_PROC_START_TIME_FORMAT };
+	const portableStartTime = portableProcessStartTime(pid);
+	if (portableStartTime !== null)
+		return { start_time: portableStartTime, start_time_format: PORTABLE_START_TIME_FORMAT };
+	return { start_time: "unknown" };
 }
 
 function validLockOwner(value: unknown): value is SessionStateLockOwner {
 	if (!value || typeof value !== "object") return false;
 	const owner = value as Partial<SessionStateLockOwner>;
+	const startTimeFormatValid =
+		owner.start_time_format === undefined ||
+		owner.start_time_format === LINUX_PROC_START_TIME_FORMAT ||
+		owner.start_time_format === PORTABLE_START_TIME_FORMAT;
 	return (
 		typeof owner.pid === "number" &&
 		Number.isSafeInteger(owner.pid) &&
 		owner.pid > 0 &&
 		typeof owner.start_time === "string" &&
+		startTimeFormatValid &&
 		typeof owner.token === "string" &&
 		owner.token.length > 0 &&
 		(owner.owner_host_id === undefined ||
@@ -295,10 +308,17 @@ async function currentLegacyOwnerHostId(): Promise<string> {
 function sameOwnerIncarnation(owner: SessionStateLockOwner): boolean {
 	if (owner.start_time === "unknown" || owner.start_time.length === 0) return true;
 	const procStartTime = readLinuxProcStartTimeSync(owner.pid);
-	if (procStartTime !== null && procStartTime === owner.start_time) return true;
 	const psStartTime = portableProcessStartTime(owner.pid);
+	if (owner.start_time_format === LINUX_PROC_START_TIME_FORMAT)
+		return procStartTime === null || procStartTime === owner.start_time;
+	if (owner.start_time_format === PORTABLE_START_TIME_FORMAT)
+		return psStartTime === null || psStartTime === owner.start_time;
+	if (procStartTime !== null && procStartTime === owner.start_time) return true;
 	if (psStartTime !== null && psStartTime === owner.start_time) return true;
-	return procStartTime === null && psStartTime === null;
+	// Legacy records do not identify the encoding of their ps timestamp. A mismatch
+	// may be only a caller timezone/locale change, so an alive unversioned owner is
+	// never reclaimable on identity mismatch.
+	return true;
 }
 
 /**
@@ -607,9 +627,10 @@ function ownerCreateFlags(): number | undefined {
 }
 
 async function newLockOwner(): Promise<SessionStateLockOwner> {
+	const identity = ownerStartIdentity(process.pid);
 	return {
 		pid: process.pid,
-		start_time: ownerStartTime(process.pid),
+		...identity,
 		token: randomUUID(),
 		owner_host_id: await currentOwnerHostId(),
 	};

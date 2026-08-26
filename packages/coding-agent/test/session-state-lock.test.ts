@@ -384,6 +384,7 @@ describe("coordinator session state lock", () => {
 				JSON.stringify({
 					pid: process.pid,
 					start_time: "Thu Jan  1 00:00:00 1970",
+					start_time_format: "ps-utc-v1",
 					token: "reused-pid-owner",
 				}),
 			);
@@ -392,6 +393,24 @@ describe("coordinator session state lock", () => {
 			await reclaimStaleSessionStateLock(lockFile);
 
 			expect(fsSync.existsSync(lockFile)).toBe(false);
+		});
+
+		it("preserves an unversioned live owner when its start-time encoding mismatches", async () => {
+			const { stateFile } = await seededRunningSession("lock-legacy-mismatched-start");
+			const lockFile = `${stateFile}.lock`;
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({
+					pid: process.pid,
+					start_time: "Thu Jan  1 00:00:00 1970",
+					token: "legacy-token",
+				}),
+			);
+			SessionStateLockTestHooks.probeProcessSignal = EPERM_PROBE;
+
+			await reclaimStaleSessionStateLock(lockFile);
+
+			expect(fsSync.existsSync(lockFile)).toBe(true);
 		});
 	});
 
