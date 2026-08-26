@@ -2617,6 +2617,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						!disableStrictTools &&
 						firstTokenTime === undefined &&
 						hasStrictAnthropicTools(params) &&
@@ -2637,6 +2638,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						!droppedForcedToolChoice &&
 						firstTokenTime === undefined &&
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						isSentForcedAnthropicToolChoice(params.tool_choice) &&
 						isForcedToolChoiceUnsupportedError(streamFailure, true)
 					) {
@@ -2668,6 +2670,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					const maskedProxyRejection = isAnthropicMaskedProxyRejection(streamFailure);
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						thinkingReplayRepairScope === "none" &&
 						thinkingReplayRepairAttempts < ANTHROPIC_MAX_THINKING_REPAIRS &&
 						firstTokenTime === undefined &&
@@ -2805,6 +2808,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						!dropFastMode &&
 						resolveServiceTier(options?.serviceTier, model.provider) === "priority" &&
 						firstTokenTime === undefined &&
@@ -2826,6 +2830,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					}
 					if (
 						!options?.fallbackManaged &&
+						!options?.disableProviderRetries &&
 						generatedCacheBudget > 0 &&
 						firstTokenTime === undefined &&
 						isAnthropicCacheBreakpointOverflowError(streamFailure)

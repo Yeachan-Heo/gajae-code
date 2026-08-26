@@ -1739,6 +1739,7 @@ async function tryRetryWithoutForcedToolChoice(
 ): Promise<boolean> {
 	if (
 		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries ||
 		runtime.toolChoiceFallbackAttempted ||
 		context.output.content.length > 0 ||
 		context.firstTokenTime !== undefined ||
@@ -1842,7 +1843,8 @@ async function tryReconnectCodexWebSocketOnConnectionLimit(
 		!websocketState ||
 		runtime.transport !== "websocket" ||
 		context.options?.signal?.aborted ||
-		context.options?.fallbackManaged
+		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries
 	) {
 		return false;
 	}
@@ -1905,6 +1907,7 @@ async function tryRecoverCodexPreviousResponseNotFound(
 		runtime.previousResponseRecoveryAttempted ||
 		!websocketState ||
 		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries ||
 		runtime.transport !== "websocket" ||
 		context.output.content.length > 0 ||
 		context.options?.signal?.aborted ||
@@ -1945,7 +1948,8 @@ async function tryReplayWebsocketFailureOverSse(
 		runtime.canSafelyReplayWebsocketOverSse &&
 		!runtime.sawTerminalEvent &&
 		!context.options?.signal?.aborted &&
-		!context.options?.fallbackManaged;
+		!context.options?.fallbackManaged &&
+		!context.options?.disableProviderRetries;
 	if (!canReplay) return false;
 
 	const state = websocketState;
@@ -1999,7 +2003,8 @@ async function tryRetryCodexProviderError(
 		context.output.content.length > 0 ||
 		runtime.providerRetryAttempt >= resolveRetryBudget(context.options?.streamMaxRetries, CODEX_MAX_RETRIES) ||
 		context.options?.signal?.aborted ||
-		context.options?.fallbackManaged
+		context.options?.fallbackManaged ||
+		context.options?.disableProviderRetries
 	) {
 		return false;
 	}
@@ -2119,7 +2124,7 @@ export const streamOpenAICodexResponses: StreamFunction<"openai-codex-responses"
 			try {
 				initialTransport = await openInitialCodexEventStream(model, streamOptions, requestSetup, requestContext);
 			} catch (error) {
-				if (streamOptions.fallbackManaged) throw error;
+				if (streamOptions.fallbackManaged || streamOptions.disableProviderRetries) throw error;
 				initialTransport = await retryCodexInitialTransportWithoutToolChoice(
 					model,
 					streamOptions,
@@ -2849,8 +2854,8 @@ async function openCodexWebSocketEventStream(
 	options?: Pick<OpenAICodexResponsesOptions, "streamFirstEventTimeoutMs" | "streamIdleTimeoutMs" | "onStreamCreated">,
 	firstEventTimeoutMs?: number,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
-	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
 	options?.onStreamCreated?.();
+	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
 	return connection.streamRequest(
 		request,
 		signal,

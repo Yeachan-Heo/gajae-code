@@ -147,7 +147,8 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			} catch (error) {
 				if (
 					!isForcedToolChoiceUnsupportedError(error, isForcedAzureResponsesToolChoice(params.tool_choice)) ||
-					options?.fallbackManaged
+					options?.fallbackManaged ||
+					options?.disableProviderRetries
 				) {
 					throw error;
 				}

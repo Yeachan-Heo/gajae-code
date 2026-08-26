@@ -34,9 +34,22 @@ const COPILOT_MODEL_RETRY_BASE_DELAY_MS = 400;
  */
 export async function callWithCopilotModelRetry<T>(
 	fn: () => Promise<T>,
-	options: { provider: string; signal?: AbortSignal; retryBaseDelayMs?: number; fallbackManaged?: boolean },
+	options: {
+		provider: string;
+		signal?: AbortSignal;
+		retryBaseDelayMs?: number;
+		fallbackManaged?: boolean;
+		requestMaxRetries?: number;
+		disableProviderRetries?: boolean;
+	},
 ): Promise<T> {
-	if (options.provider !== "github-copilot" || options.fallbackManaged) return fn();
+	if (
+		options.provider !== "github-copilot" ||
+		options.fallbackManaged ||
+		options.requestMaxRetries === 0 ||
+		options.disableProviderRetries
+	)
+		return fn();
 
 	let lastError: unknown;
 	const retryBaseDelayMs = options.retryBaseDelayMs ?? COPILOT_MODEL_RETRY_BASE_DELAY_MS;

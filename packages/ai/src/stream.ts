@@ -950,6 +950,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
 		onStreamCreated: options?.onStreamCreated,
+		disableProviderRetries: options?.disableProviderRetries,
 		onSseEvent: options?.onSseEvent,
 		attemptScope: options?.attemptScope,
 		execHandlers: options?.execHandlers,

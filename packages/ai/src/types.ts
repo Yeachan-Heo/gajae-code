@@ -472,6 +472,8 @@ export interface StreamOptions {
 	 * fallback for custom providers that do not expose a transport seam.
 	 */
 	onStreamCreated?: () => void;
+	/** Internal authority policy: disable provider-owned retries and corrective replays. */
+	disableProviderRetries?: boolean;
 	/**
 	 * Optional callback for raw Server-Sent Events as they arrive from HTTP streaming providers.
 	 *

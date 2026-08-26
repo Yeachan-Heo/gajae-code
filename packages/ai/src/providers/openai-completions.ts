@@ -649,6 +649,8 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					provider: model.provider,
 					signal: requestSignal,
 					fallbackManaged: options?.fallbackManaged,
+					requestMaxRetries: options?.requestMaxRetries,
+					disableProviderRetries: options?.disableProviderRetries,
 				});
 			} catch (error) {
 				const capturedErrorResponse = getCapturedErrorResponse();
@@ -657,6 +659,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				);
 				if (
 					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
 					firstTokenTime === undefined &&
 					isForcedToolChoiceUnsupportedError(error, sentForcedToolChoice)
 				) {
@@ -676,6 +679,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					openaiStream = await createCompletionsStream();
 				} else if (
 					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
 					isOpenRouterAnthropicModel(model) &&
 					!disableStrictTools &&
 					isCompiledGrammarTooLargeStrictError(error, capturedErrorResponse)
@@ -690,6 +694,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				} else {
 					if (
 						options?.fallbackManaged ||
+						options?.disableProviderRetries ||
 						!shouldRetryWithoutStrictTools(error, capturedErrorResponse, appliedToolStrictMode, context.tools)
 					) {
 						throw error;
@@ -734,7 +739,11 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 							continue;
 						}
 						replaySafeChunks.push(chunk);
-						if (hasNetworkErrorFinishReason(chunk) && !options?.fallbackManaged) {
+						if (
+							hasNetworkErrorFinishReason(chunk) &&
+							!options?.fallbackManaged &&
+							!options?.disableProviderRetries
+						) {
 							retryNetworkError = true;
 							break;
 						}

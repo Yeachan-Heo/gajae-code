@@ -392,7 +392,12 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
 	// Gateway authority is acquired once per managed attempt. Provider-internal
 	// retries would otherwise resend a captured credential after the broker lease
 	// is released; replacement attempts must flow through onAuthError instead.
-	const opts: SimpleStreamOptions = { signal, requestMaxRetries: 0, streamMaxRetries: 0 };
+	const opts: SimpleStreamOptions = {
+		signal,
+		requestMaxRetries: 0,
+		streamMaxRetries: 0,
+		disableProviderRetries: true,
+	};
 	const { options } = parsed;
 	// OpenAI code backend backend rejects `temperature` / `top_p` (per-model defaults only),
 	// so we drop them silently for that one provider. Every other unsupported
@@ -952,6 +957,7 @@ async function handlePiNative(
 		signal: controller.signal,
 		requestMaxRetries: 0,
 		streamMaxRetries: 0,
+		disableProviderRetries: true,
 	};
 	if (streamOpts.fallbackManaged) {
 		streamOpts.fallbackAttempt = beginAttempt(model.id, "auth-gateway-pi-native");

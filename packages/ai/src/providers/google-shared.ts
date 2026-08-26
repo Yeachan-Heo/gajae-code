@@ -936,6 +936,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				);
 				if (
 					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
 					firstTokenTime === undefined &&
 					isForcedToolChoiceUnsupportedError(error, true)
 				) {

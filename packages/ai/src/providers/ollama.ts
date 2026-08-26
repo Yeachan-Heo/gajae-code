@@ -442,6 +442,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				if (
 					firstTokenTime === undefined &&
 					!options.fallbackManaged &&
+					!options.disableProviderRetries &&
 					isForcedToolChoiceUnsupportedError(error, true)
 				) {
 					markToolChoiceIncapability(model, "auto", error.message);

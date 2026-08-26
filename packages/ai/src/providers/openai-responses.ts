@@ -409,10 +409,17 @@ export const streamOpenAIResponses: StreamFunction<"openai-responses"> = (
 					await notifyProviderResponse(options, response, model, request_id);
 					return data;
 				},
-				{ provider: model.provider, signal: requestSignal, fallbackManaged: options?.fallbackManaged },
+				{
+					provider: model.provider,
+					signal: requestSignal,
+					fallbackManaged: options?.fallbackManaged,
+					requestMaxRetries: options?.requestMaxRetries,
+					disableProviderRetries: options?.disableProviderRetries,
+				},
 			).catch(async error => {
 				if (
 					options?.fallbackManaged ||
+					options?.disableProviderRetries ||
 					!isForcedToolChoiceUnsupportedError(error, isForcedOpenAIResponsesToolChoice(params.tool_choice))
 				) {
 					throw error;

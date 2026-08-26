@@ -405,6 +405,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				const error = createGeminiCliHttpError(response, errorText);
 				if (
 					!options?.fallbackManaged &&
+					!options?.disableProviderRetries &&
 					firstTokenTime === undefined &&
 					isForcedToolChoiceUnsupportedError(error, true)
 				) {
