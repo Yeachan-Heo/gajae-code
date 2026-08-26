@@ -5,6 +5,7 @@ import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/nativ
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
+	getConfigRootDir,
 	getPluginsDir,
 	getProjectDir,
 	getTrustedHomeDir,
@@ -909,9 +910,11 @@ export async function listClaudePluginRoots(
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	const defaultAgentDir = path.join(home, getConfigDirName(), "agent");
 	const userPluginsDir =
-		userAgentDir && path.resolve(userAgentDir) !== path.resolve(defaultAgentDir)
+		userAgentDir &&
+		path.resolve(userAgentDir) !== path.resolve(defaultAgentDir) &&
+		path.resolve(userAgentDir) !== path.resolve(path.join(getConfigRootDir(), "agent"))
 			? path.join(userAgentDir, "plugins")
-			: path.join(home, getConfigDirName(), "plugins");
+			: getPluginsDir(home);
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {
