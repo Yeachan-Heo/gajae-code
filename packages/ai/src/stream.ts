@@ -815,9 +815,9 @@ export function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TA
 	if (model.maxTokensSource === "configured" && Number.isFinite(model.maxTokens) && model.maxTokens > 0) {
 		return model.maxTokens;
 	}
-	const modelMaxTokens =
-		Number.isFinite(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : DEFAULT_REQUEST_MAX_TOKENS;
-	return Math.min(modelMaxTokens, DEFAULT_REQUEST_MAX_TOKENS);
+	return Number.isFinite(model.maxTokens) && model.maxTokens > 0
+		? Math.min(model.maxTokens, DEFAULT_REQUEST_MAX_TOKENS)
+		: DEFAULT_REQUEST_MAX_TOKENS;
 }
 
 function mapOptionsForApi<TApi extends Api>(

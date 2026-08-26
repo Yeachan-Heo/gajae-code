@@ -137,6 +137,24 @@ describe("streamPiNative request shape", () => {
 		expect((bodies[1].options as Record<string, unknown>).maxTokens).toBe(70_000);
 	});
 
+	it("keeps zero and non-finite request budgets on the safe default", async () => {
+		const budgets: unknown[] = [];
+		const fetchImpl: FetchImpl = (async (_input, init) => {
+			const body = JSON.parse(init?.body as string) as { options: { maxTokens: unknown } };
+			budgets.push(body.options.maxTokens);
+			return fakeResponse([{ type: "done", reason: "stop", message: baseAssistant() }]);
+		}) as FetchImpl;
+
+		await streamSimple(fakeModel(), baseContext, { apiKey: "gw-bearer", fetch: fetchImpl, maxTokens: 0 }).result();
+		await streamSimple(fakeModel(), baseContext, {
+			apiKey: "gw-bearer",
+			fetch: fetchImpl,
+			maxTokens: Number.POSITIVE_INFINITY,
+		}).result();
+
+		expect(budgets).toEqual([32_000, 32_000]);
+	});
+
 	it("strips non-wire fields (signal, apiKey, fetch, callbacks) from `options`", async () => {
 		// `apiKey` must ride in the Authorization header, never the body — sending
 		// it twice would let a logged request leak the gateway bearer. The other
