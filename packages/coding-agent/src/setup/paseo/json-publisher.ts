@@ -259,6 +259,20 @@ export async function publishPlan(
 			await handle.sync();
 			sourceIdentity = await capturePrivateBackupIdentity(handle, tempPath);
 			tempIdentity = sourceIdentity;
+		} catch (error) {
+			tempIdentity = await capturePrivateBackupIdentity(handle, tempPath);
+			if (tempIdentity === undefined) {
+				throw new PaseoPublishError(
+					targetPath,
+					{
+						reason: "cas-conflict",
+						expected: options.expectedIdentity,
+						actual: await currentIdentity(targetPath),
+					},
+					[tempPath],
+				);
+			}
+			throw error;
 		} finally {
 			await handle.close();
 		}
