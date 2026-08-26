@@ -9437,11 +9437,20 @@ mod platform {
 	fn open_or_create_skill_directory(
 		parent: HANDLE,
 		name: &std::ffi::OsStr,
+		acl_access: bool,
 	) -> Result<HANDLE, &'static str> {
+		let access = FILE_READ_ATTRIBUTES
+			| FILE_TRAVERSE
+			| READ_CONTROL
+			| if acl_access {
+				WRITE_DAC | WRITE_OWNER
+			} else {
+				0
+			};
 		let handle = open_relative_with_disposition_status(
 			parent,
 			name,
-			FILE_READ_ATTRIBUTES | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+			access,
 			true,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 			FILE_OPEN_IF,
@@ -9462,12 +9471,7 @@ mod platform {
 			unsafe { CloseHandle(handle) };
 			return Err("not_directory");
 		}
-		let rebound = match open_relative(
-			parent,
-			name,
-			FILE_READ_ATTRIBUTES | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-			true,
-		) {
+		let rebound = match open_relative(parent, name, access, true) {
 			Ok(rebound) => rebound,
 			Err(_) => {
 				unsafe { CloseHandle(handle) };
@@ -9509,8 +9513,12 @@ mod platform {
 			},
 		};
 		let mut authority = HeldExact { target: root_handle, ancestors: Vec::new() };
-		for name in names {
-			let child = match open_or_create_skill_directory(authority.target, &name) {
+		for (index, name) in names.iter().enumerate() {
+			let child = match open_or_create_skill_directory(
+				authority.target,
+				name,
+				index + 1 == names.len(),
+			) {
 				Ok(child) => child,
 				Err(code) => return Err(code),
 			};
@@ -9686,7 +9694,7 @@ mod platform {
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
 		let skill_name = std::ffi::OsString::from(skill_name);
-		let skill_handle = match open_or_create_skill_directory(skills.target, &skill_name) {
+		let skill_handle = match open_or_create_skill_directory(skills.target, &skill_name, true) {
 			Ok(handle) => handle,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};

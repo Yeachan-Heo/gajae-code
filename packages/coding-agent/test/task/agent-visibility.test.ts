@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { Settings } from "../../src/config/settings";
 import { TaskTool } from "../../src/task";
 import { loadBundledAgents } from "../../src/task/agents";
@@ -8,7 +9,6 @@ import * as discoveryModule from "../../src/task/discovery";
 import { discoverAgents } from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 
 const temporaryRoots: string[] = [];
 
