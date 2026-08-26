@@ -279,6 +279,9 @@ export async function loadCapabilityForHome<T>(
 	home: string,
 	options: LoadOptions = {},
 ): Promise<CapabilityResult<T>> {
+	if (!options.agentDir && !options.settings) {
+		throw new Error("loadCapabilityForHome requires an explicit agentDir or session settings");
+	}
 	const resolvedHome = path.resolve(home);
 	const settingsAgentDir =
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;

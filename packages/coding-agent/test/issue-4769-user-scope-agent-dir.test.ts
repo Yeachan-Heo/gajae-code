@@ -94,7 +94,7 @@ describe("issue #4769: user scope follows the agent directory", () => {
 		await makeSkill(path.join(decoyAgentDir, "skills"), "decoy-skill");
 
 		setAgentDir(decoyAgentDir);
-		const options = { cwd: project, providers: ["native"] };
+		const options = { cwd: project, agentDir: homeAgentDir, providers: ["native"] };
 		const system = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, options);
 		const rules = await loadCapabilityForHome<Rule>(ruleCapability.id, home, options);
 		const context = await loadCapabilityForHome<ContextFile>(contextFileCapability.id, home, options);

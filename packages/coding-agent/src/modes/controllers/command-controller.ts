@@ -31,7 +31,7 @@ import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
-import type { NewSessionOptions } from "../../session/session-manager";
+import { type NewSessionOptions, SessionManager } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs } from "../../tools/render-utils";
@@ -1160,16 +1160,25 @@ export class CommandController {
 			return;
 		}
 
+		let targetHandle: fs.FileHandle | undefined;
 		try {
+			targetHandle = await SessionManager.openNoFollowDirectory(resolvedPath);
+			const targetStat = await targetHandle.stat({ bigint: true });
+			const expectedIdentity = { dev: targetStat.dev, ino: targetStat.ino };
 			await this.ctx.sessionManager.runExclusiveCwdTransition(async () => {
 				await this.ctx.sessionManager.flush();
-				await this.ctx.sessionManager.moveTo(resolvedPath);
-				setProjectDir(resolvedPath);
+				await this.ctx.sessionManager.moveTo(resolvedPath, { expectedIdentity, targetHandle });
+				if (SessionManager.isProcessCwdOwner(this.ctx.sessionManager)) setProjectDir(resolvedPath);
 				clearClaudePluginRootsCache();
 				resetCapabilities();
+				await this.ctx.session.replaceOwnedMcpManager?.(undefined);
+				await this.ctx.session.refreshMCPTools?.([]);
+				await this.ctx.session.refreshBaseSystemPrompt?.();
 				await this.ctx.refreshSlashCommandState(resolvedPath);
 				await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
 			});
+			await targetHandle.close();
+			targetHandle = undefined;
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
@@ -1180,6 +1189,7 @@ export class CommandController {
 			);
 			this.ctx.ui.requestRender();
 		} catch (err) {
+			await targetHandle?.close().catch(() => {});
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}

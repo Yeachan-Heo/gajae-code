@@ -8,6 +8,7 @@ import * as discoveryModule from "../../src/task/discovery";
 import { discoverAgents } from "../../src/task/discovery";
 import type { AgentDefinition, TaskParams } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 
 const temporaryRoots: string[] = [];
 
@@ -145,20 +146,26 @@ describe("task agent visibility", () => {
 			writeAgent(profileB, "profile-b-agent"),
 			writeAgent(decoy, "process-decoy-agent"),
 		]);
-		const settingsA = Settings.isolated({}, { agentDir: profileA });
-		const settingsB = Settings.isolated({}, { agentDir: profileB });
-		const [fromSettings, explicitWins, isolatedA, isolatedB] = await Promise.all([
-			discoverAgents(root, root, settingsA),
-			discoverAgents(root, root, settingsA, profileB),
-			discoverAgents(root, root, settingsA, profileA),
-			discoverAgents(root, root, settingsB, profileB),
-		]);
+		const previousAgentDir = getAgentDir();
+		setAgentDir(decoy);
+		try {
+			const settingsA = Settings.isolated({}, { agentDir: profileA });
+			const settingsB = Settings.isolated({}, { agentDir: profileB });
+			const [fromSettings, explicitWins, isolatedA, isolatedB] = await Promise.all([
+				discoverAgents(root, root, settingsA),
+				discoverAgents(root, root, settingsA, profileB),
+				discoverAgents(root, root, settingsA, profileA),
+				discoverAgents(root, root, settingsB, profileB),
+			]);
 
-		expect(fromSettings.agents.map(agent => agent.name)).toContain("profile-a-agent");
-		expect(fromSettings.agents.map(agent => agent.name)).not.toContain("process-decoy-agent");
-		expect(explicitWins.agents.map(agent => agent.name)).toContain("profile-b-agent");
-		expect(explicitWins.agents.map(agent => agent.name)).not.toContain("profile-a-agent");
-		expect(isolatedA.agents.map(agent => agent.name)).not.toContain("profile-b-agent");
-		expect(isolatedB.agents.map(agent => agent.name)).not.toContain("profile-a-agent");
+			expect(fromSettings.agents.map(agent => agent.name)).toContain("profile-a-agent");
+			expect(fromSettings.agents.map(agent => agent.name)).not.toContain("process-decoy-agent");
+			expect(explicitWins.agents.map(agent => agent.name)).toContain("profile-b-agent");
+			expect(explicitWins.agents.map(agent => agent.name)).not.toContain("profile-a-agent");
+			expect(isolatedA.agents.map(agent => agent.name)).not.toContain("profile-b-agent");
+			expect(isolatedB.agents.map(agent => agent.name)).not.toContain("profile-a-agent");
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
 	});
 });
