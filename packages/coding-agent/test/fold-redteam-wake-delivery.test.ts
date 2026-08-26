@@ -227,6 +227,7 @@ describe("fold red-team: exactly-once wake and notice across retry + rearm combi
 			const jobId = manager.register("bash", "folded-deadletter", async () => "payload");
 			const target = manager.getJob(jobId);
 			if (!target) throw new Error("expected job");
+			manager.markBackgrounded(jobId, target.generation);
 			const probe = probeFor(target, "folded-deadletter");
 			h.coordinator.registerParticipant(probe.adapter);
 			await h.coordinator.requestFold();
@@ -235,6 +236,7 @@ describe("fold red-team: exactly-once wake and notice across retry + rearm combi
 			await waitFor(() => manager.getDeliveryState().deadLettered > 0, 2_000);
 			expect(manager.getDeliveryState().queued).toBe(0);
 			expect(manager.getDeliveryState().deadLettered).toBe(1);
+			expect(manager.getJobsSnapshot().deadLettered.find(entry => entry.jobId === jobId)?.backgrounded).toBe(true);
 		} finally {
 			await manager.dispose({ timeoutMs: 250 });
 		}

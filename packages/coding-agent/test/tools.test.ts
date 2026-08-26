@@ -1549,6 +1549,7 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);

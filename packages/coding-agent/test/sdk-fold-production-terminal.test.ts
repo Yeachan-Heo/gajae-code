@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentSideConnection, ClientCapabilities } from "@agentclientprotocol/sdk";
-import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { TempDir } from "@gajae-code/utils";
 import { AsyncJobManager } from "../src/async";
 import { Settings } from "../src/config/settings";
@@ -36,6 +36,7 @@ describe("SDK production ACP fold path", () => {
 
 	test("creates, folds, wakes, and releases through the SDK ToolSession and ACP adapter", async () => {
 		tempDir = TempDir.createSync("@gjc-sdk-fold-acp-");
+		registerMockApi();
 		authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
 		const mock = createMockModel({ responses: [{ content: ["wake complete"] }] });
 		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
@@ -82,9 +83,10 @@ describe("SDK production ACP fold path", () => {
 				release: terminal.release,
 			}),
 		} as unknown as AgentSideConnection;
-		created.session.setClientBridge(
-			createAcpClientBridge(connection, created.session.sessionId, { terminal: true } as ClientCapabilities),
-		);
+		const bridge = createAcpClientBridge(connection, created.session.sessionId, {
+			terminal: true,
+		} as ClientCapabilities);
+		created.session.setClientBridge(bridge);
 
 		const bash = created.session.getToolForExecution("bash");
 		if (!bash) throw new Error("expected SDK bash tool");
@@ -96,15 +98,18 @@ describe("SDK production ACP fold path", () => {
 		expect(foreground.details?.async?.state).toBe("running");
 		const jobId = foreground.details?.async?.jobId;
 		if (!jobId) throw new Error("expected folded SDK job id");
+		const callsBeforeWake = mock.calls.length;
 
 		exit.resolve({ exitCode: 0, signal: null });
 		await waitFor(() => releaseCalls === 1);
-		await waitFor(() => !created!.session.yieldQueue.has("async-result"));
-		const asyncResults = created.session.agent.state.messages.filter(
-			message => message.role === "custom" && message.customType === "async-result",
-		);
-		expect(asyncResults).toHaveLength(1);
-		expect(JSON.stringify(asyncResults[0])).toContain("folded output");
-		expect(JSON.stringify(asyncResults[0])).toContain("folded client-terminal wait");
+		await waitFor(() => created!.session.yieldQueue.has("async-result"));
+		await created.session.yieldQueue.flush("idle");
+		// Flushing the receipt through the public queue drives the normal model wake.
+		expect(mock.calls.length).toBeGreaterThan(callsBeforeWake);
+		expect(mock.calls.length).toBe(callsBeforeWake + 1);
+		expect(releaseCalls).toBe(1);
+		const wakeMessages = JSON.stringify(mock.calls[mock.calls.length - 1]?.context.messages);
+		expect(wakeMessages).toContain("folded output");
+		expect(wakeMessages).toContain("folded client-terminal wait");
 	});
 });

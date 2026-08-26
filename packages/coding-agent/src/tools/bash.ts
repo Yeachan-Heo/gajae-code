@@ -1508,6 +1508,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw new ToolAbortError(formatManagedAbortFailure(undefined, undefined, job.getLatestText()));
 			}
 			job.setBackgrounded(true);
+			ownedManager.markBackgrounded(job.jobId, jobGeneration);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
