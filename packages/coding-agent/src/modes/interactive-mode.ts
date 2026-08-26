@@ -467,6 +467,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
+	optimisticUserMessageSignatures: Set<string> = new LocalSubmissionSignatureSet();
 	locallySubmittedUserSignatures: Set<string> = new LocalSubmissionSignatureSet();
 	optimisticInjectedSignatures: Map<string, number> = new Map();
 	/** Submissions whose prompt delivery has not settled yet. The input loop can
@@ -1263,16 +1264,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!submission.customType) {
 			this.#goalModeController.onUserSubmission();
 			const imageCount = submission.images?.length ?? 0;
-			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
-			this.#pendingSubmissionDisposals.set(submission, this.recordLocalSubmission(submission.text, imageCount));
+			const signature = `${submission.text}\u0000${imageCount}`;
+			this.optimisticUserMessageSignature = signature;
+			this.optimisticUserMessageSignatures.add(signature);
+			const disposeLocalSubmission = this.recordLocalSubmission(submission.text, imageCount);
+			this.#pendingSubmissionDisposals.set(submission, () => {
+				this.optimisticUserMessageSignatures.delete(signature);
+				disposeLocalSubmission();
+			});
 			this.addMessageToChat({
 				role: "user",
 				content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
 				attribution: "user",
 				timestamp: Date.now(),
 			});
-		} else {
-			this.optimisticUserMessageSignature = undefined;
 		}
 		if (canApplyComposerSubmission(options, this.editor)) {
 			this.editor.setText("");
@@ -1746,7 +1751,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async checkShutdownRequested(): Promise<void> {
-		if (!this.shutdownRequested) return;
+		if (!this.shutdownRequested || this.#pendingSubmittedInputs.size > 0) return;
 		await this.shutdown();
 	}
 

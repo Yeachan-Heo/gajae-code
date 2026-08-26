@@ -230,6 +230,7 @@ export interface InteractiveModeContext {
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;
+	optimisticUserMessageSignatures?: Set<string>;
 	locallySubmittedUserSignatures: Set<string>;
 	optimisticInjectedSignatures: Map<string, number>;
 	lastSigintTime: number;

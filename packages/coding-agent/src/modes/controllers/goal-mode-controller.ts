@@ -124,6 +124,7 @@ export class GoalModeController {
 
 	onPendingSubmissionFinished(customType?: string): void {
 		if (customType === "goal-continuation") this.#continuationTurnInFlight = false;
+		if (!this.ctx.hasPendingSubmission) this.scheduleContinuation();
 	}
 
 	onUserSubmission(): void {

@@ -418,9 +418,16 @@ export class EventController {
 			const signature = `${textContent}\u0000${imageCount}`;
 
 			this.#resetReadGroup();
-			const wasSingleOptimistic = this.ctx.optimisticUserMessageSignature === signature;
-			const wasInjectedOptimistic = !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
-			const wasOptimistic = wasSingleOptimistic || wasInjectedOptimistic;
+			const optimisticSignatures = this.ctx.optimisticUserMessageSignatures as
+				| (Set<string> & { consumeDelivered?: (value: string) => boolean })
+				| undefined;
+			const wasCountedOptimistic =
+				optimisticSignatures?.consumeDelivered?.(signature) ?? optimisticSignatures?.delete(signature) ?? false;
+			const wasSingleOptimistic =
+				!optimisticSignatures && !wasCountedOptimistic && this.ctx.optimisticUserMessageSignature === signature;
+			const wasInjectedOptimistic =
+				!wasCountedOptimistic && !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
+			const wasOptimistic = wasCountedOptimistic || wasSingleOptimistic || wasInjectedOptimistic;
 			const localSignatures = this.ctx.locallySubmittedUserSignatures as Set<string> & {
 				consumeDelivered?: (value: string) => boolean;
 			};
@@ -429,9 +436,8 @@ export class EventController {
 			if (!wasOptimistic) {
 				this.ctx.addMessageToChat(event.message);
 			}
-			// Only clear the single local slot when IT matched; an injected match is
-			// consumed from the counting Map above and must not clobber a coexisting
-			// pending local optimistic signature.
+			// Only clear the legacy display slot when it matched; counted optimistic
+			// ownership and injected ownership are consumed independently.
 			if (wasSingleOptimistic) {
 				this.ctx.optimisticUserMessageSignature = undefined;
 			}

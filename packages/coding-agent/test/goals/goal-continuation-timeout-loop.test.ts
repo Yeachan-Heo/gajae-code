@@ -211,6 +211,23 @@ describe("goal continuation repeated timeout guard", () => {
 		await expect(next).resolves.toMatchObject({ customType: "goal-continuation" });
 	});
 
+	it("reschedules continuation after the final pending submission settles", async () => {
+		const firstInput = harness.mode.getUserInput();
+		await flush();
+		const submission = harness.mode.startPendingSubmission({ text: "user follow-up" });
+		harness.mode.onInputCallback?.(submission);
+		await firstInput;
+
+		continuationTimers = [];
+		const nextInput = harness.mode.getUserInput();
+		await flush();
+		expect(continuationTimers).toHaveLength(0);
+
+		harness.mode.finishPendingSubmission(submission);
+		await advanceGoalContinuation();
+		await expect(nextInput).resolves.toMatchObject({ customType: "goal-continuation" });
+	});
+
 	it("resets the streak for changed args and changed tools", async () => {
 		await runContinuation(harness, [timeout()]);
 		await runContinuation(harness, [timeout({ command: "different" })]);

@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Interactive submissions now retain independent optimistic and delivery leases for overlapping, identical prompts. Goal-mode continuation is re-armed after the final admitted submission settles, and extension-requested shutdown waits for every admitted delivery to drain.
 - Idle notifications are now bound to the exact SDK connection generations that accepted their positioned identity prerequisite; raw-only recipients receive identity and idle through the same bounded writer command. Late joins, replaced generations, and saturated writers therefore cannot receive a dependent Telegram idle through an unrelated global broadcast.
 - When OSC 8 hyperlinks are enabled, the `/login` URL row is now an anchor pointing at itself, so a login URL wider than the pane stays clickable on every wrapped fragment. A login URL is one unbreakable token, so a pane narrower than the URL splits it across rows; the row printed the bare URL, so the wrap layer had no link to carry (#4711) and every fragment rendered as dead text. Bare URLs in Markdown prose already got this treatment; the login row did not. The existing hyperlink policy still disables OSC 8 where the terminal or user settings do not support it.
 - Foreground activity animation now uses layout-only TUI repaints, avoiding repeated reconstruction of unchanged transcript content during long sessions.

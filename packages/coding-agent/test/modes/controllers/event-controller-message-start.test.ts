@@ -22,9 +22,28 @@ function createUserMessage(text: string): UserMessage {
 	};
 }
 
+class CountedSignatureSet extends Set<string> {
+	#counts = new Map<string, number>();
+
+	constructor(entries: Array<[string, number]>) {
+		super(entries.map(([signature]) => signature));
+		for (const [signature, count] of entries) this.#counts.set(signature, count);
+	}
+
+	consumeDelivered(signature: string): boolean {
+		const count = this.#counts.get(signature) ?? 0;
+		if (count === 0) return false;
+		if (count === 1) this.#counts.delete(signature);
+		else this.#counts.set(signature, count - 1);
+		if (count === 1) super.delete(signature);
+		return true;
+	}
+}
+
 function createContext(options: {
 	editorText: string;
 	optimisticSignature?: string;
+	optimisticSignatures?: Array<[string, number]>;
 	locallySubmittedSignatures?: string[];
 	injectedSignatures?: Array<[string, number]>;
 	transcriptViewerOpen?: boolean;
@@ -56,6 +75,8 @@ function createContext(options: {
 						.map(c => c.text)
 						.join(""),
 		optimisticUserMessageSignature: options.optimisticSignature,
+		optimisticUserMessageSignatures:
+			options.optimisticSignatures === undefined ? undefined : new CountedSignatureSet(options.optimisticSignatures),
 		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
 		optimisticInjectedSignatures: new Map<string, number>(options.injectedSignatures ?? []),
 		...(options.transcriptViewerOpen !== undefined
@@ -164,6 +185,23 @@ describe("EventController message_start (user role)", () => {
 		expect(addMessageToChat).not.toHaveBeenCalled();
 		expect(setText).not.toHaveBeenCalled();
 		expect(ctx.optimisticUserMessageSignature).toBeUndefined();
+	});
+
+	it("tracks overlapping identical optimistic submissions independently", async () => {
+		const message = createUserMessage("same optimistic send");
+		const signature = "same optimistic send\u00000";
+		const { ctx, setText, addMessageToChat } = createContext({
+			editorText: "",
+			optimisticSignatures: [[signature, 2]],
+			locallySubmittedSignatures: [signature],
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message });
+		await controller.handleEvent({ type: "message_start", message });
+
+		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(setText).not.toHaveBeenCalled();
 	});
 
 	it("prefers local optimistic slot over matching injected map entry", async () => {

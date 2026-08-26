@@ -108,4 +108,21 @@ describe("issue #927 optimistic pending spinner", () => {
 		expect(localSignatures.delete(signature)).toBe(true);
 		expect(localSignatures.has(signature)).toBe(false);
 	});
+
+	it("defers extension shutdown until every admitted delivery settles", async () => {
+		const first = mode.startPendingSubmission({ text: "first" });
+		const second = mode.startPendingSubmission({ text: "second" });
+		mode.markPendingSubmissionStarted(first);
+		mode.markPendingSubmissionStarted(second);
+		mode.shutdownRequested = true;
+		const shutdown = vi.spyOn(mode, "shutdown").mockResolvedValue();
+
+		mode.finishPendingSubmission(first);
+		await mode.checkShutdownRequested();
+		expect(shutdown).not.toHaveBeenCalled();
+
+		mode.finishPendingSubmission(second);
+		await mode.checkShutdownRequested();
+		expect(shutdown).toHaveBeenCalledTimes(1);
+	});
 });
