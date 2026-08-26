@@ -915,6 +915,60 @@ interface SessionIndexOpenGroup {
 	promise: Promise<void>;
 	closed: boolean;
 }
+
+type SessionIdentityExpectation = {
+	sessionId: string;
+	stateRoot: string;
+	endpointGeneration: number;
+	pid: number;
+	processIncarnation?: string;
+	hostIncarnation?: string;
+	endpointMtimeMs?: number;
+	lifecycleRequestId?: string;
+};
+
+function supersededAtForIdentity(
+	events: readonly SessionIndexEvent[],
+	expected: SessionIdentityExpectation,
+): number | undefined {
+	const expectedRoot = resolveEquivalentPath(expected.stateRoot);
+	const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
+	const targetRegistration = events.findLast(
+		event =>
+			event.type === "host_registered" &&
+			event.sessionId === expected.sessionId &&
+			event.endpointGeneration === expected.endpointGeneration &&
+			resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+			(event.hostIncarnation ?? event.processIncarnation) === expectedIncarnation,
+	);
+	const targetAnchor =
+		targetRegistration?.indexSeq ??
+		events.find(
+			event =>
+				event.sessionId === expected.sessionId &&
+				event.endpointGeneration === expected.endpointGeneration &&
+				event.pid === expected.pid &&
+				resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+				event.processIncarnation === expected.processIncarnation &&
+				event.hostIncarnation === expected.hostIncarnation &&
+				event.endpointMtimeMs === expected.endpointMtimeMs &&
+				event.lifecycleRequestId === expected.lifecycleRequestId,
+		)?.indexSeq;
+	if (targetAnchor === undefined) return undefined;
+	return events
+		.filter(
+			event =>
+				event.type === "host_registered" &&
+				event.sessionId === expected.sessionId &&
+				event.endpointGeneration === expected.endpointGeneration &&
+				resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+				(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation &&
+				event.indexSeq > targetAnchor,
+		)
+		.map(event => event.indexSeq)
+		.sort((a, b) => a - b)[0];
+}
+
 export class SessionIndex {
 	static #operations = new Map<string, Promise<void>>();
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
@@ -1786,18 +1840,7 @@ export class SessionIndex {
 		lifecycleRequestId?: string;
 	}): IndexedSession | undefined {
 		const expectedRoot = resolveEquivalentPath(expected.stateRoot);
-		const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
-		const supersededAt = this.#events
-			.filter(
-				event =>
-					event.type === "host_registered" &&
-					event.sessionId === expected.sessionId &&
-					event.endpointGeneration === expected.endpointGeneration &&
-					resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
-					(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation,
-			)
-			.map(event => event.indexSeq)
-			.sort((a, b) => a - b)[0];
+		const supersededAt = supersededAtForIdentity(this.#events, expected);
 		const matching = this.#events.filter(
 			event =>
 				(supersededAt === undefined || event.indexSeq < supersededAt) &&
@@ -1839,17 +1882,16 @@ export class SessionIndex {
 	): { type: "host_unregistered" | "session_closed" | "session_deleted"; indexSeq: number } | undefined {
 		const expectedRoot = resolveEquivalentPath(expected.locator.stateRoot);
 		const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
-		const supersededAt = this.#events
-			.filter(
-				event =>
-					event.type === "host_registered" &&
-					event.sessionId === expected.sessionId &&
-					event.endpointGeneration === expected.endpointGeneration &&
-					resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
-					(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation,
-			)
-			.map(event => event.indexSeq)
-			.sort((a, b) => a - b)[0];
+		const supersededAt = supersededAtForIdentity(this.#events, {
+			sessionId: expected.sessionId,
+			stateRoot: expected.locator.stateRoot,
+			endpointGeneration: expected.endpointGeneration,
+			pid: expected.pid,
+			processIncarnation: expected.processIncarnation,
+			hostIncarnation: expected.hostIncarnation,
+			endpointMtimeMs: expected.endpointMtimeMs,
+			lifecycleRequestId: expected.lifecycleRequestId,
+		});
 		const event = this.#events.findLast(
 			event =>
 				(event.type === "host_unregistered" ||
@@ -1887,18 +1929,16 @@ export class SessionIndex {
 		>,
 	): number | undefined {
 		const expectedRoot = resolveEquivalentPath(expected.locator.stateRoot);
-		const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
-		const supersededAt = this.#events
-			.filter(
-				event =>
-					event.type === "host_registered" &&
-					event.sessionId === expected.sessionId &&
-					event.endpointGeneration === expected.endpointGeneration &&
-					resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
-					(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation,
-			)
-			.map(event => event.indexSeq)
-			.sort((a, b) => a - b)[0];
+		const supersededAt = supersededAtForIdentity(this.#events, {
+			sessionId: expected.sessionId,
+			stateRoot: expected.locator.stateRoot,
+			endpointGeneration: expected.endpointGeneration,
+			pid: expected.pid,
+			processIncarnation: expected.processIncarnation,
+			hostIncarnation: expected.hostIncarnation,
+			endpointMtimeMs: expected.endpointMtimeMs,
+			lifecycleRequestId: expected.lifecycleRequestId,
+		});
 		return this.#events.findLast(
 			event =>
 				event.type === "session_closed" &&
