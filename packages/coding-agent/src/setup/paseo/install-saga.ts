@@ -961,11 +961,19 @@ export async function recoverIntent(
 				};
 			}
 			await options.replayPartialBridgeMigration(after);
-			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
-				return {
-					recovered: false,
-					detail: "the provenance ledger changed during partial bridge migration cleanup; retaining the intent",
-				};
+			const ledgerAfterCleanup = await currentIdentity(intent.provenancePath);
+			if (ledgerAfterCleanup !== ledgerObserved) {
+				const cleanupLedger = await readProvenance(intent.provenancePath).catch(() => undefined);
+				const pending = cleanupLedger?.bridgeCleanupPending;
+				if (
+					pending === undefined ||
+					(await canonicalRecoveryPath(pending.originalPath)) !== (await canonicalRecoveryPath(after.bridgePath!))
+				) {
+					return {
+						recovered: false,
+						detail: "the provenance ledger changed during partial bridge migration cleanup; retaining the intent",
+					};
+				}
 			}
 			if (await bridgeLedgerMatchesFilesystem(after, undefined, intent.targetPath)) {
 				return {
