@@ -1793,18 +1793,17 @@ function findRetirementRecord(
 	id: string,
 	receipt: LifecycleRetirementReceipt | undefined,
 ): IndexedSession | undefined {
+	if (receipt !== undefined) {
+		// A later registration may make a same-ID successor the public authority.
+		// Receipt replay must search the retained identity set first so the
+		// successor can never shadow the exact staged retirement identity.
+		const staged = broker.index
+			.listSessionIdentities()
+			.find(session => session.sessionId === id && sameRetirementIdentityAsRecord(receipt.identity, session));
+		if (staged) return staged;
+	}
 	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (current || receipt === undefined) return current;
-	// A later session.delete intentionally removes the identity from the public
-	// projection. A staged ledger receipt may still be replayed only against the
-	// exact retained identity from the append-only index; this never resurrects a
-	// deleted session or accepts a different root/incarnation.
-	return broker.index
-		.listSessionIdentities()
-		.find(
-			session =>
-				session.sessionId === id && session.terminal && sameRetirementIdentityAsRecord(receipt.identity, session),
-		);
+	return current;
 }
 
 function retirementMarkerCapture(

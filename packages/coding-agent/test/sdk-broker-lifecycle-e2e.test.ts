@@ -4009,7 +4009,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 	}
 });
 
-test("reconcile_uncertain replays a ledger-stage receipt after a later session deletion", async () => {
+test("reconcile_uncertain replays a ledger-stage receipt after deletion and same-ID replacement", async () => {
 	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-reconcile-delete-race-"));
 	const stateRoot = path.join(agentDir, ".gjc", "state");
 	const sessionId = "reconcile-delete-race";
@@ -4100,6 +4100,20 @@ test("reconcile_uncertain replays a ledger-stage receipt after a later session d
 			endpointMtimeMs: indexed.endpointMtimeMs,
 			lifecycleRequestId: indexed.lifecycleRequestId,
 		});
+		await expect(
+			broker.handleRequest("session.reconcile_uncertain", input, "reconcile-delete-without-receipt"),
+		).resolves.toMatchObject({ ok: false, error: { code: "not_found" } });
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: indexed.locator,
+			endpointGeneration: indexed.endpointGeneration + 1,
+			pid: process.pid,
+			endpointMtimeMs: indexed.endpointMtimeMs + 1,
+			lifecycleRequestId: "same-id-successor",
+			processIncarnation: "same-id-successor-process",
+			hostIncarnation: "same-id-successor-host",
+		});
 		await broker.stop();
 
 		const reopened = new Broker({ agentDir });
@@ -4107,7 +4121,9 @@ test("reconcile_uncertain replays a ledger-stage receipt after a later session d
 		const replay = await reopened.handleRequest("session.reconcile_uncertain", input, retirementKey);
 		expect(replay).toMatchObject({ ok: true, result: { sessionId, retired: true, indexType: "session_closed" } });
 		expect(reopened.ledger.get(createIdentity)).toMatchObject({ state: "terminal_error" });
-		expect(reopened.index.listSessions().sessions).toEqual([]);
+		expect(reopened.index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId, endpointGeneration: indexed.endpointGeneration + 1 }),
+		]);
 
 		await expect(
 			reopened.handleRequest(
@@ -4116,10 +4132,6 @@ test("reconcile_uncertain replays a ledger-stage receipt after a later session d
 				retirementKey,
 			),
 		).resolves.toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
-		await expect(
-			reopened.handleRequest("session.reconcile_uncertain", input, "reconcile-delete-without-receipt"),
-		).resolves.toMatchObject({ ok: false, error: { code: "not_found" } });
-
 		const events = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
 			.split("\n")
 			.filter(Boolean)
