@@ -101,8 +101,8 @@ function modelApiForProvider(provider: Provider): Api | undefined {
  * model the gateway cannot authenticate). Keep this predicate shared with the
  * CLI readiness checks so every entry point applies the same fence.
  */
-export function isAuthGatewayModelBrokerConsumable(model: Pick<Model<Api>, "api">): boolean {
-	return model.api !== "bedrock-converse-stream";
+export function isAuthGatewayModelBrokerConsumable(model: Pick<Model<Api>, "api" | "transport">): boolean {
+	return model.api !== "bedrock-converse-stream" && model.api !== "google-vertex" && model.transport !== "pi-native";
 }
 
 function isModelInProviderScope(model: Model<Api>, provider: Provider): boolean {

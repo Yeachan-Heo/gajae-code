@@ -219,6 +219,13 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		).toThrow(/no source-backed models/);
 	});
 
+	it("rejects host-credential and chained transports from broker scopes", () => {
+		const vertex = model("vertex-only", "google-vertex", "google-vertex");
+		const chained = { ...model("chained-only", "openai", "openai-responses"), transport: "pi-native" as const };
+		expect(createAuthGatewayModelCatalog("google-vertex", [vertex]).models).toEqual([]);
+		expect(createAuthGatewayModelCatalog("openai", [chained]).models).toEqual([]);
+	});
+
 	it("exposes only the scoped catalog and exact Codex wire identity", async () => {
 		const codex = model("gpt-5.6-luna", "openai-codex", "openai-codex-responses");
 		const copilot = model("gpt-5.6-luna", "github-copilot", "openai-responses");
