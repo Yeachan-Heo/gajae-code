@@ -437,12 +437,28 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						}
 						return { changed: true, enabled: on };
 					}
-					case "session.cwd.move":
-						await session.sessionManager.moveTo(String(input.path));
-						await session.replaceOwnedMcpManager?.(undefined);
-						await session.refreshMCPTools?.([]);
-						await session.refreshSshTool({ activateIfAvailable: true });
+					case "session.cwd.move": {
+						const rescopeSessionCwd = session.rescopeSessionCwd;
+						if (typeof rescopeSessionCwd !== "function") {
+							throw Object.assign(
+								new Error("session.cwd.move is unavailable without an installed session seam."),
+								{ code: "unavailable" },
+							);
+						}
+						try {
+							await rescopeSessionCwd.call(session, String(input.path));
+						} catch (error) {
+							if (
+								error instanceof Error &&
+								error.message ===
+									"This session cannot rescope its working directory; only top-level unrestrained sessions can move."
+							) {
+								Object.assign(error, { code: "unavailable" });
+							}
+							throw error;
+						}
 						return { moved: true, cwd: session.sessionManager.getCwd() };
+					}
 					default:
 						if (BROKER_LIFECYCLE_OPERATIONS.has(operation)) prohibitBrokerLifecycleOperation(operation);
 						throw Object.assign(new Error(`${operation} has no AgentSession implementation.`), {

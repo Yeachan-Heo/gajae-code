@@ -264,6 +264,12 @@ function createRuntime() {
 	};
 	const typedSession = Object.assign(session, {
 		sessionManager: fakeSessionManager as unknown as SessionManager,
+		rescopeSessionCwd: async (target: string) => {
+			fakeSessionManager._flushed = true;
+			fakeSessionManager._movedTo = target;
+			fakeSessionManager._cwd = target;
+			return { from: "/tmp/project", to: target };
+		},
 	}) as unknown as AgentSession & FakeAcpBuiltinSession;
 	return {
 		output,

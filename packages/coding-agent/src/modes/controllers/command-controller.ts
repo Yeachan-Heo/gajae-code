@@ -5,12 +5,10 @@ import { CompactionCancelledError, type CompactionOutcome } from "@gajae-code/ag
 import { getEnvApiKey, type ToolCall, type UsageLimit, type UsageReport } from "@gajae-code/ai/core";
 import type { ProviderDetails } from "@gajae-code/ai/provider-details";
 import { type Keybinding, Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@gajae-code/tui";
-import { formatBytes, formatDuration, Snowflake, setProjectDir } from "@gajae-code/utils";
+import { formatBytes, formatDuration, Snowflake } from "@gajae-code/utils";
 import { resolveAppendOnlyMode } from "../../append-only-mode";
 import { jobElapsedMs } from "../../async";
-import { reset as resetCapabilities } from "../../capability";
 import type { KeybindingsManager } from "../../config/keybindings";
-import { clearClaudePluginRootsCache } from "../../discovery/helpers";
 import { loadCustomShare } from "../../export/custom-share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import type { HindsightApi, HindsightSessionState } from "../../hindsight";
@@ -31,7 +29,7 @@ import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../../session/cache-economics";
-import { type NewSessionOptions, SessionManager } from "../../session/session-manager";
+import type { NewSessionOptions } from "../../session/session-manager";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs } from "../../tools/render-utils";
@@ -1160,25 +1158,9 @@ export class CommandController {
 			return;
 		}
 
-		let targetHandle: fs.FileHandle | undefined;
 		try {
-			targetHandle = await SessionManager.openNoFollowDirectory(resolvedPath);
-			const targetStat = await targetHandle.stat({ bigint: true });
-			const expectedIdentity = { dev: targetStat.dev, ino: targetStat.ino };
-			await this.ctx.sessionManager.runExclusiveCwdTransition(async () => {
-				await this.ctx.sessionManager.flush();
-				await this.ctx.sessionManager.moveTo(resolvedPath, { expectedIdentity, targetHandle });
-				if (SessionManager.isProcessCwdOwner(this.ctx.sessionManager)) setProjectDir(resolvedPath);
-				clearClaudePluginRootsCache();
-				resetCapabilities();
-				await this.ctx.session.replaceOwnedMcpManager?.(undefined);
-				await this.ctx.session.refreshMCPTools?.([]);
-				await this.ctx.session.refreshBaseSystemPrompt?.();
-				await this.ctx.refreshSlashCommandState(resolvedPath);
-				await this.ctx.session.refreshSshTool({ activateIfAvailable: true });
-			});
-			await targetHandle.close();
-			targetHandle = undefined;
+			await this.ctx.session.rescopeSessionCwd(resolvedPath);
+			await this.ctx.refreshSlashCommandState(resolvedPath);
 
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorTopBorder();
@@ -1189,7 +1171,6 @@ export class CommandController {
 			);
 			this.ctx.ui.requestRender();
 		} catch (err) {
-			await targetHandle?.close().catch(() => {});
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
