@@ -222,12 +222,13 @@ export async function runPluginCommand(cmd: PluginCommandArgs): Promise<void> {
 // =============================================================================
 
 async function makeMarketplaceManager(): Promise<MarketplaceManager> {
+	const agentDir = getAgentDir();
 	return new MarketplaceManager({
-		marketplacesRegistryPath: getMarketplacesRegistryPath(),
-		installedRegistryPath: getInstalledPluginsRegistryPath(),
+		marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir),
+		installedRegistryPath: getInstalledPluginsRegistryPath(agentDir),
 		projectInstalledRegistryPath: await resolveOrDefaultProjectRegistryPath(getProjectDir()),
-		marketplacesCacheDir: getMarketplacesCacheDir(),
-		pluginsCacheDir: getPluginsCacheDir(),
+		marketplacesCacheDir: getMarketplacesCacheDir(agentDir),
+		pluginsCacheDir: getPluginsCacheDir(agentDir),
 	});
 }
 
