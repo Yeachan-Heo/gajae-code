@@ -101,7 +101,7 @@ export async function discoverAgents(
 
 	// Load agents from GJC marketplace plugins.
 	const { roots: pluginRoots } = isProviderEnabled("claude-plugins", activeSettings)
-		? await listClaudePluginRoots(home, resolvedCwd)
+		? await listClaudePluginRoots(home, resolvedCwd, resolvedAgentDir)
 		: { roots: [] };
 	const nonGjcPluginRoots = [];
 	for (const plugin of pluginRoots) {

@@ -126,6 +126,23 @@ describe("issue #4769: user scope follows the agent directory", () => {
 		expect(skills.items.map(item => item.name)).toEqual(["explicit-skill"]);
 	});
 
+	test("explicit-home loading excludes home marketplace roots when profile differs", async () => {
+		const pluginPath = path.join(home, "marketplace-plugin");
+		await makeSkill(path.join(pluginPath, "skills"), "leaked-skill");
+		await writeFile(
+			path.join(home, ".gjc", "plugins", "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"leak@market": [{ installPath: pluginPath, version: "1.0.0", scope: "user", enabled: true }],
+				},
+			}),
+		);
+
+		const result = await loadCapabilityForHome<Skill>(skillCapability.id, home, { cwd: project, agentDir: profile });
+		expect(result.items.map(item => item.name)).not.toContain("leaked-skill");
+	});
+
 	test("capability loading derives an omitted agent directory from the owning settings", async () => {
 		const decoyAgentDir = path.join(tempDir, "process-global-decoy");
 		await writeFile(path.join(profile, "SYSTEM.md"), "# settings-owned system");

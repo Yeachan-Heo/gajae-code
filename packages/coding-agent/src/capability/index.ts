@@ -253,7 +253,15 @@ async function loadCapabilityWithContext<T>(
 		? path.resolve(options.agentDir)
 		: path.join(home, getConfigDirName(), "agent");
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
+	const ctx: LoadContext = {
+		cwd,
+		home,
+		userAgentDir,
+		userAgentDirExplicit:
+			options.userAgentDirExplicit ?? (options.agentDir !== undefined || options.isolateAmbientPolicy === true),
+		repoRoot,
+		settings: options.settings,
+	};
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
@@ -264,7 +272,11 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
 	return await loadCapabilityWithContext(
 		capabilityId,
-		{ ...options, agentDir: options.agentDir || settingsAgentDir || getAgentDir() },
+		{
+			...options,
+			agentDir: options.agentDir || settingsAgentDir || getAgentDir(),
+			userAgentDirExplicit: options.agentDir !== undefined || settingsAgentDir !== undefined,
+		},
 		getTrustedHomeDir(),
 	);
 }

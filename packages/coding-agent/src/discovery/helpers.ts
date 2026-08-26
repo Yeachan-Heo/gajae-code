@@ -892,9 +892,10 @@ const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: 
 export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
+	userAgentDir?: string,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
-	const cacheKey = `${home}:${resolvedProjectPath ?? ""}`;
+	const cacheKey = `${home}:${userAgentDir ?? ""}:${resolvedProjectPath ?? ""}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -906,7 +907,12 @@ export async function listClaudePluginRoots(
 	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const gjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	const defaultAgentDir = path.join(home, getConfigDirName(), "agent");
+	const userPluginsDir =
+		userAgentDir && path.resolve(userAgentDir) !== path.resolve(defaultAgentDir)
+			? path.join(path.dirname(userAgentDir), "plugins")
+			: getPluginsDir(home);
+	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {
 		const gjcRegistry = parseClaudePluginsRegistry(gjcContent);

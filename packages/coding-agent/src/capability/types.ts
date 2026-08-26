@@ -32,6 +32,8 @@ export interface LoadContext {
 	 * from `home`.
 	 */
 	userAgentDir?: string;
+	/** Whether userAgentDir was explicitly selected rather than ambient default. */
+	userAgentDirExplicit?: boolean;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 	/** Owning session settings for provider policy decisions. */
@@ -108,6 +110,8 @@ export interface LoadOptions {
 	settings?: Settings;
 	/** Prevent an explicitly home-scoped load from inheriting process-global policy. */
 	isolateAmbientPolicy?: boolean;
+	/** Internal marker preserving whether agentDir was explicitly selected. */
+	userAgentDirExplicit?: boolean;
 }
 
 /**
