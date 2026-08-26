@@ -494,18 +494,42 @@ pub struct NativeDirectoryIdentity {
 /// Result of an expected-parent, no-replace directory creation.
 #[napi(object)]
 pub struct NativeDirectoryCreationResult {
-	pub ok:       bool,
-	pub code:     Option<String>,
-	pub identity: Option<NativeDirectoryIdentity>,
+	pub ok:             bool,
+	pub code:           Option<String>,
+	pub mutation_state: String,
+	pub detached_path:  Option<String>,
+	pub identity:       Option<NativeDirectoryIdentity>,
 }
 
 impl NativeDirectoryCreationResult {
 	fn failure(code: &str) -> Self {
-		Self { ok: false, code: Some(code.to_owned()), identity: None }
+		Self {
+			ok:             false,
+			code:           Some(code.to_owned()),
+			mutation_state: "not_committed".to_owned(),
+			detached_path:  None,
+			identity:       None,
+		}
+	}
+
+	fn committed_failure(code: &str, detached_path: String) -> Self {
+		Self {
+			ok:             false,
+			code:           Some(code.to_owned()),
+			mutation_state: "committed".to_owned(),
+			detached_path:  Some(detached_path),
+			identity:       None,
+		}
 	}
 
 	fn success(identity: NativeDirectoryIdentity) -> Self {
-		Self { ok: true, code: None, identity: Some(identity) }
+		Self {
+			ok:             true,
+			code:           None,
+			mutation_state: "committed".to_owned(),
+			detached_path:  None,
+			identity:       Some(identity),
+		}
 	}
 }
 
@@ -4857,6 +4881,7 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeDirectoryCreationResult::failure(code);
 		}
+		let detached_path = destination_path.to_string_lossy().into_owned();
 		let child_fd = unsafe {
 			libc::openat(
 				parent_fd,
@@ -4867,7 +4892,7 @@ pub(crate) mod platform {
 		if child_fd < 0 {
 			let code = security_code(&std::io::Error::last_os_error());
 			unsafe { libc::close(parent_fd) };
-			return NativeDirectoryCreationResult::failure(code);
+			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
 		}
 		let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe { libc::fstat(child_fd, &mut child_stat) } != 0 {
@@ -4876,14 +4901,17 @@ pub(crate) mod platform {
 				libc::close(child_fd);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::failure(code);
+			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
 		}
 		if child_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
 			unsafe {
 				libc::close(child_fd);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::failure("not_directory");
+			return NativeDirectoryCreationResult::committed_failure(
+				"not_directory",
+				detached_path.clone(),
+			);
 		}
 		let mut named_stat: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe {
@@ -4895,21 +4923,27 @@ pub(crate) mod platform {
 				libc::close(child_fd);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::failure(code);
+			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
 		}
 		if named_stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
 			unsafe {
 				libc::close(child_fd);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::failure("reparse_point");
+			return NativeDirectoryCreationResult::committed_failure(
+				"reparse_point",
+				detached_path.clone(),
+			);
 		}
 		if !stat_same_object(&child_stat, &named_stat) {
 			unsafe {
 				libc::close(child_fd);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::failure("identity_mismatch");
+			return NativeDirectoryCreationResult::committed_failure(
+				"identity_mismatch",
+				detached_path,
+			);
 		}
 		let identity = directory_identity(&child_stat);
 		unsafe {
@@ -8031,26 +8065,36 @@ mod platform {
 			};
 			return NativeDirectoryCreationResult::failure(code);
 		}
+		let detached_path = destination_path.to_string_lossy().into_owned();
 		let mut child_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(child, &mut child_information) } == 0 {
 			let code = last_error_code();
 			unsafe { CloseHandle(child) };
-			return NativeDirectoryCreationResult::failure(code);
+			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
 		}
 		if child_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 			unsafe { CloseHandle(child) };
-			return NativeDirectoryCreationResult::failure("reparse_point");
+			return NativeDirectoryCreationResult::committed_failure(
+				"reparse_point",
+				detached_path.clone(),
+			);
 		}
 		if child_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
 			unsafe { CloseHandle(child) };
-			return NativeDirectoryCreationResult::failure("not_directory");
+			return NativeDirectoryCreationResult::committed_failure(
+				"not_directory",
+				detached_path.clone(),
+			);
 		}
 		let named =
 			match open_relative(parent.target, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true) {
 				Ok(handle) => handle,
 				Err(code) => {
 					unsafe { CloseHandle(child) };
-					return NativeDirectoryCreationResult::failure(code);
+					return NativeDirectoryCreationResult::committed_failure(
+						code,
+						detached_path.clone(),
+					);
 				},
 			};
 		let mut named_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -8066,7 +8110,10 @@ mod platform {
 			CloseHandle(child);
 		}
 		if !same_identity {
-			return NativeDirectoryCreationResult::failure("identity_mismatch");
+			return NativeDirectoryCreationResult::committed_failure(
+				"identity_mismatch",
+				detached_path,
+			);
 		}
 		NativeDirectoryCreationResult::success(directory_identity(&child_information))
 	}

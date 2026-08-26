@@ -781,7 +781,7 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 		if (!created.ok || created.identity === undefined) {
 			throw new SkillsBridgeError(
 				`Paseo skills bridge root creation failed: ${preflight.bridgeDir} (${created.code ?? "unknown"})`,
-				[temporary],
+				[temporary, ...(created.detachedPath === undefined ? [] : [created.detachedPath])],
 			);
 		}
 		identity = created.identity;

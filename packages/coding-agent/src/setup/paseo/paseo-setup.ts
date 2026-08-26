@@ -1392,6 +1392,7 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 		if (!created.ok || created.identity === undefined) {
 			throw new SkillsBridgeError(`Paseo bridge root creation failed: ${bridgeDir} (${created.code ?? "unknown"})`, [
 				temporary,
+				...(created.detachedPath === undefined ? [] : [created.detachedPath]),
 			]);
 		}
 		identity = created.identity;

@@ -1770,6 +1770,8 @@ export type NativeCanonicalDirectoryIdentity =
 export interface NativeDirectoryCreationResult {
   ok: boolean
   code?: string
+  mutationState: string
+  detachedPath?: string
   identity?: NativeDirectoryIdentity
 }
 
