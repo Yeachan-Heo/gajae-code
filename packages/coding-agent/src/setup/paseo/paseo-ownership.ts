@@ -421,6 +421,11 @@ export interface IntentDiscardSidecar {
 	readonly valueSha256: string;
 }
 
+export interface IntentPublishBackup {
+	readonly backupPath: string;
+	readonly valueSha256: string;
+}
+
 /**
  * Durable, credential-free intent record.
  *
@@ -454,6 +459,8 @@ export interface IntentRecord {
 	readonly bridgePreflightPayload?: ProvenanceLedger;
 	/** Authenticated sidecar to remove only when this intent is discarded before publication. */
 	readonly discardSidecar?: IntentDiscardSidecar;
+	/** Credential backup prepared by publication; retained until the step settles. */
+	readonly publishBackup?: IntentPublishBackup;
 	readonly startedAt: string;
 }
 
@@ -467,6 +474,18 @@ function isIntentDiscardSidecar(value: unknown, targetPath: unknown): value is I
 	);
 }
 
+function isIntentPublishBackup(value: unknown, targetPath: unknown): value is IntentPublishBackup {
+	if (!isRecord(value) || typeof targetPath !== "string") return false;
+	if (typeof value.backupPath !== "string" || typeof value.valueSha256 !== "string") return false;
+	if (!/^[a-f0-9]{64}$/u.test(value.valueSha256)) return false;
+	const target = path.resolve(targetPath);
+	const backup = path.resolve(value.backupPath);
+	return (
+		path.dirname(backup) === path.dirname(target) &&
+		path.basename(backup).startsWith(`${path.basename(target)}.gjc-bak-`)
+	);
+}
+
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
 	if (intent.version !== INTENT_VERSION) {
 		throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
@@ -475,6 +494,12 @@ export async function writeIntent(intentPath: string, intent: IntentRecord): Pro
 		throw new IntentRecordCorruptError(
 			intentPath,
 			"discardSidecar is not an authenticated sidecar reference beside the target config",
+		);
+	}
+	if (intent.publishBackup !== undefined && !isIntentPublishBackup(intent.publishBackup, intent.targetPath)) {
+		throw new IntentRecordCorruptError(
+			intentPath,
+			"publishBackup is not an authenticated backup beside the target config",
 		);
 	}
 	validateIntentPayload(intentPath, intent);
@@ -660,6 +685,12 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 			throw new IntentRecordCorruptError(
 				intentPath,
 				"discardSidecar is not an authenticated sidecar reference beside the target config",
+			);
+		}
+		if (parsed?.publishBackup !== undefined && !isIntentPublishBackup(parsed.publishBackup, parsed.targetPath)) {
+			throw new IntentRecordCorruptError(
+				intentPath,
+				"publishBackup is not an authenticated backup beside the target config",
 			);
 		}
 		return parsed;

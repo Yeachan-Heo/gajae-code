@@ -156,6 +156,8 @@ export interface PublishOptions {
 	/** Take a mode-0600 backup beside the original before replacing it. */
 	readonly backup: boolean;
 	readonly now: Date;
+	/** Persist cleanup authority before credential-bearing backup bytes are created. */
+	readonly onBackupPrepared?: (backupPath: string, valueSha256: string) => Promise<void>;
 }
 
 export interface PublishResult {
@@ -220,6 +222,7 @@ export async function publishPlan(
 	if (options.backup && observed !== ABSENT_IDENTITY) {
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
+		await options.onBackupPrepared?.(backupPath, hashBytes(backupBytes.toString("utf8")));
 		backupCreated = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
 		if ((await currentIdentity(targetPath)) !== observed) {
 			if (backupCreated && !(await removePrivateBackupIfExact(backupPath, backupBytes))) {

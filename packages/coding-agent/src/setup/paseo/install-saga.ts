@@ -225,6 +225,9 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			expectedIdentity: current.identity,
 			backup: true,
 			now: input.now,
+			onBackupPrepared: async (backupPath, valueSha256) => {
+				await writeIntent(input.intentPath, { ...intent, publishBackup: { backupPath, valueSha256 } });
+			},
 		});
 		backupPath = published.backupPath;
 		publishSucceeded = published.published;
@@ -750,6 +753,33 @@ export async function recoverIntent(
 					};
 				}
 				discardSidecarRemoved = true;
+			}
+		}
+		if (intent.publishBackup !== undefined) {
+			const [targetObserved, ledgerObserved, backupExists] = await Promise.all([
+				currentIdentity(intent.targetPath),
+				currentIdentity(intent.provenancePath),
+				Bun.file(intent.publishBackup.backupPath).exists(),
+			]);
+			const targetState = classifyIdentity(
+				targetObserved,
+				intent.targetPreflightIdentity,
+				intent.targetExpectedIdentity,
+			);
+			const ledgerState = classifyIdentity(
+				ledgerObserved,
+				intent.provenancePreflightIdentity,
+				intent.provenanceExpectedIdentity,
+			);
+			if (targetState === "before" && ledgerState === "before" && backupExists) {
+				return {
+					recovered: false,
+					detail: `${recovery.detail}; credential backup authority remains at ${intent.publishBackup.backupPath}`,
+				};
+			}
+			if (!backupExists) {
+				const { publishBackup: _publishBackup, ...safeIntent } = intent;
+				await writeIntent(intentPath, safeIntent);
 			}
 		}
 		try {
