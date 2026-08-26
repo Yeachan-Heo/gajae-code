@@ -759,7 +759,17 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 	let identity: BridgeEntryIdentity | undefined;
 	let cleanupError: string | undefined;
 	try {
-		stagedSnapshot = snapshotDirectoryTree(temporary);
+		try {
+			stagedSnapshot = snapshotDirectoryTree(canonicalExistingPathForNative(temporary));
+		} catch (error) {
+			throw new SkillsBridgeError(
+				`Paseo skills bridge staging snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
+				[temporary],
+			);
+		}
+		if (!stagedSnapshot.ok || stagedSnapshot.snapshot === undefined) {
+			throw new SkillsBridgeError(`Paseo skills bridge staging snapshot was unavailable: ${temporary}`, [temporary]);
+		}
 		identity = await directoryIdentity(temporary);
 		await fs.chmod(temporary, 0o700);
 		await fs.mkdir(preflight.bridgeDir, { mode: 0o700 });
