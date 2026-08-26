@@ -4825,6 +4825,17 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		};
+		if file_mode == 0o600 {
+			if unsafe { libc::fchmod(skills_fd, 0o700) } != 0
+				|| unsafe { libc::fchmod(skill_fd, 0o700) } != 0
+			{
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure("permission_denied");
+			}
+		}
 		let Ok(final_name) = CString::new("SKILL.md") else {
 			unsafe {
 				libc::close(skill_fd);
@@ -4880,6 +4891,10 @@ pub(crate) mod platform {
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
 			return NativeSecureSkillWriteResult::failure(code);
 		}
 		drop(file);
@@ -9334,7 +9349,7 @@ mod platform {
 		let handle = open_relative_with_disposition_status(
 			parent,
 			name,
-			FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+			FILE_READ_ATTRIBUTES | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
 			true,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 			FILE_OPEN_IF,
@@ -9355,7 +9370,12 @@ mod platform {
 			unsafe { CloseHandle(handle) };
 			return Err("not_directory");
 		}
-		let rebound = match open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true) {
+		let rebound = match open_relative(
+			parent,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_TRAVERSE | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+			true,
+		) {
 			Ok(rebound) => rebound,
 			Err(_) => {
 				unsafe { CloseHandle(handle) };

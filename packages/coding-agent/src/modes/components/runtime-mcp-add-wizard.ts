@@ -129,22 +129,16 @@ export class MCPAddWizard extends Container {
 				clientId: string,
 				clientSecret: string,
 				scopes: string,
-				signal: AbortSignal,
 		  ) => Promise<MCPAddWizardOAuthResult>)
 		| null = null;
 	#onTestConnectionCallback: ((config: MCPServerConfig) => Promise<void>) | null = null;
 	#onRenderCallback: (() => void) | null = null;
-	#onCommandPaletteCallback: ((keyData: string) => boolean) | null = null;
-	#onOAuthCredentialCleanupCallback: ((credentialId: string) => Promise<void> | void) | null = null;
-	#onOAuthCredentialCleanupErrorCallback: ((credentialId: string, error: unknown) => void) | null = null;
-	#oauthAbortController: AbortController | undefined;
-	#oauthCredentialCleanupStarted = false;
-	#completed = false;
 	#disposed = false;
 	#transitionTimers = new Set<NodeJS.Timeout>();
 	#healthCheckSpinner?: NodeJS.Timeout;
 	#healthCheckTimeout?: NodeJS.Timeout;
 	#asyncGeneration = 0;
+	readonly #agentDir?: string;
 
 	constructor(
 		onComplete: (name: string, config: MCPServerConfig, scope: Scope) => void,
@@ -156,14 +150,11 @@ export class MCPAddWizard extends Container {
 			clientId: string,
 			clientSecret: string,
 			scopes: string,
-			signal: AbortSignal,
 		) => Promise<MCPAddWizardOAuthResult>,
 		onTestConnection?: (config: MCPServerConfig) => Promise<void>,
 		onRender?: () => void,
-		onCommandPalette?: (keyData: string) => boolean,
 		initialName?: string,
-		onOAuthCredentialCleanup?: (credentialId: string) => Promise<void> | void,
-		onOAuthCredentialCleanupError?: (credentialId: string, error: unknown) => void,
+		agentDir?: string,
 	) {
 		super();
 		this.#onCompleteCallback = onComplete;
@@ -171,9 +162,7 @@ export class MCPAddWizard extends Container {
 		this.#onOAuthCallback = onOAuth ?? null;
 		this.#onTestConnectionCallback = onTestConnection ?? null;
 		this.#onRenderCallback = onRender ?? null;
-		this.#onCommandPaletteCallback = onCommandPalette ?? null;
-		this.#onOAuthCredentialCleanupCallback = onOAuthCredentialCleanup ?? null;
-		this.#onOAuthCredentialCleanupErrorCallback = onOAuthCredentialCleanupError ?? null;
+		this.#agentDir = agentDir;
 		if (initialName && initialName.trim().length > 0) {
 			this.#state.name = initialName.trim();
 			this.#currentStep = "transport";
@@ -204,15 +193,6 @@ export class MCPAddWizard extends Container {
 		if (this.#disposed) return;
 		this.#disposed = true;
 		this.#asyncGeneration += 1;
-		this.#oauthAbortController?.abort(new Error("OAuth flow cancelled"));
-		this.#oauthAbortController = undefined;
-		if (!this.#completed && !this.#oauthCredentialCleanupStarted && this.#state.oauthCredentialId) {
-			this.#oauthCredentialCleanupStarted = true;
-			const credentialId = this.#state.oauthCredentialId;
-			void Promise.resolve(this.#onOAuthCredentialCleanupCallback?.(credentialId)).catch(error => {
-				this.#onOAuthCredentialCleanupErrorCallback?.(credentialId, error);
-			});
-		}
 		for (const timer of this.#transitionTimers) {
 			clearTimeout(timer);
 		}
@@ -459,7 +439,7 @@ export class MCPAddWizard extends Container {
 
 		const cwd = getProjectDir();
 
-		const userPathLabel = shortenPath(getMCPConfigPath("user", cwd));
+		const userPathLabel = shortenPath(getMCPConfigPath("user", cwd, this.#agentDir));
 		const projectPathLabel = shortenPath(getMCPConfigPath("project", cwd));
 		const options = [
 			{ value: "user" as const, label: `User level (${userPathLabel})` },
@@ -541,10 +521,6 @@ export class MCPAddWizard extends Container {
 
 		// Handle Escape (always handled by wizard)
 		if (matchesAppInterrupt(keyData)) {
-			if (this.#oauthAbortController) {
-				this.#onCancelCallback();
-				return;
-			}
 			if (this.#currentStep === "name") {
 				// Cancel wizard
 				this.#onCancelCallback();
@@ -554,8 +530,6 @@ export class MCPAddWizard extends Container {
 			this.#goBack();
 			return;
 		}
-
-		if (this.#onCommandPaletteCallback?.(keyData) === true) return;
 
 		// If we have an input field, let it handle the input
 		if (this.#inputField) {
@@ -664,7 +638,6 @@ export class MCPAddWizard extends Container {
 				break;
 			case "oauth-scopes":
 				this.#state.oauthScopes = value; // Optional
-				this.#inputField = null;
 				// Launch OAuth flow
 				void this.#launchOAuthFlow();
 				return;
@@ -1183,7 +1156,7 @@ export class MCPAddWizard extends Container {
 	}
 
 	async #launchOAuthFlow(): Promise<void> {
-		if (this.#disposed || this.#oauthAbortController) return;
+		if (this.#disposed) return;
 		const generation = ++this.#asyncGeneration;
 		if (!this.#onOAuthCallback) {
 			this.#contentContainer.clear();
@@ -1219,8 +1192,6 @@ export class MCPAddWizard extends Container {
 		this.#contentContainer.addChild(new Text(theme.fg("muted", "(Press Esc to cancel)"), 0, 0));
 		this.#requestRender();
 
-		const oauthAbortController = new AbortController();
-		this.#oauthAbortController = oauthAbortController;
 		try {
 			// Call OAuth handler
 			const oauthResult = await this.#onOAuthCallback(
@@ -1230,7 +1201,6 @@ export class MCPAddWizard extends Container {
 				this.#state.oauthClientId,
 				this.#state.oauthClientSecret,
 				this.#state.oauthScopes,
-				oauthAbortController.signal,
 			);
 			if (this.#disposed || generation !== this.#asyncGeneration) return;
 
@@ -1309,7 +1279,6 @@ export class MCPAddWizard extends Container {
 				healthPassed ? 1000 : 2000,
 			);
 		} catch (error) {
-			if (this.#disposed || generation !== this.#asyncGeneration) return;
 			// Show error with options to retry or go back
 			const errorMsg = sanitize(error instanceof Error ? error.message : String(error));
 			this.#contentContainer.clear();
@@ -1345,14 +1314,11 @@ export class MCPAddWizard extends Container {
 			// Set up as a selector step
 			this.#selectedIndex = 0;
 			this.#currentStep = "oauth-error";
-		} finally {
-			if (this.#oauthAbortController === oauthAbortController) this.#oauthAbortController = undefined;
 		}
 	}
 
 	#complete(): void {
 		if (!this.#state.scope) return;
-		this.#completed = true;
 
 		// Build the config
 		const config: MCPServerConfig = this.#buildConfig();

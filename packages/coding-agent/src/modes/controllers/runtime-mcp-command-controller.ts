@@ -501,6 +501,7 @@ export class MCPCommandController {
 				this.ctx.ui.requestRender();
 			},
 			parsed.initialName,
+			this.ctx.session.getSessionAgentDir(),
 		);
 
 		// Replace editor with wizard

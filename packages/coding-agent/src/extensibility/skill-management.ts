@@ -299,7 +299,7 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 	const name = input.name.trim();
 	if (!name) throw new SkillFrontmatterError("skill name is required");
 
-	const { frontmatter } = parseFrontmatter(input.content, { source: "<skill-content>" });
+	const { frontmatter } = parseFrontmatter(input.content, { source: "<skill-content>", level: "fatal" });
 	if (!frontmatter) throw new SkillFrontmatterError("skill content must start with a YAML frontmatter block (---)");
 	const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
 	if (!description) throw new SkillFrontmatterError("skill frontmatter must include a non-empty description");
