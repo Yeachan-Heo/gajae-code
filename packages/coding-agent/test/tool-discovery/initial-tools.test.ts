@@ -228,6 +228,27 @@ describe("alwaysActiveToolNames keeps discoverable coordination tools loaded", (
 	}, 60_000);
 });
 
+describe("an explicitly empty tool selection disables every built-in tool", () => {
+	async function tempDir(): Promise<string> {
+		return await fs.mkdtemp(path.join(os.tmpdir(), "gjc-empty-tools-"));
+	}
+
+	it("keeps the goal tool out of an empty selection while preserving it for non-empty ones", async () => {
+		const cwd = await tempDir();
+		const agentDir = await tempDir();
+
+		// `--no-tools` maps to `toolNames: []` (see cli/main.ts). Goal mode is on by
+		// default, so an empty selection is the only signal that the caller wants
+		// zero built-in tools -- it must not be re-populated with `goal`.
+		const none = await createAgentSession({ cwd, agentDir, toolNames: [] });
+		expect(none.session.getActiveToolNames()).toEqual([]);
+
+		// A non-empty explicit selection keeps `goal` available as session state.
+		const some = await createAgentSession({ cwd, agentDir, toolNames: ["read"] });
+		expect(some.session.getActiveToolNames()).toContain("goal");
+	}, 60_000);
+});
+
 describe("computeEssentialBuiltinNames", () => {
 	it("returns DEFAULT_ESSENTIAL_TOOL_NAMES when override is empty", () => {
 		const settings = Settings.isolated({});
