@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { loginVllm } from "../src/utils/oauth/vllm";
 
 describe("vLLM login", () => {
@@ -27,5 +28,33 @@ describe("vLLM login", () => {
 				onPrompt: async () => "   ",
 			}),
 		).rejects.toThrow("vLLM API key is required");
+	});
+
+	it("does not replace a stored key on empty re-login and supports logout/re-login", async () => {
+		const store = await SqliteAuthCredentialStore.open(":memory:");
+		const authStorage = new AuthStorage(store);
+		let promptValue = "  first-vllm-key  ";
+		const controller = {
+			onAuth: () => {},
+			onPrompt: async () => promptValue,
+		};
+
+		try {
+			await authStorage.login("vllm", controller);
+			expect(store.getApiKey("vllm")).toBe("first-vllm-key");
+
+			promptValue = " \t ";
+			await expect(authStorage.login("vllm", controller)).rejects.toThrow("vLLM API key is required");
+			expect(store.getApiKey("vllm")).toBe("first-vllm-key");
+
+			await authStorage.logout("vllm");
+			expect(store.getApiKey("vllm")).toBeNull();
+
+			promptValue = "  second-vllm-key  ";
+			await authStorage.login("vllm", controller);
+			expect(store.getApiKey("vllm")).toBe("second-vllm-key");
+		} finally {
+			store.close();
+		}
 	});
 });

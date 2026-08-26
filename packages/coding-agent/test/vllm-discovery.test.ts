@@ -178,7 +178,52 @@ describe("ModelRegistry vLLM Discovery", () => {
 		expect(registry.find("vllm", "sentinel-keyless-vllm-model")).toBeDefined();
 	});
 
-	test("does not let the empty-login sentinel authorize remote discovery", async () => {
+	test("neutralizes a stored legacy sentinel and preserves the environment key", async () => {
+		await authStorage.set("vllm", { type: "api_key", key: "vllm-local" });
+		Bun.env.VLLM_API_KEY = "env-vllm-key";
+
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			if (!url.includes(":8000/v1/models")) return new Response(null, { status: 404 });
+			const headers = init?.headers as Headers | Record<string, string> | undefined;
+			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+			expect(authHeader).toBe("Bearer env-vllm-key");
+			return new Response(JSON.stringify({ data: [{ id: "legacy-sentinel-vllm-model" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		// AuthStorage intentionally retains stored-credential precedence; the model
+		// registry must recognize this historical marker before it reaches inference.
+		expect(await authStorage.getApiKey("vllm")).toBe("vllm-local");
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refreshProvider("vllm", "online");
+		const model = registry.find("vllm", "legacy-sentinel-vllm-model");
+		expect(model).toBeDefined();
+		expect(await registry.getApiKey(model!)).toBe("env-vllm-key");
+	});
+
+	test("maps a stored legacy sentinel to keyless auth when no environment key exists", async () => {
+		await authStorage.set("vllm", { type: "api_key", key: "vllm-local" });
+
+		using _hook = hookFetch(input => {
+			if (!String(input).includes(":8000/v1/models")) return new Response(null, { status: 404 });
+			return new Response(JSON.stringify({ data: [{ id: "legacy-keyless-vllm-model" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refreshProvider("vllm", "online");
+		const model = registry.find("vllm", "legacy-keyless-vllm-model");
+		expect(model).toBeDefined();
+		expect(await registry.getApiKey(model!)).toBe(kNoAuth);
+	});
+
+	test("does not let the empty-login vLLM sentinel authorize remote discovery", async () => {
 		Bun.env.VLLM_BASE_URL = "https://vllm.example.test/v1";
 		authStorage.setRuntimeApiKey("vllm", "vllm-local");
 		let requestedRemote = false;

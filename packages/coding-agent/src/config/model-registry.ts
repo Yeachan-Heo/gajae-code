@@ -16,6 +16,7 @@ import {
 	enrichModelThinking,
 	getBundledModels,
 	getBundledProviders,
+	getEnvApiKey,
 	googleAntigravityModelManagerOptions,
 	googleGeminiCliModelManagerOptions,
 	isCodexGpt56Tier,
@@ -45,6 +46,10 @@ const VLLM_DEFAULT_LOCAL_TOKEN = "vllm-local";
 
 function isVllmNoAuthToken(provider: string, apiKey: string | undefined): boolean {
 	return provider === "vllm" && apiKey === VLLM_DEFAULT_LOCAL_TOKEN;
+}
+
+function normalizeVllmApiKey(provider: string, apiKey: string | undefined): string | undefined {
+	return isVllmNoAuthToken(provider, apiKey) ? getEnvApiKey(provider) : apiKey;
 }
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -2585,11 +2590,14 @@ export class ModelRegistry {
 			if (optionalAuth && isCurrentPreflight()) this.#credentiallessAuthFallbackProviders.delete(provider);
 			let apiKey: string | undefined;
 			try {
-				apiKey = await this.#peekApiKeyForProvider(provider, {
-					ignoreCredentiallessFallback: optionalAuth,
-					refreshOAuth: true,
-					baseUrl: providerConfig.baseUrl,
-				});
+				apiKey = normalizeVllmApiKey(
+					provider,
+					await this.#peekApiKeyForProvider(provider, {
+						ignoreCredentiallessFallback: optionalAuth,
+						refreshOAuth: true,
+						baseUrl: providerConfig.baseUrl,
+					}),
+				);
 				const currentAuthConfigurationGeneration = this.authStorage.getProviderConfigurationGeneration(provider);
 				if (preflightAuthConfigurationGeneration !== currentAuthConfigurationGeneration) {
 					const currentOAuthRefreshGeneration = this.authStorage.getProviderOAuthRefreshGeneration(provider);
@@ -4457,9 +4465,11 @@ export class ModelRegistry {
 	}
 
 	async #getApiKeyOrNoAuth(provider: string, lookup: () => Promise<string | undefined>): Promise<string | undefined> {
-		if (!this.#isCredentiallessProvider(provider)) return lookup();
-		if (!this.#optionalAuthProviders.has(provider)) return kNoAuth;
+		const credentialless = this.#isCredentiallessProvider(provider);
+		if (credentialless && !this.#optionalAuthProviders.has(provider)) return kNoAuth;
 		const apiKey = await lookup();
+		if (isVllmNoAuthToken(provider, apiKey)) return normalizeVllmApiKey(provider, apiKey) ?? kNoAuth;
+		if (!credentialless) return apiKey;
 		if (apiKey !== undefined) {
 			this.#credentiallessAuthFallbackProviders.delete(provider);
 			return apiKey;
