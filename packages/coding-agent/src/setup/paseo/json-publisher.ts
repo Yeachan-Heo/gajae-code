@@ -187,9 +187,11 @@ export async function publishPlan(
 	const directory = path.dirname(targetPath);
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 
-	// Compare-and-swap: re-read right before publishing so an external write
-	// between our original read and this rename is refused, not overwritten.
-	const observed = await currentIdentity(targetPath);
+	// Capture the full destination identity before reading bytes. The digest and
+	// inode must describe one snapshot; hashing first and statting later admits
+	// an A→B→A inode successor through an unchanged byte hash.
+	const expectedDestinationIdentity = await captureRegularIdentity(targetPath);
+	const observed = expectedDestinationIdentity?.sha256 ?? ABSENT_IDENTITY;
 	if (observed !== options.expectedIdentity) {
 		throw new PaseoPublishError(targetPath, {
 			reason: "cas-conflict",
@@ -201,7 +203,6 @@ export async function publishPlan(
 	let backupPath: string | undefined;
 	let backupCreated = false;
 	let backupBytes: Buffer | undefined;
-	const expectedDestinationIdentity = await captureRegularIdentity(targetPath);
 	if (observed !== ABSENT_IDENTITY && expectedDestinationIdentity === undefined) {
 		throw new PaseoPublishError(targetPath, {
 			reason: "cas-conflict",
@@ -641,7 +642,7 @@ export async function writeReplacedProviderBackup(
 		// Opening can create the path before surfacing an error, and chmod can
 		// fail after the bytes are durable; either failure must not strand a
 		// credential-bearing temporary sidecar.
-		const handle = await fs.open(temporary, "w", BACKUP_MODE);
+		const handle = await fs.open(temporary, "wx", BACKUP_MODE);
 		try {
 			await handle.writeFile(payload, "utf8");
 			await handle.sync();
