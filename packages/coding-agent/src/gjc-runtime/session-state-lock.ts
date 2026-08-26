@@ -220,10 +220,18 @@ export function setSessionStateLockNativeBindings(load: SessionStateLockNativeLo
  */
 function nativeSessionStateLock(): SessionStateLockNativeBindings {
 	try {
-		if (injectedNativeLoader) return injectedNativeLoader();
-		if (!loadedNativeBindings)
-			loadedNativeBindings = require("@gajae-code/natives") as SessionStateLockNativeBindings;
-		return loadedNativeBindings;
+		let bindings: SessionStateLockNativeBindings;
+		if (injectedNativeLoader) bindings = injectedNativeLoader();
+		else if (loadedNativeBindings) bindings = loadedNativeBindings;
+		else {
+			bindings = require("@gajae-code/natives") as SessionStateLockNativeBindings;
+			loadedNativeBindings = bindings;
+		}
+		for (const name of ["exactUnlink", "snapshotDirectoryTreeAsync", "exactRemoveDirectoryTreeAsync"] as const) {
+			if (typeof bindings[name] !== "function")
+				throw new SessionStateLockUnavailableError(new Error(`Native lock binding ${name} is unavailable.`));
+		}
+		return bindings;
 	} catch (error) {
 		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
 	}
@@ -1106,6 +1114,8 @@ async function releaseTransitionClaim(
 	transitionDir: string,
 	ownerFile: string,
 	held: LockOwnerSnapshot,
+	claim: TransitionClaimIdentity,
+	deadline: number,
 ): Promise<void> {
 	await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(ownerFile);
 	const current = await captureRegularLockOwner(ownerFile);
@@ -1113,7 +1123,9 @@ async function releaseTransitionClaim(
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
 	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
-	await fs.rmdir(transitionDir);
+	await removeTransitionClaimIfIdentityMatches(transitionDir, claim, deadline);
+	if (await transitionClaimIdentity(transitionDir))
+		throw new SessionStateLockUnavailableError(new Error("Transition claim could not be removed safely."));
 }
 
 function releasedOwnerFromSnapshot(held: LockOwnerSnapshot): SessionStateLockOwner {
@@ -1135,6 +1147,8 @@ function releasedOwnerFromSnapshot(held: LockOwnerSnapshot): SessionStateLockOwn
 interface TransitionClaimIdentity {
 	dev: bigint;
 	ino: bigint;
+	nlink: bigint;
+	size: bigint;
 	mtimeNs: bigint;
 	ctimeNs: bigint;
 }
@@ -1142,7 +1156,14 @@ interface TransitionClaimIdentity {
 async function transitionClaimIdentity(transitionDir: string): Promise<TransitionClaimIdentity | undefined> {
 	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
 	if (!stat?.isDirectory()) return undefined;
-	return { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		ctimeNs: stat.ctimeNs,
+	};
 }
 
 function sameTransitionClaimIdentity(left: TransitionClaimIdentity, right: TransitionClaimIdentity): boolean {
@@ -1165,45 +1186,7 @@ async function removeTransitionClaimIfIdentityMatches(
 	} catch {
 		return;
 	}
-	if (cleanupDeadline !== undefined && performance.now() < cleanupDeadline) {
-		if (typeof native.snapshotDirectoryTree !== "function" || typeof native.exactRemoveDirectoryTree !== "function")
-			return;
-		try {
-			const snapshot = native.snapshotDirectoryTree(transitionDir);
-			const root = snapshot.snapshot?.entries[0];
-			if (
-				!snapshot.ok ||
-				!snapshot.snapshot ||
-				!root ||
-				snapshot.snapshot.entries.length !== 1 ||
-				snapshot.snapshot.rootDev !== claim.dev.toString() ||
-				snapshot.snapshot.rootIno !== claim.ino.toString()
-			)
-				return;
-			const removed = native.exactRemoveDirectoryTree(transitionDir, snapshot.snapshot);
-			if (
-				!removed.ok &&
-				removed.code === "cleanup_pending" &&
-				removed.payloadDurable === true &&
-				removed.detachedPath === `${transitionDir}.removing`
-			) {
-				try {
-					fsSync.rmdirSync(`${transitionDir}.removing`);
-				} catch {
-					// Retain a durable detached cleanup record when the final namespace removal fails.
-				}
-			}
-		} catch {
-			// Cleanup refuses on unavailable or changed identity; callers remain fail-closed.
-		}
-		return;
-	}
-	if (
-		typeof native.snapshotDirectoryTreeAsync !== "function" ||
-		typeof native.exactRemoveDirectoryTreeAsync !== "function"
-	)
-		return;
-	const deadline = performance.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+	const deadline = cleanupDeadline ?? performance.now() + LOCK_ACQUIRE_TIMEOUT_MS;
 	let snapshot: NativeDirectoryTreeSnapshot | null;
 	try {
 		snapshot = await captureLegacyDirectoryTree(native, transitionDir, deadline);
@@ -1219,18 +1202,23 @@ async function removeTransitionClaimIfIdentityMatches(
 		snapshot.rootIno !== claim.ino.toString()
 	)
 		return;
-	const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
 	try {
-		const removed = await native.exactRemoveDirectoryTreeAsync(transitionDir, snapshot, undefined, remaining);
+		const removed = native.exactUnlink(transitionDir, {
+			dev: claim.dev,
+			ino: claim.ino,
+			nlink: claim.nlink,
+			size: claim.size,
+			mtimeNs: claim.mtimeNs,
+			directory: true,
+			quarantineName: `.gjc-transition-removing-${randomUUID()}`,
+		});
 		if (
 			!removed.ok &&
-			removed.code === "cleanup_pending" &&
-			removed.payloadDurable === true &&
-			removed.detachedPath === `${transitionDir}.removing`
-		) {
-			await fs.rmdir(`${transitionDir}.removing`).catch(() => undefined);
-		}
-		if (!removed.ok && removed.code !== "not_found" && removed.code !== "identity_mismatch") return;
+			removed.code !== "not_found" &&
+			removed.code !== "identity_mismatch" &&
+			removed.code !== "cleanup_pending"
+		)
+			return;
 	} catch {
 		// Late cleanup is best effort. A failed identity-bound removal leaves the claim
 		// fail-closed rather than risking a successor pathname.
@@ -1369,7 +1357,7 @@ async function withLockPathTransition<T>(
 		try {
 			await withinLockAcquireDeadline(
 				deadline,
-				() => releaseTransitionClaim(transitionDir, ownerFile, held),
+				() => releaseTransitionClaim(transitionDir, ownerFile, held, claim, deadline),
 				() => {
 					void cleanupTransitionClaim(transitionDir, ownerFile, held, claim);
 				},

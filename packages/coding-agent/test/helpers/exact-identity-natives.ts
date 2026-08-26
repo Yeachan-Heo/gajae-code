@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type {
 	NativeDirectoryTreeResult,
 	NativeDirectoryTreeSnapshot,
@@ -52,7 +54,8 @@ function exactUnlink(target: string, identity: NativeExactFileIdentity): NativeE
 		(identity.sha256 !== undefined && identity.sha256 !== sha256Of(bytes))
 	)
 		return { ok: false, code: "identity_mismatch" };
-	fs.unlinkSync(target);
+	if (identity.directory === true) fs.rmdirSync(target);
+	else fs.unlinkSync(target);
 	return { ok: true };
 }
 
@@ -173,7 +176,33 @@ export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 /** Whether the compiled addon actually loads in this environment. */
 function compiledNativesAvailable(): boolean {
 	try {
-		return typeof (require("@gajae-code/natives") as { exactUnlink?: unknown }).exactUnlink === "function";
+		const native = require("@gajae-code/natives") as {
+			exactUnlink?: unknown;
+			snapshotDirectoryTree?: (path: string) => NativeDirectoryTreeResult;
+			snapshotDirectoryTreeAsync?: unknown;
+			exactRemoveDirectoryTree?: (path: string, snapshot: NativeDirectoryTreeSnapshot) => NativeExactUnlinkResult;
+			exactRemoveDirectoryTreeAsync?: unknown;
+		};
+		if (
+			typeof native.exactUnlink === "function" &&
+			typeof native.snapshotDirectoryTreeAsync === "function" &&
+			typeof native.exactRemoveDirectoryTreeAsync === "function"
+		) {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-native-capability-"));
+			const directory = path.join(root, "claim");
+			try {
+				fs.mkdirSync(directory);
+				const snapshot = native.snapshotDirectoryTree?.(directory);
+				const removed =
+					snapshot?.ok && snapshot.snapshot
+						? (native.exactRemoveDirectoryTree?.(directory, snapshot.snapshot) ?? { ok: false })
+						: { ok: false };
+				return removed.ok && !fs.existsSync(directory);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		}
+		return false;
 	} catch {
 		return false;
 	}

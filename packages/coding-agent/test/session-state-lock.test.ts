@@ -139,15 +139,19 @@ function installCleanupPendingNative(lockFile: string, result: NativeExactUnlink
 			const observed = exactIdentityNativeBindings.snapshotDirectoryTree(target);
 			if (!observed.ok || JSON.stringify(observed.snapshot) !== JSON.stringify(snapshot))
 				return { ok: false, code: "identity_mismatch" };
-			if (detachOriginal) fsSync.renameSync(target, `${lockFile}.removing`);
-			return result;
+			const detachedPath = target === lockFile ? `${lockFile}.removing` : `${target}.removing`;
+			if (detachOriginal) fsSync.renameSync(target, detachedPath);
+			return detachOriginal && result.detachedPath === `${lockFile}.removing` ? { ...result, detachedPath } : result;
 		},
 		exactRemoveDirectoryTreeAsync(target, snapshot) {
 			const observed = exactIdentityNativeBindings.snapshotDirectoryTree(target);
 			if (!observed.ok || JSON.stringify(observed.snapshot) !== JSON.stringify(snapshot))
 				return Promise.resolve({ ok: false, code: "identity_mismatch" });
-			if (detachOriginal) fsSync.renameSync(target, `${lockFile}.removing`);
-			return Promise.resolve(result);
+			const detachedPath = target === lockFile ? `${lockFile}.removing` : `${target}.removing`;
+			if (detachOriginal) fsSync.renameSync(target, detachedPath);
+			return Promise.resolve(
+				detachOriginal && result.detachedPath === `${lockFile}.removing` ? { ...result, detachedPath } : result,
+			);
 		},
 	}));
 }
@@ -1221,7 +1225,6 @@ describe("coordinator session state lock", () => {
 			// The successor's record — its own inode and its own token — is untouched.
 			expect(await fs.readFile(ownerFile, "utf8")).toBe(successor);
 			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
-			expect(fsSync.existsSync(`${lockFile}.transition.removing`)).toBe(false);
 
 			// And it still holds real authority: nothing enters behind it until it is gone.
 			const entered: string[] = [];
@@ -1276,6 +1279,7 @@ describe("coordinator session state lock", () => {
 			throw primary;
 		};
 		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
 			exactUnlink() {
 				throw cleanup;
 			},
@@ -1333,21 +1337,11 @@ describe("coordinator session state lock", () => {
 			if (owner.owner_host_id) releasedHostIds.push(owner.owner_host_id);
 		};
 		setSessionStateLockNativeBindings(() => ({
-			exactUnlink() {
+			...exactIdentityNativeBindings,
+			exactUnlink(target, identity) {
+				if (identity.directory === true) return exactIdentityNativeBindings.exactUnlink(target, identity);
 				exactUnlinkCalls++;
 				return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${lockFile}.quarantine` };
-			},
-			snapshotDirectoryTree() {
-				throw new Error("unexpected directory snapshot");
-			},
-			snapshotDirectoryTreeAsync() {
-				throw new Error("unexpected directory snapshot");
-			},
-			exactRemoveDirectoryTree() {
-				throw new Error("unexpected directory removal");
-			},
-			exactRemoveDirectoryTreeAsync() {
-				throw new Error("unexpected directory removal");
 			},
 		}));
 
@@ -1438,21 +1432,11 @@ describe("coordinator session state lock", () => {
 		);
 		let exactUnlinkCalls = 0;
 		setSessionStateLockNativeBindings(() => ({
-			exactUnlink() {
+			...exactIdentityNativeBindings,
+			exactUnlink(target, identity) {
+				if (identity.directory === true) return exactIdentityNativeBindings.exactUnlink(target, identity);
 				exactUnlinkCalls++;
 				return { ok: false, code: "cleanup_failed" };
-			},
-			snapshotDirectoryTree() {
-				throw new Error("unexpected directory snapshot");
-			},
-			snapshotDirectoryTreeAsync() {
-				throw new Error("unexpected directory snapshot");
-			},
-			exactRemoveDirectoryTree() {
-				throw new Error("unexpected directory removal");
-			},
-			exactRemoveDirectoryTreeAsync() {
-				throw new Error("unexpected directory removal");
 			},
 		}));
 
@@ -1508,6 +1492,7 @@ describe("coordinator session state lock", () => {
 			});
 			await fs.writeFile(ownerFile, record);
 			setSessionStateLockNativeBindings(() => ({
+				...exactIdentityNativeBindings,
 				exactUnlink() {
 					return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${ownerFile}.quarantine` };
 				},
