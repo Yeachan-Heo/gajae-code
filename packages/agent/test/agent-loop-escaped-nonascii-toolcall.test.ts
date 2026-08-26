@@ -1261,6 +1261,14 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		}
 
 		expect(outcomes.map(outcome => outcome.type)).toEqual(["escaped_arguments_discarded"]);
+		const discardedCall =
+			outcomes[0]?.type === "escaped_arguments_discarded"
+				? outcomes[0].message.content.find(block => block.type === "toolCall")
+				: undefined;
+		expect(discardedCall?.type === "toolCall" ? discardedCall.incompleteArguments : undefined).toBe(true);
+		expect(discardedCall?.type === "toolCall" ? discardedCall.incompleteArgumentsReason : undefined).toBe(
+			"malformed",
+		);
 		expect(executed).toHaveLength(0);
 	});
 
