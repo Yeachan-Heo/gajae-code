@@ -4749,6 +4749,20 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 			(response.error.code === "terminal_uncertain" ||
 				(response.error.code === "spawn_failed" && response.startupFailure?.reason === "pending"))
 		) {
+			if (response.error.code === "terminal_uncertain")
+				expect(response.error).toMatchObject({
+					cleanup: { phase: "lifecycle", sessionId: expect.any(String), lifecycleFiles: expect.any(Array) },
+				});
+			else
+				expect(response.startupFailure).toMatchObject({
+					phase: "startup",
+					reason: "pending",
+					cleanupProof: {
+						processExited: true,
+						endpointRemoved: true,
+						hostUnregistered: { state: "not_registered" },
+					},
+				});
 			const serialized = JSON.stringify(response);
 			expect(serialized).not.toContain(bare);
 			expect(serialized).not.toContain(overlap);
@@ -4787,7 +4801,14 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		await broker.start();
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
 		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
-		if (!response.ok && response.error.code === "terminal_uncertain") return;
+		if (!response.ok && response.error.code === "terminal_uncertain") {
+			expect(response.startupFailure).toMatchObject({
+				phase: "startup",
+				reason: "pending",
+				artifactDigest: expect.any(String),
+			});
+			return;
+		}
 		expect(response).toMatchObject({
 			ok: false,
 			error: { code: "spawn_failed", endpoint: "unavailable" },
