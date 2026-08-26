@@ -843,6 +843,18 @@ export interface ContextLine {
 export declare function copyToClipboard(text: string): void
 
 /**
+ * Create one exclusive transition claim directory and its private marker
+ * through a single native blocking operation.
+ *
+ * The native implementation opens the newly-created directory without
+ * following links, creates the marker relative to that retained descriptor,
+ * and returns the directory's complete post-marker identity. `timeout_ms`
+ * bounds the JavaScript promise; the worker also checks the same deadline
+ * between mutations and removes a claim it created when the budget expires.
+ */
+export declare function createTransitionClaimAsync(path: string, marker: string, timeoutMs?: number | undefined | null): Promise<NativeTransitionClaimResult>
+
+/**
  * Returns the operating system's canonical path for the running executable.
  * Unlike argv, this is not supplied by the process caller.
  */
@@ -1976,6 +1988,19 @@ export type NativeOwnerOnlySecurityResult =
 			protocol?: never;
 			aclEvidence?: never;
 	  }
+
+/** Result of atomically creating a transition claim directory and marker. */
+export interface NativeTransitionClaimResult {
+	ok: boolean;
+	code?: string;
+	marker?: string;
+	dev?: string;
+	ino?: string;
+	nlink?: string;
+	size?: string;
+	mtimeNs?: string;
+	ctimeNs?: string;
+}
 
 /** Bound endpoint info returned from [`NotificationServer::start`]. */
 export interface NotificationEndpoint {

@@ -184,6 +184,8 @@ const requiredGeneratedBindingSymbols = [
 	"verifyOwnerOnlyPathSecurityExpected",
 	"probeWindowsJobMemory",
 	"currentExecutablePath",
+	"NativeTransitionClaimResult",
+	"createTransitionClaimAsync",
 ] as const;
 
 export function validateGeneratedBindingSource(bindings: string): void {

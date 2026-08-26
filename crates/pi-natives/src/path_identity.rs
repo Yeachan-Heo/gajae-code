@@ -478,6 +478,80 @@ impl NativeDirectoryTreeResult {
 		Self { ok: false, code: Some(code.to_owned()), snapshot: None }
 	}
 }
+
+/// Result of atomically creating a transition claim directory and its private
+/// marker through one native authority operation.
+#[napi(object)]
+pub struct NativeTransitionClaimResult {
+	pub ok:       bool,
+	pub code:     Option<String>,
+	pub marker:   Option<String>,
+	pub dev:      Option<String>,
+	pub ino:      Option<String>,
+	pub nlink:    Option<String>,
+	pub size:     Option<String>,
+	pub mtime_ns: Option<String>,
+	pub ctime_ns: Option<String>,
+}
+
+impl NativeTransitionClaimResult {
+	fn success(
+		marker: String,
+		dev: u64,
+		ino: u64,
+		nlink: u64,
+		size: u64,
+		mtime_ns: i128,
+		ctime_ns: i128,
+	) -> Self {
+		Self::success_strings(
+			marker,
+			dev.to_string(),
+			ino.to_string(),
+			nlink.to_string(),
+			size.to_string(),
+			mtime_ns.to_string(),
+			ctime_ns.to_string(),
+		)
+	}
+
+	fn success_strings(
+		marker: String,
+		dev: String,
+		ino: String,
+		nlink: String,
+		size: String,
+		mtime_ns: String,
+		ctime_ns: String,
+	) -> Self {
+		Self {
+			ok:       true,
+			code:     None,
+			marker:   Some(marker),
+			dev:      Some(dev),
+			ino:      Some(ino),
+			nlink:    Some(nlink),
+			size:     Some(size),
+			mtime_ns: Some(mtime_ns),
+			ctime_ns: Some(ctime_ns),
+		}
+	}
+
+	fn failure(code: &str) -> Self {
+		Self {
+			ok:       false,
+			code:     Some(code.to_owned()),
+			marker:   None,
+			dev:      None,
+			ino:      None,
+			nlink:    None,
+			size:     None,
+			mtime_ns: None,
+			ctime_ns: None,
+		}
+	}
+}
+
 impl NativeExactUnlinkResult {
 	const fn success() -> Self {
 		Self {
@@ -1405,6 +1479,49 @@ pub fn link_no_replace_path_async(
 	})
 }
 
+fn valid_transition_marker(marker: &str) -> bool {
+	!marker.is_empty()
+		&& marker != "."
+		&& marker != ".."
+		&& !marker
+			.chars()
+			.any(|character| matches!(character, '/' | '\\' | '\0'))
+}
+
+/// Create one exclusive transition claim directory and its private marker
+/// through a single native blocking operation.
+///
+/// The native implementation opens the newly-created directory without
+/// following links, creates the marker relative to that retained descriptor,
+/// and returns the directory's complete post-marker identity. `timeout_ms`
+/// bounds the JavaScript promise; the worker also checks the same deadline
+/// between mutations and removes a claim it created when the budget expires.
+#[napi]
+pub fn create_transition_claim_async(
+	env: &Env,
+	path: String,
+	marker: String,
+	timeout_ms: Option<u32>,
+) -> napi::Result<PromiseRaw<'_, NativeTransitionClaimResult>> {
+	if path.contains('\0') || !valid_transition_marker(&marker) {
+		return task::future(env, "create_transition_claim", async {
+			Ok(NativeTransitionClaimResult::failure("invalid_request"))
+		});
+	}
+	task::isolated_with_timeout(
+		env,
+		"create_transition_claim",
+		timeout_ms,
+		move || {
+			let deadline = timeout_ms.map(|milliseconds| {
+				std::time::Instant::now() + std::time::Duration::from_millis(u64::from(milliseconds))
+			});
+			Ok(platform::create_transition_claim(Path::new(&path), &marker, deadline))
+		},
+		Some(NativeTransitionClaimResult::failure("timed_out")),
+	)
+}
+
 /// Capture a deterministic, descriptor-relative snapshot of a regular-file and
 /// directory-only tree. Symlinks, special files, non-UTF-8 names, and topology
 /// changes are rejected rather than followed.
@@ -1865,17 +1982,20 @@ pub(crate) mod platform {
 		ffi::CString,
 		fmt::Write as _,
 		fs::{self, File},
+		io::Write as _,
 		os::{
 			fd::{AsRawFd, FromRawFd},
 			unix::ffi::OsStrExt,
 		},
 		path::{Component, Path},
+		time::Instant,
 	};
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
+		NativeOwnerOnlySecurityResult, NativeTransitionClaimResult, digest_reader, io_code,
+		security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -2271,12 +2391,258 @@ pub(crate) mod platform {
 		NativeCanonicalDirectoryIdentity::success("posix", canonical_path.to_owned())
 	}
 
+	pub(super) fn create_transition_claim(
+		path: &Path,
+		marker: &str,
+		deadline: Option<Instant>,
+	) -> NativeTransitionClaimResult {
+		if transition_deadline_expired(deadline) {
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		let (parent_fd, parent_name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeTransitionClaimResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		// SAFETY: open_parent_no_follow transfers ownership of this live descriptor.
+		let parent = unsafe { File::from_raw_fd(parent_fd) };
+		if transition_deadline_expired(deadline) {
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		// SAFETY: parent is a live directory descriptor and parent_name is a
+		// NUL-terminated single path component.
+		if unsafe { libc::mkdirat(parent.as_raw_fd(), parent_name.as_ptr(), 0o700) } != 0 {
+			return NativeTransitionClaimResult::failure(transition_creation_code(
+				&std::io::Error::last_os_error(),
+			));
+		}
+
+		// SAFETY: parent remains live and the no-follow flags reject a substituted
+		// symlink or special file at the newly-created final component.
+		let directory_fd = unsafe {
+			libc::openat(
+				parent.as_raw_fd(),
+				parent_name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if directory_fd < 0 {
+			return NativeTransitionClaimResult::failure(security_code(
+				&std::io::Error::last_os_error(),
+			));
+		}
+		// SAFETY: directory_fd is a newly-owned successful openat result.
+		let directory = unsafe { File::from_raw_fd(directory_fd) };
+		let Ok(marker_name) = CString::new(marker.as_bytes()) else {
+			return NativeTransitionClaimResult::failure("invalid_request");
+		};
+		if transition_deadline_expired(deadline) {
+			cleanup_created_transition(
+				parent.as_raw_fd(),
+				&parent_name,
+				&directory,
+				None,
+				&marker_name,
+			);
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+
+		// SAFETY: the marker is created relative to the retained directory
+		// descriptor, never through the mutable transition pathname.
+		let marker_fd = unsafe {
+			libc::openat(
+				directory.as_raw_fd(),
+				marker_name.as_ptr(),
+				libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				0o600,
+			)
+		};
+		if marker_fd < 0 {
+			let result = NativeTransitionClaimResult::failure(transition_creation_code(
+				&std::io::Error::last_os_error(),
+			));
+			cleanup_created_transition(
+				parent.as_raw_fd(),
+				&parent_name,
+				&directory,
+				None,
+				&marker_name,
+			);
+			return result;
+		}
+		// SAFETY: marker_fd is a newly-owned successful openat result.
+		let mut marker_file = unsafe { File::from_raw_fd(marker_fd) };
+		if transition_deadline_expired(deadline) {
+			cleanup_created_transition(
+				parent.as_raw_fd(),
+				&parent_name,
+				&directory,
+				Some(&marker_file),
+				&marker_name,
+			);
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		if let Err(error) = marker_file
+			.write_all(marker.as_bytes())
+			.and_then(|()| marker_file.sync_all())
+		{
+			let result = NativeTransitionClaimResult::failure(transition_creation_code(&error));
+			cleanup_created_transition(
+				parent.as_raw_fd(),
+				&parent_name,
+				&directory,
+				Some(&marker_file),
+				&marker_name,
+			);
+			return result;
+		}
+		let stat = match transition_stat(directory.as_raw_fd()) {
+			Ok(stat) => stat,
+			Err(code) => {
+				cleanup_created_transition(
+					parent.as_raw_fd(),
+					&parent_name,
+					&directory,
+					Some(&marker_file),
+					&marker_name,
+				);
+				return NativeTransitionClaimResult::failure(code);
+			},
+		};
+		if transition_deadline_expired(deadline) {
+			cleanup_created_transition(
+				parent.as_raw_fd(),
+				&parent_name,
+				&directory,
+				Some(&marker_file),
+				&marker_name,
+			);
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		drop(marker_file);
+		NativeTransitionClaimResult::success(
+			marker.to_owned(),
+			stat.st_dev as u64,
+			stat.st_ino as u64,
+			stat.st_nlink as u64,
+			stat.st_size as u64,
+			stat_mtime_ns(&stat),
+			stat_ctime_ns(&stat),
+		)
+	}
+
 	fn security_code(error: &std::io::Error) -> &'static str {
 		if error.raw_os_error() == Some(libc::ELOOP) {
 			"reparse_point"
 		} else {
 			security_io_code(error)
 		}
+	}
+
+	fn transition_creation_code(error: &std::io::Error) -> &'static str {
+		match error.raw_os_error() {
+			Some(libc::EEXIST) => "already_exists",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::ELOOP) => "reparse_point",
+			Some(libc::ENOTDIR) => "not_directory",
+			_ => security_code(error),
+		}
+	}
+
+	fn transition_deadline_expired(deadline: Option<Instant>) -> bool {
+		deadline.is_some_and(|deadline| Instant::now() >= deadline)
+	}
+
+	fn transition_stat(fd: libc::c_int) -> Result<libc::stat, &'static str> {
+		// SAFETY: zero is valid initialized storage for fstat output.
+		let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: fd is retained by the caller and stat is writable storage.
+		if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+			return Err(security_code(&std::io::Error::last_os_error()));
+		}
+		Ok(stat)
+	}
+
+	fn same_transition_object(left: &libc::stat, right: &libc::stat) -> bool {
+		left.st_dev == right.st_dev && left.st_ino == right.st_ino
+	}
+
+	/// Remove only the claim objects held by this operation after a post-create
+	/// failure. The descriptor identities are checked against their names before
+	/// either unlink, so a concurrent replacement is left untouched.
+	fn cleanup_created_transition(
+		parent_fd: libc::c_int,
+		parent_name: &CString,
+		directory: &File,
+		marker: Option<&File>,
+		marker_name: &CString,
+	) {
+		let marker_removed = match marker {
+			Some(marker) => {
+				let Ok(marker_stat) = transition_stat(marker.as_raw_fd()) else {
+					return;
+				};
+				let Ok(named) = (|| {
+					// SAFETY: directory and marker_name are live retained authority.
+					let mut named: libc::stat = unsafe { std::mem::zeroed() };
+					if unsafe {
+						libc::fstatat(
+							directory.as_raw_fd(),
+							marker_name.as_ptr(),
+							&mut named,
+							libc::AT_SYMLINK_NOFOLLOW,
+						)
+					} != 0
+					{
+						return Err(());
+					}
+					Ok(named)
+				})() else {
+					return;
+				};
+				if !same_transition_object(&marker_stat, &named) {
+					return;
+				}
+				// SAFETY: directory and marker_name remain live, and identity was
+				// checked against the descriptor that created this marker.
+				unsafe { libc::unlinkat(directory.as_raw_fd(), marker_name.as_ptr(), 0) == 0 }
+			},
+			None => {
+				// An absent marker descriptor means no marker was created by this
+				// operation. `rmdir` below still refuses a foreign marker or payload.
+				true
+			},
+		};
+		if !marker_removed {
+			return;
+		}
+		let Ok(directory_stat) = transition_stat(directory.as_raw_fd()) else {
+			return;
+		};
+		let Ok(named) = (|| {
+			// SAFETY: parent_fd and parent_name are live retained authority.
+			let mut named: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe {
+				libc::fstatat(parent_fd, parent_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} != 0
+			{
+				return Err(());
+			}
+			Ok(named)
+		})() else {
+			return;
+		};
+		if !same_transition_object(&directory_stat, &named)
+			|| named.st_mode & libc::S_IFMT != libc::S_IFDIR
+		{
+			return;
+		}
+		// SAFETY: the retained parent and name still identify the directory whose
+		// descriptor was created by this operation.
+		let _ = unsafe { libc::unlinkat(parent_fd, parent_name.as_ptr(), libc::AT_REMOVEDIR) };
 	}
 
 	#[cfg(target_os = "netbsd")]
@@ -6000,10 +6366,16 @@ pub(crate) mod platform {
 mod platform {
 	use std::{
 		ffi::{OsString, c_void},
+		fs::File,
+		io::Write as _,
 		mem::{align_of, size_of},
-		os::windows::ffi::{OsStrExt, OsStringExt},
+		os::windows::{
+			ffi::{OsStrExt, OsStringExt},
+			io::{AsRawHandle, FromRawHandle},
+		},
 		path::{Component, Path, PathBuf},
 		ptr::{null, null_mut},
+		time::Instant,
 	};
 
 	use sha2::{Digest, Sha256};
@@ -6037,9 +6409,9 @@ mod platform {
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
 		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
-		sha256,
+		NativeOwnerOnlySecurityResult, NativeTransitionClaimResult, STATUS_INVALID_PARAMETER,
+		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
+		open_with_transient_retry, sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -6306,8 +6678,13 @@ mod platform {
 	}
 
 	const FILE_OPEN: u32 = 1;
+	const FILE_CREATE: u32 = 2;
 	const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 	const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+	const FILE_LIST_DIRECTORY: u32 = 0x0000_0001;
+	const FILE_ADD_FILE: u32 = 0x0000_0002;
+	const FILE_WRITE_DATA: u32 = 0x0000_0002;
+	const DELETE_ACCESS: u32 = 0x0001_0000;
 	const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 	const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 	const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -6384,6 +6761,18 @@ mod platform {
 		}
 	}
 
+	fn transition_status_code(status: i32) -> &'static str {
+		match status as u32 {
+			0xc000_0035 => "already_exists",
+			0xc000_0022 => "permission_denied",
+			_ => ntstatus_code(status),
+		}
+	}
+
+	fn transition_deadline_expired(deadline: Option<Instant>) -> bool {
+		deadline.is_some_and(|deadline| Instant::now() >= deadline)
+	}
+
 	fn open_relative_with_share(
 		parent: HANDLE,
 		name: &std::ffi::OsStr,
@@ -6404,6 +6793,24 @@ mod platform {
 		desired_access: u32,
 		directory: bool,
 		share_access: u32,
+	) -> Result<HANDLE, i32> {
+		open_relative_with_share_status_and_disposition(
+			parent,
+			name,
+			desired_access,
+			directory,
+			share_access,
+			FILE_OPEN,
+		)
+	}
+
+	fn open_relative_with_share_status_and_disposition(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		desired_access: u32,
+		directory: bool,
+		share_access: u32,
+		create_disposition: u32,
 	) -> Result<HANDLE, i32> {
 		let mut name: Vec<u16> = name.encode_wide().collect();
 		if name.is_empty()
@@ -6449,7 +6856,7 @@ mod platform {
 				null_mut(),
 				FILE_ATTRIBUTE_NORMAL,
 				share_access,
-				FILE_OPEN,
+				create_disposition,
 				options,
 				null_mut(),
 				0,
@@ -6459,6 +6866,24 @@ mod platform {
 			return Err(create_status);
 		}
 		Ok(handle)
+	}
+
+	fn create_relative_with_share(
+		parent: HANDLE,
+		name: &std::ffi::OsStr,
+		desired_access: u32,
+		directory: bool,
+		share_access: u32,
+	) -> Result<HANDLE, &'static str> {
+		open_relative_with_share_status_and_disposition(
+			parent,
+			name,
+			desired_access,
+			directory,
+			share_access,
+			FILE_CREATE,
+		)
+		.map_err(transition_status_code)
 	}
 
 	fn open_relative(
@@ -6598,6 +7023,36 @@ mod platform {
 					},
 				};
 				if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+					unsafe { CloseHandle(handle) };
+					return Err("reparse_point".to_owned());
+				}
+				Ok(HeldExact { target: handle, ancestors: Vec::new() })
+			},
+			Err(result) => Err(result.code.unwrap_or_else(|| "io_error".to_owned())),
+		}
+	}
+
+	fn open_transition_parent(path: &Path) -> Result<HeldExact, String> {
+		let desired_access =
+			FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_ADD_FILE;
+		match open_exact(path, "directory", desired_access) {
+			Ok(handle) => Ok(handle),
+			Err(_result)
+				if path
+					.components()
+					.all(|component| matches!(component, Component::Prefix(_) | Component::RootDir)) =>
+			{
+				let handle = open_path(path, true, desired_access).map_err(str::to_owned)?;
+				let attributes = match handle_attributes(handle) {
+					Ok(attributes) => attributes,
+					Err(code) => {
+						unsafe { CloseHandle(handle) };
+						return Err(code.to_owned());
+					},
+				};
+				if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+					|| attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+				{
 					unsafe { CloseHandle(handle) };
 					return Err("reparse_point".to_owned());
 				}
@@ -8331,6 +8786,146 @@ mod platform {
 		Ok(())
 	}
 
+	fn cleanup_created_transition(directory: &HeldExact, marker: Option<File>) {
+		if let Some(marker) = marker {
+			let removed = delete_handle(marker.as_raw_handle()).is_ok();
+			drop(marker);
+			if !removed {
+				return;
+			}
+		}
+		let _ = delete_handle(directory.target);
+	}
+
+	pub(super) fn create_transition_claim(
+		path: &Path,
+		marker: &str,
+		deadline: Option<Instant>,
+	) -> NativeTransitionClaimResult {
+		if transition_deadline_expired(deadline) {
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		let path = match lexical_absolute_path(path) {
+			Ok(path) => path,
+			Err(code) => return NativeTransitionClaimResult::failure(code),
+		};
+		let Some(parent_path) = path.parent() else {
+			return NativeTransitionClaimResult::failure("invalid_request");
+		};
+		let Some(name) = path.file_name() else {
+			return NativeTransitionClaimResult::failure("invalid_request");
+		};
+		let parent = match open_transition_parent(parent_path) {
+			Ok(parent) => parent,
+			Err(code) => return NativeTransitionClaimResult::failure(&code),
+		};
+		if transition_deadline_expired(deadline) {
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		let directory_handle = match create_relative_with_share(
+			parent.target,
+			name,
+			FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_ADD_FILE | DELETE_ACCESS,
+			true,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(code) => return NativeTransitionClaimResult::failure(code),
+		};
+		let directory = HeldExact { target: directory_handle, ancestors: Vec::new() };
+		let attributes = match handle_attributes(directory.target) {
+			Ok(attributes) => attributes,
+			Err(code) => {
+				cleanup_created_transition(&directory, None);
+				return NativeTransitionClaimResult::failure(code);
+			},
+		};
+		if attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+			!= FILE_ATTRIBUTE_DIRECTORY
+		{
+			cleanup_created_transition(&directory, None);
+			return NativeTransitionClaimResult::failure("reparse_point");
+		}
+		if transition_deadline_expired(deadline) {
+			cleanup_created_transition(&directory, None);
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		let marker_name = OsString::from(marker);
+		let marker_handle = match create_relative_with_share(
+			directory.target,
+			&marker_name,
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_DATA | DELETE_ACCESS,
+			false,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) {
+			Ok(handle) => handle,
+			Err(code) => {
+				cleanup_created_transition(&directory, None);
+				return NativeTransitionClaimResult::failure(code);
+			},
+		};
+		// SAFETY: marker_handle is a newly-owned successful NtCreateFile result.
+		let mut marker_file = unsafe { File::from_raw_handle(marker_handle) };
+		let marker_attributes = match handle_attributes(marker_file.as_raw_handle()) {
+			Ok(attributes) => attributes,
+			Err(code) => {
+				cleanup_created_transition(&directory, Some(marker_file));
+				return NativeTransitionClaimResult::failure(code);
+			},
+		};
+		if marker_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+			|| marker_attributes & FILE_ATTRIBUTE_DIRECTORY != 0
+		{
+			cleanup_created_transition(&directory, Some(marker_file));
+			return NativeTransitionClaimResult::failure("reparse_point");
+		}
+		if transition_deadline_expired(deadline) {
+			cleanup_created_transition(&directory, Some(marker_file));
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		if let Err(error) = marker_file.write_all(marker.as_bytes()) {
+			cleanup_created_transition(&directory, Some(marker_file));
+			return NativeTransitionClaimResult::failure(
+				if error.kind() == std::io::ErrorKind::PermissionDenied {
+					"permission_denied"
+				} else {
+					"io_error"
+				},
+			);
+		}
+		if let Err(error) = marker_file.sync_all() {
+			cleanup_created_transition(&directory, Some(marker_file));
+			return NativeTransitionClaimResult::failure(
+				if error.kind() == std::io::ErrorKind::PermissionDenied {
+					"permission_denied"
+				} else {
+					"io_error"
+				},
+			);
+		}
+		let entry = match tree_entry(directory.target, String::new(), "directory") {
+			Ok(entry) => entry,
+			Err(code) => {
+				cleanup_created_transition(&directory, Some(marker_file));
+				return NativeTransitionClaimResult::failure(code);
+			},
+		};
+		if transition_deadline_expired(deadline) {
+			cleanup_created_transition(&directory, Some(marker_file));
+			return NativeTransitionClaimResult::failure("timed_out");
+		}
+		drop(marker_file);
+		NativeTransitionClaimResult::success_strings(
+			marker.to_owned(),
+			entry.dev,
+			entry.ino,
+			entry.nlink,
+			entry.size,
+			entry.mtime_ns,
+			entry.ctime_ns,
+		)
+	}
+
 	/// Validate the complete retained tree before any handle rename or deletion.
 	/// Entries absent from the snapshot subset may have been removed by an
 	/// earlier attempt; every entry that remains must still map uniquely to its
@@ -8572,6 +9167,7 @@ mod platform {
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeResult,
 		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativeTransitionClaimResult,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -8600,6 +9196,13 @@ mod platform {
 	}
 	pub(super) fn snapshot_directory_tree(_: &Path) -> NativeDirectoryTreeResult {
 		NativeDirectoryTreeResult::failure("tree_authority_unavailable")
+	}
+	pub(super) fn create_transition_claim(
+		_: &Path,
+		_: &str,
+		_: Option<std::time::Instant>,
+	) -> NativeTransitionClaimResult {
+		NativeTransitionClaimResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_remove_directory_tree(
 		_: &Path,

@@ -763,6 +763,11 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			`Loaded ${candidate} but it lacks required async directory removal capability \`exactRemoveDirectoryTreeAsync\`.`,
 		);
 	}
+	if (typeof bindings.createTransitionClaimAsync !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required native transition claim capability \`createTransitionClaimAsync\`.`,
+		);
+	}
 }
 
 function buildHelpMessage(ctx) {

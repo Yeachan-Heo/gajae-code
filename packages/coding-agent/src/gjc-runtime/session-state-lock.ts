@@ -6,6 +6,7 @@ import type {
 	NativeDirectoryTreeResult,
 	NativeDirectoryTreeSnapshot,
 	NativeExactUnlinkResult,
+	NativeTransitionClaimResult,
 } from "@gajae-code/natives";
 import { type FileLockOwnerToken, readFileLockInfoForGc } from "../config/file-lock";
 import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
@@ -41,16 +42,17 @@ const LOCK_STALE_MS = 30_000;
  * write-failure cleanup, release — is made under this separate claim. Only pathname
  * bookkeeping happens inside it; the caller's state-file operation never does.
  *
- * The claim is an atomic empty directory at `<file>.lock.transition`; its machine-qualified
- * owner record is the sibling `<file>.lock.transition.owner`. `mkdir` admits exactly one
- * contender, while the held directory prevents a successor until release unlinks the
- * validated sidecar and atomically `rmdir`s the claim. A crash before either step leaves a
- * fail-closed directory for explicit recovery; concurrent automatic reclaim cannot prove
- * that a directory + sibling sidecar still name the claim it inspected.
+ * The claim is an atomic directory at `<file>.lock.transition` with a private marker created
+ * relative to its native descriptor; its machine-qualified owner record is the sibling
+ * `<file>.lock.transition.owner`. Exclusive directory creation admits exactly one contender,
+ * while the held directory prevents a successor until release removes the validated marker,
+ * owner record, and claim tree. A crash before either step leaves a fail-closed directory for
+ * explicit recovery; concurrent automatic reclaim cannot prove that a directory + marker
+ * + sibling sidecar still name the claim it inspected.
  *
- * The separate sidecar keeps the claim directory empty, which is what makes `rmdir` the
- * identity-safe portable release primitive. The path stays distinct from `<file>.lock`
- * (whose regular-file owner format base writers read) and from the outer
+ * The marker is the claim's private provenance token, and the sidecar carries the owner
+ * incarnation separately. The path stays distinct from `<file>.lock` (whose regular-file
+ * owner format base writers read) and from the outer
  * `locks/mutation.lock` (whose generic directory semantics are unchanged).
  */
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
@@ -188,6 +190,7 @@ export type SessionStateLockNativeBindings = Pick<
 	| "exactUnlinkAsync"
 	| "snapshotDirectoryTree"
 	| "snapshotDirectoryTreeAsync"
+	| "createTransitionClaimAsync"
 >;
 
 /** How the deletion primitives are obtained. Throwing means they are unavailable. */
@@ -238,7 +241,12 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
 
 function transitionNativeSessionStateLock(): SessionStateLockNativeBindings {
 	const bindings = nativeSessionStateLock();
-	for (const name of ["exactUnlinkAsync", "snapshotDirectoryTreeAsync", "exactRemoveDirectoryTreeAsync"] as const) {
+	for (const name of [
+		"exactUnlinkAsync",
+		"snapshotDirectoryTreeAsync",
+		"exactRemoveDirectoryTreeAsync",
+		"createTransitionClaimAsync",
+	] as const) {
 		if (typeof bindings[name] !== "function")
 			throw new SessionStateLockUnavailableError(new Error(`Native lock binding ${name} is unavailable.`));
 	}
@@ -1280,11 +1288,36 @@ async function removeTransitionClaimIfIdentityMatches(
 
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
 async function createTransitionClaim(transitionDir: string, deadline: number): Promise<TransitionClaimIdentity> {
-	await fs.mkdir(transitionDir);
 	const marker = `.claim-${randomUUID()}`;
-	await fs.writeFile(path.join(transitionDir, marker), marker, { flag: "wx" });
-	const createdClaim = await transitionClaimIdentity(transitionDir, marker);
-	if (!createdClaim) throw new SessionStateLockUnavailableError();
+	const native = transitionNativeSessionStateLock();
+	const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
+	const result: NativeTransitionClaimResult = await native.createTransitionClaimAsync(
+		transitionDir,
+		marker,
+		remaining,
+	);
+	if (!result.ok) {
+		const code =
+			result.code === "already_exists" ? "EEXIST" : result.code === "permission_denied" ? "EPERM" : result.code;
+		throw Object.assign(new Error(`Native transition claim creation failed: ${result.code ?? "unknown"}.`), { code });
+	}
+	const nativeIdentity = [result.dev, result.ino, result.nlink, result.size, result.mtimeNs, result.ctimeNs];
+	if (result.marker !== marker || nativeIdentity.some(value => typeof value !== "string"))
+		throw new SessionStateLockUnavailableError(new Error("Native transition claim identity is incomplete."));
+	let createdClaim: TransitionClaimIdentity;
+	try {
+		createdClaim = {
+			marker,
+			dev: BigInt(result.dev!),
+			ino: BigInt(result.ino!),
+			nlink: BigInt(result.nlink!),
+			size: BigInt(result.size!),
+			mtimeNs: BigInt(result.mtimeNs!),
+			ctimeNs: BigInt(result.ctimeNs!),
+		};
+	} catch (error) {
+		throw new SessionStateLockUnavailableError(error);
+	}
 	try {
 		await SessionStateLockTestHooks.beforeTransitionIdentityCapture?.(transitionDir);
 		const claim = await transitionClaimIdentity(transitionDir, marker);

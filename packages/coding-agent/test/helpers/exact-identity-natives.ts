@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type {
@@ -7,6 +8,7 @@ import type {
 	NativeDirectoryTreeSnapshot,
 	NativeExactFileIdentity,
 	NativeExactUnlinkResult,
+	NativeTransitionClaimResult,
 } from "@gajae-code/natives";
 import {
 	type SessionStateLockNativeBindings,
@@ -156,6 +158,49 @@ async function exactRemoveDirectoryTreeAsync(
 	return await settleWithTypedTimeout(settled, timeoutMs, startedAt, { ok: false, code: "timed_out" });
 }
 
+/** Test-only stand-in for the native transition claim authority. */
+async function createTransitionClaimAsync(
+	root: string,
+	marker: string,
+	timeoutMs?: number | undefined | null,
+): Promise<NativeTransitionClaimResult> {
+	const startedAt = performance.now();
+	const settled = new Promise<NativeTransitionClaimResult>(resolve => {
+		setImmediate(async () => {
+			let directory: FileHandle | undefined;
+			let markerFile: FileHandle | undefined;
+			try {
+				await fs.promises.mkdir(root, { mode: 0o700 });
+				directory = await fs.promises.open(root, "r");
+				markerFile = await fs.promises.open(path.join(root, marker), "wx", 0o600);
+				await markerFile.writeFile(marker, "utf8");
+				await markerFile.sync();
+				const stat = await directory.stat({ bigint: true });
+				resolve({
+					ok: true,
+					marker,
+					dev: stat.dev.toString(),
+					ino: stat.ino.toString(),
+					nlink: stat.nlink.toString(),
+					size: stat.size.toString(),
+					mtimeNs: stat.mtimeNs.toString(),
+					ctimeNs: stat.ctimeNs.toString(),
+				});
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				resolve({
+					ok: false,
+					code: code === "EEXIST" ? "already_exists" : code === "EPERM" ? "permission_denied" : "io_error",
+				});
+			} finally {
+				await markerFile?.close().catch(() => undefined);
+				await directory?.close().catch(() => undefined);
+			}
+		});
+	});
+	return await settleWithTypedTimeout(settled, timeoutMs, startedAt, { ok: false, code: "timed_out" });
+}
+
 /**
  * The addon settles `timeout_ms` with a typed refusal value while the worker keeps
  * running; the JS side never blocks on the worker's completion. The double must do
@@ -181,6 +226,7 @@ async function settleWithTypedTimeout<T>(
 export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 	exactUnlink,
 	exactUnlinkAsync,
+	createTransitionClaimAsync: (root, marker, timeoutMs) => createTransitionClaimAsync(root, marker, timeoutMs),
 	snapshotDirectoryTree,
 	snapshotDirectoryTreeAsync: (root, timeoutMs) => snapshotDirectoryTreeAsync(root, timeoutMs),
 	exactRemoveDirectoryTree,
@@ -194,6 +240,7 @@ function compiledNativesAvailable(): boolean {
 		const native = require("@gajae-code/natives") as {
 			exactUnlink?: unknown;
 			exactUnlinkAsync?: unknown;
+			createTransitionClaimAsync?: unknown;
 			snapshotDirectoryTree?: (path: string) => NativeDirectoryTreeResult;
 			snapshotDirectoryTreeAsync?: unknown;
 			exactRemoveDirectoryTree?: (path: string, snapshot: NativeDirectoryTreeSnapshot) => NativeExactUnlinkResult;
@@ -202,6 +249,7 @@ function compiledNativesAvailable(): boolean {
 		if (
 			typeof native.exactUnlink === "function" &&
 			typeof native.exactUnlinkAsync === "function" &&
+			typeof native.createTransitionClaimAsync === "function" &&
 			typeof native.snapshotDirectoryTreeAsync === "function" &&
 			typeof native.exactRemoveDirectoryTreeAsync === "function"
 		) {

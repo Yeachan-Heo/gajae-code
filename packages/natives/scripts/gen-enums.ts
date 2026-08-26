@@ -231,6 +231,18 @@ function applyPathIdentityTypes(dts: string): string {
 			protocol?: never;
 			aclEvidence?: never;
 	  }`;
+	const transitionClaim = `/** Result of atomically creating a transition claim directory and marker. */
+export interface NativeTransitionClaimResult {
+	ok: boolean;
+	code?: string;
+	marker?: string;
+	dev?: string;
+	ino?: string;
+	nlink?: string;
+	size?: string;
+	mtimeNs?: string;
+	ctimeNs?: string;
+}`;
 	return dts
 		.replace(
 			/^export declare function canonicalExistingDirectoryIdentity\([^\n]*$/m,
@@ -263,7 +275,7 @@ function applyPathIdentityTypes(dts: string): string {
 		.replace(/export interface NativeCanonicalDirectoryIdentity \{[\s\S]*?\n\}/, identity)
 		.replace(
 			/export (?:interface|type) NativeOwnerOnlySecurityResult[\s\S]*?(?=\n\n\/\*\* Bound endpoint info)/,
-			security,
+			`${security}\n\n${transitionClaim}`,
 		);
 }
 
