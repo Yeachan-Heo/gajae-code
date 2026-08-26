@@ -7,6 +7,7 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	createTransitionClaimAsync,
 	exactRemoveDirectoryTree,
 	exactRestore,
 	exactUnlink,
@@ -514,6 +515,22 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect((await fs.stat(target)).mode & 0o777).toBe(0o755);
 		expect((await fs.stat(state)).mode & 0o777).toBe(0o644);
 	});
+	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
+		"creates a descriptor-bound transition claim and rejects target collisions",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+			temporaryDirectories.push(root);
+			const claim = path.join(root, "claim");
+			const first = await createTransitionClaimAsync(claim, ".claim-test", 1_000);
+			expect(first).toMatchObject({ ok: true, marker: ".claim-test" });
+			expect(typeof first.dev).toBe("string");
+			expect(await fs.readFile(path.join(claim, ".claim-test"), "utf8")).toBe(".claim-test");
+			expect(await createTransitionClaimAsync(claim, ".claim-successor", 1_000)).toEqual({
+				ok: false,
+				code: "already_exists",
+			});
+		},
+	);
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"rejects a root directory generation change after an empty snapshot",
 		async () => {
