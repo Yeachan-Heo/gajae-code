@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type * as nodeFs from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as paseoNatives from "@gajae-code/natives";
 import { snapshotDirectoryTree } from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
@@ -18,6 +20,7 @@ import {
 } from "../src/setup/paseo/install-saga";
 import * as paseoJsonPublisher from "../src/setup/paseo/json-publisher";
 import {
+	ABSENT_IDENTITY,
 	captureRegularIdentity,
 	currentIdentity,
 	hashBytes,
@@ -299,6 +302,52 @@ describe("byte preservation (AC-3)", () => {
 });
 
 describe("compare-and-swap", () => {
+	test("retains a successor when staged cleanup loses its identity race", async () => {
+		const { paths } = await makeFixture();
+		await seedConfig(paths);
+		const current = await readTarget(paths.configJson);
+		const plan = planPublish(current, draft => {
+			providersOf(draft).gjc = { enabled: true, raceMarker: "successor-test" };
+		});
+		expect(plan.unchanged).toBe(false);
+		await fs.rm(paths.configJson);
+		const originalRename = paseoNatives.renameNoReplacePath;
+		let swapped = false;
+		let successorPath = "";
+		const rename = (source: string, destination: string, expected?: paseoNatives.NativeExactFileIdentity) => {
+			if (!swapped) {
+				swapped = true;
+				successorPath = String(source);
+				fsSync.unlinkSync(String(source));
+				fsSync.writeFileSync(String(source), "successor", { mode: 0o600 });
+				return {
+					ok: false,
+					code: "identity_mismatch",
+					mutationState: "not_committed",
+					durabilityState: "not_attempted",
+					reason: "identity_violation",
+					primitive: "test",
+					phase: "preflight",
+					diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+				};
+			}
+			return originalRename(source, destination, expected);
+		};
+		await expect(
+			publishPlan(paths.configJson, plan, {
+				expectedIdentity: ABSENT_IDENTITY,
+				backup: false,
+				now: new Date(),
+				renameNoReplace: rename,
+			}),
+		).rejects.toMatchObject({
+			refusal: { reason: "cleanup-conflict" },
+			retained: [expect.stringMatching(/\.tmp$/)],
+		});
+		expect(successorPath).not.toBe("");
+		expect(await fs.readFile(successorPath, "utf8")).toBe("successor");
+	});
+
 	test("publish refuses when the file changed after it was read", async () => {
 		const { paths } = await makeFixture();
 		await seedConfig(paths);

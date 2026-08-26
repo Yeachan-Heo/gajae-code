@@ -25,6 +25,7 @@ import {
 	exactReplacePath,
 	exactUnlinkDirect,
 	type NativeExactFileIdentity,
+	type NativeNoReplaceResult,
 	renameNoReplacePath,
 } from "@gajae-code/natives";
 
@@ -81,7 +82,7 @@ export type PublishRefusal =
 	| { readonly reason: "parse-refusal"; readonly detail: string }
 	| { readonly reason: "format-drift"; readonly detail: string }
 	| { readonly reason: "cas-conflict"; readonly expected: string; readonly actual: string }
-	| { readonly reason: "sidecar-conflict"; readonly detail: string };
+	| { readonly reason: "sidecar-conflict" | "cleanup-conflict"; readonly detail: string };
 
 export class PaseoPublishError extends Error {
 	readonly refusal: PublishRefusal;
@@ -107,6 +108,8 @@ function describeRefusal(targetPath: string, refusal: PublishRefusal): string {
 			return `Refusing to write ${targetPath}: the file changed while GJC was preparing its update. Re-run to pick up the current contents.`;
 		case "sidecar-conflict":
 			return `Refusing to preserve the replaced provider value at ${targetPath}: ${refusal.detail}. Inspect or remove the existing sidecar, then re-run.`;
+		case "cleanup-conflict":
+			return `Refusing to complete publication cleanup for ${targetPath}: ${refusal.detail}. Retained paths remain authoritative for recovery.`;
 	}
 }
 
@@ -199,6 +202,12 @@ export interface PublishOptions {
 		valueSha256: string,
 		identity?: PersistedFileIdentity,
 	) => Promise<void>;
+	/** Test-only fault boundary for deterministic publication-race coverage. */
+	readonly renameNoReplace?: (
+		sourcePath: string,
+		destinationPath: string,
+		expectedSource?: NativeExactFileIdentity,
+	) => NativeNoReplaceResult;
 }
 
 export interface PublishResult {
@@ -355,6 +364,7 @@ export async function publishPlan(
 	// Never write the final path directly: a crash mid-write would leave the
 	// user's config truncated. Stage beside the target, fsync, then rename.
 	const tempPath = path.join(directory, `.${path.basename(targetPath)}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`);
+	const renameNoReplace = options.renameNoReplace ?? renameNoReplacePath;
 	const mode = await sourceMode(targetPath);
 	let tempRetained = false;
 	let tempConsumed = false;
@@ -400,7 +410,7 @@ export async function publishPlan(
 					actual: await currentIdentity(targetPath),
 				});
 			}
-			const linked = renameNoReplacePath(tempPath, targetPath, sourceIdentity);
+			const linked = renameNoReplace(tempPath, targetPath, sourceIdentity);
 			if (!linked.ok) {
 				tempRetained = linked.mutationState !== "not_committed";
 				const retained =
@@ -460,9 +470,32 @@ export async function publishPlan(
 		}
 		throw error;
 	} finally {
-		if (!tempRetained && !tempConsumed && tempIdentity !== undefined) {
-			if (!(await removePrivateBackupByIdentity(tempPath, tempIdentity))) {
-				tempRetained = true;
+		if (!tempRetained && !tempConsumed) {
+			if (tempIdentity === undefined) {
+				await Promise.reject(
+					new PaseoPublishError(
+						targetPath,
+						{
+							reason: "cleanup-conflict",
+							detail:
+								"publication aborted before the staging identity was durable; retaining the staging pathname for recovery",
+						},
+						[tempPath],
+					),
+				);
+			}
+			if (tempIdentity !== undefined && !(await removePrivateBackupByIdentity(tempPath, tempIdentity))) {
+				await Promise.reject(
+					new PaseoPublishError(
+						targetPath,
+						{
+							reason: "cleanup-conflict",
+							detail:
+								"publication failed and identity-bound staging cleanup could not be completed; retaining the staging pathname for recovery",
+						},
+						[tempPath],
+					),
+				);
 			}
 		}
 	}

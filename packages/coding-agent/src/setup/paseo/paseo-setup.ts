@@ -1641,10 +1641,13 @@ async function restoreMigratedOldBridgeEntries(
 			...(restoredDirectory ? { bridgeDirIdentity: restoredDirectory } : {}),
 		};
 	} catch (error) {
+		const retained = [bridgeDir, ...(error instanceof SkillsBridgeError ? error.retained : [])].filter(
+			(pathValue, index, all) => all.indexOf(pathValue) === index,
+		);
 		return {
 			status: "conflict",
 			detail: `old Paseo skill bridge compensation failed: ${error instanceof Error ? error.message : String(error)}`,
-			retained: [bridgeDir],
+			retained,
 		};
 	}
 }
