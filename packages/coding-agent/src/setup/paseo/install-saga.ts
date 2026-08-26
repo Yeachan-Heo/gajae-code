@@ -935,6 +935,46 @@ export async function recoverIntent(
 			after !== undefined && (await bridgeLedgerMatchesFilesystem(after, before, intent.targetPath));
 		const afterOwnPathMatches =
 			after !== undefined && (await bridgeLedgerMatchesFilesystem(after, undefined, intent.targetPath));
+		const pendingPartialMigration =
+			beforeMatches &&
+			afterOwnPathMatches &&
+			!afterMatches &&
+			cleanupDirection === "rollback" &&
+			before?.bridgePath !== after?.bridgePath &&
+			pendingAuthority !== undefined;
+		if (pendingPartialMigration) {
+			if (!options.repair) {
+				return {
+					recovered: false,
+					detail: "an interrupted partial bridge cleanup is pending; repair is required before setup can proceed",
+				};
+			}
+			if (options.replayBridgeCleanup === undefined || after === undefined || before === undefined) {
+				return {
+					recovered: false,
+					detail: "partial bridge cleanup lacks authenticated replay authority; retaining the intent",
+				};
+			}
+			await options.replayBridgeCleanup(pendingAuthority);
+			if (await bridgeLedgerMatchesFilesystem(after, undefined, intent.targetPath)) {
+				return {
+					recovered: false,
+					detail: "partial bridge cleanup remains pending after replay; retaining the intent",
+				};
+			}
+			if (!(await bridgeLedgerMatchesFilesystem(before, undefined, intent.targetPath))) {
+				return {
+					recovered: false,
+					detail: "the old bridge changed during pending partial cleanup; retaining the intent",
+				};
+			}
+			await writeProvenance(intent.provenancePath, before);
+			await clearIntent(intentPath);
+			return {
+				recovered: true,
+				detail: "the interrupted partial bridge cleanup restored the authenticated old root",
+			};
+		}
 		const samePayload =
 			before !== undefined &&
 			after !== undefined &&
