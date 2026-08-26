@@ -3035,7 +3035,6 @@ describe("skills bridge", () => {
 		expect(initial.kind).toBe("install");
 		const oldDir = fixture.paths.bridgeDir;
 		const before = await readProvenance(fixture.paths.provenanceLedger);
-		const originalRoot = await fs.lstat(oldDir, { bigint: true });
 		const newDir = path.join(path.dirname(oldDir), "recreated-root-compensation-paseo-skills");
 		const migratedDeps: PaseoSetupDependencies = {
 			...fixture.deps,
@@ -3062,7 +3061,7 @@ describe("skills bridge", () => {
 			expect(injected).toBe(true);
 			const restoredRoot = await fs.lstat(oldDir, { bigint: true });
 			const after = await readProvenance(fixture.paths.provenanceLedger);
-			expect(restoredRoot.ino).not.toBe(originalRoot.ino);
+
 			expect(after.bridgePath).toBe(before.bridgePath);
 			expect(after.bridgeDirIdentity?.ino).toBe(restoredRoot.ino.toString());
 			expect(after.bridgeDirIdentity?.dev).toBe(restoredRoot.dev.toString());

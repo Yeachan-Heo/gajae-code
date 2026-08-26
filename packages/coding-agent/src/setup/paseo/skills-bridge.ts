@@ -22,7 +22,6 @@ import {
 	exactUnlinkSymlink,
 	type NativeDirectoryTreeResult,
 	type NativeExactUnlinkResult,
-	renameNoReplacePath,
 	snapshotDirectoryTree,
 	symlinkNoReplacePath,
 } from "@gajae-code/natives";
@@ -763,23 +762,8 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 		stagedSnapshot = snapshotDirectoryTree(temporary);
 		identity = await directoryIdentity(temporary);
 		await fs.chmod(temporary, 0o700);
-		const published = renameNoReplacePath(
-			canonicalExistingPathForNative(temporary),
-			canonicalExistingPathForNative(preflight.bridgeDir),
-			{
-				dev: BigInt(identity.dev),
-				ino: BigInt(identity.ino),
-				size: BigInt(identity.size),
-				mtimeNs: BigInt(identity.mtimeNs),
-				directory: true,
-			},
-		);
-		if (!published.ok) {
-			throw new SkillsBridgeError(
-				`Paseo skills bridge appeared during creation: ${preflight.bridgeDir} (${published.code ?? published.reason})`,
-				published.detachedPath === undefined ? [temporary] : [temporary, published.detachedPath],
-			);
-		}
+		await fs.mkdir(preflight.bridgeDir, { mode: 0o700 });
+		identity = await directoryIdentity(preflight.bridgeDir);
 	} finally {
 		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
 			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);

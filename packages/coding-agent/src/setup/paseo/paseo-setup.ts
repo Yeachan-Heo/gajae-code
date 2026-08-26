@@ -5,13 +5,11 @@
  * that must be rejected before any target is touched.
  */
 
-import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	exactRemoveDirectoryTree,
 	type NativeDirectoryTreeResult,
-	renameNoReplacePath,
 	snapshotDirectoryTree,
 	symlinkNoReplacePath,
 } from "@gajae-code/natives";
@@ -1049,8 +1047,8 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						const current = await readProvenance(deps.paths.provenanceLedger);
 						const restoredLedger: ProvenanceLedger = {
 							...current,
-							bridgePath: bridgeLedger.bridgePath,
-							bridgeSourceDir: bridgeLedger.bridgeSourceDir,
+							bridgePath: migratedOldBridgeDir ?? bridgeLedger.bridgePath,
+							bridgeSourceDir: migratedOldSourceDir ?? bridgeLedger.bridgeSourceDir,
 							bridgeEntries: bridgeLedger.bridgeEntries,
 							bridgeEntryIdentities: compensatedOldBridgeEntryIdentities ?? bridgeLedger.bridgeEntryIdentities,
 							bridgeDirCreated: bridgeLedger.bridgeDirCreated,
@@ -1178,7 +1176,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 							const current = await readProvenance(deps.paths.provenanceLedger);
 							const settled: ProvenanceLedger = {
 								...current,
-								bridgePath: bridgeLedger.bridgePath,
+								bridgePath: migratedOldBridgeDir ?? bridgeLedger.bridgePath,
 								bridgeSourceDir: bridgeLedger.bridgeSourceDir,
 								bridgeEntries: bridgeLedger.bridgeEntries,
 								bridgeEntryIdentities: compensatedOldBridgeEntryIdentities,
@@ -1369,36 +1367,19 @@ async function captureMigratedOldBridgeEntries(
 async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
 	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
-	let stat: BigIntStats | undefined;
 	let identity: BridgeEntryIdentity | undefined;
 	let cleanupError: string | undefined;
 	try {
 		stagedSnapshot = snapshotDirectoryTree(temporary);
-		stat = await fs.lstat(temporary, { bigint: true });
-		identity = {
-			dev: stat.dev.toString(),
-			ino: stat.ino.toString(),
-			size: stat.size.toString(),
-			mtimeNs: stat.mtimeNs.toString(),
-		};
 		await fs.chmod(temporary, 0o700);
-		const published = renameNoReplacePath(
-			canonicalExistingPathForNative(temporary),
-			canonicalExistingPathForNative(bridgeDir),
-			{
-				dev: stat.dev,
-				ino: stat.ino,
-				size: stat.size,
-				mtimeNs: stat.mtimeNs,
-				directory: true,
-			},
-		);
-		if (!published.ok) {
-			throw new SkillsBridgeError(
-				`old Paseo bridge directory appeared during compensation: ${bridgeDir} (${published.code ?? published.reason})`,
-				published.detachedPath === undefined ? [temporary] : [temporary, published.detachedPath],
-			);
-		}
+		await fs.mkdir(bridgeDir, { mode: 0o700 });
+		const destination = await fs.lstat(bridgeDir, { bigint: true });
+		identity = {
+			dev: destination.dev.toString(),
+			ino: destination.ino.toString(),
+			size: destination.size.toString(),
+			mtimeNs: destination.mtimeNs.toString(),
+		};
 	} finally {
 		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
 			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
@@ -1407,7 +1388,7 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 		}
 	}
 	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary]);
-	if (identity === undefined || stat === undefined)
+	if (identity === undefined)
 		throw new SkillsBridgeError(`Paseo bridge identity was not captured: ${temporary}`, [temporary]);
 	return identity;
 }
@@ -1690,8 +1671,14 @@ export async function correctBridgeOwnershipAfterFailure(
 		...partial.adoptedEntries,
 	].filter((name, index, all) => all.indexOf(name) === index);
 	const corrected = await readProvenance(deps.paths.provenanceLedger);
-	const correctedPath =
-		isMigration && (actual.length > 0 || partial.bridgeDirCreated) ? deps.paths.bridgeDir : corrected.bridgePath;
+	const restoredOldPath =
+		isMigration && bridgeLedger.bridgePath !== undefined
+			? await fs
+					.lstat(bridgeLedger.bridgePath)
+					.then(() => bridgeLedger.bridgePath)
+					.catch(() => undefined)
+			: undefined;
+	const correctedPath = restoredOldPath ?? corrected.bridgePath;
 	const correctedLedger: ProvenanceLedger = {
 		...corrected,
 		...(correctedPath === undefined ? { bridgePath: undefined } : { bridgePath: correctedPath }),
