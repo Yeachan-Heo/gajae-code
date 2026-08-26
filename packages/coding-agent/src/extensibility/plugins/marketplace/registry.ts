@@ -15,7 +15,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { getConfigRootDir, getPluginsDir, isEnoent, logger, tryParseJson } from "@gajae-code/utils";
+import { getAgentDir, getConfigRootDir, getPluginsDir, isEnoent, logger, tryParseJson } from "@gajae-code/utils";
 
 import type {
 	InstalledPluginEntry,
@@ -26,23 +26,26 @@ import type {
 
 // ── Path helpers ─────────────────────────────────────────────────────
 
+export function getProfilePluginsDir(agentDir?: string): string {
+	if (!agentDir) return getPluginsDir();
+	if (path.resolve(agentDir) === path.resolve(getAgentDir())) return getPluginsDir();
+	return path.join(path.dirname(agentDir), "plugins");
+}
+
 export function getMarketplacesRegistryPath(agentDir?: string): string {
 	return path.join(agentDir ? path.dirname(agentDir) : getConfigRootDir(), "marketplaces.json");
 }
 
 export function getInstalledPluginsRegistryPath(agentDir?: string): string {
-	return path.join(
-		agentDir ? path.join(path.dirname(agentDir), "plugins") : getPluginsDir(),
-		"installed_plugins.json",
-	);
+	return path.join(getProfilePluginsDir(agentDir), "installed_plugins.json");
 }
 
 export function getMarketplacesCacheDir(agentDir?: string): string {
-	return path.join(agentDir ? path.join(path.dirname(agentDir), "plugins") : getPluginsDir(), "cache", "marketplaces");
+	return path.join(getProfilePluginsDir(agentDir), "cache", "marketplaces");
 }
 
 export function getPluginsCacheDir(agentDir?: string): string {
-	return path.join(agentDir ? path.join(path.dirname(agentDir), "plugins") : getPluginsDir(), "cache", "plugins");
+	return path.join(getProfilePluginsDir(agentDir), "cache", "plugins");
 }
 
 // ── Atomic write ─────────────────────────────────────────────────────

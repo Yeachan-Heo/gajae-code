@@ -4,6 +4,7 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
+	getAgentDir,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
@@ -882,6 +883,12 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
+function profilePluginsDir(agentDir: string): string {
+	return path.resolve(agentDir) === path.resolve(getAgentDir())
+		? getPluginsDir()
+		: path.join(path.dirname(agentDir), "plugins");
+}
+
 /**
  * List installed GJC plugin roots from the GJC plugin registry and, when present,
  * the nearest project-scoped registry resolved from `cwd`.
@@ -910,7 +917,7 @@ export async function listClaudePluginRoots(
 	const defaultAgentDir = path.join(home, getConfigDirName(), "agent");
 	const userPluginsDir =
 		userAgentDir && path.resolve(userAgentDir) !== path.resolve(defaultAgentDir)
-			? path.join(path.dirname(userAgentDir), "plugins")
+			? profilePluginsDir(userAgentDir)
 			: getPluginsDir(home);
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
