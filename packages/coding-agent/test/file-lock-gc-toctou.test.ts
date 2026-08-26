@@ -35,7 +35,7 @@ async function makeTemp(): Promise<string> {
 
 async function writeInfo(
 	lockDir: string,
-	info: { pid: number; timestamp: number; start_time?: string; owner_host_id?: string },
+	info: { pid: number; timestamp: number; start_time?: string; owner_host_id?: string; owner_token?: string },
 ): Promise<void> {
 	await fs.mkdir(lockDir, { recursive: true });
 	await fs.writeFile(
@@ -270,11 +270,30 @@ describe("withFileLock stale owner liveness (#652)", () => {
 			pid: process.pid,
 			start_time: "different-incarnation",
 			timestamp: Date.now() - 60_000,
+			owner_token: "canonical-owner",
 		});
 
 		await withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 });
 
 		expect(await fs.exists(lockDir)).toBe(false);
+	});
+
+	test("preserves a legacy live holder when its locale-dependent start time differs", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+		const lockDir = `${lockedFile}.lock`;
+		const probe = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(process.pid)], {
+			stdout: "pipe",
+			stderr: "ignore",
+			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "Pacific/Honolulu" },
+		});
+		const legacyStartTime = new TextDecoder().decode(probe.stdout).trim();
+		await writeInfo(lockDir, { pid: process.pid, start_time: legacyStartTime, timestamp: Date.now() - 60_000 });
+
+		await expect(
+			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
+		expect(await fs.exists(lockDir)).toBe(true);
 	});
 
 	test("preserves a host-qualified lock for an unqualified contender", async () => {

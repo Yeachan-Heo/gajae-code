@@ -119,7 +119,11 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 	if (ownerLiveness(owner.pid) !== "alive") return false;
 	if (!owner.start_time || owner.start_time === "unknown") return true;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
-	return currentStartTime === null || currentStartTime === owner.start_time;
+	if (currentStartTime === null || currentStartTime === owner.start_time) return true;
+	// A start-time mismatch proves PID reuse only for records written by this protocol.
+	// Legacy records did not identify their timestamp format, so a locale/timezone change
+	// can make a live holder look different and must never authorize its removal.
+	return owner.owner_token === undefined;
 }
 
 function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo {
@@ -328,7 +332,7 @@ async function localLockKey(lockPath: string): Promise<string> {
 }
 
 function ownerIncarnationChanged(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
-	if (!owner.start_time || owner.start_time === "unknown") return false;
+	if (owner.owner_token === undefined || !owner.start_time || owner.start_time === "unknown") return false;
 	if (ownerLiveness(owner.pid) !== "alive") return false;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
 	return currentStartTime !== null && currentStartTime !== owner.start_time;
