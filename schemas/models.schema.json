@@ -491,7 +491,8 @@
 									"type": "number"
 								},
 								"maxTokens": {
-									"type": "number"
+									"type": "number",
+									"exclusiveMinimum": 0
 								},
 								"headers": {
 									"type": "object",
@@ -880,7 +881,8 @@
 									"type": "number"
 								},
 								"maxTokens": {
-									"type": "number"
+									"type": "number",
+									"exclusiveMinimum": 0
 								},
 								"headers": {
 									"type": "object",
