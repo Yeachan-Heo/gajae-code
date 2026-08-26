@@ -363,6 +363,8 @@ export interface MCPServerConnection {
 	name: string;
 	/** Original config */
 	config: MCPServerConfig;
+	/** Session/manager cwd used for local roots/list responses. */
+	clientCwd?: string;
 	/** Transport instance */
 	transport: MCPTransport;
 	/** Server info from initialize */

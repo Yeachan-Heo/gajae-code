@@ -133,6 +133,7 @@ export interface MCPConnectionPoolOptions {
 			advertiseRoots?: boolean;
 			onNotification?: (method: string, params: unknown) => void;
 			onRequest?: (method: string, params: unknown) => Promise<unknown>;
+			cwd?: string;
 		},
 	) => Promise<MCPServerConnection>;
 }
@@ -672,6 +673,7 @@ export class MCPConnectionPool {
 				advertiseRoots: options.advertiseRoots,
 				onNotification: options.onNotification,
 				onRequest: options.onRequest,
+				cwd: options.effectiveCwd,
 			});
 			entry.connection = connection;
 			if (pending.cancelled || this.#pending.get(key) !== pending || this.#shuttingDown) {

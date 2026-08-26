@@ -170,12 +170,11 @@ async function collectPaginated<T>(
  * Reads getProjectDir() at call time so the root stays stable even if
  * the process cwd changes during tool execution.
  */
-async function defaultRequestHandler(method: string, _params: unknown): Promise<unknown> {
+async function defaultRequestHandler(method: string, _params: unknown, cwd = getProjectDir()): Promise<unknown> {
 	switch (method) {
 		case "ping":
 			return {};
 		case "roots/list": {
-			const cwd = getProjectDir();
 			return {
 				roots: [{ uri: url.pathToFileURL(cwd).href, name: path.basename(cwd) }],
 			};
@@ -455,7 +454,7 @@ async function requestWithInputHandling<T>(
 			}
 			if (request.method === "roots/list") {
 				// roots are answered from local state without user interaction.
-				inputResponses[key] = await defaultRequestHandler("roots/list", undefined);
+				inputResponses[key] = await defaultRequestHandler("roots/list", undefined, connection.clientCwd);
 				continue;
 			}
 			const outcome = await handler(key, request, {
@@ -502,6 +501,7 @@ export async function connectToServer(
 		advertiseRoots?: boolean;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
+		cwd?: string;
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = config.timeout ?? CONNECTION_TIMEOUT_MS;
@@ -541,6 +541,7 @@ export async function connectToServer(
 			return {
 				name,
 				config,
+				clientCwd: options?.cwd,
 				transport: transport!,
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
