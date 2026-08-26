@@ -57,7 +57,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
 8. Execution path splits:
    1. `async: true` -> `#startManagedBashJob()` registers a session async job and returns immediately.
    2. Non-PTY with `bash.autoBackground.enabled` and an async job manager -> starts a managed job, waits up to `min(thresholdMs, timeoutMs - 1000)`, and either returns the completed result or converts the run into a background job.
-   3. Otherwise runs foreground execution.
+   3. Foreground non-PTY, ACP client-terminal, and PTY waits are manager-backed when async support is available, so the fold chord can transfer ownership without restarting the command; otherwise they remain ordinary foreground waits.
 9. Foreground non-PTY calls `executeBash()` from `packages/coding-agent/src/exec/bash-executor.ts`.
 10. Foreground PTY calls `runInteractiveBashPty()` from `packages/coding-agent/src/tools/bash-interactive.ts`.
 11. Both paths allocate an output artifact first when `session.allocateOutputArtifact` is available. The artifact path/id are passed into the sink so large output can spill to disk.
@@ -108,7 +108,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
   - Background start messages direct the agent to the `job` tool (use `list: true` for a snapshot, or pass `poll: [id]` to wait).
 - Background work / cancellation
   - Async and auto-background jobs continue after the initial tool return.
-  - Cancellation aborts the native run; PTY overlay dismissal also kills the PTY.
+  - Cancellation aborts the native run; Escape and `job cancel` kill a PTY, while overlay disposal alone is non-owning for folded work.
 
 ## Limits & Caps
 - Default timeout: `300s` (`TOOL_TIMEOUTS.bash.default` in `packages/coding-agent/src/tools/tool-timeouts.ts`).

@@ -1580,10 +1580,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				const readOutput = (
 					limitMs: number,
 					includeAbort = true,
+					includeExit = false,
 				): Promise<ClientBridgeTerminalOutput | undefined> =>
 					Promise.race([
 						handle.currentOutput(),
 						...(includeAbort ? [abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
+						...(includeExit ? [exitPromise.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
 						Bun.sleep(Math.max(1, limitMs)).then(() => undefined as ClientBridgeTerminalOutput | undefined),
 					]);
 				let killPromise: Promise<void> | undefined;
@@ -1701,7 +1703,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						// Poll tick: push current output so agent-loop transcript stays consistent.
 						// Race the read against abort so a stuck `terminal/output` RPC does not
 						// delay cancellation.
-						const pollOutput = await readOutput(Math.max(1, deadlineAt - Date.now()));
+						const pollOutput = await readOutput(Math.max(1, deadlineAt - Date.now()), true, true);
 						if (pollOutput === undefined) {
 							// Abort fired during the poll-tick read; let the next loop iteration
 							// observe `runSignal?.aborted` and exit via the abort branch.

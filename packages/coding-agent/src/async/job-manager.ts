@@ -2088,7 +2088,7 @@ export class AsyncJobManager {
 			if (!dropped) break;
 			const droppedBytes = dropped.endByte - dropped.startByte;
 			state.retainedBytes -= droppedBytes;
-			state.startOffset = dropped.endByte;
+			state.startOffset = Math.max(state.startOffset, dropped.endByte);
 		}
 
 		this.#outputState.set(jobId, state);
