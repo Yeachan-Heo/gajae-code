@@ -377,8 +377,12 @@ impl NativeNoReplaceResult {
 
 	fn from_exact_with_primitive(result: NativeExactUnlinkResult, primitive: &'static str) -> Self {
 		let diagnostic_os_code = result.windows_error_code.as_deref().and_then(|value| {
-			let value = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
-			u32::from_str_radix(value, 16).ok().map(|value| value as i32)
+			let value = value
+				.strip_prefix("0x")
+				.or_else(|| value.strip_prefix("0X"))?;
+			u32::from_str_radix(value, 16)
+				.ok()
+				.map(|value| value as i32)
 		});
 		let (mutation_state, durability_state, reason) = if result.ok {
 			// A direct no-replace rename commits the namespace mutation, but does not
@@ -7671,8 +7675,7 @@ mod platform {
 			let deleted = delete_handle(child).is_ok();
 			unsafe { CloseHandle(child) };
 			return if deleted {
-				NativeExactUnlinkResult::failure(code)
-					.with_windows_error_code(windows_error_code)
+				NativeExactUnlinkResult::failure(code).with_windows_error_code(windows_error_code)
 			} else {
 				// The failed conversion left a namespace object that could not be
 				// removed. Retain that path as the authoritative cleanup evidence;
