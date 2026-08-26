@@ -5,7 +5,7 @@ import { type AppKeybinding, KEYBINDINGS } from "../src/config/keybindings";
 import { APP_ACTION_METADATA } from "../src/modes/action-registry";
 import { AVAILABILITY_GATED_NAV_PALETTE_ACTIONS } from "../src/modes/controllers/input-controller";
 
-/** Chords shipped by the low-risk TUI/UX batch, with their sole intended owner. */
+/** Chords introduced by this TUI/UX change, with their sole intended owner. */
 const NEWLY_SHIPPED_CHORD_OWNERS: ReadonlyArray<readonly [KeyId, AppKeybinding]> = [
 	["alt+shift+t", "app.todo.toggle"],
 	["alt+shift+s", "app.session.tree"],

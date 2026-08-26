@@ -5,78 +5,62 @@ import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { createSdkSessionRuntimeExtension, type SessionSdkTransport } from "../src/sdk/host/session-runtime";
 
-/**
- * Safety bound for a single emission to resolve. Far above any real host
- * dispatch time, but finite so a lost response fails the test instead of
- * hanging the file to the harness timeout.
- */
-const RESPONSE_TIMEOUT_MS = 5_000;
-
-interface HarnessOptions {
-	/** Artificial transport delivery delay; models a host that responds slowly. */
-	responseDelayMs?: number;
-	/** Safety timeout for one emission; small values are for race-contract tests. */
-	responseTimeoutMs?: number;
-}
-
 interface Harness {
 	emit(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
 	/** Response frames observed after the emission they belong to already ended. */
 	readonly lateResponses: ReadonlyArray<Record<string, unknown>>;
-	/** Adjust the artificial transport delivery delay between emissions. */
-	setResponseDelay(ms: number): void;
+	/** Deliver a specific host response through the transport after production. */
+	deliverResponse(id: string): Promise<void>;
+	/** Wait until a specific host response has been produced and queued. */
+	waitForResponse(id: string): Promise<void>;
+	/** End the current emission without delivering its queued response. */
+	expirePendingEmission(): void;
 	start(): Promise<void>;
 	stop(): Promise<void>;
 	dispatches: number;
 	persistedAtDispatch?: string;
 }
 
-function createHarness(
-	cwd: string,
-	sessionId: string,
-	sessionFile: string | undefined,
-	options: HarnessOptions = {},
-): Harness {
+function createHarness(cwd: string, sessionId: string, sessionFile: string | undefined): Harness {
 	const handlers = new Map<string, (event: unknown, context: ExtensionContext) => unknown>();
 	let receive: ((connectionId: string, frame: never) => void) | undefined;
 	let dispatches = 0;
 	let persistedAtDispatch: string | undefined;
-	let responseDelayMs = options.responseDelayMs ?? 0;
-	const responseTimeoutMs = options.responseTimeoutMs ?? RESPONSE_TIMEOUT_MS;
 	// Exactly one pending emission at a time (the tests emit sequentially). The
 	// handshake resolves with the frame correlated to the live emission only;
 	// any frame arriving before or after it is fenced as stale and recorded.
-	let pending: { id: string; resolve: (frame: Record<string, unknown>) => void } | undefined;
+	let pending:
+		| {
+				id: string;
+				resolve: (frame: Record<string, unknown>) => void;
+				reject: (error: Error) => void;
+		  }
+		| undefined;
 	const lateResponses: Array<Record<string, unknown>> = [];
-	const delayedDeliveries = new Set<ReturnType<typeof setTimeout>>();
+	const queuedResponses = new Map<string, Record<string, unknown>>();
+	const responseWaiters = new Map<string, Array<PromiseWithResolvers<void>>>();
+	const deliverResponse = (response: Record<string, unknown>): void => {
+		const current = pending;
+		// A response only satisfies the emission whose request id it carries.
+		// Anything else (a late frame from an already ended emission, or an
+		// unsolicited frame) must never resolve a later await.
+		if (current && String(response.id) === current.id) {
+			pending = undefined;
+			current.resolve(response);
+		} else {
+			lateResponses.push(response);
+		}
+	};
 	const transport: SessionSdkTransport = {
 		sessionId,
 		stateRoot: path.join(cwd, ".gjc", "state"),
 		token: "test-token",
 		sendFrame: (_connectionId, frame) => {
 			const response = frame as Record<string, unknown>;
-			const deliver = () => {
-				const current = pending;
-				// A response only satisfies the emission whose request id it
-				// carries. Anything else (a late frame from an already ended
-				// emission, or an unsolicited frame) must never resolve a later
-				// await.
-				if (current && response.id === current.id) {
-					pending = undefined;
-					current.resolve(response);
-				} else {
-					lateResponses.push(response);
-				}
-			};
-			if (responseDelayMs <= 0) {
-				deliver();
-				return;
-			}
-			const timer = setTimeout(() => {
-				delayedDeliveries.delete(timer);
-				deliver();
-			}, responseDelayMs);
-			delayedDeliveries.add(timer);
+			const id = String(response.id);
+			queuedResponses.set(id, response);
+			for (const waiter of responseWaiters.get(id) ?? []) waiter.resolve();
+			responseWaiters.delete(id);
 		},
 		onFrame: handler => {
 			receive = handler;
@@ -86,8 +70,8 @@ function createHarness(
 		},
 		start: async () => ({ url: "memory://host-steer" }),
 		stop: async () => {
-			for (const timer of delayedDeliveries) clearTimeout(timer);
-			delayedDeliveries.clear();
+			queuedResponses.clear();
+			responseWaiters.clear();
 		},
 	};
 	const api = {
@@ -126,6 +110,14 @@ function createHarness(
 		getPendingMessageCounts: () => ({ steering: 0, followUp: 0, nextTurn: 0 }),
 		getTranscript: () => [],
 	} as unknown as ExtensionContext;
+	const waitForQueuedResponse = async (id: string): Promise<void> => {
+		if (queuedResponses.has(id)) return;
+		const waiter = Promise.withResolvers<void>();
+		const waiters = responseWaiters.get(id) ?? [];
+		waiters.push(waiter);
+		responseWaiters.set(id, waiters);
+		await waiter.promise;
+	};
 	return {
 		start: async () => {
 			await handlers.get("session_start")?.({ type: "session_start" }, base);
@@ -134,22 +126,30 @@ function createHarness(
 			await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, base);
 		},
 		emit: async frame => {
-			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
-			pending = { id: String(frame.id), resolve };
+			const { promise, resolve, reject } = Promise.withResolvers<Record<string, unknown>>();
+			pending = { id: String(frame.id), resolve, reject };
 			try {
 				receive?.("client", frame as never);
-				// Deterministic handshake: resolved by the correlated response
-				// frame itself, with a bounded safety timeout. No wall-clock poll
-				// loop and no fixed sleep budget.
-				const response = await Promise.race([promise, Bun.sleep(responseTimeoutMs).then(() => undefined)]);
-				if (!response) throw new Error("host did not respond");
-				return response;
+				// The test advances the host response explicitly. There is no
+				// wall-clock race or fixed sleep budget that can expire under load.
+				return await promise;
 			} finally {
-				pending = undefined;
+				if (pending?.id === String(frame.id)) pending = undefined;
 			}
 		},
-		setResponseDelay: ms => {
-			responseDelayMs = ms;
+		waitForResponse: waitForQueuedResponse,
+		deliverResponse: async id => {
+			await waitForQueuedResponse(id);
+			const response = queuedResponses.get(id);
+			if (!response) throw new Error(`response ${id} was already delivered`);
+			queuedResponses.delete(id);
+			deliverResponse(response);
+		},
+		expirePendingEmission: () => {
+			const current = pending;
+			if (!current) throw new Error("no pending host emission");
+			pending = undefined;
+			current.reject(new Error("host did not respond"));
 		},
 		get dispatches() {
 			return dispatches;
@@ -164,22 +164,31 @@ function createHarness(
 }
 
 async function control(harness: Harness, id: string, text: string, clientRef: string) {
-	return await harness.emit({ type: "control_request", id, operation: "turn.steer", input: { text, clientRef } });
+	const response = harness.emit({ type: "control_request", id, operation: "turn.steer", input: { text, clientRef } });
+	await harness.deliverResponse(id);
+	return await response;
+}
+
+function controlWithoutDelivery(harness: Harness, id: string, text: string, clientRef: string) {
+	return harness.emit({ type: "control_request", id, operation: "turn.steer", input: { text, clientRef } });
 }
 
 async function query(harness: Harness, id: string, input: Record<string, unknown>) {
-	return await harness.emit({ type: "query_request", id, query: "turn.steer_status", input });
+	const response = harness.emit({ type: "query_request", id, query: "turn.steer_status", input });
+	await harness.deliverResponse(id);
+	return await response;
 }
 
-test("harness handshake resolves a host response slower than the retired 100ms poll bound", async () => {
+test("harness handshake resolves after explicit host progression", async () => {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-handshake-"));
 	try {
-		const harness = createHarness(cwd, "handshake-delay", undefined, { responseDelayMs: 250 });
+		const harness = createHarness(cwd, "handshake-delay", undefined);
 		await harness.start();
-		// The response arrives well after the retired 100 x Bun.sleep(1) budget
-		// would have expired; the correlated-id handshake still resolves it.
-		const delayed = await control(harness, "delayed", "delayed steer", "delayed-ref");
-		expect(delayed).toMatchObject({ ok: true, result: { accepted: true, clientRef: "delayed-ref" } });
+		// The response is held until explicit host progression, so this proof is
+		// independent of whether a fresh CI process can schedule a 1ms timer.
+		const delayed = controlWithoutDelivery(harness, "delayed", "delayed steer", "delayed-ref");
+		await harness.deliverResponse("delayed");
+		expect(await delayed).toMatchObject({ ok: true, result: { accepted: true, clientRef: "delayed-ref" } });
 		expect(harness.dispatches).toBe(1);
 		expect(harness.lateResponses).toEqual([]);
 		await harness.stop();
@@ -191,26 +200,61 @@ test("harness handshake resolves a host response slower than the retired 100ms p
 test("harness handshake times out, and a late response never satisfies a later emission", async () => {
 	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-timeout-"));
 	try {
-		const harness = createHarness(cwd, "handshake-timeout", undefined, {
-			responseDelayMs: 150,
-			responseTimeoutMs: 50,
-		});
+		const harness = createHarness(cwd, "handshake-timeout", undefined);
 		await harness.start();
-		// A response slower than the safety bound must fail the emission
-		// deterministically instead of hanging, and must leave the harness usable.
-		await expect(control(harness, "slow", "slow steer", "slow-ref")).rejects.toThrow("host did not respond");
-		// The stale frame for the timed-out id lands after that emission ended:
-		// it is fenced into lateResponses, never resolving a live await.
-		await Bun.sleep(200);
+		// Expiration is an explicit harness progression step, not a wall-clock
+		// timeout that can win or lose a Promise.race under CI load.
+		const timedOut = controlWithoutDelivery(harness, "slow", "slow steer", "slow-ref");
+		harness.expirePendingEmission();
+		await expect(timedOut).rejects.toThrow("host did not respond");
+		// Start a fresh emission before releasing the stale frame. The old frame
+		// must be fenced while this newer await is live, not merely after the
+		// harness has no pending emission.
+		await harness.waitForResponse("slow");
+		const accepted = controlWithoutDelivery(harness, "recovered", "recovering steer", "recovered-ref");
+		await harness.deliverResponse("slow");
 		expect(harness.lateResponses.length).toBe(1);
 		expect(harness.lateResponses[0]).toMatchObject({ id: "slow", type: "control_response" });
-		// A fresh emission under a different id resolves only against its own
-		// correlated response.
-		harness.setResponseDelay(0);
-		const accepted = await control(harness, "recovered", "recovering steer", "recovered-ref");
-		expect(accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "recovered-ref" } });
+		await harness.deliverResponse("recovered");
+		expect(await accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "recovered-ref" } });
 		expect(harness.dispatches).toBe(2);
 		expect(harness.lateResponses.length).toBe(1);
+		await harness.stop();
+	} finally {
+		await fs.rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("harness keeps late responses fenced across repeated bounded-load emissions", async () => {
+	const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-host-steer-stress-"));
+	try {
+		const harness = createHarness(cwd, "handshake-stress", undefined);
+		await harness.start();
+		const rounds = 16;
+		for (let index = 0; index < rounds; index++) {
+			const timedOut = controlWithoutDelivery(harness, `slow-${index}`, "slow steer", `slow-ref-${index}`);
+			harness.expirePendingEmission();
+			await expect(timedOut).rejects.toThrow("host did not respond");
+
+			await harness.waitForResponse(`slow-${index}`);
+			const recovered = controlWithoutDelivery(
+				harness,
+				`recovered-${index}`,
+				"recovering steer",
+				`recovered-ref-${index}`,
+			);
+			await harness.deliverResponse(`slow-${index}`);
+			await harness.deliverResponse(`recovered-${index}`);
+			expect(await recovered).toMatchObject({
+				ok: true,
+				result: { accepted: true, clientRef: `recovered-ref-${index}` },
+			});
+		}
+		expect(harness.lateResponses).toHaveLength(rounds);
+		expect(harness.lateResponses.map(response => response.id)).toEqual(
+			Array.from({ length: rounds }, (_, index) => `slow-${index}`),
+		);
+		expect(harness.dispatches).toBe(rounds * 2);
 		await harness.stop();
 	} finally {
 		await fs.rm(cwd, { recursive: true, force: true });
