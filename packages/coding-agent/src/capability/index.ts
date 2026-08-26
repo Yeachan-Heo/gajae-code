@@ -28,8 +28,8 @@ import type {
 
 /** Registry of all capabilities */
 const capabilities = new Map<string, Capability<unknown>>();
-const initialProcessHome = process.env.HOME ?? getTrustedHomeDir();
-const ambientDefaultAgentDir = path.join(initialProcessHome, getConfigDirName(), "agent");
+const initialProcessHome = process.env.HOME;
+const initialDefaultAgentDir = path.join(initialProcessHome ?? getTrustedHomeDir(), getConfigDirName(), "agent");
 
 /** Reverse index: provider ID -> capability IDs it's registered for */
 const providerCapabilities = new Map<string, Set<string>>();
@@ -275,7 +275,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const processAgentDir = getAgentDir();
 	const customProcessProfile =
 		(process.env.HOME === initialProcessHome || process.env.HOME === undefined) &&
-		path.resolve(processAgentDir) !== path.resolve(ambientDefaultAgentDir);
+		path.resolve(processAgentDir) !== path.resolve(initialDefaultAgentDir);
 	return await loadCapabilityWithContext(
 		capabilityId,
 		{
