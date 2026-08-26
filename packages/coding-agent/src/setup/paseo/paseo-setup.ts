@@ -275,7 +275,10 @@ async function replayPartialBridgeMigration(deps: PaseoSetupDependencies, ledger
 			bridgeDirIdentity: ledger.bridgeDirIdentity,
 			sourceDir: ledger.bridgeSourceDir,
 		},
-		{ bridgeDir: ledger.bridgePath },
+		{
+			bridgeDir: ledger.bridgePath,
+			onCleanupPending: authority => persistBridgeCleanupPending(deps, authority, DESTINATION_ROLLBACK_CLEANUP),
+		},
 	);
 }
 
