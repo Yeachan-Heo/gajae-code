@@ -756,13 +756,11 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 
 async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(preflight.bridgeDir), ".paseo-skills-create-"));
-	let stagedSnapshot: NativeDirectoryTreeResult = snapshotDirectoryTree(temporary);
+	const stagedSnapshot: NativeDirectoryTreeResult = snapshotDirectoryTree(temporary);
 	const identity = await directoryIdentity(temporary);
 	let cleanupError: string | undefined;
 	try {
 		await fs.chmod(temporary, 0o700);
-		const finalSnapshot = snapshotDirectoryTree(temporary);
-		if (finalSnapshot.ok) stagedSnapshot = finalSnapshot;
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
 			canonicalExistingPathForNative(preflight.bridgeDir),

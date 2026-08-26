@@ -265,14 +265,22 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		publishSucceeded = published.published;
 		await writeProvenance(input.provenancePath, ledgerAfter);
 		if (backupPath !== undefined && backupValueSha256 !== undefined && backupIdentity === undefined) {
-			publishSucceeded = false;
-			throw new Error(`credential publication backup identity is unavailable at ${backupPath}`);
+			throw new SagaStepError(
+				input.label,
+				`credential publication backup identity is unavailable at ${backupPath}`,
+				[input.intentPath, input.provenancePath, backupPath],
+				true,
+			);
 		}
 		if (backupPath !== undefined && backupValueSha256 !== undefined && backupIdentity !== undefined) {
 			const removed = await removePublishBackup(input.targetPath, backupPath, backupValueSha256, backupIdentity);
 			if (!removed) {
-				publishSucceeded = false;
-				throw new Error(`credential publication backup cleanup remains pending at ${backupPath}`);
+				throw new SagaStepError(
+					input.label,
+					`credential publication backup cleanup remains pending at ${backupPath}`,
+					[input.intentPath, input.provenancePath, backupPath],
+					true,
+				);
 			}
 		}
 	} catch (error) {
@@ -311,6 +319,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				true,
 			);
 		}
+		if (error instanceof SagaStepError && error.preserveState) throw error;
 		// Once publication succeeds, any failure before the ledger commit must
 		// undo the publication AND remove the artifact this step created (#4644
 		// reviews r8/r10): leaving the target carrying this step's write with no
@@ -1251,7 +1260,31 @@ export async function recoverIntent(
 					};
 				}
 			}
-			if (!backupExists || (targetState === "before" && ledgerState === "before")) {
+			if (targetState === "intended-after" && ledgerState === "intended-after" && backupExists) {
+				if (intent.publishBackup.identity === undefined) {
+					return {
+						recovered: false,
+						detail: `${recovery.detail}; committed credential backup identity is unavailable, retaining the intent and backup`,
+					};
+				}
+				const removed = await removePublishBackup(
+					intent.targetPath,
+					intent.publishBackup.backupPath,
+					intent.publishBackup.valueSha256,
+					intent.publishBackup.identity,
+				);
+				if (!removed && (await pathPresentWithoutFollowing(intent.publishBackup.backupPath))) {
+					return {
+						recovered: false,
+						detail: `${recovery.detail}; committed credential backup cleanup remains pending at ${intent.publishBackup.backupPath}`,
+					};
+				}
+			}
+			if (
+				!backupExists ||
+				(targetState === "before" && ledgerState === "before") ||
+				(targetState === "intended-after" && ledgerState === "intended-after")
+			) {
 				const { publishBackup: _publishBackup, ...safeIntent } = intent;
 				await writeIntent(intentPath, safeIntent);
 			}

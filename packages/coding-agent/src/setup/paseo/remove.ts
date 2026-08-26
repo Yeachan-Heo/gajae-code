@@ -812,7 +812,7 @@ async function revertJson(
 		const current = await readTarget(targetPath);
 		if (!current.exists) return { ok: true };
 		const plan = planPublish(current, mutate);
-		await publishPlan(targetPath, plan, { expectedIdentity: current.identity, backup: true, now });
+		await publishPlan(targetPath, plan, { expectedIdentity: current.identity, backup: false, now });
 		return { ok: true };
 	} catch (error) {
 		return {

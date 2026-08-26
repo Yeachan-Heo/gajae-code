@@ -315,7 +315,12 @@ export async function publishPlan(
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
 		await options.onBackupPrepared?.(backupPath, hashBytes(backupBytes.toString("utf8")));
-		const backup = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
+		const backup = await copyPrivately(
+			targetPath,
+			backupPath,
+			backupBytes.toString("utf8"),
+			expectedDestinationIdentity,
+		);
 		backupCreated = backup.created;
 		backupIdentity = backup.identity;
 		await options.onBackupPrepared?.(
@@ -369,6 +374,8 @@ export async function publishPlan(
 	let tempRetained = false;
 	let tempConsumed = false;
 	let tempIdentity: NativeExactFileIdentity | undefined;
+	let priorFailureMessage: string | undefined;
+	let priorFailureRetained: readonly string[] = [];
 	try {
 		const handle = await fs.open(tempPath, "wx+", mode);
 		let sourceIdentity: NativeExactFileIdentity | undefined;
@@ -454,6 +461,8 @@ export async function publishPlan(
 		}
 		await syncParentDirectory(directory);
 	} catch (error) {
+		priorFailureMessage = error instanceof Error ? error.message : String(error);
+		priorFailureRetained = error instanceof PaseoPublishError ? error.retained : [];
 		if (backupCreated && backupPath !== undefined && backupIdentity !== undefined) {
 			const removed = await removePrivateBackupByIdentity(backupPath, backupIdentity);
 			if (!removed) {
@@ -472,28 +481,28 @@ export async function publishPlan(
 	} finally {
 		if (!tempRetained && !tempConsumed) {
 			if (tempIdentity === undefined) {
+				const retained = [...new Set([...priorFailureRetained, tempPath])];
 				await Promise.reject(
 					new PaseoPublishError(
 						targetPath,
 						{
 							reason: "cleanup-conflict",
-							detail:
-								"publication aborted before the staging identity was durable; retaining the staging pathname for recovery",
+							detail: `publication failed (${priorFailureMessage ?? "unknown failure"}) before the staging identity was durable; retaining the staging pathname for recovery`,
 						},
-						[tempPath],
+						retained,
 					),
 				);
 			}
 			if (tempIdentity !== undefined && !(await removePrivateBackupByIdentity(tempPath, tempIdentity))) {
+				const retained = [...new Set([...priorFailureRetained, tempPath])];
 				await Promise.reject(
 					new PaseoPublishError(
 						targetPath,
 						{
 							reason: "cleanup-conflict",
-							detail:
-								"publication failed and identity-bound staging cleanup could not be completed; retaining the staging pathname for recovery",
+							detail: `publication failed (${priorFailureMessage ?? "unknown failure"}) and identity-bound staging cleanup could not be completed; retaining the staging pathname for recovery`,
 						},
-						[tempPath],
+						retained,
 					),
 				);
 			}
@@ -665,8 +674,30 @@ interface PrivateCopyResult {
 	readonly identity?: NativeExactFileIdentity;
 }
 
-async function copyPrivately(from: string, to: string, sourceBytes?: string): Promise<PrivateCopyResult> {
-	const bytes = sourceBytes ?? (await Bun.file(from).text());
+async function copyPrivately(
+	from: string,
+	to: string,
+	sourceBytes?: string,
+	expectedSource?: NativeExactFileIdentity,
+): Promise<PrivateCopyResult> {
+	let bytes = sourceBytes ?? (await Bun.file(from).text());
+	if (expectedSource !== undefined) {
+		const source = await openRegularSidecar(from, fs.constants.O_RDONLY);
+		if (source === undefined) throw new Error(`source identity unavailable: ${from}`);
+		try {
+			const authenticatedBytes = await source.handle.readFile();
+			const authenticatedIdentity = await capturePrivateBackupIdentity(source.handle, from, authenticatedBytes);
+			if (
+				authenticatedIdentity === undefined ||
+				!samePersistedIdentity(persistFileIdentity(authenticatedIdentity), persistFileIdentity(expectedSource))
+			) {
+				throw new Error(`source changed while preparing its private backup: ${from}`);
+			}
+			bytes = authenticatedBytes.toString("utf8");
+		} finally {
+			await source.handle.close();
+		}
+	}
 	const mode = BACKUP_MODE;
 	let handle: fs.FileHandle;
 	let ownsBackup = false;
