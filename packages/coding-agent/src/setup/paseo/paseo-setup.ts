@@ -6,7 +6,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { symlinkNoReplacePath } from "@gajae-code/natives";
+import { renameNoReplacePath, symlinkNoReplacePath } from "@gajae-code/natives";
 import { Settings } from "../../config/settings";
 import { checkPaseoSetup } from "./check";
 import { type CompletedStep, compensate, receiptStep, recoverIntent, runJsonStep, SagaStepError } from "./install-saga";
@@ -15,6 +15,7 @@ import {
 	hashBytes,
 	hasNoReparseSidecarAuthority,
 	PaseoPublishError,
+	type ReplacedProviderBackupIdentity,
 	readReplacedProviderBackup,
 	readTarget,
 	removeReplacedProviderBackup,
@@ -531,6 +532,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						valueSha256: hashBytes(serializeJson({ key: providerKey, value: replacedEntry })),
 					}
 				: undefined;
+		let writtenBackupIdentity: ReplacedProviderBackupIdentity | undefined;
 		// The exact sidecar payload this run would create ({key,value} serialized);
 		// unpersist deletes the file only when its CONTENT still hashes to these
 		// authenticated bytes (#4644 reviews r16/r17 — size alone is spoofable and
@@ -587,6 +589,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				createdReplacedRef !== undefined
 					? () =>
 							writeReplacedProviderBackup(deps.paths.configJson, providerKey, replacedEntry).then(written => {
+								writtenBackupIdentity = written.identity;
 								if (
 									!written.createdByGjc ||
 									written.backupPath !== createdReplacedRef.backupPath ||
@@ -598,6 +601,39 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 									});
 								}
 							})
+					: undefined,
+			verifyPersisted:
+				createdReplacedRef !== undefined
+					? async () => {
+							if (writtenBackupIdentity === undefined) {
+								throw new PaseoPublishError(createdReplacedRef.backupPath, {
+									reason: "sidecar-conflict",
+									detail:
+										"the replaced-provider sidecar was not identity-authenticated before config publication",
+								});
+							}
+							const observed = await fs
+								.lstat(createdReplacedRef.backupPath, { bigint: true })
+								.catch(() => undefined);
+							const preserved = await readReplacedProviderBackup(
+								createdReplacedRef.backupPath,
+								providerKey,
+								createdReplacedRef.valueSha256,
+							);
+							if (
+								observed === undefined ||
+								!observed.isFile() ||
+								observed.isSymbolicLink() ||
+								observed.dev.toString() !== writtenBackupIdentity.dev ||
+								observed.ino.toString() !== writtenBackupIdentity.ino ||
+								!preserved.found
+							) {
+								throw new PaseoPublishError(createdReplacedRef.backupPath, {
+									reason: "sidecar-conflict",
+									detail: "the replaced-provider sidecar changed before config publication",
+								});
+							}
+						}
 					: undefined,
 			unpersist:
 				createdReplacedRef !== undefined
@@ -1311,6 +1347,31 @@ async function captureMigratedOldBridgeEntries(
 	return { entries: captured, ambiguities, ...(bridgeDirIdentity ? { bridgeDirIdentity } : {}) };
 }
 
+async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
+	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
+	try {
+		await fs.chmod(temporary, 0o700);
+		const stat = await fs.lstat(temporary, { bigint: true });
+		const published = renameNoReplacePath(
+			canonicalExistingPathForNative(temporary),
+			canonicalExistingPathForNative(bridgeDir),
+		);
+		if (!published.ok) {
+			throw new SkillsBridgeError(
+				`old Paseo bridge directory appeared during compensation: ${bridgeDir} (${published.code ?? published.reason})`,
+			);
+		}
+		return {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: stat.size.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+		};
+	} finally {
+		await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+	}
+}
+
 /** Restore only old links that the migration inverse actually removed. */
 async function restoreMigratedOldBridgeEntries(
 	bridgeDir: string,
@@ -1383,21 +1444,13 @@ async function restoreMigratedOldBridgeEntries(
 						mtimeNs: existingDirectory.mtimeNs.toString(),
 					};
 		if (existingDirectory === undefined && bridgeDirCreated) {
-			await fs.mkdir(bridgeDir, { mode: 0o700 });
+			activeDirectoryIdentity = await recreateOwnedBridgeDirectory(bridgeDir);
 			recreatedDirectory = true;
 		}
-		// A removed old root is recreated with a new inode. Once that mkdir
-		// succeeds, the recreated object—not the deleted pre-cutover identity—becomes
-		// the rollback authority for every subsequent link restoration check.
-		if (recreatedDirectory) {
-			const recreated = await fs.lstat(bridgeDir, { bigint: true });
-			activeDirectoryIdentity = {
-				dev: recreated.dev.toString(),
-				ino: recreated.ino.toString(),
-				size: recreated.size.toString(),
-				mtimeNs: recreated.mtimeNs.toString(),
-			};
-		}
+		// A removed old root is recreated under a unique temporary name, captured
+		// by identity, and moved into place with no-replace semantics. The
+		// identity therefore remains authoritative even if the pathname is
+		// replaced before the first restored link is published.
 		const activeDirectory = async (): Promise<boolean> => {
 			const current = await fs.lstat(bridgeDir, { bigint: true }).catch(error => {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;

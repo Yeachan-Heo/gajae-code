@@ -773,6 +773,7 @@ export async function writeReplacedProviderBackup(
 	const payload = serializeJson({ key: providerKey, value });
 	const temporary = `${backupPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
 	let createdByGjc = true;
+	let identity: ReplacedProviderBackupIdentity | undefined;
 	try {
 		// Keep the entire temporary-file lifecycle inside this cleanup boundary.
 		// Opening can create the path before surfacing an error, and chmod can
@@ -782,33 +783,47 @@ export async function writeReplacedProviderBackup(
 		try {
 			await handle.writeFile(payload, "utf8");
 			await handle.sync();
+			// `fs.open` honors the mode only on creation, so set it explicitly.
+			await fs.chmod(temporary, BACKUP_MODE);
+			// `link` fails with EEXIST when the sidecar already exists: a rename
+			// would silently replace it, and the FIRST preserved value is the
+			// user's by contract. Keep the staged descriptor open through the link
+			// so the first identity proof is bound to the bytes we wrote.
+			try {
+				await fs.link(temporary, backupPath);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				createdByGjc = false;
+				const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
+				if (!existing.found) {
+					throw new PaseoPublishError(backupPath, {
+						reason: "sidecar-conflict",
+						detail: `a replaced-provider sidecar already exists at this path with different content for key ${providerKey}`,
+					});
+				}
+				// Idempotent: the existing sidecar already preserves exactly this value.
+			}
+			if (createdByGjc) {
+				const [staged, linked] = await Promise.all([
+					handle.stat({ bigint: true }),
+					fs.lstat(backupPath, { bigint: true }),
+				]);
+				if (!linked.isFile() || linked.isSymbolicLink() || staged.dev !== linked.dev || staged.ino !== linked.ino) {
+					throw new PaseoPublishError(backupPath, {
+						reason: "sidecar-conflict",
+						detail: "the newly linked sidecar changed before its identity was authenticated",
+					});
+				}
+				identity = { dev: linked.dev.toString(), ino: linked.ino.toString() };
+			}
 		} finally {
 			await handle.close();
-		}
-		// `fs.open` honors the mode only on creation, so set it explicitly.
-		await fs.chmod(temporary, BACKUP_MODE);
-		// `link` fails with EEXIST when the sidecar already exists: a rename
-		// would silently replace it, and the FIRST preserved value is the
-		// user's by contract.
-		try {
-			await fs.link(temporary, backupPath);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			createdByGjc = false;
-			const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
-			if (!existing.found) {
-				throw new PaseoPublishError(backupPath, {
-					reason: "sidecar-conflict",
-					detail: `a replaced-provider sidecar already exists at this path with different content for key ${providerKey}`,
-				});
-			}
-			// Idempotent: the existing sidecar already preserves exactly this value.
 		}
 		await syncParentDirectory(path.dirname(backupPath));
 	} finally {
 		await fs.rm(temporary, { force: true }).catch(() => undefined);
 	}
-	return { backupPath, valueSha256, createdByGjc };
+	return { backupPath, valueSha256, createdByGjc, ...(identity === undefined ? {} : { identity }) };
 }
 
 /** Pointer + integrity digest for one preserved pre-`--force` provider value. */
@@ -818,6 +833,13 @@ export interface ReplacedProviderBackupRef {
 	readonly valueSha256: string;
 	/** Whether this invocation created the sidecar rather than adopting an exact pre-existing copy. */
 	readonly createdByGjc: boolean;
+	/** Identity captured while the staged descriptor still named the sidecar. */
+	readonly identity?: ReplacedProviderBackupIdentity;
+}
+
+export interface ReplacedProviderBackupIdentity {
+	readonly dev: string;
+	readonly ino: string;
 }
 
 /** Outcome of reading a replaced-provider sidecar: a `null` prior is a value too. */

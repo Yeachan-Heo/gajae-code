@@ -145,6 +145,8 @@ export interface JsonStepInput {
 	readonly revertLedger: (ledger: ProvenanceLedger) => ProvenanceLedger;
 	/** Durable artifacts this step's ledger references. Runs before the target publish, so a crash after publication cannot leave the ledger (or intent) pointing at a missing artifact. */
 	readonly persist?: () => Promise<void>;
+	/** Re-authenticates a persisted artifact immediately before target publication. */
+	readonly verifyPersisted?: () => Promise<void>;
 	/** Removes what {@link persist} created; runs after a successful undo. */
 	readonly unpersist?: () => Promise<void>;
 	/** Sidecar proof written into the intent before {@link persist} creates it. */
@@ -233,6 +235,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			persistAttempted = true;
 			await input.persist();
 		}
+		if (input.verifyPersisted) await input.verifyPersisted();
 		const published = await publishPlan(input.targetPath, plan, {
 			expectedIdentity: current.identity,
 			backup: true,

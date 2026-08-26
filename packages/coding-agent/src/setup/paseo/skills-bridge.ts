@@ -20,6 +20,7 @@ import {
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
 	exactUnlinkSymlink,
+	renameNoReplacePath,
 	snapshotDirectoryTree,
 	symlinkNoReplacePath,
 } from "@gajae-code/natives";
@@ -751,12 +752,23 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	};
 }
 
-async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<void> {
+async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<BridgeEntryIdentity> {
+	const temporary = await fs.mkdtemp(path.join(path.dirname(preflight.bridgeDir), ".paseo-skills-create-"));
 	try {
-		await fs.mkdir(preflight.bridgeDir);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		throw new SkillsBridgeError(`Paseo skills bridge appeared during creation: ${preflight.bridgeDir}`);
+		await fs.chmod(temporary, 0o700);
+		const identity = await directoryIdentity(temporary);
+		const published = renameNoReplacePath(
+			canonicalExistingPathForNative(temporary),
+			canonicalExistingPathForNative(preflight.bridgeDir),
+		);
+		if (!published.ok) {
+			throw new SkillsBridgeError(
+				`Paseo skills bridge appeared during creation: ${preflight.bridgeDir} (${published.code ?? published.reason})`,
+			);
+		}
+		return identity;
+	} finally {
+		await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 
@@ -905,12 +917,11 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	};
 	try {
 		if (preflight.bridgeDirCreated && hasWork) {
-			await createBridgeDirectory(preflight);
+			bridgeDirIdentity = await createBridgeDirectory(preflight);
 			bridgeDirCreated = true;
 		}
 		if (hasWork) {
-			bridgeParentIdentity = await directoryIdentity(preflight.bridgeDir);
-			if (bridgeDirCreated) bridgeDirIdentity = bridgeParentIdentity;
+			bridgeParentIdentity = bridgeDirCreated ? bridgeDirIdentity : await directoryIdentity(preflight.bridgeDir);
 		}
 		for (const plan of preflight.prunes) {
 			if (preflight.sourceDir === undefined) {
