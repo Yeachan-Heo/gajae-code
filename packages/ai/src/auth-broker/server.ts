@@ -556,7 +556,10 @@ function serveSnapshotStream(
 			});
 			try {
 				await storage.reload();
-				if (closed || req.signal.aborted) return;
+				if (closed || req.signal.aborted) {
+					cleanup();
+					return;
+				}
 				const initial = buildSnapshot(storage, refresher, epoch, includeEpoch);
 				lastGeneration = initial.generation;
 				for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));

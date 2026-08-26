@@ -254,7 +254,6 @@ async function acquireGatewayApiKey(
 	const previous = credentialAuthorityTails.get(opts) ?? Promise.resolve();
 	const deferred = Promise.withResolvers<void>();
 	credentialAuthorityTails.set(opts, deferred.promise);
-	await previous;
 	let released = false;
 	const release = (): void => {
 		if (released) return;
@@ -263,6 +262,16 @@ async function acquireGatewayApiKey(
 		if (credentialAuthorityTails.get(opts) === deferred.promise) credentialAuthorityTails.delete(opts);
 	};
 	try {
+		if (signal.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+		const abort = Promise.withResolvers<never>();
+		const onAbort = (): void =>
+			abort.reject(signal.reason ?? new DOMException("The operation was aborted.", "AbortError"));
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			await Promise.race([previous, abort.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
 		const apiKey = await resolveGatewayApiKey(opts, model, peer, signal);
 		const dispatchTicket = await opts.storage.acquireCredentialDispatchTicket?.(model.provider, signal);
 		if (!opts.validateProviderCredential(model.provider, apiKey) || !hasProviderCredential(opts)) {

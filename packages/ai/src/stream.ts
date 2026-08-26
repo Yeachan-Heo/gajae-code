@@ -355,6 +355,7 @@ export function stream<TApi extends Api>(
 				return streamGitLabDuo(model, context, adapterOptions);
 			},
 			(options as StreamOptions | undefined)?.signal,
+			onStreamCreated,
 		);
 	}
 
