@@ -512,6 +512,16 @@ Must define at least one of:
 - `contextWindow` and `maxTokens` must be positive if provided
 - unknown provider, model, override, and request-transform keys fail schema validation; remove stale keys instead of relying on them being ignored.
 
+`maxTokens` on an explicit `models.yml` model (or `modelOverrides` entry) is the
+authoritative default output budget for that configured model. A positive
+per-request `maxTokens` option still wins. Built-in catalog values and runtime
+discovery metadata retain the transport's conservative 32,000-token default
+unless the caller supplies a positive request override; their displayed
+`maxTokens`/`max-out` value is model metadata, not an unconditional request
+promise. A request value of `0` is treated as unspecified and does not bypass
+the safe default. Provider hard limits and reasoning-budget rules remain
+enforced by the selected transport.
+
 ## Merge and override order
 
 ModelRegistry pipeline (on refresh):

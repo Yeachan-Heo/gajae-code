@@ -1179,6 +1179,9 @@ export interface ModelRequestTransform {
 	extraBody?: Record<string, unknown>;
 }
 
+/** Provenance used when resolving a model's default request output budget. */
+export type ModelMaxTokensSource = "configured" | "discovered";
+
 export interface ModelCost {
 	input: number; // $/million tokens
 	output: number; // $/million tokens
@@ -1215,6 +1218,8 @@ export interface Model<TApi extends Api = any> {
 	premiumMultiplier?: number;
 	contextWindow: number;
 	maxTokens: number;
+	/** Explicit models.yml/model-override authority; absent keeps the safe transport default. */
+	maxTokensSource?: ModelMaxTokensSource;
 	headers?: Record<string, string>;
 	/**
 	 * Streaming transport override. When `"pi-native"`, `streamSimple` routes

@@ -707,6 +707,7 @@ export async function completeSimple<TApi extends Api>(
 }
 
 const MIN_OUTPUT_TOKENS = 1024;
+const DEFAULT_REQUEST_MAX_TOKENS = 32000;
 export const OUTPUT_FALLBACK_BUFFER = 4000;
 const ANTHROPIC_USE_INTERLEAVED_THINKING = Bun.env.PI_NO_INTERLEAVED_THINKING !== "1";
 
@@ -804,6 +805,12 @@ function resolveOpenAiReasoningEffort<TApi extends Api>(
 
 const castApi = <TApi extends Api>(api: OptionsForApi<TApi>): OptionsForApi<Api> => api as OptionsForApi<Api>;
 
+function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TApi>, requested?: number): number {
+	if (requested !== undefined && requested > 0) return requested;
+	if (model.maxTokensSource === "configured") return model.maxTokens;
+	return Math.min(model.maxTokens, DEFAULT_REQUEST_MAX_TOKENS);
+}
+
 function mapOptionsForApi<TApi extends Api>(
 	model: Model<TApi>,
 	options?: SimpleStreamOptions,
@@ -816,7 +823,7 @@ function mapOptionsForApi<TApi extends Api>(
 		minP: options?.minP,
 		presencePenalty: options?.presencePenalty,
 		repetitionPenalty: options?.repetitionPenalty,
-		maxTokens: options?.maxTokens || Math.min(model.maxTokens, 32000),
+		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
 		signal: options?.signal,
 		apiKey: apiKey || options?.apiKey,
 		fallbackManaged: options?.fallbackManaged,

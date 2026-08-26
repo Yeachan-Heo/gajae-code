@@ -1,0 +1,154 @@
+import { afterEach, describe, expect, it } from "bun:test";
+import { completeSimple } from "../src/stream";
+import type { Context, Model } from "../src/types";
+
+const originalFetch = global.fetch;
+
+afterEach(() => {
+	global.fetch = originalFetch;
+});
+
+function createCompletionResponse(): Response {
+	const events = [
+		{
+			id: "chatcmpl-token-contract",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: "custom-model",
+			choices: [{ index: 0, delta: { content: "ok" }, finish_reason: null }],
+		},
+		{
+			id: "chatcmpl-token-contract",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: "custom-model",
+			choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
+		},
+		"[DONE]",
+	];
+	const body = `${events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}`).join("\n\n")}\n\n`;
+	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function createResponsesResponse(): Response {
+	const events = [
+		{ type: "response.output_text.delta", delta: "ok" },
+		{
+			type: "response.output_item.done",
+			item: {
+				type: "message",
+				id: "msg_1",
+				role: "assistant",
+				status: "completed",
+				content: [{ type: "output_text", text: "ok" }],
+			},
+		},
+		{
+			type: "response.completed",
+			response: {
+				id: "resp-token-contract",
+				status: "completed",
+				usage: { input_tokens: 11, output_tokens: 7, total_tokens: 18, input_tokens_details: { cached_tokens: 0 } },
+			},
+		},
+	];
+	const body = `${events.map(event => `data: ${JSON.stringify(event)}`).join("\n\n")}\n\ndata: [DONE]\n\n`;
+	return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+}
+
+function createModel(maxTokensSource?: Model<"openai-completions">["maxTokensSource"]): Model<"openai-completions"> {
+	return {
+		id: "custom-model",
+		name: "Custom model",
+		api: "openai-completions",
+		provider: "custom-provider",
+		baseUrl: "https://provider.example/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 131_072,
+		maxTokens: 65_536,
+		maxTokensSource,
+		compat: { maxTokensField: "max_tokens" },
+	};
+}
+
+function context(): Context {
+	return { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] };
+}
+
+async function captureCompletion(
+	model: Model<"openai-completions">,
+	options?: { maxTokens?: number },
+): Promise<{ body: Record<string, unknown>; usage: { input: number; output: number; totalTokens: number } }> {
+	let capturedBody: Record<string, unknown> | undefined;
+	global.fetch = (async (_input, init) => {
+		capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+		return createCompletionResponse();
+	}) as typeof fetch;
+
+	const response = await completeSimple(model, context(), { apiKey: "test-key", ...options });
+	if (!capturedBody) throw new Error("The fake provider did not receive a request");
+	return { body: capturedBody, usage: response.usage };
+}
+
+describe("model maxTokens request contract", () => {
+	it("uses an explicit configured limit on the wire and preserves provider usage accounting", async () => {
+		const result = await captureCompletion(createModel("configured"));
+
+		expect(result.body.max_tokens).toBe(65_536);
+		expect(result.body.max_completion_tokens).toBeUndefined();
+		expect(result.usage).toMatchObject({ input: 11, output: 7, totalTokens: 18 });
+	});
+
+	it("keeps the safe default for non-configured metadata and honors a positive request override", async () => {
+		const defaulted = await captureCompletion(createModel());
+		const overridden = await captureCompletion(createModel(), { maxTokens: 70_000 });
+
+		expect(defaulted.body.max_tokens).toBe(32_000);
+		expect(overridden.body.max_tokens).toBe(70_000);
+	});
+
+	it("treats a zero request budget as unspecified instead of bypassing the safe default", async () => {
+		const result = await captureCompletion(createModel(), { maxTokens: 0 });
+
+		expect(result.body.max_tokens).toBe(32_000);
+	});
+
+	it("maps the same resolved budget to max_completion_tokens", async () => {
+		const result = await captureCompletion({
+			...createModel("configured"),
+			compat: { maxTokensField: "max_completion_tokens" },
+		});
+
+		expect(result.body.max_completion_tokens).toBe(65_536);
+		expect(result.body.max_tokens).toBeUndefined();
+	});
+
+	it("maps configured limits to the Responses max_output_tokens field", async () => {
+		const model: Model<"openai-responses"> = {
+			id: "custom-responses-model",
+			name: "Custom Responses model",
+			api: "openai-responses",
+			provider: "custom-provider",
+			baseUrl: "https://provider.example/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 131_072,
+			maxTokens: 65_536,
+			maxTokensSource: "configured",
+		};
+		let capturedBody: Record<string, unknown> | undefined;
+		global.fetch = (async (_input, init) => {
+			capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return createResponsesResponse();
+		}) as typeof fetch;
+
+		const response = await completeSimple(model, context(), { apiKey: "test-key" });
+
+		expect(capturedBody?.max_output_tokens).toBe(65_536);
+		expect(response.usage).toMatchObject({ input: 11, output: 7, totalTokens: 18 });
+	});
+});

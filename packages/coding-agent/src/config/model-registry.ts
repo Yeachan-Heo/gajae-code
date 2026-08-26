@@ -23,6 +23,7 @@ import {
 	isKnownProvider,
 	type Model,
 	type ModelManagerOptions,
+	type ModelMaxTokensSource,
 	type ModelRefreshStrategy,
 	type ModelRequestTransform,
 	modelSupportsReasoningControl,
@@ -1001,7 +1002,10 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 			override: override.contextWindow,
 		});
 	}
-	if (override.maxTokens !== undefined) result.maxTokens = override.maxTokens;
+	if (override.maxTokens !== undefined) {
+		result.maxTokens = override.maxTokens;
+		result.maxTokensSource = "configured";
+	}
 	if (override.contextPromotionTarget !== undefined) result.contextPromotionTarget = override.contextPromotionTarget;
 	if (override.wireModelId !== undefined) result.wireModelId = override.wireModelId;
 	result.requestTransform = mergeRequestTransform(model.requestTransform, override.requestTransform);
@@ -1079,6 +1083,7 @@ type CustomModelOverlay = {
 	cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
 	contextWindow?: number;
 	maxTokens?: number;
+	maxTokensSource?: ModelMaxTokensSource;
 	headers?: Record<string, string>;
 	compat?: Model<Api>["compat"];
 	contextPromotionTarget?: string;
@@ -1155,6 +1160,7 @@ function buildCustomModelOverlay(
 		cost: modelDef.cost,
 		contextWindow: modelDef.contextWindow,
 		maxTokens: modelDef.maxTokens,
+		maxTokensSource: modelDef.maxTokens === undefined ? undefined : "configured",
 		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey),
 		compat: mergeCompat(providerCompat, modelDef.compat),
 		requestTransform: mergeRequestTransform(providerRequestTransform, modelDef.requestTransform),
@@ -1289,6 +1295,8 @@ function finalizeCustomModel(model: CustomModelOverlay, options: CustomModelBuil
 		contextWindow:
 			resolvedModel.contextWindow ?? reference?.contextWindow ?? (options.useDefaults ? 128000 : undefined),
 		maxTokens: resolvedModel.maxTokens ?? reference?.maxTokens ?? (options.useDefaults ? 16384 : undefined),
+		maxTokensSource:
+			resolvedModel.maxTokensSource ?? (reference?.maxTokensSource === "configured" ? "configured" : undefined),
 		headers: resolvedModel.headers,
 		compat: mergeCompat(reference?.compat, resolvedModel.compat),
 		contextPromotionTarget: resolvedModel.contextPromotionTarget,
@@ -3385,6 +3393,11 @@ export class ModelRegistry {
 			if (!isRecord(item) || typeof item.id !== "string" || !item.id.trim()) continue;
 			const id = item.id;
 			const referenceModel = resolveCustomModelReference(id);
+			const discoveredMaxTokens = firstPositiveDiscoveryNumber(
+				item.max_completion_tokens,
+				item.max_tokens,
+				item.max_output_tokens,
+			);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
 			discovered.push(
 				enrichModelThinking({
@@ -3407,14 +3420,8 @@ export class ModelRegistry {
 							referenceModel?.contextWindow,
 							UNK_CONTEXT_WINDOW,
 						) ?? UNK_CONTEXT_WINDOW,
-					maxTokens:
-						firstPositiveDiscoveryNumber(
-							item.max_completion_tokens,
-							item.max_tokens,
-							item.max_output_tokens,
-							referenceModel?.maxTokens,
-							UNK_MAX_TOKENS,
-						) ?? UNK_MAX_TOKENS,
+					maxTokens: discoveredMaxTokens ?? referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
+					maxTokensSource: discoveredMaxTokens === undefined ? referenceModel?.maxTokensSource : "discovered",
 					headers: providerConfig.headers,
 					compat: mergeCompat(
 						{
