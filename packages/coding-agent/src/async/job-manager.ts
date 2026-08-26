@@ -2499,6 +2499,11 @@ export class AsyncJobManager {
 			this.#ensureDeliveryLoop();
 			const loop = this.#deliveryLoop;
 			if (!loop) {
+				const pending = this.#filterDeliveries()[0];
+				if (!pending) return true;
+				const index = this.#deliveries.indexOf(pending);
+				if (index >= 0) this.#deliveries.splice(index, 1);
+				await this.#deliverDelivery(pending);
 				continue;
 			}
 

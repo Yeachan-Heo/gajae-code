@@ -246,7 +246,6 @@ describe("BashTool ACP terminal fold red-team", () => {
 		exit.resolve({ exitCode: 0, signal: null });
 		await waitFor(() => releaseSpy.mock.calls.length === 1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
-		const result = await resultPromise;
-		expect(result.details?.async).toBeUndefined();
+		await expect(resultPromise).rejects.toThrow("term-owner-pre output");
 	});
 });

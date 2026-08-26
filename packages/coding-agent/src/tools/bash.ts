@@ -66,6 +66,20 @@ import { formatToolWorkingDirectory, replaceTabs } from "./render-utils";
 import { checkTmuxSelfInjection } from "./tmux-self-injection-guard";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
+
+function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string {
+	if (offsetBytes <= 0) return text;
+	let consumed = 0;
+	let index = 0;
+	while (index < text.length && consumed < offsetBytes) {
+		const codePoint = text.codePointAt(index);
+		if (codePoint === undefined) break;
+		consumed += Buffer.byteLength(String.fromCodePoint(codePoint), "utf8");
+		index += codePoint > 0xffff ? 2 : 1;
+	}
+	return text.slice(index);
+}
+
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
@@ -1541,9 +1555,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			let latestText = "";
 			let bridgeJobId!: string;
 			let retainedAcpSnapshot = "";
+			const ACP_RAW_OVERLAP_BYTES = 512 * 1024;
 			const appendAcpSnapshot = (snapshot: string): void => {
 				if (!bridgeJobId || !snapshot) return;
-				const combined = `${snapshot}\u0000${retainedAcpSnapshot}`;
+				const snapshotBytes = Buffer.byteLength(snapshot, "utf8");
+				const retainedBytes = Buffer.byteLength(retainedAcpSnapshot, "utf8");
+				const boundedSnapshot =
+					snapshotBytes > ACP_RAW_OVERLAP_BYTES
+						? sliceTextAfterUtf8ByteOffset(snapshot, snapshotBytes - ACP_RAW_OVERLAP_BYTES)
+						: snapshot;
+				const boundedRetained =
+					retainedBytes > ACP_RAW_OVERLAP_BYTES
+						? sliceTextAfterUtf8ByteOffset(retainedAcpSnapshot, retainedBytes - ACP_RAW_OVERLAP_BYTES)
+						: retainedAcpSnapshot;
+				let separator = "\u0000";
+				while (boundedSnapshot.includes(separator) || boundedRetained.includes(separator)) separator += "\u0000";
+				const combined = `${boundedSnapshot}${separator}${boundedRetained}`;
 				const prefix = new Uint32Array(combined.length);
 				for (let index = 1; index < combined.length; index += 1) {
 					let candidate = prefix[index - 1] ?? 0;
@@ -1554,9 +1581,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					prefix[index] = candidate;
 				}
 				const overlap = prefix[combined.length - 1] ?? 0;
-				const delta = snapshot.slice(overlap);
+				const delta = boundedSnapshot.slice(overlap);
 				if (delta) ownedManager?.appendOutput(bridgeJobId, delta);
-				retainedAcpSnapshot = snapshot;
+				retainedAcpSnapshot = boundedSnapshot;
 			};
 
 			const runToCompletion = async (
@@ -1870,9 +1897,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							}
 						}
 					});
-					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.", {
-						abort: false,
-					});
+					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.");
 				},
 			);
 
