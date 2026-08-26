@@ -250,7 +250,9 @@ export class FoldCoordinator {
 			const signal = adapter.signal;
 			if (signal?.aborted) throw new Error("fold capture aborted");
 			const capture = Promise.resolve(this.#deps.captureRemainingIntent());
-			if (!signal) {
+			if (!fencesOriginatingTurn) {
+				remainingIntent = undefined;
+			} else if (!signal) {
 				remainingIntent = await capture;
 			} else {
 				const aborted = Promise.withResolvers<never>();

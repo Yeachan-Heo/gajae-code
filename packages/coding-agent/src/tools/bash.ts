@@ -1567,40 +1567,80 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const clientAdmission = ownedManager?.reserveCapacity();
 			const clientHeadBytes = resolveBashOutputSinkHeadBytes(this.session.settings);
 			const clientTailBytes = resolveBashOutputSinkTailBytes(this.session.settings);
-			let handle: ClientBridgeTerminalHandle;
-			try {
-				handle = await clientBridge.createTerminal({
+			const runBoundedCleanup = async (
+				terminal: ClientBridgeTerminalHandle,
+				operation: () => Promise<void>,
+				label: "kill" | "release",
+			): Promise<void> => {
+				const attempt = Promise.resolve()
+					.then(operation)
+					.catch((error: unknown) => {
+						logger.warn(`ACP terminal ${label} failed`, { terminalId: terminal.terminalId, error });
+					});
+				const completed = await Promise.race([
+					attempt.then(() => true),
+					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
+				]);
+				if (!completed) logger.warn(`ACP terminal ${label} timed out`, { terminalId: terminal.terminalId });
+			};
+			const createPromise = Promise.resolve().then(() =>
+				clientBridge.createTerminal!({
 					command,
 					cwd: commandCwd,
 					env: resolvedEnv
 						? Object.entries(resolvedEnv).map(([name, value]) => ({ name, value: value as string }))
 						: undefined,
 					outputByteLimit: clientHeadBytes > 0 ? undefined : clientTailBytes,
-				});
+				}),
+			);
+			const timeout = Promise.withResolvers<{ kind: "timeout" }>();
+			const abort = Promise.withResolvers<{ kind: "aborted" }>();
+			const onCreateAbort = (): void => abort.resolve({ kind: "aborted" });
+			if (signal?.aborted) onCreateAbort();
+			else signal?.addEventListener("abort", onCreateAbort, { once: true });
+			const createTimer = setTimeout(() => timeout.resolve({ kind: "timeout" }), timeoutMs);
+			let createOutcome:
+				| { kind: "created"; handle: ClientBridgeTerminalHandle }
+				| { kind: "timeout" }
+				| { kind: "aborted" };
+			try {
+				createOutcome = await Promise.race([
+					createPromise.then(handle => ({ kind: "created" as const, handle })),
+					timeout.promise,
+					abort.promise,
+				]);
 			} catch (error) {
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
+			} finally {
+				clearTimeout(createTimer);
+				signal?.removeEventListener("abort", onCreateAbort);
 			}
+
+			if (createOutcome.kind !== "created") {
+				void createPromise
+					.then(async lateHandle => {
+						await runBoundedCleanup(lateHandle, () => lateHandle.kill(), "kill");
+						await runBoundedCleanup(lateHandle, () => lateHandle.release(), "release");
+					})
+					.catch((error: unknown) => {
+						logger.warn("ACP terminal late create cleanup failed", { error });
+					});
+				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
+				if (createOutcome.kind === "aborted") throw new ToolAbortError("Command aborted");
+				throw new ToolError(`Command timed out after ${timeoutSec} seconds`);
+			}
+
+			let handle: ClientBridgeTerminalHandle;
+			handle = createOutcome.handle;
 
 			// The remote terminal is released exactly once, by whichever path settles
 			// it: a foreground return, a folded background completion, or a failure.
 			let released = false;
-			const runBoundedCleanup = async (operation: () => Promise<void>, label: "kill" | "release"): Promise<void> => {
-				const attempt = Promise.resolve()
-					.then(operation)
-					.catch((error: unknown) => {
-						logger.warn(`ACP terminal ${label} failed`, { terminalId: handle.terminalId, error });
-					});
-				const completed = await Promise.race([
-					attempt.then(() => true),
-					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
-				]);
-				if (!completed) logger.warn(`ACP terminal ${label} timed out`, { terminalId: handle.terminalId });
-			};
 			const releaseTerminalOnce = async (): Promise<void> => {
 				if (released) return;
 				released = true;
-				await runBoundedCleanup(() => handle.release(), "release");
+				await runBoundedCleanup(handle, () => handle.release(), "release");
 			};
 			let killPromise: Promise<void> | undefined;
 			const fireKill = (): Promise<void> => {
@@ -1616,7 +1656,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				return killPromise;
 			};
 			const boundedKill = async (): Promise<void> => {
-				await runBoundedCleanup(fireKill, "kill");
+				await runBoundedCleanup(handle, fireKill, "kill");
 			};
 
 			// Emit partial update so the editor can embed the live terminal card.

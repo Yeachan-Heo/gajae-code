@@ -657,6 +657,7 @@ export class AsyncJobManager {
 	readonly #descriptorResumeRunners = new Map<string, ResumeRunner>();
 	readonly #deadLetteredDeliveries = new Map<string, DeadLetteredDelivery>();
 	readonly #deadLetteredDeliveryOwners = new Map<string, string | undefined>();
+	readonly #deadLetterOverflowByOwner = new Map<string | undefined, number>();
 	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
 	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
 	/** Generations settled by failNow, so the runner's later terminal path is a no-op. */
@@ -2308,6 +2309,18 @@ export class AsyncJobManager {
 			if (ownerId && entry.ownerId !== ownerId) continue;
 			deadLettered.push({ ...entry });
 		}
+		for (const [entryOwner, count] of this.#deadLetterOverflowByOwner) {
+			if (ownerId && entryOwner !== ownerId) continue;
+			deadLettered.push({
+				jobId: `dead-letter-overflow:${entryOwner ?? "unknown"}`,
+				generation: `dead-letter-overflow:${entryOwner ?? "unknown"}`,
+				ownerId: entryOwner,
+				backgrounded: true,
+				attempt: 0,
+				lastError: `${count} additional undelivered completion(s) exceeded retained dead-letter capacity`,
+				recordedAt: Date.now(),
+			});
+		}
 
 		return { jobs, deadLettered };
 	}
@@ -2599,6 +2612,7 @@ export class AsyncJobManager {
 		this.#evictedDeadLetters.clear();
 		this.#externallySettled.clear();
 		this.#deadLetteredDeliveryOwners.clear();
+		this.#deadLetterOverflowByOwner.clear();
 		this.#suppressedDeliveries.clear();
 		this.#deliveryAckOwners.clear();
 		this.#waitGenerationAliases.clear();
@@ -2855,6 +2869,12 @@ export class AsyncJobManager {
 		while (this.#evictedDeadLetters.size > MAX_EVICTED_DEAD_LETTERS) {
 			const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
 			if (oldestGeneration === undefined) return;
+			const oldest = this.#evictedDeadLetters.get(oldestGeneration);
+			if (oldest)
+				this.#deadLetterOverflowByOwner.set(
+					oldest.ownerId,
+					(this.#deadLetterOverflowByOwner.get(oldest.ownerId) ?? 0) + 1,
+				);
 			this.#evictedDeadLetters.delete(oldestGeneration);
 		}
 	}
@@ -2881,6 +2901,8 @@ export class AsyncJobManager {
 		while (this.#deadLetteredDeliveries.size > MAX_DEAD_LETTERED_DELIVERIES) {
 			const oldestJobId = this.#deadLetteredDeliveries.keys().next().value;
 			if (oldestJobId === undefined) return;
+			const oldestOwner = this.#deadLetteredDeliveryOwners.get(oldestJobId);
+			this.#deadLetterOverflowByOwner.set(oldestOwner, (this.#deadLetterOverflowByOwner.get(oldestOwner) ?? 0) + 1);
 			this.#deadLetteredDeliveries.delete(oldestJobId);
 			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
 		}

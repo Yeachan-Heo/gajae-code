@@ -19,10 +19,11 @@ interface Harness {
 
 function makeHarness(
 	bridge: ClientBridge,
-	options: { autoBackgroundEnabled?: boolean; thresholdMs?: number } = {},
+	options: { autoBackgroundEnabled?: boolean; thresholdMs?: number; maxRunningJobs?: number } = {},
 ): Harness {
 	const delivered: Array<{ jobId: string; text: string }> = [];
 	const manager = new AsyncJobManager({
+		maxRunningJobs: options.maxRunningJobs,
 		retentionMs: 60_000,
 		onJobComplete: async (jobId, text) => {
 			delivered.push({ jobId, text });
@@ -455,6 +456,68 @@ describe("BashTool ACP terminal fold", () => {
 				if (update.content.length > 0) throw new Error("progress callback failed");
 			}),
 		).rejects.toThrow(/update diagnostics[\s\S]*Terminal output recovery failed/);
+		expect(killCalls).toBe(1);
+		expect(releaseCalls).toBe(1);
+	});
+
+	it("bounds ACP terminal creation and cleans a late handle after timeout", async () => {
+		const create = Promise.withResolvers<ClientBridgeTerminalHandle>();
+		let killCalls = 0;
+		let releaseCalls = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-late-timeout",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "", truncated: false }),
+			kill: async () => {
+				killCalls += 1;
+			},
+			release: async () => {
+				releaseCalls += 1;
+			},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: () => create.promise };
+		const h = makeHarness(bridge, { maxRunningJobs: 1 });
+		const tool = new BashTool(h.session);
+
+		const pending = tool.execute("call-late-timeout", { command: "sleep 30", timeout: 1 }, undefined, () => {});
+		await expect(pending).rejects.toThrow("Command timed out after 1 seconds");
+		expect(h.manager.hasCapacity()).toBe(true);
+
+		create.resolve(handle);
+		await waitFor(() => killCalls === 1 && releaseCalls === 1);
+		expect(killCalls).toBe(1);
+		expect(releaseCalls).toBe(1);
+	});
+
+	it("bounds ACP terminal creation and cleans a late handle after abort", async () => {
+		const create = Promise.withResolvers<ClientBridgeTerminalHandle>();
+		let killCalls = 0;
+		let releaseCalls = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-late-abort",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "", truncated: false }),
+			kill: async () => {
+				killCalls += 1;
+			},
+			release: async () => {
+				releaseCalls += 1;
+			},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: () => create.promise };
+		const createSpy = spyOn(bridge, "createTerminal");
+		const h = makeHarness(bridge, { maxRunningJobs: 1 });
+		const controller = new AbortController();
+		const tool = new BashTool(h.session);
+
+		const pending = tool.execute("call-late-abort", { command: "sleep 30", timeout: 30 }, controller.signal, () => {});
+		await waitFor(() => createSpy.mock.calls.length === 1);
+		controller.abort();
+		await expect(pending).rejects.toThrow("Command aborted");
+		expect(h.manager.hasCapacity()).toBe(true);
+
+		create.resolve(handle);
+		await waitFor(() => killCalls === 1 && releaseCalls === 1);
 		expect(killCalls).toBe(1);
 		expect(releaseCalls).toBe(1);
 	});
