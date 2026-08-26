@@ -320,6 +320,14 @@ export function stream<TApi extends Api>(
 	if (options?.fallbackManaged) {
 		options = { ...options, requestMaxRetries: 0, streamMaxRetries: 0 } as OptionsForApi<TApi>;
 	}
+	// Canonical low-level boundary: the request budget must be a positive safe
+	// integer. Provider options arrive here unvalidated (unlike `streamSimple`,
+	// whose resolver already normalizes), so an unsafe value is dropped to
+	// unspecified here once for every dispatch below — integer-only provider
+	// fields can never receive a fractional or MAX_SAFE_INTEGER+1 budget.
+	if (options?.maxTokens !== undefined && !(Number.isSafeInteger(options.maxTokens) && options.maxTokens > 0)) {
+		options = { ...options, maxTokens: undefined } as OptionsForApi<TApi>;
+	}
 	// Check custom API registry first (extension-provided APIs like "vertex-Anthropic model-api")
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {

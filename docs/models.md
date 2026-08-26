@@ -521,6 +521,13 @@ unless the caller supplies a positive request override; their displayed
 promise. A request value of `0` is treated as unspecified and does not bypass
 the safe default. Provider hard limits and reasoning-budget rules remain
 enforced by the selected transport.
+Valid budget values — configured or per-request — are positive safe integers
+(1 … 9007199254740991). Fractional values and anything above
+`Number.MAX_SAFE_INTEGER` fail schema validation in `models.yml`/overrides and
+are treated as unspecified when passed programmatically, so integer-only
+provider fields (`max_tokens`, `max_completion_tokens`, `max_output_tokens`)
+never receive an unsatisfiable budget. The low-level `stream()`/`complete()`
+boundary applies the same rule to provider options.
 
 ## Merge and override order
 

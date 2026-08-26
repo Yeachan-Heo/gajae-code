@@ -67,13 +67,34 @@ function createConfigJsonSchema(): JsonSchemaObject {
 }
 
 function createModelsJsonSchema(): JsonSchemaObject {
-	return {
+	const schema: JsonSchemaObject = {
 		$schema: DRAFT_2020_12,
 		$id: "https://gajae.ai/schemas/models.schema.json",
 		title: "GJC models.yml",
 		description: "Custom provider and model configuration for GJC. Generated from packages/coding-agent/src/config/models-config-schema.ts.",
 		...zodToWireSchema(ModelsConfigSchema),
 	};
+	// The shared wire walker strips `maximum: SAFE_INTEGER_MAX` as zod `.int()`
+	// noise (it would flood every tool wire schema). For `models.yml` budget
+	// fields the safe-integer ceiling is contract, so re-encode it explicitly on
+	// the two `maxTokens` leaves after the noise filter ran.
+	stampMaxTokensSafeCeiling(schema);
+	return schema;
+}
+
+function stampMaxTokensSafeCeiling(node: unknown): void {
+	if (Array.isArray(node)) {
+		for (const child of node) stampMaxTokensSafeCeiling(child);
+		return;
+	}
+	if (node === null || typeof node !== "object") return;
+	const obj = node as JsonSchemaObject;
+	const maxTokens = obj.maxTokens;
+	if (maxTokens !== null && typeof maxTokens === "object" && !Array.isArray(maxTokens)) {
+		const leaf = maxTokens as JsonSchemaObject;
+		if (leaf.type === "integer") leaf.maximum = Number.MAX_SAFE_INTEGER;
+	}
+	for (const key in obj) stampMaxTokensSafeCeiling(obj[key]);
 }
 
 function addNestedProperty(root: JsonSchemaObject, segments: string[], schema: JsonSchema): void {

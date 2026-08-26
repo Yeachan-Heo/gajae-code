@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
 import { Effort } from "../src/model-thinking";
-import { completeSimple, streamSimple } from "../src/stream";
+import { complete, completeSimple, streamSimple } from "../src/stream";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "../src/types";
 import { AssistantMessageEventStream } from "../src/utils/event-stream";
 
@@ -177,6 +177,26 @@ describe("model maxTokens request contract", () => {
 		expect(result.body.max_tokens).toBe(65_536);
 		expect(result.body.max_completion_tokens).toBeUndefined();
 		expect(result.body.temperature).toBe(0.5);
+	});
+
+	it("normalizes unsafe provider-option budgets at the low-level stream boundary", async () => {
+		const seen: Array<Record<string, unknown>> = [];
+		global.fetch = (async (_input, init) => {
+			seen.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+			return createCompletionResponse();
+		}) as typeof fetch;
+
+		const model = createModel();
+		await complete(model, context(), { apiKey: "test-key", maxTokens: 65_536.5 } as never);
+		await complete(model, context(), {
+			apiKey: "test-key",
+			maxTokens: Number.MAX_SAFE_INTEGER + 1,
+		} as never);
+		await complete(model, context(), { apiKey: "test-key", maxTokens: 40_000 } as never);
+
+		expect(seen[0]?.max_tokens).toBeUndefined();
+		expect(seen[1]?.max_tokens).toBeUndefined();
+		expect(seen[2]?.max_tokens).toBe(40_000);
 	});
 	it("maps the same resolved budget to max_completion_tokens", async () => {
 		const result = await captureCompletion({
