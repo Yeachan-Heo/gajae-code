@@ -83,6 +83,8 @@ interface AgentDashboardModelContext {
 	modelRegistry?: ModelRegistry;
 	activeModelPattern?: string;
 	defaultModelPattern?: string;
+	/** Explicit session-owned user agent directory, if one was selected. */
+	agentDir?: string;
 }
 
 export function resolveAgentCreationModel(
@@ -386,7 +388,12 @@ export class AgentDashboard extends Container {
 		try {
 			const selectedName = this.#selectedAgent()?.name;
 			const activeTabId = this.#tabs[this.#activeTabIndex]?.id ?? "all";
-			const { agents } = await discoverAgents(this.cwd);
+			const { agents } = await discoverAgents(
+				this.cwd,
+				undefined,
+				this.#settingsManager ?? undefined,
+				this.modelContext.agentDir,
+			);
 			const disabled = new Set((this.#settingsManager?.get("task.disabledAgents") as string[] | undefined) ?? []);
 			const overrides = this.#settingsManager?.get("task.agentModelOverrides") ?? {};
 
@@ -618,6 +625,7 @@ export class AgentDashboard extends Container {
 
 		const { session } = await createAgentSession({
 			cwd: this.cwd,
+			agentDir: this.modelContext.agentDir,
 			authStorage: modelRegistry.authStorage,
 			modelRegistry,
 			settings,
@@ -666,6 +674,7 @@ export class AgentDashboard extends Container {
 			user: this.#createScope === "user",
 			project: this.#createScope === "project",
 			cwd: this.cwd,
+			userAgentDir: this.modelContext.agentDir ?? this.#settingsManager?.getAgentDir(),
 		});
 		const targetDir = dirs[0]?.path;
 		if (!targetDir) {

@@ -3,7 +3,7 @@
  *
  * Handles /ssh subcommands for managing SSH host configurations.
  */
-import { getProjectDir, getSSHConfigPath } from "@gajae-code/utils";
+import { getSSHConfigPath } from "@gajae-code/utils";
 import { type SSHHost, sshCapability } from "../../capability/ssh";
 import { loadCapability } from "../../discovery";
 import { addSSHHost, readSSHConfigFile, removeSSHHost, type SSHHostConfig } from "../../ssh/config-writer";
@@ -193,8 +193,9 @@ export class SSHCommandController {
 		}
 
 		try {
-			const cwd = getProjectDir();
-			const filePath = getSSHConfigPath(scope, cwd, this.ctx.session.getSessionAgentDir());
+			const cwd = this.ctx.sessionManager.getCwd();
+			const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
+			const filePath = getSSHConfigPath(scope, cwd, agentDir);
 
 			const hostConfig: SSHHostConfig = { host };
 			if (username) hostConfig.username = username;
@@ -240,7 +241,7 @@ export class SSHCommandController {
 	 */
 	async #handleList(): Promise<void> {
 		try {
-			const cwd = getProjectDir();
+			const cwd = this.ctx.sessionManager.getCwd();
 
 			// Load from both user and project configs
 			const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
@@ -361,8 +362,9 @@ export class SSHCommandController {
 		}
 
 		try {
-			const cwd = getProjectDir();
-			const filePath = getSSHConfigPath(scope, cwd, this.ctx.session.getSessionAgentDir());
+			const cwd = this.ctx.sessionManager.getCwd();
+			const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
+			const filePath = getSSHConfigPath(scope, cwd, agentDir);
 			const config = await readSSHConfigFile(filePath);
 			if (!config.hosts?.[name]) {
 				this.ctx.showError(`Host "${name}" not found in ${scope} config.`);

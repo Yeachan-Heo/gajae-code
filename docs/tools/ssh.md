@@ -46,9 +46,9 @@ Failure behavior:
 - Non-zero remote exit includes captured output plus `Command exited with code N`.
 
 ## Flow
-1. `loadSshTool()` in `packages/coding-agent/src/tools/ssh.ts` calls `loadCapability(sshCapability.id, { cwd: session.cwd })` to discover hosts.
+1. `loadSshTool()` in `packages/coding-agent/src/tools/ssh.ts` calls `loadCapability()` with the session's current cwd, settings, and effective agent directory to discover hosts.
 2. `packages/coding-agent/src/discovery/ssh.ts` loads host entries from, in this order: project managed ssh config, user managed ssh config, `ssh.json` in the repo root, `.ssh.json` in the repo root.
-3. `getSSHConfigPath("project")` and `getSSHConfigPath("user")` in `packages/utils/src/dirs.ts` resolve those managed files to `.gjc/ssh.json` in the project and `~/.gjc/agent/ssh.json` in the user config dir. This tool does not read `~/.ssh/config`.
+3. `getSSHConfigPath("project")` and `getSSHConfigPath("user")` in `packages/utils/src/dirs.ts` resolve those managed files to `.gjc/ssh.json` under the session's current project cwd and `<agentDir>/ssh.json` under the session's selected user profile (`~/.gjc/agent/ssh.json` for the default profile). Interactive `/ssh` commands and `refreshSshTool()` use that same session cwd/profile pair. This tool does not read `~/.ssh/config`.
 4. Capability loading deduplicates by host name with first item winning; provider order is priority-sorted and the SSH JSON provider registers at priority `5`.
 5. `loadHosts()` in `packages/coding-agent/src/tools/ssh.ts` builds `hostsByName` and drops later duplicates again with `if (!hostsByName.has(host.name))`.
 6. Tool description text is built from `packages/coding-agent/src/prompts/tools/ssh.md` plus an `Available hosts:` list. Each host entry calls `getHostInfoForHost()` to show detected shell/OS when cached; otherwise it renders `detecting...`.
@@ -116,6 +116,7 @@ Failure behavior:
 
 ## Notes
 - Host discovery is JSON-based only. The tool does not parse OpenSSH config files.
+- The managed user config is profile-scoped: a session reads `<agentDir>/ssh.json`, where `<agentDir>` is the selected session profile, so one profile's hosts never leak into another. The managed project config is `.gjc/ssh.json` beneath the session's current cwd.
 - Discovery expands environment variables recursively in the parsed JSON and expands `~` in `key`/`keyPath`.
 - Host names are capability keys; the model must pass the config key, not the raw hostname.
 - Commands run without a PTY. `executeSSH()` uses `ptree.spawn(..., { stdin: "pipe", stderr: "full" })` and does not request an interactive terminal.

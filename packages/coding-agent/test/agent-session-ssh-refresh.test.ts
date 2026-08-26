@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
 import { getSSHConfigPath, TempDir } from "@gajae-code/utils";
@@ -36,6 +37,7 @@ describe("AgentSession SSH tool refresh", () => {
 		for (const session of sessions.splice(0)) {
 			await session.dispose();
 		}
+		vi.restoreAllMocks();
 		for (const tempDir of tempDirs.splice(0)) {
 			tempDir.removeSync();
 		}
@@ -46,7 +48,11 @@ describe("AgentSession SSH tool refresh", () => {
 		cwd: string,
 		initialTools: AgentTool[] = [],
 		registryTools = initialTools,
-		options?: { reloadSshTool?: () => Promise<AgentTool | null>; requestedToolNames?: ReadonlySet<string> },
+		options?: {
+			reloadSshTool?: () => Promise<AgentTool | null>;
+			requestedToolNames?: ReadonlySet<string>;
+			agentDir?: string;
+		},
 	): AgentSession {
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		const sessionManager = SessionManager.inMemory(cwd);
@@ -70,6 +76,7 @@ describe("AgentSession SSH tool refresh", () => {
 			agent,
 			sessionManager,
 			settings,
+			agentDir: options?.agentDir,
 			modelRegistry: {} as never,
 			toolRegistry,
 			reloadSshTool:
@@ -82,6 +89,32 @@ describe("AgentSession SSH tool refresh", () => {
 		sessions.push(session);
 		return session;
 	}
+
+	it("scopes refresh discovery to the session agent directory", async () => {
+		const tempDir = TempDir.createSync("@pi-ssh-refresh-profile-");
+		tempDirs.push(tempDir);
+		const cwd = tempDir.path();
+		const agentDir = path.join(cwd, "selected-profile");
+		await addSSHHost(getSSHConfigPath("user", cwd, agentDir), "profile-host", { host: "192.0.2.30" });
+
+		const sshTool: AgentTool = {
+			name: "ssh",
+			label: "SSH",
+			description: "profile host",
+			parameters: { type: "object", properties: {} },
+			strict: true,
+			execute: async () => ({ content: [] }),
+		};
+		const invalidateSpy = spyOn(connectionManager, "invalidateHostMetadata").mockResolvedValue(undefined);
+		const session = createSession(cwd, [sshTool], [sshTool], {
+			agentDir,
+			reloadSshTool: async () => sshTool,
+		});
+
+		await session.refreshSshTool();
+
+		expect(invalidateSpy).toHaveBeenCalledWith(new Set(["profile-host"]));
+	});
 
 	it("adds the ssh tool after a first host is written over a cached missing config", async () => {
 		const tempDir = TempDir.createSync("@pi-ssh-refresh-");

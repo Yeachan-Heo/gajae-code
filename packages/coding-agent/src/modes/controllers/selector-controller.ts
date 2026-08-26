@@ -2199,11 +2199,17 @@ export class SelectorController {
 		const activeModel = this.ctx.session.model;
 		const activeModelPattern = activeModel ? `${activeModel.provider}/${activeModel.id}` : undefined;
 		const defaultModelPattern = this.ctx.settings.getModelRole("default");
-		const dashboard = await AgentDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows, {
-			modelRegistry: this.ctx.session.modelRegistry,
-			activeModelPattern,
-			defaultModelPattern: selectorHead(defaultModelPattern),
-		});
+		const dashboard = await AgentDashboard.create(
+			this.ctx.sessionManager.getCwd(),
+			this.ctx.settings,
+			this.ctx.ui.terminal.rows,
+			{
+				modelRegistry: this.ctx.session.modelRegistry,
+				activeModelPattern,
+				defaultModelPattern: selectorHead(defaultModelPattern),
+				agentDir: this.ctx.session.getSessionAgentDir(),
+			},
+		);
 		this.showSelector(done => {
 			dashboard.onClose = () => {
 				done();

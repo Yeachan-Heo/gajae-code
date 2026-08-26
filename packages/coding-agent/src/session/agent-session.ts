@@ -10137,6 +10137,7 @@ export class AgentSession {
 		const candidateHostNames = new Set(previousHostNames);
 		const capability = await loadCapability<{ name: string }>("ssh", {
 			cwd: this.sessionManager.getCwd(),
+			agentDir: this.getSessionAgentDir(),
 			settings: this.settings,
 		});
 		for (const host of capability.items) {
