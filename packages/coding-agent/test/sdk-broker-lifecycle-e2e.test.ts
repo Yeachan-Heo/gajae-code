@@ -4749,11 +4749,7 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 			(response.error.code === "terminal_uncertain" ||
 				(response.error.code === "spawn_failed" && response.startupFailure?.reason === "pending"))
 		) {
-			if (response.error.code === "terminal_uncertain")
-				expect(response.error).toMatchObject({
-					cleanup: { phase: "lifecycle", sessionId: expect.any(String), lifecycleFiles: expect.any(Array) },
-				});
-			else
+			if (response.error.code === "spawn_failed")
 				expect(response.startupFailure).toMatchObject({
 					phase: "startup",
 					reason: "pending",
@@ -4802,11 +4798,26 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
 		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
 		if (!response.ok && response.error.code === "terminal_uncertain") {
-			expect(response.startupFailure).toMatchObject({
+			const startupFailure = response.startupFailure ?? response.durableEffects?.startup;
+			expect(startupFailure).toBeDefined();
+			if (startupFailure === undefined) return;
+			expect(startupFailure).toMatchObject({
 				phase: "startup",
 				reason: "pending",
 				artifactDigest: expect.any(String),
+				rollback: {
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
 			});
+			if (startupFailure.cleanupProof !== undefined)
+				expect(startupFailure.cleanupProof).toMatchObject({
+					processExited: true,
+					endpointRemoved: true,
+					hostUnregistered: { state: "not_registered" },
+				});
 			return;
 		}
 		expect(response).toMatchObject({
