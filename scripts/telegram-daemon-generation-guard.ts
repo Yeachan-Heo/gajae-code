@@ -45,6 +45,8 @@ const nativeAuthorityDeclarations = {
 		"exact_unlink",
 		"exact_restore",
 		"rename_no_replace_path",
+		"rename_path_no_replace_exact",
+		"retain_substituted_publication",
 		"snapshot_directory_tree",
 		"exact_remove_directory_tree",
 	],
