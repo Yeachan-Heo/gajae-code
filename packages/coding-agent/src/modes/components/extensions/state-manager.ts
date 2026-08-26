@@ -456,8 +456,8 @@ function getKindDisplayName(kind: ExtensionKind): string {
 /**
  * Build provider tabs from extensions.
  */
-export function buildProviderTabs(extensions: Extension[]): ProviderTab[] {
-	const providers = getAllProvidersInfo();
+export function buildProviderTabs(extensions: Extension[], settings?: Settings): ProviderTab[] {
+	const providers = getAllProvidersInfo(settings);
 	const tabs: ProviderTab[] = [];
 
 	// Count extensions per provider
@@ -571,7 +571,7 @@ export async function createInitialState(
 	agentDir?: string,
 ): Promise<DashboardState> {
 	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir);
-	const tabs = buildProviderTabs(extensions);
+	const tabs = buildProviderTabs(extensions, settings);
 	const tabFiltered = extensions; // "all" tab by default
 	const searchFiltered = tabFiltered;
 
@@ -612,7 +612,7 @@ export async function refreshState(
 	agentDir?: string,
 ): Promise<DashboardState> {
 	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir);
-	const tabs = buildProviderTabs(extensions);
+	const tabs = buildProviderTabs(extensions, settings);
 
 	// Get current provider from tabs
 	const activeTab = state.tabs[state.activeTabIndex];

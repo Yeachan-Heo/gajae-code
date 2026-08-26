@@ -444,7 +444,7 @@ export function getAllCapabilitiesInfo(): CapabilityInfo[] {
 /**
  * Get provider info for UI display.
  */
-export function getProviderInfo(providerId: string): ProviderInfo | undefined {
+export function getProviderInfo(providerId: string, activeSettings?: Settings): ProviderInfo | undefined {
 	const meta = providerMeta.get(providerId);
 	const caps = providerCapabilities.get(providerId);
 	if (!meta || !caps) return undefined;
@@ -466,18 +466,18 @@ export function getProviderInfo(providerId: string): ProviderInfo | undefined {
 		description: meta.description,
 		priority,
 		capabilities: Array.from(caps),
-		enabled: !disabledProviders.has(providerId),
+		enabled: isProviderEnabled(providerId, activeSettings),
 	};
 }
 
 /**
  * Get all providers info for UI display (deduplicated across capabilities).
  */
-export function getAllProvidersInfo(): ProviderInfo[] {
+export function getAllProvidersInfo(activeSettings?: Settings): ProviderInfo[] {
 	const providers: ProviderInfo[] = [];
 
 	for (const providerId of providerMeta.keys()) {
-		const info = getProviderInfo(providerId);
+		const info = getProviderInfo(providerId, activeSettings);
 		if (info) {
 			providers.push(info);
 		}
