@@ -4749,6 +4749,20 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 			(response.error.code === "terminal_uncertain" ||
 				(response.error.code === "spawn_failed" && response.startupFailure?.reason === "pending"))
 		) {
+			const startupFailure = response.startupFailure ?? response.durableEffects?.startup;
+			expect(startupFailure).toBeDefined();
+			if (startupFailure === undefined) throw new Error("Expected durable startup failure evidence.");
+			expect(startupFailure).toMatchObject({
+				phase: "startup",
+				reason: expect.any(String),
+				artifactDigest: expect.any(String),
+				rollback: {
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+			});
 			if (response.error.code === "spawn_failed")
 				expect(response.startupFailure).toMatchObject({
 					phase: "startup",
