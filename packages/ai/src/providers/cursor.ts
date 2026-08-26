@@ -188,19 +188,20 @@ const CURSOR_MAX_CONVERSATIONS = 64;
 const CURSOR_CONVERSATION_TTL_MS = 60 * 60 * 1000;
 const conversationLastAccess = new Map<string, number>();
 
-let conversationMutationLockReservations = 0;
+const conversationMutationLockReservations = new Set<string>();
 
-function reserveCursorMutationLock(conversationId: string): "existing" | "reserved" | undefined {
-	if (conversationMutationLocks.has(conversationId)) return "existing";
-	if (conversationMutationLocks.size + conversationMutationLockReservations >= CURSOR_MAX_CONVERSATIONS) {
-		return undefined;
+function reserveCursorMutationLock(conversationId: string): boolean {
+	if (conversationMutationLocks.has(conversationId) || conversationMutationLockReservations.has(conversationId))
+		return false;
+	if (conversationMutationLocks.size + conversationMutationLockReservations.size >= CURSOR_MAX_CONVERSATIONS) {
+		return false;
 	}
-	conversationMutationLockReservations += 1;
-	return "reserved";
+	conversationMutationLockReservations.add(conversationId);
+	return true;
 }
 
-function releaseCursorMutationLockReservation(): void {
-	conversationMutationLockReservations -= 1;
+function releaseCursorMutationLockReservation(conversationId: string): void {
+	conversationMutationLockReservations.delete(conversationId);
 }
 
 function registerCursorMutationLock(conversationId: string, lock: Promise<void>): void {
@@ -327,6 +328,7 @@ function runWithCursorExecDeadline<T>(
 	signal: AbortSignal | undefined,
 	deadlineMs: number,
 	onNonAbortableStarted?: (settlement: CursorNonAbortableSettlement) => void,
+	onOperationFinished?: () => void,
 ): Promise<T> {
 	const result = Promise.withResolvers<T>();
 	const operationCompletion = Promise.withResolvers<void>();
@@ -413,10 +415,12 @@ function runWithCursorExecDeadline<T>(
 	}).then(
 		value => {
 			operationCompletion.resolve();
+			onOperationFinished?.();
 			settle(() => (abortError ? result.reject(abortError) : result.resolve(value)));
 		},
 		error => {
 			operationCompletion.resolve();
+			onOperationFinished?.();
 			settle(() => result.reject(abortError ?? error));
 		},
 	);
@@ -1298,14 +1302,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							h2Request!.pause();
 							clearTransportWatchdog();
 						}
-						let mutationSlot: "existing" | "reserved" | undefined;
+						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
 							if (isExecServerMessage) {
-								mutationSlot = reserveCursorMutationLock(conversationId);
-								if (!mutationSlot) throw new Error("Cursor mutation lock capacity exhausted");
+								mutationSlotReserved = reserveCursorMutationLock(conversationId);
+								if (!mutationSlotReserved) throw new Error("Cursor mutation lock capacity exhausted");
 								clearTransportWatchdog();
 								execInFlight = true;
 							}
@@ -1337,9 +1341,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										options?.signal,
 										cursorExecDeadlineMsForTest(idleTimeoutMs),
 										settlement => {
-											if (mutationSlot === "reserved") {
-												releaseCursorMutationLockReservation();
-												mutationSlot = "existing";
+											if (mutationSlotReserved) {
+												releaseCursorMutationLockReservation(conversationId);
+												mutationSlotReserved = false;
 											}
 											pendingNonAbortableExec = settlement;
 											const lock = settlement.settled.then(
@@ -1348,13 +1352,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 											);
 											registerCursorMutationLock(conversationId, lock);
 										},
+										() => {
+											if (mutationSlotReserved) {
+												releaseCursorMutationLockReservation(conversationId);
+												mutationSlotReserved = false;
+											}
+										},
 									);
 								} else {
 									await run();
 								}
 								execSucceeded = true;
 							} finally {
-								if (mutationSlot === "reserved") releaseCursorMutationLockReservation();
 								if (isExecServerMessage) {
 									execInFlight = false;
 									if (execSucceeded && !transportWatchdogClosed && !callerAbortError) {
