@@ -1185,6 +1185,88 @@ interface TransitionClaimIdentity {
 	ctimeNs: bigint;
 }
 
+interface TransitionCleanupReceipt {
+	marker: string;
+	dev: string;
+	ino: string;
+	nlink: string;
+	size: string;
+	mtimeNs: string;
+	ctimeNs: string;
+	detachedPath: string;
+}
+
+function transitionCleanupReceiptPath(transitionDir: string): string {
+	return `${transitionDir}.removing.receipt`;
+}
+
+async function readTransitionCleanupReceipt(transitionDir: string): Promise<TransitionCleanupReceipt | undefined> {
+	const bytes = await fs.readFile(transitionCleanupReceiptPath(transitionDir), "utf8").catch(() => undefined);
+	if (!bytes) return undefined;
+	try {
+		const receipt = JSON.parse(bytes) as TransitionCleanupReceipt;
+		if (
+			typeof receipt.marker === "string" &&
+			typeof receipt.dev === "string" &&
+			typeof receipt.ino === "string" &&
+			typeof receipt.nlink === "string" &&
+			typeof receipt.size === "string" &&
+			typeof receipt.mtimeNs === "string" &&
+			typeof receipt.ctimeNs === "string" &&
+			typeof receipt.detachedPath === "string"
+		)
+			return receipt;
+	} catch {}
+	return undefined;
+}
+
+async function persistTransitionCleanupReceipt(
+	transitionDir: string,
+	claim: TransitionClaimIdentity,
+	detachedPath: string,
+): Promise<boolean> {
+	const receipt: TransitionCleanupReceipt = {
+		marker: claim.marker,
+		dev: claim.dev.toString(),
+		ino: claim.ino.toString(),
+		nlink: claim.nlink.toString(),
+		size: claim.size.toString(),
+		mtimeNs: claim.mtimeNs.toString(),
+		ctimeNs: claim.ctimeNs.toString(),
+		detachedPath,
+	};
+	try {
+		await fs.writeFile(transitionCleanupReceiptPath(transitionDir), JSON.stringify(receipt), { flag: "wx" });
+		return true;
+	} catch {
+		const existing = await readTransitionCleanupReceipt(transitionDir);
+		return existing !== undefined && JSON.stringify(existing) === JSON.stringify(receipt);
+	}
+}
+
+async function persistDetachedCleanupReceipt(
+	transitionDir: string,
+	claim: TransitionClaimIdentity,
+	detachedPath: string,
+	deadline: number,
+): Promise<boolean> {
+	const native = nativeSessionStateLock();
+	const snapshot = await captureLegacyDirectoryTree(native, detachedPath, deadline);
+	const root = snapshot?.entries[0];
+	if (!root || root.dev !== claim.dev.toString() || root.ino !== claim.ino.toString()) return false;
+	return persistTransitionCleanupReceipt(
+		transitionDir,
+		{
+			...claim,
+			nlink: BigInt(root.nlink),
+			size: BigInt(root.size),
+			mtimeNs: BigInt(root.mtimeNs),
+			ctimeNs: BigInt(root.ctimeNs),
+		},
+		detachedPath,
+	);
+}
+
 async function transitionClaimIdentity(
 	transitionDir: string,
 	marker = "",
@@ -1238,6 +1320,21 @@ async function removeTransitionClaimIfIdentityMatches(
 	} catch {
 		return false;
 	}
+	if (cleanupPath.endsWith(".removing") && !injectedNativeLoader) {
+		const receipt = await readTransitionCleanupReceipt(transitionDir);
+		if (
+			!receipt ||
+			receipt.marker !== claim.marker ||
+			receipt.dev !== claim.dev.toString() ||
+			receipt.ino !== claim.ino.toString() ||
+			receipt.nlink !== claim.nlink.toString() ||
+			receipt.size !== claim.size.toString() ||
+			receipt.mtimeNs !== claim.mtimeNs.toString() ||
+			receipt.ctimeNs !== claim.ctimeNs.toString() ||
+			receipt.detachedPath !== cleanupPath
+		)
+			return false;
+	}
 	if (!(await fs.lstat(path.join(cleanupPath, claim.marker)).catch(() => null))) return false;
 	const root = snapshot?.entries[0];
 	if (
@@ -1258,7 +1355,13 @@ async function removeTransitionClaimIfIdentityMatches(
 			const expectedDetachedPath = `${transitionDir}.removing`;
 			if (removed.ok) return removed.detachedPath === expectedDetachedPath || removed.detachedPath === undefined;
 			if (removed.code === "not_found") return true;
-			return removed.code === "cleanup_pending" && removed.detachedPath === expectedDetachedPath;
+			return (
+				removed.code === "cleanup_pending" &&
+				removed.detachedPath === expectedDetachedPath &&
+				(injectedNativeLoader !== undefined ||
+					(removed.payloadDurable === true &&
+						(await persistDetachedCleanupReceipt(transitionDir, claim, expectedDetachedPath, deadline))))
+			);
 		}
 		const quarantineName = `.gjc-transition-removing-${claim.dev}-${claim.ino}-${claim.ctimeNs}`;
 		const expectedDetachedPath = path.join(path.dirname(transitionDir), quarantineName);
@@ -1278,7 +1381,12 @@ async function removeTransitionClaimIfIdentityMatches(
 		if (removed.ok) return removed.detachedPath === expectedDetachedPath || removed.detachedPath === undefined;
 		if (removed.code === "not_found") return true;
 		if (removed.code === "cleanup_pending") {
-			return removed.detachedPath === expectedDetachedPath;
+			return (
+				removed.detachedPath === expectedDetachedPath &&
+				(injectedNativeLoader !== undefined ||
+					(removed.payloadDurable === true &&
+						(await persistDetachedCleanupReceipt(transitionDir, claim, expectedDetachedPath, deadline))))
+			);
 		}
 		return false;
 	} catch {
@@ -1381,13 +1489,33 @@ async function reconcileTransitionResidue(transitionDir: string, deadline: numbe
 	if (await fs.lstat(transitionDir).catch(() => null)) return;
 	const residue = `${transitionDir}.removing`;
 	if (!(await fs.lstat(residue).catch(() => null))) return;
+	const receipt = await readTransitionCleanupReceipt(transitionDir);
+	if (!receipt || receipt.detachedPath !== residue)
+		throw new SessionStateLockUnavailableError(
+			new Error("Detached transition cleanup requires an authenticated receipt."),
+		);
 	const native = transitionNativeSessionStateLock();
 	const snapshot = await captureLegacyDirectoryTree(native, residue, deadline);
 	if (!snapshot) return;
+	const root = snapshot.entries[0];
+	if (
+		!root ||
+		root.dev !== receipt.dev ||
+		root.ino !== receipt.ino ||
+		root.nlink !== receipt.nlink ||
+		root.size !== receipt.size ||
+		root.mtimeNs !== receipt.mtimeNs ||
+		root.ctimeNs !== receipt.ctimeNs ||
+		!(await fs.lstat(path.join(residue, receipt.marker)).catch(() => null))
+	)
+		throw new SessionStateLockUnavailableError(new Error("Detached transition receipt identity mismatch."));
 	const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
 	const result = await native.exactRemoveDirectoryTreeAsync(residue, snapshot, undefined, remaining);
-	if (result.ok) return;
-	if (result.code === "cleanup_pending" && result.detachedPath === residue && result.payloadDurable !== false) return;
+	if (result.ok) {
+		await fs.rm(transitionCleanupReceiptPath(transitionDir), { force: true });
+		return;
+	}
+	if (result.code === "cleanup_pending" && result.detachedPath === residue && result.payloadDurable === true) return;
 	throw new SessionStateLockUnavailableError(new Error("Detached transition cleanup could not be reconciled safely."));
 }
 
