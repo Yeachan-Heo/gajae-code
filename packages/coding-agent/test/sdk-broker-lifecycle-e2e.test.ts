@@ -4753,8 +4753,6 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 			expect(startupFailure).toBeDefined();
 			if (startupFailure === undefined) throw new Error("Expected durable startup failure evidence.");
 			expect(startupFailure).toMatchObject({
-				phase: "startup",
-				reason: expect.any(String),
 				artifactDigest: expect.any(String),
 				rollback: {
 					fenced: true,
@@ -4763,6 +4761,13 @@ test("production lifecycle factory failure preserves reason and redacts collecte
 					brokerRegistrationReleased: true,
 				},
 			});
+			if (startupFailure.reason === "factory_absent") {
+				expect(startupFailure).toMatchObject({ phase: "registration" });
+				expect(startupFailure.message).toContain("[redacted-secret]");
+				expect(new TextEncoder().encode(startupFailure.message).byteLength).toBeLessThanOrEqual(512);
+			} else {
+				expect(startupFailure).toMatchObject({ phase: "startup", reason: "pending" });
+			}
 			if (response.error.code === "spawn_failed")
 				expect(response.startupFailure).toMatchObject({
 					phase: "startup",
