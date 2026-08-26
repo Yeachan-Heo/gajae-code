@@ -2154,6 +2154,11 @@ pub(crate) mod platform {
 		OnceLock::new();
 
 	#[cfg(test)]
+	static BEFORE_SOURCE_CLAIM_RENAME_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+
+	#[cfg(test)]
 	static AFTER_PLACEHOLDER_DETACH_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
@@ -2238,6 +2243,16 @@ pub(crate) mod platform {
 	#[cfg(test)]
 	pub(super) fn set_after_source_claim_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*AFTER_SOURCE_CLAIM_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_before_source_claim_rename_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*BEFORE_SOURCE_CLAIM_RENAME_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
@@ -2397,6 +2412,19 @@ pub(crate) mod platform {
 		{
 			entered.send(()).expect("source claim hook receiver");
 			resume.recv().expect("source claim hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_before_source_claim_rename_for_test() {
+		if let Some((entered, resume)) = BEFORE_SOURCE_CLAIM_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("source claim rename hook receiver");
+			resume.recv().expect("source claim rename hook resume");
 		}
 	}
 
@@ -5259,6 +5287,8 @@ pub(crate) mod platform {
 					private_path.to_string_lossy().into_owned(),
 				);
 			}
+			#[cfg(test)]
+			pause_before_source_claim_rename_for_test();
 			let result =
 				rename_no_replace(source_parent, destination_parent, &private_name, &destination_name);
 			let outcome = match result {
@@ -10718,6 +10748,53 @@ mod rename_no_replace_expected_source_tests {
 		assert_eq!(fs::read(&retained_claim).expect("read retained validated claim"), b"expected");
 		assert_eq!(fs::read(&source).expect("read original source"), b"expected");
 		assert!(!destination.exists());
+	}
+
+	#[test]
+	fn claim_substitution_before_rename_is_reported_after_destination_mutation() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("source.tmp");
+		let destination = temporary.0.join("destination.tmp");
+		let retained_claim = temporary.0.join("retained-claim.tmp");
+		fs::write(&source, b"expected").expect("seed expected source");
+		let expected_source = identity(&source);
+		let claim_path = temporary.0.join(format!(
+			".gjc-rename-source-{:x}-{:x}-{}",
+			expected_source.0,
+			expected_source.1,
+			std::process::id()
+		));
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_before_source_claim_rename_hook(Some((entered_tx, resume_rx)));
+		let source_for_publish = source.clone();
+		let destination_for_publish = destination.clone();
+		let publish = thread::spawn(move || {
+			platform::rename_path_no_replace(
+				&source_for_publish,
+				&destination_for_publish,
+				Some(expected_source),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for final claim validation hook");
+		fs::rename(&claim_path, &retained_claim).expect("retain validated claim");
+		fs::write(&claim_path, b"attacker").expect("substitute claim pathname");
+		resume_tx.send(()).expect("resume final claim validation");
+		let result = publish.join().expect("expected-source publication thread");
+		platform::set_before_source_claim_rename_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("destination_identity_changed"));
+		assert_eq!(result.detached_path.as_deref(), Some(destination.to_string_lossy().as_ref()));
+		assert_eq!(result.source_retained, Some(true));
+		assert_eq!(fs::read(&destination).expect("read substituted publication"), b"attacker");
+		assert_eq!(fs::read(&retained_claim).expect("read retained expected claim"), b"expected");
+		assert_eq!(fs::read(&source).expect("read original source"), b"expected");
 	}
 }
 
