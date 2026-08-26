@@ -402,6 +402,44 @@ fn restore_exchanged_successor(
 	destination: &CString,
 	staged_identity: &RecoveryFsIdentity,
 ) -> bool {
+	let Ok(named) = statat(parent, destination) else {
+		return false;
+	};
+	if named.st_dev.to_string() != staged_identity.dev
+		|| named.st_ino.to_string() != staged_identity.ino
+		|| named.st_nlink != 1
+	{
+		return false;
+	}
+	// SAFETY: parent owns a live directory descriptor and destination is a
+	// validated single-component name.
+	let destination_fd = unsafe {
+		libc::openat(
+			parent.as_raw_fd(),
+			destination.as_ptr(),
+			libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			0,
+		)
+	};
+	if destination_fd < 0 {
+		return false;
+	}
+	// SAFETY: destination_fd is the uniquely owned descriptor returned by openat.
+	let destination_file = unsafe { File::from_raw_fd(destination_fd) };
+	let Ok(destination_identity) = regular_identity(&destination_file) else {
+		return false;
+	};
+	let Ok(destination_digest) = digest_hex(&destination_file) else {
+		return false;
+	};
+	if destination_identity.dev != staged_identity.dev
+		|| destination_identity.ino != staged_identity.ino
+		|| destination_identity.size != staged_identity.size
+		|| destination_identity.mtime_ns != staged_identity.mtime_ns
+		|| staged_identity.sha256.as_deref() != Some(destination_digest.as_str())
+	{
+		return false;
+	}
 	if rename_exchange_same_parent(parent, stage, destination).is_err() {
 		return false;
 	}
@@ -420,17 +458,24 @@ fn restore_exchanged_successor(
 
 #[cfg(target_os = "linux")]
 struct ManagedReplacementStageGuard<'a> {
-	parent: &'a File,
-	name:   CString,
-	dev:    String,
-	ino:    String,
-	active: bool,
+	parent:     &'a File,
+	recovery:   &'a File,
+	name:       CString,
+	quarantine: CString,
+	active:     bool,
 }
 
 #[cfg(target_os = "linux")]
 impl ManagedReplacementStageGuard<'_> {
-	const fn disarm(&mut self) {
+	fn retire(&mut self) -> bool {
+		if !self.active {
+			return true;
+		}
+		let retired =
+			rename_file_no_replace(self.parent, &self.name, self.recovery, &self.quarantine, || {})
+				.is_ok();
 		self.active = false;
+		retired
 	}
 }
 
@@ -440,17 +485,7 @@ impl Drop for ManagedReplacementStageGuard<'_> {
 		if !self.active {
 			return;
 		}
-		let Ok(named) = statat(self.parent, &self.name) else {
-			return;
-		};
-		if named.st_dev.to_string() != self.dev
-			|| named.st_ino.to_string() != self.ino
-			|| named.st_nlink != 1
-		{
-			return;
-		}
-		// SAFETY: the live staging name still identifies the operation-owned inode.
-		unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+		let _ = self.retire();
 	}
 }
 
@@ -3420,6 +3455,10 @@ fn replace_managed(
 		},
 	};
 	let primitive = NoReplacePrimitive::AtomicExchange;
+	let recovery_parent = match recovery_directory(root, recovery) {
+		Ok(parent) => parent,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
 	let file = match open_existing(root, relative_path, true) {
 		Ok(file) => file,
 		Err(code) => {
@@ -3517,16 +3556,17 @@ fn replace_managed(
 	}
 	// SAFETY: stage_fd is the uniquely owned descriptor returned by openat above.
 	let mut stage = unsafe { File::from_raw_fd(stage_fd) };
-	let stage_seed = match regular_identity(&stage) {
-		Ok(identity) => identity,
-		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
-	};
 	let mut stage_guard = ManagedReplacementStageGuard {
-		parent: &parent,
-		name:   stage_name.clone(),
-		dev:    stage_seed.dev.clone(),
-		ino:    stage_seed.ino,
-		active: true,
+		parent:     &parent,
+		recovery:   &recovery_parent,
+		name:       stage_name.clone(),
+		quarantine: CString::new(format!(
+			".gjc-replace-retry-{}-{}",
+			std::process::id(),
+			MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
+		))
+		.expect("replacement quarantine name contains no NUL"),
+		active:     true,
 	};
 	if crate::path_identity::platform::secure_created_owner_only_file(&stage).is_err() {
 		return publish_preflight_failure_with_primitive("permission_denied", primitive);
@@ -3650,24 +3690,9 @@ fn replace_managed(
 	}
 
 	drop(predecessor);
-	let staged_after = match statat(&parent, &stage_name) {
-		Ok(named) => named,
-		Err(code) => return committed_failure(code, "terminal_identity"),
-	};
-	if staged_after.st_dev.to_string() != expected_dev
-		|| staged_after.st_ino.to_string() != expected_ino
-		|| staged_after.st_nlink != 1
-	{
-		return committed_failure("identity_mismatch", "terminal_identity");
-	}
-	// The old generation is no longer canonical. Remove only the exact staged
-	// inode; a same-name replacement is left untouched and reported as uncertain.
-	// SAFETY: stage_name was created by this operation and its live entry still
-	// matches the expected predecessor device, inode, and link count above.
-	if unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) } != 0 {
+	if !stage_guard.retire() {
 		return committed_failure("io_error", "terminal_identity");
 	}
-	stage_guard.disarm();
 	if sync_parent(&parent).is_err() {
 		let mut receipt = canonical_identity;
 		receipt.sha256 = Some(canonical_digest);
