@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
+import { Effort } from "../src/model-thinking";
 import { completeSimple, streamSimple } from "../src/stream";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "../src/types";
 import { AssistantMessageEventStream } from "../src/utils/event-stream";
@@ -220,5 +221,34 @@ describe("model maxTokens request contract", () => {
 
 		await streamSimple(model, context(), { maxTokens: 70_000 }).result();
 		expect(captured).toEqual([70_000]);
+	});
+
+	it("keeps Anthropic thinking repairs valid for malformed in-memory model limits", async () => {
+		const payloadPromise = Promise.withResolvers<Record<string, unknown>>();
+		const controller = new AbortController();
+		controller.abort();
+		const model: Model<"anthropic-messages"> = {
+			id: "malformed-anthropic-model",
+			name: "Malformed Anthropic model",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 131_072,
+			maxTokens: -1,
+			maxTokensSource: "configured",
+		};
+
+		streamSimple(model, context(), {
+			apiKey: "test-key",
+			reasoning: Effort.XHigh,
+			signal: controller.signal,
+			onPayload: payload => payloadPromise.resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await payloadPromise.promise;
+		expect(payload.max_tokens).toBeGreaterThan(0);
 	});
 });

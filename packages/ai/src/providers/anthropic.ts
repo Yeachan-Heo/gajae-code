@@ -3320,7 +3320,11 @@ function ensureMaxTokensForThinking(params: MessageCreateParamsStreaming, model:
 	const maxTokens = params.max_tokens ?? 0;
 	const requiredMaxTokens = budgetTokens + OUTPUT_FALLBACK_BUFFER;
 	if (maxTokens < requiredMaxTokens) {
-		params.max_tokens = Math.min(requiredMaxTokens, model.maxTokens);
+		const modelMaxTokens =
+			Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
+				? model.maxTokens
+				: Math.max(maxTokens, requiredMaxTokens);
+		params.max_tokens = Math.min(requiredMaxTokens, modelMaxTokens);
 	}
 }
 
