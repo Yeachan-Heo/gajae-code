@@ -4901,23 +4901,25 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		};
-		#[cfg(target_os = "linux")]
-		if let Err(code) = secure_created_owner_only_file(&file) {
-			drop(file);
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
+		if file_mode == 0o600 {
+			#[cfg(target_os = "linux")]
+			if let Err(code) = secure_created_owner_only_file(&file) {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
 			}
-			return NativeSecureSkillWriteResult::failure(code);
-		}
-		#[cfg(target_os = "macos")]
-		if clear_and_verify_macos_acl(file.as_raw_fd()).is_err() {
-			drop(file);
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
+			#[cfg(target_os = "macos")]
+			if clear_and_verify_macos_acl(file.as_raw_fd()).is_err() {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure("acl_verify_failed");
 			}
-			return NativeSecureSkillWriteResult::failure("acl_verify_failed");
 		}
 		if file.write_all(content.as_bytes()).is_err() {
 			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
