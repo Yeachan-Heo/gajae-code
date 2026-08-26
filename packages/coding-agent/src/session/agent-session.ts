@@ -8275,6 +8275,11 @@ export class AgentSession {
 		return this.agent.state.tools.map(t => t.name);
 	}
 
+	/** Whether this session explicitly requested zero built-in tools. */
+	isExplicitEmptyToolSelection(): boolean {
+		return this.#explicitEmptyToolSelection;
+	}
+
 	/** Whether the edit tool is registered in this session. */
 	get hasEditTool(): boolean {
 		return this.#toolRegistry.has("edit");
@@ -9851,6 +9856,7 @@ export class AgentSession {
 	}
 
 	async #attachAskToolIfWorkflowActive(): Promise<void> {
+		if (this.#explicitEmptyToolSelection) return;
 		const sessionId = this.sessionManager.getSessionId();
 		const inMemoryActiveSkill =
 			this.#activeSkillState && (!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === sessionId)
@@ -9965,6 +9971,7 @@ export class AgentSession {
 	}
 
 	async #activatePendingGjcGoalModeRequest(): Promise<boolean> {
+		if (this.#explicitEmptyToolSelection) return false;
 		if (!this.settings.get("goal.enabled")) return false;
 		const pendingGoal = await consumePendingGoalModeRequest(
 			this.sessionManager.getCwd(),

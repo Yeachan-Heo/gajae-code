@@ -264,12 +264,15 @@ export class GoalModeController {
 			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
 			if (restored?.goal) {
 				this.#previousTools = this.ctx.session.getActiveToolNames();
-				await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+				if (!this.ctx.session.isExplicitEmptyToolSelection()) {
+					await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+				}
 			}
 			this.#updateStatus();
 			return true;
 		}
 		if (recoveryHydration) return false;
+		if (this.ctx.session.isExplicitEmptyToolSelection()) return false;
 		const pendingGoal = goalEnabled
 			? await consumePendingGoalModeRequest(this.ctx.sessionManager.getCwd(), this.ctx.sessionManager.getSessionId())
 			: null;
@@ -321,7 +324,9 @@ export class GoalModeController {
 					objective: options.objective ?? "",
 					provenance: options.provenance,
 				});
-		await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+		if (!this.ctx.session.isExplicitEmptyToolSelection()) {
+			await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+		}
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
 		this.#resetContinuationSuppression();
