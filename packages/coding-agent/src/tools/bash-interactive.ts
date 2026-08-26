@@ -339,6 +339,7 @@ export async function runInteractiveBashPty(
 		onControls?: (controls: InteractivePtyControls) => void;
 		onFoldKey?: () => boolean;
 		onDismiss?: () => void;
+		onOutput?: (chunk: string) => void;
 	},
 ): Promise<BashInteractiveResult> {
 	const settings = options.settings ?? (await Settings.init());
@@ -422,7 +423,9 @@ export async function runInteractiveBashPty(
 				if (finished || err || !chunk) return;
 				// The sink is fed unconditionally: output stays continuous across a
 				// fold, when no overlay exists, and after the overlay is disposed.
-				sink.push(normalizeCaptureChunk(chunk));
+				const normalizedChunk = normalizeCaptureChunk(chunk);
+				sink.push(normalizedChunk);
+				options.onOutput?.(normalizedChunk);
 				observer?.appendOutput(chunk);
 			},
 		)

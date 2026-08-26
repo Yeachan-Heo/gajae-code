@@ -1117,6 +1117,7 @@ export class AsyncJobManager {
 				this.#drainResumeQueue();
 			}
 		})().finally(() => {
+			this.#externallySettled.delete(job.generation);
 			this.#settledJobIds.add(id);
 		});
 
