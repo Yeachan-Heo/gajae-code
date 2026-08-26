@@ -67,6 +67,7 @@ import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEvent,
+	AuthRetryCredential,
 	Context,
 	Model,
 	OptionsForApi,
@@ -320,6 +321,7 @@ export function stream<TApi extends Api>(
 	model: Model<TApi>,
 	context: Context,
 	options?: OptionsForApi<TApi>,
+	onStreamCreated?: () => void,
 ): AssistantMessageEventStream {
 	if (!hasValidatedManagedAttempt(options)) assertManagedAttempt(options);
 	if (options?.fallbackManaged) {
@@ -365,15 +367,22 @@ export function stream<TApi extends Api>(
 			isProviderSafetyStopModelTrusted(model)
 				? withProviderSafetyStopAdapterInvocation(vertexOptions)
 				: vertexOptions,
+			onStreamCreated,
 		);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
-		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
+		return streamBedrock(
+			model as Model<"bedrock-converse-stream">,
+			context,
+			(options || {}) as BedrockOptions,
+			onStreamCreated,
+		);
 	} else if (model.api === "kiro-codewhisperer-stream") {
 		return streamKiroCodeWhisperer(
 			model as Model<"kiro-codewhisperer-stream">,
 			context,
 			(options || {}) as KiroCodeWhispererOptions,
+			onStreamCreated,
 		);
 	}
 
@@ -390,23 +399,39 @@ export function stream<TApi extends Api>(
 	switch (api) {
 		case "anthropic-messages": {
 			const anthropicOptions = adapterProviderOptions as AnthropicOptions;
-			return streamAnthropic(model as Model<"anthropic-messages">, context, {
-				...anthropicOptions,
-				isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
-			});
+			return streamAnthropic(
+				model as Model<"anthropic-messages">,
+				context,
+				{
+					...anthropicOptions,
+					isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
+				},
+				onStreamCreated,
+			);
 		}
 
 		case "openai-completions":
-			return streamOpenAICompletions(model as Model<"openai-completions">, context, adapterProviderOptions as any);
+			return streamOpenAICompletions(
+				model as Model<"openai-completions">,
+				context,
+				adapterProviderOptions as any,
+				onStreamCreated,
+			);
 
 		case "openai-responses":
-			return streamOpenAIResponses(model as Model<"openai-responses">, context, adapterProviderOptions as any);
+			return streamOpenAIResponses(
+				model as Model<"openai-responses">,
+				context,
+				adapterProviderOptions as any,
+				onStreamCreated,
+			);
 
 		case "azure-openai-responses":
 			return streamAzureOpenAIResponses(
 				model as Model<"azure-openai-responses">,
 				context,
 				adapterProviderOptions as any,
+				onStreamCreated,
 			);
 
 		case "openai-codex-responses":
@@ -414,23 +439,35 @@ export function stream<TApi extends Api>(
 				model as Model<"openai-codex-responses">,
 				context,
 				adapterProviderOptions as any,
+				onStreamCreated,
 			);
 
 		case "google-generative-ai":
-			return streamGoogle(model as Model<"google-generative-ai">, context, adapterProviderOptions);
+			return streamGoogle(model as Model<"google-generative-ai">, context, adapterProviderOptions, onStreamCreated);
 
 		case "google-gemini-cli":
 			return streamGoogleGeminiCli(
 				model as Model<"google-gemini-cli">,
 				context,
 				adapterProviderOptions as GoogleGeminiCliOptions,
+				onStreamCreated,
 			);
 
 		case "ollama-chat":
-			return streamOllama(model as Model<"ollama-chat">, context, adapterProviderOptions as OllamaChatOptions);
+			return streamOllama(
+				model as Model<"ollama-chat">,
+				context,
+				adapterProviderOptions as OllamaChatOptions,
+				onStreamCreated,
+			);
 
 		case "cursor-agent":
-			return streamCursor(model as Model<"cursor-agent">, context, adapterProviderOptions as CursorOptions);
+			return streamCursor(
+				model as Model<"cursor-agent">,
+				context,
+				adapterProviderOptions as CursorOptions,
+				onStreamCreated,
+			);
 
 		default:
 			throw new Error(`Unhandled API: ${api}`);
@@ -542,9 +579,19 @@ export function streamSimple<TApi extends Api>(
 			? AbortSignal.any([options.signal, consumerAbortController.signal])
 			: consumerAbortController.signal;
 		const onAuthError = options!.onAuthError!;
-		const runAttempt = async (apiKey: string, captureAuthFailure: boolean): Promise<AuthRetryFailure | undefined> => {
+		const runAttempt = async (
+			apiKey: string,
+			captureAuthFailure: boolean,
+			onStreamCreated?: () => void,
+		): Promise<AuthRetryFailure | undefined> => {
 			const bufferedEvents: AssistantMessageEvent[] = [];
 			let emittedReplayUnsafeEvent = false;
+			let admitted = false;
+			const markAdmission = (): void => {
+				if (admitted) return;
+				admitted = true;
+				onStreamCreated?.();
+			};
 			const flushBuffered = (): void => {
 				emitBufferedEvents(outer, bufferedEvents);
 				bufferedEvents.length = 0;
@@ -555,6 +602,7 @@ export function streamSimple<TApi extends Api>(
 					...options,
 					apiKey,
 					onAuthError: undefined,
+					onStreamCreated: markAdmission,
 					signal: requestSignal,
 				});
 				for await (const event of inner) {
@@ -590,6 +638,12 @@ export function streamSimple<TApi extends Api>(
 				}
 				flushBuffered();
 				outer.fail(error);
+			} finally {
+				// A lazy import or a synchronous provider failure can happen before
+				// the admission hook is reached. Release that attempt's lease in
+				// the failure path without extending a successful request's lease
+				// through the response lifetime.
+				if (!admitted) markAdmission();
 			}
 			return undefined;
 		};
@@ -603,19 +657,22 @@ export function streamSimple<TApi extends Api>(
 		};
 
 		void (async () => {
-			const failure = await runAttempt(retryApiKey, true);
+			const failure = await runAttempt(retryApiKey, true, options?.onStreamCreated);
 			if (!failure) return;
-			let nextKey: string | undefined;
+			let nextCredential: string | AuthRetryCredential | undefined;
 			try {
-				nextKey = await onAuthError(model.provider, retryApiKey, failure.error);
+				nextCredential = await onAuthError(model.provider, retryApiKey, failure.error);
 			} catch {
-				nextKey = undefined;
+				nextCredential = undefined;
 			}
-			if (!nextKey || nextKey === retryApiKey) {
+			const retryCredential: AuthRetryCredential | undefined =
+				typeof nextCredential === "string" ? { apiKey: nextCredential } : nextCredential;
+			if (!retryCredential?.apiKey || retryCredential.apiKey === retryApiKey) {
+				if (retryCredential) retryCredential.onStreamCreated?.();
 				emitFailure(failure);
 				return;
 			}
-			await runAttempt(nextKey, false);
+			await runAttempt(retryCredential.apiKey, false, retryCredential.onStreamCreated);
 		})();
 		return outer;
 	}
@@ -649,14 +706,12 @@ export function streamSimple<TApi extends Api>(
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
 		const providerOptions = mapOptionsForApi(model, options, undefined);
-		const events = stream(model, context, providerOptions);
-		options?.onStreamCreated?.();
+		const events = stream(model, context, providerOptions, options?.onStreamCreated);
 		return events;
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		const providerOptions = mapOptionsForApi(model, options, undefined);
-		const events = stream(model, context, providerOptions);
-		options?.onStreamCreated?.();
+		const events = stream(model, context, providerOptions, options?.onStreamCreated);
 		return events;
 	}
 
@@ -734,8 +789,7 @@ export function streamSimple<TApi extends Api>(
 	}
 
 	const providerOptions = mapOptionsForApi(model, options, apiKey);
-	const events = stream(model, context, providerOptions);
-	options?.onStreamCreated?.();
+	const events = stream(model, context, providerOptions, options?.onStreamCreated);
 	return events;
 }
 

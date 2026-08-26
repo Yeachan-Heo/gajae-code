@@ -353,6 +353,19 @@ export type FetchImpl = ((input: string | URL | Request, init?: RequestInit) => 
 	preconnect?: typeof globalThis.fetch.preconnect;
 };
 
+/**
+ * Credential returned by an auth retry resolver.
+ *
+ * The optional admission callback lets an authority-bearing caller retain a
+ * credential lease until the replacement provider request is actually
+ * admitted. Ordinary callers can continue returning a string from
+ * {@link StreamOptions.onAuthError}.
+ */
+export interface AuthRetryCredential {
+	apiKey: string;
+	onStreamCreated?: () => void;
+}
+
 export interface StreamOptions {
 	temperature?: number;
 	topP?: number;
@@ -384,7 +397,11 @@ export interface StreamOptions {
 	 * event has been emitted. Returning a different key retries the provider
 	 * request once.
 	 */
-	onAuthError?: (provider: string, apiKey: string, error: unknown) => Promise<string | undefined>;
+	onAuthError?: (
+		provider: string,
+		apiKey: string,
+		error: unknown,
+	) => Promise<string | AuthRetryCredential | undefined>;
 	cacheRetention?: CacheRetention;
 	/**
 	 * Additional headers to include in provider requests.

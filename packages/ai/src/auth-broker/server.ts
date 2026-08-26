@@ -478,7 +478,16 @@ function serveSnapshotStream(
 		try {
 			do {
 				pendingBumps = 0;
-				await storage.reload();
+				try {
+					await storage.reload();
+				} catch (error) {
+					logger.warn("auth-broker stream generation reload failed", {
+						peer,
+						error: cleanReason(error) ?? "credential snapshot reload failed",
+					});
+					cleanup();
+					return;
+				}
 				if (closed) return;
 				const snapshot = buildSnapshot(storage, refresher, epoch, includeEpoch);
 				// Generation must move forward; a duplicate listener firing without a
@@ -536,6 +545,8 @@ function serveSnapshotStream(
 	const stream = new ReadableStream<Uint8Array>({
 		async start(c) {
 			controller = c;
+			abortHandler = (): void => cleanup();
+			req.signal.addEventListener("abort", abortHandler, { once: true });
 			unsubscribe = storage.onGenerationChanged(() => {
 				if (initializing) {
 					pendingBumps += 1;
@@ -543,21 +554,28 @@ function serveSnapshotStream(
 				}
 				void processGenerationBump();
 			});
-			await storage.reload();
-			const initial = buildSnapshot(storage, refresher, epoch, includeEpoch);
-			lastGeneration = initial.generation;
-			for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
-			const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
-			if (!write(sseEvent("snapshot", initialEvent))) return;
-			initializing = false;
-			keepaliveTimer = setInterval(() => {
-				write(": keepalive\n\n");
-			}, keepaliveMs);
-			keepaliveTimer.unref?.();
-			if (pendingBumps > 0) void processGenerationBump();
-			abortHandler = (): void => cleanup();
-			req.signal.addEventListener("abort", abortHandler);
-			logger.info("auth-broker stream opened", { peer, generation: initial.generation });
+			try {
+				await storage.reload();
+				if (closed || req.signal.aborted) return;
+				const initial = buildSnapshot(storage, refresher, epoch, includeEpoch);
+				lastGeneration = initial.generation;
+				for (const entry of initial.credentials) lastByCredId.set(entry.id, fingerprintEntry(entry));
+				const initialEvent: SnapshotStreamSnapshotEvent = { kind: "snapshot", ...initial };
+				if (!write(sseEvent("snapshot", initialEvent))) return;
+				initializing = false;
+				keepaliveTimer = setInterval(() => {
+					write(": keepalive\n\n");
+				}, keepaliveMs);
+				keepaliveTimer.unref?.();
+				if (pendingBumps > 0) void processGenerationBump();
+				logger.info("auth-broker stream opened", { peer, generation: initial.generation });
+			} catch (error) {
+				logger.warn("auth-broker stream initialization failed", {
+					peer,
+					error: cleanReason(error) ?? "credential snapshot initialization failed",
+				});
+				cleanup();
+			}
 		},
 		cancel() {
 			cleanup();

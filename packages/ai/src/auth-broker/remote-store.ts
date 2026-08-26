@@ -21,6 +21,7 @@ import {
 	assertCanonicalMCPOAuthBinding,
 	type CachedCredentialHealth,
 	type CachedUsagePresentation,
+	type CredentialDispatchTicket,
 	type CredentialInventoryRecord,
 	type MCPOAuthRefreshClient,
 	type OAuthCredential,
@@ -472,6 +473,35 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return run;
 	}
 
+	/**
+	 * Queue a provider-admission ticket behind all currently pending snapshot
+	 * authority work. Snapshot applications that arrive after this ticket wait
+	 * for its release, so a revocation is ordered either before admission or
+	 * after it — never in the middle of the dispatch boundary.
+	 */
+	async acquireCredentialDispatchTicket(_provider: Provider, signal?: AbortSignal): Promise<CredentialDispatchTicket> {
+		const previous = this.#snapshotAuthorityTail;
+		const deferred = Promise.withResolvers<void>();
+		const ticketTail = previous.then(
+			() => deferred.promise,
+			() => deferred.promise,
+		);
+		this.#snapshotAuthorityTail = ticketTail;
+		let released = false;
+		const release = (): void => {
+			if (released) return;
+			released = true;
+			deferred.resolve();
+		};
+		try {
+			await this.#raceWithSignal(previous, signal);
+		} catch (error) {
+			release();
+			throw error;
+		}
+		return { release };
+	}
+
 	#setInventoryState(
 		capability: CredentialInventoryMetadataCapability,
 		generation: number,
@@ -824,6 +854,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	async markCredentialSuspect(credentialId: number, opts: { signal?: AbortSignal } = {}): Promise<void> {
+		const current = this.#snapshot.credentials.find(entry => entry.id === credentialId);
+		if (current?.credential.type !== "oauth") {
+			// API-key rows have no refresh token, and a stale id may already have
+			// disappeared. A 401 means the broker may have rotated or removed the
+			// row; refresh the authoritative snapshot so the caller can reselect a
+			// live key instead of hitting the OAuth endpoint.
+			await this.refreshSnapshot();
+			return;
+		}
 		await this.#client.refreshCredential(credentialId, opts.signal);
 		await this.refreshSnapshot();
 	}
@@ -1288,7 +1327,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					});
 					throw error;
 				})
-				.finally(() => this.#scopedUsageInflight.delete(provider));
+				.finally(() => {
+					if (this.#scopedUsageInflight.get(provider) === inflight) {
+						this.#scopedUsageInflight.delete(provider);
+					}
+				});
 			this.#scopedUsageInflight.set(provider, inflight);
 			return inflight;
 		}

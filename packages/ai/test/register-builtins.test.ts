@@ -9,7 +9,7 @@ import {
 	setBedrockProviderModule,
 	streamBedrock,
 } from "../src/providers/register-builtins";
-import { stream as streamModel } from "../src/stream";
+import { stream as streamModel, streamSimple } from "../src/stream";
 import type { AssistantMessage, Context, Model } from "../src/types";
 import type { AssistantMessageEventStream } from "../src/utils/event-stream";
 import { withEnv } from "./helpers";
@@ -64,6 +64,37 @@ function createAssistantMessage(
 const baseContext: Context = { messages: [] };
 
 describe("register-builtins lazy streams", () => {
+	it("fires streamSimple admission only when the lazy provider is invoked", async () => {
+		const finalMessage = createAssistantMessage("stop");
+		const source = {
+			async *[Symbol.asyncIterator]() {
+				yield { type: "start", partial: finalMessage } as const;
+			},
+			result: async () => finalMessage,
+		} as unknown as AssistantMessageEventStream;
+		let admitted = false;
+		let moduleStreamCalled = false;
+
+		setBedrockProviderModule({
+			streamBedrock: () => {
+				expect(admitted).toBe(true);
+				moduleStreamCalled = true;
+				return source;
+			},
+		});
+
+		const stream = streamSimple(createModel(), baseContext, {
+			onStreamCreated: () => {
+				expect(moduleStreamCalled).toBe(false);
+				admitted = true;
+			},
+		});
+		expect(admitted).toBe(false);
+		await stream.result();
+		expect(admitted).toBe(true);
+		expect(moduleStreamCalled).toBe(true);
+	});
+
 	it("resolves the outer stream result from source.result() when no terminal event is iterated", async () => {
 		const finalMessage = createAssistantMessage("stop");
 		const partialMessage = createAssistantMessage("stop");

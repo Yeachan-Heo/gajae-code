@@ -444,10 +444,21 @@ export type OAuthRefreshLeaseClaim =
 	| { kind: "busy"; expiresAt: number }
 	| { kind: "missing" };
 
+/**
+ * Store-owned ticket that orders a provider admission against remote
+ * credential snapshot application. The ticket is intentionally released at
+ * provider admission, not response completion.
+ */
+export interface CredentialDispatchTicket {
+	release(): void;
+}
+
 export interface AuthCredentialStore {
 	close(): void;
 	refreshSnapshot?(): Promise<unknown>;
 	onSnapshotChanged?(listener: () => void): () => void;
+	/** Order provider admission with remote snapshot authority application. */
+	acquireCredentialDispatchTicket?(provider: Provider, signal?: AbortSignal): Promise<CredentialDispatchTicket>;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
 	/** Payload-free account inventory; active and soft-disabled rows are included. */
 	listCredentialInventory?(provider?: string): CredentialInventoryRecord[];
@@ -2023,6 +2034,18 @@ export class AuthStorage {
 	async reload(): Promise<void> {
 		await this.#store.waitForReady?.();
 		this.#reloadCredentialRowsFromStore();
+	}
+
+	/**
+	 * Acquire a store-owned provider-admission ticket when the backing store
+	 * provides one (for example, a remote broker snapshot store). Local stores
+	 * need no additional ordering and return `undefined`.
+	 */
+	async acquireCredentialDispatchTicket(
+		provider: Provider,
+		signal?: AbortSignal,
+	): Promise<CredentialDispatchTicket | undefined> {
+		return this.#store.acquireCredentialDispatchTicket?.(resolveOAuthStorageProvider(provider), signal);
 	}
 
 	#reloadCredentialRowsFromStore(): void {

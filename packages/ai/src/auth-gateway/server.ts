@@ -32,6 +32,7 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
+	AuthRetryCredential,
 	Context,
 	Model,
 	Provider,
@@ -263,7 +264,25 @@ async function acquireGatewayApiKey(
 	};
 	try {
 		const apiKey = await resolveGatewayApiKey(opts, model, peer, signal);
-		return { apiKey, release };
+		const dispatchTicket = await opts.storage.acquireCredentialDispatchTicket?.(model.provider, signal);
+		if (!opts.validateProviderCredential(model.provider, apiKey) || !hasProviderCredential(opts)) {
+			dispatchTicket?.release();
+			throw new GatewayCredentialError(
+				401,
+				"authentication_error",
+				`No credential available for provider ${model.provider}`,
+			);
+		}
+		return {
+			apiKey,
+			release: () => {
+				// The store-owned ticket orders remote snapshot authority against
+				// provider admission; the gateway tail independently orders local
+				// acquisitions without serializing response lifetimes.
+				dispatchTicket?.release();
+				release();
+			},
+		};
 	} catch (error) {
 		release();
 		if (error instanceof GatewayCredentialError) throw error;
@@ -502,7 +521,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 	signal: AbortSignal,
 	format: string,
 	peer: string,
-): Promise<string | undefined> {
+): Promise<AuthRetryCredential | undefined> {
 	await opts.storage.invalidateCredentialMatching(provider, oldKey, signal);
 	logger.debug("auth-gateway retrying provider request after credential invalidation", {
 		format,
@@ -511,7 +530,8 @@ async function refreshGatewayApiKeyAfterAuthError(
 		error: cleanReason(error) ?? "Upstream request failed",
 	});
 	try {
-		return await resolveGatewayApiKey(opts, model, peer, signal);
+		const lease = await acquireGatewayApiKey(opts, model, peer, signal);
+		return { apiKey: lease.apiKey, onStreamCreated: lease.release } satisfies AuthRetryCredential;
 	} catch (resolutionError) {
 		if (resolutionError instanceof GatewayCredentialError) {
 			logger.debug("auth-gateway has no broker-authorized replacement credential", {

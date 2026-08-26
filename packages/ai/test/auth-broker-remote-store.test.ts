@@ -215,6 +215,36 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
 	});
 
+	test("does not let an obsolete scoped usage flight delete its replacement", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+
+		const first = Promise.withResolvers<{ generatedAt: number; reports: [] }>();
+		const second = Promise.withResolvers<{ generatedAt: number; reports: [] }>();
+		const fetchUsage = vi.spyOn(client, "fetchUsage").mockImplementation((_signal, provider) => {
+			if (provider !== "anthropic") throw new Error("expected scoped usage fetch");
+			return (fetchUsage.mock.calls.length === 1 ? first.promise : second.promise) as never;
+		});
+
+		const firstRequest = remote.fetchUsageReportsForProvider("anthropic" as never);
+		expect(fetchUsage).toHaveBeenCalledTimes(1);
+		// This is the same invalidation path used when a snapshot generation
+		// changes. A second request must be allowed to install its own flight.
+		remote.deleteCachePrefix("usage_cache:");
+		const secondRequest = remote.fetchUsageReportsForProvider("anthropic" as never);
+		expect(fetchUsage).toHaveBeenCalledTimes(2);
+
+		first.resolve({ generatedAt: Date.now(), reports: [] });
+		await firstRequest;
+		// The first promise has settled, but the replacement remains coalesced.
+		expect(fetchUsage).toHaveBeenCalledTimes(2);
+		second.resolve({ generatedAt: Date.now(), reports: [] });
+		await secondRequest;
+		await remote.fetchUsageReportsForProvider("anthropic" as never);
+		expect(fetchUsage).toHaveBeenCalledTimes(2);
+	});
+
 	test("hydrates metadata and durable health/usage presentations for one-shot consumers", async () => {
 		const presentationPath = path.join(tempDir, "presentations.json");
 		const client = new AuthBrokerClient({ url: handle!.url, token });

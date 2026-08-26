@@ -635,6 +635,78 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 		}
 	});
 
+	it("acquires and releases a fresh store dispatch ticket for an auth retry", async () => {
+		const testSource = "auth-gateway-provider-scope-retry-ticket-test";
+		const testApi = "auth-gateway-provider-scope-retry-ticket-test" as Api;
+		const provider = "gateway-retry-ticket-provider";
+		const scopedModel = model("retry-ticket-model", provider, testApi);
+		const keys: string[] = [];
+		const tickets: Array<{ releases: number }> = [];
+		let activeKey = "first-key";
+		registerCustomApi(
+			testApi,
+			(_model, _context, options) => {
+				keys.push(options?.apiKey ?? "");
+				if (keys.length === 1) {
+					const events = new EventStream();
+					queueMicrotask(() => events.fail(authError()));
+					return events;
+				}
+				return makeEventStream({
+					role: "assistant",
+					api: testApi,
+					provider,
+					model: scopedModel.id,
+					content: [{ type: "text", text: "recovered" }],
+					usage: ZERO_USAGE,
+					stopReason: "stop",
+					timestamp: 0,
+				});
+			},
+			testSource,
+		);
+		const storage = {
+			exportSnapshot: () => ({ credentials: [{ provider, key: activeKey }] }),
+			getApiKey: async () => activeKey,
+			invalidateCredentialMatching: async () => {
+				activeKey = "replacement-key";
+				return true;
+			},
+			acquireCredentialDispatchTicket: async () => {
+				const ticket = { releases: 0 };
+				tickets.push(ticket);
+				return { release: () => (ticket.releases += 1) };
+			},
+		} as unknown as AuthStorage;
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			hasProviderCredential: () => true,
+			reloadProviderCredentials: async () => {},
+			validateProviderCredential: (candidateProvider, apiKey) =>
+				candidateProvider === provider && apiKey === activeKey,
+			bearerTokens: [],
+			version: "test",
+			storage,
+			resolveModel: id => (id === scopedModel.id ? scopedModel : undefined),
+			listModels: () => [scopedModel],
+		});
+		try {
+			const response = await fetch(`${gateway.url}/v1/pi/stream`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ modelId: scopedModel.id, context: baseContext, stream: false }),
+			});
+			expect(response.status).toBe(200);
+			expect(keys).toEqual(["first-key", "replacement-key"]);
+			expect(tickets).toHaveLength(2);
+			expect(tickets.map(ticket => ticket.releases)).toEqual([1, 1]);
+		} finally {
+			await gateway.close();
+			unregisterCustomApis(testSource);
+		}
+	});
+
 	it("admits concurrent long-lived streams without global response-lifetime serialization", async () => {
 		const testSource = "auth-gateway-provider-scope-concurrent-stream-test";
 		const testApi = "auth-gateway-provider-scope-concurrent-stream-test" as Api;
