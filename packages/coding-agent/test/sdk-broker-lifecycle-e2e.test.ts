@@ -3937,6 +3937,23 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 			ok: false,
 			error: { code: "terminal_uncertain" },
 		});
+		await expect(
+			broker.handleRequest(
+				"session.reconcile_uncertain",
+				{
+					sessionId,
+					cwd: agentDir,
+					stateRoot,
+					endpointGeneration: 4,
+					endpointMtimeMs: 1,
+					processIncarnation: processIdentity,
+					hostIncarnation: processIdentity,
+					lifecycleRequestId: "stale-marker",
+					remoteCreateKey: "reconcile-create-key",
+				},
+				"reconcile-stale-marker",
+			),
+		).resolves.toMatchObject({ ok: false, error: { code: "retirement_proof_stale" } });
 		child.kill("SIGKILL");
 		await child.exited;
 		const deadResponse = await broker.handleRequest(

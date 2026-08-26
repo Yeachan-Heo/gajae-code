@@ -2034,8 +2034,15 @@ async function executeUncertainRetirement(
 		if (remoteCreateKey === undefined)
 			return fail("invalid_input", "remoteCreateKey must be a bounded non-empty string.");
 		const matches = broker.ledger.listUncertainCreatesBySessionId(id, lifecycleRequestId, remoteCreateKey);
-		if (matches.length === 0)
+		if (matches.length === 0) {
+			const markerCandidates = broker.ledger.listUncertainCreatesBySessionId(id, undefined, remoteCreateKey);
+			if (markerCandidates.length === 1 && markerCandidates[0]!.effectMarker !== lifecycleRequestId)
+				return fail(
+					"retirement_proof_stale",
+					"Retirement lifecycle marker does not match the indexed create identity before effect start.",
+				);
 			return fail("not_found", "No complete terminal_uncertain create identity matches this session.");
+		}
 		if (matches.length !== 1)
 			return fail("terminal_uncertain", "Multiple terminal_uncertain create identities match this session.");
 		create = matches[0]!;
