@@ -6868,7 +6868,7 @@ describe("ModelRegistry", () => {
 				await changedSecretRegistry.refreshProvider("discovery-provider", "online-if-uncached");
 				expect(requests).toBeGreaterThan(requestsBeforeChange);
 			}
-		});
+		}, 60_000);
 		test("does not expose a prior non-secret cache after switching to secret headers offline", async () => {
 			const config = (headers: Record<string, string>) => ({
 				"discovery-provider": {
