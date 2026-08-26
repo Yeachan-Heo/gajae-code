@@ -1351,12 +1351,7 @@ async function reconcileTransitionResidue(transitionDir: string, deadline: numbe
 	const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
 	const result = await native.exactRemoveDirectoryTreeAsync(residue, snapshot, undefined, remaining);
 	if (result.ok) return;
-	if (
-		result.code === "cleanup_pending" &&
-		result.detachedPath === residue &&
-		result.payloadDurable !== false
-	)
-		return;
+	if (result.code === "cleanup_pending" && result.detachedPath === residue && result.payloadDurable !== false) return;
 	throw new SessionStateLockUnavailableError(new Error("Detached transition cleanup could not be reconciled safely."));
 }
 
