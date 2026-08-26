@@ -900,6 +900,8 @@ export interface AgentSessionConfig {
 	initialMCPToolSelectionIsExplicit?: boolean;
 	/** Whether a discoverable built-in selection was explicitly supplied to the constructor, including an empty selection. */
 	initialDiscoveredBuiltinToolSelectionIsExplicit?: boolean;
+	/** Whether the caller explicitly disabled every built-in tool for this session. */
+	explicitEmptyToolSelection?: boolean;
 
 	/** Whether constructor-provided MCP selections should be persisted immediately. */
 	persistInitialMCPToolSelection?: boolean;
@@ -2660,6 +2662,7 @@ export class AgentSession {
 	/** Constructor authority applies only while this AgentSession instance remains alive. */
 	#constructorMCPToolSelection: string[] | undefined;
 	#constructorDiscoveredBuiltinToolSelection: string[] | undefined;
+	#explicitEmptyToolSelection = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
 	#memoryGuardClaimsLease: MemoryGuardClaimsLease | undefined;
 
@@ -3827,6 +3830,7 @@ export class AgentSession {
 		this.#networkPrewarmService = config.networkPrewarmService;
 		this.#onWorkspaceTreeReady = config.onWorkspaceTreeReady;
 		this.#mcpDiscoveryEnabled = config.mcpDiscoveryEnabled ?? false;
+		this.#explicitEmptyToolSelection = config.explicitEmptyToolSelection === true;
 		const configuredDiscoveryMode = config.settings.get("tools.discoveryMode");
 		this.#discoveryMode =
 			config.discoveryMode ??
@@ -8902,9 +8906,11 @@ export class AgentSession {
 			? this.#filterSelectableMCPToolNames(sessionContext.selectedMCPToolNames)
 			: (constructorMCPToolNames ?? this.#getConfiguredDefaultSelectedMCPToolNames());
 		const constructorDiscoveredBuiltinToolNames = this.#resolveConstructorDiscoveredBuiltinToolSelection();
-		const restoredDiscoveredBuiltinToolNames = sessionContext.hasPersistedDiscoveredBuiltinToolSelection
-			? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
-			: (constructorDiscoveredBuiltinToolNames ?? []);
+		const restoredDiscoveredBuiltinToolNames = this.#explicitEmptyToolSelection
+			? []
+			: sessionContext.hasPersistedDiscoveredBuiltinToolSelection
+				? this.#selectRestorableDiscoveredBuiltinToolNames(sessionContext.selectedDiscoveredBuiltinToolNames ?? [])
+				: (constructorDiscoveredBuiltinToolNames ?? []);
 		this.#selectedDiscoveredToolNames = new Set(restoredDiscoveredBuiltinToolNames);
 		await this.#applyActiveToolsByName(
 			[...nextActiveNonMCPToolNames, ...restoredMCPToolNames, ...restoredDiscoveredBuiltinToolNames],

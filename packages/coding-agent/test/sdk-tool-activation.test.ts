@@ -322,6 +322,33 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
+	it("does not restore persisted discoverable built-ins for an explicit empty selection", async () => {
+		const sessionManager = SessionManager.inMemory();
+		const targetEntryId = sessionManager.appendMessage({
+			role: "user",
+			content: "before empty selection resume",
+			timestamp: Date.now(),
+		});
+		sessionManager.appendDiscoveredBuiltinToolSelection(["find"]);
+		const { session } = await createMinimalSession(
+			tempDirs,
+			Settings.isolated({ "tools.discoveryMode": "all", "tools.essentialOverride": ["read", "bash", "edit"] }),
+			[],
+			sessionManager,
+		);
+
+		try {
+			expect(session.getActiveToolNames()).not.toContain("find");
+			expect(session.getActiveToolNames()).not.toContain("goal");
+			const result = await session.branch(targetEntryId);
+			expect(result.cancelled).toBe(false);
+			expect(session.getSelectedDiscoveredToolNames()).not.toContain("find");
+			expect(session.getActiveToolNames()).not.toContain("find");
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("keeps a restored now-essential built-in active as baseline rather than discovery authority", async () => {
 		const sessionManager = SessionManager.inMemory();
 		const targetEntryId = sessionManager.appendMessage({
