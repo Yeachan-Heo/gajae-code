@@ -101,7 +101,7 @@ const SSH_HELP_TEXT = [
 
 async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	try {
-		const userPath = getSSHConfigPath("user", runtime.cwd, runtime.settings.getAgentDir());
+		const userPath = getSSHConfigPath("user", runtime.cwd, runtime.session.getSessionAgentDir());
 		const projectPath = getSSHConfigPath("project", runtime.cwd);
 		const [userConfig, projectConfig] = await Promise.all([
 			readSSHConfigFile(userPath),
@@ -140,7 +140,7 @@ async function handleRemoveCommand(rest: string, runtime: SlashCommandRuntime): 
 	if (parsed.error) return usage(parsed.error, runtime);
 	if (!parsed.name) return usage("Usage: /ssh remove <name> [--scope project|user]", runtime);
 	try {
-		const filePath = getSSHConfigPath(parsed.scope, runtime.cwd, runtime.settings.getAgentDir());
+		const filePath = getSSHConfigPath(parsed.scope, runtime.cwd, runtime.session.getSessionAgentDir());
 		await removeSSHHost(filePath, parsed.name);
 		await runtime.session.refreshSshTool();
 		await runtime.output(`Removed SSH host "${parsed.name}" from ${parsed.scope} config.`);
@@ -161,7 +161,7 @@ async function handleAddCommand(rest: string, runtime: SlashCommandRuntime): Pro
 	if (parsed.port) hostConfig.port = parsed.port;
 	if (parsed.keyPath) hostConfig.keyPath = parsed.keyPath;
 	try {
-		const filePath = getSSHConfigPath(parsed.scope, runtime.cwd, runtime.settings.getAgentDir());
+		const filePath = getSSHConfigPath(parsed.scope, runtime.cwd, runtime.session.getSessionAgentDir());
 		await addSSHHost(filePath, parsed.name, hostConfig);
 		await runtime.session.refreshSshTool({ activateIfAvailable: true });
 		await runtime.output(`Added SSH host "${parsed.name}" (${parsed.scope}).`);

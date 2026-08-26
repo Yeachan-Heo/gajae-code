@@ -204,7 +204,7 @@ async function withPreparedMcpConnection<T>(
 ): Promise<T> {
 	const manager = new MCPManager(runtime.cwd, null, {
 		sharedPoolIdleMs: runtime.settings.get("mcp.sharedPoolIdleMs"),
-		agentDir: runtime.settings.getAgentDir(),
+		agentDir: runtime.session.getSessionAgentDir(),
 		settings: runtime.settings,
 	});
 	// Auth storage must be wired in before the prepared lease so OAuth-backed
@@ -217,7 +217,7 @@ async function collectConnectedMcpLines(
 	runtime: SlashCommandRuntime,
 	collect: (serverName: string, connection: MCPServerConnection) => Promise<string[]>,
 ): Promise<string[] | undefined> {
-	const servers = await getMcpConfiguredServers(runtime.cwd, runtime.settings.getAgentDir());
+	const servers = await getMcpConfiguredServers(runtime.cwd, runtime.session.getSessionAgentDir());
 	if (servers.length === 0) return undefined;
 
 	const lines: string[] = [];
@@ -263,7 +263,7 @@ async function handlePromptsCommand(runtime: SlashCommandRuntime): Promise<Slash
 async function handleTestCommand(rest: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	const name = rest.split(/\s+/)[0]?.trim() ?? "";
 	if (!name) return usage("Usage: /mcp test <name>", runtime);
-	const servers = await getMcpConfiguredServers(runtime.cwd, runtime.settings.getAgentDir());
+	const servers = await getMcpConfiguredServers(runtime.cwd, runtime.session.getSessionAgentDir());
 	const server = servers.find(item => item.name === name);
 	if (!server) return usage(`Server "${name}" not found. Run /mcp list to see configured servers.`, runtime);
 
