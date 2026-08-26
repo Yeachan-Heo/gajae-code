@@ -1,5 +1,3 @@
-import * as nodeFs from "node:fs";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	Agent,
@@ -38,7 +36,6 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
-	setProjectDir,
 } from "@gajae-code/utils";
 import {
 	createAppendOnlyContextManager,
@@ -84,7 +81,6 @@ import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings, releaseSettingsScope } from "../discovery";
-import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
@@ -152,7 +148,7 @@ import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state"
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
-import { AgentSession, type ForkContextSeed } from "../session/agent-session";
+import { AgentSession, type AgentSessionRescopeParticipant, type ForkContextSeed } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
@@ -2388,6 +2384,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		};
 
+		const canAgentRescopeSessionCwd =
+			!isCanonicalSubSession &&
+			!options.bashRestrictionProfile &&
+			(options.bashAllowedPrefixes ?? []).length === 0 &&
+			!options.mcpManager &&
+			explicitMcpConfigPath === undefined &&
+			options.workspaceTree === undefined;
+		const rescopeSessionCwdParticipant: AgentSessionRescopeParticipant | undefined = canAgentRescopeSessionCwd
+			? {
+					assertCanRescope: () => {
+						if (options.mcpManager && !ownsMcpManager) {
+							throw new Error(
+								"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
+							);
+						}
+					},
+					rebindCwdCapturingAuthority,
+					applyRescopedReadState,
+				}
+			: undefined;
+
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -2419,26 +2436,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
 			currentAgentType: options.currentAgentType,
-			// Agent-invokable session rescope (#4629). Provided only where
-			// relocation is safe: canonical top-level sessions (the same
-			// isCanonicalSubSession predicate that gates SDK hosting — taskDepth 0,
-			// no parentTaskPrefix, no currentAgentType) without a restricted bash
-			// surface. Runs the same sequence as the text/ACP `/move` handler so
-			// tool path resolution, the bash default cwd, and plugin caches follow
-			// the move. Unlike the user-driven `/move`, the model-invoked accessor
-			// is bound to at most one successful move per session, rejects
-			// re-entrant calls, refuses to move while a workflow skill is active
-			// (its cwd-local state and guards stay pinned to the launch root), and
-			// only narrows: the canonical target must be a strict descendant of
-			// the canonical current cwd, so an injected or speculative call cannot
-			// widen the session's tool/write scope to a parent, a sibling project,
-			// or an arbitrary absolute path.
-			...(!isCanonicalSubSession &&
-			!options.bashRestrictionProfile &&
-			(options.bashAllowedPrefixes ?? []).length === 0 &&
-			!options.mcpManager &&
-			explicitMcpConfigPath === undefined &&
-			options.workspaceTree === undefined
+			...(canAgentRescopeSessionCwd
 				? {
 						rescopeSessionCwd: (() => {
 							let moveConsumed = false;
@@ -4515,6 +4513,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await session?.refreshBaseSystemPrompt();
 			},
 			reloadSshTool,
+			rescopeSessionCwdParticipant,
 			requestedToolNames: requestedToolNameSet,
 			explicitEmptyToolSelection: hasExplicitEmptyToolSelection,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,

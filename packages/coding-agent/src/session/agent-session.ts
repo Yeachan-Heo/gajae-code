@@ -194,6 +194,7 @@ import {
 	logger,
 	prompt,
 	Snowflake,
+	setProjectDir,
 } from "@gajae-code/utils";
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
@@ -243,6 +244,7 @@ import { getDefault } from "../config/settings-schema";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
+import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
 import { MAX_EDIT_FILE_BYTES } from "../edit/read-file";
 import { disposeVmContextsByOwner } from "../eval/js/context-manager";
@@ -849,6 +851,20 @@ export interface RetainedMemorySample {
 	tuiCachedRenderBytes?: number;
 }
 
+/**
+ * Host-owned cwd-derived authority that must be rebound around an agent session
+ * relocation. The AgentSession owns the relocation transaction; hosts participate
+ * only in replacing state that lives outside the session core.
+ */
+export interface AgentSessionRescopeParticipant {
+	/** Reject relocation when the host still owns an incompatible authority. */
+	assertCanRescope?: () => void;
+	/** Rebind cwd-capturing plugin, MCP, and other host tool authority. */
+	rebindCwdCapturingAuthority: (cwd: string) => Promise<void>;
+	/** Re-discover cwd-derived context, skills, and workspace state after commit. */
+	applyRescopedReadState: (cwd: string) => Promise<void>;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -929,6 +945,8 @@ export interface AgentSessionConfig {
 	onWorkspaceTreeReady?: (tree: WorkspaceTree) => void | Promise<void>;
 	/** Rebuild the SSH tool from current capability discovery results. */
 	reloadSshTool?: () => Promise<AgentTool | null>;
+	/** Host participation for the session-owned cwd relocation transaction. */
+	rescopeSessionCwdParticipant?: AgentSessionRescopeParticipant;
 	requestedToolNames?: ReadonlySet<string>;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
@@ -3026,6 +3044,8 @@ export class AgentSession {
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #disposeAsyncJobManager: boolean;
 	#ownedMcpManager: MCPManager | undefined;
+	readonly #rescopeSessionCwdParticipant: AgentSessionRescopeParticipant | undefined;
+	#rescopeSessionCwdConsumed = false;
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
 	#pendingPythonMessages: Array<{
@@ -4473,6 +4493,7 @@ export class AgentSession {
 		if (hasCoordinatorRuntimeStateRescopeJournal(rescopeRecoveryContext)) {
 			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
 		}
+		this.#rescopeSessionCwdParticipant = config.rescopeSessionCwdParticipant;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -5019,6 +5040,202 @@ export class AgentSession {
 			return this.#restoredWorkflowSkillState;
 		}
 		return undefined;
+	}
+
+	/**
+	 * Rescope this session to a strict descendant directory. The session owns the
+	 * transaction boundary, target identity pin, process-cwd authority, rollback,
+	 * and committed-degraded behavior; the host participant only rebinds its
+	 * cwd-derived authority before and after the durable move.
+	 */
+	async rescopeSessionCwd(target: string): Promise<{ from: string; to: string }> {
+		const participant = this.#rescopeSessionCwdParticipant;
+		if (!participant) {
+			throw new Error(
+				"This session cannot rescope its working directory; only top-level unrestrained sessions can move.",
+			);
+		}
+		if (this.#rescopeSessionCwdConsumed) {
+			throw new Error("This session has already been rescoped; only one agent-invoked move is allowed per session.");
+		}
+		if (this.getEffectiveActiveWorkflowSkillState()) {
+			throw new Error("A workflow skill is active in this session; finish or exit it before rescoping.");
+		}
+		participant.assertCanRescope?.();
+		return this.sessionManager.runExclusiveCwdTransition(async () => {
+			if (this.#rescopeSessionCwdConsumed) {
+				throw new Error(
+					"This session has already been rescoped; only one agent-invoked move is allowed per session.",
+				);
+			}
+			if (this.getEffectiveActiveWorkflowSkillState()) {
+				throw new Error(
+					"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
+				);
+			}
+			const from = this.sessionManager.getCwd();
+			const resolvedPath = path.resolve(from, target);
+			let canonicalFrom: string;
+			let canonicalTarget: string;
+			try {
+				canonicalFrom = await fs.promises.realpath(from);
+				canonicalTarget = await fs.promises.realpath(resolvedPath);
+			} catch {
+				throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+			}
+			if (!(await fs.promises.stat(canonicalTarget)).isDirectory()) {
+				throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+			}
+			const relative = path.relative(canonicalFrom, canonicalTarget);
+			if (relative === "") {
+				throw new Error(`Target ${canonicalTarget} is the current session directory; nothing to move.`);
+			}
+			if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+				throw new Error(
+					`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
+				);
+			}
+			let targetHandle: fs.promises.FileHandle | undefined;
+			let expectedIdentity: { dev: bigint; ino: bigint };
+			try {
+				targetHandle = await SessionManager.openNoFollowDirectory(canonicalTarget);
+				const opened = await targetHandle.stat({ bigint: true });
+				if (!opened.isDirectory()) {
+					throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+				}
+				expectedIdentity = { dev: opened.dev, ino: opened.ino };
+				await fs.promises.access(canonicalTarget, fs.constants.R_OK | fs.constants.X_OK);
+			} catch (error) {
+				await targetHandle?.close().catch(() => {});
+				if (error instanceof Error && error.message.startsWith("Directory does not exist")) {
+					throw error;
+				}
+				throw new Error(
+					`Directory identity or access unavailable: ${canonicalTarget}${
+						error instanceof Error ? ` (${error.message})` : ""
+					}`,
+				);
+			}
+			// Process-cwd authority is an explicit claim, never inferred from
+			// `process.cwd() === from`: sibling sessions launched at the same
+			// root both satisfy that, so acting on it would chdir the process
+			// and clear process-global caches underneath the sibling.
+			const ownsProcessCwd = SessionManager.isProcessCwdOwner(this.sessionManager);
+			const restoreLaunchRoot = async (failure: unknown): Promise<never> => {
+				const restoreErrors: Error[] = [];
+				if (ownsProcessCwd) {
+					try {
+						setProjectDir(canonicalFrom);
+						if (path.resolve(process.cwd()) !== path.resolve(canonicalFrom)) {
+							throw new Error("Process cwd did not restore to the launch root.");
+						}
+					} catch (error) {
+						restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
+					}
+					try {
+						resetCapabilities();
+						const restoreRegistry = await resolveActiveProjectRegistryPath(canonicalFrom).catch(() => undefined);
+						clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
+					} catch (error) {
+						restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
+					}
+				}
+				try {
+					await participant.rebindCwdCapturingAuthority(canonicalFrom);
+				} catch (error) {
+					restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
+				}
+				if (restoreErrors.length > 0) {
+					throw new AggregateError(restoreErrors, "Failed to restore launch-root rescope authority.", {
+						cause: failure,
+					});
+				}
+				throw failure;
+			};
+			try {
+				// Every fallible step that the moved session depends on runs
+				// BEFORE the session-file commit, so a failure here leaves the
+				// session exactly where it was and the tool call is a clean
+				// rejection rather than a half-moved session.
+				if (ownsProcessCwd) {
+					setProjectDir(canonicalTarget);
+					try {
+						// `setProjectDir` chdirs a NAME. Confirm the process actually
+						// landed on the pinned directory, so a path replaced after
+						// the name checks cannot escape the validated descendant.
+						await SessionManager.assertProcessCwdIdentity(expectedIdentity);
+					} catch (error) {
+						setProjectDir(canonicalFrom);
+						throw error;
+					}
+				}
+				let rescopeFailure: unknown;
+				try {
+					if (ownsProcessCwd) {
+						resetCapabilities();
+						const projectRegistry = await resolveActiveProjectRegistryPath(canonicalTarget);
+						clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+					}
+					// Plugin/MCP/Python authority must be rebound successfully
+					// before committing; swallowing a failure here is what leaves
+					// a moved session holding launch-root tool authority.
+					await participant.rebindCwdCapturingAuthority(canonicalTarget);
+				} catch (error) {
+					rescopeFailure = error;
+				}
+				if (rescopeFailure !== undefined) {
+					await restoreLaunchRoot(rescopeFailure);
+				}
+				try {
+					await this.sessionManager.flush();
+					// Commit last: `moveTo` re-validates the pinned identity through
+					// the still-open handle at the state-changing boundary.
+					await this.sessionManager.moveTo(canonicalTarget, {
+						expectedIdentity,
+						targetHandle,
+					});
+				} catch (error) {
+					const committedCwd = this.sessionManager.getCwd();
+					const stayedAtLaunchRoot = path.resolve(committedCwd) === path.resolve(from);
+					if (stayedAtLaunchRoot) await restoreLaunchRoot(error);
+					// SessionManager can publish the durable move before a later metadata
+					// write fails. Treat that state as committed rather than reporting a
+					// rejection after the session has moved.
+					this.#rescopeSessionCwdConsumed = true;
+					logger.warn("Session rescope committed before finalization failed", {
+						error: error instanceof Error ? error.message : String(error),
+						cwd: committedCwd,
+					});
+				}
+				this.#rescopeSessionCwdConsumed = true;
+				if (ownsProcessCwd) {
+					try {
+						await shutdownAllLspClients();
+					} catch (error) {
+						logger.warn("Failed to reset launch-root LSP clients after session rescope", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+				// Cwd-derived read-only state the prompt and subagents consume.
+				// Best-effort by design: the move is committed, and a failed
+				// re-discovery must not present a committed move as a failure.
+				await participant.applyRescopedReadState(this.sessionManager.getCwd());
+				try {
+					await this.refreshSshTool({ activateIfAvailable: true });
+				} catch (error) {
+					// Non-fatal: the session has moved; the SSH tool refreshes
+					// on its next activation attempt.
+					logger.warn("Committed session rescope could not refresh the SSH tool", {
+						error: error instanceof Error ? error.message : String(error),
+						cwd: this.sessionManager.getCwd(),
+					});
+				}
+				return { from, to: this.sessionManager.getCwd() };
+			} finally {
+				await targetHandle.close().catch(() => {});
+			}
+		});
 	}
 
 	/** Replace the session-owned MCP manager after a cwd rescope. */
