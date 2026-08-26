@@ -67,9 +67,10 @@ export class MarketplaceManager {
 
 	// Invalidate fs caches for all registry paths the manager writes, then clear plugin roots.
 	#clearCache(): void {
-		const extra = this.#opts.projectInstalledRegistryPath
-			? ([this.#opts.projectInstalledRegistryPath] as readonly string[])
-			: undefined;
+		const extra = [
+			this.#opts.installedRegistryPath,
+			...(this.#opts.projectInstalledRegistryPath ? [this.#opts.projectInstalledRegistryPath] : []),
+		] as readonly string[];
 		this.#opts.clearPluginRootsCache?.(extra);
 	}
 

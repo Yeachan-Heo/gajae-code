@@ -220,7 +220,7 @@ export class ExtensionDashboard extends Container {
 	}
 
 	#applyDisabledExtensions(disabledIds: string[]): void {
-		this.#state = applyDisabledExtensionsToState(this.#state, disabledIds);
+		this.#state = applyDisabledExtensionsToState(this.#state, disabledIds, this.settings ?? undefined);
 		this.#mainList.setExtensions(this.#state.searchFiltered);
 		if (this.#state.selected) {
 			this.#inspector.setExtension(this.#state.selected);

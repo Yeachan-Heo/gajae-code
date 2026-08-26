@@ -67,7 +67,7 @@ export async function loadAllExtensions(
 			const id = makeExtensionId(kind, item.name);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (item as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(item._source.provider);
+			const providerEnabled = isProviderEnabled(item._source.provider, settings);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -158,7 +158,7 @@ export async function loadAllExtensions(
 			const id = makeExtensionId("mcp", server.name);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (server as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(server._source.provider);
+			const providerEnabled = isProviderEnabled(server._source.provider, settings);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -223,7 +223,7 @@ export async function loadAllExtensions(
 			const id = makeExtensionId("hook", `${hook.type}:${hook.tool}:${hook.name}`);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (hook as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(hook._source.provider);
+			const providerEnabled = isProviderEnabled(hook._source.provider, settings);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -268,7 +268,7 @@ export async function loadAllExtensions(
 			const id = makeExtensionId("context-file", `${file.level}:${name}`);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (file as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(file._source.provider);
+			const providerEnabled = isProviderEnabled(file._source.provider, settings);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -529,7 +529,11 @@ function isShadowedExtension(ext: Extension): boolean {
  * Apply setting-backed item disable overrides to an existing dashboard state.
  * This gives the UI immediate feedback while the full capability refresh runs.
  */
-export function applyDisabledExtensionsToState(state: DashboardState, disabledIds: string[]): DashboardState {
+export function applyDisabledExtensionsToState(
+	state: DashboardState,
+	disabledIds: string[],
+	settings?: Settings,
+): DashboardState {
 	const disabled = new Set(disabledIds);
 	const updateExtension = (ext: Extension): Extension => {
 		if (disabled.has(ext.id)) {
@@ -538,7 +542,7 @@ export function applyDisabledExtensionsToState(state: DashboardState, disabledId
 		}
 
 		if (ext.state !== "disabled" || ext.disabledReason !== "item-disabled") return ext;
-		if (!isProviderEnabled(ext.source.provider)) {
+		if (!isProviderEnabled(ext.source.provider, settings)) {
 			return { ...ext, state: "disabled", disabledReason: "provider-disabled" };
 		}
 
