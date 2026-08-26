@@ -479,12 +479,23 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 								providerKey,
 								createdReplacedRef.valueSha256,
 							);
-							if (match.found)
-								await removeReplacedProviderBackup(
+							if (match.found) {
+								const removed = await removeReplacedProviderBackup(
 									createdReplacedRef.backupPath,
 									providerKey,
 									createdReplacedRef.valueSha256,
 								);
+								if (!removed) {
+									throw new PaseoPublishError(
+										createdReplacedRef.backupPath,
+										{
+											reason: "sidecar-conflict",
+											detail: "authenticated provider sidecar cleanup retained native authority",
+										},
+										[createdReplacedRef.backupPath],
+									);
+								}
+							}
 						}
 					: undefined,
 			now,
