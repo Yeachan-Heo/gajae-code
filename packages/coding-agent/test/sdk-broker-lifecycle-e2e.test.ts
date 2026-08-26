@@ -4109,7 +4109,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			locator: indexed.locator,
 			endpointGeneration: indexed.endpointGeneration + 1,
 			pid: process.pid,
-			endpointMtimeMs: indexed.endpointMtimeMs + 1,
+			endpointMtimeMs: input.endpointMtimeMs + 1,
 			lifecycleRequestId: "same-id-successor",
 			processIncarnation: "same-id-successor-process",
 			hostIncarnation: "same-id-successor-host",
