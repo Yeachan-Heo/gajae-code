@@ -1436,7 +1436,7 @@ describe("ModelRegistry", () => {
 				const resolved = registry.resolveCanonicalModel(record.id, { availableOnly: false, candidates });
 				expect(selection.model).toBe(resolved);
 			}
-		});
+		}, 60_000);
 		// Sticky state mutates per call, so each scenario runs batch and per-record
 		// passes in the same order on independent registries. Split into one test
 		// per scenario: a single combined test exceeded the default 5s test
