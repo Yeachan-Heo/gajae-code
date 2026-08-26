@@ -221,6 +221,8 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 	await writeIntent(input.intentPath, intent);
 
 	let backupPath: string | undefined;
+	let backupValueSha256: string | undefined;
+	let backupIdentity: PersistedFileIdentity | undefined;
 	let publishSucceeded = false;
 	// Track whether the persist hook was ATTEMPTED, not only whether it
 	// resolved. `persist` can create the durable artifact and then throw; a
@@ -248,6 +250,8 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			backup: true,
 			now: input.now,
 			onBackupPrepared: async (backupPath, valueSha256, identity?: PersistedFileIdentity) => {
+				backupValueSha256 = valueSha256;
+				backupIdentity = identity;
 				await writeIntent(input.intentPath, {
 					...intent,
 					provenancePayload: ledgerAfter,
@@ -260,6 +264,17 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		backupPath = published.backupPath;
 		publishSucceeded = published.published;
 		await writeProvenance(input.provenancePath, ledgerAfter);
+		if (backupPath !== undefined && backupValueSha256 !== undefined && backupIdentity === undefined) {
+			publishSucceeded = false;
+			throw new Error(`credential publication backup identity is unavailable at ${backupPath}`);
+		}
+		if (backupPath !== undefined && backupValueSha256 !== undefined && backupIdentity !== undefined) {
+			const removed = await removePublishBackup(input.targetPath, backupPath, backupValueSha256, backupIdentity);
+			if (!removed) {
+				publishSucceeded = false;
+				throw new Error(`credential publication backup cleanup remains pending at ${backupPath}`);
+			}
+		}
 	} catch (error) {
 		if (persistAttempted) {
 			await writeIntent(input.intentPath, {
@@ -267,6 +282,15 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				provenancePayload: ledgerAfter,
 				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
 				discardSidecar: input.discardSidecar,
+				...(backupPath !== undefined && backupValueSha256 !== undefined
+					? {
+							publishBackup: {
+								backupPath,
+								valueSha256: backupValueSha256,
+								...(backupIdentity === undefined ? {} : { identity: backupIdentity }),
+							},
+						}
+					: {}),
 			}).catch(() => undefined);
 		}
 		if (!publishSucceeded && error instanceof PaseoPublishError && error.refusal.reason === "sidecar-conflict") {
