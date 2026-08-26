@@ -247,7 +247,9 @@ describe("submitInteractiveInput", () => {
 		};
 		const input = createInput();
 		const unhandled: unknown[] = [];
-		const onUnhandled = (reason: unknown): void => unhandled.push(reason);
+		const onUnhandled = (reason: unknown): void => {
+			unhandled.push(reason);
+		};
 		process.on("unhandledRejection", onUnhandled);
 		try {
 			await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
