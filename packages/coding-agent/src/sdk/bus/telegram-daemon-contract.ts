@@ -284,7 +284,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * after its autonomous ask lead-in publishes successfully, preventing idle
  * replay without changing the serving protocol.
  */
-export const DAEMON_GENERATION = 178;
+export const DAEMON_GENERATION = 179;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
