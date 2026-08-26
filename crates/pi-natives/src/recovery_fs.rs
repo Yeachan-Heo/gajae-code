@@ -396,6 +396,29 @@ fn rename_exchange_same_parent(
 }
 
 #[cfg(target_os = "linux")]
+fn restore_exchanged_successor(
+	parent: &File,
+	stage: &CString,
+	destination: &CString,
+	staged_identity: &RecoveryFsIdentity,
+) -> bool {
+	if rename_exchange_same_parent(parent, stage, destination).is_err() {
+		return false;
+	}
+	let Ok(restored_stage) = statat(parent, stage) else {
+		return false;
+	};
+	if restored_stage.st_dev.to_string() != staged_identity.dev
+		|| restored_stage.st_ino.to_string() != staged_identity.ino
+	{
+		return false;
+	}
+	// SAFETY: the staging name was created by this operation and its identity was
+	// checked after restoring the displaced successor.
+	unsafe { libc::unlinkat(parent.as_raw_fd(), stage.as_ptr(), 0) == 0 }
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoReplacePrimitive {
 	Renameat2,
@@ -3442,6 +3465,8 @@ fn replace_managed(
 		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
 	))
 	.expect("replacement staging name contains no NUL");
+	// SAFETY: parent owns a live directory descriptor and stage_name is a validated
+	// single-component NUL-terminated name.
 	let stage_fd = unsafe {
 		libc::openat(
 			parent.as_raw_fd(),
@@ -3453,6 +3478,7 @@ fn replace_managed(
 	if stage_fd < 0 {
 		return publish_preflight_failure_with_primitive("io_error", primitive);
 	}
+	// SAFETY: stage_fd is the uniquely owned descriptor returned by openat above.
 	let mut stage = unsafe { File::from_raw_fd(stage_fd) };
 	if crate::path_identity::platform::secure_created_owner_only_file(&stage).is_err() {
 		return publish_preflight_failure_with_primitive("permission_denied", primitive);
@@ -3498,16 +3524,13 @@ fn replace_managed(
 		return publish_preflight_failure_with_primitive(code, primitive);
 	}
 
-	let canonical = match open_existing(root, relative_path, false) {
-		Ok(file) => file,
-		Err(_) => {
-			return publish_post_mutation_failure_with_primitive(
-				"identity_mismatch",
-				"terminal_identity",
-				primitive,
-				None,
-			);
-		},
+	let Ok(canonical) = open_existing(root, relative_path, false) else {
+		return publish_post_mutation_failure_with_primitive(
+			"identity_mismatch",
+			"terminal_identity",
+			primitive,
+			None,
+		);
 	};
 	let canonical_identity = match regular_identity(&canonical) {
 		Ok(identity) => identity,
@@ -3530,21 +3553,11 @@ fn replace_managed(
 		&& stat_matches_regular_identity(&named_after_exchange, &canonical_identity)
 		&& crate::path_identity::platform::verify_created_owner_only_file(&canonical).is_ok();
 	if !canonical_is_ours {
+		// The exchange displaced a successor that failed the expected predecessor
+		// proof. Restore it only while the canonical name still names our staged
+		// inode; an uncoordinated replacement is never overwritten during cleanup.
 		if canonical_matches_staged {
-			// The exchange displaced a successor that failed the expected predecessor
-			// proof. Restore it only while the canonical name still names our staged
-			// inode; an uncoordinated replacement is never overwritten during cleanup.
-			if rename_exchange_same_parent(&parent, &stage_name, &name).is_ok() {
-				if let Ok(restored_stage) = statat(&parent, &stage_name) {
-					if restored_stage.st_dev.to_string() == staged_identity.dev
-						&& restored_stage.st_ino.to_string() == staged_identity.ino
-					{
-						// SAFETY: the staging name was created by this operation and the
-						// descriptor/name identity was just checked after restoration.
-						unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) };
-					}
-				}
-			}
+			let _ = restore_exchanged_successor(&parent, &stage_name, &name, &staged_identity);
 		}
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
@@ -3562,17 +3575,7 @@ fn replace_managed(
 	};
 	if !old_matches {
 		if canonical_matches_staged {
-			if rename_exchange_same_parent(&parent, &stage_name, &name).is_ok() {
-				if let Ok(restored_stage) = statat(&parent, &stage_name) {
-					if restored_stage.st_dev.to_string() == staged_identity.dev
-						&& restored_stage.st_ino.to_string() == staged_identity.ino
-					{
-						// SAFETY: the staging name was created by this operation and the
-						// descriptor/name identity was just checked after restoration.
-						unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) };
-					}
-				}
-			}
+			let _ = restore_exchanged_successor(&parent, &stage_name, &name, &staged_identity);
 		}
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
@@ -3590,6 +3593,8 @@ fn replace_managed(
 	}
 	// The old generation is no longer canonical. Remove only the exact staged
 	// inode; a same-name replacement is left untouched and reported as uncertain.
+	// SAFETY: stage_name was created by this operation and its live entry still
+	// matches the expected predecessor device, inode, and link count above.
 	if unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) } != 0 {
 		return committed_failure("io_error", "terminal_identity");
 	}
