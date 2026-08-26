@@ -4169,7 +4169,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 	}
 });
 
-test("reconcile_uncertain preserves session_closed evidence when deletion follows an index-stage crash", async () => {
+test("reconcile_uncertain fails closed when deletion wins the closure append race", async () => {
 	const agentDir = await fs.mkdtemp(
 		path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-reconcile-index-delete-race-"),
 	);
@@ -4223,58 +4223,43 @@ test("reconcile_uncertain preserves session_closed evidence when deletion follow
 		child.kill("SIGKILL");
 		await child.exited;
 
-		let injectedFailures = 0;
-		const originalTransition = broker.ledger.transition.bind(broker.ledger);
-		const transitionSpy = vi
-			.spyOn(broker.ledger, "transition")
-			.mockImplementation(async (identity, state, fields) => {
-				const stage = (
-					fields?.response as { error?: { cleanup?: { uncertainRetirement?: { stage?: unknown } } } } | undefined
-				)?.error?.cleanup?.uncertainRetirement?.stage;
-				if (stage === "ledger" && injectedFailures < 2) {
-					injectedFailures += 1;
-					throw new Error("simulated crash after session_closed index append");
-				}
-				return originalTransition(identity, state, fields);
-			});
-		await expect(broker.handleRequest("session.reconcile_uncertain", input, retirementKey)).rejects.toThrow(
-			"simulated crash after session_closed index append",
-		);
-		transitionSpy.mockRestore();
+		const originalAppend = broker.index.append.bind(broker.index);
+		const appendFailureSpy = vi.spyOn(broker.index, "append").mockImplementation(async event => {
+			if (event.type === "session_closed") throw new Error("simulated index append failure");
+			return originalAppend(event);
+		});
+		await expect(broker.handleRequest("session.reconcile_uncertain", input, retirementKey)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "cleanup_pending", cleanup: { uncertainRetirement: { stage: "index" } } },
+		});
+		appendFailureSpy.mockRestore();
 		const staged = broker.ledger.findByOperationKey(`session.reconcile_uncertain\u0000${retirementKey}`);
 		expect(staged?.response).toMatchObject({
 			ok: false,
 			error: { cleanup: { uncertainRetirement: { stage: "index" } } },
 		});
-		const indexed = broker.index.listSessionIdentities().find(session => session.sessionId === sessionId);
-		if (!indexed) throw new Error("Expected staged retirement identity in the index");
-		await broker.index.append({
-			type: "session_deleted",
-			sessionId: indexed.sessionId,
-			locator: indexed.locator,
-			endpointGeneration: indexed.endpointGeneration,
-			pid: indexed.pid,
-			processIncarnation: indexed.processIncarnation,
-			hostIncarnation: indexed.hostIncarnation,
-			endpointMtimeMs: indexed.endpointMtimeMs,
-			lifecycleRequestId: indexed.lifecycleRequestId,
-		});
 		await broker.stop();
 
 		const reopened = new Broker({ agentDir });
 		await reopened.start();
-		await expect(reopened.handleRequest("session.reconcile_uncertain", input, retirementKey)).resolves.toMatchObject({
-			ok: true,
-			result: { sessionId, retired: true, indexType: "session_closed" },
+		const reopenedAppend = reopened.index.append.bind(reopened.index);
+		const raceSpy = vi.spyOn(reopened.index, "append").mockImplementation(async event => {
+			if (event.type === "session_closed") await reopenedAppend({ ...event, type: "session_deleted" });
+			return reopenedAppend(event);
 		});
-		expect(reopened.ledger.get(createIdentity)).toMatchObject({ state: "terminal_error" });
+		await expect(reopened.handleRequest("session.reconcile_uncertain", input, retirementKey)).resolves.toMatchObject({
+			ok: false,
+			error: { code: "terminal_uncertain" },
+		});
+		raceSpy.mockRestore();
+		expect(reopened.ledger.get(createIdentity)).toMatchObject({ state: "terminal_uncertain" });
 		expect(reopened.index.listSessions().sessions).toEqual([]);
 		const events = (await fs.readFile(path.join(agentDir, "sdk", "sessions", "index.jsonl"), "utf8"))
 			.split("\n")
 			.filter(Boolean)
 			.map(line => JSON.parse(line) as { sessionId?: string; type?: string });
-		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_closed")).toHaveLength(1);
 		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_deleted")).toHaveLength(1);
+		expect(events.filter(event => event.sessionId === sessionId && event.type === "session_closed")).toHaveLength(1);
 		await reopened.stop();
 	} finally {
 		if (child.exitCode === null) child.kill("SIGKILL");
