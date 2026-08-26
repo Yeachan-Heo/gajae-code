@@ -431,6 +431,28 @@ describe("coordinator session state lock", () => {
 		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
 	});
 
+	it("does not remove a successor when post-mkdir capture fails after replacement", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-transition-capture-successor.json");
+		const transitionDir = `${stateFile}.lock.transition`;
+		SessionStateLockTestHooks.beforeTransitionIdentityCapture = async () => {
+			await fs.rmdir(transitionDir);
+			await fs.mkdir(transitionDir);
+			await fs.writeFile(path.join(transitionDir, "successor-token"), "successor");
+			throw new Error("identity capture failed after replacement");
+		};
+
+		try {
+			await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(Error);
+			expect(fsSync.existsSync(transitionDir)).toBe(true);
+			expect(await fs.readFile(path.join(transitionDir, "successor-token"), "utf8")).toBe("successor");
+		} finally {
+			SessionStateLockTestHooks.beforeTransitionIdentityCapture = undefined;
+		}
+		await fs.rm(transitionDir, { recursive: true, force: true });
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+	});
+
 	it("does not reap a successor after a late mkdir success", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "lock-late-mkdir-successor.json");
@@ -1198,6 +1220,8 @@ describe("coordinator session state lock", () => {
 			expect(faulted).toBe(true);
 			// The successor's record — its own inode and its own token — is untouched.
 			expect(await fs.readFile(ownerFile, "utf8")).toBe(successor);
+			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+			expect(fsSync.existsSync(`${lockFile}.transition.removing`)).toBe(false);
 
 			// And it still holds real authority: nothing enters behind it until it is gone.
 			const entered: string[] = [];

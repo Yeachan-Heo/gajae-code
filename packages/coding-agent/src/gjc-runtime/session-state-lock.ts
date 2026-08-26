@@ -1136,25 +1136,123 @@ interface TransitionClaimIdentity {
 	dev: bigint;
 	ino: bigint;
 	mtimeNs: bigint;
+	ctimeNs: bigint;
 }
 
 async function transitionClaimIdentity(transitionDir: string): Promise<TransitionClaimIdentity | undefined> {
 	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
 	if (!stat?.isDirectory()) return undefined;
-	return { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs };
+	return { dev: stat.dev, ino: stat.ino, mtimeNs: stat.mtimeNs, ctimeNs: stat.ctimeNs };
+}
+
+function sameTransitionClaimIdentity(left: TransitionClaimIdentity, right: TransitionClaimIdentity): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.mtimeNs === right.mtimeNs &&
+		left.ctimeNs === right.ctimeNs
+	);
+}
+
+async function removeTransitionClaimIfIdentityMatches(
+	transitionDir: string,
+	claim: TransitionClaimIdentity,
+	cleanupDeadline?: number,
+): Promise<void> {
+	let native: SessionStateLockNativeBindings;
+	try {
+		native = nativeSessionStateLock();
+	} catch {
+		return;
+	}
+	if (cleanupDeadline !== undefined && performance.now() < cleanupDeadline) {
+		if (typeof native.snapshotDirectoryTree !== "function" || typeof native.exactRemoveDirectoryTree !== "function")
+			return;
+		try {
+			const snapshot = native.snapshotDirectoryTree(transitionDir);
+			const root = snapshot.snapshot?.entries[0];
+			if (
+				!snapshot.ok ||
+				!snapshot.snapshot ||
+				!root ||
+				snapshot.snapshot.entries.length !== 1 ||
+				snapshot.snapshot.rootDev !== claim.dev.toString() ||
+				snapshot.snapshot.rootIno !== claim.ino.toString()
+			)
+				return;
+			const removed = native.exactRemoveDirectoryTree(transitionDir, snapshot.snapshot);
+			if (
+				!removed.ok &&
+				removed.code === "cleanup_pending" &&
+				removed.payloadDurable === true &&
+				removed.detachedPath === `${transitionDir}.removing`
+			) {
+				try {
+					fsSync.rmdirSync(`${transitionDir}.removing`);
+				} catch {
+					// Retain a durable detached cleanup record when the final namespace removal fails.
+				}
+			}
+		} catch {
+			// Cleanup refuses on unavailable or changed identity; callers remain fail-closed.
+		}
+		return;
+	}
+	if (
+		typeof native.snapshotDirectoryTreeAsync !== "function" ||
+		typeof native.exactRemoveDirectoryTreeAsync !== "function"
+	)
+		return;
+	const deadline = performance.now() + LOCK_ACQUIRE_TIMEOUT_MS;
+	let snapshot: NativeDirectoryTreeSnapshot | null;
+	try {
+		snapshot = await captureLegacyDirectoryTree(native, transitionDir, deadline);
+	} catch {
+		return;
+	}
+	const root = snapshot?.entries[0];
+	if (
+		!snapshot ||
+		!root ||
+		snapshot.entries.length !== 1 ||
+		snapshot.rootDev !== claim.dev.toString() ||
+		snapshot.rootIno !== claim.ino.toString()
+	)
+		return;
+	const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
+	try {
+		const removed = await native.exactRemoveDirectoryTreeAsync(transitionDir, snapshot, undefined, remaining);
+		if (
+			!removed.ok &&
+			removed.code === "cleanup_pending" &&
+			removed.payloadDurable === true &&
+			removed.detachedPath === `${transitionDir}.removing`
+		) {
+			await fs.rmdir(`${transitionDir}.removing`).catch(() => undefined);
+		}
+		if (!removed.ok && removed.code !== "not_found" && removed.code !== "identity_mismatch") return;
+	} catch {
+		// Late cleanup is best effort. A failed identity-bound removal leaves the claim
+		// fail-closed rather than risking a successor pathname.
+	}
 }
 
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
-async function createTransitionClaim(transitionDir: string): Promise<TransitionClaimIdentity> {
+async function createTransitionClaim(transitionDir: string, deadline: number): Promise<TransitionClaimIdentity> {
 	await fs.mkdir(transitionDir);
+	const createdClaim = await transitionClaimIdentity(transitionDir);
+	if (!createdClaim) throw new SessionStateLockUnavailableError();
 	try {
 		await SessionStateLockTestHooks.beforeTransitionIdentityCapture?.(transitionDir);
 		const claim = await transitionClaimIdentity(transitionDir);
 		if (!claim) throw new SessionStateLockUnavailableError();
 		await SessionStateLockTestHooks.afterTransitionMkdir?.(transitionDir);
-		return claim;
+		const settledClaim = await transitionClaimIdentity(transitionDir);
+		if (!settledClaim || !sameTransitionClaimIdentity(claim, settledClaim))
+			throw new SessionStateLockUnavailableError(new Error("Transition claim changed during capture."));
+		return settledClaim;
 	} catch (error) {
-		await fs.rmdir(transitionDir).catch(() => undefined);
+		await removeTransitionClaimIfIdentityMatches(transitionDir, createdClaim, deadline);
 		throw error;
 	}
 }
@@ -1164,31 +1262,13 @@ async function cleanupTransitionClaim(
 	ownerFile: string,
 	held: LockOwnerSnapshot | undefined,
 	claim: TransitionClaimIdentity | undefined,
+	deadline?: number,
 ): Promise<void> {
 	if (held) {
 		await rewriteHeldOwnerRecord(ownerFile, held, releasedOwnerFromSnapshot(held)).catch(() => undefined);
 	}
 	if (!claim) return;
-	const current = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
-	if (
-		!current?.isDirectory() ||
-		current.dev !== claim.dev ||
-		current.ino !== claim.ino ||
-		current.mtimeNs !== claim.mtimeNs
-	)
-		return;
-	const staged = path.join(path.dirname(transitionDir), `.gjc-stale-transition-${randomUUID()}`);
-	try {
-		await fs.rename(transitionDir, staged);
-	} catch {
-		return;
-	}
-	const moved = await fs.lstat(staged, { bigint: true }).catch(() => null);
-	if (!moved?.isDirectory() || moved.dev !== claim.dev || moved.ino !== claim.ino || moved.mtimeNs !== claim.mtimeNs) {
-		await fs.rename(staged, transitionDir).catch(() => undefined);
-		return;
-	}
-	await fs.rmdir(staged).catch(() => undefined);
+	await removeTransitionClaimIfIdentityMatches(transitionDir, claim, deadline);
 }
 
 async function reclaimStaleTransitionClaim(transitionDir: string, deadline: number): Promise<void> {
@@ -1223,6 +1303,7 @@ async function withLockPathTransition<T>(
 ): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
+	nativeSessionStateLock();
 	const owner = await newLockOwner(deadline);
 	for (;;) {
 		let claim: TransitionClaimIdentity | undefined;
@@ -1230,7 +1311,7 @@ async function withLockPathTransition<T>(
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
 			claim = await withinLockAcquireDeadline(
 				deadline,
-				() => createTransitionClaim(transitionDir),
+				() => createTransitionClaim(transitionDir, deadline),
 				result => {
 					if (result.ok) return cleanupTransitionClaim(transitionDir, ownerFile, undefined, result.value);
 				},
@@ -1252,7 +1333,8 @@ async function withLockPathTransition<T>(
 				},
 			);
 		} catch (error) {
-			if (performance.now() < deadline) await cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim);
+			if (performance.now() < deadline)
+				await cleanupTransitionClaim(transitionDir, ownerFile, undefined, claim, deadline);
 			throw error;
 		}
 		let outcome: { ok: true; value: T } | { ok: false; error: unknown };
