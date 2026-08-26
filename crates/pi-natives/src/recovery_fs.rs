@@ -419,6 +419,42 @@ fn restore_exchanged_successor(
 }
 
 #[cfg(target_os = "linux")]
+struct ManagedReplacementStageGuard<'a> {
+	parent: &'a File,
+	name:   CString,
+	dev:    String,
+	ino:    String,
+	active: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ManagedReplacementStageGuard<'_> {
+	const fn disarm(&mut self) {
+		self.active = false;
+	}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ManagedReplacementStageGuard<'_> {
+	fn drop(&mut self) {
+		if !self.active {
+			return;
+		}
+		let Ok(named) = statat(self.parent, &self.name) else {
+			return;
+		};
+		if named.st_dev.to_string() != self.dev
+			|| named.st_ino.to_string() != self.ino
+			|| named.st_nlink != 1
+		{
+			return;
+		}
+		// SAFETY: the live staging name still identifies the operation-owned inode.
+		unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
+	}
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoReplacePrimitive {
 	Renameat2,
@@ -488,6 +524,7 @@ fn lock_managed_mutation(recovery: &File) -> Result<File, &'static str> {
 	if final_named.st_dev.to_string() != opened.dev
 		|| final_named.st_ino.to_string() != opened.ino
 		|| final_named.st_nlink != 1
+		|| crate::path_identity::platform::verify_created_owner_only_file(&lock).is_err()
 	{
 		return Err("lock_failed");
 	}
@@ -3480,6 +3517,17 @@ fn replace_managed(
 	}
 	// SAFETY: stage_fd is the uniquely owned descriptor returned by openat above.
 	let mut stage = unsafe { File::from_raw_fd(stage_fd) };
+	let stage_seed = match regular_identity(&stage) {
+		Ok(identity) => identity,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	let mut stage_guard = ManagedReplacementStageGuard {
+		parent: &parent,
+		name:   stage_name.clone(),
+		dev:    stage_seed.dev.clone(),
+		ino:    stage_seed.ino,
+		active: true,
+	};
 	if crate::path_identity::platform::secure_created_owner_only_file(&stage).is_err() {
 		return publish_preflight_failure_with_primitive("permission_denied", primitive);
 	}
@@ -3523,6 +3571,27 @@ fn replace_managed(
 	if let Err(code) = rename_exchange_same_parent(&parent, &stage_name, &name) {
 		return publish_preflight_failure_with_primitive(code, primitive);
 	}
+	drop(stage);
+	// SAFETY: parent owns a live directory descriptor and stage_name is the
+	// operation-owned single-component staging name.
+	let predecessor_fd = unsafe {
+		libc::openat(
+			parent.as_raw_fd(),
+			stage_name.as_ptr(),
+			libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			0,
+		)
+	};
+	if predecessor_fd < 0 {
+		return publish_post_mutation_failure_with_primitive(
+			"identity_mismatch",
+			"terminal_identity",
+			primitive,
+			None,
+		);
+	}
+	// SAFETY: predecessor_fd is the uniquely owned descriptor returned by openat.
+	let predecessor = unsafe { File::from_raw_fd(predecessor_fd) };
 
 	let Ok(canonical) = open_existing(root, relative_path, false) else {
 		return publish_post_mutation_failure_with_primitive(
@@ -3563,7 +3632,7 @@ fn replace_managed(
 	}
 
 	let old_matches = match same_expected_after_rename(
-		&stage,
+		&predecessor,
 		expected_dev,
 		expected_ino,
 		expected_size,
@@ -3580,7 +3649,7 @@ fn replace_managed(
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
 
-	drop(stage);
+	drop(predecessor);
 	let staged_after = match statat(&parent, &stage_name) {
 		Ok(named) => named,
 		Err(code) => return committed_failure(code, "terminal_identity"),
@@ -3598,6 +3667,7 @@ fn replace_managed(
 	if unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) } != 0 {
 		return committed_failure("io_error", "terminal_identity");
 	}
+	stage_guard.disarm();
 	if sync_parent(&parent).is_err() {
 		let mut receipt = canonical_identity;
 		receipt.sha256 = Some(canonical_digest);

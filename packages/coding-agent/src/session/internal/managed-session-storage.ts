@@ -613,6 +613,12 @@ export interface ScrubbedProtocolRemnantReapResult {
 	readonly failures: number;
 }
 
+interface ApprovedRemnantDirectory {
+	readonly path: string;
+	readonly dev: bigint;
+	readonly ino: bigint;
+}
+
 function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): ScrubbedProtocolRemnantReapResult {
 	if (failures > 0)
 		logger.warn("Managed session remnant reaping completed with failures", {
@@ -622,29 +628,42 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
 	return { reaped, failures };
 }
 
-function approvedRemnantDirectoriesSync(directory: string): { directories: string[]; failures: number } {
-	const directories = [directory];
+function approvedRemnantDirectoriesSync(directory: string): {
+	directories: ApprovedRemnantDirectory[];
+	failures: number;
+} {
+	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
-	const recovery = path.join(directory, MANAGED_RECOVERY_DIRECTORY);
-	try {
-		const named = fs.lstatSync(recovery);
-		if (named.isDirectory() && !named.isSymbolicLink()) directories.push(recovery);
-	} catch (error) {
-		if (!isEnoent(error)) failures += 1;
-	}
+	const approve = (candidate: string): void => {
+		try {
+			const named = fs.lstatSync(candidate, { bigint: true });
+			if (named.isDirectory() && !named.isSymbolicLink())
+				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
+		}
+	};
+	approve(directory);
+	approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
-async function approvedRemnantDirectories(directory: string): Promise<{ directories: string[]; failures: number }> {
-	const directories = [directory];
+async function approvedRemnantDirectories(
+	directory: string,
+): Promise<{ directories: ApprovedRemnantDirectory[]; failures: number }> {
+	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
-	const recovery = path.join(directory, MANAGED_RECOVERY_DIRECTORY);
-	try {
-		const named = await fsp.lstat(recovery);
-		if (named.isDirectory() && !named.isSymbolicLink()) directories.push(recovery);
-	} catch (error) {
-		if (!isEnoent(error)) failures += 1;
-	}
+	const approve = async (candidate: string): Promise<void> => {
+		try {
+			const named = await fsp.lstat(candidate, { bigint: true });
+			if (named.isDirectory() && !named.isSymbolicLink())
+				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
+		}
+	};
+	await approve(directory);
+	await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
@@ -666,7 +685,8 @@ export function reapScrubbedProtocolRemnantsSync(
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
 	let failures = approved.failures;
-	for (const scanDirectory of approved.directories) {
+	for (const approvedDirectory of approved.directories) {
+		const scanDirectory = approvedDirectory.path;
 		let directoryHandle: fs.Dir;
 		try {
 			directoryHandle = fs.opendirSync(scanDirectory);
@@ -684,11 +704,13 @@ export function reapScrubbedProtocolRemnantsSync(
 				try {
 					const named = fs.lstatSync(pathname, { bigint: true });
 					if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n || named.size !== 0n) continue;
-					if (named.mtimeMs > cutoff) continue;
+					if (Number(named.mtimeMs) > cutoff) continue;
 					const removed = nativeSessionStorage().exactUnlinkDirect(pathname, {
 						dev: named.dev,
 						ino: named.ino,
 						nlink: named.nlink,
+						parentDev: approvedDirectory.dev,
+						parentIno: approvedDirectory.ino,
 						size: named.size,
 						mtimeNs: named.mtimeNs,
 						sha256: EMPTY_FILE_SHA256,
@@ -733,7 +755,8 @@ export async function reapScrubbedProtocolRemnants(
 	let reaped = 0;
 	let failures = approved.failures;
 	let scanned = 0;
-	for (const scanDirectory of approved.directories) {
+	for (const approvedDirectory of approved.directories) {
+		const scanDirectory = approvedDirectory.path;
 		let names: string[];
 		try {
 			names = await fsp.readdir(scanDirectory);
@@ -748,11 +771,13 @@ export async function reapScrubbedProtocolRemnants(
 			try {
 				const named = await fsp.lstat(pathname, { bigint: true });
 				if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n || named.size !== 0n) continue;
-				if (named.mtimeMs > cutoff) continue;
+				if (Number(named.mtimeMs) > cutoff) continue;
 				const removed = nativeSessionStorage().exactUnlinkDirect(pathname, {
 					dev: named.dev,
 					ino: named.ino,
 					nlink: named.nlink,
+					parentDev: approvedDirectory.dev,
+					parentIno: approvedDirectory.ino,
 					size: named.size,
 					mtimeNs: named.mtimeNs,
 					sha256: EMPTY_FILE_SHA256,
