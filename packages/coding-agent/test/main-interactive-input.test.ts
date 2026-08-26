@@ -117,6 +117,7 @@ describe("interactive startup input ordering", () => {
 			},
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
+			stop: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {
 				throw shutdownFailure;
 			}),
@@ -145,12 +146,17 @@ describe("interactive startup input ordering", () => {
 		const outcome = await Promise.race([
 			run.then(
 				() => "completed" as const,
-				error => (error === stop ? "stopped" : Promise.reject(error)),
+				error =>
+					error === shutdownFailure
+						? ("shutdown-failed" as const)
+						: error === stop
+							? ("stopped" as const)
+							: Promise.reject(error),
 			),
 			Bun.sleep(100).then(() => "timed-out" as const),
 		]);
 
-		expect(outcome).toBe("stopped");
+		expect(outcome).toBe("shutdown-failed");
 		expect(prompt).toHaveBeenCalledTimes(2);
 
 		firstPrompt.resolve();

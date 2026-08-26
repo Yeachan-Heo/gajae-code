@@ -97,16 +97,23 @@ describe("issue #927 optimistic pending spinner", () => {
 		const signature = "same follow-up\u00000";
 		mode.recordLocalSubmission("same follow-up");
 		mode.recordLocalSubmission("same follow-up");
-		const localSignatures = mode.locallySubmittedUserSignatures as Set<string> & {
-			consumeDelivered(value: string): boolean;
-		};
 
-		expect(localSignatures.consumeDelivered(signature)).toBe(true);
-		expect(localSignatures.has(signature)).toBe(true);
-		expect(localSignatures.delete(signature)).toBe(true);
-		expect(localSignatures.has(signature)).toBe(true);
-		expect(localSignatures.delete(signature)).toBe(true);
-		expect(localSignatures.has(signature)).toBe(false);
+		expect(mode.locallySubmittedUserSignatures.delete(signature)).toBe(true);
+		expect(mode.locallySubmittedUserSignatures.has(signature)).toBe(true);
+		expect(mode.locallySubmittedUserSignatures.delete(signature)).toBe(true);
+		expect(mode.locallySubmittedUserSignatures.has(signature)).toBe(false);
+	});
+
+	it("retains duplicate optimistic leases until every submission settles", () => {
+		const signature = "same optimistic\u00000";
+		const first = mode.startPendingSubmission({ text: "same optimistic" });
+		const second = mode.startPendingSubmission({ text: "same optimistic" });
+
+		expect(mode.optimisticUserMessageSignatures.has(signature)).toBe(true);
+		mode.finishPendingSubmission(first);
+		expect(mode.optimisticUserMessageSignatures.has(signature)).toBe(true);
+		mode.finishPendingSubmission(second);
+		expect(mode.optimisticUserMessageSignatures.has(signature)).toBe(false);
 	});
 
 	it("defers extension shutdown until every admitted delivery settles", async () => {

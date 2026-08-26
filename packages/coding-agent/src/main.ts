@@ -781,6 +781,10 @@ export async function runInteractiveMode(
 		);
 	}
 
+	const finalizationFailure = Promise.withResolvers<never>();
+	const activeDeliveries = new Set<Promise<void>>();
+	let hasFinalizationFailure = false;
+	let finalizationError: unknown;
 	const runStartupInputAndPromptLoop = async (): Promise<never> => {
 		const hasStartupInput = initialMessage !== undefined || initialMessages.length > 0;
 		if (!hasStartupInput && resumeAction === "continue-tail") {
@@ -825,19 +829,32 @@ export async function runInteractiveMode(
 			// admission callback during that narrow boundary, so the first follow-up
 			// is discarded. Session prompt admission serializes any root-turn race,
 			// while busy submissions are routed to the session queues.
-			void submitInteractiveInput(mode, session, input).catch(error => {
-				logger.warn("Interactive input delivery finalization failed", { error: String(error) });
-			});
+			const delivery = submitInteractiveInput(mode, session, input);
+			activeDeliveries.add(delivery);
+			void delivery
+				.catch(error => {
+					logger.warn("Interactive input delivery finalization failed", { error: String(error) });
+					hasFinalizationFailure = true;
+					finalizationError = error;
+					finalizationFailure.reject(error);
+					mode.stop();
+				})
+				.finally(() => activeDeliveries.delete(delivery));
 		}
 	};
 
-	const inputLoop = runStartupInputAndPromptLoop();
+	const inputLoop = runStartupInputAndPromptLoop().catch(async error => {
+		await Promise.allSettled(activeDeliveries);
+		if (hasFinalizationFailure) throw finalizationError;
+		throw error;
+	});
+	const inputLoopOrFinalizationFailure = Promise.race([inputLoop, finalizationFailure.promise]);
 	if (!deferredModelProfileFailure) {
-		await inputLoop;
+		await inputLoopOrFinalizationFailure;
 		return;
 	}
 	try {
-		await Promise.race([inputLoop, deferredModelProfileFailure]);
+		await Promise.race([inputLoopOrFinalizationFailure, deferredModelProfileFailure]);
 	} catch (error) {
 		if (!(error instanceof DeferredModelProfileStartupError)) throw error;
 		try {

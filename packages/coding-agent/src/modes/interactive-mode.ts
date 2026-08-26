@@ -200,6 +200,30 @@ export function resolveActivityIndicatorMessage(
 	return `Background: ${backgroundCount} task${backgroundCount === 1 ? "" : "s"}…`;
 }
 
+class CountedSignatureSet extends Set<string> {
+	#counts = new Map<string, number>();
+
+	override add(signature: string): this {
+		this.#counts.set(signature, (this.#counts.get(signature) ?? 0) + 1);
+		super.add(signature);
+		return this;
+	}
+
+	override delete(signature: string): boolean {
+		const count = this.#counts.get(signature) ?? 0;
+		if (count === 0) return false;
+		if (count === 1) this.#counts.delete(signature);
+		else this.#counts.set(signature, count - 1);
+		if (count === 1) super.delete(signature);
+		return true;
+	}
+
+	override clear(): void {
+		this.#counts.clear();
+		super.clear();
+	}
+}
+
 class LocalSubmissionSignatureSet extends Set<string> {
 	#pendingCounts = new Map<string, number>();
 	#deliveredCredits = new Map<string, number>();
@@ -468,7 +492,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
 	optimisticUserMessageSignatures: Set<string> = new LocalSubmissionSignatureSet();
-	locallySubmittedUserSignatures: Set<string> = new LocalSubmissionSignatureSet();
+	locallySubmittedUserSignatures: Set<string> = new CountedSignatureSet();
 	optimisticInjectedSignatures: Map<string, number> = new Map();
 	/** Submissions whose prompt delivery has not settled yet. The input loop can
 	 * admit a follow-up while the prior prompt is unwinding after agent_end. */
