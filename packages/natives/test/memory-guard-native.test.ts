@@ -51,6 +51,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			renameNoReplacePath: () => undefined,
+			symlinkNoReplacePath: () => undefined,
 			exactUnlinkSymlink: () => undefined,
 		};
 		expect(() =>
@@ -67,6 +68,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			renameNoReplacePath: () => undefined,
+			symlinkNoReplacePath: () => undefined,
 		};
 		expect(() =>
 			validateLoadedBindings(
@@ -82,6 +84,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			renameNoReplacePath: () => undefined,
+			symlinkNoReplacePath: () => undefined,
 			exactUnlinkSymlink: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 		};
@@ -92,5 +95,23 @@ describe("probeWindowsJobMemory", () => {
 				"cached-addon.node",
 			),
 		).toThrow("currentExecutablePath");
+	});
+
+	it("rejects stale same-version bindings without symlink publication capability", () => {
+		const bindings = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			exactUnlinkSymlink: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+		};
+		expect(() =>
+			validateLoadedBindings(
+				{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+				bindings,
+				"cached-addon.node",
+			),
+		).toThrow("symlinkNoReplacePath");
 	});
 });

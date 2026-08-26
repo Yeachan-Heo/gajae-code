@@ -24,8 +24,8 @@ import * as path from "node:path";
 import {
 	exactReplacePath,
 	exactUnlinkDirect,
-	renameNoReplacePath,
 	type NativeExactFileIdentity,
+	renameNoReplacePath,
 } from "@gajae-code/natives";
 
 /** Serialization Paseo itself produces. Verified byte-identical against the live config. */

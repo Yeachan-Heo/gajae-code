@@ -20,8 +20,8 @@ import {
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
 	exactUnlinkSymlink,
-	symlinkNoReplacePath,
 	snapshotDirectoryTree,
+	symlinkNoReplacePath,
 } from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
@@ -298,9 +298,7 @@ async function unlinkSymlinkExactly(
 	}
 	const nativeLinkPath = canonicalExistingPathForNative(linkPath);
 	const parent =
-		expectedParentIdentity === undefined
-			? await fs.stat(path.dirname(nativeLinkPath), { bigint: true })
-			: undefined;
+		expectedParentIdentity === undefined ? await fs.stat(path.dirname(nativeLinkPath), { bigint: true }) : undefined;
 	if (parent !== undefined && !parent.isDirectory()) {
 		throw new SkillsBridgeError(`Paseo skill bridge parent is not a directory: ${linkPath}`);
 	}
@@ -1266,7 +1264,8 @@ export async function inverseSkillsBridge(
 			throw new SkillsBridgeError(`Refusing to remove a replaced Paseo skills bridge directory: ${bridgeDir}`);
 		}
 	}
-	const unlinkParentIdentity = ownedNames.length > 0 ? result.bridgeParentIdentity ?? result.bridgeDirIdentity : undefined;
+	const unlinkParentIdentity =
+		ownedNames.length > 0 ? (result.bridgeParentIdentity ?? result.bridgeDirIdentity) : undefined;
 	if (ownedNames.length > 0 && unlinkParentIdentity === undefined) {
 		throw new SkillsBridgeError(`Missing authenticated Paseo skills bridge parent identity: ${bridgeDir}`);
 	}
@@ -1497,7 +1496,7 @@ export async function registerSkillsBridgeDirectory(
 		]).then(([canonicalBridge, ...canonicalRest]) => {
 			const canonicalDirectories = canonicalRest.slice(0, directories.length);
 			const canonicalReplaces = options.replaces === undefined ? undefined : canonicalRest[directories.length];
-			const next = directories.filter((directory, index) => {
+			const next = directories.filter((_directory, index) => {
 				const canonical = canonicalDirectories[index];
 				return canonical !== canonicalBridge && canonical !== canonicalReplaces;
 			});

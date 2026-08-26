@@ -131,7 +131,19 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 			dev: parent.dev,
 			ino: parent.ino,
 		});
-		if (!created.ok && created.code === "atomic_unavailable") return;
+		if (!created.ok) {
+			expect(created).toMatchObject({
+				ok: false,
+				code: "atomic_unavailable",
+				mutationState: "not_committed",
+				reason: "atomic_unavailable",
+				primitive: "windows_symlink_noreplace",
+				phase: "symlink",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			});
+			await expect(fs.lstat(destination)).rejects.toMatchObject({ code: expect.any(String) });
+			return;
+		}
 		expect(created).toMatchObject({
 			ok: true,
 			mutationState: "committed",

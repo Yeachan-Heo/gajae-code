@@ -376,6 +376,10 @@ impl NativeNoReplaceResult {
 	}
 
 	fn from_exact_with_primitive(result: NativeExactUnlinkResult, primitive: &'static str) -> Self {
+		let diagnostic_os_code = result.windows_error_code.as_deref().and_then(|value| {
+			let value = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+			u32::from_str_radix(value, 16).ok().map(|value| value as i32)
+		});
 		let (mutation_state, durability_state, reason) = if result.ok {
 			// A direct no-replace rename commits the namespace mutation, but does not
 			// fsync either parent directory.
@@ -429,7 +433,7 @@ impl NativeNoReplaceResult {
 			diagnostic:       NativePublishDiagnostic {
 				schema_version:   1,
 				collection_state: "unavailable".to_owned(),
-				os_code:          None,
+				os_code:          diagnostic_os_code,
 				sync_failures:    None,
 			},
 		}
@@ -694,7 +698,7 @@ impl NativeExactUnlinkResult {
 		}
 	}
 
-	#[allow(dead_code, reason = "used only by the Windows exact-replace retry path")]
+	#[allow(dead_code, reason = "used only by Windows pre-mutation failure paths")]
 	/// Attach path-free Windows NTSTATUS evidence to a pre-mutation failure.
 	/// Only call sites that have not touched the namespace may use this; a
 	/// post-mutation failure already carries its detached/retained paths.
@@ -6472,6 +6476,23 @@ mod platform {
 		}
 	}
 
+	/// `FSCTL_SET_REPARSE_POINT` is the only Windows symlink primitive used by
+	/// this module. On ordinary user tokens it can be rejected because the
+	/// symbolic-link privilege is disabled, and older/filesystem-specific
+	/// volumes can reject the control code entirely. Those outcomes are a
+	/// capability refusal, not an opaque I/O failure: the caller must stop
+	/// before attempting any pathname fallback or bridge mutation.
+	fn symlink_set_reparse_code(error_code: u32) -> &'static str {
+		match error_code {
+			// ERROR_INVALID_FUNCTION, ERROR_ACCESS_DENIED,
+			// ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER,
+			// ERROR_CALL_NOT_IMPLEMENTED, and ERROR_PRIVILEGE_NOT_HELD.
+			1 | 5 | 50 | 87 | 120 | 1314 => "atomic_unavailable",
+			ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => "not_found",
+			_ => "io_error",
+		}
+	}
+
 	fn open_path(path: &Path, reparse: bool, desired_access: u32) -> Result<HANDLE, &'static str> {
 		if is_network_path(path) {
 			return Err("network_unsupported");
@@ -7641,12 +7662,21 @@ mod platform {
 			)
 		};
 		if set_result == 0 {
-			let code = last_error_code();
+			// Capture GetLastError before cleanup syscalls overwrite it. Preserve
+			// the path-free OS code in the structured diagnostic so a capability
+			// refusal is actionable without exposing managed pathnames.
+			let error_code = unsafe { GetLastError() };
+			let code = symlink_set_reparse_code(error_code);
+			let windows_error_code = format!("0x{error_code:08X}");
 			let deleted = delete_handle(child).is_ok();
 			unsafe { CloseHandle(child) };
 			return if deleted {
 				NativeExactUnlinkResult::failure(code)
+					.with_windows_error_code(windows_error_code)
 			} else {
+				// The failed conversion left a namespace object that could not be
+				// removed. Retain that path as the authoritative cleanup evidence;
+				// do not label this post-mutation outcome as pre-mutation OS evidence.
 				NativeExactUnlinkResult::detached_failure(
 					"cleanup_pending",
 					destination_path.to_string_lossy().into_owned(),

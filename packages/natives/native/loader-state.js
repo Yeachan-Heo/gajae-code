@@ -763,6 +763,9 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}
+	if (typeof bindings.symlinkNoReplacePath !== "function") {
+		throw new Error(`Loaded ${candidate} but it lacks required atomic symlink capability \`symlinkNoReplacePath\`.`);
+	}
 	if (typeof bindings.exactUnlinkSymlink !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required cleanup capability \`exactUnlinkSymlink\`.`);
 	}

@@ -31,10 +31,10 @@ import {
 	INTENT_VERSION,
 	type IntentRecord,
 	type ProvenanceLedger,
+	ProvenancePublicationUncertainError,
 	provenanceLedgerIdentity,
 	readIntent,
 	readProvenance,
-	ProvenancePublicationUncertainError,
 	writeIntent,
 	writeProvenance,
 } from "./paseo-ownership";
@@ -56,13 +56,13 @@ import {
 } from "./setup-deps";
 import type { SkillsBridgeAmbiguity, SkillsBridgeInstallResult } from "./skills-bridge";
 import {
+	canonicalExistingPathForNative,
 	installSkillsBridge,
 	inverseSkillsBridge,
 	legacySourceDirFor,
-	canonicalExistingPathForNative,
 	preflightSkillsBridge,
-	replayBridgeCleanup,
 	registerSkillsBridgeDirectory,
+	replayBridgeCleanup,
 	SkillsBridgeError,
 	SkillsBridgePartialError,
 } from "./skills-bridge";
@@ -82,6 +82,24 @@ export class PaseoSetupUsageError extends Error {
 	}
 }
 
+/** Durable owner/direction for a pending bridge-root cleanup. */
+type BridgeCleanupDirection = "rollback" | "forward";
+type BridgeCleanupOwner = "destination" | "migration-old-root";
+type BridgeCleanupMetadata = {
+	readonly cleanupDirection: BridgeCleanupDirection;
+	readonly cleanupOwner: BridgeCleanupOwner;
+};
+type DurableBridgeCleanupAuthority = BridgeCleanupAuthority & Partial<BridgeCleanupMetadata>;
+
+const DESTINATION_ROLLBACK_CLEANUP: BridgeCleanupMetadata = {
+	cleanupDirection: "rollback",
+	cleanupOwner: "destination",
+};
+const MIGRATION_FORWARD_CLEANUP: BridgeCleanupMetadata = {
+	cleanupDirection: "forward",
+	cleanupOwner: "migration-old-root",
+};
+
 export type PaseoSetupOutcome =
 	| { readonly kind: "check"; readonly result: SetupCheckResult }
 	| { readonly kind: "install"; readonly result: PaseoInstallResult }
@@ -90,15 +108,34 @@ export type PaseoSetupOutcome =
 async function persistBridgeCleanupPending(
 	deps: PaseoSetupDependencies,
 	authority: BridgeCleanupAuthority,
+	metadata?: BridgeCleanupMetadata,
 ): Promise<void> {
 	const current = await readProvenance(deps.paths.provenanceLedger);
-	const pending = { ...current, bridgeCleanupPending: authority };
+	const persistedAuthority: DurableBridgeCleanupAuthority =
+		metadata === undefined ? (authority as DurableBridgeCleanupAuthority) : { ...authority, ...metadata };
+	const pending = { ...current, bridgeCleanupPending: persistedAuthority };
 	// Keep the migration intent's pre-cutover and post-cutover payloads
 	// independent. `pending` is cleanup authority for the OLD bridge root; it is
 	// not the desired destination provenance. Replacing `intent.provenancePayload`
 	// here would strand the destination state after a crash between namespace
 	// detach and the final ledger commit.
 	await writeProvenance(deps.paths.provenanceLedger, pending);
+}
+
+function cleanupMetadataOf(authority: BridgeCleanupAuthority): BridgeCleanupMetadata | undefined {
+	const candidate = authority as DurableBridgeCleanupAuthority;
+	if (candidate.cleanupDirection === undefined && candidate.cleanupOwner === undefined) return undefined;
+	if (
+		(candidate.cleanupDirection !== "rollback" && candidate.cleanupDirection !== "forward") ||
+		(candidate.cleanupOwner !== "destination" && candidate.cleanupOwner !== "migration-old-root") ||
+		(candidate.cleanupDirection === "rollback" && candidate.cleanupOwner !== "destination") ||
+		(candidate.cleanupDirection === "forward" && candidate.cleanupOwner !== "migration-old-root")
+	)
+		return undefined;
+	return {
+		cleanupDirection: candidate.cleanupDirection,
+		cleanupOwner: candidate.cleanupOwner,
+	};
 }
 
 async function canonicalPathForComparison(value: string): Promise<string> {
@@ -130,7 +167,8 @@ async function trustedBridgePathsForRecovery(deps: PaseoSetupDependencies): Prom
 	// it agrees with the ledger's recorded bridge (or the active configured
 	// bridge), so a tampered pending record cannot broaden the replay surface.
 	const pending = ledger.bridgeCleanupPending;
-	const pendingCanonicalPath = pending === undefined ? undefined : await canonicalPathForComparison(pending.originalPath);
+	const pendingCanonicalPath =
+		pending === undefined ? undefined : await canonicalPathForComparison(pending.originalPath);
 	const recordedCanonicalPath =
 		ledger.bridgePath === undefined ? undefined : await canonicalPathForComparison(ledger.bridgePath);
 	const configuredCanonicalPath = await canonicalPathForComparison(deps.paths.bridgeDir);
@@ -179,13 +217,18 @@ async function replayPendingBridgeCleanup(
 		return;
 	}
 	if (!original.isDirectory() || original.isSymbolicLink()) {
-		throw new SkillsBridgeError(`Paseo skills bridge pre-detach authority is not an empty directory: ${authority.originalPath}`);
+		throw new SkillsBridgeError(
+			`Paseo skills bridge pre-detach authority is not an empty directory: ${authority.originalPath}`,
+		);
 	}
 	const root = authority.snapshot.entries.find(entry => entry.relativePath === "");
 	if (root === undefined || root.kind !== "directory") {
-		throw new SkillsBridgeError(`Paseo skills bridge pre-detach authority has no root identity: ${authority.originalPath}`);
+		throw new SkillsBridgeError(
+			`Paseo skills bridge pre-detach authority has no root identity: ${authority.originalPath}`,
+		);
 	}
 	const ledger = await readProvenance(deps.paths.provenanceLedger);
+	const metadata = cleanupMetadataOf(authority);
 	await inverseSkillsBridge(
 		deps,
 		{
@@ -204,7 +247,7 @@ async function replayPendingBridgeCleanup(
 		},
 		{
 			bridgeDir: authority.originalPath,
-			onCleanupPending: pending => persistBridgeCleanupPending(deps, pending),
+			onCleanupPending: pending => persistBridgeCleanupPending(deps, pending, metadata),
 		},
 	);
 }
@@ -941,7 +984,8 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 				undo: async () => {
 					try {
 						await inverseSkillsBridge(deps, bridge, {
-							onCleanupPending: authority => persistBridgeCleanupPending(deps, authority),
+							onCleanupPending: authority =>
+								persistBridgeCleanupPending(deps, authority, DESTINATION_ROLLBACK_CLEANUP),
 						});
 						// The bridge ledger was prewritten to make the forward mutation
 						// recoverable. The inverse also restores captured legacy link text
@@ -1107,7 +1151,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 			try {
 				await inverseSkillsBridge(deps, oldCleanup, {
 					bridgeDir: migratedOldBridgeDir,
-					onCleanupPending: authority => persistBridgeCleanupPending(deps, authority),
+					onCleanupPending: authority => persistBridgeCleanupPending(deps, authority, MIGRATION_FORWARD_CLEANUP),
 				});
 			} catch (error) {
 				throw new SagaStepError(
@@ -1337,7 +1381,7 @@ async function restoreMigratedOldBridgeEntries(
 						ino: existingDirectory.ino.toString(),
 						size: existingDirectory.size.toString(),
 						mtimeNs: existingDirectory.mtimeNs.toString(),
-				  };
+					};
 		if (existingDirectory === undefined && bridgeDirCreated) {
 			await fs.mkdir(bridgeDir, { mode: 0o700 });
 			recreatedDirectory = true;
@@ -1372,6 +1416,16 @@ async function restoreMigratedOldBridgeEntries(
 			};
 		}
 		for (const entry of entries) {
+			// Re-check the same root identity before every observation. A pathname
+			// swap between entries must never let a successor provide evidence for
+			// this rollback.
+			if (!(await activeDirectory())) {
+				return {
+					status: "conflict",
+					detail: `old Paseo bridge directory changed during compensation: ${bridgeDir}`,
+					retained: [bridgeDir],
+				};
+			}
 			const destination = path.join(bridgeDir, entry.name);
 			const stat = await fs.lstat(destination, { bigint: true }).catch(error => {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
@@ -1391,6 +1445,13 @@ async function restoreMigratedOldBridgeEntries(
 				};
 			}
 			const linkText = await fs.readlink(destination);
+			if (!(await activeDirectory())) {
+				return {
+					status: "conflict",
+					detail: `old Paseo bridge directory changed during compensation: ${bridgeDir}`,
+					retained: [bridgeDir],
+				};
+			}
 			const observed: BridgeEntryIdentity = {
 				dev: stat.dev.toString(),
 				ino: stat.ino.toString(),
@@ -1454,14 +1515,37 @@ async function restoreMigratedOldBridgeEntries(
 				mtimeNs: restored.mtimeNs.toString(),
 			};
 		}
-		const restoredDirectory = recreatedDirectory
-			? await fs.lstat(bridgeDir, { bigint: true }).then(stat => ({
-					dev: stat.dev.toString(),
-					ino: stat.ino.toString(),
-					size: stat.size.toString(),
-					mtimeNs: stat.mtimeNs.toString(),
-				}))
-			: undefined;
+		let restoredDirectory: BridgeEntryIdentity | undefined;
+		if (recreatedDirectory) {
+			// The final lstat is still authenticated against the identity captured
+			// immediately after mkdir. A late replacement may not become rollback
+			// authority merely because it occupies the same pathname now.
+			const finalDirectory = await fs.lstat(bridgeDir, { bigint: true }).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			});
+			if (
+				finalDirectory === undefined ||
+				!finalDirectory.isDirectory() ||
+				finalDirectory.isSymbolicLink() ||
+				activeDirectoryIdentity === undefined ||
+				finalDirectory.dev.toString() !== activeDirectoryIdentity.dev ||
+				finalDirectory.ino.toString() !== activeDirectoryIdentity.ino
+			) {
+				return {
+					status: "conflict",
+					detail: `old Paseo bridge directory changed during compensation: ${bridgeDir}`,
+					retained: [bridgeDir],
+				};
+			}
+			// Keep the recreated object's dev/ino as authority while accepting the
+			// current metadata for diagnostics and later persistence.
+			restoredDirectory = {
+				...activeDirectoryIdentity,
+				size: finalDirectory.size.toString(),
+				mtimeNs: finalDirectory.mtimeNs.toString(),
+			};
+		}
 		return {
 			status: "reverted",
 			entryIdentities,
@@ -1571,7 +1655,7 @@ async function unregisterBridgeDirectory(settings: Settings, bridgeDir: string):
 		const canonicalDirectories = await Promise.all(
 			directories.map(directory => canonicalPathForComparison(directory)),
 		);
-		const next = directories.filter((directory, index) => canonicalDirectories[index] !== canonicalBridge);
+		const next = directories.filter((_directory, index) => canonicalDirectories[index] !== canonicalBridge);
 		if (next.length === directories.length) return [];
 		return [{ path: "skills.customDirectories", op: "set", value: next }];
 	});
