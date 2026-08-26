@@ -2290,8 +2290,9 @@ export interface SearchResult {
  *
  * Every ancestor is opened descriptor/handle-relatively with
  * no-follow authority; the skill directory is created through the retained
- * skills-root authority, and the final regular file is opened without
- * following reparses before its retained handle is truncated and written.
+ * skills-root authority, and content is written to a private retained file
+ * before an atomic replacement of the final name. The publication verifies
+ * identity and private permissions and synchronizes the affected namespace.
  *
  * Unix and Windows targets implement the descriptor/handle-relative primitive.
  * Other platforms return `unsupported_platform` so callers cannot silently
