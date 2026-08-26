@@ -846,11 +846,13 @@ export declare function copyToClipboard(text: string): void
  * Create one exclusive transition claim directory and its private marker
  * through a single native blocking operation.
  *
- * The native implementation opens the newly-created directory without
- * following links, creates the marker relative to that retained descriptor,
- * and returns the directory's complete post-marker identity. `timeout_ms`
- * bounds the JavaScript promise; the worker also checks the same deadline
- * between mutations and removes a claim it created when the budget expires.
+ * The native implementation creates a unique staging directory under the
+ * retained parent, opens it without following links, creates the marker
+ * relative to that retained descriptor, and publishes the directory with an
+ * atomic no-replace rename. `timeout_ms` bounds the JavaScript promise; the
+ * worker also checks the same deadline between mutations. If a failure leaves
+ * cleanup unprovable, the staging claim is retained rather than risking a
+ * mutable-name deletion.
  */
 export declare function createTransitionClaimAsync(path: string, marker: string, timeoutMs?: number | undefined | null): Promise<NativeTransitionClaimResult>
 

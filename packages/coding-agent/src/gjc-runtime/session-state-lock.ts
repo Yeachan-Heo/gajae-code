@@ -1208,6 +1208,8 @@ function sameTransitionClaimIdentity(left: TransitionClaimIdentity, right: Trans
 		left.marker === right.marker &&
 		left.dev === right.dev &&
 		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.size === right.size &&
 		left.mtimeNs === right.mtimeNs &&
 		left.ctimeNs === right.ctimeNs
 	);

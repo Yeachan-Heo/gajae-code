@@ -1491,11 +1491,13 @@ fn valid_transition_marker(marker: &str) -> bool {
 /// Create one exclusive transition claim directory and its private marker
 /// through a single native blocking operation.
 ///
-/// The native implementation opens the newly-created directory without
-/// following links, creates the marker relative to that retained descriptor,
-/// and returns the directory's complete post-marker identity. `timeout_ms`
-/// bounds the JavaScript promise; the worker also checks the same deadline
-/// between mutations and removes a claim it created when the budget expires.
+/// The native implementation creates a unique staging directory under the
+/// retained parent, opens it without following links, creates the marker
+/// relative to that retained descriptor, and publishes the directory with an
+/// atomic no-replace rename. `timeout_ms` bounds the JavaScript promise; the
+/// worker also checks the same deadline between mutations. If a failure leaves
+/// cleanup unprovable, the staging claim is retained rather than risking a
+/// mutable-name deletion.
 #[napi]
 pub fn create_transition_claim_async(
 	env: &Env,
@@ -1986,6 +1988,7 @@ pub(crate) mod platform {
 			unix::ffi::OsStrExt,
 		},
 		path::{Component, Path},
+		sync::atomic::{AtomicU64, Ordering},
 		time::Instant,
 	};
 
@@ -2001,6 +2004,9 @@ pub(crate) mod platform {
 	/// committed), so restarting is always safe; the bound only guards against a
 	/// pathological signal storm turning a retry loop into a hang.
 	const EINTR_RETRY_LIMIT: u32 = 8;
+	const TRANSITION_TEMP_ATTEMPT_LIMIT: u32 = 16;
+
+	static NEXT_TRANSITION_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 	// Test-only fault injection: the next N calls into the no-replace rename
 	// primitive report a synthetic EINTR before the real syscall runs, letting
@@ -2410,41 +2416,20 @@ pub(crate) mod platform {
 		if transition_deadline_expired(deadline) {
 			return NativeTransitionClaimResult::failure("timed_out");
 		}
-		// SAFETY: parent is a live directory descriptor and parent_name is a
-		// NUL-terminated single path component.
-		if unsafe { libc::mkdirat(parent.as_raw_fd(), parent_name.as_ptr(), 0o700) } != 0 {
-			return NativeTransitionClaimResult::failure(transition_creation_code(
-				&std::io::Error::last_os_error(),
-			));
-		}
 
-		// SAFETY: parent remains live and the no-follow flags reject a substituted
-		// symlink or special file at the newly-created final component.
-		let directory_fd = unsafe {
-			libc::openat(
-				parent.as_raw_fd(),
-				parent_name.as_ptr(),
-				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-			)
+		// Never create the directory at the deterministic target before opening it:
+		// a concurrent remove-and-replace could otherwise make openat retain a
+		// successor. A unique private staging name is opened first, and only the
+		// retained descriptor is later published through rename_no_replace.
+		let (staging_name, directory) = match create_transition_staging_directory(parent.as_raw_fd())
+		{
+			Ok(value) => value,
+			Err(code) => return NativeTransitionClaimResult::failure(code),
 		};
-		if directory_fd < 0 {
-			return NativeTransitionClaimResult::failure(security_code(
-				&std::io::Error::last_os_error(),
-			));
-		}
-		// SAFETY: directory_fd is a newly-owned successful openat result.
-		let directory = unsafe { File::from_raw_fd(directory_fd) };
 		let Ok(marker_name) = CString::new(marker.as_bytes()) else {
 			return NativeTransitionClaimResult::failure("invalid_request");
 		};
 		if transition_deadline_expired(deadline) {
-			cleanup_created_transition(
-				parent.as_raw_fd(),
-				&parent_name,
-				&directory,
-				None,
-				&marker_name,
-			);
 			return NativeTransitionClaimResult::failure("timed_out");
 		}
 
@@ -2459,77 +2444,87 @@ pub(crate) mod platform {
 			)
 		};
 		if marker_fd < 0 {
-			let result = NativeTransitionClaimResult::failure(transition_creation_code(
+			return NativeTransitionClaimResult::failure(transition_creation_code(
 				&std::io::Error::last_os_error(),
 			));
-			cleanup_created_transition(
-				parent.as_raw_fd(),
-				&parent_name,
-				&directory,
-				None,
-				&marker_name,
-			);
-			return result;
 		}
 		// SAFETY: marker_fd is a newly-owned successful openat result.
 		let mut marker_file = unsafe { File::from_raw_fd(marker_fd) };
 		if transition_deadline_expired(deadline) {
-			cleanup_created_transition(
-				parent.as_raw_fd(),
-				&parent_name,
-				&directory,
-				Some(&marker_file),
-				&marker_name,
-			);
 			return NativeTransitionClaimResult::failure("timed_out");
 		}
 		if let Err(error) = marker_file
 			.write_all(marker.as_bytes())
 			.and_then(|()| marker_file.sync_all())
 		{
-			let result = NativeTransitionClaimResult::failure(transition_creation_code(&error));
-			cleanup_created_transition(
-				parent.as_raw_fd(),
-				&parent_name,
-				&directory,
-				Some(&marker_file),
-				&marker_name,
-			);
-			return result;
+			return NativeTransitionClaimResult::failure(transition_creation_code(&error));
 		}
-		let stat = match transition_stat(directory.as_raw_fd()) {
-			Ok(stat) => stat,
-			Err(code) => {
-				cleanup_created_transition(
-					parent.as_raw_fd(),
-					&parent_name,
-					&directory,
-					Some(&marker_file),
-					&marker_name,
-				);
-				return NativeTransitionClaimResult::failure(code);
-			},
-		};
 		if transition_deadline_expired(deadline) {
-			cleanup_created_transition(
-				parent.as_raw_fd(),
-				&parent_name,
-				&directory,
-				Some(&marker_file),
-				&marker_name,
-			);
 			return NativeTransitionClaimResult::failure("timed_out");
 		}
+
+		// `rename_no_replace` is the authority boundary: it either publishes this
+		// exact staged directory or leaves the deterministic target untouched. On
+		// platforms without an atomic no-replace primitive, fail closed and retain
+		// the staging claim rather than opening or deleting a pathname successor.
+		if let Err(code) =
+			rename_no_replace(parent.as_raw_fd(), parent.as_raw_fd(), &staging_name, &parent_name)
+		{
+			return NativeTransitionClaimResult::failure(if code == "quarantine_collision" {
+				"already_exists"
+			} else {
+				code
+			});
+		}
 		drop(marker_file);
+		let stat = match transition_stat(directory.as_raw_fd()) {
+			Ok(stat) => stat,
+			Err(code) => return NativeTransitionClaimResult::failure(code),
+		};
 		NativeTransitionClaimResult::success(
 			marker.to_owned(),
-			stat.st_dev as u64,
-			stat.st_ino as u64,
-			stat.st_nlink as u64,
+			stat.st_dev,
+			stat.st_ino,
+			stat.st_nlink,
 			stat.st_size as u64,
 			stat_mtime_ns(&stat),
 			stat_ctime_ns(&stat),
 		)
+	}
+
+	fn create_transition_staging_directory(
+		parent_fd: libc::c_int,
+	) -> Result<(CString, File), &'static str> {
+		for _ in 0..TRANSITION_TEMP_ATTEMPT_LIMIT {
+			let id = NEXT_TRANSITION_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+			let staging_name =
+				CString::new(format!(".gjc-transition-{}-{:016x}", std::process::id(), id))
+					.expect("transition staging name contains no NUL");
+			// SAFETY: parent_fd is a live retained directory descriptor and the
+			// generated name is a NUL-terminated single path component.
+			if unsafe { libc::mkdirat(parent_fd, staging_name.as_ptr(), 0o700) } != 0 {
+				let error = std::io::Error::last_os_error();
+				if error.raw_os_error() == Some(libc::EEXIST) {
+					continue;
+				}
+				return Err(transition_creation_code(&error));
+			}
+			// SAFETY: the staging directory was created under the retained parent;
+			// O_NOFOLLOW rejects a substituted symlink or special file at this name.
+			let directory_fd = unsafe {
+				libc::openat(
+					parent_fd,
+					staging_name.as_ptr(),
+					libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+				)
+			};
+			if directory_fd < 0 {
+				return Err(security_code(&std::io::Error::last_os_error()));
+			}
+			// SAFETY: directory_fd is a newly-owned successful openat result.
+			return Ok((staging_name, unsafe { File::from_raw_fd(directory_fd) }));
+		}
+		Err("already_exists")
 	}
 
 	fn security_code(error: &std::io::Error) -> &'static str {
@@ -2562,89 +2557,6 @@ pub(crate) mod platform {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
 		Ok(stat)
-	}
-
-	const fn same_transition_object(left: &libc::stat, right: &libc::stat) -> bool {
-		left.st_dev == right.st_dev && left.st_ino == right.st_ino
-	}
-
-	/// Remove only the claim objects held by this operation after a post-create
-	/// failure. The descriptor identities are checked against their names before
-	/// either unlink, so a concurrent replacement is left untouched.
-	fn cleanup_created_transition(
-		parent_fd: libc::c_int,
-		parent_name: &CString,
-		directory: &File,
-		marker: Option<&File>,
-		marker_name: &CString,
-	) {
-		let marker_removed = match marker {
-			Some(marker) => {
-				let Ok(marker_stat) = transition_stat(marker.as_raw_fd()) else {
-					return;
-				};
-				let Ok(named) = (|| {
-					// SAFETY: directory and marker_name are live retained authority.
-					let mut named: libc::stat = unsafe { std::mem::zeroed() };
-					// SAFETY: directory is a live directory descriptor and named is writable
-					// storage.
-					if unsafe {
-						libc::fstatat(
-							directory.as_raw_fd(),
-							marker_name.as_ptr(),
-							&mut named,
-							libc::AT_SYMLINK_NOFOLLOW,
-						)
-					} != 0
-					{
-						return Err(());
-					}
-					Ok(named)
-				})() else {
-					return;
-				};
-				if !same_transition_object(&marker_stat, &named) {
-					return;
-				}
-				// SAFETY: directory and marker_name remain live, and identity was
-				// checked against the descriptor that created this marker.
-				unsafe { libc::unlinkat(directory.as_raw_fd(), marker_name.as_ptr(), 0) == 0 }
-			},
-			None => {
-				// An absent marker descriptor means no marker was created by this
-				// operation. `rmdir` below still refuses a foreign marker or payload.
-				true
-			},
-		};
-		if !marker_removed {
-			return;
-		}
-		let Ok(directory_stat) = transition_stat(directory.as_raw_fd()) else {
-			return;
-		};
-		let Ok(named) = (|| {
-			// SAFETY: parent_fd and parent_name are live retained authority.
-			let mut named: libc::stat = unsafe { std::mem::zeroed() };
-			// SAFETY: parent_fd is a live directory descriptor and named is writable
-			// storage.
-			if unsafe {
-				libc::fstatat(parent_fd, parent_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-			} != 0
-			{
-				return Err(());
-			}
-			Ok(named)
-		})() else {
-			return;
-		};
-		if !same_transition_object(&directory_stat, &named)
-			|| named.st_mode & libc::S_IFMT != libc::S_IFDIR
-		{
-			return;
-		}
-		// SAFETY: the retained parent and name still identify the directory whose
-		// descriptor was created by this operation.
-		let _ = unsafe { libc::unlinkat(parent_fd, parent_name.as_ptr(), libc::AT_REMOVEDIR) };
 	}
 
 	#[cfg(target_os = "netbsd")]
@@ -6114,16 +6026,19 @@ pub(crate) mod platform {
 		let root_matches = unsafe { libc::fstat(fd, &mut root) } == 0
 			&& root.st_dev as u64 == expected.root_dev.parse().ok().unwrap_or(u64::MAX)
 			&& root.st_ino as u64 == expected.root_ino.parse().ok().unwrap_or(u64::MAX)
-			&& root.st_nlink.to_string()
-				== expected_tree_entry(&expected.entries, "").map_or("", |entry| entry.nlink.as_str())
-			&& root.st_size.to_string()
-				== expected_tree_entry(&expected.entries, "").map_or("", |entry| entry.size.as_str())
-			&& stat_mtime_ns(&root).to_string()
-				== expected_tree_entry(&expected.entries, "")
-					.map_or("", |entry| entry.mtime_ns.as_str())
-			&& stat_ctime_ns(&root).to_string()
-				== expected_tree_entry(&expected.entries, "")
-					.map_or("", |entry| entry.ctime_ns.as_str());
+			&& (expected.entries.len() != 1
+				|| (root.st_nlink.to_string()
+					== expected_tree_entry(&expected.entries, "")
+						.map_or("", |entry| entry.nlink.as_str())
+					&& root.st_size.to_string()
+						== expected_tree_entry(&expected.entries, "")
+							.map_or("", |entry| entry.size.as_str())
+					&& stat_mtime_ns(&root).to_string()
+						== expected_tree_entry(&expected.entries, "")
+							.map_or("", |entry| entry.mtime_ns.as_str())
+					&& stat_ctime_ns(&root).to_string()
+						== expected_tree_entry(&expected.entries, "")
+							.map_or("", |entry| entry.ctime_ns.as_str())));
 		if !root_matches {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe {
@@ -9120,7 +9035,8 @@ mod platform {
 		};
 		if root_entry.dev != expected.root_dev
 			|| root_entry.ino != expected.root_ino
-			|| expected_tree_entry(&expected.entries, "") != Some(&root_entry)
+			|| (expected.entries.len() == 1
+				&& expected_tree_entry(&expected.entries, "") != Some(&root_entry))
 		{
 			return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 		}
