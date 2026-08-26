@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { snapshotDirectoryTree } from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 import { parseSetupArgs } from "../src/cli/setup-cli";
@@ -17,6 +18,7 @@ import {
 import * as paseoJsonPublisher from "../src/setup/paseo/json-publisher";
 import {
 	currentIdentity,
+	hasNoReparseSidecarAuthority,
 	hashBytes,
 	planPublish,
 	publishPlan,
@@ -30,6 +32,7 @@ import {
 } from "../src/setup/paseo/json-publisher";
 import { createOrchestrationSeed } from "../src/setup/paseo/orchestration-preferences";
 import {
+	type BridgeCleanupAuthority,
 	type BridgeEntryIdentity,
 	classifyIdentity,
 	classifyIntent,
@@ -421,6 +424,60 @@ describe("replaced-provider sidecar cleanup", () => {
 				for (const spy of spies.reverse()) spy.mockRestore();
 			}
 		}
+	});
+
+	test("rejects a Windows force replacement before creating a sidecar", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const userEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "USER EDIT" };
+		await seedConfig(fixture.paths, { gjc: userEntry });
+		const beforeConfig = await fs.readFile(fixture.paths.configJson, "utf8");
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (platform === undefined || platform.configurable !== true) throw new Error("process_platform_not_configurable");
+		try {
+			Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+			expect(hasNoReparseSidecarAuthority()).toBe(false);
+			await expect(runPaseoSetup({ force: true }, fixture.deps)).rejects.toBeInstanceOf(PaseoSetupUsageError);
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+		}
+		expect(await fs.readFile(fixture.paths.configJson, "utf8")).toBe(beforeConfig);
+		await expect(fs.stat(replacedProviderBackupPath(fixture.paths.configJson, "gjc"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		await expect(fs.stat(fixture.paths.provenanceLedger)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
+	test("Windows force refusal retains an existing replaced-provider cleanup authority", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		const firstUserEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "FIRST USER EDIT" };
+		await seedConfig(fixture.paths, { gjc: firstUserEntry });
+		const initial = await runPaseoSetup({ force: true }, fixture.deps);
+		expect(initial.kind).toBe("install");
+		const ledgerBefore = await fs.readFile(fixture.paths.provenanceLedger, "utf8");
+		const ref = (await readProvenance(fixture.paths.provenanceLedger)).providerReplacedEntries?.gjc;
+		if (ref === undefined) throw new Error("expected an existing sidecar authority");
+		const current = await readTarget(fixture.paths.configJson);
+		const nextUserEntry = { ...buildProviderEntry([process.execPath, "acp"]), label: "SECOND USER EDIT" };
+		const plan = planPublish(current, draft => {
+			(draft.agents as { providers: Record<string, unknown> }).providers.gjc = nextUserEntry;
+		});
+		await publishPlan(fixture.paths.configJson, plan, {
+			expectedIdentity: current.identity,
+			backup: false,
+			now: fixture.deps.now(),
+		});
+		const platform = Object.getOwnPropertyDescriptor(process, "platform");
+		if (platform === undefined || platform.configurable !== true) throw new Error("process_platform_not_configurable");
+		try {
+			Object.defineProperty(process, "platform", { ...platform, value: "win32" });
+			await expect(runPaseoSetup({ force: true }, fixture.deps)).rejects.toBeInstanceOf(PaseoSetupUsageError);
+		} finally {
+			Object.defineProperty(process, "platform", platform);
+		}
+		expect(await fs.readFile(fixture.paths.provenanceLedger, "utf8")).toBe(ledgerBefore);
+		await expect(fs.stat(ref.backupPath)).resolves.toBeDefined();
 	});
 });
 
@@ -2609,6 +2666,29 @@ describe("skills bridge", () => {
 		expect(await fs.readFile(path.join(sibling, "user.txt"), "utf8")).toBe("user content\n");
 	});
 
+	test("a migration root with a same-target replacement link fails identity authentication", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldLedger = await readProvenance(fixture.paths.provenanceLedger);
+		const replacementRoot = path.join(path.dirname(fixture.paths.bridgeDir), "replacement-paseo-skills");
+		await fs.mkdir(replacementRoot, { recursive: true });
+		const name = SKILL_NAMES[0]!;
+		await fs.symlink(path.join(fixture.paths.agentsSkillsDir as string, name), path.join(replacementRoot, name));
+		await writeProvenance(fixture.paths.provenanceLedger, { ...oldLedger, bridgePath: replacementRoot });
+
+		const remove = await runPaseoSetup({ remove: true }, fixture.deps);
+		expect(remove.kind).toBe("remove");
+		if (remove.kind !== "remove") throw new Error("expected a remove outcome");
+		expect(remove.result.outcome).toBe("partial-removal");
+		if (remove.result.outcome === "partial-removal") {
+			expect(remove.result.evidence.detail).toMatch(/authenticated migration record|identity/);
+		}
+		await expect(fs.lstat(path.join(replacementRoot, name))).resolves.toBeDefined();
+		await expect(fs.lstat(path.join(fixture.paths.bridgeDir, name))).resolves.toBeDefined();
+	});
+
 	test("a migration replaces the old custom-directory registration atomically (#4644 review r6)", async () => {
 		const fixture = await makeFixture(lsOk("gjc"));
 		await seedSkills(fixture.paths);
@@ -2850,6 +2930,56 @@ describe("skills bridge", () => {
 			const settings = await fs.readFile(path.join(process.env.GJC_CODING_AGENT_DIR ?? "", "config.yml"), "utf8");
 			expect(settings).toContain(oldDir);
 			expect(settings).not.toContain(newDir);
+		} finally {
+			settingsCommit?.mockRestore();
+			settingsInit.mockRestore();
+			readlink.mockRestore();
+		}
+	});
+
+	test("migration compensation refuses a replacement old bridge directory", async () => {
+		const fixture = await makeFixture(lsOk("gjc"));
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+		const newDir = path.join(path.dirname(oldDir), "replacement-race-paseo-skills");
+		const migratedDeps: PaseoSetupDependencies = {
+			...fixture.deps,
+			paths: { ...fixture.paths, bridgeDir: newDir },
+		};
+		let cleanupStarted = false;
+		let replaced = false;
+		const originalReadlink = fs.readlink.bind(fs);
+		const readlink = spyOn(fs, "readlink").mockImplementation((async target => {
+			const value = await originalReadlink(target, "utf8");
+			if (!cleanupStarted || replaced || String(target) !== path.join(oldDir, SKILL_NAMES[0]!)) return value;
+			replaced = true;
+			await fs.rename(oldDir, `${oldDir}.replacement`);
+			await fs.mkdir(oldDir);
+			await fs.writeFile(path.join(oldDir, "foreign"), "user content\n");
+			return value;
+		}) as typeof fs.readlink);
+		const realSettingsInit = Settings.init.bind(Settings);
+		let settingsCommit: { mockRestore(): void } | undefined;
+		const settingsInit = spyOn(Settings, "init").mockImplementation(async options => {
+			const settings = await realSettingsInit(options);
+			const commit = settings.commitAtomicBatchWithCurrent.bind(settings);
+			settingsCommit = spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async buildPatches => {
+				const receipt = await commit(buildPatches);
+				cleanupStarted = true;
+				return receipt;
+			});
+			return settings;
+		});
+		try {
+			const install = await runPaseoSetup({}, migratedDeps);
+			expect(install.kind).toBe("install");
+			if (install.kind !== "install") throw new Error("expected an install outcome");
+			expect(install.result.outcome).toBe("partial-install");
+			expect(replaced).toBe(true);
+			expect(await fs.readFile(path.join(oldDir, "foreign"), "utf8")).toBe("user content\n");
+			await expect(fs.lstat(path.join(oldDir, SKILL_NAMES[0]!))).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			settingsCommit?.mockRestore();
 			settingsInit.mockRestore();
@@ -3994,6 +4124,123 @@ describe("intent recovery", () => {
 		}
 	});
 
+	test("pending old-root cleanup does not overwrite the post-cutover intent payload", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+		for (const name of SKILL_NAMES) {
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		await runPaseoSetup({}, fixture.deps);
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const captured = snapshotDirectoryTree(oldDir);
+		if (!captured.ok || captured.snapshot === undefined) throw new Error("expected an empty bridge snapshot");
+		const parent = await fs.lstat(path.dirname(oldDir), { bigint: true });
+		const authority: BridgeCleanupAuthority = {
+			originalPath: oldDir,
+			detachedPath: `${oldDir}.removing`,
+			parentIdentity: { dev: parent.dev.toString(), ino: parent.ino.toString() },
+			snapshot: captured.snapshot,
+		};
+		const newBridge = path.join(path.dirname(oldDir), "pending-relocated-paseo-skills");
+		const after = { ...before, bridgePath: newBridge, bridgeCleanupPending: undefined };
+		await writeProvenance(fixture.paths.provenanceLedger, { ...before, bridgeCleanupPending: authority });
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: newBridge,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: provenanceLedgerIdentity(before),
+			targetExpectedIdentity: provenanceLedgerIdentity(before),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: provenanceLedgerIdentity(before),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(after),
+			provenancePayload: after,
+			bridgePreflightPayload: before,
+			startedAt: new Date().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [fixture.paths.configJson, fixture.paths.orchestrationPreferences, oldDir, newBridge],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+			trustedBridgePaths: [oldDir, newBridge],
+		});
+		expect(recovery?.recovered).toBe(false);
+		expect(recovery?.detail).toContain("pre-cutover provenance");
+		expect((await readIntent(fixture.paths.intentRecord))?.provenancePayload?.bridgePath).toBe(newBridge);
+		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgePath).toBe(oldDir);
+		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending).toEqual(authority);
+	});
+
+	test("post-detach old-root recovery commits the distinct destination payload", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		await runPaseoSetup({}, fixture.deps);
+		const oldDir = fixture.paths.bridgeDir;
+		for (const name of SKILL_NAMES) {
+			await safeRm(path.join(fixture.paths.agentsSkillsDir as string, name), { recursive: true });
+		}
+		await runPaseoSetup({}, fixture.deps);
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const captured = snapshotDirectoryTree(oldDir);
+		if (!captured.ok || captured.snapshot === undefined) throw new Error("expected an empty bridge snapshot");
+		const parent = await fs.lstat(path.dirname(oldDir), { bigint: true });
+		const authority: BridgeCleanupAuthority = {
+			originalPath: oldDir,
+			detachedPath: `${oldDir}.removing`,
+			parentIdentity: { dev: parent.dev.toString(), ino: parent.ino.toString() },
+			snapshot: captured.snapshot,
+		};
+		const newBridge = path.join(path.dirname(oldDir), "post-detach-relocated-paseo-skills");
+		await fs.mkdir(newBridge);
+		const newRoot = await fs.lstat(newBridge, { bigint: true });
+		const after = {
+			...before,
+			bridgePath: newBridge,
+			bridgeDirIdentity: {
+				dev: newRoot.dev.toString(),
+				ino: newRoot.ino.toString(),
+				size: newRoot.size.toString(),
+				mtimeNs: newRoot.mtimeNs.toString(),
+			},
+			bridgeCleanupPending: undefined,
+		};
+		await fs.rename(oldDir, authority.detachedPath);
+		await writeProvenance(fixture.paths.provenanceLedger, { ...before, bridgeCleanupPending: authority });
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: newBridge,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: provenanceLedgerIdentity(before),
+			targetExpectedIdentity: provenanceLedgerIdentity(before),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: provenanceLedgerIdentity(before),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(after),
+			provenancePayload: after,
+			bridgePreflightPayload: before,
+			startedAt: new Date().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [fixture.paths.configJson, fixture.paths.orchestrationPreferences, oldDir, newBridge],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+			trustedBridgePaths: [oldDir, newBridge],
+			replayBridgeCleanup: async pending => {
+				await fs.rm(pending.detachedPath, { recursive: true, force: true });
+			},
+		});
+		expect(recovery?.recovered).toBe(true);
+		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgePath).toBe(newBridge);
+		expect((await readProvenance(fixture.paths.provenanceLedger)).bridgeCleanupPending).toBeUndefined();
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+	});
+
 	test("bridge source recovery commits completed adoption instead of clearing it", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);
@@ -4167,6 +4414,67 @@ describe("intent recovery", () => {
 	test("target never written means discard", async () => {
 		const { intent } = await intentFixture();
 		expect((await classifyIntent(intent)).action).toBe("discard");
+	});
+
+	test("discard recovery removes a generic publication backup and clears its authority", async () => {
+		const { fixture, intent } = await intentFixture();
+		const backupPath = `${fixture.paths.configJson}.gjc-bak-recovery-test`;
+		const backupBytes = serializeJson({ before: true });
+		await fs.writeFile(backupPath, backupBytes, { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			publishBackup: { backupPath, valueSha256: hashBytes(backupBytes) },
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+		});
+		expect(recovery?.recovered).toBe(true);
+		await expect(fs.stat(backupPath)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(readIntent(fixture.paths.intentRecord)).resolves.toBeUndefined();
+	});
+
+	test("generic publication backup cleanup retains intent on a digest failure and retries safely", async () => {
+		const { fixture, intent } = await intentFixture();
+		const backupPath = `${fixture.paths.configJson}.gjc-bak-retry-test`;
+		const backupBytes = serializeJson({ before: true });
+		await fs.writeFile(backupPath, "tampered\n", { mode: 0o600 });
+		await writeIntent(fixture.paths.intentRecord, {
+			...intent,
+			publishBackup: { backupPath, valueSha256: hashBytes(backupBytes) },
+		});
+
+		const refused = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+		});
+		expect(refused?.recovered).toBe(false);
+		expect(refused?.detail).toContain("cleanup remains pending");
+		await expect(readIntent(fixture.paths.intentRecord)).resolves.toBeDefined();
+
+		await fs.writeFile(backupPath, backupBytes, { mode: 0o600 });
+		const retried = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+		});
+		expect(retried?.recovered).toBe(true);
+		await expect(fs.stat(backupPath)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	test("a third-party target identity refuses", async () => {

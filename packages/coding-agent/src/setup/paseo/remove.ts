@@ -96,6 +96,19 @@ async function readsRecordedBridgeDir(oldAgentDir: string, recordedBridgeDir: st
 		return false;
 	}
 }
+
+function sameBridgeEntryIdentity(
+	recorded: NonNullable<ProvenanceLedger["bridgeEntryIdentities"]>[string] | undefined,
+	observed: { readonly dev: bigint; readonly ino: bigint; readonly size: bigint; readonly mtimeNs: bigint },
+): boolean {
+	return (
+		recorded !== undefined &&
+		recorded.dev === observed.dev.toString() &&
+		recorded.ino === observed.ino.toString() &&
+		recorded.size === observed.size.toString() &&
+		recorded.mtimeNs === observed.mtimeNs.toString()
+	);
+}
 /**
  * Whether a directory actually holds the bridge the ledger describes: every
  * PRESENT recorded entry must be a symlink pointing into the ledger's
@@ -125,13 +138,27 @@ async function directoryHoldsRecordedBridge(ledger: ProvenanceLedger, dir: strin
 	for (const name of entries) {
 		if (path.basename(name) !== name) return false;
 		const entryPath = path.join(dir, name);
-		const stat = await fs.lstat(entryPath).catch(() => undefined);
+		const stat = await fs.lstat(entryPath, { bigint: true }).catch(() => undefined);
 		if (stat === undefined) continue; // absent entries are consistent with a migration
 		present += 1;
 		if (!stat.isSymbolicLink()) return false;
 		const text = await fs.readlink(entryPath).catch(() => undefined);
 		if (text === undefined) return false;
 		if (path.resolve(path.dirname(entryPath), text) !== path.resolve(sourceDir, name)) return false;
+		// Link text authenticates the intended target, not the object at the
+		// pathname. A user-created replacement can carry identical text, so a
+		// migration root is genuine only when every present recorded link also
+		// matches the no-follow identity GJC persisted at install time.
+		if (
+			!sameBridgeEntryIdentity(ledger.bridgeEntryIdentities?.[name], {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+			})
+		) {
+			return false;
+		}
 	}
 	// A directory holding NONE of the recorded links is not the described
 	// bridge, whatever the ledger claims about it.
@@ -194,13 +221,13 @@ export async function validatedBridgeDir(ledger: ProvenanceLedger, deps: PaseoSe
 	// identity instead of accepting a foreign ledger alone. A foreign sibling
 	// with user content fails that check regardless of what a tampered ledger
 	// claims.
-	const oldLedgerPath = path.join(oldAgentDir, "paseo", "provenance.json");
-	const foreignLedgerRecord = path.resolve(oldLedgerPath) !== path.resolve(deps.paths.provenanceLedger);
 	const holdsDescribedBridge = await directoryHoldsRecordedBridge(ledger, resolved);
-	const emptyOwnedBridge = (ledger.bridgeEntries?.length ?? 0) === 0 && ledger.bridgeDirCreated === true;
 	const genuineMigration =
 		!isCurrentBridge &&
-		(emptyOwnedBridge ? holdsDescribedBridge : foreignLedgerRecord || holdsDescribedBridge) &&
+		// A victim ledger claim is not enough: every present non-empty link must
+		// also match its recorded no-follow identity. This closes the same-target
+		// replacement case even when a separate old-agent ledger claims the path.
+		holdsDescribedBridge &&
 		isBridgeBasename(path.basename(resolved)) &&
 		(await isGenuinePaseoLedgerDir(oldAgentDir)) &&
 		(await readsRecordedBridgeDir(oldAgentDir, resolved));

@@ -166,6 +166,17 @@ export interface PublishResult {
 	readonly identity: string;
 }
 
+/**
+ * Whether this runtime can authenticate a private sidecar without following a
+ * reparse point. Node's regular `fs.open` surface does not expose the Windows
+ * `FILE_FLAG_OPEN_REPARSE_POINT` equivalent, so treating a successful open as
+ * proof there would let a junction redirect credential-bearing bytes. POSIX
+ * callers need `O_NOFOLLOW` for the same final-component guarantee.
+ */
+export function hasNoReparseSidecarAuthority(): boolean {
+	return process.platform !== "win32" && typeof fs.constants.O_NOFOLLOW === "number";
+}
+
 function backupSuffix(now: Date): string {
 	return `${now.toISOString().replace(/[:.]/g, "-")}-${nodeCrypto.randomUUID()}`;
 }
@@ -429,10 +440,10 @@ async function openRegularSidecar(
 	// regular lstat followed by a Windows open can still traverse a reparse
 	// point, so sidecar authentication fails closed on Windows until the native
 	// no-reparse opener is available.
-	if (process.platform === "win32") return undefined;
+	if (!hasNoReparseSidecarAuthority()) return undefined;
 	const initial = await fs.lstat(backupPath, { bigint: true });
 	if (!initial.isFile()) return undefined;
-	const nofollow = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+	const nofollow = fs.constants.O_NOFOLLOW as number;
 	const handle = await fs.open(backupPath, flags | nofollow);
 	try {
 		const opened = await handle.stat({ bigint: true });
@@ -452,6 +463,69 @@ async function openRegularSidecar(
 	} catch (error) {
 		await handle.close().catch(() => undefined);
 		throw error;
+	}
+}
+
+/**
+ * True only for a publication backup beside the target that GJC itself could
+ * have generated. The path is intentionally structural: the unique suffix is
+ * carried by the intent record and is not re-derived during recovery.
+ */
+export function isCanonicalPublishBackupPath(targetPath: unknown, backupPath: unknown): backupPath is string {
+	if (typeof targetPath !== "string" || typeof backupPath !== "string") return false;
+	if (!path.isAbsolute(targetPath) || !path.isAbsolute(backupPath)) return false;
+	const target = path.resolve(targetPath);
+	const backup = path.resolve(backupPath);
+	return (
+		path.dirname(target) === path.dirname(backup) &&
+		path.basename(backup).startsWith(`${path.basename(target)}.gjc-bak-`)
+	);
+}
+
+/**
+ * Remove an interrupted generic publication backup only while its authenticated
+ * bytes and regular-file identity still own the recorded pathname. This is the
+ * recovery inverse for a backup created before target publication: a failed
+ * unlink leaves the intent and exact path in place so a later run can retry
+ * rather than silently clearing cleanup authority.
+ */
+export async function removePublishBackup(
+	targetPath: string,
+	backupPath: string,
+	expectedSha256: string,
+): Promise<boolean> {
+	try {
+		if (!isCanonicalPublishBackupPath(targetPath, backupPath)) return false;
+		if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
+		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
+		if (opened === undefined) return false;
+		const { handle, stat } = opened;
+		let bytes: Buffer;
+		try {
+			bytes = await handle.readFile();
+		} finally {
+			await handle.close();
+		}
+		const digest = nodeCrypto.createHash("sha256").update(bytes).digest("hex");
+		if (digest !== expectedSha256) return false;
+		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
+		if (!parent.isDirectory()) return false;
+		const identity: NativeExactFileIdentity = {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			sha256: digest,
+			quarantineName: `.gjc-paseo-publish-backup-${process.pid}-${nodeCrypto.randomUUID()}`,
+		};
+		const canonicalBackupPath = await canonicalSidecarPathForNativeUnlink(backupPath);
+		const result = exactUnlinkDirect(canonicalBackupPath, identity);
+		return result.ok || result.code === "not_found";
+	} catch {
+		return false;
 	}
 }
 
@@ -658,6 +732,13 @@ export async function writeReplacedProviderBackup(
 	value: unknown,
 ): Promise<ReplacedProviderBackupRef> {
 	const backupPath = replacedProviderBackupPath(configJsonPath, providerKey);
+	if (!hasNoReparseSidecarAuthority()) {
+		throw new PaseoPublishError(backupPath, {
+			reason: "sidecar-conflict",
+			detail:
+				"this runtime cannot authenticate a no-reparse sidecar; refusing to create a credential-bearing replaced-provider backup",
+		});
+	}
 	const valueSha256 = hashBytes(serializeJson(value));
 	const payload = serializeJson({ key: providerKey, value });
 	const temporary = `${backupPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;

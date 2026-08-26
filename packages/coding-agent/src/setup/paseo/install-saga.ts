@@ -27,6 +27,7 @@ import {
 	publishPlan,
 	readTarget,
 	removeDiscardSidecar,
+	removePublishBackup,
 } from "./json-publisher";
 import {
 	classifyIdentity,
@@ -411,6 +412,27 @@ export interface RecoverIntentOptions {
 	readonly trustedBridgePaths?: readonly string[];
 }
 
+async function canonicalRecoveryPath(value: string): Promise<string> {
+	const absolute = path.resolve(value);
+	try {
+		return await fs.realpath(absolute);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		const parent = await fs.realpath(path.dirname(absolute)).catch(() => path.dirname(absolute));
+		return path.join(parent, path.basename(absolute));
+	}
+}
+
+async function pathPresentWithoutFollowing(value: string): Promise<boolean> {
+	try {
+		await fs.lstat(value);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+		throw error;
+	}
+}
+
 async function bridgeLedgerMatchesFilesystem(
 	ledger: ProvenanceLedger,
 	previous: ProvenanceLedger | undefined,
@@ -597,6 +619,33 @@ export async function recoverIntent(
 		const ledgerObserved = await currentIdentity(intent.provenancePath);
 		const before = intent.bridgePreflightPayload;
 		const after = intent.provenancePayload;
+		let liveLedger: ProvenanceLedger;
+		try {
+			liveLedger = await readProvenance(intent.provenancePath);
+		} catch (error) {
+			return {
+				recovered: false,
+				detail: `the provenance ledger at ${intent.provenancePath} could not be authenticated during bridge recovery: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
+		// Migration cleanup is authorized by the pre-cutover root, while the
+		// desired destination provenance remains in `after`. A pending authority
+		// therefore belongs to `before`; it must not rewrite the destination
+		// payload or be validated against the new path.
+		const pendingAuthority = liveLedger.bridgeCleanupPending;
+		const pendingBefore =
+			before !== undefined && pendingAuthority !== undefined
+				? { ...before, bridgeCleanupPending: pendingAuthority }
+				: undefined;
+		const pendingBeforeIdentity = pendingBefore === undefined ? undefined : provenanceLedgerIdentity(pendingBefore);
+		const pendingLedgerMatches = pendingBeforeIdentity !== undefined && pendingBeforeIdentity === ledgerObserved;
+		const pendingPathMatchesOld =
+			pendingAuthority !== undefined &&
+			before?.bridgePath !== undefined &&
+			(await canonicalRecoveryPath(pendingAuthority.originalPath)) === (await canonicalRecoveryPath(before.bridgePath)) &&
+			(await canonicalRecoveryPath(pendingAuthority.detachedPath)) ===
+				(await canonicalRecoveryPath(`${before.bridgePath}.removing`));
+		const authenticatedPending = pendingLedgerMatches && pendingPathMatchesOld;
 		const settledAfter =
 			after !== undefined && after.bridgeCleanupPending !== undefined
 				? provenanceLedgerIdentity({ ...after, bridgeCleanupPending: undefined })
@@ -604,7 +653,8 @@ export async function recoverIntent(
 		if (
 			ledgerObserved !== intent.provenancePreflightIdentity &&
 			ledgerObserved !== intent.provenanceExpectedIdentity &&
-			ledgerObserved !== settledAfter
+			ledgerObserved !== settledAfter &&
+			!authenticatedPending
 		) {
 			return {
 				recovered: false,
@@ -625,10 +675,19 @@ export async function recoverIntent(
 		const safeSettled =
 			settledAfter !== undefined && beforeMatches && !afterMatches && ledgerObserved === settledAfter;
 		const safePendingPreDetach =
-			after?.bridgeCleanupPending !== undefined &&
-			beforeMatches &&
-			(ledgerObserved === intent.provenanceExpectedIdentity ||
-				ledgerObserved === intent.provenancePreflightIdentity);
+			authenticatedPending && beforeMatches && !afterMatches;
+		const pendingOriginalPathState =
+			pendingAuthority === undefined
+				? undefined
+				: await fs.lstat(pendingAuthority.originalPath).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				});
+		const safePendingPostDetach =
+			authenticatedPending &&
+			afterMatches &&
+			pendingAuthority !== undefined &&
+			pendingOriginalPathState === undefined;
 		const safeCompensationPending =
 			before?.bridgeCleanupPending !== undefined &&
 			before !== undefined &&
@@ -647,10 +706,11 @@ export async function recoverIntent(
 				!safeCompleted &&
 				!safeSettled &&
 				!safePendingPreDetach &&
+				!safePendingPostDetach &&
 				!safeCompensationPending &&
 				!recoverableCutover &&
 				!(samePayload && beforeMatches)) ||
-			(beforeMatches && afterMatches && !samePayload && !safePendingPreDetach && !safeCompensationPending)
+			(beforeMatches && afterMatches && !samePayload && !safePendingPreDetach && !safePendingPostDetach && !safeCompensationPending)
 		) {
 			return {
 				recovered: false,
@@ -663,60 +723,30 @@ export async function recoverIntent(
 				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
 			};
 		}
+		if (safePendingPreDetach) {
+			return {
+				recovered: false,
+				detail:
+					"the old Paseo bridge cleanup authority is durably recorded but detach has not committed; retaining the pre-cutover provenance and intent for a safe migration retry",
+			};
+		}
 		let pendingReplayed = false;
-		if (after?.bridgeCleanupPending !== undefined && options.replayBridgeCleanup !== undefined) {
-			const currentLedger = await readProvenance(intent.provenancePath);
-			const currentPending = currentLedger.bridgeCleanupPending;
-			if (currentPending === undefined && settledAfter !== undefined && ledgerObserved === settledAfter) {
+		if (safePendingPostDetach) {
+			if (pendingAuthority === undefined || before === undefined || after === undefined) {
 				return {
 					recovered: false,
-					detail:
-						"pending bridge intent has no durable cleanup authority; retaining it instead of assuming detach completed",
-				};
-			}
-			if (
-				currentPending === undefined ||
-				JSON.stringify(currentPending) !== JSON.stringify(after.bridgeCleanupPending)
-			) {
-				return {
-					recovered: false,
-					detail: `the durable pending bridge cleanup authority changed before replay; refusing to overwrite it`,
-				};
-			}
-			const [originalPathState, detachedPathState] = await Promise.all([
-				fs.lstat(currentPending.originalPath).catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-					throw error;
-				}),
-				fs.lstat(currentPending.detachedPath).catch(error => {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-					throw error;
-				}),
-			]);
-			if (originalPathState !== undefined) {
-				return {
-					recovered: false,
-					detail:
-						"pending bridge cleanup has not proven detach; retaining the intent for lifecycle-specific retry",
+					detail: "pending bridge recovery is missing its authenticated migration payload; retaining the intent",
 				};
 			}
 			const allowedPaths = options.trustedBridgePaths ?? [intent.targetPath];
-			if (
-				!allowedPaths.some(value => path.resolve(value) === path.resolve(after.bridgeCleanupPending!.originalPath))
-			) {
+			const [pendingCanonicalPath, ...allowedCanonicalPaths] = await Promise.all([
+				canonicalRecoveryPath(pendingAuthority.originalPath),
+				...allowedPaths.map(value => canonicalRecoveryPath(value)),
+			]);
+			if (pendingCanonicalPath === undefined || !allowedCanonicalPaths.includes(pendingCanonicalPath)) {
 				return {
 					recovered: false,
-					detail: `the pending bridge cleanup authority is outside the intent's trusted bridge paths: ${after.bridgeCleanupPending.originalPath}`,
-				};
-			}
-			if (
-				after.bridgePath === undefined ||
-				path.resolve(after.bridgePath) !== path.resolve(after.bridgeCleanupPending.originalPath) ||
-				!allowedPaths.some(value => path.resolve(value) === path.resolve(after.bridgePath!))
-			) {
-				return {
-					recovered: false,
-					detail: "the pending bridge cleanup destination is not bound to the authenticated after-bridge path",
+					detail: `the pending bridge cleanup authority is outside the intent's trusted bridge paths: ${pendingAuthority.originalPath}`,
 				};
 			}
 			const observedBeforeReplay = await currentIdentity(intent.provenancePath);
@@ -726,20 +756,26 @@ export async function recoverIntent(
 					detail: `the provenance ledger changed before pending bridge replay; refusing to overwrite the newer record`,
 				};
 			}
-			if (detachedPathState !== undefined) await options.replayBridgeCleanup(after.bridgeCleanupPending);
+			const detachedPathState = await fs.lstat(pendingAuthority.detachedPath).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			});
+			if (detachedPathState !== undefined) {
+				if (options.replayBridgeCleanup === undefined) {
+					return {
+						recovered: false,
+						detail: "pending bridge cleanup needs its native replay authority; retaining the intent",
+					};
+				}
+				await options.replayBridgeCleanup(pendingAuthority);
+			}
 			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
 				return {
 					recovered: false,
 					detail: `the provenance ledger changed during pending bridge replay; refusing to overwrite the newer record`,
 				};
 			}
-			const authorityPath = path.resolve(after.bridgeCleanupPending.originalPath);
-			const beforeOwnsAuthority =
-				before?.bridgePath !== undefined && path.resolve(before.bridgePath) === authorityPath;
-			const afterOwnsAuthority = path.resolve(after.bridgePath ?? "") === authorityPath;
-			const settleSource = beforeOwnsAuthority && !afterOwnsAuthority ? after : (before ?? after);
-			const settled = { ...settleSource, bridgeCleanupPending: undefined };
-			await writeProvenance(intent.provenancePath, settled);
+			await writeProvenance(intent.provenancePath, { ...after, bridgeCleanupPending: undefined });
 			pendingReplayed = true;
 		}
 		if (safeCompensationPending) {
@@ -815,7 +851,7 @@ export async function recoverIntent(
 			const [targetObserved, ledgerObserved, backupExists] = await Promise.all([
 				currentIdentity(intent.targetPath),
 				currentIdentity(intent.provenancePath),
-				Bun.file(intent.publishBackup.backupPath).exists(),
+				pathPresentWithoutFollowing(intent.publishBackup.backupPath),
 			]);
 			const targetState = classifyIdentity(
 				targetObserved,
@@ -828,12 +864,29 @@ export async function recoverIntent(
 				intent.provenanceExpectedIdentity,
 			);
 			if (targetState === "before" && ledgerState === "before" && backupExists) {
-				return {
-					recovered: false,
-					detail: `${recovery.detail}; credential backup authority remains at ${intent.publishBackup.backupPath}`,
-				};
+				const [targetBeforeCleanup, ledgerBeforeCleanup] = await Promise.all([
+					currentIdentity(intent.targetPath),
+					currentIdentity(intent.provenancePath),
+				]);
+				if (targetBeforeCleanup !== targetObserved || ledgerBeforeCleanup !== ledgerObserved) {
+					return {
+						recovered: false,
+						detail: `${recovery.detail}; recovery state changed before generic backup cleanup; retaining the intent`,
+					};
+				}
+				const removed = await removePublishBackup(
+					intent.targetPath,
+					intent.publishBackup.backupPath,
+					intent.publishBackup.valueSha256,
+				);
+				if (!removed && (await pathPresentWithoutFollowing(intent.publishBackup.backupPath))) {
+					return {
+						recovered: false,
+						detail: `${recovery.detail}; credential backup cleanup remains pending at ${intent.publishBackup.backupPath}`,
+					};
+				}
 			}
-			if (!backupExists) {
+			if (!backupExists || (targetState === "before" && ledgerState === "before")) {
 				const { publishBackup: _publishBackup, ...safeIntent } = intent;
 				await writeIntent(intentPath, safeIntent);
 			}
