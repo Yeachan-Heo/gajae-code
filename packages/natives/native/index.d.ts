@@ -939,9 +939,10 @@ export declare function exactUnlink(path: string, identity: NativeExactFileIdent
 /**
  * Async variant of [`exact_unlink`] on a dedicated native thread.
  *
- * Directory detachment can perform exchange, placeholder, and metadata operations
- * that block on a wedged filesystem. Keep that work outside the JavaScript thread
- * while preserving the exact identity and durable quarantine receipt contract.
+ * Directory detachment can perform exchange, placeholder, and metadata
+ * operations that block on a wedged filesystem. Keep that work outside the
+ * JavaScript thread while preserving the exact identity and durable quarantine
+ * receipt contract.
  */
 export declare function exactUnlinkAsync(path: string, identity: NativeExactFileIdentity, timeoutMs?: number | undefined | null): Promise<NativeExactUnlinkResult>
 

@@ -1224,9 +1224,10 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 
 /// Async variant of [`exact_unlink`] on a dedicated native thread.
 ///
-/// Directory detachment can perform exchange, placeholder, and metadata operations
-/// that block on a wedged filesystem. Keep that work outside the JavaScript thread
-/// while preserving the exact identity and durable quarantine receipt contract.
+/// Directory detachment can perform exchange, placeholder, and metadata
+/// operations that block on a wedged filesystem. Keep that work outside the
+/// JavaScript thread while preserving the exact identity and durable quarantine
+/// receipt contract.
 #[napi]
 pub fn exact_unlink_async(
 	env: &Env,
@@ -5737,7 +5738,17 @@ pub(crate) mod platform {
 		// SAFETY: the descriptor is live and the initialized output struct is writable.
 		let root_matches = unsafe { libc::fstat(fd, &mut root) } == 0
 			&& root.st_dev as u64 == expected.root_dev.parse().ok().unwrap_or(u64::MAX)
-			&& root.st_ino as u64 == expected.root_ino.parse().ok().unwrap_or(u64::MAX);
+			&& root.st_ino as u64 == expected.root_ino.parse().ok().unwrap_or(u64::MAX)
+			&& root.st_nlink.to_string()
+				== expected_tree_entry(&expected.entries, "").map_or("", |entry| entry.nlink.as_str())
+			&& root.st_size.to_string()
+				== expected_tree_entry(&expected.entries, "").map_or("", |entry| entry.size.as_str())
+			&& stat_mtime_ns(&root).to_string()
+				== expected_tree_entry(&expected.entries, "")
+					.map_or("", |entry| entry.mtime_ns.as_str())
+			&& stat_ctime_ns(&root).to_string()
+				== expected_tree_entry(&expected.entries, "")
+					.map_or("", |entry| entry.ctime_ns.as_str());
 		if !root_matches {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe {
@@ -8502,7 +8513,10 @@ mod platform {
 			Ok(entry) => entry,
 			Err(code) => return NativeExactUnlinkResult::detached_failure(code, retained_path),
 		};
-		if root_entry.dev != expected.root_dev || root_entry.ino != expected.root_ino {
+		if root_entry.dev != expected.root_dev
+			|| root_entry.ino != expected.root_ino
+			|| expected_tree_entry(&expected.entries, "") != Some(&root_entry)
+		{
 			return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 		}
 		if let Err(code) = validate_tree_handle(root.target, "", &expected.entries) {

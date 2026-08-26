@@ -515,6 +515,26 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 		expect((await fs.stat(state)).mode & 0o777).toBe(0o644);
 	});
 	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
+		"rejects a root directory generation change after an empty snapshot",
+		async () => {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+			temporaryDirectories.push(root);
+			const detached = path.join(root, ".gjc-delete-generation");
+			await fs.mkdir(detached);
+			const snapshot = snapshotDirectoryTree(detached);
+			expect(snapshot.ok).toBe(true);
+			if (!snapshot.ok || !snapshot.snapshot) throw new Error("missing tree snapshot");
+
+			const now = new Date();
+			await fs.utimes(detached, now, new Date(now.getTime() + 1000));
+			expect(exactRemoveDirectoryTree(detached, snapshot.snapshot)).toMatchObject({
+				ok: false,
+				code: "identity_mismatch",
+			});
+			expect((await fs.stat(detached)).isDirectory()).toBe(true);
+		},
+	);
+	it.skipIf(process.platform !== "linux" && process.platform !== "darwin")(
 		"retains the caller-planned root after a tree snapshot failure",
 		async () => {
 			const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));

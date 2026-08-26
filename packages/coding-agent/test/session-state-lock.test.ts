@@ -440,7 +440,7 @@ describe("coordinator session state lock", () => {
 		const stateFile = path.join(root, "lock-transition-capture-successor.json");
 		const transitionDir = `${stateFile}.lock.transition`;
 		SessionStateLockTestHooks.beforeTransitionIdentityCapture = async () => {
-			await fs.rmdir(transitionDir);
+			await fs.rm(transitionDir, { recursive: true, force: true });
 			await fs.mkdir(transitionDir);
 			await fs.writeFile(path.join(transitionDir, "successor-token"), "successor");
 			throw new Error("identity capture failed after replacement");
@@ -471,7 +471,7 @@ describe("coordinator session state lock", () => {
 		);
 
 		const transitionDir = `${lockFile}.transition`;
-		if (fsSync.existsSync(transitionDir)) await fs.rmdir(transitionDir);
+		if (fsSync.existsSync(transitionDir)) await fs.rm(transitionDir, { recursive: true, force: true });
 		await Bun.sleep(20);
 		await fs.mkdir(transitionDir);
 		await fs.writeFile(path.join(transitionDir, "successor-token"), "successor");
