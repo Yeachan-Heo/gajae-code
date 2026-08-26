@@ -190,15 +190,15 @@ describe("BashTool ACP terminal fold red-team", () => {
 		expect(row?.deliveryState).toBe("delivered");
 		await waitFor(() => releaseSpy.mock.calls.length === 1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
-		// kill may be invoked once (abort path) or never (wait failure), but the
-		// command must not keep running: the delivery proves the run settled.
-		expect(killSpy.mock.calls.length).toBeLessThanOrEqual(1);
+		// A rejected wait must stop the remote command before releasing the handle.
+		expect(killSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("owner teardown mid-fold: failNow delivers the failure, release happens once, cancel is refused", async () => {
 		const { exit, handle } = makeHandle("term-owner");
 		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
 		const releaseSpy = spyOn(handle, "release");
+		const killSpy = spyOn(handle, "kill");
 
 		const h = makeHarness(bridge);
 		const tool = new BashTool(h.session);
@@ -225,6 +225,7 @@ describe("BashTool ACP terminal fold red-team", () => {
 		exit.resolve({ exitCode: 0, signal: null });
 		await waitFor(() => releaseSpy.mock.calls.length === 1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
+		expect(killSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("owner teardown BEFORE the fold: the foreground wait still releases once", async () => {
@@ -235,6 +236,7 @@ describe("BashTool ACP terminal fold red-team", () => {
 		const h = makeHarness(bridge);
 		const tool = new BashTool(h.session);
 		const resultPromise = tool.execute("call-owner-pre", { command: "sleep 30" }, undefined, () => {});
+		const resultError = resultPromise.catch(error => error);
 		await waitFor(() => h.adapters.length === 1);
 
 		h.manager.runOwnerProducerCleanups({ ownerId: "0-Main" });
@@ -246,6 +248,7 @@ describe("BashTool ACP terminal fold red-team", () => {
 		exit.resolve({ exitCode: 0, signal: null });
 		await waitFor(() => releaseSpy.mock.calls.length === 1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
-		await expect(resultPromise).rejects.toThrow("term-owner-pre output");
+		expect(await resultError).toHaveProperty("message");
+		expect((await resultError).message).toContain("term-owner-pre output");
 	});
 });

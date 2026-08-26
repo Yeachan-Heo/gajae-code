@@ -219,13 +219,19 @@ export class JobsObserver {
 		// Keep every backgrounded job visible. A non-delivered terminal entry is
 		// also retained here so pending/failed delivery can never disappear merely
 		// because it was not marked backgrounded by its producer.
+		const deadLettersByKey = new Map(
+			asyncSnapshot.deadLettered.map(entry => [jobKey(entry.jobId, entry.generation), entry] as const),
+		);
 		const foldedJobs: FoldedJobView[] = asyncSnapshot.jobs
 			.filter(
 				entry =>
 					entry.backgrounded ||
 					(entry.status !== "running" && (entry.status === "failed" || entry.deliveryState !== "delivered")),
 			)
-			.map(entry => ({ ...entry }));
+			.map(entry => {
+				const lastError = deadLettersByKey.get(jobKey(entry.id, entry.generation))?.lastError;
+				return lastError === undefined ? { ...entry } : { ...entry, errorText: lastError };
+			});
 		const foldedKeys = new Set(foldedJobs.map(entry => jobKey(entry.id, entry.generation)));
 		for (const entry of asyncSnapshot.deadLettered) {
 			const key = jobKey(entry.jobId, entry.generation);

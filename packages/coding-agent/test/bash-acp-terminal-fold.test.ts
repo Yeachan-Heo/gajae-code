@@ -396,9 +396,45 @@ describe("BashTool ACP terminal fold", () => {
 		expect(killCalls).toBe(1);
 	});
 
+	it("kills and retains prior output when ACP waitForExit rejects", async () => {
+		let outputReads = 0;
+		let killCalls = 0;
+		let releaseCalls = 0;
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-wait-recovery",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "wait diagnostics\n", truncated: false };
+				throw new Error("terminal/output failed during wait recovery");
+			},
+			kill: async () => {
+				killCalls += 1;
+			},
+			release: async () => {
+				releaseCalls += 1;
+			},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		const resultPromise = tool.execute("call-wait-recovery", { command: "echo done" }, undefined, () => {});
+		await waitFor(() => outputReads === 1);
+		exit.reject(new Error("terminal/wait failed: disconnected"));
+
+		await expect(resultPromise).rejects.toThrow(
+			/wait diagnostics[\s\S]*Terminal wait failed[\s\S]*terminal\/wait failed: disconnected[\s\S]*Terminal output recovery failed[\s\S]*terminal\/output failed during wait recovery/,
+		);
+		expect(killCalls).toBe(1);
+		expect(releaseCalls).toBe(1);
+	});
+
 	it("kills and retains output when ACP progress update throws", async () => {
 		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
 		let killCalls = 0;
+		let releaseCalls = 0;
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-update-recovery",
 			waitForExit: () => exit.promise,
@@ -406,7 +442,9 @@ describe("BashTool ACP terminal fold", () => {
 			kill: async () => {
 				killCalls += 1;
 			},
-			release: async () => {},
+			release: async () => {
+				releaseCalls += 1;
+			},
 		};
 		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
 		const h = makeHarness(bridge);
@@ -418,5 +456,6 @@ describe("BashTool ACP terminal fold", () => {
 			}),
 		).rejects.toThrow(/update diagnostics[\s\S]*Terminal output recovery failed/);
 		expect(killCalls).toBe(1);
+		expect(releaseCalls).toBe(1);
 	});
 });

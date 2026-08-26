@@ -330,6 +330,28 @@ function formatClientTerminalReadFailure(
 	return formatBashFailureMessage(result, outputText, "Terminal output read failed");
 }
 
+function formatClientTerminalWaitFailure(
+	prepared: PreparedClientTerminalOutput,
+	waitDiagnostic: string,
+	readDiagnostic?: string,
+	pendingNotices: readonly string[] = [],
+): string {
+	const notices = [
+		...pendingNotices,
+		...(prepared.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+		...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+		`Terminal wait failed: ${waitDiagnostic}`,
+		...(readDiagnostic ? [`Terminal output recovery failed: ${readDiagnostic}`] : []),
+	];
+	const outputText = [prepared.summary.output || "(no output)", ...notices].filter(Boolean).join("\n");
+	const result: BashResult = {
+		...prepared.summary,
+		exitCode: undefined,
+		cancelled: false,
+	};
+	return formatBashFailureMessage(result, outputText, "Terminal wait failed");
+}
+
 function appendArtifactDetails(text: string, result: BashResult | BashInteractiveResult): string {
 	const suffixParts: string[] = [];
 	const reference = artifactReferenceForResult(result);
@@ -1564,9 +1586,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// it: a foreground return, a folded background completion, or a failure.
 			let released = false;
 			const runBoundedCleanup = async (operation: () => Promise<void>, label: "kill" | "release"): Promise<void> => {
-				const attempt = operation().catch((error: unknown) => {
-					logger.warn(`ACP terminal ${label} failed`, { terminalId: handle.terminalId, error });
-				});
+				const attempt = Promise.resolve()
+					.then(operation)
+					.catch((error: unknown) => {
+						logger.warn(`ACP terminal ${label} failed`, { terminalId: handle.terminalId, error });
+					});
 				const completed = await Promise.race([
 					attempt.then(() => true),
 					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
@@ -1581,9 +1605,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			let killPromise: Promise<void> | undefined;
 			const fireKill = (): Promise<void> => {
 				if (killPromise) return killPromise;
-				killPromise = handle.kill().catch((error: unknown) => {
+				try {
+					killPromise = Promise.resolve(handle.kill()).catch((error: unknown) => {
+						logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
+					});
+				} catch (error) {
 					logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
-				});
+					killPromise = Promise.resolve();
+				}
 				return killPromise;
 			};
 			const boundedKill = async (): Promise<void> => {
@@ -1594,7 +1623,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			try {
 				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
 			} catch (error) {
-				await Promise.all([boundedKill(), releaseTerminalOnce()]);
+				await boundedKill();
+				await releaseTerminalOnce();
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
 			}
@@ -1639,14 +1669,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const runToCompletion = async (
 				runSignal: AbortSignal | undefined,
 			): Promise<AgentToolResult<BashToolDetails>> => {
-				const exitPromise = handle.waitForExit();
-				let exitStatus!: ClientBridgeTerminalExitStatus;
-
 				type BridgeRaceResult =
 					| { kind: "exit"; status: ClientBridgeTerminalExitStatus }
+					| { kind: "wait-failed"; error: unknown }
 					| { kind: "poll" }
 					| { kind: "timeout" }
 					| { kind: "aborted" };
+				const exitPromise = Promise.resolve().then(() => handle.waitForExit());
+				const exitRacePromise: Promise<BridgeRaceResult> = exitPromise.then(
+					status => ({ kind: "exit" as const, status }),
+					error => ({ kind: "wait-failed" as const, error }),
+				);
+				let exitStatus!: ClientBridgeTerminalExitStatus;
 
 				// Set up abort listener before entering the poll loop. The listener
 				// kicks off `handle.kill()` synchronously so a `session/cancel`
@@ -1664,7 +1698,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					return Promise.race([
 						handle.currentOutput(),
 						...(includeAbort ? [abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
-						...(includeExit ? [exitPromise.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
+						...(includeExit
+							? [exitRacePromise.then(() => undefined as ClientBridgeTerminalOutput | undefined)]
+							: []),
 						timeout.promise,
 					]).finally(() => clearTimeout(timer));
 				};
@@ -1698,7 +1734,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					// Poll until the process exits, times out, or the caller aborts.
 					for (;;) {
 						const racers: Array<Promise<BridgeRaceResult>> = [
-							exitPromise.then(s => ({ kind: "exit" as const, status: s })),
+							exitRacePromise,
 							timeoutPromise,
 							Bun.sleep(250).then(() => ({ kind: "poll" as const })),
 						];
@@ -1725,6 +1761,32 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							throw new ToolAbortError(
 								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
+							);
+						}
+
+						if (raced.kind === "wait-failed") {
+							await boundedKill();
+							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
+							let readDiagnostic: string | undefined;
+							try {
+								current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
+							} catch (error) {
+								current = retainedAcpOutput();
+								readDiagnostic = boundArtifactSaveDiagnostic(error);
+								logger.warn("ACP terminal output recovery after wait failure failed", {
+									terminalId: handle.terminalId,
+									error,
+								});
+							}
+							appendAcpSnapshot(current.output);
+							const prepared = await prepareClientTerminalOutput(this.session, current);
+							throw new ToolError(
+								formatClientTerminalWaitFailure(
+									prepared,
+									boundArtifactSaveDiagnostic(raced.error),
+									readDiagnostic,
+									pendingNotices,
+								),
 							);
 						}
 
@@ -1962,7 +2024,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					},
 				);
 			} catch (error) {
-				await Promise.all([boundedKill(), releaseTerminalOnce()]);
+				await boundedKill();
+				await releaseTerminalOnce();
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
 			}
@@ -1975,7 +2038,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const unregisterOwnerCleanup = bridgeManager.registerOwnerCleanup(
 				this.session.getAgentId?.() ?? "0-Main",
 				() => {
-					void Promise.all([boundedKill(), releaseTerminalOnce()]);
+					void boundedKill().then(() => releaseTerminalOnce());
 					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.");
 				},
 			);
@@ -2096,6 +2159,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let lastPtyFoldKeyTime = 0;
 		let ptyJobId!: string;
 		let ptyOutputSeen = false;
+		let ptyOutcome: BashInteractiveResult | undefined;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
@@ -2113,6 +2177,31 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						if (!ownedManager) return;
 						const ptyManager = ownedManager;
 						const ptyLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
+						const ptyOwnerId = this.session.getAgentId?.() ?? "0-Main";
+						let ptyKillStarted = false;
+						const killPtyOnce = (): void => {
+							if (ptyKillStarted) return;
+							ptyKillStarted = true;
+							try {
+								controls.kill();
+							} catch (error) {
+								logger.warn("PTY kill failed", {
+									jobId: ptyJobId,
+									error: error instanceof Error ? error.message : String(error),
+								});
+							}
+						};
+						const ownerTeardownText = (): string => {
+							const retained = ptyManager.readOutputSince(ptyJobId, 0, { ownerId: ptyOwnerId });
+							const output = ptyOutcome?.output || retained?.text || "";
+							if (!output && !ptyOutcome) return "PTY job owner was torn down.";
+							const summary = ptyOutcome ? { ...ptyOutcome, output } : interactiveResultFromText(output);
+							const body = [
+								output || "(no output)",
+								...(retained?.truncated && !ptyOutcome?.truncated ? ["(output truncated)"] : []),
+							].join("\n");
+							return formatBashFailureMessage(summary, body, "PTY job owner was torn down.");
+						};
 						// The job's runner simply awaits the run that is ALREADY executing,
 						// so registering never re-executes the command.
 						try {
@@ -2136,21 +2225,29 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								{
 									ownerId: this.session.getAgentId?.() ?? undefined,
 									admissionToken: ptyAdmission,
-									lifecycle: { onCancel: () => controls.kill() },
+									lifecycle: { onCancel: killPtyOnce },
 								},
 							);
 						} catch (error) {
-							controls.kill();
+							killPtyOnce();
 							if (ptyAdmission) ptyManager.releaseCapacity(ptyAdmission);
 							throw error;
 						}
 						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
 						registerOwnedIfLineaged(ptyManager, toolCallId, ptyJobId, this.session.getSessionId?.() ?? undefined);
-						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(
-							this.session.getAgentId?.() ?? "0-Main",
-							() => {
-								controls.kill();
-								ptyManager.failNow(ptyJobId, ptyGeneration, "PTY job owner was torn down.");
+						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(ptyOwnerId, () => {
+							killPtyOnce();
+							ptyManager.failNow(ptyJobId, ptyGeneration, ownerTeardownText());
+						});
+						void controls.terminalCompletion.then(
+							outcome => {
+								ptyOutcome = outcome;
+							},
+							(error: unknown) => {
+								logger.warn("PTY terminal completion failed", {
+									jobId: ptyJobId,
+									error: error instanceof Error ? error.message : String(error),
+								});
 							},
 						);
 						void controls.terminalCompletion.finally(unregisterPtyOwnerCleanup);

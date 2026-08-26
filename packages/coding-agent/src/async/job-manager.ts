@@ -262,6 +262,11 @@ interface AsyncJobDelivery {
 	jobId: string;
 	generation: string;
 	job: AsyncJob;
+	/** Delivery-owned public projection fields retained after the live job is evicted. */
+	kind: AsyncJob["type"];
+	label: string;
+	status: AsyncJob["status"];
+	backgrounded: boolean;
 	text: string;
 	originalBytes?: number;
 	truncated?: boolean;
@@ -2263,6 +2268,27 @@ export class AsyncJobManager {
 		});
 
 		const ownerId = filter?.ownerId;
+		const projectedKeys = new Set(jobs.map(job => `${job.id}:${job.generation}`));
+		// A zero-retention job can disappear from #jobs while its completion
+		// callback is still queued or in flight. Project that delivery from its
+		// immutable scalar fields so folded work remains visible until the callback
+		// reaches a terminal delivery boundary; do not retain or expose its payload.
+		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
+			if (ownerId && delivery.ownerId !== ownerId) continue;
+			const key = `${delivery.jobId}:${delivery.generation}`;
+			if (projectedKeys.has(key)) continue;
+			projectedKeys.add(key);
+			jobs.push({
+				id: delivery.jobId,
+				kind: delivery.kind,
+				label: delivery.label,
+				status: delivery.status,
+				generation: delivery.generation,
+				backgrounded: delivery.backgrounded,
+				deliveryState: "pending",
+			});
+		}
+
 		const deadLettered: DeadLetteredJobSnapshotEntry[] = [];
 		for (const entry of this.#deadLetteredDeliveries.values()) {
 			const entryOwner = this.#deadLetteredDeliveryOwners.get(entry.jobId);
@@ -2474,6 +2500,9 @@ export class AsyncJobManager {
 		const job = this.#jobs.get(jobId);
 		if (!job || job.generation !== generation) return false;
 		job.metadata = { ...job.metadata, backgrounded: true };
+		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
+			if (delivery.jobId === jobId && delivery.generation === generation) delivery.backgrounded = true;
+		}
 		this.#notifyChange();
 		return true;
 	}
@@ -2630,6 +2659,10 @@ export class AsyncJobManager {
 		this.#notifyChange();
 		if (this.#retentionMs <= 0) {
 			this.#evictJob(jobId);
+			// The terminal notification above precedes eviction so consumers can see
+			// the terminal transition; publish once more after the record disappears
+			// so observers can project any delivery that still owns the generation.
+			this.#notifyChange();
 			return;
 		}
 		const existing = this.#evictionTimers.get(jobId);
@@ -2813,7 +2846,7 @@ export class AsyncJobManager {
 			jobId: delivery.jobId,
 			generation: delivery.generation,
 			ownerId: delivery.ownerId,
-			backgrounded: delivery.job.metadata?.backgrounded === true,
+			backgrounded: delivery.backgrounded,
 			attempt: delivery.attempt,
 			lastError: delivery.lastError,
 			recordedAt: Date.now(),
@@ -2868,6 +2901,10 @@ export class AsyncJobManager {
 			jobId,
 			generation: job.generation,
 			job,
+			kind: job.type,
+			label: job.label,
+			status: job.status,
+			backgrounded: job.metadata?.backgrounded === true,
 			text: deliveryText.text,
 			originalBytes: deliveryText.originalBytes,
 			truncated: deliveryText.truncated,
@@ -2894,6 +2931,14 @@ export class AsyncJobManager {
 			originalBytes: bytes,
 			truncated: true,
 		};
+	}
+
+	#boundedDeliveryErrorText(text: string): string {
+		const bytes = Buffer.byteLength(text, "utf8");
+		if (bytes <= DELIVERY_MAX_TEXT_BYTES) return text;
+		const marker = ` [async delivery error truncated from ${bytes} bytes]`;
+		const prefixBytes = Math.max(0, DELIVERY_MAX_TEXT_BYTES - Buffer.byteLength(marker, "utf8"));
+		return `${sliceTextToUtf8ByteLength(text, prefixBytes)}${marker}`;
 	}
 
 	#ensureDeliveryLoop(): void {
@@ -2947,13 +2992,17 @@ export class AsyncJobManager {
 				await this.#onJobComplete(delivery.jobId, delivery.text, delivery.job);
 			} catch (error) {
 				delivery.attempt += 1;
-				delivery.lastError = error instanceof Error ? error.message : String(error);
-				if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
-					// The retry cap is the only route that may outlive its record here:
-					// #recordDeadLetter is pruned by record existence, so an
-					// already-evicted job's cap failure would leave no visible terminal
-					// state at all. The queue-overflow drop path keeps its existing
-					// behavior and is deliberately unchanged.
+				delivery.lastError = this.#boundedDeliveryErrorText(error instanceof Error ? error.message : String(error));
+				if (this.#disposed) {
+					logger.warn("Async job completion delivery dropped after manager disposal", {
+						jobId: delivery.jobId,
+						attempt: delivery.attempt,
+						error: delivery.lastError,
+					});
+				} else if (delivery.attempt >= DELIVERY_MAX_ATTEMPTS) {
+					// Record the failure in the bounded scalar map when its job record has
+					// already been evicted; otherwise #recordDeadLetter is pruned by record
+					// existence and the terminal failure would become invisible.
 					this.#recordDeadLetterOrEvicted(delivery);
 					logger.warn("Async job completion delivery reached retry cap", {
 						jobId: delivery.jobId,

@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import type { AsyncJobManager } from "../src/async";
+import { AsyncJobManager } from "../src/async";
 import { buildJobsListItems } from "../src/modes/components/jobs-overlay-model";
 import { renderSegment, type SegmentContext } from "../src/modes/components/status-line/segments";
 import { type AsyncJobsSnapshot, EMPTY_JOBS_SNAPSHOT, JobsObserver } from "../src/modes/jobs-observer";
@@ -134,6 +134,7 @@ describe("folded jobs surfacing", () => {
 		const failedItem = foldedItems.find(item => item.value.startsWith("folded:folded-failed:"));
 		expect(failedItem).toMatchObject({
 			description: "failed-visible",
+			value: "folded:folded-failed:generation-1",
 			hint: "failed",
 			disabled: true,
 		});
@@ -169,14 +170,98 @@ describe("folded jobs surfacing", () => {
 		expect(items).toHaveLength(1);
 		expect(items[0]).toMatchObject({
 			label: "dead-letter · gone",
-			description: "failed-visible",
+			description: "failed-visible · attempt 3 · error: terminal failure",
 			hint: "failed",
 			disabled: true,
+			value: "folded:gone:generation-gone",
 		});
 		expect(observed.worstState).toBe("failed");
 		expect(observed.monitors).toEqual(EMPTY_JOBS_SNAPSHOT.monitors);
 
 		observer.dispose();
+	});
+
+	test("renders bounded dead-letter attempt and error metadata in folded rows", () => {
+		const sourceSnapshot: AsyncJobsSnapshot = {
+			jobs: [],
+			deadLettered: [
+				{
+					jobId: "bounded-dead-letter",
+					generation: "generation-bounded-dead-letter",
+					attempt: 3,
+					lastError: `delivery failed\t${"x".repeat(10_000)}`,
+					recordedAt: 1,
+				},
+			],
+		};
+		const observer = new JobsObserver(fakeManager(sourceSnapshot), undefined);
+		const item = buildJobsListItems(observer.getSnapshot())[0];
+		const description = item?.description ?? "";
+
+		expect(description).toContain("attempt 3");
+		expect(description).toContain("error: delivery failed");
+		expect(description).not.toContain("\t");
+		expect(description.length).toBeLessThanOrEqual(80);
+
+		observer.dispose();
+	});
+
+	test("renders an existing folded row's retained error text without dead-letter duplication", () => {
+		const items = buildJobsListItems({
+			...EMPTY_JOBS_SNAPSHOT,
+			foldedJobs: [
+				{
+					id: "retained-error",
+					kind: "bash",
+					label: "retained error",
+					status: "failed",
+					generation: "generation-retained-error",
+					backgrounded: true,
+					deliveryState: "failed-visible",
+					errorText: "callback failed",
+				},
+			],
+		});
+
+		expect(items[0]?.description).toContain("error: callback failed");
+		expect(items[0]?.description).not.toContain("attempt");
+	});
+
+	test("surfaces an in-flight zero-retention delivery after its job record is evicted", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async () => {
+				deliveryStarted.resolve();
+				await releaseDelivery.promise;
+			},
+		});
+		const observer = new JobsObserver(manager, "owner-folded");
+
+		try {
+			const jobId = manager.register("bash", "evicted folded delivery", async () => "payload", {
+				ownerId: "owner-folded",
+				metadata: { backgrounded: true },
+			});
+			const generation = manager.getJob(jobId)?.generation ?? "";
+			await deliveryStarted.promise;
+
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(observer.getSnapshot().foldedJobs).toContainEqual({
+				id: jobId,
+				kind: "bash",
+				label: "evicted folded delivery",
+				status: "completed",
+				generation,
+				backgrounded: true,
+				deliveryState: "pending",
+			});
+		} finally {
+			releaseDelivery.resolve();
+			observer.dispose();
+			await manager.dispose({ timeoutMs: 250 });
+		}
 	});
 
 	// AC6 asserted as a partition PROPERTY rather than case by case: every

@@ -83,10 +83,27 @@ export function buildJobsListItems(snapshot: JobsSnapshot): SelectItem[] {
 	for (const job of foldedJobs) {
 		const state = displayText(job.deliveryState, TRUNCATE_LENGTHS.SHORT);
 		const kind = preview(job.kind, TRUNCATE_LENGTHS.SHORT);
+		const deadLetter = (snapshot.deadLettered ?? []).find(
+			entry => snapshotJobKey(entry.jobId, entry.generation) === snapshotJobKey(job.id, job.generation),
+		);
+		const errorText = job.errorText ?? deadLetter?.lastError;
+		const description =
+			deadLetter || errorText
+				? displayText(
+						[
+							state,
+							deadLetter ? `attempt ${deadLetter.attempt}` : undefined,
+							errorText ? `error: ${errorText}` : undefined,
+						]
+							.filter((part): part is string => part !== undefined)
+							.join(" · "),
+						TRUNCATE_LENGTHS.CONTENT,
+					)
+				: state;
 		items.push({
 			value: `folded:${job.id}:${job.generation}`,
 			label: `${kind} · ${preview(job.label, TRUNCATE_LENGTHS.SHORT)}`,
-			description: state,
+			description,
 			hint: job.status === "failed" || job.deliveryState === "failed-visible" ? "failed" : "read-only",
 			disabled: true,
 		});

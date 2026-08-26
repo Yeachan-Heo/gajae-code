@@ -253,18 +253,87 @@ describe("AsyncJobManager delivery reliability", () => {
 		try {
 			for (let index = 0; index < 110; index += 1) {
 				manager.register("bash", `overflow ${index}`, async () => `payload-${index}`, {
+					ownerId: "owner-overflow",
 					metadata: { backgrounded: true },
 				});
 			}
 			await waitFor(() => manager.getDeliveryState().deadLettered > 0, 4_000);
-			const snapshot = manager.getJobsSnapshot();
+			const snapshot = manager.getJobsSnapshot({ ownerId: "owner-overflow" });
 			expect(snapshot.deadLettered.length).toBeGreaterThan(0);
 			expect(snapshot.deadLettered.every(entry => entry.backgrounded)).toBe(true);
+			expect(snapshot.deadLettered.every(entry => entry.ownerId === "owner-overflow")).toBe(true);
 			deliveryGate.resolve();
 			await manager.waitForAll();
 		} finally {
 			deliveryGate.resolve();
 			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
+
+	test("zero-retention snapshot keeps an in-flight evicted delivery visible", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async () => {
+				deliveryStarted.resolve();
+				await releaseDelivery.promise;
+			},
+		});
+
+		try {
+			const jobId = manager.register("bash", "folded pending delivery", async () => "folded payload", {
+				ownerId: "owner-folded",
+				metadata: { backgrounded: true },
+			});
+			const generation = manager.getJob(jobId)?.generation ?? "";
+			await deliveryStarted.promise;
+
+			expect(manager.getJob(jobId)).toBeUndefined();
+			expect(manager.getJobsSnapshot({ ownerId: "other-owner" }).jobs).toEqual([]);
+			expect(manager.getJobsSnapshot({ ownerId: "owner-folded" }).jobs).toContainEqual({
+				id: jobId,
+				kind: "bash",
+				label: "folded pending delivery",
+				status: "completed",
+				generation,
+				backgrounded: true,
+				deliveryState: "pending",
+			});
+		} finally {
+			releaseDelivery.resolve();
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
+
+	test("late delivery rejection after disposal is not requeued", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		let attempts = 0;
+		const manager = new AsyncJobManager({
+			retentionMs: 0,
+			onJobComplete: async () => {
+				attempts += 1;
+				deliveryStarted.resolve();
+				await releaseDelivery.promise;
+				throw new Error("late delivery rejection");
+			},
+		});
+
+		let disposePromise: Promise<boolean> | undefined;
+		try {
+			manager.register("bash", "late rejection", async () => "payload");
+			await deliveryStarted.promise;
+			disposePromise = manager.dispose({ timeoutMs: 250 });
+			releaseDelivery.resolve();
+
+			expect(await disposePromise).toBe(true);
+			expect(attempts).toBe(1);
+			expect(manager.getDeliveryState()).toMatchObject({ queued: 0, deadLettered: 0 });
+		} finally {
+			releaseDelivery.resolve();
+			if (disposePromise) await disposePromise;
+			else await manager.dispose({ timeoutMs: 250 });
 		}
 	});
 });
