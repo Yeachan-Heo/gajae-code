@@ -398,6 +398,7 @@ fn rename_exchange_same_parent(
 #[cfg(target_os = "linux")]
 fn restore_exchanged_successor(
 	parent: &File,
+	recovery: &File,
 	stage: &CString,
 	destination: &CString,
 	staged_identity: &RecoveryFsIdentity,
@@ -440,6 +441,15 @@ fn restore_exchanged_successor(
 	{
 		return false;
 	}
+	let Ok(final_named) = statat(parent, destination) else {
+		return false;
+	};
+	if final_named.st_dev.to_string() != staged_identity.dev
+		|| final_named.st_ino.to_string() != staged_identity.ino
+		|| final_named.st_nlink != 1
+	{
+		return false;
+	}
 	if rename_exchange_same_parent(parent, stage, destination).is_err() {
 		return false;
 	}
@@ -451,9 +461,13 @@ fn restore_exchanged_successor(
 	{
 		return false;
 	}
-	// SAFETY: the staging name was created by this operation and its identity was
-	// checked after restoring the displaced successor.
-	unsafe { libc::unlinkat(parent.as_raw_fd(), stage.as_ptr(), 0) == 0 }
+	let quarantine = CString::new(format!(
+		".gjc-replace-retry-{}-{}",
+		std::process::id(),
+		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
+	))
+	.expect("replacement quarantine name contains no NUL");
+	rename_file_no_replace(parent, stage, recovery, &quarantine, || {}).is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -3666,7 +3680,13 @@ fn replace_managed(
 		// proof. Restore it only while the canonical name still names our staged
 		// inode; an uncoordinated replacement is never overwritten during cleanup.
 		if canonical_matches_staged {
-			let _ = restore_exchanged_successor(&parent, &stage_name, &name, &staged_identity);
+			let _ = restore_exchanged_successor(
+				&parent,
+				&recovery_parent,
+				&stage_name,
+				&name,
+				&staged_identity,
+			);
 		}
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
@@ -3684,7 +3704,13 @@ fn replace_managed(
 	};
 	if !old_matches {
 		if canonical_matches_staged {
-			let _ = restore_exchanged_successor(&parent, &stage_name, &name, &staged_identity);
+			let _ = restore_exchanged_successor(
+				&parent,
+				&recovery_parent,
+				&stage_name,
+				&name,
+				&staged_identity,
+			);
 		}
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
