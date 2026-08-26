@@ -4798,26 +4798,11 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		const input = { cwd: root, readinessTimeoutMs: 4_000 };
 		const response = await broker.handleRequest("session.create", input, "profile-cutoff");
 		if (!response.ok && response.error.code === "terminal_uncertain") {
-			const startupFailure = response.startupFailure ?? response.durableEffects?.startup;
-			expect(startupFailure).toBeDefined();
-			if (startupFailure === undefined) return;
-			expect(startupFailure).toMatchObject({
-				phase: "startup",
-				reason: "pending",
-				artifactDigest: expect.any(String),
-				rollback: {
-					fenced: true,
-					runtimeRemoved: true,
-					hostStopped: true,
-					brokerRegistrationReleased: true,
-				},
-			});
-			if (startupFailure.cleanupProof !== undefined)
-				expect(startupFailure.cleanupProof).toMatchObject({
-					processExited: true,
-					endpointRemoved: true,
-					hostUnregistered: { state: "not_registered" },
-				});
+			expect(response.error.message).toBe(
+				"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+			);
+			const replay = await broker.handleRequest("session.create", input, "profile-cutoff");
+			expect(replay).toEqual(response);
 			return;
 		}
 		expect(response).toMatchObject({
