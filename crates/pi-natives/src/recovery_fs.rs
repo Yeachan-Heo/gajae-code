@@ -137,6 +137,9 @@ static APPEND_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 static APPEND_PARENT_SYNC_FAULT: OnceLock<std::sync::Mutex<bool>> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static APPEND_FILE_SYNC_FAULT: OnceLock<std::sync::Mutex<bool>> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 static APPEND_WRITE_FAIL_PREFIX: OnceLock<std::sync::Mutex<Option<usize>>> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
@@ -224,6 +227,14 @@ fn set_append_parent_sync_fault(fault: bool) {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+fn set_append_file_sync_fault(fault: bool) {
+	*APPEND_FILE_SYNC_FAULT
+		.get_or_init(|| std::sync::Mutex::new(false))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = fault;
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn set_append_write_fail_prefix(prefix: Option<usize>) {
 	*APPEND_WRITE_FAIL_PREFIX
 		.get_or_init(|| std::sync::Mutex::new(None))
@@ -257,6 +268,19 @@ fn sync_append_parent(parent: &File) -> std::io::Result<()> {
 		return Err(std::io::Error::from_raw_os_error(libc::EIO));
 	}
 	parent.sync_all()
+}
+
+#[cfg(target_os = "linux")]
+fn sync_append_file(file: &File) -> std::io::Result<()> {
+	#[cfg(test)]
+	if *APPEND_FILE_SYNC_FAULT
+		.get_or_init(|| std::sync::Mutex::new(false))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+	{
+		return Err(std::io::Error::from_raw_os_error(libc::EIO));
+	}
+	file.sync_all()
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -3101,8 +3125,22 @@ fn append_managed(
 	}
 	#[cfg(test)]
 	pause_append_after_write_for_test();
-	if file.sync_all().is_err() {
-		return RecoveryFsResult::append_failure("fsync_failed", "committed", "not_provable", None);
+	if sync_append_file(&file).is_err() {
+		return RecoveryFsResult::append_failure(
+			"fsync_failed",
+			"committed",
+			"not_provable",
+			append_post_identity_if_exact(
+				&file,
+				&parent,
+				&name,
+				expected_dev,
+				expected_ino,
+				expected_size,
+				expected_sha256,
+				data,
+			),
+		);
 	}
 	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
 		return RecoveryFsResult::append_failure(
@@ -4249,6 +4287,10 @@ mod tests {
 
 	#[test]
 	fn managed_append_returns_digest_bound_terminal_identity() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let temporary = TempDir::new();
 		let root = temporary.root();
 		let original = b"original-transcript";
@@ -4306,6 +4348,47 @@ mod tests {
 			&file_digest(original),
 		);
 		set_append_parent_sync_fault(false);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("fsync_failed"));
+		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
+		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
+		let receipt = result.identity.expect("exact committed append receipt");
+		assert_eq!(
+			receipt.sha256.as_deref(),
+			Some(file_digest(b"original-transcript\nappend").as_str())
+		);
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("transcript"),
+			b"original-transcript\nappend"
+		);
+	}
+
+	#[test]
+	fn managed_append_preserves_receipt_when_file_sync_is_unprovable() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let appended = b"\nappend";
+		let identity = managed_file(&root, "transcript", original);
+		set_append_file_sync_fault(true);
+		let result = append_managed(
+			&root,
+			None,
+			"transcript",
+			appended,
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		set_append_file_sync_fault(false);
 
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("fsync_failed"));

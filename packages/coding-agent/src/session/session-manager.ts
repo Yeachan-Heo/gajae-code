@@ -11284,6 +11284,7 @@ export class SessionManager {
 			// complete rewrite without recapturing the pathname. Identity-less committed
 			// outcomes deliberately fall through and become sticky below: retrying the
 			// stale predecessor could overwrite an exchanged-out successor.
+			this.#needsFullRewriteOnNextPersist = true;
 			return normalized;
 		}
 		if (!this.#persistError) this.#persistError = normalized;

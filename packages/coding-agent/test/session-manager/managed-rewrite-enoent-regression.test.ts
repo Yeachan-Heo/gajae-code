@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as native from "@gajae-code/natives";
 import {
+	ManagedCommittedMutationError,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	reapScrubbedProtocolRemnantsSync,
@@ -438,6 +439,41 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		).toThrow(/managed_append_committed_outcome_uncertain/);
 		await manager.flush();
 		expect(await readText(sessionFile)).toContain("receipt-backed-recovery");
+		await manager.close().catch(() => {});
+	});
+
+	it("schedules a retry after a descriptor-bound rewrite failure", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const assistant = manager
+			.getBranch()
+			.find(entry => entry.type === "message" && entry.message.role === "assistant");
+		if (assistant?.type !== "message") throw new Error("Expected assistant entry");
+		manager.applyEntryMessageUpdates([{ ...assistant, message: { ...assistant.message } } as never]);
+
+		const replaceExpected = ManagedSessionDescendantStore.prototype.replaceExpectedIdentitySync;
+		let failOnce = true;
+		vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync").mockImplementation(function (
+			this: ManagedSessionDescendantStore,
+			relativePath,
+			bytes,
+			expected,
+		) {
+			const receipt = replaceExpected.call(this, relativePath, bytes, expected);
+			if (failOnce) {
+				failOnce = false;
+				throw new ManagedCommittedMutationError("replace", new Error("post-publication-receipt-failure"), receipt);
+			}
+			return receipt;
+		});
+
+		await expect(manager.flush()).rejects.toThrow(/managed_replace_committed_outcome_uncertain/);
+		await manager.flush();
+		expect(await readText(manager.getSessionFile()!)).toContain('"hello"');
 		await manager.close().catch(() => {});
 	});
 
