@@ -8934,7 +8934,11 @@ mod platform {
 			Ok(path) => path,
 			Err(code) => return NativeExactUnlinkResult::failure(code),
 		};
-		let source = match open_exact(&source_path, "file", FILE_READ_ATTRIBUTES | FILE_READ_DATA) {
+		let source = match open_exact(
+			&source_path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+		) {
 			Ok(handle) => handle,
 			Err(result) => {
 				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
