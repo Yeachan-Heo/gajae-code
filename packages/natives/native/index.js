@@ -39,6 +39,7 @@ export const astGrep = nativeBindings.astGrep;
 export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExistingDirectoryIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
+export const createDirectoryNoReplacePath = nativeBindings.createDirectoryNoReplacePath;
 export const currentExecutablePath = nativeBindings.currentExecutablePath;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;

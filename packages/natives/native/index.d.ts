@@ -844,6 +844,14 @@ export interface ContextLine {
 export declare function copyToClipboard(text: string): void
 
 /**
+ * Create exactly the final directory component through a retained,
+ * no-follow parent. The parent identity is checked against the descriptor
+ * used for the native create primitive, and an occupied destination is never
+ * replaced or treated as success.
+ */
+export declare function createDirectoryNoReplacePath(destinationPath: string, expectedParent: NativeDirectoryParentIdentity): NativeDirectoryCreationResult
+
+/**
  * Returns the operating system's canonical path for the running executable.
  * Unlike argv, this is not supplied by the process caller.
  */
@@ -1757,6 +1765,26 @@ export type NativeCanonicalDirectoryIdentity =
 			canonicalPath?: never;
 			code: "not_found" | "not_directory" | "not_utf8" | "network_unsupported" | "identity_unavailable" | "io_error";
 	  }
+
+/** Result of an expected-parent, no-replace directory creation. */
+export interface NativeDirectoryCreationResult {
+  ok: boolean
+  code?: string
+  identity?: NativeDirectoryIdentity
+}
+
+/**
+ * No-follow identity returned after creating one directory component.
+ *
+ * String fields preserve platform-sized identity values across the N-API
+ * boundary without JavaScript number precision loss.
+ */
+export interface NativeDirectoryIdentity {
+  dev: string
+  ino: string
+  size: string
+  mtimeNs: string
+}
 
 export interface NativeDirectoryParentIdentity {
   dev: bigint

@@ -8,6 +8,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	createDirectoryNoReplacePath,
 	exactRemoveDirectoryTree,
 	type NativeDirectoryTreeResult,
 	snapshotDirectoryTree,
@@ -1382,14 +1383,18 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 			throw new SkillsBridgeError(`Paseo bridge staging snapshot was unavailable: ${temporary}`, [temporary]);
 		}
 		await fs.chmod(temporary, 0o700);
-		await fs.mkdir(bridgeDir, { mode: 0o700 });
-		const destination = await fs.lstat(bridgeDir, { bigint: true });
-		identity = {
-			dev: destination.dev.toString(),
-			ino: destination.ino.toString(),
-			size: destination.size.toString(),
-			mtimeNs: destination.mtimeNs.toString(),
-		};
+		const nativeBridgeDir = canonicalExistingPathForNative(bridgeDir);
+		const parent = await fs.lstat(path.dirname(nativeBridgeDir), { bigint: true });
+		const created = createDirectoryNoReplacePath(nativeBridgeDir, {
+			dev: parent.dev,
+			ino: parent.ino,
+		});
+		if (!created.ok || created.identity === undefined) {
+			throw new SkillsBridgeError(`Paseo bridge root creation failed: ${bridgeDir} (${created.code ?? "unknown"})`, [
+				temporary,
+			]);
+		}
+		identity = created.identity;
 	} finally {
 		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
 			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);

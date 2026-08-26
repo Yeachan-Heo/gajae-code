@@ -479,6 +479,36 @@ pub struct NativeDirectoryParentIdentity {
 	pub ino: BigInt,
 }
 
+/// No-follow identity returned after creating one directory component.
+///
+/// String fields preserve platform-sized identity values across the N-API
+/// boundary without JavaScript number precision loss.
+#[napi(object)]
+pub struct NativeDirectoryIdentity {
+	pub dev:      String,
+	pub ino:      String,
+	pub size:     String,
+	pub mtime_ns: String,
+}
+
+/// Result of an expected-parent, no-replace directory creation.
+#[napi(object)]
+pub struct NativeDirectoryCreationResult {
+	pub ok:       bool,
+	pub code:     Option<String>,
+	pub identity: Option<NativeDirectoryIdentity>,
+}
+
+impl NativeDirectoryCreationResult {
+	fn failure(code: &str) -> Self {
+		Self { ok: false, code: Some(code.to_owned()), identity: None }
+	}
+
+	fn success(identity: NativeDirectoryIdentity) -> Self {
+		Self { ok: true, code: None, identity: Some(identity) }
+	}
+}
+
 #[napi(object)]
 pub struct NativeDirectoryTreeResult {
 	pub ok:       bool,
@@ -1417,6 +1447,27 @@ pub fn symlink_no_replace_path(
 	)
 }
 
+/// Create exactly the final directory component through a retained,
+/// no-follow parent. The parent identity is checked against the descriptor
+/// used for the native create primitive, and an occupied destination is never
+/// replaced or treated as success.
+#[napi]
+pub fn create_directory_no_replace_path(
+	destination_path: String,
+	expected_parent: NativeDirectoryParentIdentity,
+) -> NativeDirectoryCreationResult {
+	let destination = Path::new(&destination_path);
+	if destination_path.contains('\0') || !destination.is_absolute() {
+		return NativeDirectoryCreationResult::failure("invalid_request");
+	}
+	let (dev_negative, dev, dev_lossless) = expected_parent.dev.get_u64();
+	let (ino_negative, ino, ino_lossless) = expected_parent.ino.get_u64();
+	if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+		return NativeDirectoryCreationResult::failure("parent_mismatch");
+	}
+	platform::create_directory_no_replace_path(destination, (dev, ino))
+}
+
 #[napi]
 pub fn rename_no_replace_path(
 	source_path: String,
@@ -1904,9 +1955,10 @@ pub(crate) mod platform {
 	};
 
 	use super::{
-		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
+		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryCreationResult,
+		NativeDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
+		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		digest_reader, io_code, security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -2358,6 +2410,15 @@ pub(crate) mod platform {
 	#[cfg(not(target_os = "netbsd"))]
 	fn stat_ctime_ns(stat: &libc::stat) -> i128 {
 		i128::from(stat.st_ctime) * 1_000_000_000 + i128::from(stat.st_ctime_nsec)
+	}
+
+	fn directory_identity(stat: &libc::stat) -> NativeDirectoryIdentity {
+		NativeDirectoryIdentity {
+			dev:      (stat.st_dev as u64).to_string(),
+			ino:      (stat.st_ino as u64).to_string(),
+			size:     (stat.st_size as u64).to_string(),
+			mtime_ns: stat_mtime_ns(stat).to_string(),
+		}
 	}
 
 	struct AuthorityEdge {
@@ -4753,6 +4814,111 @@ pub(crate) mod platform {
 		result
 	}
 
+	/// Create one directory through a retained parent descriptor. `mkdirat`
+	/// claims only the final name and fails with `EEXIST` when another entry
+	/// already occupies it; the resulting directory is reopened no-follow and
+	/// its descriptor identity is compared with the named entry before return.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent and created child descriptors remain live across the bounded \
+		          mkdirat/openat verification"
+	)]
+	pub(super) fn create_directory_no_replace_path(
+		destination_path: &Path,
+		expected_parent: (u64, u64),
+	) -> NativeDirectoryCreationResult {
+		let (parent_fd, name) = match open_parent_no_follow(destination_path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeDirectoryCreationResult::failure(
+					result.code.as_deref().unwrap_or("io_error"),
+				);
+			},
+		};
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0 {
+			let code = security_code(&std::io::Error::last_os_error());
+			unsafe { libc::close(parent_fd) };
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		if parent_stat.st_dev as u64 != expected_parent.0
+			|| parent_stat.st_ino as u64 != expected_parent.1
+		{
+			unsafe { libc::close(parent_fd) };
+			return NativeDirectoryCreationResult::failure("parent_mismatch");
+		}
+		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
+			let error = std::io::Error::last_os_error();
+			let code = if error.raw_os_error() == Some(libc::EEXIST) {
+				"already_exists"
+			} else {
+				security_code(&error)
+			};
+			unsafe { libc::close(parent_fd) };
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		let child_fd = unsafe {
+			libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			)
+		};
+		if child_fd < 0 {
+			let code = security_code(&std::io::Error::last_os_error());
+			unsafe { libc::close(parent_fd) };
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(child_fd, &mut child_stat) } != 0 {
+			let code = security_code(&std::io::Error::last_os_error());
+			unsafe {
+				libc::close(child_fd);
+				libc::close(parent_fd);
+			}
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		if child_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+			unsafe {
+				libc::close(child_fd);
+				libc::close(parent_fd);
+			}
+			return NativeDirectoryCreationResult::failure("not_directory");
+		}
+		let mut named_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe {
+			libc::fstatat(parent_fd, name.as_ptr(), &mut named_stat, libc::AT_SYMLINK_NOFOLLOW)
+		} != 0
+		{
+			let code = security_code(&std::io::Error::last_os_error());
+			unsafe {
+				libc::close(child_fd);
+				libc::close(parent_fd);
+			}
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		if named_stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+			unsafe {
+				libc::close(child_fd);
+				libc::close(parent_fd);
+			}
+			return NativeDirectoryCreationResult::failure("reparse_point");
+		}
+		if !stat_same_object(&child_stat, &named_stat) {
+			unsafe {
+				libc::close(child_fd);
+				libc::close(parent_fd);
+			}
+			return NativeDirectoryCreationResult::failure("identity_mismatch");
+		}
+		let identity = directory_identity(&child_stat);
+		unsafe {
+			libc::close(child_fd);
+			libc::close(parent_fd);
+		}
+		NativeDirectoryCreationResult::success(identity)
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "publication descriptors are owned here and closed exactly once on every branch"
@@ -6461,11 +6627,11 @@ mod platform {
 
 	use super::{
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
-		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
-		sha256,
+		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryCreationResult,
+		NativeDirectoryIdentity, NativeDirectoryTreeEntry, NativeDirectoryTreeResult,
+		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status,
+		native_windows_error_code, open_with_transient_retry, sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -7767,6 +7933,142 @@ mod platform {
 		}
 		unsafe { CloseHandle(child) };
 		NativeExactUnlinkResult::success()
+	}
+
+	fn directory_identity(information: &BY_HANDLE_FILE_INFORMATION) -> NativeDirectoryIdentity {
+		let ino =
+			(u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+		let filetime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+			| u64::from(information.ftLastWriteTime.dwLowDateTime);
+		let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
+		NativeDirectoryIdentity {
+			dev:      u64::from(information.dwVolumeSerialNumber).to_string(),
+			ino:      ino.to_string(),
+			size:     size.to_string(),
+			mtime_ns: mtime_ns.to_string(),
+		}
+	}
+
+	/// Create one directory through a retained parent handle. `FILE_CREATE`
+	/// claims the final name without replacing an existing entry; the returned
+	/// handle and a second no-follow open of the name must both identify a real
+	/// directory before its identity is returned.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent and child handles remain live across descriptor-relative NT \
+		          create and verification"
+	)]
+	pub(super) fn create_directory_no_replace_path(
+		destination_path: &Path,
+		expected_parent: (u64, u64),
+	) -> NativeDirectoryCreationResult {
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => return NativeDirectoryCreationResult::failure(code),
+		};
+		let Some(parent_path) = destination_path.parent() else {
+			return NativeDirectoryCreationResult::failure("io_error");
+		};
+		let Some(name) = destination_path.file_name() else {
+			return NativeDirectoryCreationResult::failure("io_error");
+		};
+		let parent = match open_directory_exact(parent_path) {
+			Ok(parent) => parent,
+			Err(code) => return NativeDirectoryCreationResult::failure(&code),
+		};
+		let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(parent.target, &mut parent_information) } == 0
+			|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent.0
+			|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+				| u64::from(parent_information.nFileIndexLow))
+				!= expected_parent.1
+		{
+			return NativeDirectoryCreationResult::failure("parent_mismatch");
+		}
+		let mut name_wide: Vec<u16> = name.encode_wide().collect();
+		if name_wide.is_empty()
+			|| name_wide.iter().any(|unit| *unit == 0)
+			|| name_wide.len() > (u16::MAX as usize / 2)
+		{
+			return NativeDirectoryCreationResult::failure("invalid_request");
+		}
+		let mut object_name = UnicodeString {
+			length:         (name_wide.len() * size_of::<u16>()) as u16,
+			maximum_length: (name_wide.len() * size_of::<u16>()) as u16,
+			buffer:         name_wide.as_mut_ptr(),
+		};
+		let mut attributes = ObjectAttributes {
+			length: size_of::<ObjectAttributes>() as u32,
+			root_directory: parent.target,
+			object_name: &mut object_name,
+			attributes: 0,
+			security_descriptor: null_mut(),
+			security_quality_of_service: null_mut(),
+		};
+		let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+		let mut child = INVALID_HANDLE_VALUE;
+		let create_status = unsafe {
+			NtCreateFile(
+				&mut child,
+				GENERIC_ALL | SYNCHRONIZE,
+				&mut attributes,
+				&mut status,
+				null_mut(),
+				FILE_ATTRIBUTE_NORMAL,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				FILE_CREATE,
+				FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+				null_mut(),
+				0,
+			)
+		};
+		if create_status < 0 {
+			let code = if create_status as u32 == 0xc000_0035 {
+				"already_exists"
+			} else {
+				ntstatus_code(create_status)
+			};
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		let mut child_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(child, &mut child_information) } == 0 {
+			let code = last_error_code();
+			unsafe { CloseHandle(child) };
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		if child_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+			unsafe { CloseHandle(child) };
+			return NativeDirectoryCreationResult::failure("reparse_point");
+		}
+		if child_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+			unsafe { CloseHandle(child) };
+			return NativeDirectoryCreationResult::failure("not_directory");
+		}
+		let named =
+			match open_relative(parent.target, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true) {
+				Ok(handle) => handle,
+				Err(code) => {
+					unsafe { CloseHandle(child) };
+					return NativeDirectoryCreationResult::failure(code);
+				},
+			};
+		let mut named_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let named_ok = unsafe { GetFileInformationByHandle(named, &mut named_information) } != 0;
+		let same_identity = named_ok
+			&& named_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0
+			&& named_information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+			&& named_information.dwVolumeSerialNumber == child_information.dwVolumeSerialNumber
+			&& named_information.nFileIndexHigh == child_information.nFileIndexHigh
+			&& named_information.nFileIndexLow == child_information.nFileIndexLow;
+		unsafe {
+			CloseHandle(named);
+			CloseHandle(child);
+		}
+		if !same_identity {
+			return NativeDirectoryCreationResult::failure("identity_mismatch");
+		}
+		NativeDirectoryCreationResult::success(directory_identity(&child_information))
 	}
 
 	/// Windows implements no-replace renames natively, so the POSIX hard-link
@@ -9432,8 +9734,9 @@ mod platform {
 	use std::path::Path;
 
 	use super::{
-		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeResult,
-		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryCreationResult,
+		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
+		NativeOwnerOnlySecurityResult,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -9457,6 +9760,12 @@ mod platform {
 		_: (u64, u64),
 	) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
+	}
+	pub(super) fn create_directory_no_replace_path(
+		_: &Path,
+		_: (u64, u64),
+	) -> NativeDirectoryCreationResult {
+		NativeDirectoryCreationResult::failure("unsupported_platform")
 	}
 	pub(super) fn exact_unlink(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
@@ -9929,6 +10238,97 @@ mod rename_no_replace_eintr_tests {
 
 		// Clear the injector so later tests in this process are unaffected.
 		platform::inject_rename_no_replace_eintr(0);
+	}
+}
+
+#[cfg(all(test, unix))]
+mod create_directory_no_replace_tests {
+	use std::{
+		fs,
+		os::unix::fs::MetadataExt,
+		path::PathBuf,
+		sync::atomic::{AtomicU64, Ordering},
+	};
+
+	use super::platform;
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-create-directory-no-replace-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+			));
+			fs::create_dir(&path).expect("create directory-create temp directory");
+			let resolved =
+				fs::canonicalize(&path).expect("canonicalize directory-create temp directory");
+			Self(resolved)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	#[test]
+	fn create_directory_rejects_a_mismatched_parent_before_mutation() {
+		let root = TempDir::new();
+		let other = TempDir::new();
+		let destination = root.0.join("created");
+		let wrong_parent = fs::metadata(&other.0).expect("stat wrong parent");
+
+		let result = platform::create_directory_no_replace_path(
+			&destination,
+			(wrong_parent.dev(), wrong_parent.ino()),
+		);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("parent_mismatch"));
+		assert!(!destination.exists());
+	}
+
+	#[test]
+	fn create_directory_rejects_an_occupied_destination() {
+		let root = TempDir::new();
+		let destination = root.0.join("occupied");
+		fs::create_dir(&destination).expect("create occupied destination");
+		let parent = fs::metadata(&root.0).expect("stat parent");
+
+		let result =
+			platform::create_directory_no_replace_path(&destination, (parent.dev(), parent.ino()));
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("already_exists"));
+		assert!(destination.is_dir());
+	}
+
+	#[test]
+	fn create_directory_returns_the_created_no_follow_identity() {
+		let root = TempDir::new();
+		let destination = root.0.join("created");
+		let parent = fs::metadata(&root.0).expect("stat parent");
+
+		let result =
+			platform::create_directory_no_replace_path(&destination, (parent.dev(), parent.ino()));
+
+		assert!(result.ok);
+		let identity = result.identity.expect("created directory identity");
+		let created = fs::symlink_metadata(&destination).expect("stat created directory");
+		assert!(created.is_dir());
+		assert!(!created.file_type().is_symlink());
+		assert_eq!(identity.dev, created.dev().to_string());
+		assert_eq!(identity.ino, created.ino().to_string());
+		assert_eq!(identity.size, created.size().to_string());
+		assert_eq!(
+			identity.mtime_ns,
+			(created.mtime() * 1_000_000_000 + created.mtime_nsec()).to_string()
+		);
 	}
 }
 
