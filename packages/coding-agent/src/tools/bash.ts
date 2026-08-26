@@ -1659,6 +1659,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						try {
 							current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 						} catch (error) {
+							current = retainedAcpOutput();
 							readDiagnostic = boundArtifactSaveDiagnostic(error);
 							logger.warn("ACP terminal aborted output read failed", {
 								terminalId: handle.terminalId,
@@ -1690,6 +1691,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							try {
 								current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 							} catch (error) {
+								current = retainedAcpOutput();
 								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal aborted output read failed", {
 									terminalId: handle.terminalId,
@@ -1714,6 +1716,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							try {
 								current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 							} catch (error) {
+								current = retainedAcpOutput();
 								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal final output read failed", {
 									terminalId: handle.terminalId,
@@ -1782,6 +1785,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					try {
 						current = (await readOutput(1_000, false)) ?? retainedAcpOutput();
 					} catch (error) {
+						current = retainedAcpOutput();
 						readDiagnostic = boundArtifactSaveDiagnostic(error);
 						logger.warn("ACP terminal aborted output read failed", {
 							terminalId: handle.terminalId,
