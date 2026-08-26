@@ -375,7 +375,7 @@ describe("ModelRegistry", () => {
 			writeRawModelsJson({
 				openai: {
 					modelOverrides: {
-						"gpt-4o": { contextWindow: -5 },
+						"gpt-4o": { contextWindow: -5, maxTokens: -5 },
 						"gpt-4.1": { contextWindow: Number.NaN },
 					},
 				},

@@ -116,6 +116,12 @@ describe("model maxTokens request contract", () => {
 		expect(result.body.max_tokens).toBe(32_000);
 	});
 
+	it("does not let invalid configured metadata produce an invalid provider budget", async () => {
+		const result = await captureCompletion({ ...createModel("configured"), maxTokens: -1 });
+
+		expect(result.body.max_tokens).toBe(32_000);
+	});
+
 	it("maps the same resolved budget to max_completion_tokens", async () => {
 		const result = await captureCompletion({
 			...createModel("configured"),

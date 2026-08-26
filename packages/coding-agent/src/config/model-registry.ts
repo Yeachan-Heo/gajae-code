@@ -1002,7 +1002,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 			override: override.contextWindow,
 		});
 	}
-	if (override.maxTokens !== undefined) {
+	if (override.maxTokens !== undefined && Number.isFinite(override.maxTokens) && override.maxTokens > 0) {
 		result.maxTokens = override.maxTokens;
 		result.maxTokensSource = "configured";
 	}

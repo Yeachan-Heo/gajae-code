@@ -811,9 +811,13 @@ function resolveOpenAiReasoningEffort<TApi extends Api>(
 const castApi = <TApi extends Api>(api: OptionsForApi<TApi>): OptionsForApi<Api> => api as OptionsForApi<Api>;
 
 export function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TApi>, requested?: number): number {
-	if (requested !== undefined && requested > 0) return requested;
-	if (model.maxTokensSource === "configured") return model.maxTokens;
-	return Math.min(model.maxTokens, DEFAULT_REQUEST_MAX_TOKENS);
+	if (requested !== undefined && Number.isFinite(requested) && requested > 0) return requested;
+	if (model.maxTokensSource === "configured" && Number.isFinite(model.maxTokens) && model.maxTokens > 0) {
+		return model.maxTokens;
+	}
+	const modelMaxTokens =
+		Number.isFinite(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : DEFAULT_REQUEST_MAX_TOKENS;
+	return Math.min(modelMaxTokens, DEFAULT_REQUEST_MAX_TOKENS);
 }
 
 function mapOptionsForApi<TApi extends Api>(
