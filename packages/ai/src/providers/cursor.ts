@@ -388,6 +388,7 @@ function runWithCursorExecDeadline<T>(
 	if (signal?.aborted) {
 		controller.abort(cursorAbortError(signal));
 		settle(() => result.reject(cursorAbortError(signal)));
+		onOperationFinished?.();
 		return result.promise;
 	}
 	if (signal) signal.addEventListener("abort", onAbort, { once: true });
