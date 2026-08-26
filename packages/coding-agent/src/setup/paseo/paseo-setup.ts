@@ -4,6 +4,8 @@
  * Dispatches to diagnosis, install, or removal, and owns the flag combinations
  * that must be rejected before any target is touched.
  */
+
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -1366,16 +1368,19 @@ async function captureMigratedOldBridgeEntries(
 
 async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
-	const stagedSnapshot: NativeDirectoryTreeResult = snapshotDirectoryTree(temporary);
-	const stat = await fs.lstat(temporary, { bigint: true });
-	const identity: BridgeEntryIdentity = {
-		dev: stat.dev.toString(),
-		ino: stat.ino.toString(),
-		size: stat.size.toString(),
-		mtimeNs: stat.mtimeNs.toString(),
-	};
+	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
+	let stat: BigIntStats | undefined;
+	let identity: BridgeEntryIdentity | undefined;
 	let cleanupError: string | undefined;
 	try {
+		stagedSnapshot = snapshotDirectoryTree(temporary);
+		stat = await fs.lstat(temporary, { bigint: true });
+		identity = {
+			dev: stat.dev.toString(),
+			ino: stat.ino.toString(),
+			size: stat.size.toString(),
+			mtimeNs: stat.mtimeNs.toString(),
+		};
 		await fs.chmod(temporary, 0o700);
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
@@ -1402,7 +1407,8 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 		}
 	}
 	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary]);
-	if (identity === undefined) throw new SkillsBridgeError(`Paseo bridge identity was not captured: ${temporary}`);
+	if (identity === undefined || stat === undefined)
+		throw new SkillsBridgeError(`Paseo bridge identity was not captured: ${temporary}`, [temporary]);
 	return identity;
 }
 

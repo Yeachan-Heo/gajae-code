@@ -313,19 +313,15 @@ export async function publishPlan(
 			});
 		}
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
-		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
-		await options.onBackupPrepared?.(backupPath, hashBytes(backupBytes.toString("utf8")));
-		const backup = await copyPrivately(
-			targetPath,
-			backupPath,
-			backupBytes.toString("utf8"),
-			expectedDestinationIdentity,
-		);
+		backupBytes = await readAuthenticatedBackupBytes(targetPath, expectedDestinationIdentity);
+		const backupValueSha256 = hashBytes(backupBytes.toString("utf8"));
+		await options.onBackupPrepared?.(backupPath, backupValueSha256);
+		const backup = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
 		backupCreated = backup.created;
 		backupIdentity = backup.identity;
 		await options.onBackupPrepared?.(
 			backupPath,
-			hashBytes(backupBytes.toString("utf8")),
+			backupValueSha256,
 			backupIdentity === undefined ? undefined : persistFileIdentity(backupIdentity),
 		);
 		if ((await currentIdentity(targetPath)) !== observed) {
@@ -809,6 +805,28 @@ export async function captureRegularIdentity(filePath: string): Promise<NativeEx
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 		throw error;
+	}
+}
+
+async function readAuthenticatedBackupBytes(
+	filePath: string,
+	expectedIdentity: NativeExactFileIdentity | undefined,
+): Promise<Buffer> {
+	const opened = await openRegularSidecar(filePath, fs.constants.O_RDONLY);
+	if (opened === undefined) throw new Error(`source identity unavailable: ${filePath}`);
+	try {
+		const bytes = await opened.handle.readFile();
+		const observedIdentity = await capturePrivateBackupIdentity(opened.handle, filePath, bytes);
+		if (
+			observedIdentity === undefined ||
+			(expectedIdentity !== undefined &&
+				!samePersistedIdentity(persistFileIdentity(observedIdentity), persistFileIdentity(expectedIdentity)))
+		) {
+			throw new Error(`source changed while preparing its private backup: ${filePath}`);
+		}
+		return bytes;
+	} finally {
+		await opened.handle.close();
 	}
 }
 
