@@ -4,8 +4,8 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
-	getAgentDir,
 	getConfigDirName,
+	getConfigRootDir,
 	getPluginsDir,
 	getProjectDir,
 	getTrustedHomeDir,
@@ -884,7 +884,7 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 const pluginRootsCache = new Map<string, { roots: ClaudePluginRoot[]; warnings: string[] }>();
 
 function profilePluginsDir(agentDir: string): string {
-	return path.resolve(agentDir) === path.resolve(getAgentDir())
+	return path.resolve(agentDir) === path.resolve(path.join(getConfigRootDir(), "agent"))
 		? getPluginsDir()
 		: path.join(path.dirname(agentDir), "plugins");
 }
