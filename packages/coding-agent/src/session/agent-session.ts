@@ -2644,6 +2644,7 @@ export class AgentSession {
 	 * capture `this` but are only invoked after construction.
 	 */
 	readonly #foldCoordinator = new FoldCoordinator({
+		hasActiveTurn: () => this.activePromptHandle !== undefined,
 		armSteeringFence: () => {
 			this.agent.setSteeringAdmissionFence(() => true);
 			return () => this.agent.setSteeringAdmissionFence(undefined);

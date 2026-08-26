@@ -132,6 +132,8 @@ export interface FoldCoordinatorDeps {
 	 * intact instead of draining it.
 	 */
 	armSteeringFence: () => () => void;
+	/** Whether this fold belongs to a currently running Agent turn. */
+	hasActiveTurn?: () => boolean;
 	/** Arm the cooperative stop so the turn ends after the fold result, never via abort. */
 	requestStop: () => void;
 	/** Capture what the interrupted turn still intended to accomplish. */
@@ -239,7 +241,8 @@ export class FoldCoordinator {
 		// S3 claim + reserve, S4 hand-off is the reservation itself, S5 arm the fence.
 		this.#folding.add(job);
 		this.#slots.set(job, { state: "reserved", adapter, parked: undefined, parkedAt: undefined });
-		const releaseFence = this.#deps.armSteeringFence();
+		const fencesOriginatingTurn = this.#deps.hasActiveTurn?.() ?? true;
+		const releaseFence = fencesOriginatingTurn ? this.#deps.armSteeringFence() : () => {};
 
 		let remainingIntent: string | undefined;
 		try {
@@ -299,7 +302,7 @@ export class FoldCoordinator {
 			releaseFence();
 			return { status: "already-terminal", reason: "the foreground observer already settled" };
 		}
-		this.#deps.requestStop();
+		if (fencesOriginatingTurn) this.#deps.requestStop();
 		this.#folding.delete(job);
 
 		// A6 flush: replay a parked completion through the same T2 branch so it
