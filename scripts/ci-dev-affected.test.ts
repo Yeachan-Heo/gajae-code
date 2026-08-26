@@ -237,6 +237,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session/managed-lock-lease.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-fsync.windows.test.ts");
 		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/sdk-session-index-lock-contention.test.ts");
+		expect(windowsJob).toContain("bun test ./packages/coding-agent/test/session-state-lock.test.ts");
 		// The required predicate must textually match the job gate so the aggregate
 		// invariant (windowsDoctor === required ? success : skipped) never fails closed.
 		const requiredLines = workflow.split("\n").filter(line => line.includes("CI_DEV_WINDOWS_DOCTOR_REQUIRED:"));
@@ -1270,6 +1271,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/test/sdk-session-index-lock-contention.test.ts",
 			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
 			"packages/coding-agent/src/config/file-lock.ts",
+			// #4990: the session-state lock's owner-record create/retract protocol
+			// depends on Windows handle-sharing semantics (the create descriptor
+			// grants no share-delete), so the lock and its suite must execute on
+			// the windows-latest job.
+			"packages/coding-agent/src/gjc-runtime/session-state-lock.ts",
+			"packages/coding-agent/test/session-state-lock.test.ts",
 			// canonicalEnvKey() folds project-dotenv provenance keys on win32 only,
 			// so a Linux shard exercises an identity function and proves nothing.
 			"packages/utils/src/dirs.ts",

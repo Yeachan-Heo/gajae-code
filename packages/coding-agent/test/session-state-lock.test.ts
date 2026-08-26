@@ -257,6 +257,22 @@ describe("coordinator session state lock", () => {
 		expect((await readJson(lockFile)).token).toBe("live-owner-token");
 	});
 
+	describe("the portable process start probe", () => {
+		it("returns a stable, non-null start value for the current process on every supported platform", () => {
+			// The reclaim-by-incarnation tests below presuppose this: without a reader value
+			// a start-time mismatch is indeterminate and the record has to survive. Windows
+			// has no `ps`, so there the natives addon's kernel-derived creation time answers.
+			const first = processStartTime(process.pid);
+			expect(first).not.toBeNull();
+			expect(processStartTime(process.pid)).toBe(first);
+			if (process.platform === "win32") expect(first).toMatch(/^windows:\d+$/);
+		});
+
+		it("returns null for a pid that cannot be probed instead of throwing", () => {
+			expect(processStartTime(DEAD_PID)).toBeNull();
+		});
+	});
+
 	/**
 	 * `process.kill(pid, 0)` answers three different questions with one call, and only one
 	 * of its answers means the owner is gone.
@@ -664,12 +680,13 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.statSync(lockDir).isDirectory()).toBe(true);
 	});
 
-	for (const { name, create } of [
+	for (const { name, create, posixOnly } of [
 		{
 			name: "a symlink",
 			create: async (lockFile: string, target: string) => {
 				await fs.symlink(target, lockFile);
 			},
+			posixOnly: false,
 		},
 		{
 			name: "a FIFO",
@@ -677,25 +694,34 @@ describe("coordinator session state lock", () => {
 				const proc = Bun.spawnSync(["mkfifo", lockFile], { stdout: "ignore", stderr: "ignore" });
 				if (proc.exitCode !== 0) throw new Error("mkfifo unavailable");
 			},
+			posixOnly: true,
 		},
 	]) {
-		it(`fails closed on ${name} at the lock path without reading or removing it`, async () => {
-			const { root, stateFile } = await seededRunningSession(`lock-${name.replace(/\W+/g, "-")}`);
-			const lockFile = `${stateFile}.lock`;
-			const target = path.join(root, "protected-target");
-			await Bun.write(target, "protected");
-			await create(lockFile, target);
+		// FIFOs do not exist on Windows (no mkfifo), so that variant is POSIX-only. The
+		// descriptor-proved-regular contract it exercises stays covered on Windows by the
+		// symlink variant, which runs on every platform.
+		(posixOnly ? it.skipIf(process.platform === "win32") : it)(
+			`fails closed on ${name} at the lock path without reading or removing it`,
+			async () => {
+				const { root, stateFile } = await seededRunningSession(`lock-${name.replace(/\W+/g, "-")}`);
+				const lockFile = `${stateFile}.lock`;
+				const target = path.join(root, "protected-target");
+				await Bun.write(target, "protected");
+				await create(lockFile, target);
 
-			await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toThrow(
-				/Existing runtime state marker is invalid or unreadable/,
-			);
-			await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+				await expect(writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z")).rejects.toThrow(
+					/Existing runtime state marker is invalid or unreadable/,
+				);
+				await expect(reclaimStaleSessionStateLock(lockFile)).rejects.toBeInstanceOf(
+					SessionStateLockUnavailableError,
+				);
 
-			// Neither the lock path nor whatever it points at was touched.
-			expect(fsSync.lstatSync(lockFile).isFile()).toBe(false);
-			expect(await Bun.file(target).text()).toBe("protected");
-			expect((await readJson(stateFile)).activity).toBeUndefined();
-		});
+				// Neither the lock path nor whatever it points at was touched.
+				expect(fsSync.lstatSync(lockFile).isFile()).toBe(false);
+				expect(await Bun.file(target).text()).toBe("protected");
+				expect((await readJson(stateFile)).activity).toBeUndefined();
+			},
+		);
 	}
 
 	/**
@@ -729,31 +755,40 @@ describe("coordinator session state lock", () => {
 		expect(JSON.parse(await fs.readFile(target, "utf8")).token).toBe("target-owner-token");
 	});
 
-	it("refuses a lock path swapped to a FIFO after the type decision instead of blocking on it", async () => {
-		const { stateFile } = await seededRunningSession("lock-swap-fifo");
-		const lockFile = `${stateFile}.lock`;
-		await fs.writeFile(lockFile, JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }));
+	// POSIX-only: the fixture needs mkfifo (and its EOF helper needs sh), neither of which
+	// exists on Windows. The same after-decision swap contract is covered on Windows by the
+	// symlink variant directly above.
+	it.skipIf(process.platform === "win32")(
+		"refuses a lock path swapped to a FIFO after the type decision instead of blocking on it",
+		async () => {
+			const { stateFile } = await seededRunningSession("lock-swap-fifo");
+			const lockFile = `${stateFile}.lock`;
+			await fs.writeFile(
+				lockFile,
+				JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "dead-owner-token" }),
+			);
 
-		SessionStateLockTestHooks.afterLockTypeDecision = async () => {
-			SessionStateLockTestHooks.afterLockTypeDecision = undefined;
-			await fs.rm(lockFile);
-			const proc = Bun.spawnSync(["mkfifo", lockFile], { stdout: "ignore", stderr: "ignore" });
-			if (proc.exitCode !== 0) throw new Error("mkfifo unavailable");
-		};
+			SessionStateLockTestHooks.afterLockTypeDecision = async () => {
+				SessionStateLockTestHooks.afterLockTypeDecision = undefined;
+				await fs.rm(lockFile);
+				const proc = Bun.spawnSync(["mkfifo", lockFile], { stdout: "ignore", stderr: "ignore" });
+				if (proc.exitCode !== 0) throw new Error("mkfifo unavailable");
+			};
 
-		const reclaim = reclaimStaleSessionStateLock(lockFile).then(
-			() => "completed" as const,
-			error => (error instanceof SessionStateLockUnavailableError ? ("refused" as const) : ("faulted" as const)),
-		);
-		// A by-name read of a writerless FIFO never returns. Bound the observation so the
-		// defect is a deterministic failed expectation rather than a hung suite.
-		const outcome = await Promise.race([reclaim, Bun.sleep(1_500).then(() => "blocked" as const)]);
-		// Hand a blocked reader its EOF, if one was left behind, so the suite can still exit.
-		if (outcome === "blocked") Bun.spawnSync(["sh", "-c", `: > ${JSON.stringify(lockFile)}`]);
+			const reclaim = reclaimStaleSessionStateLock(lockFile).then(
+				() => "completed" as const,
+				error => (error instanceof SessionStateLockUnavailableError ? ("refused" as const) : ("faulted" as const)),
+			);
+			// A by-name read of a writerless FIFO never returns. Bound the observation so the
+			// defect is a deterministic failed expectation rather than a hung suite.
+			const outcome = await Promise.race([reclaim, Bun.sleep(1_500).then(() => "blocked" as const)]);
+			// Hand a blocked reader its EOF, if one was left behind, so the suite can still exit.
+			if (outcome === "blocked") Bun.spawnSync(["sh", "-c", `: > ${JSON.stringify(lockFile)}`]);
 
-		expect(outcome).toBe("refused");
-		expect(fsSync.lstatSync(lockFile).isFIFO()).toBe(true);
-	});
+			expect(outcome).toBe("refused");
+			expect(fsSync.lstatSync(lockFile).isFIFO()).toBe(true);
+		},
+	);
 
 	/**
 	 * A pathname transition claim keeps CURRENT writers of this protocol out of the window.
@@ -927,6 +962,84 @@ describe("coordinator session state lock", () => {
 		expect(fsSync.existsSync(lockFile)).toBe(false);
 		// The pathname is immediately usable again, with no stale window to wait out.
 		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+	});
+
+	/**
+	 * Windows cannot run the identity-bound delete while the create descriptor is still
+	 * open (the descriptor grants no share-delete), so the retract path there closes the
+	 * descriptor first and lets the compare-and-delete re-prove the full recorded identity
+	 * at delete time. Forcing the windows-validated strategy proves that ordering on
+	 * whatever filesystem this suite runs on: the record is still retracted, and a
+	 * successor in the window is still refused rather than deleted.
+	 */
+	it("retracts its own half-written record under the windows-validated strategy", async () => {
+		SessionStateLockTestHooks.ownerAccessStrategy = "windows-validated";
+		const { stateFile } = await seededRunningSession("lock-write-failure-retract-windows");
+		const lockFile = `${stateFile}.lock`;
+
+		let faulted = false;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+			if (file !== lockFile) return;
+			SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+			faulted = true;
+			// Written through the pathname, so the object is still the one this writer
+			// created — the record is partial, not foreign.
+			await fs.writeFile(file, '{"pid":');
+			throw new Error("simulated owner record write fault");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		expect(faulted).toBe(true);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		// The pathname is immediately usable again, with no stale window to wait out.
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+	});
+
+	it("leaves a successor that took the owner path while a failed writer was cleaning up under the windows-validated strategy", async () => {
+		SessionStateLockTestHooks.ownerAccessStrategy = "windows-validated";
+		const { stateFile } = await seededRunningSession("lock-write-failure-successor-windows");
+		const lockFile = `${stateFile}.lock`;
+		const successor = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "windows-write-failure-successor-token",
+		});
+
+		let faulted = false;
+		SessionStateLockTestHooks.ownerRecordWriteFault = async file => {
+			if (file !== lockFile) return;
+			SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+			faulted = true;
+			// The record this writer created, half written; then a stale reclaim frees the
+			// pathname and a successor claims it before the failed writer's cleanup runs.
+			await fs.writeFile(file, '{"pid":');
+			await fs.rm(file);
+			await fs.writeFile(file, successor);
+			throw new Error("simulated owner record write fault");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+
+		expect(faulted).toBe(true);
+		// The successor's record — its own object and its own token — is untouched.
+		expect(await fs.readFile(lockFile, "utf8")).toBe(successor);
+
+		// And it still holds real authority: nothing enters behind it until it is gone.
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(200)]);
+		expect(entered).toEqual([]);
+
+		await fs.rm(lockFile);
+		await contender;
+		expect(entered).toEqual(["entered"]);
 	});
 
 	it("preserves an owner-write failure when exact retraction also fails", async () => {

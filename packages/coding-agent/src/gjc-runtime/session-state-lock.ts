@@ -662,11 +662,19 @@ async function openOwnerIdentity(handle: fs.FileHandle): Promise<OpenOwnerIdenti
  * the compare-and-delete cannot object — the capture and the authorization would be the
  * same foreign object.
  *
- * So the created descriptor is still open here, and it stays open: it is what makes the
- * comparison sound instead of merely likely, because the created inode cannot be recycled
+ * So on POSIX the created descriptor is still open here, and it stays open: it is what makes
+ * the comparison sound instead of merely likely, because the created inode cannot be recycled
  * underneath a successor while this process holds it. Only when a fresh no-follow capture
  * of the pathname proves to be that same still-open object is the existing exact unlink
  * allowed to run — and it then closes the remaining capture-to-unlink race on the bytes.
+ *
+ * Windows inverts that order. Opening the object for DELETE while this descriptor pins it
+ * fails (the create descriptor grants no share-delete), so the descriptor cannot outlive the
+ * proof there. It has already vouched for the object identity before it closes; afterwards
+ * the compare-and-delete itself re-proves the FULL recorded identity — dev/ino, link count,
+ * size, mtime, and payload hash — against whatever the pathname names at delete time. A
+ * successor that takes the pathname in the close-to-delete window fails that compare and is
+ * left alone, which keeps the retraction fail-closed without the descriptor.
  *
  * Anything short of that proof — a descriptor that no longer answers, a capture that
  * refuses or reports a type swap, a different object at the path — leaves the pathname
@@ -680,6 +688,7 @@ async function retractFailedOwnerRecord(
 	if (!created) return;
 	const stillOpen = await openOwnerIdentity(handle);
 	if (!stillOpen || stillOpen.dev !== created.dev || stillOpen.ino !== created.ino) return;
+	if (ownerAccessStrategy() === "windows-validated") await handle.close().catch(() => undefined);
 	const current = await captureRegularLockOwner(file).catch(() => null);
 	if (!current || current.dev !== created.dev || current.ino !== created.ino) return;
 	exactUnlinkOwnerRecord(file, current);

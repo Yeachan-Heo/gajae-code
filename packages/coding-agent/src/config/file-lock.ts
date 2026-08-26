@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { hasFsCode, isEnoent } from "@gajae-code/utils/fs-error";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 export interface FileLockOptions {
 	staleMs?: number;
@@ -33,9 +34,22 @@ export const FileLockTestHooks: {
 /**
  * Returns the OS-provided process start timestamp for PID-reuse detection.
  * `ps` is available on the supported Unix hosts (macOS and Linux), unlike
- * Linux's `/proc/<pid>/stat` pseudo-file.
+ * Linux's `/proc/<pid>/stat` pseudo-file. Windows has no `ps`; there the
+ * kernel-derived process creation time exposed by the natives addon
+ * (`Process.incarnation`, the same identity evidence the SDK broker prefers)
+ * is used instead. Either way the value is only ever compared for equality
+ * against a value this same function produced on the same platform, and `null`
+ * stays fail-closed: an owner whose incarnation cannot be proved is never
+ * treated as reused.
  */
 export function processStartTime(pid: number): string | null {
+	if (process.platform === "win32") {
+		try {
+			return nativeProcessBindings().Process.fromPid(pid)?.incarnation ?? null;
+		} catch {
+			return null;
+		}
+	}
 	try {
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
 		if (result.exitCode !== 0) return null;
