@@ -98,6 +98,7 @@ export class PlanModeController {
 	}
 
 	async restoreFromSession(sessionContext: SessionContext): Promise<void> {
+		if (this.ctx.session.isExplicitEmptyToolSelection()) return;
 		if (!this.ctx.session.settings.get("plan.enabled")) {
 			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused")
 				this.ctx.sessionManager.appendModeChange("none");
@@ -115,6 +116,10 @@ export class PlanModeController {
 
 	async enter(options?: { planFilePath?: string; workflow?: "parallel" | "iterative" }): Promise<void> {
 		if (this.#enabled) return;
+		if (this.ctx.session.isExplicitEmptyToolSelection()) {
+			this.ctx.showWarning("Plan mode requires built-in tools and is unavailable in a --no-tools session.");
+			return;
+		}
 		if (!this.ctx.modeGate.enter("plan")) return this.ctx.showWarning("Exit goal mode first.");
 		this.#paused = false;
 		const planFilePath = options?.planFilePath ?? "local://PLAN.md";
