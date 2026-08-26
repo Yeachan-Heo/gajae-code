@@ -437,13 +437,6 @@ async function requestWithInputHandling<T>(
 	if (!inputRequired) return stripResultType(initial);
 
 	const handler = options?.inputHandler;
-	if (!handler) {
-		throw new MCPExpectedFailure(
-			new Error(
-				`MCP server "${connection.name}" requested additional input (input_required) for ${method}, but no interactive input handler is available`,
-			),
-		);
-	}
 	const correlationId = crypto.randomUUID();
 
 	for (let attempt = 0; attempt < MAX_MRTR_RETRIES; attempt++) {
@@ -453,9 +446,21 @@ async function requestWithInputHandling<T>(
 				throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
 			}
 			if (request.method === "roots/list") {
+				if (connection.rootsEnabled === false) {
+					throw new MCPExpectedFailure(
+						new Error(`MCP server "${connection.name}" requested roots/list while roots are disabled`),
+					);
+				}
 				// roots are answered from local state without user interaction.
 				inputResponses[key] = await defaultRequestHandler("roots/list", undefined, connection.clientCwd);
 				continue;
+			}
+			if (!handler) {
+				throw new MCPExpectedFailure(
+					new Error(
+						`MCP server "${connection.name}" requested additional input (input_required) for ${method}, but no interactive input handler is available`,
+					),
+				);
 			}
 			const outcome = await handler(key, request, {
 				serverName: connection.name,
@@ -542,6 +547,7 @@ export async function connectToServer(
 				name,
 				config,
 				clientCwd: options?.cwd,
+				rootsEnabled: options?.advertiseRoots !== false,
 				transport: transport!,
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
@@ -588,6 +594,7 @@ export async function connectToServer(
 				name,
 				config,
 				clientCwd: options?.cwd,
+				rootsEnabled: options?.advertiseRoots !== false,
 				transport,
 				serverInfo,
 				capabilities,

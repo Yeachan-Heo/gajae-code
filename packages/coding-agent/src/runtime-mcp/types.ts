@@ -365,6 +365,8 @@ export interface MCPServerConnection {
 	config: MCPServerConfig;
 	/** Session/manager cwd used for local roots/list responses. */
 	clientCwd?: string;
+	/** Whether this connection advertised and permits roots/list responses. */
+	rootsEnabled?: boolean;
 	/** Transport instance */
 	transport: MCPTransport;
 	/** Server info from initialize */
