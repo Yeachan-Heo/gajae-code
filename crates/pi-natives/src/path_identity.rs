@@ -315,6 +315,11 @@ pub struct NativeExactUnlinkResult {
 	/// On Windows this is returned in the caller's namespace; retained handle
 	/// operations continue to use the volume-GUID canonical path internally.
 	pub detached_path: Option<String>,
+	/// When an expected POSIX regular-file source is published through a private
+	/// hard-link claim, the original source pathname remains available for the
+	/// caller's identity-bound cleanup. Absent for the legacy pathname-rename
+	/// protocol and for every Windows result.
+	pub source_retained: Option<bool>,
 	pub retained_successor_path: Option<String>,
 	/// An internal exchange-placeholder cleanup entry retained after cleanup
 	/// could not complete. This is never a canonical publisher successor and
@@ -353,6 +358,11 @@ pub struct NativePublishDiagnostic {
 pub struct NativeNoReplaceResult {
 	pub ok:               bool,
 	pub code:             Option<String>,
+	/// True when an expected POSIX regular-file source was published from a
+	/// retained hard-link claim and its original pathname still names the inode.
+	/// The field is optional so legacy two-argument callers keep their existing
+	/// result shape and Windows retains its pathname-rename behavior.
+	pub source_retained:  Option<bool>,
 	pub mutation_state:   String,
 	pub durability_state: String,
 	pub reason:           String,
@@ -377,6 +387,7 @@ impl NativeNoReplaceResult {
 	}
 
 	fn from_exact_with_primitive(result: NativeExactUnlinkResult, primitive: &'static str) -> Self {
+		let source_retained = result.source_retained;
 		let diagnostic_os_code = result.windows_error_code.as_deref().and_then(|value| {
 			let value = value
 				.strip_prefix("0x")
@@ -417,13 +428,14 @@ impl NativeNoReplaceResult {
 			}
 		};
 		Self {
-			ok:               result.ok,
-			code:             result.code,
-			mutation_state:   mutation_state.to_owned(),
+			ok: result.ok,
+			code: result.code,
+			source_retained,
+			mutation_state: mutation_state.to_owned(),
 			durability_state: durability_state.to_owned(),
-			reason:           reason.to_owned(),
-			primitive:        primitive.to_owned(),
-			phase:            if mutation_state == "committed" && !result.ok {
+			reason: reason.to_owned(),
+			primitive: primitive.to_owned(),
+			phase: if mutation_state == "committed" && !result.ok {
 				"terminal_identity"
 			} else if mutation_state == "committed" {
 				"complete"
@@ -435,8 +447,8 @@ impl NativeNoReplaceResult {
 				"rename"
 			}
 			.to_owned(),
-			detached_path:    result.detached_path,
-			diagnostic:       NativePublishDiagnostic {
+			detached_path: result.detached_path,
+			diagnostic: NativePublishDiagnostic {
 				schema_version:   1,
 				collection_state: "unavailable".to_owned(),
 				os_code:          diagnostic_os_code,
@@ -556,6 +568,7 @@ impl NativeExactUnlinkResult {
 			code: None,
 			payload_durable: None,
 			detached_path: None,
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
@@ -569,6 +582,7 @@ impl NativeExactUnlinkResult {
 			code: None,
 			payload_durable: None,
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
@@ -582,6 +596,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
@@ -596,6 +611,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: Some(true),
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
@@ -614,6 +630,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: Some(true),
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
@@ -632,6 +649,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: Some(true),
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
@@ -651,6 +669,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: Some(successor_path),
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
@@ -672,6 +691,12 @@ impl NativeExactUnlinkResult {
 	}
 
 	#[cfg(unix)]
+	fn with_source_retained(mut self) -> Self {
+		self.source_retained = Some(true);
+		self
+	}
+
+	#[cfg(unix)]
 	fn detached_failure_with_placeholder(
 		code: &str,
 		path: String,
@@ -682,6 +707,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
@@ -696,6 +722,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: Some(path),
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
@@ -710,6 +737,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: None,
+			source_retained: None,
 			retained_successor_path: Some(successor_path),
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
@@ -724,6 +752,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: None,
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: Some(placeholder_path),
 			retained_unknown_path: None,
@@ -738,6 +767,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: None,
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: Some(unknown_path),
@@ -751,6 +781,7 @@ impl NativeExactUnlinkResult {
 			code: Some(code.to_owned()),
 			payload_durable: None,
 			detached_path: None,
+			source_retained: None,
 			retained_successor_path: None,
 			retained_placeholder_path: None,
 			retained_unknown_path: None,
@@ -1492,6 +1523,12 @@ pub fn create_directory_no_replace_path(
 	platform::create_directory_no_replace_path(destination, (dev, ino))
 }
 
+/// Atomically publish `sourcePath` at `destinationPath` without replacing an
+/// occupied destination. When an expected regular-file identity is supplied on
+/// POSIX, publication is made from a private same-directory hard-link claim;
+/// the original source pathname remains as a cleanup link and the result sets
+/// `sourceRetained: true`. Callers must release any open source descriptor
+/// before removing that pathname through their identity-bound cleanup path.
 #[napi]
 pub fn rename_no_replace_path(
 	source_path: String,
@@ -2108,6 +2145,15 @@ pub(crate) mod platform {
 		OnceLock::new();
 
 	#[cfg(test)]
+	static BEFORE_SOURCE_CLAIM_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+
+	#[cfg(test)]
+	static AFTER_SOURCE_CLAIM_HOOK: OnceLock<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>> =
+		OnceLock::new();
+
+	#[cfg(test)]
 	static AFTER_PLACEHOLDER_DETACH_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
@@ -2174,6 +2220,24 @@ pub(crate) mod platform {
 	#[cfg(test)]
 	pub(super) fn set_before_exchange_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
 		*BEFORE_EXCHANGE_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_before_source_claim_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*BEFORE_SOURCE_CLAIM_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn set_after_source_claim_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+		*AFTER_SOURCE_CLAIM_HOOK
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
@@ -2307,6 +2371,32 @@ pub(crate) mod platform {
 		{
 			entered.send(()).expect("before exchange hook receiver");
 			resume.recv().expect("before exchange hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_before_source_claim_for_test() {
+		if let Some((entered, resume)) = BEFORE_SOURCE_CLAIM_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("source claim hook receiver");
+			resume.recv().expect("source claim hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_after_source_claim_for_test() {
+		if let Some((entered, resume)) = AFTER_SOURCE_CLAIM_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered.send(()).expect("source claim hook receiver");
+			resume.recv().expect("source claim hook resume");
 		}
 	}
 
@@ -4955,6 +5045,77 @@ pub(crate) mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
+		reason = "the retained source and parent descriptors remain live through claim cleanup"
+	)]
+	fn source_claim_cleanup(
+		source_fd: libc::c_int,
+		source_parent_fd: libc::c_int,
+		source_stat: &libc::stat,
+		claim_path: &Path,
+	) -> NativeExactUnlinkResult {
+		let digest = match digest_fd(source_fd) {
+			Ok(digest) => digest,
+			Err(code) => {
+				return NativeExactUnlinkResult::detached_failure(
+					code,
+					claim_path.to_string_lossy().into_owned(),
+				);
+			},
+		};
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(source_parent_fd, &mut parent_stat) } != 0 {
+			return NativeExactUnlinkResult::detached_failure(
+				"parent_mismatch",
+				claim_path.to_string_lossy().into_owned(),
+			);
+		}
+		let identity = ExactFileIdentity {
+			dev:             source_stat.st_dev as u64,
+			ino:             source_stat.st_ino as u64,
+			nlink:           None,
+			parent_dev:      Some(parent_stat.st_dev as u64),
+			parent_ino:      Some(parent_stat.st_ino as u64),
+			size:            source_stat.st_size as u64,
+			mtime_ns:        stat_mtime_ns(source_stat) as i64,
+			directory:       false,
+			detach_only:     false,
+			quarantine_name: Some(format!(
+				".gjc-rename-source-cleanup-{:x}-{:x}-{}",
+				source_stat.st_dev,
+				source_stat.st_ino,
+				std::process::id(),
+			)),
+			sha256:          Some(digest),
+			allow_hard_link: true,
+		};
+		let result = exact_unlink_direct(claim_path, &identity);
+		if result.ok {
+			return result;
+		}
+		let detached_path = result
+			.detached_path
+			.unwrap_or_else(|| claim_path.to_string_lossy().into_owned());
+		let code = match result.code.as_deref() {
+			Some("identity_mismatch" | "parent_mismatch" | "reparse_point") => "identity_mismatch",
+			_ => "cleanup_pending",
+		};
+		NativeExactUnlinkResult::detached_failure(code, detached_path)
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor and NUL-terminated claim name remain live for the \
+		          probe"
+	)]
+	fn source_claim_exists(parent_fd: libc::c_int, claim_name: &CString) -> bool {
+		let mut claim: libc::stat = unsafe { std::mem::zeroed() };
+		(unsafe {
+			libc::fstatat(parent_fd, claim_name.as_ptr(), &mut claim, libc::AT_SYMLINK_NOFOLLOW)
+		}) == 0
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
 		reason = "publication descriptors are owned here and closed exactly once on every branch"
 	)]
 	pub(super) fn rename_path_no_replace(
@@ -5048,6 +5209,116 @@ pub(crate) mod platform {
 				return *result;
 			},
 		};
+		if let Some((expected_dev, expected_ino)) = expected_source {
+			let private_name = CString::new(format!(
+				".gjc-rename-source-{:x}-{:x}-{}",
+				expected_dev,
+				expected_ino,
+				std::process::id(),
+			))
+			.expect("private source claim name contains no NUL");
+			let private_path = source_path
+				.parent()
+				.unwrap_or_else(|| Path::new("."))
+				.join(private_name.to_string_lossy().as_ref());
+			#[cfg(test)]
+			pause_before_source_claim_for_test();
+			let link_result =
+				link_no_replace(source_parent, &source_name, source_parent, &private_name);
+			if let Err(code) = link_result {
+				// An interrupted link can have committed before returning an error. Keep
+				// any visible private entry as detached evidence instead of treating the
+				// source claim as an ordinary preflight failure.
+				let claim_exists = source_claim_exists(source_parent, &private_name);
+				unsafe {
+					libc::close(source_fd);
+					libc::close(source_parent);
+					libc::close(destination_parent);
+				}
+				return if claim_exists {
+					NativeExactUnlinkResult::detached_failure(
+						"identity_mismatch",
+						private_path.to_string_lossy().into_owned(),
+					)
+				} else {
+					NativeExactUnlinkResult::failure(code)
+				};
+			}
+			#[cfg(test)]
+			pause_after_source_claim_for_test();
+			if !published_matches_open_source(source_parent, &private_name, &source_stat)
+				|| !published_matches_open_source(source_parent, &source_name, &source_stat)
+			{
+				unsafe {
+					libc::close(source_fd);
+					libc::close(source_parent);
+					libc::close(destination_parent);
+				}
+				return NativeExactUnlinkResult::detached_failure(
+					"identity_mismatch",
+					private_path.to_string_lossy().into_owned(),
+				);
+			}
+			let result =
+				rename_no_replace(source_parent, destination_parent, &private_name, &destination_name);
+			let outcome = match result {
+				Ok(())
+					if published_matches_open_source(
+						destination_parent,
+						&destination_name,
+						&source_stat,
+					) && published_matches_open_source(source_parent, &source_name, &source_stat) =>
+				{
+					NativeExactUnlinkResult::success().with_source_retained()
+				},
+				Ok(()) => NativeExactUnlinkResult::detached_failure(
+					"destination_identity_changed",
+					destination_path.to_string_lossy().into_owned(),
+				)
+				.with_source_retained(),
+				Err(code) => {
+					let claim_matches =
+						published_matches_open_source(source_parent, &private_name, &source_stat);
+					let source_matches =
+						published_matches_open_source(source_parent, &source_name, &source_stat);
+					if !claim_matches || !source_matches {
+						let detached_path = if source_claim_exists(source_parent, &private_name) {
+							private_path.to_string_lossy().into_owned()
+						} else if published_matches_open_source(
+							destination_parent,
+							&destination_name,
+							&source_stat,
+						) {
+							destination_path.to_string_lossy().into_owned()
+						} else {
+							private_path.to_string_lossy().into_owned()
+						};
+						NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
+							.with_source_retained()
+					} else {
+						let rollback =
+							source_claim_cleanup(source_fd, source_parent, &source_stat, &private_path);
+						if rollback.ok {
+							NativeExactUnlinkResult::failure(code)
+						} else if rollback.detached_path.is_some() {
+							rollback.with_source_retained()
+						} else {
+							NativeExactUnlinkResult::detached_failure(
+								rollback.code.as_deref().unwrap_or("cleanup_pending"),
+								private_path.to_string_lossy().into_owned(),
+							)
+							.with_source_retained()
+						}
+					}
+				},
+			};
+			unsafe {
+				libc::close(source_fd);
+				libc::close(source_parent);
+				libc::close(destination_parent);
+			}
+			return outcome;
+		}
 		let result =
 			rename_no_replace(source_parent, destination_parent, &source_name, &destination_name);
 		let outcome = match result {
@@ -5248,9 +5519,10 @@ pub(crate) mod platform {
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
 				&& (identity.allow_hard_link
 					|| (opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)))
-				&& identity
-					.nlink
-					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
+				&& (identity.allow_hard_link
+					|| identity
+						.nlink
+						.is_none_or(|nlink| nlink == opened.st_nlink as u64))
 				&& identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
@@ -8214,6 +8486,7 @@ mod platform {
 					code: result.code,
 					payload_durable: None,
 					detached_path: None,
+					source_retained: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
@@ -8440,6 +8713,7 @@ mod platform {
 					code: result.code,
 					payload_durable: None,
 					detached_path: None,
+					source_retained: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
@@ -9710,6 +9984,7 @@ mod platform {
 							code: result.code,
 							payload_durable: None,
 							detached_path: None,
+							source_retained: None,
 							retained_successor_path: None,
 							retained_placeholder_path: None,
 							retained_unknown_path: None,
@@ -9724,6 +9999,7 @@ mod platform {
 					code: result.code,
 					payload_durable: None,
 					detached_path: None,
+					source_retained: None,
 					retained_successor_path: None,
 					retained_placeholder_path: None,
 					retained_unknown_path: None,
@@ -10285,6 +10561,163 @@ mod rename_no_replace_eintr_tests {
 
 		// Clear the injector so later tests in this process are unaffected.
 		platform::inject_rename_no_replace_eintr(0);
+	}
+}
+
+#[cfg(all(test, unix))]
+mod rename_no_replace_expected_source_tests {
+	use std::{
+		fs,
+		os::unix::fs::MetadataExt,
+		path::PathBuf,
+		sync::{
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		},
+		thread,
+	};
+
+	use super::{PATH_IDENTITY_HOOK_TEST_LOCK, platform};
+
+	static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+	struct TempDir(PathBuf);
+
+	impl TempDir {
+		fn new() -> Self {
+			let path = std::env::temp_dir().join(format!(
+				"gjc-rename-no-replace-expected-source-{}-{}",
+				std::process::id(),
+				NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed),
+			));
+			fs::create_dir(&path).expect("create expected-source temp directory");
+			let resolved =
+				fs::canonicalize(&path).expect("canonicalize expected-source temp directory");
+			Self(resolved)
+		}
+	}
+
+	impl Drop for TempDir {
+		fn drop(&mut self) {
+			let _ = fs::remove_dir_all(&self.0);
+		}
+	}
+
+	fn identity(path: &PathBuf) -> (u64, u64) {
+		let metadata = fs::metadata(path).expect("stat expected source");
+		(metadata.dev(), metadata.ino())
+	}
+
+	#[test]
+	fn expected_regular_source_publishes_from_a_claim_and_keeps_the_source_name() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("source.tmp");
+		let destination = temporary.0.join("destination.tmp");
+		fs::write(&source, b"payload").expect("seed expected source");
+		let expected_source = identity(&source);
+
+		let result = platform::rename_path_no_replace(&source, &destination, Some(expected_source));
+
+		assert!(result.ok, "expected-source publication failed: {:?}", result.code);
+		assert_eq!(result.source_retained, Some(true));
+		assert_eq!(fs::read(&source).expect("read retained source"), b"payload");
+		assert_eq!(fs::read(&destination).expect("read published destination"), b"payload");
+		assert_eq!(identity(&source), identity(&destination));
+	}
+
+	#[test]
+	fn source_name_substitution_before_claim_retains_the_claim_as_detached_evidence() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("source.tmp");
+		let destination = temporary.0.join("destination.tmp");
+		let retained_source = temporary.0.join("retained-source.tmp");
+		fs::write(&source, b"expected").expect("seed expected source");
+		let expected_source = identity(&source);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_before_source_claim_hook(Some((entered_tx, resume_rx)));
+		let source_for_publish = source.clone();
+		let destination_for_publish = destination.clone();
+		let publish = thread::spawn(move || {
+			platform::rename_path_no_replace(
+				&source_for_publish,
+				&destination_for_publish,
+				Some(expected_source),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for expected-source claim hook");
+		fs::rename(&source, &retained_source).expect("retain expected source");
+		fs::write(&source, b"attacker").expect("substitute source name");
+		resume_tx.send(()).expect("resume expected-source claim");
+		let result = publish.join().expect("expected-source publication thread");
+		platform::set_before_source_claim_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		let detached = result
+			.detached_path
+			.as_deref()
+			.expect("retained source claim path");
+		assert!(detached.contains(".gjc-rename-source-"));
+		assert_eq!(fs::read(detached).expect("read retained claim"), b"attacker");
+		assert_eq!(fs::read(&source).expect("read substituted source"), b"attacker");
+		assert_eq!(fs::read(&retained_source).expect("read expected source"), b"expected");
+		assert!(!destination.exists());
+	}
+
+	#[test]
+	fn claim_substitution_after_link_retains_the_replaced_claim() {
+		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let source = temporary.0.join("source.tmp");
+		let destination = temporary.0.join("destination.tmp");
+		let retained_claim = temporary.0.join("retained-claim.tmp");
+		fs::write(&source, b"expected").expect("seed expected source");
+		let expected_source = identity(&source);
+		let claim_path = temporary.0.join(format!(
+			".gjc-rename-source-{:x}-{:x}-{}",
+			expected_source.0,
+			expected_source.1,
+			std::process::id(),
+		));
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_after_source_claim_hook(Some((entered_tx, resume_rx)));
+		let source_for_publish = source.clone();
+		let destination_for_publish = destination.clone();
+		let publish = thread::spawn(move || {
+			platform::rename_path_no_replace(
+				&source_for_publish,
+				&destination_for_publish,
+				Some(expected_source),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for linked source claim hook");
+		fs::rename(&claim_path, &retained_claim).expect("retain original source claim");
+		fs::write(&claim_path, b"attacker").expect("substitute source claim");
+		resume_tx.send(()).expect("resume linked source claim");
+		let result = publish.join().expect("expected-source publication thread");
+		platform::set_after_source_claim_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.detached_path.as_deref(), Some(claim_path.to_string_lossy().as_ref()));
+		assert_eq!(fs::read(&claim_path).expect("read retained substituted claim"), b"attacker");
+		assert_eq!(fs::read(&retained_claim).expect("read retained validated claim"), b"expected");
+		assert_eq!(fs::read(&source).expect("read original source"), b"expected");
+		assert!(!destination.exists());
 	}
 }
 

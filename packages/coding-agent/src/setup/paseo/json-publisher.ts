@@ -369,6 +369,7 @@ export async function publishPlan(
 	const mode = await sourceMode(targetPath);
 	let tempRetained = false;
 	let tempConsumed = false;
+	let tempSourceRetained = false;
 	let tempIdentity: NativeExactFileIdentity | undefined;
 	let priorFailureMessage: string | undefined;
 	let priorFailureRetained: readonly string[] = [];
@@ -415,7 +416,7 @@ export async function publishPlan(
 			}
 			const linked = renameNoReplace(tempPath, targetPath, sourceIdentity);
 			if (!linked.ok) {
-				tempRetained = linked.mutationState !== "not_committed";
+				tempRetained = linked.detachedPath !== undefined || linked.mutationState !== "not_committed";
 				const retained =
 					linked.detachedPath === undefined ? (tempRetained ? [tempPath] : []) : [tempPath, linked.detachedPath];
 				throw new PaseoPublishError(
@@ -428,7 +429,8 @@ export async function publishPlan(
 					retained,
 				);
 			}
-			tempConsumed = true;
+			tempSourceRetained = linked.sourceRetained === true;
+			tempConsumed = !tempSourceRetained;
 		} else {
 			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, expectedDestinationIdentity);
 			if (!replaced.ok) {
@@ -489,7 +491,10 @@ export async function publishPlan(
 					),
 				);
 			}
-			if (tempIdentity !== undefined && !(await removePrivateBackupByIdentity(tempPath, tempIdentity))) {
+			if (
+				tempIdentity !== undefined &&
+				!(await removePrivateBackupByIdentity(tempPath, tempIdentity, tempSourceRetained))
+			) {
 				const retained = [...new Set([...priorFailureRetained, tempPath])];
 				await Promise.reject(
 					new PaseoPublishError(
@@ -830,10 +835,14 @@ async function readAuthenticatedBackupBytes(
 	}
 }
 
-async function removePrivateBackupByIdentity(backupPath: string, identity: NativeExactFileIdentity): Promise<boolean> {
+async function removePrivateBackupByIdentity(
+	backupPath: string,
+	identity: NativeExactFileIdentity,
+	allowHardLink = false,
+): Promise<boolean> {
 	try {
 		const canonical = await canonicalSidecarPathForNativeUnlink(backupPath);
-		return exactUnlinkDirect(canonical, identity).ok;
+		return exactUnlinkDirect(canonical, { ...identity, allowHardLink }).ok;
 	} catch {
 		return false;
 	}
@@ -912,6 +921,7 @@ export async function writeReplacedProviderBackup(
 	let stagedIdentity: NativeExactFileIdentity | undefined;
 	let temporaryCleaned = true;
 	let temporaryPublished = false;
+	let temporarySourceRetained = false;
 	try {
 		// Keep the entire temporary-file lifecycle inside this cleanup boundary.
 		// Opening can create the path before surfacing an error, and chmod can
@@ -960,7 +970,8 @@ export async function writeReplacedProviderBackup(
 					});
 				}
 			} else {
-				temporaryPublished = true;
+				temporarySourceRetained = published.sourceRetained === true;
+				temporaryPublished = !temporarySourceRetained;
 			}
 			if (createdByGjc) {
 				const linked = await fs.lstat(backupPath, { bigint: true });
@@ -1004,7 +1015,7 @@ export async function writeReplacedProviderBackup(
 		await syncParentDirectory(path.dirname(backupPath));
 	} finally {
 		if (!temporaryPublished && stagedIdentity !== undefined)
-			temporaryCleaned = await removePrivateBackupByIdentity(temporary, stagedIdentity);
+			temporaryCleaned = await removePrivateBackupByIdentity(temporary, stagedIdentity, temporarySourceRetained);
 	}
 	if (!temporaryCleaned) {
 		throw new PaseoPublishError(

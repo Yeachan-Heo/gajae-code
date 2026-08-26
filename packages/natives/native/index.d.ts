@@ -1882,6 +1882,13 @@ export interface NativeExactUnlinkResult {
    * operations continue to use the volume-GUID canonical path internally.
    */
   detachedPath?: string
+  /**
+   * When an expected POSIX regular-file source is published through a private
+   * hard-link claim, the original source pathname remains available for the
+   * caller's identity-bound cleanup. Absent for the legacy pathname-rename
+   * protocol and for every Windows result.
+   */
+  sourceRetained?: boolean
   retainedSuccessorPath?: string
   /**
    * An internal exchange-placeholder cleanup entry retained after cleanup
@@ -1907,6 +1914,13 @@ export interface NativeExactUnlinkResult {
 export interface NativeNoReplaceResult {
   ok: boolean
   code?: string
+  /**
+   * True when an expected POSIX regular-file source was published from a
+   * retained hard-link claim and its original pathname still names the inode.
+   * The field is optional so legacy two-argument callers keep their existing
+   * result shape and Windows retains its pathname-rename behavior.
+   */
+  sourceRetained?: boolean
   mutationState: string
   durabilityState: string
   reason: string
@@ -2201,6 +2215,14 @@ export interface RecoveryFsRetainedCleanupResult {
   treeSnapshot?: NativeDirectoryTreeSnapshot
 }
 
+/**
+ * Atomically publish `sourcePath` at `destinationPath` without replacing an
+ * occupied destination. When an expected regular-file identity is supplied on
+ * POSIX, publication is made from a private same-directory hard-link claim;
+ * the original source pathname remains as a cleanup link and the result sets
+ * `sourceRetained: true`. Callers must release any open source descriptor
+ * before removing that pathname through their identity-bound cleanup path.
+ */
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string, expectedSource?: NativeExactFileIdentity | undefined | null): NativeNoReplaceResult
 
 /**
