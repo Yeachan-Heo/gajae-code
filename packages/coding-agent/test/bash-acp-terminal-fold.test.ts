@@ -295,14 +295,13 @@ describe("BashTool ACP terminal fold", () => {
 
 	it("retains polled ACP output without a job manager", async () => {
 		let outputReads = 0;
-		const pendingOutput = new Promise<ClientBridgeTerminalOutput>(() => {});
 		const handle: ClientBridgeTerminalHandle = {
 			terminalId: "term-managerless-timeout-recovery",
 			waitForExit: () => new Promise(() => {}),
 			currentOutput: async () => {
 				outputReads += 1;
-				if (outputReads === 1) return { output: "managerless diagnostics\n", truncated: false };
-				return pendingOutput;
+				if (outputReads <= 3) return { output: "managerless diagnostics\n", truncated: false };
+				throw new Error("terminal/output failed during recovery");
 			},
 			kill: async () => {},
 			release: async () => {},
