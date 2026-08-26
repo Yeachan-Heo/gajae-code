@@ -66,12 +66,13 @@ export async function discoverAgents(
 	agentDir?: string,
 ): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
+	const resolvedAgentDir = agentDir ?? activeSettings?.getAgentDir();
 	const agentSources = Array.from(
-		new Set(getConfigDirs("", { project: false, userAgentDir: agentDir }).map(entry => entry.source)),
+		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
 	);
 
 	// Get user directories (priority order: .gjc, ...)
-	const userDirs = getConfigDirs("agents", { project: false, userAgentDir: agentDir })
+	const userDirs = getConfigDirs("agents", { project: false, userAgentDir: resolvedAgentDir })
 		.filter(entry => agentSources.includes(entry.source))
 		.map(entry => ({
 			...entry,

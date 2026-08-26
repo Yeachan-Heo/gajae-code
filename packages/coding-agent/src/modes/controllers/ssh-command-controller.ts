@@ -243,7 +243,8 @@ export class SSHCommandController {
 			const cwd = getProjectDir();
 
 			// Load from both user and project configs
-			const userPath = getSSHConfigPath("user", cwd, this.ctx.session.getSessionAgentDir());
+			const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
+			const userPath = getSSHConfigPath("user", cwd, agentDir);
 			const projectPath = getSSHConfigPath("project", cwd);
 
 			const [userConfig, projectConfig] = await Promise.all([
@@ -258,7 +259,11 @@ export class SSHCommandController {
 			const configHostNames = new Set([...userHosts, ...projectHosts]);
 			let discoveredHosts: SSHHost[] = [];
 			try {
-				const result = await loadCapability<SSHHost>(sshCapability.id, { cwd });
+				const result = await loadCapability<SSHHost>(sshCapability.id, {
+					cwd,
+					settings: this.ctx.settings,
+					agentDir,
+				});
 				discoveredHosts = result.items.filter(h => !configHostNames.has(h.name));
 			} catch {
 				// Ignore discovery errors

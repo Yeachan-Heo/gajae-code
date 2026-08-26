@@ -148,7 +148,7 @@ describe("task agent visibility", () => {
 		const settingsA = Settings.isolated({}, { agentDir: profileA });
 		const settingsB = Settings.isolated({}, { agentDir: profileB });
 		const [fromSettings, explicitWins, isolatedA, isolatedB] = await Promise.all([
-			discoverAgents(root, root, settingsA, settingsA.getAgentDir()),
+			discoverAgents(root, root, settingsA),
 			discoverAgents(root, root, settingsA, profileB),
 			discoverAgents(root, root, settingsA, profileA),
 			discoverAgents(root, root, settingsB, profileB),
