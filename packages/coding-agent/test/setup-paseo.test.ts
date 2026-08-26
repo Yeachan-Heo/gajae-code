@@ -2424,8 +2424,9 @@ describe("skills bridge", () => {
 		// A read-only provenance directory: readProvenance sees ENOENT (an
 		// empty ledger) before the step, and writeProvenance's temp-file open
 		// fails EACCES only AFTER the publish + persist succeeded.
-		const blocker = path.join(fixture.root, "blocker");
-		await fs.mkdir(blocker, { recursive: true, mode: 0o500 });
+		const blocker = path.join(path.dirname(fixture.paths.intentRecord), "blocker");
+		await fs.mkdir(blocker, { recursive: true });
+		await fs.chmod(blocker, 0o500);
 		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		let persisted = false;
 

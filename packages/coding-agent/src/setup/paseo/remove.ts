@@ -15,24 +15,32 @@ import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	currentIdentity,
 	PaseoPublishError,
 	planPublish,
 	publishPlan,
 	readReplacedProviderBackup,
 	readTarget,
 	removeReplacedProviderBackup,
+	removeSourceClaim,
 	replacedProviderBackupPath,
+	type SourceClaimReceipt,
 } from "./json-publisher";
 import { removeSeededRoles } from "./orchestration-preferences";
 import {
 	type BridgeCleanupAuthority,
+	clearIntent,
 	EMPTY_LEDGER,
+	INTENT_VERSION,
+	type IntentRecord,
 	isProvenancedOrchestrationKey,
 	isProvenancedProvider,
 	type ProvenanceLedger,
 	type ProviderReplacedRef,
 	provenancedProviderKeys,
+	readIntent,
 	readProvenance,
+	writeIntent,
 	writeProvenance,
 } from "./paseo-ownership";
 import { type PaseoProviderEntry, providerEntryHash } from "./provider-config";
@@ -551,10 +559,17 @@ export async function removePaseoSetup(
 		// Roles live under `providers`, so removal must reach into that map. Deleting
 		// a top-level key would clear our provenance while leaving the role pointing
 		// at the provider entry we are about to delete.
-		const outcome = await revertJson(deps.paths.orchestrationPreferences, options.now, draft =>
-			removeSeededRoles(draft, seededKeys, (key, currentValue) =>
-				isProvenancedOrchestrationKey(nextLedger, key, currentValue ?? ""),
-			),
+		const outcome = await revertJson(
+			deps.paths.orchestrationPreferences,
+			options.now,
+			"orchestration-preferences",
+			seededKeys,
+			deps.paths.intentRecord,
+			deps.paths.provenanceLedger,
+			draft =>
+				removeSeededRoles(draft, seededKeys, (key, currentValue) =>
+					isProvenancedOrchestrationKey(nextLedger, key, currentValue ?? ""),
+				),
 		);
 		if (!outcome.ok) {
 			remaining.push(deps.paths.orchestrationPreferences, ...outcome.retained);
@@ -653,26 +668,34 @@ export async function removePaseoSetup(
 			}
 		}
 		const revertedOrdinaryKeys = new Set<string>();
-		const outcome = await revertJson(deps.paths.configJson, options.now, draft => {
-			const providers = providersOf(draft);
-			if (!providers) return;
-			for (const key of providerKeys) {
-				const entry = providers[key];
-				if (entry === undefined) continue;
-				const hash = providerEntryHash(entry as PaseoProviderEntry);
-				if (!isProvenancedProvider(nextLedger, key, hash)) {
-					if (restoredContinuations.has(key)) continue;
-					survivors[key] = nextLedger.providerKeys[key] ?? hash;
-					continue;
+		const outcome = await revertJson(
+			deps.paths.configJson,
+			options.now,
+			"provider-config",
+			providerKeys,
+			deps.paths.intentRecord,
+			deps.paths.provenanceLedger,
+			draft => {
+				const providers = providersOf(draft);
+				if (!providers) return;
+				for (const key of providerKeys) {
+					const entry = providers[key];
+					if (entry === undefined) continue;
+					const hash = providerEntryHash(entry as PaseoProviderEntry);
+					if (!isProvenancedProvider(nextLedger, key, hash)) {
+						if (restoredContinuations.has(key)) continue;
+						survivors[key] = nextLedger.providerKeys[key] ?? hash;
+						continue;
+					}
+					const replaced = restores.get(key);
+					if (replaced !== undefined) providers[key] = replaced;
+					else {
+						delete providers[key];
+						revertedOrdinaryKeys.add(key);
+					}
 				}
-				const replaced = restores.get(key);
-				if (replaced !== undefined) providers[key] = replaced;
-				else {
-					delete providers[key];
-					revertedOrdinaryKeys.add(key);
-				}
-			}
-		});
+			},
+		);
 		if (!outcome.ok) {
 			remaining.push(deps.paths.configJson, ...outcome.retained);
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
@@ -806,20 +829,155 @@ function providersOf(draft: Record<string, unknown>): Record<string, unknown> | 
 async function revertJson(
 	targetPath: string,
 	now: Date,
+	step: "provider-config" | "orchestration-preferences",
+	ownedKeys: readonly string[],
+	intentPath: string,
+	provenancePath: string,
 	mutate: (draft: Record<string, unknown>) => void,
 ): Promise<{ ok: true } | { ok: false; detail: string; retained: readonly string[] }> {
+	let sourceClaim: (SourceClaimReceipt & { readonly targetPath: string }) | undefined;
+	let ownsIntent = false;
 	try {
 		const current = await readTarget(targetPath);
 		if (!current.exists) return { ok: true };
 		const plan = planPublish(current, mutate);
-		await publishPlan(targetPath, plan, { expectedIdentity: current.identity, backup: false, now });
+		const existingIntent = await readIntent(intentPath);
+		if (
+			existingIntent !== undefined &&
+			(path.resolve(existingIntent.provenancePath) !== path.resolve(provenancePath) ||
+				existingIntent.step !== "skills-bridge")
+		) {
+			return {
+				ok: false,
+				detail: `another durable intent is already recorded at ${intentPath}; refusing to overwrite it during removal`,
+				retained: [intentPath],
+			};
+		}
+		if (existingIntent === undefined) {
+			const provenanceIdentity = await currentIdentity(provenancePath);
+			const intent: IntentRecord = {
+				version: INTENT_VERSION,
+				step,
+				targetPath,
+				ownedKeys,
+				targetPreflightIdentity: current.identity,
+				targetExpectedIdentity: plan.expectedIdentity,
+				provenancePath,
+				provenancePreflightIdentity: provenanceIdentity,
+				provenanceExpectedIdentity: provenanceIdentity,
+				startedAt: now.toISOString(),
+			};
+			await writeIntent(intentPath, intent);
+			ownsIntent = true;
+		}
+		await publishPlan(targetPath, plan, {
+			expectedIdentity: current.identity,
+			backup: false,
+			now,
+			onSourceClaimPrepared: async (claimPath, stagingPath, identity) => {
+				const durable = await readIntent(intentPath);
+				if (durable === undefined) {
+					throw new PaseoPublishError(
+						targetPath,
+						{ reason: "cleanup-conflict", detail: `durable source-claim intent disappeared (${intentPath})` },
+						[intentPath],
+					);
+				}
+				if (path.resolve(durable.provenancePath) !== path.resolve(provenancePath)) {
+					throw new PaseoPublishError(
+						targetPath,
+						{
+							reason: "cleanup-conflict",
+							detail: `durable source-claim intent names a different provenance ledger (${durable.provenancePath})`,
+						},
+						[intentPath],
+					);
+				}
+				const receipt: SourceClaimReceipt & { readonly targetPath: string } = {
+					targetPath,
+					claimPath,
+					stagingPath,
+					identity,
+				};
+				sourceClaim = receipt;
+				await writeIntent(intentPath, {
+					...durable,
+					sourceClaims: [...(durable.sourceClaims ?? []), receipt],
+				});
+			},
+		});
+		if (sourceClaim !== undefined) {
+			const cleanup = await removeSourceClaim(sourceClaim);
+			if (!cleanup.removed) {
+				await retainSourceClaimReceipt(intentPath, sourceClaim, cleanup.retained);
+				return {
+					ok: false,
+					detail: `source claim/staging cleanup remains pending at ${cleanup.retained.join(", ") || sourceClaim.claimPath}`,
+					retained: [intentPath, ...cleanup.retained],
+				};
+			}
+			await removeSourceClaimReceipt(intentPath, sourceClaim);
+		}
+		if (ownsIntent) await clearIntent(intentPath);
 		return { ok: true };
 	} catch (error) {
 		return {
 			ok: false,
 			detail: error instanceof Error ? error.message : String(error),
-			retained: error instanceof PaseoPublishError ? error.retained : [],
+			retained: [
+				...(ownsIntent || sourceClaim !== undefined ? [intentPath] : []),
+				...(sourceClaim === undefined ? [] : [sourceClaim.claimPath, sourceClaim.stagingPath]),
+				...(error instanceof PaseoPublishError ? error.retained : []),
+			],
 		};
+	}
+}
+
+function sourceClaimReceiptKey(receipt: SourceClaimReceipt & { readonly targetPath: string }): string {
+	return [
+		receipt.targetPath,
+		receipt.claimPath,
+		receipt.stagingPath,
+		receipt.identity.dev,
+		receipt.identity.ino,
+		receipt.identity.parentDev,
+		receipt.identity.parentIno,
+		receipt.identity.size,
+		receipt.identity.mtimeNs,
+		receipt.identity.sha256,
+	].join("\0");
+}
+
+async function retainSourceClaimReceipt(
+	intentPath: string,
+	receipt: SourceClaimReceipt & { readonly targetPath: string },
+	retainedPaths: readonly string[],
+): Promise<void> {
+	const durable = await readIntent(intentPath);
+	if (durable === undefined) return;
+	const key = sourceClaimReceiptKey(receipt);
+	const retained = { ...receipt, retainedPaths: [...new Set(retainedPaths)] };
+	const sourceClaims = (durable.sourceClaims ?? []).map(candidate =>
+		sourceClaimReceiptKey(candidate) === key ? retained : candidate,
+	);
+	if (!sourceClaims.some(candidate => sourceClaimReceiptKey(candidate) === key)) sourceClaims.push(retained);
+	await writeIntent(intentPath, { ...durable, sourceClaims });
+}
+
+async function removeSourceClaimReceipt(
+	intentPath: string,
+	receipt: SourceClaimReceipt & { readonly targetPath: string },
+): Promise<void> {
+	const durable = await readIntent(intentPath);
+	if (durable === undefined) throw new Error(`source claim authority disappeared before cleanup (${intentPath})`);
+	const key = sourceClaimReceiptKey(receipt);
+	const remaining = (durable.sourceClaims ?? []).filter(candidate => sourceClaimReceiptKey(candidate) !== key);
+	if (remaining.length === (durable.sourceClaims ?? []).length) return;
+	if (remaining.length === 0) {
+		const { sourceClaims: _sourceClaims, ...withoutSourceClaims } = durable;
+		await writeIntent(intentPath, withoutSourceClaims);
+	} else {
+		await writeIntent(intentPath, { ...durable, sourceClaims: remaining });
 	}
 }
 

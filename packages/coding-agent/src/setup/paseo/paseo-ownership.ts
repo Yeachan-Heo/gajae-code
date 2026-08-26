@@ -490,6 +490,8 @@ export interface IntentRecord {
 	readonly publishBackup?: IntentPublishBackup;
 	/** POSIX source hard-link claim and staging authority prepared before native mutation. */
 	readonly sourceClaim?: IntentSourceClaim;
+	/** POSIX source authorities prepared by compensation/removal publishes. */
+	readonly sourceClaims?: readonly (SourceClaimReceipt & { readonly targetPath: string })[];
 	readonly startedAt: string;
 }
 
@@ -522,6 +524,7 @@ async function isIntentSourceClaim(value: unknown, targetPath: unknown): Promise
 	if (
 		typeof value.claimPath !== "string" ||
 		typeof value.stagingPath !== "string" ||
+		!path.isAbsolute(targetPath) ||
 		!path.isAbsolute(value.claimPath) ||
 		!path.isAbsolute(value.stagingPath) ||
 		!isPersistedFileIdentity(value.identity)
@@ -532,6 +535,8 @@ async function isIntentSourceClaim(value: unknown, targetPath: unknown): Promise
 	const staging = path.resolve(value.stagingPath);
 	const targetDir = path.dirname(target);
 	if (
+		target === claim ||
+		target === staging ||
 		claim === staging ||
 		path.dirname(claim) !== targetDir ||
 		path.dirname(staging) !== targetDir ||
@@ -539,11 +544,19 @@ async function isIntentSourceClaim(value: unknown, targetPath: unknown): Promise
 		!path.basename(staging).endsWith(".tmp")
 	)
 		return false;
-	const [targetParent, stagingParent] = await Promise.all([
+	const [targetParent, claimParent, stagingParent] = await Promise.all([
 		fs.realpath(path.dirname(target)).catch(() => undefined),
+		fs.realpath(path.dirname(claim)).catch(() => undefined),
 		fs.realpath(path.dirname(staging)).catch(() => undefined),
 	]);
-	if (targetParent === undefined || stagingParent === undefined || targetParent !== stagingParent) return false;
+	if (
+		targetParent === undefined ||
+		claimParent === undefined ||
+		stagingParent === undefined ||
+		targetParent !== claimParent ||
+		targetParent !== stagingParent
+	)
+		return false;
 	try {
 		const claimName = path.basename(value.claimPath);
 		const operations = [
@@ -596,6 +609,11 @@ async function isIntentSourceClaim(value: unknown, targetPath: unknown): Promise
 	return true;
 }
 
+async function isIntentSourceClaimReceipt(value: unknown): Promise<boolean> {
+	if (!isRecord(value) || typeof value.targetPath !== "string") return false;
+	return isIntentSourceClaim(value, value.targetPath);
+}
+
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
 	if (intent.version !== INTENT_VERSION) {
 		throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
@@ -620,6 +638,13 @@ export async function writeIntent(intentPath: string, intent: IntentRecord): Pro
 	}
 	if (intent.sourceClaim !== undefined && intent.step === "skills-bridge") {
 		throw new IntentRecordCorruptError(intentPath, "sourceClaim is not valid for a skills bridge intent");
+	}
+	if (
+		intent.sourceClaims !== undefined &&
+		(!Array.isArray(intent.sourceClaims) ||
+			!(await Promise.all(intent.sourceClaims.map(receipt => isIntentSourceClaimReceipt(receipt)))).every(Boolean))
+	) {
+		throw new IntentRecordCorruptError(intentPath, "sourceClaims contains an unauthenticated source claim receipt");
 	}
 	validateIntentPayload(intentPath, intent);
 	await fs.mkdir(path.dirname(intentPath), { recursive: true, mode: 0o700 });
@@ -820,6 +845,18 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 		}
 		if (parsed?.sourceClaim !== undefined && parsed.step === "skills-bridge") {
 			throw new IntentRecordCorruptError(intentPath, "sourceClaim is not valid for a skills bridge intent");
+		}
+		if (
+			parsed?.sourceClaims !== undefined &&
+			(!Array.isArray(parsed.sourceClaims) ||
+				!(await Promise.all(parsed.sourceClaims.map(receipt => isIntentSourceClaimReceipt(receipt)))).every(
+					Boolean,
+				))
+		) {
+			throw new IntentRecordCorruptError(
+				intentPath,
+				"sourceClaims contains an unauthenticated source claim receipt",
+			);
 		}
 		return parsed;
 	} catch (error) {

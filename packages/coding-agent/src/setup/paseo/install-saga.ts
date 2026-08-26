@@ -342,12 +342,16 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			backupValueSha256 !== undefined ||
 			backupIdentity !== undefined
 		) {
+			const durableIntent = await readIntent(input.intentPath).catch(() => undefined);
+			const recoveryIntent = durableIntent ?? intent;
+			const recoveredSourceClaim = sourceClaim ?? recoveryIntent.sourceClaim;
 			await writeIntent(input.intentPath, {
-				...intent,
+				...recoveryIntent,
 				provenancePayload: ledgerAfter,
 				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
 				discardSidecar: input.discardSidecar,
-				...(sourceClaim === undefined ? {} : { sourceClaim }),
+				...(recoveredSourceClaim === undefined ? {} : { sourceClaim: recoveredSourceClaim }),
+				...(recoveryIntent.sourceClaims === undefined ? {} : { sourceClaims: recoveryIntent.sourceClaims }),
 				...(backupPath !== undefined && backupValueSha256 !== undefined
 					? {
 							publishBackup: {
@@ -388,6 +392,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		if (publishSucceeded) {
 			let reverted = false;
 			let rollbackFailed = false;
+			let rollbackSourceClaim: (SourceClaimReceipt & { readonly targetPath: string }) | undefined;
 			const rollbackRetained: string[] = [];
 			try {
 				const observed = await currentIdentity(input.targetPath);
@@ -398,8 +403,27 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 						expectedIdentity: afterPublish.identity,
 						backup: false,
 						now: input.now,
+						onSourceClaimPrepared: async (claimPath, stagingPath, identity) => {
+							rollbackSourceClaim = await appendSourceClaimReceipt(
+								input.intentPath,
+								input.targetPath,
+								input.provenancePath,
+								claimPath,
+								stagingPath,
+								identity,
+							);
+						},
 					});
-					reverted = true;
+					if (rollbackSourceClaim !== undefined) {
+						const cleanup = await removeSourceClaim(rollbackSourceClaim);
+						if (!cleanup.removed) {
+							await retainSourceClaimReceiptInIntent(input.intentPath, rollbackSourceClaim, cleanup.retained);
+							rollbackRetained.push(input.intentPath, ...cleanup.retained);
+						} else {
+							await removeSourceClaimReceiptFromIntent(input.intentPath, rollbackSourceClaim);
+						}
+					}
+					reverted = rollbackSourceClaim === undefined || rollbackRetained.length === 0;
 				}
 				// A DIFFERENT identity means someone else changed the target
 				// after our publish: the rollback deliberately does not
@@ -476,11 +500,66 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				}
 				const now = await readTarget(input.targetPath);
 				const revertPlan = planPublish(now, input.revert);
-				await publishPlan(input.targetPath, revertPlan, {
-					expectedIdentity: now.identity,
-					backup: false,
-					now: input.now,
-				});
+				let sourceClaim: (SourceClaimReceipt & { readonly targetPath: string }) | undefined;
+				let ownsUndoIntent = false;
+				try {
+					if ((await readIntent(input.intentPath)) === undefined) {
+						const provenanceBefore = await readProvenance(input.provenancePath);
+						const provenancePreflightIdentity = await currentIdentity(input.provenancePath);
+						const provenanceAfter = input.revertLedger(provenanceBefore);
+						await writeIntent(input.intentPath, {
+							version: INTENT_VERSION,
+							step: input.step,
+							targetPath: input.targetPath,
+							ownedKeys: input.ownedKeys,
+							targetPreflightIdentity: now.identity,
+							targetExpectedIdentity: revertPlan.expectedIdentity,
+							provenancePath: input.provenancePath,
+							provenancePreflightIdentity,
+							provenanceExpectedIdentity: provenanceLedgerIdentity(provenanceAfter),
+							provenancePayload: provenanceAfter,
+							startedAt: input.now.toISOString(),
+						});
+						ownsUndoIntent = true;
+					}
+					await publishPlan(input.targetPath, revertPlan, {
+						expectedIdentity: now.identity,
+						backup: false,
+						now: input.now,
+						onSourceClaimPrepared: async (claimPath, stagingPath, identity) => {
+							sourceClaim = await appendSourceClaimReceipt(
+								input.intentPath,
+								input.targetPath,
+								input.provenancePath,
+								claimPath,
+								stagingPath,
+								identity,
+							);
+						},
+					});
+					if (sourceClaim !== undefined) {
+						const cleanup = await removeSourceClaim(sourceClaim);
+						if (!cleanup.removed) {
+							await retainSourceClaimReceiptInIntent(input.intentPath, sourceClaim, cleanup.retained);
+							return {
+								status: "conflict",
+								detail: `source claim/staging cleanup remains pending at ${cleanup.retained.join(", ") || sourceClaim.claimPath}`,
+								retained: [input.intentPath, ...cleanup.retained],
+							};
+						}
+						await removeSourceClaimReceiptFromIntent(input.intentPath, sourceClaim);
+					}
+				} catch (error) {
+					return {
+						status: "conflict",
+						detail: error instanceof Error ? error.message : String(error),
+						retained: [
+							input.intentPath,
+							...(sourceClaim === undefined ? [] : [sourceClaim.claimPath, sourceClaim.stagingPath]),
+							...(error instanceof PaseoPublishError ? error.retained : []),
+						],
+					};
+				}
 				const revertedLedger = input.revertLedger(await readProvenance(input.provenancePath));
 				await writeProvenance(input.provenancePath, revertedLedger);
 				const pendingBridgeIntent = await readIntent(input.intentPath);
@@ -500,6 +579,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 					});
 				}
 				if (persistAttempted && input.unpersist) await input.unpersist();
+				if (ownsUndoIntent) await clearIntent(input.intentPath);
 				return { status: "reverted" };
 			},
 		},
@@ -583,22 +663,171 @@ async function pathPresentWithoutFollowing(value: string): Promise<boolean> {
 	}
 }
 
-async function cleanupSourceClaimReceipt(
+function sourceClaimReceiptKey(receipt: SourceClaimReceipt & { readonly targetPath: string }): string {
+	return [
+		receipt.targetPath,
+		receipt.claimPath,
+		receipt.stagingPath,
+		receipt.identity.dev,
+		receipt.identity.ino,
+		receipt.identity.parentDev,
+		receipt.identity.parentIno,
+		receipt.identity.size,
+		receipt.identity.mtimeNs,
+		receipt.identity.sha256,
+	].join("\0");
+}
+
+/**
+ * Authenticate and settle every source claim retained by an intent. The
+ * legacy singular field is kept separate because forward publication records
+ * bind its target through the surrounding intent; compensation/removal
+ * receipts carry their own target and live in `sourceClaims`.
+ */
+async function cleanupSourceClaimReceipts(
 	intentPath: string,
-	intent: IntentRecord,
 ): Promise<{ readonly removed: boolean; readonly detail?: string }> {
-	if (intent.sourceClaim === undefined) return { removed: true };
-	const cleanup = await removeSourceClaim(intent.sourceClaim);
-	if (cleanup.removed) return { removed: true };
-	const sourceClaim =
-		cleanup.retained.length === 0
-			? intent.sourceClaim
-			: { ...intent.sourceClaim, retainedPaths: [...new Set(cleanup.retained)] };
-	await writeIntent(intentPath, { ...intent, sourceClaim }).catch(() => undefined);
-	return {
-		removed: false,
-		detail: `authenticated source claim/staging cleanup remains pending at ${cleanup.retained.join(", ") || intent.sourceClaim.claimPath}`,
+	let durable: IntentRecord | undefined;
+	try {
+		durable = await readIntent(intentPath);
+	} catch (error) {
+		return {
+			removed: false,
+			detail: `source claim authority could not be authenticated during cleanup: ${error instanceof Error ? error.message : String(error)}`,
+		};
+	}
+	if (durable === undefined) {
+		return { removed: false, detail: `source claim authority disappeared before cleanup (${intentPath})` };
+	}
+	let removed = true;
+	const details: string[] = [];
+	let nextIntent: IntentRecord = durable;
+	if (durable.sourceClaim !== undefined) {
+		const cleanup = await removeSourceClaim(durable.sourceClaim).catch(error => ({
+			removed: false,
+			retained: [durable.sourceClaim!.claimPath, durable.sourceClaim!.stagingPath],
+			detail: error instanceof Error ? error.message : String(error),
+		}));
+		if (!cleanup.removed) {
+			removed = false;
+			details.push(
+				`authenticated source claim/staging cleanup remains pending at ${cleanup.retained.join(", ") || durable.sourceClaim.claimPath}${"detail" in cleanup && cleanup.detail ? ` (${cleanup.detail})` : ""}`,
+			);
+			nextIntent = {
+				...nextIntent,
+				sourceClaim:
+					cleanup.retained.length === 0
+						? durable.sourceClaim
+						: { ...durable.sourceClaim, retainedPaths: [...new Set(cleanup.retained)] },
+			};
+		} else {
+			const { sourceClaim: _sourceClaim, ...withoutSourceClaim } = nextIntent;
+			nextIntent = withoutSourceClaim;
+		}
+	}
+	const retainedReceipts: (SourceClaimReceipt & { readonly targetPath: string })[] = [];
+	for (const receipt of durable.sourceClaims ?? []) {
+		const cleanup = await removeSourceClaim(receipt).catch(error => ({
+			removed: false,
+			retained: [receipt.claimPath, receipt.stagingPath],
+			detail: error instanceof Error ? error.message : String(error),
+		}));
+		if (cleanup.removed) continue;
+		removed = false;
+		details.push(
+			`authenticated source claim/staging cleanup remains pending at ${cleanup.retained.join(", ") || receipt.claimPath}${"detail" in cleanup && cleanup.detail ? ` (${cleanup.detail})` : ""}`,
+		);
+		retainedReceipts.push(
+			cleanup.retained.length === 0 ? receipt : { ...receipt, retainedPaths: [...new Set(cleanup.retained)] },
+		);
+	}
+	if (durable.sourceClaims !== undefined && retainedReceipts.length !== durable.sourceClaims.length) {
+		nextIntent =
+			retainedReceipts.length === 0
+				? (() => {
+						const { sourceClaims: _sourceClaims, ...withoutSourceClaims } = nextIntent;
+						return withoutSourceClaims;
+					})()
+				: { ...nextIntent, sourceClaims: retainedReceipts };
+	} else if (durable.sourceClaims !== undefined && retainedReceipts.length > 0) {
+		nextIntent = { ...nextIntent, sourceClaims: retainedReceipts };
+	}
+	if (nextIntent !== durable) {
+		try {
+			await writeIntent(intentPath, nextIntent);
+		} catch (error) {
+			removed = false;
+			details.push(
+				`source claim cleanup authority could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	return removed ? { removed: true } : { removed: false, detail: details.join("; ") };
+}
+
+async function appendSourceClaimReceipt(
+	intentPath: string,
+	targetPath: string,
+	provenancePath: string,
+	claimPath: string,
+	stagingPath: string,
+	identity: PersistedFileIdentity,
+): Promise<SourceClaimReceipt & { readonly targetPath: string }> {
+	const durable = await readIntent(intentPath);
+	if (durable === undefined) {
+		throw new Error(
+			`source claim authority cannot be persisted because the durable intent is absent (${intentPath})`,
+		);
+	}
+	if (path.resolve(durable.provenancePath) !== path.resolve(provenancePath)) {
+		throw new Error(`source claim authority targets a different provenance ledger (${durable.provenancePath})`);
+	}
+	const receipt: SourceClaimReceipt & { readonly targetPath: string } = {
+		targetPath,
+		claimPath,
+		stagingPath,
+		identity,
 	};
+	await writeIntent(intentPath, {
+		...durable,
+		sourceClaims: [...(durable.sourceClaims ?? []), receipt],
+	});
+	return receipt;
+}
+
+async function removeSourceClaimReceiptFromIntent(
+	intentPath: string,
+	receipt: SourceClaimReceipt & { readonly targetPath: string },
+): Promise<void> {
+	const durable = await readIntent(intentPath);
+	if (durable === undefined) {
+		throw new Error(`source claim authority disappeared before cleanup (${intentPath})`);
+	}
+	const key = sourceClaimReceiptKey(receipt);
+	const remaining = (durable.sourceClaims ?? []).filter(candidate => sourceClaimReceiptKey(candidate) !== key);
+	if (remaining.length === (durable.sourceClaims ?? []).length) return;
+	if (remaining.length === 0) {
+		const { sourceClaims: _sourceClaims, ...withoutSourceClaims } = durable;
+		await writeIntent(intentPath, withoutSourceClaims);
+	} else {
+		await writeIntent(intentPath, { ...durable, sourceClaims: remaining });
+	}
+}
+
+async function retainSourceClaimReceiptInIntent(
+	intentPath: string,
+	receipt: SourceClaimReceipt & { readonly targetPath: string },
+	retainedPaths: readonly string[],
+): Promise<void> {
+	const durable = await readIntent(intentPath);
+	if (durable === undefined) return;
+	const key = sourceClaimReceiptKey(receipt);
+	const retained = { ...receipt, retainedPaths: [...new Set(retainedPaths)] };
+	const sourceClaims = (durable.sourceClaims ?? []).map(candidate =>
+		sourceClaimReceiptKey(candidate) === key ? retained : candidate,
+	);
+	if (!sourceClaims.some(candidate => sourceClaimReceiptKey(candidate) === key)) sourceClaims.push(retained);
+	await writeIntent(intentPath, { ...durable, sourceClaims });
 }
 
 async function bridgeLedgerMatchesFilesystem(
@@ -902,6 +1131,14 @@ export async function recoverIntent(
 				detail: `the intent provenance path is outside the trusted Paseo ledger: ${intent.provenancePath}`,
 			};
 		}
+		for (const receipt of intent.sourceClaims ?? []) {
+			if (!options.expectedTargetPaths.some(target => path.resolve(target) === path.resolve(receipt.targetPath))) {
+				return {
+					recovered: false,
+					detail: `a source-claim receipt target is outside the trusted Paseo target set: ${receipt.targetPath}`,
+				};
+			}
+		}
 	}
 	if (intent.step === "skills-bridge") {
 		const ledgerObserved = await currentIdentity(intent.provenancePath);
@@ -986,6 +1223,13 @@ export async function recoverIntent(
 				};
 			}
 			await writeProvenance(intent.provenancePath, before);
+			const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
+			if (!sourceCleanup.removed) {
+				return {
+					recovered: false,
+					detail: `the interrupted partial bridge cleanup restored the authenticated old root; ${sourceCleanup.detail}`,
+				};
+			}
 			await clearIntent(intentPath);
 			return {
 				recovered: true,
@@ -1045,6 +1289,13 @@ export async function recoverIntent(
 				};
 			}
 			await writeProvenance(intent.provenancePath, before);
+			const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
+			if (!sourceCleanup.removed) {
+				return {
+					recovered: false,
+					detail: `the interrupted partial bridge migration was rolled back to the authenticated old root; ${sourceCleanup.detail}`,
+				};
+			}
 			await clearIntent(intentPath);
 			return {
 				recovered: true,
@@ -1204,6 +1455,13 @@ export async function recoverIntent(
 				};
 			}
 			await writeProvenance(intent.provenancePath, { ...before, bridgeCleanupPending: undefined });
+			const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
+			if (!sourceCleanup.removed) {
+				return {
+					recovered: false,
+					detail: `the interrupted destination bridge rollback completed its cleanup and restored pre-install provenance; ${sourceCleanup.detail}`,
+				};
+			}
 			await clearIntent(intentPath);
 			return {
 				recovered: true,
@@ -1276,6 +1534,13 @@ export async function recoverIntent(
 				};
 			}
 			await writeProvenance(intent.provenancePath, { ...after, bridgeCleanupPending: undefined });
+			const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
+			if (!sourceCleanup.removed) {
+				return {
+					recovered: false,
+					detail: `the interrupted bridge migration completed its pre-detach cleanup and committed destination provenance; ${sourceCleanup.detail}`,
+				};
+			}
 			await clearIntent(intentPath);
 			return {
 				recovered: true,
@@ -1356,6 +1621,13 @@ export async function recoverIntent(
 			}
 			await writeProvenance(intent.provenancePath, await refreshBridgeLedgerIdentities(after!));
 		}
+		const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
+		if (!sourceCleanup.removed) {
+			return {
+				recovered: false,
+				detail: `the interrupted bridge migration was reconciled; ${sourceCleanup.detail}`,
+			};
+		}
 		await clearIntent(intentPath);
 		return {
 			recovered: true,
@@ -1370,7 +1642,7 @@ export async function recoverIntent(
 	if (recovery.action === "discard") {
 		let discardSidecarRemoved = false;
 		let sourceClaimRemoved = false;
-		if (intent.sourceClaim !== undefined) {
+		if (intent.sourceClaim !== undefined || intent.sourceClaims !== undefined) {
 			const [targetObserved, ledgerObserved] = await Promise.all([
 				currentIdentity(intent.targetPath),
 				currentIdentity(intent.provenancePath),
@@ -1391,7 +1663,7 @@ export async function recoverIntent(
 					detail: `${recovery.detail}; recovery state changed while authenticating source-claim cleanup; retaining the intent`,
 				};
 			}
-			const sourceCleanup = await cleanupSourceClaimReceipt(intentPath, intent);
+			const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
 			if (!sourceCleanup.removed) {
 				return { recovered: false, detail: `${recovery.detail}; ${sourceCleanup.detail}` };
 			}
@@ -1520,7 +1792,8 @@ export async function recoverIntent(
 				(targetState === "before" && ledgerState === "before") ||
 				(targetState === "intended-after" && ledgerState === "intended-after")
 			) {
-				const { publishBackup: _publishBackup, ...safeIntent } = intent;
+				const currentIntent = (await readIntent(intentPath)) ?? intent;
+				const { publishBackup: _publishBackup, ...safeIntent } = currentIntent;
 				await writeIntent(intentPath, safeIntent);
 			}
 		}
@@ -1529,20 +1802,20 @@ export async function recoverIntent(
 		} catch (error) {
 			if (
 				(!discardSidecarRemoved || intent.discardSidecar === undefined) &&
-				(!sourceClaimRemoved || intent.sourceClaim === undefined)
+				(!sourceClaimRemoved || (intent.sourceClaim === undefined && intent.sourceClaims === undefined))
 			)
 				throw error;
 			// The authenticated artifact is already gone. Remove its cleanup
 			// authority from the durable intent before retrying the clear, so a
 			// later recovery cannot fail forever on an intentionally absent file.
-			let safeIntent: IntentRecord = intent;
+			let safeIntent: IntentRecord = (await readIntent(intentPath)) ?? intent;
 			if (discardSidecarRemoved) {
 				const { discardSidecar: _discardSidecar, ...withoutDiscardSidecar } = safeIntent;
 				safeIntent = withoutDiscardSidecar;
 			}
 			if (sourceClaimRemoved) {
-				const { sourceClaim: _sourceClaim, ...withoutSourceClaim } = safeIntent;
-				safeIntent = withoutSourceClaim;
+				const { sourceClaim: _sourceClaim, sourceClaims: _sourceClaims, ...withoutSourceClaims } = safeIntent;
+				safeIntent = withoutSourceClaims;
 			}
 			await writeIntent(intentPath, safeIntent);
 			await clearIntent(intentPath);
@@ -1578,8 +1851,8 @@ export async function recoverIntent(
 		};
 	}
 	await writeProvenance(intent.provenancePath, validatedPending);
-	if (intent.sourceClaim !== undefined) {
-		const sourceCleanup = await cleanupSourceClaimReceipt(intentPath, intent);
+	if (intent.sourceClaim !== undefined || intent.sourceClaims !== undefined) {
+		const sourceCleanup = await cleanupSourceClaimReceipts(intentPath);
 		if (!sourceCleanup.removed) {
 			return { recovered: false, detail: `${recovery.detail}; ${sourceCleanup.detail}` };
 		}
