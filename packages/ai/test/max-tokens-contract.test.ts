@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { registerCustomApi, unregisterCustomApis } from "../src/api-registry";
 import { completeSimple, streamSimple } from "../src/stream";
-import type { Context, Model } from "../src/types";
+import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions } from "../src/types";
+import { AssistantMessageEventStream } from "../src/utils/event-stream";
 
 const originalFetch = global.fetch;
 
 afterEach(() => {
 	global.fetch = originalFetch;
+	unregisterCustomApis("max-tokens-contract");
 });
 
 function createCompletionResponse(): Response {
@@ -76,6 +79,29 @@ function createModel(maxTokensSource?: Model<"openai-completions">["maxTokensSou
 
 function context(): Context {
 	return { messages: [{ role: "user", content: "hello", timestamp: Date.now() }] };
+}
+
+function customApiResult(model: Model<Api>): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	stream.push({ type: "done", reason: "stop", message });
+	return stream;
 }
 
 async function captureCompletion(
@@ -178,5 +204,21 @@ describe("model maxTokens request contract", () => {
 		});
 
 		expect((await payloadPromise.promise).max_tokens).toBe(65_536);
+	});
+
+	it("passes the resolved budget to extension-provided custom APIs", async () => {
+		const captured: Array<number | undefined> = [];
+		registerCustomApi(
+			"max-tokens-contract-api",
+			(_model: Model<Api>, _context: Context, options?: SimpleStreamOptions) => {
+				captured.push(options?.maxTokens);
+				return customApiResult(_model);
+			},
+			"max-tokens-contract",
+		);
+		const model = { ...createModel("configured"), api: "max-tokens-contract-api" } as Model<Api>;
+
+		await streamSimple(model, context(), { maxTokens: 70_000 }).result();
+		expect(captured).toEqual([70_000]);
 	});
 });

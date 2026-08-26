@@ -624,7 +624,7 @@ export function streamSimple<TApi extends Api>(
 	// Check custom API registry (extension-provided APIs)
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
-		return customApiProvider.streamSimple(model, context, options);
+		return customApiProvider.streamSimple(model, context, { ...options, maxTokens: resolvedRequestMaxTokens });
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
