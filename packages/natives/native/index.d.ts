@@ -844,10 +844,12 @@ export interface ContextLine {
 export declare function copyToClipboard(text: string): void
 
 /**
- * Create exactly the final directory component through a retained,
- * no-follow parent. The parent identity is checked against the descriptor
- * used for the native create primitive, and an occupied destination is never
- * replaced or treated as success.
+ * Create exactly the final directory component through a retained, no-follow
+ * parent.
+ *
+ * The parent identity is checked against the descriptor used for the native
+ * create primitive, and an occupied destination is never replaced or treated
+ * as success.
  */
 export declare function createDirectoryNoReplacePath(destinationPath: string, expectedParent: NativeDirectoryParentIdentity): NativeDirectoryCreationResult
 
@@ -2217,11 +2219,13 @@ export interface RecoveryFsRetainedCleanupResult {
 
 /**
  * Atomically publish `sourcePath` at `destinationPath` without replacing an
- * occupied destination. When an expected regular-file identity is supplied on
- * POSIX, publication is made from a private same-directory hard-link claim;
- * the original source pathname remains as a cleanup link and the result sets
- * `sourceRetained: true`. Callers must release any open source descriptor
- * before removing that pathname through their identity-bound cleanup path.
+ * occupied destination.
+ *
+ * When an expected regular-file identity is supplied on POSIX, publication is
+ * made from a private same-directory hard-link claim; the original source
+ * pathname remains as a cleanup link and the result sets `sourceRetained:
+ * true`. Callers must release any open source descriptor before removing that
+ * pathname through their identity-bound cleanup path.
  */
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string, expectedSource?: NativeExactFileIdentity | undefined | null): NativeNoReplaceResult
 

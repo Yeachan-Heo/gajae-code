@@ -2564,10 +2564,40 @@ pub(crate) mod platform {
 		i128::from(stat.st_ctime) * 1_000_000_000 + i128::from(stat.st_ctime_nsec)
 	}
 
+	#[cfg(target_os = "linux")]
+	const fn stat_dev(stat: &libc::stat) -> u64 {
+		stat.st_dev
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	const fn stat_dev(stat: &libc::stat) -> u64 {
+		stat.st_dev as u64
+	}
+
+	#[cfg(target_os = "linux")]
+	const fn stat_ino(stat: &libc::stat) -> u64 {
+		stat.st_ino
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	const fn stat_ino(stat: &libc::stat) -> u64 {
+		stat.st_ino as u64
+	}
+
+	#[cfg(target_os = "linux")]
+	const fn stat_nlink(stat: &libc::stat) -> u64 {
+		stat.st_nlink
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	const fn stat_nlink(stat: &libc::stat) -> u64 {
+		stat.st_nlink as u64
+	}
+
 	fn directory_identity(stat: &libc::stat) -> NativeDirectoryIdentity {
 		NativeDirectoryIdentity {
-			dev:      stat.st_dev.to_string(),
-			ino:      stat.st_ino.to_string(),
+			dev:      stat_dev(stat).to_string(),
+			ino:      stat_ino(stat).to_string(),
 			size:     (stat.st_size as u64).to_string(),
 			mtime_ns: stat_mtime_ns(stat).to_string(),
 		}
@@ -4891,8 +4921,8 @@ pub(crate) mod platform {
 		};
 		let mut parent: libc::stat = unsafe { std::mem::zeroed() };
 		(unsafe { libc::fstat(parent_fd, &mut parent) }) == 0
-			&& parent.st_dev == expected_dev
-			&& parent.st_ino == expected_ino
+			&& stat_dev(&parent) == expected_dev
+			&& stat_ino(&parent) == expected_ino
 	}
 
 	fn exact_open_source_matches(
@@ -4901,15 +4931,18 @@ pub(crate) mod platform {
 		identity: &ExactFileIdentity,
 	) -> Result<bool, &'static str> {
 		if source.st_mode & libc::S_IFMT != libc::S_IFREG
-			|| source.st_dev != identity.dev
-			|| source.st_ino != identity.ino
+			|| stat_dev(source) != identity.dev
+			|| stat_ino(source) != identity.ino
 			|| source.st_size as u64 != identity.size
 			|| stat_mtime_ns(source) != i128::from(identity.mtime_ns)
 		{
 			return Ok(false);
 		}
 		if !identity.allow_hard_link
-			&& (source.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != source.st_nlink))
+			&& (stat_nlink(source) != 1
+				|| identity
+					.nlink
+					.is_some_and(|nlink| nlink != stat_nlink(source)))
 		{
 			return Ok(false);
 		}
@@ -4930,11 +4963,11 @@ pub(crate) mod platform {
 		let mut current: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW) }
 			!= 0 || current.st_mode & libc::S_IFMT != libc::S_IFREG
-			|| current.st_dev as u64 != identity.dev
-			|| current.st_ino as u64 != identity.ino
+			|| stat_dev(&current) != identity.dev
+			|| stat_ino(&current) != identity.ino
 			|| current.st_size as u64 != identity.size
 			|| stat_mtime_ns(&current) != i128::from(identity.mtime_ns)
-			|| expected_nlink.is_some_and(|nlink| current.st_nlink as u64 != nlink)
+			|| expected_nlink.is_some_and(|nlink| stat_nlink(&current) != nlink)
 		{
 			return false;
 		}
@@ -5309,8 +5342,8 @@ pub(crate) mod platform {
 			);
 		}
 		let identity = ExactFileIdentity {
-			dev:             source_stat.st_dev,
-			ino:             source_stat.st_ino,
+			dev:             stat_dev(source_stat),
+			ino:             stat_ino(source_stat),
 			nlink:           None,
 			parent_dev:      Some(parent_stat.st_dev as u64),
 			parent_ino:      Some(parent_stat.st_ino as u64),
@@ -5464,7 +5497,7 @@ pub(crate) mod platform {
 			.unwrap_or_else(|| Path::new("."))
 			.join(private_name.to_string_lossy().as_ref());
 		let expected_nlink =
-			(!expected_source.allow_hard_link).then_some(source_stat.st_nlink.saturating_add(1));
+			(!expected_source.allow_hard_link).then_some(stat_nlink(&source_stat).saturating_add(1));
 		#[cfg(test)]
 		pause_before_source_claim_for_test();
 		let link_result = link_no_replace(source_parent, &source_name, source_parent, &private_name);
@@ -5625,7 +5658,7 @@ pub(crate) mod platform {
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		if let Some((expected_dev, expected_ino)) = expected_source
-			&& (source_named.st_dev != expected_dev || source_named.st_ino != expected_ino)
+			&& (stat_dev(&source_named) != expected_dev || stat_ino(&source_named) != expected_ino)
 		{
 			unsafe { libc::close(source_parent) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
@@ -5671,7 +5704,7 @@ pub(crate) mod platform {
 			},
 		};
 		if let Some((expected_dev, expected_ino)) = expected_source
-			&& (source_stat.st_dev != expected_dev || source_stat.st_ino != expected_ino)
+			&& (stat_dev(&source_stat) != expected_dev || stat_ino(&source_stat) != expected_ino)
 		{
 			unsafe {
 				libc::close(source_fd);
