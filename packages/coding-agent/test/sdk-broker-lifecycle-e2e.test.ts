@@ -4107,7 +4107,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			type: "host_registered",
 			sessionId,
 			locator: indexed.locator,
-			endpointGeneration: indexed.endpointGeneration + 1,
+			endpointGeneration: indexed.endpointGeneration,
 			pid: process.pid,
 			endpointMtimeMs: input.endpointMtimeMs + 1,
 			lifecycleRequestId: "same-id-successor",
@@ -4122,7 +4122,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		expect(replay).toMatchObject({ ok: true, result: { sessionId, retired: true, indexType: "session_closed" } });
 		expect(reopened.ledger.get(createIdentity)).toMatchObject({ state: "terminal_error" });
 		expect(reopened.index.listSessions().sessions).toEqual([
-			expect.objectContaining({ sessionId, endpointGeneration: indexed.endpointGeneration + 1 }),
+			expect.objectContaining({ sessionId, endpointGeneration: indexed.endpointGeneration }),
 		]);
 
 		await expect(

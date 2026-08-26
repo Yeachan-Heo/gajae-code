@@ -1794,6 +1794,8 @@ function findRetirementRecord(
 	receipt: LifecycleRetirementReceipt | undefined,
 ): IndexedSession | undefined {
 	if (receipt !== undefined) {
+		const historical = broker.index.findHistoricalSessionIdentity(receipt.identity);
+		if (historical) return historical;
 		// A later registration may make a same-ID successor the public authority.
 		// Receipt replay must search the retained identity set first so the
 		// successor can never shadow the exact staged retirement identity.

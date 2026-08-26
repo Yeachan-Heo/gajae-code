@@ -1774,6 +1774,55 @@ export class SessionIndex {
 		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).identities;
 	}
 
+	/** Reconstructs a receipt-bound identity even when admission superseded it. */
+	findHistoricalSessionIdentity(expected: {
+		sessionId: string;
+		stateRoot: string;
+		endpointGeneration: number;
+		pid: number;
+		processIncarnation?: string;
+		hostIncarnation?: string;
+		endpointMtimeMs?: number;
+		lifecycleRequestId?: string;
+	}): IndexedSession | undefined {
+		const expectedRoot = resolveEquivalentPath(expected.stateRoot);
+		const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
+		const supersededAt = this.#events
+			.filter(
+				event =>
+					event.type === "host_registered" &&
+					event.sessionId === expected.sessionId &&
+					event.endpointGeneration === expected.endpointGeneration &&
+					resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+					(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation,
+			)
+			.map(event => event.indexSeq)
+			.sort((a, b) => a - b)[0];
+		const matching = this.#events.filter(
+			event =>
+				(supersededAt === undefined || event.indexSeq < supersededAt) &&
+				event.sessionId === expected.sessionId &&
+				event.endpointGeneration === expected.endpointGeneration &&
+				event.pid === expected.pid &&
+				resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+				event.processIncarnation === expected.processIncarnation &&
+				event.hostIncarnation === expected.hostIncarnation &&
+				event.endpointMtimeMs === expected.endpointMtimeMs &&
+				event.lifecycleRequestId === expected.lifecycleRequestId,
+		);
+		const latest = matching.findLast(event => event.type !== "host_heartbeat");
+		if (latest === undefined) return undefined;
+		return projectIdentity(
+			{
+				identity: identityKey(latest),
+				latest,
+				heartbeat: matching.findLast(event => event.type === "host_heartbeat"),
+			},
+			false,
+			this.#policy.clock(),
+		);
+	}
+
 	/** Returns the latest identity-bound terminal event, if retained. */
 	findSessionTerminalEvidence(
 		expected: Pick<
@@ -1789,11 +1838,25 @@ export class SessionIndex {
 		>,
 	): { type: "host_unregistered" | "session_closed" | "session_deleted"; indexSeq: number } | undefined {
 		const expectedRoot = resolveEquivalentPath(expected.locator.stateRoot);
-		const event = admitEvents(this.#events).admitted.findLast(
+		const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
+		const supersededAt = this.#events
+			.filter(
+				event =>
+					event.type === "host_registered" &&
+					event.sessionId === expected.sessionId &&
+					event.endpointGeneration === expected.endpointGeneration &&
+					resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+					(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation,
+			)
+			.map(event => event.indexSeq)
+			.sort((a, b) => a - b)[0];
+		const event = this.#events.findLast(
 			event =>
 				(event.type === "host_unregistered" ||
 					event.type === "session_closed" ||
 					event.type === "session_deleted") &&
+				(event.hostIncarnation ?? event.processIncarnation) === expectedIncarnation &&
+				(supersededAt === undefined || event.indexSeq < supersededAt) &&
 				event.sessionId === expected.sessionId &&
 				event.endpointGeneration === expected.endpointGeneration &&
 				event.pid === expected.pid &&
@@ -1824,9 +1887,22 @@ export class SessionIndex {
 		>,
 	): number | undefined {
 		const expectedRoot = resolveEquivalentPath(expected.locator.stateRoot);
-		return admitEvents(this.#events).admitted.findLast(
+		const expectedIncarnation = expected.hostIncarnation ?? expected.processIncarnation;
+		const supersededAt = this.#events
+			.filter(
+				event =>
+					event.type === "host_registered" &&
+					event.sessionId === expected.sessionId &&
+					event.endpointGeneration === expected.endpointGeneration &&
+					resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+					(event.hostIncarnation ?? event.processIncarnation) !== expectedIncarnation,
+			)
+			.map(event => event.indexSeq)
+			.sort((a, b) => a - b)[0];
+		return this.#events.findLast(
 			event =>
 				event.type === "session_closed" &&
+				(supersededAt === undefined || event.indexSeq < supersededAt) &&
 				event.sessionId === expected.sessionId &&
 				event.endpointGeneration === expected.endpointGeneration &&
 				event.pid === expected.pid &&
