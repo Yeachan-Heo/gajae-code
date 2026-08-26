@@ -1934,8 +1934,7 @@ export class ManagedSessionDescendantStore {
 		// otherwise descriptor-identical file: a malicious or racing writer can
 		// restore timestamps and length, so descriptor equality never waives it.
 		if (
-			!expected.sha256 ||
-			bounded.sha256 !== expected.sha256 ||
+			(expected.sha256 !== undefined && bounded.sha256 !== expected.sha256) ||
 			(!descriptorMatches &&
 				(bounded.dev !== expected.dev.toString() ||
 					bounded.ino !== expected.ino.toString() ||

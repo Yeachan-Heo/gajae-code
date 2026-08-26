@@ -597,7 +597,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		const sessionFile = manager.getSessionFile()!;
 		await manager.close();
 
-		const reopened = await SessionManager.open(sessionFile, destination);
+		const reopened = await SessionManager.open(sessionFile, destination, undefined, "copy-retain", "enabled");
 		try {
 			const before = fs.statSync(sessionFile);
 			fs.utimesSync(sessionFile, new Date(before.atimeMs + 1_000), new Date(before.mtimeMs + 1_000));
