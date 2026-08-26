@@ -24,7 +24,9 @@ import {
 	hashBytes,
 	isCanonicalReplacedProviderBackupPath,
 	type PersistedFileIdentity,
+	type SourceClaimReceipt,
 	serializeJson,
+	sourceClaimPath,
 } from "./json-publisher";
 
 export const PROVENANCE_VERSION = 1;
@@ -357,6 +359,12 @@ function isPersistedFileIdentity(value: unknown): value is PersistedFileIdentity
 		["dev", "ino", "parentDev", "parentIno", "size", "mtimeNs", "sha256"].every(
 			key => typeof value[key] === "string",
 		) &&
+		/^[0-9]+$/u.test(value.dev as string) &&
+		/^[0-9]+$/u.test(value.ino as string) &&
+		/^[0-9]+$/u.test(value.parentDev as string) &&
+		/^[0-9]+$/u.test(value.parentIno as string) &&
+		/^[0-9]+$/u.test(value.size as string) &&
+		/^-?[0-9]+$/u.test(value.mtimeNs as string) &&
 		/^[a-f0-9]{64}$/u.test(value.sha256 as string)
 	);
 }
@@ -442,6 +450,9 @@ export interface IntentPublishBackup {
 	readonly identity?: PersistedFileIdentity;
 }
 
+/** Authenticated POSIX source-claim and staging authority for an interrupted publish. */
+export type IntentSourceClaim = SourceClaimReceipt;
+
 /**
  * Durable, credential-free intent record.
  *
@@ -477,6 +488,8 @@ export interface IntentRecord {
 	readonly discardSidecar?: IntentDiscardSidecar;
 	/** Credential backup prepared by publication; retained until the step settles. */
 	readonly publishBackup?: IntentPublishBackup;
+	/** POSIX source hard-link claim and staging authority prepared before native mutation. */
+	readonly sourceClaim?: IntentSourceClaim;
 	readonly startedAt: string;
 }
 
@@ -504,6 +517,85 @@ function isIntentPublishBackup(value: unknown, targetPath: unknown): value is In
 	);
 }
 
+async function isIntentSourceClaim(value: unknown, targetPath: unknown): Promise<boolean> {
+	if (!isRecord(value) || typeof targetPath !== "string") return false;
+	if (
+		typeof value.claimPath !== "string" ||
+		typeof value.stagingPath !== "string" ||
+		!path.isAbsolute(value.claimPath) ||
+		!path.isAbsolute(value.stagingPath) ||
+		!isPersistedFileIdentity(value.identity)
+	)
+		return false;
+	const target = path.resolve(targetPath);
+	const claim = path.resolve(value.claimPath);
+	const staging = path.resolve(value.stagingPath);
+	const targetDir = path.dirname(target);
+	if (
+		claim === staging ||
+		path.dirname(claim) !== targetDir ||
+		path.dirname(staging) !== targetDir ||
+		!path.basename(staging).startsWith(`.${path.basename(target)}.`) ||
+		!path.basename(staging).endsWith(".tmp")
+	)
+		return false;
+	const [targetParent, stagingParent] = await Promise.all([
+		fs.realpath(path.dirname(target)).catch(() => undefined),
+		fs.realpath(path.dirname(staging)).catch(() => undefined),
+	]);
+	if (targetParent === undefined || stagingParent === undefined || targetParent !== stagingParent) return false;
+	try {
+		const claimName = path.basename(value.claimPath);
+		const operations = [
+			[
+				"rename" as const,
+				path.basename(sourceClaimPath(value.stagingPath, value.identity, 1, "rename")).slice(0, -1),
+				10,
+			],
+			[
+				"exact-replace" as const,
+				path.basename(sourceClaimPath(value.stagingPath, value.identity, 1, "exact-replace")).slice(0, -1),
+				16,
+			],
+		] as const;
+		let matched = false;
+		for (const [operation, prefix, radix] of operations) {
+			const processIdText = claimName.slice(prefix.length);
+			if (
+				!claimName.startsWith(prefix) ||
+				!new RegExp(`^[0-${radix === 10 ? "9" : "9a-f"}]+$`, "u").test(processIdText)
+			)
+				continue;
+			const processId = Number.parseInt(processIdText, radix);
+			if (!Number.isSafeInteger(processId) || processId <= 0) continue;
+			if (path.resolve(sourceClaimPath(value.stagingPath, value.identity, processId, operation)) === claim) {
+				matched = true;
+				break;
+			}
+		}
+		if (!matched) return false;
+	} catch {
+		return false;
+	}
+	if (value.retainedPaths !== undefined) {
+		if (
+			!Array.isArray(value.retainedPaths) ||
+			!value.retainedPaths.every(
+				candidate =>
+					typeof candidate === "string" &&
+					path.isAbsolute(candidate) &&
+					path.dirname(path.resolve(candidate)) === targetDir &&
+					(path.resolve(candidate) === claim ||
+						path.resolve(candidate) === staging ||
+						path.basename(candidate).startsWith(".gjc-paseo-source-") ||
+						path.basename(candidate).startsWith(".gjc-exact-unlink-placeholder-")),
+			)
+		)
+			return false;
+	}
+	return true;
+}
+
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
 	if (intent.version !== INTENT_VERSION) {
 		throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
@@ -519,6 +611,15 @@ export async function writeIntent(intentPath: string, intent: IntentRecord): Pro
 			intentPath,
 			"publishBackup is not an authenticated backup beside the target config",
 		);
+	}
+	if (intent.sourceClaim !== undefined && !(await isIntentSourceClaim(intent.sourceClaim, intent.targetPath))) {
+		throw new IntentRecordCorruptError(
+			intentPath,
+			"sourceClaim is not an authenticated source claim beside the target",
+		);
+	}
+	if (intent.sourceClaim !== undefined && intent.step === "skills-bridge") {
+		throw new IntentRecordCorruptError(intentPath, "sourceClaim is not valid for a skills bridge intent");
 	}
 	validateIntentPayload(intentPath, intent);
 	await fs.mkdir(path.dirname(intentPath), { recursive: true, mode: 0o700 });
@@ -710,6 +811,15 @@ export async function readIntent(intentPath: string): Promise<IntentRecord | und
 				intentPath,
 				"publishBackup is not an authenticated backup beside the target config",
 			);
+		}
+		if (parsed?.sourceClaim !== undefined && !(await isIntentSourceClaim(parsed.sourceClaim, parsed.targetPath))) {
+			throw new IntentRecordCorruptError(
+				intentPath,
+				"sourceClaim is not an authenticated source claim beside the target",
+			);
+		}
+		if (parsed?.sourceClaim !== undefined && parsed.step === "skills-bridge") {
+			throw new IntentRecordCorruptError(intentPath, "sourceClaim is not valid for a skills bridge intent");
 		}
 		return parsed;
 	} catch (error) {

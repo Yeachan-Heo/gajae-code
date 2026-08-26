@@ -48,6 +48,20 @@ export interface PersistedFileIdentity {
 	readonly sha256: string;
 }
 
+/**
+ * Durable authority for the private POSIX hard-link claim used by native
+ * regular-file publication. The claim and staging names share one inode, so
+ * one persisted identity authenticates either pathname without recording any
+ * file contents in the intent record.
+ */
+export interface SourceClaimReceipt {
+	readonly claimPath: string;
+	readonly stagingPath: string;
+	readonly identity: PersistedFileIdentity;
+	/** Native cleanup/quarantine paths retained after an identity-bound race. */
+	readonly retainedPaths?: readonly string[];
+}
+
 export function persistFileIdentity(identity: NativeExactFileIdentity): PersistedFileIdentity {
 	if (identity.parentDev === undefined || identity.parentIno === undefined || identity.sha256 === undefined) {
 		throw new Error("file identity is incomplete");
@@ -61,6 +75,59 @@ export function persistFileIdentity(identity: NativeExactFileIdentity): Persiste
 		mtimeNs: identity.mtimeNs.toString(),
 		sha256: identity.sha256,
 	};
+}
+
+function identityHex(value: bigint | string): string {
+	const numeric = typeof value === "bigint" ? value : BigInt(value);
+	if (numeric < 0n) throw new Error("file identity contains a negative device or inode");
+	return numeric.toString(16);
+}
+
+export type SourceClaimOperation = "rename" | "exact-replace";
+
+/**
+ * Compute the private source-claim pathname used by native expected-source
+ * publication exactly: source parent, lowercase
+ * hexadecimal device and inode, then the operation's process-id encoding
+ * (`rename` uses decimal; `exact-replace` uses hexadecimal).
+ */
+export function sourceClaimPath(
+	sourcePath: string,
+	sourceIdentity: { dev: bigint | string; ino: bigint | string },
+	processId = process.pid,
+	operation: SourceClaimOperation = "rename",
+): string {
+	if (!Number.isSafeInteger(processId) || processId <= 0) throw new Error("invalid source-claim process id");
+	const prefix = operation === "rename" ? ".gjc-rename-source" : ".gjc-exact-replace-source";
+	const processIdText = operation === "rename" ? String(processId) : processId.toString(16);
+	return path.join(
+		path.dirname(sourcePath),
+		`${prefix}-${identityHex(sourceIdentity.dev)}-${identityHex(sourceIdentity.ino)}-${processIdText}`,
+	);
+}
+
+function sourceClaimDescriptor(
+	claimPath: string,
+	identity: { dev: bigint | string; ino: bigint | string },
+): { readonly processId: number; readonly operation: SourceClaimOperation } | undefined {
+	try {
+		const identityPrefix = `${identityHex(identity.dev)}-${identityHex(identity.ino)}-`;
+		const name = path.basename(claimPath);
+		const candidates: readonly [SourceClaimOperation, string, (value: string) => number][] = [
+			["rename", `.gjc-rename-source-${identityPrefix}`, value => Number(value)],
+			["exact-replace", `.gjc-exact-replace-source-${identityPrefix}`, value => Number.parseInt(value, 16)],
+		];
+		for (const [operation, prefix, parse] of candidates) {
+			const processIdText = name.slice(prefix.length);
+			if (!name.startsWith(prefix) || !/^[0-9a-f]+$/u.test(processIdText)) continue;
+			if (operation === "rename" && !/^[0-9]+$/u.test(processIdText)) continue;
+			const processId = parse(processIdText);
+			if (Number.isSafeInteger(processId) && processId > 0) return { processId, operation };
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 function samePersistedIdentity(left: PersistedFileIdentity, right: PersistedFileIdentity): boolean {
@@ -196,6 +263,16 @@ export interface PublishOptions {
 	/** Take a mode-0600 backup beside the original before replacing it. */
 	readonly backup: boolean;
 	readonly now: Date;
+	/**
+	 * Persist source-claim authority before native creates its POSIX hard-link
+	 * claim. Windows keeps its pathname-rename protocol and never invokes this
+	 * callback.
+	 */
+	readonly onSourceClaimPrepared?: (
+		claimPath: string,
+		stagingPath: string,
+		identity: PersistedFileIdentity,
+	) => Promise<void>;
 	/** Persist cleanup authority before and after credential-bearing backup creation. */
 	readonly onBackupPrepared?: (
 		backupPath: string,
@@ -414,6 +491,13 @@ export async function publishPlan(
 					actual: await currentIdentity(targetPath),
 				});
 			}
+			if (process.platform !== "win32") {
+				await options.onSourceClaimPrepared?.(
+					sourceClaimPath(tempPath, sourceIdentity),
+					tempPath,
+					persistFileIdentity(sourceIdentity),
+				);
+			}
 			const linked = renameNoReplace(tempPath, targetPath, sourceIdentity);
 			if (!linked.ok) {
 				tempRetained = linked.detachedPath !== undefined || linked.mutationState !== "not_committed";
@@ -432,6 +516,13 @@ export async function publishPlan(
 			tempSourceRetained = linked.sourceRetained === true;
 			tempConsumed = !tempSourceRetained;
 		} else {
+			if (process.platform !== "win32") {
+				await options.onSourceClaimPrepared?.(
+					sourceClaimPath(tempPath, sourceIdentity, process.pid, "exact-replace"),
+					tempPath,
+					persistFileIdentity(sourceIdentity),
+				);
+			}
 			const replaced = exactReplacePath(tempPath, targetPath, sourceIdentity, expectedDestinationIdentity);
 			if (!replaced.ok) {
 				tempRetained =
@@ -846,6 +937,169 @@ async function removePrivateBackupByIdentity(
 	} catch {
 		return false;
 	}
+}
+
+export interface SourceClaimCleanupResult {
+	readonly removed: boolean;
+	readonly retained: readonly string[];
+}
+
+function sourceClaimCleanupName(receipt: SourceClaimReceipt, artifactPath: string, role: "claim" | "staging"): string {
+	const digest = hashBytes(
+		`${role}\0${path.basename(artifactPath)}\0${receipt.identity.dev}\0${receipt.identity.ino}`,
+	).slice(0, 24);
+	return `.gjc-paseo-source-${role}-${digest}`;
+}
+
+function nativeSourceClaimIdentity(
+	identity: PersistedFileIdentity,
+	quarantineName: string,
+): NativeExactFileIdentity | undefined {
+	if (
+		!/^[0-9]+$/u.test(identity.dev) ||
+		!/^[0-9]+$/u.test(identity.ino) ||
+		!/^[0-9]+$/u.test(identity.parentDev) ||
+		!/^[0-9]+$/u.test(identity.parentIno) ||
+		!/^[0-9]+$/u.test(identity.size) ||
+		!/^-?[0-9]+$/u.test(identity.mtimeNs) ||
+		!/^[a-f0-9]{64}$/u.test(identity.sha256)
+	)
+		return undefined;
+	try {
+		return {
+			dev: BigInt(identity.dev),
+			ino: BigInt(identity.ino),
+			parentDev: BigInt(identity.parentDev),
+			parentIno: BigInt(identity.parentIno),
+			size: BigInt(identity.size),
+			mtimeNs: BigInt(identity.mtimeNs),
+			sha256: identity.sha256,
+			quarantineName,
+			allowHardLink: true,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
+function sourceClaimNamespace(receipt: SourceClaimReceipt, candidate: string): boolean {
+	if (!path.isAbsolute(candidate)) return false;
+	const parent = path.dirname(path.resolve(receipt.stagingPath));
+	const resolved = path.resolve(candidate);
+	if (path.dirname(resolved) !== parent) return false;
+	if (resolved === path.resolve(receipt.claimPath) || resolved === path.resolve(receipt.stagingPath)) return true;
+	const name = path.basename(resolved);
+	return name.startsWith(".gjc-paseo-source-") || name.startsWith(".gjc-exact-unlink-placeholder-");
+}
+
+function normalizeSourceClaimRetainedPath(receipt: SourceClaimReceipt, candidate: unknown): string | undefined {
+	if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return undefined;
+	const name = path.basename(candidate);
+	if (
+		name !== path.basename(receipt.claimPath) &&
+		name !== path.basename(receipt.stagingPath) &&
+		!name.startsWith(".gjc-paseo-source-") &&
+		!name.startsWith(".gjc-exact-unlink-placeholder-")
+	)
+		return undefined;
+	return path.join(path.dirname(path.resolve(receipt.stagingPath)), name);
+}
+
+async function removeSourceArtifactByIdentity(
+	receipt: SourceClaimReceipt,
+	artifactPath: string,
+	identity: PersistedFileIdentity,
+	role: "claim" | "staging",
+): Promise<SourceClaimCleanupResult> {
+	const candidate = path.resolve(artifactPath);
+	if (!sourceClaimNamespace(receipt, candidate)) return { removed: false, retained: [candidate] };
+	let present: boolean;
+	try {
+		await fs.lstat(candidate);
+		present = true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removed: true, retained: [] };
+		return { removed: false, retained: [candidate] };
+	}
+	const canonical = await canonicalSidecarPathForNativeUnlink(candidate).catch(() => undefined);
+	const nativeIdentity = nativeSourceClaimIdentity(identity, sourceClaimCleanupName(receipt, candidate, role));
+	if (canonical === undefined || nativeIdentity === undefined) return { removed: false, retained: [candidate] };
+	try {
+		const result = exactUnlinkDirect(canonical, nativeIdentity);
+		if (result.ok || result.code === "not_found") return { removed: true, retained: [] };
+		const retained = [result.detachedPath, result.retainedPlaceholderPath, result.retainedUnknownPath]
+			.map(value => normalizeSourceClaimRetainedPath(receipt, value))
+			.filter((value): value is string => value !== undefined);
+		if (retained.length === 0) {
+			try {
+				await fs.lstat(candidate);
+				retained.push(candidate);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") retained.push(candidate);
+			}
+		}
+		return { removed: false, retained: [...new Set(retained)] };
+	} catch {
+		return { removed: false, retained: present ? [candidate] : [] };
+	}
+}
+
+/**
+ * Authenticate and remove the source hard-link claim and its staging name.
+ *
+ * Native source publication can leave either name (or a detached cleanup
+ * entry) behind after a crash. Every removal is bound to the persisted inode,
+ * parent, metadata, and digest; a missing pathname is success only after this
+ * receipt has already established that the artifact was part of this step.
+ */
+export async function removeSourceClaim(receipt: SourceClaimReceipt): Promise<SourceClaimCleanupResult> {
+	try {
+		const descriptor = sourceClaimDescriptor(receipt.claimPath, receipt.identity);
+		if (
+			!hasNoReparseSidecarAuthority() ||
+			!path.isAbsolute(receipt.claimPath) ||
+			!path.isAbsolute(receipt.stagingPath) ||
+			path.resolve(receipt.claimPath) === path.resolve(receipt.stagingPath) ||
+			path.dirname(path.resolve(receipt.claimPath)) !== path.dirname(path.resolve(receipt.stagingPath)) ||
+			descriptor === undefined ||
+			path.resolve(
+				sourceClaimPath(receipt.stagingPath, receipt.identity, descriptor.processId, descriptor.operation),
+			) !== path.resolve(receipt.claimPath)
+		)
+			return {
+				removed: false,
+				retained: [receipt.claimPath, receipt.stagingPath, ...(receipt.retainedPaths ?? [])],
+			};
+	} catch {
+		return {
+			removed: false,
+			retained: [receipt.claimPath, receipt.stagingPath, ...(receipt.retainedPaths ?? [])],
+		};
+	}
+	const retained: string[] = [];
+	const identity = receipt.identity;
+	const parent = path.dirname(path.resolve(receipt.stagingPath));
+	const cleanupCandidates = [
+		path.join(parent, sourceClaimCleanupName(receipt, receipt.claimPath, "claim")),
+		path.join(parent, sourceClaimCleanupName(receipt, receipt.stagingPath, "staging")),
+		...(receipt.retainedPaths ?? []),
+	];
+	for (const candidate of [...new Set(cleanupCandidates)]) {
+		const normalized = normalizeSourceClaimRetainedPath(receipt, candidate);
+		if (normalized === undefined) {
+			retained.push(String(candidate));
+			continue;
+		}
+		const result = path.basename(normalized).startsWith(".gjc-exact-unlink-placeholder-")
+			? { removed: false, retained: [normalized] }
+			: await removeSourceArtifactByIdentity(receipt, normalized, identity, "claim");
+		if (!result.removed) retained.push(...result.retained);
+	}
+	const claim = await removeSourceArtifactByIdentity(receipt, receipt.claimPath, identity, "claim");
+	if (!claim.removed) retained.push(...claim.retained);
+	const staging = await removeSourceArtifactByIdentity(receipt, receipt.stagingPath, identity, "staging");
+	if (!staging.removed) retained.push(...staging.retained);
+	return { removed: retained.length === 0, retained: [...new Set(retained)] };
 }
 
 /**

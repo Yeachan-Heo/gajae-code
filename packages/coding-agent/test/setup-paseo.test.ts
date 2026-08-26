@@ -34,6 +34,7 @@ import {
 	removeReplacedProviderBackup,
 	replacedProviderBackupPath,
 	serializeJson,
+	sourceClaimPath,
 	writeReplacedProviderBackup,
 } from "../src/setup/paseo/json-publisher";
 import { createOrchestrationSeed } from "../src/setup/paseo/orchestration-preferences";
@@ -4960,6 +4961,77 @@ describe("intent recovery", () => {
 	test("target never written means discard", async () => {
 		const { intent } = await intentFixture();
 		expect((await classifyIntent(intent)).action).toBe("discard");
+	});
+
+	test("source claim receipt retains a before/before intent until authenticated cleanup", async () => {
+		if (process.platform === "win32") return;
+		const fixture = await makeFixture();
+		let claimPath: string | undefined;
+		let stagingPath: string | undefined;
+		await expect(
+			runJsonStep({
+				label: fixture.paths.configJson,
+				step: "provider-config",
+				targetPath: fixture.paths.configJson,
+				provenancePath: fixture.paths.provenanceLedger,
+				intentPath: fixture.paths.intentRecord,
+				ownedKeys: ["agents.providers.gjc"],
+				mutate: draft => {
+					draft.createdByGjc = true;
+				},
+				nextLedger: ledger => ({
+					...ledger,
+					providerKeys: { ...ledger.providerKeys, gjc: "created-by-gjc" },
+				}),
+				revert: draft => {
+					delete draft.createdByGjc;
+				},
+				revertLedger: ledger => ledger,
+				renameNoReplace: (source, _destination, expected) => {
+					if (expected === undefined) throw new Error("missing source identity");
+					const claim = sourceClaimPath(source, expected);
+					claimPath = claim;
+					stagingPath = source;
+					const claimed = paseoNatives.linkNoReplacePath(source, claim);
+					if (!claimed.ok) throw new Error(`source claim failed: ${claimed.code ?? "unknown"}`);
+					return {
+						ok: false,
+						code: "simulated_crash_after_source_claim",
+						mutationState: "committed",
+						durabilityState: "durable",
+						reason: "simulated_crash",
+						primitive: "test",
+						phase: "source_claim",
+						diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+					};
+				},
+				now: new Date("2026-01-01T00:00:00.000Z"),
+			}),
+		).rejects.toBeInstanceOf(SagaStepError);
+
+		expect(claimPath).toBeDefined();
+		expect(stagingPath).toBeDefined();
+		const retained = await readIntent(fixture.paths.intentRecord);
+		expect(retained?.sourceClaim).toMatchObject({
+			claimPath,
+			stagingPath,
+		});
+		await expect(fs.stat(claimPath as string)).resolves.toBeDefined();
+		await expect(fs.stat(stagingPath as string)).resolves.toBeDefined();
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [
+				fixture.paths.configJson,
+				fixture.paths.orchestrationPreferences,
+				fixture.paths.bridgeDir,
+			],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+		});
+		expect(recovery?.recovered).toBe(true);
+		await expect(readIntent(fixture.paths.intentRecord)).resolves.toBeUndefined();
+		await expect(fs.stat(claimPath as string)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.stat(stagingPath as string)).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	test("discard recovery removes a generic publication backup and clears its authority", async () => {

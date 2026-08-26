@@ -25,11 +25,14 @@ import {
 	hasNoReparseSidecarAuthority,
 	PaseoPublishError,
 	type PersistedFileIdentity,
+	type PublishOptions,
 	planPublish,
 	publishPlan,
 	readTarget,
 	removeDiscardSidecar,
 	removePublishBackup,
+	removeSourceClaim,
+	type SourceClaimReceipt,
 } from "./json-publisher";
 import {
 	type BridgeCleanupAuthority,
@@ -152,6 +155,8 @@ export interface JsonStepInput {
 	readonly unpersist?: () => Promise<void>;
 	/** Sidecar proof written into the intent before {@link persist} creates it. */
 	readonly discardSidecar?: IntentDiscardSidecar;
+	/** Test-only native publication seam; production uses the native default. */
+	readonly renameNoReplace?: PublishOptions["renameNoReplace"];
 	readonly now: Date;
 }
 
@@ -220,6 +225,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 	};
 	await writeIntent(input.intentPath, intent);
 
+	let sourceClaim: SourceClaimReceipt | undefined;
 	let backupPath: string | undefined;
 	let backupValueSha256: string | undefined;
 	let backupIdentity: PersistedFileIdentity | undefined;
@@ -242,6 +248,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				provenancePayload: ledgerAfter,
 				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
 				discardSidecar: input.discardSidecar,
+				...(sourceClaim === undefined ? {} : { sourceClaim }),
 			});
 		}
 		if (input.verifyPersisted) await input.verifyPersisted();
@@ -249,6 +256,25 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			expectedIdentity: current.identity,
 			backup: true,
 			now: input.now,
+			onSourceClaimPrepared: async (claimPath, stagingPath, identity) => {
+				sourceClaim = { claimPath, stagingPath, identity };
+				await writeIntent(input.intentPath, {
+					...intent,
+					provenancePayload: ledgerAfter,
+					provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
+					discardSidecar: input.discardSidecar,
+					sourceClaim,
+					...(backupPath !== undefined && backupValueSha256 !== undefined
+						? {
+								publishBackup: {
+									backupPath,
+									valueSha256: backupValueSha256,
+									...(backupIdentity === undefined ? {} : { identity: backupIdentity }),
+								},
+							}
+						: {}),
+				});
+			},
 			onBackupPrepared: async (preparedBackupPath, valueSha256, identity?: PersistedFileIdentity) => {
 				backupPath = preparedBackupPath;
 				backupValueSha256 = valueSha256;
@@ -263,11 +289,31 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 						valueSha256,
 						...(identity === undefined ? {} : { identity }),
 					},
+					...(sourceClaim === undefined ? {} : { sourceClaim }),
 				});
 			},
+			renameNoReplace: input.renameNoReplace,
 		});
 		backupPath = published.backupPath;
 		publishSucceeded = published.published;
+		if (sourceClaim !== undefined) {
+			sourceClaim = undefined;
+			await writeIntent(input.intentPath, {
+				...intent,
+				provenancePayload: ledgerAfter,
+				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
+				discardSidecar: input.discardSidecar,
+				...(backupPath !== undefined && backupValueSha256 !== undefined
+					? {
+							publishBackup: {
+								backupPath,
+								valueSha256: backupValueSha256,
+								...(backupIdentity === undefined ? {} : { identity: backupIdentity }),
+							},
+						}
+					: {}),
+			});
+		}
 		await writeProvenance(input.provenancePath, ledgerAfter);
 		if (backupPath !== undefined && backupValueSha256 !== undefined && backupIdentity === undefined) {
 			throw new SagaStepError(
@@ -291,6 +337,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 	} catch (error) {
 		if (
 			persistAttempted ||
+			sourceClaim !== undefined ||
 			backupPath !== undefined ||
 			backupValueSha256 !== undefined ||
 			backupIdentity !== undefined
@@ -300,6 +347,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				provenancePayload: ledgerAfter,
 				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
 				discardSidecar: input.discardSidecar,
+				...(sourceClaim === undefined ? {} : { sourceClaim }),
 				...(backupPath !== undefined && backupValueSha256 !== undefined
 					? {
 							publishBackup: {
@@ -514,6 +562,24 @@ async function pathPresentWithoutFollowing(value: string): Promise<boolean> {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
 		throw error;
 	}
+}
+
+async function cleanupSourceClaimReceipt(
+	intentPath: string,
+	intent: IntentRecord,
+): Promise<{ readonly removed: boolean; readonly detail?: string }> {
+	if (intent.sourceClaim === undefined) return { removed: true };
+	const cleanup = await removeSourceClaim(intent.sourceClaim);
+	if (cleanup.removed) return { removed: true };
+	const sourceClaim =
+		cleanup.retained.length === 0
+			? intent.sourceClaim
+			: { ...intent.sourceClaim, retainedPaths: [...new Set(cleanup.retained)] };
+	await writeIntent(intentPath, { ...intent, sourceClaim }).catch(() => undefined);
+	return {
+		removed: false,
+		detail: `authenticated source claim/staging cleanup remains pending at ${cleanup.retained.join(", ") || intent.sourceClaim.claimPath}`,
+	};
 }
 
 async function bridgeLedgerMatchesFilesystem(
@@ -1187,6 +1253,44 @@ export async function recoverIntent(
 	if (!options.repair) return { recovered: false, detail: recovery.detail };
 	if (recovery.action === "discard") {
 		let discardSidecarRemoved = false;
+		let sourceClaimRemoved = false;
+		if (intent.sourceClaim !== undefined) {
+			const [targetObserved, ledgerObserved] = await Promise.all([
+				currentIdentity(intent.targetPath),
+				currentIdentity(intent.provenancePath),
+			]);
+			const targetState = classifyIdentity(
+				targetObserved,
+				intent.targetPreflightIdentity,
+				intent.targetExpectedIdentity,
+			);
+			const ledgerState = classifyIdentity(
+				ledgerObserved,
+				intent.provenancePreflightIdentity,
+				intent.provenanceExpectedIdentity,
+			);
+			if (targetState === "divergent" || ledgerState === "divergent") {
+				return {
+					recovered: false,
+					detail: `${recovery.detail}; recovery state changed while authenticating source-claim cleanup; retaining the intent`,
+				};
+			}
+			const sourceCleanup = await cleanupSourceClaimReceipt(intentPath, intent);
+			if (!sourceCleanup.removed) {
+				return { recovered: false, detail: `${recovery.detail}; ${sourceCleanup.detail}` };
+			}
+			const [targetAfterCleanup, ledgerAfterCleanup] = await Promise.all([
+				currentIdentity(intent.targetPath),
+				currentIdentity(intent.provenancePath),
+			]);
+			if (targetAfterCleanup !== targetObserved || ledgerAfterCleanup !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: `${recovery.detail}; recovery state changed during source-claim cleanup; retaining the intent`,
+				};
+			}
+			sourceClaimRemoved = true;
+		}
 		// A sidecar is disposable only when the target never reached its intended
 		// identity. If both target and ledger writes landed, the ledger now owns
 		// the sidecar and it must survive for `--remove` restoration. Re-read the
@@ -1307,11 +1411,23 @@ export async function recoverIntent(
 		try {
 			await clearIntent(intentPath);
 		} catch (error) {
-			if (!discardSidecarRemoved || intent.discardSidecar === undefined) throw error;
+			if (
+				(!discardSidecarRemoved || intent.discardSidecar === undefined) &&
+				(!sourceClaimRemoved || intent.sourceClaim === undefined)
+			)
+				throw error;
 			// The authenticated artifact is already gone. Remove its cleanup
 			// authority from the durable intent before retrying the clear, so a
 			// later recovery cannot fail forever on an intentionally absent file.
-			const { discardSidecar: _discardSidecar, ...safeIntent } = intent;
+			let safeIntent: IntentRecord = intent;
+			if (discardSidecarRemoved) {
+				const { discardSidecar: _discardSidecar, ...withoutDiscardSidecar } = safeIntent;
+				safeIntent = withoutDiscardSidecar;
+			}
+			if (sourceClaimRemoved) {
+				const { sourceClaim: _sourceClaim, ...withoutSourceClaim } = safeIntent;
+				safeIntent = withoutSourceClaim;
+			}
 			await writeIntent(intentPath, safeIntent);
 			await clearIntent(intentPath);
 		}
@@ -1346,6 +1462,12 @@ export async function recoverIntent(
 		};
 	}
 	await writeProvenance(intent.provenancePath, validatedPending);
+	if (intent.sourceClaim !== undefined) {
+		const sourceCleanup = await cleanupSourceClaimReceipt(intentPath, intent);
+		if (!sourceCleanup.removed) {
+			return { recovered: false, detail: `${recovery.detail}; ${sourceCleanup.detail}` };
+		}
+	}
 	if (intent.publishBackup !== undefined && (await pathPresentWithoutFollowing(intent.publishBackup.backupPath))) {
 		if (intent.publishBackup.identity === undefined) {
 			return {
