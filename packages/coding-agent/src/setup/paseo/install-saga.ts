@@ -481,7 +481,24 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 					backup: false,
 					now: input.now,
 				});
-				await writeProvenance(input.provenancePath, input.revertLedger(await readProvenance(input.provenancePath)));
+				const revertedLedger = input.revertLedger(await readProvenance(input.provenancePath));
+				await writeProvenance(input.provenancePath, revertedLedger);
+				const pendingBridgeIntent = await readIntent(input.intentPath);
+				if (
+					pendingBridgeIntent?.step === "skills-bridge" &&
+					pendingBridgeIntent.provenancePath === input.provenancePath
+				) {
+					// Bridge compensation can undo an earlier JSON step after a partial
+					// migration has already rewritten the ledger to Q. Keep the bridge
+					// intent's expected payload synchronized with that authenticated
+					// non-bridge rollback, otherwise recovery sees a false ledger
+					// divergence and cannot converge P/Q.
+					await writeIntent(input.intentPath, {
+						...pendingBridgeIntent,
+						provenanceExpectedIdentity: provenanceLedgerIdentity(revertedLedger),
+						provenancePayload: revertedLedger,
+					});
+				}
 				if (persistAttempted && input.unpersist) await input.unpersist();
 				return { status: "reverted" };
 			},
