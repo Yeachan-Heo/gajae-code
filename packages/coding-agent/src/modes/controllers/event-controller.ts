@@ -25,6 +25,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import { completionNotifyDisabledByEnv } from "../../sdk/bus/config";
 import { summaryFromMessage } from "../../sdk/bus/helpers";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import { getLocalSubmissionId } from "../../session/local-submission-identity";
 import { type CustomMessage, isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import { transferSessionMessageIdentity } from "../../session/session-manager";
 import type { ResolveToolDetails } from "../../tools/resolve";
@@ -418,13 +419,14 @@ export class EventController {
 			const signature = `${textContent}\u0000${imageCount}`;
 
 			this.#resetReadGroup();
-			const optimisticSignatures = this.ctx.optimisticUserMessageSignatures as
-				| (Set<string> & { consumeDelivered?: (value: string) => boolean })
-				| undefined;
-			const wasCountedOptimistic =
-				optimisticSignatures?.consumeDelivered?.(signature) ?? optimisticSignatures?.delete(signature) ?? false;
+			const optimisticSubmissionId = getLocalSubmissionId(event.message);
+			const wasCountedOptimistic = optimisticSubmissionId
+				? (this.ctx.optimisticUserMessageIds?.delete(optimisticSubmissionId) ?? false)
+				: false;
 			const wasSingleOptimistic =
-				!optimisticSignatures && !wasCountedOptimistic && this.ctx.optimisticUserMessageSignature === signature;
+				!this.ctx.optimisticUserMessageIds &&
+				!wasCountedOptimistic &&
+				this.ctx.optimisticUserMessageSignature === signature;
 			const wasInjectedOptimistic =
 				!wasCountedOptimistic && !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
 			const wasOptimistic = wasCountedOptimistic || wasSingleOptimistic || wasInjectedOptimistic;

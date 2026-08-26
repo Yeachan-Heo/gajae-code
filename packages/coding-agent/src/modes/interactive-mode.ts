@@ -47,6 +47,7 @@ import {
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
 import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
+import { createLocalSubmissionId } from "../session/local-submission-identity";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
 import type { LspStartupServerInfo } from "../tools";
@@ -220,55 +221,6 @@ class CountedSignatureSet extends Set<string> {
 
 	override clear(): void {
 		this.#counts.clear();
-		super.clear();
-	}
-}
-
-class LocalSubmissionSignatureSet extends Set<string> {
-	#pendingCounts = new Map<string, number>();
-	#deliveredCredits = new Map<string, number>();
-
-	#sync(signature: string): void {
-		const count = (this.#pendingCounts.get(signature) ?? 0) + (this.#deliveredCredits.get(signature) ?? 0);
-		if (count > 0) super.add(signature);
-		else super.delete(signature);
-	}
-
-	override add(signature: string): this {
-		this.#pendingCounts.set(signature, (this.#pendingCounts.get(signature) ?? 0) + 1);
-		super.add(signature);
-		return this;
-	}
-
-	consumeDelivered(signature: string): boolean {
-		const pending = this.#pendingCounts.get(signature) ?? 0;
-		if (pending === 0) return false;
-		if (pending === 1) this.#pendingCounts.delete(signature);
-		else this.#pendingCounts.set(signature, pending - 1);
-		this.#deliveredCredits.set(signature, (this.#deliveredCredits.get(signature) ?? 0) + 1);
-		this.#sync(signature);
-		return true;
-	}
-
-	override delete(signature: string): boolean {
-		const delivered = this.#deliveredCredits.get(signature) ?? 0;
-		if (delivered > 0) {
-			if (delivered === 1) this.#deliveredCredits.delete(signature);
-			else this.#deliveredCredits.set(signature, delivered - 1);
-			this.#sync(signature);
-			return true;
-		}
-		const pending = this.#pendingCounts.get(signature) ?? 0;
-		if (pending === 0) return false;
-		if (pending === 1) this.#pendingCounts.delete(signature);
-		else this.#pendingCounts.set(signature, pending - 1);
-		this.#sync(signature);
-		return true;
-	}
-
-	override clear(): void {
-		this.#pendingCounts.clear();
-		this.#deliveredCredits.clear();
 		super.clear();
 	}
 }
@@ -491,7 +443,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
-	optimisticUserMessageSignatures: Set<string> = new LocalSubmissionSignatureSet();
+	optimisticUserMessageIds: Set<string> = new Set();
 	locallySubmittedUserSignatures: Set<string> = new CountedSignatureSet();
 	optimisticInjectedSignatures: Map<string, number> = new Map();
 	/** Submissions whose prompt delivery has not settled yet. The input loop can
@@ -1281,6 +1233,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			images: input.images,
 			customType: input.customType,
 			display: input.display,
+			localSubmissionId: input.customType ? undefined : createLocalSubmissionId(),
 			cancelled: false,
 			started: false,
 		};
@@ -1290,12 +1243,13 @@ export class InteractiveMode implements InteractiveModeContext {
 			const imageCount = submission.images?.length ?? 0;
 			const signature = `${submission.text}\u0000${imageCount}`;
 			this.optimisticUserMessageSignature = signature;
-			this.optimisticUserMessageSignatures.add(signature);
-			const disposeLocalSubmission = this.recordLocalSubmission(submission.text, imageCount);
-			this.#pendingSubmissionDisposals.set(submission, () => {
-				this.optimisticUserMessageSignatures.delete(signature);
-				disposeLocalSubmission();
-			});
+			const localSubmissionId = submission.localSubmissionId;
+			if (localSubmissionId) {
+				this.optimisticUserMessageIds.add(localSubmissionId);
+				this.#pendingSubmissionDisposals.set(submission, () => {
+					this.optimisticUserMessageIds.delete(localSubmissionId);
+				});
+			}
 			this.addMessageToChat({
 				role: "user",
 				content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],

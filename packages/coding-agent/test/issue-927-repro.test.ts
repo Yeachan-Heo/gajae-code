@@ -85,12 +85,14 @@ describe("issue #927 optimistic pending spinner", () => {
 		expect(mode.hasPendingSubmission()).toBe(true);
 		expect(mode.loadingAnimation).toBeDefined();
 		expect(mode.locallySubmittedUserSignatures.has("first follow-up\u00000")).toBe(false);
-		expect(mode.locallySubmittedUserSignatures.has("second follow-up\u00000")).toBe(true);
+		expect(mode.locallySubmittedUserSignatures.has("second follow-up\u00000")).toBe(false);
+		expect(mode.optimisticUserMessageIds.size).toBe(1);
 
 		mode.finishPendingSubmission(second);
 		expect(mode.hasPendingSubmission()).toBe(false);
 		expect(mode.loadingAnimation).toBeUndefined();
 		expect(mode.locallySubmittedUserSignatures.has("second follow-up\u00000")).toBe(false);
+		expect(mode.optimisticUserMessageIds.size).toBe(0);
 	});
 
 	it("retains duplicate local signature leases until every owner settles", () => {
@@ -105,15 +107,19 @@ describe("issue #927 optimistic pending spinner", () => {
 	});
 
 	it("retains duplicate optimistic leases until every submission settles", () => {
-		const signature = "same optimistic\u00000";
 		const first = mode.startPendingSubmission({ text: "same optimistic" });
 		const second = mode.startPendingSubmission({ text: "same optimistic" });
+		const firstId = first.localSubmissionId;
+		const secondId = second.localSubmissionId;
+		expect(firstId).toBeDefined();
+		expect(secondId).toBeDefined();
 
-		expect(mode.optimisticUserMessageSignatures.has(signature)).toBe(true);
+		expect(mode.optimisticUserMessageIds.size).toBe(2);
 		mode.finishPendingSubmission(first);
-		expect(mode.optimisticUserMessageSignatures.has(signature)).toBe(true);
+		expect(firstId ? mode.optimisticUserMessageIds.has(firstId) : false).toBe(false);
+		expect(secondId ? mode.optimisticUserMessageIds.has(secondId) : false).toBe(true);
 		mode.finishPendingSubmission(second);
-		expect(mode.optimisticUserMessageSignatures.has(signature)).toBe(false);
+		expect(mode.optimisticUserMessageIds.size).toBe(0);
 	});
 
 	it("defers extension shutdown until every admitted delivery settles", async () => {

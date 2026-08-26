@@ -48,6 +48,7 @@ export type SubmittedUserInput = {
 	images?: ImageContent[];
 	customType?: string;
 	display?: boolean;
+	localSubmissionId?: string;
 	cancelled: boolean;
 	started: boolean;
 };
@@ -230,7 +231,7 @@ export interface InteractiveModeContext {
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined;
-	optimisticUserMessageSignatures?: Set<string>;
+	optimisticUserMessageIds?: Set<string>;
 	locallySubmittedUserSignatures: Set<string>;
 	optimisticInjectedSignatures: Map<string, number>;
 	lastSigintTime: number;

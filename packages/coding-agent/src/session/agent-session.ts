@@ -441,6 +441,7 @@ import {
 } from "./contribution-prep";
 import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
+import { markLocalSubmission } from "./local-submission-identity";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -1027,6 +1028,8 @@ export interface PromptOptions {
 	synthetic?: boolean;
 	/** Explicit billing/initiator attribution for the prompt. Defaults to user prompts as `user` and synthetic prompts as `agent`. */
 	attribution?: MessageAttribution;
+	/** Transient local UI correlation for optimistic user-message reconciliation. */
+	localSubmissionId?: string;
 	/** Skip pre-send compaction checks for this prompt (internal use for maintenance flows). */
 	skipCompactionCheck?: boolean;
 	/**
@@ -10413,6 +10416,8 @@ export class AgentSession {
 							timestamp: Date.now(),
 						}
 					: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+				if (!options?.synthetic && options?.localSubmissionId)
+					markLocalSubmission(message, options.localSubmissionId);
 				if (deepInterviewUserIntentEpoch !== undefined)
 					this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
 				await this.refreshGjcSubskillTools();

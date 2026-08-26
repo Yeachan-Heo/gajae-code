@@ -5,6 +5,7 @@ import { IrcObservationLedger } from "@gajae-code/coding-agent/modes/irc-observa
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { UiHelpers } from "@gajae-code/coding-agent/modes/utils/ui-helpers";
+import { markLocalSubmission } from "@gajae-code/coding-agent/session/local-submission-identity";
 import type { CustomMessage } from "@gajae-code/coding-agent/session/messages";
 
 import { Container } from "@gajae-code/tui";
@@ -22,28 +23,10 @@ function createUserMessage(text: string): UserMessage {
 	};
 }
 
-class CountedSignatureSet extends Set<string> {
-	#counts = new Map<string, number>();
-
-	constructor(entries: Array<[string, number]>) {
-		super(entries.map(([signature]) => signature));
-		for (const [signature, count] of entries) this.#counts.set(signature, count);
-	}
-
-	consumeDelivered(signature: string): boolean {
-		const count = this.#counts.get(signature) ?? 0;
-		if (count === 0) return false;
-		if (count === 1) this.#counts.delete(signature);
-		else this.#counts.set(signature, count - 1);
-		if (count === 1) super.delete(signature);
-		return true;
-	}
-}
-
 function createContext(options: {
 	editorText: string;
 	optimisticSignature?: string;
-	optimisticSignatures?: Array<[string, number]>;
+	optimisticIds?: string[];
 	locallySubmittedSignatures?: string[];
 	injectedSignatures?: Array<[string, number]>;
 	transcriptViewerOpen?: boolean;
@@ -75,8 +58,7 @@ function createContext(options: {
 						.map(c => c.text)
 						.join(""),
 		optimisticUserMessageSignature: options.optimisticSignature,
-		optimisticUserMessageSignatures:
-			options.optimisticSignatures === undefined ? undefined : new CountedSignatureSet(options.optimisticSignatures),
+		optimisticUserMessageIds: options.optimisticIds === undefined ? undefined : new Set(options.optimisticIds),
 		locallySubmittedUserSignatures: new Set<string>(options.locallySubmittedSignatures ?? []),
 		optimisticInjectedSignatures: new Map<string, number>(options.injectedSignatures ?? []),
 		...(options.transcriptViewerOpen !== undefined
@@ -188,19 +170,42 @@ describe("EventController message_start (user role)", () => {
 	});
 
 	it("tracks overlapping identical optimistic submissions independently", async () => {
-		const message = createUserMessage("same optimistic send");
+		const firstMessage = createUserMessage("same optimistic send");
+		const secondMessage = createUserMessage("same optimistic send");
 		const signature = "same optimistic send\u00000";
+		markLocalSubmission(firstMessage, "optimistic-1");
+		markLocalSubmission(secondMessage, "optimistic-2");
 		const { ctx, setText, addMessageToChat } = createContext({
 			editorText: "",
-			optimisticSignatures: [[signature, 2]],
+			optimisticIds: ["optimistic-1", "optimistic-2"],
 			locallySubmittedSignatures: [signature],
 		});
 		const controller = new EventController(ctx);
 
-		await controller.handleEvent({ type: "message_start", message });
-		await controller.handleEvent({ type: "message_start", message });
+		await controller.handleEvent({ type: "message_start", message: firstMessage });
+		await controller.handleEvent({ type: "message_start", message: secondMessage });
 
 		expect(addMessageToChat).not.toHaveBeenCalled();
+		expect(setText).not.toHaveBeenCalled();
+	});
+
+	it("does not let a queued same-signature message consume optimistic ownership", async () => {
+		const queuedMessage = createUserMessage("same producer text");
+		const optimisticMessage = createUserMessage("same producer text");
+		const signature = "same producer text\u00000";
+		markLocalSubmission(optimisticMessage, "optimistic-only");
+		const { ctx, addMessageToChat, setText } = createContext({
+			editorText: "draft",
+			optimisticIds: ["optimistic-only"],
+			locallySubmittedSignatures: [signature],
+		});
+		const controller = new EventController(ctx);
+
+		await controller.handleEvent({ type: "message_start", message: queuedMessage });
+		await controller.handleEvent({ type: "message_start", message: optimisticMessage });
+
+		expect(addMessageToChat).toHaveBeenCalledTimes(1);
+		expect(addMessageToChat).toHaveBeenCalledWith(queuedMessage);
 		expect(setText).not.toHaveBeenCalled();
 	});
 
