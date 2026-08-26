@@ -237,4 +237,34 @@ describe("AsyncJobManager delivery reliability", () => {
 			await manager.dispose({ timeoutMs: 250 });
 		}
 	});
+
+	test("queue-overflow delivery drop preserves evicted dead-letter evidence", async () => {
+		const deliveryGate = Promise.withResolvers<void>();
+		let deliveryAttempts = 0;
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 150,
+			retentionMs: 0,
+			onJobComplete: async () => {
+				deliveryAttempts += 1;
+				if (deliveryAttempts === 1) await deliveryGate.promise;
+			},
+		});
+
+		try {
+			for (let index = 0; index < 110; index += 1) {
+				manager.register("bash", `overflow ${index}`, async () => `payload-${index}`, {
+					metadata: { backgrounded: true },
+				});
+			}
+			await waitFor(() => manager.getDeliveryState().deadLettered > 0, 4_000);
+			const snapshot = manager.getJobsSnapshot();
+			expect(snapshot.deadLettered.length).toBeGreaterThan(0);
+			expect(snapshot.deadLettered.every(entry => entry.backgrounded)).toBe(true);
+			deliveryGate.resolve();
+			await manager.waitForAll();
+		} finally {
+			deliveryGate.resolve();
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
 });

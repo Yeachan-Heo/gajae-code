@@ -341,4 +341,32 @@ describe("BashTool ACP terminal fold", () => {
 		expect(text).toContain("normal-exit diagnostics");
 		expect(text).toContain("Terminal output recovery failed");
 	});
+
+	it("retains polled ACP output when abort races final recovery", async () => {
+		let outputReads = 0;
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const pendingOutput = new Promise<ClientBridgeTerminalOutput>(() => {});
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-abort-recovery",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "abort diagnostics\n", truncated: false };
+				return pendingOutput;
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const controller = new AbortController();
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		const resultPromise = tool.execute("call-abort-recovery", { command: "echo done" }, controller.signal, () => {});
+		await waitFor(() => outputReads === 1);
+		exit.resolve({ exitCode: 0, signal: null });
+		await waitFor(() => outputReads === 2);
+		controller.abort();
+		await expect(resultPromise).rejects.toThrow(/abort diagnostics[\s\S]*Command aborted/);
+	});
 });

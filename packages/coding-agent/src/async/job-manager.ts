@@ -2854,6 +2854,12 @@ export class AsyncJobManager {
 		this.#notifyChange();
 	}
 
+	#recordDeadLetterOrEvicted(delivery: AsyncJobDelivery): void {
+		const currentJob = this.#jobs.get(delivery.jobId);
+		if (currentJob?.generation === delivery.generation) this.#recordDeadLetter(delivery);
+		else this.#recordEvictedDeadLetter(delivery);
+	}
+
 	#enqueueDelivery(jobId: string, text: string): void {
 		const job = this.#jobs.get(jobId);
 		if (!job || this.#isDeliveryAcknowledged(jobId, job.generation)) return;
@@ -2871,7 +2877,7 @@ export class AsyncJobManager {
 		});
 		while (this.#deliveries.length > DEFAULT_MAX_DELIVERY_QUEUE) {
 			const dropped = this.#deliveries.shift();
-			if (dropped) this.#recordDeadLetter(dropped);
+			if (dropped) this.#recordDeadLetterOrEvicted(dropped);
 		}
 		this.#notifyChange();
 		this.#ensureDeliveryLoop();
@@ -2948,8 +2954,7 @@ export class AsyncJobManager {
 					// already-evicted job's cap failure would leave no visible terminal
 					// state at all. The queue-overflow drop path keeps its existing
 					// behavior and is deliberately unchanged.
-					if (this.#jobs.has(delivery.jobId)) this.#recordDeadLetter(delivery);
-					else this.#recordEvictedDeadLetter(delivery);
+					this.#recordDeadLetterOrEvicted(delivery);
 					logger.warn("Async job completion delivery reached retry cap", {
 						jobId: delivery.jobId,
 						attempt: delivery.attempt,
