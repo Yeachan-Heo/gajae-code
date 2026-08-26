@@ -2395,8 +2395,17 @@ export async function createMCPManager(
 }> {
 	const manager =
 		options?.configPath !== undefined
-			? new MCPManager(cwd, null, { toolsOnly: true, sharedPoolIdleMs: options?.sharedPoolIdleMs })
-			: new MCPManager(cwd, null, { sharedPoolIdleMs: options?.sharedPoolIdleMs });
+			? new MCPManager(cwd, null, {
+					toolsOnly: true,
+					sharedPoolIdleMs: options?.sharedPoolIdleMs,
+					agentDir: options?.agentDir,
+					settings: options?.settings,
+				})
+			: new MCPManager(cwd, null, {
+					sharedPoolIdleMs: options?.sharedPoolIdleMs,
+					agentDir: options?.agentDir,
+					settings: options?.settings,
+				});
 	const result = await manager.discoverAndConnect(options);
 	return { manager, result };
 }

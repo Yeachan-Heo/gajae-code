@@ -527,7 +527,9 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 		pathOf: server => server._source.path,
 		extensionIdOf: server => mcpCapability.toExtensionId?.(server),
 	});
-	const disabledServers = new Set(await readDisabledServers(getMCPConfigPath("user", cwd)));
+	const disabledServers = new Set(
+		await readDisabledServers(getMCPConfigPath("user", cwd, activeSettings.getAgentDir())),
+	);
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// The startup projection: `loadAllMCPConfigs` is what a session uses when

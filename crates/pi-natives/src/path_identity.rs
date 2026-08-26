@@ -4879,6 +4879,9 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
+		if let Err(code) = fsync_root_parent(skill_fd) {
+			return NativeSecureSkillWriteResult::failure(code);
+		}
 		drop(file);
 		unsafe {
 			libc::close(skill_fd);

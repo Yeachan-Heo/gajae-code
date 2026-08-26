@@ -203,6 +203,8 @@ async function withPreparedMcpConnection<T>(
 ): Promise<T> {
 	const manager = new MCPManager(runtime.cwd, null, {
 		sharedPoolIdleMs: runtime.settings.get("mcp.sharedPoolIdleMs"),
+		agentDir: runtime.settings.getAgentDir(),
+		settings: runtime.settings,
 	});
 	// Auth storage must be wired in before the prepared lease so OAuth-backed
 	// servers can refresh credentials and inject Authorization headers.
@@ -312,7 +314,7 @@ async function handleSmitherySearchCommand(rest: string, runtime: SlashCommandRu
 	const parsed = parseMcpSearchArgs(rest);
 	if (parsed.error) return usage(parsed.error, runtime);
 	try {
-		const apiKey = await getSmitheryApiKey();
+		const apiKey = await getSmitheryApiKey(runtime.settings.getAgentDir());
 		const results = await searchSmitheryRegistry(parsed.keyword, {
 			limit: parsed.limit,
 			apiKey: apiKey ?? undefined,

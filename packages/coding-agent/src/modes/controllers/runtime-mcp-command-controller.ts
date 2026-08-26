@@ -5,7 +5,7 @@
  */
 import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
-import { matchesKey, type OverlayHandle, Spacer, Text } from "@gajae-code/tui";
+import { Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
@@ -18,7 +18,7 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
-import { canonicalMCPResourceUri, type MCPOAuthConfig, MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
+import { canonicalMCPResourceUri, MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
 	createSmitheryCliAuthSession,
@@ -38,13 +38,10 @@ import type { MCPAuthConfig, MCPServerConfig } from "../../runtime-mcp/types";
 import type { OAuthCredential } from "../../session/auth-storage";
 import { shortenPath } from "../../tools/render-utils";
 import { openPath } from "../../utils/open";
-import { CommandPalette, type CommandPaletteEntry } from "../components/command-palette";
 import { MCPAddWizard } from "../components/runtime-mcp-add-wizard";
 import { parseCommandArgs } from "../shared";
-import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import { theme } from "../theme/theme";
 import type { InteractiveModeContext } from "../types";
-import { matchesAppInterrupt } from "../utils/keybinding-matchers";
 import { groupBySource, parseRemoveArgs, readScopeFlag, showCommandMessage } from "./command-controller-shared";
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
@@ -72,18 +69,6 @@ interface OAuthFlowResult {
 
 type MCPAddScope = "user" | "project";
 type MCPAddTransport = "http" | "sse";
-
-type MCPAuthFlow = Pick<MCPOAuthFlow, "resolvedClientId" | "registeredClientSecret"> & {
-	login(): Promise<{ access: string; refresh: string; expires: number }>;
-};
-
-type MCPAuthCallbacks = {
-	onAuth(info: { url: string; instructions?: string }): void;
-	onProgress(message: string): void;
-	signal?: AbortSignal;
-};
-
-type MCPAuthFlowFactory = (config: MCPOAuthConfig, callbacks: MCPAuthCallbacks) => MCPAuthFlow;
 
 type MCPAddParsed = {
 	initialName?: string;
@@ -394,46 +379,6 @@ export class MCPCommandController {
 		return { keyword, scope, limit, semantic };
 	}
 
-	#openWizardOAuthCommandPalette(wizard: MCPAddWizard, keyData: string): boolean {
-		if (this.ctx.hasOAuthUrlForCopy?.() !== true) return false;
-		if (!this.ctx.keybindings.getKeys("app.commandPalette.open").some(key => matchesKey(keyData, key))) return false;
-
-		let overlayHandle: OverlayHandle | undefined;
-		const close = (): void => {
-			overlayHandle?.hide();
-			this.ctx.ui.setFocus(wizard);
-			this.ctx.ui.requestRender(true);
-		};
-		const copyEntry: CommandPaletteEntry = {
-			id: "action:app.clipboard.copyOAuthUrl",
-			label: "Copy OAuth URL",
-			description: "Copy the pending OAuth authorization URL",
-			keybinding: this.ctx.keybindings.getDisplayString("app.clipboard.copyOAuthUrl") || undefined,
-			handler: async () => {
-				await this.ctx.copyOAuthUrl();
-			},
-		};
-		const palette = new CommandPalette(
-			[copyEntry],
-			entry => {
-				close();
-				void Promise.resolve(entry.handler?.()).catch(error => {
-					this.ctx.showError(error instanceof Error ? error.message : String(error));
-				});
-			},
-			close,
-		);
-		overlayHandle = this.ctx.ui.showOverlay(palette, {
-			anchor: "bottom-center",
-			width: "100%",
-			maxHeight: "100%",
-			margin: 0,
-		});
-		this.ctx.ui.setFocus(palette);
-		this.ctx.ui.requestRender();
-		return true;
-	}
-
 	/**
 	 * Handle /mcp add - Launch interactive wizard or quick-add from args
 	 */
@@ -479,7 +424,7 @@ export class MCPCommandController {
 
 						try {
 							const oauthClientSecret = finalConfig.oauth?.clientSecret ?? "";
-							const oauthResult = await this.handleOAuthFlow(
+							const oauthResult = await this.#handleOAuthFlow(
 								finalConfig.url,
 								oauth.authorizationUrl,
 								oauth.tokenUrl,
@@ -530,8 +475,7 @@ export class MCPCommandController {
 		};
 
 		// Create wizard with OAuth handler and connection test
-		let wizard: MCPAddWizard;
-		wizard = new MCPAddWizard(
+		const wizard = new MCPAddWizard(
 			async (name: string, config: MCPServerConfig, scope: "user" | "project") => {
 				done();
 				await this.#handleWizardComplete(name, config, scope);
@@ -547,23 +491,8 @@ export class MCPCommandController {
 				clientId: string,
 				clientSecret: string,
 				scopes: string,
-				signal: AbortSignal,
 			) => {
-				return await this.handleOAuthFlow(
-					endpointUrl,
-					authUrl,
-					tokenUrl,
-					clientId,
-					clientSecret,
-					scopes,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					undefined,
-					signal,
-				);
+				return await this.#handleOAuthFlow(endpointUrl, authUrl, tokenUrl, clientId, clientSecret, scopes);
 			},
 			async (config: MCPServerConfig) => {
 				return await this.#handleTestConnection(config);
@@ -571,15 +500,7 @@ export class MCPCommandController {
 			() => {
 				this.ctx.ui.requestRender();
 			},
-			keyData => this.#openWizardOAuthCommandPalette(wizard, keyData),
 			parsed.initialName,
-			credentialId => this.#removeManagedOAuthCredential(credentialId),
-			(credentialId, error) =>
-				this.ctx.showError(
-					`Cancelled OAuth cleanup failed for ${credentialId}; the credential may remain stored. ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-				),
 		);
 
 		// Replace editor with wizard
@@ -596,8 +517,7 @@ export class MCPCommandController {
 	/**
 	 * Handle OAuth authentication flow for MCP server
 	 */
-	/** Internal OAuth entry point; injectable flow construction keeps controller lifecycle coverage deterministic. */
-	async handleOAuthFlow(
+	async #handleOAuthFlow(
 		endpointUrl: string,
 		authUrl: string,
 		tokenUrl: string,
@@ -608,9 +528,6 @@ export class MCPCommandController {
 		callbackPath?: string,
 		redirectUri?: string,
 		oauthMeta?: { issuer?: string; issuerResponseIssSupported?: boolean },
-		createFlow: MCPAuthFlowFactory = (config, callbacks) => new MCPOAuthFlow(config, callbacks),
-		openBrowser: (url: string) => void = openPath,
-		signal?: AbortSignal,
 	): Promise<OAuthFlowResult> {
 		const authStorage = this.ctx.session.modelRegistry.authStorage;
 		let parsedAuthUrl: URL;
@@ -629,31 +546,10 @@ export class MCPCommandController {
 
 		const resolvedClientId = clientId.trim() || parsedAuthUrl.searchParams.get("client_id") || undefined;
 		const resolvedClientSecret = clientSecret.trim() || undefined;
-		const copyOAuthUrlKey = this.ctx.keybindings?.getDisplayString?.("app.clipboard.copyOAuthUrl") ?? "";
-		const copyOAuthUrlHint = copyOAuthUrlKey
-			? `Use ${copyOAuthUrlKey} or command palette → Copy OAuth URL to copy this exact URL:`
-			: "Use command palette → Copy OAuth URL to copy this exact URL:";
-		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
-		const timeoutController = new AbortController();
-		const userController = new AbortController();
-		const flowSignal = AbortSignal.any([
-			userController.signal,
-			timeoutController.signal,
-			...(signal ? [signal] : []),
-		]);
-		let flowFinished = false;
-		const cancellationUnsubscribe =
-			signal === undefined && typeof this.ctx.ui.addInputListener === "function"
-				? this.ctx.ui.addInputListener(data => {
-						if (data !== "\x03" && !matchesAppInterrupt(data)) return;
-						userController.abort(new Error("OAuth flow cancelled"));
-						return { consume: true };
-					})
-				: undefined;
 
 		try {
 			// Create OAuth flow
-			const flow = createFlow(
+			const flow = new MCPOAuthFlow(
 				{
 					authorizationUrl: authUrl,
 					tokenUrl: tokenEndpoint,
@@ -673,10 +569,6 @@ export class MCPCommandController {
 				},
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
-						if (flowFinished || flowSignal.aborted) return;
-						queueMicrotask(() => {
-							if (!flowFinished && !flowSignal.aborted) oauthUrlCopyLease.replace(info.url);
-						});
 						// Show auth URL prominently in chat
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(
@@ -701,7 +593,7 @@ export class MCPCommandController {
 						this.ctx.ui.requestRender();
 						// Try to open browser automatically
 						try {
-							openBrowser(info.url);
+							openPath(info.url);
 
 							// Show confirmation that browser should open
 							this.ctx.chatContainer.addChild(new Spacer(1));
@@ -712,10 +604,10 @@ export class MCPCommandController {
 							this.ctx.chatContainer.addChild(
 								new Text(theme.fg("muted", "Alternative if browser did not open:"), 1, 0),
 							);
-							this.ctx.chatContainer.addChild(new Text(theme.fg("success", copyOAuthUrlHint), 1, 0));
 							this.ctx.chatContainer.addChild(
-								new Text(theme.fg("accent", buildOAuthLoginAnchor(info.url)), 1, 0),
+								new Text(theme.fg("success", "Copy this exact URL in your browser:"), 1, 0),
 							);
+							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
 							this.ctx.ui.requestRender();
 						} catch (_error) {
 							// Show error if browser doesn't open
@@ -723,10 +615,10 @@ export class MCPCommandController {
 							this.ctx.chatContainer.addChild(
 								new Text(theme.fg("warning", "→ Could not open browser automatically"), 1, 0),
 							);
-							this.ctx.chatContainer.addChild(new Text(theme.fg("success", copyOAuthUrlHint), 1, 0));
 							this.ctx.chatContainer.addChild(
-								new Text(theme.fg("accent", buildOAuthLoginAnchor(info.url)), 1, 0),
+								new Text(theme.fg("success", "Copy this exact URL in your browser:"), 1, 0),
 							);
+							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
 							this.ctx.ui.requestRender();
 						}
 					},
@@ -735,26 +627,11 @@ export class MCPCommandController {
 						this.ctx.chatContainer.addChild(new Text(theme.fg("muted", message), 1, 0));
 						this.ctx.ui.requestRender();
 					},
-					signal: flowSignal,
 				},
 			);
 
 			// Execute OAuth flow with 5 minute timeout
-			const { promise: timeoutPromise, reject: rejectTimeout } = Promise.withResolvers<never>();
-			const timeoutId = setTimeout(
-				() => {
-					timeoutController.abort(new Error("OAuth flow timed out after 5 minutes"));
-					rejectTimeout(new Error("OAuth flow timed out after 5 minutes"));
-				},
-				5 * 60 * 1000,
-			);
-			let credentials: { access: string; refresh: string; expires: number };
-			try {
-				credentials = await Promise.race([flow.login(), timeoutPromise]);
-			} finally {
-				flowFinished = true;
-				clearTimeout(timeoutId);
-			}
+			const credentials = await withTimeout(flow.login(), 5 * 60 * 1000, "OAuth flow timed out after 5 minutes");
 
 			this.ctx.chatContainer.addChild(new Spacer(1));
 			this.ctx.chatContainer.addChild(new Text(theme.fg("success", "✓ Authorization completed in browser."), 1, 0));
@@ -764,7 +641,6 @@ export class MCPCommandController {
 			const credentialId = `mcp_oauth_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 
 			// Store credentials in auth storage
-			flowSignal.throwIfAborted();
 			const oauthCredential: OAuthCredential = {
 				type: "oauth",
 				...credentials,
@@ -776,10 +652,6 @@ export class MCPCommandController {
 
 			// Store under a synthetic provider name
 			await authStorage.set(credentialId, oauthCredential);
-			if (flowSignal.aborted) {
-				await authStorage.remove(credentialId);
-				flowSignal.throwIfAborted();
-			}
 
 			return {
 				credentialId,
@@ -802,9 +674,6 @@ export class MCPCommandController {
 			} else {
 				throw new Error(`OAuth authentication failed: ${errorMsg}`);
 			}
-		} finally {
-			oauthUrlCopyLease.release();
-			cancellationUnsubscribe?.();
 		}
 	}
 
@@ -1498,7 +1367,7 @@ export class MCPCommandController {
 
 			this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));
 
-			const oauthResult = await this.handleOAuthFlow(
+			const oauthResult = await this.#handleOAuthFlow(
 				found.config.url,
 				oauth.authorizationUrl,
 				oauth.tokenUrl,
@@ -1811,7 +1680,7 @@ export class MCPCommandController {
 	async #handleSmitheryLoginWithApiKey(): Promise<boolean> {
 		const apiKey = await this.#promptSmitheryApiKey("Smithery API key (Esc to cancel)");
 		if (!apiKey) return false;
-		await saveSmitheryApiKey(apiKey);
+		await saveSmitheryApiKey(apiKey, this.ctx.session.getSessionAgentDir());
 		this.ctx.showStatus("Smithery API key saved.");
 		return true;
 	}
@@ -1840,14 +1709,6 @@ export class MCPCommandController {
 
 	async #handleSmitheryBrowserLogin(): Promise<boolean> {
 		const session = await createSmitheryCliAuthSession();
-		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
-		const abortController = new AbortController();
-		const interruptUnsubscribe = this.ctx.ui.addInputListener?.(data => {
-			if (data !== "\x03" && !matchesAppInterrupt(data)) return;
-			abortController.abort(new Error("Smithery authorization cancelled."));
-			return { consume: true };
-		});
-		oauthUrlCopyLease.replace(session.authUrl);
 		const fallbackLoginUrl = getSmitheryLoginUrl();
 		this.#showMessage(
 			[
@@ -1855,7 +1716,7 @@ export class MCPCommandController {
 				theme.bold("Smithery Login"),
 				theme.fg("muted", "Browser authorization started. Complete auth in your browser."),
 				theme.fg("dim", "Authorize URL:"),
-				theme.fg("accent", buildOAuthLoginAnchor(session.authUrl)),
+				theme.fg("accent", session.authUrl),
 				theme.fg("dim", `Fallback: ${fallbackLoginUrl}`),
 				"",
 			].join("\n"),
@@ -1866,16 +1727,11 @@ export class MCPCommandController {
 			// URL is already shown above.
 		}
 
-		try {
-			const apiKey = await this.#waitForSmitheryCliApiKey(session.sessionId, abortController.signal);
-			await this.#validateSmitheryApiKey(apiKey);
-			await saveSmitheryApiKey(apiKey);
-			this.ctx.showStatus("Smithery API key saved.");
-			return true;
-		} finally {
-			oauthUrlCopyLease.release();
-			interruptUnsubscribe?.();
-		}
+		const apiKey = await this.#waitForSmitheryCliApiKey(session.sessionId, new AbortController().signal);
+		await this.#validateSmitheryApiKey(apiKey);
+		await saveSmitheryApiKey(apiKey, this.ctx.session.getSessionAgentDir());
+		this.ctx.showStatus("Smithery API key saved.");
+		return true;
 	}
 
 	async #promptSmitheryLogin(reason: string): Promise<boolean> {
@@ -1909,7 +1765,8 @@ export class MCPCommandController {
 	}
 
 	async #requireSmitheryApiKey(reason: string): Promise<string> {
-		let apiKey = await getSmitheryApiKey();
+		const agentDir = this.ctx.session.getSessionAgentDir();
+		let apiKey = await getSmitheryApiKey(agentDir);
 		if (apiKey) return apiKey;
 
 		const loggedIn = await this.#promptSmitheryLogin(reason);
@@ -1917,7 +1774,7 @@ export class MCPCommandController {
 			throw new Error("Smithery login cancelled. Run /mcp smithery-login, then retry /mcp smithery-search.");
 		}
 
-		apiKey = await getSmitheryApiKey();
+		apiKey = await getSmitheryApiKey(agentDir);
 		if (!apiKey) {
 			throw new Error("Smithery API key not found after login.");
 		}
@@ -1950,7 +1807,7 @@ export class MCPCommandController {
 	}
 
 	async #handleSmitheryLogout(): Promise<void> {
-		const removed = await clearSmitheryApiKey();
+		const removed = await clearSmitheryApiKey(this.ctx.session.getSessionAgentDir());
 		this.ctx.showStatus(removed ? "Smithery API key removed." : "No cached Smithery API key found.");
 	}
 

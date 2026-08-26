@@ -30,8 +30,8 @@ type SmitheryAuthPayload = {
 	apiKey?: string;
 };
 
-function getSmitheryAuthPath(): string {
-	return path.join(getAgentDir(), SMITHERY_AUTH_FILENAME);
+function getSmitheryAuthPath(agentDir?: string): string {
+	return path.join(agentDir ?? getAgentDir(), SMITHERY_AUTH_FILENAME);
 }
 
 function normalizeApiKey(value: string | undefined): string | undefined {
@@ -75,12 +75,12 @@ export async function pollSmitheryCliAuthSession(
 	return (await response.json()) as SmitheryCliPollResponse;
 }
 
-export async function getSmitheryApiKey(): Promise<string | undefined> {
+export async function getSmitheryApiKey(agentDir?: string): Promise<string | undefined> {
 	// Trusted sources only: this key authenticates every Smithery API call.
 	const envKey = normalizeApiKey($credentialEnv("SMITHERY_API_KEY"));
 	if (envKey) return envKey;
 
-	const authPath = getSmitheryAuthPath();
+	const authPath = getSmitheryAuthPath(agentDir);
 	try {
 		const payload = (await Bun.file(authPath).json()) as SmitheryAuthPayload;
 		return normalizeApiKey(payload.apiKey);
@@ -91,13 +91,13 @@ export async function getSmitheryApiKey(): Promise<string | undefined> {
 	}
 }
 
-export async function saveSmitheryApiKey(apiKey: string): Promise<void> {
+export async function saveSmitheryApiKey(apiKey: string, agentDir?: string): Promise<void> {
 	const normalized = normalizeApiKey(apiKey);
 	if (!normalized) {
 		throw new Error("Smithery API key cannot be empty.");
 	}
 
-	const authPath = getSmitheryAuthPath();
+	const authPath = getSmitheryAuthPath(agentDir);
 	const payload: SmitheryAuthPayload = { apiKey: normalized };
 	await Bun.write(authPath, `${JSON.stringify(payload, null, 2)}\n`);
 	try {
@@ -107,8 +107,8 @@ export async function saveSmitheryApiKey(apiKey: string): Promise<void> {
 	}
 }
 
-export async function clearSmitheryApiKey(): Promise<boolean> {
-	const authPath = getSmitheryAuthPath();
+export async function clearSmitheryApiKey(agentDir?: string): Promise<boolean> {
+	const authPath = getSmitheryAuthPath(agentDir);
 	try {
 		await fs.rm(authPath);
 		return true;
