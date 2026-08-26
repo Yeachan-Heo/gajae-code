@@ -2795,7 +2795,7 @@ async function openCodexSseEventStream(
 	signal?: AbortSignal,
 	onSseEvent?: OpenAICodexResponsesOptions["onSseEvent"],
 	fetchOverride?: FetchImpl,
-	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries">,
+	options?: Pick<OpenAICodexResponsesOptions, "requestMaxRetries" | "onStreamCreated">,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const headers = createCodexHeaders(requestHeaders, accountId, apiKey, sessionId, "sse", state);
 	logCodexDebug("codex request", {
@@ -2805,6 +2805,7 @@ async function openCodexSseEventStream(
 		sentTurnStateHeader: headers.has(X_CODEX_TURN_STATE_HEADER),
 		sentModelsEtagHeader: headers.has(X_MODELS_ETAG_HEADER),
 	});
+	options?.onStreamCreated?.();
 	const response = await fetchWithRetry(url, {
 		method: "POST",
 		headers,
@@ -2845,10 +2846,11 @@ async function openCodexWebSocketEventStream(
 	request: Record<string, unknown>,
 	state: CodexWebSocketSessionState,
 	signal?: AbortSignal,
-	options?: Pick<OpenAICodexResponsesOptions, "streamFirstEventTimeoutMs" | "streamIdleTimeoutMs">,
+	options?: Pick<OpenAICodexResponsesOptions, "streamFirstEventTimeoutMs" | "streamIdleTimeoutMs" | "onStreamCreated">,
 	firstEventTimeoutMs?: number,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const connection = await getOrCreateCodexWebSocketConnection(state, url, headers, signal, options);
+	options?.onStreamCreated?.();
 	return connection.streamRequest(
 		request,
 		signal,

@@ -419,6 +419,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 				url: `${baseUrl}/api/chat`,
 				body,
 			};
+			options?.onStreamCreated?.();
 			let response = await fetchWithRetry(`${baseUrl}/api/chat`, {
 				method: "POST",
 				headers: {
@@ -457,6 +458,7 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 					body = { ...body };
 					delete (body as { tool_choice?: unknown }).tool_choice;
 					rawRequestDump = { ...rawRequestDump, body };
+					options?.onStreamCreated?.();
 					response = await fetchWithRetry(`${baseUrl}/api/chat`, {
 						method: "POST",
 						headers: {

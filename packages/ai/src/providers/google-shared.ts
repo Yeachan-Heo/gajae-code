@@ -921,6 +921,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				options.toolChoice !== "auto" &&
 				options.toolChoice !== "none";
 			const fetchImpl = plan.fetch ?? options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
+			options?.onStreamCreated?.();
 			let response = await fetchImpl(plan.url, {
 				method: "POST",
 				headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },
@@ -957,6 +958,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 					params = retryParams;
 					rawRequestDump = { ...rawRequestDump, body: params };
 					wireBody = paramsToWireBody(params);
+					options?.onStreamCreated?.();
 					response = await fetchImpl(plan.url, {
 						method: "POST",
 						headers: { ...plan.headers, "Content-Type": "application/json", Accept: "text/event-stream" },

@@ -2143,6 +2143,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
 				const { requestSignal } = activeAbortTracker;
 				setRawRequestDump(params);
+				options?.onStreamCreated?.();
 				const anthropicRequest = client.messages.create(
 					{ ...params, stream: true },
 					{

@@ -636,6 +636,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					headers: requestHeaders,
 					body: params,
 				};
+				options?.onStreamCreated?.();
 				const { data, response, request_id } = await client.chat.completions
 					.create(params as OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming, { signal: requestSignal })
 					.withResponse();

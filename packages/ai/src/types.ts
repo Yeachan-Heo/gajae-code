@@ -467,6 +467,12 @@ export interface StreamOptions {
 		scope?: AttemptScopeRef,
 	) => void | Promise<void>;
 	/**
+	 * Internal dispatch-admission hook. Providers invoke this immediately before
+	 * submitting an outbound request; stream forwarding retains a first-response
+	 * fallback for custom providers that do not expose a transport seam.
+	 */
+	onStreamCreated?: () => void;
+	/**
 	 * Optional callback for raw Server-Sent Events as they arrive from HTTP streaming providers.
 	 *
 	 * Diagnostic only: provider implementations must ignore callback failures and must not
@@ -523,12 +529,6 @@ export interface AttemptScopeRef {
 
 // Unified options with reasoning passed to streamSimple() and completeSimple()
 export interface SimpleStreamOptions extends StreamOptions {
-	/**
-	 * Internal dispatch-admission hook. Called once the provider stream has been
-	 * created, including after a deferred provider import completes. Providers
-	 * must not call this themselves; `streamSimple` owns the callback boundary.
-	 */
-	onStreamCreated?: () => void;
 	reasoning?: Effort;
 	/**
 	 * Force-disable reasoning for the request even when the model supports it.
