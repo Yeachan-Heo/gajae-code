@@ -59,6 +59,17 @@ function exactUnlink(target: string, identity: NativeExactFileIdentity): NativeE
 	return { ok: true };
 }
 
+async function exactUnlinkAsync(
+	target: string,
+	identity: NativeExactFileIdentity,
+	timeoutMs?: number | null,
+): Promise<NativeExactUnlinkResult> {
+	return await settleWithTypedTimeout(Promise.resolve(exactUnlink(target, identity)), timeoutMs, performance.now(), {
+		ok: false,
+		code: "timed_out",
+	});
+}
+
 /** Shared with the worker-thread doubles so the two shapes cannot drift. */
 const snapshotDirectoryTree = snapshotDirectoryTreeOp;
 const exactRemoveDirectoryTree = exactRemoveDirectoryTreeOp;
@@ -166,6 +177,7 @@ async function settleWithTypedTimeout<T>(
 
 export const exactIdentityNativeBindings: SessionStateLockNativeBindings = {
 	exactUnlink,
+	exactUnlinkAsync,
 	snapshotDirectoryTree,
 	snapshotDirectoryTreeAsync: (root, timeoutMs) => snapshotDirectoryTreeAsync(root, timeoutMs),
 	exactRemoveDirectoryTree,
@@ -178,6 +190,7 @@ function compiledNativesAvailable(): boolean {
 	try {
 		const native = require("@gajae-code/natives") as {
 			exactUnlink?: unknown;
+			exactUnlinkAsync?: unknown;
 			snapshotDirectoryTree?: (path: string) => NativeDirectoryTreeResult;
 			snapshotDirectoryTreeAsync?: unknown;
 			exactRemoveDirectoryTree?: (path: string, snapshot: NativeDirectoryTreeSnapshot) => NativeExactUnlinkResult;
@@ -185,6 +198,7 @@ function compiledNativesAvailable(): boolean {
 		};
 		if (
 			typeof native.exactUnlink === "function" &&
+			typeof native.exactUnlinkAsync === "function" &&
 			typeof native.snapshotDirectoryTreeAsync === "function" &&
 			typeof native.exactRemoveDirectoryTreeAsync === "function"
 		) {
@@ -197,7 +211,10 @@ function compiledNativesAvailable(): boolean {
 					snapshot?.ok && snapshot.snapshot
 						? (native.exactRemoveDirectoryTree?.(directory, snapshot.snapshot) ?? { ok: false })
 						: { ok: false };
-				return removed.ok && !fs.existsSync(directory);
+				return (
+					(removed.ok || (removed.code === "cleanup_pending" && typeof removed.detachedPath === "string")) &&
+					!fs.existsSync(directory)
+				);
 			} finally {
 				fs.rmSync(root, { recursive: true, force: true });
 			}

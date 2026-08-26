@@ -1222,6 +1222,37 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	platform::exact_unlink(Path::new(&path), &identity)
 }
 
+/// Async variant of [`exact_unlink`] on a dedicated native thread.
+///
+/// Directory detachment can perform exchange, placeholder, and metadata operations
+/// that block on a wedged filesystem. Keep that work outside the JavaScript thread
+/// while preserving the exact identity and durable quarantine receipt contract.
+#[napi]
+pub fn exact_unlink_async(
+	env: &Env,
+	path: String,
+	identity: NativeExactFileIdentity,
+	timeout_ms: Option<u32>,
+) -> napi::Result<PromiseRaw<'_, NativeExactUnlinkResult>> {
+	if path.contains('\0') {
+		return task::future(env, "exact_unlink", async {
+			Ok(NativeExactUnlinkResult::failure("io_error"))
+		});
+	}
+	let Some(identity) = exact_file_identity(&identity) else {
+		return task::future(env, "exact_unlink", async {
+			Ok(NativeExactUnlinkResult::failure("identity_mismatch"))
+		});
+	};
+	task::isolated_with_timeout(
+		env,
+		"exact_unlink",
+		timeout_ms,
+		move || Ok(platform::exact_unlink(Path::new(&path), &identity)),
+		Some(NativeExactUnlinkResult::failure("timed_out")),
+	)
+}
+
 /// Delete only the regular file that still has the supplied platform identity,
 /// without the exchange/quarantine protocol used by [`exact_unlink`].
 ///

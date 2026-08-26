@@ -185,6 +185,7 @@ export type SessionStateLockNativeBindings = Pick<
 	| "exactRemoveDirectoryTree"
 	| "exactRemoveDirectoryTreeAsync"
 	| "exactUnlink"
+	| "exactUnlinkAsync"
 	| "snapshotDirectoryTree"
 	| "snapshotDirectoryTreeAsync"
 >;
@@ -227,7 +228,12 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
 			bindings = require("@gajae-code/natives") as SessionStateLockNativeBindings;
 			loadedNativeBindings = bindings;
 		}
-		for (const name of ["exactUnlink", "snapshotDirectoryTreeAsync", "exactRemoveDirectoryTreeAsync"] as const) {
+		for (const name of [
+			"exactUnlink",
+			"exactUnlinkAsync",
+			"snapshotDirectoryTreeAsync",
+			"exactRemoveDirectoryTreeAsync",
+		] as const) {
 			if (typeof bindings[name] !== "function")
 				throw new SessionStateLockUnavailableError(new Error(`Native lock binding ${name} is unavailable.`));
 		}
@@ -1123,8 +1129,8 @@ async function releaseTransitionClaim(
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
 	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
-	await removeTransitionClaimIfIdentityMatches(transitionDir, claim, deadline);
-	if (await transitionClaimIdentity(transitionDir))
+	const removed = await removeTransitionClaimIfIdentityMatches(transitionDir, claim, deadline);
+	if (!removed || (await transitionClaimIdentity(transitionDir)))
 		throw new SessionStateLockUnavailableError(new Error("Transition claim could not be removed safely."));
 }
 
@@ -1179,19 +1185,19 @@ async function removeTransitionClaimIfIdentityMatches(
 	transitionDir: string,
 	claim: TransitionClaimIdentity,
 	cleanupDeadline?: number,
-): Promise<void> {
+): Promise<boolean> {
 	let native: SessionStateLockNativeBindings;
 	try {
 		native = nativeSessionStateLock();
 	} catch {
-		return;
+		return false;
 	}
 	const deadline = cleanupDeadline ?? performance.now() + LOCK_ACQUIRE_TIMEOUT_MS;
 	let snapshot: NativeDirectoryTreeSnapshot | null;
 	try {
 		snapshot = await captureLegacyDirectoryTree(native, transitionDir, deadline);
 	} catch {
-		return;
+		return false;
 	}
 	const root = snapshot?.entries[0];
 	if (
@@ -1201,27 +1207,28 @@ async function removeTransitionClaimIfIdentityMatches(
 		snapshot.rootDev !== claim.dev.toString() ||
 		snapshot.rootIno !== claim.ino.toString()
 	)
-		return;
+		return false;
 	try {
-		const removed = native.exactUnlink(transitionDir, {
+		const quarantineName = `.gjc-transition-removing-${claim.dev}-${claim.ino}-${claim.ctimeNs}`;
+		const removed = await native.exactUnlinkAsync(transitionDir, {
 			dev: claim.dev,
 			ino: claim.ino,
 			nlink: claim.nlink,
 			size: claim.size,
 			mtimeNs: claim.mtimeNs,
 			directory: true,
-			quarantineName: `.gjc-transition-removing-${randomUUID()}`,
+			quarantineName,
 		});
-		if (
-			!removed.ok &&
-			removed.code !== "not_found" &&
-			removed.code !== "identity_mismatch" &&
-			removed.code !== "cleanup_pending"
-		)
-			return;
+		if (removed.ok || removed.code === "not_found") return true;
+		if (removed.code === "cleanup_pending") {
+			const expectedDetachedPath = path.join(path.dirname(transitionDir), quarantineName);
+			return removed.detachedPath === expectedDetachedPath;
+		}
+		return false;
 	} catch {
 		// Late cleanup is best effort. A failed identity-bound removal leaves the claim
 		// fail-closed rather than risking a successor pathname.
+		return false;
 	}
 }
 

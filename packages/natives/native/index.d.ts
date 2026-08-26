@@ -937,6 +937,15 @@ export declare function exactRestore(detachedPath: string, originalPath: string,
 export declare function exactUnlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
+ * Async variant of [`exact_unlink`] on a dedicated native thread.
+ *
+ * Directory detachment can perform exchange, placeholder, and metadata operations
+ * that block on a wedged filesystem. Keep that work outside the JavaScript thread
+ * while preserving the exact identity and durable quarantine receipt contract.
+ */
+export declare function exactUnlinkAsync(path: string, identity: NativeExactFileIdentity, timeoutMs?: number | undefined | null): Promise<NativeExactUnlinkResult>
+
+/**
  * Delete only the regular file that still has the supplied platform identity,
  * without the exchange/quarantine protocol used by [`exact_unlink`].
  *
