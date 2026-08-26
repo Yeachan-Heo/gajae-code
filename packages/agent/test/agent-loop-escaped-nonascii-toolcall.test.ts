@@ -1352,47 +1352,55 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		);
 	});
 
-	it("executes the benign em-dash ask case AFTER the resample budget on a display-safe tool", async () => {
+	it("executes the benign em-dash ask case without resampling on a display-safe tool", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
-		// Three escaped wire attempts consume the budget (1 original + 2
-		// resamples); the third reaches terminal execution, where the
-		// field-scoped display-safe exemption lets the benign payload run.
+		// The display-safe degrade skips the resample/discard chain entirely:
+		// the first (and only) escaped wire attempt executes the decoded call.
 		const mock = createMockModel({
-			responses: [
-				emDashEscapedTurn("tc-1"),
-				emDashEscapedTurn("tc-2"),
-				emDashEscapedTurn("tc-3"),
-				{ content: ["done"] },
-			],
+			responses: [emDashEscapedTurn("tc-1"), { content: ["done"] }],
 		});
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const warnings: Array<{ message: string; context?: Record<string, unknown> }> = [];
+		const warn = vi.spyOn(logger, "warn").mockImplementation((message, logContext) => {
+			warnings.push({ message, context: logContext });
+		});
 
 		const toolResults: Array<{ isError?: boolean; text: string }> = [];
-		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
-		for await (const event of stream) {
-			if (event.type === "tool_execution_end") {
-				const first = event.result.content?.[0];
-				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+		try {
+			const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+			for await (const event of stream) {
+				if (event.type === "tool_execution_end") {
+					const first = event.result.content?.[0];
+					toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+				}
 			}
-		}
-		const produced = await stream.result();
+			const produced = await stream.result();
 
-		// The full budget ran before execution: 1 original + 2 resamples + the
-		// follow-up elicited by the executed tool result.
-		expect(mock.calls).toHaveLength(4);
-		expect(executed).toEqual([{ question: "How should the daemon drive sessions — in-process?" }]);
-		expect(toolResults).toHaveLength(1);
-		expect(toolResults[0].isError).toBeFalsy();
-		expect(
-			produced.some(
-				message =>
-					message.role === "assistant" &&
-					message.content.some(
-						block => block.type === "toolCall" && block.escapedUnicodeArgumentEvidence !== undefined,
-					),
-			),
-		).toBe(false);
+			expect(mock.calls).toHaveLength(2);
+			expect(executed).toEqual([{ question: "How should the daemon drive sessions — in-process?" }]);
+			expect(toolResults).toHaveLength(1);
+			expect(toolResults[0].isError).toBeFalsy();
+			// Exactly one warning, shape-only, and no escaped payload left behind.
+			expect(warnings).toEqual([
+				{
+					message: "agent: executing a tool-call turn whose display-safe arguments were \\uXXXX-escaped",
+					context: { mode: "in_loop", escapedToolCallCount: 1, escapedToolCallCountCapped: false },
+				},
+			]);
+			expect(JSON.stringify(warnings)).not.toContain("in-process");
+			expect(
+				produced.some(
+					message =>
+						message.role === "assistant" &&
+						message.content.some(
+							block => block.type === "toolCall" && block.escapedUnicodeArgumentEvidence !== undefined,
+						),
+				),
+			).toBe(false);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it.each([
@@ -1474,7 +1482,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			],
 		});
 		const mock = createMockModel({
-			responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+			responses: [turn("tc-1"), { content: ["done"] }],
 		});
 		const stream = agentLoop(
 			[createUserMessage("ask me")],
@@ -1487,14 +1495,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			// drain
 		}
 
-		expect(mock.calls).toHaveLength(4);
+		// Display-safe: the first wire attempt executes, no resample is spent.
+		expect(mock.calls).toHaveLength(2);
 		expect(executed).toEqual([argumentsValue]);
 	});
 
-	it.each([
-		["shifted decoded position", String.raw`{"question":"x\u2014"}`, "—x"],
-		["unrepresented decoded U+2014", `${String.raw`{"question":"\u2014 `}—"}`, "— —"],
-	])("rejects %s despite an otherwise valid evidence envelope", async (_label, rawArguments, decodedQuestion) => {
+	it("rejects a shifted decoded position despite an otherwise valid evidence envelope", async () => {
+		const rawArguments = String.raw`{"question":"x\u2014"}`;
 		const executed: Array<Record<string, unknown>> = [];
 		const turn = (id: string) => ({
 			content: [
@@ -1502,7 +1509,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 					type: "toolCall" as const,
 					id,
 					name: "ask",
-					arguments: { question: decodedQuestion },
+					arguments: { question: "—x" },
 					escapedNonAsciiArguments: true,
 					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
 				},
@@ -1532,6 +1539,145 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 					),
 			),
 		).toBe(false);
+	});
+
+	it("executes when literal non-ASCII display text accompanies the corroborated escape", async () => {
+		// The escaped em-dash corroborates offset 0; the literal em-dash at
+		// offset 2 was never a wire defect and needs no evidence.
+		const rawArguments = `${String.raw`{"question":"\u2014 `}—"}`;
+		const executed: Array<Record<string, unknown>> = [];
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { question: "— —" },
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [turn("tc-1"), { content: ["done"] }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+		expect(mock.calls).toHaveLength(2);
+		expect(executed).toEqual([{ question: "— —" }]);
+	});
+
+	it.each([
+		["hangul", String.raw`{"question":"\ub9c8\uc9c0\ub9c9 \ubcd1\ubaa9"}`, QUESTION],
+		["emoji", String.raw`{"question":"feeling \ud83d\ude00 today?"}`, "feeling 😀 today?"],
+		["en-dash", String.raw`{"question":"range 0\u20131 inclusive?"}`, "range 0–1 inclusive?"],
+		["currency", String.raw`{"question":"price \u20a91,000?"}`, "price ₩1,000?"],
+	])("executes a corroborated escaped %s payload on a display-safe tool with one warning and no resample", async (_label, rawArguments, decodedQuestion) => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { question: decodedQuestion },
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({ responses: [turn("tc-1"), { content: ["done"] }] });
+		const warnings: string[] = [];
+		const warn = vi.spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(message);
+		});
+		try {
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				context,
+				{ model: mock.model, convertToLlm: identityConverter },
+				undefined,
+				mock.stream,
+			);
+			for await (const _event of stream) {
+				// drain
+			}
+			// Issue #4983 acceptance: the decoded display text executes on the
+			// first wire attempt; exactly one warning, no resample.
+			expect(executed).toEqual([{ question: decodedQuestion }]);
+			expect(mock.calls).toHaveLength(2);
+			expect(warnings).toEqual([
+				"agent: executing a tool-call turn whose display-safe arguments were \\uXXXX-escaped",
+			]);
+		} finally {
+			warn.mockRestore();
+		}
+	});
+
+	it("executes a display-safe escaped turn in managed fallback without reporting the discarded outcome", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		const rawArguments = String.raw`{"question":"\ub9c8\uc9c0\ub9c9 \ubcd1\ubaa9"}`;
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { question: QUESTION },
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({ responses: [turn("tc-managed-display"), { content: ["done"] }] });
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const warnings: Array<{ message: string; context?: Record<string, unknown> }> = [];
+		const warn = vi.spyOn(logger, "warn").mockImplementation((message, logContext) => {
+			warnings.push({ message, context: logContext });
+		});
+		try {
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				context,
+				{
+					model: mock.model,
+					convertToLlm: identityConverter,
+					fallbackManaged: true,
+					onManagedAttemptOutcome: outcome => {
+						outcomes.push(outcome);
+						return { type: "terminal", terminal: { stopReason: "error" } };
+					},
+				},
+				undefined,
+				mock.stream,
+			);
+			for await (const _event of stream) {
+				// drain
+			}
+			// Issue #4983 acceptance: no managed-fallback retry is charged — the
+			// session policy never sees an escaped_arguments_discarded outcome —
+			// and the turn executes with a single managed-mode warning.
+			expect(outcomes).toHaveLength(0);
+			expect(executed).toEqual([{ question: QUESTION }]);
+			expect(warnings).toEqual([
+				{
+					message: "agent: executing a tool-call turn whose display-safe arguments were \\uXXXX-escaped",
+					context: { mode: "managed", escapedToolCallCount: 1, escapedToolCallCountCapped: false },
+				},
+			]);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("fails closed when raw escape evidence is malformed, missing, or overflowed", async () => {
@@ -1717,7 +1863,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(toolResults[0].text).toContain("\\uXXXX");
 	});
 
-	it("rejects a nibble-adjacent symbol escape even on a display-safe tool", async () => {
+	it("rejects an uncorroborated symbol escape even on a display-safe tool", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
 		const enDashTurn = (id: string) => ({
@@ -1726,7 +1872,8 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 					type: "toolCall" as const,
 					id,
 					name: "ask",
-					// U+2013 EN DASH — one nibble from the exempted U+2014.
+					// No raw escape evidence rides this turn, so nothing corroborates
+					// the decoded text against the wire payload.
 					arguments: { question: "range 0–1 inclusive?" },
 					escapedNonAsciiArguments: true,
 				},
@@ -1746,15 +1893,15 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			}
 		}
 
-		// The curated set admits only U+2014; every other symbol — including the
-		// nibble-adjacent en-dash — keeps the fail-closed rejection.
+		// Without corroborating raw evidence even display-field text keeps the
+		// fail-closed rejection — the decode can never be verified.
 		expect(executed).toHaveLength(0);
 		expect(toolResults).toHaveLength(1);
 		expect(toolResults[0].isError).toBe(true);
 		expect(toolResults[0].text).toContain("\\uXXXX");
 	});
 
-	it("rejects currency, math, full-width, separator, letter, and emoji escapes on a display-safe tool", async () => {
+	it("rejects uncorroborated currency, math, full-width, separator, letter, and emoji escapes on a display-safe tool", async () => {
 		const redTeam: Array<[string, string]> = [
 			["currency ₩", "price ₩1,000?"],
 			["math ≈", "is x ≈ y?"],

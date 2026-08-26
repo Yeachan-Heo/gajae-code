@@ -157,3 +157,19 @@ describe("AskTool escaped deep-interview durability (#4926)", () => {
 		}
 	});
 });
+
+describe("AskTool display-safe escaped argument fields (#4983)", () => {
+	let tempDir: TempDir | undefined;
+
+	afterEach(() => {
+		tempDir?.removeSync();
+	});
+
+	it("declares question text and option labels as its only display-safe fields", () => {
+		tempDir = TempDir.createSync("@gjc-ask-display-safe-4983-");
+		const tool = new AskTool(createSession(tempDir.path(), "ask-display-safe"));
+		// Only pure display text opts in: ids, workflow gates, and deep-interview
+		// metadata stay load-bearing and keep the fail-closed rejection.
+		expect(tool.displaySafeEscapedArgFields).toEqual(["questions.question", "questions.options.label"]);
+	});
+});

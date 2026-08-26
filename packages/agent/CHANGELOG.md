@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Escaped non-ASCII tool-call arguments whose every `\uXXXX` escape corroborates a decoded non-ASCII character inside a tool's declared `displaySafeEscapedArgFields` now degrade to a single warning and execute the decoded call, instead of discarding the turn and charging the bounded resample/managed-fallback retry chain. Previously even purely cosmetic display text (e.g. an `ask` question written in Korean or with emoji) burned the full resample budget and then failed the run closed, which made the default Anthropic presets error out on a model-side encoding habit. Raw-evidence corroboration is now per-scalar (offset + process-keyed scalar tag against any decoded non-ASCII character in a declared display field) rather than restricted to U+2014, and literal non-ASCII display text alongside a corroborated escape no longer needs evidence. Load-bearing fields, ASCII-landing escapes, missing/malformed evidence, and non-display-safe tools keep the fail-closed discard-and-reject behavior. (#4983)
+
 ## [0.15.2] - 2026-08-25
 
 ### Changed

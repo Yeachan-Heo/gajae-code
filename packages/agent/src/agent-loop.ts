@@ -437,31 +437,20 @@ function stripUnicodeEscapeEvidence(message: AssistantMessage): void {
 }
 
 /**
- * The complete set of non-ASCII characters an escaped payload may decode to and
- * still execute on a display-safe tool after the resample budget: U+2014 EM DASH
- * only. This is the exact character JSON encoders spell as `\u2014` that
- * motivated the false positive — an English question text like "sessions —
- * in-process?" with no other non-ASCII. Curated deliberately: a mistyped nibble
- * here can only produce another punctuation/letter codepoint, and any such
- * landing (or any other escaped character at all) keeps the fail-closed
- * rejection. Currency, math, full-width, separator, letter, mark, number, and
- * surrogate escapes all stay rejected everywhere.
+ * Display-safe handling for tools that opt specific argument fields into it:
+ * every non-ASCII character of the decoded arguments must live inside one of
+ * the declared display-field paths, and the raw escape evidence must
+ * corroborate each escaped scalar against the decoded display text. A
+ * mistyped nibble here can only change what the user reads on screen, never
+ * what executes or persists, so the call degrades to a single warning instead
+ * of the fail-closed rejection that load-bearing fields keep.
  */
-const DISPLAY_SAFE_ESCAPED_CODEPOINTS = new Set([0x2014]);
 
 /** Structural type for tools that opt specific argument fields into display-safe handling. */
 type DisplaySafeEscapedTool = AgentTool<TSchema> & {
 	/** Argument fields (dotted paths into the arguments object) that render to the user as display text. */
 	displaySafeEscapedArgFields?: readonly string[];
 };
-
-/**
- * Whether a non-ASCII codepoint is benign typographic punctuation that a JSON
- * encoder may escape in display text. See {@link DISPLAY_SAFE_ESCAPED_CODEPOINTS}.
- */
-function isDisplaySafeEscapedCodepoint(cp: number): boolean {
-	return DISPLAY_SAFE_ESCAPED_CODEPOINTS.has(cp);
-}
 
 /** Whether the tool declared any display-only argument fields at all. */
 function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean {
@@ -472,10 +461,9 @@ function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean
  * Walk the decoded arguments and decide whether the escaped payload is
  * display-safe: every non-ASCII character must live inside one of the tool's
  * declared display-field paths (dotted, array-index-free: `questions.question`
- * matches every question in the `questions` array) AND be benign typographic
- * punctuation. Any non-ASCII outside the display fields — ids, metadata,
- * persisted records, or an object key — keeps the fail-closed rejection, as
- * does any non-benign codepoint inside them.
+ * matches every question in the `questions` array). Any non-ASCII outside the
+ * display fields — ids, metadata, persisted records, or an object key — keeps
+ * the fail-closed rejection.
  */
 function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, args: Record<string, unknown>): boolean {
 	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
@@ -490,8 +478,8 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 				const cp = ch.codePointAt(0);
 				if (cp === undefined || cp < 0x80) continue;
 				// Outside the display fields no non-ASCII is tolerated at all;
-				// inside them only the curated punctuation set is.
-				if (!isDisplayPath(path) || !isDisplaySafeEscapedCodepoint(cp)) return false;
+				// inside them any decoded character is display text.
+				if (!isDisplayPath(path)) return false;
 			}
 			return true;
 		}
@@ -517,9 +505,10 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 
 /**
  * Validate the original raw escape positions, not just the decoded values.
- * Missing, malformed, overflowed, key-position, non-U+2014, or path-mismatched
- * evidence fails closed. Process-keyed scalar/path tags keep argument text out of the
- * carried metadata while still binding every escape to a declared display field.
+ * Missing, malformed, overflowed, key-position, ASCII-landing, or
+ * path-mismatched evidence fails closed. Process-keyed scalar/path tags keep
+ * argument text out of the carried metadata while still binding every escape
+ * to a decoded non-ASCII character inside a declared display field.
  */
 function isDisplaySafeRawEscapeEvidence(
 	tool: AgentTool<TSchema> | undefined,
@@ -538,7 +527,7 @@ function isDisplaySafeRawEscapeEvidence(
 		return false;
 	if (evidence.positions.length === 0 || evidence.positions.length > 32) return false;
 
-	const allowedValues = new Map<string, { offsets: Set<number>; matched: Set<number> }>();
+	const allowedValues = new Map<string, { offsets: Map<number, string>; matched: Set<number> }>();
 	const valueOrdinals = new Map<string, number>();
 	const prefixes = fields.map(field => field.split("."));
 	const isDisplayPath = (path: readonly string[]): boolean =>
@@ -550,10 +539,10 @@ function isDisplaySafeRawEscapeEvidence(
 			const pathTag = unicodeEscapePathTag(path);
 			const valueOrdinal = valueOrdinals.get(pathTag) ?? 0;
 			valueOrdinals.set(pathTag, valueOrdinal + 1);
-			const offsets = new Set<number>();
+			const offsets = new Map<number, string>();
 			for (let offset = 0; offset < node.length; ) {
 				const codePoint = node.codePointAt(offset);
-				if (codePoint === 0x2014) offsets.add(offset);
+				if (codePoint !== undefined && codePoint >= 0x80) offsets.set(offset, unicodeEscapeScalarTag(codePoint));
 				offset += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
 			}
 			allowedValues.set(`${pathTag}:${valueOrdinal}`, { offsets, matched: new Set() });
@@ -574,11 +563,10 @@ function isDisplaySafeRawEscapeEvidence(
 	walk(args);
 
 	let previousOffset = -1;
-	const allowedScalarTag = unicodeEscapeScalarTag(0x2014);
 	for (const position of evidence.positions) {
 		if (
 			position.location !== "value" ||
-			position.scalarTag !== allowedScalarTag ||
+			!/^[0-9a-f]{64}$/.test(position.scalarTag) ||
 			!Number.isSafeInteger(position.offset) ||
 			position.offset <= previousOffset ||
 			!/^[0-9a-f]{64}$/.test(position.pathTag) ||
@@ -591,10 +579,44 @@ function isDisplaySafeRawEscapeEvidence(
 		}
 		previousOffset = position.offset;
 		const value = allowedValues.get(`${position.pathTag}:${position.valueOrdinal}`);
-		if (!value?.offsets.has(position.valueOffset) || value.matched.has(position.valueOffset)) return false;
+		// Each escape must corroborate an actual decoded non-ASCII character at
+		// that exact offset inside a declared display string: an ASCII landing
+		// (a possible one-nibble mutation of a non-ASCII escape), a load-bearing
+		// field, or a shifted position all fail closed.
+		if (
+			!value ||
+			value.offsets.get(position.valueOffset) !== position.scalarTag ||
+			value.matched.has(position.valueOffset)
+		)
+			return false;
 		value.matched.add(position.valueOffset);
 	}
-	return [...allowedValues.values()].every(value => value.offsets.size === value.matched.size);
+	return true;
+}
+/**
+ * Whether every escaped tool call in the turn lands entirely on declared
+ * display-safe fields of its registered tool. Only then does the turn skip
+ * the resample/discard chain: a single load-bearing escaped call keeps the
+ * whole turn fail-closed.
+ */
+function allEscapedToolCallsDisplaySafe(
+	message: AssistantMessage,
+	tools: readonly AgentTool<TSchema>[] | undefined,
+): boolean {
+	let sawEscapedCall = false;
+	for (const block of message.content) {
+		if (block.type !== "toolCall") continue;
+		if (block.escapedNonAsciiArguments !== true && block.escapedUnicodeArgumentEvidence === undefined) continue;
+		sawEscapedCall = true;
+		const tool = tools?.find(candidate => candidate.name === block.name);
+		const args = block.arguments as Record<string, unknown>;
+		if (
+			!isDisplaySafeEscapedArguments(tool, args) ||
+			!isDisplaySafeRawEscapeEvidence(tool, args, block.escapedUnicodeArgumentEvidence)
+		)
+			return false;
+	}
+	return sawEscapedCall;
 }
 /** Remove only the exact assistant response committed by its streaming attempt. */
 function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
@@ -3711,12 +3733,27 @@ async function runLoopBody(
 			// owns a bounded same-model retry; the defect is never treated as
 			// provider evidence, so the fallback chain never advances on it.
 			//
-			// The budget runs unconditionally for escaped payloads: even a
-			// display-safe tool (whose terminal exemption lives in
-			// `executeToolCalls`) resamples here first, so the model always gets
-			// its chances to emit literal UTF-8 and the fallback stays rare
-			// rather than becoming the default path.
+			// The single bounded exception is the display-safe degrade: when
+			// every escaped call in the turn corroborates its escaped scalars
+			// against decoded non-ASCII text inside the tool's declared
+			// display-only fields, a mistyped nibble can only change what the
+			// user reads on screen. That turn skips the resample/discard chain
+			// entirely — no managed retry is charged — executes the decoded
+			// call, and warns once so the fire rate stays measurable.
 			if (
+				message.stopReason !== "error" &&
+				message.stopReason !== "aborted" &&
+				hasEscapedNonAsciiToolCall(message) &&
+				allEscapedToolCallsDisplaySafe(message, currentContext.tools)
+			) {
+				// Display-safe degrade: execute the decoded arguments as-is and warn
+				// once (shape-only, never names or payload). The turn is neither
+				// resampled nor reported to the managed fallback policy.
+				logger.warn("agent: executing a tool-call turn whose display-safe arguments were \\uXXXX-escaped", {
+					mode: config.fallbackManaged ? "managed" : "in_loop",
+					...escapedNonAsciiToolCallShape(message),
+				});
+			} else if (
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
@@ -4945,10 +4982,11 @@ async function executeToolCalls(
 					// equally valid character — the payload is unverifiable and cannot be
 					// repaired after parsing, so it is rejected rather than executed on
 					// silently corrupted text. The one bounded exception is a tool that
-					// declared its arguments display-only (see
-					// isDisplaySafeEscapedArguments): user-facing question text whose
-					// only escaped scalars are exact U+2014 positions, corroborated against
-					// the decoded display fields. Missing or ASCII-position evidence rejects.
+					// declared display-only argument fields (see
+					// isDisplaySafeEscapedArguments): user-facing display text whose
+					// escaped scalars all corroborate decoded non-ASCII characters
+					// inside those fields. Missing, malformed, or ASCII-position
+					// evidence rejects.
 					//
 					// Terminal for this call: the resample budget is already spent, so
 					// log it (shape-only) to make the fire rate measurable without

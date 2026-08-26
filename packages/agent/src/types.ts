@@ -740,13 +740,13 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	/**
 	 * Argument fields (dotted paths into the arguments object) that render to
 	 * the user as pure display text — question wording and option labels, never
-	 * ids, metadata, or persisted records. The agent loop uses this to bound the
-	 * escaped-non-ASCII terminal rejection AFTER the resample budget is spent:
-	 * when every non-ASCII character under these fields is benign typographic
-	 * punctuation (e.g. an em-dash a JSON encoder escaped), the call executes
-	 * instead of failing closed. Every other field of these arguments — and
-	 * every field of every other tool — keeps the fail-closed rejection for
-	 * unverified `\uXXXX` payloads.
+	 * ids, metadata, or persisted records. When every `\uXXXX`-escaped scalar in
+	 * a tool call corroborates a decoded non-ASCII character inside these
+	 * fields, the agent loop degrades to a single warning and executes the
+	 * decoded call instead of discarding the turn: a mistyped hex digit there
+	 * can only change what the user reads, never what executes or persists.
+	 * Every other field of these arguments — and every field of every other
+	 * tool — keeps the fail-closed rejection for unverified `\uXXXX` payloads.
 	 */
 	displaySafeEscapedArgFields?: readonly string[];
 

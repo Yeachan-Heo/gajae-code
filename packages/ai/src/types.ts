@@ -626,11 +626,12 @@ export interface ToolCall {
 	 * Such a payload parses cleanly but
 	 * is unverifiable: one mistyped hex digit decodes to a different, equally
 	 * valid character, so the text can be silently wrong with no in-band evidence.
-	 * The agent loop resamples the turn unconditionally a bounded number of
-	 * times and then rejects the call instead of executing it. The single
-	 * bounded after-budget exception is a tool that enumerated its display
-	 * fields (`displaySafeEscapedArgFields`) whose non-ASCII content is benign
-	 * typographic punctuation — rendered question text, never executable
+	 * The agent loop resamples the turn a bounded number of times and then
+	 * rejects the call instead of executing it. The single bounded exception
+	 * is a tool that enumerated its display-only fields
+	 * (`displaySafeEscapedArgFields`): when every escaped scalar corroborates
+	 * a decoded non-ASCII character inside those fields, the call executes
+	 * with a warning instead — rendered question text, never executable
 	 * content, ids, or durable metadata.
 	 * Escapes that are required (control characters) or unavoidable (lone
 	 * surrogates) never set this.

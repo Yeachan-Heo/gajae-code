@@ -733,6 +733,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 	readonly rawArgumentValidation = (arguments_: Record<string, unknown>): RawArgumentValidationResult =>
 		recoverRoundZeroIntentContract(arguments_, this.session.getDeepInterviewAskStage?.());
 	readonly strict = true;
+	/**
+	 * Display-only fields: question text and option labels render to the user
+	 * and carry no executable or persisted meaning, so `\uXXXX`-escaped
+	 * non-ASCII text inside them degrades to a warning instead of failing the
+	 * run (issue #4983). Ids, workflow-gate metadata, and deep-interview
+	 * records stay load-bearing and keep the fail-closed rejection.
+	 */
+	readonly displaySafeEscapedArgFields = ["questions.question", "questions.options.label"] as const;
 	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
 		this.description = prompt.render(askDescription);
