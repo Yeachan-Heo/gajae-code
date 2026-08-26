@@ -4314,6 +4314,87 @@ describe("intent recovery", () => {
 		}
 	});
 
+	test("partial bridge migration recovery removes Q and restores authenticated P", async () => {
+		const fixture = await makeFixture();
+		await seedSkills(fixture.paths);
+		await seedConfig(fixture.paths);
+		const installed = await runPaseoSetup({}, fixture.deps);
+		expect(installed.kind).toBe("install");
+		const oldDir = fixture.paths.bridgeDir;
+		const before = await readProvenance(fixture.paths.provenanceLedger);
+		const beforeBridge = await snapshotTree(oldDir);
+		const sourceDir = before.bridgeSourceDir;
+		if (sourceDir === undefined) throw new Error("expected an authenticated bridge source");
+		const newBridge = path.join(fixture.root, "partial-relocated-paseo-skills");
+		const migratedName = SKILL_NAMES[0]!;
+		await fs.mkdir(newBridge);
+		const migratedLink = path.join(newBridge, migratedName);
+		await fs.symlink(path.join(sourceDir, migratedName), migratedLink);
+		const migratedLinkStat = await fs.lstat(migratedLink, { bigint: true });
+		const migratedRootStat = await fs.lstat(newBridge, { bigint: true });
+		const after = {
+			...before,
+			bridgePath: newBridge,
+			bridgeEntries: [migratedName],
+			bridgeEntryIdentities: {
+				[migratedName]: {
+					dev: migratedLinkStat.dev.toString(),
+					ino: migratedLinkStat.ino.toString(),
+					size: migratedLinkStat.size.toString(),
+					mtimeNs: migratedLinkStat.mtimeNs.toString(),
+				},
+			},
+			bridgeDirCreated: true,
+			bridgeDirIdentity: {
+				dev: migratedRootStat.dev.toString(),
+				ino: migratedRootStat.ino.toString(),
+				size: migratedRootStat.size.toString(),
+				mtimeNs: migratedRootStat.mtimeNs.toString(),
+			},
+		};
+		await writeProvenance(fixture.paths.provenanceLedger, after);
+		await writeIntent(fixture.paths.intentRecord, {
+			version: INTENT_VERSION,
+			step: "skills-bridge",
+			targetPath: newBridge,
+			ownedKeys: ["paseo.skills-bridge"],
+			targetPreflightIdentity: provenanceLedgerIdentity(before),
+			targetExpectedIdentity: provenanceLedgerIdentity(before),
+			provenancePath: fixture.paths.provenanceLedger,
+			provenancePreflightIdentity: provenanceLedgerIdentity(before),
+			provenanceExpectedIdentity: provenanceLedgerIdentity(after),
+			provenancePayload: after,
+			bridgePreflightPayload: before,
+			startedAt: fixture.deps.now().toISOString(),
+		});
+
+		const recovery = await recoverIntent(fixture.paths.intentRecord, {
+			repair: true,
+			expectedTargetPaths: [fixture.paths.configJson, fixture.paths.orchestrationPreferences, oldDir, newBridge],
+			expectedProvenancePath: fixture.paths.provenanceLedger,
+			replayPartialBridgeMigration: ledger =>
+				inverseSkillsBridge(
+					fixture.deps,
+					{
+						createdEntries: ledger.bridgeEntries ?? [],
+						prunedEntries: [],
+						adoptedEntries: [],
+						entryIdentities: ledger.bridgeEntryIdentities ?? {},
+						bridgeDirCreated: ledger.bridgeDirCreated === true,
+						bridgeDirIdentity: ledger.bridgeDirIdentity,
+						sourceDir: ledger.bridgeSourceDir,
+					},
+					{ bridgeDir: ledger.bridgePath },
+				),
+		});
+		expect(recovery?.recovered).toBe(true);
+		expect(await readIntent(fixture.paths.intentRecord)).toBeUndefined();
+		expect(await readProvenance(fixture.paths.provenanceLedger)).toEqual(before);
+		expect(await snapshotTree(oldDir)).toBe(beforeBridge);
+		await expect(fs.lstat(newBridge)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.lstat(migratedLink)).rejects.toMatchObject({ code: "ENOENT" });
+	});
+
 	test("pending old-root cleanup does not overwrite the post-cutover intent payload", async () => {
 		const fixture = await makeFixture();
 		await seedSkills(fixture.paths);

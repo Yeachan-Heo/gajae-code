@@ -539,6 +539,8 @@ export interface RecoverIntentOptions {
 	readonly expectedProvenancePath?: string;
 	/** Replays a detached bridge authority before clearing a repaired intent. */
 	readonly replayBridgeCleanup?: (authority: BridgeCleanupAuthority) => Promise<void>;
+	/** Removes an authenticated partial new-root migration before restoring old provenance. */
+	readonly replayPartialBridgeMigration?: (ledger: ProvenanceLedger) => Promise<void>;
 	/** Bridge roots authenticated by the active setup caller. */
 	readonly trustedBridgePaths?: readonly string[];
 }
@@ -931,10 +933,59 @@ export async function recoverIntent(
 			before !== undefined && (await bridgeLedgerMatchesFilesystem(before, undefined, intent.targetPath));
 		const afterMatches =
 			after !== undefined && (await bridgeLedgerMatchesFilesystem(after, before, intent.targetPath));
+		const afterOwnPathMatches =
+			after !== undefined && (await bridgeLedgerMatchesFilesystem(after, undefined, intent.targetPath));
 		const samePayload =
 			before !== undefined &&
 			after !== undefined &&
 			provenanceLedgerIdentity(before) === provenanceLedgerIdentity(after);
+		const partialMigration =
+			beforeMatches &&
+			afterOwnPathMatches &&
+			!afterMatches &&
+			pendingAuthority === undefined &&
+			before?.bridgePath !== after?.bridgePath &&
+			ledgerObserved === intent.provenanceExpectedIdentity;
+		if (partialMigration) {
+			if (!options.repair) {
+				return {
+					recovered: false,
+					detail:
+						"an interrupted bridge migration has a partial new root; repair is required before setup can proceed",
+				};
+			}
+			if (options.replayPartialBridgeMigration === undefined || after === undefined || before === undefined) {
+				return {
+					recovered: false,
+					detail: "partial bridge migration cleanup lacks authenticated replay authority; retaining the intent",
+				};
+			}
+			await options.replayPartialBridgeMigration(after);
+			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: "the provenance ledger changed during partial bridge migration cleanup; retaining the intent",
+				};
+			}
+			if (await bridgeLedgerMatchesFilesystem(after, undefined, intent.targetPath)) {
+				return {
+					recovered: false,
+					detail: "partial new bridge migration cleanup remains pending; retaining the intent",
+				};
+			}
+			if (!(await bridgeLedgerMatchesFilesystem(before, undefined, intent.targetPath))) {
+				return {
+					recovered: false,
+					detail: "the old bridge changed during partial migration cleanup; retaining the intent",
+				};
+			}
+			await writeProvenance(intent.provenancePath, before);
+			await clearIntent(intentPath);
+			return {
+				recovered: true,
+				detail: "the interrupted partial bridge migration was rolled back to the authenticated old root",
+			};
+		}
 		const safePreflight = beforeMatches && !afterMatches && ledgerObserved === intent.provenancePreflightIdentity;
 		const safeCompleted =
 			afterMatches && (ledgerObserved === intent.provenanceExpectedIdentity || ledgerObserved === settledAfter);

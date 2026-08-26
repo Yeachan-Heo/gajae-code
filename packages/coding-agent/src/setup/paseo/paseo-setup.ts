@@ -260,6 +260,25 @@ async function replayPendingBridgeCleanup(
 	);
 }
 
+async function replayPartialBridgeMigration(deps: PaseoSetupDependencies, ledger: ProvenanceLedger): Promise<void> {
+	if (ledger.bridgePath === undefined || ledger.bridgeSourceDir === undefined) {
+		throw new SkillsBridgeError("partial bridge migration cleanup is missing its authenticated path or source");
+	}
+	await inverseSkillsBridge(
+		deps,
+		{
+			createdEntries: ledger.bridgeEntries ?? [],
+			prunedEntries: [],
+			adoptedEntries: [],
+			entryIdentities: ledger.bridgeEntryIdentities ?? {},
+			bridgeDirCreated: ledger.bridgeDirCreated === true,
+			bridgeDirIdentity: ledger.bridgeDirIdentity,
+			sourceDir: ledger.bridgeSourceDir,
+		},
+		{ bridgeDir: ledger.bridgePath },
+	);
+}
+
 /**
  * Reject flag combinations that have no coherent meaning.
  *
@@ -297,6 +316,7 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 				expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 				expectedProvenancePath: deps.paths.provenanceLedger,
 				replayBridgeCleanup: authority => replayPendingBridgeCleanup(deps, authority),
+				replayPartialBridgeMigration: ledger => replayPartialBridgeMigration(deps, ledger),
 				trustedBridgePaths: await trustedBridgePathsForRecovery(deps),
 			});
 			if (recovery && !recovery.recovered) {
@@ -378,6 +398,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 		expectedProvenancePath: deps.paths.provenanceLedger,
 		replayBridgeCleanup: authority => replayPendingBridgeCleanup(deps, authority),
+		replayPartialBridgeMigration: ledger => replayPartialBridgeMigration(deps, ledger),
 		trustedBridgePaths: await trustedBridgePathsForRecovery(deps),
 	});
 	if (recovery && !recovery.recovered) {
