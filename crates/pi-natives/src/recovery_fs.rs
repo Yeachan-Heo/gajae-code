@@ -126,6 +126,11 @@ static APPEND_AFTER_WRITE_HOOK: OnceLock<
 > = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static APPEND_AFTER_EXACT_PROOF_HOOK: OnceLock<
+	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 static APPEND_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
@@ -186,6 +191,27 @@ fn pause_append_after_write_for_test() {
 	{
 		entered.send(()).expect("append after-write hook receiver");
 		resume.recv().expect("append after-write hook resume");
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_append_after_exact_proof_hook(hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>) {
+	*APPEND_AFTER_EXACT_PROOF_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn pause_append_after_exact_proof_for_test() {
+	if let Some((entered, resume)) = APPEND_AFTER_EXACT_PROOF_HOOK
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		entered.send(()).expect("append after-proof hook receiver");
+		resume.recv().expect("append after-proof hook resume");
 	}
 }
 
@@ -3086,25 +3112,6 @@ fn append_managed(
 			None,
 		);
 	}
-	if append_post_identity_if_exact(
-		&file,
-		&parent,
-		&name,
-		expected_dev,
-		expected_ino,
-		expected_size,
-		expected_sha256,
-		data,
-	)
-	.is_none()
-	{
-		return RecoveryFsResult::append_failure(
-			"identity_mismatch",
-			"committed",
-			"not_provable",
-			None,
-		);
-	}
 	let identity = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
@@ -3136,15 +3143,6 @@ fn append_managed(
 			None,
 		);
 	}
-	// The digest is retained for the next append expectation. Recheck both the
-	// descriptor and name after reading so a concurrent successor cannot be
-	// adopted merely because it raced after the post-append identity check.
-	let sha256 = match digest_hex(&file) {
-		Ok(value) => value,
-		Err(code) => {
-			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
-		},
-	};
 	let descriptor_after = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
@@ -3165,6 +3163,39 @@ fn append_managed(
 			None,
 		);
 	}
+	let exact_identity = match append_post_identity_if_exact(
+		&file,
+		&parent,
+		&name,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_sha256,
+		data,
+	) {
+		Some(value) => value,
+		None => {
+			return RecoveryFsResult::append_failure(
+				"identity_mismatch",
+				"committed",
+				"not_provable",
+				None,
+			);
+		},
+	};
+	let exact_sha256 = match exact_identity.sha256.clone() {
+		Some(value) => value,
+		None => {
+			return RecoveryFsResult::append_failure(
+				"identity_mismatch",
+				"committed",
+				"not_provable",
+				None,
+			);
+		},
+	};
+	#[cfg(test)]
+	pause_append_after_exact_proof_for_test();
 	if sync_append_parent(&parent).is_err() {
 		return RecoveryFsResult::append_failure(
 			"fsync_failed",
@@ -3187,7 +3218,7 @@ fn append_managed(
 	// last window must never be reported as a successful append receipt.
 	#[cfg(test)]
 	pause_append_after_final_sync_for_test();
-	let terminal_descriptor = match regular_identity(&file) {
+	let mut terminal_descriptor = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
 			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
@@ -3199,6 +3230,7 @@ fn append_managed(
 			return RecoveryFsResult::append_failure(code, "committed", "not_provable", None);
 		},
 	};
+	terminal_descriptor.sha256 = Some(terminal_digest.clone());
 	let terminal_named = match statat(&parent, &name) {
 		Ok(value) => value,
 		Err(code) => {
@@ -3213,8 +3245,8 @@ fn append_managed(
 			None,
 		);
 	}
-	if terminal_descriptor != identity
-		|| terminal_digest != sha256
+	if terminal_descriptor != exact_identity
+		|| terminal_digest != exact_sha256
 		|| !stat_matches_regular_identity(&terminal_named, &terminal_descriptor)
 	{
 		return RecoveryFsResult::append_failure(
@@ -4450,6 +4482,61 @@ mod tests {
 		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
 		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
 		assert!(result.identity.is_none(), "same-size foreign content must not authorize rewrite");
+		assert_eq!(fs::read(temporary.0.join("transcript")).expect("transcript"), foreign_contents);
+	}
+
+	#[test]
+	fn managed_append_rechecks_exact_proof_before_returning_receipt() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let own_append = b"\nown";
+		let foreign_contents = b"foreign-content-bytes!!";
+		let identity = managed_file(&root, "transcript", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_append_after_exact_proof_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_append = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let append = std::thread::spawn(move || {
+			append_managed(
+				&root_for_append,
+				None,
+				"transcript",
+				own_append,
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for append exact-proof boundary");
+		fs::write(temporary.0.join("transcript"), foreign_contents)
+			.expect("same-size post-proof overwrite");
+		resume_tx
+			.send(())
+			.expect("resume append exact-proof boundary");
+		let result = append.join().expect("append thread");
+		set_append_after_exact_proof_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
+		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
+		assert!(result.identity.is_none(), "post-proof tamper must not authorize rewrite");
 		assert_eq!(fs::read(temporary.0.join("transcript")).expect("transcript"), foreign_contents);
 	}
 
