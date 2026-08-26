@@ -4,10 +4,10 @@
  * Integrates MCP tool discovery with the custom tools system.
  */
 import { logger } from "@gajae-code/utils";
+import type { Settings } from "../config/settings";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import { AgentStorage } from "../session/agent-storage";
 import type { AuthStorage } from "../session/auth-storage";
-import type { Settings } from "../config/settings";
 import { type MCPLoadResult, MCPManager } from "./manager";
 import { MCPToolCache } from "./tool-cache";
 

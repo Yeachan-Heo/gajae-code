@@ -1,6 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getAgentDir } from "@gajae-code/utils";
 import {
 	type GjcBundleTransactionDecision,
 	GjcPluginSourceUnavailableError,
@@ -45,7 +46,6 @@ import type {
 	GjcUpdateApplyResult,
 	GjcUpdatePreview,
 } from "./types";
-import { getAgentDir } from "@gajae-code/utils";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
 /**
