@@ -874,6 +874,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2Settled = false;
 		let h2Failure: unknown;
 		let sawTurnEnded = false;
+		let terminalAdmissionClosed = false;
 		let responseEnded = false;
 		let queueDrained = false;
 		let endStreamError: Error | null = null;
@@ -890,13 +891,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		const settleH2WhenReady = (): void => {
 			if (!queueDrained) return;
 			if (endStreamError) {
-				settleH2(endStreamError);
+				settleBehindFence(() => settleH2(endStreamError));
 			} else if (sawTurnEnded) {
 				// A drained turnEnded is the successful terminal condition; Cursor
 				// may leave the HTTP/2 response open after sending it.
-				settleH2();
+				settleBehindFence(() => settleH2());
 			} else if (responseEnded) {
-				settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded"));
+				settleBehindFence(() => settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded")));
 			}
 		};
 		let transportWatchdog: NodeJS.Timeout | null = null;
@@ -1260,10 +1261,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			processPendingBuffer = () => {
 				if (processingPausedForExec || processingPausedForQueue) return;
 				while (pendingBuffer.length >= 5) {
-					if (sawTurnEnded) {
+					if (terminalAdmissionClosed) {
 						// A validated turnEnded closes admission. Drop coalesced bytes
-						// behind it so a late exec cannot reach the local handler after
-						// terminal bookkeeping has started.
+						// behind any terminal frame so a late exec cannot reach the local
+						// handler after terminal bookkeeping has started.
 						pendingBuffer = Buffer.alloc(0);
 						h2Request?.pause();
 						break;
@@ -1276,13 +1277,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
+						terminalAdmissionClosed = true;
+						responseEnded = true;
+						pendingBuffer = Buffer.alloc(0);
+						h2Request?.pause();
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
-							coordinator.fail(endError);
-						} else {
-							coordinator.turnEnded();
+							endStreamError = endError;
 						}
-						continue;
+						break;
 					}
 
 					try {
@@ -1382,6 +1385,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// still runs in order, while settlement waits for queue drain.
 						if (isTurnEnded) {
 							sawTurnEnded = true;
+							terminalAdmissionClosed = true;
 							drainMessageQueue();
 						}
 						// A single HTTP/2 data chunk can contain hundreds of valid,
