@@ -1540,6 +1540,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			};
 			let latestText = "";
 			let bridgeJobId!: string;
+			let retainedAcpSnapshot = "";
+			const appendAcpSnapshot = (snapshot: string): void => {
+				if (!bridgeJobId || !snapshot) return;
+				const delta = snapshot.startsWith(retainedAcpSnapshot)
+					? snapshot.slice(retainedAcpSnapshot.length)
+					: snapshot;
+				if (delta) ownedManager?.appendOutput(bridgeJobId, delta);
+				retainedAcpSnapshot = snapshot;
+			};
 
 			const runToCompletion = async (
 				runSignal: AbortSignal | undefined,
@@ -1686,7 +1695,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								? `${summary.output}${summary.output.endsWith("\n") ? "" : "\n"}(output truncated)`
 								: summary.output;
 						latestText = pollText;
-						if (bridgeJobId) ownedManager?.appendOutput(bridgeJobId, pollText);
+						appendAcpSnapshot(pollText);
 						onUpdate?.({
 							content: [{ type: "text", text: pollText }],
 							details: { terminalId: handle.terminalId },
@@ -1730,6 +1739,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				};
 
 				const bridgeNotices: string[] = [];
+				appendAcpSnapshot(prepared.summary.output);
 				if (finalOutput.truncated || prepared.locallyTruncated) bridgeNotices.push("(output truncated)");
 				for (const notice of pendingNotices) bridgeNotices.push(notice);
 				if (prepared.artifactSaveNotice) bridgeNotices.push(prepared.artifactSaveNotice);
@@ -1776,7 +1786,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							const result = await runToCompletion(runSignal);
 							const finalText = this.#extractTextResult(result);
 							latestText = finalText;
-							bridgeManager.appendOutput(jobId, finalText);
 							if (!bridgeBackgrounded) settleBridgeForeground();
 							bridgeCompletion.resolve({ kind: "completed", result });
 							await reportProgress(
@@ -1951,6 +1960,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		let ptyBackgrounded = false;
 		let lastPtyFoldKeyTime = 0;
 		let ptyJobId!: string;
+		let ptyOutputSeen = false;
 		const result: BashResult | BashInteractiveResult = interactiveUi
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
@@ -1975,14 +1985,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								"bash",
 								ptyLabel,
 								async () => {
+									let outcome: BashInteractiveResult | undefined;
 									try {
-										const outcome = await controls.terminalCompletion;
-										ptyManager.appendOutput(ptyJobId, this.#formatResultOutput(outcome));
+										outcome = await controls.terminalCompletion;
 										const completed = this.#buildCompletedResult(outcome, timeoutSec, {
 											requestedTimeoutSec,
 										});
 										return this.#extractTextResult(completed);
 									} finally {
+										if (!ptyOutputSeen && outcome)
+											ptyManager.appendOutput(ptyJobId, this.#formatResultOutput(outcome));
 										if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
 									}
 								},
@@ -2053,6 +2065,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						return this.session.requestForegroundBashBackground?.() ?? false;
 					},
 					onOutput: chunk => {
+						ptyOutputSeen = true;
 						if (ptyJobId) ownedManager?.appendOutput(ptyJobId, chunk);
 					},
 				}).catch(error => {
