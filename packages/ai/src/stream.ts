@@ -613,10 +613,11 @@ export function streamSimple<TApi extends Api>(
 	// the gateway bearer instead. Comes BEFORE the custom-API check so
 	// extension-registered APIs can't accidentally override a configured
 	// pi-native transport.
+	const resolvedRequestMaxTokens = resolveDefaultRequestMaxTokens(model, options?.maxTokens);
 	if (model.transport === "pi-native") {
 		return streamFromLazyImport(async () => {
 			const { streamPiNative } = await import("./providers/pi-native-client");
-			return streamPiNative(model, context, options);
+			return streamPiNative(model, context, { ...options, maxTokens: resolvedRequestMaxTokens });
 		}, options?.signal);
 	}
 
@@ -643,7 +644,7 @@ export function streamSimple<TApi extends Api>(
 	const adapterOptions = isProviderSafetyStopModelTrusted(model)
 		? withProviderSafetyStopAdapterInvocation(options ?? {})
 		: options;
-	const resolvedSpecialProviderMaxTokens = resolveDefaultRequestMaxTokens(model, options?.maxTokens);
+	const resolvedSpecialProviderMaxTokens = resolvedRequestMaxTokens;
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
 	if (model.provider === "gitlab-duo") {
