@@ -225,6 +225,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		);
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
+	const models = getBundledModels(provider as GeneratedProvider);
+	if (models.length === 0 || models.every(model => model.api === "bedrock-converse-stream")) {
+		throw new Error(`Auth gateway scope ${provider} has no broker-consumable models`);
+	}
 
 	// Build a broker-backed AuthStorage — same pattern as discoverAuthStorage()
 	// in sdk/session.ts. The gateway never touches local SQLite.
@@ -243,7 +247,6 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		await storage.reload();
 		assertEnabledProviderCredential(storage.exportSnapshot(), provider);
 
-		const models = getBundledModels(provider as GeneratedProvider);
 		const catalog = createAuthGatewayModelCatalog(provider, models);
 		if (catalog.models.length === 0) {
 			throw new Error(`Auth gateway scope ${provider} has no source-backed models`);
