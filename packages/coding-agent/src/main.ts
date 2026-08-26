@@ -343,7 +343,11 @@ export interface InteractiveModeNotify {
 export async function submitInteractiveInput(
 	mode: Pick<
 		InteractiveMode,
-		"markPendingSubmissionStarted" | "finishPendingSubmission" | "showError" | "checkShutdownRequested"
+		| "markPendingSubmissionStarted"
+		| "finishPendingSubmission"
+		| "showError"
+		| "checkShutdownRequested"
+		| "waitForAgentEnd"
 	>,
 	session: Pick<AgentSession, "prompt" | "promptCustomMessage">,
 	input: SubmittedUserInput,
@@ -357,15 +361,35 @@ export async function submitInteractiveInput(
 		if (!input.started && !mode.markPendingSubmissionStarted(input)) {
 			return;
 		}
-		if (input.customType) {
-			await session.promptCustomMessage({
-				customType: input.customType,
-				content: input.text,
-				display: input.display ?? false,
-				attribution: "agent",
-			});
-		} else {
-			await session.prompt(input.text, { images: input.images });
+		const agentEnd = mode.waitForAgentEnd();
+		try {
+			const prompt = input.customType
+				? session.promptCustomMessage({
+						customType: input.customType,
+						content: input.text,
+						display: input.display ?? false,
+						attribution: "agent",
+					})
+				: session.prompt(input.text, { images: input.images });
+			const promptResult = prompt.then(
+				() => ({ type: "prompt" as const }),
+				(error: unknown) => ({ type: "error" as const, error }),
+			);
+			const result = await Promise.race([
+				promptResult,
+				agentEnd.promise.then(() => ({ type: "agent_end" as const })),
+			]);
+			if (result.type === "error") {
+				const errorMessage = result.error instanceof Error ? result.error.message : "Unknown error occurred";
+				mode.showError(errorMessage);
+			} else if (result.type === "agent_end") {
+				void prompt.catch((error: unknown) => {
+					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+					mode.showError(errorMessage);
+				});
+			}
+		} finally {
+			agentEnd.dispose();
 		}
 	} catch (error: unknown) {
 		const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";

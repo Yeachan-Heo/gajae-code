@@ -162,6 +162,10 @@ describe("AgentSession concurrent prompt guard", () => {
 			finishPendingSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: vi.fn(() => ({
+				promise: Promise.withResolvers<void>().promise,
+				dispose: vi.fn(),
+			})),
 		};
 		const input: SubmittedUserInput = {
 			text: "cancel during auth",

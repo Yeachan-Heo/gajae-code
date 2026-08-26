@@ -442,6 +442,31 @@ export class InteractiveMode implements InteractiveModeContext {
 	#cleanupUnsubscribe?: () => void;
 	#itermPetTransport?: ItermPetTransport;
 
+	waitForAgentEnd(): { promise: Promise<void>; dispose: () => void } {
+		const deferred = Promise.withResolvers<void>();
+		let disposed = false;
+		let unsubscribe: (() => void) | undefined;
+		const dispose = () => {
+			if (disposed) return;
+			disposed = true;
+			unsubscribe?.();
+			unsubscribe = undefined;
+		};
+		const listener = (event: AgentSessionEvent) => {
+			if (disposed || event.type !== "agent_end") return;
+			dispose();
+			deferred.resolve();
+		};
+
+		const subscribedUnsubscribe = this.session.subscribe(listener);
+		unsubscribe = subscribedUnsubscribe;
+		if (disposed) {
+			subscribedUnsubscribe();
+		}
+
+		return { promise: deferred.promise, dispose };
+	}
+
 	/**
 	 * Pet-unavailable warning text. The iTerm transport reason is parenthesized
 	 * only when a transport actually reported one; non-iTerm terminals and a
@@ -1150,6 +1175,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	async getUserInput(): Promise<SubmittedUserInput> {
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#goalModeController.beforeGetUserInput();
+		}
+		const deferredSubmission = this.#inputController.takeDeferredSubmission();
+		if (deferredSubmission) {
+			return deferredSubmission;
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<SubmittedUserInput>();
 		let unsubscribeStop = () => {};

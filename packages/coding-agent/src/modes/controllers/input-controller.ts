@@ -15,6 +15,7 @@ import {
 	type ComposerSubmissionOptions,
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
+	type SubmittedUserInput,
 	stopInteractiveActivityIndicator,
 } from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
@@ -92,6 +93,11 @@ function isExpandable(obj: unknown): obj is Expandable {
 export class InputController {
 	readonly actionRegistry: ActionRegistry<void>;
 	readonly #loadPastedImageBatch: typeof loadPastedImageBatch;
+	#deferredSubmission?: {
+		text: string;
+		images?: InteractiveModeContext["pendingImages"];
+		composer: ComposerSubmissionOptions;
+	};
 	#imagePlaceholderDeletionUndo?: {
 		beforeText: string;
 		afterText: string;
@@ -1162,10 +1168,32 @@ export class InputController {
 			const submission = this.ctx.startPendingSubmission({ text, images }, composer);
 
 			this.ctx.onInputCallback(submission);
+		} else if (!this.#deferredSubmission) {
+			const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
+			this.#deferredSubmission = { text, images, composer };
+			if (this.#canModifyComposer(composer)) {
+				this.ctx.editor.setText("");
+				this.#clearPendingImagesIfOwnedBy(pendingImages, composer);
+				this.ctx.editor.addToHistory(text);
+			}
+			return;
+		} else {
+			this.ctx.showStatus("Your previous message is waiting to be sent. Keep this draft and send it again shortly.");
+			return;
 		}
 		if (this.#canModifyComposer(composer)) {
 			this.ctx.editor.addToHistory(text);
 		}
+	}
+
+	takeDeferredSubmission(): SubmittedUserInput | undefined {
+		const deferredSubmission = this.#deferredSubmission;
+		if (!deferredSubmission) return undefined;
+		this.#deferredSubmission = undefined;
+		return this.ctx.startPendingSubmission(
+			{ text: deferredSubmission.text, images: deferredSubmission.images },
+			{ ownsComposer: false, editor: deferredSubmission.composer.editor },
+		);
 	}
 
 	handleCtrlC(): void {

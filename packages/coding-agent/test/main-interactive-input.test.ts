@@ -4,9 +4,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runInteractiveMode, StartupUpdateOrchestrator, submitInteractiveInput } from "@gajae-code/coding-agent/main";
-import type { InteractiveMode } from "@gajae-code/coding-agent/modes/interactive-mode";
+import { InteractiveMode } from "@gajae-code/coding-agent/modes/interactive-mode";
 import type { SubmittedUserInput } from "@gajae-code/coding-agent/modes/types";
-import type { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_LAUNCH_ID_ENV,
@@ -24,13 +24,25 @@ function createInput(overrides: Partial<SubmittedUserInput> = {}): SubmittedUser
 	};
 }
 
+function createAgentEndWaiter() {
+	const agentEnd = Promise.withResolvers<void>();
+	const dispose = vi.fn();
+	return {
+		agentEnd,
+		dispose,
+		waitForAgentEnd: vi.fn(() => ({ promise: agentEnd.promise, dispose })),
+	};
+}
+
 describe("submitInteractiveInput", () => {
 	it("prompts already-started continue submissions without re-checking optimistic state", async () => {
+		const waiter = createAgentEndWaiter();
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => false),
 			finishPendingSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: waiter.waitForAgentEnd,
 		};
 		const session = {
 			prompt: vi.fn(async () => {}),
@@ -44,14 +56,17 @@ describe("submitInteractiveInput", () => {
 		expect(session.prompt).toHaveBeenCalledWith("", { images: undefined });
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.showError).not.toHaveBeenCalled();
+		expect(waiter.dispose).toHaveBeenCalledTimes(1);
 	});
 
 	it("skips prompting when optimistic submission was cancelled before start", async () => {
+		const waiter = createAgentEndWaiter();
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => false),
 			finishPendingSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: waiter.waitForAgentEnd,
 		};
 		const session = {
 			prompt: vi.fn(async () => {}),
@@ -65,14 +80,17 @@ describe("submitInteractiveInput", () => {
 		expect(session.prompt).not.toHaveBeenCalled();
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.showError).not.toHaveBeenCalled();
+		expect(waiter.waitForAgentEnd).not.toHaveBeenCalled();
 	});
 
 	it("routes hidden custom submissions through promptCustomMessage", async () => {
+		const waiter = createAgentEndWaiter();
 		const mode = {
 			markPendingSubmissionStarted: vi.fn(() => true),
 			finishPendingSubmission: vi.fn(),
 			showError: vi.fn(),
 			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: waiter.waitForAgentEnd,
 		};
 		const session = {
 			prompt: vi.fn(async () => {}),
@@ -91,6 +109,90 @@ describe("submitInteractiveInput", () => {
 		});
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.showError).not.toHaveBeenCalled();
+	});
+
+	it("releases input ownership at agent_end while the prompt remains pending", async () => {
+		const prompt = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const listeners = new Set<(event: AgentSessionEvent) => void>();
+		const unsubscribe = vi.fn((listener: (event: AgentSessionEvent) => void) => listeners.delete(listener));
+		const session = {
+			prompt: vi.fn(() => {
+				events.push("prompt");
+				return prompt.promise;
+			}),
+			promptCustomMessage: vi.fn(async () => {}),
+			subscribe: vi.fn((listener: (event: AgentSessionEvent) => void) => {
+				events.push("subscribe");
+				listeners.add(listener);
+				return () => unsubscribe(listener);
+			}),
+		};
+		const interactiveMode = Object.create(InteractiveMode.prototype) as InteractiveMode;
+		interactiveMode.session = session as unknown as AgentSession;
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: interactiveMode.waitForAgentEnd.bind(interactiveMode),
+		};
+		const input = createInput();
+
+		const submission = submitInteractiveInput(mode, session, input);
+		expect(events).toEqual(["subscribe", "prompt"]);
+		for (const listener of listeners) {
+			listener({ type: "agent_end" } as AgentSessionEvent);
+		}
+		await submission;
+
+		expect(mode.finishPendingSubmission).toHaveBeenCalledTimes(1);
+		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
+		expect(unsubscribe).toHaveBeenCalledTimes(1);
+	});
+
+	it("reports a late prompt rejection after agent_end once", async () => {
+		const waiter = createAgentEndWaiter();
+		const prompt = Promise.withResolvers<void>();
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: waiter.waitForAgentEnd,
+		};
+		const session = {
+			prompt: vi.fn(() => prompt.promise),
+			promptCustomMessage: vi.fn(async () => {}),
+		};
+
+		const submission = submitInteractiveInput(mode, session, createInput());
+		waiter.agentEnd.resolve();
+		await submission;
+		prompt.reject(new Error("late failure"));
+		await Promise.resolve();
+
+		expect(mode.showError).toHaveBeenCalledTimes(1);
+		expect(mode.showError).toHaveBeenCalledWith("late failure");
+	});
+
+	it("disposes the agent-end waiter when the prompt settles first", async () => {
+		const waiter = createAgentEndWaiter();
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: waiter.waitForAgentEnd,
+		};
+		const session = {
+			prompt: vi.fn(async () => {}),
+			promptCustomMessage: vi.fn(async () => {}),
+		};
+
+		await submitInteractiveInput(mode, session, createInput());
+
+		expect(waiter.dispose).toHaveBeenCalledTimes(1);
 	});
 });
 

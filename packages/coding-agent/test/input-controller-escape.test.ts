@@ -1286,6 +1286,87 @@ describe("InputController escape behavior", () => {
 		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
 	});
 });
+
+describe("InputController deferred submissions", () => {
+	it("stores accepted normal input while no callback is installed and clears its owned composer", async () => {
+		const { ctx, editor } = createContext();
+		ctx.onInputCallback = undefined;
+		const controller = new InputController(ctx);
+
+		editor.setText("  deferred message  ");
+		await controller.submitText("  deferred message  ", { ownsComposer: true, editor: ctx.editor });
+
+		expect(editor.getText()).toBe("");
+		expect(editor.addToHistory).toHaveBeenCalledTimes(1);
+		expect(editor.addToHistory).toHaveBeenCalledWith("deferred message");
+	});
+
+	it("promotes a deferred submission once with its copied images", async () => {
+		const { ctx, spies } = createContext();
+		ctx.onInputCallback = undefined;
+		const image = { type: "image", data: "deferred-image" } as InteractiveModeContext["pendingImages"][number];
+		const images = [image];
+		ctx.pendingImages = images;
+		const controller = new InputController(ctx);
+
+		await controller.submitText("[image 1] deferred message", { ownsComposer: true, editor: ctx.editor });
+		const submission = controller.takeDeferredSubmission();
+
+		expect(submission).toEqual(createSubmission({ text: "[image 1] deferred message", images }));
+		expect(spies.startPendingSubmission).toHaveBeenCalledWith(
+			{ text: "[image 1] deferred message", images },
+			{ ownsComposer: false, editor: ctx.editor },
+		);
+		expect(spies.startPendingSubmission.mock.calls[0]?.[0].images).not.toBe(images);
+		expect(controller.takeDeferredSubmission()).toBeUndefined();
+	});
+
+	it("does not clear a newer editor draft when promoting a deferred submission", async () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.onInputCallback = undefined;
+		const controller = new InputController(ctx);
+
+		await controller.submitText("deferred message", { ownsComposer: true, editor: ctx.editor });
+		editor.setText("newer draft");
+		controller.takeDeferredSubmission();
+
+		expect(editor.getText()).toBe("newer draft");
+		expect(spies.startPendingSubmission.mock.calls[0]?.[1]).toEqual({ ownsComposer: false, editor: ctx.editor });
+	});
+
+	it("retains a newer draft when the deferred slot is already occupied", async () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.onInputCallback = undefined;
+		const image = { type: "image", data: "newer-image" } as InteractiveModeContext["pendingImages"][number];
+		const controller = new InputController(ctx);
+
+		await controller.submitText("first message", { ownsComposer: true, editor: ctx.editor });
+		editor.setText("second message");
+		ctx.pendingImages = [image];
+		await controller.submitText("second message", { ownsComposer: true, editor: ctx.editor });
+
+		expect(editor.getText()).toBe("second message");
+		expect(ctx.pendingImages).toEqual([image]);
+		expect(spies.showStatus).toHaveBeenCalledWith(
+			"Your previous message is waiting to be sent. Keep this draft and send it again shortly.",
+		);
+		expect(controller.takeDeferredSubmission()).toEqual(createSubmission({ text: "first message" }));
+	});
+
+	it("handles Bash commands without a callback without populating the deferred slot", async () => {
+		const { ctx } = createContext();
+		ctx.onInputCallback = undefined;
+		const handleBashCommand = vi.fn(async () => {});
+		ctx.handleBashCommand = handleBashCommand;
+		const controller = new InputController(ctx);
+
+		await controller.submitText("! echo deferred", { ownsComposer: true, editor: ctx.editor });
+
+		expect(handleBashCommand).toHaveBeenCalledTimes(1);
+		expect(handleBashCommand).toHaveBeenCalledWith("echo deferred", false);
+		expect(controller.takeDeferredSubmission()).toBeUndefined();
+	});
+});
 describe("InputController command palette", () => {
 	it("runs registered actions directly and excludes unsupported actions and self-reentry", () => {
 		const { ctx } = createContext();
