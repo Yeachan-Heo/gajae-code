@@ -2192,9 +2192,9 @@ async function executeUncertainRetirement(
 		);
 	if (receipt.stage === "index") {
 		let indexSeq = receipt.indexSeq;
-		const terminalEvidence = broker.index.findSessionTerminalEvidence(record);
-		if (terminalEvidence?.type === "session_closed") indexSeq ??= terminalEvidence.indexSeq;
-		else if (terminalEvidence?.type === "session_deleted")
+		const sessionClosedEvidence = broker.index.findSessionClosedEvidence(record);
+		if (sessionClosedEvidence !== undefined) indexSeq ??= sessionClosedEvidence;
+		else if (broker.index.findSessionTerminalEvidence(record)?.type === "session_deleted")
 			return fail(
 				"terminal_uncertain",
 				"Uncertain session retirement cannot certify session closure after a deletion tombstone.",

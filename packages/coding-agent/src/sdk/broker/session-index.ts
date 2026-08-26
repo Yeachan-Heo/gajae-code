@@ -1809,6 +1809,35 @@ export class SessionIndex {
 			: undefined;
 	}
 
+	/** Returns the latest identity-bound session_closed evidence, even after a tombstone. */
+	findSessionClosedEvidence(
+		expected: Pick<
+			IndexedSession,
+			| "sessionId"
+			| "locator"
+			| "endpointGeneration"
+			| "pid"
+			| "processIncarnation"
+			| "hostIncarnation"
+			| "endpointMtimeMs"
+			| "lifecycleRequestId"
+		>,
+	): number | undefined {
+		const expectedRoot = resolveEquivalentPath(expected.locator.stateRoot);
+		return admitEvents(this.#events).admitted.findLast(
+			event =>
+				event.type === "session_closed" &&
+				event.sessionId === expected.sessionId &&
+				event.endpointGeneration === expected.endpointGeneration &&
+				event.pid === expected.pid &&
+				resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+				event.processIncarnation === expected.processIncarnation &&
+				event.hostIncarnation === expected.hostIncarnation &&
+				event.endpointMtimeMs === expected.endpointMtimeMs &&
+				event.lifecycleRequestId === expected.lifecycleRequestId,
+		)?.indexSeq;
+	}
+
 	/**
 	 * Production coalesced heartbeat checkpoint pass (C2): appends one
 	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.
