@@ -1681,14 +1681,8 @@ export async function correctBridgeOwnershipAfterFailure(
 		...partial.adoptedEntries,
 	].filter((name, index, all) => all.indexOf(name) === index);
 	const corrected = await readProvenance(deps.paths.provenanceLedger);
-	const restoredOldPath =
-		isMigration && bridgeLedger.bridgePath !== undefined
-			? await fs
-					.lstat(bridgeLedger.bridgePath)
-					.then(() => bridgeLedger.bridgePath)
-					.catch(() => undefined)
-			: undefined;
-	const correctedPath = restoredOldPath ?? corrected.bridgePath;
+	const correctedPath =
+		isMigration && (actual.length > 0 || partial.bridgeDirCreated) ? deps.paths.bridgeDir : corrected.bridgePath;
 	const correctedLedger: ProvenanceLedger = {
 		...corrected,
 		...(correctedPath === undefined ? { bridgePath: undefined } : { bridgePath: correctedPath }),
