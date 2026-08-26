@@ -1774,6 +1774,41 @@ export class SessionIndex {
 		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir, probedIncarnations).identities;
 	}
 
+	/** Returns the latest identity-bound terminal event, if retained. */
+	findSessionTerminalEvidence(
+		expected: Pick<
+			IndexedSession,
+			| "sessionId"
+			| "locator"
+			| "endpointGeneration"
+			| "pid"
+			| "processIncarnation"
+			| "hostIncarnation"
+			| "endpointMtimeMs"
+			| "lifecycleRequestId"
+		>,
+	): { type: "host_unregistered" | "session_closed" | "session_deleted"; indexSeq: number } | undefined {
+		const expectedRoot = resolveEquivalentPath(expected.locator.stateRoot);
+		const event = admitEvents(this.#events).admitted.findLast(
+			event =>
+				(event.type === "host_unregistered" ||
+					event.type === "session_closed" ||
+					event.type === "session_deleted") &&
+				event.sessionId === expected.sessionId &&
+				event.endpointGeneration === expected.endpointGeneration &&
+				event.pid === expected.pid &&
+				resolveEquivalentPath(event.locator.stateRoot) === expectedRoot &&
+				event.processIncarnation === expected.processIncarnation &&
+				event.hostIncarnation === expected.hostIncarnation &&
+				event.endpointMtimeMs === expected.endpointMtimeMs &&
+				event.lifecycleRequestId === expected.lifecycleRequestId,
+		);
+		return event &&
+			(event.type === "host_unregistered" || event.type === "session_closed" || event.type === "session_deleted")
+			? { type: event.type, indexSeq: event.indexSeq }
+			: undefined;
+	}
+
 	/**
 	 * Production coalesced heartbeat checkpoint pass (C2): appends one
 	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.

@@ -2192,7 +2192,15 @@ async function executeUncertainRetirement(
 		);
 	if (receipt.stage === "index") {
 		let indexSeq = receipt.indexSeq;
-		if (!record.terminal) {
+		const terminalEvidence = broker.index.findSessionTerminalEvidence(record);
+		if (terminalEvidence?.type === "session_closed") indexSeq ??= terminalEvidence.indexSeq;
+		else if (terminalEvidence?.type === "session_deleted")
+			return fail(
+				"terminal_uncertain",
+				"Uncertain session retirement cannot certify session closure after a deletion tombstone.",
+				cleanup,
+			);
+		else {
 			try {
 				const event = await broker.index.append({
 					type: "session_closed",
@@ -2209,7 +2217,7 @@ async function executeUncertainRetirement(
 			} catch {
 				return fail("cleanup_pending", "Uncertain session retirement is staged before index closure.", cleanup);
 			}
-		} else indexSeq ??= record.indexSeq;
+		}
 		const staged: LifecycleRetirementCleanup = {
 			...cleanup,
 			uncertainRetirement: { ...receipt, stage: "ledger", ...(indexSeq === undefined ? {} : { indexSeq }) },
