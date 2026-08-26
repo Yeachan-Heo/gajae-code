@@ -202,6 +202,23 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		expect(catalog.resolve("gpt-5.6-luna")).toBe(codex);
 	});
 
+	it("rejects Bedrock-only catalogs for direct gateway callers", () => {
+		const bedrock = model("anthropic.claude-only", "amazon-bedrock", "bedrock-converse-stream");
+		expect(createAuthGatewayModelCatalog("amazon-bedrock", [bedrock]).models).toEqual([]);
+		expect(() =>
+			startAuthGateway({
+				bind: "127.0.0.1:0",
+				providerScope: { provider: "amazon-bedrock" },
+				...testAuthority("amazon-bedrock"),
+				bearerTokens: [],
+				version: "test",
+				storage: {} as AuthStorage,
+				resolveModel: id => (id === bedrock.id ? bedrock : undefined),
+				listModels: () => [bedrock],
+			}),
+		).toThrow(/no source-backed models/);
+	});
+
 	it("exposes only the scoped catalog and exact Codex wire identity", async () => {
 		const codex = model("gpt-5.6-luna", "openai-codex", "openai-codex-responses");
 		const copilot = model("gpt-5.6-luna", "github-copilot", "openai-responses");

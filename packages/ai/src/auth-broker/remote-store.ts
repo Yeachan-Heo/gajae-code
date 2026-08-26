@@ -459,6 +459,27 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return true;
 	}
 
+	/**
+	 * A full GET can race the SSE stream. Once a newer snapshot from the same
+	 * broker epoch has been accepted, an older GET is merely superseded data —
+	 * not an authority failure that should turn a healthy request into a 503.
+	 * Epoch regressions remain rejected so a delayed response from a retired
+	 * broker cannot cross an authority boundary.
+	 */
+	#isSupersededSnapshot(snapshot: SnapshotResponse, generation: number): boolean {
+		if (this.#epoch !== undefined || snapshot.epoch !== undefined) {
+			return (
+				snapshot.epoch === this.#epoch &&
+				(generation < this.#generation ||
+					(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs))
+			);
+		}
+		return (
+			(generation < this.#generation && snapshot.serverNowMs <= this.#snapshot.serverNowMs) ||
+			(generation === this.#generation && snapshot.serverNowMs < this.#snapshot.serverNowMs)
+		);
+	}
+
 	onSnapshotChanged(listener: () => void): () => void {
 		this.#snapshotListeners.add(listener);
 		return () => this.#snapshotListeners.delete(listener);
@@ -663,7 +684,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (result.status === 200) {
 					await this.#withSnapshotAuthority(async () => {
 						if (!this.#applySnapshot(result.snapshot, result.generation)) {
-							throw new Error("Auth broker background snapshot authority was rejected");
+							if (!this.#isSupersededSnapshot(result.snapshot, result.generation)) {
+								throw new Error("Auth broker background snapshot authority was rejected");
+							}
 						}
 					});
 				}
@@ -783,7 +806,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			await this.#raceWithSignal(
 				this.#withSnapshotAuthority(async () => {
 					if (!this.#applySnapshot(result.snapshot, result.generation)) {
-						throw new Error("Auth broker snapshot authority was rejected");
+						if (!this.#isSupersededSnapshot(result.snapshot, result.generation)) {
+							throw new Error("Auth broker snapshot authority was rejected");
+						}
 					}
 				}),
 				signal,
@@ -841,7 +866,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (result.status === 200) {
 			await this.#withSnapshotAuthority(async () => {
 				if (!this.#applySnapshot(result.snapshot, result.generation)) {
-					throw new Error("Auth broker freshness snapshot authority was rejected");
+					if (!this.#isSupersededSnapshot(result.snapshot, result.generation)) {
+						throw new Error("Auth broker freshness snapshot authority was rejected");
+					}
 				}
 			});
 		}
@@ -1222,7 +1249,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<UsageReport | null> {
-		const reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal).catch(() => null);
+		let reports: UsageReport[] | null;
+		try {
+			reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal);
+		} catch (error) {
+			// A caller cancellation is control flow, not a missing usage report.
+			// Preserve it so selection/dispatch can stop promptly; only ordinary
+			// broker/provider failures degrade to "no usage".
+			if (signal?.aborted) throw error;
+			return null;
+		}
 		if (!reports) return null;
 		return matchUsageReport(reports, provider, credential);
 	}

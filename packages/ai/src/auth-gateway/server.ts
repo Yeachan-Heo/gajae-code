@@ -92,6 +92,19 @@ function modelApiForProvider(provider: Provider): Api | undefined {
 	return AUTH_GATEWAY_PROVIDER_APIS[provider];
 }
 
+/**
+ * Whether a model can be served through the broker-backed auth gateway.
+ *
+ * Bedrock's credential chain is process-local AWS authority, not a broker
+ * credential. Advertising a native Bedrock model from this gateway would let
+ * direct callers bypass the broker boundary (and make readiness lie about a
+ * model the gateway cannot authenticate). Keep this predicate shared with the
+ * CLI readiness checks so every entry point applies the same fence.
+ */
+export function isAuthGatewayModelBrokerConsumable(model: Pick<Model<Api>, "api">): boolean {
+	return model.api !== "bedrock-converse-stream";
+}
+
 function isModelInProviderScope(model: Model<Api>, provider: Provider): boolean {
 	if (model.provider !== provider) return false;
 	const expectedApi = modelApiForProvider(provider);
@@ -112,6 +125,7 @@ export function createAuthGatewayModelCatalog(
 ): AuthGatewayModelCatalog {
 	const byId = new Map<string, Model<Api>>();
 	for (const model of models) {
+		if (!isAuthGatewayModelBrokerConsumable(model)) continue;
 		if (!isModelInProviderScope(model, provider)) continue;
 		if (byId.has(model.id)) {
 			throw new Error(`Ambiguous auth-gateway model id ${model.id} for provider ${provider}`);

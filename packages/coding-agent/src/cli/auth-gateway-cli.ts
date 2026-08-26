@@ -17,6 +17,7 @@ import * as path from "node:path";
 import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import {
 	createAuthGatewayModelCatalog,
+	isAuthGatewayModelBrokerConsumable,
 	isSafeProviderScope,
 	startAuthGateway,
 } from "@gajae-code/ai/auth-gateway/server";
@@ -226,7 +227,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	}
 	const bind = flags.bind ?? DEFAULT_AUTH_GATEWAY_BIND;
 	const models = getBundledModels(provider as GeneratedProvider);
-	if (models.length === 0 || models.every(model => model.api === "bedrock-converse-stream")) {
+	if (!models.some(isAuthGatewayModelBrokerConsumable)) {
 		throw new Error(`Auth gateway scope ${provider} has no broker-consumable models`);
 	}
 

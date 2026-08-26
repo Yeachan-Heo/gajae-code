@@ -350,6 +350,73 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		remoteStore.close();
 	});
 
+	test("does not fail a refresh when an older same-epoch GET is superseded", async () => {
+		const initialSnapshot: SnapshotResponse = {
+			generation: 1,
+			epoch: "100-current-epoch",
+			generatedAt: 100,
+			serverNowMs: 100,
+			refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+			credentials: [],
+		};
+		let nextSnapshot: SnapshotResponse = { ...initialSnapshot, generation: 2, serverNowMs: 200 };
+		const client = new AuthBrokerClient({
+			url: "http://broker.test",
+			token: "token",
+			fetchImpl: (async () => {
+				await Bun.sleep(1);
+				return new Response(JSON.stringify(nextSnapshot), {
+					status: 200,
+					headers: {
+						"Content-Type": "application/json",
+						ETag: `"${nextSnapshot.epoch}:${nextSnapshot.generation}"`,
+					},
+				});
+			}) as unknown as typeof fetch,
+			maxRetries: 0,
+		});
+		const remoteStore = new RemoteAuthCredentialStore({ client, initialSnapshot, streamSnapshots: false });
+
+		await remoteStore.refreshSnapshot();
+		expect(remoteStore.snapshot.generation).toBe(2);
+		nextSnapshot = { ...initialSnapshot, generatedAt: 150, serverNowMs: 150 };
+		await expect(remoteStore.refreshSnapshot()).resolves.toBe(remoteStore.snapshot);
+		expect(remoteStore.snapshot.generation).toBe(2);
+		remoteStore.close();
+	});
+
+	test("rethrows caller cancellation from scoped usage lookup", async () => {
+		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
+		const remoteStore = new RemoteAuthCredentialStore({
+			client: brokerClient,
+			initialSnapshot: {
+				generation: 0,
+				generatedAt: 0,
+				serverNowMs: 0,
+				refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+				credentials: [],
+			},
+			streamSnapshots: false,
+		});
+		const usage = Promise.withResolvers<{ generatedAt: number; reports: [] }>();
+		vi.spyOn(brokerClient, "fetchUsage").mockImplementation(async () => usage.promise as never);
+		const controller = new AbortController();
+		const request = remoteStore.getUsageReport(
+			"anthropic",
+			{
+				type: "oauth",
+				access: "access",
+				refresh: REMOTE_REFRESH_SENTINEL,
+				expires: Date.now() + 60_000,
+			},
+			controller.signal,
+		);
+		controller.abort();
+		await expect(request).rejects.toThrow(/aborted/);
+		usage.resolve({ generatedAt: Date.now(), reports: [] });
+		remoteStore.close();
+	});
+
 	test("getUsageReport coalesces parallel callers and matches by identity", async () => {
 		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
 		const remoteStore = new RemoteAuthCredentialStore({

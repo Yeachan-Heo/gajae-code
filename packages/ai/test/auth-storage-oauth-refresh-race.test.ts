@@ -1041,6 +1041,76 @@ describe("AuthStorage OAuth refresh race", () => {
 		});
 	});
 
+	test("keeps the selected OAuth row id stable when a live reload reorders rows", async () => {
+		if (!authStorage || !store) throw new Error("test setup failed");
+
+		const refreshStarted = Promise.withResolvers<void>();
+		const releaseRefresh = Promise.withResolvers<void>();
+		oauthUtils.registerOAuthProvider({
+			id: "unit-oauth-reorder",
+			name: "Unit OAuth Reorder",
+			sourceId: "auth-storage-oauth-refresh-race-test",
+			async login() {
+				return { access: "unused", refresh: "unused", expires: Date.now() + 60 * 60_000 };
+			},
+			async refreshToken(credentials) {
+				refreshStarted.resolve();
+				await releaseRefresh.promise;
+				return {
+					...credentials,
+					access: "reordered-rotated-access",
+					refresh: "reordered-rotated-refresh",
+					expires: Date.now() + 60 * 60_000,
+				};
+			},
+			getApiKey(credentials) {
+				return credentials.access;
+			},
+		});
+
+		await authStorage.set("unit-oauth-reorder", [
+			{ type: "oauth", access: "selected-access", refresh: "selected-refresh", expires: Date.now() - 60_000 },
+			{
+				type: "oauth",
+				access: "other-access",
+				refresh: "other-refresh",
+				expires: Date.now() + 60 * 60_000,
+			},
+		]);
+		const rowsBefore = store.listAuthCredentials("unit-oauth-reorder");
+		const selectedId = rowsBefore[0]?.id;
+		const otherId = rowsBefore[1]?.id;
+		if (selectedId === undefined || otherId === undefined) throw new Error("expected two OAuth rows");
+		authStorage.setRuntimeCredentialSelector("unit-oauth-reorder", { kind: "id", value: String(selectedId) });
+
+		const originalList = store.listAuthCredentials.bind(store);
+		let reorder = false;
+		vi.spyOn(store, "listAuthCredentials").mockImplementation((provider?: string) => {
+			const rows = originalList(provider);
+			return reorder ? [...rows].reverse() : rows;
+		});
+
+		const resolution = authStorage.getApiKey("unit-oauth-reorder", "session-reordered");
+		await refreshStarted.promise;
+		reorder = true;
+		await authStorage.reload();
+		releaseRefresh.resolve();
+
+		expect(await resolution).toBe("reordered-rotated-access");
+		const rowsAfter = store.listAuthCredentials("unit-oauth-reorder");
+		expect(rowsAfter.map(row => row.id)).toEqual([otherId, selectedId]);
+		expect(rowsAfter.find(row => row.id === selectedId)?.credential).toMatchObject({
+			type: "oauth",
+			access: "reordered-rotated-access",
+			refresh: "reordered-rotated-refresh",
+		});
+		expect(rowsAfter.find(row => row.id === otherId)?.credential).toMatchObject({
+			type: "oauth",
+			access: "other-access",
+			refresh: "other-refresh",
+		});
+	});
+
 	test("leases one rotating token across SQLite connections and adopts the winner", async () => {
 		if (!authStorage || !store) throw new Error("test setup failed");
 		const peerStore = await SqliteAuthCredentialStore.open(path.join(tempDir, "agent.db"));
