@@ -488,6 +488,7 @@ import {
 	bindToolLineage,
 	classifyOwnedEnvelope,
 	isOwnedCompletionEnvelope,
+	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
 	lookupTerminalScope,
 	mintTurnLineageIdHash,
@@ -504,10 +505,15 @@ import { YieldQueue } from "./yield-queue";
 const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
 const ASYNC_PREVIEW_MAX_CHARS = 4_000;
 
-async function formatParkedAsyncResult(sessionManager: SessionManager, result: string): Promise<string> {
+async function formatParkedAsyncResult(
+	sessionManager: SessionManager,
+	result: string,
+	allowArtifact = true,
+): Promise<string> {
 	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
 	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
 	try {
+		if (!allowArtifact) return preview;
 		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
 		if (artifactPath && artifactId) {
 			await Bun.write(artifactPath, result);
@@ -2668,14 +2674,12 @@ export class AgentSession {
 						registration,
 					}
 				: undefined;
-			void formatParkedAsyncResult(
-				this.sessionManager,
-				`${disposition.text}\n\n${describeFoldReceipt(disposition.receipt)}`,
-			).then(result => {
+			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
+			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact).then(formattedResult => {
 				this.yieldQueue.enqueue("async-result", {
 					jobId: disposition.receipt.jobId,
 					generation: disposition.receipt.jobGeneration,
-					result,
+					result: `${formattedResult}\n\n${describeFoldReceipt(disposition.receipt)}`,
 					job,
 					durationMs: undefined,
 					ownedCompletion,
