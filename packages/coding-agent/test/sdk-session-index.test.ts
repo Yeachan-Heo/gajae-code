@@ -1360,6 +1360,54 @@ describe("SDK session index", () => {
 			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
 		]);
 	});
+	it("preserves closure before deletion but rejects delayed closure evidence", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retirement-evidence-"));
+		const index = await new SessionIndex(dir).open();
+		const expected = {
+			sessionId: "retirement-evidence",
+			stateRoot: dir,
+			endpointGeneration: 1,
+			pid: process.pid,
+			processIncarnation: "retirement-process",
+			hostIncarnation: "retirement-host",
+			endpointMtimeMs: 11,
+			lifecycleRequestId: "retirement-request",
+		};
+		try {
+			await index.append({
+				type: "host_registered",
+				locator: { repo: dir, stateRoot: dir },
+				...expected,
+			});
+			const closed = await index.append({
+				type: "session_closed",
+				locator: { repo: dir, stateRoot: dir },
+				...expected,
+			});
+			await index.append({ type: "session_deleted", locator: { repo: dir, stateRoot: dir }, ...expected });
+			const historical = index.findHistoricalSessionIdentity(expected);
+			if (!historical) throw new Error("Expected historical retirement identity");
+			expect(index.findSessionClosedEvidence(historical)).toBe(closed.indexSeq);
+
+			const delayedExpected = { ...expected, sessionId: "retirement-delayed" };
+			await index.append({
+				type: "host_registered",
+				locator: { repo: dir, stateRoot: dir },
+				...delayedExpected,
+			});
+			await index.append({ type: "session_deleted", locator: { repo: dir, stateRoot: dir }, ...delayedExpected });
+			await index.append({ type: "session_closed", locator: { repo: dir, stateRoot: dir }, ...delayedExpected });
+			const delayedHistorical = index.findHistoricalSessionIdentity(delayedExpected);
+			if (!delayedHistorical) throw new Error("Expected delayed historical identity");
+			expect(index.findSessionClosedEvidence(delayedHistorical)).toBeUndefined();
+			expect(index.findSessionTerminalEvidence(delayedHistorical)).toEqual({
+				type: "session_deleted",
+				indexSeq: 5,
+			});
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
 	it("refreshIfChanged skips the locked rescan while the index is unchanged (#4689)", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-"));
 		await new SessionIndex(dir).append(event("polled"));

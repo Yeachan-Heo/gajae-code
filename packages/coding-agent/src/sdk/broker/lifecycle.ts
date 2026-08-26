@@ -2186,7 +2186,13 @@ async function executeUncertainRetirement(
 			"Uncertain session retirement is pending because the lifecycle parent identity changed.",
 			cleanup,
 		);
-	if (receipt.stage === "ledger" && (!receipt.indexSeq || !record.terminal || record.indexSeq < receipt.indexSeq))
+	if (
+		receipt.stage === "ledger" &&
+		(!receipt.indexSeq ||
+			!record.terminal ||
+			record.indexSeq < receipt.indexSeq ||
+			broker.index.findSessionClosedEvidence(record) === undefined)
+	)
 		return fail(
 			"terminal_uncertain",
 			"Uncertain session retirement ledger replay lacks the durable session_closed index proof.",

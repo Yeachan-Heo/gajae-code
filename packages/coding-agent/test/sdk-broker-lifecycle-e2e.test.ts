@@ -4039,6 +4039,28 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await fs.writeFile(path.join(stateRoot, "sdk", `${sessionId}.lifecycle.ready.json`), canonicalJson(marker));
 		await broker.start();
 		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: input.endpointGeneration,
+			pid: process.pid,
+			endpointMtimeMs: input.endpointMtimeMs,
+			lifecycleRequestId: "older-incarnation",
+			processIncarnation: "older-process",
+			hostIncarnation: "older-host",
+		});
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: agentDir, stateRoot },
+			endpointGeneration: input.endpointGeneration,
+			pid: child.pid,
+			endpointMtimeMs: input.endpointMtimeMs,
+			lifecycleRequestId,
+			processIncarnation: processIdentity,
+			hostIncarnation: processIdentity,
+		});
+		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
 			locator: { repo: agentDir, stateRoot },
@@ -4108,11 +4130,11 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 			sessionId,
 			locator: indexed.locator,
 			endpointGeneration: indexed.endpointGeneration,
-			pid: process.pid,
+			pid: indexed.pid,
 			endpointMtimeMs: input.endpointMtimeMs + 1,
 			lifecycleRequestId: "same-id-successor",
-			processIncarnation: "same-id-successor-process",
-			hostIncarnation: "same-id-successor-host",
+			processIncarnation: input.processIncarnation,
+			hostIncarnation: input.hostIncarnation,
 		});
 		await broker.stop();
 
