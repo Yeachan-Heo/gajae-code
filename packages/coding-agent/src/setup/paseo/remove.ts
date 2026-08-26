@@ -718,12 +718,8 @@ export async function removePaseoSetup(
 			}
 		}
 		const cleanedKeys = new Set<string>();
-		for (const {
-			key,
-			ref: { backupPath, valueSha256 },
-		} of relevantRefs) {
-			const ref = nextLedger.providerReplacedEntries?.[key];
-			if (ref?.createdByGjc === false) {
+		for (const { key, ref: providerRef } of relevantRefs) {
+			if (providerRef.createdByGjc === false) {
 				// An exact sidecar that predated this install remains user-owned even
 				// after it restored the replaced value; clear only GJC's ledger pointer.
 				cleanedKeys.add(key);
@@ -731,10 +727,18 @@ export async function removePaseoSetup(
 			}
 			// Authenticate and delete under one inode-bound protocol. A pathname
 			// replacement after authentication is retained, never removed.
-			if (await removeReplacedProviderBackup(backupPath, key, valueSha256)) {
+			if (
+				providerRef.identity !== undefined &&
+				(await removeReplacedProviderBackup(
+					providerRef.backupPath,
+					key,
+					providerRef.valueSha256,
+					providerRef.identity,
+				))
+			) {
 				cleanedKeys.add(key);
 			} else {
-				orphaned.push(backupPath);
+				orphaned.push(providerRef.backupPath);
 			}
 		}
 		const keptRefs: Record<string, ProviderReplacedRef> = { ...(nextLedger.providerReplacedEntries ?? {}) };

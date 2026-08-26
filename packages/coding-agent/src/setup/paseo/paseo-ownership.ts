@@ -20,9 +20,12 @@ import * as path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import {
 	ABSENT_IDENTITY,
+	captureRegularIdentity,
 	currentIdentity,
 	hashBytes,
 	isCanonicalReplacedProviderBackupPath,
+	type PersistedFileIdentity,
+	persistFileIdentity,
 	serializeJson,
 } from "./json-publisher";
 
@@ -35,8 +38,10 @@ export interface ProviderReplacedRef {
 	readonly backupPath: string;
 	/** Digest of the preserved value, binding the sidecar's bytes to this record. */
 	readonly valueSha256: string;
-	/** False when the sidecar predated this install and remains user-owned. */
+	/** Whether this sidecar predated this install and remains user-owned. */
 	readonly createdByGjc?: boolean;
+	/** Identity proof retained for authenticated later cleanup. */
+	readonly identity?: PersistedFileIdentity;
 }
 
 /**
@@ -246,7 +251,8 @@ function isProviderReplacedRefRecord(value: unknown): value is Record<string, Pr
 			typeof ref.backupPath !== "string" ||
 			!path.isAbsolute(ref.backupPath) ||
 			typeof ref.valueSha256 !== "string" ||
-			(ref.createdByGjc !== undefined && typeof ref.createdByGjc !== "boolean")
+			(ref.createdByGjc !== undefined && typeof ref.createdByGjc !== "boolean") ||
+			(ref.identity !== undefined && !isPersistedFileIdentity(ref.identity))
 		) {
 			return false;
 		}
@@ -347,6 +353,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
+function isPersistedFileIdentity(value: unknown): value is PersistedFileIdentity {
+	return (
+		isRecord(value) &&
+		["dev", "ino", "parentDev", "parentIno", "size", "mtimeNs", "sha256"].every(
+			key => typeof value[key] === "string",
+		) &&
+		/^[a-f0-9]{64}$/u.test(value.sha256 as string)
+	);
+}
+
 async function syncParentDirectory(filePath: string): Promise<void> {
 	// Windows does not support fsync on directory handles; file contents are
 	// already synced before rename, so the renamed entry remains valid there.
@@ -419,11 +435,13 @@ export type IntentStep = "provider-config" | "orchestration-preferences" | "skil
 export interface IntentDiscardSidecar {
 	readonly backupPath: string;
 	readonly valueSha256: string;
+	readonly identity?: PersistedFileIdentity;
 }
 
 export interface IntentPublishBackup {
 	readonly backupPath: string;
 	readonly valueSha256: string;
+	readonly identity?: PersistedFileIdentity;
 }
 
 /**
@@ -470,6 +488,7 @@ function isIntentDiscardSidecar(value: unknown, targetPath: unknown): value is I
 		typeof value.backupPath === "string" &&
 		typeof value.valueSha256 === "string" &&
 		/^[a-f0-9]{64}$/u.test(value.valueSha256) &&
+		(value.identity === undefined || isPersistedFileIdentity(value.identity)) &&
 		isCanonicalReplacedProviderBackupPath(targetPath, value.backupPath)
 	);
 }
@@ -478,6 +497,7 @@ function isIntentPublishBackup(value: unknown, targetPath: unknown): value is In
 	if (!isRecord(value) || typeof targetPath !== "string") return false;
 	if (typeof value.backupPath !== "string" || typeof value.valueSha256 !== "string") return false;
 	if (!/^[a-f0-9]{64}$/u.test(value.valueSha256)) return false;
+	if (value.identity !== undefined && !isPersistedFileIdentity(value.identity)) return false;
 	const target = path.resolve(targetPath);
 	const backup = path.resolve(value.backupPath);
 	return (
@@ -487,6 +507,30 @@ function isIntentPublishBackup(value: unknown, targetPath: unknown): value is In
 }
 
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
+	let persistedIntent = intent;
+	if (intent.discardSidecar?.identity === undefined) {
+		const identity =
+			intent.discardSidecar === undefined
+				? undefined
+				: await captureRegularIdentity(intent.discardSidecar.backupPath);
+		if (identity !== undefined && intent.discardSidecar !== undefined) {
+			persistedIntent = {
+				...persistedIntent,
+				discardSidecar: { ...intent.discardSidecar, identity: persistFileIdentity(identity) },
+			};
+		}
+	}
+	if (intent.publishBackup?.identity === undefined) {
+		const identity =
+			intent.publishBackup === undefined ? undefined : await captureRegularIdentity(intent.publishBackup.backupPath);
+		if (identity !== undefined && intent.publishBackup !== undefined) {
+			persistedIntent = {
+				...persistedIntent,
+				publishBackup: { ...intent.publishBackup, identity: persistFileIdentity(identity) },
+			};
+		}
+	}
+	intent = persistedIntent;
 	if (intent.version !== INTENT_VERSION) {
 		throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
 	}

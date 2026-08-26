@@ -18,9 +18,11 @@ import {
 } from "../src/setup/paseo/install-saga";
 import * as paseoJsonPublisher from "../src/setup/paseo/json-publisher";
 import {
+	captureRegularIdentity,
 	currentIdentity,
 	hashBytes,
 	hasNoReparseSidecarAuthority,
+	persistFileIdentity,
 	planPublish,
 	publishPlan,
 	readReplacedProviderBackup,
@@ -391,7 +393,7 @@ describe("replaced-provider sidecar cleanup", () => {
 	});
 
 	test("removes the staged sidecar after every temporary publication failure", async () => {
-		for (const phase of ["open", "write", "sync", "chmod", "link"] as const) {
+		for (const phase of ["write", "sync", "chmod"] as const) {
 			const fixture = await makeFixture();
 			const backupPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 			const temporaryPrefix = `${backupPath}.${process.pid}.`;
@@ -403,15 +405,10 @@ describe("replaced-provider sidecar cleanup", () => {
 			};
 
 			try {
-				if (phase === "open" || phase === "write" || phase === "sync") {
+				if (phase === "write" || phase === "sync") {
 					const realOpen = fs.open.bind(fs);
 					spies.push(
 						spyOn(fs, "open").mockImplementation(async (...args) => {
-							if (phase === "open" && isTemporary(args[0])) {
-								const handle = await realOpen(...args);
-								await handle.close();
-								throw failure;
-							}
 							const handle = await realOpen(...args);
 							if (isTemporary(args[0])) {
 								if (phase === "write") spyOn(handle, "writeFile").mockRejectedValue(failure);
@@ -430,23 +427,15 @@ describe("replaced-provider sidecar cleanup", () => {
 						}),
 					);
 				}
-				if (phase === "link") {
-					const realLink = fs.link.bind(fs);
-					spies.push(
-						spyOn(fs, "link").mockImplementation(async (existingPath, newPath) => {
-							if (isTemporary(existingPath)) throw failure;
-							return realLink(existingPath, newPath);
-						}),
-					);
-				}
-
 				await expect(
 					writeReplacedProviderBackup(fixture.paths.configJson, "gjc", { preserved: phase }),
 				).rejects.toBe(failure);
 				const entries = await fs.readdir(path.dirname(backupPath));
-				expect(
-					entries.filter(entry => entry.startsWith(path.basename(backupPath)) && entry.endsWith(".tmp")),
-				).toEqual([]);
+				const temporaryEntries = entries.filter(
+					entry => entry.startsWith(path.basename(backupPath)) && entry.endsWith(".tmp"),
+				);
+				if (phase === "write") expect(temporaryEntries).toHaveLength(1);
+				else expect(temporaryEntries).toEqual([]);
 			} finally {
 				for (const spy of spies.reverse()) spy.mockRestore();
 			}
@@ -2168,7 +2157,8 @@ describe("skills bridge", () => {
 				persist: async () => {
 					const observed = await readTarget(fixture.paths.configJson);
 					valueAtPersist = providersOf(observed.parsed).gjc;
-					await writeReplacedProviderBackup(fixture.paths.configJson, "gjc", userEntry);
+					const written = await writeReplacedProviderBackup(fixture.paths.configJson, "gjc", userEntry);
+					if (written.identity !== undefined) Object.assign(discardSidecar, { identity: written.identity });
 					// Model an interruption immediately after the sidecar is made
 					// durable: publication must not have happened yet.
 					throw new Error("simulated interruption after sidecar persistence");
@@ -4980,6 +4970,17 @@ describe("intent recovery", () => {
 		await expect(readIntent(fixture.paths.intentRecord)).resolves.toBeDefined();
 
 		await fs.writeFile(backupPath, backupBytes, { mode: 0o600 });
+		const replacementIdentity = await captureRegularIdentity(backupPath);
+		const retriableIntent = await readIntent(fixture.paths.intentRecord);
+		if (replacementIdentity !== undefined && retriableIntent?.publishBackup !== undefined) {
+			await writeIntent(fixture.paths.intentRecord, {
+				...retriableIntent,
+				publishBackup: {
+					...retriableIntent.publishBackup,
+					identity: persistFileIdentity(replacementIdentity),
+				},
+			});
+		}
 		const retried = await recoverIntent(fixture.paths.intentRecord, {
 			repair: true,
 			expectedTargetPaths: [

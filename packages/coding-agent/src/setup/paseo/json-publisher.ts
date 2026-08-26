@@ -37,6 +37,43 @@ export function hashBytes(bytes: string): string {
 	return nodeCrypto.createHash("sha256").update(bytes).digest("hex");
 }
 
+export interface PersistedFileIdentity {
+	readonly dev: string;
+	readonly ino: string;
+	readonly parentDev: string;
+	readonly parentIno: string;
+	readonly size: string;
+	readonly mtimeNs: string;
+	readonly sha256: string;
+}
+
+export function persistFileIdentity(identity: NativeExactFileIdentity): PersistedFileIdentity {
+	if (identity.parentDev === undefined || identity.parentIno === undefined || identity.sha256 === undefined) {
+		throw new Error("file identity is incomplete");
+	}
+	return {
+		dev: identity.dev.toString(),
+		ino: identity.ino.toString(),
+		parentDev: identity.parentDev.toString(),
+		parentIno: identity.parentIno.toString(),
+		size: identity.size.toString(),
+		mtimeNs: identity.mtimeNs.toString(),
+		sha256: identity.sha256,
+	};
+}
+
+function samePersistedIdentity(left: PersistedFileIdentity, right: PersistedFileIdentity): boolean {
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.parentDev === right.parentDev &&
+		left.parentIno === right.parentIno &&
+		left.size === right.size &&
+		left.mtimeNs === right.mtimeNs &&
+		left.sha256 === right.sha256
+	);
+}
+
 /** Marker recorded when a target did not exist at preflight. */
 export const ABSENT_IDENTITY = "absent";
 
@@ -156,8 +193,12 @@ export interface PublishOptions {
 	/** Take a mode-0600 backup beside the original before replacing it. */
 	readonly backup: boolean;
 	readonly now: Date;
-	/** Persist cleanup authority before credential-bearing backup bytes are created. */
-	readonly onBackupPrepared?: (backupPath: string, valueSha256: string) => Promise<void>;
+	/** Persist cleanup authority before and after credential-bearing backup creation. */
+	readonly onBackupPrepared?: (
+		backupPath: string,
+		valueSha256: string,
+		identity?: PersistedFileIdentity,
+	) => Promise<void>;
 }
 
 export interface PublishResult {
@@ -232,6 +273,7 @@ export async function publishPlan(
 
 	let backupPath: string | undefined;
 	let backupCreated = false;
+	let backupIdentity: NativeExactFileIdentity | undefined;
 	let backupBytes: Buffer | undefined;
 	if (observed !== ABSENT_IDENTITY && expectedDestinationIdentity === undefined) {
 		throw new PaseoPublishError(targetPath, {
@@ -264,9 +306,20 @@ export async function publishPlan(
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
 		await options.onBackupPrepared?.(backupPath, hashBytes(backupBytes.toString("utf8")));
-		backupCreated = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
+		const backup = await copyPrivately(targetPath, backupPath, backupBytes.toString("utf8"));
+		backupCreated = backup.created;
+		backupIdentity = backup.identity;
+		await options.onBackupPrepared?.(
+			backupPath,
+			hashBytes(backupBytes.toString("utf8")),
+			backupIdentity === undefined ? undefined : persistFileIdentity(backupIdentity),
+		);
 		if ((await currentIdentity(targetPath)) !== observed) {
-			if (backupCreated && !(await removePrivateBackupIfExact(backupPath, backupBytes))) {
+			if (
+				backupCreated &&
+				backupIdentity !== undefined &&
+				!(await removePrivateBackupByIdentity(backupPath, backupIdentity))
+			) {
 				throw new PaseoPublishError(
 					targetPath,
 					{
@@ -298,10 +351,10 @@ export async function publishPlan(
 		try {
 			await handle.writeFile(plan.nextRaw, "utf8");
 			await handle.sync();
-			sourceIdentity = await capturePrivateBackupIdentity(handle, tempPath);
+			sourceIdentity = await capturePrivateBackupIdentity(handle, tempPath, Buffer.from(plan.nextRaw, "utf8"));
 			tempIdentity = sourceIdentity;
 		} catch (error) {
-			tempIdentity = await capturePrivateBackupIdentity(handle, tempPath);
+			tempIdentity = await capturePrivateBackupIdentity(handle, tempPath, Buffer.from(plan.nextRaw, "utf8"));
 			if (tempIdentity === undefined) {
 				throw new PaseoPublishError(
 					targetPath,
@@ -375,8 +428,8 @@ export async function publishPlan(
 		}
 		await syncParentDirectory(directory);
 	} catch (error) {
-		if (backupCreated && backupPath !== undefined && backupBytes !== undefined) {
-			const removed = await removePrivateBackupIfExact(backupPath, backupBytes);
+		if (backupCreated && backupPath !== undefined && backupIdentity !== undefined) {
+			const removed = await removePrivateBackupByIdentity(backupPath, backupIdentity);
 			if (!removed) {
 				throw new PaseoPublishError(
 					targetPath,
@@ -523,32 +576,31 @@ export async function removePublishBackup(
 	targetPath: string,
 	backupPath: string,
 	expectedSha256: string,
+	expectedIdentity?: PersistedFileIdentity,
 ): Promise<boolean> {
 	try {
 		if (!isCanonicalPublishBackupPath(targetPath, backupPath)) return false;
 		if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
 		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
 		if (opened === undefined) return false;
-		const { handle, stat } = opened;
+		const { handle } = opened;
 		let bytes: Buffer;
+		let captured: NativeExactFileIdentity | undefined;
 		try {
 			bytes = await handle.readFile();
+			captured = await capturePrivateBackupIdentity(handle, backupPath, bytes);
 		} finally {
 			await handle.close();
 		}
 		const digest = nodeCrypto.createHash("sha256").update(bytes).digest("hex");
 		if (digest !== expectedSha256) return false;
-		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
-		if (!parent.isDirectory()) return false;
+		if (
+			captured === undefined ||
+			(expectedIdentity !== undefined && !samePersistedIdentity(expectedIdentity, persistFileIdentity(captured)))
+		)
+			return false;
 		const identity: NativeExactFileIdentity = {
-			dev: stat.dev,
-			ino: stat.ino,
-			nlink: stat.nlink,
-			parentDev: parent.dev,
-			parentIno: parent.ino,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			sha256: digest,
+			...captured,
 			quarantineName: `.gjc-paseo-publish-backup-${process.pid}-${nodeCrypto.randomUUID()}`,
 		};
 		const canonicalBackupPath = await canonicalSidecarPathForNativeUnlink(backupPath);
@@ -559,7 +611,12 @@ export async function removePublishBackup(
 	}
 }
 
-async function copyPrivately(from: string, to: string, sourceBytes?: string): Promise<boolean> {
+interface PrivateCopyResult {
+	readonly created: boolean;
+	readonly identity?: NativeExactFileIdentity;
+}
+
+async function copyPrivately(from: string, to: string, sourceBytes?: string): Promise<PrivateCopyResult> {
 	const bytes = sourceBytes ?? (await Bun.file(from).text());
 	const mode = BACKUP_MODE;
 	let handle: fs.FileHandle;
@@ -579,20 +636,22 @@ async function copyPrivately(from: string, to: string, sourceBytes?: string): Pr
 		} finally {
 			await existing.handle.close();
 		}
-		if (existingBytes.toString("utf8") === bytes) return false;
+		if (existingBytes.toString("utf8") === bytes) return { created: false };
 		throw new Error(`backup path already contains different content: ${to}`);
 	}
 	try {
 		try {
 			await handle.writeFile(bytes, "utf8");
 			await handle.sync();
+			await handle.chmod(mode);
+			capturedIdentity = await capturePrivateBackupIdentity(handle, to, Buffer.from(bytes, "utf8"));
+			if (capturedIdentity === undefined) throw new Error(`backup identity unavailable: ${to}`);
 		} catch (error) {
-			capturedIdentity = await capturePrivateBackupIdentity(handle, to);
+			capturedIdentity ??= await capturePrivateBackupIdentity(handle, to, Buffer.from(bytes, "utf8"));
 			throw error;
 		} finally {
 			await handle.close();
 		}
-		await fs.chmod(to, mode);
 		await syncParentDirectory(path.dirname(to));
 	} catch (error) {
 		if (ownsBackup) {
@@ -607,19 +666,26 @@ async function copyPrivately(from: string, to: string, sourceBytes?: string): Pr
 		}
 		throw error;
 	}
-	return true;
+	return { created: true, identity: capturedIdentity };
 }
 
 async function capturePrivateBackupIdentity(
 	handle: fs.FileHandle,
 	backupPath: string,
+	knownBytes?: Buffer,
 ): Promise<NativeExactFileIdentity | undefined> {
 	try {
 		const stat = await handle.stat({ bigint: true });
 		if (stat.size > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
-		const bytes = Buffer.alloc(Number(stat.size));
-		const read = await handle.read(bytes, 0, bytes.length, 0);
-		if (read.bytesRead !== bytes.length) return undefined;
+		let bytes: Buffer;
+		if (knownBytes !== undefined) {
+			bytes = knownBytes;
+		} else {
+			bytes = Buffer.alloc(Number(stat.size));
+			const read = await handle.read(bytes, 0, bytes.length, 0);
+			if (read.bytesRead !== bytes.length) return undefined;
+		}
+		if (bytes.length !== Number(stat.size)) return undefined;
 		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
 		return {
 			dev: stat.dev,
@@ -637,7 +703,7 @@ async function capturePrivateBackupIdentity(
 	}
 }
 
-async function captureRegularIdentity(filePath: string): Promise<NativeExactFileIdentity | undefined> {
+export async function captureRegularIdentity(filePath: string): Promise<NativeExactFileIdentity | undefined> {
 	try {
 		const link = await fs.lstat(filePath, { bigint: true });
 		if (!link.isFile()) return undefined;
@@ -675,35 +741,6 @@ async function removePrivateBackupByIdentity(backupPath: string, identity: Nativ
 	}
 }
 
-async function removePrivateBackupIfExact(backupPath: string, expectedBytes: Buffer): Promise<boolean> {
-	try {
-		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
-		if (opened === undefined) return false;
-		let bytes: Buffer;
-		try {
-			bytes = await opened.handle.readFile();
-		} finally {
-			await opened.handle.close();
-		}
-		if (!bytes.equals(expectedBytes)) return false;
-		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
-		const identity: NativeExactFileIdentity = {
-			dev: opened.stat.dev,
-			ino: opened.stat.ino,
-			nlink: opened.stat.nlink,
-			parentDev: parent.dev,
-			parentIno: parent.ino,
-			size: opened.stat.size,
-			mtimeNs: opened.stat.mtimeNs,
-			sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
-			quarantineName: `.gjc-paseo-backup-cleanup-${process.pid}-${nodeCrypto.randomUUID()}`,
-		};
-		const canonical = await canonicalSidecarPathForNativeUnlink(backupPath);
-		return exactUnlinkDirect(canonical, identity).ok;
-	} catch {
-		return false;
-	}
-}
 /**
  * Where a pre-`--force` provider value is preserved for a later restore.
  *
@@ -773,7 +810,10 @@ export async function writeReplacedProviderBackup(
 	const payload = serializeJson({ key: providerKey, value });
 	const temporary = `${backupPath}.${process.pid}.${nodeCrypto.randomUUID()}.tmp`;
 	let createdByGjc = true;
-	let identity: ReplacedProviderBackupIdentity | undefined;
+	let identity: PersistedFileIdentity | undefined;
+	let stagedIdentity: NativeExactFileIdentity | undefined;
+	let temporaryCleaned = true;
+	let temporaryPublished = false;
 	try {
 		// Keep the entire temporary-file lifecycle inside this cleanup boundary.
 		// Opening can create the path before surfacing an error, and chmod can
@@ -783,16 +823,30 @@ export async function writeReplacedProviderBackup(
 		try {
 			await handle.writeFile(payload, "utf8");
 			await handle.sync();
+			stagedIdentity = await capturePrivateBackupIdentity(handle, temporary, Buffer.from(payload, "utf8"));
+			if (stagedIdentity === undefined) {
+				throw new PaseoPublishError(backupPath, {
+					reason: "sidecar-conflict",
+					detail: "the staged replaced-provider sidecar could not be identity-authenticated",
+				});
+			}
 			// `fs.open` honors the mode only on creation, so set it explicitly.
 			await fs.chmod(temporary, BACKUP_MODE);
-			// `link` fails with EEXIST when the sidecar already exists: a rename
-			// would silently replace it, and the FIRST preserved value is the
-			// user's by contract. Keep the staged descriptor open through the link
-			// so the first identity proof is bound to the bytes we wrote.
-			try {
-				await fs.link(temporary, backupPath);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			// Claim the final name with no-replace rename. Unlike a hard link, this
+			// consumes the staging pathname atomically, so there is no second
+			// pathname to clean up after the descriptor closes.
+			const [nativeTemporary, nativeBackup] = await Promise.all([
+				canonicalSidecarPathForNativeUnlink(temporary),
+				canonicalSidecarPathForNativeUnlink(backupPath),
+			]);
+			const published = renameNoReplacePath(nativeTemporary, nativeBackup);
+			if (!published.ok) {
+				if (published.code !== "already_exists" && published.code !== "quarantine_collision") {
+					throw new PaseoPublishError(backupPath, {
+						reason: "sidecar-conflict",
+						detail: `the replaced-provider sidecar could not be published: ${published.code ?? published.reason}`,
+					});
+				}
 				createdByGjc = false;
 				const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);
 				if (!existing.found) {
@@ -801,27 +855,50 @@ export async function writeReplacedProviderBackup(
 						detail: `a replaced-provider sidecar already exists at this path with different content for key ${providerKey}`,
 					});
 				}
-				// Idempotent: the existing sidecar already preserves exactly this value.
+			} else {
+				temporaryPublished = true;
 			}
 			if (createdByGjc) {
-				const [staged, linked] = await Promise.all([
-					handle.stat({ bigint: true }),
-					fs.lstat(backupPath, { bigint: true }),
-				]);
-				if (!linked.isFile() || linked.isSymbolicLink() || staged.dev !== linked.dev || staged.ino !== linked.ino) {
+				const linked = await fs.lstat(backupPath, { bigint: true });
+				if (
+					!linked.isFile() ||
+					linked.isSymbolicLink() ||
+					stagedIdentity === undefined ||
+					linked.dev !== stagedIdentity.dev ||
+					linked.ino !== stagedIdentity.ino
+				) {
 					throw new PaseoPublishError(backupPath, {
 						reason: "sidecar-conflict",
 						detail: "the newly linked sidecar changed before its identity was authenticated",
 					});
 				}
-				identity = { dev: linked.dev.toString(), ino: linked.ino.toString() };
 			}
 		} finally {
+			if (stagedIdentity === undefined) {
+				stagedIdentity = await capturePrivateBackupIdentity(handle, temporary, Buffer.from(payload, "utf8"));
+			}
 			await handle.close();
 		}
 		await syncParentDirectory(path.dirname(backupPath));
 	} finally {
-		await fs.rm(temporary, { force: true }).catch(() => undefined);
+		if (!temporaryPublished && stagedIdentity !== undefined)
+			temporaryCleaned = await removePrivateBackupByIdentity(temporary, stagedIdentity);
+	}
+	if (!temporaryCleaned) {
+		throw new PaseoPublishError(backupPath, {
+			reason: "sidecar-conflict",
+			detail: "the temporary replaced-provider sidecar could not be cleaned by identity",
+		});
+	}
+	if (createdByGjc) {
+		const finalIdentity = await captureRegularIdentity(backupPath);
+		if (finalIdentity === undefined) {
+			throw new PaseoPublishError(backupPath, {
+				reason: "sidecar-conflict",
+				detail: "the final replaced-provider sidecar could not be identity-authenticated",
+			});
+		}
+		identity = persistFileIdentity(finalIdentity);
 	}
 	return { backupPath, valueSha256, createdByGjc, ...(identity === undefined ? {} : { identity }) };
 }
@@ -834,12 +911,7 @@ export interface ReplacedProviderBackupRef {
 	/** Whether this invocation created the sidecar rather than adopting an exact pre-existing copy. */
 	readonly createdByGjc: boolean;
 	/** Identity captured while the staged descriptor still named the sidecar. */
-	readonly identity?: ReplacedProviderBackupIdentity;
-}
-
-export interface ReplacedProviderBackupIdentity {
-	readonly dev: string;
-	readonly ino: string;
+	readonly identity?: PersistedFileIdentity;
 }
 
 /** Outcome of reading a replaced-provider sidecar: a `null` prior is a value too. */
@@ -857,6 +929,7 @@ export async function readReplacedProviderBackup(
 	backupPath: string,
 	providerKey: string,
 	expectedSha256: string,
+	expectedIdentity?: PersistedFileIdentity,
 ): Promise<ReplacedProviderBackup> {
 	try {
 		// The read is fd-bound and symlink-rejecting (#4644 review r9): the path
@@ -871,6 +944,15 @@ export async function readReplacedProviderBackup(
 		let bytes: string;
 		try {
 			bytes = await new Response(await handle.readFile()).text();
+			if (expectedIdentity !== undefined) {
+				const observedIdentity = await capturePrivateBackupIdentity(handle, backupPath, Buffer.from(bytes, "utf8"));
+				if (
+					observedIdentity === undefined ||
+					!samePersistedIdentity(expectedIdentity, persistFileIdentity(observedIdentity))
+				) {
+					return { found: false };
+				}
+			}
 		} finally {
 			await handle.close();
 		}
@@ -895,30 +977,29 @@ export async function removeReplacedProviderBackup(
 	backupPath: string,
 	providerKey: string,
 	expectedSha256: string,
+	expectedIdentity?: PersistedFileIdentity,
 ): Promise<boolean> {
 	try {
 		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
 		if (opened === undefined) return false;
-		const { handle, stat } = opened;
+		const { handle } = opened;
 		let bytes: Buffer;
+		let captured: NativeExactFileIdentity | undefined;
 		try {
 			bytes = await handle.readFile();
+			captured = await capturePrivateBackupIdentity(handle, backupPath, bytes);
 		} finally {
 			await handle.close();
 		}
 		const parsed = JSON.parse(bytes.toString("utf8")) as { key?: unknown; value?: unknown };
 		if (parsed.key !== providerKey || hashBytes(serializeJson(parsed.value)) !== expectedSha256) return false;
-		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
-		if (!parent.isDirectory()) return false;
+		if (
+			captured === undefined ||
+			(expectedIdentity !== undefined && !samePersistedIdentity(expectedIdentity, persistFileIdentity(captured)))
+		)
+			return false;
 		const identity: NativeExactFileIdentity = {
-			dev: stat.dev,
-			ino: stat.ino,
-			nlink: stat.nlink,
-			parentDev: parent.dev,
-			parentIno: parent.ino,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			sha256: nodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+			...captured,
 			quarantineName: `.gjc-paseo-sidecar-${process.pid}-${nodeCrypto.randomUUID()}`,
 		};
 		const canonicalBackupPath = await canonicalSidecarPathForNativeUnlink(backupPath);
@@ -942,6 +1023,7 @@ export async function removeDiscardSidecar(
 	configJsonPath: string,
 	backupPath: string,
 	expectedSha256: string,
+	expectedIdentity?: PersistedFileIdentity,
 ): Promise<boolean> {
 	try {
 		// Validate the namespace before opening, hashing, or unlinking anything.
@@ -951,26 +1033,24 @@ export async function removeDiscardSidecar(
 		if (!/^[a-f0-9]{64}$/u.test(expectedSha256)) return false;
 		const opened = await openRegularSidecar(backupPath, fs.constants.O_RDONLY);
 		if (opened === undefined) return false;
-		const { handle, stat } = opened;
+		const { handle } = opened;
 		let bytes: Buffer;
+		let captured: NativeExactFileIdentity | undefined;
 		try {
 			bytes = await handle.readFile();
+			captured = await capturePrivateBackupIdentity(handle, backupPath, bytes);
 		} finally {
 			await handle.close();
 		}
 		const digest = nodeCrypto.createHash("sha256").update(bytes).digest("hex");
 		if (digest !== expectedSha256) return false;
-		const parent = await fs.stat(path.dirname(backupPath), { bigint: true });
-		if (!parent.isDirectory()) return false;
+		if (
+			captured === undefined ||
+			(expectedIdentity !== undefined && !samePersistedIdentity(expectedIdentity, persistFileIdentity(captured)))
+		)
+			return false;
 		const identity: NativeExactFileIdentity = {
-			dev: stat.dev,
-			ino: stat.ino,
-			nlink: stat.nlink,
-			parentDev: parent.dev,
-			parentIno: parent.ino,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			sha256: digest,
+			...captured,
 			quarantineName: `.gjc-paseo-discard-${process.pid}-${nodeCrypto.randomUUID()}`,
 		};
 		// Keep the namespace and fd-bound identity checks above on the lexical

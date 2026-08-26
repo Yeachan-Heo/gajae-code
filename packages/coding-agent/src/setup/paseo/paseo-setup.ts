@@ -6,7 +6,12 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { renameNoReplacePath, symlinkNoReplacePath } from "@gajae-code/natives";
+import {
+	exactRemoveDirectoryTree,
+	renameNoReplacePath,
+	snapshotDirectoryTree,
+	symlinkNoReplacePath,
+} from "@gajae-code/natives";
 import { Settings } from "../../config/settings";
 import { checkPaseoSetup } from "./check";
 import { type CompletedStep, compensate, receiptStep, recoverIntent, runJsonStep, SagaStepError } from "./install-saga";
@@ -15,7 +20,7 @@ import {
 	hashBytes,
 	hasNoReparseSidecarAuthority,
 	PaseoPublishError,
-	type ReplacedProviderBackupIdentity,
+	type PersistedFileIdentity,
 	readReplacedProviderBackup,
 	readTarget,
 	removeReplacedProviderBackup,
@@ -532,7 +537,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						valueSha256: hashBytes(serializeJson({ key: providerKey, value: replacedEntry })),
 					}
 				: undefined;
-		let writtenBackupIdentity: ReplacedProviderBackupIdentity | undefined;
+		let writtenBackupIdentity: PersistedFileIdentity | undefined;
 		// The exact sidecar payload this run would create ({key,value} serialized);
 		// unpersist deletes the file only when its CONTENT still hashes to these
 		// authenticated bytes (#4644 reviews r16/r17 — size alone is spoofable and
@@ -590,6 +595,11 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 					? () =>
 							writeReplacedProviderBackup(deps.paths.configJson, providerKey, replacedEntry).then(written => {
 								writtenBackupIdentity = written.identity;
+								if (written.identity !== undefined && createdReplacedRef !== undefined) {
+									Object.assign(createdReplacedRef, { identity: written.identity });
+									if (discardSidecar !== undefined)
+										Object.assign(discardSidecar, { identity: written.identity });
+								}
 								if (
 									!written.createdByGjc ||
 									written.backupPath !== createdReplacedRef.backupPath ||
@@ -654,6 +664,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 									createdReplacedRef.backupPath,
 									providerKey,
 									createdReplacedRef.valueSha256,
+									writtenBackupIdentity,
 								);
 								if (!removed) {
 									throw new PaseoPublishError(
@@ -1349,6 +1360,7 @@ async function captureMigratedOldBridgeEntries(
 
 async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
+	const stagedSnapshot = snapshotDirectoryTree(temporary);
 	try {
 		await fs.chmod(temporary, 0o700);
 		const stat = await fs.lstat(temporary, { bigint: true });
@@ -1368,7 +1380,9 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 			mtimeNs: stat.mtimeNs.toString(),
 		};
 	} finally {
-		await fs.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+		if (stagedSnapshot.ok && stagedSnapshot.snapshot !== undefined) {
+			exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
+		}
 	}
 }
 

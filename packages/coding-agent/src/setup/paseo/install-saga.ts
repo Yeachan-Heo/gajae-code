@@ -24,6 +24,7 @@ import {
 	currentIdentity,
 	hasNoReparseSidecarAuthority,
 	PaseoPublishError,
+	type PersistedFileIdentity,
 	planPublish,
 	publishPlan,
 	readTarget,
@@ -234,20 +235,40 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		if (input.persist) {
 			persistAttempted = true;
 			await input.persist();
+			await writeIntent(input.intentPath, {
+				...intent,
+				provenancePayload: ledgerAfter,
+				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
+				discardSidecar: input.discardSidecar,
+			});
 		}
 		if (input.verifyPersisted) await input.verifyPersisted();
 		const published = await publishPlan(input.targetPath, plan, {
 			expectedIdentity: current.identity,
 			backup: true,
 			now: input.now,
-			onBackupPrepared: async (backupPath, valueSha256) => {
-				await writeIntent(input.intentPath, { ...intent, publishBackup: { backupPath, valueSha256 } });
+			onBackupPrepared: async (backupPath, valueSha256, identity?: PersistedFileIdentity) => {
+				await writeIntent(input.intentPath, {
+					...intent,
+					provenancePayload: ledgerAfter,
+					provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
+					discardSidecar: input.discardSidecar,
+					publishBackup: { backupPath, valueSha256, ...(identity === undefined ? {} : { identity }) },
+				});
 			},
 		});
 		backupPath = published.backupPath;
 		publishSucceeded = published.published;
 		await writeProvenance(input.provenancePath, ledgerAfter);
 	} catch (error) {
+		if (persistAttempted) {
+			await writeIntent(input.intentPath, {
+				...intent,
+				provenancePayload: ledgerAfter,
+				provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
+				discardSidecar: input.discardSidecar,
+			}).catch(() => undefined);
+		}
 		if (!publishSucceeded && error instanceof PaseoPublishError && error.refusal.reason === "sidecar-conflict") {
 			// A same-content sidecar may have appeared after preflight. It is not
 			// ours, so remove the failed intent's discard authority before retry
@@ -1145,11 +1166,15 @@ export async function recoverIntent(
 				};
 			}
 			if (targetState === "before" && ledgerState === "before") {
-				const removed = await removeDiscardSidecar(
-					intent.targetPath,
-					intent.discardSidecar.backupPath,
-					intent.discardSidecar.valueSha256,
-				);
+				const removed =
+					intent.discardSidecar.identity === undefined
+						? false
+						: await removeDiscardSidecar(
+								intent.targetPath,
+								intent.discardSidecar.backupPath,
+								intent.discardSidecar.valueSha256,
+								intent.discardSidecar.identity,
+							);
 				if (!removed) {
 					return {
 						recovered: false,
@@ -1186,11 +1211,15 @@ export async function recoverIntent(
 						detail: `${recovery.detail}; recovery state changed before generic backup cleanup; retaining the intent`,
 					};
 				}
-				const removed = await removePublishBackup(
-					intent.targetPath,
-					intent.publishBackup.backupPath,
-					intent.publishBackup.valueSha256,
-				);
+				const removed =
+					intent.publishBackup.identity === undefined
+						? false
+						: await removePublishBackup(
+								intent.targetPath,
+								intent.publishBackup.backupPath,
+								intent.publishBackup.valueSha256,
+								intent.publishBackup.identity,
+							);
 				if (!removed && (await pathPresentWithoutFollowing(intent.publishBackup.backupPath))) {
 					return {
 						recovered: false,
