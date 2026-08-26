@@ -1845,6 +1845,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					bridgeBackgrounded = next;
 				},
 			};
+			void bridgeHandle.completion.finally(unregisterOwnerCleanup);
+			registerOwnedIfLineaged(bridgeManager, toolCallId, bridgeJobId, bridgeEndpointId);
 
 			const bridgeFoldRequest = Promise.withResolvers<void>();
 			const unregisterBridgeFold = this.session.registerForegroundFoldParticipant?.({
@@ -1972,12 +1974,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								"bash",
 								ptyLabel,
 								async () => {
-									const outcome = await controls.terminalCompletion;
-									ptyManager.appendOutput(ptyJobId, this.#formatResultOutput(outcome));
-									const completed = this.#buildCompletedResult(outcome, timeoutSec, { requestedTimeoutSec });
-									const text = this.#extractTextResult(completed);
-									if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
-									return text;
+									try {
+										const outcome = await controls.terminalCompletion;
+										ptyManager.appendOutput(ptyJobId, this.#formatResultOutput(outcome));
+										const completed = this.#buildCompletedResult(outcome, timeoutSec, {
+											requestedTimeoutSec,
+										});
+										return this.#extractTextResult(completed);
+									} finally {
+										if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
+									}
 								},
 								{ ownerId: this.session.getAgentId?.() ?? undefined, admissionToken: ptyAdmission },
 							);
@@ -1987,6 +1993,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							throw error;
 						}
 						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
+						registerOwnedIfLineaged(ptyManager, toolCallId, ptyJobId, this.session.getSessionId?.() ?? undefined);
 						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(
 							this.session.getAgentId?.() ?? "0-Main",
 							() => {
