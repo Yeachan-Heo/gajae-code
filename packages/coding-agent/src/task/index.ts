@@ -864,7 +864,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	static async create(session: ToolSession, options?: { runSubprocess?: typeof runSubprocess }): Promise<TaskTool> {
 		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
 		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
-		const { agents } = await discoverAgents(session.cwd);
+		const { agents } = await discoverAgents(session.cwd, undefined, session.settings, session.getSessionAgentDir?.());
 		const tool = new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
 		tool.#testRunSubprocess = options?.runSubprocess;
 		return tool;
@@ -1667,7 +1667,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		}
 		const boundParams: TaskParams = { ...params, tasks: bindingResolution.tasks };
 
-		const { agents, projectAgentsDir } = await discoverAgents(this.session.cwd);
+		const { agents, projectAgentsDir } = await discoverAgents(
+			this.session.cwd,
+			undefined,
+			this.session.settings,
+			this.session.getSessionAgentDir?.(),
+		);
 		const { agent: agentName, context, schema: outputSchema } = boundParams;
 		const simpleMode = this.#getTaskSimpleMode();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);

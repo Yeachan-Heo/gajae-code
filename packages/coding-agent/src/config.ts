@@ -74,6 +74,8 @@ export interface GetConfigDirsOptions {
 	cwd?: string;
 	/** Only return directories that exist. Default: false */
 	existingOnly?: boolean;
+	/** Resolved session-owned user agent directory, when a session selects one. */
+	userAgentDir?: string;
 }
 
 /**
@@ -93,15 +95,22 @@ export interface GetConfigDirsOptions {
  * getConfigDirs("skills", { user: false, existingOnly: true })
  */
 export function getConfigDirs(subpath: string, options: GetConfigDirsOptions = {}): ConfigDirEntry[] {
-	const { user = true, project = true, cwd = getProjectDir(), existingOnly = false } = options;
+	const { user = true, project = true, cwd = getProjectDir(), existingOnly = false, userAgentDir } = options;
 	const results: ConfigDirEntry[] = [];
 
 	// User-level directories (highest priority)
 	if (user) {
-		for (const { base, name } of USER_CONFIG_BASES) {
-			const resolvedPath = path.resolve(base(), subpath);
+		if (userAgentDir) {
+			const resolvedPath = path.resolve(userAgentDir, subpath);
 			if (!existingOnly || fs.existsSync(resolvedPath)) {
-				results.push({ path: resolvedPath, source: name, level: "user" });
+				results.push({ path: resolvedPath, source: CONFIG_DIR_NAME, level: "user" });
+			}
+		} else {
+			for (const { base, name } of USER_CONFIG_BASES) {
+				const resolvedPath = path.resolve(base(), subpath);
+				if (!existingOnly || fs.existsSync(resolvedPath)) {
+					results.push({ path: resolvedPath, source: name, level: "user" });
+				}
 			}
 		}
 	}
