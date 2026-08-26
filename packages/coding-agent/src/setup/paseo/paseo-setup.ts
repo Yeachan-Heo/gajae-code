@@ -8,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	exactRemoveDirectoryTree,
+	type NativeDirectoryTreeResult,
 	renameNoReplacePath,
 	snapshotDirectoryTree,
 	symlinkNoReplacePath,
@@ -317,13 +318,17 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 			// Unregister the LEDGER-RECORDED directory (the one GJC actually
 			// registered at install time); after a path migration this can differ
 			// from the current default bridge path.
-			const recordedBridgeDir = ledger.bridgePath ?? deps.paths.bridgeDir;
-			const result = await removePaseoSetup(deps, {
-				now: deps.now(),
-				unregisterBridgeDirectory: async () => {
-					await unregisterBridgeDirectory(settings, recordedBridgeDir);
-				},
-			});
+			const result = await removePaseoSetup(
+				deps,
+				ledger.bridgePath === undefined
+					? { now: deps.now() }
+					: {
+							now: deps.now(),
+							unregisterBridgeDirectory: async () => {
+								await unregisterBridgeDirectory(settings, ledger.bridgePath!);
+							},
+						},
+			);
 			return { kind: "remove", result };
 		});
 	}
@@ -629,6 +634,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 								createdReplacedRef.backupPath,
 								providerKey,
 								createdReplacedRef.valueSha256,
+								writtenBackupIdentity,
 							);
 							if (
 								observed === undefined ||
@@ -1360,9 +1366,12 @@ async function captureMigratedOldBridgeEntries(
 
 async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
-	const stagedSnapshot = snapshotDirectoryTree(temporary);
+	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
+	let identity: BridgeEntryIdentity | undefined;
+	let cleanupError: string | undefined;
 	try {
 		await fs.chmod(temporary, 0o700);
+		stagedSnapshot = snapshotDirectoryTree(temporary);
 		const stat = await fs.lstat(temporary, { bigint: true });
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
@@ -1373,17 +1382,22 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 				`old Paseo bridge directory appeared during compensation: ${bridgeDir} (${published.code ?? published.reason})`,
 			);
 		}
-		return {
+		identity = {
 			dev: stat.dev.toString(),
 			ino: stat.ino.toString(),
 			size: stat.size.toString(),
 			mtimeNs: stat.mtimeNs.toString(),
 		};
 	} finally {
-		if (stagedSnapshot.ok && stagedSnapshot.snapshot !== undefined) {
-			exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
+		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
+			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
+			if (!cleanup.ok && cleanup.code !== "not_found")
+				cleanupError = `Paseo bridge staging cleanup retained authority: ${temporary}`;
 		}
 	}
+	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary]);
+	if (identity === undefined) throw new SkillsBridgeError(`Paseo bridge identity was not captured: ${temporary}`);
+	return identity;
 }
 
 /** Restore only old links that the migration inverse actually removed. */

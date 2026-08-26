@@ -4927,9 +4927,14 @@ describe("intent recovery", () => {
 		const backupPath = `${fixture.paths.configJson}.gjc-bak-recovery-test`;
 		const backupBytes = serializeJson({ before: true });
 		await fs.writeFile(backupPath, backupBytes, { mode: 0o600 });
+		const backupIdentity = await captureRegularIdentity(backupPath);
 		await writeIntent(fixture.paths.intentRecord, {
 			...intent,
-			publishBackup: { backupPath, valueSha256: hashBytes(backupBytes) },
+			publishBackup: {
+				backupPath,
+				valueSha256: hashBytes(backupBytes),
+				identity: backupIdentity === undefined ? undefined : persistFileIdentity(backupIdentity),
+			},
 		});
 
 		const recovery = await recoverIntent(fixture.paths.intentRecord, {
@@ -5222,9 +5227,14 @@ describe("intent recovery", () => {
 		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
 		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		const sidecarIdentity = await captureRegularIdentity(sidecarPath);
 		await writeIntent(fixture.paths.intentRecord, {
 			...intent,
-			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+			discardSidecar: {
+				backupPath: sidecarPath,
+				valueSha256: hashBytes(sidecarBytes),
+				identity: sidecarIdentity === undefined ? undefined : persistFileIdentity(sidecarIdentity),
+			},
 		});
 
 		const realStat = fs.stat.bind(fs);
@@ -5292,9 +5302,14 @@ describe("intent recovery", () => {
 		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
 		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		const sidecarIdentity = await captureRegularIdentity(sidecarPath);
 		await writeIntent(fixture.paths.intentRecord, {
 			...intent,
-			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+			discardSidecar: {
+				backupPath: sidecarPath,
+				valueSha256: hashBytes(sidecarBytes),
+				identity: sidecarIdentity === undefined ? undefined : persistFileIdentity(sidecarIdentity),
+			},
 		});
 
 		const recovery = await recoverIntent(fixture.paths.intentRecord, {
@@ -5341,9 +5356,14 @@ describe("intent recovery", () => {
 		const sidecarPath = replacedProviderBackupPath(fixture.paths.configJson, "gjc");
 		const sidecarBytes = serializeJson({ key: "gjc", value: { preserved: true } });
 		await fs.writeFile(sidecarPath, sidecarBytes, { mode: 0o600 });
+		const sidecarIdentity = await captureRegularIdentity(sidecarPath);
 		await writeIntent(fixture.paths.intentRecord, {
 			...intent,
-			discardSidecar: { backupPath: sidecarPath, valueSha256: hashBytes(sidecarBytes) },
+			discardSidecar: {
+				backupPath: sidecarPath,
+				valueSha256: hashBytes(sidecarBytes),
+				identity: sidecarIdentity === undefined ? undefined : persistFileIdentity(sidecarIdentity),
+			},
 		});
 
 		const realStat = fs.stat.bind(fs);

@@ -20,6 +20,8 @@ import {
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
 	exactUnlinkSymlink,
+	type NativeDirectoryTreeResult,
+	type NativeExactUnlinkResult,
 	renameNoReplacePath,
 	snapshotDirectoryTree,
 	symlinkNoReplacePath,
@@ -754,10 +756,13 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 
 async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(preflight.bridgeDir), ".paseo-skills-create-"));
-	const stagedSnapshot = snapshotDirectoryTree(temporary);
+	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
+	let identity: BridgeEntryIdentity | undefined;
+	let cleanupError: string | undefined;
 	try {
 		await fs.chmod(temporary, 0o700);
-		const identity = await directoryIdentity(temporary);
+		stagedSnapshot = snapshotDirectoryTree(temporary);
+		identity = await directoryIdentity(temporary);
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
 			canonicalExistingPathForNative(preflight.bridgeDir),
@@ -767,12 +772,18 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 				`Paseo skills bridge appeared during creation: ${preflight.bridgeDir} (${published.code ?? published.reason})`,
 			);
 		}
-		return identity;
 	} finally {
-		if (stagedSnapshot.ok && stagedSnapshot.snapshot !== undefined) {
-			exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
+		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
+			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
+			if (!cleanup.ok && cleanup.code !== "not_found") {
+				cleanupError = `Paseo skills bridge staging cleanup retained authority: ${temporary}`;
+			}
 		}
 	}
+	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary]);
+	if (identity === undefined)
+		throw new SkillsBridgeError(`Paseo skills bridge identity was not captured: ${temporary}`);
+	return identity;
 }
 
 async function pruneRecordedDangling(
@@ -1048,7 +1059,7 @@ async function removeOwnedEmptyBridgeDirectory(
 	// leaves a ledger that names the only authorized `.removing` object.
 	await onCleanupPending?.(authority);
 
-	let removal: ReturnType<typeof exactRemoveDirectoryTree>;
+	let removal: NativeExactUnlinkResult;
 	try {
 		removal = exactRemoveDirectoryTree(nativeBridgeDir, captured.snapshot, {
 			dev: parent.dev,
@@ -1097,10 +1108,7 @@ async function removeOwnedEmptyBridgeDirectory(
  * a successor tree. The identity check binds the cleanup to the persisted root
  * before the final namespace removal.
  */
-async function finishBridgeCleanup(
-	authority: BridgeCleanupAuthority,
-	removal: ReturnType<typeof exactRemoveDirectoryTree>,
-): Promise<void> {
+async function finishBridgeCleanup(authority: BridgeCleanupAuthority, removal: NativeExactUnlinkResult): Promise<void> {
 	const retainedAuthority =
 		removal.retainedSuccessorPath ?? removal.retainedPlaceholderPath ?? removal.retainedUnknownPath;
 	if (retainedAuthority !== undefined) {
@@ -1171,7 +1179,7 @@ export async function replayBridgeCleanup(authority: BridgeCleanupAuthority): Pr
 	) {
 		throw new SkillsBridgeError(`Paseo skills bridge detached authority diverged: ${authority.originalPath}`);
 	}
-	let removal: ReturnType<typeof exactRemoveDirectoryTree>;
+	let removal: NativeExactUnlinkResult;
 	try {
 		removal = exactRemoveDirectoryTree(authority.detachedPath, authority.snapshot, {
 			dev: BigInt(authority.parentIdentity.dev),

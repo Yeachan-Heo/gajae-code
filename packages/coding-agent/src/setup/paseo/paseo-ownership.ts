@@ -20,12 +20,10 @@ import * as path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import {
 	ABSENT_IDENTITY,
-	captureRegularIdentity,
 	currentIdentity,
 	hashBytes,
 	isCanonicalReplacedProviderBackupPath,
 	type PersistedFileIdentity,
-	persistFileIdentity,
 	serializeJson,
 } from "./json-publisher";
 
@@ -507,30 +505,6 @@ function isIntentPublishBackup(value: unknown, targetPath: unknown): value is In
 }
 
 export async function writeIntent(intentPath: string, intent: IntentRecord): Promise<void> {
-	let persistedIntent = intent;
-	if (intent.discardSidecar?.identity === undefined) {
-		const identity =
-			intent.discardSidecar === undefined
-				? undefined
-				: await captureRegularIdentity(intent.discardSidecar.backupPath);
-		if (identity !== undefined && intent.discardSidecar !== undefined) {
-			persistedIntent = {
-				...persistedIntent,
-				discardSidecar: { ...intent.discardSidecar, identity: persistFileIdentity(identity) },
-			};
-		}
-	}
-	if (intent.publishBackup?.identity === undefined) {
-		const identity =
-			intent.publishBackup === undefined ? undefined : await captureRegularIdentity(intent.publishBackup.backupPath);
-		if (identity !== undefined && intent.publishBackup !== undefined) {
-			persistedIntent = {
-				...persistedIntent,
-				publishBackup: { ...intent.publishBackup, identity: persistFileIdentity(identity) },
-			};
-		}
-	}
-	intent = persistedIntent;
 	if (intent.version !== INTENT_VERSION) {
 		throw new IntentRecordCorruptError(intentPath, `version is not ${INTENT_VERSION}`);
 	}

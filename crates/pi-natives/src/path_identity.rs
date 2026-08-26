@@ -4631,6 +4631,23 @@ pub(crate) mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
+		reason = "the destination parent descriptor remains live through the source identity check"
+	)]
+	fn published_matches_source(
+		parent_fd: libc::c_int,
+		name: &CString,
+		source: &libc::stat,
+	) -> bool {
+		let mut current: libc::stat = unsafe { std::mem::zeroed() };
+		(unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW) })
+			== 0 && current.st_dev == source.st_dev
+			&& current.st_ino == source.st_ino
+			&& current.st_size == source.st_size
+			&& stat_mtime_ns(&current) == stat_mtime_ns(source)
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
 		reason = "the retained parent descriptor and exact identity remain live through quarantine \
 		          cleanup"
 	)]
@@ -4755,14 +4772,24 @@ pub(crate) mod platform {
 			};
 			let result =
 				rename_no_replace(source_parent, destination_parent, &source_name, &destination_name);
+			let outcome = match result {
+				Ok(())
+					if published_matches_source(
+						destination_parent,
+						&destination_name,
+						&source_named,
+					) =>
+				{
+					NativeExactUnlinkResult::success()
+				},
+				Ok(()) => NativeExactUnlinkResult::failure("destination_identity_changed"),
+				Err(code) => NativeExactUnlinkResult::failure(code),
+			};
 			unsafe {
 				libc::close(source_parent);
 				libc::close(destination_parent);
 			}
-			return match result {
-				Ok(()) => NativeExactUnlinkResult::success(),
-				Err(code) => NativeExactUnlinkResult::failure(code),
-			};
+			return outcome;
 		}
 		let (source_fd, source_stat) = match open_publication_source(source_parent, &source_name) {
 			Ok(value) => value,

@@ -336,6 +336,20 @@ export async function publishPlan(
 				actual: await currentIdentity(targetPath),
 			});
 		}
+		if (backupPath !== undefined && backupIdentity !== undefined) {
+			const observedBackup = await captureRegularIdentity(backupPath);
+			if (
+				observedBackup === undefined ||
+				JSON.stringify(persistFileIdentity(observedBackup)) !== JSON.stringify(persistFileIdentity(backupIdentity))
+			) {
+				if (backupCreated) await removePrivateBackupByIdentity(backupPath, backupIdentity);
+				throw new PaseoPublishError(targetPath, {
+					reason: "cas-conflict",
+					expected: options.expectedIdentity,
+					actual: await currentIdentity(targetPath),
+				});
+			}
+		}
 	}
 
 	// Never write the final path directly: a crash mid-write would leave the
@@ -891,14 +905,13 @@ export async function writeReplacedProviderBackup(
 		});
 	}
 	if (createdByGjc) {
-		const finalIdentity = await captureRegularIdentity(backupPath);
-		if (finalIdentity === undefined) {
+		if (stagedIdentity === undefined) {
 			throw new PaseoPublishError(backupPath, {
 				reason: "sidecar-conflict",
-				detail: "the final replaced-provider sidecar could not be identity-authenticated",
+				detail: "the final replaced-provider sidecar lost its staged identity",
 			});
 		}
-		identity = persistFileIdentity(finalIdentity);
+		identity = persistFileIdentity(stagedIdentity);
 	}
 	return { backupPath, valueSha256, createdByGjc, ...(identity === undefined ? {} : { identity }) };
 }
