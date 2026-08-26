@@ -111,6 +111,9 @@ describe("BashTool ACP terminal fold", () => {
 		// card bound to the same remote id.
 		expect(result.details?.async?.state).toBe("running");
 		expect(result.details?.terminalId).toBe("term-fold");
+		const backgroundJobId = result.details?.async?.jobId;
+		expect(backgroundJobId).toBeTruthy();
+		expect(h.manager.getJob(backgroundJobId!)?.metadata?.backgrounded).toBe(true);
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		// Retained, not torn down: folding must never kill or release the remote work.
 		expect(releaseSpy).not.toHaveBeenCalled();

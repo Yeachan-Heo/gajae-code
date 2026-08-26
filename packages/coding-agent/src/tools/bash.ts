@@ -1988,6 +1988,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// Folded (or auto-backgrounded): the remote terminal keeps running and its
 			// result arrives as a background completion.
 			bridgeHandle.setBackgrounded(true);
+			bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration);
 			return this.#buildBackgroundStartResult(bridgeJobId, bridgeLabel, bridgeHandle.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
