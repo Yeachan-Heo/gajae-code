@@ -595,7 +595,7 @@ export function extractMcpInputRequired(result: unknown): MCPInputRequiredData |
 		// Unrecognized resultType values are invalid per the specification.
 		throw new Error(`MCP result has unrecognized resultType "${String(resultType)}"`);
 	}
-	const inputRequests: MCPInputRequiredData["inputRequests"] = {};
+	const inputRequests = Object.create(null) as MCPInputRequiredData["inputRequests"];
 	if (result.inputRequests !== undefined) {
 		if (!isRecord(result.inputRequests)) {
 			throw new Error("MCP input_required result has malformed inputRequests");

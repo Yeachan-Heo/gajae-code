@@ -252,8 +252,6 @@ function buildModernClientContext(options?: { advertiseRoots?: boolean }): MCPMo
 	const capabilities: Record<string, unknown> = {};
 	if (options?.advertiseRoots !== false) {
 		capabilities.roots = { listChanged: true };
-		// Form-mode elicitation is bridged to GJC's structured ask surface (MRTR).
-		capabilities.elicitation = { form: {} };
 	}
 	return {
 		protocolVersion: MCP_PROTOCOL_VERSION_2026_07_28,
@@ -440,7 +438,7 @@ async function requestWithInputHandling<T>(
 	const correlationId = crypto.randomUUID();
 
 	for (let attempt = 0; attempt < MAX_MRTR_RETRIES; attempt++) {
-		const inputResponses: Record<string, unknown> = {};
+		const inputResponses = Object.create(null) as Record<string, unknown>;
 		for (const [key, request] of Object.entries(inputRequired.inputRequests)) {
 			if (options?.signal?.aborted) {
 				throw options.signal.reason instanceof Error ? options.signal.reason : new Error("Aborted");
