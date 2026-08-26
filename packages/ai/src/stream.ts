@@ -643,6 +643,7 @@ export function streamSimple<TApi extends Api>(
 	const adapterOptions = isProviderSafetyStopModelTrusted(model)
 		? withProviderSafetyStopAdapterInvocation(options ?? {})
 		: options;
+	const resolvedSpecialProviderMaxTokens = resolveDefaultRequestMaxTokens(model, options?.maxTokens);
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
 	if (model.provider === "gitlab-duo") {
@@ -654,6 +655,7 @@ export function streamSimple<TApi extends Api>(
 				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
 					...adapterOptions,
 					apiKey,
+					maxTokens: resolvedSpecialProviderMaxTokens,
 				}),
 			);
 		}, options?.signal);
@@ -670,6 +672,7 @@ export function streamSimple<TApi extends Api>(
 				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
 					...adapterOptions,
 					apiKey,
+					maxTokens: resolvedSpecialProviderMaxTokens,
 					format: options?.kimiApiFormat ?? "anthropic",
 				}),
 			);
@@ -687,6 +690,7 @@ export function streamSimple<TApi extends Api>(
 				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
 					...adapterOptions,
 					apiKey,
+					maxTokens: resolvedSpecialProviderMaxTokens,
 					format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
 				}),
 			);
@@ -805,7 +809,7 @@ function resolveOpenAiReasoningEffort<TApi extends Api>(
 
 const castApi = <TApi extends Api>(api: OptionsForApi<TApi>): OptionsForApi<Api> => api as OptionsForApi<Api>;
 
-function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TApi>, requested?: number): number {
+export function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TApi>, requested?: number): number {
 	if (requested !== undefined && requested > 0) return requested;
 	if (model.maxTokensSource === "configured") return model.maxTokens;
 	return Math.min(model.maxTokens, DEFAULT_REQUEST_MAX_TOKENS);

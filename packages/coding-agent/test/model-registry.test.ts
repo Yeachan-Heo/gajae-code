@@ -2774,6 +2774,23 @@ describe("ModelRegistry", () => {
 			expect(sonnetModels[0].baseUrl).toBe("https://my-proxy.example.com/v1");
 		});
 
+		test("same-ID custom maxTokens remains authoritative after replacement", () => {
+			writeRawModelsJson({
+				openrouter: {
+					baseUrl: "https://my-proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [{ id: "anthropic/claude-sonnet-4", maxTokens: 65_536 }],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("openrouter", "anthropic/claude-sonnet-4");
+
+			expect(model?.maxTokens).toBe(65_536);
+			expect(model?.maxTokensSource).toBe("configured");
+		});
+
 		test("custom same-id replacement does not keep bundled headers", () => {
 			writeRawModelsJson({
 				"github-copilot": {

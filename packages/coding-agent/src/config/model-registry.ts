@@ -1819,6 +1819,7 @@ export class ModelRegistry {
 					cost: customModel.cost ?? existingModel.cost,
 					contextWindow: customModel.contextWindow ?? existingModel.contextWindow,
 					maxTokens: customModel.maxTokens ?? existingModel.maxTokens,
+					maxTokensSource: customModel.maxTokensSource ?? existingModel.maxTokensSource,
 					// Same-id custom definitions replace bundled transport behavior. Provider-level
 					// headers/compat were already folded into customModel during parsing; do not
 					// re-merge bundled transport metadata here.
