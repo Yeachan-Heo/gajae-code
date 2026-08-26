@@ -940,6 +940,7 @@ export async function writeReplacedProviderBackup(
 			]);
 			const published = renameNoReplacePath(nativeTemporary, nativeBackup, stagedIdentity);
 			if (!published.ok) {
+				temporaryPublished = published.mutationState !== "not_committed";
 				if (published.code !== "already_exists" && published.code !== "quarantine_collision") {
 					throw new PaseoPublishError(
 						backupPath,
@@ -978,9 +979,27 @@ export async function writeReplacedProviderBackup(
 			}
 		} finally {
 			if (stagedIdentity === undefined) {
-				stagedIdentity = await capturePrivateBackupIdentity(handle, temporary, Buffer.from(payload, "utf8"));
+				const stat = await handle.stat({ bigint: true }).catch(() => undefined);
+				let partialBytes: Buffer | undefined;
+				if (stat !== undefined && stat.size === BigInt(Buffer.byteLength(payload))) {
+					partialBytes = Buffer.from(payload, "utf8");
+				} else if (stat !== undefined) {
+					const reader = await fs.open(temporary, "r").catch(() => undefined);
+					if (reader !== undefined) {
+						try {
+							const readerStat = await reader.stat({ bigint: true });
+							if (readerStat.dev === stat.dev && readerStat.ino === stat.ino)
+								partialBytes = await reader.readFile();
+						} finally {
+							await reader.close();
+						}
+					}
+				}
+				if (partialBytes !== undefined)
+					stagedIdentity = await capturePrivateBackupIdentity(handle, temporary, partialBytes);
 			}
 			await handle.close();
+			if (stagedIdentity === undefined) temporaryCleaned = false;
 		}
 		await syncParentDirectory(path.dirname(backupPath));
 	} finally {
@@ -988,10 +1007,14 @@ export async function writeReplacedProviderBackup(
 			temporaryCleaned = await removePrivateBackupByIdentity(temporary, stagedIdentity);
 	}
 	if (!temporaryCleaned) {
-		throw new PaseoPublishError(backupPath, {
-			reason: "sidecar-conflict",
-			detail: "the temporary replaced-provider sidecar could not be cleaned by identity",
-		});
+		throw new PaseoPublishError(
+			backupPath,
+			{
+				reason: "sidecar-conflict",
+				detail: "the temporary replaced-provider sidecar could not be cleaned by identity",
+			},
+			[temporary],
+		);
 	}
 	if (createdByGjc) {
 		if (stagedIdentity === undefined) {

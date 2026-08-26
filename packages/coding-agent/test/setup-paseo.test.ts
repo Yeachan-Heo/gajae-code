@@ -475,8 +475,8 @@ describe("replaced-provider sidecar cleanup", () => {
 				const temporaryEntries = entries.filter(
 					entry => entry.startsWith(path.basename(backupPath)) && entry.endsWith(".tmp"),
 				);
-				if (phase === "write") expect(temporaryEntries).toHaveLength(1);
-				else expect(temporaryEntries).toEqual([]);
+
+				expect(temporaryEntries).toEqual([]);
 			} finally {
 				for (const spy of spies.reverse()) spy.mockRestore();
 			}
