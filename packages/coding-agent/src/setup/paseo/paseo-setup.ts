@@ -1403,7 +1403,7 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 				cleanupError = `Paseo bridge staging cleanup retained authority: ${temporary}`;
 		}
 	}
-	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary]);
+	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary], identity);
 	if (identity === undefined)
 		throw new SkillsBridgeError(`Paseo bridge identity was not captured: ${temporary}`, [temporary]);
 	return identity;

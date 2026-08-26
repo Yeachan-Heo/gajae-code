@@ -246,11 +246,13 @@ export interface SkillsBridgeInstallResult {
 
 export class SkillsBridgeError extends Error {
 	readonly retained: readonly string[];
+	readonly bridgeDirIdentity?: BridgeEntryIdentity;
 
-	constructor(message: string, retained: readonly string[] = []) {
+	constructor(message: string, retained: readonly string[] = [], bridgeDirIdentity?: BridgeEntryIdentity) {
 		super(message);
 		this.name = "SkillsBridgeError";
 		this.retained = retained;
+		this.bridgeDirIdentity = bridgeDirIdentity;
 	}
 }
 /**
@@ -793,7 +795,7 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 			}
 		}
 	}
-	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary]);
+	if (cleanupError !== undefined) throw new SkillsBridgeError(cleanupError, [temporary], identity);
 	if (identity === undefined)
 		throw new SkillsBridgeError(`Paseo skills bridge identity was not captured: ${temporary}`, [temporary]);
 	return identity;
@@ -938,6 +940,11 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	});
 	const fail = (error: unknown): never => {
 		if (error instanceof SkillsBridgePartialError) throw error;
+		if (error instanceof SkillsBridgeError && error.bridgeDirIdentity !== undefined) {
+			bridgeDirCreated = true;
+			bridgeDirIdentity = error.bridgeDirIdentity;
+			bridgeParentIdentity = error.bridgeDirIdentity;
+		}
 		const message =
 			error instanceof SkillsBridgeError ? error.message : error instanceof Error ? error.message : String(error);
 		throw new SkillsBridgePartialError(message, partial(), error instanceof SkillsBridgeError ? error.retained : []);
