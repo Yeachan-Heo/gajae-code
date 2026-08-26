@@ -1172,6 +1172,23 @@ async function transitionClaimIdentity(transitionDir: string): Promise<Transitio
 	};
 }
 
+function transitionClaimIdentitySync(transitionDir: string): TransitionClaimIdentity | undefined {
+	try {
+		const stat = fsSync.lstatSync(transitionDir, { bigint: true });
+		if (!stat.isDirectory()) return undefined;
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			ctimeNs: stat.ctimeNs,
+		};
+	} catch {
+		return undefined;
+	}
+}
+
 function sameTransitionClaimIdentity(left: TransitionClaimIdentity, right: TransitionClaimIdentity): boolean {
 	return (
 		left.dev === right.dev &&
@@ -1209,19 +1226,32 @@ async function removeTransitionClaimIfIdentityMatches(
 	)
 		return false;
 	try {
+		const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
+		if (snapshot.entries.length !== 1) {
+			const removed = await native.exactRemoveDirectoryTreeAsync(transitionDir, snapshot, undefined, remaining);
+			const expectedDetachedPath = `${transitionDir}.removing`;
+			if (removed.ok) return removed.detachedPath === expectedDetachedPath || removed.detachedPath === undefined;
+			if (removed.code === "not_found") return true;
+			return removed.code === "cleanup_pending" && removed.detachedPath === expectedDetachedPath;
+		}
 		const quarantineName = `.gjc-transition-removing-${claim.dev}-${claim.ino}-${claim.ctimeNs}`;
-		const removed = await native.exactUnlinkAsync(transitionDir, {
-			dev: claim.dev,
-			ino: claim.ino,
-			nlink: claim.nlink,
-			size: claim.size,
-			mtimeNs: claim.mtimeNs,
-			directory: true,
-			quarantineName,
-		});
-		if (removed.ok || removed.code === "not_found") return true;
+		const expectedDetachedPath = path.join(path.dirname(transitionDir), quarantineName);
+		const removed = await native.exactUnlinkAsync(
+			transitionDir,
+			{
+				dev: claim.dev,
+				ino: claim.ino,
+				nlink: claim.nlink,
+				size: claim.size,
+				mtimeNs: claim.mtimeNs,
+				directory: true,
+				quarantineName,
+			},
+			remaining,
+		);
+		if (removed.ok) return removed.detachedPath === expectedDetachedPath || removed.detachedPath === undefined;
+		if (removed.code === "not_found") return true;
 		if (removed.code === "cleanup_pending") {
-			const expectedDetachedPath = path.join(path.dirname(transitionDir), quarantineName);
 			return removed.detachedPath === expectedDetachedPath;
 		}
 		return false;
@@ -1234,8 +1264,8 @@ async function removeTransitionClaimIfIdentityMatches(
 
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
 async function createTransitionClaim(transitionDir: string, deadline: number): Promise<TransitionClaimIdentity> {
-	await fs.mkdir(transitionDir);
-	const createdClaim = await transitionClaimIdentity(transitionDir);
+	fsSync.mkdirSync(transitionDir);
+	const createdClaim = transitionClaimIdentitySync(transitionDir);
 	if (!createdClaim) throw new SessionStateLockUnavailableError();
 	try {
 		await SessionStateLockTestHooks.beforeTransitionIdentityCapture?.(transitionDir);

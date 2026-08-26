@@ -71,5 +71,5 @@ export function exactRemoveDirectoryTreeOp(
 	// inode, and a wholesale re-creation are all the same verdict — not ours to delete.
 	if (JSON.stringify(observed.snapshot) !== JSON.stringify(snapshot)) return { ok: false, code: "identity_mismatch" };
 	fs.rmSync(root, { recursive: true });
-	return { ok: true };
+	return { ok: true, detachedPath: `${root}.removing` };
 }

@@ -64,7 +64,10 @@ async function exactUnlinkAsync(
 	identity: NativeExactFileIdentity,
 	timeoutMs?: number | null,
 ): Promise<NativeExactUnlinkResult> {
-	return await settleWithTypedTimeout(Promise.resolve(exactUnlink(target, identity)), timeoutMs, performance.now(), {
+	const deferred = new Promise<NativeExactUnlinkResult>(resolve => {
+		setImmediate(() => resolve(exactUnlink(target, identity)));
+	});
+	return await settleWithTypedTimeout(deferred, timeoutMs, performance.now(), {
 		ok: false,
 		code: "timed_out",
 	});
