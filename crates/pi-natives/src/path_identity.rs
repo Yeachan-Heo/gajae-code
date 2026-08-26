@@ -691,7 +691,7 @@ impl NativeExactUnlinkResult {
 	}
 
 	#[cfg(unix)]
-	fn with_source_retained(mut self) -> Self {
+	const fn with_source_retained(mut self) -> Self {
 		self.source_retained = Some(true);
 		self
 	}
@@ -1502,10 +1502,12 @@ pub fn symlink_no_replace_path(
 	)
 }
 
-/// Create exactly the final directory component through a retained,
-/// no-follow parent. The parent identity is checked against the descriptor
-/// used for the native create primitive, and an occupied destination is never
-/// replaced or treated as success.
+/// Create exactly the final directory component through a retained, no-follow
+/// parent.
+///
+/// The parent identity is checked against the descriptor used for the native
+/// create primitive, and an occupied destination is never replaced or treated
+/// as success.
 #[napi]
 pub fn create_directory_no_replace_path(
 	destination_path: String,
@@ -1524,11 +1526,13 @@ pub fn create_directory_no_replace_path(
 }
 
 /// Atomically publish `sourcePath` at `destinationPath` without replacing an
-/// occupied destination. When an expected regular-file identity is supplied on
-/// POSIX, publication is made from a private same-directory hard-link claim;
-/// the original source pathname remains as a cleanup link and the result sets
-/// `sourceRetained: true`. Callers must release any open source descriptor
-/// before removing that pathname through their identity-bound cleanup path.
+/// occupied destination.
+///
+/// When an expected regular-file identity is supplied on POSIX, publication is
+/// made from a private same-directory hard-link claim; the original source
+/// pathname remains as a cleanup link and the result sets `sourceRetained:
+/// true`. Callers must release any open source descriptor before removing that
+/// pathname through their identity-bound cleanup path.
 #[napi]
 pub fn rename_no_replace_path(
 	source_path: String,
@@ -2562,8 +2566,8 @@ pub(crate) mod platform {
 
 	fn directory_identity(stat: &libc::stat) -> NativeDirectoryIdentity {
 		NativeDirectoryIdentity {
-			dev:      (stat.st_dev as u64).to_string(),
-			ino:      (stat.st_ino as u64).to_string(),
+			dev:      stat.st_dev.to_string(),
+			ino:      stat.st_ino.to_string(),
 			size:     (stat.st_size as u64).to_string(),
 			mtime_ns: stat_mtime_ns(stat).to_string(),
 		}
@@ -4887,8 +4891,8 @@ pub(crate) mod platform {
 		};
 		let mut parent: libc::stat = unsafe { std::mem::zeroed() };
 		(unsafe { libc::fstat(parent_fd, &mut parent) }) == 0
-			&& parent.st_dev as u64 == expected_dev
-			&& parent.st_ino as u64 == expected_ino
+			&& parent.st_dev == expected_dev
+			&& parent.st_ino == expected_ino
 	}
 
 	fn exact_open_source_matches(
@@ -4897,18 +4901,15 @@ pub(crate) mod platform {
 		identity: &ExactFileIdentity,
 	) -> Result<bool, &'static str> {
 		if source.st_mode & libc::S_IFMT != libc::S_IFREG
-			|| source.st_dev as u64 != identity.dev
-			|| source.st_ino as u64 != identity.ino
+			|| source.st_dev != identity.dev
+			|| source.st_ino != identity.ino
 			|| source.st_size as u64 != identity.size
 			|| stat_mtime_ns(source) != i128::from(identity.mtime_ns)
 		{
 			return Ok(false);
 		}
 		if !identity.allow_hard_link
-			&& (source.st_nlink != 1
-				|| identity
-					.nlink
-					.is_some_and(|nlink| nlink != source.st_nlink as u64))
+			&& (source.st_nlink != 1 || identity.nlink.is_some_and(|nlink| nlink != source.st_nlink))
 		{
 			return Ok(false);
 		}
@@ -5308,8 +5309,8 @@ pub(crate) mod platform {
 			);
 		}
 		let identity = ExactFileIdentity {
-			dev:             source_stat.st_dev as u64,
-			ino:             source_stat.st_ino as u64,
+			dev:             source_stat.st_dev,
+			ino:             source_stat.st_ino,
 			nlink:           None,
 			parent_dev:      Some(parent_stat.st_dev as u64),
 			parent_ino:      Some(parent_stat.st_ino as u64),
@@ -5462,8 +5463,8 @@ pub(crate) mod platform {
 			.parent()
 			.unwrap_or_else(|| Path::new("."))
 			.join(private_name.to_string_lossy().as_ref());
-		let expected_nlink = (!expected_source.allow_hard_link)
-			.then_some((source_stat.st_nlink as u64).saturating_add(1));
+		let expected_nlink =
+			(!expected_source.allow_hard_link).then_some(source_stat.st_nlink.saturating_add(1));
 		#[cfg(test)]
 		pause_before_source_claim_for_test();
 		let link_result = link_no_replace(source_parent, &source_name, source_parent, &private_name);
@@ -5623,12 +5624,11 @@ pub(crate) mod platform {
 			unsafe { libc::close(source_parent) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
-		if let Some((expected_dev, expected_ino)) = expected_source {
-			if source_named.st_dev as u64 != expected_dev || source_named.st_ino as u64 != expected_ino
-			{
-				unsafe { libc::close(source_parent) };
-				return NativeExactUnlinkResult::failure("identity_mismatch");
-			}
+		if let Some((expected_dev, expected_ino)) = expected_source
+			&& (source_named.st_dev != expected_dev || source_named.st_ino != expected_ino)
+		{
+			unsafe { libc::close(source_parent) };
+			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		if source_named.st_mode & libc::S_IFMT == libc::S_IFDIR {
 			let (destination_parent, destination_name) = match open_parent_no_follow(destination_path)
@@ -5670,14 +5670,14 @@ pub(crate) mod platform {
 				return NativeExactUnlinkResult::failure(code);
 			},
 		};
-		if let Some((expected_dev, expected_ino)) = expected_source {
-			if source_stat.st_dev as u64 != expected_dev || source_stat.st_ino as u64 != expected_ino {
-				unsafe {
-					libc::close(source_fd);
-					libc::close(source_parent);
-				}
-				return NativeExactUnlinkResult::failure("identity_mismatch");
+		if let Some((expected_dev, expected_ino)) = expected_source
+			&& (source_stat.st_dev != expected_dev || source_stat.st_ino != expected_ino)
+		{
+			unsafe {
+				libc::close(source_fd);
+				libc::close(source_parent);
 			}
+			return NativeExactUnlinkResult::failure("identity_mismatch");
 		}
 		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
 			Ok(value) => value,
