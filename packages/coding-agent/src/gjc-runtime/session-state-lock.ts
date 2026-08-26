@@ -1340,6 +1340,26 @@ async function reclaimStaleTransitionClaim(transitionDir: string, deadline: numb
 	// crashed atomic claim therefore stays fail-closed for explicit recovery.
 }
 
+async function reconcileTransitionResidue(transitionDir: string, deadline: number): Promise<void> {
+	if (injectedNativeLoader) return;
+	if (await fs.lstat(transitionDir).catch(() => null)) return;
+	const residue = `${transitionDir}.removing`;
+	if (!(await fs.lstat(residue).catch(() => null))) return;
+	const native = transitionNativeSessionStateLock();
+	const snapshot = await captureLegacyDirectoryTree(native, residue, deadline);
+	if (!snapshot) return;
+	const remaining = Math.max(1, Math.ceil(deadline - performance.now()));
+	const result = await native.exactRemoveDirectoryTreeAsync(residue, snapshot, undefined, remaining);
+	if (result.ok) return;
+	if (
+		result.code === "cleanup_pending" &&
+		result.detachedPath === residue &&
+		result.payloadDurable !== false
+	)
+		return;
+	throw new SessionStateLockUnavailableError(new Error("Detached transition cleanup could not be reconciled safely."));
+}
+
 /** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
 async function withLockPathTransition<T>(
 	lockFile: string,
@@ -1355,6 +1375,7 @@ async function withLockPathTransition<T>(
 		let claim: TransitionClaimIdentity | undefined;
 		try {
 			if (performance.now() >= deadline) throw new SessionStateLockUnavailableError();
+			await reconcileTransitionResidue(transitionDir, deadline);
 			claim = await withinLockAcquireDeadline(
 				deadline,
 				() => createTransitionClaim(transitionDir, deadline),
