@@ -2985,6 +2985,25 @@ fn append_managed(
 			None,
 		);
 	}
+	if append_post_identity_if_exact(
+		&file,
+		&parent,
+		&name,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_sha256,
+		data,
+	)
+	.is_none()
+	{
+		return RecoveryFsResult::append_failure(
+			"identity_mismatch",
+			"committed",
+			"not_provable",
+			None,
+		);
+	}
 	let identity = match regular_identity(&file) {
 		Ok(value) => value,
 		Err(code) => {
@@ -4187,6 +4206,62 @@ mod tests {
 			fs::read(temporary.0.join("transcript")).expect("transcript"),
 			b"original-transcript\nown\nforeign"
 		);
+	}
+
+	#[test]
+	fn managed_append_withholds_receipt_when_foreign_writer_replaces_same_size_bytes() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let own_append = b"\nown";
+		let foreign_contents = b"foreign-content-bytes!!";
+		assert_eq!(foreign_contents.len(), original.len() + own_append.len());
+		let identity = managed_file(&root, "transcript", original);
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		set_append_after_write_hook(Some((entered_tx, resume_rx)));
+
+		let root_for_append = root.try_clone().expect("clone retained root");
+		let dev = identity.dev.clone();
+		let ino = identity.ino.clone();
+		let size = identity.size.clone();
+		let mtime_ns = identity.mtime_ns.clone();
+		let ctime_ns = identity.ctime_ns.clone();
+		let append = std::thread::spawn(move || {
+			append_managed(
+				&root_for_append,
+				None,
+				"transcript",
+				own_append,
+				&dev,
+				&ino,
+				&size,
+				&mtime_ns,
+				&ctime_ns,
+				&file_digest(original),
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for append after-write boundary");
+		fs::write(temporary.0.join("transcript"), foreign_contents)
+			.expect("same-size foreign overwrite");
+		resume_tx
+			.send(())
+			.expect("resume append after-write boundary");
+		let result = append.join().expect("append thread");
+		set_append_after_write_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.mutation_state.as_deref(), Some("committed"));
+		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
+		assert!(result.identity.is_none(), "same-size foreign content must not authorize rewrite");
+		assert_eq!(fs::read(temporary.0.join("transcript")).expect("transcript"), foreign_contents);
 	}
 
 	#[test]
