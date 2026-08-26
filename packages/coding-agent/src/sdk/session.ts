@@ -2568,6 +2568,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// (review thread P1). For a top-level session this equals the
 			// session id.
 			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+			registerForegroundFoldParticipant: adapter =>
+				session?.registerForegroundFoldParticipant(adapter) ?? (() => {}),
+			hasForegroundBashBackgroundRequestHandler: () => session?.hasForegroundBashBackgroundRequestHandler() ?? false,
+			requestForegroundBashBackground: () => session?.requestForegroundBashBackground() ?? false,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
