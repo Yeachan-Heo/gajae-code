@@ -4911,6 +4911,96 @@ pub(crate) mod platform {
 		exact_unlink_at(parent_fd, name.clone(), path, &identity)
 	}
 
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor keeps the substituted publication and its \
+		          placeholder in one namespace"
+	)]
+	fn retain_substituted_publication(
+		parent_fd: libc::c_int,
+		name: &CString,
+		path: &Path,
+	) -> NativeExactUnlinkResult {
+		let mut current: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0 || current.st_mode & libc::S_IFMT != libc::S_IFREG
+		{
+			return NativeExactUnlinkResult::detached_failure(
+				"destination_identity_changed",
+				path.to_string_lossy().into_owned(),
+			);
+		}
+		let quarantine = CString::new(format!(
+			".gjc-rename-successor-{:x}-{:x}-{}",
+			current.st_dev,
+			current.st_ino,
+			std::process::id()
+		))
+		.expect("successor quarantine name contains no NUL");
+		let placeholder = match create_exchange_placeholder(parent_fd, &quarantine, false) {
+			Ok(value) => value,
+			Err(code) => {
+				return NativeExactUnlinkResult::detached_failure(
+					code,
+					path.to_string_lossy().into_owned(),
+				);
+			},
+		};
+		if let Err(code) = rename_exchange(parent_fd, parent_fd, name, &quarantine) {
+			return match remove_exchange_placeholder(parent_fd, &quarantine, placeholder) {
+				ExchangePlaceholderRemoval::Removed => {
+					NativeExactUnlinkResult::detached_failure(code, path.to_string_lossy().into_owned())
+				},
+				_ => NativeExactUnlinkResult::detached_failure(
+					"cleanup_pending",
+					path.to_string_lossy().into_owned(),
+				),
+			};
+		}
+		let detached_path = path
+			.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(quarantine.to_string_lossy().as_ref())
+			.to_string_lossy()
+			.into_owned();
+		match remove_exchange_placeholder(parent_fd, name, placeholder) {
+			ExchangePlaceholderRemoval::Removed => {
+				NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
+			},
+			ExchangePlaceholderRemoval::Failed => {
+				NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					detached_path,
+					path.to_string_lossy().into_owned(),
+				)
+			},
+			ExchangePlaceholderRemoval::RetainedMismatch(retained_name) => {
+				NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					detached_path,
+					path
+						.parent()
+						.unwrap_or_else(|| Path::new("."))
+						.join(retained_name.to_string_lossy().as_ref())
+						.to_string_lossy()
+						.into_owned(),
+				)
+			},
+			ExchangePlaceholderRemoval::RetainedFailure(retained_name, _) => {
+				NativeExactUnlinkResult::detached_failure_with_unknown(
+					"identity_mismatch",
+					detached_path,
+					path
+						.parent()
+						.unwrap_or_else(|| Path::new("."))
+						.join(retained_name.to_string_lossy().as_ref())
+						.to_string_lossy()
+						.into_owned(),
+				)
+			},
+		}
+	}
+
 	/// Create a symbolic link through a retained parent descriptor. `symlinkat`
 	/// claims the destination name without following either the parent path or
 	/// the link target; a swapped parent therefore fails the identity check
@@ -5292,20 +5382,31 @@ pub(crate) mod platform {
 			let result =
 				rename_no_replace(source_parent, destination_parent, &private_name, &destination_name);
 			let outcome = match result {
-				Ok(())
-					if published_matches_open_source(
+				Ok(()) => {
+					let destination_matches = published_matches_open_source(
 						destination_parent,
 						&destination_name,
 						&source_stat,
-					) && published_matches_open_source(source_parent, &source_name, &source_stat) =>
-				{
-					NativeExactUnlinkResult::success().with_source_retained()
+					);
+					let source_matches =
+						published_matches_open_source(source_parent, &source_name, &source_stat);
+					if destination_matches && source_matches {
+						NativeExactUnlinkResult::success().with_source_retained()
+					} else if !destination_matches {
+						retain_substituted_publication(
+							destination_parent,
+							&destination_name,
+							destination_path,
+						)
+						.with_source_retained()
+					} else {
+						NativeExactUnlinkResult::detached_failure(
+							"identity_mismatch",
+							destination_path.to_string_lossy().into_owned(),
+						)
+						.with_source_retained()
+					}
 				},
-				Ok(()) => NativeExactUnlinkResult::detached_failure(
-					"destination_identity_changed",
-					destination_path.to_string_lossy().into_owned(),
-				)
-				.with_source_retained(),
 				Err(code) => {
 					let claim_matches =
 						published_matches_open_source(source_parent, &private_name, &source_stat);
@@ -10792,10 +10893,15 @@ mod rename_no_replace_expected_source_tests {
 		platform::set_before_source_claim_rename_hook(None);
 
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("destination_identity_changed"));
-		assert_eq!(result.detached_path.as_deref(), Some(destination.to_string_lossy().as_ref()));
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		let detached = result
+			.detached_path
+			.as_deref()
+			.expect("retained successor path");
+		assert!(detached.contains(".gjc-rename-successor-"));
 		assert_eq!(result.source_retained, Some(true));
-		assert_eq!(fs::read(&destination).expect("read substituted publication"), b"attacker");
+		assert!(!destination.exists(), "the substituted publication must be rolled back");
+		assert_eq!(fs::read(detached).expect("read retained substituted publication"), b"attacker");
 		assert_eq!(fs::read(&retained_claim).expect("read retained expected claim"), b"expected");
 		assert_eq!(fs::read(&source).expect("read original source"), b"expected");
 	}
