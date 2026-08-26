@@ -132,6 +132,9 @@ static APPEND_TEST_SERIAL: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
 static APPEND_PARENT_SYNC_FAULT: OnceLock<std::sync::Mutex<bool>> = OnceLock::new();
 
 #[cfg(all(test, target_os = "linux"))]
+static APPEND_WRITE_FAIL_PREFIX: OnceLock<std::sync::Mutex<Option<usize>>> = OnceLock::new();
+
+#[cfg(all(test, target_os = "linux"))]
 static REPLACE_BEFORE_IN_PLACE_WRITE_HOOK: OnceLock<
 	std::sync::Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 > = OnceLock::new();
@@ -192,6 +195,29 @@ fn set_append_parent_sync_fault(fault: bool) {
 		.get_or_init(|| std::sync::Mutex::new(false))
 		.lock()
 		.unwrap_or_else(|poisoned| poisoned.into_inner()) = fault;
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn set_append_write_fail_prefix(prefix: Option<usize>) {
+	*APPEND_WRITE_FAIL_PREFIX
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner()) = prefix;
+}
+
+#[cfg(target_os = "linux")]
+fn append_write(mut file: &File, data: &[u8]) -> std::io::Result<()> {
+	#[cfg(test)]
+	if let Some(prefix) = APPEND_WRITE_FAIL_PREFIX
+		.get_or_init(|| std::sync::Mutex::new(None))
+		.lock()
+		.unwrap_or_else(|poisoned| poisoned.into_inner())
+		.take()
+	{
+		file.write_all(&data[..prefix.min(data.len())])?;
+		return Err(std::io::Error::from_raw_os_error(libc::EIO));
+	}
+	file.write_all(data)
 }
 
 #[cfg(target_os = "linux")]
@@ -2834,16 +2860,52 @@ fn append_post_identity_if_exact(
 	expected_sha256: &str,
 	data: &[u8],
 ) -> Option<RecoveryFsIdentity> {
+	let expected_size_value = expected_size.parse::<u64>().ok()?;
+	let expected_total = expected_size_value.checked_add(data.len() as u64)?;
+	let identity = append_post_identity_if_prefix(
+		file,
+		parent,
+		name,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_sha256,
+		data,
+	)?;
+	if identity.size != expected_total.to_string() {
+		return None;
+	}
+	Some(identity)
+}
+
+#[cfg(target_os = "linux")]
+fn append_post_identity_if_prefix(
+	file: &File,
+	parent: &File,
+	name: &CString,
+	expected_dev: &str,
+	expected_ino: &str,
+	expected_size: &str,
+	expected_sha256: &str,
+	data: &[u8],
+) -> Option<RecoveryFsIdentity> {
 	let expected_size = expected_size.parse::<u64>().ok()?;
-	let expected_total = expected_size.checked_add(data.len() as u64)?;
 	let mut identity = regular_identity(file).ok()?;
 	if identity.dev != expected_dev
 		|| identity.ino != expected_ino
-		|| identity.size != expected_total.to_string()
+		|| identity.size.parse::<u64>().ok()? < expected_size
+		|| identity.size.parse::<u64>().ok()? > expected_size.checked_add(data.len() as u64)?
 	{
 		return None;
 	}
-	if !verify_exact_append_bytes(file, expected_size, expected_sha256, data).ok()? {
+	let appended_len = identity
+		.size
+		.parse::<u64>()
+		.ok()?
+		.checked_sub(expected_size)? as usize;
+	if !verify_exact_append_bytes(file, expected_size, expected_sha256, &data[..appended_len])
+		.ok()?
+	{
 		return None;
 	}
 	crate::path_identity::platform::verify_created_owner_only_file(file).ok()?;
@@ -2994,8 +3056,22 @@ fn append_managed(
 			None,
 		);
 	}
-	if file.write_all(data).is_err() {
-		return RecoveryFsResult::append_failure("io_error", "unknown", "not_provable", None);
+	if append_write(&file, data).is_err() {
+		return RecoveryFsResult::append_failure(
+			"io_error",
+			"unknown",
+			"not_provable",
+			append_post_identity_if_prefix(
+				&file,
+				&parent,
+				&name,
+				expected_dev,
+				expected_ino,
+				expected_size,
+				expected_sha256,
+				data,
+			),
+		);
 	}
 	#[cfg(test)]
 	pause_append_after_write_for_test();
@@ -4217,6 +4293,45 @@ mod tests {
 		assert_eq!(
 			fs::read(temporary.0.join("transcript")).expect("transcript"),
 			b"original-transcript\nappend"
+		);
+	}
+
+	#[test]
+	fn managed_append_returns_receipt_for_a_proven_partial_write() {
+		let _serial = APPEND_TEST_SERIAL
+			.get_or_init(|| std::sync::Mutex::new(()))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.root();
+		let original = b"original-transcript";
+		let appended = b"\nappend";
+		let partial = b"\na";
+		let identity = managed_file(&root, "transcript", original);
+		set_append_write_fail_prefix(Some(partial.len()));
+		let result = append_managed(
+			&root,
+			None,
+			"transcript",
+			appended,
+			&identity.dev,
+			&identity.ino,
+			&identity.size,
+			&identity.mtime_ns,
+			&identity.ctime_ns,
+			&file_digest(original),
+		);
+		set_append_write_fail_prefix(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("io_error"));
+		assert_eq!(result.mutation_state.as_deref(), Some("unknown"));
+		assert_eq!(result.durability_state.as_deref(), Some("not_provable"));
+		let receipt = result.identity.expect("partial append receipt");
+		assert_eq!(receipt.sha256.as_deref(), Some(file_digest(b"original-transcript\na").as_str()));
+		assert_eq!(
+			fs::read(temporary.0.join("transcript")).expect("transcript"),
+			b"original-transcript\na"
 		);
 	}
 
