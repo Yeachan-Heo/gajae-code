@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 52;
+export const GUARD_CONTRACT_VERSION = 53;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -47,6 +47,7 @@ const nativeAuthorityDeclarations = {
 		"rename_no_replace_path",
 		"rename_path_no_replace_exact",
 		"retain_substituted_publication",
+		"create_directory_no_replace_path",
 		"snapshot_directory_tree",
 		"exact_remove_directory_tree",
 	],

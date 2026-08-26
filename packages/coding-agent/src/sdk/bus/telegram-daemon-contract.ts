@@ -286,7 +286,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * native filesystem authority boundary for exact Paseo publication and bridge
  * recovery.
  */
-export const DAEMON_GENERATION = 179;
+export const DAEMON_GENERATION = 180;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

@@ -5176,7 +5176,33 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeDirectoryCreationResult::failure("parent_mismatch");
 		}
-		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
+		let mut occupied: libc::stat = unsafe { std::mem::zeroed() };
+		let destination_probe = unsafe {
+			libc::fstatat(parent_fd, name.as_ptr(), &mut occupied, libc::AT_SYMLINK_NOFOLLOW)
+		};
+		if destination_probe == 0 {
+			unsafe { libc::close(parent_fd) };
+			return NativeDirectoryCreationResult::failure("already_exists");
+		}
+		if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+			let code = security_code(&std::io::Error::last_os_error());
+			unsafe { libc::close(parent_fd) };
+			return NativeDirectoryCreationResult::failure(code);
+		}
+		let private_name = CString::new(format!(
+			".gjc-paseo-created-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.map(|duration| duration.as_nanos())
+				.unwrap_or_default()
+		))
+		.expect("private created-directory name contains no NUL");
+		let private_path = destination_path
+			.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(private_name.to_string_lossy().as_ref());
+		if unsafe { libc::mkdirat(parent_fd, private_name.as_ptr(), 0o700) } != 0 {
 			let error = std::io::Error::last_os_error();
 			let code = if error.raw_os_error() == Some(libc::EEXIST) {
 				"already_exists"
@@ -5186,69 +5212,66 @@ pub(crate) mod platform {
 			unsafe { libc::close(parent_fd) };
 			return NativeDirectoryCreationResult::failure(code);
 		}
-		let detached_path = destination_path.to_string_lossy().into_owned();
 		let child_fd = unsafe {
 			libc::openat(
 				parent_fd,
-				name.as_ptr(),
+				private_name.as_ptr(),
 				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
 			)
 		};
 		if child_fd < 0 {
 			let code = security_code(&std::io::Error::last_os_error());
+			let removed =
+				unsafe { libc::unlinkat(parent_fd, private_name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
 			unsafe { libc::close(parent_fd) };
-			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
+			return if removed {
+				NativeDirectoryCreationResult::failure(code)
+			} else {
+				NativeDirectoryCreationResult::committed_failure(
+					code,
+					private_path.to_string_lossy().into_owned(),
+				)
+			};
 		}
 		let mut child_stat: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe { libc::fstat(child_fd, &mut child_stat) } != 0 {
 			let code = security_code(&std::io::Error::last_os_error());
 			unsafe {
 				libc::close(child_fd);
+				let _ = libc::unlinkat(parent_fd, private_name.as_ptr(), libc::AT_REMOVEDIR);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
+			return NativeDirectoryCreationResult::committed_failure(
+				code,
+				private_path.to_string_lossy().into_owned(),
+			);
 		}
 		if child_stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
 			unsafe {
 				libc::close(child_fd);
+				let _ = libc::unlinkat(parent_fd, private_name.as_ptr(), libc::AT_REMOVEDIR);
 				libc::close(parent_fd);
 			}
 			return NativeDirectoryCreationResult::committed_failure(
 				"not_directory",
-				detached_path.clone(),
+				private_path.to_string_lossy().into_owned(),
 			);
 		}
-		let mut named_stat: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe {
-			libc::fstatat(parent_fd, name.as_ptr(), &mut named_stat, libc::AT_SYMLINK_NOFOLLOW)
-		} != 0
-		{
-			let code = security_code(&std::io::Error::last_os_error());
+		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &private_name, &name) {
+			let removed =
+				unsafe { libc::unlinkat(parent_fd, private_name.as_ptr(), libc::AT_REMOVEDIR) } == 0;
 			unsafe {
 				libc::close(child_fd);
 				libc::close(parent_fd);
 			}
-			return NativeDirectoryCreationResult::committed_failure(code, detached_path.clone());
-		}
-		if named_stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
-			unsafe {
-				libc::close(child_fd);
-				libc::close(parent_fd);
-			}
-			return NativeDirectoryCreationResult::committed_failure(
-				"reparse_point",
-				detached_path.clone(),
-			);
-		}
-		if !stat_same_object(&child_stat, &named_stat) {
-			unsafe {
-				libc::close(child_fd);
-				libc::close(parent_fd);
-			}
-			return NativeDirectoryCreationResult::committed_failure(
-				"identity_mismatch",
-				detached_path,
-			);
+			return if removed {
+				NativeDirectoryCreationResult::failure(code)
+			} else {
+				NativeDirectoryCreationResult::committed_failure(
+					code,
+					private_path.to_string_lossy().into_owned(),
+				)
+			};
 		}
 		let identity = directory_identity(&child_stat);
 		unsafe {
