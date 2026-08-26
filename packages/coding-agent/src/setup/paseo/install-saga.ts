@@ -289,7 +289,12 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			}
 		}
 	} catch (error) {
-		if (persistAttempted) {
+		if (
+			persistAttempted ||
+			backupPath !== undefined ||
+			backupValueSha256 !== undefined ||
+			backupIdentity !== undefined
+		) {
 			await writeIntent(input.intentPath, {
 				...intent,
 				provenancePayload: ledgerAfter,
