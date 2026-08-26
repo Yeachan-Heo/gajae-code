@@ -10,7 +10,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { getAgentProfileAuthority, getTrustedHomeDir, logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
@@ -101,7 +101,12 @@ export async function discoverAgents(
 
 	// Load agents from GJC marketplace plugins.
 	const { roots: pluginRoots } = isProviderEnabled("claude-plugins", activeSettings)
-		? await listClaudePluginRoots(home, resolvedCwd, resolvedAgentDir)
+		? await listClaudePluginRoots(
+				home,
+				resolvedCwd,
+				resolvedAgentDir,
+				agentDir ? "custom" : getAgentProfileAuthority(),
+			)
 		: { roots: [] };
 	const nonGjcPluginRoots = [];
 	for (const plugin of pluginRoots) {
