@@ -2462,6 +2462,23 @@ pub(crate) mod platform {
 		if transition_deadline_expired(deadline) {
 			return NativeTransitionClaimResult::failure("timed_out");
 		}
+		let Ok(current) = transition_stat(directory.as_raw_fd()) else {
+			return NativeTransitionClaimResult::failure("identity_mismatch");
+		};
+		// SAFETY: libc::stat is plain writable storage initialized by fstatat.
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: parent is a live directory descriptor and named is writable storage.
+		if unsafe {
+			libc::fstatat(
+				parent.as_raw_fd(),
+				staging_name.as_ptr(),
+				&mut named,
+				libc::AT_SYMLINK_NOFOLLOW,
+			)
+		} != 0 || !same_transition_object(&current, &named)
+		{
+			return NativeTransitionClaimResult::failure("identity_mismatch");
+		}
 
 		// `rename_no_replace` is the authority boundary: it either publishes this
 		// exact staged directory or leaves the deterministic target untouched. On
@@ -2522,7 +2539,19 @@ pub(crate) mod platform {
 				return Err(security_code(&std::io::Error::last_os_error()));
 			}
 			// SAFETY: directory_fd is a newly-owned successful openat result.
-			return Ok((staging_name, unsafe { File::from_raw_fd(directory_fd) }));
+			let directory = unsafe { File::from_raw_fd(directory_fd) };
+			let opened = transition_stat(directory.as_raw_fd())?;
+			// SAFETY: libc::stat is plain writable storage initialized by fstatat.
+			let mut named: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is a live directory descriptor and named is writable
+			// storage.
+			if unsafe {
+				libc::fstatat(parent_fd, staging_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} != 0 || !same_transition_object(&opened, &named)
+			{
+				return Err("identity_mismatch");
+			}
+			return Ok((staging_name, directory));
 		}
 		Err("already_exists")
 	}
@@ -2557,6 +2586,10 @@ pub(crate) mod platform {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
 		Ok(stat)
+	}
+
+	const fn same_transition_object(left: &libc::stat, right: &libc::stat) -> bool {
+		left.st_dev == right.st_dev && left.st_ino == right.st_ino
 	}
 
 	#[cfg(target_os = "netbsd")]

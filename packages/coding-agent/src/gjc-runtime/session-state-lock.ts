@@ -1140,7 +1140,7 @@ async function releaseTransitionClaim(
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
 	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
 	const releasedClaim = await transitionClaimIdentity(transitionDir, claim.marker);
-	if (!releasedClaim || releasedClaim.dev !== claim.dev || releasedClaim.ino !== claim.ino)
+	if (!releasedClaim || !sameTransitionClaimIdentity(releasedClaim, claim))
 		throw new SessionStateLockUnavailableError(new Error("Transition claim changed during owner release."));
 	await removeTransitionClaimIfIdentityMatches(transitionDir, releasedClaim, deadline);
 	await removePrivateMarkerResidue(transitionDir, releasedClaim);
@@ -1348,7 +1348,7 @@ async function cleanupTransitionClaim(
 	}
 	if (!claim) return;
 	const effectiveClaim = await transitionClaimIdentity(transitionDir, claim.marker);
-	if (!effectiveClaim || effectiveClaim.dev !== claim.dev || effectiveClaim.ino !== claim.ino) return;
+	if (!effectiveClaim || !sameTransitionClaimIdentity(effectiveClaim, claim)) return;
 	await removeTransitionClaimIfIdentityMatches(transitionDir, effectiveClaim, deadline);
 	await removePrivateMarkerResidue(transitionDir, effectiveClaim);
 }
@@ -1436,7 +1436,7 @@ async function withLockPathTransition<T>(
 			throw error;
 		}
 		const ownedClaim = await transitionClaimIdentity(transitionDir, claim.marker);
-		if (!ownedClaim || ownedClaim.dev !== claim.dev || ownedClaim.ino !== claim.ino) {
+		if (!ownedClaim || !sameTransitionClaimIdentity(ownedClaim, claim)) {
 			await cleanupTransitionClaim(transitionDir, ownerFile, held, claim, deadline);
 			throw new SessionStateLockUnavailableError(new Error("Transition claim changed while acquiring its owner."));
 		}
