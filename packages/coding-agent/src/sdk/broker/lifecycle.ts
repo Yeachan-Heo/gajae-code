@@ -2210,7 +2210,7 @@ async function executeUncertainRetirement(
 			);
 		else {
 			try {
-				const event = await broker.index.append({
+				await broker.index.append({
 					type: "session_closed",
 					sessionId: id,
 					locator: record.locator,
