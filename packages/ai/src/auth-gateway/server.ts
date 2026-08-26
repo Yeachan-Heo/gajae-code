@@ -102,7 +102,12 @@ function modelApiForProvider(provider: Provider): Api | undefined {
  * CLI readiness checks so every entry point applies the same fence.
  */
 export function isAuthGatewayModelBrokerConsumable(model: Pick<Model<Api>, "api" | "transport">): boolean {
-	return model.api !== "bedrock-converse-stream" && model.api !== "google-vertex" && model.transport !== "pi-native";
+	return (
+		model.api !== "bedrock-converse-stream" &&
+		model.api !== "google-vertex" &&
+		model.api !== "kiro-codewhisperer-stream" &&
+		model.transport !== "pi-native"
+	);
 }
 
 function isModelInProviderScope(model: Model<Api>, provider: Provider): boolean {
@@ -384,7 +389,10 @@ function deriveSessionId(modelId: string, context: Context): string {
 }
 
 function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: AbortSignal): SimpleStreamOptions {
-	const opts: SimpleStreamOptions = { signal };
+	// Gateway authority is acquired once per managed attempt. Provider-internal
+	// retries would otherwise resend a captured credential after the broker lease
+	// is released; replacement attempts must flow through onAuthError instead.
+	const opts: SimpleStreamOptions = { signal, requestMaxRetries: 0, streamMaxRetries: 0 };
 	const { options } = parsed;
 	// OpenAI code backend backend rejects `temperature` / `top_p` (per-model defaults only),
 	// so we drop them silently for that one provider. Every other unsupported

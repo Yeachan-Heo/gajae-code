@@ -547,6 +547,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2ClientErrorHandler = error => settleH2(error);
 			h2Client.on("error", h2ClientErrorHandler);
 
+			options?.onStreamCreated?.();
 			h2Request = h2Client.request({
 				":method": "POST",
 				":path": "/agent.v1.AgentService/Run",
@@ -701,7 +702,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (h2Settled) {
 				await h2Completion.promise;
 			}
-			options?.onStreamCreated?.();
 			h2Request.write(frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
