@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- `/login vllm` no longer stores the `vllm-local` no-auth sentinel as a persisted API key. `AuthStorage.getApiKey()` resolves stored `api_key` credentials before environment variables, so a stored sentinel from an empty login could outrank a real `VLLM_API_KEY` env var and reach normal inference. `/login vllm` now requires a real API key (empty input throws `vLLM API key is required; local no-auth servers are discovered automatically`); local no-auth servers remain discovered automatically via the descriptor's `allowUnauthenticated` flag and need no login.
+
 ## [0.15.2] - 2026-08-25
 
 ### Changed

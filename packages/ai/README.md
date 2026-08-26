@@ -1074,7 +1074,7 @@ The quickest way to authenticate:
 ```bash
 bunx @gajae-code/ai login              # interactive provider selection
 bunx @gajae-code/ai login anthropic    # login to specific provider
-bunx @gajae-code/ai login vllm         # store vLLM API key (or placeholder for local no-auth)
+bunx @gajae-code/ai login vllm         # store vLLM API key (local no-auth servers are discovered automatically)
 bunx @gajae-code/ai login xai          # sign in with xAI/Grok OAuth
 bunx @gajae-code/ai list               # list available providers
 ```
