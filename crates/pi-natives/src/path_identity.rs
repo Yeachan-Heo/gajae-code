@@ -4810,7 +4810,7 @@ pub(crate) mod platform {
 		content: &str,
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
-		let (skills_fd, _canonical_root) = match open_or_create_skill_root(root_path) {
+		let (skills_fd, canonical_root) = match open_or_create_skill_root(root_path) {
 			Ok(value) => value,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
@@ -4826,9 +4826,18 @@ pub(crate) mod platform {
 			},
 		};
 		if file_mode == 0o600 {
-			if unsafe { libc::fchmod(skills_fd, 0o700) } != 0
-				|| unsafe { libc::fchmod(skill_fd, 0o700) } != 0
-			{
+			#[cfg(target_os = "linux")]
+			let directory_security = apply_owner_only_fd_security(&canonical_root, "directory", skills_fd)
+				.ok && apply_owner_only_fd_security(
+				&canonical_root.join(&skill_name),
+				"directory",
+				skill_fd,
+			)
+			.ok;
+			#[cfg(not(target_os = "linux"))]
+			let directory_security = unsafe { libc::fchmod(skills_fd, 0o700) } == 0
+				&& unsafe { libc::fchmod(skill_fd, 0o700) } == 0;
+			if !directory_security {
 				unsafe {
 					libc::close(skill_fd);
 					libc::close(skills_fd);
@@ -4889,6 +4898,30 @@ pub(crate) mod platform {
 				libc::close(skills_fd);
 			}
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+		}
+		#[cfg(target_os = "linux")]
+		{
+			let published_path = canonical_root.join(&skill_name).join("SKILL.md");
+			let applied = apply_owner_only_fd_security(&published_path, "file", private_fd);
+			if !applied.ok {
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(
+					applied.code.as_deref().unwrap_or("acl_apply_failed"),
+				);
+			}
+			let verified = verify_owner_only_fd_security(&published_path, "file", private_fd);
+			if !verified.ok {
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(
+					verified.code.as_deref().unwrap_or("acl_verify_failed"),
+				);
+			}
 		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
 			unsafe {
