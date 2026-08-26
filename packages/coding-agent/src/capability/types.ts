@@ -106,6 +106,8 @@ export interface LoadOptions {
 	disabledExtensions?: string[];
 	/** Session settings whose provider policy applies to this load. */
 	settings?: Settings;
+	/** Prevent an explicitly home-scoped load from inheriting process-global policy. */
+	isolateAmbientPolicy?: boolean;
 }
 
 /**

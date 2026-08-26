@@ -4554,27 +4554,30 @@ pub(crate) mod platform {
 	fn open_or_create_skill_directory(
 		parent_fd: libc::c_int,
 		name: &CString,
-	) -> Result<libc::c_int, &'static str> {
+	) -> Result<(libc::c_int, bool), &'static str> {
 		let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
 		let opened = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
 		if opened >= 0 {
-			return Ok(opened);
+			return Ok((opened, false));
 		}
 		let first_error = std::io::Error::last_os_error();
 		if first_error.raw_os_error() != Some(libc::ENOENT) {
 			return Err(skill_write_error(&first_error));
 		}
-		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
+		let created = if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
 			let mkdir_error = std::io::Error::last_os_error();
 			if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
 				return Err(skill_write_error(&mkdir_error));
 			}
-		}
+			false
+		} else {
+			true
+		};
 		let reopened = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
 		if reopened < 0 {
 			return Err(skill_write_error(&std::io::Error::last_os_error()));
 		}
-		Ok(reopened)
+		Ok((reopened, created))
 	}
 
 	/// Descriptor-walk an absolute path, creating missing directories along the
@@ -4584,7 +4587,10 @@ pub(crate) mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the walk owns the current descriptor and closes each predecessor exactly once"
 	)]
-	fn open_or_create_skill_root(path: &Path) -> Result<(libc::c_int, PathBuf), &'static str> {
+	fn open_or_create_skill_root(
+		path: &Path,
+		directory_mode: libc::mode_t,
+	) -> Result<(libc::c_int, PathBuf), &'static str> {
 		let walk_path = descriptor_walk_path(path);
 		if !walk_path.is_absolute() {
 			return Err("invalid_request");
@@ -4612,13 +4618,20 @@ pub(crate) mod platform {
 				unsafe { libc::close(current) };
 				return Err("invalid_request");
 			};
-			let next = match open_or_create_skill_directory(current, &name) {
+			let (next, created) = match open_or_create_skill_directory(current, &name) {
 				Ok(next) => next,
 				Err(code) => {
 					unsafe { libc::close(current) };
 					return Err(code);
 				},
 			};
+			if created && unsafe { libc::fchmod(next, directory_mode) } != 0 {
+				unsafe {
+					libc::close(next);
+					libc::close(current);
+				}
+				return Err(skill_write_error(&std::io::Error::last_os_error()));
+			}
 			if let Err(code) = fsync_root_parent(current) {
 				unsafe {
 					libc::close(next);
@@ -4832,7 +4845,8 @@ pub(crate) mod platform {
 		content: &str,
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
-		let (skills_fd, canonical_root) = match open_or_create_skill_root(root_path) {
+		let directory_mode = if file_mode == 0o600 { 0o700 } else { 0o755 };
+		let (skills_fd, canonical_root) = match open_or_create_skill_root(root_path, directory_mode) {
 			Ok(value) => value,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
@@ -4840,13 +4854,23 @@ pub(crate) mod platform {
 			unsafe { libc::close(skills_fd) };
 			return NativeSecureSkillWriteResult::failure("invalid_request");
 		};
-		let skill_fd = match open_or_create_skill_directory(skills_fd, &skill_component) {
-			Ok(fd) => fd,
-			Err(code) => {
-				unsafe { libc::close(skills_fd) };
-				return NativeSecureSkillWriteResult::failure(code);
-			},
-		};
+		let (skill_fd, skill_created) =
+			match open_or_create_skill_directory(skills_fd, &skill_component) {
+				Ok(fd) => fd,
+				Err(code) => {
+					unsafe { libc::close(skills_fd) };
+					return NativeSecureSkillWriteResult::failure(code);
+				},
+			};
+		if skill_created && unsafe { libc::fchmod(skill_fd, directory_mode) } != 0 {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure(skill_write_error(
+				&std::io::Error::last_os_error(),
+			));
+		}
 		if file_mode == 0o600 {
 			#[cfg(target_os = "linux")]
 			let directory_security = apply_owner_only_fd_security(&canonical_root, "directory", skills_fd)
@@ -9709,12 +9733,6 @@ mod platform {
 				cleanup.err().unwrap_or("durability_failed"),
 			);
 		}
-		let final_name: Vec<u16> = file_name.encode_wide().collect();
-		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {
-			let cleanup = cleanup_private_skill_file(file);
-			unsafe { CloseHandle(file) };
-			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
-		}
 		if file_mode == 0o600 {
 			let sid = match current_user_sid() {
 				Ok(sid) => sid,
@@ -9742,6 +9760,12 @@ mod platform {
 					cleanup.err().unwrap_or("acl_verify_failed"),
 				);
 			}
+		}
+		let final_name: Vec<u16> = file_name.encode_wide().collect();
+		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {
+			let cleanup = cleanup_private_skill_file(file);
+			unsafe { CloseHandle(file) };
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
 		unsafe { CloseHandle(file) };
 		NativeSecureSkillWriteResult::success(

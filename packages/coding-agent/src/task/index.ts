@@ -1673,6 +1673,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			this.session.settings,
 			this.session.getSessionAgentDir?.(),
 		);
+		const parentAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
 		const { agent: agentName, context, schema: outputSchema } = boundParams;
 		const simpleMode = this.#getTaskSimpleMode();
 		const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
@@ -2329,7 +2330,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelRegistry: this.session.modelRegistry,
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
-						parentAgentDir: this.session.getSessionAgentDir?.(),
+						parentAgentDir,
 						inheritedServiceTier: this.session.serviceTier,
 						contextFiles,
 						skills: availableSkills,
@@ -2414,7 +2415,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						modelRegistry: this.session.modelRegistry,
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
-						parentAgentDir: this.session.getSessionAgentDir?.(),
+						parentAgentDir,
 						inheritedServiceTier: this.session.serviceTier,
 						contextFiles,
 						skills: availableSkills,

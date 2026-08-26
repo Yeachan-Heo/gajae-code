@@ -94,6 +94,8 @@ function createSession(
 		parentEnableLsp?: boolean;
 		planMode?: PlanModeState;
 		taskEnableLsp?: boolean;
+		agentDir?: string;
+		omitSessionAgentDir?: boolean;
 	} = {},
 ): ToolSession {
 	const modelRegistry = {
@@ -107,15 +109,19 @@ function createSession(
 		cwd: "/tmp",
 		hasUI: false,
 		enableLsp: options.parentEnableLsp,
-		settings: Settings.isolated({
-			"async.enabled": false,
-			"task.isolation.mode": options.isolationMode ?? "none",
-			...(options.taskEnableLsp !== undefined ? { "task.enableLsp": options.taskEnableLsp } : {}),
-		}),
+		settings: Settings.isolated(
+			{
+				"async.enabled": false,
+				"task.isolation.mode": options.isolationMode ?? "none",
+				...(options.taskEnableLsp !== undefined ? { "task.enableLsp": options.taskEnableLsp } : {}),
+			},
+			{ agentDir: options.agentDir },
+		),
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
 		modelRegistry,
 		getPlanModeState: () => options.planMode,
+		...(options.omitSessionAgentDir ? {} : { getSessionAgentDir: () => options.agentDir }),
 	} as unknown as ToolSession;
 }
 
@@ -269,6 +275,26 @@ describe("subagent LSP availability", () => {
 
 		expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
 		expect(getOptions()?.enableLsp).toBe(false);
+	});
+
+	it("passes the authoritative parent agent directory to non-isolated and isolated children", async () => {
+		mockAgents({
+			name: "task",
+			description: "Task agent",
+			systemPrompt: "Use normal tools.",
+			source: "bundled",
+		});
+		const { getOptions } = mockCreateAgentSession();
+		const parentAgentDir = "/tmp/task-parent-profile";
+		const tool = await TaskTool.create(createSession({ agentDir: parentAgentDir, omitSessionAgentDir: true }));
+		await executeDetached(tool, TEST_TASK);
+		expect(getOptions()?.agentDir).toBe(parentAgentDir);
+
+		mockIsolation();
+		const isolatedOptions = mockCreateAgentSession();
+		const isolatedTool = await TaskTool.create(createSession({ isolationMode: "auto", agentDir: parentAgentDir }));
+		await executeDetached(isolatedTool, { ...TEST_TASK, isolated: true });
+		expect(isolatedOptions.getOptions()?.agentDir).toBe(parentAgentDir);
 	});
 
 	it("applies plan-mode subagent tools and honors task.enableLsp", async () => {

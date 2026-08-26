@@ -757,9 +757,9 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		for (const sourceDir of sourceDirs) {
 			const candidate = path.join(sourceDir, filename);
 			try {
-				sourcePath = candidate;
 				sourceSnapshot = sourceSnapshots.get(candidate) ?? safeFileSnapshot(candidate);
 				sourceSnapshots.set(candidate, sourceSnapshot);
+				sourcePath = candidate;
 				break;
 			} catch (error) {
 				if (isMissingPathError(error)) continue;

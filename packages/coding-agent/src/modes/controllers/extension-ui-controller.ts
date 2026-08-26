@@ -396,7 +396,7 @@ export class ExtensionUiController {
 			}
 			case "session.cwd.move":
 				await session.sessionManager.moveTo(String(input.path));
-				await session.refreshSshTool();
+				await session.refreshSshTool({ activateIfAvailable: true });
 				return { moved: true, cwd: session.sessionManager.getCwd() };
 			default:
 				if (BROKER_LIFECYCLE_OPERATIONS.has(operation)) prohibitBrokerLifecycleOperation(operation);

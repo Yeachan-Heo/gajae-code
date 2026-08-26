@@ -113,7 +113,7 @@ async function loadImpl<T>(
 		: new Set<string>(
 				options.disabledExtensions ??
 					options.settings?.get("disabledExtensions") ??
-					settings?.get("disabledExtensions") ??
+					(options.isolateAmbientPolicy ? [] : settings?.get("disabledExtensions")) ??
 					[],
 			);
 
@@ -214,8 +214,12 @@ async function loadImpl<T>(
  * Filter providers based on options and disabled state.
  */
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
-	const activeSettings = options.settings ?? settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir()));
-	const activeDisabledProviders = new Set(activeSettings?.get("disabledProviders") ?? disabledProviders);
+	const activeSettings =
+		options.settings ??
+		(options.isolateAmbientPolicy ? undefined : settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir())));
+	const activeDisabledProviders = new Set(
+		activeSettings?.get("disabledProviders") ?? (options.isolateAmbientPolicy ? [] : disabledProviders),
+	);
 	let providers = (capability.providers as Provider<T>[]).filter(
 		p => options.includeDisabledProviders === true || !activeDisabledProviders.has(p.id),
 	);
@@ -266,17 +270,27 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 }
 
 /**
- * Load a capability against an explicitly supplied home for SDK compatibility
- * seams that already expose a home-scoped discovery option. This stays internal
- * to the coding-agent package; the public loadCapability API remains bound to
- * the trusted process home.
+ * Load a capability against an explicitly supplied home for internal SDK
+ * compatibility seams. The regular loadCapability API remains bound to the
+ * trusted process home.
  */
 export async function loadCapabilityForHome<T>(
 	capabilityId: string,
 	home: string,
 	options: LoadOptions = {},
 ): Promise<CapabilityResult<T>> {
-	return await loadCapabilityWithContext(capabilityId, options, path.resolve(home));
+	const resolvedHome = path.resolve(home);
+	const settingsAgentDir =
+		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
+	return await loadCapabilityWithContext(
+		capabilityId,
+		{
+			...options,
+			agentDir: options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
+			isolateAmbientPolicy: true,
+		},
+		resolvedHome,
+	);
 }
 
 // =============================================================================
