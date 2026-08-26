@@ -633,6 +633,8 @@ export async function recoverIntent(
 			before?.bridgeCleanupPending !== undefined &&
 			before !== undefined &&
 			after !== undefined &&
+			provenanceLedgerIdentity(before) === intent.provenancePreflightIdentity &&
+			before.bridgePath !== after.bridgePath &&
 			JSON.stringify(nonBridgeLedgerShape(before)) === JSON.stringify(nonBridgeLedgerShape(after)) &&
 			beforeMatches &&
 			afterMatches &&
@@ -691,7 +693,7 @@ export async function recoverIntent(
 					throw error;
 				}),
 			]);
-			if (originalPathState !== undefined || detachedPathState === undefined) {
+			if (originalPathState !== undefined) {
 				return {
 					recovered: false,
 					detail:
@@ -714,7 +716,7 @@ export async function recoverIntent(
 					detail: `the provenance ledger changed before pending bridge replay; refusing to overwrite the newer record`,
 				};
 			}
-			await options.replayBridgeCleanup(after.bridgeCleanupPending);
+			if (detachedPathState !== undefined) await options.replayBridgeCleanup(after.bridgeCleanupPending);
 			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
 				return {
 					recovered: false,

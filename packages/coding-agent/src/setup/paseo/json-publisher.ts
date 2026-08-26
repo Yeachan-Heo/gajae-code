@@ -263,7 +263,13 @@ export async function publishPlan(
 			await handle.close();
 		}
 		const destinationIdentity = await captureRegularIdentity(targetPath);
-		if (sourceIdentity === undefined) throw new Error(`staged Paseo publication is not a regular file: ${tempPath}`);
+		if (sourceIdentity === undefined) {
+			throw new PaseoPublishError(
+				targetPath,
+				{ reason: "cas-conflict", expected: options.expectedIdentity, actual: await currentIdentity(targetPath) },
+				[tempPath],
+			);
+		}
 		if (expectedDestinationIdentity === undefined) {
 			if (destinationIdentity !== undefined) {
 				throw new PaseoPublishError(targetPath, {
@@ -331,7 +337,17 @@ export async function publishPlan(
 		throw error;
 	} finally {
 		if (!tempRetained && !tempConsumed && tempIdentity !== undefined) {
-			await removePrivateBackupByIdentity(tempPath, tempIdentity);
+			if (!(await removePrivateBackupByIdentity(tempPath, tempIdentity))) {
+				throw new PaseoPublishError(
+					targetPath,
+					{
+						reason: "cas-conflict",
+						expected: options.expectedIdentity,
+						actual: await currentIdentity(targetPath),
+					},
+					[tempPath],
+				);
+			}
 		}
 	}
 
