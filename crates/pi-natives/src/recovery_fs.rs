@@ -3632,7 +3632,7 @@ fn replace_managed(
 		libc::openat(
 			parent.as_raw_fd(),
 			stage_name.as_ptr(),
-			libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
 			0,
 		)
 	};
@@ -3715,6 +3715,12 @@ fn replace_managed(
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
 
+	// The predecessor is no longer canonical after the staged successor proof.
+	// Scrub it through the retained descriptor before moving it to recovery so
+	// successful rewrites do not retain complete historical transcripts forever.
+	if predecessor.set_len(0).is_err() || predecessor.sync_all().is_err() {
+		return committed_failure("io_error", "predecessor_scrub");
+	}
 	drop(predecessor);
 	if !stage_guard.retire() {
 		return committed_failure("io_error", "terminal_identity");
