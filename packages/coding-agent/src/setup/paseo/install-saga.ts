@@ -709,6 +709,16 @@ export async function recoverIntent(
 					detail: `the pending bridge cleanup authority is outside the intent's trusted bridge paths: ${after.bridgeCleanupPending.originalPath}`,
 				};
 			}
+			if (
+				after.bridgePath === undefined ||
+				path.resolve(after.bridgePath) !== path.resolve(after.bridgeCleanupPending.originalPath) ||
+				!allowedPaths.some(value => path.resolve(value) === path.resolve(after.bridgePath!))
+			) {
+				return {
+					recovered: false,
+					detail: "the pending bridge cleanup destination is not bound to the authenticated after-bridge path",
+				};
+			}
 			const observedBeforeReplay = await currentIdentity(intent.provenancePath);
 			if (observedBeforeReplay !== ledgerObserved) {
 				return {
