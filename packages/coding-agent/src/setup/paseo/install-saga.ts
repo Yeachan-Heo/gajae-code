@@ -1298,6 +1298,26 @@ export async function recoverIntent(
 		};
 	}
 	await writeProvenance(intent.provenancePath, validatedPending);
+	if (intent.publishBackup !== undefined && (await pathPresentWithoutFollowing(intent.publishBackup.backupPath))) {
+		if (intent.publishBackup.identity === undefined) {
+			return {
+				recovered: false,
+				detail: `${recovery.detail}; credential backup identity is unavailable, retaining the intent and backup`,
+			};
+		}
+		const removed = await removePublishBackup(
+			intent.targetPath,
+			intent.publishBackup.backupPath,
+			intent.publishBackup.valueSha256,
+			intent.publishBackup.identity,
+		);
+		if (!removed && (await pathPresentWithoutFollowing(intent.publishBackup.backupPath))) {
+			return {
+				recovered: false,
+				detail: `${recovery.detail}; credential backup cleanup remains pending at ${intent.publishBackup.backupPath}`,
+			};
+		}
+	}
 	await clearIntent(intentPath);
 	return { recovered: true, detail: `${recovery.detail}; provenance recorded` };
 }

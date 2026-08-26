@@ -15,6 +15,7 @@ import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	PaseoPublishError,
 	planPublish,
 	publishPlan,
 	readReplacedProviderBackup,
@@ -556,12 +557,12 @@ export async function removePaseoSetup(
 			),
 		);
 		if (!outcome.ok) {
-			remaining.push(deps.paths.orchestrationPreferences);
+			remaining.push(deps.paths.orchestrationPreferences, ...outcome.retained);
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
 			return partial(removed, remaining, {
 				failedStep: deps.paths.orchestrationPreferences,
 				detail: outcome.detail,
-				retained: [deps.paths.provenanceLedger],
+				retained: [deps.paths.provenanceLedger, ...outcome.retained],
 			});
 		}
 		removed.push(deps.paths.orchestrationPreferences);
@@ -611,7 +612,7 @@ export async function removePaseoSetup(
 						retained: [deps.paths.provenanceLedger],
 					});
 				}
-				const backup = await readReplacedProviderBackup(ref.backupPath, key, ref.valueSha256);
+				const backup = await readReplacedProviderBackup(ref.backupPath, key, ref.valueSha256, ref.identity);
 				if (!backup.found) {
 					remaining.push(deps.paths.configJson);
 					await writeProvenance(deps.paths.provenanceLedger, nextLedger);
@@ -644,7 +645,7 @@ export async function removePaseoSetup(
 					retained: [deps.paths.provenanceLedger],
 				});
 			}
-			const backup = await readReplacedProviderBackup(ref.backupPath, key, ref.valueSha256);
+			const backup = await readReplacedProviderBackup(ref.backupPath, key, ref.valueSha256, ref.identity);
 			if (backup.found && JSON.stringify(entry) === JSON.stringify(backup.value)) {
 				restoredContinuations.add(key);
 			} else {
@@ -673,12 +674,12 @@ export async function removePaseoSetup(
 			}
 		});
 		if (!outcome.ok) {
-			remaining.push(deps.paths.configJson);
+			remaining.push(deps.paths.configJson, ...outcome.retained);
 			await writeProvenance(deps.paths.provenanceLedger, nextLedger);
 			return partial(removed, remaining, {
 				failedStep: deps.paths.configJson,
 				detail: outcome.detail,
-				retained: [deps.paths.provenanceLedger],
+				retained: [deps.paths.provenanceLedger, ...outcome.retained],
 			});
 		}
 		// The restored values are back in Paseo's config; the sidecars that held
@@ -806,7 +807,7 @@ async function revertJson(
 	targetPath: string,
 	now: Date,
 	mutate: (draft: Record<string, unknown>) => void,
-): Promise<{ ok: true } | { ok: false; detail: string }> {
+): Promise<{ ok: true } | { ok: false; detail: string; retained: readonly string[] }> {
 	try {
 		const current = await readTarget(targetPath);
 		if (!current.exists) return { ok: true };
@@ -814,7 +815,11 @@ async function revertJson(
 		await publishPlan(targetPath, plan, { expectedIdentity: current.identity, backup: true, now });
 		return { ok: true };
 	} catch (error) {
-		return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+		return {
+			ok: false,
+			detail: error instanceof Error ? error.message : String(error),
+			retained: error instanceof PaseoPublishError ? error.retained : [],
+		};
 	}
 }
 

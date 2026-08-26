@@ -879,8 +879,9 @@ export async function writeReplacedProviderBackup(
 					detail: "the staged replaced-provider sidecar could not be identity-authenticated",
 				});
 			}
-			// `fs.open` honors the mode only on creation, so set it explicitly.
-			await fs.chmod(temporary, BACKUP_MODE);
+			// `fs.open` honors the mode only on creation, so set it explicitly on
+			// the retained descriptor rather than re-resolving the staging pathname.
+			await handle.chmod(BACKUP_MODE);
 			// Claim the final name with no-replace rename. Unlike a hard link, this
 			// consumes the staging pathname atomically, so there is no second
 			// pathname to clean up after the descriptor closes.

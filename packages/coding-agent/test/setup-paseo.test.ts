@@ -454,7 +454,7 @@ describe("replaced-provider sidecar cleanup", () => {
 			};
 
 			try {
-				if (phase === "write" || phase === "sync") {
+				if (phase === "write" || phase === "sync" || phase === "chmod") {
 					const realOpen = fs.open.bind(fs);
 					spies.push(
 						spyOn(fs, "open").mockImplementation(async (...args) => {
@@ -462,17 +462,9 @@ describe("replaced-provider sidecar cleanup", () => {
 							if (isTemporary(args[0])) {
 								if (phase === "write") spyOn(handle, "writeFile").mockRejectedValue(failure);
 								if (phase === "sync") spyOn(handle, "sync").mockRejectedValue(failure);
+								if (phase === "chmod") spyOn(handle, "chmod").mockRejectedValue(failure);
 							}
 							return handle;
-						}),
-					);
-				}
-				if (phase === "chmod") {
-					const realChmod = fs.chmod.bind(fs);
-					spies.push(
-						spyOn(fs, "chmod").mockImplementation(async (target, mode) => {
-							if (isTemporary(target)) throw failure;
-							return realChmod(target, mode);
 						}),
 					);
 				}
