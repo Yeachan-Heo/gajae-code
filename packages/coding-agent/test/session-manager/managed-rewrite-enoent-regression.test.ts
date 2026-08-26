@@ -733,6 +733,39 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		}
 	});
 
+	it("rejects metadata drift when the expected predecessor has no digest", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const relativePath = path.basename(sessionFile);
+		const store = new ManagedSessionDescendantStore(managedDirectoryRoot(agentDir), path.dirname(sessionFile));
+		try {
+			const bounded = store.captureBoundedAppendExpectation(relativePath);
+			if (!bounded) throw new Error("Expected managed transcript identity");
+			const expected = {
+				dev: BigInt(bounded.dev),
+				ino: BigInt(bounded.ino),
+				nlink: BigInt(bounded.nlink),
+				size: Number(bounded.size),
+				mtimeNs: BigInt(bounded.mtimeNs),
+				ctimeNs: BigInt(bounded.ctimeNs),
+				sha256: undefined,
+			};
+			const original = await readBytes(sessionFile);
+			expect(() =>
+				store.appendExpectedIdentitySync(relativePath, Buffer.from("must-not-append\n"), expected),
+			).toThrow("managed_append_identity_mismatch");
+			expect((await readBytes(sessionFile)).equals(original)).toBe(true);
+		} finally {
+			store.close();
+			await manager.close().catch(() => {});
+		}
+	});
+
 	it("fails closed when content evidence differs despite equal descriptor fields", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);

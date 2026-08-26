@@ -1920,6 +1920,8 @@ export class ManagedSessionDescendantStore {
 		bytes: Uint8Array,
 		expected: ManagedFileIdentity,
 	): ManagedAppendReceipt {
+		if (typeof expected.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(expected.sha256))
+			throw new Error("managed_append_identity_mismatch");
 		const bounded = this.captureBoundedAppendExpectation(relativePath);
 		if (!bounded) throw new Error("managed_append_identity_mismatch");
 		const descriptorMatches =
