@@ -7199,6 +7199,15 @@ mod platform {
 			&& mtime_ns == i128::from(identity.mtime_ns)
 	}
 
+	fn handle_expected_source_matches(
+		information: &BY_HANDLE_FILE_INFORMATION,
+		expected: (u64, u64),
+	) -> bool {
+		let ino =
+			(u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+		u64::from(information.dwVolumeSerialNumber) == expected.0 && ino == expected.1
+	}
+
 	fn handles_same_object_checked(left: HANDLE, right: HANDLE) -> Result<bool, &'static str> {
 		let mut left_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		let mut right_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -7770,7 +7779,7 @@ mod platform {
 	pub(super) fn rename_path_no_replace(
 		source_path: &Path,
 		destination_path: &Path,
-		_expected_source: Option<(u64, u64)>,
+		expected_source: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		let source_path = match lexical_absolute_path(source_path) {
 			Ok(path) => path,
@@ -7808,6 +7817,14 @@ mod platform {
 				return NativeExactUnlinkResult::failure(result.code.as_deref().unwrap_or("io_error"));
 			},
 		};
+		if let Some(expected_source) = expected_source {
+			let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+			if unsafe { GetFileInformationByHandle(source.target, &mut information) } == 0
+				|| !handle_expected_source_matches(&information, expected_source)
+			{
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+		}
 		let Some(destination_parent_path) = destination_path.parent() else {
 			return NativeExactUnlinkResult::failure("io_error");
 		};

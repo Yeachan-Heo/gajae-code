@@ -1367,13 +1367,18 @@ async function captureMigratedOldBridgeEntries(
 async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
 	let stagedSnapshot: NativeDirectoryTreeResult = snapshotDirectoryTree(temporary);
-	let identity: BridgeEntryIdentity | undefined;
+	const stat = await fs.lstat(temporary, { bigint: true });
+	const identity: BridgeEntryIdentity = {
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: stat.size.toString(),
+		mtimeNs: stat.mtimeNs.toString(),
+	};
 	let cleanupError: string | undefined;
 	try {
 		await fs.chmod(temporary, 0o700);
 		const finalSnapshot = snapshotDirectoryTree(temporary);
 		if (finalSnapshot.ok) stagedSnapshot = finalSnapshot;
-		const stat = await fs.lstat(temporary, { bigint: true });
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
 			canonicalExistingPathForNative(bridgeDir),
@@ -1391,12 +1396,6 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 				published.detachedPath === undefined ? [temporary] : [temporary, published.detachedPath],
 			);
 		}
-		identity = {
-			dev: stat.dev.toString(),
-			ino: stat.ino.toString(),
-			size: stat.size.toString(),
-			mtimeNs: stat.mtimeNs.toString(),
-		};
 	} finally {
 		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
 			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
