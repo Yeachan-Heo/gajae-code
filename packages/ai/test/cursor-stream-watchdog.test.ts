@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { cursorExecDeadlineMsForTest, streamCursor } from "../src/providers/cursor";
+import { cursorExecDeadlineMsForTest, disposeCursorConversation, streamCursor } from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
 import {
 	AgentServerMessageSchema,
@@ -1092,6 +1092,73 @@ describe("Cursor raw transport watchdog", () => {
 		);
 		expect(directEvents.filter(isTerminalEvent)).toHaveLength(1);
 		expect(streamCount).toBe(1);
+	}, 9_000);
+
+	it("retains a disposed conversation fence until the detached mutation settles", async () => {
+		let streamCount = 0;
+		const baseUrl = await createCursorServer(stream => {
+			streamCount += 1;
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				if (streamCount === 1) {
+					sendServerMessage(stream, {
+						case: "execServerMessage",
+						value: create(ExecServerMessageSchema, {
+							id: 1,
+							message: {
+								case: "piWriteArgs",
+								value: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+							},
+						}),
+					});
+					return;
+				}
+				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
+				stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG));
+			}, 10);
+		});
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const conversationId = "disposed-mutation-lock";
+		const first = collectTerminal(baseUrl, {
+			conversationId,
+			streamIdleTimeoutMs: 40,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await release.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		await first;
+		disposeCursorConversation(conversationId);
+
+		const second = streamCursor({ ...cursorModel, baseUrl }, baseContext, {
+			apiKey: "test-token",
+			conversationId,
+			streamFirstEventTimeoutMs: 40,
+		});
+		for await (const _event of second) {
+		}
+		const secondResult = await second.result();
+		expect(secondResult.stopReason).toBe("error");
+		expect(secondResult.errorMessage).toContain(
+			"Cursor stream timed out while waiting for the first transport event",
+		);
+		expect(streamCount).toBe(1);
+		release.resolve();
+		await Bun.sleep(10);
 	}, 9_000);
 
 	it("caps the fence on caller abort without an unhandled rejection", async () => {

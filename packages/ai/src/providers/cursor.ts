@@ -181,6 +181,12 @@ const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 // later turn cannot start another request while the detached mutation is still
 // changing local state.
 const conversationMutationLocks = new Map<string, Promise<void>>();
+type CursorMutationLockBarrier = {
+	pending: number;
+	promise: Promise<void>;
+	resolve: () => void;
+};
+let conversationMutationLockBarrier: CursorMutationLockBarrier | undefined;
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -188,11 +194,61 @@ const CURSOR_MAX_CONVERSATIONS = 64;
 const CURSOR_CONVERSATION_TTL_MS = 60 * 60 * 1000;
 const conversationLastAccess = new Map<string, number>();
 
+function retireCursorMutationLocks(locks: Iterable<Promise<void>>): void {
+	for (const lock of locks) {
+		let barrier = conversationMutationLockBarrier;
+		if (!barrier) {
+			const deferred = Promise.withResolvers<void>();
+			barrier = { pending: 0, promise: deferred.promise, resolve: deferred.resolve };
+			conversationMutationLockBarrier = barrier;
+		}
+		barrier.pending += 1;
+		void lock.then(
+			() => releaseCursorMutationLockBarrier(barrier!),
+			() => releaseCursorMutationLockBarrier(barrier!),
+		);
+	}
+}
+
+function releaseCursorMutationLockBarrier(barrier: CursorMutationLockBarrier): void {
+	barrier.pending -= 1;
+	if (barrier.pending !== 0) return;
+	barrier.resolve();
+	if (conversationMutationLockBarrier === barrier) conversationMutationLockBarrier = undefined;
+}
+
+function registerCursorMutationLock(conversationId: string, lock: Promise<void>): void {
+	if (conversationMutationLockBarrier) {
+		retireCursorMutationLocks([lock]);
+		return;
+	}
+	const previous = conversationMutationLocks.get(conversationId);
+	if (previous) {
+		conversationMutationLocks.delete(conversationId);
+		retireCursorMutationLocks([previous, lock]);
+		return;
+	}
+	conversationMutationLocks.set(conversationId, lock);
+	void lock.then(() => {
+		if (conversationMutationLocks.get(conversationId) === lock) conversationMutationLocks.delete(conversationId);
+	});
+	if (conversationMutationLocks.size > CURSOR_MAX_CONVERSATIONS) {
+		const locks = [...conversationMutationLocks.values()];
+		conversationMutationLocks.clear();
+		retireCursorMutationLocks(locks);
+	}
+}
+
 /** Drop all cached state + blob bytes for a conversation (F15 bound + session-teardown hook). */
 export function disposeCursorConversation(conversationId: string): void {
 	conversationStateCache.delete(conversationId);
 	conversationBlobStores.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
+	const mutationLock = conversationMutationLocks.get(conversationId);
+	if (mutationLock) {
+		conversationMutationLocks.delete(conversationId);
+		retireCursorMutationLocks([mutationLock]);
+	}
 }
 
 async function waitForCursorMutationLock(
@@ -202,7 +258,8 @@ async function waitForCursorMutationLock(
 	timeoutError: () => Error,
 ): Promise<void> {
 	const lock = conversationMutationLocks.get(conversationId);
-	if (!lock) return;
+	const barrier = conversationMutationLockBarrier;
+	if (!lock && !barrier) return;
 	if (signal?.aborted) throw cursorAbortError(signal);
 	const deadline = Promise.withResolvers<never>();
 	deadline.promise.catch(() => {});
@@ -217,7 +274,10 @@ async function waitForCursorMutationLock(
 	try {
 		const racers: Promise<never>[] = [deadline.promise];
 		if (signal) racers.push(aborted.promise);
-		await Promise.race([lock, ...racers]);
+		const fences: Promise<void>[] = [];
+		if (barrier) fences.push(barrier.promise);
+		if (lock) fences.push(lock);
+		await Promise.race([Promise.all(fences).then(() => undefined), ...racers]);
 	} finally {
 		if (signal) signal.removeEventListener("abort", onAbort);
 		if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -1317,12 +1377,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 												() => undefined,
 												() => undefined,
 											);
-											conversationMutationLocks.set(conversationId, lock);
-											void lock.then(() => {
-												if (conversationMutationLocks.get(conversationId) === lock) {
-													conversationMutationLocks.delete(conversationId);
-												}
-											});
+											registerCursorMutationLock(conversationId, lock);
 										},
 									);
 								} else {
