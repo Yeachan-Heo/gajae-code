@@ -1321,7 +1321,8 @@ async function createTransitionClaim(transitionDir: string, deadline: number): P
 	try {
 		await SessionStateLockTestHooks.beforeTransitionIdentityCapture?.(transitionDir);
 		const claim = await transitionClaimIdentity(transitionDir, marker);
-		if (!claim) throw new SessionStateLockUnavailableError();
+		if (!claim || !sameTransitionClaimIdentity(createdClaim, claim))
+			throw new SessionStateLockUnavailableError(new Error("Native transition claim changed before capture."));
 		await SessionStateLockTestHooks.afterTransitionMkdir?.(transitionDir);
 		const settledClaim = await transitionClaimIdentity(transitionDir, marker);
 		if (!settledClaim || !sameTransitionClaimIdentity(claim, settledClaim))

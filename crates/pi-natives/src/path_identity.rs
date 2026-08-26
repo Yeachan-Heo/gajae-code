@@ -515,7 +515,7 @@ impl NativeTransitionClaimResult {
 		)
 	}
 
-	fn success_strings(
+	const fn success_strings(
 		marker: String,
 		dev: String,
 		ino: String,
@@ -1508,16 +1508,14 @@ pub fn create_transition_claim_async(
 			Ok(NativeTransitionClaimResult::failure("invalid_request"))
 		});
 	}
+	let deadline = timeout_ms.map(|milliseconds| {
+		std::time::Instant::now() + std::time::Duration::from_millis(u64::from(milliseconds))
+	});
 	task::isolated_with_timeout(
 		env,
 		"create_transition_claim",
 		timeout_ms,
-		move || {
-			let deadline = timeout_ms.map(|milliseconds| {
-				std::time::Instant::now() + std::time::Duration::from_millis(u64::from(milliseconds))
-			});
-			Ok(platform::create_transition_claim(Path::new(&path), &marker, deadline))
-		},
+		move || Ok(platform::create_transition_claim(Path::new(&path), &marker, deadline)),
 		Some(NativeTransitionClaimResult::failure("timed_out")),
 	)
 }
@@ -2566,7 +2564,7 @@ pub(crate) mod platform {
 		Ok(stat)
 	}
 
-	fn same_transition_object(left: &libc::stat, right: &libc::stat) -> bool {
+	const fn same_transition_object(left: &libc::stat, right: &libc::stat) -> bool {
 		left.st_dev == right.st_dev && left.st_ino == right.st_ino
 	}
 
@@ -2588,6 +2586,8 @@ pub(crate) mod platform {
 				let Ok(named) = (|| {
 					// SAFETY: directory and marker_name are live retained authority.
 					let mut named: libc::stat = unsafe { std::mem::zeroed() };
+					// SAFETY: directory is a live directory descriptor and named is writable
+					// storage.
 					if unsafe {
 						libc::fstatat(
 							directory.as_raw_fd(),
@@ -2625,6 +2625,8 @@ pub(crate) mod platform {
 		let Ok(named) = (|| {
 			// SAFETY: parent_fd and parent_name are live retained authority.
 			let mut named: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is a live directory descriptor and named is writable
+			// storage.
 			if unsafe {
 				libc::fstatat(parent_fd, parent_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
 			} != 0
