@@ -4997,12 +4997,35 @@ pub(crate) mod platform {
 	) -> NativeExactUnlinkResult {
 		let mut current: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut current, libc::AT_SYMLINK_NOFOLLOW) }
-			!= 0 || current.st_mode & libc::S_IFMT != libc::S_IFREG
+			!= 0
 		{
 			return NativeExactUnlinkResult::detached_failure(
 				"destination_identity_changed",
 				path.to_string_lossy().into_owned(),
 			);
+		}
+		if current.st_mode & libc::S_IFMT != libc::S_IFREG {
+			let quarantine = CString::new(format!(
+				".gjc-rename-nonregular-{:x}-{:x}-{}",
+				current.st_dev,
+				current.st_ino,
+				std::process::id()
+			))
+			.expect("nonregular successor quarantine name contains no NUL");
+			return match rename_no_replace(parent_fd, parent_fd, name, &quarantine) {
+				Ok(()) => NativeExactUnlinkResult::detached_failure(
+					"identity_mismatch",
+					path
+						.parent()
+						.unwrap_or_else(|| Path::new("."))
+						.join(quarantine.to_string_lossy().as_ref())
+						.to_string_lossy()
+						.into_owned(),
+				),
+				Err(code) => {
+					NativeExactUnlinkResult::detached_failure(code, path.to_string_lossy().into_owned())
+				},
+			};
 		}
 		let quarantine = CString::new(format!(
 			".gjc-rename-successor-{:x}-{:x}-{}",
