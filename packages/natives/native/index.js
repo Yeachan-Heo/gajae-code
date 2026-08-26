@@ -93,6 +93,7 @@ export const sliceWithWidth = nativeBindings.sliceWithWidth;
 export const snapshotDirectoryTree = nativeBindings.snapshotDirectoryTree;
 export const summarizeCode = nativeBindings.summarizeCode;
 export const supportsLanguage = nativeBindings.supportsLanguage;
+export const symlinkNoReplacePath = nativeBindings.symlinkNoReplacePath;
 export const truncateLinesToWidth = nativeBindings.truncateLinesToWidth;
 export const truncateToWidth = nativeBindings.truncateToWidth;
 export const verifyOwnerOnlyFdSecurity = nativeBindings.verifyOwnerOnlyFdSecurity;

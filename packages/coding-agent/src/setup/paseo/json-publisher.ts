@@ -196,6 +196,23 @@ export async function publishPlan(
 	options: PublishOptions,
 ): Promise<PublishResult> {
 	if (plan.unchanged) return { published: false, identity: options.expectedIdentity };
+	if (options.backup && !hasNoReparseSidecarAuthority()) {
+		// Check the target before creating its parent directory. An existing
+		// target means this publication would create a generic credential backup;
+		// Windows cannot authenticate that final path component without native
+		// no-reparse authority, so refuse before any filesystem mutation.
+		const targetPresent = await fs.lstat(targetPath).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		});
+		if (targetPresent !== undefined) {
+			throw new PaseoPublishError(targetPath, {
+				reason: "sidecar-conflict",
+				detail:
+					"this runtime cannot authenticate a no-reparse generic publication backup; refusing to create a credential-bearing backup",
+			});
+		}
+	}
 
 	const directory = path.dirname(targetPath);
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
@@ -231,6 +248,19 @@ export async function publishPlan(
 		});
 	}
 	if (options.backup && observed !== ABSENT_IDENTITY) {
+		// Generic publication backups are credential-bearing copies of the
+		// caller-owned target. Node has no Windows equivalent of
+		// FILE_FLAG_OPEN_REPARSE_POINT, so a pathname-only copy could follow a
+		// junction and leave recovery without authenticated cleanup authority.
+		// Refuse before creating the backup (and before the target mutation) rather
+		// than publishing an artifact recovery cannot safely authenticate.
+		if (!hasNoReparseSidecarAuthority()) {
+			throw new PaseoPublishError(targetPath, {
+				reason: "sidecar-conflict",
+				detail:
+					"this runtime cannot authenticate a no-reparse generic publication backup; refusing to create a credential-bearing backup",
+			});
+		}
 		backupPath = `${targetPath}.gjc-bak-${backupSuffix(options.now)}`;
 		backupBytes = Buffer.from(await Bun.file(targetPath).bytes());
 		await options.onBackupPrepared?.(backupPath, hashBytes(backupBytes.toString("utf8")));

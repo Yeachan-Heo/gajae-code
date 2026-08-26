@@ -16,6 +16,7 @@ import {
 	repairOwnerOnlyPathSecurityExpected,
 	retainBrokerPublication,
 	snapshotDirectoryTree,
+	symlinkNoReplacePath,
 	verifyOwnerOnlyPathSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
 } from "../native/index.js";
@@ -102,6 +103,42 @@ describe.skipIf(process.platform !== "win32")("Windows native path identity", ()
 		expect(verifyOwnerOnlyPathSecurity(alias, "directory")).toEqual(rejected);
 		expect(applyOwnerOnlyPathSecurity(path.join(alias, "state.json"), "file")).toEqual(rejected);
 		expect(verifyOwnerOnlyPathSecurity(path.join(alias, "state.json"), "file")).toEqual(rejected);
+	});
+
+	it("binds symbolic-link creation to the expected parent identity", async () => {
+		const root = await temporaryDirectory();
+		const other = await temporaryDirectory();
+		const target = path.join(root, "target.txt");
+		const destination = path.join(root, "published");
+		await fs.writeFile(target, "target");
+		const wrongParent = await fs.stat(other, { bigint: true });
+
+		const rejected = symlinkNoReplacePath(target, destination, {
+			dev: wrongParent.dev,
+			ino: wrongParent.ino,
+		});
+		expect(rejected).toMatchObject({
+			ok: false,
+			code: "parent_mismatch",
+			mutationState: "not_committed",
+			reason: "identity_violation",
+			primitive: "windows_symlink_noreplace",
+		});
+		await expect(fs.lstat(destination)).rejects.toMatchObject({ code: expect.any(String) });
+
+		const parent = await fs.stat(root, { bigint: true });
+		const created = symlinkNoReplacePath(target, destination, {
+			dev: parent.dev,
+			ino: parent.ino,
+		});
+		if (!created.ok && created.code === "atomic_unavailable") return;
+		expect(created).toMatchObject({
+			ok: true,
+			mutationState: "committed",
+			reason: "none",
+			primitive: "windows_symlink_noreplace",
+		});
+		expect(await fs.readlink(destination)).toBe(target);
 	});
 	it("rejects an ancestor junction inserted after exact identity capture without touching its target", async () => {
 		const root = await temporaryDirectory();

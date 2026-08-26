@@ -363,6 +363,19 @@ pub struct NativeNoReplaceResult {
 
 impl NativeNoReplaceResult {
 	fn from_exact(result: NativeExactUnlinkResult) -> Self {
+		let primitive = if cfg!(target_os = "linux") {
+			"renameat2_noreplace"
+		} else if cfg!(target_os = "macos") {
+			"renameatx_np_excl"
+		} else if cfg!(windows) {
+			"windows_rename_noreplace"
+		} else {
+			"unsupported"
+		};
+		Self::from_exact_with_primitive(result, primitive)
+	}
+
+	fn from_exact_with_primitive(result: NativeExactUnlinkResult, primitive: &'static str) -> Self {
 		let (mutation_state, durability_state, reason) = if result.ok {
 			// A direct no-replace rename commits the namespace mutation, but does not
 			// fsync either parent directory.
@@ -381,7 +394,7 @@ impl NativeNoReplaceResult {
 				Some("destination_identity_changed") => {
 					("committed", "not_provable", "identity_violation")
 				},
-				Some("reparse_point" | "identity_mismatch") => {
+				Some("parent_mismatch" | "reparse_point" | "identity_mismatch") => {
 					("not_committed", "not_attempted", "identity_violation")
 				},
 				// A signal landing before the syscall entered the kernel (or between
@@ -400,22 +413,15 @@ impl NativeNoReplaceResult {
 			mutation_state:   mutation_state.to_owned(),
 			durability_state: durability_state.to_owned(),
 			reason:           reason.to_owned(),
-			primitive:        if cfg!(target_os = "linux") {
-				"renameat2_noreplace"
-			} else if cfg!(target_os = "macos") {
-				"renameatx_np_excl"
-			} else if cfg!(windows) {
-				"windows_rename_noreplace"
-			} else {
-				"unsupported"
-			}
-			.to_owned(),
+			primitive:        primitive.to_owned(),
 			phase:            if mutation_state == "committed" && !result.ok {
 				"terminal_identity"
 			} else if mutation_state == "committed" {
 				"complete"
 			} else if matches!(reason, "invalid_request" | "identity_violation") {
 				"preflight"
+			} else if primitive.contains("symlink") {
+				"symlink"
 			} else {
 				"rename"
 			}
@@ -1344,6 +1350,61 @@ pub fn exact_restore(
 		return NativeExactUnlinkResult::failure("identity_mismatch");
 	};
 	platform::exact_restore(Path::new(&detached_path), Path::new(&original_path), &identity)
+}
+
+/// Create one symbolic link under a retained, no-follow parent directory.
+///
+/// The destination name is claimed with a no-replace primitive while the
+/// expected parent identity is checked against the descriptor that performs
+/// the mutation. A parent mismatch is a pre-mutation identity violation; the
+/// operation never falls back to a pathname-only symlink call.
+#[napi]
+pub fn symlink_no_replace_path(
+	target_path: String,
+	destination_path: String,
+	expected_parent: NativeDirectoryParentIdentity,
+) -> NativeNoReplaceResult {
+	if target_path.contains('\0') || destination_path.contains('\0') {
+		return NativeNoReplaceResult::from_exact_with_primitive(
+			NativeExactUnlinkResult::failure("invalid_request"),
+			if cfg!(windows) {
+				"windows_symlink_noreplace"
+			} else if cfg!(unix) {
+				"symlinkat_noreplace"
+			} else {
+				"unsupported"
+			},
+		);
+	}
+	let (dev_negative, dev, dev_lossless) = expected_parent.dev.get_u64();
+	let (ino_negative, ino, ino_lossless) = expected_parent.ino.get_u64();
+	if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+		return NativeNoReplaceResult::from_exact_with_primitive(
+			NativeExactUnlinkResult::failure("parent_mismatch"),
+			if cfg!(windows) {
+				"windows_symlink_noreplace"
+			} else if cfg!(unix) {
+				"symlinkat_noreplace"
+			} else {
+				"unsupported"
+			},
+		);
+	}
+	let primitive = if cfg!(windows) {
+		"windows_symlink_noreplace"
+	} else if cfg!(unix) {
+		"symlinkat_noreplace"
+	} else {
+		"unsupported"
+	};
+	NativeNoReplaceResult::from_exact_with_primitive(
+		platform::symlink_path_no_replace(
+			Path::new(&target_path),
+			Path::new(&destination_path),
+			(dev, ino),
+		),
+		primitive,
+	)
 }
 
 #[napi]
@@ -4605,6 +4666,51 @@ pub(crate) mod platform {
 		exact_unlink_at(parent_fd, name.clone(), path, &identity)
 	}
 
+	/// Create a symbolic link through a retained parent descriptor. `symlinkat`
+	/// claims the destination name without following either the parent path or
+	/// the link target; a swapped parent therefore fails the identity check
+	/// before the syscall and cannot redirect the mutation to a successor.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent descriptor and NUL-terminated names remain live across \
+		          symlinkat"
+	)]
+	pub(super) fn symlink_path_no_replace(
+		target_path: &Path,
+		destination_path: &Path,
+		expected_parent: (u64, u64),
+	) -> NativeExactUnlinkResult {
+		let (parent_fd, name) = match open_parent_no_follow(destination_path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+			|| parent_stat.st_dev as u64 != expected_parent.0
+			|| parent_stat.st_ino as u64 != expected_parent.1
+		{
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let Ok(target) = CString::new(target_path.as_os_str().as_bytes()) else {
+			unsafe { libc::close(parent_fd) };
+			return NativeExactUnlinkResult::failure("invalid_request");
+		};
+		let result = if unsafe { libc::symlinkat(target.as_ptr(), parent_fd, name.as_ptr()) } == 0 {
+			NativeExactUnlinkResult::success()
+		} else {
+			let error = std::io::Error::last_os_error();
+			let code = if error.raw_os_error() == Some(libc::EEXIST) {
+				"already_exists"
+			} else {
+				security_code(&error)
+			};
+			NativeExactUnlinkResult::failure(code)
+		};
+		unsafe { libc::close(parent_fd) };
+		result
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "publication descriptors are owned here and closed exactly once on every branch"
@@ -6268,7 +6374,11 @@ mod platform {
 			READ_CONTROL, ReadFile, SetFileInformationByHandle, SetFilePointerEx, VOLUME_NAME_GUID,
 			WRITE_DAC, WRITE_OWNER,
 		},
-		System::Threading::{GetCurrentProcess, OpenProcessToken},
+		System::{
+			IO::DeviceIoControl,
+			Ioctl::FSCTL_SET_REPARSE_POINT,
+			Threading::{GetCurrentProcess, OpenProcessToken},
+		},
 	};
 
 	use super::{
@@ -6328,6 +6438,9 @@ mod platform {
 		DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 	const FILE_RENAME_INFORMATION_CLASS: i32 = 10;
+	const FILE_CREATE: u32 = 2;
+	const IO_REPARSE_TAG_SYMLINK: u32 = 0xa000_000c;
+	const SYMLINK_FLAG_RELATIVE: u32 = 1;
 
 	#[repr(C)]
 	struct HandleRenameInformation {
@@ -7378,6 +7491,170 @@ mod platform {
 				}
 			},
 		}
+	}
+
+	fn symlink_reparse_buffer(target_path: &Path) -> Result<Vec<u8>, &'static str> {
+		let target: Vec<u16> = target_path.as_os_str().encode_wide().collect();
+		if target.is_empty() || target.iter().any(|unit| *unit == 0) {
+			return Err("invalid_request");
+		}
+		let relative = !target_path.is_absolute();
+		let substitute = if relative {
+			target.clone()
+		} else {
+			let mut value = if target.starts_with(&[92, 92, 63, 92]) {
+				"\\??\\".encode_utf16().collect::<Vec<_>>()
+			} else if target.starts_with(&[92, 92]) {
+				"\\??\\UNC\\".encode_utf16().collect::<Vec<_>>()
+			} else {
+				"\\??\\".encode_utf16().collect::<Vec<_>>()
+			};
+			let skip = if target.starts_with(&[92, 92, 63, 92]) {
+				4
+			} else if target.starts_with(&[92, 92]) {
+				2
+			} else {
+				0
+			};
+			value.extend_from_slice(&target[skip..]);
+			value
+		};
+		let substitute_bytes = substitute.len().checked_mul(2).ok_or("invalid_request")?;
+		let print_bytes = target.len().checked_mul(2).ok_or("invalid_request")?;
+		let data_length = 12usize
+			.checked_add(substitute_bytes)
+			.and_then(|value| value.checked_add(print_bytes))
+			.ok_or("invalid_request")?;
+		if data_length > u16::MAX as usize {
+			return Err("invalid_request");
+		}
+		let total = 8usize.checked_add(data_length).ok_or("invalid_request")?;
+		let mut buffer = vec![0u8; total];
+		buffer[0..4].copy_from_slice(&IO_REPARSE_TAG_SYMLINK.to_le_bytes());
+		buffer[4..6].copy_from_slice(&(data_length as u16).to_le_bytes());
+		buffer[8..10].copy_from_slice(&0u16.to_le_bytes());
+		buffer[10..12].copy_from_slice(&(substitute_bytes as u16).to_le_bytes());
+		buffer[12..14].copy_from_slice(&(substitute_bytes as u16).to_le_bytes());
+		buffer[14..16].copy_from_slice(&(print_bytes as u16).to_le_bytes());
+		buffer[16..20]
+			.copy_from_slice(&(if relative { SYMLINK_FLAG_RELATIVE } else { 0 }).to_le_bytes());
+		let mut offset = 20usize;
+		for unit in substitute.iter().chain(target.iter()) {
+			buffer[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+			offset += 2;
+		}
+		Ok(buffer)
+	}
+
+	/// Create a Windows symbolic-link reparse point through a retained parent
+	/// handle. The child name is first claimed with `FILE_CREATE`; only that
+	/// handle is then converted to a reparse point, so neither a parent junction
+	/// swap nor a destination collision can redirect the mutation.
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained parent and child handles remain live across descriptor-relative NT \
+		          syscalls"
+	)]
+	pub(super) fn symlink_path_no_replace(
+		target_path: &Path,
+		destination_path: &Path,
+		expected_parent: (u64, u64),
+	) -> NativeExactUnlinkResult {
+		let destination_path = match lexical_absolute_path(destination_path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let Some(parent_path) = destination_path.parent() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let Some(name) = destination_path.file_name() else {
+			return NativeExactUnlinkResult::failure("io_error");
+		};
+		let parent = match open_directory_exact(parent_path) {
+			Ok(parent) => parent,
+			Err(code) => return NativeExactUnlinkResult::failure(&code),
+		};
+		let mut parent_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(parent.target, &mut parent_information) } == 0
+			|| u64::from(parent_information.dwVolumeSerialNumber) != expected_parent.0
+			|| ((u64::from(parent_information.nFileIndexHigh) << 32)
+				| u64::from(parent_information.nFileIndexLow))
+				!= expected_parent.1
+		{
+			return NativeExactUnlinkResult::failure("parent_mismatch");
+		}
+		let mut name_wide: Vec<u16> = name.encode_wide().collect();
+		if name_wide.is_empty()
+			|| name_wide.iter().any(|unit| *unit == 0)
+			|| name_wide.len() > (u16::MAX as usize / 2)
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let buffer = match symlink_reparse_buffer(target_path) {
+			Ok(buffer) => buffer,
+			Err(code) => return NativeExactUnlinkResult::failure(code),
+		};
+		let mut object_name = UnicodeString {
+			length:         (name_wide.len() * size_of::<u16>()) as u16,
+			maximum_length: (name_wide.len() * size_of::<u16>()) as u16,
+			buffer:         name_wide.as_mut_ptr(),
+		};
+		let mut attributes = ObjectAttributes {
+			length: size_of::<ObjectAttributes>() as u32,
+			root_directory: parent.target,
+			object_name: &mut object_name,
+			attributes: 0,
+			security_descriptor: null_mut(),
+			security_quality_of_service: null_mut(),
+		};
+		let mut status: IoStatusBlock = unsafe { std::mem::zeroed() };
+		let mut child = INVALID_HANDLE_VALUE;
+		let create_status = unsafe {
+			NtCreateFile(
+				&mut child,
+				GENERIC_ALL | SYNCHRONIZE,
+				&mut attributes,
+				&mut status,
+				null_mut(),
+				FILE_ATTRIBUTE_NORMAL,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				FILE_CREATE,
+				FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+				null_mut(),
+				0,
+			)
+		};
+		if create_status < 0 {
+			return NativeExactUnlinkResult::failure(ntstatus_code(create_status));
+		}
+		let mut returned = 0u32;
+		let set_result = unsafe {
+			DeviceIoControl(
+				child,
+				FSCTL_SET_REPARSE_POINT,
+				buffer.as_ptr().cast(),
+				buffer.len() as u32,
+				null_mut(),
+				0,
+				&mut returned,
+				null_mut(),
+			)
+		};
+		if set_result == 0 {
+			let code = last_error_code();
+			let deleted = delete_handle(child).is_ok();
+			unsafe { CloseHandle(child) };
+			return if deleted {
+				NativeExactUnlinkResult::failure(code)
+			} else {
+				NativeExactUnlinkResult::detached_failure(
+					"cleanup_pending",
+					destination_path.to_string_lossy().into_owned(),
+				)
+			};
+		}
+		unsafe { CloseHandle(child) };
+		NativeExactUnlinkResult::success()
 	}
 
 	/// Windows implements no-replace renames natively, so the POSIX hard-link
@@ -9046,6 +9323,13 @@ mod platform {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
 	pub(super) fn link_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("atomic_unavailable")
+	}
+	pub(super) fn symlink_path_no_replace(
+		_: &Path,
+		_: &Path,
+		_: (u64, u64),
+	) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
 	pub(super) fn exact_unlink(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {

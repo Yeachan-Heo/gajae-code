@@ -20,6 +20,7 @@ import {
 	canonicalExistingDirectoryIdentity,
 	exactRemoveDirectoryTree,
 	exactUnlinkSymlink,
+	symlinkNoReplacePath,
 	snapshotDirectoryTree,
 } from "@gajae-code/natives";
 import { getTrustedHomeDir } from "@gajae-code/utils";
@@ -232,6 +233,9 @@ export interface SkillsBridgeInstallResult {
 	/** Install-time no-follow identities for entries this run created or adopted. */
 	readonly entryIdentities: Readonly<Record<string, BridgeEntryIdentity>>;
 	readonly bridgeDirCreated: boolean;
+	/** Mutation-boundary identity of the bridge root used as each link's parent. */
+	readonly bridgeParentIdentity?: BridgeEntryIdentity;
+	/** No-follow identity of the bridge directory GJC created. */
 	readonly bridgeDirIdentity?: BridgeEntryIdentity;
 	/** Directory the created links point at; absent when nothing was created. */
 	readonly sourceDir?: string;
@@ -277,28 +281,35 @@ async function quarantineUnlinkVerified(
 	linkPath: string,
 	expectedTarget: string,
 	expectedIdentity: SymlinkIdentity,
+	expectedParentIdentity?: BridgeEntryIdentity,
 ): Promise<void> {
-	await unlinkSymlinkExactly(linkPath, expectedTarget, expectedIdentity);
+	await unlinkSymlinkExactly(linkPath, expectedTarget, expectedIdentity, expectedParentIdentity);
 }
 
 async function unlinkSymlinkExactly(
 	linkPath: string,
 	expectedTarget: string,
 	expectedIdentity: SymlinkIdentity,
+	expectedParentIdentity?: BridgeEntryIdentity,
 ): Promise<void> {
 	const text = await fs.readlink(linkPath).catch(() => undefined);
 	if (text === undefined || resolvedLinkTarget(text, linkPath) !== expectedTarget) {
 		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before removal: ${linkPath}`);
 	}
 	const nativeLinkPath = canonicalExistingPathForNative(linkPath);
-	const parent = await fs.stat(path.dirname(nativeLinkPath), { bigint: true });
-	if (!parent.isDirectory()) throw new SkillsBridgeError(`Paseo skill bridge parent is not a directory: ${linkPath}`);
+	const parent =
+		expectedParentIdentity === undefined
+			? await fs.stat(path.dirname(nativeLinkPath), { bigint: true })
+			: undefined;
+	if (parent !== undefined && !parent.isDirectory()) {
+		throw new SkillsBridgeError(`Paseo skill bridge parent is not a directory: ${linkPath}`);
+	}
 	const result = exactUnlinkSymlink(nativeLinkPath, {
 		dev: expectedIdentity.dev,
 		ino: expectedIdentity.ino,
 		nlink: 1n,
-		parentDev: parent.dev,
-		parentIno: parent.ino,
+		parentDev: expectedParentIdentity === undefined ? parent!.dev : BigInt(expectedParentIdentity.dev),
+		parentIno: expectedParentIdentity === undefined ? parent!.ino : BigInt(expectedParentIdentity.ino),
 		size: expectedIdentity.size,
 		mtimeNs: expectedIdentity.mtimeNs,
 		quarantineName: `.gjc-paseo-quarantine-${process.pid}-${nodeCrypto.randomUUID()}`,
@@ -317,7 +328,7 @@ async function unlinkSymlinkExactly(
 	}
 }
 
-function canonicalExistingPathForNative(targetPath: string): string {
+export function canonicalExistingPathForNative(targetPath: string): string {
 	const absolute = path.resolve(targetPath);
 	const parent = canonicalExistingDirectoryIdentity(path.dirname(absolute));
 	if (!parent.ok || parent.canonicalPath === undefined) {
@@ -751,7 +762,10 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 	}
 }
 
-async function pruneRecordedDangling(entry: BridgeEntryPlan): Promise<void> {
+async function pruneRecordedDangling(
+	entry: BridgeEntryPlan,
+	expectedParentIdentity?: BridgeEntryIdentity,
+): Promise<void> {
 	if (entry.danglingTarget === undefined)
 		throw new SkillsBridgeError(`Missing dangling-link evidence for ${entry.linkPath}`);
 	if (entry.danglingIdentity === undefined)
@@ -760,14 +774,24 @@ async function pruneRecordedDangling(entry: BridgeEntryPlan): Promise<void> {
 	if (state.kind !== "dangling" || state.link !== entry.danglingTarget) {
 		throw new SkillsBridgeError(`Paseo skill bridge entry diverged before pruning: ${entry.linkPath}`);
 	}
-	await quarantineUnlinkVerified(entry.linkPath, entry.targetPath, entry.danglingIdentity);
+	await quarantineUnlinkVerified(entry.linkPath, entry.targetPath, entry.danglingIdentity, expectedParentIdentity);
 }
 
-async function createNoReplace(entry: BridgeEntryPlan): Promise<void> {
-	try {
-		await fs.symlink(entry.targetPath, entry.linkPath);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+async function createNoReplace(entry: BridgeEntryPlan, expectedParentIdentity?: BridgeEntryIdentity): Promise<void> {
+	if (expectedParentIdentity === undefined) {
+		throw new SkillsBridgeError(`Missing Paseo skill bridge parent identity during creation: ${entry.linkPath}`);
+	}
+	const nativeLinkPath = canonicalExistingPathForNative(entry.linkPath);
+	const created = symlinkNoReplacePath(entry.targetPath, nativeLinkPath, {
+		dev: BigInt(expectedParentIdentity.dev),
+		ino: BigInt(expectedParentIdentity.ino),
+	});
+	if (!created.ok) {
+		if (created.code !== "already_exists" && created.code !== "quarantine_collision") {
+			throw new SkillsBridgeError(
+				`Paseo skill bridge entry could not be created at the identity-bound mutation boundary: ${entry.linkPath} (${created.code ?? created.reason})`,
+			);
+		}
 		const observed = await entryState(entry.linkPath, entry.targetPath);
 		throw new SkillsBridgeError(
 			`Paseo skill bridge entry appeared during creation (${observed.kind}): ${entry.linkPath}`,
@@ -775,7 +799,11 @@ async function createNoReplace(entry: BridgeEntryPlan): Promise<void> {
 	}
 }
 
-async function pruneStale(plan: BridgePrunePlan, sourceDir: string): Promise<void> {
+async function pruneStale(
+	plan: BridgePrunePlan,
+	sourceDir: string,
+	expectedParentIdentity?: BridgeEntryIdentity,
+): Promise<void> {
 	// The source snapshot was taken during preflight, but a Paseo update can
 	// recreate a skill before the destructive unlink. Revalidate immediately
 	// before pruning so a link that is live again is preserved and remains
@@ -794,10 +822,19 @@ async function pruneStale(plan: BridgePrunePlan, sourceDir: string): Promise<voi
 			);
 		}
 	}
-	await quarantineUnlinkVerified(plan.linkPath, resolvedLinkTarget(plan.linkTarget, plan.linkPath), plan.linkIdentity);
+	await quarantineUnlinkVerified(
+		plan.linkPath,
+		resolvedLinkTarget(plan.linkTarget, plan.linkPath),
+		plan.linkIdentity,
+		expectedParentIdentity,
+	);
 }
 
-export async function adoptLegacyLink(plan: BridgeAdoptPlan, legacySourceDir: string): Promise<void> {
+export async function adoptLegacyLink(
+	plan: BridgeAdoptPlan,
+	legacySourceDir: string,
+	expectedParentIdentity?: BridgeEntryIdentity,
+): Promise<void> {
 	// The preflight recorded this exact symlink as GJC's own legacy link; the
 	// captured object is verified post-rename inside the quarantine, so a
 	// pathname swap can never delete a foreign link. The ORIGINAL link is
@@ -806,14 +843,36 @@ export async function adoptLegacyLink(plan: BridgeAdoptPlan, legacySourceDir: st
 	// means a concurrent entry claimed the name — the legacy link then stays
 	// recoverable in the quarantine, never deleted by this path).
 	const legacyText = plan.linkTarget;
-	await quarantineUnlinkVerified(plan.linkPath, path.resolve(legacySourceDir, plan.name), plan.linkIdentity);
-	try {
-		await fs.symlink(plan.targetPath, plan.linkPath);
-	} catch (error) {
+	const parentIdentity = expectedParentIdentity ?? (await directoryIdentity(path.dirname(plan.linkPath)));
+	await quarantineUnlinkVerified(
+		plan.linkPath,
+		path.resolve(legacySourceDir, plan.name),
+		plan.linkIdentity,
+		parentIdentity,
+	);
+	const nativeLinkPath = canonicalExistingPathForNative(plan.linkPath);
+	const created = symlinkNoReplacePath(plan.targetPath, nativeLinkPath, {
+		dev: BigInt(parentIdentity.dev),
+		ino: BigInt(parentIdentity.ino),
+	});
+	if (!created.ok) {
 		// Restore the original legacy link before surfacing the failure so a
-		// partial failure never leaves the bridge entry missing outright.
-		await fs.symlink(legacyText, plan.linkPath).catch(() => undefined);
-		throw error;
+		// partial failure never leaves the bridge entry missing outright. Both
+		// publishes remain no-replace and descriptor-relative to the same root.
+		const restored = symlinkNoReplacePath(legacyText, nativeLinkPath, {
+			dev: BigInt(parentIdentity.dev),
+			ino: BigInt(parentIdentity.ino),
+		});
+		if (!restored.ok) {
+			throw new SkillsBridgeError(
+				`Refusing to restore adopted Paseo skill bridge entry ${plan.linkPath}: ${restored.code ?? restored.reason}`,
+				[path.dirname(plan.linkPath)],
+			);
+		}
+		throw new SkillsBridgeError(
+			`Failed to publish adopted Paseo skill bridge entry ${plan.linkPath}: ${created.code ?? created.reason}`,
+			[path.dirname(plan.linkPath)],
+		);
 	}
 }
 
@@ -822,6 +881,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	const hasWork =
 		Object.keys(preflight.entries).length > 0 || preflight.prunes.length > 0 || preflight.adopts.length > 0;
 	let bridgeDirCreated = false;
+	let bridgeParentIdentity: BridgeEntryIdentity | undefined;
 	let bridgeDirIdentity: BridgeEntryIdentity | undefined;
 	const createdEntries: string[] = [];
 	const prunedEntries: string[] = [];
@@ -835,6 +895,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		adoptedLinkTexts: { ...adoptedLinkTexts },
 		entryIdentities: { ...entryIdentities },
 		bridgeDirCreated,
+		...(bridgeParentIdentity ? { bridgeParentIdentity } : {}),
 		...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
 		...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
 	});
@@ -848,19 +909,22 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 		if (preflight.bridgeDirCreated && hasWork) {
 			await createBridgeDirectory(preflight);
 			bridgeDirCreated = true;
-			bridgeDirIdentity = await directoryIdentity(preflight.bridgeDir);
+		}
+		if (hasWork) {
+			bridgeParentIdentity = await directoryIdentity(preflight.bridgeDir);
+			if (bridgeDirCreated) bridgeDirIdentity = bridgeParentIdentity;
 		}
 		for (const plan of preflight.prunes) {
 			if (preflight.sourceDir === undefined) {
 				throw new SkillsBridgeError(`Missing Paseo skill source during prune: ${plan.linkPath}`);
 			}
-			await pruneStale(plan, preflight.sourceDir);
+			await pruneStale(plan, preflight.sourceDir, bridgeParentIdentity);
 			prunedEntries.push(plan.name);
 		}
 		for (const entry of Object.values(preflight.entries)) {
 			if (entry.action === "noop") continue;
-			if (entry.action === "prune-and-recreate") await pruneRecordedDangling(entry);
-			await createNoReplace(entry);
+			if (entry.action === "prune-and-recreate") await pruneRecordedDangling(entry, bridgeParentIdentity);
+			await createNoReplace(entry, bridgeParentIdentity);
 			createdEntries.push(entry.name);
 			entryIdentities[entry.name] = await captureInstalledEntryIdentity(
 				preflight.bridgeDir,
@@ -870,7 +934,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 			await assertInstalledEntryTarget(preflight.bridgeDir, entry.name);
 		}
 		for (const adopt of preflight.adopts) {
-			await adoptLegacyLink(adopt, adopt.legacySourceDir);
+			await adoptLegacyLink(adopt, adopt.legacySourceDir, bridgeParentIdentity);
 			adoptedEntries.push(adopt.name);
 			adoptedLinkTexts[adopt.name] = adopt.linkTarget;
 			entryIdentities[adopt.name] = await captureInstalledEntryIdentity(
@@ -891,6 +955,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				adoptedLinkTexts,
 				entryIdentities,
 				bridgeDirCreated,
+				...(bridgeParentIdentity ? { bridgeParentIdentity } : {}),
 				...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
 				...(preflight.sourceDir ? { sourceDir: preflight.sourceDir } : {}),
 			}
@@ -901,6 +966,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				adoptedLinkTexts,
 				entryIdentities,
 				bridgeDirCreated,
+				...(bridgeParentIdentity ? { bridgeParentIdentity } : {}),
 				...(bridgeDirIdentity ? { bridgeDirIdentity } : {}),
 			};
 }
@@ -1156,6 +1222,7 @@ export async function inverseSkillsBridge(
 	if (result.sourceDir === undefined) {
 		throw new SkillsBridgeError("Refusing to undo Paseo skill bridge entries without a recorded source directory");
 	}
+	const sourceDir = result.sourceDir;
 	const adoptedLinkTexts = result.adoptedLinkTexts ?? {};
 	for (const name of result.adoptedEntries) {
 		if (typeof adoptedLinkTexts[name] !== "string") {
@@ -1167,12 +1234,47 @@ export async function inverseSkillsBridge(
 	// path migration must not make removal inspect the old directory while
 	// unlinking from the current one.
 	const bridgeDir = options.bridgeDir ?? deps.paths.bridgeDir;
+	const ownedNames = [...result.createdEntries, ...result.adoptedEntries];
+	// Capture the bridge root identity once, before inspecting or unlinking any
+	// recorded entry. When install/migration already recorded the root, a
+	// replacement is rejected immediately; otherwise this snapshot is the
+	// authority passed to every native unlink below. The native descriptor walk
+	// repeats the same identity check at the mutation boundary, so a root swap
+	// after this capture cannot redirect an unlink into its successor.
+	const expectedBridgeRootIdentity = result.bridgeParentIdentity ?? result.bridgeDirIdentity;
+	if (ownedNames.length > 0 && expectedBridgeRootIdentity === undefined) {
+		// Existing bridge directories were not GJC-owned, so older result shapes
+		// did not persist their identity. Capture the live root once rather than
+		// deriving a fresh parent identity for each destructive operation.
+		try {
+			result = { ...result, bridgeParentIdentity: await directoryIdentity(bridgeDir) };
+		} catch (error) {
+			throw new SkillsBridgeError(
+				`Refusing to remove Paseo skill bridge entries without an authenticated bridge root: ${bridgeDir} (${error instanceof Error ? error.message : String(error)})`,
+			);
+		}
+	} else if (ownedNames.length > 0) {
+		const observedBridgeRoot = await directoryIdentity(bridgeDir).catch(error => {
+			throw new SkillsBridgeError(
+				`Refusing to remove Paseo skill bridge entries without the recorded bridge root: ${bridgeDir} (${error instanceof Error ? error.message : String(error)})`,
+			);
+		});
+		if (
+			observedBridgeRoot.dev !== expectedBridgeRootIdentity!.dev ||
+			observedBridgeRoot.ino !== expectedBridgeRootIdentity!.ino
+		) {
+			throw new SkillsBridgeError(`Refusing to remove a replaced Paseo skills bridge directory: ${bridgeDir}`);
+		}
+	}
+	const unlinkParentIdentity = ownedNames.length > 0 ? result.bridgeParentIdentity ?? result.bridgeDirIdentity : undefined;
+	if (ownedNames.length > 0 && unlinkParentIdentity === undefined) {
+		throw new SkillsBridgeError(`Missing authenticated Paseo skills bridge parent identity: ${bridgeDir}`);
+	}
 	const diverged: string[] = [];
 	const removals: { readonly destination: string; readonly target: string; readonly identity: SymlinkIdentity }[] = [];
-	const ownedNames = [...result.createdEntries, ...result.adoptedEntries];
 	for (const name of ownedNames) {
 		const destination = path.join(bridgeDir, name);
-		const target = path.resolve(result.sourceDir, name);
+		const target = path.resolve(sourceDir, name);
 		const state = await entryState(destination, target);
 		// `dangling` still carries link text pointing exactly where we wrote it;
 		// the source went away (Paseo uninstalled or updated), and a dead link in
@@ -1205,7 +1307,7 @@ export async function inverseSkillsBridge(
 		throw new SkillsBridgeError(`Refusing to remove diverged Paseo skill bridge entries: ${diverged.join(", ")}`);
 	}
 	for (const removal of removals) {
-		await quarantineUnlinkVerified(removal.destination, removal.target, removal.identity);
+		await quarantineUnlinkVerified(removal.destination, removal.target, removal.identity, unlinkParentIdentity);
 	}
 	// Adoption replaces a pre-#4638 legacy link rather than creating a new
 	// pathname. Once the replacement is removed with its recorded identity,
@@ -1215,16 +1317,22 @@ export async function inverseSkillsBridge(
 	for (const name of result.adoptedEntries) {
 		const destination = path.join(bridgeDir, name);
 		const original = adoptedLinkTexts[name]!;
-		try {
-			await fs.symlink(original, destination);
-		} catch (error) {
+		if (unlinkParentIdentity === undefined) {
+			throw new SkillsBridgeError(`Missing authenticated Paseo skills bridge parent identity: ${bridgeDir}`);
+		}
+		const restored = symlinkNoReplacePath(original, canonicalExistingPathForNative(destination), {
+			dev: BigInt(unlinkParentIdentity.dev),
+			ino: BigInt(unlinkParentIdentity.ino),
+		});
+		if (!restored.ok) {
 			throw new SkillsBridgeError(
-				`Refusing to restore adopted Paseo skill bridge entry ${destination}: ${error instanceof Error ? error.message : String(error)}`,
+				`Refusing to restore adopted Paseo skill bridge entry ${destination}: ${restored.code ?? restored.reason}`,
+				[bridgeDir],
 			);
 		}
 		const observed = await fs.readlink(destination).catch(() => undefined);
 		if (observed !== original) {
-			throw new SkillsBridgeError(`Adopted Paseo skill bridge restoration diverged: ${destination}`);
+			throw new SkillsBridgeError(`Adopted Paseo skill bridge restoration diverged: ${destination}`, [bridgeDir]);
 		}
 	}
 	if (!result.bridgeDirCreated) return;

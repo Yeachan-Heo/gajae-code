@@ -2406,6 +2406,16 @@ export interface SummarySegment {
  */
 export declare function supportsLanguage(lang: string): boolean
 
+/**
+ * Create one symbolic link under a retained, no-follow parent directory.
+ *
+ * The destination name is claimed with a no-replace primitive while the
+ * expected parent identity is checked against the descriptor that performs
+ * the mutation. A parent mismatch is a pre-mutation identity violation; the
+ * operation never falls back to a pathname-only symlink call.
+ */
+export declare function symlinkNoReplacePath(targetPath: string, destinationPath: string, expectedParent: NativeDirectoryParentIdentity): NativeNoReplaceResult
+
 /** Truncate many strings to a visible width, preserving ANSI codes. */
 export declare function truncateLinesToWidth(lines: Array<string>, maxWidth: number, ellipsisKind: Ellipsis | undefined | null, pad: boolean | undefined | null, tabWidth: number): Array<string>
 

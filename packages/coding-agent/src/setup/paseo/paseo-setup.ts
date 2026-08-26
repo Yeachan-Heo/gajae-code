@@ -6,6 +6,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { symlinkNoReplacePath } from "@gajae-code/natives";
 import { Settings } from "../../config/settings";
 import { checkPaseoSetup } from "./check";
 import { type CompletedStep, compensate, receiptStep, recoverIntent, runJsonStep, SagaStepError } from "./install-saga";
@@ -58,6 +59,7 @@ import {
 	installSkillsBridge,
 	inverseSkillsBridge,
 	legacySourceDirFor,
+	canonicalExistingPathForNative,
 	preflightSkillsBridge,
 	replayBridgeCleanup,
 	registerSkillsBridgeDirectory,
@@ -121,7 +123,90 @@ async function trustedBridgePathsForRecovery(deps: PaseoSetupDependencies): Prom
 			// an unauthenticated ledger path to the replay allow-list.
 		}
 	}
+	// A post-detach migration intentionally leaves the original root absent;
+	// `validatedBridgeDir` cannot authenticate that missing pathname. The
+	// pending authority is nevertheless durable proof of the exact old root and
+	// its deterministic `.removing` sibling. Admit that original path only when
+	// it agrees with the ledger's recorded bridge (or the active configured
+	// bridge), so a tampered pending record cannot broaden the replay surface.
+	const pending = ledger.bridgeCleanupPending;
+	const pendingCanonicalPath = pending === undefined ? undefined : await canonicalPathForComparison(pending.originalPath);
+	const recordedCanonicalPath =
+		ledger.bridgePath === undefined ? undefined : await canonicalPathForComparison(ledger.bridgePath);
+	const configuredCanonicalPath = await canonicalPathForComparison(deps.paths.bridgeDir);
+	if (
+		pending !== undefined &&
+		pendingCanonicalPath !== undefined &&
+		((recordedCanonicalPath !== undefined && pendingCanonicalPath === recordedCanonicalPath) ||
+			(recordedCanonicalPath === undefined && pendingCanonicalPath === configuredCanonicalPath))
+	) {
+		paths.push(pending.originalPath);
+	}
 	return [...new Set(await Promise.all(paths.map(value => canonicalPathForComparison(value))))];
+}
+
+/**
+ * Replay a pending bridge cleanup from either side of the native detach.
+ *
+ * `replayBridgeCleanup` handles the normal post-detach case, where only the
+ * inert `.removing` sibling remains. A crash can also land after old links are
+ * removed but before the native no-replace detach, leaving the original empty
+ * root live. In that pre-detach window we invoke the same identity-bound
+ * inverse with an empty result so it can perform the detach safely; the
+ * pending authority is persisted again before that native mutation.
+ */
+async function replayPendingBridgeCleanup(
+	deps: PaseoSetupDependencies,
+	authority: BridgeCleanupAuthority,
+): Promise<void> {
+	const [original, detached] = await Promise.all([
+		fs.lstat(authority.originalPath).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}),
+		fs.lstat(authority.detachedPath).catch(error => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}),
+	]);
+	if (original !== undefined && detached !== undefined) {
+		throw new SkillsBridgeError(
+			`Paseo skills bridge cleanup authority has both original and detached roots live: ${authority.originalPath}`,
+		);
+	}
+	if (original === undefined) {
+		await replayBridgeCleanup(authority);
+		return;
+	}
+	if (!original.isDirectory() || original.isSymbolicLink()) {
+		throw new SkillsBridgeError(`Paseo skills bridge pre-detach authority is not an empty directory: ${authority.originalPath}`);
+	}
+	const root = authority.snapshot.entries.find(entry => entry.relativePath === "");
+	if (root === undefined || root.kind !== "directory") {
+		throw new SkillsBridgeError(`Paseo skills bridge pre-detach authority has no root identity: ${authority.originalPath}`);
+	}
+	const ledger = await readProvenance(deps.paths.provenanceLedger);
+	await inverseSkillsBridge(
+		deps,
+		{
+			createdEntries: [],
+			prunedEntries: [],
+			adoptedEntries: [],
+			entryIdentities: {},
+			bridgeDirCreated: true,
+			bridgeDirIdentity: {
+				dev: root.dev,
+				ino: root.ino,
+				size: root.size,
+				mtimeNs: root.mtimeNs,
+			},
+			sourceDir: ledger.bridgeSourceDir ?? legacySourceDirFor(deps),
+		},
+		{
+			bridgeDir: authority.originalPath,
+			onCleanupPending: pending => persistBridgeCleanupPending(deps, pending),
+		},
+	);
 }
 
 /**
@@ -160,7 +245,7 @@ export async function runPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepe
 				repair: true,
 				expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 				expectedProvenancePath: deps.paths.provenanceLedger,
-				replayBridgeCleanup: authority => replayBridgeCleanup(authority),
+				replayBridgeCleanup: authority => replayPendingBridgeCleanup(deps, authority),
 				trustedBridgePaths: await trustedBridgePathsForRecovery(deps),
 			});
 			if (recovery && !recovery.recovered) {
@@ -237,7 +322,7 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		repair: true,
 		expectedTargetPaths: [deps.paths.configJson, deps.paths.orchestrationPreferences, deps.paths.bridgeDir],
 		expectedProvenancePath: deps.paths.provenanceLedger,
-		replayBridgeCleanup: authority => replayBridgeCleanup(authority),
+		replayBridgeCleanup: authority => replayPendingBridgeCleanup(deps, authority),
 		trustedBridgePaths: await trustedBridgePathsForRecovery(deps),
 	});
 	if (recovery && !recovery.recovered) {
@@ -1244,12 +1329,23 @@ async function restoreMigratedOldBridgeEntries(
 			};
 		}
 		let recreatedDirectory = false;
+		let activeDirectoryIdentity =
+			existingDirectory === undefined
+				? undefined
+				: {
+						dev: existingDirectory.dev.toString(),
+						ino: existingDirectory.ino.toString(),
+						size: existingDirectory.size.toString(),
+						mtimeNs: existingDirectory.mtimeNs.toString(),
+				  };
 		if (existingDirectory === undefined && bridgeDirCreated) {
 			await fs.mkdir(bridgeDir, { mode: 0o700 });
 			recreatedDirectory = true;
 		}
-		let activeDirectoryIdentity = expectedBridgeDirIdentity;
-		if (activeDirectoryIdentity === undefined && recreatedDirectory) {
+		// A removed old root is recreated with a new inode. Once that mkdir
+		// succeeds, the recreated object—not the deleted pre-cutover identity—becomes
+		// the rollback authority for every subsequent link restoration check.
+		if (recreatedDirectory) {
 			const recreated = await fs.lstat(bridgeDir, { bigint: true });
 			activeDirectoryIdentity = {
 				dev: recreated.dev.toString(),
@@ -1321,9 +1417,28 @@ async function restoreMigratedOldBridgeEntries(
 					retained: [bridgeDir],
 				};
 			}
-			// No replacement: EEXIST is a compensation conflict, and the
-			// occupant remains untouched for the operator to inspect.
-			await fs.symlink(entry.linkText, destination);
+			// No replacement: the native operation retains the expected bridge-root
+			// descriptor through the create mutation. EEXIST and a swapped root are
+			// structured pre-mutation conflicts; no pathname-only symlink fallback is
+			// permitted here.
+			if (activeDirectoryIdentity === undefined) {
+				return {
+					status: "conflict",
+					detail: `old Paseo bridge directory identity was unavailable during compensation: ${bridgeDir}`,
+					retained: [bridgeDir],
+				};
+			}
+			const created = symlinkNoReplacePath(entry.linkText, canonicalExistingPathForNative(destination), {
+				dev: BigInt(activeDirectoryIdentity.dev),
+				ino: BigInt(activeDirectoryIdentity.ino),
+			});
+			if (!created.ok) {
+				return {
+					status: "conflict",
+					detail: `old Paseo skill bridge entry could not be restored at the identity-bound mutation boundary: ${destination} (${created.code ?? created.reason})`,
+					retained: [bridgeDir],
+				};
+			}
 			const restored = await fs.lstat(destination, { bigint: true });
 			if (!restored.isSymbolicLink() || (await fs.readlink(destination)) !== entry.linkText) {
 				return {

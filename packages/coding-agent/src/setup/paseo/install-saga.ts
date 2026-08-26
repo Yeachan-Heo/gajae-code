@@ -22,6 +22,7 @@ import * as path from "node:path";
 import type { CasReceipt } from "../../config/atomic-yaml-patch";
 import {
 	currentIdentity,
+	hasNoReparseSidecarAuthority,
 	PaseoPublishError,
 	planPublish,
 	publishPlan,
@@ -180,6 +181,16 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		);
 	}
 	const plan = planPublish(current, input.mutate);
+	// Every forward JSON step requests a credential-bearing publication backup.
+	// Node cannot authenticate a no-reparse final component on Windows, so fail
+	// before writing intent or running a persist hook; otherwise a generic
+	// backup could be created and left unrecoverable after a crash.
+	if (current.exists && !plan.unchanged && !hasNoReparseSidecarAuthority()) {
+		throw new SagaStepError(
+			input.label,
+			`${input.targetPath} cannot be safely backed up on this runtime: generic publication backups require no-reparse authority; no backup or mutation was created`,
+		);
+	}
 
 	const ledgerBefore = await readProvenance(input.provenancePath);
 	const ledgerAfter = input.nextLedger(ledgerBefore);
@@ -542,6 +553,64 @@ async function bridgeLedgerMatchesFilesystem(
 	return cleanupPendingMatches();
 }
 
+/**
+ * Authenticate the narrow pre-detach window of an empty owned bridge root.
+ *
+ * The migration inverse removes the recorded links before asking the native
+ * remover to detach the now-empty root.  A crash between those two operations
+ * leaves the destination already published, the old root still at its
+ * original pathname, and a pending authority in the old provenance payload.
+ * The ordinary ledger matcher intentionally rejects that shape because a
+ * pending authority normally means the original name is gone.  This predicate
+ * proves the exceptional state instead of treating it as an inconsistency:
+ * the root and parent identities still match the durable authority, the
+ * deterministic detached sibling is absent, and the root is genuinely empty.
+ */
+async function bridgePendingPreDetachMatchesFilesystem(
+	ledger: ProvenanceLedger,
+	authority: BridgeCleanupAuthority,
+): Promise<boolean> {
+	if (
+		ledger.bridgePath === undefined ||
+		ledger.bridgeDirCreated !== true
+	)
+		return false;
+	try {
+		if ((await canonicalRecoveryPath(ledger.bridgePath)) !== (await canonicalRecoveryPath(authority.originalPath))) {
+			return false;
+		}
+		const [original, detached, parent] = await Promise.all([
+			fs.lstat(authority.originalPath, { bigint: true }),
+			fs.lstat(authority.detachedPath, { bigint: true }).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+				throw error;
+			}),
+			fs.lstat(path.dirname(authority.originalPath), { bigint: true }),
+		]);
+		if (
+			detached !== undefined ||
+			!original.isDirectory() ||
+			original.isSymbolicLink() ||
+			parent.isSymbolicLink() ||
+			!parent.isDirectory() ||
+			parent.dev !== BigInt(authority.parentIdentity.dev) ||
+			parent.ino !== BigInt(authority.parentIdentity.ino) ||
+			original.dev !== BigInt(authority.snapshot.rootDev) ||
+			original.ino !== BigInt(authority.snapshot.rootIno)
+		)
+			return false;
+		if (
+			ledger.bridgeDirIdentity !== undefined &&
+			(ledger.bridgeDirIdentity.dev !== original.dev.toString() ||
+				ledger.bridgeDirIdentity.ino !== original.ino.toString())
+		)
+			return false;
+		return (await fs.readdir(authority.originalPath)).length === 0;
+	} catch {
+		return false;
+	}
+}
+
 async function refreshBridgeLedgerIdentities(ledger: ProvenanceLedger): Promise<ProvenanceLedger> {
 	if (ledger.bridgePath === undefined) return ledger;
 	const bridgeEntryIdentities: Record<string, { dev: string; ino: string; size: string; mtimeNs: string }> = {};
@@ -674,8 +743,16 @@ export async function recoverIntent(
 			afterMatches && (ledgerObserved === intent.provenanceExpectedIdentity || ledgerObserved === settledAfter);
 		const safeSettled =
 			settledAfter !== undefined && beforeMatches && !afterMatches && ledgerObserved === settledAfter;
-		const safePendingPreDetach =
-			authenticatedPending && beforeMatches && !afterMatches;
+		const pendingPreDetachMatches =
+			authenticatedPending &&
+			before !== undefined &&
+			pendingAuthority !== undefined &&
+			(await bridgePendingPreDetachMatchesFilesystem(before, pendingAuthority));
+		const safePendingPreDetach = pendingPreDetachMatches && afterMatches;
+		// The same authenticated authority may be observed before the destination
+		// has been published. That is a valid waiting state, but not yet a
+		// forward-progress transition: retain the pre-cutover record and intent.
+		const pendingPreDetachWaiting = pendingPreDetachMatches && beforeMatches && !afterMatches;
 		const pendingOriginalPathState =
 			pendingAuthority === undefined
 				? undefined
@@ -706,6 +783,7 @@ export async function recoverIntent(
 				!safeCompleted &&
 				!safeSettled &&
 				!safePendingPreDetach &&
+				!pendingPreDetachWaiting &&
 				!safePendingPostDetach &&
 				!safeCompensationPending &&
 				!recoverableCutover &&
@@ -723,11 +801,78 @@ export async function recoverIntent(
 				detail: "an interrupted bridge migration is pending; install must repair it before setup can proceed",
 			};
 		}
-		if (safePendingPreDetach) {
+		if (pendingPreDetachWaiting) {
 			return {
 				recovered: false,
 				detail:
 					"the old Paseo bridge cleanup authority is durably recorded but detach has not committed; retaining the pre-cutover provenance and intent for a safe migration retry",
+			};
+		}
+		if (safePendingPreDetach) {
+			if (pendingAuthority === undefined || before === undefined || after === undefined) {
+				return {
+					recovered: false,
+					detail: "pre-detach bridge recovery is missing its authenticated migration payload; retaining the intent",
+				};
+			}
+			const allowedPaths = options.trustedBridgePaths ?? [intent.targetPath];
+			const [pendingCanonicalPath, ...allowedCanonicalPaths] = await Promise.all([
+				canonicalRecoveryPath(pendingAuthority.originalPath),
+				...allowedPaths.map(value => canonicalRecoveryPath(value)),
+			]);
+			if (!allowedCanonicalPaths.includes(pendingCanonicalPath)) {
+				return {
+					recovered: false,
+					detail: `the pending bridge cleanup authority is outside the intent's trusted bridge paths: ${pendingAuthority.originalPath}`,
+				};
+			}
+			const observedBeforeReplay = await currentIdentity(intent.provenancePath);
+			if (observedBeforeReplay !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: "the provenance ledger changed before pre-detach bridge replay; refusing to overwrite the newer record",
+				};
+			}
+			if (options.replayBridgeCleanup === undefined) {
+				return {
+					recovered: false,
+					detail: "pre-detach bridge cleanup needs its native replay authority; retaining the intent",
+				};
+			}
+			await options.replayBridgeCleanup(pendingAuthority);
+			if ((await currentIdentity(intent.provenancePath)) !== ledgerObserved) {
+				return {
+					recovered: false,
+					detail: "the provenance ledger changed during pre-detach bridge replay; refusing to overwrite the newer record",
+				};
+			}
+			const [originalAfterReplay, detachedAfterReplay] = await Promise.all([
+				fs.lstat(pendingAuthority.originalPath).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}),
+				fs.lstat(pendingAuthority.detachedPath).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}),
+			]);
+			if (originalAfterReplay !== undefined || detachedAfterReplay !== undefined) {
+				return {
+					recovered: false,
+					detail: "pre-detach bridge cleanup remains pending; retaining the destination provenance and intent",
+				};
+			}
+			if (!(await bridgeLedgerMatchesFilesystem(after, before, intent.targetPath))) {
+				return {
+					recovered: false,
+					detail: "the destination bridge changed during pre-detach cleanup; retaining the destination provenance and intent",
+				};
+			}
+			await writeProvenance(intent.provenancePath, { ...after, bridgeCleanupPending: undefined });
+			await clearIntent(intentPath);
+			return {
+				recovered: true,
+				detail: "the interrupted bridge migration completed its pre-detach cleanup and committed destination provenance",
 			};
 		}
 		let pendingReplayed = false;

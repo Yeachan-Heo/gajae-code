@@ -12,6 +12,7 @@ import {
 	exactUnlink,
 	exactUnlinkDirect,
 	snapshotDirectoryTree,
+	symlinkNoReplacePath,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
 
@@ -177,6 +178,43 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			}),
 		).toEqual({ ok: false, code: "identity_mismatch" });
 		expect(await fs.readFile(file, "utf8")).toBe("replacement");
+	});
+
+	it("binds symbolic-link creation to the expected parent identity", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const other = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(other);
+		const target = path.join(root, "target");
+		const destination = path.join(root, "published");
+		await fs.writeFile(target, "target");
+		const wrongParent = await fs.stat(other, { bigint: true });
+
+		const rejected = symlinkNoReplacePath(target, destination, {
+			dev: wrongParent.dev,
+			ino: wrongParent.ino,
+		});
+		expect(rejected).toMatchObject({
+			ok: false,
+			code: "parent_mismatch",
+			mutationState: "not_committed",
+			reason: "identity_violation",
+			primitive: "symlinkat_noreplace",
+		});
+		await expect(fs.lstat(destination)).rejects.toMatchObject({ code: "ENOENT" });
+
+		const parent = await fs.stat(root, { bigint: true });
+		const created = symlinkNoReplacePath(target, destination, {
+			dev: parent.dev,
+			ino: parent.ino,
+		});
+		expect(created).toMatchObject({
+			ok: true,
+			mutationState: "committed",
+			reason: "none",
+			primitive: "symlinkat_noreplace",
+		});
+		expect(await fs.readlink(destination)).toBe(target);
 	});
 
 	it("directly removes one authorized regular file without leaving exchange debris", async () => {
