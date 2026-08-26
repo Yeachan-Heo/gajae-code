@@ -590,7 +590,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	readonly strict = true;
 	readonly loadMode = "discoverable";
 	readonly renderResult = renderResult;
-	readonly #discoveredAgents: AgentDefinition[];
+	#discoveredAgents: AgentDefinition[];
 	readonly #blockedAgent: string | undefined;
 	/**
 	 * Session-lifetime durable artifact state is shared atomically by every
@@ -933,6 +933,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		const paramsWithBindings: TaskParams = { ...params, tasks: taskItems };
 		if (taskItems.length === 0) {
 			return this.#executeSync(_toolCallId, paramsWithBindings, signal, onUpdate);
+		}
+		try {
+			const refreshed = await discoverAgents(
+				this.session.cwd,
+				undefined,
+				this.session.settings,
+				this.session.getSessionAgentDir?.(),
+			);
+			this.#discoveredAgents = refreshed.agents;
+		} catch (error) {
+			return createTaskModeError(
+				`Task agent discovery failed before execution: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 		const agent = getAgent(this.#discoveredAgents, params.agent);
 		if (!agent) {

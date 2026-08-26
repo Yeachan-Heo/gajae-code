@@ -9697,16 +9697,21 @@ mod platform {
 		if file_mode == 0o600 {
 			let sid = match current_user_sid() {
 				Ok(sid) => sid,
-				Err(()) => return NativeSecureSkillWriteResult::failure("acl_unavailable"),
+				Err(()) => {
+					unsafe { CloseHandle(skill_handle) };
+					return NativeSecureSkillWriteResult::failure("acl_unavailable");
+				},
 			};
 			let root_applied = set_owner_only_acl(skills.target, "directory", &sid, true);
 			if !root_applied.ok {
+				unsafe { CloseHandle(skill_handle) };
 				return NativeSecureSkillWriteResult::failure(
 					root_applied.code.as_deref().unwrap_or("acl_apply_failed"),
 				);
 			}
 			let applied = set_owner_only_acl(skill_handle, "directory", &sid, true);
 			if !applied.ok {
+				unsafe { CloseHandle(skill_handle) };
 				return NativeSecureSkillWriteResult::failure(
 					applied.code.as_deref().unwrap_or("acl_apply_failed"),
 				);
