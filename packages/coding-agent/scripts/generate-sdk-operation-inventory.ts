@@ -79,6 +79,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:setForcedToolChoice": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillState": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getActiveSkillPhase": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:isExplicitEmptyToolSelection":
+		"internal tool-selection predicate used to preserve the --no-tools boundary, not a user-facing SDK control seam",
 	"agent_session:getEffectiveActiveWorkflowSkillState":
 		"internal restored-or-live workflow guard for session rescope, not a user-facing SDK control seam",
 	"agent_session:replaceOwnedMcpManager":
