@@ -260,6 +260,8 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 		// recovery so a durable sidecar is not discarded as if the step committed.
 		if (publishSucceeded) {
 			let reverted = false;
+			let rollbackFailed = false;
+			const rollbackRetained: string[] = [];
 			try {
 				const observed = await currentIdentity(input.targetPath);
 				if (observed === plan.expectedIdentity) {
@@ -280,17 +282,39 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				// the next run's recovery classification and the persisted
 				// artifact must stay (the intent's ledger payload still
 				// references it). reverted stays false on this path.
-			} catch {
+			} catch (rollbackError) {
 				reverted = false;
+				rollbackFailed = true;
+				if (rollbackError instanceof PaseoPublishError) rollbackRetained.push(...rollbackError.retained);
 			}
+			if (!reverted) rollbackFailed = true;
 			if (reverted) {
 				// Any ATTEMPTED persist may have created the artifact before
 				// throwing (#4644 review r14): cleanup removes it whether or
 				// not the hook resolved, so no credential-bearing sidecar is
 				// ever left unreferenced.
-				if (persistAttempted && input.unpersist) await input.unpersist();
-				await clearIntent(input.intentPath);
+				try {
+					if (persistAttempted && input.unpersist) await input.unpersist();
+					await clearIntent(input.intentPath);
+				} catch (cleanupError) {
+					rollbackFailed = true;
+					rollbackRetained.push(input.intentPath, ...(backupPath ? [backupPath] : []));
+					if (cleanupError instanceof PaseoPublishError) rollbackRetained.push(...cleanupError.retained);
+				}
 			}
+			if (rollbackFailed) rollbackRetained.push(input.targetPath, input.provenancePath);
+			const retained = [
+				input.intentPath,
+				...(backupPath ? [backupPath] : []),
+				...(error instanceof PaseoPublishError ? error.retained : []),
+				...rollbackRetained,
+			];
+			const message = rollbackFailed
+				? `${error instanceof Error ? error.message : String(error)}; target rollback or cleanup remains unresolved`
+				: error instanceof Error
+					? error.message
+					: String(error);
+			throw new SagaStepError(input.label, message, retained, rollbackFailed || retained.length > 0);
 		}
 		throw new SagaStepError(
 			input.label,
