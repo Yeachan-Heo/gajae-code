@@ -352,15 +352,7 @@ export async function publishPlan(
 	} finally {
 		if (!tempRetained && !tempConsumed && tempIdentity !== undefined) {
 			if (!(await removePrivateBackupByIdentity(tempPath, tempIdentity))) {
-				throw new PaseoPublishError(
-					targetPath,
-					{
-						reason: "cas-conflict",
-						expected: options.expectedIdentity,
-						actual: await currentIdentity(targetPath),
-					},
-					[tempPath],
-				);
+				tempRetained = true;
 			}
 		}
 	}
