@@ -510,7 +510,12 @@ describe("BashTool ACP terminal fold", () => {
 		const controller = new AbortController();
 		const tool = new BashTool(h.session);
 
-		const pending = tool.execute("call-late-abort", { command: "sleep 30", timeout: 30 }, controller.signal, () => {});
+		const pending = tool.execute(
+			"call-late-abort",
+			{ command: "sleep 30", timeout: 30 },
+			controller.signal,
+			() => {},
+		);
 		await waitFor(() => createSpy.mock.calls.length === 1);
 		controller.abort();
 		await expect(pending).rejects.toThrow("Command aborted");
