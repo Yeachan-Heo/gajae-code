@@ -947,7 +947,12 @@ async function handlePiNative(
 	// trust the client's options (already allow-listed by `parseRequest`) and
 	// only inject server-controlled fields. The OpenAI code backend temperature/topP strip
 	// matches `buildStreamOptions` — OpenAI code backend rejects them with a 400.
-	const streamOpts: SimpleStreamOptions = { ...parsed.options, signal: controller.signal };
+	const streamOpts: SimpleStreamOptions = {
+		...parsed.options,
+		signal: controller.signal,
+		requestMaxRetries: 0,
+		streamMaxRetries: 0,
+	};
 	if (streamOpts.fallbackManaged) {
 		streamOpts.fallbackAttempt = beginAttempt(model.id, "auth-gateway-pi-native");
 	} else {

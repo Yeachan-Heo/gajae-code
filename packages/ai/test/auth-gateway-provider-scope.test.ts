@@ -1043,6 +1043,8 @@ describe("provider-scoped auth-gateway cancellation", () => {
 			api,
 			(_model, _context, options) => {
 				if (options?.signal) signalSeen.resolve(options.signal);
+				expect(options?.requestMaxRetries).toBe(0);
+				expect(options?.streamMaxRetries).toBe(0);
 				return makeHangingEventStream(options?.signal, {
 					role: "assistant",
 					api,
