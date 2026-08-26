@@ -1985,7 +1985,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 										if (!ptyBackgrounded) ptyManager.cancel(ptyJobId);
 									}
 								},
-								{ ownerId: this.session.getAgentId?.() ?? undefined, admissionToken: ptyAdmission },
+								{
+									ownerId: this.session.getAgentId?.() ?? undefined,
+									admissionToken: ptyAdmission,
+									lifecycle: { onCancel: () => controls.kill() },
+								},
 							);
 						} catch (error) {
 							controls.kill();
