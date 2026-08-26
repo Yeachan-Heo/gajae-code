@@ -2868,7 +2868,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					// Anthropic and non-CPA proxies are untouched.
 					const cpaAliasFailure = parseCpaToolAliasRestoreFailure(streamFailure);
 					if (cpaAliasFailure && firstTokenTime === undefined) {
-						if (options?.fallbackManaged) {
+						if (options?.fallbackManaged || options?.disableProviderRetries) {
 							// The managed fallback controller owns retries: never retry
 							// inside the attempt it handed us. Record the corrective
 							// steering against this exact turn and surface the raw error;
