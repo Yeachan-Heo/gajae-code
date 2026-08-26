@@ -5048,7 +5048,10 @@ export class AgentSession {
 	 * and committed-degraded behavior; the host participant only rebinds its
 	 * cwd-derived authority before and after the durable move.
 	 */
-	async rescopeSessionCwd(target: string): Promise<{ from: string; to: string }> {
+	async rescopeSessionCwd(
+		target: string,
+		options: { scope?: "any" | "descendant" } = {},
+	): Promise<{ from: string; to: string }> {
 		const participant = this.#rescopeSessionCwdParticipant;
 		if (!participant) {
 			throw new Error(
@@ -5090,7 +5093,10 @@ export class AgentSession {
 			if (relative === "") {
 				throw new Error(`Target ${canonicalTarget} is the current session directory; nothing to move.`);
 			}
-			if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			if (
+				options.scope !== "any" &&
+				(relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative))
+			) {
 				throw new Error(
 					`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
 				);

@@ -402,7 +402,7 @@ export class ExtensionUiController {
 					});
 				}
 				try {
-					await rescopeSessionCwd.call(session, String(input.path));
+					await rescopeSessionCwd.call(session, String(input.path), { scope: "any" });
 				} catch (error) {
 					if (
 						error instanceof Error &&

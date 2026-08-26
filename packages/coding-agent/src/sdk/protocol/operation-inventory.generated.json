@@ -2560,6 +2560,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:rescopeSessionCwd",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal relocation transaction invoked by trusted ingress adapters; not a standalone SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:replaceOwnedMcpManager",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

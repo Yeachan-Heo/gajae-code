@@ -2171,7 +2171,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			if (!isDirectory) return usage(`Directory does not exist or is not a directory: ${resolvedPath}`, runtime);
 			try {
-				await runtime.session.rescopeSessionCwd(resolvedPath);
+				await runtime.session.rescopeSessionCwd(resolvedPath, { scope: "any" });
 			} catch (err) {
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}

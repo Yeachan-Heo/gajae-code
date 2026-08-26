@@ -1159,7 +1159,7 @@ export class CommandController {
 		}
 
 		try {
-			await this.ctx.session.rescopeSessionCwd(resolvedPath);
+			await this.ctx.session.rescopeSessionCwd(resolvedPath, { scope: "any" });
 			await this.ctx.refreshSlashCommandState(resolvedPath);
 
 			this.ctx.statusLine.invalidate();
