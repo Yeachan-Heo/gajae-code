@@ -4618,6 +4618,13 @@ pub(crate) mod platform {
 					return Err(code);
 				},
 			};
+			if let Err(code) = fsync_root_parent(current) {
+				unsafe {
+					libc::close(next);
+					libc::close(current);
+				}
+				return Err(code);
+			}
 			unsafe { libc::close(current) };
 			current = next;
 			canonical.push(segment);
@@ -4893,6 +4900,24 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		};
+		#[cfg(target_os = "linux")]
+		if let Err(code) = secure_created_owner_only_file(&file) {
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure(code);
+		}
+		#[cfg(target_os = "macos")]
+		if clear_and_verify_macos_acl(file.as_raw_fd()).is_err() {
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("acl_verify_failed");
+		}
 		if file.write_all(content.as_bytes()).is_err() {
 			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 			drop(file);
@@ -4922,38 +4947,6 @@ pub(crate) mod platform {
 				libc::close(skills_fd);
 			}
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
-		}
-		#[cfg(target_os = "linux")]
-		{
-			let published_path = canonical_root.join(&skill_name).join("SKILL.md");
-			let applied = apply_owner_only_fd_security(&published_path, "file", private_fd);
-			if !applied.ok {
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(
-					applied.code.as_deref().unwrap_or("acl_apply_failed"),
-				);
-			}
-			let verified = verify_owner_only_fd_security(&published_path, "file", private_fd);
-			if !verified.ok {
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(
-					verified.code.as_deref().unwrap_or("acl_verify_failed"),
-				);
-			}
-		}
-		#[cfg(target_os = "macos")]
-		if clear_and_verify_macos_acl(private_fd).is_err() {
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure("acl_verify_failed");
 		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
 			unsafe {
