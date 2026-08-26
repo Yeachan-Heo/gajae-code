@@ -475,6 +475,10 @@ class DirResolver {
 		this.refreshCategoryDirs(snapshot, isDefault);
 	}
 
+	get profileAuthority(): "default" | "custom" {
+		return this.#xdgEligible ? "default" : "custom";
+	}
+
 	/**
 	 * `isDefault` decides whether the agent directory may follow `$XDG_*_HOME`.
 	 *
@@ -652,6 +656,11 @@ export function getAgentDir(): string {
 	dirs.refreshConfigDirOverride();
 	dirs.assertHomeAvailable();
 	return dirs.agentDir;
+}
+
+/** Resolver-owned profile classification, stable across HOME refreshes. */
+export function getAgentProfileAuthority(): "default" | "custom" {
+	return dirs.profileAuthority;
 }
 
 export function getConfigDirName(): string {

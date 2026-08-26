@@ -348,7 +348,10 @@ describe("listClaudePluginRoots", () => {
 			"---\nname: manifest-skill\ndescription: Manifest skill\n---\nBody\n",
 		);
 
-		const result = await loadCapability<Skill>("skills", { cwd: tempDir });
+		const result = await loadCapability<Skill>("skills", {
+			cwd: tempDir,
+			agentDir: path.join(tempDir, ".gjc", "agent"),
+		});
 		expect(result.warnings).toEqual([]);
 		expect(result.all.length).toBeGreaterThan(0);
 		const found = result.all.find(skill => skill.name === "manifest-skills:manifest-skill");
@@ -386,7 +389,10 @@ describe("listClaudePluginRoots", () => {
 		);
 		await fs.writeFile(path.join(pluginPath, ".claude", "commands", "ship.md"), "Ship it\n");
 
-		const result = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
+		const result = await loadCapability<SlashCommand>("slash-commands", {
+			cwd: tempDir,
+			agentDir: path.join(tempDir, ".gjc", "agent"),
+		});
 		expect(result.warnings).toEqual([]);
 		expect(result.all.length).toBeGreaterThan(0);
 		const found = result.all.find(command => command.name === "manifest-commands:ship");
@@ -424,7 +430,10 @@ describe("listClaudePluginRoots", () => {
 		);
 		await fs.writeFile(path.join(pluginPath, ".claude", "commands", "plan.md"), "Plan it\n");
 
-		const result = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
+		const result = await loadCapability<SlashCommand>("slash-commands", {
+			cwd: tempDir,
+			agentDir: path.join(tempDir, ".gjc", "agent"),
+		});
 		expect(result.warnings).toEqual([]);
 		const found = result.all.find(command => command.name === "manifest-commands-key:plan");
 
@@ -465,7 +474,10 @@ describe("listClaudePluginRoots", () => {
 		// This file exists only under the legacy dir — should NOT be found
 		await fs.writeFile(path.join(pluginPath, "legacy-commands", "old.md"), "Old\n");
 
-		const result = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
+		const result = await loadCapability<SlashCommand>("slash-commands", {
+			cwd: tempDir,
+			agentDir: path.join(tempDir, ".gjc", "agent"),
+		});
 		expect(result.warnings).toEqual([]);
 		const found = result.all.find(command => command.name === "manifest-commands-precedence:ship");
 		const notFound = result.all.find(command => command.name === "manifest-commands-precedence:old");
@@ -506,7 +518,10 @@ describe("listClaudePluginRoots", () => {
 			"---\nname: outside-skill\ndescription: Outside skill\n---\nBody\n",
 		);
 
-		const result = await loadCapability<Skill>("skills", { cwd: tempDir });
+		const result = await loadCapability<Skill>("skills", {
+			cwd: tempDir,
+			agentDir: path.join(tempDir, ".gjc", "agent"),
+		});
 		expect(result.warnings[0]).toContain("Ignoring skills path outside plugin root");
 		const found = result.all.find(skill => skill.name === "manifest-skills-outside:outside-skill");
 
@@ -543,7 +558,10 @@ describe("listClaudePluginRoots", () => {
 		);
 		await fs.writeFile(path.join(outsideDir, "ship.md"), "Ship it\n");
 
-		const result = await loadCapability<SlashCommand>("slash-commands", { cwd: tempDir });
+		const result = await loadCapability<SlashCommand>("slash-commands", {
+			cwd: tempDir,
+			agentDir: path.join(tempDir, ".gjc", "agent"),
+		});
 		expect(result.warnings[0]).toContain("Ignoring slash-commands path outside plugin root");
 		const found = result.all.find(command => command.name === "manifest-commands-outside:ship");
 
