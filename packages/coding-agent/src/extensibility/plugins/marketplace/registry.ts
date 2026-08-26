@@ -30,11 +30,18 @@ export function getProfilePluginsDir(agentDir?: string): string {
 	if (!agentDir) return getPluginsDir();
 	const defaultAgentDir = path.join(getConfigRootDir(), "agent");
 	if (path.resolve(agentDir) === path.resolve(defaultAgentDir)) return getPluginsDir();
-	return path.join(path.dirname(agentDir), "plugins");
+	return path.join(agentDir, "plugins");
 }
 
 export function getMarketplacesRegistryPath(agentDir?: string): string {
-	return path.join(agentDir ? path.dirname(agentDir) : getConfigRootDir(), "marketplaces.json");
+	return path.join(
+		agentDir
+			? path.resolve(agentDir) === path.resolve(path.join(getConfigRootDir(), "agent"))
+				? getConfigRootDir()
+				: agentDir
+			: getConfigRootDir(),
+		"marketplaces.json",
+	);
 }
 
 export function getInstalledPluginsRegistryPath(agentDir?: string): string {
