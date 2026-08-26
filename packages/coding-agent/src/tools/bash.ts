@@ -1533,30 +1533,33 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw error;
 			}
 
+			// The remote terminal is released exactly once, by whichever path settles
+			// it: a foreground return, a folded background completion, or a failure.
+			let released = false;
+			const runBoundedCleanup = async (operation: () => Promise<void>, label: "kill" | "release"): Promise<void> => {
+				const attempt = operation().catch((error: unknown) => {
+					logger.warn(`ACP terminal ${label} failed`, { terminalId: handle.terminalId, error });
+				});
+				const completed = await Promise.race([
+					attempt.then(() => true),
+					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
+				]);
+				if (!completed) logger.warn(`ACP terminal ${label} timed out`, { terminalId: handle.terminalId });
+			};
+			const releaseTerminalOnce = async (): Promise<void> => {
+				if (released) return;
+				released = true;
+				await runBoundedCleanup(() => handle.release(), "release");
+			};
+
 			// Emit partial update so the editor can embed the live terminal card.
 			try {
 				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
 			} catch (error) {
-				await Promise.allSettled([handle.kill(), handle.release()]);
+				await Promise.all([runBoundedCleanup(() => handle.kill(), "kill"), releaseTerminalOnce()]);
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
 			}
-
-			// The remote terminal is released exactly once, by whichever path settles
-			// it: a foreground return, a folded background completion, or a failure.
-			let released = false;
-			const releaseTerminalOnce = async (): Promise<void> => {
-				if (released) return;
-				released = true;
-				const releaseAttempt = handle.release().catch((error: unknown) => {
-					logger.warn("ACP terminal release failed", { terminalId: handle.terminalId, error });
-				});
-				const completed = await Promise.race([
-					releaseAttempt.then(() => true),
-					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
-				]);
-				if (!completed) logger.warn("ACP terminal release timed out", { terminalId: handle.terminalId });
-			};
 			let latestText = "";
 			let bridgeJobId!: string;
 			let retainedAcpSnapshot = "";

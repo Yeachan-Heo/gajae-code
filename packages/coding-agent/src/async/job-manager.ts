@@ -292,6 +292,7 @@ interface EvictedDeadLetteredDelivery {
 	jobId: string;
 	generation: string;
 	ownerId?: string;
+	backgrounded: boolean;
 	attempt: number;
 	lastError?: string;
 	recordedAt: number;
@@ -316,6 +317,8 @@ export interface DeadLetteredJobSnapshotEntry {
 	jobId: string;
 	generation: string;
 	ownerId?: string;
+	/** Whether the failed delivery originated from a backgrounded job. */
+	backgrounded?: boolean;
 	attempt: number;
 	lastError?: string;
 	recordedAt: number;
@@ -2264,10 +2267,12 @@ export class AsyncJobManager {
 		for (const entry of this.#deadLetteredDeliveries.values()) {
 			const entryOwner = this.#deadLetteredDeliveryOwners.get(entry.jobId);
 			if (ownerId && entryOwner !== ownerId) continue;
+			const currentJob = this.#jobs.get(entry.jobId);
 			deadLettered.push({
 				jobId: entry.jobId,
 				generation: entry.generation,
 				ownerId: entryOwner,
+				backgrounded: currentJob?.generation === entry.generation && currentJob.metadata?.backgrounded === true,
 				attempt: entry.attempt,
 				lastError: entry.lastError,
 				recordedAt: Date.now(),
@@ -2791,6 +2796,7 @@ export class AsyncJobManager {
 			jobId: delivery.jobId,
 			generation: delivery.generation,
 			ownerId: delivery.ownerId,
+			backgrounded: delivery.job.metadata?.backgrounded === true,
 			attempt: delivery.attempt,
 			lastError: delivery.lastError,
 			recordedAt: Date.now(),

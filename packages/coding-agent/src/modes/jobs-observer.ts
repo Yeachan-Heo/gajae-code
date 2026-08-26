@@ -34,6 +34,7 @@ export interface DeadLetteredJobSnapshotEntry {
 	jobId: string;
 	generation: string;
 	ownerId?: string;
+	backgrounded?: boolean;
 	attempt: number;
 	lastError?: string;
 	recordedAt: number;
@@ -236,7 +237,7 @@ export class JobsObserver {
 				label: entry.jobId,
 				status: "failed",
 				generation: entry.generation,
-				backgrounded: true,
+				backgrounded: entry.backgrounded === true,
 				deliveryState: "failed-visible",
 				errorText: entry.lastError,
 			});

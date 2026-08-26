@@ -198,4 +198,26 @@ describe("BashTool ACP terminal fold", () => {
 		expect(createSpy).toHaveBeenCalledTimes(1);
 		expect(result.details?.terminalId).toBe("term-route");
 	});
+
+	it("returns an update error when post-create ACP cleanup never settles", async () => {
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-update-error",
+			waitForExit: async () => ({ exitCode: 0, signal: null }),
+			currentOutput: async () => ({ output: "", truncated: false }),
+			kill: async () => await new Promise<void>(() => {}),
+			release: async () => await new Promise<void>(() => {}),
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool(h.session);
+		const startedAt = Date.now();
+
+		await expect(
+			tool.execute("call-update-error", { command: "sleep 30" }, undefined, () => {
+				throw new Error("editor update failed");
+			}),
+		).rejects.toThrow("editor update failed");
+		expect(Date.now() - startedAt).toBeLessThan(2_500);
+		expect(h.manager.getJobsSnapshot().jobs).toHaveLength(0);
+	});
 });

@@ -92,9 +92,18 @@ describe("folded jobs surfacing", () => {
 				{
 					jobId: "evicted-failed",
 					generation: "generation-4",
+					backgrounded: true,
 					attempt: 3,
 					lastError: "delivery\tfailed",
 					recordedAt: 1,
+				},
+				{
+					jobId: "evicted-ordinary",
+					generation: "generation-ordinary-evicted",
+					backgrounded: false,
+					attempt: 3,
+					lastError: "ordinary delivery failed",
+					recordedAt: 2,
 				},
 			],
 		};
@@ -108,6 +117,7 @@ describe("folded jobs surfacing", () => {
 			"delivered-folded",
 			"ordinary-failed",
 			"evicted-failed",
+			"evicted-ordinary",
 		]);
 		// The observer preserves the manager's contradictory-but-authoritative
 		// state instead of deriving delivery from status or dead-letter presence.
@@ -119,8 +129,8 @@ describe("folded jobs surfacing", () => {
 
 		const items = buildJobsListItems(observed);
 		const foldedItems = items.filter(item => item.value.startsWith("folded:"));
-		expect(foldedItems).toHaveLength(5);
-		expect(new Set(foldedItems.map(item => item.value)).size).toBe(5);
+		expect(foldedItems).toHaveLength(6);
+		expect(new Set(foldedItems.map(item => item.value)).size).toBe(6);
 		const failedItem = foldedItems.find(item => item.value.startsWith("folded:folded-failed:"));
 		expect(failedItem).toMatchObject({
 			description: "failed-visible",
