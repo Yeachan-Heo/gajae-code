@@ -642,8 +642,11 @@ export async function recoverIntent(
 			const currentLedger = await readProvenance(intent.provenancePath);
 			const currentPending = currentLedger.bridgeCleanupPending;
 			if (currentPending === undefined && settledAfter !== undefined && ledgerObserved === settledAfter) {
-				await clearIntent(intentPath);
-				return { recovered: true, detail: "the pending bridge cleanup already settled before intent clearance" };
+				return {
+					recovered: false,
+					detail:
+						"pending bridge intent has no durable cleanup authority; retaining it instead of assuming detach completed",
+				};
 			}
 			if (
 				currentPending === undefined ||
@@ -652,6 +655,23 @@ export async function recoverIntent(
 				return {
 					recovered: false,
 					detail: `the durable pending bridge cleanup authority changed before replay; refusing to overwrite it`,
+				};
+			}
+			const [originalPathState, detachedPathState] = await Promise.all([
+				fs.lstat(currentPending.originalPath).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}),
+				fs.lstat(currentPending.detachedPath).catch(error => {
+					if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+					throw error;
+				}),
+			]);
+			if (originalPathState !== undefined || detachedPathState === undefined) {
+				return {
+					recovered: false,
+					detail:
+						"pending bridge cleanup has not proven detach; retaining the intent for lifecycle-specific retry",
 				};
 			}
 			const allowedPaths = options.trustedBridgePaths ?? [intent.targetPath];
