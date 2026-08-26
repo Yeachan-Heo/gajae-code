@@ -91,17 +91,25 @@ describe("atomic YAML patches", () => {
 		expect(await readYaml(configPath)).toEqual({ feature: { enabled: true } });
 	});
 
-	test("reclaims a stale lock with malformed owner metadata", async () => {
-		const configPath = await configPathForTest();
-		const lockPath = `${configPath}.lock`;
-		await fs.mkdir(lockPath);
-		await fs.writeFile(path.join(lockPath, "info"), JSON.stringify({ pid: 0, timestamp: "invalid" }));
-		const staleAt = new Date(Date.now() - 20_000);
-		await fs.utimes(lockPath, staleAt, staleAt);
+	test(
+		"fails closed on a stale lock with malformed owner metadata",
+		async () => {
+			const configPath = await configPathForTest();
+			const lockPath = `${configPath}.lock`;
+			await fs.mkdir(lockPath);
+			await fs.writeFile(path.join(lockPath, "info"), JSON.stringify({ pid: 0, timestamp: "invalid" }));
+			const staleAt = new Date(Date.now() - 20_000);
+			await fs.utimes(lockPath, staleAt, staleAt);
 
-		await applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: true }]);
-		expect(await readYaml(configPath)).toEqual({ feature: { enabled: true } });
-	});
+			await expect(
+				applyAtomicYamlPatches(configPath, [{ path: "feature.enabled", op: "set", value: true }]),
+			).rejects.toThrow("Failed to acquire lock");
+			expect(await fs.readFile(path.join(lockPath, "info"), "utf8")).toBe(
+				JSON.stringify({ pid: 0, timestamp: "invalid" }),
+			);
+		},
+		{ timeout: 10_000 },
+	);
 
 	test("rejects an expected-hash write after another writer wins", async () => {
 		const configPath = await configPathForTest();
