@@ -85,7 +85,7 @@ describe("Anthropic ASCII-escaped non-ASCII tool arguments", () => {
 		const [tool] = toolCalls(result);
 
 		expect(tool?.arguments).toEqual({ question: "마지막 병목" });
-		expect(tool?.escapedNonAsciiArguments).toBeFalsy();
+		expect(tool?.escapedNonAsciiArguments).toBeUndefined();
 		expect(tool?.escapedUnicodeArgumentEvidence).toBeUndefined();
 		expect(tool && "partialJson" in tool).toBe(false);
 	});
@@ -95,20 +95,31 @@ describe("Anthropic ASCII-escaped non-ASCII tool arguments", () => {
 		const [tool] = toolCalls(result);
 
 		expect(tool?.arguments).toEqual({ question: "w &" });
-		expect(tool?.escapedNonAsciiArguments).toBeFalsy();
+		expect(tool?.escapedNonAsciiArguments).toBeUndefined();
 		expect(tool?.escapedUnicodeArgumentEvidence).toBeUndefined();
+	});
+
+	it("retains non-enumerable guard evidence for an unpaired surrogate", async () => {
+		const result = await run(script(String.raw`{"question":"\ud83d"}`));
+		const [tool] = toolCalls(result);
+
+		expect(tool?.arguments).toEqual({ question: String.fromCharCode(0xd83d) });
+		expect(tool?.escapedNonAsciiArguments).toBe(true);
+		expect(tool?.escapedUnicodeArgumentEvidence).toMatchObject({ malformed: true });
+		expect(JSON.stringify(tool)).not.toContain("escapedUnicodeArgumentEvidence");
+		expect(tool ? Object.keys(tool) : []).not.toContain("escapedUnicodeArgumentEvidence");
 	});
 
 	it("does not flag literal UTF-8 arguments", async () => {
 		const result = await run(script('{"question":"마지막 병목"}'));
 
-		expect(toolCalls(result)[0]?.escapedNonAsciiArguments).toBeFalsy();
+		expect(toolCalls(result)[0]?.escapedNonAsciiArguments).toBeUndefined();
 	});
 
 	it("does not flag an escaped backslash that is the written source text", async () => {
 		const result = await run(script(String.raw`{"question":"if c == \\uac00:"}`));
 
 		expect(toolCalls(result)[0]?.arguments).toEqual({ question: String.raw`if c == \uac00:` });
-		expect(toolCalls(result)[0]?.escapedNonAsciiArguments).toBeFalsy();
+		expect(toolCalls(result)[0]?.escapedNonAsciiArguments).toBeUndefined();
 	});
 });

@@ -6,7 +6,7 @@
 
 ### Fixed
 
-- Valid JSON `\uXXXX` tool arguments now execute as their canonical decoded strings instead of entering the escaped-non-ASCII resample loop. Provider adapters retain guard metadata only for malformed JSON, duplicate/deep evidence, and unpaired UTF-16 surrogates, so those cases remain fail-closed while standard escaped Hangul, emoji surrogate pairs, and printable ASCII no longer consume retries or terminate managed runs.
+- Valid JSON `\uXXXX` tool arguments now execute as their canonical decoded strings instead of entering the escaped-non-ASCII resample loop. This intentionally treats every syntactically valid decoded scalar as canonical; runtime validation cannot infer whether a valid hex digit differed from the model's intent. Provider adapters retain guard metadata for malformed escape-bearing JSON, duplicate/deep suspicious escape evidence, and unpaired UTF-16 surrogates, while standard escaped Hangul, emoji surrogate pairs, and printable ASCII no longer consume retries or terminate managed runs.
 - Explicit positive `maxTokens` values declared for custom `models.yml` models
   and model overrides now reach the provider request across the shared stream
   mapping (`max_tokens`, `max_completion_tokens`, and `max_output_tokens`).

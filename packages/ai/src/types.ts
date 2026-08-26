@@ -620,31 +620,22 @@ export interface ToolCall {
 	 */
 	incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 	/**
-	 * Set when the raw argument JSON spelled a printable character as a `\uXXXX`
-	 * escape instead of a literal character. This includes ASCII landings because
-	 * a one-nibble mutation can move an intended non-ASCII scalar below U+0080.
-	 * Such a payload parses cleanly but
-	 * is unverifiable: one mistyped hex digit decodes to a different, equally
-	 * valid character, so the text can be silently wrong with no in-band evidence.
-	 * The agent loop resamples the turn a bounded number of times and then
-	 * rejects the call instead of executing it. The single bounded exception
-	 * is a tool that enumerated its display-only fields
-	 * (`displaySafeEscapedArgFields`): when every escaped scalar corroborates
-	 * a decoded non-ASCII character inside those fields, the call executes
-	 * with a warning instead — rendered question text, never executable
-	 * content, ids, or durable metadata.
-	 * Escapes that are required (control characters) or unavoidable (lone
-	 * surrogates) never set this.
+	 * Set by current producers when raw argument JSON carries unsafe Unicode
+	 * data, such as malformed escape evidence or a decoded unpaired surrogate.
+	 * Valid JSON `\uXXXX` escapes are canonical spellings of the decoded string
+	 * and current producers do not set this flag for them.
+	 *
+	 * Legacy producers may still set the flag for any escaped non-ASCII spelling.
+	 * The agent loop keeps its bounded legacy resample/display-safe behavior for
+	 * those calls while consuming the transient evidence below.
 	 */
 	escapedNonAsciiArguments?: boolean;
 	/**
-	 * Bounded, payload-free evidence for the original raw escape positions and
-	 * process-keyed scalar/path identities. Required for the display-safe terminal exemption: decoded values
-	 * alone cannot prove that an ASCII landing such as `\u0077` was not a
-	 * one-nibble mutation of a non-ASCII escape. Presence of this evidence implies
-	 * the guarded state even if a legacy producer omitted
-	 * `escapedNonAsciiArguments`. The agent consumes and removes this transient
-	 * field before the tool-call message can become durable.
+	 * Bounded, payload-free evidence for raw Unicode argument data. Current
+	 * producers attach it only for unsafe data; legacy producers may attach
+	 * non-malformed positional evidence used by the display-safe compatibility
+	 * path. The agent consumes and removes this transient field before the
+	 * tool-call message can become durable.
 	 */
 	escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 }

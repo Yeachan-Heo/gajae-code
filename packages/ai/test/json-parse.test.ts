@@ -220,6 +220,7 @@ describe("findUnnecessaryUnicodeEscape", () => {
 		["Hangul", String.raw`{"q":"\ub9c8\uc9c0\ub9c9 \ubcd1\ubaa9"}`],
 		["emoji surrogate pair", String.raw`{"q":"\ud83d\ude00"}`],
 		["printable ASCII", String.raw`{"q":"\u0077"}`],
+		["valid one-nibble-different scalar", String.raw`{"q":"\ub123"}`],
 		["escaped source syntax", String.raw`{"q":"\\u2014"}`],
 	])("treats valid JSON escapes as canonical decoded arguments: %s", (_label, raw) => {
 		expect(collectUnsafeUnicodeEscapeEvidence(raw)).toBeUndefined();

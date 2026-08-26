@@ -486,15 +486,13 @@ export function collectUnicodeEscapeEvidence(json: string): UnicodeEscapeEvidenc
 
 function hasUnpairedUnicodeSurrogate(value: unknown): boolean {
 	const pending: unknown[] = [value];
-	const seen = new WeakSet<object>();
 	while (pending.length > 0) {
 		const current = pending.pop();
 		if (typeof current === "string") {
 			if (!current.isWellFormed()) return true;
 			continue;
 		}
-		if (typeof current !== "object" || current === null || seen.has(current)) continue;
-		seen.add(current);
+		if (typeof current !== "object" || current === null) continue;
 		if (Array.isArray(current)) {
 			for (const child of current) pending.push(child);
 			continue;
@@ -510,9 +508,11 @@ function hasUnpairedUnicodeSurrogate(value: unknown): boolean {
 /**
  * Return evidence only when decoded tool arguments are unsafe to execute.
  *
- * Valid JSON escapes and literal UTF-8 have the same canonical decoded value.
- * Malformed JSON, duplicate/deep evidence, and unpaired UTF-16 surrogates keep
- * the existing fail-closed path.
+ * Valid JSON escapes and literal UTF-8 have the same canonical decoded value,
+ * including a valid scalar whose hex digits differ from what a caller intended:
+ * runtime syntax validation cannot infer author intent after decoding.
+ * Malformed escape-bearing JSON, duplicate/deep suspicious escape evidence, and
+ * unpaired UTF-16 surrogates keep the fail-closed path.
  */
 export function collectUnsafeUnicodeEscapeEvidence(json: string): UnicodeEscapeEvidence | undefined {
 	const hasUnicodeEscape = json.includes("\\u");

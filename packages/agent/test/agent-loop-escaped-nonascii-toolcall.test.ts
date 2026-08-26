@@ -9,10 +9,10 @@ import type {
 	AgentTool,
 	ManagedAttemptOutcome,
 } from "@gajae-code/agent-core/types";
-import type { AssistantMessage, Message } from "@gajae-code/ai";
+import type { AssistantMessage, Message, ToolCall } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
-import { collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
+import { captureUnicodeEscapeEvidence, collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import * as logger from "@gajae-code/utils/logger";
 import * as z from "zod/v4";
 import { createUserMessage } from "./helpers";
@@ -154,6 +154,31 @@ function thinkingToolTurn(id: string, escaped = false) {
 }
 
 describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
+	it("executes canonical valid escapes without a resample, including mutating tools", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const call: ToolCall = {
+			type: "toolCall",
+			id: "tc-canonical-escape",
+			name: "write",
+			arguments: { question: QUESTION },
+		};
+		expect(captureUnicodeEscapeEvidence(call, String.raw`{"question":"\ub9c8\uc9c0\ub9c9 \ubcd1\ubaa9"}`)).toBe(
+			false,
+		);
+		expect(call.escapedNonAsciiArguments).toBeUndefined();
+
+		const mock = createMockModel({ responses: [{ content: [call] }, { content: ["done"] }] });
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [mutatingTool(executed)] };
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const stream = agentLoop([createUserMessage("write it")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(executed).toEqual([{ question: QUESTION }]);
+		expect(mock.model.calls).toHaveLength(2);
+	});
+
 	it("logs only bounded shape for in-loop discards and terminal rejection", async () => {
 		const decodedPayload = "DECODED_PAYLOAD_마지막 병목";
 		const toolCallId = "CALL_ID_SECRET";

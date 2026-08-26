@@ -40,10 +40,10 @@ export interface HealedToolCall {
 	readonly name: string;
 	readonly arguments: string;
 	/**
-	 * Whether the raw leaked payload spelled a printable non-ASCII character as a
-	 * `\uXXXX` escape. Captured BEFORE the normalizing round-trip below, which
-	 * decodes escapes into literal characters and would otherwise erase the only
-	 * evidence that the text is unverifiable.
+	 * Whether the raw leaked payload carried unsafe Unicode argument data.
+	 * Captured before the normalizing round-trip below, which would otherwise
+	 * erase malformed escape evidence. Valid `\uXXXX` spellings decode
+	 * canonically and leave this false.
 	 */
 	readonly escapedNonAsciiArguments: boolean;
 	readonly escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;

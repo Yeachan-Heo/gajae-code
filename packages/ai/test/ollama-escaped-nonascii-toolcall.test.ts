@@ -66,7 +66,7 @@ describe("Ollama ASCII-escaped non-ASCII tool arguments", () => {
 		const tool = firstTool(result);
 
 		expect(tool?.arguments).toEqual({ question: "마지막 병목" });
-		expect(tool?.escapedNonAsciiArguments).toBeFalsy();
+		expect(tool?.escapedNonAsciiArguments).toBeUndefined();
 		expect(tool?.escapedUnicodeArgumentEvidence).toBeUndefined();
 		expect(tool && "partialJson" in tool).toBe(false);
 	});
@@ -76,26 +76,26 @@ describe("Ollama ASCII-escaped non-ASCII tool arguments", () => {
 		const tool = firstTool(result);
 
 		expect(tool?.arguments).toEqual({ question: "w &" });
-		expect(tool?.escapedNonAsciiArguments).toBeFalsy();
+		expect(tool?.escapedNonAsciiArguments).toBeUndefined();
 		expect(tool?.escapedUnicodeArgumentEvidence).toBeUndefined();
 	});
 
 	it("does not flag literal UTF-8 arguments", async () => {
 		const result = await run('{"question":"마지막 병목"}');
 
-		expect(firstTool(result)?.escapedNonAsciiArguments).toBeFalsy();
+		expect(firstTool(result)?.escapedNonAsciiArguments).toBeUndefined();
 	});
 
 	it("does not flag an escaped backslash that is the written source text", async () => {
 		const result = await run(String.raw`{"question":"if c == \\uac00:"}`);
 
 		expect(firstTool(result)?.arguments).toEqual({ question: String.raw`if c == \uac00:` });
-		expect(firstTool(result)?.escapedNonAsciiArguments).toBeFalsy();
+		expect(firstTool(result)?.escapedNonAsciiArguments).toBeUndefined();
 	});
 
 	it("does not flag ASCII-only arguments", async () => {
 		const result = await run('{"question":"hello world"}');
 
-		expect(firstTool(result)?.escapedNonAsciiArguments).toBeFalsy();
+		expect(firstTool(result)?.escapedNonAsciiArguments).toBeUndefined();
 	});
 });

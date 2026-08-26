@@ -2113,7 +2113,10 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 		if (rawEvidence === undefined) continue;
 		const evidence = managedUnicodeEscapeEvidence(rawEvidence);
 		if (evidence) attachUnicodeEscapeEvidence(destination, evidence);
-		else destination.escapedNonAsciiArguments = true;
+		else {
+			destination.incompleteArguments = true;
+			destination.incompleteArgumentsReason = "malformed";
+		}
 	}
 }
 
@@ -2145,6 +2148,8 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
 	const rawEscapedUnicodeArgumentEvidence = managedProperty(value, "escapedUnicodeArgumentEvidence");
 	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
+	const invalidEscapedUnicodeEvidence =
+		rawEscapedUnicodeArgumentEvidence !== undefined && escapedUnicodeArgumentEvidence === undefined;
 	const escapedArgumentsGuarded = escapedNonAsciiArguments === true || rawEscapedUnicodeArgumentEvidence !== undefined;
 	return {
 		type,
@@ -2154,16 +2159,22 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 		...(typeof thoughtSignature === "string" ? { thoughtSignature } : {}),
 		...(typeof intent === "string" ? { intent } : {}),
 		...(typeof customWireName === "string" ? { customWireName } : {}),
-		...(typeof incompleteArguments === "boolean" ? { incompleteArguments } : {}),
-		...(typeof incompleteArgumentsReason === "string"
-			? {
-					incompleteArgumentsReason: incompleteArgumentsReason as
-						| "truncated"
-						| "malformed"
-						| "conflicting"
-						| "ambiguous",
-				}
-			: {}),
+		...(invalidEscapedUnicodeEvidence
+			? { incompleteArguments: true }
+			: typeof incompleteArguments === "boolean"
+				? { incompleteArguments }
+				: {}),
+		...(invalidEscapedUnicodeEvidence
+			? { incompleteArgumentsReason: "malformed" as const }
+			: typeof incompleteArgumentsReason === "string"
+				? {
+						incompleteArgumentsReason: incompleteArgumentsReason as
+							| "truncated"
+							| "malformed"
+							| "conflicting"
+							| "ambiguous",
+					}
+				: {}),
 		...(escapedArgumentsGuarded
 			? { escapedNonAsciiArguments: true }
 			: typeof escapedNonAsciiArguments === "boolean"

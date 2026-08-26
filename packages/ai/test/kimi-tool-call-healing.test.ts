@@ -348,7 +348,7 @@ describe("Kimi K2 leaked tool-call healing", () => {
 		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0].arguments).toEqual({ question: "마지막 병목" });
-		expect(toolCalls[0].escapedNonAsciiArguments).toBeFalsy();
+		expect(toolCalls[0].escapedNonAsciiArguments).toBeUndefined();
 		expect(toolCalls[0].escapedUnicodeArgumentEvidence).toBeUndefined();
 	});
 
@@ -364,6 +364,6 @@ describe("Kimi K2 leaked tool-call healing", () => {
 		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test" }).result();
 		const toolCalls = result.content.filter((b): b is ToolCall => b.type === "toolCall");
 		expect(toolCalls).toHaveLength(1);
-		expect(toolCalls[0].escapedNonAsciiArguments).toBeFalsy();
+		expect(toolCalls[0].escapedNonAsciiArguments).toBeUndefined();
 	});
 });
