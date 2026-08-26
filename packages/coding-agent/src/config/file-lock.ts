@@ -29,6 +29,7 @@ const DEFAULT_OPTIONS: Required<
 /** Release retries cover transient Windows/Dropbox handle denial without extending the lock indefinitely. */
 export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 5;
 export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 10;
+const PROCESS_START_TIME_FORMAT = "utc-v1";
 
 type LocalLockState = {
 	owner: FileLockOwnerToken;
@@ -120,16 +121,18 @@ function ownerIsAlive(owner: FileLockOwnerToken, startTimeCache?: Map<string, st
 	if (!owner.start_time || owner.start_time === "unknown") return true;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
 	if (currentStartTime === null || currentStartTime === owner.start_time) return true;
-	// A start-time mismatch proves PID reuse only for records written by this protocol.
-	// Legacy records did not identify their timestamp format, so a locale/timezone change
-	// can make a live holder look different and must never authorize its removal.
-	return owner.owner_token === undefined;
+	// A start-time mismatch proves PID reuse only for records that identify the
+	// canonical UTC encoding. Legacy records did not identify their timestamp format,
+	// so a locale/timezone change can make a live holder look different and must never
+	// authorize its removal.
+	return owner.start_time_format !== PROCESS_START_TIME_FORMAT;
 }
 
 function lockInfo(ownerHostId: string | undefined, ownerToken: string): LockInfo {
 	return {
 		pid: process.pid,
 		start_time: currentProcessStartTime(),
+		start_time_format: PROCESS_START_TIME_FORMAT,
 		timestamp: Date.now(),
 		owner_token: ownerToken,
 		...(ownerHostId === undefined ? {} : { owner_host_id: ownerHostId }),
@@ -279,7 +282,7 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 	}
 
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
-	const { pid, start_time, timestamp, owner_host_id, owner_token } = parsed as Partial<LockInfo>;
+	const { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token } = parsed as Partial<LockInfo>;
 	if (
 		typeof pid !== "number" ||
 		!Number.isInteger(pid) ||
@@ -287,11 +290,12 @@ async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
 		typeof timestamp !== "number" ||
 		!Number.isFinite(timestamp) ||
 		(start_time !== undefined && (typeof start_time !== "string" || !start_time)) ||
+		(start_time_format !== undefined && (typeof start_time_format !== "string" || !start_time_format)) ||
 		(owner_host_id !== undefined && (typeof owner_host_id !== "string" || !owner_host_id)) ||
 		(owner_token !== undefined && (typeof owner_token !== "string" || !owner_token))
 	)
 		return null;
-	return { pid, start_time, timestamp, owner_host_id, owner_token };
+	return { pid, start_time, start_time_format, timestamp, owner_host_id, owner_token };
 }
 
 /** @internal */
@@ -303,6 +307,8 @@ export async function readFileLockInfoForGc(lockDir: string): Promise<FileLockOw
 export interface FileLockOwnerToken {
 	pid: number;
 	start_time?: string;
+	/** Encoding marker for the canonical UTC process-start identity. */
+	start_time_format?: string;
 	owner_host_id?: string;
 	/** Unique acquisition generation, present on locks created by this runtime. */
 	owner_token?: string;
@@ -332,7 +338,8 @@ async function localLockKey(lockPath: string): Promise<string> {
 }
 
 function ownerIncarnationChanged(owner: FileLockOwnerToken, startTimeCache?: Map<string, string | null>): boolean {
-	if (owner.owner_token === undefined || !owner.start_time || owner.start_time === "unknown") return false;
+	if (owner.start_time_format !== PROCESS_START_TIME_FORMAT || !owner.start_time || owner.start_time === "unknown")
+		return false;
 	if (ownerLiveness(owner.pid) !== "alive") return false;
 	const currentStartTime = cachedProcessStartTime(owner, startTimeCache);
 	return currentStartTime !== null && currentStartTime !== owner.start_time;

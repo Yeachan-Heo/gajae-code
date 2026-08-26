@@ -35,7 +35,14 @@ async function makeTemp(): Promise<string> {
 
 async function writeInfo(
 	lockDir: string,
-	info: { pid: number; timestamp: number; start_time?: string; owner_host_id?: string; owner_token?: string },
+	info: {
+		pid: number;
+		timestamp: number;
+		start_time?: string;
+		start_time_format?: string;
+		owner_host_id?: string;
+		owner_token?: string;
+	},
 ): Promise<void> {
 	await fs.mkdir(lockDir, { recursive: true });
 	await fs.writeFile(
@@ -269,6 +276,7 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		await writeInfo(lockDir, {
 			pid: process.pid,
 			start_time: "different-incarnation",
+			start_time_format: "utc-v1",
 			timestamp: Date.now() - 60_000,
 			owner_token: "canonical-owner",
 		});
@@ -288,7 +296,13 @@ describe("withFileLock stale owner liveness (#652)", () => {
 			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "Pacific/Honolulu" },
 		});
 		const legacyStartTime = new TextDecoder().decode(probe.stdout).trim();
-		await writeInfo(lockDir, { pid: process.pid, start_time: legacyStartTime, timestamp: Date.now() - 60_000 });
+		await writeInfo(lockDir, {
+			pid: process.pid,
+			start_time: legacyStartTime,
+			start_time_format: "utc-v1-old",
+			timestamp: Date.now() - 60_000,
+			owner_token: "legacy-token",
+		});
 
 		await expect(
 			withFileLock(lockedFile, async () => {}, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
