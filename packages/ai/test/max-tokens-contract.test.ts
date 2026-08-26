@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { completeSimple } from "../src/stream";
+import { completeSimple, streamSimple } from "../src/stream";
 import type { Context, Model } from "../src/types";
 
 const originalFetch = global.fetch;
@@ -150,5 +150,27 @@ describe("model maxTokens request contract", () => {
 
 		expect(capturedBody?.max_output_tokens).toBe(65_536);
 		expect(response.usage).toMatchObject({ input: 11, output: 7, totalTokens: 18 });
+	});
+
+	it("applies configured limits before the Synthetic OpenAI compatibility dispatch", async () => {
+		const result = await captureCompletion({ ...createModel("configured"), provider: "synthetic" }, undefined);
+
+		expect(result.body.max_tokens).toBe(65_536);
+	});
+
+	it("applies configured limits before the Synthetic Anthropic compatibility dispatch", async () => {
+		const model = { ...createModel("configured"), provider: "synthetic" };
+		const controller = new AbortController();
+		controller.abort();
+		const payloadPromise = Promise.withResolvers<Record<string, unknown>>();
+
+		streamSimple(model, context(), {
+			apiKey: "test-key",
+			syntheticApiFormat: "anthropic",
+			signal: controller.signal,
+			onPayload: payload => payloadPromise.resolve(payload as Record<string, unknown>),
+		});
+
+		expect((await payloadPromise.promise).max_tokens).toBe(65_536);
 	});
 });
