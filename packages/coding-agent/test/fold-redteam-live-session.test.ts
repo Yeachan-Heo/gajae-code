@@ -173,7 +173,8 @@ describe("fold red-team: live session duplicate notice/wake", () => {
 				generation: job.generation,
 				result: `${formatted}\n\n${describeFoldReceipt(first.receipt)}`,
 			};
-			session.yieldQueue.enqueue("async-result", entry);
+			expect(session.foldCoordinator.claimCompletionDelivery(job)).toBe(true);
+			expect(session.foldCoordinator.claimCompletionDelivery(job)).toBe(false);
 			session.yieldQueue.enqueue("async-result", entry);
 			// The session's own 800ms scheduler.wait drives the scheduled flush
 			// (scheduleIdleFlush -> #schedulePostPromptTask with delayMs); the

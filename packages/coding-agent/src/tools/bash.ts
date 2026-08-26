@@ -88,6 +88,7 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
+const ACP_RELEASE_TIMEOUT_MS = 1_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
 	GREP_COLOR: "",
@@ -681,6 +682,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		this.description = prompt.render(bashDescription, {
 			asyncEnabled: this.#asyncEnabled,
 			autoBackgroundEnabled: this.#autoBackgroundEnabled,
+			foregroundFoldEnabled: this.session.registerForegroundFoldParticipant !== undefined,
 			autoBackgroundThresholdSeconds: Math.max(0, Math.floor(this.#autoBackgroundThresholdMs / 1000)),
 			hasAstGrep: this.session.settings.get("astGrep.enabled"),
 			hasAstEdit: this.session.settings.get("astEdit.enabled"),
@@ -1546,11 +1548,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const releaseTerminalOnce = async (): Promise<void> => {
 				if (released) return;
 				released = true;
-				try {
-					await handle.release();
-				} catch (error) {
+				const releaseAttempt = handle.release().catch((error: unknown) => {
 					logger.warn("ACP terminal release failed", { terminalId: handle.terminalId, error });
-				}
+				});
+				const completed = await Promise.race([
+					releaseAttempt.then(() => true),
+					Bun.sleep(ACP_RELEASE_TIMEOUT_MS).then(() => false),
+				]);
+				if (!completed) logger.warn("ACP terminal release timed out", { terminalId: handle.terminalId });
 			};
 			let latestText = "";
 			let bridgeJobId!: string;

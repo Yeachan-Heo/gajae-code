@@ -180,10 +180,13 @@ export class FoldCoordinator {
 	 */
 	readonly #slots = new WeakMap<AsyncJob, FoldSlot>();
 	readonly #carriers = new WeakMap<AsyncJob, FoldReceipt>();
-	readonly #participants = new Map<string, FoldAdapter>();
+	readonly #participants = new Map<number, FoldAdapter>();
+	#nextParticipantId = 0;
 	readonly #folding = new WeakSet<AsyncJob>();
 	/** Jobs whose completion notice has already been emitted. */
 	readonly #noticed = new WeakSet<AsyncJob>();
+	/** Jobs whose receipt-bearing completion has already been queued. */
+	readonly #delivered = new WeakSet<AsyncJob>();
 	readonly #deps: FoldCoordinatorDeps;
 
 	constructor(deps: FoldCoordinatorDeps) {
@@ -192,7 +195,7 @@ export class FoldCoordinator {
 
 	/** Register a foldable wait. The most recently registered wait is the default target. */
 	registerParticipant(adapter: FoldAdapter): () => void {
-		const key = `${adapter.jobId}:${adapter.jobGeneration}`;
+		const key = ++this.#nextParticipantId;
 		this.#participants.set(key, adapter);
 		return () => {
 			if (this.#participants.get(key) === adapter) this.#participants.delete(key);
@@ -388,6 +391,13 @@ export class FoldCoordinator {
 	claimCompletionNotice(job: AsyncJob): boolean {
 		if (this.#noticed.has(job)) return false;
 		this.#noticed.add(job);
+		return true;
+	}
+
+	/** Claim the receipt-bearing queue entry once across manager delivery retries. */
+	claimCompletionDelivery(job: AsyncJob): boolean {
+		if (this.#delivered.has(job)) return false;
+		this.#delivered.add(job);
 		return true;
 	}
 

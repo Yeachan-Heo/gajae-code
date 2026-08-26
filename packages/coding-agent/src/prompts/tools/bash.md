@@ -16,7 +16,7 @@ Executes bash command in shell session for terminal operations like git, bun, ca
 {{#if asyncEnabled}}
 - Use `async: true` for long-running commands when you don't need immediate output; the call returns a background job ID and the result is delivered automatically as a follow-up.
 {{/if}}
-{{#if autoBackgroundEnabled}}
+{{#if foregroundFoldEnabled}}
 - In the interactive TUI, the user can press the fold chord twice (default `Alt+Shift+B`, plus `Cmd+B` on macOS; remappable via the `app.tool.backgroundFold` keybinding) while a foreground command is still running to fold it into a background job. All three command surfaces fold: managed non-PTY bash, editor/ACP client-terminal commands, and PTY-mode commands. A folded command keeps its original timeout and is never killed or restarted by folding; a folded PTY continues output-only, so it stops accepting input. The turn then ends cleanly and a later turn resumes automatically with the command's result, so the interrupted task is finished rather than abandoned. `task`/`subagent` waits are deliberately NOT foldable. Do not instruct users to use raw shell `Ctrl+Z`/`bg` inside the GJC TUI; ownership and output routing are not safe there.
 {{/if}}
 </instruction>

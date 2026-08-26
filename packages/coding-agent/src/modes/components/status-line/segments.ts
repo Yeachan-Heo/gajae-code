@@ -307,7 +307,7 @@ const jobsSegment: StatusLineSegment = {
 	id: "jobs",
 	render(ctx) {
 		const { jobs } = ctx;
-		const foldedJobCount = jobs.foldedJobs?.length ?? 0;
+		const foldedJobCount = jobs.foldedJobs?.filter(job => job.backgrounded).length ?? 0;
 		const visible =
 			jobs.activeMonitorCount > 0 || jobs.activeCronCount > 0 || foldedJobCount > 0 || jobs.worstState === "failed";
 		if (!visible) {

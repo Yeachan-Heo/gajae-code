@@ -78,6 +78,15 @@ describe("folded jobs surfacing", () => {
 					backgrounded: true,
 					deliveryState: "delivered",
 				},
+				{
+					id: "ordinary-failed",
+					kind: "bash",
+					label: "ordinary failed command",
+					status: "failed",
+					generation: "generation-ordinary",
+					backgrounded: false,
+					deliveryState: "failed-visible",
+				},
 			],
 			deadLettered: [
 				{
@@ -97,6 +106,7 @@ describe("folded jobs surfacing", () => {
 			"folded-failed",
 			"folded-pending",
 			"delivered-folded",
+			"ordinary-failed",
 			"evicted-failed",
 		]);
 		// The observer preserves the manager's contradictory-but-authoritative
@@ -109,8 +119,8 @@ describe("folded jobs surfacing", () => {
 
 		const items = buildJobsListItems(observed);
 		const foldedItems = items.filter(item => item.value.startsWith("folded:"));
-		expect(foldedItems).toHaveLength(4);
-		expect(new Set(foldedItems.map(item => item.value)).size).toBe(4);
+		expect(foldedItems).toHaveLength(5);
+		expect(new Set(foldedItems.map(item => item.value)).size).toBe(5);
 		const failedItem = foldedItems.find(item => item.value.startsWith("folded:folded-failed:"));
 		expect(failedItem).toMatchObject({
 			description: "failed-visible",
@@ -122,6 +132,7 @@ describe("folded jobs surfacing", () => {
 		const rendered = renderSegment("jobs", segmentContext(observed));
 		expect(rendered.visible).toBe(true);
 		expect(Bun.stripANSI(rendered.content)).toContain("4 folded");
+		expect(Bun.stripANSI(rendered.content)).not.toContain("5 folded");
 		expect(observed.worstState).toBe("failed");
 
 		observer.dispose();

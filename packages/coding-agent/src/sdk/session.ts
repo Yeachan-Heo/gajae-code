@@ -2076,6 +2076,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								: ({ kind: "ordinary" } as const);
 							if (foldDisposition.kind === "parked") return;
 							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
+							if (
+								foldDisposition.kind === "receipt" &&
+								job &&
+								!session.foldCoordinator.claimCompletionDelivery(job)
+							)
+								return;
 							// A folded job's result must arrive with its receipt so the wake turn
 							// completes the original task rather than merely reporting output.
 							const deliveredResult =

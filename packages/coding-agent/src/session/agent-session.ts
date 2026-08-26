@@ -2676,6 +2676,7 @@ export class AgentSession {
 				: undefined;
 			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
 			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact).then(formattedResult => {
+				if (!this.#foldCoordinator.claimCompletionDelivery(job)) return;
 				this.yieldQueue.enqueue("async-result", {
 					jobId: disposition.receipt.jobId,
 					generation: disposition.receipt.jobGeneration,
