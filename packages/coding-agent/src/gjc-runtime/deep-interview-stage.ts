@@ -8,6 +8,7 @@ import {
 	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewIntentManifest,
 	assertDeepInterviewStructuredResponseWithinLimit,
+	ENVELOPE_RESERVED_STATE_KEYS,
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
@@ -185,7 +186,19 @@ const RUNTIME_OWNED_ENVELOPE_KEYS = [
  */
 const RECORDER_OWNED_STATE_KEYS = ["intent_contract", "intent_review"] as const;
 
-/** Strip runtime-owned keys from a staged payload; returns the ignored key names. */
+/**
+ * Remove sanitizer-owned keys from a staged payload and classify the
+ * normalization-owned ones; returns every ignored key name.
+ *
+ * Nested `state.*` occurrences of envelope-reserved keys are named but not
+ * removed here: `normalizeDeepInterviewEnvelope` is still the only remover, so
+ * the payload handed to validation stays byte-identical to what the caller sent.
+ * Naming them routes an already-certain discard through the existing
+ * `ignored_runtime_owned_keys` channel, which previously reported nothing for
+ * the nested form -- `{"state":{"current_phase":"cancelled"}}` returned an
+ * unqualified `ok:true` for an instruction that never took effect, while the
+ * same key at the top level was reported.
+ */
 function sanitizeStagedPayload(payload: Record<string, unknown>): {
 	payload: Record<string, unknown>;
 	ignoredKeys: string[];
@@ -205,6 +218,12 @@ function sanitizeStagedPayload(payload: Record<string, unknown>): {
 				delete state[key];
 				ignoredKeys.push(`state.${key}`);
 			}
+		}
+		// Report only -- do not delete. Removing these here would strip content
+		// before `assertDeepInterviewStructuredResponseWithinLimit`, so an oversized
+		// discarded value would stop failing `DI_STAGE_INPUT_INVALID`.
+		for (const key of ENVELOPE_RESERVED_STATE_KEYS) {
+			if (key in state) ignoredKeys.push(`state.${key}`);
 		}
 		next.state = state;
 	}
