@@ -228,19 +228,21 @@ function nativeSessionStateLock(): SessionStateLockNativeBindings {
 			bindings = require("@gajae-code/natives") as SessionStateLockNativeBindings;
 			loadedNativeBindings = bindings;
 		}
-		for (const name of [
-			"exactUnlink",
-			"exactUnlinkAsync",
-			"snapshotDirectoryTreeAsync",
-			"exactRemoveDirectoryTreeAsync",
-		] as const) {
-			if (typeof bindings[name] !== "function")
-				throw new SessionStateLockUnavailableError(new Error(`Native lock binding ${name} is unavailable.`));
-		}
+		if (typeof bindings.exactUnlink !== "function")
+			throw new SessionStateLockUnavailableError(new Error("Native lock binding exactUnlink is unavailable."));
 		return bindings;
 	} catch (error) {
 		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
 	}
+}
+
+function transitionNativeSessionStateLock(): SessionStateLockNativeBindings {
+	const bindings = nativeSessionStateLock();
+	for (const name of ["exactUnlinkAsync", "snapshotDirectoryTreeAsync", "exactRemoveDirectoryTreeAsync"] as const) {
+		if (typeof bindings[name] !== "function")
+			throw new SessionStateLockUnavailableError(new Error(`Native lock binding ${name} is unavailable.`));
+	}
+	return bindings;
 }
 
 /**
@@ -1172,23 +1174,6 @@ async function transitionClaimIdentity(transitionDir: string): Promise<Transitio
 	};
 }
 
-function transitionClaimIdentitySync(transitionDir: string): TransitionClaimIdentity | undefined {
-	try {
-		const stat = fsSync.lstatSync(transitionDir, { bigint: true });
-		if (!stat.isDirectory()) return undefined;
-		return {
-			dev: stat.dev,
-			ino: stat.ino,
-			nlink: stat.nlink,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			ctimeNs: stat.ctimeNs,
-		};
-	} catch {
-		return undefined;
-	}
-}
-
 function sameTransitionClaimIdentity(left: TransitionClaimIdentity, right: TransitionClaimIdentity): boolean {
 	return (
 		left.dev === right.dev &&
@@ -1264,8 +1249,8 @@ async function removeTransitionClaimIfIdentityMatches(
 
 /** Best-effort cleanup after a bounded transition preflight finishes late. */
 async function createTransitionClaim(transitionDir: string, deadline: number): Promise<TransitionClaimIdentity> {
-	fsSync.mkdirSync(transitionDir);
-	const createdClaim = transitionClaimIdentitySync(transitionDir);
+	await fs.mkdir(transitionDir);
+	const createdClaim = await transitionClaimIdentity(transitionDir);
 	if (!createdClaim) throw new SessionStateLockUnavailableError();
 	try {
 		await SessionStateLockTestHooks.beforeTransitionIdentityCapture?.(transitionDir);
@@ -1328,7 +1313,7 @@ async function withLockPathTransition<T>(
 ): Promise<T> {
 	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
 	const ownerFile = `${transitionDir}.owner`;
-	nativeSessionStateLock();
+	transitionNativeSessionStateLock();
 	const owner = await newLockOwner(deadline);
 	for (;;) {
 		let claim: TransitionClaimIdentity | undefined;
