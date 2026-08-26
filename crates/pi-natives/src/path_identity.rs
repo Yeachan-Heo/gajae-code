@@ -10750,6 +10750,9 @@ mod rename_no_replace_expected_source_tests {
 		assert!(!destination.exists());
 	}
 
+	// This reproducer intentionally records the unsafe publication window: the
+	// retained receipt is required, but the production protocol still needs an
+	// object-bound final mutation to prevent the successor from reaching target.
 	#[test]
 	fn claim_substitution_before_rename_is_reported_after_destination_mutation() {
 		let _guard = PATH_IDENTITY_HOOK_TEST_LOCK
