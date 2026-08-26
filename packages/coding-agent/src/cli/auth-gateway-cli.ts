@@ -253,8 +253,8 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		const handle = startAuthGateway({
 			storage,
 			hasProviderCredential: () => store.snapshot.credentials.some(entry => entry.provider === provider),
-			reloadProviderCredentials: async () => {
-				await store.refreshSnapshot();
+			reloadProviderCredentials: async signal => {
+				await store.refreshSnapshot(signal);
 				await storage.reload();
 			},
 			validateProviderCredential: (candidateProvider, apiKey) =>

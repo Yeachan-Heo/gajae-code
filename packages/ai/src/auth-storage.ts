@@ -455,7 +455,7 @@ export interface CredentialDispatchTicket {
 
 export interface AuthCredentialStore {
 	close(): void;
-	refreshSnapshot?(): Promise<unknown>;
+	refreshSnapshot?(signal?: AbortSignal): Promise<unknown>;
 	onSnapshotChanged?(listener: () => void): () => void;
 	/** Order provider admission with remote snapshot authority application. */
 	acquireCredentialDispatchTicket?(provider: Provider, signal?: AbortSignal): Promise<CredentialDispatchTicket>;
