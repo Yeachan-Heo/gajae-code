@@ -82,6 +82,7 @@ export class ExtensionDashboard extends Container {
 					this.#handleProviderToggle(providerId);
 				},
 				masterSwitchProvider: this.#getActiveProviderId(),
+				settings: sm,
 			},
 			maxVisible,
 		);
@@ -162,7 +163,7 @@ export class ExtensionDashboard extends Container {
 	}
 
 	#handleProviderToggle(providerId: string): void {
-		toggleProvider(providerId);
+		this.settings ? toggleProvider(providerId, this.settings) : toggleProvider(providerId);
 		void this.#refreshFromState();
 	}
 

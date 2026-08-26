@@ -13,6 +13,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@gajae-code/tui";
+import type { Settings } from "../../../config/settings";
 import { isProviderEnabled } from "../../../discovery";
 import { theme } from "../../../modes/theme/theme";
 import { applyFilter } from "./state-manager";
@@ -27,6 +28,7 @@ export interface ExtensionListCallbacks {
 	onMasterToggle?: (providerId: string) => void;
 	/** Provider ID for master switch (null = no master switch) */
 	masterSwitchProvider?: string | null;
+	settings?: Settings | null;
 }
 
 const DEFAULT_MAX_VISIBLE = 15;
@@ -45,6 +47,7 @@ export class ExtensionList implements Component {
 	#focused = false;
 	#masterSwitchProvider: string | null = null;
 	#maxVisible: number;
+	#settings: Settings | null;
 
 	constructor(
 		private extensions: Extension[],
@@ -52,6 +55,7 @@ export class ExtensionList implements Component {
 		maxVisible?: number,
 	) {
 		this.#masterSwitchProvider = callbacks.masterSwitchProvider ?? null;
+		this.#settings = callbacks.settings ?? null;
 		this.#maxVisible = maxVisible ?? DEFAULT_MAX_VISIBLE;
 		this.#rebuildList();
 	}
@@ -127,7 +131,9 @@ export class ExtensionList implements Component {
 		}
 
 		// Determine if master switch is off (for dimming child items)
-		const masterDisabled = this.#masterSwitchProvider !== null && !isProviderEnabled(this.#masterSwitchProvider);
+		const masterDisabled =
+			this.#masterSwitchProvider !== null &&
+			!isProviderEnabled(this.#masterSwitchProvider, this.#settings ?? undefined);
 
 		// Calculate visible range
 		const startIdx = this.#scrollOffset;
@@ -299,7 +305,7 @@ export class ExtensionList implements Component {
 		// Provider-specific view: Master switch + flat list
 		if (this.#masterSwitchProvider) {
 			const providerName = filtered[0]?.source.providerName ?? this.#masterSwitchProvider;
-			const enabled = isProviderEnabled(this.#masterSwitchProvider);
+			const enabled = isProviderEnabled(this.#masterSwitchProvider, this.#settings ?? undefined);
 
 			this.#listItems.push({
 				type: "master",
@@ -418,7 +424,8 @@ export class ExtensionList implements Component {
 			} else if (item?.type === "extension") {
 				// Only allow toggling if master is enabled
 				const masterDisabled =
-					this.#masterSwitchProvider !== null && !isProviderEnabled(this.#masterSwitchProvider);
+					this.#masterSwitchProvider !== null &&
+					!isProviderEnabled(this.#masterSwitchProvider, this.#settings ?? undefined);
 				if (!masterDisabled) {
 					const newEnabled = item.item.state === "disabled";
 					this.callbacks.onToggle?.(item.item.id, newEnabled);
@@ -434,7 +441,8 @@ export class ExtensionList implements Component {
 				this.callbacks.onMasterToggle?.(item.providerId);
 			} else if (item?.type === "extension") {
 				const masterDisabled =
-					this.#masterSwitchProvider !== null && !isProviderEnabled(this.#masterSwitchProvider);
+					this.#masterSwitchProvider !== null &&
+					!isProviderEnabled(this.#masterSwitchProvider, this.#settings ?? undefined);
 				if (!masterDisabled) {
 					const newEnabled = item.item.state === "disabled";
 					this.callbacks.onToggle?.(item.item.id, newEnabled);

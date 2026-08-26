@@ -4,7 +4,6 @@
  */
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
-import type { Settings } from "../../../config/settings";
 import type { ContextFile } from "../../../capability/context-file";
 import type { ExtensionModule } from "../../../capability/extension-module";
 import type { Hook } from "../../../capability/hook";
@@ -15,6 +14,7 @@ import type { Skill } from "../../../capability/skill";
 import type { SlashCommand } from "../../../capability/slash-command";
 import type { CustomTool } from "../../../capability/tool";
 import type { SourceMeta } from "../../../capability/types";
+import type { Settings } from "../../../config/settings";
 import {
 	disableProvider,
 	enableProvider,
@@ -591,12 +591,12 @@ export async function createInitialState(
 /**
  * Toggle provider enabled state.
  */
-export function toggleProvider(providerId: string): boolean {
-	if (isProviderEnabled(providerId)) {
-		disableProvider(providerId);
+export function toggleProvider(providerId: string, settings?: Settings): boolean {
+	if (isProviderEnabled(providerId, settings)) {
+		disableProvider(providerId, settings);
 		return false;
 	} else {
-		enableProvider(providerId);
+		enableProvider(providerId, settings);
 		return true;
 	}
 }
