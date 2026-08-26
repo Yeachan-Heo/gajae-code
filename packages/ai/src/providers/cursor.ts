@@ -701,6 +701,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (h2Settled) {
 				await h2Completion.promise;
 			}
+			options?.onStreamCreated?.();
 			h2Request.write(frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {

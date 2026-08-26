@@ -179,6 +179,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#usageInflight?: Promise<UsageReport[] | null>;
 	#scopedUsageCache = new Map<Provider, UsageCacheEntry>();
 	#scopedUsageInflight = new Map<Provider, Promise<UsageReport[] | null>>();
+	#scopedUsageFailures = new Map<Provider, number>();
 	#usageCacheEpoch = 0;
 	#inventoryMetadata = new Map<number, CredentialMetadataRecord>();
 	#inventoryMetadataGeneration = -1;
@@ -1037,6 +1038,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#usageInflight = undefined;
 		this.#scopedUsageCache.clear();
 		this.#scopedUsageInflight.clear();
+		this.#scopedUsageFailures.clear();
 		this.#usageCacheEpoch += 1;
 	}
 
@@ -1347,6 +1349,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		if (provider) {
 			const cached = this.#scopedUsageCache.get(provider);
 			if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) return Promise.resolve(cached.reports);
+			const failedAt = this.#scopedUsageFailures.get(provider);
+			if (failedAt !== undefined && Date.now() - failedAt < USAGE_CACHE_TTL_MS) return Promise.resolve(null);
 			const existing = this.#scopedUsageInflight.get(provider);
 			if (existing) return existing;
 			const epoch = this.#usageCacheEpoch;
@@ -1355,6 +1359,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				.then(body => {
 					if (this.#usageCacheEpoch === epoch) {
 						this.#scopedUsageCache.set(provider, { reports: body.reports, fetchedAt: Date.now() });
+						this.#scopedUsageFailures.delete(provider);
 						this.#recordUsageReports(body.reports, epoch);
 					}
 					return body.reports;
@@ -1364,6 +1369,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						provider,
 						error: cleanReason(error) ?? "Usage unavailable.",
 					});
+					if (this.#usageCacheEpoch === epoch) this.#scopedUsageFailures.set(provider, Date.now());
 					return null;
 				})
 				.finally(() => {

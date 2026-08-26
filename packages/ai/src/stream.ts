@@ -707,8 +707,10 @@ export function streamSimple<TApi extends Api>(
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
 		const events = customApiProvider.streamSimple(model, context, { ...options, maxTokens: resolvedRequestMaxTokens });
-		options?.onStreamCreated?.();
-		return events;
+		if (!options?.onStreamCreated) return events;
+		const forwarded = new AssistantMessageEventStream();
+		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
+		return forwarded;
 	}
 
 	// Vertex AI uses Application Default Credentials, not API keys
@@ -947,6 +949,7 @@ function mapOptionsForApi<TApi extends Api>(
 		providerSessionState: options?.providerSessionState,
 		onPayload: options?.onPayload,
 		onResponse: options?.onResponse,
+		onStreamCreated: options?.onStreamCreated,
 		onSseEvent: options?.onSseEvent,
 		attemptScope: options?.attemptScope,
 		execHandlers: options?.execHandlers,

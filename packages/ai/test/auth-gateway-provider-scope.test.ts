@@ -775,9 +775,10 @@ describe("provider-scoped auth-gateway credential dispatch", () => {
 		let calls = 0;
 		registerCustomApi(
 			testApi,
-			() => {
+			(_model, _context, options) => {
 				const index = calls++;
 				started[index]?.resolve();
+				options?.onStreamCreated?.();
 				return pending[index] as AssistantMessageEventStream;
 			},
 			testSource,

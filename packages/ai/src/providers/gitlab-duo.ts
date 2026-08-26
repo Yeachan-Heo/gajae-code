@@ -176,12 +176,14 @@ const directAccessCache = new Map<string, DirectAccessToken>();
 async function getDirectAccessToken(
 	gitlabAccessToken: string,
 	fetchImpl: FetchImpl = fetch,
+	onStreamCreated?: () => void,
 ): Promise<DirectAccessToken> {
 	const cached = directAccessCache.get(gitlabAccessToken);
 	if (cached && cached.expiresAt > Date.now()) {
 		return cached;
 	}
 
+	onStreamCreated?.();
 	const response = await fetchImpl(`${GITLAB_COM_URL}/api/v4/ai/third_party_agents/direct_access`, {
 		method: "POST",
 		headers: {
@@ -244,7 +246,7 @@ export function streamGitLabDuo(
 				throw new Error(`Unsupported GitLab Duo model: ${model.id}`);
 			}
 
-			const directAccess = await getDirectAccessToken(options.apiKey, options.fetch);
+			const directAccess = await getDirectAccessToken(options.apiKey, options.fetch, options.onStreamCreated);
 			const headers = {
 				...directAccess.headers,
 				...options.headers,
@@ -280,6 +282,7 @@ export function streamGitLabDuo(
 								sessionId: options.sessionId,
 								providerSessionState: options.providerSessionState,
 								onPayload: options.onPayload,
+								onStreamCreated: options.onStreamCreated,
 								attemptScope: options?.attemptScope,
 								onResponse: options.onResponse,
 								onSseEvent: options.onSseEvent,
@@ -318,6 +321,7 @@ export function streamGitLabDuo(
 									sessionId: options.sessionId,
 									providerSessionState: options.providerSessionState,
 									onPayload: options.onPayload,
+									onStreamCreated: options.onStreamCreated,
 									attemptScope: options?.attemptScope,
 									onResponse: options.onResponse,
 									onSseEvent: options.onSseEvent,
@@ -351,6 +355,7 @@ export function streamGitLabDuo(
 									sessionId: options.sessionId,
 									providerSessionState: options.providerSessionState,
 									onPayload: options.onPayload,
+									onStreamCreated: options.onStreamCreated,
 									attemptScope: options?.attemptScope,
 									onResponse: options.onResponse,
 									onSseEvent: options.onSseEvent,
