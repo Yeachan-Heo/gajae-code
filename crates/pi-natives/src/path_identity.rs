@@ -8957,10 +8957,11 @@ mod platform {
 			Ok(path) => path,
 			Err(code) => return NativeExactUnlinkResult::failure(code),
 		};
-		let source = match open_exact(
+		let source = match open_exact_with_share(
 			&source_path,
 			"file",
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA | 0x0001_0000,
+			FILE_SHARE_READ,
 		) {
 			Ok(handle) => handle,
 			Err(result) => {
