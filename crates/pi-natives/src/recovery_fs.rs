@@ -2953,7 +2953,7 @@ fn verify_exact_append_bytes(
 	let mut reader = file.try_clone().map_err(|_| "io_error")?;
 	reader.seek(SeekFrom::Start(0)).map_err(|_| "io_error")?;
 	let mut hasher = Sha256::new();
-	let mut buffer = [0u8; 64 * 1024];
+	let mut buffer = vec![0u8; 64 * 1024];
 	let mut remaining = expected_size;
 	while remaining > 0 {
 		let limit = remaining.min(buffer.len() as u64) as usize;
@@ -3051,7 +3051,7 @@ fn append_managed(
 		return RecoveryFsResult::append_failure(code, "not_committed", "not_attempted", None);
 	}
 	// SAFETY: successful openat returned a uniquely owned fd.
-	let mut file = unsafe { File::from_raw_fd(fd) };
+	let file = unsafe { File::from_raw_fd(fd) };
 	if crate::path_identity::platform::verify_created_owner_only_file(&file).is_err() {
 		return RecoveryFsResult::append_failure(
 			"permission_denied",
@@ -3163,7 +3163,7 @@ fn append_managed(
 			None,
 		);
 	}
-	let exact_identity = match append_post_identity_if_exact(
+	let Some(exact_identity) = append_post_identity_if_exact(
 		&file,
 		&parent,
 		&name,
@@ -3172,27 +3172,21 @@ fn append_managed(
 		expected_size,
 		expected_sha256,
 		data,
-	) {
-		Some(value) => value,
-		None => {
-			return RecoveryFsResult::append_failure(
-				"identity_mismatch",
-				"committed",
-				"not_provable",
-				None,
-			);
-		},
+	) else {
+		return RecoveryFsResult::append_failure(
+			"identity_mismatch",
+			"committed",
+			"not_provable",
+			None,
+		);
 	};
-	let exact_sha256 = match exact_identity.sha256.clone() {
-		Some(value) => value,
-		None => {
-			return RecoveryFsResult::append_failure(
-				"identity_mismatch",
-				"committed",
-				"not_provable",
-				None,
-			);
-		},
+	let Some(exact_sha256) = exact_identity.sha256.clone() else {
+		return RecoveryFsResult::append_failure(
+			"identity_mismatch",
+			"committed",
+			"not_provable",
+			None,
+		);
 	};
 	#[cfg(test)]
 	pause_append_after_exact_proof_for_test();
