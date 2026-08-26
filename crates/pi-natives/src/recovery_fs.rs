@@ -2984,7 +2984,12 @@ fn append_managed(
 		);
 	}
 	if parent.sync_all().is_err() {
-		return RecoveryFsResult::append_failure("fsync_failed", "committed", "not_provable", None);
+		return RecoveryFsResult::append_failure(
+			"fsync_failed",
+			"committed",
+			"not_provable",
+			append_post_identity(&file, &parent, &name),
+		);
 	}
 	// Directory fsync is the final durability boundary. Re-prove both the
 	// descriptor and the canonical name after it; a successor switch in that

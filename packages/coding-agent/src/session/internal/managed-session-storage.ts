@@ -603,6 +603,8 @@ const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
 
 /** Minimum interval between best-effort remnant reaps of one bound store directory. */
 const SCRUBBED_REMNANT_REAP_INTERVAL_MS = 60_000;
+/** Maximum dirents inspected by one synchronous preparation sweep. */
+const SCRUBBED_REMNANT_SYNC_SCAN_LIMIT = 256;
 
 export interface ScrubbedProtocolRemnantReapResult {
 	readonly reaped: number;
@@ -663,25 +665,32 @@ export function reapScrubbedProtocolRemnantsSync(
 	let reaped = 0;
 	let failures = approved.failures;
 	for (const scanDirectory of approved.directories) {
-		let names: string[];
+		let directoryHandle: fs.Dir;
 		try {
-			names = fs.readdirSync(scanDirectory);
+			directoryHandle = fs.opendirSync(scanDirectory);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 			continue;
 		}
-		for (const name of names) {
-			if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
-			const pathname = path.join(scanDirectory, name);
-			try {
-				const named = fs.lstatSync(pathname);
-				if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
-				if (named.mtimeMs > cutoff) continue;
-				fs.unlinkSync(pathname);
-				reaped += 1;
-			} catch (error) {
-				if (!isEnoent(error)) failures += 1;
+		try {
+			for (let scanned = 0; scanned < SCRUBBED_REMNANT_SYNC_SCAN_LIMIT; scanned++) {
+				const entry = directoryHandle.readSync();
+				if (entry === null) break;
+				const name = entry.name;
+				if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+				const pathname = path.join(scanDirectory, name);
+				try {
+					const named = fs.lstatSync(pathname);
+					if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+					if (named.mtimeMs > cutoff) continue;
+					fs.unlinkSync(pathname);
+					reaped += 1;
+				} catch (error) {
+					if (!isEnoent(error)) failures += 1;
+				}
 			}
+		} finally {
+			directoryHandle.closeSync();
 		}
 	}
 	return reportScrubbedProtocolRemnantReap(reaped, failures);

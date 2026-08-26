@@ -14,6 +14,14 @@ function tempDir(prefix: string): string {
 	return fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), prefix));
 }
 
+async function readText(filePath: string): Promise<string> {
+	return Bun.file(filePath).text();
+}
+
+async function readBytes(filePath: string): Promise<Buffer> {
+	return Buffer.from(await Bun.file(filePath).arrayBuffer());
+}
+
 describe("managed rewrite ENOENT regression (P0)", () => {
 	let root: string;
 	let agentDir: string;
@@ -55,7 +63,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		).not.toThrow();
 
 		expect(fs.existsSync(sessionFile!)).toBe(true);
-		expect(fs.readFileSync(sessionFile!, "utf8")).toContain("after-delete");
+		expect(await readText(sessionFile!)).toContain("after-delete");
 
 		await manager.close();
 	});
@@ -83,7 +91,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "must-not-overwrite-successor", timestamp: Date.now() }),
 		).toThrow();
-		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		expect(await readText(sessionFile)).toBe(successor);
 		await manager.close().catch(() => {});
 	});
 
@@ -124,12 +132,12 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "durable-after-delete", timestamp: Date.now() }),
 		).toThrow(/managed_replace_committed_outcome_uncertain/);
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
+		expect(await readText(sessionFile)).toContain("durable-after-delete");
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-delete"))).toBe(true);
 
 		await manager.ensureOnDisk();
 		expect(replaceExpected).toHaveBeenCalledTimes(1);
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-delete");
+		expect(await readText(sessionFile)).toContain("durable-after-delete");
 		await manager.close().catch(() => {});
 	});
 
@@ -178,8 +186,8 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "must-not-overwrite-successor", timestamp: Date.now() }),
 		).toThrow(/identity_mismatch/);
-		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
-		expect(fs.readFileSync(predecessor, "utf8")).not.toContain("must-not-overwrite-successor");
+		expect(await readText(sessionFile)).toBe(successor);
+		expect(await readText(predecessor)).not.toContain("must-not-overwrite-successor");
 		await manager.close().catch(() => {});
 	});
 
@@ -234,7 +242,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			manager.appendMessage({ role: "user", content: "identity-less-committed", timestamp: Date.now() }),
 		).toThrow(/managed_append_committed_outcome_uncertain/);
 		const residentCount = manager.getBranch().length;
-		const persisted = fs.readFileSync(sessionFile, "utf8");
+		const persisted = await readText(sessionFile);
 		expect(persisted).toContain("identity-less-committed");
 		const residentAssistant = manager
 			.getBranch()
@@ -256,7 +264,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		).toThrow(/managed_append_committed_outcome_uncertain/);
 		expect(appendCalls).toBe(1);
 		expect(manager.getBranch()).toHaveLength(residentCount);
-		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-not-retry-stale-predecessor");
+		expect(await readText(sessionFile)).not.toContain("must-not-retry-stale-predecessor");
 		await manager.close().catch(() => {});
 	});
 
@@ -321,7 +329,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		);
 		expect(JSON.stringify(manager.getEntryForFidelity(oldCustomId))).toBe(beforeEntry);
 		expect(manager.getObservabilityStatsForTests().coldSpillWriteCount).toBe(beforeStats.coldSpillWriteCount);
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("identity-less-eviction-barrier");
+		expect(await readText(sessionFile)).toContain("identity-less-eviction-barrier");
 		await manager.close().catch(() => {});
 	});
 
@@ -332,7 +340,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		manager.appendMessage(makeAssistantMessage() as never);
 		await manager.flush();
 		const sessionFile = manager.getSessionFile()!;
-		const before = fs.readFileSync(sessionFile);
+		const before = await readBytes(sessionFile);
 		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(() => ({
 			ok: false,
 			code: "identity_mismatch",
@@ -348,7 +356,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			expect(() => store.appendExpectedSync(relativePath, Buffer.from("not-written\n"), expected)).toThrow(
 				"identity_mismatch",
 			);
-			expect(fs.readFileSync(sessionFile).equals(before)).toBe(true);
+			expect((await readBytes(sessionFile)).equals(before)).toBe(true);
 		} finally {
 			store.close();
 			await manager.close().catch(() => {});
@@ -383,7 +391,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "durable-after-publish-error", timestamp: Date.now() }),
 		).toThrow(/managed_replace_committed_outcome_uncertain/);
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
+		expect(await readText(sessionFile)).toContain("durable-after-publish-error");
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("durable-after-publish-error"))).toBe(
 			true,
 		);
@@ -392,7 +400,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			/managed_replace_committed_outcome_uncertain|destination_conflict/,
 		);
 		expect(replaceExpected).not.toHaveBeenCalled();
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("durable-after-publish-error");
+		expect(await readText(sessionFile)).toContain("durable-after-publish-error");
 		await manager.close().catch(() => {});
 	});
 
@@ -451,7 +459,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			manager.appendMessage({ role: "user", content: "must-remain-resident", timestamp: Date.now() }),
 		).toThrow(/managed_replace_committed_outcome_uncertain/);
 		expect(unknownOutcome).toBe(true);
-		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		expect(await readText(sessionFile)).toBe(successor);
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("must-remain-resident"))).toBe(true);
 		await manager.close().catch(() => {});
 	});
@@ -464,6 +472,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.flush();
 
 		const sessionFile = manager.getSessionFile()!;
+		const intendedBytes = await readBytes(sessionFile);
 		fs.rmSync(sessionFile);
 		const realRenameManagedFileNoReplace = native.RecoveryFsRoot.prototype.renameManagedFileNoReplace;
 		const replaceExpected = vi.spyOn(ManagedSessionDescendantStore.prototype, "replaceExpectedIdentitySync");
@@ -507,7 +516,6 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 				return result;
 			}
 			const successorPath = `${sessionFile}.byte-identical-successor`;
-			const intendedBytes = fs.readFileSync(sessionFile);
 			fs.writeFileSync(successorPath, intendedBytes);
 			const publishedIno = fs.statSync(sessionFile).ino;
 			fs.rmSync(sessionFile);
@@ -534,14 +542,14 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		).toThrow(/managed_replace_committed_outcome_uncertain/);
 		expect(unknownOutcome).toBe(true);
 		expect(successorBytes).toBeDefined();
-		expect(fs.readFileSync(sessionFile).equals(Buffer.from(successorBytes!))).toBe(true);
+		expect((await readBytes(sessionFile)).equals(Buffer.from(successorBytes!))).toBe(true);
 		expect(manager.getBranch().some(entry => JSON.stringify(entry).includes("must-remain-resident"))).toBe(true);
 
 		await expect(manager.ensureOnDisk()).rejects.toThrow(
 			/managed_replace_committed_outcome_uncertain|destination_conflict/,
 		);
 		expect(replaceExpected).not.toHaveBeenCalled();
-		expect(fs.readFileSync(sessionFile).equals(Buffer.from(successorBytes!))).toBe(true);
+		expect((await readBytes(sessionFile)).equals(Buffer.from(successorBytes!))).toBe(true);
 		await manager.close().catch(() => {});
 	});
 
@@ -553,13 +561,13 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.flush();
 
 		const sessionFile = manager.getSessionFile()!;
-		const original = fs.readFileSync(sessionFile);
+		const original = await readBytes(sessionFile);
 		const before = fs.statSync(sessionFile);
 		fs.utimesSync(sessionFile, new Date(before.atimeMs + 1_000), new Date(before.mtimeMs + 1_000));
 		const drifted = fs.statSync(sessionFile);
 		expect(drifted.ino).toBe(before.ino);
 		expect(drifted.size).toBe(before.size);
-		expect(fs.readFileSync(sessionFile).equals(original)).toBe(true);
+		expect((await readBytes(sessionFile)).equals(original)).toBe(true);
 
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "after-metadata-drift", timestamp: Date.now() }),
@@ -575,8 +583,8 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			manager.appendMessage({ role: "user", content: "after-second-metadata-drift", timestamp: Date.now() }),
 		).not.toThrow();
 		await manager.flush();
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("after-metadata-drift");
-		expect(fs.readFileSync(sessionFile, "utf8")).toContain("after-second-metadata-drift");
+		expect(await readText(sessionFile)).toContain("after-metadata-drift");
+		expect(await readText(sessionFile)).toContain("after-second-metadata-drift");
 		await manager.close();
 	});
 
@@ -597,7 +605,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 				reopened.appendMessage({ role: "user", content: "reopened-after-touch", timestamp: Date.now() }),
 			).not.toThrow();
 			await reopened.flush();
-			expect(fs.readFileSync(sessionFile, "utf8")).toContain("reopened-after-touch");
+			expect(await readText(sessionFile)).toContain("reopened-after-touch");
 		} finally {
 			await reopened.close();
 		}
@@ -626,7 +634,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() => manager.appendMessage({ role: "user", content: "must-fail-closed", timestamp: Date.now() })).toThrow(
 			/managed_append_identity_mismatch/,
 		);
-		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-fail-closed");
+		expect(await readText(sessionFile)).not.toContain("must-fail-closed");
 		await manager.close().catch(() => {});
 	});
 
@@ -639,7 +647,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 
 		const sessionFile = manager.getSessionFile()!;
 		const before = fs.statSync(sessionFile);
-		const original = fs.readFileSync(sessionFile, "utf8");
+		const original = await readText(sessionFile);
 		const overwritten = original.replace('"hello"', '"world"');
 		expect(Buffer.byteLength(overwritten)).toBe(Buffer.byteLength(original));
 		fs.writeFileSync(sessionFile, overwritten);
@@ -648,7 +656,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() => manager.appendMessage({ role: "user", content: "must-fail-closed", timestamp: Date.now() })).toThrow(
 			/managed_append_identity_mismatch/,
 		);
-		expect(fs.readFileSync(sessionFile, "utf8")).toBe(overwritten);
+		expect(await readText(sessionFile)).toBe(overwritten);
 		await manager.close().catch(() => {});
 	});
 
@@ -674,11 +682,11 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 				ctimeNs: BigInt(bounded.ctimeNs),
 				sha256: "0".repeat(64),
 			};
-			const original = fs.readFileSync(sessionFile);
+			const original = await readBytes(sessionFile);
 			expect(() =>
 				store.replaceExpectedIdentitySync(relativePath, Buffer.from("must-not-replace\n"), expected),
 			).toThrow("managed_replace_identity_mismatch");
-			expect(fs.readFileSync(sessionFile).equals(original)).toBe(true);
+			expect((await readBytes(sessionFile)).equals(original)).toBe(true);
 		} finally {
 			store.close();
 			await manager.close().catch(() => {});
@@ -707,7 +715,7 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(() =>
 			manager.appendMessage({ role: "user", content: "still-fail-closed", timestamp: Date.now() }),
 		).toThrow(/identity_mismatch|managed_replace_identity_mismatch/);
-		expect(fs.readFileSync(sessionFile, "utf8")).toBe(successor);
+		expect(await readText(sessionFile)).toBe(successor);
 		await manager.close().catch(() => {});
 	});
 });

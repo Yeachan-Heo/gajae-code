@@ -8388,7 +8388,14 @@ export class SessionManager {
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
 			this.#managedPersistExpectedIdentity =
-				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
+				this.destination.kind === "managed"
+					? this.#captureManagedPersistIdentity(
+							sessionFile,
+							managedIdentityFromDescriptor(descriptor),
+							undefined,
+							false,
+						)
+					: undefined;
 			this.#lazyReopenSucceeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
@@ -8576,7 +8583,14 @@ export class SessionManager {
 				return false;
 			}
 			this.#managedPersistExpectedIdentity =
-				this.destination.kind === "managed" ? this.#captureManagedPersistIdentity(sessionFile) : undefined;
+				this.destination.kind === "managed"
+					? this.#captureManagedPersistIdentity(
+							sessionFile,
+							managedIdentityFromDescriptor(before),
+							undefined,
+							false,
+						)
+					: undefined;
 			this.#sessionId = discovery.header.id;
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
@@ -14969,23 +14983,26 @@ export class SessionManager {
 		sessionFile: string,
 		expected?: ManagedFileIdentity,
 		expectedBytes?: Uint8Array,
+		includeDigest = true,
 	): ManagedFileIdentity {
 		const store = this.#managedTranscriptStore(sessionFile);
 		const relativePath = path.basename(sessionFile);
-		const bounded = store.captureBoundedAppendExpectation(relativePath);
 		const descriptor = store.descriptorExpected(relativePath);
-		if (!bounded || !descriptor) throw new Error("managed_persist_identity_unavailable");
+		if (!descriptor) throw new Error("managed_persist_identity_unavailable");
 		const identity = managedIdentityFromDescriptor(descriptor);
+		const bounded = includeDigest ? store.captureBoundedAppendExpectation(relativePath) : undefined;
 		if (
-			bounded.dev !== identity.dev.toString() ||
-			bounded.ino !== identity.ino.toString() ||
-			bounded.nlink !== identity.nlink.toString() ||
-			bounded.size !== String(identity.size) ||
-			bounded.mtimeNs !== identity.mtimeNs.toString() ||
-			bounded.ctimeNs !== identity.ctimeNs.toString()
+			includeDigest &&
+			(!bounded ||
+				bounded.dev !== identity.dev.toString() ||
+				bounded.ino !== identity.ino.toString() ||
+				bounded.nlink !== identity.nlink.toString() ||
+				bounded.size !== String(identity.size) ||
+				bounded.mtimeNs !== identity.mtimeNs.toString() ||
+				bounded.ctimeNs !== identity.ctimeNs.toString())
 		)
 			throw new Error("managed_persist_identity_unavailable");
-		const captured = { ...identity, sha256: bounded.sha256 };
+		const captured = bounded ? { ...identity, sha256: bounded.sha256 } : identity;
 		if (expectedBytes && captured.sha256 !== crypto.createHash("sha256").update(expectedBytes).digest("hex"))
 			throw new Error("managed_persist_identity_unavailable");
 		if (
@@ -14994,7 +15011,9 @@ export class SessionManager {
 				captured.ino !== expected.ino ||
 				captured.nlink !== expected.nlink ||
 				captured.size !== expected.size ||
-				captured.sha256 !== expected.sha256)
+				captured.mtimeNs !== expected.mtimeNs ||
+				captured.ctimeNs !== expected.ctimeNs ||
+				(expected.sha256 !== undefined && captured.sha256 !== expected.sha256))
 		)
 			throw new Error("managed_persist_identity_unavailable");
 		return captured;
@@ -15614,6 +15633,7 @@ export class SessionManager {
 				await this.#persistWriter.flush();
 				await this.#persistWriter.fsync();
 			}
+			if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) await this.#rewriteFileContents();
 		});
 		if (this.#persistError) throw this.#persistError;
 	}
@@ -20162,7 +20182,14 @@ export class SessionManager {
 				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
 					throw new Error("Could not open session: unstable");
 				manager.#managedPersistExpectedIdentity =
-					manager.destination.kind === "managed" ? manager.#captureManagedPersistIdentity(filePath) : undefined;
+					manager.destination.kind === "managed"
+						? manager.#captureManagedPersistIdentity(
+								filePath,
+								managedIdentityFromDescriptor(managedBoundedDescriptor),
+								undefined,
+								false,
+							)
+						: undefined;
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
@@ -20282,7 +20309,12 @@ export class SessionManager {
 						throw new Error("source_changed");
 					boundedManager.#managedPersistExpectedIdentity =
 						boundedManager.destination.kind === "managed"
-							? boundedManager.#captureManagedPersistIdentity(resolved)
+							? boundedManager.#captureManagedPersistIdentity(
+									resolved,
+									managedIdentityFromDescriptor(capturedDescriptor),
+									undefined,
+									false,
+								)
 							: undefined;
 					boundedManager.buildSessionContext();
 					return boundedManager;
