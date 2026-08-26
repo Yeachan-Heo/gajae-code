@@ -4514,7 +4514,7 @@ describe("intent recovery", () => {
 			expectedProvenancePath: fixture.paths.provenanceLedger,
 			trustedBridgePaths: [oldDir, newBridge],
 			replayBridgeCleanup: async pending => {
-				await fs.rm(pending.detachedPath, { recursive: true, force: true });
+				await safeRm(pending.detachedPath, { recursive: true, force: true });
 			},
 		});
 		expect(recovery?.recovered).toBe(true);
