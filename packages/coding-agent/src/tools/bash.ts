@@ -1572,7 +1572,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			let retainedAcpSnapshot = "";
 			const ACP_RAW_OVERLAP_BYTES = 512 * 1024;
 			const appendAcpSnapshot = (snapshot: string): void => {
-				if (!bridgeJobId || !snapshot) return;
+				if (!snapshot) return;
 				const snapshotBytes = Buffer.byteLength(snapshot, "utf8");
 				const retainedBytes = Buffer.byteLength(retainedAcpSnapshot, "utf8");
 				const boundedSnapshot =
@@ -1597,7 +1597,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 				const overlap = prefix[combined.length - 1] ?? 0;
 				const delta = boundedSnapshot.slice(overlap);
-				if (delta) ownedManager?.appendOutput(bridgeJobId, delta);
+				if (bridgeJobId && delta) ownedManager?.appendOutput(bridgeJobId, delta);
 				retainedAcpSnapshot = boundedSnapshot;
 			};
 			const retainedAcpOutput = (): ClientBridgeTerminalOutput => ({

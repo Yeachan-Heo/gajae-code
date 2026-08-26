@@ -292,4 +292,27 @@ describe("BashTool ACP terminal fold", () => {
 		expect(text).toContain("polled diagnostics");
 		expect(text).toContain("Command timed out after 1 seconds");
 	});
+
+	it("retains polled ACP output without a job manager", async () => {
+		let outputReads = 0;
+		const pendingOutput = new Promise<ClientBridgeTerminalOutput>(() => {});
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-managerless-timeout-recovery",
+			waitForExit: () => new Promise(() => {}),
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "managerless diagnostics\n", truncated: false };
+				return pendingOutput;
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		await expect(
+			tool.execute("call-managerless-timeout-recovery", { command: "sleep 30", timeout: 1 }, undefined, () => {}),
+		).rejects.toThrow(/managerless diagnostics[\s\S]*Command timed out after 1 seconds/);
+	});
 });
