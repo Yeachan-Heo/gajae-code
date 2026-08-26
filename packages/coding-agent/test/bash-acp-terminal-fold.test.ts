@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { AsyncJobManager } from "../src/async";
 import { JobsObserver } from "../src/modes/jobs-observer";
-import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/client-bridge";
+import type {
+	ClientBridge,
+	ClientBridgeTerminalHandle,
+	ClientBridgeTerminalOutput,
+} from "../src/session/client-bridge";
 import type { FoldAdapter } from "../src/session/fold-coordinator";
 import type { ToolSession } from "../src/tools";
 import { BashTool } from "../src/tools/bash";
@@ -256,5 +260,36 @@ describe("BashTool ACP terminal fold", () => {
 		).rejects.toThrow("editor update failed");
 		expect(Date.now() - startedAt).toBeLessThan(2_500);
 		expect(h.manager.getJobsSnapshot().jobs).toHaveLength(0);
+	});
+
+	it("retains polled ACP output when timeout recovery read expires", async () => {
+		let outputReads = 0;
+		const pendingOutput = new Promise<ClientBridgeTerminalOutput>(() => {});
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-timeout-recovery",
+			waitForExit: () => new Promise(() => {}),
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "polled diagnostics\n", truncated: false };
+				return pendingOutput;
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool(h.session);
+
+		const result = await tool.execute(
+			"call-timeout-recovery",
+			{ command: "sleep 30", timeout: 1 },
+			undefined,
+			() => {},
+		);
+		expect(result.details?.async?.state).toBe("running");
+		await waitFor(() => h.delivered.length === 1, 4_000);
+		const text = h.delivered[0]?.text ?? "";
+		expect(text).toContain("polled diagnostics");
+		expect(text).toContain("Command timed out after 1 seconds");
 	});
 });

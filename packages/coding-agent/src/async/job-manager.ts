@@ -2651,6 +2651,23 @@ export class AsyncJobManager {
 		this.#runLifecycle(jobId, "evict");
 		this.#purgeTerminalSubagentStateForJob(jobId);
 		const job = this.#jobs.get(jobId);
+		const deadLetter = this.#deadLetteredDeliveries.get(jobId);
+		if (job && deadLetter && deadLetter.generation === job.generation) {
+			this.#evictedDeadLetters.set(deadLetter.generation, {
+				jobId: deadLetter.jobId,
+				generation: deadLetter.generation,
+				ownerId: this.#deadLetteredDeliveryOwners.get(jobId),
+				backgrounded: job.metadata?.backgrounded === true,
+				attempt: deadLetter.attempt,
+				lastError: deadLetter.lastError,
+				recordedAt: Date.now(),
+			});
+			while (this.#evictedDeadLetters.size > MAX_EVICTED_DEAD_LETTERS) {
+				const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
+				if (oldestGeneration === undefined) break;
+				this.#evictedDeadLetters.delete(oldestGeneration);
+			}
+		}
 		this.#jobs.delete(jobId);
 		this.#settledJobIds.delete(jobId);
 		this.#lifecycles.delete(jobId);

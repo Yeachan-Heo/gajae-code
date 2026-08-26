@@ -196,4 +196,45 @@ describe("AsyncJobManager delivery reliability", () => {
 			resetTerminalAbortRegistriesForTests();
 		}
 	});
+
+	test("live retry-cap dead letter survives terminal job eviction", async () => {
+		let attempts = 0;
+		const manager = new AsyncJobManager({
+			retentionMs: 2_000,
+			onJobComplete: async () => {
+				attempts += 1;
+				throw new Error("delivery always fails while retained");
+			},
+		});
+
+		try {
+			const jobId = manager.register("bash", "retained dead-letter", async () => "lost-payload", {
+				metadata: { backgrounded: true },
+			});
+			const generation = manager.getJob(jobId)?.generation ?? jobId;
+			await waitFor(() => attempts >= 3, 8_000);
+			await waitFor(() => manager.getJobsSnapshot().deadLettered.length === 1, 2_000);
+
+			const liveDeadLetter = manager.getJobsSnapshot().deadLettered[0];
+			expect(liveDeadLetter).toMatchObject({
+				jobId,
+				generation,
+				backgrounded: true,
+				attempt: 3,
+				lastError: "delivery always fails while retained",
+			});
+
+			await waitFor(() => manager.getJob(jobId) === undefined, 4_000);
+			const evictedDeadLetter = manager.getJobsSnapshot().deadLettered[0];
+			expect(evictedDeadLetter).toMatchObject({
+				jobId,
+				generation,
+				backgrounded: true,
+				attempt: 3,
+				lastError: "delivery always fails while retained",
+			});
+		} finally {
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
 });
