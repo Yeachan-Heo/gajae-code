@@ -244,11 +244,6 @@ export function disposeCursorConversation(conversationId: string): void {
 	conversationStateCache.delete(conversationId);
 	conversationBlobStores.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
-	const mutationLock = conversationMutationLocks.get(conversationId);
-	if (mutationLock) {
-		conversationMutationLocks.delete(conversationId);
-		retireCursorMutationLocks([mutationLock]);
-	}
 }
 
 async function waitForCursorMutationLock(

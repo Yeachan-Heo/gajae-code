@@ -1144,6 +1144,16 @@ describe("Cursor raw transport watchdog", () => {
 		await first;
 		disposeCursorConversation(conversationId);
 
+		const unrelated = streamCursor({ ...cursorModel, baseUrl }, baseContext, {
+			apiKey: "test-token",
+			conversationId: "unrelated-conversation",
+			streamFirstEventTimeoutMs: 100,
+		});
+		for await (const _event of unrelated) {
+		}
+		const unrelatedResult = await unrelated.result();
+		expect(unrelatedResult.stopReason).toBe("stop");
+
 		const second = streamCursor({ ...cursorModel, baseUrl }, baseContext, {
 			apiKey: "test-token",
 			conversationId,
@@ -1156,7 +1166,7 @@ describe("Cursor raw transport watchdog", () => {
 		expect(secondResult.errorMessage).toContain(
 			"Cursor stream timed out while waiting for the first transport event",
 		);
-		expect(streamCount).toBe(1);
+		expect(streamCount).toBe(2);
 		release.resolve();
 		await Bun.sleep(10);
 	}, 9_000);
