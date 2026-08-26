@@ -102,6 +102,20 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		}
 	});
 
+	test("stamps canonical format on newly created lock records", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "state.json");
+
+		await withFileLock(lockedFile, async () => {
+			const info = JSON.parse(await fs.readFile(path.join(`${lockedFile}.lock`, "info"), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(info.start_time_format).toBe("utc-v1");
+			expect(typeof info.owner_token).toBe("string");
+		});
+	});
+
 	test("does not overlap a live holder that exceeds staleMs", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
