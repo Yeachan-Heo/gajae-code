@@ -3179,6 +3179,20 @@ pub(crate) mod platform {
 		}
 	}
 
+	#[cfg(target_os = "macos")]
+	fn clear_and_verify_macos_acl(fd: libc::c_int) -> Result<(), &'static str> {
+		let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+		if duplicate < 0 {
+			return Err("acl_unavailable");
+		}
+		let file = unsafe { File::from_raw_fd(duplicate) };
+		clear_extended_acl(&file).map_err(|_| "acl_apply_failed")?;
+		if has_extended_acl(&file).map_err(|_| "acl_verify_failed")? {
+			return Err("acl_verify_failed");
+		}
+		Ok(())
+	}
+
 	fn verify_authority(
 		authority: &CheckedPathAuthority,
 		kind: &str,
@@ -4844,6 +4858,16 @@ pub(crate) mod platform {
 				}
 				return NativeSecureSkillWriteResult::failure("permission_denied");
 			}
+			#[cfg(target_os = "macos")]
+			if clear_and_verify_macos_acl(skills_fd).is_err()
+				|| clear_and_verify_macos_acl(skill_fd).is_err()
+			{
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure("acl_verify_failed");
+			}
 		}
 		let Ok(final_name) = CString::new("SKILL.md") else {
 			unsafe {
@@ -4923,7 +4947,22 @@ pub(crate) mod platform {
 				);
 			}
 		}
+		#[cfg(target_os = "macos")]
+		if clear_and_verify_macos_acl(private_fd).is_err() {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("acl_verify_failed");
+		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure(code);
+		}
+		if let Err(code) = fsync_root_parent(skills_fd) {
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);

@@ -302,7 +302,7 @@ async function handleAddCommand(rest: string, runtime: SlashCommandRuntime): Pro
 	const config = buildMcpServerConfig(parsed);
 	if (!config) return usage(MCP_ADD_USAGE, runtime);
 	try {
-		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd, runtime.settings.getAgentDir());
+		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd, runtime.session.getSessionAgentDir());
 		await addMCPServer(filePath, parsed.name, config);
 		await runtime.output(`Added MCP server "${parsed.name}" (${parsed.scope}).`);
 		return commandConsumed();
@@ -315,7 +315,7 @@ async function handleSmitherySearchCommand(rest: string, runtime: SlashCommandRu
 	const parsed = parseMcpSearchArgs(rest);
 	if (parsed.error) return usage(parsed.error, runtime);
 	try {
-		const apiKey = await getSmitheryApiKey(runtime.settings.getAgentDir());
+		const apiKey = await getSmitheryApiKey(runtime.session.getSessionAgentDir());
 		const results = await searchSmitheryRegistry(parsed.keyword, {
 			limit: parsed.limit,
 			apiKey: apiKey ?? undefined,
@@ -348,7 +348,7 @@ async function handleSmitherySearchCommand(rest: string, runtime: SlashCommandRu
 
 async function handleListCommand(runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	try {
-		const userPath = getMCPConfigPath("user", runtime.cwd, runtime.settings.getAgentDir());
+		const userPath = getMCPConfigPath("user", runtime.cwd, runtime.session.getSessionAgentDir());
 		const projectPath = getMCPConfigPath("project", runtime.cwd);
 		const [userConfig, projectConfig] = await Promise.all([
 			readMCPConfigFile(userPath),
@@ -416,7 +416,7 @@ async function handleEnableDisableCommand(
 	if (!name) return usage(`Usage: /mcp ${verb} <name>`, runtime);
 	const enabled = verb === "enable";
 	try {
-		const userPath = getMCPConfigPath("user", runtime.cwd, runtime.settings.getAgentDir());
+		const userPath = getMCPConfigPath("user", runtime.cwd, runtime.session.getSessionAgentDir());
 		const projectPath = getMCPConfigPath("project", runtime.cwd);
 		const [userConfig, projectConfig] = await Promise.all([
 			readMCPConfigFile(userPath),
@@ -449,7 +449,7 @@ async function handleRemoveCommand(rest: string, runtime: SlashCommandRuntime): 
 	if (parsed.error) return usage(parsed.error, runtime);
 	if (!parsed.name) return usage("Usage: /mcp remove <name> [--scope project|user]", runtime);
 	try {
-		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd, runtime.settings.getAgentDir());
+		const filePath = getMCPConfigPath(parsed.scope, runtime.cwd, runtime.session.getSessionAgentDir());
 		await removeMCPServer(filePath, parsed.name);
 		await runtime.output(`Removed server "${parsed.name}" from ${parsed.scope} config.`);
 		return commandConsumed();
