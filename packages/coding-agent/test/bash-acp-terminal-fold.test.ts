@@ -314,4 +314,31 @@ describe("BashTool ACP terminal fold", () => {
 			tool.execute("call-managerless-timeout-recovery", { command: "sleep 30", timeout: 1 }, undefined, () => {}),
 		).rejects.toThrow(/managerless diagnostics[\s\S]*Command timed out after 1 seconds/);
 	});
+
+	it("retains polled ACP output when normal-exit final read rejects", async () => {
+		let outputReads = 0;
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-normal-exit-recovery",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "normal-exit diagnostics\n", truncated: false };
+				throw new Error("terminal/output failed after exit");
+			},
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		const resultPromise = tool.execute("call-normal-exit-recovery", { command: "echo done" }, undefined, () => {});
+		await waitFor(() => outputReads === 1);
+		exit.resolve({ exitCode: 0, signal: null });
+		const result = await resultPromise;
+		const text = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
+		expect(text).toContain("normal-exit diagnostics");
+		expect(text).toContain("Terminal output recovery failed");
+	});
 });
