@@ -7,14 +7,7 @@
  * - Loading items for a capability across all providers
  */
 import * as path from "node:path";
-import {
-	getAgentDir,
-	getConfigDirName,
-	getPluginsDir,
-	getProjectDir,
-	getTrustedHomeDir,
-	logger,
-} from "@gajae-code/utils";
+import { getAgentDir, getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -35,6 +28,8 @@ import type {
 
 /** Registry of all capabilities */
 const capabilities = new Map<string, Capability<unknown>>();
+const initialProcessHome = process.env.HOME ?? getTrustedHomeDir();
+const ambientDefaultAgentDir = path.join(initialProcessHome, getConfigDirName(), "agent");
 
 /** Reverse index: provider ID -> capability IDs it's registered for */
 const providerCapabilities = new Map<string, Set<string>>();
@@ -279,8 +274,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
 	const processAgentDir = getAgentDir();
 	const customProcessProfile =
-		path.resolve(processAgentDir) !== path.resolve(path.join(path.dirname(getPluginsDir()), "agent")) &&
-		(await Bun.file(path.join(processAgentDir, "plugins", "installed_plugins.json")).exists());
+		process.env.HOME === initialProcessHome && path.resolve(processAgentDir) !== path.resolve(ambientDefaultAgentDir);
 	return await loadCapabilityWithContext(
 		capabilityId,
 		{
