@@ -2221,7 +2221,14 @@ async function executeUncertainRetirement(
 					...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
 					...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 				});
-				indexSeq = event.indexSeq;
+				const verifiedIndexSeq = broker.index.findSessionClosedEvidence(record);
+				if (verifiedIndexSeq === undefined)
+					return fail(
+						"terminal_uncertain",
+						"Uncertain session retirement could not verify the appended session closure against the current index.",
+						cleanup,
+					);
+				indexSeq = verifiedIndexSeq;
 			} catch {
 				return fail("cleanup_pending", "Uncertain session retirement is staged before index closure.", cleanup);
 			}
