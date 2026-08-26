@@ -3193,6 +3193,13 @@ fn replace_managed(
 	if !expected_matches_before_truncate {
 		return publish_preflight_failure_with_primitive("identity_mismatch", primitive);
 	}
+	let named_before_truncate = match statat(&parent, &name) {
+		Ok(named) => named,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	if !stat_matches_regular_identity(&named_before_truncate, &before) {
+		return publish_preflight_failure_with_primitive("identity_mismatch", primitive);
+	}
 
 	let committed_failure = |code: &'static str, phase: &'static str| {
 		publish_post_mutation_failure_with_primitive(code, phase, primitive, None)
