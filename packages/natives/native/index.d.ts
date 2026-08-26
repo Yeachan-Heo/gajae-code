@@ -2170,7 +2170,7 @@ export interface RecoveryFsRetainedCleanupResult {
   treeSnapshot?: NativeDirectoryTreeSnapshot
 }
 
-export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
+export declare function renameNoReplacePath(sourcePath: string, destinationPath: string, expectedSource?: NativeExactFileIdentity | undefined | null): NativeNoReplaceResult
 
 /**
  * Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking

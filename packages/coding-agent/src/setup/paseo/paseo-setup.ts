@@ -1376,6 +1376,13 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
 			canonicalExistingPathForNative(bridgeDir),
+			{
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				directory: true,
+			},
 		);
 		if (!published.ok) {
 			throw new SkillsBridgeError(

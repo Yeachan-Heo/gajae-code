@@ -1419,15 +1419,30 @@ pub fn symlink_no_replace_path(
 pub fn rename_no_replace_path(
 	source_path: String,
 	destination_path: String,
+	expected_source: Option<NativeExactFileIdentity>,
 ) -> NativeNoReplaceResult {
 	if source_path.contains('\0') || destination_path.contains('\0') {
 		return NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure(
 			"invalid_request",
 		));
 	}
+	let expected_source = match expected_source {
+		None => None,
+		Some(identity) => {
+			let (dev_negative, dev, dev_lossless) = identity.dev.get_u64();
+			let (ino_negative, ino, ino_lossless) = identity.ino.get_u64();
+			if dev_negative || ino_negative || !dev_lossless || !ino_lossless {
+				return NativeNoReplaceResult::from_exact(NativeExactUnlinkResult::failure(
+					"identity_mismatch",
+				));
+			}
+			Some((dev, ino))
+		},
+	};
 	NativeNoReplaceResult::from_exact(platform::rename_path_no_replace(
 		Path::new(&source_path),
 		Path::new(&destination_path),
+		expected_source,
 	))
 }
 
@@ -1472,7 +1487,7 @@ pub fn rename_no_replace_path_async(
 	destination_path: String,
 ) -> task::Promise<NativeNoReplaceResult> {
 	task::blocking("rename_no_replace_path", (), move |_| {
-		Ok(rename_no_replace_path(source_path, destination_path))
+		Ok(rename_no_replace_path(source_path, destination_path, None))
 	})
 }
 
@@ -4743,6 +4758,7 @@ pub(crate) mod platform {
 	pub(super) fn rename_path_no_replace(
 		source_path: &Path,
 		destination_path: &Path,
+		expected_source: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		let (source_parent, source_name) = match open_parent_no_follow(source_path) {
 			Ok(value) => value,
@@ -4760,6 +4776,13 @@ pub(crate) mod platform {
 		{
 			unsafe { libc::close(source_parent) };
 			return NativeExactUnlinkResult::failure("identity_mismatch");
+		}
+		if let Some((expected_dev, expected_ino)) = expected_source {
+			if source_named.st_dev as u64 != expected_dev || source_named.st_ino as u64 != expected_ino
+			{
+				unsafe { libc::close(source_parent) };
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
 		}
 		if source_named.st_mode & libc::S_IFMT == libc::S_IFDIR {
 			let (destination_parent, destination_name) = match open_parent_no_follow(destination_path)
@@ -7727,6 +7750,7 @@ mod platform {
 	pub(super) fn rename_path_no_replace(
 		source_path: &Path,
 		destination_path: &Path,
+		_expected_source: Option<(u64, u64)>,
 	) -> NativeExactUnlinkResult {
 		let source_path = match lexical_absolute_path(source_path) {
 			Ok(path) => path,
@@ -9379,7 +9403,11 @@ mod platform {
 	) -> NativeCanonicalDirectoryIdentity {
 		NativeCanonicalDirectoryIdentity::failure("identity_unavailable")
 	}
-	pub(super) fn rename_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
+	pub(super) fn rename_path_no_replace(
+		_: &Path,
+		_: &Path,
+		_: Option<(u64, u64)>,
+	) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
 	pub(super) fn link_path_no_replace(_: &Path, _: &Path) -> NativeExactUnlinkResult {
@@ -9549,6 +9577,7 @@ mod owner_only_security_tests {
 		let renamed = rename_no_replace_path(
 			source.to_string_lossy().into_owned(),
 			destination.to_string_lossy().into_owned(),
+			None,
 		);
 		assert!(renamed.ok, "{:?}", renamed.code);
 		assert_eq!(renamed.mutation_state, "committed");
@@ -9563,6 +9592,7 @@ mod owner_only_security_tests {
 		let collision = rename_no_replace_path(
 			collision_source.to_string_lossy().into_owned(),
 			destination.to_string_lossy().into_owned(),
+			None,
 		);
 		assert!(!collision.ok);
 		assert_eq!(collision.code.as_deref(), Some("quarantine_collision"));
@@ -9602,7 +9632,7 @@ mod owner_only_security_tests {
 
 	#[test]
 	fn rename_no_replace_rejects_nul_request_before_syscall() {
-		let result = rename_no_replace_path("source\0".to_owned(), "destination".to_owned());
+		let result = rename_no_replace_path("source\0".to_owned(), "destination".to_owned(), None);
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("invalid_request"));
 		assert_eq!(result.reason, "invalid_request");
@@ -9829,6 +9859,7 @@ mod rename_no_replace_eintr_tests {
 		let result = rename_no_replace_path(
 			source.to_string_lossy().into_owned(),
 			destination.to_string_lossy().into_owned(),
+			None,
 		);
 		assert!(result.ok, "{:?} / {}", result.code, result.reason);
 		assert_eq!(result.reason, "none");
@@ -9848,6 +9879,7 @@ mod rename_no_replace_eintr_tests {
 		let result = rename_no_replace_path(
 			source.to_string_lossy().into_owned(),
 			destination.to_string_lossy().into_owned(),
+			None,
 		);
 		assert!(!result.ok);
 		assert_eq!(result.code.as_deref(), Some("interrupted"));
@@ -11102,7 +11134,8 @@ mod link_no_replace_tests {
 		fs::write(temporary.0.join("occupied"), b"existing").expect("seed destination");
 
 		let linked = link_no_replace_path(temporary.join("staging"), temporary.join("occupied"));
-		let renamed = rename_no_replace_path(temporary.join("staging"), temporary.join("occupied"));
+		let renamed =
+			rename_no_replace_path(temporary.join("staging"), temporary.join("occupied"), None);
 
 		assert!(!linked.ok, "an occupied destination must never be published over");
 		assert_eq!(linked.reason, "destination_exists");

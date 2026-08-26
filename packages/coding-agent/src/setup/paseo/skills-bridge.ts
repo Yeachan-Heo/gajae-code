@@ -766,6 +766,13 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
 			canonicalExistingPathForNative(preflight.bridgeDir),
+			{
+				dev: BigInt(identity.dev),
+				ino: BigInt(identity.ino),
+				size: BigInt(identity.size),
+				mtimeNs: BigInt(identity.mtimeNs),
+				directory: true,
+			},
 		);
 		if (!published.ok) {
 			throw new SkillsBridgeError(
