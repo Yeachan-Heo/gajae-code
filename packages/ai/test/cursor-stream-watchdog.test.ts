@@ -935,6 +935,75 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("drops buffered execs when a gRPC trailer failure closes admission", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
+			stream.on("wantTrailers", () => {
+				stream.sendTrailers({ "grpc-status": "13", "grpc-message": "transport%20reset" });
+			});
+			setTimeout(() => {
+				const first = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: {
+							case: "piWriteArgs",
+							value: create(PiWriteExecArgsSchema, { path: "archive.zip:first.txt", content: "first" }),
+						},
+					}),
+				});
+				const second = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 2,
+						message: {
+							case: "piWriteArgs",
+							value: create(PiWriteExecArgsSchema, { path: "archive.zip:second.txt", content: "second" }),
+						},
+					}),
+				});
+				stream.write(Buffer.concat([first, second]));
+				setTimeout(() => stream.end(), 10);
+			}, 10);
+		});
+		const started = Promise.withResolvers<void>();
+		const settleWrite = Promise.withResolvers<void>();
+		let executionCount = 0;
+		let terminalPublished = false;
+		const pending = collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 100,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					executionCount += 1;
+					call.markNonAbortable?.();
+					started.resolve();
+					await settleWrite.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		}).then(value => {
+			terminalPublished = true;
+			return value;
+		});
+
+		await started.promise;
+		await Bun.sleep(40);
+		expect(terminalPublished).toBe(false);
+		settleWrite.resolve();
+		const { events, result } = await pending;
+		expect(executionCount).toBe(1);
+		expect(result.errorMessage).toContain("gRPC error 13: transport reset");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("aborts the per-exec signal when the caller aborts mid-exec", async () => {
 		const controller = new AbortController();
 		const baseUrl = await createCursorServer(stream => {

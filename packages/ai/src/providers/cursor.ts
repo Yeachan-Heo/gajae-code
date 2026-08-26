@@ -1223,6 +1223,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				h2Request?.close();
 				settleBehindFence(() => settleH2(error));
 			});
+			const closeTerminalAdmission = (): void => {
+				terminalAdmissionClosed = true;
+				pendingBuffer = Buffer.alloc(0);
+				h2Request?.pause();
+			};
 			const drainMessageQueue = (): void => {
 				void messageQueue.drain().then(
 					() => {
@@ -1239,6 +1244,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
+					closeTerminalAdmission();
 					settleBehindFence(() =>
 						settleH2(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`)),
 					);
@@ -1265,8 +1271,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// A validated turnEnded closes admission. Drop coalesced bytes
 						// behind any terminal frame so a late exec cannot reach the local
 						// handler after terminal bookkeeping has started.
-						pendingBuffer = Buffer.alloc(0);
-						h2Request?.pause();
+						closeTerminalAdmission();
 						break;
 					}
 					const flags = pendingBuffer[0];
@@ -1277,10 +1282,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
-						terminalAdmissionClosed = true;
+						closeTerminalAdmission();
 						responseEnded = true;
-						pendingBuffer = Buffer.alloc(0);
-						h2Request?.pause();
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
 							endStreamError = endError;
@@ -1308,6 +1311,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
+							if (isExecServerMessage && terminalAdmissionClosed) return;
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
@@ -1370,7 +1374,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							} finally {
 								if (isExecServerMessage) {
 									execInFlight = false;
-									if (execSucceeded && !transportWatchdogClosed && !callerAbortError) {
+									if (
+										execSucceeded &&
+										!transportWatchdogClosed &&
+										!callerAbortError &&
+										!terminalAdmissionClosed
+									) {
 										processingPausedForExec = false;
 										h2Request!.resume();
 										refreshTransportWatchdog();
