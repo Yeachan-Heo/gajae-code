@@ -731,8 +731,8 @@ export async function reapScrubbedProtocolRemnants(
 			continue;
 		}
 		for (const name of names) {
-			if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
 			if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
+			if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
 			const pathname = path.join(scanDirectory, name);
 			try {
 				const named = await fsp.lstat(pathname);

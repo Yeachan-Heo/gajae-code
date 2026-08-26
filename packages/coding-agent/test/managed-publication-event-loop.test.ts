@@ -229,6 +229,21 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 		});
 	});
 
+	it("yields while scanning retained non-remnant evidence", async () => {
+		await withTempDir("gjc-remnant-inert-scan-", async dir => {
+			const retained = await seedRemnant(dir, ".gjc-managed-exchange-retained", 60 * 60 * 1000, new Uint8Array([1]));
+			for (let index = 0; index < 600; index++) {
+				await fsp.writeFile(path.join(dir, `retained-evidence-${index.toString().padStart(4, "0")}`), "evidence");
+			}
+
+			const result = await reapScrubbedProtocolRemnants(dir);
+
+			expect(result).toEqual({ reaped: 0, failures: 0 });
+			expect(fs.existsSync(retained)).toBe(true);
+			expect((await fsp.readdir(dir)).length).toBe(601);
+		});
+	});
+
 	it("treats a missing directory as a benign no-op", async () => {
 		const missing = path.join(os.tmpdir(), `gjc-remnant-missing-${Date.now()}`);
 		expect(await reapScrubbedProtocolRemnants(missing)).toEqual({ reaped: 0, failures: 0 });
