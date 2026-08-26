@@ -556,6 +556,7 @@ function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean
 function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, args: Record<string, unknown>): boolean {
 	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
 	if (!fields || fields.length === 0) return false;
+	if (args.deepInterview !== undefined || args.workflowGate !== undefined) return false;
 	const prefixes = fields.map(field => field.split("."));
 	const isDisplayPath = (path: readonly string[]): boolean =>
 		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));

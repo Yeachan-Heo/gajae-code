@@ -3609,7 +3609,10 @@ export class ModelRegistry {
 		// and failures there are handled gracefully.
 		const peekKey = async (descriptor: { providerId: string }) => {
 			const configurationGeneration = this.authStorage.getProviderConfigurationGeneration(descriptor.providerId);
-			const apiKey = await this.#peekApiKeyForProvider(descriptor.providerId);
+			const apiKey = normalizeVllmApiKey(
+				descriptor.providerId,
+				await this.#peekApiKeyForProvider(descriptor.providerId),
+			);
 			if (configurationGeneration !== this.authStorage.getProviderConfigurationGeneration(descriptor.providerId)) {
 				return { apiKey: undefined, authGeneration: undefined };
 			}
