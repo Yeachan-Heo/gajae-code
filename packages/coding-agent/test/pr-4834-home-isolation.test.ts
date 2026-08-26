@@ -4,7 +4,7 @@ import type * as nfs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
+import { initializeWithSettings, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
 import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { hookCapability } from "@gajae-code/coding-agent/capability/hook";
@@ -15,6 +15,7 @@ import { type SlashCommand, slashCommandCapability } from "@gajae-code/coding-ag
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
+import { Settings } from "../src/config/settings";
 // Register all discovery providers as a side effect.
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 // Register all discovery providers as a side effect.
@@ -254,6 +255,20 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 
 		const decoyReads = [...reads].filter(p => p.startsWith(decoyAgentDir));
 		expect(decoyReads).toEqual([]);
+	});
+
+	test("explicit home ignores contaminated process provider and extension policy", async () => {
+		const homeAgentDir = path.join(home, ".gjc", "agent");
+		await seedProfile(homeAgentDir, "home");
+		initializeWithSettings(Settings.isolated({ disabledProviders: ["native"], disabledExtensions: ["home-skill"] }));
+		try {
+			const options = { cwd: project, providers: ["native"] as string[] };
+			const skills = await loadCapabilityForHome<Skill>(skillCapability.id, home, options);
+			expect(skills.items.map(item => item.name)).toEqual(["home-skill"]);
+			expect(skills.warnings).toEqual([]);
+		} finally {
+			initializeWithSettings(Settings.isolated());
+		}
 	});
 
 	test("explicit home still honors an explicit agent directory", async () => {

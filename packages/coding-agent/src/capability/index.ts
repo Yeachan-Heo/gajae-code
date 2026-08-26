@@ -113,7 +113,7 @@ async function loadImpl<T>(
 		: new Set<string>(
 				options.disabledExtensions ??
 					options.settings?.get("disabledExtensions") ??
-					settings?.get("disabledExtensions") ??
+					(options.isolatedHome ? undefined : settings?.get("disabledExtensions")) ??
 					[],
 			);
 
@@ -214,8 +214,12 @@ async function loadImpl<T>(
  * Filter providers based on options and disabled state.
  */
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
-	const activeSettings = options.settings ?? settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir()));
-	const activeDisabledProviders = new Set(activeSettings?.get("disabledProviders") ?? disabledProviders);
+	const activeSettings = options.isolatedHome
+		? options.settings
+		: (options.settings ?? settingsByCwd.get(path.normalize(options.cwd ?? getProjectDir())));
+	const activeDisabledProviders = new Set(
+		activeSettings?.get("disabledProviders") ?? (options.isolatedHome ? [] : disabledProviders),
+	);
 	let providers = (capability.providers as Provider<T>[]).filter(
 		p => options.includeDisabledProviders === true || !activeDisabledProviders.has(p.id),
 	);
@@ -292,10 +296,11 @@ export async function loadCapabilityForHome<T>(
 
 	const cwd = options.cwd ?? getProjectDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: options.settings };
-	const providers = filterProviders(capability, options);
+	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
+	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: isolatedOptions.settings };
+	const providers = filterProviders(capability, isolatedOptions);
 
-	return await loadImpl(capability, providers, ctx, options);
+	return await loadImpl(capability, providers, ctx, isolatedOptions);
 }
 
 // =============================================================================
