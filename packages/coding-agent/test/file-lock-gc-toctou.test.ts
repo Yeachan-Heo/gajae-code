@@ -3,7 +3,12 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { FileLockTestHooks, removeFileLockDirForGc, withFileLock } from "@gajae-code/coding-agent/config/file-lock";
+import {
+	FileLockTestHooks,
+	processStartTime,
+	removeFileLockDirForGc,
+	withFileLock,
+} from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
 import { snapshotDirectoryTree } from "@gajae-code/natives";
@@ -65,6 +70,31 @@ function deadLockRecord(lockDir: string): GcRecord {
 }
 
 describe("withFileLock stale owner liveness (#652)", () => {
+	test("keeps process identity stable across caller locale and timezone", () => {
+		if (process.platform === "win32") return;
+		const original = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };
+		try {
+			process.env.TZ = "Pacific/Honolulu";
+			process.env.LC_ALL = "C";
+			process.env.LANG = "C";
+			const holderIdentity = processStartTime(process.pid);
+			process.env.TZ = "Asia/Tokyo";
+			process.env.LC_ALL = "de_DE.UTF-8";
+			process.env.LANG = "de_DE.UTF-8";
+			const contenderIdentity = processStartTime(process.pid);
+
+			expect(holderIdentity).not.toBeNull();
+			expect(contenderIdentity).toBe(holderIdentity);
+		} finally {
+			if (original.TZ === undefined) delete process.env.TZ;
+			else process.env.TZ = original.TZ;
+			if (original.LC_ALL === undefined) delete process.env.LC_ALL;
+			else process.env.LC_ALL = original.LC_ALL;
+			if (original.LANG === undefined) delete process.env.LANG;
+			else process.env.LANG = original.LANG;
+		}
+	});
+
 	test("does not overlap a live holder that exceeds staleMs", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");

@@ -85,7 +85,11 @@ export function processStartTime(pid: number): string | null {
 			const startTime = new TextDecoder().decode(result.stdout).trim();
 			return startTime || null;
 		}
-		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], { stdout: "pipe", stderr: "ignore" });
+		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
+			stdout: "pipe",
+			stderr: "ignore",
+			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+		});
 		if (result.exitCode !== 0) return null;
 		const startTime = new TextDecoder().decode(result.stdout).trim();
 		return startTime || null;
