@@ -252,10 +252,17 @@ function forwardStream<TApi extends Api>(
 	model: Model<TApi>,
 	options: OptionsForApi<TApi>,
 	abortTracker: AbortSourceTracker,
+	onStreamCreated?: () => void,
 	limits?: LazyStreamLimits,
 ): void {
 	(async () => {
 		try {
+			let admitted = false;
+			const markAdmission = (): void => {
+				if (admitted) return;
+				admitted = true;
+				onStreamCreated?.();
+			};
 			let watchedSource = source;
 			if (!limits?.providerOwnsWatchdog) {
 				const idleTimeoutMs = options.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(limits?.defaultIdleTimeoutMs);
@@ -286,6 +293,7 @@ function forwardStream<TApi extends Api>(
 			}
 
 			for await (const event of watchedSource) {
+				markAdmission();
 				target.push(event);
 			}
 			if (hasFinalResult(source)) {
@@ -355,8 +363,7 @@ function createLazyStream<TApi extends Api>(
 				abortTracker = createAbortSourceTracker(streamOptions.signal);
 				const providerOptions = { ...streamOptions, signal: abortTracker.requestSignal } as OptionsForApi<TApi>;
 				const inner = module.stream(model, context, providerOptions);
-				forwardStream(outer, inner, model, streamOptions, abortTracker, limits);
-				onStreamCreated?.();
+				forwardStream(outer, inner, model, streamOptions, abortTracker, onStreamCreated, limits);
 			})
 			.catch(error => {
 				const message = createLazyLoadErrorMessage(model, error);

@@ -83,7 +83,7 @@ describe("auth gateway credential lease", () => {
 		expect(releases).toBe(1);
 	});
 
-	it("keeps a lazy-import lease until the provider stream is created", async () => {
+	it("keeps a lazy-import lease until the provider emits its first event", async () => {
 		const inner = Promise.withResolvers<AssistantMessageEventStream>();
 		let admitted = 0;
 		let releases = 0;
@@ -108,9 +108,25 @@ describe("auth gateway credential lease", () => {
 		const providerEvents = new EventStream();
 		inner.resolve(providerEvents);
 		await Bun.sleep(0);
+		// Constructing the provider stream is not outbound admission. The lease
+		// remains held until the provider produces its first response event.
+		expect(admitted).toBe(0);
+		expect(releases).toBe(0);
+		providerEvents.push({
+			type: "start",
+			partial: {
+				role: "assistant",
+				api: "openai-completions",
+				provider: "lazy-admission-test",
+				model: "lazy-admission-model",
+				content: [],
+				usage: ZERO_USAGE,
+				stopReason: "stop",
+				timestamp: 0,
+			},
+		});
+		await Bun.sleep(0);
 		expect(admitted).toBe(1);
-		// The stream is intentionally still live: release happened at admission,
-		// not after the provider response completes.
 		expect(releases).toBe(1);
 		providerEvents.fail(new Error("provider stream stopped"));
 		await events.result().catch(() => undefined);
