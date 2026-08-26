@@ -181,12 +181,6 @@ const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
 // later turn cannot start another request while the detached mutation is still
 // changing local state.
 const conversationMutationLocks = new Map<string, Promise<void>>();
-type CursorMutationLockBarrier = {
-	pending: number;
-	promise: Promise<void>;
-	resolve: () => void;
-};
-let conversationMutationLockBarrier: CursorMutationLockBarrier | undefined;
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -194,49 +188,26 @@ const CURSOR_MAX_CONVERSATIONS = 64;
 const CURSOR_CONVERSATION_TTL_MS = 60 * 60 * 1000;
 const conversationLastAccess = new Map<string, number>();
 
-function retireCursorMutationLocks(locks: Iterable<Promise<void>>): void {
-	for (const lock of locks) {
-		let barrier = conversationMutationLockBarrier;
-		if (!barrier) {
-			const deferred = Promise.withResolvers<void>();
-			barrier = { pending: 0, promise: deferred.promise, resolve: deferred.resolve };
-			conversationMutationLockBarrier = barrier;
-		}
-		barrier.pending += 1;
-		void lock.then(
-			() => releaseCursorMutationLockBarrier(barrier!),
-			() => releaseCursorMutationLockBarrier(barrier!),
-		);
+let conversationMutationLockReservations = 0;
+
+function reserveCursorMutationLock(conversationId: string): "existing" | "reserved" | undefined {
+	if (conversationMutationLocks.has(conversationId)) return "existing";
+	if (conversationMutationLocks.size + conversationMutationLockReservations >= CURSOR_MAX_CONVERSATIONS) {
+		return undefined;
 	}
+	conversationMutationLockReservations += 1;
+	return "reserved";
 }
 
-function releaseCursorMutationLockBarrier(barrier: CursorMutationLockBarrier): void {
-	barrier.pending -= 1;
-	if (barrier.pending !== 0) return;
-	barrier.resolve();
-	if (conversationMutationLockBarrier === barrier) conversationMutationLockBarrier = undefined;
+function releaseCursorMutationLockReservation(): void {
+	conversationMutationLockReservations -= 1;
 }
 
 function registerCursorMutationLock(conversationId: string, lock: Promise<void>): void {
-	if (conversationMutationLockBarrier) {
-		retireCursorMutationLocks([lock]);
-		return;
-	}
-	const previous = conversationMutationLocks.get(conversationId);
-	if (previous) {
-		conversationMutationLocks.delete(conversationId);
-		retireCursorMutationLocks([previous, lock]);
-		return;
-	}
 	conversationMutationLocks.set(conversationId, lock);
 	void lock.then(() => {
 		if (conversationMutationLocks.get(conversationId) === lock) conversationMutationLocks.delete(conversationId);
 	});
-	if (conversationMutationLocks.size > CURSOR_MAX_CONVERSATIONS) {
-		const locks = [...conversationMutationLocks.values()];
-		conversationMutationLocks.clear();
-		retireCursorMutationLocks(locks);
-	}
 }
 
 /** Drop all cached state + blob bytes for a conversation (F15 bound + session-teardown hook). */
@@ -253,8 +224,7 @@ async function waitForCursorMutationLock(
 	timeoutError: () => Error,
 ): Promise<void> {
 	const lock = conversationMutationLocks.get(conversationId);
-	const barrier = conversationMutationLockBarrier;
-	if (!lock && !barrier) return;
+	if (!lock) return;
 	if (signal?.aborted) throw cursorAbortError(signal);
 	const deadline = Promise.withResolvers<never>();
 	deadline.promise.catch(() => {});
@@ -269,10 +239,7 @@ async function waitForCursorMutationLock(
 	try {
 		const racers: Promise<never>[] = [deadline.promise];
 		if (signal) racers.push(aborted.promise);
-		const fences: Promise<void>[] = [];
-		if (barrier) fences.push(barrier.promise);
-		if (lock) fences.push(lock);
-		await Promise.race([Promise.all(fences).then(() => undefined), ...racers]);
+		await Promise.race([lock, ...racers]);
 	} finally {
 		if (signal) signal.removeEventListener("abort", onAbort);
 		if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -1331,11 +1298,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							h2Request!.pause();
 							clearTransportWatchdog();
 						}
+						let mutationSlot: "existing" | "reserved" | undefined;
 						const queued = messageQueue.enqueue(async () => {
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
 							if (isExecServerMessage) {
+								mutationSlot = reserveCursorMutationLock(conversationId);
+								if (!mutationSlot) throw new Error("Cursor mutation lock capacity exhausted");
 								clearTransportWatchdog();
 								execInFlight = true;
 							}
@@ -1367,6 +1337,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										options?.signal,
 										cursorExecDeadlineMsForTest(idleTimeoutMs),
 										settlement => {
+											if (mutationSlot === "reserved") {
+												releaseCursorMutationLockReservation();
+												mutationSlot = "existing";
+											}
 											pendingNonAbortableExec = settlement;
 											const lock = settlement.settled.then(
 												() => undefined,
@@ -1380,6 +1354,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 								}
 								execSucceeded = true;
 							} finally {
+								if (mutationSlot === "reserved") releaseCursorMutationLockReservation();
 								if (isExecServerMessage) {
 									execInFlight = false;
 									if (execSucceeded && !transportWatchdogClosed && !callerAbortError) {
