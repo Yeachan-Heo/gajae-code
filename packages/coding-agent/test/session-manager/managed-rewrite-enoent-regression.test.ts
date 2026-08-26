@@ -7,6 +7,7 @@ import * as native from "@gajae-code/natives";
 import {
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
+	reapScrubbedProtocolRemnantsSync,
 } from "../../src/session/internal/managed-session-storage";
 import { makeAssistantMessage } from "./helpers";
 
@@ -331,6 +332,71 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		expect(manager.getObservabilityStatsForTests().coldSpillWriteCount).toBe(beforeStats.coldSpillWriteCount);
 		expect(await readText(sessionFile)).toContain("identity-less-eviction-barrier");
 		await manager.close().catch(() => {});
+	});
+
+	it("services a descriptor-bound committed append receipt during flush", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const appendManaged = native.RecoveryFsRoot.prototype.appendManaged;
+		let failOnce = true;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const result = appendManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return result;
+			failOnce = false;
+			return {
+				...result,
+				ok: false,
+				code: "fsync_failed",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "receipt-backed-recovery", timestamp: Date.now() }),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
+		await manager.flush();
+		expect(await readText(sessionFile)).toContain("receipt-backed-recovery");
+		await manager.close().catch(() => {});
+	});
+
+	it("bounds synchronous remnant reaping to one directory batch", () => {
+		const reapRoot = path.join(root, "reap");
+		fs.mkdirSync(reapRoot, { recursive: true });
+		for (let index = 0; index < 300; index++) {
+			const pathname = path.join(reapRoot, `.gjc-replace-retry-${index}`);
+			fs.writeFileSync(pathname, "");
+			fs.utimesSync(pathname, new Date(0), new Date(0));
+		}
+
+		const result = reapScrubbedProtocolRemnantsSync(reapRoot, 0);
+		expect(result.reaped).toBe(256);
+		expect(fs.readdirSync(reapRoot)).toHaveLength(44);
 	});
 
 	it("keeps a pre-write append identity mismatch non-committed", async () => {
