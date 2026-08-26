@@ -59,7 +59,7 @@ function createSelector(options: SelectorOptions = {}) {
 	return { component, previews, changedSettings, previewWidths };
 }
 function selectCustomEditor(component: SettingsSelectorComponent): void {
-	for (let i = 0; i < 5; i++) component.handleInput("\x1b[B");
+	for (let i = 0; i < 6; i++) component.handleInput("\x1b[B");
 }
 
 function openCustomEditor(component: SettingsSelectorComponent): void {
@@ -76,7 +76,7 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 	it("keeps Custom out of the generic preset selector", () => {
 		const { component } = createSelector();
 
-		for (let i = 0; i < 4; i++) component.handleInput("\x1b[B");
+		for (let i = 0; i < 5; i++) component.handleInput("\x1b[B");
 
 		component.handleInput("\n");
 
