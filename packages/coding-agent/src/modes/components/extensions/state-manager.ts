@@ -4,6 +4,7 @@
  */
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
+import type { Settings } from "../../../config/settings";
 import type { ContextFile } from "../../../capability/context-file";
 import type { ExtensionModule } from "../../../capability/extension-module";
 import type { Hook } from "../../../capability/hook";
@@ -43,7 +44,12 @@ export interface ExtensionSettingsManager {
 /**
  * Load all extensions from all capabilities.
  */
-export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): Promise<Extension[]> {
+export async function loadAllExtensions(
+	cwd?: string,
+	disabledIds?: string[],
+	settings?: Settings,
+	agentDir?: string,
+): Promise<Extension[]> {
 	const extensions: Extension[] = [];
 	const disabledExtensions = new Set<string>(disabledIds ?? []);
 
@@ -97,7 +103,12 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 		}
 	}
 
-	const loadOpts = cwd ? { cwd, includeDisabled: true } : { includeDisabled: true };
+	const loadOpts = {
+		...(cwd ? { cwd } : {}),
+		includeDisabled: true,
+		...(settings ? { settings } : {}),
+		...(agentDir ? { agentDir } : {}),
+	};
 
 	// Load skills
 	try {
@@ -553,8 +564,13 @@ export function applyDisabledExtensionsToState(state: DashboardState, disabledId
 /**
  * Create initial dashboard state.
  */
-export async function createInitialState(cwd?: string, disabledIds?: string[]): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds);
+export async function createInitialState(
+	cwd?: string,
+	disabledIds?: string[],
+	settings?: Settings,
+	agentDir?: string,
+): Promise<DashboardState> {
+	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir);
 	const tabs = buildProviderTabs(extensions);
 	const tabFiltered = extensions; // "all" tab by default
 	const searchFiltered = tabFiltered;
@@ -592,8 +608,10 @@ export async function refreshState(
 	state: DashboardState,
 	cwd?: string,
 	disabledIds?: string[],
+	settings?: Settings,
+	agentDir?: string,
 ): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds);
+	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir);
 	const tabs = buildProviderTabs(extensions);
 
 	// Get current provider from tabs

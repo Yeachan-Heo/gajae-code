@@ -2158,6 +2158,7 @@ export class SelectorController {
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.settings,
 			this.ctx.ui.terminal.rows,
+			this.ctx.session.getSessionAgentDir?.(),
 		);
 		this.showSelector(done => {
 			dashboard.onClose = () => {
