@@ -26,20 +26,23 @@ import type {
 
 // ── Path helpers ─────────────────────────────────────────────────────
 
-export function getMarketplacesRegistryPath(): string {
-	return path.join(getConfigRootDir(), "marketplaces.json");
+export function getMarketplacesRegistryPath(agentDir?: string): string {
+	return path.join(agentDir ? path.dirname(agentDir) : getConfigRootDir(), "marketplaces.json");
 }
 
-export function getInstalledPluginsRegistryPath(): string {
-	return path.join(getPluginsDir(), "installed_plugins.json");
+export function getInstalledPluginsRegistryPath(agentDir?: string): string {
+	return path.join(
+		agentDir ? path.join(path.dirname(agentDir), "plugins") : getPluginsDir(),
+		"installed_plugins.json",
+	);
 }
 
-export function getMarketplacesCacheDir(): string {
-	return path.join(getPluginsDir(), "cache", "marketplaces");
+export function getMarketplacesCacheDir(agentDir?: string): string {
+	return path.join(agentDir ? path.join(path.dirname(agentDir), "plugins") : getPluginsDir(), "cache", "marketplaces");
 }
 
-export function getPluginsCacheDir(): string {
-	return path.join(getPluginsDir(), "cache", "plugins");
+export function getPluginsCacheDir(agentDir?: string): string {
+	return path.join(agentDir ? path.join(path.dirname(agentDir), "plugins") : getPluginsDir(), "cache", "plugins");
 }
 
 // ── Atomic write ─────────────────────────────────────────────────────

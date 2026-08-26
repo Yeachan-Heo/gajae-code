@@ -2960,13 +2960,14 @@ export class SelectorController {
 	}
 
 	async showPluginSelector(mode: "install" | "uninstall" = "install"): Promise<void> {
+		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.();
 		const mgr = new MarketplaceManager({
-			marketplacesRegistryPath: getMarketplacesRegistryPath(),
-			installedRegistryPath: getInstalledPluginsRegistryPath(),
+			marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir),
+			installedRegistryPath: getInstalledPluginsRegistryPath(agentDir),
 			projectInstalledRegistryPath:
 				(await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd())) ?? undefined,
-			marketplacesCacheDir: getMarketplacesCacheDir(),
-			pluginsCacheDir: getPluginsCacheDir(),
+			marketplacesCacheDir: getMarketplacesCacheDir(agentDir),
+			pluginsCacheDir: getPluginsCacheDir(agentDir),
 			clearPluginRootsCache: clearPluginRootsAndCaches,
 		});
 
