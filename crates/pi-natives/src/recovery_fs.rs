@@ -4895,7 +4895,7 @@ mod tests {
 	}
 
 	#[test]
-	fn managed_replace_updates_in_place_without_overwriting_a_raced_successor() {
+	fn managed_replace_stages_successor_without_overwriting_a_raced_successor() {
 		let _serial = REPLACE_TEST_SERIAL
 			.get_or_init(|| std::sync::Mutex::new(()))
 			.lock()
