@@ -911,7 +911,7 @@ export async function listClaudePluginRoots(
 	const userPluginsDir =
 		userAgentDir && path.resolve(userAgentDir) !== path.resolve(defaultAgentDir)
 			? path.join(userAgentDir, "plugins")
-			: getPluginsDir(home);
+			: path.join(home, getConfigDirName(), "plugins");
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {
