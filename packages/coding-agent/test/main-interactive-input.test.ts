@@ -142,6 +142,9 @@ describe("submitInteractiveInput", () => {
 		const submission = submitInteractiveInput(mode, session, input);
 		expect(events).toEqual(["subscribe", "prompt"]);
 		for (const listener of listeners) {
+			listener({ type: "agent_start" } as AgentSessionEvent);
+		}
+		for (const listener of listeners) {
 			listener({ type: "agent_end" } as AgentSessionEvent);
 		}
 		await submission;
@@ -149,6 +152,39 @@ describe("submitInteractiveInput", () => {
 		expect(mode.finishPendingSubmission).toHaveBeenCalledTimes(1);
 		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
 		expect(unsubscribe).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not release ownership for an unrelated terminal event", async () => {
+		const prompt = Promise.withResolvers<void>();
+		const listeners = new Set<(event: AgentSessionEvent) => void>();
+		const session = {
+			prompt: vi.fn(() => prompt.promise),
+			promptCustomMessage: vi.fn(async () => {}),
+			subscribe: vi.fn((listener: (event: AgentSessionEvent) => void) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			}),
+		};
+		const interactiveMode = Object.create(InteractiveMode.prototype) as InteractiveMode;
+		interactiveMode.session = session as unknown as AgentSession;
+		const mode = {
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			showError: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {}),
+			waitForAgentEnd: interactiveMode.waitForAgentEnd.bind(interactiveMode),
+		};
+
+		const submission = submitInteractiveInput(mode, session, createInput());
+		for (const listener of listeners) listener({ type: "agent_end" } as AgentSessionEvent);
+		await Bun.sleep(10);
+		expect(mode.finishPendingSubmission).not.toHaveBeenCalled();
+
+		for (const listener of listeners) listener({ type: "agent_start" } as AgentSessionEvent);
+		for (const listener of listeners) listener({ type: "agent_end" } as AgentSessionEvent);
+		await submission;
+		expect(mode.finishPendingSubmission).toHaveBeenCalledTimes(1);
+		prompt.resolve();
 	});
 
 	it("reports a late prompt rejection after agent_end once", async () => {

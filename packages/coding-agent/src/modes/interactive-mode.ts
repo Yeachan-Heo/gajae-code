@@ -445,6 +445,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	waitForAgentEnd(): { promise: Promise<void>; dispose: () => void } {
 		const deferred = Promise.withResolvers<void>();
 		let disposed = false;
+		let agentStarted = false;
 		let unsubscribe: (() => void) | undefined;
 		const dispose = () => {
 			if (disposed) return;
@@ -453,7 +454,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			unsubscribe = undefined;
 		};
 		const listener = (event: AgentSessionEvent) => {
-			if (disposed || event.type !== "agent_end") return;
+			if (disposed) return;
+			if (event.type === "agent_start") {
+				agentStarted = true;
+				return;
+			}
+			if (event.type !== "agent_end" || !agentStarted) return;
 			dispose();
 			deferred.resolve();
 		};
@@ -1173,6 +1179,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
+		if (this.#stopped || this.#isShuttingDown) {
+			throw Object.assign(new Error("Interactive mode stopped"), { code: "cancelled" });
+		}
 		if (this.session.getGoalModeState()?.mode === "exiting") {
 			await this.#goalModeController.beforeGetUserInput();
 		}
@@ -1614,6 +1623,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	stop(): void {
 		const wasInitialized = this.isInitialized;
 		this.#stopped = true;
+		this.#inputController.discardDeferredSubmission();
 		for (const listener of this.#stopListeners) {
 			try {
 				listener();
@@ -1677,6 +1687,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		// `/btw` owns the shared composer while its panel is open. Never persist a
 		// side-chat draft or pending side-chat images into the main-session draft.
 		const hadActiveBtw = this.#btwController.hasOpenPanel();
+		const deferredSubmission = this.#inputController.takeDeferredSubmissionForShutdown();
+		if (
+			deferredSubmission &&
+			!hadActiveBtw &&
+			this.editor.getText().length === 0 &&
+			this.pendingImages.length === 0
+		) {
+			this.editor.setText(deferredSubmission.text);
+			this.pendingImages = deferredSubmission.images ? [...deferredSubmission.images] : [];
+		}
 		const draftText = selectShutdownDraft(this.editor.getText(), hadActiveBtw);
 		if (hadActiveBtw) this.pendingImages = [];
 		this.#btwController.dispose();

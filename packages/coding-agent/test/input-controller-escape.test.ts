@@ -1366,6 +1366,34 @@ describe("InputController deferred submissions", () => {
 		expect(handleBashCommand).toHaveBeenCalledWith("echo deferred", false);
 		expect(controller.takeDeferredSubmission()).toBeUndefined();
 	});
+
+	it("removes a deferred submission through the shutdown path without promoting it", async () => {
+		const { ctx, editor } = createContext();
+		ctx.onInputCallback = undefined;
+		const controller = new InputController(ctx);
+
+		editor.setText("deferred before shutdown");
+		await controller.submitText("deferred before shutdown", { ownsComposer: true, editor: ctx.editor });
+
+		expect(controller.takeDeferredSubmissionForShutdown()).toEqual({
+			text: "deferred before shutdown",
+			images: undefined,
+		});
+		expect(controller.takeDeferredSubmission()).toBeUndefined();
+	});
+
+	it("discards the deferred slot when the interactive mode stops", async () => {
+		const { ctx, editor } = createContext();
+		ctx.onInputCallback = undefined;
+		const controller = new InputController(ctx);
+
+		editor.setText("deferred before stop");
+		await controller.submitText("deferred before stop", { ownsComposer: true, editor: ctx.editor });
+
+		controller.discardDeferredSubmission();
+
+		expect(controller.takeDeferredSubmission()).toBeUndefined();
+	});
 });
 describe("InputController command palette", () => {
 	it("runs registered actions directly and excludes unsupported actions and self-reentry", () => {

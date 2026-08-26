@@ -1196,6 +1196,20 @@ export class InputController {
 		);
 	}
 
+	takeDeferredSubmissionForShutdown(): { text: string; images?: InteractiveModeContext["pendingImages"] } | undefined {
+		const deferredSubmission = this.#deferredSubmission;
+		if (!deferredSubmission) return undefined;
+		this.#deferredSubmission = undefined;
+		return {
+			text: deferredSubmission.text,
+			images: deferredSubmission.images,
+		};
+	}
+
+	discardDeferredSubmission(): void {
+		this.#deferredSubmission = undefined;
+	}
+
 	handleCtrlC(): void {
 		const now = Date.now();
 		if (now - this.ctx.lastSigintTime < 500) {
