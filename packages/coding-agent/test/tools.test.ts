@@ -1605,6 +1605,8 @@ function b() {
 			const asyncStarted = await tool.execute("test-call-async-tail", { command, async: true });
 			const asyncJobId = asyncStarted.details?.async?.jobId;
 			expect(asyncJobId).toBeDefined();
+			expect(asyncJobManager.getJob(asyncJobId!)?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === asyncJobId)?.backgrounded).toBe(true);
 			await asyncJobManager.getJob(asyncJobId!)?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 

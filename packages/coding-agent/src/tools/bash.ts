@@ -1365,7 +1365,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// that was the process-global instance may have been disposed,
 			// clearing instance() while THIS session's manager stays
 			// registered by endpoint (review thread P1).
-			if (!this.#resolveOwnedJobManager()) {
+			const asyncManager = admissionManager ?? this.#resolveOwnedJobManager();
+			if (!asyncManager) {
 				throw new ToolError("Async job manager unavailable for this session.");
 			}
 			const job = this.#startManagedBashJob({
@@ -1381,6 +1382,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				startBackgrounded: true,
 				toolCallId,
 			});
+			const jobGeneration = asyncManager.getJob(job.jobId)?.generation ?? job.jobId;
+			job.setBackgrounded(true);
+			asyncManager.markBackgrounded(job.jobId, jobGeneration);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
