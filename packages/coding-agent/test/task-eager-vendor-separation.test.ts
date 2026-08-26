@@ -208,6 +208,27 @@ describe("vendor-separated delegation in the system prompt", () => {
 		}
 	});
 
+	it("does not activate task after profile activation in an explicit empty selection", async () => {
+		const settings = Settings.isolated({
+			"tools.discoveryMode": "all",
+			modelRoles: { default: "openai-codex/gpt-5.6-sol:low" },
+			"task.agentModelOverrides": { executor: "openai-codex/gpt-5.6-terra:low" },
+		});
+		const { session } = await createSession(settings, []);
+		try {
+			expect(session.getActiveToolNames()).not.toContain("task");
+
+			settings.override("modelRoles", { default: "anthropic/claude-opus-5:medium" });
+			settings.override("task.agentModelOverrides", { executor: "openai-codex/gpt-5.5:high" });
+			await session.syncEagerDelegation();
+
+			expect(session.getActiveToolNames()).not.toContain("task");
+			expect(session.systemPrompt.join("\n")).not.toContain(DELEGATION_DIRECTIVE);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("omits the delegation directive for a single-vendor layout", async () => {
 		const { session } = await createSession(
 			Settings.isolated({

@@ -13920,7 +13920,12 @@ export class AgentSession {
 				? this.#modelRegistry.getModelProfile?.(this.#activeModelProfile)
 				: undefined,
 		});
-		if (eagerTasks && this.#toolRegistry.has("task") && !this.getActiveToolNames().includes("task")) {
+		if (
+			!this.#explicitEmptyToolSelection &&
+			eagerTasks &&
+			this.#toolRegistry.has("task") &&
+			!this.getActiveToolNames().includes("task")
+		) {
 			await this.activateDiscoveredTools(["task"]);
 		}
 		await this.refreshBaseSystemPrompt();
