@@ -62,7 +62,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
 10. Foreground PTY calls `runInteractiveBashPty()` from `packages/coding-agent/src/tools/bash-interactive.ts`.
 11. Both paths allocate an output artifact first when `session.allocateOutputArtifact` is available. The artifact path/id are passed into the sink so large output can spill to disk.
 12. `executeBash()` loads shell settings, optional shell snapshot, and shell minimizer settings, then runs via a persistent native `Shell` session or one-shot `executeShell()`. `docs/bash-tool-runtime.md` covers that path in detail.
-13. `runInteractiveBashPty()` creates a `PtySession`, overlays an xterm-backed console UI, forwards user key input into the PTY, captures output through `OutputSink`, and kills the PTY on dismiss/dispose.
+13. `runInteractiveBashPty()` creates a `PtySession`, overlays an xterm-backed console UI, forwards user key input into the PTY, captures output through `OutputSink`, and keeps the PTY owned by the manager when its observer folds. Escape explicitly kills; disposal alone never kills folded work.
 14. On completion, `#buildCompletedResult()` formats `(no output)` when needed, attaches truncation metadata from the `OutputSink` summary, and re-checks exit status / timeout / cancellation before returning.
 15. On non-zero exit, timeout, missing exit status, or cancellation, `#buildResultText()` throws with the captured output included in the error message.
 
@@ -83,6 +83,11 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
    - Starts like a foreground managed job, then backgrounds it when it outlives the wait window.
 5. Intercepted command
    - No subprocess created.
+
+6. Foreground fold
+   - The remappable `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold a running managed non-PTY Bash wait, ACP client-terminal wait, or PTY wait into a manager-owned job.
+   - The foreground turn stops cleanly after the result boundary; completion wakes a later turn with a receipt containing output, original intent, and a `job` retrieval handle.
+   - Folded jobs retain their original deadline and live `job tail` output. PTY observer disposal is non-owning; `job cancel` kills the live PTY through the manager lifecycle.
    - Returns a `ToolError` pointing the model at `read`, `search`, `find`, `edit`, or `write`.
 
 ## Side Effects

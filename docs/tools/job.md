@@ -78,6 +78,11 @@ Read-only snapshot path:
 - Cancel then poll: call with both. Cancellations are applied first, then the tool watches the remaining resolved `poll` ids.
 - Read-only inspection: call with `list: true` for the same snapshot data without waiting on completion.
 
+Foreground fold contract:
+- The `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold managed non-PTY Bash, ACP client-terminal, and PTY waits into the same job manager.
+- Folded completion wakes a fresh turn with a receipt containing bounded output, the original request, and a `job` retrieval handle. The original command deadline remains active and `job tail` is available while the job runs.
+- PTY overlay disposal is non-owning; explicit Escape and `job cancel` stop the PTY through its lifecycle hook. `task` and `subagent` waits are not foldable.
+
 Spawn paths that produce jobs:
 - `packages/coding-agent/src/tools/bash.ts`
   - `async: true` always registers a `type: "bash"` job with `AsyncJobManager.register(...)` and returns a start message.

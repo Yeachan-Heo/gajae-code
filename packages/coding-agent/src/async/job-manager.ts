@@ -2344,6 +2344,7 @@ export class AsyncJobManager {
 			this.#deliveries.length,
 			...this.#deliveries.filter(delivery => !this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)),
 		);
+		this.#notifyChange();
 		return before - this.#deliveries.length;
 	}
 
@@ -2815,6 +2816,7 @@ export class AsyncJobManager {
 			this.#deadLetteredDeliveries.delete(oldestJobId);
 			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
 		}
+		this.#notifyChange();
 	}
 
 	#enqueueDelivery(jobId: string, text: string): void {
@@ -2836,6 +2838,7 @@ export class AsyncJobManager {
 			const dropped = this.#deliveries.shift();
 			if (dropped) this.#recordDeadLetter(dropped);
 		}
+		this.#notifyChange();
 		this.#ensureDeliveryLoop();
 	}
 
