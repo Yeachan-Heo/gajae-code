@@ -400,9 +400,11 @@ export async function publishPlan(
 					actual: await currentIdentity(targetPath),
 				});
 			}
-			const linked = renameNoReplacePath(tempPath, targetPath);
+			const linked = renameNoReplacePath(tempPath, targetPath, sourceIdentity);
 			if (!linked.ok) {
 				tempRetained = linked.mutationState !== "not_committed";
+				const retained =
+					linked.detachedPath === undefined ? (tempRetained ? [tempPath] : []) : [tempPath, linked.detachedPath];
 				throw new PaseoPublishError(
 					targetPath,
 					{
@@ -410,7 +412,7 @@ export async function publishPlan(
 						expected: options.expectedIdentity,
 						actual: await currentIdentity(targetPath),
 					},
-					tempRetained ? [tempPath] : [],
+					retained,
 				);
 			}
 			tempConsumed = true;
@@ -853,13 +855,17 @@ export async function writeReplacedProviderBackup(
 				canonicalSidecarPathForNativeUnlink(temporary),
 				canonicalSidecarPathForNativeUnlink(backupPath),
 			]);
-			const published = renameNoReplacePath(nativeTemporary, nativeBackup);
+			const published = renameNoReplacePath(nativeTemporary, nativeBackup, stagedIdentity);
 			if (!published.ok) {
 				if (published.code !== "already_exists" && published.code !== "quarantine_collision") {
-					throw new PaseoPublishError(backupPath, {
-						reason: "sidecar-conflict",
-						detail: `the replaced-provider sidecar could not be published: ${published.code ?? published.reason}`,
-					});
+					throw new PaseoPublishError(
+						backupPath,
+						{
+							reason: "sidecar-conflict",
+							detail: `the replaced-provider sidecar could not be published: ${published.code ?? published.reason}`,
+						},
+						published.detachedPath === undefined ? [temporary] : [temporary, published.detachedPath],
+					);
 				}
 				createdByGjc = false;
 				const existing = await readReplacedProviderBackup(backupPath, providerKey, valueSha256);

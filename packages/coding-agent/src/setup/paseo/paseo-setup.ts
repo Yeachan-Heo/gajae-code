@@ -1366,12 +1366,13 @@ async function captureMigratedOldBridgeEntries(
 
 async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(bridgeDir), ".paseo-bridge-restore-"));
-	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
+	let stagedSnapshot: NativeDirectoryTreeResult = snapshotDirectoryTree(temporary);
 	let identity: BridgeEntryIdentity | undefined;
 	let cleanupError: string | undefined;
 	try {
 		await fs.chmod(temporary, 0o700);
-		stagedSnapshot = snapshotDirectoryTree(temporary);
+		const finalSnapshot = snapshotDirectoryTree(temporary);
+		if (finalSnapshot.ok) stagedSnapshot = finalSnapshot;
 		const stat = await fs.lstat(temporary, { bigint: true });
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
@@ -1387,6 +1388,7 @@ async function recreateOwnedBridgeDirectory(bridgeDir: string): Promise<BridgeEn
 		if (!published.ok) {
 			throw new SkillsBridgeError(
 				`old Paseo bridge directory appeared during compensation: ${bridgeDir} (${published.code ?? published.reason})`,
+				published.detachedPath === undefined ? [temporary] : [temporary, published.detachedPath],
 			);
 		}
 		identity = {

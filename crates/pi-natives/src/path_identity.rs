@@ -358,6 +358,7 @@ pub struct NativeNoReplaceResult {
 	pub reason:           String,
 	pub primitive:        String,
 	pub phase:            String,
+	pub detached_path:    Option<String>,
 	pub diagnostic:       NativePublishDiagnostic,
 }
 
@@ -434,6 +435,7 @@ impl NativeNoReplaceResult {
 				"rename"
 			}
 			.to_owned(),
+			detached_path:    result.detached_path,
 			diagnostic:       NativePublishDiagnostic {
 				schema_version:   1,
 				collection_state: "unavailable".to_owned(),
@@ -4805,7 +4807,10 @@ pub(crate) mod platform {
 				{
 					NativeExactUnlinkResult::success()
 				},
-				Ok(()) => NativeExactUnlinkResult::failure("destination_identity_changed"),
+				Ok(()) => NativeExactUnlinkResult::detached_failure(
+					"destination_identity_changed",
+					destination_path.to_string_lossy().into_owned(),
+				),
 				Err(code) => NativeExactUnlinkResult::failure(code),
 			};
 			unsafe {
@@ -4821,6 +4826,15 @@ pub(crate) mod platform {
 				return NativeExactUnlinkResult::failure(code);
 			},
 		};
+		if let Some((expected_dev, expected_ino)) = expected_source {
+			if source_stat.st_dev as u64 != expected_dev || source_stat.st_ino as u64 != expected_ino {
+				unsafe {
+					libc::close(source_fd);
+					libc::close(source_parent);
+				}
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+		}
 		let (destination_parent, destination_name) = match open_parent_no_follow(destination_path) {
 			Ok(value) => value,
 			Err(result) => {
@@ -4846,7 +4860,10 @@ pub(crate) mod platform {
 			{
 				NativeExactUnlinkResult::success()
 			},
-			Ok(()) => NativeExactUnlinkResult::failure("destination_identity_changed"),
+			Ok(()) => NativeExactUnlinkResult::detached_failure(
+				"destination_identity_changed",
+				destination_path.to_string_lossy().into_owned(),
+			),
 			Err(code) => NativeExactUnlinkResult::failure(code),
 		};
 		unsafe {
@@ -6403,7 +6420,10 @@ mod platform {
 	use std::{
 		ffi::{OsString, c_void},
 		mem::{align_of, size_of},
-		os::windows::ffi::{OsStrExt, OsStringExt},
+		os::windows::{
+			ffi::{OsStrExt, OsStringExt},
+			fs::MetadataExt,
+		},
 		path::{Component, Path, PathBuf},
 		ptr::{null, null_mut},
 	};
@@ -7760,6 +7780,17 @@ mod platform {
 			Ok(path) => path,
 			Err(code) => return NativeExactUnlinkResult::failure(code),
 		};
+		if let Some((expected_dev, expected_ino)) = expected_source {
+			let metadata = match std::fs::symlink_metadata(&source_path) {
+				Ok(metadata) => metadata,
+				Err(error) => return NativeExactUnlinkResult::failure(security_code(&error)),
+			};
+			if metadata.volume_serial_number() as u64 != expected_dev
+				|| metadata.file_index() != expected_ino
+			{
+				return NativeExactUnlinkResult::failure("identity_mismatch");
+			}
+		}
 		let source_kind = match std::fs::symlink_metadata(&source_path) {
 			Ok(metadata) if metadata.file_type().is_dir() => "directory",
 			Ok(_) => "file",

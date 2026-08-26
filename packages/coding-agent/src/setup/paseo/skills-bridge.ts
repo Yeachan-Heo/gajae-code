@@ -756,12 +756,13 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 
 async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(preflight.bridgeDir), ".paseo-skills-create-"));
-	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
+	let stagedSnapshot: NativeDirectoryTreeResult = snapshotDirectoryTree(temporary);
 	let identity: BridgeEntryIdentity | undefined;
 	let cleanupError: string | undefined;
 	try {
 		await fs.chmod(temporary, 0o700);
-		stagedSnapshot = snapshotDirectoryTree(temporary);
+		const finalSnapshot = snapshotDirectoryTree(temporary);
+		if (finalSnapshot.ok) stagedSnapshot = finalSnapshot;
 		identity = await directoryIdentity(temporary);
 		const published = renameNoReplacePath(
 			canonicalExistingPathForNative(temporary),
@@ -777,6 +778,7 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 		if (!published.ok) {
 			throw new SkillsBridgeError(
 				`Paseo skills bridge appeared during creation: ${preflight.bridgeDir} (${published.code ?? published.reason})`,
+				published.detachedPath === undefined ? [temporary] : [temporary, published.detachedPath],
 			);
 		}
 	} finally {

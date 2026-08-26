@@ -1882,6 +1882,7 @@ export interface NativeNoReplaceResult {
   reason: string
   primitive: string
   phase: string
+  detachedPath?: string
   diagnostic: NativePublishDiagnostic
 }
 
