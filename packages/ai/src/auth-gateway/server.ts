@@ -70,7 +70,7 @@ export interface AuthGatewayBootOptions extends AuthGatewayServerOptions {
 	 */
 	hasProviderCredential: () => boolean;
 	/** Refresh the dispatch cache from the current broker snapshot before use. */
-	reloadProviderCredentials: () => Promise<void>;
+	reloadProviderCredentials: (signal?: AbortSignal) => Promise<void>;
 	/** Confirm that the selected key is still present in the current authority snapshot. */
 	validateProviderCredential: (provider: string, apiKey: string) => boolean;
 	/**
@@ -151,9 +151,12 @@ function hasProviderCredential(opts: AuthGatewayBootOptions): boolean {
 
 type ProviderScopeAvailability = "available" | "absent" | "reload_failed";
 
-async function providerScopeAvailability(opts: AuthGatewayBootOptions): Promise<ProviderScopeAvailability> {
+async function providerScopeAvailability(
+	opts: AuthGatewayBootOptions,
+	signal?: AbortSignal,
+): Promise<ProviderScopeAvailability> {
 	try {
-		await opts.reloadProviderCredentials();
+		await opts.reloadProviderCredentials(signal);
 	} catch (error) {
 		logger.warn("auth-gateway provider snapshot reload failed", {
 			provider: opts.providerScope.provider,
@@ -203,7 +206,7 @@ export function releaseGatewayCredentialLeaseOnAdmission(
 	// A deferred provider import can fail before the admission hook runs. Do
 	// not strand the authority lease in that case, but never wait for a
 	// successful stream's full response lifetime.
-	void events.result().catch(releaseOnce);
+	void events.result().then(releaseOnce, releaseOnce);
 }
 
 async function resolveGatewayApiKey(
@@ -213,7 +216,7 @@ async function resolveGatewayApiKey(
 	signal: AbortSignal,
 ): Promise<string> {
 	try {
-		const scopeAvailability = await providerScopeAvailability(opts);
+		const scopeAvailability = await providerScopeAvailability(opts, signal);
 		if (scopeAvailability === "reload_failed") {
 			throw new GatewayCredentialError(503, "upstream_error", "Auth broker unavailable");
 		}
@@ -253,14 +256,20 @@ async function acquireGatewayApiKey(
 ): Promise<GatewayCredentialLease> {
 	const previous = credentialAuthorityTails.get(opts) ?? Promise.resolve();
 	const deferred = Promise.withResolvers<void>();
-	credentialAuthorityTails.set(opts, deferred.promise);
+	const tail = previous.then(
+		() => deferred.promise,
+		() => deferred.promise,
+	);
+	credentialAuthorityTails.set(opts, tail);
 	let released = false;
 	const release = (): void => {
 		if (released) return;
 		released = true;
 		deferred.resolve();
-		if (credentialAuthorityTails.get(opts) === deferred.promise) credentialAuthorityTails.delete(opts);
 	};
+	void tail.then(() => {
+		if (credentialAuthorityTails.get(opts) === tail) credentialAuthorityTails.delete(opts);
+	});
 	try {
 		if (signal.aborted) throw signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
 		const abort = Promise.withResolvers<never>();
@@ -1175,7 +1184,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// Same shape as the broker's `/v1/usage`, so widget/llm-git speak to either with the
 				// same client struct.
 				if (req.method === "GET" && pathname === "/v1/usage") {
-					const scopeAvailability = await providerScopeAvailability(opts);
+					const scopeAvailability = await providerScopeAvailability(opts, req.signal);
 					if (scopeAvailability === "reload_failed") {
 						return withCors(
 							json(503, { error: { code: "broker_unavailable", message: "Auth broker unavailable." } }),
@@ -1201,7 +1210,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 				// pool is producing 401s. Aggregated `/v1/usage` silently drops failed
 				// credentials, so we need a separate endpoint that captures errors.
 				if (req.method === "GET" && pathname === "/v1/credentials/check") {
-					const scopeAvailability = await providerScopeAvailability(opts);
+					const scopeAvailability = await providerScopeAvailability(opts, req.signal);
 					if (scopeAvailability === "reload_failed") {
 						return withCors(
 							json(503, { error: { code: "broker_unavailable", message: "Auth broker unavailable." } }),
