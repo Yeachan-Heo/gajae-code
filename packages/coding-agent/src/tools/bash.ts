@@ -1578,12 +1578,23 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				released = true;
 				await runBoundedCleanup(() => handle.release(), "release");
 			};
+			let killPromise: Promise<void> | undefined;
+			const fireKill = (): Promise<void> => {
+				if (killPromise) return killPromise;
+				killPromise = handle.kill().catch((error: unknown) => {
+					logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
+				});
+				return killPromise;
+			};
+			const boundedKill = async (): Promise<void> => {
+				await runBoundedCleanup(fireKill, "kill");
+			};
 
 			// Emit partial update so the editor can embed the live terminal card.
 			try {
 				onUpdate?.({ content: [], details: { terminalId: handle.terminalId } });
 			} catch (error) {
-				await Promise.all([runBoundedCleanup(() => handle.kill(), "kill"), releaseTerminalOnce()]);
+				await Promise.all([boundedKill(), releaseTerminalOnce()]);
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
 			}
@@ -1643,27 +1654,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				// instead of waiting for the next `currentOutput()` to return.
 				const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
 				const deadlineAt = Date.now() + timeoutMs;
-				const readOutput = (
+				const readOutput = async (
 					limitMs: number,
 					includeAbort = true,
 					includeExit = false,
-				): Promise<ClientBridgeTerminalOutput | undefined> =>
-					Promise.race([
+				): Promise<ClientBridgeTerminalOutput | undefined> => {
+					const timeout = Promise.withResolvers<undefined>();
+					const timer = setTimeout(() => timeout.resolve(undefined), Math.max(1, limitMs));
+					return Promise.race([
 						handle.currentOutput(),
 						...(includeAbort ? [abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
 						...(includeExit ? [exitPromise.then(() => undefined as ClientBridgeTerminalOutput | undefined)] : []),
-						Bun.sleep(Math.max(1, limitMs)).then(() => undefined as ClientBridgeTerminalOutput | undefined),
-					]);
-				let killPromise: Promise<void> | undefined;
-				const fireKill = (): Promise<void> => {
-					if (killPromise) return killPromise;
-					killPromise = handle.kill().catch((error: unknown) => {
-						logger.warn("ACP terminal kill failed", { terminalId: handle.terminalId, error });
-					});
-					return killPromise;
-				};
-				const boundedKill = async (): Promise<void> => {
-					await Promise.race([fireKill(), Bun.sleep(1_000)]);
+						timeout.promise,
+					]).finally(() => clearTimeout(timer));
 				};
 				const onAbortSignal = () => {
 					resolveAborted();
@@ -1803,10 +1806,18 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								: summary.output;
 						latestText = pollText;
 						appendAcpSnapshot(pollOutput.output);
-						onUpdate?.({
-							content: [{ type: "text", text: pollText }],
-							details: { terminalId: handle.terminalId },
-						});
+						try {
+							onUpdate?.({
+								content: [{ type: "text", text: pollText }],
+								details: { terminalId: handle.terminalId },
+							});
+						} catch (error) {
+							await boundedKill();
+							const diagnostic = boundArtifactSaveDiagnostic(error);
+							const recoveredOutput = retainedAcpOutput();
+							const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+							throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
+						}
 					}
 				} finally {
 					runSignal?.removeEventListener("abort", onAbortSignal);
@@ -1951,16 +1962,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					},
 				);
 			} catch (error) {
-				await Promise.race([
-					handle.kill().catch((killError: unknown) => {
-						logger.warn("ACP terminal registration cleanup kill failed", {
-							terminalId: handle.terminalId,
-							error: killError,
-						});
-					}),
-					Bun.sleep(1_000),
-				]);
-				await releaseTerminalOnce();
+				await Promise.all([boundedKill(), releaseTerminalOnce()]);
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;
 			}
@@ -1973,16 +1975,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const unregisterOwnerCleanup = bridgeManager.registerOwnerCleanup(
 				this.session.getAgentId?.() ?? "0-Main",
 				() => {
-					void Promise.allSettled([handle.kill(), releaseTerminalOnce()]).then(results => {
-						for (const result of results) {
-							if (result.status === "rejected") {
-								logger.warn("ACP terminal teardown RPC failed", {
-									terminalId: handle.terminalId,
-									error: result.reason,
-								});
-							}
-						}
-					});
+					void Promise.all([boundedKill(), releaseTerminalOnce()]);
 					bridgeManager.failNow(bridgeJobId, bridgeGeneration, "Client terminal owner was torn down.");
 				},
 			);

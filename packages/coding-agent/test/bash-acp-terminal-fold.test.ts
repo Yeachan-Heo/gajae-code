@@ -395,4 +395,28 @@ describe("BashTool ACP terminal fold", () => {
 		);
 		expect(killCalls).toBe(1);
 	});
+
+	it("kills and retains output when ACP progress update throws", async () => {
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		let killCalls = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-update-recovery",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => ({ output: "update diagnostics\n", truncated: false }),
+			kill: async () => {
+				killCalls += 1;
+			},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		await expect(
+			tool.execute("call-update-recovery", { command: "echo done" }, undefined, update => {
+				if (update.content.length > 0) throw new Error("progress callback failed");
+			}),
+		).rejects.toThrow(/update diagnostics[\s\S]*Terminal output recovery failed/);
+		expect(killCalls).toBe(1);
+	});
 });
