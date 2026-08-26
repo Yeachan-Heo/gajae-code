@@ -949,13 +949,13 @@ export async function recoverIntent(
 					detail: "an interrupted partial bridge cleanup is pending; repair is required before setup can proceed",
 				};
 			}
-			if (options.replayBridgeCleanup === undefined || after === undefined || before === undefined) {
+			if (options.replayPartialBridgeMigration === undefined || after === undefined || before === undefined) {
 				return {
 					recovered: false,
 					detail: "partial bridge cleanup lacks authenticated replay authority; retaining the intent",
 				};
 			}
-			await options.replayBridgeCleanup(pendingAuthority);
+			await options.replayPartialBridgeMigration(after);
 			if (await bridgeLedgerMatchesFilesystem(after, undefined, intent.targetPath)) {
 				return {
 					recovered: false,
