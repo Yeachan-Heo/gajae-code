@@ -689,8 +689,14 @@ export function reapScrubbedProtocolRemnantsSync(
 					if (!isEnoent(error)) failures += 1;
 				}
 			}
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
 		} finally {
-			directoryHandle.closeSync();
+			try {
+				directoryHandle.closeSync();
+			} catch (error) {
+				if (!isEnoent(error)) failures += 1;
+			}
 		}
 	}
 	return reportScrubbedProtocolRemnantReap(reaped, failures);

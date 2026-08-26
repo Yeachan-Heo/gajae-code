@@ -15057,6 +15057,15 @@ export class SessionManager {
 				let replacementPublicationCommitted = false;
 				let replacementPublication: ManagedFileIdentity | undefined;
 				try {
+					// Bounded startup deliberately defers the transcript hash. A full rewrite
+					// is the first operation that needs it, so validate the descriptor and
+					// capture the digest immediately before replacing the file.
+					if (this.#managedPersistExpectedIdentity && !this.#managedPersistExpectedIdentity.sha256) {
+						this.#managedPersistExpectedIdentity = this.#captureManagedPersistIdentity(
+							sessionFile,
+							this.#managedPersistExpectedIdentity,
+						);
+					}
 					if (this.#managedPersistExpectedIdentity) {
 						try {
 							replacementPublication = store.replaceExpectedIdentitySync(
