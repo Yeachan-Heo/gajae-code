@@ -126,6 +126,24 @@ describe("auth gateway credential lease", () => {
 			},
 		});
 		await Bun.sleep(0);
+		expect(admitted).toBe(0);
+		expect(releases).toBe(0);
+		providerEvents.push({
+			type: "text_delta",
+			contentIndex: 0,
+			delta: "admitted",
+			partial: {
+				role: "assistant",
+				api: "openai-completions",
+				provider: "lazy-admission-test",
+				model: "lazy-admission-model",
+				content: [{ type: "text", text: "admitted" }],
+				usage: ZERO_USAGE,
+				stopReason: "stop",
+				timestamp: 0,
+			},
+		});
+		await Bun.sleep(0);
 		expect(admitted).toBe(1);
 		expect(releases).toBe(1);
 		providerEvents.fail(new Error("provider stream stopped"));

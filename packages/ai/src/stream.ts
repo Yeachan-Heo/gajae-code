@@ -279,7 +279,7 @@ function pipeAssistantStream(
 				onStreamCreated?.();
 			};
 			for await (const event of inner) {
-				markAdmission();
+				if (event.type !== "start") markAdmission();
 				outer.push(event);
 				// The inner provider stream owns abort semantics (it receives the
 				// same signal), but stop forwarding as soon as the consumer

@@ -1364,7 +1364,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						provider,
 						error: cleanReason(error) ?? "Usage unavailable.",
 					});
-					throw error;
+					return null;
 				})
 				.finally(() => {
 					if (this.#scopedUsageInflight.get(provider) === inflight) {

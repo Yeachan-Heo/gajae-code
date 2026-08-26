@@ -293,7 +293,7 @@ function forwardStream<TApi extends Api>(
 			}
 
 			for await (const event of watchedSource) {
-				markAdmission();
+				if (event.type !== "start") markAdmission();
 				target.push(event);
 			}
 			if (hasFinalResult(source)) {

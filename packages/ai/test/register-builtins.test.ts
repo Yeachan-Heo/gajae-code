@@ -69,6 +69,7 @@ describe("register-builtins lazy streams", () => {
 		const source = {
 			async *[Symbol.asyncIterator]() {
 				yield { type: "start", partial: finalMessage } as const;
+				yield { type: "text_delta", contentIndex: 0, delta: "ok", partial: finalMessage } as const;
 			},
 			result: async () => finalMessage,
 		} as unknown as AssistantMessageEventStream;

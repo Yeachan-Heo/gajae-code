@@ -245,6 +245,15 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		expect(fetchUsage).toHaveBeenCalledTimes(2);
 	});
 
+	test("degrades ordinary scoped usage failures to a null report", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		vi.spyOn(client, "fetchUsage").mockRejectedValue(new Error("broker usage unavailable: secret"));
+
+		await expect(remote.fetchUsageReportsForProvider("anthropic" as never)).resolves.toBeNull();
+	});
+
 	test("hydrates metadata and durable health/usage presentations for one-shot consumers", async () => {
 		const presentationPath = path.join(tempDir, "presentations.json");
 		const client = new AuthBrokerClient({ url: handle!.url, token });
