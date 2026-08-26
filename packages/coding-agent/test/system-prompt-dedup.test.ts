@@ -12,6 +12,7 @@ import {
 	loadSystemPromptFiles,
 } from "@gajae-code/coding-agent/system-prompt";
 import { getAgentDir, resetAgentDirFromEnvironment } from "@gajae-code/utils";
+import { safeRmSync } from "../../../scripts/safe-cleanup";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function escapeRegExp(text: string): string {
@@ -135,7 +136,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		expect(paths).toContain(path.join(projectDir, "AGENTS.md"));
 		// The agent-dir fixture outlives this test's temp dirs; remove it so the
 		// shared user scope stays clean for later tests in this file.
-		fs.rmSync(userAgentsPath, { force: true });
+		safeRmSync(userAgentsPath, { force: true });
 		clearCache();
 	});
 
@@ -153,7 +154,7 @@ describe("SYSTEM.md prompt assembly", () => {
 		const files = await loadProjectContextFiles({ cwd: projectDir });
 
 		expect(files.map(file => file.path)).toEqual([userAgentsPath]);
-		fs.rmSync(userAgentsPath, { force: true });
+		safeRmSync(userAgentsPath, { force: true });
 		clearCache();
 	});
 
