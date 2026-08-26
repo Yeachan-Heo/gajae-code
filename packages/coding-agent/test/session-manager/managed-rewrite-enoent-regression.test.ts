@@ -54,6 +54,31 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close();
 	});
 
+	it("keeps appending after an external agent touches the transcript timestamps (#4892)", async () => {
+		// AV / search indexing / backup agents advance mtime+ctime without writing to
+		// the file. That must not terminate the session: the transcript object and its
+		// content are unchanged, so the append proceeds against the same predecessor.
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const before = fs.readFileSync(sessionFile);
+		const touched = new Date(fs.statSync(sessionFile).mtimeMs + 5_000);
+		fs.utimesSync(sessionFile, touched, touched);
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "after-touch", timestamp: Date.now() }),
+		).not.toThrow();
+
+		const after = fs.readFileSync(sessionFile);
+		expect(after.subarray(0, before.byteLength).equals(before)).toBe(true);
+		expect(after.toString("utf8")).toContain("after-touch");
+		await manager.close();
+	});
+
 	it("still fails closed on identity_mismatch (concurrent successor not overwritten)", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);

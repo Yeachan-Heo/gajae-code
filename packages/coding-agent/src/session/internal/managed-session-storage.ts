@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, type Hash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
@@ -242,9 +242,11 @@ export interface ManagedFileSnapshot {
 	};
 }
 /**
- * Descriptor identity of one managed file object. Deliberately excludes the
- * content sha256: append receipts must bind the post-operation object without
- * re-reading the whole payload.
+ * Descriptor identity of one managed file object. The content `sha256` is
+ * present only when the operation that produced this identity already proved
+ * the digest (a streaming capture, or an append whose predecessor digest and
+ * exact appended bytes were both verified). It is never re-read on demand, so
+ * an identity without a digest simply cannot authenticate content later.
  */
 export interface ManagedFileIdentity {
 	dev: bigint;
@@ -253,6 +255,7 @@ export interface ManagedFileIdentity {
 	size: number;
 	mtimeNs: bigint;
 	ctimeNs: bigint;
+	sha256?: string;
 }
 
 /**
@@ -288,6 +291,7 @@ export interface ManagedBoundedAppendExpectation {
 }
 
 function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFileIdentity {
+	const sha256 = validManagedDigest(identity.sha256);
 	return {
 		dev: BigInt(identity.dev),
 		ino: BigInt(identity.ino),
@@ -295,7 +299,35 @@ function managedFileIdentityFromNative(identity: RecoveryFsIdentity): ManagedFil
 		size: Number(identity.size),
 		mtimeNs: BigInt(identity.mtimeNs),
 		ctimeNs: BigInt(identity.ctimeNs),
+		...(sha256 ? { sha256 } : {}),
 	};
+}
+
+/** Normalized lowercase content digest, or undefined when the value is not one. */
+function validManagedDigest(value: unknown): string | undefined {
+	return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value) ? value.toLowerCase() : undefined;
+}
+
+/**
+ * Digest of the successor produced by an append whose predecessor content was
+ * verified against `expected.sha256`. `digestState` is the streaming hash of
+ * that verified predecessor, so `state + bytes` is exactly the successor
+ * content and needs no second read. Returns undefined unless the post-append
+ * length is exactly the predecessor length plus the request, which keeps an
+ * unproven digest out of the receipt instead of guessing.
+ */
+function derivedAppendDigest(
+	expected: ManagedBoundedAppendExpectation,
+	bytes: Uint8Array,
+	successor: ManagedFileIdentity,
+	digestState: Hash | undefined,
+): string | undefined {
+	if (!digestState) return undefined;
+	const predecessorSize = Number(expected.size);
+	if (!Number.isSafeInteger(predecessorSize)) return undefined;
+	const successorSize = predecessorSize + bytes.byteLength;
+	if (!Number.isSafeInteger(successorSize) || successor.size !== successorSize) return undefined;
+	return digestState.copy().update(bytes).digest("hex");
 }
 
 function managedAppendReceiptFromIdentity(identity: ManagedFileIdentity): ManagedAppendReceipt {
@@ -1693,21 +1725,36 @@ export class ManagedSessionDescendantStore {
 	}
 
 	captureBoundedAppendExpectation(relativePath: string): ManagedBoundedAppendExpectation | undefined {
+		return this.#captureAppendExpectation(relativePath)?.expectation;
+	}
+
+	/**
+	 * Bounded append expectation plus the streaming digest state that produced its
+	 * `sha256`. Retaining the state lets a successful append derive the successor
+	 * digest from verified predecessor bytes without a second transcript-linear read.
+	 */
+	#captureAppendExpectation(
+		relativePath: string,
+	): { expectation: ManagedBoundedAppendExpectation; digestState: Hash } | undefined {
 		this.#assertBound();
-		let identity: ManagedFileSnapshot["identity"];
+		let captured: { identity: ManagedFileSnapshot["identity"]; digestState: Hash };
 		try {
-			identity = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+			captured = captureManagedFileDigestStateNoFollow(this.#resolve(relativePath));
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
 			throw error;
 		}
+		const identity = captured.identity;
 		return {
-			dev: identity.dev.toString(),
-			ino: identity.ino.toString(),
-			size: identity.size.toString(),
-			mtimeNs: identity.mtimeNs.toString(),
-			ctimeNs: identity.ctimeNs.toString(),
-			sha256: identity.sha256,
+			expectation: {
+				dev: identity.dev.toString(),
+				ino: identity.ino.toString(),
+				size: identity.size.toString(),
+				mtimeNs: identity.mtimeNs.toString(),
+				ctimeNs: identity.ctimeNs.toString(),
+				sha256: identity.sha256,
+			},
+			digestState: captured.digestState,
 		};
 	}
 
@@ -1715,6 +1762,7 @@ export class ManagedSessionDescendantStore {
 		relativePath: string,
 		bytes: Uint8Array,
 		expected: ManagedBoundedAppendExpectation,
+		digestState?: Hash,
 	): ManagedAppendReceipt {
 		this.#beforeMutation();
 		this.#assertBound();
@@ -1752,26 +1800,43 @@ export class ManagedSessionDescendantStore {
 		if (!appended.ok) throw managedAppendFailure(appended.code);
 		if (!appended.identity)
 			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
+		const successor = managedFileIdentityFromNative(appended.identity);
+		const derived = successor.sha256 ?? derivedAppendDigest(expected, bytes, successor, digestState);
 		this.#assertBound();
-		return managedAppendReceiptFromIdentity(managedFileIdentityFromNative(appended.identity));
+		return managedAppendReceiptFromIdentity(derived ? { ...successor, sha256: derived } : successor);
 	}
 
+	/**
+	 * Append against the identity this session last committed.
+	 *
+	 * Metadata-only drift (#4892) — `mtime`/`ctime` advancing while the same file
+	 * object still holds byte-identical content — is benign: AV, search indexing,
+	 * and backup/sync agents touch transcripts without writing to them, and on
+	 * Windows that is routine. It is accepted only when the committed content
+	 * digest still matches the freshly captured one.
+	 *
+	 * Everything else stays fail-closed exactly as before: a missing predecessor,
+	 * a different object (`dev`/`ino`), a different length, a different digest, or
+	 * no committed digest to compare against. A concurrent successor is therefore
+	 * still never appended to.
+	 */
 	appendExpectedIdentitySync(
 		relativePath: string,
 		bytes: Uint8Array,
 		expected: ManagedFileIdentity,
 	): ManagedAppendReceipt {
-		const bounded = this.captureBoundedAppendExpectation(relativePath);
-		if (
-			!bounded ||
-			bounded.dev !== expected.dev.toString() ||
-			bounded.ino !== expected.ino.toString() ||
-			bounded.size !== String(expected.size) ||
-			bounded.mtimeNs !== expected.mtimeNs.toString() ||
-			bounded.ctimeNs !== expected.ctimeNs.toString()
-		)
-			throw new Error("managed_append_identity_mismatch");
-		return this.appendExpectedSync(relativePath, bytes, bounded);
+		const captured = this.#captureAppendExpectation(relativePath);
+		if (!captured) throw new Error("managed_append_identity_mismatch");
+		const bounded = captured.expectation;
+		const sameObject =
+			bounded.dev === expected.dev.toString() &&
+			bounded.ino === expected.ino.toString() &&
+			bounded.size === String(expected.size);
+		const sameTimes =
+			bounded.mtimeNs === expected.mtimeNs.toString() && bounded.ctimeNs === expected.ctimeNs.toString();
+		const sameContent = expected.sha256 !== undefined && expected.sha256 === bounded.sha256;
+		if (!sameObject || (!sameTimes && !sameContent)) throw new Error("managed_append_identity_mismatch");
+		return this.appendExpectedSync(relativePath, bytes, bounded, captured.digestState);
 	}
 
 	appendSync(relativePath: string, bytes: Uint8Array): ManagedAppendReceipt {
@@ -2846,6 +2911,19 @@ export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number
 }
 
 function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedFileSnapshot["identity"] {
+	return captureManagedFileDigestStateNoFollow(pathname).identity;
+}
+
+/**
+ * Streaming descriptor-bound capture that also hands back the hash positioned at
+ * end-of-file. The state is what makes a proven append receipt free: appending
+ * the request bytes to it yields the successor digest without re-reading the
+ * transcript.
+ */
+function captureManagedFileDigestStateNoFollow(pathname: string): {
+	identity: ManagedFileSnapshot["identity"];
+	digestState: Hash;
+} {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
 		const before = fs.fstatSync(fd, { bigint: true });
@@ -2862,7 +2940,7 @@ function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedF
 		const named = fs.lstatSync(pathname, { bigint: true });
 		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
 			throw new Error("source_changed");
-		return identity(before, hash.digest("hex"));
+		return { identity: identity(before, hash.copy().digest("hex")), digestState: hash };
 	} finally {
 		fs.closeSync(fd);
 	}

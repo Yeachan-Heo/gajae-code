@@ -14997,7 +14997,17 @@ export class SessionManager {
 				} else store.replaceSync(relativePath, bytes);
 				const descriptor = store.descriptorExpected(relativePath);
 				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
-				this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
+				// The managed replace protocol verifies the published successor against the
+				// bytes it wrote, so this session already knows the transcript content and
+				// can retain its digest for free. The next append then authenticates benign
+				// metadata drift (#4892) instead of failing closed on a touched-but-identical
+				// file. A length that does not match the published bytes proves nothing and
+				// retains no digest.
+				const rewrittenIdentity = managedIdentityFromDescriptor(descriptor);
+				this.#managedPersistExpectedIdentity =
+					descriptor.size === bytes.byteLength
+						? { ...rewrittenIdentity, sha256: crypto.createHash("sha256").update(bytes).digest("hex") }
+						: rewrittenIdentity;
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				return;
 			}
