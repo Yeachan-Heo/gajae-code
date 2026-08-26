@@ -2389,8 +2389,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			!options.bashRestrictionProfile &&
 			(options.bashAllowedPrefixes ?? []).length === 0 &&
 			!options.mcpManager &&
-			explicitMcpConfigPath === undefined &&
-			options.workspaceTree === undefined;
+			explicitMcpConfigPath === undefined;
 		const rescopeSessionCwdParticipant: AgentSessionRescopeParticipant | undefined = canAgentRescopeSessionCwd
 			? {
 					assertCanRescope: () => {
