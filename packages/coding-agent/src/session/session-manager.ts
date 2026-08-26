@@ -15785,7 +15785,11 @@ export class SessionManager {
 		await this.#queuePersistTask(async () => {
 			const writer = this.#persistWriter;
 			if (!writer) {
-				this.#flushed = true;
+				if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) {
+					await this.#rewriteFileContents();
+				} else {
+					this.#flushed = true;
+				}
 				return;
 			}
 			try {
@@ -15795,10 +15799,14 @@ export class SessionManager {
 			}
 			outcome = this.#closeOutcomeFromWriter(writer);
 			if (outcome.kind === "closed") {
-				this.#flushed = true;
 				// Confirmed closed: release writer ownership.
 				this.#persistWriter = undefined;
 				this.#persistWriterPath = undefined;
+				if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) {
+					await this.#rewriteFileContents();
+				} else {
+					this.#flushed = true;
+				}
 			} else if (outcome.kind === "close_unknown") {
 				// Quarantined (terminal): release ownership so no retry/finalizer
 				// touches the uncertain fd again.

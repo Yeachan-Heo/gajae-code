@@ -25,6 +25,7 @@ type NativeManagedSessionStorage = Pick<
 	| "exactRemoveDirectoryTree"
 	| "exactReplacePath"
 	| "exactUnlink"
+	| "exactUnlinkDirect"
 	| "linkNoReplacePath"
 	| "linkNoReplacePathAsync"
 	| "openRecoveryFsRoot"
@@ -605,6 +606,7 @@ const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
 const SCRUBBED_REMNANT_REAP_INTERVAL_MS = 60_000;
 /** Maximum dirents inspected by one synchronous preparation sweep. */
 const SCRUBBED_REMNANT_SYNC_SCAN_LIMIT = 256;
+const EMPTY_FILE_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 export interface ScrubbedProtocolRemnantReapResult {
 	readonly reaped: number;
@@ -680,11 +682,20 @@ export function reapScrubbedProtocolRemnantsSync(
 				if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
 				const pathname = path.join(scanDirectory, name);
 				try {
-					const named = fs.lstatSync(pathname);
-					if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+					const named = fs.lstatSync(pathname, { bigint: true });
+					if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n || named.size !== 0n) continue;
 					if (named.mtimeMs > cutoff) continue;
-					fs.unlinkSync(pathname);
-					reaped += 1;
+					const removed = nativeSessionStorage().exactUnlinkDirect(pathname, {
+						dev: named.dev,
+						ino: named.ino,
+						nlink: named.nlink,
+						size: named.size,
+						mtimeNs: named.mtimeNs,
+						sha256: EMPTY_FILE_SHA256,
+						quarantineName: `.gjc-remnant-${process.pid}-${randomUUID()}`,
+					});
+					if (removed.ok || removed.code === "not_found") reaped += Number(removed.ok);
+					else failures += 1;
 				} catch (error) {
 					if (!isEnoent(error)) failures += 1;
 				}
@@ -735,11 +746,20 @@ export async function reapScrubbedProtocolRemnants(
 			if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
 			const pathname = path.join(scanDirectory, name);
 			try {
-				const named = await fsp.lstat(pathname);
-				if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+				const named = await fsp.lstat(pathname, { bigint: true });
+				if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1n || named.size !== 0n) continue;
 				if (named.mtimeMs > cutoff) continue;
-				await fsp.unlink(pathname);
-				reaped += 1;
+				const removed = nativeSessionStorage().exactUnlinkDirect(pathname, {
+					dev: named.dev,
+					ino: named.ino,
+					nlink: named.nlink,
+					size: named.size,
+					mtimeNs: named.mtimeNs,
+					sha256: EMPTY_FILE_SHA256,
+					quarantineName: `.gjc-remnant-${process.pid}-${randomUUID()}`,
+				});
+				if (removed.ok || removed.code === "not_found") reaped += Number(removed.ok);
+				else failures += 1;
 			} catch (error) {
 				if (!isEnoent(error)) failures += 1;
 			}

@@ -477,6 +477,56 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close().catch(() => {});
 	});
 
+	it("services pending managed recovery during closeStrict", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const sessionFile = manager.getSessionFile()!;
+
+		const appendManaged = native.RecoveryFsRoot.prototype.appendManaged;
+		let failOnce = true;
+		vi.spyOn(native.RecoveryFsRoot.prototype, "appendManaged").mockImplementation(function (
+			this: native.RecoveryFsRoot,
+			relativePath,
+			bytes,
+			expectedDev,
+			expectedIno,
+			expectedSize,
+			expectedMtimeNs,
+			expectedCtimeNs,
+			expectedSha256,
+		) {
+			const result = appendManaged.call(
+				this,
+				relativePath,
+				bytes,
+				expectedDev,
+				expectedIno,
+				expectedSize,
+				expectedMtimeNs,
+				expectedCtimeNs,
+				expectedSha256,
+			);
+			if (!failOnce) return result;
+			failOnce = false;
+			return {
+				...result,
+				ok: false,
+				code: "fsync_failed",
+				mutationState: "committed",
+				durabilityState: "not_provable",
+			};
+		});
+
+		expect(() =>
+			manager.appendMessage({ role: "user", content: "close-strict-recovery", timestamp: Date.now() }),
+		).toThrow(/managed_append_committed_outcome_uncertain/);
+		await expect(manager.closeStrict()).resolves.toEqual({ kind: "closed" });
+		expect(await readText(sessionFile)).toContain("close-strict-recovery");
+	});
+
 	it("bounds synchronous remnant reaping to one directory batch", () => {
 		const reapRoot = path.join(root, "reap");
 		fs.mkdirSync(reapRoot, { recursive: true });

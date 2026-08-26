@@ -19,6 +19,7 @@ export type NativePublishPrimitive =
 	| "linkat_noreplace"
 	| "mkdirat_renameat_noreplace"
 	| "in_place_descriptor"
+	| "rename_exchange"
 	| "renameatx_np_excl"
 	| "windows_rename_noreplace"
 	| "unsupported"
@@ -92,6 +93,7 @@ const primitives = new Set<NativePublishPrimitive>([
 	"linkat_noreplace",
 	"mkdirat_renameat_noreplace",
 	"in_place_descriptor",
+	"rename_exchange",
 	"renameatx_np_excl",
 	"windows_rename_noreplace",
 	"unsupported",
@@ -270,6 +272,7 @@ export function classifyNativePublishOutcome(
 			: operation === "retained_tree"
 				? outcome.primitive === "renameat2_noreplace" || outcome.primitive === "mkdirat_renameat_noreplace"
 				: outcome.primitive === "in_place_descriptor" ||
+					outcome.primitive === "rename_exchange" ||
 					(outcome.primitive === "unsupported" &&
 						!outcome.ok &&
 						outcome.mutationState === "not_committed" &&

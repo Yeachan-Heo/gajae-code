@@ -368,12 +368,40 @@ const fn rename_flags_unsupported(errno: Option<i32>) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn rename_exchange_same_parent(
+	parent: &File,
+	source: &CString,
+	destination: &CString,
+) -> Result<(), &'static str> {
+	// SAFETY: parent owns a live directory descriptor and both names are validated
+	// single-component NUL-terminated strings.
+	let result = unsafe {
+		libc::syscall(
+			libc::SYS_renameat2,
+			parent.as_raw_fd(),
+			source.as_ptr(),
+			parent.as_raw_fd(),
+			destination.as_ptr(),
+			libc::RENAME_EXCHANGE,
+		)
+	};
+	if result == 0 {
+		Ok(())
+	} else {
+		match std::io::Error::last_os_error().raw_os_error() {
+			Some(libc::EINVAL | libc::ENOSYS) => Err("atomic_unavailable"),
+			_ => Err("io_error"),
+		}
+	}
+}
+
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoReplacePrimitive {
 	Renameat2,
 	Linkat,
 	MkdiratRenameat,
-	InPlaceDescriptor,
+	AtomicExchange,
 }
 
 #[cfg(target_os = "linux")]
@@ -383,7 +411,7 @@ impl NoReplacePrimitive {
 			Self::Renameat2 => "renameat2_noreplace",
 			Self::Linkat => "linkat_noreplace",
 			Self::MkdiratRenameat => "mkdirat_renameat_noreplace",
-			Self::InPlaceDescriptor => "in_place_descriptor",
+			Self::AtomicExchange => "rename_exchange",
 		}
 	}
 }
@@ -395,7 +423,7 @@ impl NoReplacePrimitive {
 /// replacement, which is rejected by [`replace_managed`].
 fn lock_managed_mutation(recovery: &File) -> Result<File, &'static str> {
 	use std::os::fd::FromRawFd;
-	let name = c".gjc-managed-mutation-lock";
+	let name = std::ffi::CString::new(".gjc-managed-mutation-lock").map_err(|_| "lock_failed")?;
 	// SAFETY: `recovery` owns a valid directory descriptor and `name` is a
 	// static NUL-terminated leaf. O_NOFOLLOW prevents a substituted symlink from
 	// becoming the lock authority.
@@ -412,6 +440,16 @@ fn lock_managed_mutation(recovery: &File) -> Result<File, &'static str> {
 	}
 	// SAFETY: successful openat returned a uniquely owned descriptor.
 	let lock = unsafe { File::from_raw_fd(fd) };
+	let opened = identity(&lock).map_err(|_| "lock_failed")?;
+	let named = statat(recovery, &name).map_err(|_| "lock_failed")?;
+	if named.st_mode & libc::S_IFMT != libc::S_IFREG
+		|| named.st_nlink != 1
+		|| opened.dev != named.st_dev.to_string()
+		|| opened.ino != named.st_ino.to_string()
+		|| opened.nlink != named.st_nlink.to_string()
+	{
+		return Err("lock_failed");
+	}
 	if crate::path_identity::platform::secure_created_owner_only_file(&lock).is_err() {
 		return Err("lock_failed");
 	}
@@ -421,6 +459,13 @@ fn lock_managed_mutation(recovery: &File) -> Result<File, &'static str> {
 	// SAFETY: `lock` owns a regular lock descriptor. `flock` serializes every
 	// managed mutation that uses this retained recovery directory.
 	if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+		return Err("lock_failed");
+	}
+	let final_named = statat(recovery, &name).map_err(|_| "lock_failed")?;
+	if final_named.st_dev.to_string() != opened.dev
+		|| final_named.st_ino.to_string() != opened.ino
+		|| final_named.st_nlink != 1
+	{
 		return Err("lock_failed");
 	}
 	Ok(lock)
@@ -630,7 +675,7 @@ fn sync_parent(parent: &File) -> std::io::Result<()> {
 }
 
 #[napi(object)]
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 
 pub struct RecoveryFsIdentity {
 	pub dev:      String,
@@ -1411,16 +1456,13 @@ impl RecoveryFsRoot {
 		}
 	}
 
-	/// Rewrite one existing managed file through its retained descriptor.
+	/// Rewrite one existing managed file through a staged, file-synced
+	/// successor.
 	///
-	/// A pathname exchange cannot bind an expected destination inode against an
-	/// uncoordinated writer, so existing destinations are never renamed,
-	/// exchanged, unlinked, or replaced by pathname. Instead, this operation
-	/// opens and verifies the expected inode, then mutates that inode in place.
-	/// If a writer replaces the canonical name after the last path check, the
-	/// write can affect only the already-open predecessor; the successor remains
-	/// authoritative at the canonical name and the result is reported as a
-	/// committed identity failure without a retry receipt.
+	/// The expected destination is revalidated before an atomic same-directory
+	/// exchange. If an uncoordinated writer wins the exchange boundary, the
+	/// displaced successor is restored while the canonical name still points at
+	/// this operation's staged inode; no retry-authorizing receipt is returned.
 	#[napi]
 	pub fn replace_managed(
 		&self,
@@ -3308,20 +3350,17 @@ fn replace_managed(
 	if data.len() as u64 > MAX_MANAGED_CONTENT_BYTES {
 		return publish_preflight_failure_with_primitive(
 			"content_too_large",
-			NoReplacePrimitive::InPlaceDescriptor,
+			NoReplacePrimitive::AtomicExchange,
 		);
 	}
 	let _mutation_lock = match managed_mutation_lock(root, recovery) {
 		Ok(lock) => lock,
 		Err(code) => {
-			return publish_preflight_failure_with_primitive(
-				code,
-				NoReplacePrimitive::InPlaceDescriptor,
-			);
+			return publish_preflight_failure_with_primitive(code, NoReplacePrimitive::AtomicExchange);
 		},
 	};
-	let primitive = NoReplacePrimitive::InPlaceDescriptor;
-	let mut file = match open_existing(root, relative_path, true) {
+	let primitive = NoReplacePrimitive::AtomicExchange;
+	let file = match open_existing(root, relative_path, true) {
 		Ok(file) => file,
 		Err(code) => {
 			return publish_preflight_failure_with_primitive(
@@ -3397,66 +3436,186 @@ fn replace_managed(
 		publish_post_mutation_failure_with_primitive(code, phase, primitive, None)
 	};
 	let expected_digest = hex_digest(Sha256::digest(data).into());
-	// SAFETY: file is a validated regular file descriptor opened by this routine.
-	if unsafe { libc::ftruncate(file.as_raw_fd(), 0) } != 0 {
-		return committed_failure("io_error", "file_sync");
+	let stage_name = CString::new(format!(
+		".gjc-managed-replace-{}-{}",
+		std::process::id(),
+		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
+	))
+	.expect("replacement staging name contains no NUL");
+	let stage_fd = unsafe {
+		libc::openat(
+			parent.as_raw_fd(),
+			stage_name.as_ptr(),
+			libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+			0o600,
+		)
+	};
+	if stage_fd < 0 {
+		return publish_preflight_failure_with_primitive("io_error", primitive);
 	}
-	if file.seek(SeekFrom::Start(0)).is_err() || file.write_all(data).is_err() {
-		return committed_failure("io_error", "file_sync");
+	let mut stage = unsafe { File::from_raw_fd(stage_fd) };
+	if crate::path_identity::platform::secure_created_owner_only_file(&stage).is_err() {
+		return publish_preflight_failure_with_primitive("permission_denied", primitive);
 	}
-	if file.sync_all().is_err() {
-		return committed_failure("fsync_failed", "file_sync");
+	if stage.write_all(data).is_err() || stage.sync_all().is_err() {
+		return publish_preflight_failure_with_primitive("io_error", primitive);
 	}
-	let terminal = match regular_identity(&file) {
+	if crate::path_identity::platform::verify_created_owner_only_file(&stage).is_err() {
+		return publish_preflight_failure_with_primitive("permission_denied", primitive);
+	}
+	let mut staged_identity = match regular_identity(&stage) {
+		Ok(identity) => identity,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	staged_identity.sha256 = Some(expected_digest.clone());
+
+	let expected_before_exchange = match same_expected(
+		&file,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_mtime_ns,
+		expected_ctime_ns,
+		expected_sha256,
+	) {
+		Ok(matches) => matches,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	let named_before_exchange = match statat(&parent, &name) {
+		Ok(named) => named,
+		Err(code) => return publish_preflight_failure_with_primitive(code, primitive),
+	};
+	if !expected_before_exchange || !stat_matches_regular_identity(&named_before_exchange, &before) {
+		return publish_preflight_failure_with_primitive("identity_mismatch", primitive);
+	}
+	#[cfg(test)]
+	{
+		pause_replace_before_in_place_write_for_test();
+		pause_replace_after_final_name_check_for_test();
+	}
+	drop(file);
+	if let Err(code) = rename_exchange_same_parent(&parent, &stage_name, &name) {
+		return publish_preflight_failure_with_primitive(code, primitive);
+	}
+
+	let canonical = match open_existing(root, relative_path, false) {
+		Ok(file) => file,
+		Err(_) => {
+			return publish_post_mutation_failure_with_primitive(
+				"identity_mismatch",
+				"terminal_identity",
+				primitive,
+				None,
+			);
+		},
+	};
+	let canonical_identity = match regular_identity(&canonical) {
 		Ok(identity) => identity,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	let digest = match digest_hex(&file) {
+	let canonical_digest = match digest_hex(&canonical) {
 		Ok(digest) => digest,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	let named_after = match statat(&parent, &name) {
+	let named_after_exchange = match statat(&parent, &name) {
 		Ok(named) => named,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	if digest != expected_digest || !stat_matches_regular_identity(&named_after, &terminal) {
+	let canonical_matches_staged = canonical_identity.dev == staged_identity.dev
+		&& canonical_identity.ino == staged_identity.ino
+		&& canonical_identity.size == staged_identity.size
+		&& canonical_identity.mtime_ns == staged_identity.mtime_ns
+		&& canonical_digest == expected_digest;
+	let canonical_is_ours = canonical_matches_staged
+		&& stat_matches_regular_identity(&named_after_exchange, &canonical_identity)
+		&& crate::path_identity::platform::verify_created_owner_only_file(&canonical).is_ok();
+	if !canonical_is_ours {
+		if canonical_matches_staged {
+			// The exchange displaced a successor that failed the expected predecessor
+			// proof. Restore it only while the canonical name still names our staged
+			// inode; an uncoordinated replacement is never overwritten during cleanup.
+			if rename_exchange_same_parent(&parent, &stage_name, &name).is_ok() {
+				if let Ok(restored_stage) = statat(&parent, &stage_name) {
+					if restored_stage.st_dev.to_string() == staged_identity.dev
+						&& restored_stage.st_ino.to_string() == staged_identity.ino
+					{
+						// SAFETY: the staging name was created by this operation and the
+						// descriptor/name identity was just checked after restoration.
+						unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) };
+					}
+				}
+			}
+		}
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
-	// A canonical successor can replace the name after the first terminal check.
-	// Keep this seam deterministic in tests, then repeat the descriptor/digest/name
-	// proof before any success receipt is constructed; the retained predecessor is
-	// evidence only once it is no longer canonical.
-	#[cfg(test)]
-	pause_replace_after_final_name_check_for_test();
-	let terminal_after = match regular_identity(&file) {
-		Ok(identity) => identity,
+
+	let old_matches = match same_expected_after_rename(
+		&stage,
+		expected_dev,
+		expected_ino,
+		expected_size,
+		expected_mtime_ns,
+		expected_sha256,
+	) {
+		Ok(matches) => matches,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	let digest_after = match digest_hex(&file) {
-		Ok(digest) => digest,
-		Err(code) => return committed_failure(code, "terminal_identity"),
-	};
-	let named_after_final = match statat(&parent, &name) {
+	if !old_matches {
+		if canonical_matches_staged {
+			if rename_exchange_same_parent(&parent, &stage_name, &name).is_ok() {
+				if let Ok(restored_stage) = statat(&parent, &stage_name) {
+					if restored_stage.st_dev.to_string() == staged_identity.dev
+						&& restored_stage.st_ino.to_string() == staged_identity.ino
+					{
+						// SAFETY: the staging name was created by this operation and the
+						// descriptor/name identity was just checked after restoration.
+						unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) };
+					}
+				}
+			}
+		}
+		return committed_failure("identity_mismatch", "terminal_identity");
+	}
+
+	drop(stage);
+	let staged_after = match statat(&parent, &stage_name) {
 		Ok(named) => named,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	if terminal_after != terminal
-		|| digest_after != expected_digest
-		|| !stat_matches_regular_identity(&named_after_final, &terminal_after)
+	if staged_after.st_dev.to_string() != expected_dev
+		|| staged_after.st_ino.to_string() != expected_ino
+		|| staged_after.st_nlink != 1
 	{
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
-	if sync_parent(&parent).is_err() {
-		return committed_failure("fsync_failed", "destination_parent_sync");
+	// The old generation is no longer canonical. Remove only the exact staged
+	// inode; a same-name replacement is left untouched and reported as uncertain.
+	if unsafe { libc::unlinkat(parent.as_raw_fd(), stage_name.as_ptr(), 0) } != 0 {
+		return committed_failure("io_error", "terminal_identity");
 	}
-	// The parent sync is the durability boundary, not an identity proof. Recheck
-	// once more after it so a successor that wins during the sync cannot receive a
-	// stale predecessor receipt.
-	let terminal_final = match regular_identity(&file) {
+	if sync_parent(&parent).is_err() {
+		let mut receipt = canonical_identity;
+		receipt.sha256 = Some(canonical_digest);
+		return publish_post_mutation_failure_with_primitive_and_identity(
+			"fsync_failed",
+			"destination_parent_sync",
+			primitive,
+			Some(receipt),
+			None,
+		);
+	}
+	let terminal = match open_existing(root, relative_path, false) {
+		Ok(file) => file,
+		Err(code) => return committed_failure(code, "terminal_identity"),
+	};
+	if crate::path_identity::platform::verify_created_owner_only_file(&terminal).is_err() {
+		return committed_failure("permission_denied", "terminal_identity");
+	}
+	let mut terminal_identity = match regular_identity(&terminal) {
 		Ok(identity) => identity,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	let digest_final = match digest_hex(&file) {
+	let terminal_digest = match digest_hex(&terminal) {
 		Ok(digest) => digest,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
@@ -3464,15 +3623,13 @@ fn replace_managed(
 		Ok(named) => named,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	if terminal_final != terminal_after
-		|| digest_final != expected_digest
-		|| !stat_matches_regular_identity(&named_final, &terminal_final)
+	if terminal_digest != expected_digest
+		|| !stat_matches_regular_identity(&named_final, &terminal_identity)
 	{
 		return committed_failure("identity_mismatch", "terminal_identity");
 	}
-	let mut terminal = terminal_final;
-	terminal.sha256 = Some(digest_final);
-	RecoveryFsPublishResult::success(terminal, primitive)
+	terminal_identity.sha256 = Some(terminal_digest);
+	RecoveryFsPublishResult::success(terminal_identity, primitive)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4651,7 +4808,7 @@ mod tests {
 		assert_eq!(result.mutation_state, "not_committed");
 		assert_eq!(result.durability_state, "not_attempted");
 		assert_eq!(result.reason, "identity_violation");
-		assert_eq!(result.primitive, "in_place_descriptor");
+		assert_eq!(result.primitive, "rename_exchange");
 		assert_eq!(
 			fs::read(temporary.0.join("transcript")).expect("successor"),
 			b"concurrent-successor"
@@ -4709,7 +4866,7 @@ mod tests {
 		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
 		assert_eq!(result.mutation_state, "not_committed");
 		assert_eq!(result.reason, "identity_violation");
-		assert_eq!(result.primitive, "in_place_descriptor");
+		assert_eq!(result.primitive, "rename_exchange");
 		assert_eq!(
 			fs::read(temporary.0.join("selector.json")).expect("successor"),
 			b"concurrent-successor"
@@ -4768,7 +4925,7 @@ mod tests {
 		assert_eq!(result.mutation_state, "not_committed");
 		assert_eq!(result.durability_state, "not_attempted");
 		assert_eq!(result.reason, "identity_violation");
-		assert_eq!(result.primitive, "in_place_descriptor");
+		assert_eq!(result.primitive, "rename_exchange");
 		assert_eq!(
 			fs::read(temporary.0.join("content.json")).expect("concurrent content"),
 			b"concurrent-content-change"
@@ -4824,7 +4981,7 @@ mod tests {
 		assert_eq!(result.durability_state, "not_provable");
 		assert_eq!(result.reason, "identity_violation");
 		assert_eq!(result.phase, "terminal_identity");
-		assert_eq!(result.primitive, "in_place_descriptor");
+		assert_eq!(result.primitive, "rename_exchange");
 		assert!(result.identity.is_none(), "successor race must not return a stale receipt");
 		assert_eq!(
 			fs::read(temporary.0.join("final-check.json")).expect("canonical successor"),
@@ -4832,7 +4989,7 @@ mod tests {
 		);
 		assert_eq!(
 			fs::read(temporary.0.join("retained-predecessor")).expect("retained predecessor"),
-			b"replacement-final-check"
+			original
 		);
 	}
 
