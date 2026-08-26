@@ -811,11 +811,11 @@ function resolveOpenAiReasoningEffort<TApi extends Api>(
 const castApi = <TApi extends Api>(api: OptionsForApi<TApi>): OptionsForApi<Api> => api as OptionsForApi<Api>;
 
 export function resolveDefaultRequestMaxTokens<TApi extends Api>(model: Model<TApi>, requested?: number): number {
-	if (requested !== undefined && Number.isFinite(requested) && requested > 0) return requested;
-	if (model.maxTokensSource === "configured" && Number.isFinite(model.maxTokens) && model.maxTokens > 0) {
+	if (requested !== undefined && Number.isSafeInteger(requested) && requested > 0) return requested;
+	if (model.maxTokensSource === "configured" && Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0) {
 		return model.maxTokens;
 	}
-	return Number.isFinite(model.maxTokens) && model.maxTokens > 0
+	return Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0
 		? Math.min(model.maxTokens, DEFAULT_REQUEST_MAX_TOKENS)
 		: DEFAULT_REQUEST_MAX_TOKENS;
 }
@@ -904,8 +904,13 @@ function mapOptionsForApi<TApi extends Api>(
 				});
 			}
 
-			// Caller's maxTokens is the desired output; add thinking budget on top, capped at model limit
-			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, model.maxTokens);
+			// Caller's maxTokens is the desired output; add thinking budget on top,
+			// capped at the model limit. `base.maxTokens` is already resolver-sanitized,
+			// so only a finite positive model cap participates (malformed metadata
+			// cannot reintroduce NaN into the wire budget).
+			const modelCap =
+				Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : base.maxTokens;
+			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, modelCap);
 
 			// If not enough room for thinking + output, reduce thinking budget
 			if (maxTokens <= thinkingBudget) {
@@ -1064,12 +1069,17 @@ function mapOptionsForApi<TApi extends Api>(
 
 			let thinkingBudget = options.thinkingBudgets?.[effort] ?? GOOGLE_THINKING[effort];
 
-			// Caller's maxTokens is the desired output; add thinking budget on top, capped at model limit
-			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, model.maxTokens);
+			// Caller's maxTokens is the desired output; add thinking budget on top,
+			// capped at the model limit. `base.maxTokens` is already resolver-sanitized,
+			// so only a finite positive model cap participates (malformed metadata
+			// cannot reintroduce NaN into the wire budget).
+			const modelCap =
+				Number.isSafeInteger(model.maxTokens) && model.maxTokens > 0 ? model.maxTokens : base.maxTokens;
+			const maxTokens = Math.min((base.maxTokens || 0) + thinkingBudget, modelCap);
 
 			// If not enough room for thinking + output, reduce thinking budget
 			if (maxTokens <= thinkingBudget) {
-				thinkingBudget = Math.max(0, maxTokens - MIN_OUTPUT_TOKENS) ?? 0;
+				thinkingBudget = Math.max(0, maxTokens - MIN_OUTPUT_TOKENS);
 			}
 
 			// If thinking budget is too low, disable thinking

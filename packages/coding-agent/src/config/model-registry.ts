@@ -1002,7 +1002,7 @@ function applyModelOverride(model: Model<Api>, override: ModelOverride): Model<A
 			override: override.contextWindow,
 		});
 	}
-	if (override.maxTokens !== undefined && Number.isFinite(override.maxTokens) && override.maxTokens > 0) {
+	if (override.maxTokens !== undefined && Number.isSafeInteger(override.maxTokens) && override.maxTokens > 0) {
 		result.maxTokens = override.maxTokens;
 		result.maxTokensSource = "configured";
 	}
@@ -1160,7 +1160,10 @@ function buildCustomModelOverlay(
 		cost: modelDef.cost,
 		contextWindow: modelDef.contextWindow,
 		maxTokens: modelDef.maxTokens,
-		maxTokensSource: modelDef.maxTokens === undefined ? undefined : "configured",
+		maxTokensSource:
+			modelDef.maxTokens !== undefined && Number.isSafeInteger(modelDef.maxTokens) && modelDef.maxTokens > 0
+				? "configured"
+				: undefined,
 		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey),
 		compat: mergeCompat(providerCompat, modelDef.compat),
 		requestTransform: mergeRequestTransform(providerRequestTransform, modelDef.requestTransform),

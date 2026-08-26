@@ -149,6 +149,35 @@ describe("model maxTokens request contract", () => {
 		expect(result.body.max_tokens).toBe(32_000);
 	});
 
+	it("rejects fractional and unsafe-integer request budgets in favor of the safe default", async () => {
+		const fractional = await captureCompletion(createModel(), { maxTokens: 65_536.5 });
+		const unsafe = await captureCompletion(createModel(), { maxTokens: Number.MAX_SAFE_INTEGER + 1 });
+
+		expect(fractional.body.max_tokens).toBe(32_000);
+		expect(unsafe.body.max_tokens).toBe(32_000);
+	});
+
+	it("does not let fractional or unsafe configured metadata produce a non-integer wire budget", async () => {
+		const fractional = await captureCompletion({ ...createModel("configured"), maxTokens: 65_536.5 });
+		const unsafe = await captureCompletion({
+			...createModel("configured"),
+			maxTokens: Number.MAX_SAFE_INTEGER + 1,
+		});
+
+		expect(fractional.body.max_tokens).toBe(32_000);
+		expect(unsafe.body.max_tokens).toBe(32_000);
+	});
+
+	it("keeps compat.extraBody from adding a competing output-limit field", async () => {
+		const result = await captureCompletion({
+			...createModel("configured"),
+			compat: { maxTokensField: "max_tokens", extraBody: { max_completion_tokens: 1, temperature: 0.5 } },
+		});
+
+		expect(result.body.max_tokens).toBe(65_536);
+		expect(result.body.max_completion_tokens).toBeUndefined();
+		expect(result.body.temperature).toBe(0.5);
+	});
 	it("maps the same resolved budget to max_completion_tokens", async () => {
 		const result = await captureCompletion({
 			...createModel("configured"),
@@ -250,5 +279,39 @@ describe("model maxTokens request contract", () => {
 
 		const payload = await payloadPromise.promise;
 		expect(payload.max_tokens).toBeGreaterThan(0);
+	});
+	it("shrinks the thinking budget when a configured cap cannot fit budget plus output", async () => {
+		const payloadPromise = Promise.withResolvers<Record<string, unknown>>();
+		const controller = new AbortController();
+		controller.abort();
+		const model: Model<"anthropic-messages"> = {
+			id: "capped-anthropic-model",
+			name: "Capped Anthropic model",
+			api: "anthropic-messages",
+			provider: "anthropic",
+			baseUrl: "https://api.anthropic.com",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 131_072,
+			maxTokens: 8_192,
+			maxTokensSource: "configured",
+		};
+
+		streamSimple(model, context(), {
+			apiKey: "test-key",
+			reasoning: Effort.XHigh,
+			thinkingBudgets: { [Effort.XHigh]: 8_192 },
+			signal: controller.signal,
+			onPayload: payload => payloadPromise.resolve(payload as Record<string, unknown>),
+		});
+
+		const payload = await payloadPromise.promise;
+		const maxTokens = payload.max_tokens as number;
+		const thinking = payload.thinking as { type: string; budget_tokens?: number } | undefined;
+		expect(maxTokens).toBe(8_192);
+		if (thinking?.type === "enabled") {
+			expect(thinking.budget_tokens ?? 0).toBeLessThan(maxTokens);
+		}
 	});
 });

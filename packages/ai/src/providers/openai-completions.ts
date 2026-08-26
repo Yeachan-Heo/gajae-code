@@ -1637,7 +1637,14 @@ function buildParams(
 	}
 
 	if (compat.extraBody) {
-		Object.assign(params, compat.extraBody);
+		// The resolved output limit owns the selected wire field; extraBody is a
+		// free-form compatibility escape hatch and must not add a competing
+		// max-token field or overwrite the resolved budget.
+		const { max_tokens, max_completion_tokens, max_output_tokens, ...restExtra } = compat.extraBody as Record<
+			string,
+			unknown
+		>;
+		Object.assign(params, restExtra);
 	}
 	applyOpenAIRequestTransformBody(params, model.requestTransform);
 	if (!supportsReasoningParams) {
