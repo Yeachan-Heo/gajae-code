@@ -9674,6 +9674,12 @@ mod platform {
 				Ok(sid) => sid,
 				Err(()) => return NativeSecureSkillWriteResult::failure("acl_unavailable"),
 			};
+			let root_applied = set_owner_only_acl(skills.target, "directory", &sid, true);
+			if !root_applied.ok {
+				return NativeSecureSkillWriteResult::failure(
+					root_applied.code.as_deref().unwrap_or("acl_apply_failed"),
+				);
+			}
 			let applied = set_owner_only_acl(skill_handle, "directory", &sid, true);
 			if !applied.ok {
 				return NativeSecureSkillWriteResult::failure(

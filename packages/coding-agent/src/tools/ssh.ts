@@ -106,7 +106,11 @@ async function loadHosts(session: ToolSession): Promise<{
 	hostNames: string[];
 	hostsByName: Map<string, SSHHost>;
 }> {
-	const result = await loadCapability<SSHHost>(sshCapability.id, { cwd: session.cwd, settings: session.settings });
+	const result = await loadCapability<SSHHost>(sshCapability.id, {
+		cwd: session.cwd,
+		settings: session.settings,
+		agentDir: session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.(),
+	});
 	const hostsByName = new Map<string, SSHHost>();
 	for (const host of result.items) {
 		if (!hostsByName.has(host.name)) {

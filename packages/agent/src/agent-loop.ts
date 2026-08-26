@@ -556,7 +556,14 @@ function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean
 function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, args: Record<string, unknown>): boolean {
 	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
 	if (!fields || fields.length === 0) return false;
-	if (args.deepInterview !== undefined || args.workflowGate !== undefined) return false;
+	const containsLoadBearingMetadata = (node: unknown): boolean => {
+		if (Array.isArray(node)) return node.some(containsLoadBearingMetadata);
+		if (typeof node !== "object" || node === null) return false;
+		return Object.entries(node).some(
+			([key, value]) => key === "deepInterview" || key === "workflowGate" || containsLoadBearingMetadata(value),
+		);
+	};
+	if (containsLoadBearingMetadata(args)) return false;
 	const prefixes = fields.map(field => field.split("."));
 	const isDisplayPath = (path: readonly string[]): boolean =>
 		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));
