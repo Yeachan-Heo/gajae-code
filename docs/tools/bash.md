@@ -88,7 +88,6 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
    - The remappable `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold a running managed non-PTY Bash wait, ACP client-terminal wait, or PTY wait into a manager-owned job.
    - The foreground turn stops cleanly after the result boundary; completion wakes a later turn with a receipt containing output, original intent, and a `job` retrieval handle.
    - Folded jobs retain their original deadline and live `job tail` output. PTY observer disposal is non-owning; `job cancel` kills the live PTY through the manager lifecycle.
-   - Returns a `ToolError` pointing the model at `read`, `search`, `find`, `edit`, or `write`.
 
 ## Side Effects
 - Filesystem
