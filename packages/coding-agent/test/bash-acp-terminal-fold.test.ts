@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { AsyncJobManager } from "../src/async";
+import { JobsObserver } from "../src/modes/jobs-observer";
 import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/client-bridge";
 import type { FoldAdapter } from "../src/session/fold-coordinator";
 import type { ToolSession } from "../src/tools";
@@ -12,7 +13,10 @@ interface Harness {
 	delivered: Array<{ jobId: string; text: string }>;
 }
 
-function makeHarness(bridge: ClientBridge): Harness {
+function makeHarness(
+	bridge: ClientBridge,
+	options: { autoBackgroundEnabled?: boolean; thresholdMs?: number } = {},
+): Harness {
 	const delivered: Array<{ jobId: string; text: string }> = [];
 	const manager = new AsyncJobManager({
 		retentionMs: 60_000,
@@ -29,8 +33,8 @@ function makeHarness(bridge: ClientBridge): Harness {
 		settings: {
 			get(key: string) {
 				if (key === "async.enabled") return true;
-				if (key === "bash.autoBackground.enabled") return false;
-				if (key === "bash.autoBackground.thresholdMs") return 60_000;
+				if (key === "bash.autoBackground.enabled") return options.autoBackgroundEnabled ?? false;
+				if (key === "bash.autoBackground.thresholdMs") return options.thresholdMs ?? 60_000;
 				if (key === "bashInterceptor.enabled") return false;
 				if (key === "astGrep.enabled") return false;
 				if (key === "astEdit.enabled") return false;
@@ -126,6 +130,39 @@ describe("BashTool ACP terminal fold", () => {
 		// Released exactly once, by the job that owns it now.
 		await waitFor(() => releaseSpy.mock.calls.length === 1);
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("auto-backgrounds an ACP terminal with manager and observer visibility", async () => {
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		let releaseCalls = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-auto-background",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => ({ output: "auto background output\n", truncated: false }),
+			kill: async () => {},
+			release: async () => {
+				releaseCalls += 1;
+			},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge, { autoBackgroundEnabled: true, thresholdMs: 10 });
+		const observer = new JobsObserver(h.manager, "0-Main");
+		try {
+			const tool = new BashTool(h.session);
+			const result = await tool.execute("call-auto-background", { command: "sleep 30" }, undefined, () => {});
+			expect(result.details?.async?.state).toBe("running");
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) throw new Error("expected auto-backgrounded ACP job id");
+			expect(h.manager.getJob(jobId)?.metadata?.backgrounded).toBe(true);
+			expect(observer.getSnapshot().foldedJobs?.find(job => job.id === jobId)?.backgrounded).toBe(true);
+
+			exit.resolve({ exitCode: 0, signal: null });
+			await waitFor(() => h.delivered.length === 1);
+			await waitFor(() => releaseCalls === 1);
+			expect(releaseCalls).toBe(1);
+		} finally {
+			observer.dispose();
+		}
 	});
 
 	it("surfaces a client-killed folded terminal as a delivered failure, releasing once", async () => {
