@@ -1543,14 +1543,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			let retainedAcpSnapshot = "";
 			const appendAcpSnapshot = (snapshot: string): void => {
 				if (!bridgeJobId || !snapshot) return;
-				const limit = Math.min(retainedAcpSnapshot.length, snapshot.length);
-				let overlap = 0;
-				for (let size = limit; size > 0; size -= 1) {
-					if (retainedAcpSnapshot.endsWith(snapshot.slice(0, size))) {
-						overlap = size;
-						break;
+				const combined = `${snapshot}\u0000${retainedAcpSnapshot}`;
+				const prefix = new Uint32Array(combined.length);
+				for (let index = 1; index < combined.length; index += 1) {
+					let candidate = prefix[index - 1] ?? 0;
+					while (candidate > 0 && combined[index] !== combined[candidate]) {
+						candidate = prefix[candidate - 1] ?? 0;
 					}
+					if (combined[index] === combined[candidate]) candidate += 1;
+					prefix[index] = candidate;
 				}
+				const overlap = prefix[combined.length - 1] ?? 0;
 				const delta = snapshot.slice(overlap);
 				if (delta) ownedManager?.appendOutput(bridgeJobId, delta);
 				retainedAcpSnapshot = snapshot;
@@ -1573,6 +1576,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				// arriving mid-poll terminates the remote command immediately,
 				// instead of waiting for the next `currentOutput()` to return.
 				const { promise: abortedP, resolve: resolveAborted } = Promise.withResolvers<void>();
+				const deadlineAt = Date.now() + timeoutMs;
+				const readOutput = (limitMs: number): Promise<ClientBridgeTerminalOutput | undefined> =>
+					Promise.race([
+						handle.currentOutput(),
+						abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined),
+						Bun.sleep(Math.max(1, limitMs)).then(() => undefined as ClientBridgeTerminalOutput | undefined),
+					]);
 				let killPromise: Promise<void> | undefined;
 				const fireKill = (): Promise<void> => {
 					if (killPromise) return killPromise;
@@ -1593,7 +1603,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 						let readDiagnostic: string | undefined;
 						try {
-							current = await handle.currentOutput();
+							current = (await readOutput(1_000)) ?? current;
 						} catch (error) {
 							readDiagnostic = boundArtifactSaveDiagnostic(error);
 							logger.warn("ACP terminal aborted output read failed", {
@@ -1601,6 +1611,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								error,
 							});
 						}
+						appendAcpSnapshot(current.output);
 						const prepared = await prepareClientTerminalOutput(this.session, current);
 						throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 					}
@@ -1623,7 +1634,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 							let readDiagnostic: string | undefined;
 							try {
-								current = await handle.currentOutput();
+								current = (await readOutput(1_000)) ?? current;
 							} catch (error) {
 								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal aborted output read failed", {
@@ -1631,6 +1642,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									error,
 								});
 							}
+							appendAcpSnapshot(current.output);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							throw new ToolAbortError(
 								formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices),
@@ -1646,7 +1658,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 							let readDiagnostic: string | undefined;
 							try {
-								current = await handle.currentOutput();
+								current = (await readOutput(1_000)) ?? current;
 							} catch (error) {
 								readDiagnostic = boundArtifactSaveDiagnostic(error);
 								logger.warn("ACP terminal final output read failed", {
@@ -1654,6 +1666,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									error,
 								});
 							}
+							appendAcpSnapshot(current.output);
 							const prepared = await prepareClientTerminalOutput(this.session, current);
 							const timeoutNotices = [
 								...pendingNotices,
@@ -1682,10 +1695,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						// Poll tick: push current output so agent-loop transcript stays consistent.
 						// Race the read against abort so a stuck `terminal/output` RPC does not
 						// delay cancellation.
-						const pollOutput = await Promise.race([
-							handle.currentOutput(),
-							abortedP.then(() => undefined as ClientBridgeTerminalOutput | undefined),
-						]);
+						const pollOutput = await readOutput(Math.max(1, deadlineAt - Date.now()));
 						if (pollOutput === undefined) {
 							// Abort fired during the poll-tick read; let the next loop iteration
 							// observe `runSignal?.aborted` and exit via the abort branch.
@@ -1716,7 +1726,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 					let readDiagnostic: string | undefined;
 					try {
-						current = await handle.currentOutput();
+						current = (await readOutput(1_000)) ?? current;
 					} catch (error) {
 						readDiagnostic = boundArtifactSaveDiagnostic(error);
 						logger.warn("ACP terminal aborted output read failed", {
@@ -1724,18 +1734,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							error,
 						});
 					}
+					appendAcpSnapshot(current.output);
 					const prepared = await prepareClientTerminalOutput(this.session, current);
 					throw new ToolAbortError(formatClientTerminalAbortFailure(prepared, readDiagnostic, pendingNotices));
 				}
 
 				// Fetch final output; the terminal is released in the outer finally.
-				const finalOutput = await handle.currentOutput();
+				const finalOutput = (await readOutput(1_000)) ?? { output: "", truncated: true };
 
 				// Map exit status: null exitCode with a signal → treat as signal kill (137).
 				const rawExitCode = exitStatus.exitCode;
 				const exitCode: number | undefined =
 					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
+				appendAcpSnapshot(finalOutput.output);
 				const prepared = await prepareClientTerminalOutput(this.session, finalOutput);
 
 				const bridgeResult: BashResult = {
@@ -1745,7 +1757,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				};
 
 				const bridgeNotices: string[] = [];
-				appendAcpSnapshot(prepared.summary.output);
 				if (finalOutput.truncated || prepared.locallyTruncated) bridgeNotices.push("(output truncated)");
 				for (const notice of pendingNotices) bridgeNotices.push(notice);
 				if (prepared.artifactSaveNotice) bridgeNotices.push(prepared.artifactSaveNotice);
