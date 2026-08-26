@@ -699,7 +699,8 @@ export class MCPCommandController {
 		name: string,
 	): Promise<{ filePath: string; scope: "user" | "project"; config: MCPServerConfig } | null> {
 		const cwd = getProjectDir();
-		const userPath = getMCPConfigPath("user", cwd, this.ctx.session.getSessionAgentDir());
+		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
+		const userPath = getMCPConfigPath("user", cwd, agentDir);
 		const projectPath = getMCPConfigPath("project", cwd);
 
 		const [userConfig, projectConfig] = await Promise.all([

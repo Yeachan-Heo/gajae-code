@@ -4851,7 +4851,7 @@ pub(crate) mod platform {
 			#[cfg(target_os = "linux")]
 			let directory_security = apply_owner_only_fd_security(&canonical_root, "directory", skills_fd)
 				.ok && apply_owner_only_fd_security(
-				&canonical_root.join(&skill_name),
+				&canonical_root.join(skill_name),
 				"directory",
 				skill_fd,
 			)
