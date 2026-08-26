@@ -246,12 +246,20 @@ describe("submitInteractiveInput", () => {
 			promptCustomMessage: vi.fn(async () => {}),
 		};
 		const input = createInput();
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown): void => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
+			await Bun.sleep(0);
 
-		await expect(submitInteractiveInput(mode, session, input)).resolves.toBeUndefined();
-
-		expect(mode.showError).toHaveBeenCalledWith("managed_append_identity_mismatch");
-		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
-		expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
+			expect(unhandled).toEqual([]);
+			expect(mode.showError).toHaveBeenCalledWith("managed_append_identity_mismatch");
+			expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
+			expect(mode.checkShutdownRequested).toHaveBeenCalledTimes(1);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 });
 

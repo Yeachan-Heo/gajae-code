@@ -580,6 +580,29 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.close();
 	});
 
+	it("seeds a reopened managed session with a digest before accepting a timestamp touch", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "seed", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+		const sessionFile = manager.getSessionFile()!;
+		await manager.close();
+
+		const reopened = await SessionManager.open(sessionFile, destination);
+		try {
+			const before = fs.statSync(sessionFile);
+			fs.utimesSync(sessionFile, new Date(before.atimeMs + 1_000), new Date(before.mtimeMs + 1_000));
+			expect(() =>
+				reopened.appendMessage({ role: "user", content: "reopened-after-touch", timestamp: Date.now() }),
+			).not.toThrow();
+			await reopened.flush();
+			expect(fs.readFileSync(sessionFile, "utf8")).toContain("reopened-after-touch");
+		} finally {
+			await reopened.close();
+		}
+	});
+
 	it("fails closed when content evidence differs despite equal descriptor fields", async () => {
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
@@ -604,6 +627,28 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 			/managed_append_identity_mismatch/,
 		);
 		expect(fs.readFileSync(sessionFile, "utf8")).not.toContain("must-fail-closed");
+		await manager.close().catch(() => {});
+	});
+
+	it("rejects a same-length overwrite even after the timestamp is restored", async () => {
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		manager.appendMessage(makeAssistantMessage() as never);
+		await manager.flush();
+
+		const sessionFile = manager.getSessionFile()!;
+		const before = fs.statSync(sessionFile);
+		const original = fs.readFileSync(sessionFile, "utf8");
+		const overwritten = original.replace('"hello"', '"world"');
+		expect(Buffer.byteLength(overwritten)).toBe(Buffer.byteLength(original));
+		fs.writeFileSync(sessionFile, overwritten);
+		fs.utimesSync(sessionFile, new Date(before.atimeMs), new Date(before.mtimeMs));
+
+		expect(() => manager.appendMessage({ role: "user", content: "must-fail-closed", timestamp: Date.now() })).toThrow(
+			/managed_append_identity_mismatch/,
+		);
+		expect(fs.readFileSync(sessionFile, "utf8")).toBe(overwritten);
 		await manager.close().catch(() => {});
 	});
 
