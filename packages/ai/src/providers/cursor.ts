@@ -878,6 +878,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let responseEnded = false;
 		let queueDrained = false;
 		let endStreamError: Error | null = null;
+		let pendingBuffer = Buffer.alloc(0);
+		const closeTerminalAdmission = (): void => {
+			terminalAdmissionClosed = true;
+			pendingBuffer = Buffer.alloc(0);
+			h2Request?.pause();
+		};
 		const settleH2 = (error?: unknown): void => {
 			if (h2Settled) return;
 			h2Settled = true;
@@ -1156,7 +1162,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// Recheck after the (possibly async) proxy handshake, immediately before
 			// the bearer-authenticated request is created.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
-			h2ClientErrorHandler = error => settleBehindFence(() => settleH2(error));
+			h2ClientErrorHandler = error => {
+				closeTerminalAdmission();
+				settleBehindFence(() => settleH2(error));
+			};
 			h2Client.on("error", h2ClientErrorHandler);
 
 			h2Request = h2Client.request({
@@ -1171,7 +1180,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
-			h2RequestErrorHandler = error => settleBehindFence(() => settleH2(error));
+			h2RequestErrorHandler = error => {
+				closeTerminalAdmission();
+				settleBehindFence(() => settleH2(error));
+			};
 			h2Request.on("error", h2RequestErrorHandler);
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			// Cursor owns the first-event watchdog, so its budget starts before
@@ -1180,7 +1192,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// credential-bearing request after serialization already exhausted it.
 			stream.push({ type: "start", partial: output });
 
-			let pendingBuffer = Buffer.alloc(0);
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
@@ -1223,11 +1234,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				h2Request?.close();
 				settleBehindFence(() => settleH2(error));
 			});
-			const closeTerminalAdmission = (): void => {
-				terminalAdmissionClosed = true;
-				pendingBuffer = Buffer.alloc(0);
-				h2Request?.pause();
-			};
 			const drainMessageQueue = (): void => {
 				void messageQueue.drain().then(
 					() => {

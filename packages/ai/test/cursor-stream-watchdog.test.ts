@@ -1004,6 +1004,69 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("drops buffered execs when an HTTP/2 reset closes admission", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.on("error", () => {});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const first = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: {
+							case: "piWriteArgs",
+							value: create(PiWriteExecArgsSchema, { path: "archive.zip:first.txt", content: "first" }),
+						},
+					}),
+				});
+				const second = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 2,
+						message: {
+							case: "piWriteArgs",
+							value: create(PiWriteExecArgsSchema, { path: "archive.zip:second.txt", content: "second" }),
+						},
+					}),
+				});
+				stream.write(Buffer.concat([first, second]));
+				setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 10);
+			}, 10);
+		});
+		const started = Promise.withResolvers<void>();
+		const settleWrite = Promise.withResolvers<void>();
+		let executionCount = 0;
+		const pending = collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 100,
+			streamFirstEventTimeoutMs: 500,
+			execHandlers: {
+				piWrite: async call => {
+					executionCount += 1;
+					call.markNonAbortable?.();
+					started.resolve();
+					await settleWrite.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+
+		await started.promise;
+		await Bun.sleep(40);
+		settleWrite.resolve();
+		const { events, result } = await pending;
+		expect(executionCount).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toMatch(/HTTP\/2|stream|reset|closed/i);
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("aborts the per-exec signal when the caller aborts mid-exec", async () => {
 		const controller = new AbortController();
 		const baseUrl = await createCursorServer(stream => {
