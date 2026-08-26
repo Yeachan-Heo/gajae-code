@@ -628,7 +628,10 @@ function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): Sc
 	return { reaped, failures };
 }
 
-function approvedRemnantDirectoriesSync(directory: string): {
+function approvedRemnantDirectoriesSync(
+	directory: string,
+	expectedRoot?: { dev: bigint; ino: bigint },
+): {
 	directories: ApprovedRemnantDirectory[];
 	failures: number;
 } {
@@ -637,33 +640,46 @@ function approvedRemnantDirectoriesSync(directory: string): {
 	const approve = (candidate: string): void => {
 		try {
 			const named = fs.lstatSync(candidate, { bigint: true });
-			if (named.isDirectory() && !named.isSymbolicLink())
+			if (
+				named.isDirectory() &&
+				!named.isSymbolicLink() &&
+				(expectedRoot === undefined ||
+					candidate !== directory ||
+					(named.dev === expectedRoot.dev && named.ino === expectedRoot.ino))
+			)
 				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
 	};
 	approve(directory);
-	approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
+	if (expectedRoot === undefined) approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
 async function approvedRemnantDirectories(
 	directory: string,
+	expectedRoot?: { dev: bigint; ino: bigint },
 ): Promise<{ directories: ApprovedRemnantDirectory[]; failures: number }> {
 	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
 	const approve = async (candidate: string): Promise<void> => {
 		try {
 			const named = await fsp.lstat(candidate, { bigint: true });
-			if (named.isDirectory() && !named.isSymbolicLink())
+			if (
+				named.isDirectory() &&
+				!named.isSymbolicLink() &&
+				(expectedRoot === undefined ||
+					candidate !== directory ||
+					(named.dev === expectedRoot.dev && named.ino === expectedRoot.ino))
+			)
 				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
 		}
 	};
 	await approve(directory);
-	await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
+	if (expectedRoot === undefined) await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
@@ -680,8 +696,9 @@ async function approvedRemnantDirectories(
 export function reapScrubbedProtocolRemnantsSync(
 	directory: string,
 	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+	expectedRoot?: { dev: bigint; ino: bigint },
 ): ScrubbedProtocolRemnantReapResult {
-	const approved = approvedRemnantDirectoriesSync(directory);
+	const approved = approvedRemnantDirectoriesSync(directory, expectedRoot);
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
 	let failures = approved.failures;
@@ -749,8 +766,9 @@ const SCRUBBED_REMNANT_REAP_BATCH_SIZE = 256;
 export async function reapScrubbedProtocolRemnants(
 	directory: string,
 	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+	expectedRoot?: { dev: bigint; ino: bigint },
 ): Promise<ScrubbedProtocolRemnantReapResult> {
-	const approved = await approvedRemnantDirectories(directory);
+	const approved = await approvedRemnantDirectories(directory, expectedRoot);
 	const cutoff = Date.now() - minAgeMs;
 	let reaped = 0;
 	let failures = approved.failures;
@@ -1643,7 +1661,7 @@ export class ManagedSessionDescendantStore {
 		if (this.#remnantReapInFlight || now - this.#lastRemnantReapAttempt < SCRUBBED_REMNANT_REAP_INTERVAL_MS) return;
 		this.#lastRemnantReapAttempt = now;
 		this.#remnantReapInFlight = true;
-		void reapScrubbedProtocolRemnants(this.#baseDir)
+		void reapScrubbedProtocolRemnants(this.#baseDir, SCRUBBED_REMNANT_MIN_AGE_MS, this.#subtreeRoot)
 			.catch((error: unknown) => {
 				logger.warn("Managed session remnant reaping failed", { error: String(error) });
 			})
