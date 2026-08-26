@@ -122,9 +122,12 @@ export class PlanModeController {
 		this.#previousTools = previousTools;
 		this.#planFilePath = planFilePath;
 		this.#enabled = true;
-		await this.ctx.session.setActiveToolsByName(
-			this.ctx.session.getToolByName("resolve") ? [...new Set([...previousTools, "resolve"])] : previousTools,
-		);
+		const planTools = this.ctx.session.isExplicitEmptyToolSelection()
+			? previousTools
+			: this.ctx.session.getToolByName("resolve")
+				? [...new Set([...previousTools, "resolve"])]
+				: previousTools;
+		await this.ctx.session.setActiveToolsByName(planTools);
 		this.ctx.session.setPlanModeState({
 			enabled: true,
 			planFilePath,
@@ -143,7 +146,7 @@ export class PlanModeController {
 	async exit(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
 		if (!this.#enabled) return;
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
-		if (this.#previousTools?.length) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (this.#previousTools !== undefined) await this.ctx.session.setActiveToolsByName(this.#previousTools);
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
 			if (await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
 				this.#providerSessionScope = undefined;
