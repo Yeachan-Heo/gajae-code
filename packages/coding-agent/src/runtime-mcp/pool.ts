@@ -760,6 +760,7 @@ export class MCPConnectionPool {
 	#scheduleRootsNotification(entry: PoolEntry): void {
 		if (
 			this.#shuttingDown ||
+			entry.connection.protocol.era === "modern" ||
 			entry.rootsNotificationScheduled ||
 			entry.state === "closed" ||
 			entry.transportCloseStarted
