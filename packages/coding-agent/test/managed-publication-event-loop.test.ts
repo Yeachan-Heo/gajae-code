@@ -232,15 +232,24 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 	it("yields while scanning retained non-remnant evidence", async () => {
 		await withTempDir("gjc-remnant-inert-scan-", async dir => {
 			const retained = await seedRemnant(dir, ".gjc-managed-exchange-retained", 60 * 60 * 1000, new Uint8Array([1]));
-			for (let index = 0; index < 600; index++) {
-				await fsp.writeFile(path.join(dir, `retained-evidence-${index.toString().padStart(4, "0")}`), "evidence");
-			}
+			const inertNames = Array.from(
+				{ length: 600 },
+				(_, index) => `retained-evidence-${index.toString().padStart(4, "0")}`,
+			);
+			const readdir = vi.spyOn(fsp, "readdir").mockResolvedValue(inertNames as never);
+			let yielded = false;
+			const turn = Bun.sleep(0).then(() => {
+				yielded = true;
+			});
 
 			const result = await reapScrubbedProtocolRemnants(dir);
+			await turn;
 
 			expect(result).toEqual({ reaped: 0, failures: 0 });
+			expect(yielded).toBe(true);
 			expect(fs.existsSync(retained)).toBe(true);
-			expect((await fsp.readdir(dir)).length).toBe(601);
+			expect(readdir).toHaveBeenCalledWith(dir);
+			readdir.mockRestore();
 		});
 	});
 
