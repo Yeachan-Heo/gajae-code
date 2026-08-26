@@ -7789,17 +7789,7 @@ mod platform {
 			Ok(path) => path,
 			Err(code) => return NativeExactUnlinkResult::failure(code),
 		};
-		if let Some((expected_dev, expected_ino)) = expected_source {
-			let metadata = match std::fs::symlink_metadata(&source_path) {
-				Ok(metadata) => metadata,
-				Err(error) => return NativeExactUnlinkResult::failure(security_code(&error)),
-			};
-			if metadata.volume_serial_number() as u64 != expected_dev
-				|| metadata.file_index() != expected_ino
-			{
-				return NativeExactUnlinkResult::failure("identity_mismatch");
-			}
-		}
+
 		let source_kind = match std::fs::symlink_metadata(&source_path) {
 			Ok(metadata) if metadata.file_type().is_dir() => "directory",
 			Ok(_) => "file",

@@ -249,7 +249,8 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 			expectedIdentity: current.identity,
 			backup: true,
 			now: input.now,
-			onBackupPrepared: async (backupPath, valueSha256, identity?: PersistedFileIdentity) => {
+			onBackupPrepared: async (preparedBackupPath, valueSha256, identity?: PersistedFileIdentity) => {
+				backupPath = preparedBackupPath;
 				backupValueSha256 = valueSha256;
 				backupIdentity = identity;
 				await writeIntent(input.intentPath, {
@@ -257,7 +258,11 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 					provenancePayload: ledgerAfter,
 					provenanceExpectedIdentity: provenanceLedgerIdentity(ledgerAfter),
 					discardSidecar: input.discardSidecar,
-					publishBackup: { backupPath, valueSha256, ...(identity === undefined ? {} : { identity }) },
+					publishBackup: {
+						backupPath: preparedBackupPath,
+						valueSha256,
+						...(identity === undefined ? {} : { identity }),
+					},
 				});
 			},
 		});
