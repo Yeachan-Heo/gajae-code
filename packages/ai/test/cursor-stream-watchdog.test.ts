@@ -540,16 +540,16 @@ describe("Cursor raw transport watchdog", () => {
 						case: "conversationCheckpointUpdate",
 						value: create(ConversationStateStructureSchema, {}),
 					}),
-				45,
+				80,
 			);
 			setTimeout(() => {
 				sendInteractionUpdate(stream, { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) });
 				stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG));
-			}, 80);
+			}, 150);
 		});
 
 		const { result } = await collectTerminal(baseUrl, {
-			streamFirstEventTimeoutMs: 150,
+			streamFirstEventTimeoutMs: 200,
 			streamIdleTimeoutMs: 100,
 		});
 
