@@ -1101,7 +1101,7 @@ describe("Cursor raw transport watchdog", () => {
 			}, 10);
 		});
 		const started = Promise.withResolvers<void>();
-		const conversationId = "never-settling-mutation-lock";
+		const conversationId = `never-settling-mutation-lock-${crypto.randomUUID()}`;
 		const first = collectTerminal(baseUrl, {
 			conversationId,
 			streamIdleTimeoutMs: 40,
