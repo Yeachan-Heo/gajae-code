@@ -395,6 +395,11 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 					: String(error);
 			throw new SagaStepError(input.label, message, retained, rollbackFailed || retained.length > 0);
 		}
+		const preserveState =
+			backupPath !== undefined ||
+			backupValueSha256 !== undefined ||
+			backupIdentity !== undefined ||
+			(error instanceof PaseoPublishError && error.retained.length > 0);
 		throw new SagaStepError(
 			input.label,
 			error instanceof Error ? error.message : String(error),
@@ -403,7 +408,7 @@ export async function runJsonStep(input: JsonStepInput): Promise<JsonStepOutput>
 				...(backupPath ? [backupPath] : []),
 				...(error instanceof PaseoPublishError ? error.retained : []),
 			],
-			error instanceof PaseoPublishError && error.retained.length > 0,
+			preserveState,
 		);
 	}
 	await clearIntent(input.intentPath);
