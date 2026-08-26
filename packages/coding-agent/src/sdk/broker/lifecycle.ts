@@ -1788,6 +1788,25 @@ function sameRetirementIdentityAsRecord(identity: LifecycleRetirementIdentity, r
 	);
 }
 
+function findRetirementRecord(
+	broker: Broker,
+	id: string,
+	receipt: LifecycleRetirementReceipt | undefined,
+): IndexedSession | undefined {
+	const current = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	if (current || receipt === undefined) return current;
+	// A later session.delete intentionally removes the identity from the public
+	// projection. A staged ledger receipt may still be replayed only against the
+	// exact retained identity from the append-only index; this never resurrects a
+	// deleted session or accepts a different root/incarnation.
+	return broker.index
+		.listSessionIdentities()
+		.find(
+			session =>
+				session.sessionId === id && session.terminal && sameRetirementIdentityAsRecord(receipt.identity, session),
+		);
+}
+
 function retirementMarkerCapture(
 	root: string,
 	id: string,
@@ -2006,15 +2025,17 @@ async function executeUncertainRetirement(
 	if (!id) return fail("invalid_input", "sessionId is required.");
 	if (!isCanonicalSessionId(id)) return fail("invalid_input", "sessionId must be a canonical safe identifier.");
 	await broker.index.refresh();
-	let record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (!record) return fail("not_found", "session is not indexed");
 	let receipt = cleanup?.uncertainRetirement;
+	let record = findRetirementRecord(broker, id, receipt);
+	if (!record) return fail("not_found", "session is not indexed");
 	let retirementIdentity: LifecycleRetirementIdentity;
 	let create = receipt ? broker.ledger.get(receipt.identity.createIdentity) : undefined;
 	if (receipt) {
+		const suppliedIdentity = retirementIdentityFromInput(input, record, receipt.identity.createIdentity);
+		if (isLifecycleBrokerResponse(suppliedIdentity)) return suppliedIdentity;
 		if (
 			receipt.identity.sessionId !== id ||
-			text(input.remoteCreateKey) !== receipt.identity.remoteCreateKey ||
+			canonicalJson(suppliedIdentity) !== canonicalJson(receipt.identity) ||
 			!sameRetirementIdentityAsRecord(receipt.identity, record)
 		)
 			return fail(
@@ -2022,7 +2043,7 @@ async function executeUncertainRetirement(
 				"Staged retirement identity no longer matches the indexed session authority.",
 				cleanup,
 			);
-		retirementIdentity = receipt.identity;
+		retirementIdentity = suppliedIdentity;
 		if (!create) return fail("terminal_uncertain", "Staged retirement create identity is no longer present.");
 	} else {
 		if (record.ambiguous || !isSessionAuthorityEligible(record))
@@ -2149,7 +2170,7 @@ async function executeUncertainRetirement(
 		);
 
 	await broker.index.refresh();
-	record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
+	record = findRetirementRecord(broker, id, receipt);
 	if (!record || !sameRetirementIdentityAsRecord(retirementIdentity, record))
 		return fail("endpoint_stale", "Session authority changed before retirement index closure.", cleanup);
 	if (!exactLifecycleEndpointAbsent(retirementIdentity.stateRoot, id))
@@ -2164,7 +2185,7 @@ async function executeUncertainRetirement(
 			"Uncertain session retirement is pending because the lifecycle parent identity changed.",
 			cleanup,
 		);
-	if (receipt.stage === "ledger" && (!receipt.indexSeq || !record.terminal || record.indexSeq !== receipt.indexSeq))
+	if (receipt.stage === "ledger" && (!receipt.indexSeq || !record.terminal || record.indexSeq < receipt.indexSeq))
 		return fail(
 			"terminal_uncertain",
 			"Uncertain session retirement ledger replay lacks the durable session_closed index proof.",
