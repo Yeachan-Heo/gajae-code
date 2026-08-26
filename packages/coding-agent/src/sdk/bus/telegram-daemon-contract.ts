@@ -282,9 +282,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * retained across this upgrade.
  * Generation 177 consumes an exact same-window lean settlement receipt only
  * after its autonomous ask lead-in publishes successfully, preventing idle
- * replay without changing the serving protocol.
+ * replay without changing the serving protocol. Generation 178 refreshes the
+ * native filesystem authority boundary for exact Paseo publication and bridge
+ * recovery.
  */
-export const DAEMON_GENERATION = 178;
+export const DAEMON_GENERATION = 179;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

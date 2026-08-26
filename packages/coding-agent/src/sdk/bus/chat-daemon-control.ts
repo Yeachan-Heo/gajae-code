@@ -129,11 +129,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * SessionRouter whose idle tick no longer re-acquires the machine-global
  * session-index lock every 2s; staleness retirement moved to a 30s sweep and
  * lease heartbeats no longer force an authority reconcile. A pre-upgrade owner
- * would retain the old hot polling loop, so replacement is required.
+ * would retain the old hot polling loop, so replacement is required. The next
+ * generation refreshes the native filesystem authority boundary used by Paseo
+ * setup and recovery.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 69,
-	slack: 72,
+	discord: 70,
+	slack: 73,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

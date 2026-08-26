@@ -756,7 +756,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 178 at serving epoch 88", () => {
+test("publishes exact durable authority generation 179 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -798,7 +798,9 @@ test("publishes exact durable authority generation 178 at serving epoch 88", () 
 	// same-window lean settlement receipts; serving protocol remains epoch 88.
 	// Generation 178: idle publication waits for positioned identity delivery to
 	// cross the native writer barrier before the independent broadcast lane.
-	expect(DAEMON_GENERATION).toBe(178);
+	// Generation 179: refreshes the native filesystem authority boundary used by
+	// Paseo setup and recovery.
+	expect(DAEMON_GENERATION).toBe(179);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {
