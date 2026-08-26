@@ -1135,14 +1135,20 @@ async function releaseTransitionClaim(
 	if (!releasedClaim || releasedClaim.dev !== claim.dev || releasedClaim.ino !== claim.ino)
 		throw new SessionStateLockUnavailableError(new Error("Transition claim changed during owner release."));
 	await removeTransitionClaimIfIdentityMatches(transitionDir, releasedClaim, deadline);
-	const markerPath = path.join(transitionDir, releasedClaim.marker);
-	if (await fs.lstat(markerPath).catch(() => null)) {
-		await fs.unlink(markerPath).catch(() => undefined);
-		await fs.rmdir(transitionDir).catch(() => undefined);
-	}
+	await removePrivateMarkerResidue(transitionDir, releasedClaim);
 	if (await transitionClaimIdentity(transitionDir)) {
 		throw new SessionStateLockUnavailableError(new Error("Transition claim could not be removed safely."));
 	}
+}
+
+async function removePrivateMarkerResidue(transitionDir: string, claim: TransitionClaimIdentity): Promise<void> {
+	const residual = await transitionClaimIdentity(transitionDir, claim.marker);
+	if (!residual || residual.dev !== claim.dev || residual.ino !== claim.ino) return;
+	const markerPath = path.join(transitionDir, claim.marker);
+	const marker = await fs.readFile(markerPath, "utf8").catch(() => undefined);
+	if (marker !== claim.marker) return;
+	await fs.unlink(markerPath).catch(() => undefined);
+	await fs.rmdir(transitionDir).catch(() => undefined);
 }
 
 function releasedOwnerFromSnapshot(held: LockOwnerSnapshot): SessionStateLockOwner {
@@ -1308,11 +1314,7 @@ async function cleanupTransitionClaim(
 	const effectiveClaim = await transitionClaimIdentity(transitionDir, claim.marker);
 	if (!effectiveClaim || effectiveClaim.dev !== claim.dev || effectiveClaim.ino !== claim.ino) return;
 	await removeTransitionClaimIfIdentityMatches(transitionDir, effectiveClaim, deadline);
-	const markerPath = path.join(transitionDir, effectiveClaim.marker);
-	if (await fs.lstat(markerPath).catch(() => null)) {
-		await fs.unlink(markerPath).catch(() => undefined);
-		await fs.rmdir(transitionDir).catch(() => undefined);
-	}
+	await removePrivateMarkerResidue(transitionDir, effectiveClaim);
 }
 
 async function reclaimStaleTransitionClaim(transitionDir: string, deadline: number): Promise<void> {

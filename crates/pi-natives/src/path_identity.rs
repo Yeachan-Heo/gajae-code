@@ -5347,7 +5347,13 @@ pub(crate) mod platform {
 		};
 		let identity_matches = stat.st_mode & libc::S_IFMT == expected_kind
 			&& stat.st_dev as u64 == expected.dev.parse().ok().unwrap_or(u64::MAX)
-			&& stat.st_ino as u64 == expected.ino.parse().ok().unwrap_or(u64::MAX);
+			&& stat.st_ino as u64 == expected.ino.parse().ok().unwrap_or(u64::MAX)
+			&& (allow_scrubbed
+				|| !directory
+				|| (stat.st_nlink.to_string() == expected.nlink
+					&& stat.st_size.to_string() == expected.size
+					&& stat_mtime_ns(&stat).to_string() == expected.mtime_ns
+					&& stat_ctime_ns(&stat).to_string() == expected.ctime_ns));
 		let content_matches = if directory {
 			expected.sha256.is_none()
 		} else {
@@ -5602,6 +5608,7 @@ pub(crate) mod platform {
 		fd: libc::c_int,
 		relative: &str,
 		expected: &[NativeDirectoryTreeEntry],
+		allow_scrubbed: bool,
 	) -> Result<(), &'static str> {
 		let mut names = directory_names(fd)?;
 		names.sort();
@@ -5645,9 +5652,9 @@ pub(crate) mod platform {
 			{
 				return Err("identity_mismatch");
 			}
-			let child = open_tree_entry(fd, &physical, expected_child, true)?;
+			let child = open_tree_entry(fd, &physical, expected_child, allow_scrubbed)?;
 			let result = if expected_child.kind == "directory" {
-				validate_tree_fd(child, &child_relative, expected)
+				validate_tree_fd(child, &child_relative, expected, allow_scrubbed)
 			} else {
 				Ok(())
 			};
@@ -5757,7 +5764,7 @@ pub(crate) mod platform {
 			}
 			return NativeExactUnlinkResult::detached_failure("identity_mismatch", retained_path);
 		}
-		if let Err(code) = validate_tree_fd(fd, "", &expected.entries) {
+		if let Err(code) = validate_tree_fd(fd, "", &expected.entries, false) {
 			// SAFETY: this branch owns the live descriptor and closes it exactly once.
 			unsafe {
 				libc::close(fd);
@@ -5915,9 +5922,9 @@ pub(crate) mod platform {
 				detached_retained_path,
 			);
 		}
-		if let Err(code) = validate_tree_fd(detached_fd, "", &expected.entries)
+		if let Err(code) = validate_tree_fd(detached_fd, "", &expected.entries, false)
 			.and_then(|()| scrub_tree_fd(detached_fd, "", &expected.entries))
-			.and_then(|()| validate_tree_fd(detached_fd, "", &expected.entries))
+			.and_then(|()| validate_tree_fd(detached_fd, "", &expected.entries, true))
 		{
 			// SAFETY: this branch owns the live descriptors and closes each exactly once.
 			unsafe {
@@ -8227,10 +8234,11 @@ mod platform {
 		Ok(actual.kind == expected.kind
 			&& actual.dev == expected.dev
 			&& actual.ino == expected.ino
-			&& (kind == "directory"
-				|| (actual.size == expected.size
-					&& actual.mtime_ns == expected.mtime_ns
-					&& actual.sha256 == expected.sha256)))
+			&& actual.nlink == expected.nlink
+			&& actual.size == expected.size
+			&& actual.mtime_ns == expected.mtime_ns
+			&& actual.ctime_ns == expected.ctime_ns
+			&& (kind == "directory" || actual.sha256 == expected.sha256))
 	}
 
 	fn expected_tree_entry<'a>(
