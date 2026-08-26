@@ -536,6 +536,31 @@ describe("InputController escape behavior", () => {
 		expect(editor.getText()).toBe("");
 	});
 
+	it("admits text, slash, and shell input exactly once after terminal cleanup (#4970)", async () => {
+		const { ctx, editor, spies } = createContext();
+		const help = vi.fn();
+		const bash = vi.fn(async () => {});
+		ctx.handleHelpCommand = help;
+		ctx.handleBashCommand = bash;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		await controller.submitText("plain follow-up", { ownsComposer: true, editor: ctx.editor });
+		await controller.submitText("/help", { ownsComposer: true, editor: ctx.editor });
+		await controller.submitText("!printf follow-up", { ownsComposer: true, editor: ctx.editor });
+
+		expect(spies.onInputCallback).toHaveBeenCalledTimes(1);
+		expect(spies.onInputCallback).toHaveBeenCalledWith(
+			expect.objectContaining({ text: "plain follow-up", cancelled: false }),
+		);
+		expect(help).toHaveBeenCalledTimes(1);
+		expect(bash).toHaveBeenCalledTimes(1);
+		expect(bash).toHaveBeenCalledWith("printf follow-up", false);
+	});
+
 	it("still restores queued work behind a loader after the turn ended (#4741)", () => {
 		const { ctx, editor, spies } = createContext();
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];

@@ -421,7 +421,11 @@ export class EventController {
 			const wasSingleOptimistic = this.ctx.optimisticUserMessageSignature === signature;
 			const wasInjectedOptimistic = !wasSingleOptimistic && consumeInjectedOptimisticSignature(this.ctx, signature);
 			const wasOptimistic = wasSingleOptimistic || wasInjectedOptimistic;
-			const wasLocallySubmitted = this.ctx.locallySubmittedUserSignatures.delete(signature) || wasOptimistic;
+			const localSignatures = this.ctx.locallySubmittedUserSignatures as Set<string> & {
+				consumeDelivered?: (value: string) => boolean;
+			};
+			const wasLocallySubmitted =
+				(localSignatures.consumeDelivered?.(signature) ?? localSignatures.delete(signature)) || wasOptimistic;
 			if (!wasOptimistic) {
 				this.ctx.addMessageToChat(event.message);
 			}

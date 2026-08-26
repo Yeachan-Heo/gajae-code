@@ -95,6 +95,68 @@ describe("submitInteractiveInput", () => {
 });
 
 describe("interactive startup input ordering", () => {
+	it("keeps the next input admission open while the prior terminal prompt unwinds", async () => {
+		const firstPrompt = Promise.withResolvers<void>();
+		const stop = new Error("stop interactive input");
+		const shutdownFailure = new Error("shutdown check failed");
+		const inputs = [createInput({ text: "first" }), createInput({ text: "second" })];
+		let inputIndex = 0;
+		const prompt = vi.fn(async (text: string) => {
+			if (text === "first") await firstPrompt.promise;
+		});
+		const session = { prompt } as unknown as AgentSession;
+		const mode = {
+			init: async () => {},
+			renderInitialMessages: () => {},
+			showNewVersionNotification: () => {},
+			showError: () => {},
+			getUserInput: async () => {
+				const input = inputs[inputIndex++];
+				if (input) return input;
+				throw stop;
+			},
+			markPendingSubmissionStarted: vi.fn(() => true),
+			finishPendingSubmission: vi.fn(),
+			checkShutdownRequested: vi.fn(async () => {
+				throw shutdownFailure;
+			}),
+		} as unknown as InteractiveMode;
+
+		const run = runInteractiveMode(
+			session,
+			"test",
+			undefined,
+			[],
+			new StartupUpdateOrchestrator(
+				"interactive",
+				() => false,
+				async () => undefined,
+			),
+			[],
+			() => {},
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			() => mode,
+			"continue-tail",
+		);
+		const outcome = await Promise.race([
+			run.then(
+				() => "completed" as const,
+				error => (error === stop ? "stopped" : Promise.reject(error)),
+			),
+			Bun.sleep(100).then(() => "timed-out" as const),
+		]);
+
+		expect(outcome).toBe("stopped");
+		expect(prompt).toHaveBeenCalledTimes(2);
+
+		firstPrompt.resolve();
+		await run.catch(() => {});
+	});
+
 	it("runs queued startup messages once after UI initialization instead of continuing the persisted tail", async () => {
 		const events: string[] = [];
 		const stop = new Error("stop interactive input");

@@ -819,7 +819,15 @@ export async function runInteractiveMode(
 
 		while (true) {
 			const input = await mode.getUserInput();
-			await submitInteractiveInput(mode, session, input);
+			// Keep the next input waiter installed while prompt delivery unwinds. A
+			// terminal agent_end is published before the current prompt promise has
+			// necessarily returned; awaiting here leaves the composer without an
+			// admission callback during that narrow boundary, so the first follow-up
+			// is discarded. Session prompt admission serializes any root-turn race,
+			// while busy submissions are routed to the session queues.
+			void submitInteractiveInput(mode, session, input).catch(error => {
+				logger.warn("Interactive input delivery finalization failed", { error: String(error) });
+			});
 		}
 	};
 

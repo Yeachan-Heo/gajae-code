@@ -199,6 +199,56 @@ export function resolveActivityIndicatorMessage(
 	if (backgroundCount === 0) return undefined;
 	return `Background: ${backgroundCount} task${backgroundCount === 1 ? "" : "s"}…`;
 }
+
+class LocalSubmissionSignatureSet extends Set<string> {
+	#pendingCounts = new Map<string, number>();
+	#deliveredCredits = new Map<string, number>();
+
+	#sync(signature: string): void {
+		const count = (this.#pendingCounts.get(signature) ?? 0) + (this.#deliveredCredits.get(signature) ?? 0);
+		if (count > 0) super.add(signature);
+		else super.delete(signature);
+	}
+
+	override add(signature: string): this {
+		this.#pendingCounts.set(signature, (this.#pendingCounts.get(signature) ?? 0) + 1);
+		super.add(signature);
+		return this;
+	}
+
+	consumeDelivered(signature: string): boolean {
+		const pending = this.#pendingCounts.get(signature) ?? 0;
+		if (pending === 0) return false;
+		if (pending === 1) this.#pendingCounts.delete(signature);
+		else this.#pendingCounts.set(signature, pending - 1);
+		this.#deliveredCredits.set(signature, (this.#deliveredCredits.get(signature) ?? 0) + 1);
+		this.#sync(signature);
+		return true;
+	}
+
+	override delete(signature: string): boolean {
+		const delivered = this.#deliveredCredits.get(signature) ?? 0;
+		if (delivered > 0) {
+			if (delivered === 1) this.#deliveredCredits.delete(signature);
+			else this.#deliveredCredits.set(signature, delivered - 1);
+			this.#sync(signature);
+			return true;
+		}
+		const pending = this.#pendingCounts.get(signature) ?? 0;
+		if (pending === 0) return false;
+		if (pending === 1) this.#pendingCounts.delete(signature);
+		else this.#pendingCounts.set(signature, pending - 1);
+		this.#sync(signature);
+		return true;
+	}
+
+	override clear(): void {
+		this.#pendingCounts.clear();
+		this.#deliveredCredits.clear();
+		super.clear();
+	}
+}
+
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 const COMPOSER_RIGHT_GUTTER_WIDTH = 1;
 
@@ -417,10 +467,12 @@ export class InteractiveMode implements InteractiveModeContext {
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
 	optimisticUserMessageSignature: string | undefined = undefined;
-	locallySubmittedUserSignatures: Set<string> = new Set();
+	locallySubmittedUserSignatures: Set<string> = new LocalSubmissionSignatureSet();
 	optimisticInjectedSignatures: Map<string, number> = new Map();
-	#pendingSubmittedInput: SubmittedUserInput | undefined;
-	#pendingSubmissionDispose: (() => void) | undefined;
+	/** Submissions whose prompt delivery has not settled yet. The input loop can
+	 * admit a follow-up while the prior prompt is unwinding after agent_end. */
+	#pendingSubmittedInputs = new Set<SubmittedUserInput>();
+	#pendingSubmissionDisposals = new Map<SubmittedUserInput, () => void>();
 	lastSigintTime = 0;
 	lastEscapeTime = 0;
 	lastComposerClearEscapeTime = 0;
@@ -573,7 +625,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				return thisMode.onInputCallback;
 			},
 			get hasPendingSubmission() {
-				return thisMode.#pendingSubmittedInput !== undefined;
+				return thisMode.#pendingSubmittedInputs.size > 0;
 			},
 			get hasPendingImages() {
 				return thisMode.pendingImages.length > 0;
@@ -1207,12 +1259,12 @@ export class InteractiveMode implements InteractiveModeContext {
 			cancelled: false,
 			started: false,
 		};
-		this.#pendingSubmittedInput = submission;
+		this.#pendingSubmittedInputs.add(submission);
 		if (!submission.customType) {
 			this.#goalModeController.onUserSubmission();
 			const imageCount = submission.images?.length ?? 0;
 			this.optimisticUserMessageSignature = `${submission.text}\u0000${imageCount}`;
-			this.#pendingSubmissionDispose = this.recordLocalSubmission(submission.text, imageCount);
+			this.#pendingSubmissionDisposals.set(submission, this.recordLocalSubmission(submission.text, imageCount));
 			this.addMessageToChat({
 				role: "user",
 				content: [{ type: "text", text: submission.text }, ...(submission.images ?? [])],
@@ -1221,7 +1273,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			});
 		} else {
 			this.optimisticUserMessageSignature = undefined;
-			this.#pendingSubmissionDispose = undefined;
 		}
 		if (canApplyComposerSubmission(options, this.editor)) {
 			this.editor.setText("");
@@ -1232,19 +1283,19 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	cancelPendingSubmission(): boolean {
-		const submission = this.#pendingSubmittedInput;
+		const submission = [...this.#pendingSubmittedInputs].reverse().find(candidate => !candidate.started);
 		if (!submission || submission.started) {
 			return false;
 		}
 
 		submission.cancelled = true;
-		this.#pendingSubmittedInput = undefined;
-		this.optimisticUserMessageSignature = undefined;
-		this.#pendingSubmissionDispose?.();
-		this.#pendingSubmissionDispose = undefined;
+		this.#pendingSubmittedInputs.delete(submission);
+		this.#pendingSubmissionDisposals.get(submission)?.();
+		this.#pendingSubmissionDisposals.delete(submission);
+		if (this.#pendingSubmittedInputs.size === 0) this.optimisticUserMessageSignature = undefined;
 		this.#pendingWorkingMessage = undefined;
 		this.#goalModeController.onPendingSubmissionFinished(submission.customType);
-		this.stopLoadingAnimation();
+		if (this.#pendingSubmittedInputs.size === 0) this.stopLoadingAnimation();
 		if (!submission.customType) {
 			this.pendingImages = submission.images ? [...submission.images] : [];
 			this.rebuildChatFromMessages("reconcile-same-transcript");
@@ -1255,11 +1306,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		return true;
 	}
 	hasPendingSubmission(): boolean {
-		return this.#pendingSubmittedInput !== undefined;
+		return this.#pendingSubmittedInputs.size > 0;
 	}
 
 	markPendingSubmissionStarted(input: SubmittedUserInput): boolean {
-		if (this.#pendingSubmittedInput !== input || input.cancelled) {
+		if (!this.#pendingSubmittedInputs.has(input) || input.cancelled) {
 			return false;
 		}
 		input.started = true;
@@ -1267,17 +1318,19 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	finishPendingSubmission(input: SubmittedUserInput): void {
-		const wasPendingSubmission = this.#pendingSubmittedInput === input;
-		const pendingSubmissionDispose = this.#pendingSubmissionDispose;
-		if (wasPendingSubmission) {
-			this.#pendingSubmittedInput = undefined;
-			this.#pendingSubmissionDispose = undefined;
-		}
+		const wasPendingSubmission = this.#pendingSubmittedInputs.delete(input);
+		const pendingSubmissionDispose = this.#pendingSubmissionDisposals.get(input);
+		this.#pendingSubmissionDisposals.delete(input);
+		pendingSubmissionDispose?.();
 		this.#goalModeController.onPendingSubmissionFinished(input.customType);
 
-		if (wasPendingSubmission && !this.session.isStreaming && !this.streamingComponent) {
+		if (
+			wasPendingSubmission &&
+			this.#pendingSubmittedInputs.size === 0 &&
+			!this.session.isStreaming &&
+			!this.streamingComponent
+		) {
 			this.optimisticUserMessageSignature = undefined;
-			pendingSubmissionDispose?.();
 			this.#pendingWorkingMessage = undefined;
 			this.stopLoadingAnimation();
 		}
@@ -1776,12 +1829,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	showError(message: string): void {
-		this.#pendingSubmittedInput = undefined;
-		this.optimisticUserMessageSignature = undefined;
-		this.#pendingSubmissionDispose?.();
-		this.#pendingSubmissionDispose = undefined;
 		this.#pendingWorkingMessage = undefined;
-		this.stopLoadingAnimation();
+		if (this.#pendingSubmittedInputs.size === 0) this.stopLoadingAnimation();
 		this.#uiHelpers.showError(message);
 	}
 

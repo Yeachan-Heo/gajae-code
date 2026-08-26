@@ -71,4 +71,41 @@ describe("issue #927 optimistic pending spinner", () => {
 		expect(mode.locallySubmittedUserSignatures.has("/extension-no-turn\u00000")).toBe(false);
 		expect(mode.statusContainer.children.length).toBe(0);
 	});
+
+	it("keeps overlapping prompt ownership exact until both deliveries settle", () => {
+		const first = mode.startPendingSubmission({ text: "first follow-up" });
+		const second = mode.startPendingSubmission({ text: "second follow-up" });
+		mode.markPendingSubmissionStarted(first);
+		mode.markPendingSubmissionStarted(second);
+		mode.showError("first delivery failed");
+
+		expect(mode.hasPendingSubmission()).toBe(true);
+		expect(mode.loadingAnimation).toBeDefined();
+		mode.finishPendingSubmission(first);
+		expect(mode.hasPendingSubmission()).toBe(true);
+		expect(mode.loadingAnimation).toBeDefined();
+		expect(mode.locallySubmittedUserSignatures.has("first follow-up\u00000")).toBe(false);
+		expect(mode.locallySubmittedUserSignatures.has("second follow-up\u00000")).toBe(true);
+
+		mode.finishPendingSubmission(second);
+		expect(mode.hasPendingSubmission()).toBe(false);
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(mode.locallySubmittedUserSignatures.has("second follow-up\u00000")).toBe(false);
+	});
+
+	it("retains duplicate local signature leases until every owner settles", () => {
+		const signature = "same follow-up\u00000";
+		mode.recordLocalSubmission("same follow-up");
+		mode.recordLocalSubmission("same follow-up");
+		const localSignatures = mode.locallySubmittedUserSignatures as Set<string> & {
+			consumeDelivered(value: string): boolean;
+		};
+
+		expect(localSignatures.consumeDelivered(signature)).toBe(true);
+		expect(localSignatures.has(signature)).toBe(true);
+		expect(localSignatures.delete(signature)).toBe(true);
+		expect(localSignatures.has(signature)).toBe(true);
+		expect(localSignatures.delete(signature)).toBe(true);
+		expect(localSignatures.has(signature)).toBe(false);
+	});
 });
