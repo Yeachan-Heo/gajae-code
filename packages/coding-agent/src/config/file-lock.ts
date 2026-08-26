@@ -71,21 +71,6 @@ export function processStartTime(pid: number): string | null {
 		}
 	}
 	try {
-		if (process.platform === "win32") {
-			const result = Bun.spawnSync(
-				[
-					"powershell.exe",
-					"-NoProfile",
-					"-NonInteractive",
-					"-Command",
-					`$p = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($null -ne $p) { $p.StartTime.ToUniversalTime().ToString('o') }`,
-				],
-				{ stdout: "pipe", stderr: "ignore" },
-			);
-			if (result.exitCode !== 0) return null;
-			const startTime = new TextDecoder().decode(result.stdout).trim();
-			return startTime || null;
-		}
 		const result = Bun.spawnSync(["ps", "-o", "lstart=", "-p", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
