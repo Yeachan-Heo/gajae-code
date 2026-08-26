@@ -310,6 +310,26 @@ function formatClientTerminalAbortFailure(
 	return formatBashFailureMessage(result, outputText, "Command aborted");
 }
 
+function formatClientTerminalReadFailure(
+	prepared: PreparedClientTerminalOutput,
+	readDiagnostic: string,
+	pendingNotices: readonly string[] = [],
+): string {
+	const notices = [
+		...pendingNotices,
+		...(prepared.current.truncated || prepared.locallyTruncated ? ["(output truncated)"] : []),
+		...(prepared.artifactSaveNotice ? [prepared.artifactSaveNotice] : []),
+		`Terminal output recovery failed: ${readDiagnostic}`,
+	];
+	const outputText = [prepared.summary.output || "(no output)", ...notices].filter(Boolean).join("\n");
+	const result: BashResult = {
+		...prepared.summary,
+		exitCode: undefined,
+		cancelled: false,
+	};
+	return formatBashFailureMessage(result, outputText, "Terminal output read failed");
+}
+
 function appendArtifactDetails(text: string, result: BashResult | BashInteractiveResult): string {
 	const suffixParts: string[] = [];
 	const reference = artifactReferenceForResult(result);
@@ -1752,7 +1772,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						// Poll tick: push current output so agent-loop transcript stays consistent.
 						// Race the read against abort so a stuck `terminal/output` RPC does not
 						// delay cancellation.
-						const pollOutput = await readOutput(Math.max(1, deadlineAt - Date.now()), true, true);
+						let pollOutput: ClientBridgeTerminalOutput | undefined;
+						try {
+							pollOutput = await readOutput(Math.max(1, deadlineAt - Date.now()), true, true);
+						} catch (error) {
+							await boundedKill();
+							const diagnostic = boundArtifactSaveDiagnostic(error);
+							const recoveredOutput = retainedAcpOutput();
+							appendAcpSnapshot(recoveredOutput.output);
+							const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+							logger.warn("ACP terminal poll output read failed", {
+								terminalId: handle.terminalId,
+								error,
+							});
+							throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
+						}
 						if (pollOutput === undefined) {
 							// Abort fired during the poll-tick read; let the next loop iteration
 							// observe `runSignal?.aborted` and exit via the abort branch.
@@ -1917,6 +1951,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					},
 				);
 			} catch (error) {
+				await Promise.race([
+					handle.kill().catch((killError: unknown) => {
+						logger.warn("ACP terminal registration cleanup kill failed", {
+							terminalId: handle.terminalId,
+							error: killError,
+						});
+					}),
+					Bun.sleep(1_000),
+				]);
 				await releaseTerminalOnce();
 				if (clientAdmission) ownedManager?.releaseCapacity(clientAdmission);
 				throw error;

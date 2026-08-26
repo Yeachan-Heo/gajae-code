@@ -369,4 +369,30 @@ describe("BashTool ACP terminal fold", () => {
 		controller.abort();
 		await expect(resultPromise).rejects.toThrow(/abort diagnostics[\s\S]*Command aborted/);
 	});
+
+	it("kills and retains output when an ACP poll read rejects", async () => {
+		let outputReads = 0;
+		let killCalls = 0;
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-poll-recovery",
+			waitForExit: () => new Promise(() => {}),
+			currentOutput: async () => {
+				outputReads += 1;
+				if (outputReads === 1) return { output: "poll diagnostics\n", truncated: false };
+				throw new Error("terminal/output failed during poll");
+			},
+			kill: async () => {
+				killCalls += 1;
+			},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const h = makeHarness(bridge);
+		const tool = new BashTool({ ...h.session, getAsyncJobManager: undefined } as unknown as ToolSession);
+
+		await expect(tool.execute("call-poll-recovery", { command: "echo done" }, undefined, () => {})).rejects.toThrow(
+			/poll diagnostics[\s\S]*Terminal output recovery failed[\s\S]*terminal\/output failed during poll/,
+		);
+		expect(killCalls).toBe(1);
+	});
 });
