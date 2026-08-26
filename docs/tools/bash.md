@@ -73,7 +73,7 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
    - Streams tail-only updates through `streamTailUpdates()` and `TailBuffer(DEFAULT_MAX_BYTES)`.
 2. Foreground PTY
    - Requires `pty: true`, UI context, and `GJC_NO_PTY !== "1"`.
-   - Uses `runInteractiveBashPty()` and a `PtySession` overlay.
+   - Uses `runInteractiveBashPty()` and a `PtySession` overlay; observer disposal is non-owning, while Escape or `job cancel` kills the session.
    - Supports interactive input; `Esc` kills the session from the overlay.
 3. Explicit background job
    - Requires `async: true` and `async.enabled`.

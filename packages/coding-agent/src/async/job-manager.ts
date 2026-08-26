@@ -2070,11 +2070,18 @@ export class AsyncJobManager {
 		const byteLength = Buffer.byteLength(chunk, "utf8");
 		if (byteLength === 0) return;
 
-		const startByte = state.nextOffset;
-		const endByte = startByte + byteLength;
-		state.chunks.push({ startByte, endByte, text: chunk });
-		state.retainedBytes += byteLength;
+		const retainedChunk =
+			byteLength > this.#outputRetentionBytes
+				? sliceTextAfterUtf8ByteOffset(chunk, byteLength - this.#outputRetentionBytes)
+				: chunk;
+		const retainedByteLength = Buffer.byteLength(retainedChunk, "utf8");
+		const skippedBytes = byteLength - retainedByteLength;
+		const startByte = state.nextOffset + skippedBytes;
+		const endByte = startByte + retainedByteLength;
+		state.chunks.push({ startByte, endByte, text: retainedChunk });
+		state.retainedBytes += retainedByteLength;
 		state.nextOffset = endByte;
+		if (skippedBytes > 0) state.startOffset = Math.max(state.startOffset, startByte);
 
 		while (state.retainedBytes > this.#outputRetentionBytes && state.chunks.length > 0) {
 			const dropped = state.chunks.shift();
@@ -2890,6 +2897,7 @@ export class AsyncJobManager {
 				continue;
 
 			this.#deliveries.splice(index, 1);
+			this.#notifyChange();
 			await this.#deliverDelivery(delivery);
 		}
 	}
@@ -2897,6 +2905,7 @@ export class AsyncJobManager {
 	#deliverDelivery(delivery: AsyncJobDelivery): Promise<void> {
 		const promise = (async () => {
 			this.#inFlightDeliveries.push(delivery);
+			this.#notifyChange();
 			try {
 				const currentJob = this.#jobs.get(delivery.jobId);
 				if (currentJob && currentJob.generation !== delivery.generation) return;
@@ -2929,6 +2938,7 @@ export class AsyncJobManager {
 						!this.#isDeliveryAcknowledged(delivery.jobId, delivery.generation)
 					) {
 						this.#deliveries.push(delivery);
+						this.#notifyChange();
 					}
 					logger.warn("Async job completion delivery failed", {
 						jobId: delivery.jobId,
@@ -2940,6 +2950,7 @@ export class AsyncJobManager {
 			} finally {
 				const index = this.#inFlightDeliveries.indexOf(delivery);
 				if (index !== -1) this.#inFlightDeliveries.splice(index, 1);
+				this.#notifyChange();
 				if (!this.#disposed && this.#hasDeliverable()) this.#ensureDeliveryLoop();
 			}
 		})();

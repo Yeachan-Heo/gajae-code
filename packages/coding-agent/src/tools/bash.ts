@@ -1594,6 +1594,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					});
 					return killPromise;
 				};
+				const boundedKill = async (): Promise<void> => {
+					await Promise.race([fireKill(), Bun.sleep(1_000)]);
+				};
 				const onAbortSignal = () => {
 					resolveAborted();
 					void fireKill();
@@ -1602,7 +1605,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 				try {
 					if (runSignal?.aborted) {
-						await fireKill();
+						await boundedKill();
 						let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 						let readDiagnostic: string | undefined;
 						try {
@@ -1633,7 +1636,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						const raced = await Promise.race(racers);
 
 						if (raced.kind === "aborted" || runSignal?.aborted) {
-							await fireKill();
+							await boundedKill();
 							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 							let readDiagnostic: string | undefined;
 							try {
@@ -1657,7 +1660,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							// RPC cannot let a timed-out command keep running past the
 							// enforced timeout. The handle stays valid post-kill so the
 							// buffered output is still readable.
-							await fireKill();
+							await boundedKill();
 							let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 							let readDiagnostic: string | undefined;
 							try {
@@ -1725,7 +1728,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 
 				if (runSignal?.aborted) {
-					await fireKill();
+					await boundedKill();
 					let current: ClientBridgeTerminalOutput = { output: "", truncated: false };
 					let readDiagnostic: string | undefined;
 					try {
@@ -1743,7 +1746,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 
 				// Fetch final output; the terminal is released in the outer finally.
-				const finalOutput = (await readOutput(1_000)) ?? { output: "", truncated: true };
+				const finalOutput =
+					(await readOutput(1_000, false)) ??
+					({ output: retainedAcpSnapshot, truncated: true } satisfies ClientBridgeTerminalOutput);
+				if (runSignal?.aborted) {
+					await boundedKill();
+					throw new ToolAbortError("ACP terminal cancelled during final output recovery.");
+				}
 
 				// Map exit status: null exitCode with a signal → treat as signal kill (137).
 				const rawExitCode = exitStatus.exitCode;
