@@ -80,6 +80,7 @@ describe("issue #956: interactive /mcp test", () => {
 			chatContainer: { addChild },
 			ui: { requestRender },
 			editor: {},
+			sessionManager: { getCwd: () => projectDir },
 			showError,
 			showStatus,
 			session: { refreshMCPTools },
