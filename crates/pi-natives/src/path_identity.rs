@@ -4549,7 +4549,7 @@ pub(crate) mod platform {
 		if first_error.raw_os_error() != Some(libc::ENOENT) {
 			return Err(skill_write_error(&first_error));
 		}
-		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o777) } != 0 {
+		if unsafe { libc::mkdirat(parent_fd, name.as_ptr(), 0o700) } != 0 {
 			let mkdir_error = std::io::Error::last_os_error();
 			if mkdir_error.raw_os_error() != Some(libc::EEXIST) {
 				return Err(skill_write_error(&mkdir_error));
@@ -9582,6 +9582,18 @@ mod platform {
 			return NativeSecureSkillWriteResult::failure(code);
 		}
 		skills.retain_child(skill_handle);
+		if file_mode == 0o600 {
+			let sid = match current_user_sid() {
+				Ok(sid) => sid,
+				Err(()) => return NativeSecureSkillWriteResult::failure("acl_unavailable"),
+			};
+			let applied = set_owner_only_acl(skill_handle, "directory", &sid, true);
+			if !applied.ok {
+				return NativeSecureSkillWriteResult::failure(
+					applied.code.as_deref().unwrap_or("acl_apply_failed"),
+				);
+			}
+		}
 		let file_name = std::ffi::OsStr::new("SKILL.md");
 		if let Err(code) = inspect_existing_skill_file(skills.target, file_name) {
 			return NativeSecureSkillWriteResult::failure(code);

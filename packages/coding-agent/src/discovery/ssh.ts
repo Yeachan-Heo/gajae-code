@@ -139,7 +139,7 @@ async function loadSshJsonFile(
 async function load(ctx: LoadContext): Promise<LoadResult<SSHHost>> {
 	const candidateSources: Array<{ path: string; level: "user" | "project" }> = [
 		{ path: getSSHConfigPath("project", ctx.cwd), level: "project" },
-		{ path: getSSHConfigPath("user", ctx.cwd), level: "user" },
+		{ path: getSSHConfigPath("user", ctx.cwd, ctx.userAgentDir), level: "user" },
 		{ path: path.join(ctx.cwd, "ssh.json"), level: "project" },
 		{ path: path.join(ctx.cwd, ".ssh.json"), level: "project" },
 	];

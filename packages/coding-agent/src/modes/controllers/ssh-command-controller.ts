@@ -194,7 +194,7 @@ export class SSHCommandController {
 
 		try {
 			const cwd = getProjectDir();
-			const filePath = getSSHConfigPath(scope, cwd);
+			const filePath = getSSHConfigPath(scope, cwd, this.ctx.session.getSessionAgentDir());
 
 			const hostConfig: SSHHostConfig = { host };
 			if (username) hostConfig.username = username;
@@ -243,7 +243,7 @@ export class SSHCommandController {
 			const cwd = getProjectDir();
 
 			// Load from both user and project configs
-			const userPath = getSSHConfigPath("user", cwd);
+			const userPath = getSSHConfigPath("user", cwd, this.ctx.session.getSessionAgentDir());
 			const projectPath = getSSHConfigPath("project", cwd);
 
 			const [userConfig, projectConfig] = await Promise.all([
@@ -357,7 +357,7 @@ export class SSHCommandController {
 
 		try {
 			const cwd = getProjectDir();
-			const filePath = getSSHConfigPath(scope, cwd);
+			const filePath = getSSHConfigPath(scope, cwd, this.ctx.session.getSessionAgentDir());
 			const config = await readSSHConfigFile(filePath);
 			if (!config.hosts?.[name]) {
 				this.ctx.showError(`Host "${name}" not found in ${scope} config.`);
