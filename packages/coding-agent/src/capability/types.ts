@@ -34,6 +34,8 @@ export interface LoadContext {
 	userAgentDir?: string;
 	/** Whether userAgentDir was explicitly selected rather than ambient default. */
 	userAgentDirExplicit?: boolean;
+	/** Resolver-owned profile classification, stable across HOME refreshes. */
+	profileAuthority?: "default" | "custom";
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 	/** Owning session settings for provider policy decisions. */
@@ -112,6 +114,8 @@ export interface LoadOptions {
 	isolateAmbientPolicy?: boolean;
 	/** Internal marker preserving whether agentDir was explicitly selected. */
 	userAgentDirExplicit?: boolean;
+	/** Internal resolver-owned profile classification. */
+	profileAuthority?: "default" | "custom";
 }
 
 /**

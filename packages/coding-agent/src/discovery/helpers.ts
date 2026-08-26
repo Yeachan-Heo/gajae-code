@@ -5,7 +5,6 @@ import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/nativ
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
-	getConfigRootDir,
 	getPluginsDir,
 	getProjectDir,
 	getTrustedHomeDir,
@@ -894,9 +893,10 @@ export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
 	userAgentDir?: string,
+	profileAuthority: "default" | "custom" = "default",
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
-	const cacheKey = `${home}:${userAgentDir ?? ""}:${resolvedProjectPath ?? ""}`;
+	const cacheKey = `${home}:${userAgentDir ?? ""}:${profileAuthority}:${resolvedProjectPath ?? ""}`;
 	const cached = pluginRootsCache.get(cacheKey);
 	if (cached) return cached;
 
@@ -908,13 +908,8 @@ export async function listClaudePluginRoots(
 	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const defaultAgentDir = path.join(home, getConfigDirName(), "agent");
 	const userPluginsDir =
-		userAgentDir &&
-		path.resolve(userAgentDir) !== path.resolve(defaultAgentDir) &&
-		path.resolve(userAgentDir) !== path.resolve(path.join(getConfigRootDir(), "agent"))
-			? path.join(userAgentDir, "plugins")
-			: getPluginsDir(home);
+		profileAuthority === "custom" && userAgentDir ? path.join(userAgentDir, "plugins") : getPluginsDir(home);
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {

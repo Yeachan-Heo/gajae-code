@@ -351,6 +351,7 @@ describe("listClaudePluginRoots", () => {
 		const result = await loadCapability<Skill>("skills", {
 			cwd: tempDir,
 			agentDir: path.join(tempDir, ".gjc", "agent"),
+			profileAuthority: "default",
 		});
 		expect(result.warnings).toEqual([]);
 		expect(result.all.length).toBeGreaterThan(0);
@@ -392,6 +393,7 @@ describe("listClaudePluginRoots", () => {
 		const result = await loadCapability<SlashCommand>("slash-commands", {
 			cwd: tempDir,
 			agentDir: path.join(tempDir, ".gjc", "agent"),
+			profileAuthority: "default",
 		});
 		expect(result.warnings).toEqual([]);
 		expect(result.all.length).toBeGreaterThan(0);
@@ -433,6 +435,7 @@ describe("listClaudePluginRoots", () => {
 		const result = await loadCapability<SlashCommand>("slash-commands", {
 			cwd: tempDir,
 			agentDir: path.join(tempDir, ".gjc", "agent"),
+			profileAuthority: "default",
 		});
 		expect(result.warnings).toEqual([]);
 		const found = result.all.find(command => command.name === "manifest-commands-key:plan");
@@ -477,6 +480,7 @@ describe("listClaudePluginRoots", () => {
 		const result = await loadCapability<SlashCommand>("slash-commands", {
 			cwd: tempDir,
 			agentDir: path.join(tempDir, ".gjc", "agent"),
+			profileAuthority: "default",
 		});
 		expect(result.warnings).toEqual([]);
 		const found = result.all.find(command => command.name === "manifest-commands-precedence:ship");
@@ -521,6 +525,7 @@ describe("listClaudePluginRoots", () => {
 		const result = await loadCapability<Skill>("skills", {
 			cwd: tempDir,
 			agentDir: path.join(tempDir, ".gjc", "agent"),
+			profileAuthority: "default",
 		});
 		expect(result.warnings[0]).toContain("Ignoring skills path outside plugin root");
 		const found = result.all.find(skill => skill.name === "manifest-skills-outside:outside-skill");
@@ -561,6 +566,7 @@ describe("listClaudePluginRoots", () => {
 		const result = await loadCapability<SlashCommand>("slash-commands", {
 			cwd: tempDir,
 			agentDir: path.join(tempDir, ".gjc", "agent"),
+			profileAuthority: "default",
 		});
 		expect(result.warnings[0]).toContain("Ignoring slash-commands path outside plugin root");
 		const found = result.all.find(command => command.name === "manifest-commands-outside:ship");

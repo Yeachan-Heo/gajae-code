@@ -266,6 +266,7 @@ async function loadCapabilityWithContext<T>(
 		userAgentDir,
 		userAgentDirExplicit:
 			options.userAgentDirExplicit ?? (options.agentDir !== undefined || options.isolateAmbientPolicy === true),
+		profileAuthority: options.profileAuthority,
 		repoRoot,
 		settings: options.settings,
 	};
@@ -284,6 +285,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 			...options,
 			agentDir: options.agentDir || settingsAgentDir || getAgentDir(),
 			userAgentDirExplicit: options.agentDir !== undefined || settingsAgentDir !== undefined || customProcessProfile,
+			profileAuthority: options.profileAuthority ?? (customProcessProfile ? "custom" : "default"),
 		},
 		getTrustedHomeDir(),
 	);
@@ -311,6 +313,13 @@ export async function loadCapabilityForHome<T>(
 			...options,
 			agentDir: options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
 			isolateAmbientPolicy: true,
+			profileAuthority:
+				options.profileAuthority ??
+				(path.resolve(
+					options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
+				) === path.resolve(path.join(resolvedHome, getConfigDirName(), "agent"))
+					? "default"
+					: "custom"),
 		},
 		resolvedHome,
 	);

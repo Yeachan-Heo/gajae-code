@@ -96,8 +96,9 @@ async function listNonGjcPluginRoots(
 	home: string,
 	cwd: string,
 	userAgentDir?: string,
+	profileAuthority: "default" | "custom" = "default",
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
-	const { roots, warnings } = await listClaudePluginRoots(home, cwd, userAgentDir);
+	const { roots, warnings } = await listClaudePluginRoots(home, cwd, userAgentDir, profileAuthority);
 	const filteredRoots: ClaudePluginRoot[] = [];
 	const filteredWarnings = [...warnings];
 
@@ -124,6 +125,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		ctx.home,
 		ctx.cwd,
 		ctx.userAgentDirExplicit ? ctx.userAgentDir : undefined,
+		ctx.profileAuthority,
 	);
 	warnings.push(...rootWarnings);
 
@@ -163,6 +165,7 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 		ctx.home,
 		ctx.cwd,
 		ctx.userAgentDirExplicit ? ctx.userAgentDir : undefined,
+		ctx.profileAuthority,
 	);
 	warnings.push(...rootWarnings);
 
@@ -207,6 +210,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 		ctx.home,
 		ctx.cwd,
 		ctx.userAgentDirExplicit ? ctx.userAgentDir : undefined,
+		ctx.profileAuthority,
 	);
 	warnings.push(...rootWarnings);
 
@@ -258,6 +262,7 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 		ctx.home,
 		ctx.cwd,
 		ctx.userAgentDirExplicit ? ctx.userAgentDir : undefined,
+		ctx.profileAuthority,
 	);
 	warnings.push(...rootWarnings);
 
@@ -299,6 +304,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		ctx.home,
 		ctx.cwd,
 		ctx.userAgentDirExplicit ? ctx.userAgentDir : undefined,
+		ctx.profileAuthority,
 	);
 	warnings.push(...rootWarnings);
 
