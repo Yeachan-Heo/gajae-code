@@ -6,7 +6,7 @@
 import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
 import { Spacer, Text } from "@gajae-code/tui";
-import { getAgentDir, getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import { getAgentDir, getMCPConfigPath } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
 import { listTools } from "../../runtime-mcp/client";
@@ -686,7 +686,7 @@ export class MCPCommandController {
 		const testName = `test_${Date.now()}`;
 		const manager =
 			this.ctx.mcpManager ??
-			new MCPManager(getProjectDir(), null, {
+			new MCPManager(this.ctx.sessionManager.getCwd(), null, {
 				sharedPoolIdleMs: this.ctx.settings.get("mcp.sharedPoolIdleMs"),
 				agentDir: this.ctx.session.getSessionAgentDir(),
 				settings: this.ctx.settings,
@@ -698,7 +698,7 @@ export class MCPCommandController {
 	async #findConfiguredServer(
 		name: string,
 	): Promise<{ filePath: string; scope: "user" | "project"; config: MCPServerConfig } | null> {
-		const cwd = getProjectDir();
+		const cwd = this.ctx.sessionManager.getCwd();
 		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings?.getAgentDir?.() ?? getAgentDir();
 		const userPath = getMCPConfigPath("user", cwd, agentDir);
 		const projectPath = getMCPConfigPath("project", cwd);
@@ -849,7 +849,7 @@ export class MCPCommandController {
 	async #handleWizardComplete(name: string, config: MCPServerConfig, scope: "user" | "project"): Promise<void> {
 		try {
 			// Determine file path
-			const cwd = getProjectDir();
+			const cwd = this.ctx.sessionManager.getCwd();
 			const filePath = getMCPConfigPath(scope, cwd, this.ctx.session.getSessionAgentDir());
 
 			// Add server to config
@@ -945,7 +945,7 @@ export class MCPCommandController {
 	 */
 	async #handleList(): Promise<void> {
 		try {
-			const cwd = getProjectDir();
+			const cwd = this.ctx.sessionManager.getCwd();
 
 			// Load from both user and project configs
 			const userPath = getMCPConfigPath("user", cwd, this.ctx.session.getSessionAgentDir());
@@ -1094,7 +1094,7 @@ export class MCPCommandController {
 		}
 
 		try {
-			const cwd = getProjectDir();
+			const cwd = this.ctx.sessionManager.getCwd();
 			const userPath = getMCPConfigPath("user", cwd, this.ctx.session.getSessionAgentDir());
 			const projectPath = getMCPConfigPath("project", cwd);
 			const filePath = scope === "user" ? userPath : projectPath;
@@ -1159,7 +1159,7 @@ export class MCPCommandController {
 			// Resolve auth config if needed
 			const manager =
 				this.ctx.mcpManager ??
-				new MCPManager(getProjectDir(), null, {
+				new MCPManager(this.ctx.sessionManager.getCwd(), null, {
 					sharedPoolIdleMs: this.ctx.settings.get("mcp.sharedPoolIdleMs"),
 					agentDir: this.ctx.session.getSessionAgentDir(),
 					settings: this.ctx.settings,
@@ -1228,7 +1228,11 @@ export class MCPCommandController {
 			const found = await this.#findConfiguredServer(name);
 			if (!found) {
 				// Check if this is a discovered server from a third-party config
-				const userConfigPath = getMCPConfigPath("user", getProjectDir(), this.ctx.session.getSessionAgentDir());
+				const userConfigPath = getMCPConfigPath(
+					"user",
+					this.ctx.sessionManager.getCwd(),
+					this.ctx.session.getSessionAgentDir(),
+				);
 				const disabledServers = new Set(await readDisabledServers(userConfigPath));
 				const isDiscovered = this.ctx.mcpManager?.getSource(name);
 				const isCurrentlyDisabled = disabledServers.has(name);
@@ -1814,7 +1818,7 @@ export class MCPCommandController {
 	}
 
 	async #nextAvailableServerName(scope: MCPAddScope, baseName: string): Promise<string> {
-		const filePath = getMCPConfigPath(scope, getProjectDir(), this.ctx.session.getSessionAgentDir());
+		const filePath = getMCPConfigPath(scope, this.ctx.sessionManager.getCwd(), this.ctx.session.getSessionAgentDir());
 		const config = await readMCPConfigFile(filePath);
 		const existingNames = new Set(Object.keys(config.mcpServers ?? {}));
 		if (!existingNames.has(baseName)) return baseName;
@@ -1834,7 +1838,11 @@ export class MCPCommandController {
 				this.ctx.showError("Server name cannot be empty.");
 				continue;
 			}
-			const filePath = getMCPConfigPath(scope, getProjectDir(), this.ctx.session.getSessionAgentDir());
+			const filePath = getMCPConfigPath(
+				scope,
+				this.ctx.sessionManager.getCwd(),
+				this.ctx.session.getSessionAgentDir(),
+			);
 			const config = await readMCPConfigFile(filePath);
 			if (config.mcpServers?.[proposed]) {
 				this.ctx.showError(`Server "${proposed}" already exists in ${scope} config.`);

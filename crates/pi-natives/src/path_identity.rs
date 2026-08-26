@@ -9694,7 +9694,6 @@ mod platform {
 			unsafe { CloseHandle(skill_handle) };
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		skills.retain_child(skill_handle);
 		if file_mode == 0o600 {
 			let sid = match current_user_sid() {
 				Ok(sid) => sid,
@@ -9713,6 +9712,7 @@ mod platform {
 				);
 			}
 		}
+		skills.retain_child(skill_handle);
 		let file_name = std::ffi::OsStr::new("SKILL.md");
 		if let Err(code) = inspect_existing_skill_file(skills.target, file_name) {
 			return NativeSecureSkillWriteResult::failure(code);
