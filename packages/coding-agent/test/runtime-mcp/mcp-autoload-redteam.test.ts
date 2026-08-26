@@ -97,6 +97,14 @@ function synchronizePluginMcpStartup(): void {
 		};
 	});
 }
+
+async function waitForMcpSeal(manager: MCPManager | undefined): Promise<void> {
+	const deadline = Date.now() + 5_000;
+	while (Date.now() < deadline) {
+		if (manager?.isConnectionSetSealed()) return;
+		await Bun.sleep(25);
+	}
+}
 const originalAgentDir = getAgentDir();
 
 describe("red-team: conventional MCP autoload", () => {
@@ -353,7 +361,8 @@ describe("red-team: conventional MCP autoload", () => {
 				expect(session.getAllToolNames()).toContain("mcp__domain_docs_lookup");
 				expect(session.getAllToolNames()).toContain("mcp__solo_hello");
 				// Plugin presence seals the connection set (fixed session lifetime).
-await sealObserved.promise;
+				await sealObserved.promise;
+				await waitForMcpSeal(mcpManager);
 				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
 			} finally {
 				await session.dispose();
@@ -456,6 +465,7 @@ await sealObserved.promise;
 			synchronizePluginMcpStartup();
 			const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 			try {
+				await waitForMcpSeal(mcpManager);
 				expect(mcpManager?.isConnectionSetSealed()).toBe(true);
 				// /mcp reload -> discoverAndConnect({ nativeOnly: true }) must not
 				// silently re-run discovery on a sealed manager.
