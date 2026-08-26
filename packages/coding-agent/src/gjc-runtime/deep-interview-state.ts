@@ -206,6 +206,8 @@ export const ENVELOPE_RESERVED_STATE_KEYS = [
 	"active",
 	"current_phase",
 	"state_revision",
+	"source_state_revision",
+	"last_applied_draft_id",
 	"session_id",
 ] as const;
 
