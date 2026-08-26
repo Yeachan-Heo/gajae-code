@@ -6,7 +6,7 @@
 import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
 import { Spacer, Text } from "@gajae-code/tui";
-import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import { getAgentDir, getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
 import { listTools } from "../../runtime-mcp/client";
@@ -501,7 +501,7 @@ export class MCPCommandController {
 				this.ctx.ui.requestRender();
 			},
 			parsed.initialName,
-			this.ctx.session.getSessionAgentDir(),
+			this.ctx.session?.getSessionAgentDir?.() ?? this.ctx.settings?.getAgentDir?.() ?? getAgentDir(),
 		);
 
 		// Replace editor with wizard
@@ -699,7 +699,7 @@ export class MCPCommandController {
 		name: string,
 	): Promise<{ filePath: string; scope: "user" | "project"; config: MCPServerConfig } | null> {
 		const cwd = getProjectDir();
-		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
+		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings?.getAgentDir?.() ?? getAgentDir();
 		const userPath = getMCPConfigPath("user", cwd, agentDir);
 		const projectPath = getMCPConfigPath("project", cwd);
 
