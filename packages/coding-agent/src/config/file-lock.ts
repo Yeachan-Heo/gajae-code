@@ -692,6 +692,24 @@ async function retryPendingLocalRelease(lockPath: string, knownKey?: string): Pr
 	}
 }
 
+async function pendingLocalReleaseKey(lockPath: string, localKey: string): Promise<string | undefined> {
+	const direct = localLockStates.get(localKey);
+	if (direct) return direct.status === "held" ? undefined : localKey;
+	let info: LockInfo | null;
+	try {
+		info = await readLockInfo(lockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return undefined;
+		throw error;
+	}
+	const ownerToken = info?.owner_token;
+	if (!ownerToken) return undefined;
+	for (const [key, state] of localLockStates) {
+		if (key !== localKey && state.status !== "held" && state.owner.owner_token === ownerToken) return key;
+	}
+	return undefined;
+}
+
 async function releaseLock(lockPath: string, owner: FileLockOwnerToken, knownKey?: string): Promise<void> {
 	const key = knownKey ?? (await localLockKey(lockPath));
 	const state = localLockStates.get(key);
@@ -781,10 +799,11 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 			localLockStates.set(localKey, { owner, status: "held" });
 			return () => releaseLock(lockPath, owner, localKey);
 		}
-		const localState = localLockStates.get(localKey);
-		if (localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
+		const pendingKey = await pendingLocalReleaseKey(lockPath, localKey);
+		const localState = localLockStates.get(pendingKey ?? localKey);
+		if (pendingKey !== undefined && localState?.status !== "held" && localState?.owner.owner_token !== undefined) {
 			try {
-				await retryPendingLocalRelease(lockPath, localKey);
+				await retryPendingLocalRelease(lockPath, pendingKey);
 				continue;
 			} catch {
 				// Keep contending below. A failed local retry is not authority to steal a

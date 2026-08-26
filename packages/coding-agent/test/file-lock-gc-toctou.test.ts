@@ -626,6 +626,54 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		expect(contenderEntered).toBe(true);
 	});
 
+	test("recovers pending ownership when parent canonicalization initially falls back", async () => {
+		const base = await makeTemp();
+		const realParent = path.join(base, "real");
+		const aliasParent = path.join(base, "alias");
+		await fs.mkdir(realParent);
+		await fs.symlink(realParent, aliasParent, "dir");
+		const realFile = path.join(realParent, "state.json");
+		const aliasFile = path.join(aliasParent, "state.json");
+		const realpath = fs.realpath;
+		let failParentCanonicalization = true;
+		vi.spyOn(fs, "realpath").mockImplementation((async target => {
+			if (failParentCanonicalization && String(target) === aliasParent) {
+				failParentCanonicalization = false;
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			}
+			return await realpath(target);
+		}) as typeof fs.realpath);
+		const realRm = fs.rm;
+		vi.spyOn(fs, "rm").mockImplementation((async (target, options) => {
+			if (String(target) === `${aliasFile}.lock`)
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			return await realRm(target, options);
+		}) as typeof fs.rm);
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				throw Object.assign(new Error("sharing violation"), { code: "EPERM" });
+			},
+		});
+
+		await expect(withFileLock(aliasFile, async () => {}, { retries: 2, retryDelayMs: 1 })).rejects.toThrow(
+			"sharing violation",
+		);
+		vi.restoreAllMocks();
+		FileLockTestHooks.nativeQuarantineBindings = undefined;
+
+		let entered = false;
+		await withFileLock(
+			realFile,
+			async () => {
+				entered = true;
+			},
+			{ retries: 2, retryDelayMs: 1 },
+		);
+		expect(entered).toBe(true);
+		expect(await fs.exists(`${realFile}.lock`)).toBe(false);
+	});
+
 	test("registers ownership before canonicalization can fail after publication", async () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
