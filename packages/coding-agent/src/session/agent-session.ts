@@ -501,6 +501,26 @@ import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
 import { YieldQueue } from "./yield-queue";
 
+const ASYNC_INLINE_RESULT_MAX_CHARS = 12_000;
+const ASYNC_PREVIEW_MAX_CHARS = 4_000;
+
+async function formatParkedAsyncResult(sessionManager: SessionManager, result: string): Promise<string> {
+	if (result.length <= ASYNC_INLINE_RESULT_MAX_CHARS) return result;
+	const preview = `${result.slice(0, ASYNC_PREVIEW_MAX_CHARS)}\n\n[Output truncated. Showing first ${ASYNC_PREVIEW_MAX_CHARS.toLocaleString()} characters.]`;
+	try {
+		const { path: artifactPath, id: artifactId } = await sessionManager.allocateArtifactPath("async");
+		if (artifactPath && artifactId) {
+			await Bun.write(artifactPath, result);
+			return `${preview}\nFull output: artifact://${artifactId}`;
+		}
+	} catch (error) {
+		logger.warn("Failed to persist parked async follow-up artifact", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+	return preview;
+}
+
 /**
  * #4560: structured workflow recovery projection from canonical durable
  * Ralplan/Ultragoal state, consumed by the compaction summary context and
@@ -2634,19 +2654,32 @@ export class AgentSession {
 				? AsyncJobManager.endpointIdOf(this.#ownedAsyncJobManager)
 				: undefined;
 			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
-			this.yieldQueue.enqueue("async-result", {
-				jobId: disposition.receipt.jobId,
-				generation: disposition.receipt.jobGeneration,
-				result: `${disposition.text}\n\n${describeFoldReceipt(disposition.receipt)}`,
-				job,
-				durationMs: undefined,
-				ownedCompletion: registration
-					? {
-							lineageIdHash: registration.lineageIdHash,
-							promptAttemptEpoch: registration.promptAttemptEpoch,
-							registration,
-						}
-					: undefined,
+			if (this.#foldCoordinator.claimCompletionNotice(job)) {
+				this.emitNotice(
+					"info",
+					`Folded job ${disposition.receipt.jobId} (${disposition.receipt.label}) finished.`,
+					"fold",
+				);
+			}
+			const ownedCompletion = registration
+				? {
+						lineageIdHash: registration.lineageIdHash,
+						promptAttemptEpoch: registration.promptAttemptEpoch,
+						registration,
+					}
+				: undefined;
+			void formatParkedAsyncResult(
+				this.sessionManager,
+				`${disposition.text}\n\n${describeFoldReceipt(disposition.receipt)}`,
+			).then(result => {
+				this.yieldQueue.enqueue("async-result", {
+					jobId: disposition.receipt.jobId,
+					generation: disposition.receipt.jobGeneration,
+					result,
+					job,
+					durationMs: undefined,
+					ownedCompletion,
+				});
 			});
 		},
 	});
