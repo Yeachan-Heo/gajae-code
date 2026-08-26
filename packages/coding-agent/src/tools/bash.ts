@@ -1428,7 +1428,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				},
 				toolCallId,
 			});
+			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
 			if (startBackgrounded) {
+				job.setBackgrounded(true);
+				ownedManager.markBackgrounded(job.jobId, jobGeneration);
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
@@ -1444,7 +1447,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				foregroundSettled = true;
 				return "resolved";
 			};
-			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
 			const unregisterBackgroundRequest = this.session.registerForegroundFoldParticipant?.({
 				kind: "bash-managed",
 				jobId: job.jobId,

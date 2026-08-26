@@ -1558,6 +1558,29 @@ function b() {
 			await asyncJobManager.dispose();
 		});
 
+		it("marks zero-wait auto-background jobs in the manager snapshot", async () => {
+			const asyncJobManager = new AsyncJobManager({ onJobComplete: async () => {} });
+			AsyncJobManager.setInstance(asyncJobManager);
+			const tool = new BashTool(
+				createTestToolSession(
+					testDir,
+					Settings.isolated({
+						"bash.autoBackground.enabled": true,
+						"bash.autoBackground.thresholdMs": 0,
+					}),
+					{ getSessionId: () => "test-session" },
+				),
+			);
+
+			const result = await tool.execute("test-call-9-auto-zero-wait", { command: "sleep 0.05" });
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) throw new Error("expected an immediate auto-background job id");
+			expect(asyncJobManager.getJob(jobId)?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
+			await asyncJobManager.getJob(jobId)?.promise;
+			await asyncJobManager.dispose();
+		});
+
 		it("should bound async and monitor output while preserving full local evidence", async () => {
 			const deliveries: Array<{ jobId: string; text: string }> = [];
 			const monitorLines: string[] = [];
@@ -1696,6 +1719,8 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			const postFoldProgress = updates.filter(update => update.text.includes("after-fold"));
@@ -1804,6 +1829,8 @@ function b() {
 			}
 			const runningJob = asyncJobManager.getJob(jobId);
 			expect(runningJob?.status).toBe("running");
+			expect(runningJob?.metadata?.backgrounded).toBe(true);
+			expect(asyncJobManager.getJobsSnapshot().jobs.find(job => job.id === jobId)?.backgrounded).toBe(true);
 			await runningJob?.promise;
 			await asyncJobManager.drainDeliveries({ timeoutMs: 1 });
 			expect(deliveries).toHaveLength(1);

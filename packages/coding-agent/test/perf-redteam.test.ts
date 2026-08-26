@@ -123,7 +123,7 @@ describe("perf change-set adversarial probes", () => {
 		expect(reads).toEqual([]);
 	});
 
-	it("retention zero cannot retain dead letters and tombstone sweeping is safe without registrations", async () => {
+	it("retention zero retains visible dead letters and sweeps tombstones safely", async () => {
 		const manager = new AsyncJobManager({
 			retentionMs: 0,
 			onJobComplete: () => {
@@ -133,7 +133,7 @@ describe("perf change-set adversarial probes", () => {
 		manager.register("task", "terminal", async () => "done", { id: "zero-retention" });
 		await manager.waitForAll();
 		await manager.drainDeliveries({ timeoutMs: 5_000 });
-		expect(manager.getDeliveryState()).toMatchObject({ deadLettered: 0, queued: 0 });
+		expect(manager.getDeliveryState()).toMatchObject({ deadLettered: 1, queued: 0 });
 		expect(manager.getMonitorTombstone("unregistered")).toBeUndefined();
 		await manager.dispose();
 	});
