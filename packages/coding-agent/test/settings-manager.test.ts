@@ -96,13 +96,23 @@ describe("Settings", () => {
 		}
 	});
 
-	it("currentOrInit reuses a cwd-initialized singleton without warning on blank options", async () => {
+	it("blank currentOrInit after cwd init stays silent while blank Settings.init still warns", async () => {
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const reinitCalls = () =>
+			warning.mock.calls.filter(([message]) => String(message).includes("called again with different options"));
 		try {
 			const first = await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
-			const reused = await Settings.currentOrInit();
-			expect(reused).toBe(first);
-			expect(warning).not.toHaveBeenCalled();
+
+			for (let i = 0; i < 20; i++) {
+				expect(await Settings.init()).toBe(first);
+			}
+			expect(reinitCalls()).toHaveLength(20);
+
+			warning.mockClear();
+			for (let i = 0; i < 20; i++) {
+				expect(await Settings.currentOrInit()).toBe(first);
+			}
+			expect(reinitCalls()).toHaveLength(0);
 		} finally {
 			warning.mockRestore();
 		}

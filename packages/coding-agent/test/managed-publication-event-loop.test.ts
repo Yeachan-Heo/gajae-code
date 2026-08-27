@@ -51,11 +51,11 @@ async function waitFor(condition: () => Promise<boolean>, timeoutMs = 10_000): P
 	throw new Error("condition not met before timeout");
 }
 
-function sha256(contents: string): string {
+function sha256(contents: string | Uint8Array): string {
 	return createHash("sha256").update(contents).digest("hex");
 }
 
-async function exactIdentity(pathname: string, contents: string): Promise<native.NativeExactFileIdentity> {
+async function exactIdentity(pathname: string, contents: string | Uint8Array): Promise<native.NativeExactFileIdentity> {
 	const stat = await fsp.stat(pathname, { bigint: true });
 	const parent = await fsp.stat(path.dirname(pathname), { bigint: true });
 	return {
@@ -193,6 +193,108 @@ describe("async native exact-replace boundary", () => {
 			expect(result.ok).toBe(true);
 			expect(await fsp.readFile(destination, "utf8")).toBe("successor");
 			expect(fs.existsSync(source)).toBe(false);
+		});
+	});
+
+	it("sync exactReplacePath fulfills from a microtask while exactReplacePathAsync stays on the pool", async () => {
+		await withTempDir("gjc-exact-replace-microtask-contrast-", async dir => {
+			async function seed(name: string): Promise<{
+				source: string;
+				destination: string;
+				expectedSource: native.NativeExactFileIdentity;
+				expectedDestination: native.NativeExactFileIdentity;
+			}> {
+				const source = path.join(dir, `${name}-source`);
+				const destination = path.join(dir, `${name}-dest`);
+				await fsp.writeFile(source, "successor");
+				await fsp.writeFile(destination, "predecessor");
+				return {
+					source,
+					destination,
+					expectedSource: await exactIdentity(source, "successor"),
+					expectedDestination: await exactIdentity(destination, "predecessor"),
+				};
+			}
+
+			const syncPair = await seed("sync");
+			let syncSettled = false;
+			const syncPending = (async () =>
+				native.exactReplacePath(
+					syncPair.source,
+					syncPair.destination,
+					syncPair.expectedSource,
+					syncPair.expectedDestination,
+				))().then(() => {
+				syncSettled = true;
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(syncSettled).toBe(true);
+			await syncPending;
+
+			const asyncPair = await seed("async");
+			let asyncSettled = false;
+			const asyncPending = native
+				.exactReplacePathAsync(
+					asyncPair.source,
+					asyncPair.destination,
+					asyncPair.expectedSource,
+					asyncPair.expectedDestination,
+				)
+				.then(() => {
+					asyncSettled = true;
+				});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(asyncSettled).toBe(false);
+			await asyncPending;
+			expect(await fsp.readFile(asyncPair.destination, "utf8")).toBe("successor");
+		});
+	});
+
+	it("yields macrotask turns to the event loop while exactReplacePathAsync is in flight", async () => {
+		await withTempDir("gjc-async-exact-replace-liveness-", async dir => {
+			const payload = new Uint8Array(4 * 1024 * 1024).fill(0x61);
+			const digest = sha256(payload);
+			async function identityOf(pathname: string): Promise<native.NativeExactFileIdentity> {
+				const stat = await fsp.stat(pathname, { bigint: true });
+				const parent = await fsp.stat(path.dirname(pathname), { bigint: true });
+				return {
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: digest,
+				};
+			}
+
+			let settled = 0;
+			const replacements = [];
+			for (let index = 0; index < 8; index++) {
+				const source = path.join(dir, `staging-${index}`);
+				const destination = path.join(dir, `published-${index}`);
+				await fsp.writeFile(source, payload);
+				await fsp.writeFile(destination, payload);
+				replacements.push(
+					native
+						.exactReplacePathAsync(source, destination, await identityOf(source), await identityOf(destination))
+						.then(() => {
+							settled += 1;
+						}),
+				);
+			}
+			// Same liveness contract as renameNoReplacePathAsync / issue #4394: a
+			// zero-delay timer must fire before the pool-bound SHA-256 and namespace
+			// exchange can settle. The pre-fix exactReplacePath ran on the JS thread
+			// and starved exactly these turns.
+			await Bun.sleep(0);
+			expect(settled).toBe(0);
+			await Bun.sleep(0);
+			await Promise.all(replacements);
+			expect(settled).toBe(8);
 		});
 	});
 

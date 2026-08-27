@@ -14,6 +14,7 @@ import { DEFAULT_MAX_BYTES } from "@gajae-code/coding-agent/session/streaming-ou
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import type { Shell } from "@gajae-code/natives";
 import * as piNatives from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import { safeRmSync } from "../../../scripts/safe-cleanup";
 
 const BACKGROUND_COMPLETION_RACE_MS = 750;
@@ -61,6 +62,21 @@ describe("executeBash", () => {
 		const result = await executeBash("exit 7", { cwd: tempDir, timeout: 5000 });
 		expect(result.exitCode).toBe(7);
 		expect(result.cancelled).toBe(false);
+	});
+
+	it("does not reinit-warn when falling back to the process Settings singleton", async () => {
+		const warning = vi.spyOn(logger, "warn");
+		try {
+			for (let i = 0; i < 5; i++) {
+				const result = await executeBash("true", { cwd: tempDir, timeout: 5000, oneShot: true });
+				expect(result.exitCode).toBe(0);
+			}
+			expect(
+				warning.mock.calls.filter(([message]) => String(message).includes("Settings.init called again")),
+			).toEqual([]);
+		} finally {
+			warning.mockRestore();
+		}
 	});
 
 	it("scrubs inherited managed transcript paths from shell sessions", async () => {
