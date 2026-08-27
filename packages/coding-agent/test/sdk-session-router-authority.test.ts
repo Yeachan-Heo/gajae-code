@@ -69,6 +69,11 @@ async function routerFixture(
 		onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void | Promise<void>;
 		onNotificationSubscription?: (subscription: NotificationSubscription) => void | Promise<void>;
 		onNotificationSubscriptionReady?: (subscription: NotificationSubscription) => void | Promise<void>;
+		onNotificationSubscriptionRemoved?: (
+			subscription: NotificationSubscription,
+			reason?: "removed" | "replaced" | "replaced_same_generation" | "cancelled",
+		) => void | Promise<void>;
+		onNotificationFrame?: (subscription: NotificationSubscription, frame: SessionRouterFrame) => void | Promise<void>;
 		start?: boolean;
 		initiallyIndexed?: boolean;
 		onIndexRefresh?: () => void | Promise<void>;
@@ -188,6 +193,8 @@ async function routerFixture(
 			onFrame: options.onFrame,
 			onNotificationSubscription: options.onNotificationSubscription,
 			onNotificationSubscriptionReady: options.onNotificationSubscriptionReady,
+			onNotificationSubscriptionRemoved: options.onNotificationSubscriptionRemoved,
+			onNotificationFrame: options.onNotificationFrame,
 			onSessionRemoved: options.onSessionRemoved,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
@@ -711,6 +718,113 @@ describe("SessionRouter dispatch authority", () => {
 			expect(attachment).not.toBeNull();
 			expect(attachment?.isCurrent()).toBe(true);
 			expect(await fixture.router.request(fixture.sessionId, { type: "query_request" })).toEqual({ events: [] });
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("retains a notification subscription when a single publication is refused", async () => {
+		// A provider that refuses ONE publication has already settled that frame as
+		// rejected on its own side; the next frame normally succeeds. Cancelling the
+		// subscription there latched notificationCancelled for the life of the
+		// AttachedSession, and a still-running session never gets a new one, so its
+		// mirroring stayed dead until that session was restarted.
+		const delivered: string[] = [];
+		const subscriptions: NotificationSubscription[] = [];
+		let refuseNext = true;
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				delivered.push(String(frame.name));
+				if (!refuseNext) return;
+				refuseNext = false;
+				throw new Error("Telegram publication rejected before send: trusted attachment lease is stale");
+			},
+		});
+		try {
+			fixture.clients[0]?.emit({ type: "refused", sessionId: fixture.sessionId });
+			await waitFor(() => delivered.length === 1, "The first notification frame was not dispatched.");
+			await Bun.sleep(10);
+			fixture.clients[0]?.emit({ type: "accepted", sessionId: fixture.sessionId });
+			await waitFor(() => delivered.length === 2, "A single refused publication cancelled the subscription.");
+			expect(delivered).toEqual(["refused", "accepted"]);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("ends the refusal run at the next delivered notification frame", async () => {
+		// The bound is on CONSECUTIVE refusals. A provider that refuses four frames,
+		// delivers one, then refuses four more never reaches the limit, so an
+		// intermittent authority flip cannot accumulate into a cancellation.
+		const delivered: string[] = [];
+		const subscriptions: NotificationSubscription[] = [];
+		let refuse = true;
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				delivered.push(String(frame.name));
+				if (refuse) throw new Error("publication refused");
+			},
+		});
+		try {
+			for (const round of ["a", "b"]) {
+				for (let index = 0; index < 4; index++) {
+					const expected = delivered.length + 1;
+					fixture.clients[0]?.emit({ type: `${round}${index}`, sessionId: fixture.sessionId });
+					await waitFor(() => delivered.length === expected, `Frame ${round}${index} was not dispatched.`);
+					await Bun.sleep(5);
+				}
+				refuse = false;
+				const accepted = delivered.length + 1;
+				fixture.clients[0]?.emit({ type: `${round}-ok`, sessionId: fixture.sessionId });
+				await waitFor(() => delivered.length === accepted, `Frame ${round}-ok was not dispatched.`);
+				await Bun.sleep(5);
+				refuse = true;
+			}
+			expect(delivered).toHaveLength(10);
+			expect(subscriptions[0]?.isActive()).toBe(true);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("cancels a notification subscription after a bounded run of refusals", async () => {
+		// The tolerance is bounded: a provider that never accepts anything is still
+		// conceded, so a permanently broken subscription cannot be dispatched to
+		// forever. The exact count is the contract -- the run, not the first frame.
+		const delivered: string[] = [];
+		const removals: string[] = [];
+		const subscriptions: NotificationSubscription[] = [];
+		const fixture = await routerFixture({
+			onNotificationSubscription: subscription => {
+				subscriptions.push(subscription);
+			},
+			onNotificationSubscriptionRemoved: (_subscription, reason) => {
+				removals.push(String(reason));
+			},
+			onNotificationFrame: (_subscription, frame) => {
+				delivered.push(String(frame.name));
+				throw new Error("publication refused");
+			},
+		});
+		try {
+			for (let index = 0; index < 8; index++) {
+				fixture.clients[0]?.emit({ type: `refused-${index}`, sessionId: fixture.sessionId });
+				await Bun.sleep(10);
+			}
+			// Five consecutive refusals are dispatched; the sixth frame finds the
+			// subscription already conceded and is never handed to the provider.
+			expect(delivered).toEqual(["refused-0", "refused-1", "refused-2", "refused-3", "refused-4"]);
+			expect(removals).toEqual(["cancelled"]);
+			expect(subscriptions[0]?.isActive()).toBe(false);
+			// Core attachment authority is untouched by a conceded subscription.
+			expect(fixture.router.attachment(fixture.sessionId)?.isCurrent()).toBe(true);
 		} finally {
 			await fixture.router.stop();
 		}

@@ -295,6 +295,8 @@ type AttachedSession = {
 	readonly capability: SessionAttachment;
 	readonly notificationSubscription: NotificationSubscription;
 	notificationCancelled: boolean;
+	/** Consecutive refused notification publications; reset by the next delivered frame. */
+	notificationFailures: number;
 	readonly notificationCursor: { generation: number; seq: number };
 	published: boolean;
 	initializingPublication: boolean;
@@ -352,6 +354,17 @@ const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
  */
 const SESSION_ROUTER_IDLE_SWEEP_MS = 30_000;
 const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
+/**
+ * Consecutive local notification-dispatch failures tolerated before the
+ * subscription is conceded. A provider that refuses ONE publication is not a
+ * dead subscription: it has already settled that publication as rejected on its
+ * own side, and the next frame normally succeeds. Cancelling on the first
+ * rejection latched `notificationCancelled` for the life of the
+ * `AttachedSession`, which only a new attachment clears -- a still-running
+ * session never gets one, so its mirroring stayed dead until the session was
+ * restarted. Mirrors {@link DELIVERY_ATTEMPT_LIMIT} on the ordered path.
+ */
+const NOTIFICATION_LOCAL_FAILURE_LIMIT = 5;
 /**
  * Client-message types the native session server authorizes with the
  * per-session endpoint token (`tokens_match` in crates/gjc-sdk server.rs).
@@ -1548,6 +1561,7 @@ export class SessionRouter {
 			capability,
 			notificationSubscription,
 			notificationCancelled: false,
+			notificationFailures: 0,
 			notificationCursor,
 			published: false,
 			publication,
@@ -1827,15 +1841,25 @@ export class SessionRouter {
 					this.#detachNotification(attached, "cancelled");
 					return;
 				}
+				// A delivered frame ends the consecutive-failure run.
+				attached.notificationFailures = 0;
 				if (frame.seq !== undefined)
 					attached.notificationSubscription.advanceCursor(frame.generation ?? attached.generation, frame.seq);
 			},
 			(error: unknown) => {
-				this.#detachNotification(attached, "cancelled");
+				// Concede only after a bounded consecutive run: a single refused
+				// publication drops that frame, it does not end the subscription.
+				attached.notificationFailures += 1;
+				const detail = error instanceof Error ? error.message : String(error);
+				if (attached.notificationFailures >= NOTIFICATION_LOCAL_FAILURE_LIMIT) {
+					this.#detachNotification(attached, "cancelled");
+					logger.warn(
+						`SDK notification subscription ${attached.notificationSubscription.subscriptionId} failed locally ${attached.notificationFailures} times in a row; cancelling: ${detail}`,
+					);
+					return;
+				}
 				logger.warn(
-					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} failed locally: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
+					`SDK notification subscription ${attached.notificationSubscription.subscriptionId} refused one frame (${attached.notificationFailures}/${NOTIFICATION_LOCAL_FAILURE_LIMIT}); subscription retained: ${detail}`,
 				);
 			},
 		);
