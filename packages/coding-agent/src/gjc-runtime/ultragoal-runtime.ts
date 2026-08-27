@@ -1,6 +1,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isPlaceholderToken } from "@gajae-code/utils";
 import type { WorkflowHudSummary } from "../skill-state/active-state";
 import { buildUltragoalHudSummary as buildWorkflowUltragoalHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
@@ -1691,7 +1692,8 @@ export function isSubstantiveEvidence(value: unknown): boolean {
 	const words = trimmed.split(/\s+/).filter(word => /[a-z0-9]/i.test(word));
 	if (words.length < MIN_SUBSTANTIVE_EVIDENCE_WORDS) return false;
 	const normalized = trimmed.toLowerCase();
-	return !["todo", "tbd", "n/a", "na", "none", "placeholder", "empty", "stub"].includes(normalized);
+	// Shared with the ask contract screen so the two lists cannot drift (#5002).
+	return !isPlaceholderToken(normalized);
 }
 
 export function hasTypedVerifiedReceipt(value: unknown): boolean {

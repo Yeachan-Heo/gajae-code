@@ -5,6 +5,7 @@
  */
 import { INTENT_FIELD } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult } from "@gajae-code/ai/types";
+import { isPlaceholderToken } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { deepInterviewCharacterCount } from "../gjc-runtime/deep-interview-state";
 
@@ -138,7 +139,7 @@ function createQuestionItemSchema(deepInterviewSchema: z.ZodType<DeepInterviewMe
 	return z
 		.object({
 			id: z.string().describe("question id"),
-			question: z.string().describe("question text"),
+			question: z.string().trim().min(1).describe("question text"),
 			options: z.array(OptionItem).describe("available options"),
 			multi: z.boolean().describe("allow multiple selections").optional(),
 			recommended: z.number().describe("recommended option index").optional(),
@@ -223,7 +224,7 @@ const PostTopologyQuestionItem = createQuestionItemSchema(z.union([DeepInterview
 
 const OrdinaryQuestionItem = z.object({
 	id: z.string().describe("question id"),
-	question: z.string().describe("question text"),
+	question: z.string().trim().min(1).describe("question text"),
 	options: z.array(OptionItem).describe("available options"),
 	multi: z.boolean().describe("allow multiple selections").optional(),
 	recommended: z.number().describe("recommended option index").optional(),
@@ -438,13 +439,11 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
  * derived from metadata. Mirrors the ultragoal placeholder screen
  * (`ultragoal-runtime.ts`) and adds `unused`, the token reported from the field.
  */
-const PLACEHOLDER_QUESTION_BODIES = ["unused", "todo", "tbd", "n/a", "na", "none", "placeholder", "empty", "stub"];
-
 function isPlaceholderQuestionBody(value: unknown): boolean {
 	if (typeof value !== "string") return false;
 	const trimmed = value.trim();
 	if (trimmed.length === 0) return true;
-	return PLACEHOLDER_QUESTION_BODIES.includes(trimmed.toLowerCase());
+	return isPlaceholderToken(trimmed);
 }
 
 /**

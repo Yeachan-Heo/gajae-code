@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { recoverRoundZeroIntentContract } from "@gajae-code/coding-agent/tools/ask-contract";
+import { askSchema, recoverRoundZeroIntentContract } from "@gajae-code/coding-agent/tools/ask-contract";
 
 function validate(question: string) {
 	return recoverRoundZeroIntentContract({
@@ -33,5 +33,28 @@ describe("deep-interview ask question bodies", () => {
 	it("leaves a substantive question body alone", () => {
 		const result = validate("Which auth mechanism should the service use?") as { outcome: string; code?: string };
 		expect(result.code).not.toBe("ask-deep-interview-question-body-required");
+	});
+});
+
+describe("ask schema question bodies", () => {
+	it("rejects an empty or whitespace-only body on every ask surface, not just deep-interview", () => {
+		// #5002 review B4: the token screen only fires for asks carrying deepInterview
+		// metadata, so the schema itself has to close the empty/whitespace class for a
+		// plain ask — otherwise the same hollow screen is still reachable.
+		for (const body of ["", "   ", "\n\t"]) {
+			const parsed = askSchema.safeParse({
+				questions: [{ id: "q1", question: body, options: [{ label: "a" }, { label: "b" }] }],
+			});
+			expect(parsed.success).toBe(false);
+		}
+	});
+
+	it("accepts a short but real question body", () => {
+		for (const body of ["Why?", "JWT or OAuth2?", "None of the above?"]) {
+			const parsed = askSchema.safeParse({
+				questions: [{ id: "q1", question: body, options: [{ label: "a" }, { label: "b" }] }],
+			});
+			expect(parsed.success).toBe(true);
+		}
 	});
 });
