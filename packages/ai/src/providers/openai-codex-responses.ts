@@ -1571,6 +1571,8 @@ function handleOutputItemDone(
 			arguments: terminalArguments as Record<string, unknown>,
 		};
 		captureUnicodeEscapeEvidence(toolCall, item.arguments);
+		delete runtime.currentBlock.escapedNonAsciiArguments;
+		delete runtime.currentBlock.escapedUnicodeArgumentEvidence;
 		Object.assign(runtime.currentBlock, toolCall);
 		captureUnicodeEscapeEvidence(runtime.currentBlock, item.arguments);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
@@ -1625,6 +1627,8 @@ function handleOutputItemDone(
 			arguments: { input: terminalInput },
 			customWireName: item.name,
 		};
+		delete runtime.currentBlock.escapedNonAsciiArguments;
+		delete runtime.currentBlock.escapedUnicodeArgumentEvidence;
 		Object.assign(runtime.currentBlock, toolCall);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
 		delete (runtime.currentBlock as { doneInput?: string }).doneInput;
