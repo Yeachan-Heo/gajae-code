@@ -752,7 +752,7 @@ export async function resolveRalplanTargetRoot(
 	// command shell before git receives the argument. HEAD is sufficient after
 	// resolving a repository root: an unborn or non-commit HEAD still fails the
 	// same validation, while the argv remains shell-safe on every platform.
-	const verified = Bun.spawn(["git", "-C", canonical, "cat-file", "-t", "HEAD"], {
+	const verified = Bun.spawn(["git", "-C", canonical, "rev-parse", "--verify", "HEAD"], {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
