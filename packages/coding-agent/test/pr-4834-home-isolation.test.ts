@@ -12,6 +12,7 @@ import { type Rule, ruleCapability } from "@gajae-code/coding-agent/capability/r
 import { settingsCapability } from "@gajae-code/coding-agent/capability/settings";
 import { type Skill, skillCapability } from "@gajae-code/coding-agent/capability/skill";
 import { type SlashCommand, slashCommandCapability } from "@gajae-code/coding-agent/capability/slash-command";
+import { type SSHHost, sshCapability } from "@gajae-code/coding-agent/capability/ssh";
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
@@ -321,6 +322,36 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			expect(itemPath.startsWith(homeAgentDir)).toBe(false);
 			expect(itemPath.startsWith(explicitAgentDir)).toBe(true);
 		}
+	});
+
+	test("explicit home scopes ssh-json user discovery away from the ambient profile", async () => {
+		const homeAgentDir = path.join(home, ".gjc", "agent");
+		const decoyAgentDir = path.join(tempDir, "process-decoy", ".gjc", "agent");
+		await writeFile(
+			path.join(homeAgentDir, "ssh.json"),
+			JSON.stringify({ hosts: { home: { host: "home.example", username: "home-user" } } }),
+		);
+		await writeFile(
+			path.join(decoyAgentDir, "ssh.json"),
+			JSON.stringify({ hosts: { decoy: { host: "decoy.example", username: "decoy-user" } } }),
+		);
+		setAgentDir(decoyAgentDir);
+
+		const reads = new Set<string>();
+		const realReadFile = fs.readFile.bind(fs);
+		vi.spyOn(fs, "readFile").mockImplementation(((filePath: Parameters<typeof fs.readFile>[0]) => {
+			if (!(typeof filePath === "object" && "close" in filePath)) reads.add(path.resolve(String(filePath)));
+			return realReadFile(filePath, "utf-8");
+		}) as unknown as typeof fs.readFile);
+
+		const result = await loadCapabilityForHome<SSHHost>(sshCapability.id, home, {
+			cwd: project,
+			providers: ["ssh-json"],
+		});
+
+		expect(result.items.map(item => item.name)).toEqual(["home"]);
+		expect(result.items[0]?._source.path).toBe(path.join(homeAgentDir, "ssh.json"));
+		expect([...reads].filter(filePath => filePath.startsWith(decoyAgentDir))).toEqual([]);
 	});
 
 	test("non-absolute home fails closed instead of using the process profile", async () => {

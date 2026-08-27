@@ -275,6 +275,7 @@ export interface CursorOptions extends StreamOptions {
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
+const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
 // A started non-abortable mutation must settle before the exec terminal is
 // published, but settlement cannot be allowed to hang the turn forever: once
@@ -329,6 +330,7 @@ function runWithCursorExecDeadline<T>(
 	deadlineMs: number,
 	onNonAbortableStarted?: (settlement: CursorNonAbortableSettlement) => void,
 	onOperationFinished?: () => void,
+	onWrapperFinished?: () => void,
 ): Promise<T> {
 	const result = Promise.withResolvers<T>();
 	const operationCompletion = Promise.withResolvers<void>();
@@ -356,6 +358,7 @@ function runWithCursorExecDeadline<T>(
 		if (settled) return;
 		settled = true;
 		cleanup();
+		onWrapperFinished?.();
 		settlement();
 	};
 	// A started non-abortable mutation defers rejection until it settles, but not
@@ -402,6 +405,10 @@ function runWithCursorExecDeadline<T>(
 		else settle(() => result.reject(abortError!));
 	}, deadlineMs);
 	void operation(controller.signal, () => {
+		if (nonAbortableStarted) return;
+		if (settled) {
+			throw new Error("Cursor non-abortable exec was marked after wrapper terminalization");
+		}
 		nonAbortableStarted = true;
 		// A mutation marked after the deadline already fired starts its grace
 		// window immediately instead of escaping the cap.
@@ -478,176 +485,13 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 	}
 }
 
-interface CursorRequestWriter {
-	enqueue(frame: Uint8Array): void;
-	isActive(): boolean;
-	registerShellGate(close: () => void): () => void;
-}
-
-class CursorRequestCoordinator implements CursorRequestWriter {
-	#state: "open" | "draining" | "failed" | "succeeded" = "open";
-	#tasks = new Set<Promise<void>>();
-	#taskChain = Promise.resolve();
-	#hasAdmittedTask = false;
-	#frames: Uint8Array[] = [];
-	#writing = false;
-	#drainWaiters: Array<() => void> = [];
-	#failure: Error | null = null;
-	#shellGates = new Set<() => void>();
-	#request: http2.ClientHttp2Stream;
-	#stopHeartbeat: () => void;
-	#onSuccess: () => void;
-	#onFailure: (error: Error) => void;
-	#drainTimer: NodeJS.Timeout | null = null;
-	#drainTimeoutMs: number | undefined;
-
-	constructor(
-		request: http2.ClientHttp2Stream,
-		stopHeartbeat: () => void,
-		onSuccess: () => void,
-		onFailure: (error: Error) => void,
-		drainTimeoutMs: number | undefined,
-	) {
-		this.#request = request;
-		this.#stopHeartbeat = stopHeartbeat;
-		this.#onSuccess = onSuccess;
-		this.#onFailure = onFailure;
-		this.#drainTimeoutMs = drainTimeoutMs;
-	}
-
-	isActive(): boolean {
-		return this.#state === "open" || this.#state === "draining";
-	}
-
-	canAdmitTask(): boolean {
-		return this.#state === "open";
-	}
-
-	hasTurnEnded(): boolean {
-		return this.#state === "draining" || this.#state === "succeeded";
-	}
-
-	failureError(): Error | null {
-		return this.#failure;
-	}
-
-	enqueue(frame: Uint8Array): void {
-		if (!this.isActive()) return;
-		this.#frames.push(Buffer.from(frame));
-		this.#writeNext();
-	}
-
-	registerShellGate(close: () => void): () => void {
-		if (!this.isActive()) {
-			close();
-			return () => {};
-		}
-		this.#shellGates.add(close);
-		return () => this.#shellGates.delete(close);
-	}
-
-	admit(taskFactory: () => Promise<void>): void {
-		if (!this.canAdmitTask()) return;
-		const orderedTask = this.#hasAdmittedTask
-			? this.#taskChain.then(() => {
-					if (this.#state === "failed" || this.#state === "succeeded") return;
-					return taskFactory();
-				})
-			: taskFactory();
-		this.#hasAdmittedTask = true;
-		this.#taskChain = orderedTask.then(
-			() => {},
-			error => {
-				this.fail(error instanceof Error ? error : new Error(String(error)));
-			},
-		);
-		this.#tasks.add(orderedTask);
-		void orderedTask.then(
-			() => this.#tasks.delete(orderedTask),
-			() => this.#tasks.delete(orderedTask),
-		);
-	}
-
-	turnEnded(): void {
-		if (this.#state !== "open") return;
-		this.#state = "draining";
-		this.#stopHeartbeat();
-		if (this.#drainTimeoutMs !== undefined && this.#drainTimeoutMs > 0) {
-			this.#drainTimer = setTimeout(() => {
-				this.fail(new Error(`Cursor admitted work drain timed out after ${this.#drainTimeoutMs}ms`));
-			}, this.#drainTimeoutMs);
-		}
-		void Promise.all([...this.#tasks]).then(
-			() => {
-				if (this.#state !== "draining") return;
-				this.#drain(() => {
-					if (this.#state !== "draining") return;
-					if (this.#drainTimer) {
-						clearTimeout(this.#drainTimer);
-						this.#drainTimer = null;
-					}
-					this.#state = "succeeded";
-					this.#onSuccess();
-				});
-			},
-			error => this.fail(error instanceof Error ? error : new Error(String(error))),
-		);
-	}
-
-	fail(error: Error): void {
-		if (this.#state === "failed" || this.#state === "succeeded") return;
-		this.#state = "failed";
-		this.#failure = error;
-		if (this.#drainTimer) {
-			clearTimeout(this.#drainTimer);
-			this.#drainTimer = null;
-		}
-		this.#stopHeartbeat();
-		for (const close of this.#shellGates) close();
-		this.#shellGates.clear();
-		this.#frames = [];
-		this.#writing = false;
-		this.#releaseDrains();
-		this.#request.close();
-		this.#onFailure(error);
-	}
-
-	#writeNext(): void {
-		if (this.#writing || !this.isActive()) return;
-		const frame = this.#frames.shift();
-		if (!frame) {
-			this.#releaseDrains();
-			return;
-		}
-		this.#writing = true;
-		try {
-			this.#request.write(frame, error => {
-				this.#writing = false;
-				if (error) {
-					this.fail(error);
-					return;
-				}
-				this.#writeNext();
-			});
-		} catch (error) {
-			this.#writing = false;
-			this.fail(error instanceof Error ? error : new Error(String(error)));
-		}
-	}
-
-	#drain(resolve: () => void): void {
-		if (!this.#writing && this.#frames.length === 0) {
-			resolve();
-			return;
-		}
-		this.#drainWaiters.push(resolve);
-	}
-
-	#releaseDrains(): void {
-		if (this.#writing || this.#frames.length > 0) return;
-		const waiters = this.#drainWaiters;
-		this.#drainWaiters = [];
-		for (const resolve of waiters) resolve();
+function decodeGrpcMessage(value: unknown): string {
+	const raw = typeof value === "string" ? value : value == null ? "" : String(value);
+	const boundedRaw = raw.slice(0, CURSOR_MAX_GRPC_MESSAGE_LENGTH);
+	try {
+		return decodeURIComponent(boundedRaw).slice(0, CURSOR_MAX_GRPC_MESSAGE_LENGTH);
+	} catch {
+		return boundedRaw;
 	}
 }
 
@@ -825,6 +669,26 @@ export function mapH2TransportError(error: unknown, baseUrl: string): unknown {
 	);
 }
 
+/** Whether a decoded server envelope carries a known semantic message. */
+function isMeaningfulCursorServerMessage(msg: AgentServerMessage): boolean {
+	switch (msg.message.case) {
+		case "interactionUpdate":
+			return msg.message.value.message.case !== undefined;
+		case "execServerMessage":
+			return msg.message.value.message.case !== undefined;
+		case "execServerControlMessage":
+			return msg.message.value.message.case !== undefined;
+		case "interactionQuery":
+			return msg.message.value.query.case !== undefined;
+		case "kvServerMessage":
+			return msg.message.value.message.case !== undefined;
+		case "conversationCheckpointUpdate":
+			return true;
+		default:
+			return false;
+	}
+}
+
 export const streamCursor: StreamFunction<"cursor-agent"> = (
 	model: Model<"cursor-agent">,
 	context: Context,
@@ -867,22 +731,29 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
 		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
+		let h2ClientCloseHandler: (() => void) | undefined;
 		let h2RequestErrorHandler: ((error: Error) => void) | undefined;
+		let h2RequestCloseHandler: (() => void) | undefined;
+		let h2RequestAbortedHandler: (() => void) | undefined;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
 		const h2Completion = Promise.withResolvers<void>();
 		h2Completion.promise.catch(() => {});
 		let h2Settled = false;
 		let h2Failure: unknown;
 		let sawTurnEnded = false;
-		let terminalAdmissionClosed = false;
+		let terminalAdmissionMode: "open" | "raw-eof" | "closed" = "open";
 		let responseEnded = false;
 		let queueDrained = false;
 		let endStreamError: Error | null = null;
 		let pendingBuffer = Buffer.alloc(0);
 		const closeTerminalAdmission = (): void => {
-			terminalAdmissionClosed = true;
+			terminalAdmissionMode = "closed";
 			pendingBuffer = Buffer.alloc(0);
 			h2Request?.pause();
+		};
+		const sealExecAdmissionAtRawEof = (): void => {
+			if (terminalAdmissionMode !== "open") return;
+			terminalAdmissionMode = "raw-eof";
 		};
 		const settleH2 = (error?: unknown): void => {
 			if (h2Settled) return;
@@ -910,11 +781,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let transportWatchdogClosed = false;
 		let callerAbortError: Error | undefined;
 		let pendingNonAbortableExec: CursorNonAbortableSettlement | undefined;
-		const closeForCallerAbort = () => {
+		let localTransportCloseRequested = false;
+		const closeTransportLocally = (): void => {
+			localTransportCloseRequested = true;
 			h2Request?.close();
 			h2Client?.close();
 			proxiedSocket?.destroy();
-			settleH2(callerAbortError!);
 		};
 		// Terminal publication (caller abort, transport error, or stream end)
 		// must wait for any started non-abortable mutation to settle: a network
@@ -935,12 +807,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 			publish();
 		};
+		const terminalize = (error: unknown): void => {
+			closeTerminalAdmission();
+			closeTransportLocally();
+			settleBehindFence(() => settleH2(error));
+		};
+		const closeForCallerAbort = () => {
+			terminalize(callerAbortError!);
+		};
 		const onCallerAbort = () => {
 			const signal = options?.signal;
 			if (!signal) return;
 			if (callerAbortError) return;
 			callerAbortError = cursorAbortError(signal);
-			settleBehindFence(closeForCallerAbort);
+			closeForCallerAbort();
 		};
 		// Abort fence: install the listener before any setup work so a caller that
 		// aborts during payload construction or a proxy handshake can never lose the
@@ -1056,11 +936,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				transportWatchdog = setTimeout(() => {
 					if (transportWatchdogClosed) return;
 					const error = errorFactory();
-					h2Request?.close();
-					settleH2(error);
+					terminalize(error);
 				}, timeoutMs);
 			};
 			const refreshTransportWatchdog = () => {
+				if (terminalAdmissionMode !== "open") return;
 				// An in-flight exec handler legitimately produces no inbound frames
 				// while it runs: a heartbeat/checkpoint arriving after it started
 				// must not re-arm the watchdog the exec path cleared, or a slow
@@ -1159,14 +1039,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			} else {
 				h2Client = http2.connect(baseUrl);
 			}
+			if (h2Settled) await h2Completion.promise;
 			// Recheck after the (possibly async) proxy handshake, immediately before
 			// the bearer-authenticated request is created.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			h2ClientErrorHandler = error => {
-				closeTerminalAdmission();
-				settleBehindFence(() => settleH2(error));
+				terminalize(error);
 			};
 			h2Client.on("error", h2ClientErrorHandler);
+			h2ClientCloseHandler = () => {
+				if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+				terminalize(new Error("Cursor HTTP/2 session closed before turnEnded"));
+			};
+			h2Client.on("close", h2ClientCloseHandler);
 
 			h2Request = h2Client.request({
 				":method": "POST",
@@ -1181,10 +1066,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-request-id": crypto.randomUUID(),
 			});
 			h2RequestErrorHandler = error => {
-				closeTerminalAdmission();
-				settleBehindFence(() => settleH2(error));
+				terminalize(error);
 			};
 			h2Request.on("error", h2RequestErrorHandler);
+			const handleUnexpectedRequestClose = (_kind: "closed" | "aborted"): void => {
+				if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+				responseEnded = true;
+				sealExecAdmissionAtRawEof();
+				processPendingBuffer?.();
+				finishResponseAfterParsing();
+			};
+			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
+			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
+			h2Request.on("close", h2RequestCloseHandler);
+			h2Request.on("aborted", h2RequestAbortedHandler);
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			// Cursor owns the first-event watchdog, so its budget starts before
 			// history/blob/protobuf serialization. Synchronous setup cannot be
@@ -1231,8 +1126,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			const messageQueue = createCursorMessageQueueForTest(error => {
 				log("error", "handleServerMessage", { error: String(error) });
-				h2Request?.close();
-				settleBehindFence(() => settleH2(error));
+				terminalize(error);
 			});
 			const drainMessageQueue = (): void => {
 				void messageQueue.drain().then(
@@ -1250,10 +1144,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
-					closeTerminalAdmission();
-					settleBehindFence(() =>
-						settleH2(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`)),
-					);
+					terminalize(new Error(`gRPC error ${status}: ${decodeGrpcMessage(msg)}`));
 				}
 			});
 
@@ -1273,7 +1164,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			processPendingBuffer = () => {
 				if (processingPausedForExec || processingPausedForQueue) return;
 				while (pendingBuffer.length >= 5) {
-					if (terminalAdmissionClosed) {
+					if (terminalAdmissionMode === "closed") {
 						// A validated turnEnded closes admission. Drop coalesced bytes
 						// behind any terminal frame so a late exec cannot reach the local
 						// handler after terminal bookkeeping has started.
@@ -1303,25 +1194,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// checkpoints, and server-side exec) without emitting a normalized
 						// assistant event. Watch the validated Connect/protobuf boundary rather
 						// than the normalized stream so those turns do not false-stall.
-						refreshTransportWatchdog();
+						const isMeaningful = isMeaningfulCursorServerMessage(serverMessage);
+						if (isMeaningful) refreshTransportWatchdog();
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
-						if (isExecServerMessage) {
+						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage) continue;
+						const isExecutable = isExecServerMessage && isMeaningful;
+						if (isExecutable) {
 							processingPausedForExec = true;
 							h2Request!.pause();
 							clearTransportWatchdog();
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
-							if (isExecServerMessage && terminalAdmissionClosed) return;
+							if (isExecServerMessage && terminalAdmissionMode !== "open") return;
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
-							if (isExecServerMessage) {
+							if (isExecutable) {
 								mutationSlotReserved = reserveCursorMutationLock(conversationId);
 								if (!mutationSlotReserved) throw new Error("Cursor mutation lock capacity exhausted");
 								clearTransportWatchdog();
@@ -1346,7 +1240,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										execSignal,
 										markNonAbortable,
 									);
-								if (isExecServerMessage) {
+								if (isExecutable) {
 									// The deadline races the handler promise but the per-exec
 									// AbortSignal it owns reaches cooperative handlers so caller
 									// cancellation and the local deadline can actually stop work.
@@ -1372,23 +1266,29 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 												mutationSlotReserved = false;
 											}
 										},
+										() => {
+											if (mutationSlotReserved) {
+												releaseCursorMutationLockReservation(conversationId);
+												mutationSlotReserved = false;
+											}
+										},
 									);
 								} else {
 									await run();
 								}
 								execSucceeded = true;
 							} finally {
-								if (isExecServerMessage) {
+								if (isExecutable) {
 									execInFlight = false;
 									if (
 										execSucceeded &&
 										!transportWatchdogClosed &&
 										!callerAbortError &&
-										!terminalAdmissionClosed
+										terminalAdmissionMode !== "closed"
 									) {
 										processingPausedForExec = false;
 										h2Request!.resume();
-										refreshTransportWatchdog();
+										if (isMeaningful) refreshTransportWatchdog();
 										processPendingBuffer?.();
 									}
 								}
@@ -1400,7 +1300,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// still runs in order, while settlement waits for queue drain.
 						if (isTurnEnded) {
 							sawTurnEnded = true;
-							terminalAdmissionClosed = true;
+							closeTerminalAdmission();
 							drainMessageQueue();
 						}
 						// A single HTTP/2 data chunk can contain hundreds of valid,
@@ -1412,7 +1312,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							h2Request!.pause();
 							const resumeAfterDrain = () => {
 								processingPausedForQueue = false;
-								if (!processingPausedForExec && !transportWatchdogClosed && !callerAbortError) {
+								if (
+									!processingPausedForExec &&
+									!transportWatchdogClosed &&
+									!callerAbortError &&
+									terminalAdmissionMode !== "closed"
+								) {
 									h2Request!.resume();
 									processPendingBuffer?.();
 								}
@@ -1424,10 +1329,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							break;
 						}
 
-
-						if (isExecServerMessage) break;
+						if (isExecutable) break;
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
+						terminalize(e);
+						break;
 					}
 				}
 				// HTTP/2 can emit `end` while a coalesced chunk still has frames
@@ -1438,6 +1344,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			h2Request.on("end", () => {
 				responseEnded = true;
+				sealExecAdmissionAtRawEof();
 				processPendingBuffer?.();
 				finishResponseAfterParsing();
 			});
@@ -1515,7 +1422,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		} catch (error) {
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
-			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
+			if (!h2Settled) terminalize(error);
+			const mappedError = h2Failure ?? error;
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
 			output.transportFailure = transportFailureFacts(error);
