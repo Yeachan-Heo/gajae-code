@@ -2501,12 +2501,12 @@
 			"sdkId": "bash.execute",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 			"testNamePattern": "AD-A-C25",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C25:"
 			],
@@ -4901,12 +4901,12 @@
 			"sdkId": "session.cwd.move",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-C49",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp-2.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-C49:"
 			],
@@ -7301,12 +7301,12 @@
 			"sdkId": "workflow.gates.list",
 			"adapter": "acp",
 			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 			"testNamePattern": "AD-A-Q12",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-4.test.ts",
 				"--test-name-pattern",
 				"^AD-A-Q12:"
 			],
