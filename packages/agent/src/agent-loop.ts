@@ -5359,6 +5359,7 @@ function createAbortedToolResult(
 	reason: "aborted" | "error",
 	errorMessage?: string,
 ): ToolResultMessage {
+	delete toolCall.escapedUnicodeArgumentEvidence;
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
 	const result: AgentToolResult<any> = {
 		content: [{ type: "text", text: errorMessage ? `${message}: ${errorMessage}` : `${message}.` }],
