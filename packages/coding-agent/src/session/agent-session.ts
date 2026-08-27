@@ -5241,6 +5241,7 @@ export class AgentSession {
 				try {
 					await this.refreshSshTool({ activateIfAvailable: true });
 				} catch (error) {
+					this.agent.setTools(this.agent.state.tools.filter(tool => tool.name !== "ssh"));
 					this.#toolRegistry.delete("ssh");
 					this.#selectedDiscoveredToolNames.delete("ssh");
 					await this.#applyActiveToolsByName(this.getActiveToolNames().filter(name => name !== "ssh"));
