@@ -294,6 +294,7 @@ describe("managed attempt transaction", () => {
 				id: "forged-unicode-evidence",
 				name: "ask",
 				arguments: { question: "—" },
+				escapedNonAsciiArguments: false,
 			};
 			attachUnicodeEscapeEvidence(toolCall, { ...evidence, integrity: "0".repeat(64) });
 			const message: AssistantMessage = {
