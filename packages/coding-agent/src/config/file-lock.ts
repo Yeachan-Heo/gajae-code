@@ -207,8 +207,7 @@ function sameLockInfoPathState(left: LockInfoPathState, right: LockInfoPathState
 }
 
 function normalizeLockKey(lockPath: string): string {
-	const normalized = path.normalize(lockPath);
-	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+	return path.normalize(lockPath);
 }
 
 const LOCK_INFO_OPEN_FLAGS =
@@ -547,7 +546,7 @@ async function tryAcquireLock(
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "EEXIST" || code === "ENOTEMPTY") return null;
-			if (code === "EPERM") {
+			if (isTransientReleaseError(error)) {
 				try {
 					await fs.stat(lockPath);
 					return null;
@@ -564,7 +563,7 @@ async function tryAcquireLock(
 
 function isTransientReleaseError(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
-	return code === "EBUSY" || code === "EPERM" || code === "ENOTEMPTY";
+	return code === "EBUSY" || code === "EPERM" || code === "EACCES" || code === "ENOTEMPTY";
 }
 
 type NativeFileLockBindings = {

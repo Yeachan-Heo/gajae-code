@@ -546,7 +546,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
-		const readError = Object.assign(new Error("metadata access denied"), { code: "EACCES" });
+		const readError = Object.assign(new Error("metadata access denied"), { code: "EIO" });
 		await writeInfo(lockDir, { pid: DEAD_PID, timestamp: Date.now() - 10_000 });
 
 		vi.spyOn(fs, "open").mockRejectedValueOnce(readError);
@@ -561,7 +561,7 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		const base = await makeTemp();
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
-		const releaseError = Object.assign(new Error("lock removal denied"), { code: "EACCES" });
+		const releaseError = Object.assign(new Error("lock removal denied"), { code: "EIO" });
 		let completed = false;
 
 		vi.spyOn(fs, "rm").mockRejectedValueOnce(releaseError);
@@ -672,6 +672,24 @@ describe("file lock cleanup failure handling (#2478)", () => {
 		);
 		expect(entered).toBe(true);
 		expect(await fs.exists(`${realFile}.lock`)).toBe(false);
+	});
+
+	test("keeps case-distinct lock keys independent", async () => {
+		const base = await makeTemp();
+		const upper = path.join(base, "State.json");
+		const lower = path.join(base, "state.json");
+		let upperEntered = false;
+		let lowerEntered = false;
+		await withFileLock(upper, async () => {
+			upperEntered = true;
+			await withFileLock(lower, async () => {
+				lowerEntered = true;
+			});
+		});
+		expect(upperEntered).toBe(true);
+		expect(lowerEntered).toBe(true);
+		expect(await fs.exists(`${upper}.lock`)).toBe(false);
+		expect(await fs.exists(`${lower}.lock`)).toBe(false);
 	});
 
 	test("registers ownership before canonicalization can fail after publication", async () => {
