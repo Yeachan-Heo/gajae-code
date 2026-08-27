@@ -487,10 +487,15 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 	try {
 		const currentStats = await fs.stat(lockPath);
 		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
-		await fs.rm(lockPath, { recursive: true, force: true });
-		return true;
+		const captured = nativeFileLockBindings().snapshotDirectoryTree(lockPath);
+		if (!captured.ok || !captured.snapshot) return false;
+		if (captured.snapshot.rootDev !== String(currentStats.dev) || captured.snapshot.rootIno !== String(currentStats.ino))
+			return false;
+		const removed = nativeFileLockBindings().exactRemoveDirectoryTree(lockPath, captured.snapshot);
+		return removed.ok || removed.code === "not_found";
 	} catch (err) {
 		if (isEnoent(err)) return false;
+		if (isTransientReleaseError(err)) return false;
 		throw err;
 	}
 }
@@ -532,8 +537,6 @@ async function tryAcquireLock(
 	if (ownerHostId === undefined) {
 		try {
 			await fs.mkdir(lockPath);
-			onAcquired?.();
-			return await writeLockInfo(lockPath, lockInfo(undefined, ownerToken));
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "EEXIST") return null;
@@ -547,6 +550,8 @@ async function tryAcquireLock(
 			}
 			throw error;
 		}
+		onAcquired?.();
+		return await writeLockInfo(lockPath, lockInfo(undefined, ownerToken));
 	}
 
 	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
@@ -566,7 +571,6 @@ async function tryAcquireLock(
 					await fs.stat(lockPath);
 					return null;
 				} catch (statError) {
-					if (isTransientReleaseError(statError)) return null;
 					if (!isEnoent(statError)) throw statError;
 				}
 			}

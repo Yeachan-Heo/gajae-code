@@ -77,6 +77,23 @@ function deadLockRecord(lockDir: string): GcRecord {
 }
 
 describe("withFileLock stale owner liveness (#652)", () => {
+	test("propagates transient onAcquired failures instead of retrying an empty lock", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "publication.json");
+		const failure = Object.assign(new Error("publication denied"), { code: "EACCES" });
+
+		await expect(
+			withFileLock(file, async () => undefined, {
+				retries: 2,
+				retryDelayMs: 1,
+				onAcquired: () => {
+					throw failure;
+				},
+			}),
+		).rejects.toBe(failure);
+		expect((await fs.readdir(`${file}.lock`)).length).toBe(0);
+	});
+
 	test("keeps process identity stable across caller locale and timezone", () => {
 		if (process.platform === "win32") return;
 		const original = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };
@@ -162,6 +179,30 @@ describe("withFileLock stale owner liveness (#652)", () => {
 
 		expect(acquired).toBe(true);
 		expect(await fs.exists(lockDir)).toBe(false);
+	});
+	test("does not remove a successor during stale ownerless lock cleanup", async () => {
+		const base = await makeTemp();
+		const lockedFile = path.join(base, "ownerless.json");
+		const lockDir = `${lockedFile}.lock`;
+		await fs.mkdir(lockDir);
+		const staleTime = new Date(Date.now() - 10_000);
+		await fs.utimes(lockDir, staleTime, staleTime);
+		let replaced = false;
+		FileLockTestHooks.nativeQuarantineBindings = () => ({
+			snapshotDirectoryTree,
+			exactRemoveDirectoryTree: () => {
+				replaced = true;
+				rmSync(lockDir, { recursive: true, force: true });
+				mkdirSync(lockDir);
+				return { ok: false, code: "identity_mismatch" };
+			},
+		});
+
+		await expect(
+			withFileLock(lockedFile, async () => undefined, { staleMs: 1, retries: 2, retryDelayMs: 1 }),
+		).rejects.toThrow("Failed to acquire lock");
+		expect(replaced).toBe(true);
+		expect(await fs.stat(lockDir)).toBeDefined();
 	});
 	test("retries when Windows transiently denies reading a contended lock info file", async () => {
 		const base = await makeTemp();
