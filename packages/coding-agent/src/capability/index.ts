@@ -279,13 +279,21 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const settingsAgentDir =
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
 	const customProcessProfile = getAgentProfileAuthority() === "custom";
+	const selectedAgentDir = options.agentDir || settingsAgentDir;
+	const selectedProfileAuthority =
+		options.profileAuthority ??
+		(selectedAgentDir && path.resolve(selectedAgentDir) !== path.resolve(getAgentDir())
+			? "custom"
+			: customProcessProfile
+				? "custom"
+				: "default");
 	return await loadCapabilityWithContext(
 		capabilityId,
 		{
 			...options,
 			agentDir: options.agentDir || settingsAgentDir || getAgentDir(),
 			userAgentDirExplicit: options.agentDir !== undefined || settingsAgentDir !== undefined || customProcessProfile,
-			profileAuthority: options.profileAuthority ?? (customProcessProfile ? "custom" : "default"),
+			profileAuthority: selectedProfileAuthority,
 		},
 		getTrustedHomeDir(),
 	);
