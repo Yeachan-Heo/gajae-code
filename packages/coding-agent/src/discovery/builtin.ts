@@ -41,9 +41,6 @@ const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
 
-function getUserAgentDirs(): string[] {
-	return [PATHS.userAgent];
-}
 /**
  * Absolute user-scope directories for native loaders. An explicit
  * `ctx.userAgentDir` — `loadCapability` always sets one, and
