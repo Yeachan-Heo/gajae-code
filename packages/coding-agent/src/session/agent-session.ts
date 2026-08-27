@@ -5052,13 +5052,14 @@ export class AgentSession {
 		target: string,
 		options: { scope?: "any" | "descendant" } = {},
 	): Promise<{ from: string; to: string }> {
+		const enforceOneShot = options.scope !== "any";
 		const participant = this.#rescopeSessionCwdParticipant;
 		if (!participant) {
 			throw new Error(
 				"This session cannot rescope its working directory; only top-level unrestrained sessions can move.",
 			);
 		}
-		if (this.#rescopeSessionCwdConsumed) {
+		if (enforceOneShot && this.#rescopeSessionCwdConsumed) {
 			throw new Error("This session has already been rescoped; only one agent-invoked move is allowed per session.");
 		}
 		if (this.getEffectiveActiveWorkflowSkillState()) {
@@ -5066,7 +5067,7 @@ export class AgentSession {
 		}
 		participant.assertCanRescope?.();
 		return this.sessionManager.runExclusiveCwdTransition(async () => {
-			if (this.#rescopeSessionCwdConsumed) {
+			if (enforceOneShot && this.#rescopeSessionCwdConsumed) {
 				throw new Error(
 					"This session has already been rescoped; only one agent-invoked move is allowed per session.",
 				);
@@ -5207,13 +5208,13 @@ export class AgentSession {
 					// SessionManager can publish the durable move before a later metadata
 					// write fails. Treat that state as committed rather than reporting a
 					// rejection after the session has moved.
-					this.#rescopeSessionCwdConsumed = true;
+					if (enforceOneShot) this.#rescopeSessionCwdConsumed = true;
 					logger.warn("Session rescope committed before finalization failed", {
 						error: error instanceof Error ? error.message : String(error),
 						cwd: committedCwd,
 					});
 				}
-				this.#rescopeSessionCwdConsumed = true;
+				if (enforceOneShot) this.#rescopeSessionCwdConsumed = true;
 				if (ownsProcessCwd) {
 					try {
 						await shutdownAllLspClients();
