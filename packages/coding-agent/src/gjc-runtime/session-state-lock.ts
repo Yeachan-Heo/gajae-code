@@ -283,6 +283,7 @@ function validLockOwner(value: unknown): value is SessionStateLockOwner {
 }
 
 let ownerHostIdPromise: Promise<string> | undefined;
+let ownerHostIdLoader: (() => Promise<string>) | undefined;
 let legacyOwnerHostIdPromise: Promise<string> | undefined;
 
 async function currentOwnerHostId(): Promise<string> {
@@ -291,8 +292,12 @@ async function currentOwnerHostId(): Promise<string> {
 		if (SessionStateLockTestHooks.ownerHostId) {
 			hostId = await SessionStateLockTestHooks.ownerHostId();
 		} else {
-			const promise =
-				ownerHostIdPromise ?? (SessionStateLockTestHooks.loadInstallationHostId ?? loadInstallationHostId)();
+			const loader = SessionStateLockTestHooks.loadInstallationHostId ?? loadInstallationHostId;
+			if (ownerHostIdLoader !== loader) {
+				ownerHostIdLoader = loader;
+				ownerHostIdPromise = undefined;
+			}
+			const promise = ownerHostIdPromise ?? loader();
 			ownerHostIdPromise = promise;
 			try {
 				hostId = await promise;
