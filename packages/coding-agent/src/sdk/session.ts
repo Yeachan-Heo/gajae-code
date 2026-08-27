@@ -2218,6 +2218,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let publishOwnedConventionalMcpTools = false;
 		let syncConventionalToolsForManager: ((tools: CustomTool[]) => Promise<void>) | undefined;
 		let replacementMcpToolsSync: Promise<void> = Promise.resolve();
+		let replacementMcpGeneration = 0;
 		let ownedPluginServersConnected = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const stagedMcpCleanup = new Map<MCPManager, () => void>();
@@ -2246,6 +2247,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		const rebindCwdCapturingAuthority = async (to: string): Promise<void> => {
 			if (!session) return;
+			const generation = ++replacementMcpGeneration;
+			let replacementReady = false;
+			let pendingReplacementTools: CustomTool[] | undefined;
 			if (options.mcpManager && !ownsMcpManager) {
 				throw new Error(
 					"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
@@ -2304,8 +2308,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						nextManager.setAuthStorage(authStorage);
 						wireMcpManagerCallbacks(nextManager);
 						nextManager.setOnToolsChanged(tools => {
+							if (generation !== replacementMcpGeneration) return;
+							if (!replacementReady) {
+								pendingReplacementTools = tools as CustomTool[];
+								return;
+							}
 							replacementMcpToolsSync = replacementMcpToolsSync
-								.then(() => session.refreshMCPTools(tools as CustomTool[]))
+								.then(() => {
+									if (generation !== replacementMcpGeneration) return;
+									return session.refreshMCPTools(tools as CustomTool[]);
+								})
 								.catch(error => {
 									logger.warn("Failed to refresh relocated MCP tools", { error: safeErrorForLog(error) });
 								});
@@ -2356,6 +2368,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				ownsMcpManager = Boolean(nextManager);
 				await session.replaceOwnedMcpManager(nextManager);
 				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[]);
+				replacementReady = true;
+				if (pendingReplacementTools) {
+					const pending = pendingReplacementTools;
+					pendingReplacementTools = undefined;
+					replacementMcpToolsSync = replacementMcpToolsSync
+						.then(() => {
+							if (generation !== replacementMcpGeneration) return;
+							return session.refreshMCPTools(pending);
+						})
+						.catch(error => {
+							logger.warn("Failed to refresh relocated MCP tools", { error: safeErrorForLog(error) });
+						});
+				}
 				if (nextManager) {
 					stagedMcpCleanup.get(nextManager)?.();
 					stagedMcpCleanup.delete(nextManager);
