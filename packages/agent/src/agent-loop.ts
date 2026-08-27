@@ -4867,21 +4867,21 @@ async function executeToolCalls(
 		stream.push({ type: "message_start", message: toolResultMessage, scope });
 		stream.push({ type: "message_end", message: toolResultMessage, scope });
 	};
-	const hasInvalidEscapedCall = records.some(({ toolCall, tool, args }) => {
+	const isInvalidEscapedRecord = (record: (typeof records)[number]): boolean => {
+		if (record.toolCall.incompleteArguments === true) return true;
 		const guarded =
-			toolCall.escapedNonAsciiArguments === true || toolCall.escapedUnicodeArgumentEvidence !== undefined;
+			record.toolCall.escapedNonAsciiArguments === true ||
+			record.toolCall.escapedUnicodeArgumentEvidence !== undefined;
 		if (!guarded) return false;
 		return !(
-			isDisplaySafeEscapedArguments(tool, args) &&
-			isDisplaySafeRawEscapeEvidence(tool, args, toolCall.escapedUnicodeArgumentEvidence)
+			isDisplaySafeEscapedArguments(record.tool, record.args) &&
+			isDisplaySafeRawEscapeEvidence(record.tool, record.args, record.toolCall.escapedUnicodeArgumentEvidence)
 		);
-	});
+	};
+	const hasInvalidEscapedCall = records.some(isInvalidEscapedRecord);
 	if (hasInvalidEscapedCall) {
 		for (const record of records) {
-			const guarded =
-				record.toolCall.escapedNonAsciiArguments === true ||
-				record.toolCall.escapedUnicodeArgumentEvidence !== undefined;
-			if (guarded) continue;
+			if (isInvalidEscapedRecord(record)) continue;
 			record.skipped = true;
 			emitToolResult(record, createSkippedToolResult(), true);
 		}
