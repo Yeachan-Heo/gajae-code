@@ -21,6 +21,7 @@ use std::{
 	},
 	path::{Component, Path},
 	sync::atomic::{AtomicU64, Ordering},
+	time::{SystemTime, UNIX_EPOCH},
 };
 
 use napi::bindgen_prelude::Uint8Array;
@@ -810,6 +811,12 @@ pub struct RecoveryFsResult {
 	pub durability_state: Option<String>,
 }
 
+#[napi(object)]
+pub struct RecoveryFsRemnantReapResult {
+	pub reaped:   u32,
+	pub failures: u32,
+}
+
 /// Fail-closed outcome for a removal whose detached object remains retained.
 /// `recovery_path` identifies evidence only; it grants no authority to replay
 /// or delete the retained object.
@@ -1383,6 +1390,130 @@ impl RecoveryFsRoot {
 		}
 		#[cfg(not(target_os = "linux"))]
 		RecoveryFsResult::failure("unsupported_platform")
+	}
+
+	/// Reap aged zero-byte write-protocol remnants through the retained recovery
+	/// directory descriptor. The descriptor keeps nested-store cleanup bound to
+	/// the authority captured when this root was retained; no mutable pathname
+	/// walk is used for the recovery namespace. The caller separately scans the
+	/// current managed root through its existing expected-identity path.
+	#[napi]
+	pub fn reap_scrubbed_protocol_remnants(&self, min_age_ms: i64) -> RecoveryFsRemnantReapResult {
+		#[cfg(target_os = "linux")]
+		{
+			const PREFIXES: [&[u8]; 6] = [
+				b".gjc-exact-unlink-placeholder-",
+				b".gjc-exact-replace-destination-",
+				b".gjc-receipt-remove-",
+				b".gjc-receipt-placeholder-remove-",
+				b".gjc-replace-retry-",
+				b".gjc-managed-exchange-",
+			];
+			let root_guard = self.root.lock();
+			let Some(root) = root_guard.as_ref() else {
+				return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 };
+			};
+			let recovery_guard = self.recovery.lock();
+			let recovery = match recovery_guard.as_ref() {
+				Some(recovery) => match recovery.try_clone() {
+					Ok(recovery) => recovery,
+					Err(_) => return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 },
+				},
+				None => match recovery_directory(root, None) {
+					Ok(recovery) => recovery,
+					Err(_) => return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 },
+				},
+			};
+			let Ok(_mutation_lock) = lock_managed_mutation(&recovery) else {
+				return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 };
+			};
+			let cutoff_ns = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map_or(0, |duration| {
+					i128::from(duration.as_secs()) * 1_000_000_000 + i128::from(duration.subsec_nanos())
+				})
+				.saturating_sub(i128::from(min_age_ms.max(0)) * 1_000_000);
+			let mut result = RecoveryFsRemnantReapResult { reaped: 0, failures: 0 };
+			let mut reap_directory = |directory: &File, label: &str| {
+				let Ok(names) = tree_names(directory.as_raw_fd()) else {
+					result.failures += 1;
+					return;
+				};
+				for bytes in names {
+					if !PREFIXES.iter().any(|prefix| bytes.starts_with(prefix)) {
+						continue;
+					}
+					let Ok(name) = CString::new(bytes) else {
+						result.failures += 1;
+						continue;
+					};
+					// SAFETY: zero is a valid initialized representation for libc::stat.
+					let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+					// SAFETY: the retained directory descriptor and NUL-terminated entry name
+					// remain live for the duration of this metadata query.
+					if unsafe {
+						libc::fstatat(
+							directory.as_raw_fd(),
+							name.as_ptr(),
+							&mut stat,
+							libc::AT_SYMLINK_NOFOLLOW,
+						)
+					} != 0
+					{
+						if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+							result.failures += 1;
+						}
+						continue;
+					}
+					if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+						|| stat.st_nlink != 1
+						|| stat.st_size != 0
+						|| stat_mtime_ns(&stat) > cutoff_ns
+					{
+						continue;
+					}
+					let path = Path::new(label).join(name.to_string_lossy().as_ref());
+					let quarantine = CString::new(format!(
+						".gjc-remnant-{}-{}",
+						std::process::id(),
+						MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed),
+					))
+					.expect("generated quarantine name contains no NUL");
+					let removed = crate::path_identity::platform::exact_unlink_empty_regular_at(
+						directory.as_raw_fd(),
+						name.clone(),
+						&path,
+						quarantine,
+						stat.st_dev as u64,
+						stat.st_ino as u64,
+						stat_mtime_ns(&stat),
+					);
+					// SAFETY: the retained directory descriptor and NUL-terminated entry name
+					// remain live while checking whether the cleanup target disappeared.
+					let target_gone = unsafe {
+						libc::fstatat(
+							directory.as_raw_fd(),
+							name.as_ptr(),
+							&mut stat,
+							libc::AT_SYMLINK_NOFOLLOW,
+						)
+					} != 0 && std::io::Error::last_os_error().raw_os_error()
+						== Some(libc::ENOENT);
+					if removed.ok || target_gone {
+						result.reaped += 1;
+					} else if removed.code.as_deref() != Some("not_found") {
+						result.failures += 1;
+					}
+				}
+			};
+			reap_directory(&recovery, ".gjc-recovery");
+			result
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			let _ = min_age_ms;
+			RecoveryFsRemnantReapResult { reaped: 0, failures: 0 }
+		}
 	}
 
 	/// Derive a retained child-directory capability from this root and exact

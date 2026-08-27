@@ -201,17 +201,20 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 		});
 	});
 
-	it("reaps bound recovery debris when the store root identity is supplied", async () => {
+	it("reaps bound recovery debris through retained native authority", async () => {
 		await withTempDir("gjc-bound-recovery-reap-", async dir => {
 			const recovery = path.join(dir, ".gjc-recovery");
 			await fsp.mkdir(recovery, { mode: 0o700 });
 			const aged = await seedRemnant(recovery, ".gjc-replace-retry-bound", 60 * 60 * 1000);
-			const root = await fsp.lstat(dir, { bigint: true });
+			const authority = native.openRecoveryFsRoot(dir);
+			try {
+				const result = authority.reapScrubbedProtocolRemnants(0);
 
-			const result = await reapScrubbedProtocolRemnants(dir, 0, { dev: root.dev, ino: root.ino });
-
-			expect(result).toEqual({ reaped: 1, failures: 0 });
-			expect(fs.existsSync(aged)).toBe(false);
+				expect(result).toEqual({ reaped: 1, failures: 0 });
+				expect(fs.existsSync(aged)).toBe(false);
+			} finally {
+				authority.close();
+			}
 		});
 	});
 

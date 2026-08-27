@@ -3786,6 +3786,32 @@ pub(crate) mod platform {
 		result
 	}
 
+	pub fn exact_unlink_empty_regular_at(
+		parent_fd: libc::c_int,
+		name: CString,
+		path: &Path,
+		quarantine_name: CString,
+		dev: u64,
+		ino: u64,
+		mtime_ns: i128,
+	) -> NativeExactUnlinkResult {
+		let identity = ExactFileIdentity {
+			dev,
+			ino,
+			nlink: Some(1),
+			parent_dev: None,
+			parent_ino: None,
+			size: 0,
+			mtime_ns: i64::try_from(mtime_ns).unwrap_or(i64::MAX),
+			directory: false,
+			detach_only: false,
+			quarantine_name: quarantine_name.into_string().ok(),
+			sha256: Some(sha256(b"")),
+			allow_hard_link: false,
+		};
+		exact_unlink_at(parent_fd, name, path, &identity)
+	}
+
 	/// Remove one regular file without invoking the exchange protocol. The
 	/// caller supplies a private, single-component quarantine name; the
 	/// no-replace rename is the mutation boundary that detaches whichever entry

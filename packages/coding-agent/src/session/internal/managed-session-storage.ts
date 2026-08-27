@@ -637,7 +637,7 @@ function approvedRemnantDirectoriesSync(
 } {
 	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
-	const approve = (candidate: string): boolean => {
+	const approve = (candidate: string): void => {
 		try {
 			const named = fs.lstatSync(candidate, { bigint: true });
 			if (
@@ -648,14 +648,12 @@ function approvedRemnantDirectoriesSync(
 					(named.dev === expectedRoot.dev && named.ino === expectedRoot.ino))
 			)
 				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
-			return directories.some(entry => entry.path === candidate);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
-			return false;
 		}
 	};
-	const rootApproved = approve(directory);
-	if (rootApproved) approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
+	approve(directory);
+	if (expectedRoot === undefined) approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
@@ -665,7 +663,7 @@ async function approvedRemnantDirectories(
 ): Promise<{ directories: ApprovedRemnantDirectory[]; failures: number }> {
 	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
-	const approve = async (candidate: string): Promise<boolean> => {
+	const approve = async (candidate: string): Promise<void> => {
 		try {
 			const named = await fsp.lstat(candidate, { bigint: true });
 			if (
@@ -676,14 +674,12 @@ async function approvedRemnantDirectories(
 					(named.dev === expectedRoot.dev && named.ino === expectedRoot.ino))
 			)
 				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
-			return directories.some(entry => entry.path === candidate);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
-			return false;
 		}
 	};
-	const rootApproved = await approve(directory);
-	if (rootApproved) await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
+	await approve(directory);
+	if (expectedRoot === undefined) await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
@@ -1665,6 +1661,29 @@ export class ManagedSessionDescendantStore {
 		if (this.#remnantReapInFlight || now - this.#lastRemnantReapAttempt < SCRUBBED_REMNANT_REAP_INTERVAL_MS) return;
 		this.#lastRemnantReapAttempt = now;
 		this.#remnantReapInFlight = true;
+		const authority = this.#authority;
+		if (authority) {
+			void Promise.resolve()
+				.then(async () => {
+					const [nativeResult, pathResult] = await Promise.all([
+						Promise.resolve(authority.reapScrubbedProtocolRemnants(SCRUBBED_REMNANT_MIN_AGE_MS)),
+						reapScrubbedProtocolRemnants(this.#baseDir, SCRUBBED_REMNANT_MIN_AGE_MS, this.#subtreeRoot),
+					]);
+					const failures = nativeResult.failures + pathResult.failures;
+					if (failures > 0)
+						logger.warn("Managed session remnant reaping completed with failures", {
+							failureCount: failures,
+							reapedCount: nativeResult.reaped + pathResult.reaped,
+						});
+				})
+				.catch((error: unknown) => {
+					logger.warn("Managed session remnant reaping failed", { error: String(error) });
+				})
+				.finally(() => {
+					this.#remnantReapInFlight = false;
+				});
+			return;
+		}
 		void reapScrubbedProtocolRemnants(this.#baseDir, SCRUBBED_REMNANT_MIN_AGE_MS, this.#subtreeRoot)
 			.catch((error: unknown) => {
 				logger.warn("Managed session remnant reaping failed", { error: String(error) });

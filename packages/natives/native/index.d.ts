@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Long-lived macOS appearance observer.
  *
@@ -403,6 +402,14 @@ export declare class RecoveryFsFile {
 export declare class RecoveryFsRoot {
   /** Return the stable identity of the retained root descriptor. */
   identity(): RecoveryFsResult
+  /**
+   * Reap aged zero-byte write-protocol remnants through the retained recovery
+   * directory descriptor. The descriptor keeps nested-store cleanup bound to
+   * the authority captured when this root was retained; no mutable pathname
+   * walk is used for the recovery namespace. The caller separately scans the
+   * current managed root through its existing expected-identity path.
+   */
+  reapScrubbedProtocolRemnants(minAgeMs: number): RecoveryFsRemnantReapResult
   /**
    * Derive a retained child-directory capability from this root and exact
    * identity evidence.
@@ -2139,6 +2146,11 @@ export interface RecoveryFsPublishSyncFailure {
   parentRole: string
   osCode?: number
   kind: string
+}
+
+export interface RecoveryFsRemnantReapResult {
+  reaped: number
+  failures: number
 }
 
 export interface RecoveryFsResult {
