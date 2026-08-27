@@ -15492,11 +15492,19 @@ export class SessionManager {
 						this.#writeEntriesAtomicallySync(persistedEntries);
 					}
 				} catch (error) {
-					transition.dispose();
 					if (error instanceof ManagedCommittedMutationError && error.operation === "append") {
 						this.#managedPersistExpectedIdentity = error.identity;
 						this.#needsFullRewriteOnNextPersist = true;
-						if (!error.identity) this.#recordPersistError(error);
+						if (error.identity) {
+							this.#commitResidentTextStoreTransition(transition, false);
+							this.#flushed = true;
+							this.#ensuredOnDisk = true;
+						} else {
+							transition.dispose();
+							this.#recordPersistError(error);
+						}
+					} else {
+						transition.dispose();
 					}
 					return { kind: "unknown", error: toError(error) };
 				}
