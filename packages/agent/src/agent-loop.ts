@@ -403,13 +403,19 @@ export const ESCAPED_NONASCII_RECOVERY_PROMPT = escapedNonAsciiRecoveryPrompt;
 const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
-function escapedToolCallMetadata(block: Extract<AssistantMessage["content"][number], { type: "toolCall" }>): {
+interface EscapedToolCallMetadata {
 	guarded: boolean;
 	malformed: boolean;
 	evidence: UnicodeEscapeEvidence | undefined;
 	incompleteArguments: boolean;
 	incompleteArgumentsReason: unknown;
-} {
+}
+
+const acceptedToolCallMetadata = new WeakMap<object, EscapedToolCallMetadata>();
+
+function escapedToolCallMetadata(
+	block: Extract<AssistantMessage["content"][number], { type: "toolCall" }>,
+): EscapedToolCallMetadata {
 	const guardRead = managedOwnPropertyRead(block, "escapedNonAsciiArguments");
 	const evidenceRead = managedOwnPropertyRead(block, "escapedUnicodeArgumentEvidence");
 	const incompleteRead = managedPropertyRead(block, "incompleteArguments");
@@ -2267,12 +2273,21 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const thoughtSignature = managedProperty(value, "thoughtSignature");
 	const intent = managedProperty(value, "intent");
 	const customWireName = managedProperty(value, "customWireName");
-	const incompleteArguments = managedProperty(value, "incompleteArguments");
-	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
+	const incompleteArgumentsRead = managedPropertyRead(value, "incompleteArguments");
+	const incompleteArgumentsReasonRead = managedPropertyRead(value, "incompleteArgumentsReason");
 	const escapedGuardRead = managedOwnPropertyRead(value, "escapedNonAsciiArguments");
 	const evidenceRead = managedOwnPropertyRead(value, "escapedUnicodeArgumentEvidence");
 	const inheritedGuard = managedInheritedProperty(value, "escapedNonAsciiArguments");
 	const inheritedEvidence = managedInheritedProperty(value, "escapedUnicodeArgumentEvidence");
+	const inheritedIncompleteArguments = managedInheritedProperty(value, "incompleteArguments");
+	const inheritedIncompleteArgumentsReason = managedInheritedProperty(value, "incompleteArgumentsReason");
+	const incompleteMetadataMalformed =
+		!incompleteArgumentsRead.ok ||
+		!incompleteArgumentsReasonRead.ok ||
+		inheritedIncompleteArguments ||
+		inheritedIncompleteArgumentsReason;
+	const incompleteArguments = incompleteArgumentsRead.value;
+	const incompleteArgumentsReason = incompleteArgumentsReasonRead.value;
 	const escapedNonAsciiArguments = escapedGuardRead.value;
 	const rawEscapedUnicodeArgumentEvidence = evidenceRead.value;
 	let escapedUnicodeArgumentEvidence: UnicodeEscapeEvidence | undefined;
@@ -2289,7 +2304,8 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 				escapedUnicodeArgumentEvidence.malformed)) ||
 		!escapedGuardRead.ok ||
 		inheritedGuard ||
-		inheritedEvidence;
+		inheritedEvidence ||
+		incompleteMetadataMalformed;
 	const escapedArgumentsGuarded =
 		invalidEscapedUnicodeEvidence ||
 		(escapedGuardRead.present && escapedGuardRead.ok && escapedNonAsciiArguments === true) ||
@@ -2736,7 +2752,31 @@ class ManagedAttemptTransaction {
 	}
 
 	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
-		return this.#assistantSnapshot(message);
+		const sourceMetadata = message.content.map(block =>
+			block?.type === "toolCall" ? escapedToolCallMetadata(block) : undefined,
+		);
+		const snapshot = this.#assistantSnapshot(message);
+		if (snapshot.role !== "assistant") return snapshot;
+		for (let index = 0; index < message.content.length; index += 1) {
+			const sourceBlock = message.content[index];
+			const snapshotBlock = snapshot.content[index];
+			if (sourceBlock?.type !== "toolCall" || snapshotBlock?.type !== "toolCall") continue;
+			const metadata = sourceMetadata[index];
+			if (metadata) {
+				if (metadata.malformed) {
+					const marked = {
+						...snapshotBlock,
+						incompleteArguments: true,
+						incompleteArgumentsReason: "malformed" as const,
+					};
+					snapshot.content[index] = marked;
+					acceptedToolCallMetadata.set(marked, metadata);
+				} else {
+					acceptedToolCallMetadata.set(snapshotBlock, metadata);
+				}
+			}
+		}
+		return snapshot;
 	}
 
 	discard(): void {
@@ -4906,7 +4946,7 @@ async function executeToolCalls(
 	let steeringCheck: Promise<void> | null = null;
 
 	const records = toolCalls.map(toolCall => {
-		const metadata = escapedToolCallMetadata(toolCall);
+		const metadata = acceptedToolCallMetadata.get(toolCall) ?? escapedToolCallMetadata(toolCall);
 		return {
 			toolCall: stripToolCallEvidence(toolCall),
 			metadata,
