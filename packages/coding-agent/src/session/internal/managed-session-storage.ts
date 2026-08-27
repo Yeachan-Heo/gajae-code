@@ -637,7 +637,7 @@ function approvedRemnantDirectoriesSync(
 } {
 	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
-	const approve = (candidate: string): void => {
+	const approve = (candidate: string): boolean => {
 		try {
 			const named = fs.lstatSync(candidate, { bigint: true });
 			if (
@@ -648,12 +648,14 @@ function approvedRemnantDirectoriesSync(
 					(named.dev === expectedRoot.dev && named.ino === expectedRoot.ino))
 			)
 				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
+			return directories.some(entry => entry.path === candidate);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
+			return false;
 		}
 	};
-	approve(directory);
-	if (expectedRoot === undefined) approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
+	const rootApproved = approve(directory);
+	if (rootApproved) approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
@@ -663,7 +665,7 @@ async function approvedRemnantDirectories(
 ): Promise<{ directories: ApprovedRemnantDirectory[]; failures: number }> {
 	const directories: ApprovedRemnantDirectory[] = [];
 	let failures = 0;
-	const approve = async (candidate: string): Promise<void> => {
+	const approve = async (candidate: string): Promise<boolean> => {
 		try {
 			const named = await fsp.lstat(candidate, { bigint: true });
 			if (
@@ -674,12 +676,14 @@ async function approvedRemnantDirectories(
 					(named.dev === expectedRoot.dev && named.ino === expectedRoot.ino))
 			)
 				directories.push({ path: candidate, dev: named.dev, ino: named.ino });
+			return directories.some(entry => entry.path === candidate);
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
+			return false;
 		}
 	};
-	await approve(directory);
-	if (expectedRoot === undefined) await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
+	const rootApproved = await approve(directory);
+	if (rootApproved) await approve(path.join(directory, MANAGED_RECOVERY_DIRECTORY));
 	return { directories, failures };
 }
 
