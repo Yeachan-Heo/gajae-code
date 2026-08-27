@@ -20,6 +20,7 @@ const DELIVERY_PREVIEW_HEAD_BYTES = 32 * 1024;
 const DELIVERY_PREVIEW_TAIL_BYTES = 32 * 1024;
 const DELIVERY_MAX_ATTEMPTS = 3;
 const MAX_DEAD_LETTERED_DELIVERIES = 50;
+const MAX_DEAD_LETTER_OVERFLOW_OWNERS = 64;
 const MAX_EVICTED_DEAD_LETTERS = 64;
 
 export interface AsyncJob {
@@ -45,6 +46,8 @@ export interface AsyncJob {
 	setupFailureSummary?: string;
 	/** Safe, bounded summary of a terminal local (non-provider) failure kind. */
 	localErrorSummary?: LocalErrorSummary;
+	/** Compact delivery-failure marker retained while the job row remains live. */
+	deliveryFailure?: { attempt: number; lastError?: string };
 	metadata?: AsyncJobMetadata;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "0-Main",
@@ -2250,6 +2253,9 @@ export class AsyncJobManager {
 		for (const entry of this.#evictedDeadLetters.values()) {
 			failedVisible.add(`${entry.jobId}:${entry.generation}`);
 		}
+		for (const job of this.#jobs.values()) {
+			if (job.deliveryFailure) failedVisible.add(`${job.id}:${job.generation}`);
+		}
 
 		const jobs = this.#filterJobs(this.#jobs.values(), filter).map<AsyncJobSnapshotEntry>(job => {
 			const key = `${job.id}:${job.generation}`;
@@ -2738,19 +2744,27 @@ export class AsyncJobManager {
 		this.#purgeTerminalSubagentStateForJob(jobId);
 		const job = this.#jobs.get(jobId);
 		const deadLetter = this.#deadLetteredDeliveries.get(jobId);
-		if (job && deadLetter && deadLetter.generation === job.generation) {
-			this.#evictedDeadLetters.set(deadLetter.generation, {
-				jobId: deadLetter.jobId,
-				generation: deadLetter.generation,
-				ownerId: this.#deadLetteredDeliveryOwners.get(jobId),
+		const failure =
+			job?.deliveryFailure && (!deadLetter || deadLetter.generation === job.generation)
+				? job.deliveryFailure
+				: deadLetter && job?.generation === deadLetter.generation
+					? deadLetter
+					: undefined;
+		if (job && failure) {
+			this.#evictedDeadLetters.set(job.generation, {
+				jobId: job.id,
+				generation: job.generation,
+				ownerId: this.#deadLetteredDeliveryOwners.get(jobId) ?? job.ownerId,
 				backgrounded: job.metadata?.backgrounded === true,
-				attempt: deadLetter.attempt,
-				lastError: deadLetter.lastError,
+				attempt: failure.attempt,
+				lastError: failure.lastError,
 				recordedAt: Date.now(),
 			});
 			while (this.#evictedDeadLetters.size > MAX_EVICTED_DEAD_LETTERS) {
 				const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
 				if (oldestGeneration === undefined) break;
+				const oldest = this.#evictedDeadLetters.get(oldestGeneration);
+				if (oldest) this.#recordDeadLetterOverflow(oldest.ownerId);
 				this.#evictedDeadLetters.delete(oldestGeneration);
 			}
 		}
@@ -2909,11 +2923,7 @@ export class AsyncJobManager {
 			const oldestGeneration = this.#evictedDeadLetters.keys().next().value;
 			if (oldestGeneration === undefined) return;
 			const oldest = this.#evictedDeadLetters.get(oldestGeneration);
-			if (oldest)
-				this.#deadLetterOverflowByOwner.set(
-					oldest.ownerId,
-					(this.#deadLetterOverflowByOwner.get(oldest.ownerId) ?? 0) + 1,
-				);
+			if (oldest) this.#recordDeadLetterOverflow(oldest.ownerId);
 			this.#evictedDeadLetters.delete(oldestGeneration);
 		}
 	}
@@ -2922,6 +2932,7 @@ export class AsyncJobManager {
 		this.#pruneEvictedDeadLetters();
 		const currentJob = this.#jobs.get(delivery.jobId);
 		if (!currentJob || currentJob.generation !== delivery.generation) return;
+		currentJob.deliveryFailure = { attempt: delivery.attempt, lastError: delivery.lastError };
 		this.#deadLetteredDeliveries.delete(delivery.jobId);
 		this.#deadLetteredDeliveryOwners.delete(delivery.jobId);
 		this.#deadLetteredDeliveries.set(delivery.jobId, {
@@ -2941,11 +2952,20 @@ export class AsyncJobManager {
 			const oldestJobId = this.#deadLetteredDeliveries.keys().next().value;
 			if (oldestJobId === undefined) return;
 			const oldestOwner = this.#deadLetteredDeliveryOwners.get(oldestJobId);
-			this.#deadLetterOverflowByOwner.set(oldestOwner, (this.#deadLetterOverflowByOwner.get(oldestOwner) ?? 0) + 1);
+			this.#recordDeadLetterOverflow(oldestOwner);
 			this.#deadLetteredDeliveries.delete(oldestJobId);
 			this.#deadLetteredDeliveryOwners.delete(oldestJobId);
 		}
 		this.#notifyChange();
+	}
+
+	#recordDeadLetterOverflow(ownerId: string | undefined): void {
+		const key =
+			this.#deadLetterOverflowByOwner.has(ownerId) ||
+			this.#deadLetterOverflowByOwner.size < MAX_DEAD_LETTER_OVERFLOW_OWNERS
+				? ownerId
+				: undefined;
+		this.#deadLetterOverflowByOwner.set(key, (this.#deadLetterOverflowByOwner.get(key) ?? 0) + 1);
 	}
 
 	#recordDeadLetterOrEvicted(delivery: AsyncJobDelivery): void {

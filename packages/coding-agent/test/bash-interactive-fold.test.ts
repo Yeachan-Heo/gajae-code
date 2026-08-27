@@ -89,6 +89,7 @@ describe("interactive PTY fold ownership", () => {
 		try {
 			await Settings.init({ inMemory: true, cwd: dir });
 			const artifactPath = path.join(dir, "folded.log");
+			const controller = new AbortController();
 			let controls: InteractivePtyControls | undefined;
 
 			const result = await runInteractiveBashPty(createTestUi(), {
@@ -97,11 +98,14 @@ describe("interactive PTY fold ownership", () => {
 				timeoutMs: 20_000,
 				artifactPath,
 				artifactId: "folded",
+				signal: controller.signal,
 				// Force every chunk to spill so the artifact proves continuity.
 				spillThreshold: 1,
 				onControls: next => {
 					controls = next;
 					next.detachObserver(FOLD_RESULT);
+					next.detachForegroundCancellation();
+					controller.abort();
 				},
 			});
 

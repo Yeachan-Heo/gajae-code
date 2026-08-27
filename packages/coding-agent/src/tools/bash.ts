@@ -37,6 +37,7 @@ import {
 import {
 	lookupOwnedRegistration,
 	registerOwnedIfLineaged,
+	resolveToolLineage,
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
 
@@ -1500,6 +1501,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				label: job.label,
 				cwdSensitive: true,
 				signal,
+				originatingTurn: resolveToolLineage(toolCallId, AsyncJobManager.endpointIdOf(ownedManager)) !== undefined,
 				outputRef: {
 					jobId: job.jobId,
 					generation: jobGeneration,
@@ -2096,6 +2098,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			registerOwnedIfLineaged(bridgeManager, toolCallId, bridgeJobId, bridgeEndpointId);
 
 			const bridgeFoldRequest = Promise.withResolvers<void>();
+			const bridgeOriginatingTurn =
+				resolveToolLineage(toolCallId, AsyncJobManager.endpointIdOf(bridgeManager)) !== undefined;
 			const unregisterBridgeFold = this.session.registerForegroundFoldParticipant?.({
 				kind: "client-terminal",
 				jobId: bridgeJobId,
@@ -2103,6 +2107,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				label: bridgeLabel,
 				cwdSensitive: true,
 				signal,
+				originatingTurn: bridgeOriginatingTurn,
 				outputRef: {
 					jobId: bridgeJobId,
 					generation: bridgeGeneration,
@@ -2298,6 +2303,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							label: ptyLabel,
 							cwdSensitive: true,
 							signal,
+							originatingTurn:
+								resolveToolLineage(toolCallId, AsyncJobManager.endpointIdOf(ptyManager)) !== undefined,
 							outputRef: {
 								jobId: ptyJobId,
 								generation: ptyGeneration,
@@ -2318,6 +2325,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 									interactiveResultFromText(this.#extractTextResult(started)),
 								);
 								if (outcome === "resolved") {
+									controls.detachForegroundCancellation();
 									ptyBackgrounded = true;
 									ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
 									ptyFoldResult = started;

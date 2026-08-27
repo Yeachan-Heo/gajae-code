@@ -88,6 +88,8 @@ export interface FoldAdapter {
 	readonly cwdSensitive: boolean;
 	/** Signal for the foreground wait; aborting capture must roll back the fold. */
 	readonly signal?: AbortSignal;
+	/** True only when the adapter was created by a model-owned Agent turn. */
+	readonly originatingTurn?: boolean;
 	readonly outputRef: JobOutputRetrieval;
 	/** Registration-bound resolver: the job for this adapter, or undefined once evicted or reused. */
 	readonly getJob: () => AsyncJob | undefined;
@@ -241,7 +243,7 @@ export class FoldCoordinator {
 		// S3 claim + reserve, S4 hand-off is the reservation itself, S5 arm the fence.
 		this.#folding.add(job);
 		this.#slots.set(job, { state: "reserved", adapter, parked: undefined, parkedAt: undefined });
-		const fencesOriginatingTurn = this.#deps.hasActiveTurn?.() ?? true;
+		const fencesOriginatingTurn = adapter.originatingTurn ?? this.#deps.hasActiveTurn?.() ?? true;
 		const releaseFence = fencesOriginatingTurn ? this.#deps.armSteeringFence() : () => {};
 
 		let remainingIntent: string | undefined;

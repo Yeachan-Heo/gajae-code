@@ -29,7 +29,11 @@ interface AdapterProbe {
 	settleOutcome: ForegroundSettleOutcome;
 }
 
-function adapterFor(target: AsyncJob, settleOutcome: ForegroundSettleOutcome = "resolved"): AdapterProbe {
+function adapterFor(
+	target: AsyncJob,
+	settleOutcome: ForegroundSettleOutcome = "resolved",
+	originatingTurn?: boolean,
+): AdapterProbe {
 	const detached: FoldReceipt[] = [];
 	const handedBack: ForegroundTerminalPayload[] = [];
 	const probe: AdapterProbe = {
@@ -42,6 +46,7 @@ function adapterFor(target: AsyncJob, settleOutcome: ForegroundSettleOutcome = "
 			jobGeneration: target.generation,
 			label: target.label,
 			cwdSensitive: true,
+			originatingTurn,
 			outputRef: {
 				jobId: target.id,
 				generation: target.generation,
@@ -93,6 +98,19 @@ function harness(captureRemainingIntent: () => Promise<string | undefined> | str
 }
 
 describe("FoldCoordinator", () => {
+	test("direct SDK folds do not arm or stop an unrelated Agent turn", async () => {
+		const state = harness(async () => "stale historical intent");
+		const target = job("direct-sdk", "generation-direct-sdk");
+		const probe = adapterFor(target, "resolved", false);
+		state.coordinator.registerParticipant(probe.adapter);
+
+		const result = await state.coordinator.requestFold();
+
+		expect(result.status).toBe("folded");
+		expect(state.fenceArmed).toBe(0);
+		expect(state.stops).toBe(0);
+		expect(probe.detached[0]?.remainingIntent).toBeUndefined();
+	});
 	test("folds a registered wait, arming the fence before capture and stopping after it", async () => {
 		let capturedWhileFenced = -1;
 		const h = harness(() => {

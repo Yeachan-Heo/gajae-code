@@ -319,6 +319,8 @@ export interface InteractivePtyControls {
 	terminalCompletion: Promise<BashInteractiveResult>;
 	/** Kill the owned process during owner teardown; the observer never calls this. */
 	kill: () => void;
+	/** Stop forwarding the foreground abort signal after ownership transfers on fold. */
+	detachForegroundCancellation: () => void;
 }
 
 export async function runInteractiveBashPty(
@@ -368,6 +370,10 @@ export async function runInteractiveBashPty(
 	};
 
 	const session = new PtySession();
+	const processAbortController = new AbortController();
+	const forwardForegroundAbort = () => processAbortController.abort();
+	if (options.signal?.aborted) processAbortController.abort();
+	else options.signal?.addEventListener("abort", forwardForegroundAbort, { once: true });
 	let observer: BashInteractiveOverlayComponent | undefined;
 	let settleForeground: ((result: BashInteractiveResult) => void) | undefined;
 	let settled = false;
@@ -398,6 +404,7 @@ export async function runInteractiveBashPty(
 				timedOut: run.timedOut,
 				...summary,
 			};
+			options.signal?.removeEventListener("abort", forwardForegroundAbort);
 			// Publish the real outcome BEFORE settling: a folded run's foreground is
 			// already gone, and this is the only path that can deliver its result.
 			terminal.resolve(outcome);
@@ -414,7 +421,7 @@ export async function runInteractiveBashPty(
 				cwd: options.cwd,
 				timeoutMs: options.timeoutMs,
 				env: { ...NON_INTERACTIVE_ENV, ...options.env },
-				signal: options.signal,
+				signal: processAbortController.signal,
 				cols: initialPtySize.cols,
 				rows: initialPtySize.rows,
 				shell: resolvedShell,
@@ -438,6 +445,9 @@ export async function runInteractiveBashPty(
 	options.onControls?.({
 		terminalCompletion: terminal.promise,
 		kill: () => session.kill(),
+		detachForegroundCancellation: () => {
+			options.signal?.removeEventListener("abort", forwardForegroundAbort);
+		},
 		detachObserver: (foldResult: BashInteractiveResult) => {
 			const outcome = settle(foldResult);
 			if (outcome === "resolved") observer = undefined;
