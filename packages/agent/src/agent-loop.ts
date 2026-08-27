@@ -2144,13 +2144,26 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 		const inheritedEvidence = matches.map(candidate =>
 			managedInheritedProperty(candidate, "escapedUnicodeArgumentEvidence"),
 		);
+		const guardReads = matches.map(candidate => managedOwnPropertyRead(candidate, "escapedNonAsciiArguments"));
+		const inheritedGuards = matches.map(candidate => managedInheritedProperty(candidate, "escapedNonAsciiArguments"));
 		if (matches.length !== 1) {
-			if (evidenceReads.some(read => read.present) || inheritedEvidence.some(Boolean)) {
+			if (
+				evidenceReads.some(read => read.present) ||
+				inheritedEvidence.some(Boolean) ||
+				guardReads.some(read => read.present) ||
+				inheritedGuards.some(Boolean)
+			) {
 				destination.incompleteArguments = true;
 				destination.incompleteArgumentsReason = "malformed";
 			}
 			continue;
 		}
+		const guardRead = guardReads[0]!;
+		if (!guardRead.ok || inheritedGuards[0]) {
+			destination.incompleteArguments = true;
+			destination.incompleteArgumentsReason = "malformed";
+		}
+		if (guardRead.ok && guardRead.present && guardRead.value === true) destination.escapedNonAsciiArguments = true;
 		const evidenceRead = evidenceReads[0]!;
 		if (!evidenceRead.present || !evidenceRead.ok || evidenceRead.value === undefined || inheritedEvidence[0]) {
 			if (evidenceRead.present || inheritedEvidence[0]) {
