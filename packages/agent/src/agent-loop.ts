@@ -4866,6 +4866,7 @@ async function executeToolCalls(
 	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
 		if (record.resultEmitted) return;
 		const { toolCall } = record;
+		delete toolCall.escapedUnicodeArgumentEvidence;
 		const eventFields =
 			record.eventFields ?? ({ toolCallId: toolCall.id, toolName: toolCall.name, intent: toolCall.intent } as const);
 		// A call that was skipped or aborted before dispatch still owes the stream a
