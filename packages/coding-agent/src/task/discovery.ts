@@ -10,7 +10,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentProfileAuthority, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { getAgentProfileAuthority, getConfigDirName, getTrustedHomeDir, logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
@@ -67,6 +67,10 @@ export async function discoverAgents(
 ): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
 	const resolvedAgentDir = agentDir ?? activeSettings?.getAgentDir();
+	const profileAuthority =
+		resolvedAgentDir && path.resolve(resolvedAgentDir) !== path.resolve(path.join(home, getConfigDirName(), "agent"))
+			? "custom"
+			: getAgentProfileAuthority();
 	const agentSources = Array.from(
 		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
 	);
@@ -101,12 +105,7 @@ export async function discoverAgents(
 
 	// Load agents from GJC marketplace plugins.
 	const { roots: pluginRoots } = isProviderEnabled("claude-plugins", activeSettings)
-		? await listClaudePluginRoots(
-				home,
-				resolvedCwd,
-				resolvedAgentDir,
-				agentDir ? "custom" : getAgentProfileAuthority(),
-			)
+		? await listClaudePluginRoots(home, resolvedCwd, resolvedAgentDir, profileAuthority)
 		: { roots: [] };
 	const nonGjcPluginRoots = [];
 	for (const plugin of pluginRoots) {
