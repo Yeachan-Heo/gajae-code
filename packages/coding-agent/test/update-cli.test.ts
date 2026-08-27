@@ -590,7 +590,11 @@ describe("update-cli managed notification recovery", () => {
 					path: runtimePath,
 				}),
 			});
-			expect(checksumCalls).toEqual([{ tag: release.tag, assetName: "gjc-linux-x64", filePath: target.path }]);
+			const osName = process.platform === "darwin" ? "darwin" : "linux";
+			const arch = process.arch === "arm64" ? "arm64" : "x64";
+			expect(checksumCalls).toEqual([
+				{ tag: release.tag, assetName: `gjc-${osName}-${arch}`, filePath: target.path },
+			]);
 			expect(result).toEqual({ ok: true, actual: release.version, path: target.path });
 		});
 
