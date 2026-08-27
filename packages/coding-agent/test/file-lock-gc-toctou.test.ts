@@ -122,6 +122,17 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		}
 	});
 
+	test("honors an already-aborted signal before creating lock parents", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "not-created", "state.json");
+		const reason = new Error("cancelled before acquisition");
+		const controller = new AbortController();
+		controller.abort(reason);
+
+		await expect(withFileLock(file, async () => undefined, { signal: controller.signal })).rejects.toBe(reason);
+		expect(await fs.exists(path.dirname(file))).toBe(false);
+	});
+
 	test("keeps process identity stable across caller locale and timezone", () => {
 		if (process.platform === "win32") return;
 		const original = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };

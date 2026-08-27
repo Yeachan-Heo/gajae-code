@@ -816,6 +816,7 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 	if (options.previousOwnerHostIds?.some(hostId => !hostId))
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
+	if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 	const lockPath = getLockPath(filePath);
 	await ensureLockParent(path.dirname(lockPath));
 	const ownerToken = crypto.randomUUID();
