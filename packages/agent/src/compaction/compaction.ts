@@ -18,6 +18,7 @@ import {
 import { logger, prompt } from "@gajae-code/utils";
 import { type AgentTelemetry, instrumentedCompleteSimple } from "../telemetry";
 import type { AgentMessage, AgentTool } from "../types";
+import type { AdaptiveCompactionDecisionState, AdaptiveCompactionOptions } from "./adaptive";
 import type { CompactionEntry, SessionEntry } from "./entries";
 import { type ConvertToLlm, convertToLlm, createBranchSummaryMessage, createCustomMessage } from "./messages";
 import {
@@ -33,7 +34,6 @@ import compactionSummaryPrompt from "./prompts/compaction-summary.md" with { typ
 import compactionTurnPrefixPrompt from "./prompts/compaction-turn-prefix.md" with { type: "text" };
 import compactionUpdateSummaryPrompt from "./prompts/compaction-update-summary.md" with { type: "text" };
 import handoffDocumentPrompt from "./prompts/handoff-document.md" with { type: "text" };
-
 import {
 	computeFileLists,
 	createFileOps,
@@ -136,6 +136,8 @@ export interface CompactionSettings {
 	strategy?: "context-full" | "handoff" | "off";
 	thresholdPercent?: number;
 	thresholdTokens?: number;
+	adaptive?: AdaptiveCompactionOptions;
+	adaptiveState?: AdaptiveCompactionDecisionState;
 	reserveTokens: number;
 	keepRecentTokens: number;
 	autoContinue?: boolean;
@@ -165,6 +167,40 @@ export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	autoContinue: true,
 	remoteEnabled: true,
 };
+
+export function computeAdaptiveThresholdPercent(
+	basePercent: number,
+	contextTokens: number,
+	contextWindow: number,
+	state: AdaptiveCompactionDecisionState | undefined,
+	options: AdaptiveCompactionOptions | undefined,
+): number {
+	const clampedBasePercent = Number.isFinite(basePercent) ? Math.min(99, Math.max(1, basePercent)) : 85;
+	if (!options?.enabled) return basePercent;
+	if (!state || !Number.isFinite(contextWindow) || contextWindow <= 0) return clampedBasePercent;
+	if (!Number.isFinite(options.turnWindow) || options.turnWindow <= 0) return clampedBasePercent;
+
+	const safeContextTokens = Number.isFinite(contextTokens) ? Math.max(0, contextTokens) : 0;
+	const fillRatio = safeContextTokens / contextWindow;
+	const baseRatio = clampedBasePercent / 100;
+	if (fillRatio < baseRatio * 0.7) return clampedBasePercent;
+
+	const turnsSinceCompact = Number.isFinite(state.turnsSinceCompact) ? Math.max(0, state.turnsSinceCompact) : 0;
+	const callsInWindow = Number.isFinite(state.callsInWindow) ? Math.max(0, state.callsInWindow) : 0;
+	if (turnsSinceCompact <= 3) return clampedBasePercent;
+	const windowTurns = Math.max(1, options.turnWindow * 4);
+	const intensity = Math.min(1, callsInWindow / windowTurns);
+	const aggression = Number.isFinite(options.aggression) ? Math.min(1, Math.max(0, options.aggression)) : 0;
+	const configuredMinThresholdPercent = options.minThresholdPercent;
+	const minThresholdPercent = Math.min(
+		clampedBasePercent,
+		typeof configuredMinThresholdPercent === "number" && Number.isFinite(configuredMinThresholdPercent)
+			? Math.max(1, configuredMinThresholdPercent)
+			: clampedBasePercent * 0.5,
+	);
+	const loweredPercent = clampedBasePercent - (clampedBasePercent - minThresholdPercent) * aggression * intensity;
+	return Math.max(1, Math.min(99, Math.round(loweredPercent)));
+}
 
 // ============================================================================
 // Token calculation
@@ -244,7 +280,7 @@ export function shouldCompact(
 	maxOutputTokens = 0,
 ): boolean {
 	if (!settings.enabled || settings.strategy === "off" || contextWindow <= 0) return false;
-	const thresholdTokens = resolveThresholdTokens(contextWindow, settings, maxOutputTokens);
+	const thresholdTokens = resolveThresholdTokens(contextWindow, settings, maxOutputTokens, contextTokens);
 	return contextTokens > thresholdTokens;
 }
 
@@ -381,6 +417,7 @@ export function resolveThresholdTokens(
 	contextWindow: number,
 	settings: CompactionSettings,
 	maxOutputTokens = 0,
+	contextTokens?: number,
 ): number {
 	// Fixed token limit takes priority over percentage
 	const thresholdTokens = settings.thresholdTokens;
@@ -392,10 +429,38 @@ export function resolveThresholdTokens(
 	// Percentage-based threshold
 	const thresholdPercent = settings.thresholdPercent;
 	if (typeof thresholdPercent !== "number" || !Number.isFinite(thresholdPercent) || thresholdPercent <= 0) {
-		return contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens);
+		if (!settings.adaptive?.enabled) {
+			return contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens);
+		}
+		const adaptiveBasePercent = Number.isFinite(settings.adaptive.baseThresholdPercent)
+			? Math.min(99, Math.max(1, settings.adaptive.baseThresholdPercent))
+			: 85;
+		const adaptiveThresholdPercent = computeAdaptiveThresholdPercent(
+			adaptiveBasePercent,
+			adaptiveContextTokens(contextTokens, settings.adaptiveState?.lastContextTokens),
+			contextWindow,
+			settings.adaptiveState,
+			settings.adaptive,
+		);
+		return Math.floor(contextWindow * (adaptiveThresholdPercent / 100));
 	}
 	const clampedThresholdPercent = Math.min(99, Math.max(1, thresholdPercent));
-	return Math.floor(contextWindow * (clampedThresholdPercent / 100));
+	const adaptiveThresholdPercent = computeAdaptiveThresholdPercent(
+		settings.adaptive?.baseThresholdPercent ?? clampedThresholdPercent,
+		adaptiveContextTokens(contextTokens, settings.adaptiveState?.lastContextTokens),
+		contextWindow,
+		settings.adaptiveState,
+		settings.adaptive,
+	);
+	const effectiveThresholdPercent = settings.adaptive?.enabled ? adaptiveThresholdPercent : clampedThresholdPercent;
+	return Math.floor(contextWindow * (effectiveThresholdPercent / 100));
+}
+
+function adaptiveContextTokens(contextTokens: number | undefined, lastContextTokens: number | undefined): number {
+	if (contextTokens !== undefined && Number.isFinite(contextTokens)) return Math.max(0, contextTokens);
+	if (typeof lastContextTokens === "number" && Number.isFinite(lastContextTokens))
+		return Math.max(0, lastContextTokens);
+	return 0;
 }
 
 // ============================================================================

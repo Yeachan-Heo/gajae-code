@@ -369,7 +369,7 @@ OAuth host chain: `KIMI_CODE_OAUTH_HOST` → `KIMI_OAUTH_HOST` → `https://auth
 | `GJC_OPENAI_CODE_WEBSOCKET_IDLE_TIMEOUT_MS` | Positive integer override (default 300000)           |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_BUDGET`    | Non-negative integer override (default 5)            |
 | `GJC_OPENAI_CODE_WEBSOCKET_RETRY_DELAY_MS`  | Positive integer base backoff override (default 500) |
-| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer OpenAI stream idle timeout override. Unset: 120s, except xAI Grok / Grok Build providers and Grok model ids on any OpenAI-compatible host use 300s (same floor as Anthropic long-reasoning). `0` disables. |
+| `GJC_OPENAI_STREAM_IDLE_TIMEOUT_MS`   | Positive integer OpenAI stream idle timeout override. Unset: 120s, except xAI Grok / Grok Build providers and Grok model ids on any OpenAI-compatible host use 300s (same floor as Anthropic long-reasoning). `0` disables. LM Studio keeps the shared idle timeout, but its first-event window is 300s by default to allow local model loading/prefill; `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` overrides that window. |
 
 ### Cursor provider debug
 

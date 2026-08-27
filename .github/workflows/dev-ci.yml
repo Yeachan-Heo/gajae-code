@@ -1004,8 +1004,9 @@ jobs:
   # selected risk canaries. A dispatch remains available for exact-head bootstrap
   # evidence. Every merge candidate shares one non-cancelling lane: a candidate
   # selects and materializes against dev, so overlapping candidates could otherwise
-  # validate against incompatible integration state. Keep up to 100 candidates
-  # pending instead of replacing an older pending validation.
+  # validate against incompatible integration state. GitHub's queue depth is fixed
+  # by capacity; candidates without a free slot wait pending instead of replacing
+  # an older pending validation.
   virtual-integration:
     name: Virtual integration validation
     needs: [affected-plan, affected]
@@ -1013,7 +1014,6 @@ jobs:
     concurrency:
       group: dev-ci-virtual-integration
       cancel-in-progress: false
-      queue: max
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     permissions:

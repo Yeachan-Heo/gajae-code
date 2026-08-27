@@ -67,6 +67,9 @@ const RUNTIME_FAILURE_CODES = new Set([
 	"local_snapshot_failure",
 	"provider_down",
 	"provider_unavailable",
+	"provider_rejected",
+	"provider_http_402",
+	"provider_http_429",
 	"upstream_stream_interrupted",
 	"argument_validation",
 	"execution",
@@ -120,11 +123,19 @@ function safeErrorStatus(error: unknown): number | undefined {
 	try {
 		return (
 			extractHttpStatusFromError({ status: (error as { errorStatus?: unknown } | undefined)?.errorStatus }) ??
-			extractHttpStatusFromError(error)
+			extractHttpStatusFromError(error) ??
+			extractHttpStatusFromError((error as { transportFailure?: unknown } | undefined)?.transportFailure)
 		);
 	} catch {
 		return undefined;
 	}
+}
+
+function providerFailureCode(error: unknown): string | undefined {
+	const status = safeErrorStatus(error);
+	if (status === undefined) return undefined;
+	if (status === 402 || status === 429) return `provider_http_${status}`;
+	return "provider_rejected";
 }
 
 function assertUserImagePlaceholdersHavePayload(messages: readonly AgentMessage[]): void {
@@ -2080,6 +2091,10 @@ export class Agent {
 			if (this.#activeRunId !== runId) {
 				return;
 			}
+			const providerCode = providerFailureCode(err);
+			const runtimeFailureCode = abortController.signal.aborted
+				? "aborted"
+				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
 
 			const errorMsg: AgentMessage = {
 				role: "assistant",
@@ -2116,10 +2131,7 @@ export class Agent {
 				// signal, and a local staging failure comes from the identity-
 				// checked managedLocalErrorDiagnostic — a foreign error that
 				// self-declares a local kind still maps to agent_failed.
-				error: sanitizeAgentFailure(
-					err,
-					abortController.signal.aborted ? "aborted" : managedLocalErrorDiagnostic(err)?.errorKind,
-				),
+				error: sanitizeAgentFailure(err, runtimeFailureCode),
 				scope: handle.scope,
 			});
 			this.requestRunTerminal(managedLogicalRunOwner ?? runId, {

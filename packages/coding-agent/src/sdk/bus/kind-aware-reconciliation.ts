@@ -355,7 +355,13 @@ export function createKindAwareReconciliation(
 				// as-is (cleanupRecords is intentionally not re-run). First reason wins: a
 				// late generic frame never overwrites a specific one. Persisted so the reason
 				// survives reconnect/restart reconciliation.
-				if (frame.type === "agent_failed" && record.error === undefined) {
+				if (frame.type === "agent_failed") {
+					const failure = sanitizePromptFailure(frame.error);
+					if (
+						record.error !== undefined &&
+						!(record.error.code === "agent_failed" && failure.code !== "agent_failed")
+					)
+						return { value: undefined, changed: false };
 					record.error = sanitizePromptFailure(frame.error);
 					return { value: undefined, changed: true };
 				}
@@ -373,7 +379,9 @@ export function createKindAwareReconciliation(
 			if (frame.type === "agent_failed") {
 				// agent_failed is additive diagnostics; agent_end remains the sole
 				// terminal lifecycle boundary for the correlated invocation.
-				record.error ??= sanitizePromptFailure(frame.error);
+				const failure = sanitizePromptFailure(frame.error);
+				if (record.error === undefined || (record.error.code === "agent_failed" && failure.code !== "agent_failed"))
+					record.error = failure;
 				delete record.deadlineRecoveryPending;
 				delete record.deadlineMaxAt;
 				return { value: undefined, changed: true };

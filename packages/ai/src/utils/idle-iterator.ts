@@ -5,6 +5,11 @@ const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_STREAM_FIRST_EVENT_TIMEOUT_MS = 100_000;
 const ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS = 600_000;
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MS = 300_000;
+// Local LM Studio models can spend several minutes loading weights and filling
+// the prompt before emitting their first SSE event. Keep the shared default
+// for other OpenAI-compatible providers, but avoid aborting legitimate local
+// inference during that startup window.
+const LM_STUDIO_FIRST_EVENT_TIMEOUT_MS = 300_000;
 // Ollama Cloud is a hosted proxy where queueing/cold-start plus long prefill
 // (thinking-mode requests over 1M-context sessions) routinely exceeds 120s before
 // the first streamed token; 300s matches kimi-code's floor for long-reasoning silence.
@@ -34,6 +39,7 @@ export function isGrokModelId(modelId: string | undefined): boolean {
 
 export function getProviderFirstEventTimeoutFallbackMs(provider: string): number | undefined {
 	if (provider === "alibaba-token-plan") return ALIBABA_TOKEN_PLAN_FIRST_EVENT_TIMEOUT_MS;
+	if (provider === "lm-studio") return LM_STUDIO_FIRST_EVENT_TIMEOUT_MS;
 	if (provider === "ollama-cloud") return OLLAMA_CLOUD_FIRST_EVENT_TIMEOUT_MS;
 	return provider === "kimi-code" ? KIMI_CODE_FIRST_EVENT_TIMEOUT_MS : undefined;
 }

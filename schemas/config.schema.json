@@ -1564,6 +1564,37 @@
 					"description": "Fixed token limit for context maintenance; overrides percentage if set",
 					"default": -1
 				},
+				"adaptive": {
+					"type": "object",
+					"properties": {
+						"enabled": {
+							"type": "boolean",
+							"description": "Adjust compaction frequency by context size and call rate",
+							"default": false
+						},
+						"baseThresholdPercent": {
+							"type": "number",
+							"description": "Base context percentage used when adaptive compaction is enabled",
+							"default": 85
+						},
+						"aggression": {
+							"type": "number",
+							"description": "How strongly call rate lowers the compaction threshold; use 0 to 1",
+							"default": 0.15
+						},
+						"turnWindow": {
+							"type": "number",
+							"description": "Minutes of recent calls considered by adaptive compaction",
+							"default": 15
+						},
+						"minThresholdPercent": {
+							"type": "number",
+							"description": "Lowest context percentage adaptive compaction may lower the threshold to",
+							"default": 50
+						}
+					},
+					"additionalProperties": false
+				},
 				"handoffSaveToDisk": {
 					"type": "boolean",
 					"description": "Save auto-triggered handoff documents as session artifacts (resolvable artifact:// URIs); manual /handoff does not save",

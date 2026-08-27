@@ -742,7 +742,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
 				await options?.onPreflightAcceptCommit?.();
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -994,7 +994,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
 				await options?.onPreflightAcceptCommit?.();
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -1356,7 +1356,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
 				await options?.onPreflightAcceptCommit?.();
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -1710,7 +1710,7 @@ describe("SessionSdkSessionRuntime", () => {
 				// Production-faithful: an accepted run stays in-flight for the whole
 				// test; sendUserMessage resolution (turn completion) never precedes
 				// agent_start (#4668 success-retirement).
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -2959,6 +2959,8 @@ interface PreflightHooks {
 interface ResponseFrame {
 	id?: string;
 	ok?: boolean;
+	code?: string;
+	error?: { code: string; message: string };
 	result?: { status?: string; commandId?: string; turnId?: string; error?: { code: string; message: string } };
 }
 
@@ -2966,6 +2968,11 @@ interface InvocationHarness {
 	control(operation: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	query(name: string, input: Record<string, unknown>): Promise<ResponseFrame>;
 	emit(event: string, payload?: unknown): Promise<void>;
+	switchSession(sessionId: string): Promise<void>;
+	branch(sessionId: string): Promise<void>;
+	requestOnSession(sessionId: string, frame: Record<string, unknown>): Promise<ResponseFrame>;
+	sendToSession(sessionId: string, frame: Record<string, unknown>): void;
+	sent(sessionId: string): SdkFrame[];
 	readonly broadcasts: SdkFrame[];
 	stop(): Promise<void>;
 }
@@ -2985,6 +2992,10 @@ async function invocationHarness(
 		settings?: Settings;
 		/** Throw to inject a durable-write failure for matching transitions. */
 		persistInterceptor?: (transition: { type: string }) => void;
+		/** Hold one matching durable transition until the test releases it. */
+		persistHold?: { type: string; onEntered: () => void; release: Promise<void> };
+		onLifecycleDrainTimeout?: () => void;
+		onFailureDiagnosticKeyCount?: (count: number) => void;
 		agentFailedWriteFailures?: number;
 	},
 ): Promise<InvocationHarness> {
@@ -2992,6 +3003,8 @@ async function invocationHarness(
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>();
 	const broadcasts: SdkFrame[] = [];
 	let deliver: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	const deliveries = new Map<string, (connectionId: string, frame: SdkFrame) => void>();
+	const sentFrames = new Map<string, SdkFrame[]>();
 	let nextId = 0;
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
@@ -3000,10 +3013,15 @@ async function invocationHarness(
 		sendUserMessage: hooks.sendUserMessage ?? (async () => {}),
 	} as unknown as ExtensionAPI;
 	const interceptorStore = hooks.persistInterceptor
-		? createInterceptorReconciliationStore(hooks.persistInterceptor, hooks.agentFailedWriteFailures)
+		? createInterceptorReconciliationStore(
+				hooks.persistInterceptor,
+				hooks.agentFailedWriteFailures,
+				hooks.persistHold,
+			)
 		: undefined;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
 		...(interceptorStore
 			? {
 					terminalAbortSeams: {
@@ -3015,6 +3033,9 @@ async function invocationHarness(
 					},
 				}
 			: {}),
+		...(hooks.onFailureDiagnosticKeyCount
+			? { onFailureDiagnosticKeyCountForTests: hooks.onFailureDiagnosticKeyCount }
+			: {}),
 		...(hooks.settings ? { settings: hooks.settings } : {}),
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
 			sessionId: id,
@@ -3022,12 +3043,17 @@ async function invocationHarness(
 			token,
 			onFrame(handler) {
 				deliver = handler;
+				deliveries.set(id, handler);
 				return () => {
 					if (deliver === handler) deliver = undefined;
+					if (deliveries.get(id) === handler) deliveries.delete(id);
 				};
 			},
 			sendFrame(_connectionId, frame) {
 				const response = frame as ResponseFrame;
+				const frames = sentFrames.get(id) ?? [];
+				frames.push(frame);
+				sentFrames.set(id, frames);
 				if (typeof response.id === "string") waiters.get(response.id)?.(response);
 			},
 			broadcastFrame(frame) {
@@ -3046,6 +3072,7 @@ async function invocationHarness(
 		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
 			getSessionName: () => undefined,
 			getBranch: () => [],
 		},
@@ -3069,6 +3096,44 @@ async function invocationHarness(
 		stop: async () => {
 			await handlers.get("session_shutdown")?.({}, ctx);
 		},
+		switchSession: async sessionId => {
+			await handlers.get("session_switch")?.(
+				{},
+				{
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getSessionId: () => sessionId,
+						getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+					},
+				},
+			);
+		},
+		branch: async sessionId => {
+			await handlers.get("session_branch")?.(
+				{},
+				{
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getSessionId: () => sessionId,
+						getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+					},
+				},
+			);
+		},
+		requestOnSession: (sessionId, frame) => {
+			const id = `frame-${nextId}`;
+			nextId += 1;
+			const { promise, resolve } = Promise.withResolvers<ResponseFrame>();
+			waiters.set(id, resolve);
+			deliveries.get(sessionId)?.("client", { ...frame, id } as SdkFrame);
+			return promise;
+		},
+		sendToSession: (sessionId, frame) => {
+			deliveries.get(sessionId)?.("client", frame as SdkFrame);
+		},
+		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
 
@@ -3078,33 +3143,45 @@ async function invocationHarness(
 function createInterceptorReconciliationStore(
 	interceptor: (transition: { type: string }) => void,
 	agentFailedWriteFailures = 1,
+	persistHold?: { type: string; onEntered: () => void; release: Promise<void> },
 ): SdkOnlyReconciliationStore {
 	const failureCounts = new Map<string, number>();
+	let holdConsumed = false;
 	const backing = createInterceptorBackingStore();
 	return {
 		path: null,
 		load: async () => backing.records.map(record => ({ ...record })),
 		async transact(mutator) {
 			const records = mutator(backing.records.map(record => ({ ...record })));
+			let transitionType: "agent_failed" | "agent_end" | undefined;
 			for (const record of records as Array<{ status?: string; terminalAt?: number; commandId?: string }>) {
 				// The intermediate durable state an agent_failed write produces:
 				// the reason is set but the row is not terminal yet. Tests choose how
 				// many consecutive writes fail before the recovery replay succeeds.
 				const identity = String(record?.commandId ?? "unknown");
 				const failureCount = failureCounts.get(identity) ?? 0;
+				if (record?.terminalAt === undefined && (record as { error?: unknown }).error !== undefined)
+					transitionType ??= "agent_failed";
 				if (
 					record?.terminalAt === undefined &&
 					(record as { error?: unknown }).error !== undefined &&
 					failureCount < agentFailedWriteFailures
 				) {
+					transitionType = "agent_failed";
 					failureCounts.set(identity, failureCount + 1);
 					interceptor({ type: "agent_failed" });
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
 				const previous = backing.records.find(candidate => candidate.commandId === record.commandId);
-				if (record.terminalAt !== undefined && previous?.terminalAt === undefined) {
+				if (record?.terminalAt !== undefined && previous?.terminalAt === undefined) {
+					transitionType = "agent_end";
 					interceptor({ type: "agent_end" });
 				}
+			}
+			if (persistHold && !holdConsumed && persistHold.type === transitionType) {
+				holdConsumed = true;
+				persistHold.onEntered();
+				await persistHold.release;
 			}
 			backing.records = records;
 		},
@@ -3134,14 +3211,645 @@ async function settledStatus(
 	throw new Error(`${name} never reported a terminal reconciliation status`);
 }
 
+function neverSettlingPromise(): Promise<void> {
+	return Promise.withResolvers<void>().promise;
+}
+
 describe("post-acceptance invocation terminalization", () => {
+	test.each([
+		{ status: 402, code: "provider_http_402" },
+		{ status: 429, code: "provider_http_429" },
+		{ status: 500, code: "provider_rejected" },
+	])("terminalizes a streamed provider HTTP $status rejection and permits a healthy abort_and_prompt replacement", async ({
+		status,
+		code,
+	}) => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-provider-http-${status}-`));
+		try {
+			let prompts = 0;
+			const harness = await invocationHarness(`provider-http-${status}`, cwd, {
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) await neverSettlingPromise();
+				},
+			});
+			const failed = await harness.control("turn.prompt", { text: "provider rejects", clientRef: `http-${status}` });
+			expect(failed.ok).toBe(true);
+			const failedIds = { commandId: failed.result?.commandId, turnId: failed.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorStatus: status,
+						transportFailure: { kind: "transport", status },
+					},
+				],
+			});
+
+			const terminal = await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				clientRef: `http-${status}`,
+			});
+			expect(terminal).toMatchObject({
+				status: "failed",
+				error: { code, message: "Prompt submission failed." },
+				terminalAt: expect.any(Number),
+			});
+			const stable = await harness.query("turn.result", { kind: "prompt", ...failedIds });
+			expect(stable.result).toEqual(terminal);
+
+			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
+			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
+			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{ role: "assistant", stopReason: "error", errorStatus: 429 },
+					{ role: "assistant", stopReason: "stop" },
+				],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("classifies a statusless provider error completion as rejected", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-"));
+		try {
+			const harness = await invocationHarness("provider-statusless", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider rejects" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("upgrades a generic agent_failed diagnostic when agent_end proves provider rejection", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-upgrade-"));
+		try {
+			const harness = await invocationHarness("provider-statusless-upgrade", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider rejects" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("generic agent failure"), { code: "agent_failed" }),
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			const failures = harness.broadcasts.filter(frame => frame.kind === "agent_failed");
+			expect(failures.at(-1)).toMatchObject({ payload: { error: { code: "provider_rejected" } } });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves a specific agent_failed diagnostic when agent_end is statusless", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-specific-"));
+		try {
+			const harness = await invocationHarness("provider-statusless-specific", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider unavailable" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider unavailable"), { code: "provider_unavailable" }),
+			});
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_unavailable" },
+			});
+			expect(harness.broadcasts.filter(frame => frame.kind === "agent_failed")).toHaveLength(1);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("upgrades every shared generic diagnostic on a statusless provider end", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-shared-"));
+		try {
+			let promoted: ((promotion: { startsOwnRun?: boolean }) => void) | undefined;
+			const harness = await invocationHarness("provider-statusless-shared", cwd, {
+				sendUserMessage: async (content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if (content === "attached") {
+						promoted = (options as { onQueuedPromoted?: (promotion: { startsOwnRun?: boolean }) => void })
+							?.onQueuedPromoted;
+						return;
+					}
+					await neverSettlingPromise();
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const attached = await harness.control("turn.follow_up", { text: "attached" });
+			expect(attached.ok).toBe(true);
+			promoted?.({ startsOwnRun: false });
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			const attachedIds = { commandId: attached.result?.commandId, turnId: attached.result?.turnId };
+			await harness.emit("agent_failed", { error: Object.assign(new Error("generic"), { code: "agent_failed" }) });
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", attachedIds)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("does not misclassify a local malformed-tool circuit breaker as provider rejection", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-local-malformed-tool-"));
+		try {
+			const harness = await invocationHarness("local-malformed-tool", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "local malformed tool" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorMessage:
+							"Stopping after 3 consecutive turns of malformed tool calls; the model did not produce a usable tool call or answer.",
+					},
+				],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("does not misclassify a local composer policy breaker as provider rejection", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-local-composer-policy-"));
+		try {
+			const harness = await invocationHarness("local-composer-policy", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "local composer policy" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorMessage:
+							"Composer bash policy blocked repository file I/O again after its one automatic recovery turn.",
+					},
+				],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("terminalizes when provider end metadata exposes a throwing accessor", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-throwing-metadata-"));
+		try {
+			const harness = await invocationHarness("provider-throwing-metadata", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider metadata" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			const event = {} as Record<string, unknown>;
+			Object.defineProperty(event, "messages", {
+				get() {
+					throw new Error("provider metadata accessor failed");
+				},
+			});
+			await harness.emit("agent_end", event);
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "terminal_ok",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("binds a delayed predecessor provider failure to its own batch after a replacement starts", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-delayed-provider-batch-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const secondInflight = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("delayed-provider-batch", cwd, {
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) await firstInflight.promise;
+					if (prompts === 2) await secondInflight.promise;
+				},
+				persistInterceptor: () => {},
+			});
+			const first = await harness.control("turn.prompt", { text: "first", clientRef: "delayed-first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
+			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
+			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
+			await harness.emit("agent_start");
+			expect((await harness.query("turn.prompt_status", replacementIds)).result?.status).toBe("in_flight");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_http_402" },
+			});
+			expect((await harness.query("turn.prompt_status", replacementIds)).result?.status).toBe("in_flight");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			firstInflight.resolve();
+			secondInflight.resolve();
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		{ operation: "switchSession" as const, label: "session switch" },
+		{ operation: "branch" as const, label: "session branch" },
+	])("keeps a held 402/429 predecessor terminal across $label", async ({ operation }) => {
+		for (const { status, code } of [
+			{ status: 402, code: "provider_http_402" },
+			{ status: 429, code: "provider_http_429" },
+		]) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-${operation}-provider-race-`));
+			try {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const firstInflight = Promise.withResolvers<void>();
+				const secondInflight = Promise.withResolvers<void>();
+				let timeoutWarnings = 0;
+				const diagnosticKeyCounts: number[] = [];
+				let prompts = 0;
+				const harness = await invocationHarness(`${operation}-provider-race`, cwd, {
+					persistInterceptor: () => {},
+					onLifecycleDrainTimeout: () => {
+						timeoutWarnings += 1;
+					},
+					onFailureDiagnosticKeyCount: count => {
+						diagnosticKeyCounts.push(count);
+					},
+					persistHold: { type: "agent_failed", onEntered: entered.resolve, release: release.promise },
+					agentFailedWriteFailures: 0,
+					sendUserMessage: async (_content, options) => {
+						prompts += 1;
+						await options?.onPreflightAcceptCommit?.();
+						if (prompts === 1) await firstInflight.promise;
+						if (prompts === 2) await secondInflight.promise;
+					},
+				});
+				const first = await harness.control("turn.prompt", {
+					text: "first",
+					clientRef: `${operation}-${status}-first`,
+				});
+				expect(first.ok).toBe(true);
+				const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+				await harness.emit("agent_start");
+				const end = harness.emit("agent_end", {
+					messages: [{ role: "assistant", stopReason: "error", errorStatus: status }],
+				});
+				await entered.promise;
+				const lifecycleChange = harness[operation](`${operation}-successor`);
+				await Bun.sleep(10);
+				const [oldControl, oldQuery, oldReplay, oldProvider, oldReverse] = await Promise.all([
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "control_request",
+						operation: "turn.prompt",
+						input: {},
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "query_request",
+						query: "turn.prompt_status",
+						input: {},
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "event_replay",
+						sinceGeneration: 0,
+						sinceSeq: 0,
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "register_provider",
+						capability: "fs",
+						definitions: {},
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "reverse_response",
+						leaseId: "old-lease",
+						ok: true,
+						result: {},
+					}),
+				]);
+				harness.sendToSession(`${operation}-provider-race`, { type: "provider_heartbeat", leaseId: "old-lease" });
+				harness.sendToSession(`${operation}-provider-race`, { type: "lease_release", leaseId: "old-lease" });
+				expect(
+					[oldControl, oldQuery, oldReplay, oldProvider, oldReverse].map(
+						response => response.error?.code ?? response.code,
+					),
+				).toEqual([
+					"session_quiescing",
+					"session_quiescing",
+					"session_quiescing",
+					"session_quiescing",
+					"session_quiescing",
+				]);
+				expect(
+					harness.sent(`${operation}-provider-race`).filter(frame => frame.type === "transport_error"),
+				).toHaveLength(3);
+				release.resolve();
+				await Promise.all([end, lifecycleChange]);
+				expect(timeoutWarnings).toBe(0);
+				expect(diagnosticKeyCounts.at(-1)).toBe(0);
+				const failure = harness.broadcasts.find(frame => {
+					const payload = frame.payload;
+					return (
+						frame.kind === "agent_failed" &&
+						typeof payload === "object" &&
+						payload !== null &&
+						(payload as { commandId?: unknown }).commandId === firstIds.commandId &&
+						(payload as { turnId?: unknown }).turnId === firstIds.turnId
+					);
+				});
+				expect(failure).toMatchObject({ kind: "agent_failed", payload: { error: { code } } });
+				expect(harness.broadcasts.filter(frame => frame.kind === "agent_end").length).toBeGreaterThan(0);
+
+				const successor = await harness.control("turn.prompt", { text: "successor" });
+				expect(successor.ok).toBe(true);
+				const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
+				await harness.emit("agent_start");
+				await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+				secondInflight.resolve();
+				expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
+					status: "terminal_ok",
+				});
+				firstInflight.resolve();
+				expect(prompts).toBe(2);
+				await harness.stop();
+			} finally {
+				await Bun.sleep(50);
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test.each([
+		{ operation: "switchSession" as const, label: "session switch" },
+		{ operation: "branch" as const, label: "session branch" },
+	])("bounds a stalled 402/429 lifecycle drain during $label", async ({ operation }) => {
+		for (const status of [402, 429]) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-${operation}-provider-stall-`));
+			try {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const firstInflight = Promise.withResolvers<void>();
+				let timeoutWarnings = 0;
+				const harness = await invocationHarness(`${operation}-provider-stall`, cwd, {
+					persistInterceptor: () => {},
+					onLifecycleDrainTimeout: () => {
+						timeoutWarnings += 1;
+					},
+					persistHold: { type: "agent_failed", onEntered: entered.resolve, release: release.promise },
+					agentFailedWriteFailures: 0,
+					sendUserMessage: async (_content, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						await firstInflight.promise;
+					},
+				});
+				const first = await harness.control("turn.prompt", { text: "first" });
+				expect(first.ok).toBe(true);
+				await harness.emit("agent_start");
+				const end = harness.emit("agent_end", {
+					messages: [{ role: "assistant", stopReason: "error", errorStatus: status }],
+				});
+				await entered.promise;
+				const startedAt = Date.now();
+				const lifecycleChange = harness[operation](`${operation}-stall-successor`);
+				await lifecycleChange;
+				expect(Date.now() - startedAt).toBeLessThan(1_500);
+				expect(timeoutWarnings).toBe(1);
+				release.resolve();
+				firstInflight.resolve();
+				await end;
+				await harness.stop();
+			} finally {
+				await Bun.sleep(50);
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test("deduplicates repeated agent_failed diagnostics for one invocation", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-agent-failed-dedupe-"));
+		try {
+			const inflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("agent-failed-dedupe", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await inflight.promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const correlation = accepted.result;
+			await harness.emit("agent_start");
+			const failure = { error: Object.assign(new Error("provider failed"), { code: "provider_rejected" }) };
+			await harness.emit("agent_failed", failure);
+			await harness.emit("agent_failed", failure);
+			expect(
+				harness.broadcasts.filter(
+					frame =>
+						frame.kind === "agent_failed" &&
+						(frame.payload as { commandId?: string }).commandId === correlation?.commandId &&
+						(frame.payload as { turnId?: string }).turnId === correlation?.turnId,
+				),
+			).toHaveLength(1);
+			await harness.emit("agent_end");
+			inflight.resolve();
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("routes a delayed predecessor agent_end after replacement completion to the retired owner", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-delayed-retired-owner-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const secondInflight = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("retired-owner-a", cwd, {
+				persistInterceptor: () => {},
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) await firstInflight.promise;
+					if (prompts === 2) await secondInflight.promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.switchSession("retired-owner-b");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
+			});
+			const failure = harness.broadcasts.find(frame => {
+				const payload = frame.payload;
+				return (
+					frame.kind === "agent_failed" &&
+					typeof payload === "object" &&
+					payload !== null &&
+					(payload as { commandId?: unknown }).commandId === firstIds.commandId &&
+					(payload as { turnId?: unknown }).turnId === firstIds.turnId
+				);
+			});
+			expect(failure).toMatchObject({ kind: "agent_failed", payload: { error: { code: "provider_http_402" } } });
+			const successor = await harness.control("turn.prompt", { text: "successor" });
+			expect(successor.ok).toBe(true);
+			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+			secondInflight.resolve();
+			expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			firstInflight.resolve();
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed for tokenless delayed events when a session id is reused", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-reused-session-retired-owner-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("reused-session", cwd, {
+				persistInterceptor: () => {},
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await firstInflight.promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.switchSession("different-session");
+			await harness.switchSession("reused-session");
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
+			});
+			const failure = harness.broadcasts.find(frame => {
+				const payload = frame.payload;
+				return (
+					frame.kind === "agent_failed" &&
+					typeof payload === "object" &&
+					payload !== null &&
+					(payload as { commandId?: unknown }).commandId === firstIds.commandId &&
+					(payload as { turnId?: unknown }).turnId === firstIds.turnId
+				);
+			});
+			expect(failure).toBeUndefined();
+			firstInflight.resolve();
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a prompt killed by a provider stream interrupt reports a terminal failed status", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-"));
 		try {
 			const harness = await invocationHarness("terminalize-prompt", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
@@ -3172,7 +3880,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-abort", cwd, {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 				abort: () => {},
 			});
@@ -3293,6 +4001,55 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("reused-session successor tool progress renews its active deadline", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-reused-successor-progress-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const successorStarted = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("reused-successor-progress", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) {
+						await firstInflight.promise;
+						return;
+					}
+					successorStarted.resolve();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.switchSession("reused-successor-progress-other");
+			await harness.switchSession("reused-successor-progress");
+			const successor = await harness.control("turn.prompt", { text: "successor" });
+			expect(successor.ok).toBe(true);
+			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
+			await harness.emit("agent_start");
+			await successorStarted.promise;
+			for (let index = 0; index < 4; index += 1) {
+				await harness.emit("tool_execution_start");
+				await Bun.sleep(15);
+			}
+			expect(await harness.query("turn.prompt_status", successorIds)).toMatchObject({
+				result: { status: expect.stringMatching(/accepted|in_flight/) },
+			});
+			await harness.emit("agent_end");
+			firstInflight.resolve();
+			await harness.stop();
+			expect(prompts).toBe(2);
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("abort_and_prompt starts exactly one successor and is not duplicated by delayed abort teardown", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-and-prompt-once-"));
 		try {
@@ -3339,7 +4096,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("terminalize-skill", cwd, {
 				invokeSkill: async (_name, _args, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("skill.invoke", { name: "ralplan" });
@@ -3563,7 +4320,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					// Accepted, then permanently no execution progress and no agent_start.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const accepted = await harness.control("turn.prompt", { text: "hello" });
@@ -3597,7 +4354,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				settings: zeroProgressSettings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const original = await harness.control("turn.prompt", { text: "original" });
@@ -3731,7 +4488,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						return;
 					}
 					// The first turn accepts and then never makes progress.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -3817,7 +4574,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						)?.onQueuedPromoted;
 						return;
 					}
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -3873,7 +4630,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 					promoted = options?.onQueuedPromoted;
 					return;
 				}
-				await new Promise<void>(() => {});
+				await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -3994,7 +4751,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						return;
 					}
 					// The first turn accepts and then keeps streaming.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4052,7 +4809,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						return;
 					}
 					// The first turn accepts and then keeps streaming.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4128,7 +4885,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 				persistInterceptor: transition => {
 					if (transition.type === "agent_failed") {
@@ -4212,7 +4969,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const harness = await invocationHarness("skill-terminal-retry", cwd, {
 				invokeSkill: async (_name, _args, options) => {
 					await options?.onPreflightAcceptCommit?.();
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 				persistInterceptor: transition => {
 					if (transition.type === "agent_end" && failedWrites < 2) {
@@ -4238,6 +4995,48 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			}
 			if (settled === undefined) throw new Error("active skill terminal recovery never converged");
 			expect(failedWrites).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("retains skill terminal recovery across session replacement", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-terminal-replacement-"));
+		let failFirstTerminalWrite = true;
+		try {
+			const harness = await invocationHarness("skill-terminal-replacement", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await neverSettlingPromise();
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_end" && failFirstTerminalWrite) {
+						failFirstTerminalWrite = false;
+						throw Object.assign(new Error("injected terminal persistence failure"), { code: "io_error" });
+					}
+				},
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "replacement-hang",
+				args: "",
+				clientRef: "skill-terminal-replacement-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			await Bun.sleep(50);
+			await harness.switchSession("skill-terminal-replacement-next");
+			await Bun.sleep(1_100);
+			let settled: { status?: string; error?: { code?: string } } | undefined;
+			for (let attempt = 0; attempt < 500 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-terminal-replacement-ref" });
+				const result = frame.result as { status?: string; error?: { code?: string } } | undefined;
+				if (result?.status === "terminal_ok" || result?.status === "failed") settled = result;
+				else await Bun.sleep(10);
+			}
+			expect(settled?.status).toBe("terminal_ok");
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
@@ -4335,7 +5134,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						)?.onQueuedPromoted;
 						return;
 					}
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const first = await harness.control("turn.prompt", { text: "first" });
@@ -4369,7 +5168,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				sendUserMessage: async (_content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					// The failing turn accepts and then never makes progress on its own.
-					await new Promise<void>(() => {});
+					await neverSettlingPromise();
 				},
 			});
 			const failing = await harness.control("turn.prompt", { text: "failing" });
@@ -4420,7 +5219,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 				options: { onPreflightAcceptCommit?: () => Promise<void> } | undefined,
 			) => {
 				await options?.onPreflightAcceptCommit?.();
-				if (content === "hangs") await new Promise<void>(() => {});
+				if (content === "hangs") await neverSettlingPromise();
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
@@ -4818,7 +5617,7 @@ test("SDK-only host keeps the idle-submitted prompt's owner when isIdle flips du
 			// Production-faithful: the accepted run stays in-flight; sendUserMessage
 			// resolution (turn completion) never precedes agent_start (#4668
 			// success-retirement).
-			await new Promise<void>(() => {});
+			await neverSettlingPromise();
 		},
 	} as unknown as ExtensionAPI;
 	const transport = memoryTransport();

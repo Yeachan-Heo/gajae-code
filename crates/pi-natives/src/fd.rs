@@ -69,6 +69,37 @@ fn normalize_fuzzy_text(value: &str) -> String {
 		.collect()
 }
 
+const HANGUL_SYLLABLE_BASE: u32 = 0xac00;
+const HANGUL_SYLLABLE_COUNT: u32 = 11_172;
+const SYLLABLES_PER_INITIAL: u32 = 588;
+
+/// Keyboard-typed compatibility jamo (U+3131 block) for each of the 19
+/// Hangul initial consonants, indexed by a syllable's initial-consonant index.
+const INITIAL_COMPAT_JAMO: [char; 19] = [
+	'ㄱ', 'ㄲ', 'ㄴ', 'ㄷ', 'ㄸ', 'ㄹ', 'ㅁ', 'ㅂ', 'ㅃ', 'ㅅ', 'ㅆ', 'ㅇ', 'ㅈ', 'ㅉ', 'ㅊ', 'ㅋ',
+	'ㅌ', 'ㅍ', 'ㅎ',
+];
+
+fn hangul_initial_jamo(ch: char) -> Option<char> {
+	let offset = (ch as u32).checked_sub(HANGUL_SYLLABLE_BASE)?;
+	if offset >= HANGUL_SYLLABLE_COUNT {
+		return None;
+	}
+	Some(INITIAL_COMPAT_JAMO[(offset / SYLLABLES_PER_INITIAL) as usize])
+}
+
+/// A query char matches a target char literally, or — when the query char is a
+/// bare consonant jamo — by the target syllable's initial consonant (초성
+/// 검색).
+#[allow(
+	clippy::suspicious_operation_groupings,
+	reason = "the asymmetry is intended: a bare jamo query char matches the target syllable's \
+	          initial"
+)]
+fn fuzzy_char_matches(query_ch: char, target_ch: char) -> bool {
+	query_ch == target_ch || hangul_initial_jamo(target_ch) == Some(query_ch)
+}
+
 fn fuzzy_subsequence_score(query_chars: &[char], target: &str) -> u32 {
 	if query_chars.is_empty() {
 		return 1;
@@ -80,7 +111,7 @@ fn fuzzy_subsequence_score(query_chars: &[char], target: &str) -> u32 {
 		if query_index >= query_chars.len() {
 			break;
 		}
-		if query_chars[query_index] == target_ch {
+		if fuzzy_char_matches(query_chars[query_index], target_ch) {
 			if let Some(last_index) = last_match_index
 				&& target_index > last_index + 1
 			{
@@ -306,5 +337,84 @@ mod tests {
 	#[test]
 	fn nfc_normalize_borrows_composed_text() {
 		assert!(matches!(nfc_normalize("plain/ascii.txt"), Cow::Borrowed(_)));
+	}
+
+	#[test]
+	fn chosung_query_matches_syllable_initials() {
+		assert_eq!(score("\u{D55C}\u{AE00}.txt", "\u{314E}\u{3131}"), 90);
+	}
+
+	#[test]
+	fn chosung_query_matches_nfd_file_name() {
+		let nfd = "\u{1112}\u{1161}\u{11AB}\u{1100}\u{1173}\u{11AF}.txt";
+		assert_eq!(score(nfd, "\u{314E}\u{3131}"), 90);
+	}
+
+	#[test]
+	fn chosung_mixed_with_full_syllables() {
+		assert_eq!(score("\u{D55C}\u{AE00}.txt", "\u{314E}\u{AE00}"), 90);
+		assert_eq!(score("\u{D55C}\u{AE00}.txt", "\u{D55C}\u{3131}"), 90);
+	}
+
+	#[test]
+	fn chosung_double_consonants() {
+		assert!(score("\u{B538}\u{AE30}.txt", "\u{3138}\u{3131}") > 0);
+		assert!(score("\u{C4F0}\u{AE30}.md", "\u{3146}") > 0);
+	}
+
+	#[test]
+	fn chosung_requires_subsequence_order() {
+		assert_eq!(score("\u{D55C}\u{AE00}.txt", "\u{3131}\u{314E}"), 0);
+	}
+
+	#[test]
+	fn chosung_rejects_absent_initials() {
+		assert_eq!(score("\u{D55C}\u{AE00}.txt", "\u{3134}"), 0);
+	}
+
+	#[test]
+	fn chosung_covers_syllable_block_boundaries() {
+		assert!(score("\u{AC00}.txt", "\u{3131}") > 0);
+		assert!(score("\u{D7A3}.txt", "\u{314E}") > 0);
+	}
+
+	#[test]
+	fn vowel_jamo_only_matches_literally() {
+		assert_eq!(score("\u{D55C}\u{AE00}.txt", "\u{314F}"), 0);
+		assert!(score("\u{314F}note.txt", "\u{314F}") > 0);
+	}
+
+	#[test]
+	fn literal_jamo_file_name_outranks_chosung_match() {
+		let literal = score("\u{314E}\u{3131}.txt", "\u{314E}\u{3131}");
+		let chosung = score("\u{D55C}\u{AE00}.txt", "\u{314E}\u{3131}");
+		assert_eq!(literal, 100);
+		assert!(literal > chosung);
+	}
+
+	#[test]
+	fn chosung_matches_path_segments_for_path_queries() {
+		assert!(score("\u{D55C}\u{AE00}/readme.md", "\u{314E}\u{3131}/read") > 0);
+		assert_eq!(score("\u{D55C}\u{AE00}/readme.md", "\u{314E}\u{3131}"), 0);
+	}
+
+	#[test]
+	fn chosung_gap_penalty_prefers_adjacent_matches() {
+		let adjacent = score("\u{D55C}\u{AE00}\u{BAA8}\u{C74C}.txt", "\u{314E}\u{3131}");
+		let gapped = score("\u{D55C}\u{AE00}\u{BAA8}\u{C74C}.txt", "\u{314E}\u{BAA8}");
+		assert!(adjacent > gapped);
+		assert!(gapped > 0);
+	}
+
+	#[test]
+	fn hangul_initial_jamo_maps_all_nineteen_initials() {
+		for (index, jamo) in INITIAL_COMPAT_JAMO.iter().enumerate() {
+			let syllable =
+				char::from_u32(HANGUL_SYLLABLE_BASE + index as u32 * SYLLABLES_PER_INITIAL).unwrap();
+			assert_eq!(hangul_initial_jamo(syllable), Some(*jamo));
+		}
+		assert_eq!(hangul_initial_jamo('a'), None);
+		assert_eq!(hangul_initial_jamo('\u{314E}'), None);
+		assert_eq!(hangul_initial_jamo('\u{1112}'), None);
 	}
 }

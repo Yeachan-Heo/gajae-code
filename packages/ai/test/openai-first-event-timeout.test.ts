@@ -21,6 +21,18 @@ const alibabaOpenAICompletionsModel = getBundledModel(
 	"alibaba-token-plan",
 	"deepseek-v4-pro",
 ) as Model<"openai-completions">;
+const lmStudioCompletionsModel: Model<"openai-completions"> = {
+	id: "local-model",
+	name: "LM Studio Local Model",
+	api: "openai-completions",
+	provider: "lm-studio",
+	baseUrl: "http://127.0.0.1:1234/v1",
+	reasoning: true,
+	input: ["text"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 32768,
+	maxTokens: 4096,
+};
 const azureOpenAIResponsesModel: Model<"azure-openai-responses"> = {
 	id: "gpt-5-mini",
 	name: "GPT-5 Mini",
@@ -530,6 +542,37 @@ describe("OpenAI-family first-event timeouts", () => {
 			}).result();
 			await flushMicrotasks();
 			expect(fetchAttempts).toBe(1);
+
+			vi.advanceTimersByTime(120_000);
+			await flushMicrotasks();
+			let settled = false;
+			void pending.then(() => {
+				settled = true;
+			});
+			await flushMicrotasks();
+			expect(settled).toBe(false);
+
+			vi.advanceTimersByTime(30_000);
+			await flushMicrotasks();
+			const result = await pending;
+			expect(result.stopReason).toBe("stop");
+			expect(getFirstTextContent(result)).toMatchObject({ type: "text", text: "Hello delayed" });
+		});
+	});
+
+	it("lets LM Studio completions wait past the shared 120s SDK timeout for local model startup", async () => {
+		vi.useFakeTimers();
+		await withEnv({ PI_STREAM_FIRST_EVENT_TIMEOUT_MS: undefined }, async () => {
+			const delayedFetch = createDelayedFetch(150_000, () =>
+				createOpenAICompletionsSuccessResponse(lmStudioCompletionsModel.id),
+			);
+			global.fetch = Object.assign(delayedFetch, { preconnect: originalFetch.preconnect });
+
+			const pending = streamOpenAICompletions(lmStudioCompletionsModel, baseContext(), {
+				apiKey: "test-key",
+				requestMaxRetries: 0,
+			}).result();
+			await flushMicrotasks();
 
 			vi.advanceTimersByTime(120_000);
 			await flushMicrotasks();

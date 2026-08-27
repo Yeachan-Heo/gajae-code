@@ -184,6 +184,8 @@ export interface AgentStartEvent {
 export interface AgentEndEvent {
 	type: "agent_end";
 	messages: AgentMessage[];
+	/** Internal SDK queue-owner binding for exact lifecycle attribution. */
+	sdkRunToken?: string;
 	/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
 	stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
 	/** Present for maintenance checkpoints; non-aborted checkpoints are not terminal. */

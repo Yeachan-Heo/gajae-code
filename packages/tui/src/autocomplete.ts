@@ -121,9 +121,19 @@ function buildCompletionValue(
 	return `${openQuote}${path}${closeQuote}`;
 }
 
+const HANGUL_INITIAL_COMPAT_JAMO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ";
+
+function hangulInitialJamo(char: string): string | undefined {
+	const offset = char.charCodeAt(0) - 0xac00;
+	if (offset < 0 || offset >= 11172) return undefined;
+	return HANGUL_INITIAL_COMPAT_JAMO[Math.floor(offset / 588)];
+}
+
 /**
  * Check if query is a subsequence of target (fuzzy match).
  * "wig" matches "skill:wig" because w-i-g appear in order.
+ * A bare Hangul consonant also matches a syllable's initial (초성 검색),
+ * so "ㅎㄱ" matches "한글".
  */
 function fuzzyMatch(query: string, target: string): boolean {
 	if (query.length === 0) return true;
@@ -131,7 +141,9 @@ function fuzzyMatch(query: string, target: string): boolean {
 
 	let qi = 0;
 	for (let ti = 0; ti < target.length && qi < query.length; ti++) {
-		if (query[qi] === target[ti]) qi++;
+		const queryChar = query[qi] as string;
+		const targetChar = target[ti] as string;
+		if (queryChar === targetChar || hangulInitialJamo(targetChar) === queryChar) qi++;
 	}
 	return qi === query.length;
 }

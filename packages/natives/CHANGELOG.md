@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `fuzzyFind` subsequence scoring supports Hangul chosung (초성) matching: a bare consonant jamo in the query matches any syllable with that initial consonant. Exact, prefix, and contains tiers are unchanged, so literal matches keep outranking chosung matches.
+
 ### Fixed
 
 - `fuzzyFind` NFC-normalizes queries and candidate paths before scoring so composed (NFC) queries match decomposed (NFD) file names as returned by macOS volumes.

@@ -19,7 +19,7 @@ interface WorkflowJob {
 	needs?: string[];
 	if?: string;
 	env?: Record<string, string>;
-	concurrency?: { group: string; "cancel-in-progress"?: string | boolean; queue?: string };
+	concurrency?: { group: string; "cancel-in-progress"?: string | boolean };
 	steps: WorkflowStep[];
 }
 
@@ -187,7 +187,11 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
 		// Every candidate must serialize: each one selects a dev base and materializes
 		// a merge, so concurrent runs could validate incompatible integration states.
-		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false\n      queue: max");
+		// Candidates must serialize on one non-cancelling lane with schema-valid keys
+		// only: GitHub Actions concurrency has exactly `group` and
+		// `cancel-in-progress`; unknown keys make the workflow fail actionlint.
+		expect(source).toContain("group: dev-ci-virtual-integration\n      cancel-in-progress: false");
+		expect(source).not.toMatch(/^\s+queue:/m);
 		expect(source).toContain("Select authoritative terminal-green dev base");
 		expect(source).toContain("bun scripts/ci-virtual-integration.ts --select-base");
 		expect(source).toContain("CI_VI_BASE_SHA: ${{ steps.green-dev.outputs.base_sha }}");
@@ -244,6 +248,12 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(raw).toBeDefined();
 		expect(raw!.group).toBe("dev-ci-virtual-integration");
 		expect(raw!["cancel-in-progress"]).toBe(false);
-		expect(raw!.queue).toBe("max");
+		// Regression for the dev workflow_dispatch zero-step "Virtual integration
+		// validation" terminal-red incident burst (runs 33025650533..33038420275):
+		// the job block previously carried an unsupported `queue: max` key that is
+		// outside GitHub Actions' documented concurrency schema and made every
+		// static workflow gate fail. Concurrency admits only group +
+		// cancel-in-progress; queue depth is platform-controlled.
+		expect(Object.keys(raw!).sort()).toEqual(["cancel-in-progress", "group"]);
 	});
 });

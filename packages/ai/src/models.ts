@@ -29,7 +29,15 @@ const providerModelRegistry: Map<string, Map<string, Model<Api>>> = new Map();
 function getBundledCatalog(): BundledCatalog {
 	// TS types a .json import as its contents; at runtime `with { type: "file" }`
 	// yields the file path (bunfs path in compiled binaries, disk path in dev).
-	bundledCatalog ??= JSON.parse(readFileSync(modelsJsonPath as unknown as string, "utf8")) as BundledCatalog;
+	if (bundledCatalog !== undefined) return bundledCatalog;
+	const resource = modelsJsonPath as unknown;
+	if (typeof resource === "string") {
+		bundledCatalog = JSON.parse(readFileSync(resource, "utf8")) as BundledCatalog;
+	} else if (resource !== null && typeof resource === "object") {
+		bundledCatalog = resource as BundledCatalog;
+	} else {
+		throw new Error("Bundled models catalog resource is invalid.");
+	}
 	return bundledCatalog;
 }
 

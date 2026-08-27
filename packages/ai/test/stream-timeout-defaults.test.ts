@@ -73,6 +73,10 @@ describe("getProviderFirstEventTimeoutFallbackMs(provider)", () => {
 		expect(getProviderFirstEventTimeoutFallbackMs("ollama-cloud")).toBe(300_000);
 	});
 
+	it("gives LM Studio a 300-second first-event window for local model startup", () => {
+		expect(getProviderFirstEventTimeoutFallbackMs("lm-studio")).toBe(300_000);
+	});
+
 	it("does not widen unrelated providers", () => {
 		expect(getProviderFirstEventTimeoutFallbackMs("anthropic")).toBeUndefined();
 	});
@@ -159,6 +163,10 @@ describe("getStreamFirstEventTimeoutMs(idleTimeoutMs, fallbackMs)", () => {
 describe("resolveOpenAISdkRequestTimeoutMs(provider, override)", () => {
 	it("uses the Alibaba 600s fallback when neither env nor caller pins a value", () => {
 		expect(resolveOpenAISdkRequestTimeoutMs("alibaba-token-plan")).toBe(600_000);
+	});
+
+	it("uses the LM Studio 300s fallback for slow local request setup", () => {
+		expect(resolveOpenAISdkRequestTimeoutMs("lm-studio")).toBe(300_000);
 	});
 
 	it("honors an explicit shorter Alibaba override for pre-headers setup", () => {

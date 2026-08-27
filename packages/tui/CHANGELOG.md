@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `@` fuzzy file search supports Hangul chosung (초성) matching: a bare consonant matches any syllable with that initial, so `@ㅎㄱ` finds `한글.txt`. Literal and full-syllable matches keep ranking above chosung matches.
+
 ### Fixed
 
 - Path autocomplete matches decomposed (NFD) file names against composed (NFC) input. Composer keystrokes are NFC-normalized while macOS volumes commonly return Hangul and other composed scripts in NFD, so `@한` found nothing even though `한글.txt` existed; both the directory-listing prefix match and the fuzzy filter now compare NFC forms while completion values keep the on-disk name. The native fuzzy finder applies the same normalization to queries and candidates.

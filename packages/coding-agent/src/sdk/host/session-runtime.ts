@@ -87,6 +87,8 @@ const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
  *  after this bound are abandoned — their durable broker state is the recovery
  *  authority, and outcomes are inherently uncertain. */
 const GATE_RESOLUTION_QUIESCENCE_MS = 5_000;
+/** Maximum time a replaced runtime may retain a lifecycle persistence task. */
+const LIFECYCLE_QUIESCENCE_MS = 1_000;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -397,6 +399,10 @@ export interface CreateSdkSessionRuntimeOptions {
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
+	/** Test-only observation of a genuinely timed-out lifecycle drain. */
+	onLifecycleDrainTimeoutForTests?: () => void;
+	/** Test-only observation of bounded failure-diagnostic deduplication state. */
+	onFailureDiagnosticKeyCountForTests?: (count: number) => void;
 }
 
 function unavailable(operation: string): () => never {
@@ -746,7 +752,13 @@ export function createInvocationReconciliation(
 				// failure reason may arrive on a different delivery path than the one that
 				// claimed the terminal. Enrich the settled record instead of dropping it;
 				// never resurrect (status/terminalAt untouched), and first reason wins.
-				if (frame.type === "agent_failed" && record.error === undefined) {
+				if (frame.type === "agent_failed") {
+					const failure = sanitizePromptFailure(frame.error);
+					if (
+						record.error !== undefined &&
+						!(record.error.code === "agent_failed" && failure.code !== "agent_failed")
+					)
+						return;
 					const next = { ...record, revision: ++mutationRevision };
 					logger.error("SDK invocation failed (late)", {
 						kind,
@@ -754,7 +766,7 @@ export function createInvocationReconciliation(
 						turnId: correlation.turnId,
 						error: formatPromptFailureForLocalLog(frame.error),
 					});
-					next.error = sanitizePromptFailure(frame.error);
+					next.error = failure;
 					records.set(recordKey, next);
 					try {
 						await persist();
@@ -779,7 +791,9 @@ export function createInvocationReconciliation(
 					turnId: correlation.turnId,
 					error: formatPromptFailureForLocalLog(frame.error),
 				});
-				next.error ??= sanitizePromptFailure(frame.error);
+				const failure = sanitizePromptFailure(frame.error);
+				if (next.error === undefined || (next.error.code === "agent_failed" && failure.code !== "agent_failed"))
+					next.error = failure;
 			} else {
 				next.status = next.error === undefined ? "terminal_ok" : "failed";
 				next.terminalAt = Date.now();
@@ -1507,6 +1521,85 @@ function rejectionRecoveryIntent(error: unknown): { code: string; message: strin
 	return sanitizePromptFailure(error);
 }
 
+/**
+ * A provider can finish a stream with an assistant error message rather than
+ * rejecting the prompt promise. The SDK extension receives the final agent_end
+ * after retry/fallback policy has settled, so this is the safe boundary at which
+ * to publish the additive failure diagnostic before terminal reconciliation.
+ */
+function providerFailureFromAgentEnd(event: unknown): { code: string; message: string } | undefined {
+	try {
+		if (!event || typeof event !== "object") return undefined;
+		const messages = (event as { messages?: unknown }).messages;
+		if (!Array.isArray(messages)) return undefined;
+		const lastAssistant = [...messages]
+			.reverse()
+			.find(
+				message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant",
+			);
+		if (!lastAssistant || typeof lastAssistant !== "object") return undefined;
+		const assistant = lastAssistant as {
+			stopReason?: unknown;
+			errorMessage?: unknown;
+			errorKind?: unknown;
+			errorStatus?: unknown;
+			transportFailure?: { status?: unknown };
+		};
+		let stopReason: unknown;
+		try {
+			stopReason = assistant.stopReason;
+		} catch {
+			return undefined;
+		}
+		if (stopReason !== "error") return undefined;
+		let errorKind: unknown;
+		try {
+			errorKind = assistant.errorKind;
+		} catch {
+			return undefined;
+		}
+		if (errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow") return undefined;
+		let errorMessage: unknown;
+		try {
+			errorMessage = assistant.errorMessage;
+		} catch {
+			return undefined;
+		}
+		// Agent-local malformed-tool and composer policy circuit breakers also use
+		// stopReason=error, but they are not provider failures and must not be
+		// reported as provider_rejected to SDK callers.
+		if (
+			typeof errorMessage === "string" &&
+			(errorMessage.includes("Composer bash policy blocked repository file I/O again") ||
+				errorMessage.includes("consecutive turns of malformed tool calls"))
+		)
+			return undefined;
+		let status: number | undefined;
+		try {
+			const errorStatus = assistant.errorStatus;
+			if (typeof errorStatus === "number" && Number.isSafeInteger(errorStatus)) status = errorStatus;
+		} catch {
+			// A malformed errorStatus is equivalent to a statusless provider error.
+		}
+		if (status === undefined) {
+			try {
+				const transportStatus = assistant.transportFailure?.status;
+				if (typeof transportStatus === "number" && Number.isSafeInteger(transportStatus)) status = transportStatus;
+			} catch {
+				// A throwing transport metadata accessor is also statusless.
+			}
+		}
+		if (status === 402 || status === 429)
+			return { code: `provider_http_${status}`, message: "Prompt submission failed." };
+		if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
+		return { code: "provider_rejected", message: "Prompt submission failed." };
+	} catch {
+		// Provider metadata is untrusted: an SDK/provider adapter may expose a
+		// throwing getter while the lifecycle boundary still needs to terminalize.
+		return undefined;
+	}
+}
+
 function createControlSurface(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
@@ -1516,12 +1609,14 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
 		startsOwnTurn: boolean,
+		sdkRunToken: string,
 	) => void,
 	steerReconciliation: KindAwareReconciliation,
 	onPromotedTurn?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
+		sdkRunToken: string,
 		promotion?: { startsOwnRun?: boolean; removed?: boolean },
 	) => void,
 	policy?: SdkSurfacePolicy,
@@ -1627,6 +1722,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		clientRef: string | undefined,
 		run: (options: {
+			sdkRunToken: string;
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Internal disposition before a queued submission is actually consumed. */
@@ -1646,6 +1742,7 @@ function createControlSurface(
 		const retainedClientRef = normalizeClientRef(clientRef);
 		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
+		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const preflight = Promise.withResolvers<void>();
 		let accepted = false;
 		let settled = false;
@@ -1672,7 +1769,7 @@ function createControlSurface(
 				// The accepted submission does NOT own the active turn until its run
 				// actually STARTS: the connection is carried on the pending entry and
 				// associated at agent_start instead (review thread P1).
-				onAccepted(kind, correlation, requesterConnectionId, startsOwnTurn);
+				onAccepted(kind, correlation, requesterConnectionId, startsOwnTurn, sdkRunToken);
 				preflight.resolve();
 			} catch (error) {
 				settled = true;
@@ -1704,6 +1801,7 @@ function createControlSurface(
 			const submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
+					sdkRunToken,
 					onPreflightAcceptCommit: accept,
 					onDispatchDisposition: promotion => {
 						promotionStartsOwnRun = promotion.startsOwnRun;
@@ -1724,7 +1822,7 @@ function createControlSurface(
 					// terminal-abort that turn (review threads P1/P2).
 					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => {
 						promotionStartsOwnRun = promotion?.startsOwnRun;
-						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion);
+						onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion);
 					},
 					queuedAtDispatch,
 				}),
@@ -1768,7 +1866,7 @@ function createControlSurface(
 									});
 									retirePendingOwner?.(kind, correlation, "always");
 								} catch (transitionError) {
-									if (kind === "prompt") {
+									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(kind, correlation, "recover-terminal");
 										return;
 									}
@@ -1830,7 +1928,7 @@ function createControlSurface(
 								try {
 									await reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 								} catch {
-									if (kind === "prompt") {
+									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(
 											kind,
 											correlation,
@@ -1863,7 +1961,7 @@ function createControlSurface(
 								try {
 									await reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
 								} catch (transitionError) {
-									if (kind === "prompt") {
+									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(
 											kind,
 											correlation,
@@ -2784,10 +2882,14 @@ function createControlSurface(
 	};
 	return {
 		prompt: async (text, images, clientRef) =>
-			submit("prompt", clientRef, ({ queuedAtDispatch, ...options }) =>
+			submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunToken, ...options }) =>
 				api.sendUserMessage(
 					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
-					queuedAtDispatch ? { ...options, queuedAtDispatch: true } : options,
+					{
+						...options,
+						sdkRunToken,
+						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
+					},
 				),
 			),
 		steer: async (text, clientRef) => {
@@ -3033,10 +3135,28 @@ export function registerSdkOnlyNotificationCommand(api: ExtensionAPI): void {
 	});
 }
 
+function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
+	const error = { code: "session_quiescing", message: "The session endpoint is being replaced." };
+	const id = typeof frame.id === "string" ? frame.id : "";
+	if (frame.type === "control_request") return { type: "control_response", id, ok: false, error };
+	if (frame.type === "query_request") return { type: "query_response", id, ok: false, error };
+	if (frame.type === "event_replay") return { type: "event_replay_result", id, ok: false, error };
+	if (frame.type === "session_activate")
+		return { type: "session_activate_result", id, ok: false, status: "authority_unavailable", error };
+	if (frame.type === "register_provider") return { type: "register_provider_result", id, ok: false, error };
+	if (frame.type === "reverse_response")
+		return { type: "transport_error", id, code: error.code, message: error.message };
+	if (frame.type === "provider_heartbeat" || frame.type === "lease_release")
+		return { type: "transport_error", code: "session_quiescing", message: error.message };
+	return undefined;
+}
+
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	let active:
 		| {
+				sessionId: string;
+				sessionIdentity: string;
 				runtime: SessionSdkSessionRuntime;
 				revisions: RevisionStore;
 				cursors: CursorRegistry;
@@ -3047,8 +3167,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					kind: InvocationKind;
 					correlation: InvocationCorrelation;
 					connectionId: string | undefined;
+					sdkRunToken: string;
 				}>;
 				registerBroker: () => Promise<void>;
+				quiesceInput: () => void;
 				fenceGateResolutions: () => void;
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
@@ -3060,18 +3182,163 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						kind: InvocationKind;
 						correlation: InvocationCorrelation;
 						connectionId: string | undefined;
+						sdkRunToken: string;
 					}>;
 					attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				}>;
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
 				lifecycleEpoch: number;
+				failureDiagnosticKeys: Set<string>;
+				failureDiagnosticCodes: Map<string, string>;
+				lifecycleTasks: Set<Promise<void>>;
 				/** Failure reasons whose durable agent_failed write failed; the
 				 * subsequent agent_end must re-record them before terminalizing or
 				 * the record classifies terminal_ok (exact-head review P1). */
 				unrecordedFailureReasons?: Map<string, { code: string; message: string }>;
 		  }
 		| undefined;
+	type RuntimeState = NonNullable<typeof active>;
+	type LifecycleBatch = RuntimeState["openLifecycleBatches"][number];
+	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
+	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
+	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
+	const skillRecoveryControllers = new Map<string, AbortController>();
+	const skillTerminalRecoveryControllers = new Map<string, AbortController>();
+	const ambiguousLifecycleIdentities = new Set<string>();
+	const lifecycleRunOwners = new Map<
+		string,
+		{ state: RuntimeState; batch?: LifecycleBatch; correlationKey?: string }
+	>();
+	const lifecycleCorrelationKey = (correlation: InvocationCorrelation): string =>
+		`${correlation.commandId}:${correlation.turnId}`;
+	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionFile = ctx.sessionManager.getSessionFile?.();
+		if (sessionFile) return `${sessionId}\u0000${sessionFile}`;
+		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		return `${sessionId}\u0000${resolveReconciliationSessionFile(undefined, stateRoot, sessionId)}`;
+	};
+	const lifecycleStateForContext = (
+		ctx: ExtensionContext,
+		type: "agent_start" | "agent_end" | "agent_failed" = "agent_start",
+	): RuntimeState | undefined => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionIdentity = sessionIdentityForContext(ctx);
+		if (!sessionIdentity) return undefined;
+		const retired = (retiredLifecycleOwners.get(sessionId) ?? []).filter(
+			owner => owner.sessionIdentity === sessionIdentity,
+		);
+		if (type !== "agent_start") {
+			if (ambiguousLifecycleIdentities.has(sessionIdentity)) return undefined;
+			if (retired.length > 1) {
+				ambiguousLifecycleIdentities.add(sessionIdentity);
+				return undefined;
+			}
+			const delayedOwner = retired.find(owner => owner.openLifecycleBatches.length > 0);
+			if (delayedOwner) {
+				if (active?.sessionIdentity === sessionIdentity && active.lifecycleActive) {
+					ambiguousLifecycleIdentities.add(sessionIdentity);
+					return undefined;
+				}
+				return delayedOwner;
+			}
+		}
+		if (active?.sessionIdentity === sessionIdentity) return active;
+		return retired[0];
+	};
+	const lifecycleStateForEvent = (
+		ctx: ExtensionContext,
+		type: "agent_start" | "agent_end" | "agent_failed",
+		sdkRunToken: unknown,
+	): RuntimeState | undefined =>
+		typeof sdkRunToken === "string" && sdkRunToken.length > 0
+			? lifecycleRunOwners.get(sdkRunToken)?.state
+			: lifecycleStateForContext(ctx, type);
+	const removeRetiredLifecycleOwner = (owner: RuntimeState): void => {
+		const timer = retiredLifecycleOwnerTimers.get(owner);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			retiredLifecycleOwnerTimers.delete(owner);
+		}
+		const owners = retiredLifecycleOwners.get(owner.sessionId);
+		if (!owners) {
+			ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
+			return;
+		}
+		const remaining = owners.filter(candidate => candidate !== owner);
+		if (remaining.length === 0) retiredLifecycleOwners.delete(owner.sessionId);
+		else retiredLifecycleOwners.set(owner.sessionId, remaining);
+		const remainingSameIdentity = remaining.filter(candidate => candidate.sessionIdentity === owner.sessionIdentity);
+		if (remainingSameIdentity.length < 2) ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
+		// Expiry is the final lifecycle-reference boundary. Do not retain
+		// diagnostic suppression or failed-write recovery state after the owner is
+		// no longer eligible to receive a delayed event.
+		owner.failureDiagnosticKeys.clear();
+		owner.failureDiagnosticCodes.clear();
+		owner.unrecordedFailureReasons?.clear();
+		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
+	};
+	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
+		if (
+			owner.pending.length > 0 ||
+			owner.openLifecycleBatches.length > 0 ||
+			(owner.attachedInvocations?.length ?? 0) > 0 ||
+			(owner.drainedInvocations?.length ?? 0) > 0 ||
+			owner.lifecycleTasks.size > 0
+		)
+			return;
+		removeRetiredLifecycleOwner(owner);
+	};
+	const removeLifecycleTokenAliases = (owner: RuntimeState, correlation: InvocationCorrelation): void => {
+		const target = lifecycleCorrelationKey(correlation);
+		for (const [token, binding] of lifecycleRunOwners) {
+			if (binding.state === owner && binding.correlationKey === target) lifecycleRunOwners.delete(token);
+		}
+	};
+	const removeLifecycleReferences = (owner: RuntimeState, correlation: InvocationCorrelation): void => {
+		const target = lifecycleCorrelationKey(correlation);
+		const retainedPending = owner.pending.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
+		owner.pending.splice(0, owner.pending.length, ...retainedPending);
+		for (const batch of owner.openLifecycleBatches) {
+			batch.invocations = batch.invocations.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
+			batch.attachedInvocations = batch.attachedInvocations.filter(
+				entry => lifecycleCorrelationKey(entry.correlation) !== target,
+			);
+		}
+		owner.openLifecycleBatches = owner.openLifecycleBatches.filter(
+			batch => batch.invocations.length > 0 || batch.attachedInvocations.length > 0,
+		);
+		owner.drainedInvocations = owner.drainedInvocations?.filter(
+			entry => lifecycleCorrelationKey(entry.correlation) !== target,
+		);
+		owner.attachedInvocations = owner.attachedInvocations?.filter(
+			entry => lifecycleCorrelationKey(entry.correlation) !== target,
+		);
+		if (owner.activeInvocation && lifecycleCorrelationKey(owner.activeInvocation.correlation) === target) {
+			const replacement =
+				owner.openLifecycleBatches.flatMap(batch => batch.invocations)[0] ?? owner.attachedInvocations?.[0];
+			owner.activeInvocation = replacement
+				? { kind: replacement.kind, correlation: replacement.correlation }
+				: undefined;
+		}
+		removeLifecycleTokenAliases(owner, correlation);
+		if (owner === active) {
+			const owners = new Set<string>();
+			const activeBatch = owner.activeInvocation
+				? owner.openLifecycleBatches.find(batch =>
+						batch.invocations.some(
+							entry =>
+								lifecycleCorrelationKey(entry.correlation) ===
+								lifecycleCorrelationKey(owner.activeInvocation!.correlation),
+						),
+					)
+				: undefined;
+			for (const entry of activeBatch?.invocations ?? [])
+				if (entry.connectionId !== undefined) owners.add(entry.connectionId);
+			activePromptOwnerHolder.connectionIds = owners.size > 0 ? owners : undefined;
+		}
+	};
 	// Shared with the control surface's terminal abort: the correlated
 	// agent_end publication capture (AC 19). terminalAbort installs a fresh
 	// resolver before settling the abort; emitLifecycle resolves it with the
@@ -3089,15 +3356,28 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// turn it did not submit, and never set for agent-initiated turns (review
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
+	let nextLifecycleEpoch = 0;
 	const skillTerminalRecoveryKeys = new Set<string>();
+	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
+		if (!owner) return Promise.resolve();
+		let task: Promise<void>;
+		task = handler().finally(() => {
+			owner.lifecycleTasks.delete(task);
+			maybeRetireLifecycleOwner(owner);
+		});
+		owner.lifecycleTasks.add(task);
+		return task;
+	};
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
 		ctx: ExtensionContext,
 		failureCause?: unknown,
 		maintenanceOutcome?: string,
+		lifecycleOwner?: LifecycleOwner,
 	): Promise<void> => {
-		const current = active;
+		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
+		const failureBatch = lifecycleOwner?.batch;
 		const adoptLifecycleBatch = (
 			batch:
 				| Array<{
@@ -3111,7 +3391,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.activeInvocation = undefined;
 				current.drainedInvocations = undefined;
 				current.attachedInvocations = undefined;
-				activePromptOwnerHolder.connectionIds = undefined;
+				if (current === active) activePromptOwnerHolder.connectionIds = undefined;
 				return;
 			}
 			current.activeInvocation = batch[0];
@@ -3119,19 +3399,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			current.attachedInvocations = undefined;
 			const owners = new Set<string>();
 			for (const entry of batch) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
-			activePromptOwnerHolder.connectionIds = owners;
+			if (current === active) activePromptOwnerHolder.connectionIds = owners;
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_failed") {
-			const activeInvocation = current.activeInvocation;
+			const activeInvocation = failureBatch?.invocations[0] ?? current.activeInvocation;
 			const activeBatch = activeInvocation
-				? current.openLifecycleBatches.find(batch =>
+				? (failureBatch ??
+					current.openLifecycleBatches.find(batch =>
 						batch.invocations.some(
 							entry =>
 								entry.correlation.commandId === activeInvocation.correlation.commandId &&
 								entry.correlation.turnId === activeInvocation.correlation.turnId,
 						),
-					)
+					))
 				: undefined;
 			const fallback =
 				activeBatch?.invocations ??
@@ -3152,8 +3433,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			);
 			transitions = [...fallback, ...attached].map(({ kind, correlation }) => ({ kind, correlation }));
 		} else if (type === "agent_start") {
-			current.lifecycleEpoch += 1;
-			activePromptOwnerHolder.lifecycleEpoch = current.lifecycleEpoch;
+			current.lifecycleEpoch = ++nextLifecycleEpoch;
+			if (current === active) activePromptOwnerHolder.lifecycleEpoch = current.lifecycleEpoch;
 			// Mark lifecycle active even when the drain is empty: a monitor/cron
 			// run started by the session has no SDK pending entry but is still a
 			// real active run that later in-run promotions must attach to instead
@@ -3211,8 +3492,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// may already have advanced to. Publication proof and race retirement must
 		// use the same batch identity as reconciliation.
 		const eventLifecycleEpoch =
-			type === "agent_end"
-				? (current.openLifecycleBatches[0]?.epoch ?? current.lifecycleEpoch)
+			(type === "agent_failed" || type === "agent_end") && failureBatch
+				? failureBatch.epoch
 				: current.lifecycleEpoch;
 		const resolveTerminalPublicationWaiters = (observed: boolean): void => {
 			const waiters = terminalPublicationCapture.waiters;
@@ -3223,17 +3504,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			for (const waiter of matched) waiter.resolve(observed);
 		};
 		const retireEndedLifecycleBatch = (): void => {
-			const ended = current.openLifecycleBatches[0];
+			const ended = failureBatch ?? current.openLifecycleBatches[0];
 			if (!ended) return;
 			const transitionKeys = new Set(
 				transitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
 			);
 			if (
-				ended.invocations.some(({ correlation }) =>
+				!ended.invocations.some(({ correlation }) =>
 					transitionKeys.has(`${correlation.commandId}:${correlation.turnId}`),
 				)
 			)
-				current.openLifecycleBatches.shift();
+				return;
+			const index = current.openLifecycleBatches.indexOf(ended);
+			if (index >= 0) current.openLifecycleBatches.splice(index, 1);
 		};
 		const scheduleSkillTerminalRecovery = (invocation: {
 			kind: InvocationKind;
@@ -3243,6 +3526,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			const recoveryKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
 			if (skillTerminalRecoveryKeys.has(recoveryKey)) return;
 			skillTerminalRecoveryKeys.add(recoveryKey);
+			const controller = new AbortController();
+			skillTerminalRecoveryControllers.set(recoveryKey, controller);
 			const attempt = async (): Promise<void> => {
 				try {
 					const unrecorded = current.unrecordedFailureReasons?.get(recoveryKey);
@@ -3255,6 +3540,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}
 					await current.reconciliation.noteTransition("skill", invocation.correlation, { type: "agent_end" });
 					skillTerminalRecoveryKeys.delete(recoveryKey);
+					current.failureDiagnosticKeys.delete(recoveryKey);
 					for (const batch of current.openLifecycleBatches) {
 						batch.invocations = batch.invocations.filter(
 							entry =>
@@ -3277,16 +3563,33 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
 					if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
 				} catch (error) {
+					if (controller.signal.aborted) {
+						skillTerminalRecoveryKeys.delete(recoveryKey);
+						return;
+					}
 					logger.error("SDK skill lifecycle terminal recovery retrying", {
 						commandId: invocation.correlation.commandId,
 						turnId: invocation.correlation.turnId,
 						error: sanitizePromptFailure(error),
 					});
-					await Bun.sleep(1_000);
+					const wait = Promise.withResolvers<void>();
+					const timer = setTimeout(wait.resolve, 1_000);
+					timer.unref();
+					const onAbort = () => {
+						clearTimeout(timer);
+						wait.resolve();
+					};
+					controller.signal.addEventListener("abort", onAbort, { once: true });
+					await wait.promise;
+					controller.signal.removeEventListener("abort", onAbort);
+					if (controller.signal.aborted) {
+						skillTerminalRecoveryKeys.delete(recoveryKey);
+						return;
+					}
 					return attempt();
 				}
 			};
-			void attempt();
+			void attempt().finally(() => skillTerminalRecoveryControllers.delete(recoveryKey));
 		};
 		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
 			try {
@@ -3295,6 +3598,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// Maintenance checkpoints are non-terminal lifecycle observations.
 			}
 			return;
+		}
+		const correlationKey = (correlation: InvocationCorrelation): string =>
+			`${correlation.commandId}:${correlation.turnId}`;
+		if (type === "agent_failed") {
+			transitions = transitions.filter(
+				invocation => !current.failureDiagnosticKeys.has(correlationKey(invocation.correlation)),
+			);
+			const diagnosticCode = sanitizePromptFailure(
+				failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+			).code;
+			for (const invocation of transitions)
+				current.failureDiagnosticKeys.add(correlationKey(invocation.correlation));
+			for (const invocation of transitions)
+				current.failureDiagnosticCodes.set(correlationKey(invocation.correlation), diagnosticCode);
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
@@ -3356,7 +3673,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}
 				}
 			}
-			const sessionId = ctx.sessionManager.getSessionId();
+			const sessionId = lifecycleOwner?.sessionId ?? ctx.sessionManager.getSessionId();
 			if (type === "agent_failed") {
 				// Failure is a correlated diagnostic, not the terminal lifecycle boundary.
 				// Publish one safe frame per invocation so clients can attribute a shared
@@ -3395,6 +3712,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// and the next agent_end is paired with stale ownership.
 				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
 				retireEndedLifecycleBatch();
+				const failedKeys = new Set(failedTransitions.map(({ correlation }) => correlationKey(correlation)));
+				for (const invocation of transitions) {
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						removeLifecycleReferences(current, invocation.correlation);
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
+				}
+				options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 				resolveTerminalPublicationWaiters(observed);
 				return;
 			}
@@ -3410,7 +3737,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				resolveTerminalPublicationWaiters(observed);
 				return;
 			}
-			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
+			const ended = failureBatch ?? current.openLifecycleBatches[0];
+			if (ended) {
+				const index = current.openLifecycleBatches.indexOf(ended);
+				if (index >= 0) current.openLifecycleBatches.splice(index, 1);
+			}
+			for (const invocation of transitions) removeLifecycleReferences(current, invocation.correlation);
+			for (const invocation of transitions)
+				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+			for (const invocation of transitions)
+				current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
+			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
 			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
@@ -3422,33 +3759,122 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveTerminalPublicationWaiters(observed);
 		}
 	};
-	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
-	api.on(
-		"agent_end",
-		async (event, ctx) =>
+	api.on("agent_start", (event, ctx) => {
+		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
+		return trackLifecycle(async () => {
+			await emitLifecycle(
+				"agent_start",
+				ctx,
+				undefined,
+				undefined,
+				owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+			);
+			if (owner && typeof event.sdkRunToken === "string" && event.sdkRunToken.length > 0) {
+				const batch = owner.openLifecycleBatches.at(-1);
+				const entry = batch?.invocations.find(item => item.sdkRunToken === event.sdkRunToken);
+				const previous = lifecycleRunOwners.get(event.sdkRunToken);
+				lifecycleRunOwners.set(event.sdkRunToken, {
+					state: owner,
+					batch,
+					...(previous?.correlationKey !== undefined
+						? { correlationKey: previous.correlationKey }
+						: entry
+							? { correlationKey: lifecycleCorrelationKey(entry.correlation) }
+							: {}),
+				});
+			}
+		}, owner);
+	});
+	api.on("agent_end", (event, ctx) => {
+		const tokenBinding =
+			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
+		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
+		// Capture the oldest unmatched batch synchronously. A successor may start
+		// while the failed diagnostic persists; that must not retarget the
+		// predecessor's reason or terminal boundary to the successor invocation.
+		const endedBatch = tokenBinding?.batch ?? owner?.openLifecycleBatches[0];
+		const lifecycleOwner = owner
+			? {
+					state: owner,
+					sessionId: owner.sessionId,
+					...(endedBatch ? { batch: endedBatch } : {}),
+				}
+			: undefined;
+		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
+		const failure = providerFailureFromAgentEnd(event);
+		const failureCandidates = endedBatch
+			? [...endedBatch.invocations, ...endedBatch.attachedInvocations]
+			: currentInvocation
+				? [currentInvocation]
+				: [];
+		const genericFailureKeys = failureCandidates
+			.map(({ correlation }) => lifecycleCorrelationKey(correlation))
+			.filter(key => owner?.failureDiagnosticCodes.get(key) === "agent_failed");
+		const hasExistingFailure = failureCandidates.some(({ correlation }) =>
+			owner?.failureDiagnosticKeys.has(lifecycleCorrelationKey(correlation)),
+		);
+		const failureAlreadyPublished = failure === undefined || (hasExistingFailure && genericFailureKeys.length === 0);
+		return trackLifecycle(async () => {
+			if (failure && !failureAlreadyPublished) {
+				for (const key of genericFailureKeys) owner?.failureDiagnosticKeys.delete(key);
+				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
+			}
 			await emitLifecycle(
 				"agent_end",
 				ctx,
 				undefined,
 				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-			),
-	);
-	api.on("agent_failed", async (event, ctx) => emitLifecycle("agent_failed", ctx, event.error));
+				lifecycleOwner,
+			);
+		}, owner).finally(() => {
+			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
+				lifecycleRunOwners.delete(event.sdkRunToken);
+		});
+	});
+	api.on("agent_failed", (event, ctx) => {
+		const tokenBinding =
+			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
+		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_failed", event.sdkRunToken);
+		const failedBatch = tokenBinding?.batch ?? owner?.openLifecycleBatches[0];
+		return trackLifecycle(
+			async () =>
+				emitLifecycle(
+					"agent_failed",
+					ctx,
+					event.error,
+					undefined,
+					owner
+						? {
+								state: owner,
+								sessionId: owner.sessionId,
+								...(failedBatch ? { batch: failedBatch } : {}),
+							}
+						: undefined,
+				),
+			owner,
+		);
+	});
 	api.on("turn_start", async (_event, ctx) => {
-		const current = active;
+		const current = lifecycleStateForContext(ctx, "agent_start");
 		if (!current) return;
 		await current.registerBroker();
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
 	api.on("turn_end", (_event, ctx) =>
-		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
+		lifecycleStateForContext(ctx, "agent_end")?.runtime.emitEvent({
+			type: "turn_end",
+			sessionId: ctx.sessionManager.getSessionId(),
+		}),
 	);
 	// Tool activity renews the deadline of EVERY prompt correlation attached to
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
-	// false-fire prompt_deadline_exceeded during a long shared run (#4668).
-	const renewAttributableProgress = (eventType: string): void => {
-		const current = active;
+	// false-fire prompt_deadline_exceeded during a long shared run.
+	const renewAttributableProgress = (eventType: string, ctx: ExtensionContext): void => {
+		// Tool events do not carry an SDK run token. Prefer the lifecycle-active
+		// runtime for the current session so a retained predecessor cannot make a
+		// live replacement look ambiguous and suppress its lease renewal.
+		const current = lifecycleStateForContext(ctx, "agent_start");
 		if (!current) return;
 		// Renew only invocations adopted by the CURRENT run: the live lifecycle
 		// batch plus in-run attachments. drainedInvocations may still hold
@@ -3488,12 +3914,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	api.on("tool_execution_start", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_start");
-		void ctx;
+		renewAttributableProgress("tool_execution_start", ctx);
 	});
 	api.on("tool_execution_end", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_end");
-		void ctx;
+		renewAttributableProgress("tool_execution_end", ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -3513,6 +3937,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const sessionFile =
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
+		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
 			createReconciliationStore({ sessionFile, sessionId });
@@ -3534,18 +3959,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				return typeof v === "number" && Number.isFinite(v) ? v : 21_600_000;
 			},
 			onExpired: correlation => {
-				const idx = pending.findIndex(
-					entry =>
-						entry.correlation.commandId === correlation.commandId &&
-						entry.correlation.turnId === correlation.turnId,
-				);
-				if (idx >= 0) pending.splice(idx, 1);
+				const owner = lifecycleOwnerHolder.state;
+				if (!owner) return;
+				removeLifecycleReferences(owner, correlation);
+				maybeRetireLifecycleOwner(owner);
 			},
 		});
 		const pending: Array<{
 			kind: InvocationKind;
 			correlation: InvocationCorrelation;
 			connectionId: string | undefined;
+			sdkRunToken: string;
 		}> = [];
 		for (const { correlation, acceptedAt, deadlineMaxAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
 			deadlineManager.recoverPending(correlation, acceptedAt, deadlineMaxAt);
@@ -3555,6 +3979,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				kind: InvocationKind;
 				correlation: InvocationCorrelation;
 				connectionId: string | undefined;
+				sdkRunToken: string;
 			}>;
 			attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 		}> = [];
@@ -3584,6 +4009,60 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			settings: options.settings,
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
+		const inputGate = { quiescing: false };
+		const lifecycleOwnerHolder: { state?: RuntimeState; quiescing: boolean } = { quiescing: false };
+		const skillRecoveryTasks = new Map<string, Promise<void>>();
+		const scheduleSkillRecovery = (
+			correlation: InvocationCorrelation,
+			failureIntent?: { code: string; message: string },
+		): void => {
+			const key = lifecycleCorrelationKey(correlation);
+			if (skillRecoveryTasks.has(key)) return;
+			const controller = new AbortController();
+			skillRecoveryControllers.set(key, controller);
+			const intent = failureIntent;
+			const task = (async (): Promise<void> => {
+				let failureRecorded = intent === undefined;
+				for (;;) {
+					if (controller.signal.aborted) return;
+					try {
+						if (!failureRecorded) {
+							await reconciliation.noteTransition("skill", correlation, {
+								type: "agent_failed",
+								error: Object.assign(new Error(intent?.message ?? "skill invocation failed"), {
+									code: intent?.code ?? "skill_failed",
+								}),
+							} as never);
+							failureRecorded = true;
+						}
+						await reconciliation.noteTransition("skill", correlation, { type: "agent_end" });
+						return;
+					} catch (error) {
+						if (controller.signal.aborted) return;
+						logger.error("SDK skill lifecycle recovery retrying", {
+							commandId: correlation.commandId,
+							turnId: correlation.turnId,
+							error: sanitizePromptFailure(error),
+						});
+						const wait = Promise.withResolvers<void>();
+						const timer = setTimeout(wait.resolve, 1_000);
+						timer.unref();
+						const onAbort = () => {
+							clearTimeout(timer);
+							wait.resolve();
+						};
+						controller.signal.addEventListener("abort", onAbort, { once: true });
+						await wait.promise;
+						controller.signal.removeEventListener("abort", onAbort);
+					}
+				}
+			})();
+			skillRecoveryTasks.set(key, task);
+			void task.finally(() => {
+				skillRecoveryTasks.delete(key);
+				skillRecoveryControllers.delete(key);
+			});
+		};
 		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
 		// their queue or race a run WITHOUT consumption (exact-head review: clearing
@@ -3597,6 +4076,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation: InvocationCorrelation,
 			error: { code: string; message: string },
 		): void => {
+			if (lifecycleOwnerHolder.state) removeLifecycleTokenAliases(lifecycleOwnerHolder.state, correlation);
 			const attempt = async (remaining: number): Promise<void> => {
 				try {
 					// 1. Record the failure reason durably FIRST. If this write fails,
@@ -3608,10 +4088,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					} as never);
 				} catch (reasonError) {
 					if (remaining <= 1) {
-						// Hand replay to the deadline manager: the lease stays armed and
-						// its bounded expiry retries the durable terminal transition
-						// instead of leaving an accepted row with no recovery owner.
-						deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
+						// Prompts use the deadline lease; skills have no prompt lease and
+						// must use their kind-aware durable retry owner instead.
+						if (kind === "skill")
+							scheduleSkillRecovery(correlation, { code: error.code, message: error.message });
+						else
+							deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
 						logger.error("SDK abandoned submission failed to record its failure reason", {
 							kind,
 							commandId: correlation.commandId,
@@ -3630,8 +4112,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
 				} catch (transitionError) {
-					// Keep the lease armed; the manager replays the real agent_end.
-					deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
+					// Keep prompt recovery leased; skill recovery has no prompt lease.
+					if (kind === "skill") scheduleSkillRecovery(correlation);
+					else deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
 					logger.error("SDK abandoned submission failed to terminalize", {
 						kind,
 						commandId: correlation.commandId,
@@ -3647,13 +4130,26 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			ctx,
 			api,
 			reconciliation,
-			(kind, correlation, connectionId, startsOwnTurn) => {
+			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
+				const owner = lifecycleOwnerHolder.state;
+				if (lifecycleOwnerHolder.quiescing) {
+					terminalizeAbandonedSubmission(kind, correlation, {
+						code: "session_quiescing",
+						message: "Session endpoint was replaced before the invocation started.",
+					});
+					return;
+				}
+				if (sdkRunToken && owner)
+					lifecycleRunOwners.set(sdkRunToken, {
+						state: owner,
+						correlationKey: lifecycleCorrelationKey(correlation),
+					});
 				// Only submissions that start their OWN turn get a pending entry: a
 				// steering-queued submission consumed inside the current run never
 				// emits the agent_start that would consume the entry, so leaving it
 				// queued would assign its stale connection as owner of a later
 				// agent-initiated turn (review thread P1).
-				if (startsOwnTurn) pending.push({ kind, correlation, connectionId });
+				if (startsOwnTurn) pending.push({ kind, correlation, connectionId, sdkRunToken });
 				// Anchor the zero-progress deadline at durable acceptance, not at
 				// agent_start (#4668): an accepted own-turn prompt that wedges
 				// between acceptance and run start (provider/credential/compaction
@@ -3666,7 +4162,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
-			(kind, correlation, connectionId, promotion) => {
+			(kind, correlation, connectionId, sdkRunToken, promotion) => {
+				const bindPromotedToken = (batch?: LifecycleBatch): void => {
+					const owner = lifecycleOwnerHolder.state;
+					if (sdkRunToken && owner)
+						lifecycleRunOwners.set(sdkRunToken, {
+							state: owner,
+							batch,
+							correlationKey: lifecycleCorrelationKey(correlation),
+						});
+				};
+				if (lifecycleOwnerHolder.quiescing) {
+					terminalizeAbandonedSubmission(kind, correlation, {
+						code: "session_quiescing",
+						message: "Session endpoint was replaced before the invocation started.",
+					});
+					return;
+				}
 				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
 				// submission that wedges before its run's agent_start must still
 				// terminalize boundedly instead of remaining accepted forever.
@@ -3696,7 +4208,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// starts with an empty pending queue at its agent_start; create the
 					// entry at promotion so the submitting connection owns that turn
 					// (review thread P2).
-					pending.push({ kind, correlation, connectionId });
+					pending.push({ kind, correlation, connectionId, sdkRunToken });
 					return;
 				}
 				// Consumed INSIDE the currently running turn: no new agent_start
@@ -3759,6 +4271,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						)
 					)
 						activeBatch.attachedInvocations.push({ kind, correlation });
+					bindPromotedToken(activeBatch);
 					return;
 				}
 				// No in-flight run visible and this is an in-run consumption
@@ -3794,8 +4307,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// the matching correlation so a later agent-initiated turn never
 				// inherits the failed submission's connection as owner (review
 				// thread P1).
-				const index = pending.findIndex(entry => entry.correlation === correlation);
-				if (index >= 0) pending.splice(index, 1);
+				if (!lifecycleOwnerHolder.quiescing) {
+					const index = pending.findIndex(entry => entry.correlation === correlation);
+					if (index >= 0) {
+						const [removed] = pending.splice(index, 1);
+						if (removed && lifecycleRunOwners.get(removed.sdkRunToken)?.state === lifecycleOwnerHolder.state)
+							lifecycleRunOwners.delete(removed.sdkRunToken);
+					}
+				}
 				// Release the acceptance-anchored lease ONLY when the durable row is
 				// already terminal (exact-head review #4): clearing it before the
 				// settlement writes land strands the row accepted with no recovery
@@ -3808,6 +4327,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					return;
 				}
 				if (leaseRelease === "recover-failure" && failureIntent !== undefined) {
+					if (kind === "skill") {
+						scheduleSkillRecovery(correlation, failureIntent);
+						return;
+					}
 					// Compound failure-plus-terminal recovery: the settlement's durable
 					// writes failed, so the lease stays armed as the recovery owner and its
 					// replay re-records the failure reason before agent_end (exact-head
@@ -3816,6 +4339,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					return;
 				}
 				if (leaseRelease === "recover-terminal") {
+					if (kind === "skill") {
+						scheduleSkillRecovery(correlation);
+						return;
+					}
 					deadlineManager.noteTerminalTransition(correlation);
 					return;
 				}
@@ -3892,6 +4419,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			onFrameAdmission: (_connectionId, frame) =>
+				inputGate.quiescing ? quiescingFrame(frame as Record<string, unknown>) : undefined,
 			control: async (connectionId, frame) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
@@ -4028,7 +4557,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
 			}
 		};
-		active = {
+		const runtimeOwner: RuntimeState = {
+			sessionId,
+			sessionIdentity,
 			runtime,
 			revisions,
 			cursors,
@@ -4038,6 +4569,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			pending,
 			openLifecycleBatches,
 			registerBroker,
+			quiesceInput: () => {
+				inputGate.quiescing = true;
+				lifecycleOwnerHolder.quiescing = true;
+			},
 			fenceGateResolutions: () => {
 				acceptingGateResolutions = false;
 			},
@@ -4045,7 +4580,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			disposeGate,
 			lifecycleActive: false,
 			lifecycleEpoch: 0,
+			failureDiagnosticKeys: new Set(),
+			failureDiagnosticCodes: new Map(),
+			lifecycleTasks: new Set(),
 		};
+		lifecycleOwnerHolder.state = runtimeOwner;
+		active = runtimeOwner;
 		try {
 			await runtime.start();
 			await registerBroker();
@@ -4059,7 +4599,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					code: errorCode(cleanupError),
 					error: String(cleanupError),
 				});
-				active = {
+				const failedRuntimeOwner: RuntimeState = {
+					sessionId,
+					sessionIdentity,
 					runtime,
 					revisions,
 					cursors,
@@ -4069,6 +4611,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					pending,
 					openLifecycleBatches,
 					registerBroker,
+					quiesceInput: () => {
+						inputGate.quiescing = true;
+						lifecycleOwnerHolder.quiescing = true;
+					},
 					fenceGateResolutions: () => {
 						acceptingGateResolutions = false;
 					},
@@ -4076,7 +4622,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					disposeGate,
 					lifecycleActive: false,
 					lifecycleEpoch: 0,
+					failureDiagnosticKeys: new Set(),
+					failureDiagnosticCodes: new Map(),
+					lifecycleTasks: new Set(),
 				};
+				lifecycleOwnerHolder.state = failedRuntimeOwner;
+				active = failedRuntimeOwner;
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
 			cursors.close();
@@ -4084,19 +4635,70 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			throw error;
 		}
 	};
-	const stopActive = async (): Promise<void> => {
+	const stopActive = async (cancelSkillRecovery = false): Promise<void> => {
 		const current = active;
 		if (!current) return;
-		current.deadlineManager.clearAll();
+		if (cancelSkillRecovery) {
+			for (const controller of skillRecoveryControllers.values()) controller.abort();
+			for (const controller of skillTerminalRecoveryControllers.values()) controller.abort();
+		}
+		activePromptOwnerHolder.connectionIds = undefined;
+		activePromptOwnerHolder.lifecycleEpoch = undefined;
+		current.quiesceInput();
 		current.fenceGateResolutions();
 		try {
 			await current.waitForGateResolutionQuiescence();
+			if (current.lifecycleTasks.size > 0) {
+				const lifecycleDrain = Promise.all([...current.lifecycleTasks]);
+				const timeout = Promise.withResolvers<void>();
+				const timer = setTimeout(timeout.resolve, LIFECYCLE_QUIESCENCE_MS);
+				const drained = Promise.race([lifecycleDrain, timeout.promise]);
+				await drained;
+				clearTimeout(timer);
+				if (current.lifecycleTasks.size > 0) {
+					logger.warn("SDK runtime lifecycle drain timed out; durable lifecycle recovery remains authoritative.");
+					options.onLifecycleDrainTimeoutForTests?.();
+				}
+			}
 			active = undefined;
+			const retainsLifecycleWork =
+				current.pending.length > 0 ||
+				current.openLifecycleBatches.length > 0 ||
+				(current.attachedInvocations?.length ?? 0) > 0 ||
+				(current.drainedInvocations?.length ?? 0) > 0 ||
+				current.lifecycleTasks.size > 0;
+			if (retainsLifecycleWork) {
+				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
+				if (!owners.includes(current)) owners.push(current);
+				retiredLifecycleOwners.set(current.sessionId, owners);
+				const retryCleanup = (): void => {
+					retiredLifecycleOwnerTimers.delete(current);
+					if (
+						current.pending.length > 0 ||
+						current.openLifecycleBatches.length > 0 ||
+						(current.attachedInvocations?.length ?? 0) > 0 ||
+						(current.drainedInvocations?.length ?? 0) > 0 ||
+						current.lifecycleTasks.size > 0
+					) {
+						const retry = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
+						retry.unref();
+						retiredLifecycleOwnerTimers.set(current, retry);
+						return;
+					}
+					removeRetiredLifecycleOwner(current);
+				};
+				const timer = setTimeout(retryCleanup, LIFECYCLE_QUIESCENCE_MS);
+				timer.unref();
+				retiredLifecycleOwnerTimers.set(current, timer);
+			} else current.deadlineManager.clearAll();
 			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
+			// Keep the immutable owner available for a retry when transport teardown
+			// fails after quiescing. Clearing `active` before stop prevents a second
+			// shutdown from retrying the failed endpoint removal.
+			if (active === undefined) active = current;
 			logger.error("sdk runtime stop failed", { code: errorCode(error), error: String(error) });
-			active = current;
 			throw error;
 		}
 		current.cursors.close();
@@ -4114,6 +4716,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await startRuntime(ctx);
 	});
 	api.on("session_shutdown", async () => {
-		await stopActive();
+		await stopActive(true);
 	});
 }

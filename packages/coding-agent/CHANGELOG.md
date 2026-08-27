@@ -8,6 +8,8 @@
 
 ### Added
 
+- Added opt-in `compaction.adaptive.*` settings and wired them into post-turn and pre-prompt auto-compaction. Adaptive mode remains disabled by default, preserves fixed-token precedence, and exposes bounded base, aggression, call-window, and minimum-threshold controls.
+
 - The `ask` tool declares its display-only argument fields (`questions.question`, `questions.options.label`) via `displaySafeEscapedArgFields`, so an `ask` call whose question text or option labels arrive as `\uXXXX` escapes (common from Anthropic models writing Korean or emoji) completes with a single warning instead of discarding the turn, charging the managed-fallback retry budget, and ultimately failing the run. Ids, workflow-gate metadata, and deep-interview records remain load-bearing and keep the fail-closed rejection. (#4983)
 
 - Added an explicit `Copy OAuth URL` command-palette action for interactive `/login` and runtime MCP OAuth flows. It copies the exact pending authorization URL through the configured clipboard transport only after the user selects the action; it never overwrites the clipboard automatically and clears the pending URL when the flow ends. This preserves OSC 8 policy, tmux/SSH/no-hyperlink behavior, and avoids relying on padded soft-wrapped terminal rows for copying.
@@ -38,6 +40,7 @@
 - Notification adapters can now opt into one live representation per native effect: adapters that accept a positioned event are excluded from its matching raw fan-out, while ordinary direct SDK and raw-only legacy subscribers retain their existing delivery. Telegram opts in, preventing turn output, tool activity, and reasoning summaries from rendering twice after #4570; acknowledged terminal shutdown delivery is unchanged.
 - Lean notifications no longer replay a retained completion receipt at idle when identical text was already delivered immediately before an autonomous `ask`; distinct receipts and other settlement windows remain preserved.
 - Generic file-lock release now retries transient Windows sharing denials and quarantines a verified self-owned lock when deletion remains unavailable, using an in-process acquisition generation rather than reclaiming every live lock with the same PID. Terminal `agent_end` publication remains independent of coordinator sidecar persistence, and a repeated interactive exit escalates through bounded postmortem cleanup. (#4943)
+- SDK prompts now publish a bounded structured terminal failure when a provider immediately returns HTTP 402 or 429. The accepted receipt remains non-terminal until the correlated `agent_end`, while `turn.result`/`turn.prompt_status` no longer strand the prompt as `in_flight`; replacement turns remain independently abortable and recoverable. (#4941)
 
 ## [0.15.2] - 2026-08-25
 
@@ -46,7 +49,6 @@
 - Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
 
 ## [0.15.1] - 2026-08-25
-
 ### Added
 
 - Added `/language [en|ko]`, the interactive slash command for the persisted `ui.language` selection. Without arguments it reports the current language; with a canonical code, locale tag (`en-US`, `ko-KR`), endonym (`한국어`), English name, or common aliases (`eng`, `kr`, `kor`) it persists the canonical `en`/`ko` value through settings and confirms in the selected language. An unsupported value is rejected with the available list and changes nothing. See `docs/ui-language.md`.

@@ -285,6 +285,79 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(result?.items.map(item => item.value)).toContain(`./${nfdDirectory}/linked/`);
 		});
 	});
+
+	describe("hangul chosung fuzzy matching", () => {
+		let baseDir: string;
+		const hangulName = "\uD55C\uAE00.txt";
+
+		beforeEach(() => {
+			baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-chosung-test-"));
+		});
+
+		afterEach(() => {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		});
+
+		it("matches syllable initials from a bare-consonant @ query", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${hangulName}`);
+		});
+
+		it("matches chosung against NFD-stored file names", async () => {
+			const nfdName = "\u1112\u1161\u11AB\u1100\u1173\u11AF.txt";
+			fs.writeFileSync(path.join(baseDir, nfdName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${nfdName}`);
+		});
+
+		it("mixes chosung with full syllables in one query", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\uAE00";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain(`@${hangulName}`);
+		});
+
+		it("does not match syllables whose initials differ", async () => {
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u3134\u3137";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).not.toContain(`@${hangulName}`);
+		});
+
+		it("ranks a literal jamo file name above a chosung match", async () => {
+			const literalName = "\u314E\u3131.txt";
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			fs.writeFileSync(path.join(baseDir, literalName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@\u314E\u3131";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values.indexOf(`@${literalName}`)).toBeGreaterThanOrEqual(0);
+			expect(values.indexOf(`@${hangulName}`)).toBeGreaterThan(values.indexOf(`@${literalName}`));
+		});
+
+		it("keeps ascii fuzzy queries unaffected", async () => {
+			fs.writeFileSync(path.join(baseDir, "history-search.ts"), "content\n");
+			fs.writeFileSync(path.join(baseDir, hangulName), "content\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@histsr";
+			const result = await provider.getSuggestions([line], 0, line.length);
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@history-search.ts");
+			expect(values).not.toContain(`@${hangulName}`);
+		});
+	});
 });
 
 describe("slash command token classification", () => {

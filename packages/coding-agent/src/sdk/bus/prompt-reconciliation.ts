@@ -202,8 +202,11 @@ export function createPromptReconciliation(options: { now?: () => number } = {})
 			// the settled record instead of being dropped; it must not resurrect it,
 			// so status, terminalAt, retention order, and clientRefIndex stay as-is.
 			// First reason wins: a late generic frame never overwrites a specific one.
-			if (frame.type === "agent_failed" && record.error === undefined)
-				record.error = sanitizePromptFailure(frame.error);
+			if (frame.type === "agent_failed") {
+				const failure = sanitizePromptFailure(frame.error);
+				if (record.error === undefined || (record.error.code === "agent_failed" && failure.code !== "agent_failed"))
+					record.error = failure;
+			}
 			return;
 		}
 		if (frame.type === "agent_start") {

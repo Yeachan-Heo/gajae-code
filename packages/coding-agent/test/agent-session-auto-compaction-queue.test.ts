@@ -138,10 +138,15 @@ describe("AgentSession auto-compaction queue resume", () => {
 			},
 		});
 
-		// Seed a minimal session branch so prepareCompaction() returns a preparation.
+		// Seed enough history for prepareCompaction() to have a non-empty cut.
 		sessionManager.appendMessage({
 			role: "user",
 			content: "hello",
+			timestamp: Date.now(),
+		});
+		sessionManager.appendMessage({
+			role: "user",
+			content: "previous context",
 			timestamp: Date.now(),
 		});
 
@@ -184,7 +189,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
 		const continueQueuedMessagesSpy = vi.spyOn(session.agent, "continueQueuedMessages").mockResolvedValue();
 
-		// Wait for auto_compaction_end event to know when the async handler is done
+		// Wait for auto_compaction_end before advancing queued continuation.
 		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
 		session.subscribe(event => {
 			if (event.type === "auto_compaction_end") onCompactionDone();
@@ -231,7 +236,6 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(continueQueuedMessagesSpy).toHaveBeenCalledTimes(1);
 		const runtimeSignals = getRuntimeSignals();
-		expect(runtimeSignals).toContain("compaction:start:threshold");
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
 	});
 	it("does not reserve model output capability for threshold maintenance", async () => {
@@ -256,6 +260,88 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(getRuntimeSignals()).not.toContain("compaction:start:threshold");
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+	});
+
+	it("uses adaptive threshold to compact below the static threshold when enabled", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.thresholdPercent", 99);
+		session.settings.set("compaction.adaptive.enabled", true);
+		session.settings.set("compaction.adaptive.baseThresholdPercent", 85);
+		session.settings.set("compaction.adaptive.aggression", 0.5);
+		session.settings.set("compaction.adaptive.turnWindow", 15);
+		session.settings.set("compaction.adaptive.minThresholdPercent", 50);
+		const totalTokens = Math.floor((session.model?.contextWindow ?? 200_000) * 0.9);
+		const inputTokens = totalTokens - 1_000;
+
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: inputTokens,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		let compactionTriggered = false;
+		const { promise: compactionStarted, resolve: onCompactionStarted } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_start" && event.reason === "threshold") {
+				compactionTriggered = true;
+				onCompactionStarted();
+			}
+		});
+		session.agent.emitExternalEvent({
+			type: "message_end",
+			message: { ...assistantMsg, timestamp: Date.now() },
+		});
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		await withTimeout(session.waitForIdle(), 1000, "Adaptive compaction turn did not become idle");
+
+		await withTimeout(compactionStarted, 1000, "Adaptive compaction did not start");
+		expect(compactionTriggered).toBe(true);
+	});
+
+	it("keeps the same below-threshold session un-compacted when adaptive is disabled", async () => {
+		session.settings.set("compaction.thresholdPercent", 99);
+		session.settings.set("compaction.adaptive.enabled", false);
+		const totalTokens = Math.floor((session.model?.contextWindow ?? 200_000) * 0.9);
+		const inputTokens = totalTokens - 1_000;
+
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: inputTokens,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+
+		for (let i = 0; i < 60; i++) {
+			session.agent.emitExternalEvent({ type: "message_end", message: { ...assistantMsg, timestamp: Date.now() } });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		}
 		await Promise.resolve();
 		await Promise.resolve();
 
@@ -635,8 +721,10 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 	it("forwards todo reminder lifecycle signals to extensions", async () => {
 		vi.useRealTimers();
-		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
-
+		const continued = Promise.withResolvers<void>();
+		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => {
+			continued.resolve();
+		});
 		session.setTodoPhases([
 			{
 				name: "Execution",
@@ -671,8 +759,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		await withTimeout(reminderDone, 1000, "Todo reminder timed out");
-		await Promise.resolve();
-
+		await continued.promise;
 		expect(getRuntimeSignals()).toContain("todo:1/3");
 		await withTimeout(
 			(async () => {

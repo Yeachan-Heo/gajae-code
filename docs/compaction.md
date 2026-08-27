@@ -381,6 +381,8 @@ From `settings-schema.ts`:
 - `compaction.remoteEnabled` = `true`
 - `compaction.remoteEndpoint` = `undefined`
 - `compaction.thresholdPercent` = `-1` and `compaction.thresholdTokens` = `-1`; when no positive override is set, the threshold is `contextWindow - max(15% of contextWindow, reserveTokens)`
+- `compaction.adaptive.enabled` = `false`
+- `compaction.adaptive.baseThresholdPercent` = `85`, `compaction.adaptive.aggression` = `0.15`, `compaction.adaptive.turnWindow` = `15` minutes, and `compaction.adaptive.minThresholdPercent` = `50`; when enabled, the adaptive base replaces the sentinel reserve-based percentage and is lowered only for sustained high-context, high-call-rate sessions
 - `compaction.idleEnabled` = `false` (when enabled, idle maintenance rewrites history with reason `"idle"` and never auto-continues)
 - `branchSummary.enabled` = `false`
 - `branchSummary.reserveTokens` = `16384`

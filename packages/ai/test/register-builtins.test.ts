@@ -235,6 +235,7 @@ describe("register-builtins lazy streams", () => {
 describe("resolveLazyStreamFirstEventFallbackMs", () => {
 	it("returns each slow provider's centralized first-event fallback", () => {
 		expect(resolveLazyStreamFirstEventFallbackMs("alibaba-token-plan")).toBe(600_000);
+		expect(resolveLazyStreamFirstEventFallbackMs("lm-studio")).toBe(300_000);
 		expect(resolveLazyStreamFirstEventFallbackMs("kimi-code")).toBe(300_000);
 	});
 	it("returns undefined for unrelated providers", () => {

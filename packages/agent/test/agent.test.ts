@@ -24,6 +24,46 @@ describe("Agent", () => {
 		expect(JSON.stringify(failures[0])).not.toContain("hunter2");
 	});
 
+	it.each([
+		{ status: 402, code: "provider_http_402" },
+		{ status: 429, code: "provider_http_429" },
+		{ status: 500, code: "provider_rejected" },
+	])("preserves structured HTTP provider status %status in agent_failed", async ({ status, code }) => {
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(`HTTP ${status}`), { status });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error);
+		});
+
+		await agent.prompt("trigger status failure", { fallbackManaged: true });
+
+		expect(failures).toEqual([{ code, message: "Agent run failed." }]);
+	});
+
+	it.each([
+		{ status: 402, code: "provider_http_402" },
+		{ status: 429, code: "provider_http_429" },
+		{ status: 500, code: "provider_rejected" },
+	])("preserves carrier-only HTTP status %status in agent_failed", async ({ status, code }) => {
+		const agent = new Agent({
+			streamFn: () => {
+				throw Object.assign(new Error(`carrier HTTP ${status}`), { transportFailure: { status } });
+			},
+		});
+		const failures: Array<{ code?: string; message?: string }> = [];
+		agent.subscribe(event => {
+			if (event.type === "agent_failed") failures.push(event.error);
+		});
+
+		await agent.prompt("trigger carrier status failure", { fallbackManaged: false });
+
+		expect(failures).toEqual([{ code, message: "Agent run failed." }]);
+	});
+
 	it("maps provider-forged lifecycle classifiers to the generic failure class", async () => {
 		// Exact-head review P1: a provider error self-declaring "aborted" (or any
 		// runtime-owned lifecycle classifier) must never be classified as such;
