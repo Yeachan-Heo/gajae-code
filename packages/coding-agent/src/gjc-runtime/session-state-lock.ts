@@ -56,6 +56,11 @@ const LOCK_STALE_MS = 30_000;
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
 const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
+const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+function isTransientLockError(error: unknown): boolean {
+	return TRANSIENT_LOCK_ERROR_CODES.has((error as NodeJS.ErrnoException).code ?? "");
+}
 
 interface SessionStateLockOwner {
 	pid: number;
@@ -972,7 +977,15 @@ async function releaseTransitionClaim(
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
 	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
-	await fs.rmdir(transitionDir);
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await fs.rmdir(transitionDir);
+			return;
+		} catch (error) {
+			if (!isTransientLockError(error) || attempt >= 4) throw error;
+			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+		}
+	}
 }
 
 async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void> {
@@ -1004,7 +1017,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			await fs.mkdir(transitionDir);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
+			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
 			await reclaimStaleTransitionClaim(transitionDir);
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 			continue;
@@ -1261,7 +1274,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// A legacy `<file>.lock/` directory reports EISDIR (EPERM on some platforms);
 			// both are contention to be evaluated, not a hard failure.
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST" && code !== "EISDIR" && code !== "EPERM")
+			if (code !== "EEXIST" && code !== "EISDIR" && !isTransientLockError(error))
 				throw error instanceof SessionStateLockUnavailableError
 					? error
 					: new SessionStateLockUnavailableError(error);

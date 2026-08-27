@@ -423,7 +423,7 @@ async function staleLockSnapshot(
 		// Windows can transiently deny reads of a just-created lock metadata file
 		// while another contender is publishing it. Treat that as active
 		// contention and retry rather than failing the caller or reaping by path.
-		if (hasFsCode(error, "EPERM")) return { stale: false };
+		if (isTransientReleaseError(error)) return { stale: false };
 		throw error;
 	}
 	if (!info && ownerHostId !== undefined) return { stale: false };
@@ -476,7 +476,13 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
 		return (await removeFileLockDirForGc(lockPath, snapshot.owner)) === "removed";
 	}
 
-	const currentInfo = await readLockInfo(lockPath);
+	let currentInfo: LockInfo | null;
+	try {
+		currentInfo = await readLockInfo(lockPath);
+	} catch (error) {
+		if (isTransientReleaseError(error)) return false;
+		throw error;
+	}
 	if (currentInfo) return false;
 	try {
 		const currentStats = await fs.stat(lockPath);
