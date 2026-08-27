@@ -674,6 +674,45 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		]);
 	});
 
+	it("does not execute a clean sibling when a terminal call has incomplete arguments", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tc-clean-terminal", name: "ask", arguments: { question: "ASCII" } },
+						{
+							type: "toolCall",
+							id: "tc-incomplete-terminal",
+							name: "ask",
+							arguments: { question: "partial" },
+							incompleteArguments: true,
+							incompleteArgumentsReason: "malformed",
+						},
+					],
+				},
+				{ content: ["done"] },
+				{ content: ["done"] },
+			],
+		});
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(executed).toHaveLength(0);
+	});
+
 	it("recovers on the second resample with clean history and one tool publication", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
