@@ -2111,7 +2111,7 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 	const liveContent = managedProperty(liveMessage, "content");
 	if (!Array.isArray(liveContent)) return;
 	for (const destination of content) {
-		if (destination.type !== "toolCall") continue;
+		if (!destination || typeof destination !== "object" || destination.type !== "toolCall") continue;
 		const matches = liveContent.filter(
 			candidate =>
 				isManagedPlainRecord(candidate) &&
@@ -4944,7 +4944,7 @@ async function executeToolCalls(
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
-		if (interruptState.triggered) {
+		if (record.skipped || interruptState.triggered) {
 			// Skip both span emission and the collector orphan record here. The
 			// scheduler-task finalizer emits the skipped result and collector record;
 			// the tail sweep below remains a defensive fallback for unexpected throws.
