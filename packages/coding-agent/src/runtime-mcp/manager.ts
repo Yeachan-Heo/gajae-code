@@ -616,7 +616,7 @@ export class MCPManager {
 			try {
 				await lease.release();
 				this.#retryableLeaseReleases.delete(lease);
-				this.#leaseByConnection.delete(connection);
+				if (this.#leaseByConnection.get(connection) === lease) this.#leaseByConnection.delete(connection);
 			} catch (error) {
 				if (retainFailure) this.#retryableLeaseReleases.set(lease, { name, connection });
 				throw error;
@@ -630,7 +630,8 @@ export class MCPManager {
 		try {
 			await registered.release();
 			this.#retryableLeaseReleases.delete(registered);
-			this.#leaseByConnection.delete(registered.connection);
+			if (this.#leaseByConnection.get(registered.connection) === registered)
+				this.#leaseByConnection.delete(registered.connection);
 		} catch (error) {
 			if (retainFailure) this.#retryableLeaseReleases.set(registered, { name, connection: registered.connection });
 			throw error;
@@ -676,7 +677,8 @@ export class MCPManager {
 			try {
 				await lease.release();
 				this.#retryableLeaseReleases.delete(lease);
-				this.#leaseByConnection.delete(retained.connection);
+				if (this.#leaseByConnection.get(retained.connection) === lease)
+					this.#leaseByConnection.delete(retained.connection);
 			} catch (error) {
 				failures.push(this.#logLeaseReleaseFailure(retained.name, retained.connection, error, lease.key));
 			}
@@ -743,8 +745,10 @@ export class MCPManager {
 		void promise.then(
 			() => {
 				this.#retiredLeaseReleases.delete(retired);
+				if (lease && this.#leaseByConnection.get(connection) === lease) this.#leaseByConnection.delete(connection);
 			},
 			() => {
+				if (lease) this.#retryableLeaseReleases.set(lease, { name, connection });
 				// Keep rejected retired releases for disconnectAll aggregation.
 			},
 		);
