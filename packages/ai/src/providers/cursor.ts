@@ -331,11 +331,16 @@ function runWithCursorExecDeadline<T>(
 	onNonAbortableStarted?: (settlement: CursorNonAbortableSettlement) => void,
 	onOperationFinished?: () => void,
 	onWrapperFinished?: () => void,
+	onControllerReady?: (abort: (reason?: Error) => void) => void,
+	transportTerminated?: () => boolean,
 ): Promise<T> {
 	const result = Promise.withResolvers<T>();
 	const operationCompletion = Promise.withResolvers<void>();
 	operationCompletion.promise.catch(() => {});
 	const controller = new AbortController();
+	const abortController = (reason?: Error): void => {
+		if (!controller.signal.aborted) controller.abort(reason);
+	};
 	const settlementExceeded = Promise.withResolvers<never>();
 	// The fence observes `exceeded` through Promise.race; keep this branch silent.
 	settlementExceeded.promise.catch(() => {});
@@ -382,14 +387,15 @@ function runWithCursorExecDeadline<T>(
 	const onAbort = () => {
 		if (signal) {
 			abortError = cursorAbortError(signal);
-			controller.abort(abortError);
+			abortController(abortError);
 			if (nonAbortableStarted) armSettlementGrace();
 			else settle(() => result.reject(abortError!));
 		}
 	};
+	onControllerReady?.(abortController);
 
 	if (signal?.aborted) {
-		controller.abort(cursorAbortError(signal));
+		abortController(cursorAbortError(signal));
 		settle(() => result.reject(cursorAbortError(signal)));
 		onOperationFinished?.();
 		return result.promise;
@@ -400,13 +406,13 @@ function runWithCursorExecDeadline<T>(
 		// the per-exec signal so cooperative tools stop, and the rejection below
 		// still bounds how long this turn waits for the handler promise.
 		abortError = new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`);
-		controller.abort(abortError);
+		abortController(abortError);
 		if (nonAbortableStarted) armSettlementGrace();
 		else settle(() => result.reject(abortError!));
 	}, deadlineMs);
 	void operation(controller.signal, () => {
 		if (nonAbortableStarted) return;
-		if (settled) {
+		if (settled || transportTerminated?.()) {
 			throw new Error("Cursor non-abortable exec was marked after wrapper terminalization");
 		}
 		nonAbortableStarted = true;
@@ -778,6 +784,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let callerAbortError: Error | undefined;
 		let pendingNonAbortableExec: CursorNonAbortableSettlement | undefined;
 		let localTransportCloseRequested = false;
+		let transportTerminalized = false;
+		let activeExecAbort: ((reason?: Error) => void) | undefined;
 		const closeTransportLocally = (): void => {
 			localTransportCloseRequested = true;
 			h2Request?.close();
@@ -804,6 +812,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			publish();
 		};
 		const terminalize = (error: unknown): void => {
+			transportTerminalized = true;
+			activeExecAbort?.(error instanceof Error ? error : new Error(String(error)));
+			activeExecAbort = undefined;
 			closeTerminalAdmission();
 			closeTransportLocally();
 			settleBehindFence(() => settleH2(error));
@@ -1263,11 +1274,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 											}
 										},
 										() => {
+											activeExecAbort = undefined;
 											if (mutationSlotReserved) {
 												releaseCursorMutationLockReservation(conversationId);
 												mutationSlotReserved = false;
 											}
 										},
+										abort => {
+											activeExecAbort = abort;
+										},
+										() => transportTerminalized,
 									);
 								} else {
 									await run();
