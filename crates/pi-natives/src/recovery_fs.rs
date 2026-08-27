@@ -1458,7 +1458,7 @@ impl RecoveryFsRoot {
 				.saturating_sub(i128::from(min_age_ms.max(0)) * 1_000_000);
 			let mut result = RecoveryFsRemnantReapResult { reaped: 0, failures: 0 };
 			let mut reap_directory = |directory: &File, label: &str| {
-				let Ok(names) = tree_names_limited(directory.as_raw_fd(), 256) else {
+				let Ok(names) = tree_names(directory.as_raw_fd()) else {
 					result.failures += 1;
 					return;
 				};
@@ -3811,6 +3811,11 @@ fn replace_managed(
 		return publish_preflight_failure_with_primitive(code, primitive);
 	}
 	drop(stage);
+	// Commit the namespace exchange before destructively scrubbing the displaced
+	// predecessor. A crash must not recover the old namespace with truncated data.
+	if sync_parent(&parent).is_err() {
+		return committed_failure("fsync_failed", "destination_parent_sync");
+	}
 	// SAFETY: parent owns a live directory descriptor and stage_name is the
 	// operation-owned single-component staging name.
 	let predecessor_fd = unsafe {

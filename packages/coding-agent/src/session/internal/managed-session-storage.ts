@@ -3318,6 +3318,22 @@ export function publishManagedFileNoReplaceSync(
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") failure ??= error;
 		}
 	}
+	if (failure === undefined && linkPublished) {
+		try {
+			fsyncDirectory(parent);
+			const destinationFd = fs.openSync(destination, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+			try {
+				secureFileDescriptor(destination, destinationFd, "verify");
+				const terminal = fs.fstatSync(destinationFd, { bigint: true });
+				publishedIdentity = identity(terminal, publishedIdentity?.sha256 ?? createHash("sha256").update(bytes).digest("hex"));
+			} finally {
+				fs.closeSync(destinationFd);
+			}
+		} catch (error) {
+			failure = error;
+			publishedIdentity = undefined;
+		}
+	}
 	if (failure !== undefined) {
 		if (publicationCommitted)
 			throw new ManagedCommittedMutationError(

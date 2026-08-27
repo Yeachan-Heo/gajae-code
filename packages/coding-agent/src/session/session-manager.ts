@@ -15324,6 +15324,7 @@ export class SessionManager {
 		thinkingLevel: string | undefined,
 		options?: { readonly appendThinkingLevel: boolean },
 	): Promise<DefaultModelSelectionStage> {
+		this.#assertResidentMutationWritable();
 		const sessionFile = this.#sessionFile;
 		const persistsToExistingFile = this.persist && sessionFile !== undefined && this.#storage.existsSync(sessionFile);
 		const managedAppendExpectation =
@@ -15423,6 +15424,7 @@ export class SessionManager {
 	}
 
 	promoteDefaultModelSelection(stage: DefaultModelSelectionStage): DefaultModelSelectionPromotion {
+		this.#assertResidentMutationWritable();
 		if (
 			stage.entryRevision !== this.#entryRevision ||
 			stage.leafRevision !== this.#leafRevision ||
