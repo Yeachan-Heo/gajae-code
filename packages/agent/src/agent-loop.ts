@@ -435,6 +435,8 @@ function escapedToolCallMetadata(
 		!incompleteReasonRead.ok ||
 		inheritedGuard ||
 		inheritedEvidence ||
+		(typeof incompleteRead.value === "string" && SANITIZER_SENTINELS.has(incompleteRead.value)) ||
+		(typeof incompleteReasonRead.value === "string" && SANITIZER_SENTINELS.has(incompleteReasonRead.value)) ||
 		(evidenceRead.present && (evidenceRead.value === undefined || evidence === undefined || evidence.malformed));
 	const incomplete = incompleteRead.ok && incompleteRead.value === true;
 	return {
@@ -445,7 +447,8 @@ function escapedToolCallMetadata(
 		malformed: malformedMetadata || incomplete,
 		evidence,
 		incompleteArguments: incomplete,
-		incompleteArgumentsReason: incompleteReasonRead.ok ? incompleteReasonRead.value : "malformed",
+		incompleteArgumentsReason:
+			!incompleteReasonRead.ok || malformedMetadata ? "malformed" : incompleteReasonRead.value,
 	};
 }
 
@@ -2160,11 +2163,18 @@ function managedContentBlock(block: unknown): AssistantMessage["content"] {
 
 function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | undefined {
 	if (!isManagedPlainRecord(value)) return undefined;
-	const positionsValue = managedProperty(value, "positions");
-	const totalPositions = managedProperty(value, "totalPositions");
-	const truncated = managedProperty(value, "truncated");
-	const malformed = managedProperty(value, "malformed");
-	const integrity = managedProperty(value, "integrity");
+	const envelopeReads = Object.fromEntries(
+		["positions", "totalPositions", "truncated", "malformed", "integrity"].map(key => [
+			key,
+			managedOwnPropertyRead(value, key),
+		]),
+	) as Record<string, { present: boolean; ok: boolean; value: unknown }>;
+	if (Object.values(envelopeReads).some(read => !read.present || !read.ok)) return undefined;
+	const positionsValue = envelopeReads.positions!.value;
+	const totalPositions = envelopeReads.totalPositions!.value;
+	const truncated = envelopeReads.truncated!.value;
+	const malformed = envelopeReads.malformed!.value;
+	const integrity = envelopeReads.integrity!.value;
 	if (!Array.isArray(positionsValue) || positionsValue.length > 32) return undefined;
 	if (
 		typeof totalPositions !== "number" ||
@@ -2179,12 +2189,19 @@ function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | u
 	const positions: UnicodeEscapeEvidence["positions"][number][] = [];
 	for (const positionValue of positionsValue) {
 		if (!isManagedPlainRecord(positionValue)) return undefined;
-		const offset = managedProperty(positionValue, "offset");
-		const scalarTag = managedProperty(positionValue, "scalarTag");
-		const pathTag = managedProperty(positionValue, "pathTag");
-		const location = managedProperty(positionValue, "location");
-		const valueOrdinal = managedProperty(positionValue, "valueOrdinal");
-		const valueOffset = managedProperty(positionValue, "valueOffset");
+		const positionReads = Object.fromEntries(
+			["offset", "scalarTag", "pathTag", "location", "valueOrdinal", "valueOffset"].map(key => [
+				key,
+				managedOwnPropertyRead(positionValue, key),
+			]),
+		) as Record<string, { present: boolean; ok: boolean; value: unknown }>;
+		if (Object.values(positionReads).some(read => !read.present || !read.ok)) return undefined;
+		const offset = positionReads.offset!.value;
+		const scalarTag = positionReads.scalarTag!.value;
+		const pathTag = positionReads.pathTag!.value;
+		const location = positionReads.location!.value;
+		const valueOrdinal = positionReads.valueOrdinal!.value;
+		const valueOffset = positionReads.valueOffset!.value;
 		if (
 			typeof offset !== "number" ||
 			!Number.isSafeInteger(offset) ||
@@ -2301,13 +2318,17 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const inheritedEvidence = managedInheritedProperty(value, "escapedUnicodeArgumentEvidence");
 	const inheritedIncompleteArguments = managedInheritedProperty(value, "incompleteArguments");
 	const inheritedIncompleteArgumentsReason = managedInheritedProperty(value, "incompleteArgumentsReason");
+	const incompleteArguments = incompleteArgumentsRead.value;
+	const incompleteArgumentsReason = incompleteArgumentsReasonRead.value;
+	const incompleteMetadataSentinel =
+		(typeof incompleteArguments === "string" && SANITIZER_SENTINELS.has(incompleteArguments)) ||
+		(typeof incompleteArgumentsReason === "string" && SANITIZER_SENTINELS.has(incompleteArgumentsReason));
 	const incompleteMetadataMalformed =
 		!incompleteArgumentsRead.ok ||
 		!incompleteArgumentsReasonRead.ok ||
 		inheritedIncompleteArguments ||
-		inheritedIncompleteArgumentsReason;
-	const incompleteArguments = incompleteArgumentsRead.value;
-	const incompleteArgumentsReason = incompleteArgumentsReasonRead.value;
+		inheritedIncompleteArgumentsReason ||
+		incompleteMetadataSentinel;
 	const escapedNonAsciiArguments = escapedGuardRead.value;
 	const rawEscapedUnicodeArgumentEvidence = evidenceRead.value;
 	let escapedUnicodeArgumentEvidence: UnicodeEscapeEvidence | undefined;
@@ -2772,13 +2793,15 @@ class ManagedAttemptTransaction {
 	}
 
 	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
-		const sourceMetadata = message.content.map(block =>
+		const sourceContent = Array.isArray(message.content) ? message.content : [];
+		const sourceMetadata = sourceContent.map(block =>
 			block?.type === "toolCall" ? escapedToolCallMetadata(block) : undefined,
 		);
 		const snapshot = this.#assistantSnapshot(message);
 		if (snapshot.role !== "assistant") return snapshot;
-		for (let index = 0; index < message.content.length; index += 1) {
-			const sourceBlock = message.content[index];
+		if (!Array.isArray(snapshot.content)) snapshot.content = [];
+		for (let index = 0; index < sourceContent.length; index += 1) {
+			const sourceBlock = sourceContent[index];
 			if (sourceBlock?.type !== "toolCall") continue;
 			const metadata = sourceMetadata[index];
 			let snapshotBlock = snapshot.content[index];
