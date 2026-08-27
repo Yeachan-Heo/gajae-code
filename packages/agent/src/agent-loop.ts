@@ -419,20 +419,20 @@ function escapedToolCallMetadata(block: Extract<AssistantMessage["content"][numb
 	} catch {
 		evidence = undefined;
 	}
-	const malformed =
+	const malformedMetadata =
 		!guardRead.ok ||
 		!evidenceRead.ok ||
 		!incompleteRead.ok ||
 		inheritedGuard ||
 		inheritedEvidence ||
-		(incompleteRead.ok && incompleteRead.value === true) ||
 		(evidenceRead.present && (evidenceRead.value === undefined || evidence === undefined || evidence.malformed));
+	const incomplete = incompleteRead.ok && incompleteRead.value === true;
 	return {
 		guarded:
-			malformed ||
+			malformedMetadata ||
 			(guardRead.present && guardRead.value === true) ||
 			(evidenceRead.present && evidenceRead.value !== undefined),
-		malformed,
+		malformed: malformedMetadata || incomplete,
 		evidence,
 	};
 }
