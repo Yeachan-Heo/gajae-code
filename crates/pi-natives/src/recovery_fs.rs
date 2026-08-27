@@ -1480,7 +1480,7 @@ impl RecoveryFsRoot {
 						MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed),
 					))
 					.expect("generated quarantine name contains no NUL");
-					let removed = crate::path_identity::platform::exact_unlink_empty_regular_at(
+					let removed = crate::path_identity::platform::exact_unlink_empty_regular_direct_at(
 						directory.as_raw_fd(),
 						name.clone(),
 						&path,

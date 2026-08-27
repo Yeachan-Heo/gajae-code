@@ -1093,7 +1093,10 @@ export function prepareManagedSessionScopeForWriteSync(
 		// This must precede the first managed-store mutation: binding publication
 		// reconciles receipts with the normal 50k fail-closed bound, while an older
 		// macOS scope can contain only proven, terminal zero-byte remnants above it.
-		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
+		reapScrubbedProtocolRemnantsSync(scope.directoryPath, undefined, {
+			dev: preparedDirectory.dev,
+			ino: preparedDirectory.ino,
+		});
 		let store: ManagedSessionDescendantStore;
 		const openManagedStore = (): ManagedSessionDescendantStore => {
 			const next = buildStore();
@@ -1157,7 +1160,10 @@ export function prepareManagedSessionScopeForWriteSync(
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		stage = "tombstones_directory";
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
-		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
+		reapScrubbedProtocolRemnantsSync(scope.directoryPath, undefined, {
+			dev: preparedDirectory.dev,
+			ino: preparedDirectory.ino,
+		});
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;
@@ -3738,7 +3744,7 @@ export async function prepareManagedSessionScopeForWrite(
 		ensureManagedDirectory(path.join(internal, MANAGED_RECEIPTS_DIRECTORY), root, policy);
 		ensureManagedDirectory(path.join(internal, MANAGED_TOMBSTONES_DIRECTORY), root, policy);
 		await reconcileManagedTombstones(scope, expectedCandidate);
-		reapScrubbedProtocolRemnantsSync(scope.directoryPath);
+		reapScrubbedProtocolRemnantsSync(scope.directoryPath, undefined, managedDirectoryIdentityForScope(scope));
 		return { kind: "resolved", scope };
 	} catch (error) {
 		const publication = error instanceof ManagedPublishError ? error : undefined;

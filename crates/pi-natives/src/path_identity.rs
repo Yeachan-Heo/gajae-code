@@ -3786,7 +3786,7 @@ pub(crate) mod platform {
 		result
 	}
 
-	pub fn exact_unlink_empty_regular_at(
+	pub fn exact_unlink_empty_regular_direct_at(
 		parent_fd: libc::c_int,
 		name: CString,
 		path: &Path,
@@ -3805,11 +3805,37 @@ pub(crate) mod platform {
 			mtime_ns: i64::try_from(mtime_ns).unwrap_or(i64::MAX),
 			directory: false,
 			detach_only: false,
-			quarantine_name: quarantine_name.into_string().ok(),
+			quarantine_name: None,
 			sha256: Some(sha256(b"")),
 			allow_hard_link: false,
 		};
-		exact_unlink_at(parent_fd, name, path, &identity)
+		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &name, &quarantine_name) {
+			return NativeExactUnlinkResult::failure(code);
+		}
+		let detached_path = path
+			.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(quarantine_name.to_string_lossy().as_ref())
+			.to_string_lossy()
+			.into_owned();
+		if !matches!(exact_regular_matches(parent_fd, &quarantine_name, &identity), Ok(true)) {
+			let restored = rename_no_replace(parent_fd, parent_fd, &quarantine_name, &name).is_ok();
+			return if restored {
+				NativeExactUnlinkResult::failure("identity_mismatch")
+			} else {
+				NativeExactUnlinkResult::detached_failure("identity_mismatch", detached_path)
+			};
+		}
+		// SAFETY: parent_fd remains live and quarantine_name names the detached,
+		// identity-verified regular file.
+		if unsafe { libc::unlinkat(parent_fd, quarantine_name.as_ptr(), 0) } != 0 {
+			return NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path);
+		}
+		// SAFETY: parent_fd remains live and binds the mutated recovery namespace.
+		if unsafe { libc::fsync(parent_fd) } != 0 {
+			return NativeExactUnlinkResult::failure("durability_failed");
+		}
+		NativeExactUnlinkResult::success()
 	}
 
 	/// Remove one regular file without invoking the exchange protocol. The
