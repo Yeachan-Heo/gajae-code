@@ -463,7 +463,7 @@ fn restore_exchanged_successor(
 		return false;
 	}
 	let quarantine = CString::new(format!(
-		".gjc-replace-retry-{}-{}",
+		".gjc-replace-evidence-{}-{}",
 		std::process::id(),
 		MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
 	))
@@ -482,6 +482,15 @@ struct ManagedReplacementStageGuard<'a> {
 
 #[cfg(target_os = "linux")]
 impl ManagedReplacementStageGuard<'_> {
+	fn mark_scrubbed(&mut self) {
+		self.quarantine = CString::new(format!(
+			".gjc-replace-retry-{}-{}",
+			std::process::id(),
+			MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed),
+		))
+		.expect("replacement quarantine name contains no NUL");
+	}
+
 	fn retire(&mut self) -> bool {
 		if !self.active {
 			return true;
@@ -1409,20 +1418,12 @@ impl RecoveryFsRoot {
 				b".gjc-replace-retry-",
 				b".gjc-managed-exchange-",
 			];
-			let root_guard = self.root.lock();
-			let Some(root) = root_guard.as_ref() else {
+			let recovery_guard = self.recovery.lock();
+			let Some(recovery) = recovery_guard.as_ref() else {
 				return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 };
 			};
-			let recovery_guard = self.recovery.lock();
-			let recovery = match recovery_guard.as_ref() {
-				Some(recovery) => match recovery.try_clone() {
-					Ok(recovery) => recovery,
-					Err(_) => return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 },
-				},
-				None => match recovery_directory(root, None) {
-					Ok(recovery) => recovery,
-					Err(_) => return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 },
-				},
+			let Ok(recovery) = recovery.try_clone() else {
+				return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 };
 			};
 			let Ok(_mutation_lock) = lock_managed_mutation(&recovery) else {
 				return RecoveryFsRemnantReapResult { reaped: 0, failures: 1 };
@@ -1435,7 +1436,7 @@ impl RecoveryFsRoot {
 				.saturating_sub(i128::from(min_age_ms.max(0)) * 1_000_000);
 			let mut result = RecoveryFsRemnantReapResult { reaped: 0, failures: 0 };
 			let mut reap_directory = |directory: &File, label: &str| {
-				let Ok(names) = tree_names(directory.as_raw_fd()) else {
+				let Ok(names) = tree_names_limited(directory.as_raw_fd(), 256) else {
 					result.failures += 1;
 					return;
 				};
@@ -2158,7 +2159,8 @@ pub fn open_recovery_fs_root(path: String) -> napi::Result<RecoveryFsRoot> {
 	#[cfg(target_os = "linux")]
 	{
 		let root = open_root(Path::new(&path)).map_err(napi::Error::from_reason)?;
-		Ok(RecoveryFsRoot { root: Mutex::new(Some(root)), recovery: Mutex::new(None) })
+		let recovery = recovery_directory(&root, None).map_err(napi::Error::from_reason)?;
+		Ok(RecoveryFsRoot { root: Mutex::new(Some(root)), recovery: Mutex::new(Some(recovery)) })
 	}
 	#[cfg(not(target_os = "linux"))]
 	{
@@ -3706,7 +3708,7 @@ fn replace_managed(
 		recovery:   &recovery_parent,
 		name:       stage_name.clone(),
 		quarantine: CString::new(format!(
-			".gjc-replace-retry-{}-{}",
+			".gjc-replace-evidence-{}-{}",
 			std::process::id(),
 			MANAGED_REPLACEMENT_ID.fetch_add(1, Ordering::Relaxed)
 		))
@@ -3852,6 +3854,7 @@ fn replace_managed(
 	if predecessor.set_len(0).is_err() || predecessor.sync_all().is_err() {
 		return committed_failure("io_error", "predecessor_scrub");
 	}
+	stage_guard.mark_scrubbed();
 	drop(predecessor);
 	if !stage_guard.retire() {
 		return committed_failure("io_error", "terminal_identity");
@@ -3999,6 +4002,19 @@ fn tree_digest_file(file: &File) -> Result<String, &'static str> {
 
 #[cfg(target_os = "linux")]
 fn tree_names(fd: libc::c_int) -> Result<Vec<Vec<u8>>, &'static str> {
+	tree_names_with_limit(fd, None)
+}
+
+#[cfg(target_os = "linux")]
+fn tree_names_limited(fd: libc::c_int, limit: usize) -> Result<Vec<Vec<u8>>, &'static str> {
+	tree_names_with_limit(fd, Some(limit))
+}
+
+#[cfg(target_os = "linux")]
+fn tree_names_with_limit(
+	fd: libc::c_int,
+	limit: Option<usize>,
+) -> Result<Vec<Vec<u8>>, &'static str> {
 	// SAFETY: fd is live and opening "." creates a fresh directory description with
 	// an independent stream offset.
 	let duplicate = unsafe {
@@ -4042,6 +4058,12 @@ fn tree_names(fd: libc::c_int) -> Result<Vec<Vec<u8>>, &'static str> {
 		let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
 		if name != b"." && name != b".." {
 			names.push(name.to_vec());
+			if limit.is_some_and(|limit| names.len() >= limit) {
+				// SAFETY: directory is owned here and closed exactly once at the bounded
+				// scan boundary.
+				unsafe { libc::closedir(directory) };
+				return Ok(names);
+			}
 		}
 	}
 }

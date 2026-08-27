@@ -166,6 +166,7 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			const aged = await seedRemnant(dir, `${REMNANT_PREFIX}aged`, 60 * 60 * 1000);
 			const fresh = await seedRemnant(dir, `${REMNANT_PREFIX}fresh`, 0);
 			const payload = await seedRemnant(dir, `${REMNANT_PREFIX}payload`, 60 * 60 * 1000, new Uint8Array([1]));
+			const evidence = await seedRemnant(dir, ".gjc-replace-evidence-failed-scrub", 60 * 60 * 1000);
 			const ordinary = path.join(dir, "session.jsonl");
 			await fsp.writeFile(ordinary, "transcript");
 
@@ -175,6 +176,7 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			expect(fs.existsSync(aged)).toBe(false);
 			expect(fs.existsSync(fresh)).toBe(true);
 			expect(fs.existsSync(payload)).toBe(true);
+			expect(fs.existsSync(evidence)).toBe(true);
 			expect(fs.existsSync(ordinary)).toBe(true);
 		});
 	});
