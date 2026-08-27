@@ -2732,7 +2732,7 @@ export class AsyncJobManager {
 				// recycled record would give the pending old delivery a mismatched
 				// generation and #deliverDelivery would silently discard it before
 				// onJobComplete ever ran.
-				if (!this.#jobs.has(id) && !this.#hasPendingDeliveryForJobId(id)) {
+				if (!this.#jobs.has(id) && !this.#hasDeliveryCollisionForJobId(id)) {
 					return id;
 				}
 				candidate += 1;

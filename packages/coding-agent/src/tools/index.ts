@@ -242,8 +242,7 @@ export interface ToolSession {
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
 	/** Request that the active foreground wait fold into a background job, if supported. */
 	requestForegroundBashBackground?: () => boolean;
-	/** True only while the supplied tool call is executing inside an Agent turn. */
-	isActiveToolCall?: (toolCallId: string) => boolean;
+
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Resolves when the session queues user steering (or `signal` aborts) without consuming it; wait-style tools use this to end their observation early. */

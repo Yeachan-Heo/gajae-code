@@ -131,7 +131,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasForegroundBashBackgroundRequestHandler":
 		"internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:requestForegroundBashBackground": "internal accessor/plumbing, not a user-facing SDK control seam",
-	"agent_session:isActiveToolCall": "internal accessor/plumbing, not a user-facing SDK control seam",
+
 	"agent_session:getSelectedMCPToolNames": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:isToolDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getDiscoverableToolSearchIndex": "internal accessor/plumbing, not a user-facing control seam",

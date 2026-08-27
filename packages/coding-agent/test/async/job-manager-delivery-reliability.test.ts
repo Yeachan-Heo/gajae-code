@@ -381,5 +381,13 @@ describe("AsyncJobManager delivery reliability", () => {
 		manager.releaseDeliveryClaim(original.generation);
 		await manager.waitForAll();
 		await manager.dispose({ timeoutMs: 250 });
+
+		const automaticManager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		const automaticId = automaticManager.register("bash", "automatic claimed", async () => "done");
+		const automaticJob = automaticManager.getJob(automaticId);
+		if (!automaticJob) throw new Error("expected automatic claimed job");
+		automaticManager.retainDeliveryClaim(automaticJob);
+		expect(automaticManager.register("bash", "automatic replacement", async () => "replacement")).toBe("bg_2");
+		await automaticManager.dispose({ timeoutMs: 250 });
 	});
 });

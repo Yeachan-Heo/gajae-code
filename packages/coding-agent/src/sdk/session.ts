@@ -2582,7 +2582,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				session?.registerForegroundFoldParticipant(adapter) ?? (() => {}),
 			hasForegroundBashBackgroundRequestHandler: () => session?.hasForegroundBashBackgroundRequestHandler() ?? false,
 			requestForegroundBashBackground: () => session?.requestForegroundBashBackground() ?? false,
-			isActiveToolCall: toolCallId => session?.isActiveToolCall(toolCallId) ?? false,
+
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
