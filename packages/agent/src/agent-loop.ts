@@ -2093,7 +2093,8 @@ function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | u
 		}
 		positions.push({ offset, scalarTag, pathTag, location, valueOrdinal, valueOffset });
 	}
-	return { positions, totalPositions, truncated, malformed, integrity };
+	const evidence = { positions, totalPositions, truncated, malformed, integrity };
+	return verifyUnicodeEscapeEvidence(evidence) ? evidence : undefined;
 }
 
 function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["content"], liveMessage: unknown): void {

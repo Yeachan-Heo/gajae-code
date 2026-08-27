@@ -1718,7 +1718,8 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const cases = [
 			undefined,
 			escapeEvidence(String.raw`{"question":"\u2014"`),
-			{ ...escapeEvidence(String.raw`{"question":"\u2014"}`), truncated: true },
+			{ ...escapeEvidence(String.raw`{"question":"\u2014"`), truncated: true },
+			{ ...complete, integrity: "0".repeat(64) },
 			{ ...complete, positions: complete.positions.slice(0, 1) },
 		];
 		for (const evidence of cases) {
