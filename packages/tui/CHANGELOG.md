@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Same-width TUI frames no longer scan the full raw transcript with `visibleWidth()` to decide whether a width reflow is required. That check is only consulted on an actual column change, so loader shimmer / layout-only ticks no longer remeasure every historical row 60 times a second. Resize admission is unchanged: a width change still walks raw rows until one exceeds the old/new width, then takes the existing reflow or no-reflow path.
 - Loader instances can opt into layout-only repaint requests so transient status animation does not force unchanged transcript subtree reconstruction.
 
 ## [0.15.2] - 2026-08-25
