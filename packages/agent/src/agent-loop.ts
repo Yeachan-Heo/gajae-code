@@ -403,12 +403,42 @@ export const ESCAPED_NONASCII_RECOVERY_PROMPT = escapedNonAsciiRecoveryPrompt;
 const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
+function escapedToolCallMetadata(block: Extract<AssistantMessage["content"][number], { type: "toolCall" }>): {
+	guarded: boolean;
+	malformed: boolean;
+	evidence: UnicodeEscapeEvidence | undefined;
+} {
+	const guardRead = managedOwnPropertyRead(block, "escapedNonAsciiArguments");
+	const evidenceRead = managedOwnPropertyRead(block, "escapedUnicodeArgumentEvidence");
+	const incompleteRead = managedPropertyRead(block, "incompleteArguments");
+	const inheritedGuard = managedInheritedProperty(block, "escapedNonAsciiArguments");
+	const inheritedEvidence = managedInheritedProperty(block, "escapedUnicodeArgumentEvidence");
+	let evidence: UnicodeEscapeEvidence | undefined;
+	try {
+		evidence = managedUnicodeEscapeEvidence(evidenceRead.value);
+	} catch {
+		evidence = undefined;
+	}
+	const malformed =
+		!guardRead.ok ||
+		!evidenceRead.ok ||
+		!incompleteRead.ok ||
+		inheritedGuard ||
+		inheritedEvidence ||
+		(incompleteRead.ok && incompleteRead.value === true) ||
+		(evidenceRead.present && (evidenceRead.value === undefined || evidence === undefined || evidence.malformed));
+	return {
+		guarded:
+			malformed ||
+			(guardRead.present && guardRead.value === true) ||
+			(evidenceRead.present && evidenceRead.value !== undefined),
+		malformed,
+		evidence,
+	};
+}
+
 function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
-	return message.content.some(
-		block =>
-			block.type === "toolCall" &&
-			(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined),
-	);
+	return message.content.some(block => block.type === "toolCall" && escapedToolCallMetadata(block).guarded);
 }
 
 const ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX = 8;
@@ -419,9 +449,7 @@ function escapedNonAsciiToolCallShape(message: AssistantMessage): {
 	escapedToolCallCountCapped: boolean;
 } {
 	const count = message.content.filter(
-		block =>
-			block.type === "toolCall" &&
-			(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined),
+		block => block.type === "toolCall" && escapedToolCallMetadata(block).guarded,
 	).length;
 	return {
 		escapedToolCallCount: Math.min(count, ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX),
@@ -606,14 +634,13 @@ function allEscapedToolCallsDisplaySafe(
 	let sawEscapedCall = false;
 	for (const block of message.content) {
 		if (block.type !== "toolCall") continue;
-		if (block.escapedNonAsciiArguments !== true && block.escapedUnicodeArgumentEvidence === undefined) continue;
+		const metadata = escapedToolCallMetadata(block);
+		if (!metadata.guarded) continue;
+		if (metadata.malformed) return false;
 		sawEscapedCall = true;
 		const tool = tools?.find(candidate => candidate.name === block.name);
 		const args = block.arguments as Record<string, unknown>;
-		if (
-			!isDisplaySafeEscapedArguments(tool, args) ||
-			!isDisplaySafeRawEscapeEvidence(tool, args, block.escapedUnicodeArgumentEvidence)
-		)
+		if (!isDisplaySafeEscapedArguments(tool, args) || !isDisplaySafeRawEscapeEvidence(tool, args, metadata.evidence))
 			return false;
 	}
 	return sawEscapedCall;
@@ -2173,7 +2200,12 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 			continue;
 		}
 		const rawEvidence = evidenceRead.value;
-		const evidence = managedUnicodeEscapeEvidence(rawEvidence);
+		let evidence: UnicodeEscapeEvidence | undefined;
+		try {
+			evidence = managedUnicodeEscapeEvidence(rawEvidence);
+		} catch {
+			evidence = undefined;
+		}
 		if (evidence && !evidence.malformed) attachUnicodeEscapeEvidence(destination, evidence);
 		else {
 			destination.incompleteArguments = true;
@@ -2213,7 +2245,12 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const inheritedEvidence = managedInheritedProperty(value, "escapedUnicodeArgumentEvidence");
 	const escapedNonAsciiArguments = escapedGuardRead.value;
 	const rawEscapedUnicodeArgumentEvidence = evidenceRead.value;
-	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
+	let escapedUnicodeArgumentEvidence: UnicodeEscapeEvidence | undefined;
+	try {
+		escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
+	} catch {
+		escapedUnicodeArgumentEvidence = undefined;
+	}
 	const invalidEscapedUnicodeEvidence =
 		(evidenceRead.present &&
 			(!evidenceRead.ok ||
@@ -4933,14 +4970,12 @@ async function executeToolCalls(
 		stream.push({ type: "message_end", message: toolResultMessage, scope });
 	};
 	const isInvalidEscapedRecord = (record: (typeof records)[number]): boolean => {
-		if (record.toolCall.incompleteArguments === true) return true;
-		const guarded =
-			record.toolCall.escapedNonAsciiArguments === true ||
-			record.toolCall.escapedUnicodeArgumentEvidence !== undefined;
-		if (!guarded) return false;
+		const metadata = escapedToolCallMetadata(record.toolCall);
+		if (metadata.malformed) return true;
+		if (!metadata.guarded) return false;
 		return !(
 			isDisplaySafeEscapedArguments(record.tool, record.args) &&
-			isDisplaySafeRawEscapeEvidence(record.tool, record.args, record.toolCall.escapedUnicodeArgumentEvidence)
+			isDisplaySafeRawEscapeEvidence(record.tool, record.args, metadata.evidence)
 		);
 	};
 	const hasInvalidEscapedCall = records.some(isInvalidEscapedRecord);
@@ -5055,16 +5090,19 @@ async function executeToolCalls(
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
-				const escapedUnicodeArgumentEvidence = toolCall.escapedUnicodeArgumentEvidence;
-				const escapedArgumentsGuarded =
-					toolCall.escapedNonAsciiArguments || escapedUnicodeArgumentEvidence !== undefined;
+				const metadata = escapedToolCallMetadata(toolCall);
+				const escapedUnicodeArgumentEvidence = metadata.evidence;
+				const escapedArgumentsGuarded = metadata.guarded;
 				if (escapedArgumentsGuarded) delete toolCall.escapedUnicodeArgumentEvidence;
-				if (toolCall.incompleteArguments) {
+				const incompleteRead = managedPropertyRead(toolCall, "incompleteArguments");
+				const incompleteArguments = metadata.malformed || (incompleteRead.ok && incompleteRead.value === true);
+				if (incompleteArguments) {
 					record.argumentValidationFailed = true;
 					// The provider flagged this call's arguments as unsafe to execute.
 					// The typed reason selects accurate recovery guidance; callers that
 					// only read the boolean still get a safe, actionable rejection.
-					const reason = toolCall.incompleteArgumentsReason;
+					const reasonRead = managedPropertyRead(toolCall, "incompleteArgumentsReason");
+					const reason = reasonRead.ok ? reasonRead.value : "malformed";
 					const detail =
 						reason === "malformed"
 							? `The terminal arguments for tool call "${toolCall.name}" did not decode to a valid JSON object. The arguments cannot be executed. Re-issue the call with valid, complete arguments.`

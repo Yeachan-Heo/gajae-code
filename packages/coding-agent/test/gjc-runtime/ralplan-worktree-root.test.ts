@@ -33,6 +33,26 @@ async function git(args: string[], cwd: string): Promise<void> {
 	}
 }
 
+async function gitText(args: string[], cwd: string, input?: string): Promise<string> {
+	const proc = Bun.spawn(["git", ...args], {
+		cwd,
+		stdin: input === undefined ? undefined : "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if (input !== undefined) {
+		proc.stdin.write(input);
+		proc.stdin.end();
+	}
+	const [code, stdout, stderr] = await Promise.all([
+		proc.exited,
+		new Response(proc.stdout).text(),
+		new Response(proc.stderr).text(),
+	]);
+	if (code !== 0) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+	return stdout.trim();
+}
+
 /** Two scratch git repos: an intended target worktree and an unrelated dispatcher cwd. */
 async function initRepo(prefix?: string): Promise<string> {
 	const root = await tempDir(prefix);
@@ -873,6 +893,40 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(seed.status).toBe(2);
 		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
 		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it.each(["blob", "tree"] as const)("rejects a %s object in HEAD before seed or write mutation", async kind => {
+		const session = `wt-noncommit-${kind}`;
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const target = await initRepo(`gjc-ralplan-${kind}-head-`);
+		const objectId =
+			kind === "blob"
+				? await gitText(["hash-object", "-w", "--stdin"], target, "not a commit")
+				: await gitText(["write-tree"], target);
+		await fs.writeFile(path.join(target, ".git", "HEAD"), `${objectId}\n`);
+
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", `${kind} head`],
+			dispatcher,
+		);
+		expect(seed.status).toBe(2);
+		expect(seed.stderr ?? "").toMatch(/not a commit worktree/);
+		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
+
+		const write = await runNativeRalplanCommand(
+			explicitWriteArgs({
+				worktreeRoot: target,
+				stage: "planner",
+				stageN: 1,
+				session,
+				artifact: "must not write",
+			}),
+			dispatcher,
+		);
+		expect(write.status).toBe(2);
+		expect(write.stderr ?? "").toMatch(/not a commit worktree/);
+		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 	});
 
