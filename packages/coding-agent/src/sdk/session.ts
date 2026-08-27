@@ -2074,7 +2074,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							const foldDisposition = job
 								? session.foldCoordinator.onDelivery(job, result)
 								: ({ kind: "ordinary" } as const);
-							if (foldDisposition.kind === "parked") return;
+							if (foldDisposition.kind === "parked") {
+								if (job) asyncJobManager?.retainParkedDelivery(job, result);
+								return;
+							}
 							const formattedResult = await formatAsyncResultForFollowUp(result, !deniedOwnedDelivery);
 							if (
 								foldDisposition.kind === "receipt" &&

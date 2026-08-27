@@ -660,6 +660,7 @@ export class AsyncJobManager {
 	readonly #deadLetterOverflowByOwner = new Map<string | undefined, number>();
 	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
 	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
+	readonly #parkedDeliveries = new Map<string, AsyncJobDelivery>();
 	/** Generations settled by failNow, so the runner's later terminal path is a no-op. */
 	readonly #externallySettled = new Set<string>();
 	/** Closed before #disposed so owner cleanups can settle work but cannot register more. */
@@ -2289,6 +2290,21 @@ export class AsyncJobManager {
 				deliveryState: "pending",
 			});
 		}
+		for (const delivery of this.#parkedDeliveries.values()) {
+			if (ownerId && delivery.ownerId !== ownerId) continue;
+			const key = `${delivery.jobId}:${delivery.generation}`;
+			if (projectedKeys.has(key)) continue;
+			projectedKeys.add(key);
+			jobs.push({
+				id: delivery.jobId,
+				kind: delivery.kind,
+				label: delivery.label,
+				status: delivery.status,
+				generation: delivery.generation,
+				backgrounded: delivery.backgrounded,
+				deliveryState: "pending",
+			});
+		}
 
 		const deadLettered: DeadLetteredJobSnapshotEntry[] = [];
 		for (const entry of this.#deadLetteredDeliveries.values()) {
@@ -2323,6 +2339,28 @@ export class AsyncJobManager {
 		}
 
 		return { jobs, deadLettered };
+	}
+
+	retainParkedDelivery(job: AsyncJob, text: string): void {
+		if (this.#disposed) return;
+		this.#parkedDeliveries.set(job.generation, {
+			jobId: job.id,
+			generation: job.generation,
+			job,
+			kind: job.type,
+			label: job.label,
+			status: job.status,
+			backgrounded: job.metadata?.backgrounded === true,
+			text,
+			attempt: 0,
+			nextAttemptAt: Date.now(),
+			ownerId: job.ownerId,
+		});
+		this.#notifyChange();
+	}
+
+	clearParkedDelivery(generation: string): void {
+		if (this.#parkedDeliveries.delete(generation)) this.#notifyChange();
 	}
 
 	hasPendingDeliveries(filter?: AsyncJobFilter): boolean {
@@ -2610,6 +2648,7 @@ export class AsyncJobManager {
 		this.#inFlightDeliveries.length = 0;
 		this.#deadLetteredDeliveries.clear();
 		this.#evictedDeadLetters.clear();
+		this.#parkedDeliveries.clear();
 		this.#externallySettled.clear();
 		this.#deadLetteredDeliveryOwners.clear();
 		this.#deadLetterOverflowByOwner.clear();

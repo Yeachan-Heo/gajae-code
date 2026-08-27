@@ -2657,6 +2657,7 @@ export class AgentSession {
 		// This mirrors exactly what the sdk delivery seam does for a live receipt
 		// delivery, so the parked path cannot rely on an unrelated idle rearm.
 		deliverParked: (job, disposition) => {
+			this.#ownedAsyncJobManager?.clearParkedDelivery(job.generation);
 			const endpointId = this.#ownedAsyncJobManager
 				? AsyncJobManager.endpointIdOf(this.#ownedAsyncJobManager)
 				: undefined;

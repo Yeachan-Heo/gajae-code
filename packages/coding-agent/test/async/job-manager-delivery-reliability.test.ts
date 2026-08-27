@@ -336,4 +336,37 @@ describe("AsyncJobManager delivery reliability", () => {
 			else await manager.dispose({ timeoutMs: 250 });
 		}
 	});
+
+	test("parked fold delivery remains visible until receipt replay", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		let resolveJob!: (value: string) => void;
+		const jobId = manager.register(
+			"bash",
+			"parked fold",
+			() => new Promise<string>(resolve => (resolveJob = resolve)),
+			{
+				id: "parked-fold",
+				metadata: { backgrounded: true },
+			},
+		);
+		const job = manager.getJob(jobId);
+		if (!job) throw new Error("expected parked job");
+		manager.retainParkedDelivery(job, "parked output");
+		expect(manager.getJobsSnapshot().jobs).toContainEqual({
+			id: jobId,
+			kind: "bash",
+			label: "parked fold",
+			status: "running",
+			generation: job.generation,
+			backgrounded: true,
+			deliveryState: "pending",
+		});
+		manager.clearParkedDelivery(job.generation);
+		expect(manager.getJobsSnapshot().jobs).toContainEqual(
+			expect.objectContaining({ id: jobId, deliveryState: "pending" }),
+		);
+		resolveJob("done");
+		await manager.waitForAll();
+		await manager.dispose({ timeoutMs: 250 });
+	});
 });
