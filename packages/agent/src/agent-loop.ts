@@ -656,6 +656,16 @@ function managedProperty(value: unknown, key: string): unknown {
 	return managedPropertyRead(value, key).value;
 }
 
+function managedOwnPropertyRead(value: unknown, key: string): { present: boolean; ok: boolean; value: unknown } {
+	if (!value || typeof value !== "object") return { present: false, ok: true, value: undefined };
+	try {
+		if (!Object.hasOwn(value, key)) return { present: false, ok: true, value: undefined };
+		return { present: true, ok: true, value: Reflect.get(value, key) };
+	} catch {
+		return { present: true, ok: false, value: undefined };
+	}
+}
+
 function managedTransportFailure(failure: unknown) {
 	const facts = managedProperty(failure, "transportFailure");
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
@@ -2119,9 +2129,25 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 				managedProperty(candidate, "id") === destination.id &&
 				managedProperty(candidate, "name") === destination.name,
 		);
-		if (matches.length !== 1) continue;
-		const rawEvidence = managedProperty(matches[0], "escapedUnicodeArgumentEvidence");
-		if (rawEvidence === undefined) continue;
+		const evidenceReads = matches.map(candidate =>
+			managedOwnPropertyRead(candidate, "escapedUnicodeArgumentEvidence"),
+		);
+		if (matches.length !== 1) {
+			if (evidenceReads.some(read => read.present)) {
+				destination.incompleteArguments = true;
+				destination.incompleteArgumentsReason = "malformed";
+			}
+			continue;
+		}
+		const evidenceRead = evidenceReads[0]!;
+		if (!evidenceRead.present || !evidenceRead.ok || evidenceRead.value === undefined) {
+			if (evidenceRead.present) {
+				destination.incompleteArguments = true;
+				destination.incompleteArgumentsReason = "malformed";
+			}
+			continue;
+		}
+		const rawEvidence = evidenceRead.value;
 		const evidence = managedUnicodeEscapeEvidence(rawEvidence);
 		if (evidence && !evidence.malformed) attachUnicodeEscapeEvidence(destination, evidence);
 		else {
@@ -2156,13 +2182,32 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const customWireName = managedProperty(value, "customWireName");
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
-	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
-	const rawEscapedUnicodeArgumentEvidence = managedProperty(value, "escapedUnicodeArgumentEvidence");
+	const escapedGuardRead = managedOwnPropertyRead(value, "escapedNonAsciiArguments");
+	const evidenceRead = managedOwnPropertyRead(value, "escapedUnicodeArgumentEvidence");
+	const inheritedGuard =
+		!escapedGuardRead.present &&
+		(() => {
+			try {
+				return "escapedNonAsciiArguments" in value;
+			} catch {
+				return true;
+			}
+		})();
+	const escapedNonAsciiArguments = escapedGuardRead.value;
+	const rawEscapedUnicodeArgumentEvidence = evidenceRead.value;
 	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
 	const invalidEscapedUnicodeEvidence =
-		rawEscapedUnicodeArgumentEvidence !== undefined &&
-		(escapedUnicodeArgumentEvidence === undefined || escapedUnicodeArgumentEvidence.malformed);
-	const escapedArgumentsGuarded = escapedNonAsciiArguments === true || rawEscapedUnicodeArgumentEvidence !== undefined;
+		(evidenceRead.present &&
+			(!evidenceRead.ok ||
+				rawEscapedUnicodeArgumentEvidence === undefined ||
+				escapedUnicodeArgumentEvidence === undefined ||
+				escapedUnicodeArgumentEvidence.malformed)) ||
+		!escapedGuardRead.ok ||
+		inheritedGuard;
+	const escapedArgumentsGuarded =
+		invalidEscapedUnicodeEvidence ||
+		(escapedGuardRead.present && escapedGuardRead.ok && escapedNonAsciiArguments === true) ||
+		(evidenceRead.present && evidenceRead.ok && escapedUnicodeArgumentEvidence !== undefined);
 	return {
 		type,
 		id,
@@ -4883,6 +4928,7 @@ async function executeToolCalls(
 		for (const record of records) {
 			if (isInvalidEscapedRecord(record)) continue;
 			record.skipped = true;
+			delete record.toolCall.escapedUnicodeArgumentEvidence;
 			emitToolResult(record, createSkippedToolResult(), true);
 		}
 	}
