@@ -2794,12 +2794,16 @@ class ManagedAttemptTransaction {
 
 	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
 		const sourceContent = Array.isArray(message.content) ? message.content : [];
-		const sourceMetadata = sourceContent.map(block =>
-			block?.type === "toolCall" ? escapedToolCallMetadata(block) : undefined,
-		);
-		const snapshot = this.#assistantSnapshot(message);
+		const sourceMetadata: Array<EscapedToolCallMetadata | undefined> = [];
+		for (let index = 0; index < sourceContent.length; index += 1) {
+			const block = sourceContent[index];
+			sourceMetadata[index] = block?.type === "toolCall" ? escapedToolCallMetadata(block) : undefined;
+		}
+		let snapshot = this.#assistantSnapshot(message);
 		if (snapshot.role !== "assistant") return snapshot;
-		if (!Array.isArray(snapshot.content)) snapshot.content = [];
+		if (!Array.isArray(snapshot.content)) {
+			snapshot = managedAssistantShell(message, this.model, this.#degradedFieldDiagnostics, true);
+		}
 		for (let index = 0; index < sourceContent.length; index += 1) {
 			const sourceBlock = sourceContent[index];
 			if (sourceBlock?.type !== "toolCall") continue;
@@ -2812,16 +2816,30 @@ class ManagedAttemptTransaction {
 				snapshot.content[index] = snapshotBlock;
 			}
 			if (metadata) {
-				if (metadata.malformed) {
+				const detachedMetadata = escapedToolCallMetadata(snapshotBlock);
+				const evidencePresenceChanged = Boolean(metadata.evidence) !== Boolean(detachedMetadata.evidence);
+				const metadataChanged =
+					metadata.guarded !== detachedMetadata.guarded ||
+					metadata.incompleteArguments !== detachedMetadata.incompleteArguments ||
+					evidencePresenceChanged;
+				const combinedMetadata: EscapedToolCallMetadata = {
+					guarded: metadata.guarded || detachedMetadata.guarded || metadataChanged,
+					malformed: metadata.malformed || detachedMetadata.malformed || metadataChanged,
+					evidence: metadata.evidence ?? detachedMetadata.evidence,
+					incompleteArguments: metadata.incompleteArguments || detachedMetadata.incompleteArguments,
+					incompleteArgumentsReason:
+						metadata.incompleteArgumentsReason ?? detachedMetadata.incompleteArgumentsReason,
+				};
+				if (combinedMetadata.malformed) {
 					const marked = {
 						...snapshotBlock,
 						incompleteArguments: true,
 						incompleteArgumentsReason: "malformed" as const,
 					};
 					snapshot.content[index] = marked;
-					acceptedToolCallMetadata.set(marked, metadata);
+					acceptedToolCallMetadata.set(marked, combinedMetadata);
 				} else {
-					acceptedToolCallMetadata.set(snapshotBlock, metadata);
+					acceptedToolCallMetadata.set(snapshotBlock, combinedMetadata);
 				}
 			}
 		}
