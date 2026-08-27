@@ -15493,6 +15493,11 @@ export class SessionManager {
 					}
 				} catch (error) {
 					transition.dispose();
+					if (error instanceof ManagedCommittedMutationError && error.operation === "append") {
+						this.#managedPersistExpectedIdentity = error.identity;
+						this.#needsFullRewriteOnNextPersist = true;
+						if (!error.identity) this.#recordPersistError(error);
+					}
 					return { kind: "unknown", error: toError(error) };
 				}
 			} else {
