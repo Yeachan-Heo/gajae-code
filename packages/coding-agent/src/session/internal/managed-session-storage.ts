@@ -3333,9 +3333,19 @@ export function publishManagedFileNoReplaceSync(
 			try {
 				secureFileDescriptor(destination, destinationFd, "verify");
 				const terminal = fs.fstatSync(destinationFd, { bigint: true });
-				const digest = publishedIdentity?.sha256 ?? createHash("sha256").update(bytes).digest("hex");
 				if (terminal.dev !== stagingIdentity?.dev || terminal.ino !== stagingIdentity?.ino) {
 					throw new Error("destination_identity_changed");
+				}
+				const hash = createHash("sha256");
+				const chunk = Buffer.alloc(64 * 1024);
+				for (;;) {
+					const count = fs.readSync(destinationFd, chunk, 0, chunk.byteLength, null);
+					if (count === 0) break;
+					hash.update(chunk.subarray(0, count));
+				}
+				const digest = hash.digest("hex");
+				if (digest !== createHash("sha256").update(bytes).digest("hex")) {
+					throw new Error("destination_content_changed");
 				}
 				publishedIdentity = identity(terminal, digest);
 			} finally {
