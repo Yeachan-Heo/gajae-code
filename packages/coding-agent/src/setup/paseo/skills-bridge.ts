@@ -244,6 +244,13 @@ export interface SkillsBridgeInstallResult {
 	readonly sourceDir?: string;
 }
 
+export interface SkillsBridgeInstallOptions {
+	/** Persist the created root identity before any public bridge entry mutation. */
+	readonly onBridgeDirCreated?: (identity: BridgeEntryIdentity) => Promise<void>;
+	/** Persist each created/adopted entry identity before the next mutation. */
+	readonly onBridgeEntryCreated?: (name: string, identity: BridgeEntryIdentity) => Promise<void>;
+}
+
 export class SkillsBridgeError extends Error {
 	readonly retained: readonly string[];
 	readonly bridgeDirIdentity?: BridgeEntryIdentity;
@@ -756,7 +763,10 @@ export async function preflightSkillsBridge(deps: PaseoSetupDependencies): Promi
 	};
 }
 
-async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<BridgeEntryIdentity> {
+async function createBridgeDirectory(
+	preflight: SkillsBridgePreflight,
+	onBridgeDirCreated?: (identity: BridgeEntryIdentity) => Promise<void>,
+): Promise<BridgeEntryIdentity> {
 	const temporary = await fs.mkdtemp(path.join(path.dirname(preflight.bridgeDir), ".paseo-skills-create-"));
 	let stagedSnapshot: NativeDirectoryTreeResult | undefined;
 	let identity: BridgeEntryIdentity | undefined;
@@ -787,6 +797,17 @@ async function createBridgeDirectory(preflight: SkillsBridgePreflight): Promise<
 			);
 		}
 		identity = created.identity;
+		if (onBridgeDirCreated !== undefined) {
+			try {
+				await onBridgeDirCreated(identity);
+			} catch (error) {
+				throw new SkillsBridgeError(
+					`Paseo skills bridge root authority could not be persisted: ${error instanceof Error ? error.message : String(error)}`,
+					[temporary],
+					identity,
+				);
+			}
+		}
 	} finally {
 		if (stagedSnapshot?.ok && stagedSnapshot.snapshot !== undefined) {
 			const cleanup = exactRemoveDirectoryTree(canonicalExistingPathForNative(temporary), stagedSnapshot.snapshot);
@@ -916,7 +937,10 @@ export async function adoptLegacyLink(
 }
 
 /** Create only preflight-approved bridge links; symlink publication never replaces an existing entry. */
-export async function installSkillsBridge(preflight: SkillsBridgePreflight): Promise<SkillsBridgeInstallResult> {
+export async function installSkillsBridge(
+	preflight: SkillsBridgePreflight,
+	options: SkillsBridgeInstallOptions = {},
+): Promise<SkillsBridgeInstallResult> {
 	const hasWork =
 		Object.keys(preflight.entries).length > 0 || preflight.prunes.length > 0 || preflight.adopts.length > 0;
 	let bridgeDirCreated = false;
@@ -951,7 +975,7 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 	};
 	try {
 		if (preflight.bridgeDirCreated && hasWork) {
-			bridgeDirIdentity = await createBridgeDirectory(preflight);
+			bridgeDirIdentity = await createBridgeDirectory(preflight, options.onBridgeDirCreated);
 			bridgeDirCreated = true;
 		}
 		if (hasWork) {
@@ -974,6 +998,8 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				entry.name,
 				preflight.sourceDir,
 			);
+			if (options.onBridgeEntryCreated !== undefined)
+				await options.onBridgeEntryCreated(entry.name, entryIdentities[entry.name]!);
 			await assertInstalledEntryTarget(preflight.bridgeDir, entry.name);
 		}
 		for (const adopt of preflight.adopts) {
@@ -985,6 +1011,8 @@ export async function installSkillsBridge(preflight: SkillsBridgePreflight): Pro
 				adopt.name,
 				preflight.sourceDir,
 			);
+			if (options.onBridgeEntryCreated !== undefined)
+				await options.onBridgeEntryCreated(adopt.name, entryIdentities[adopt.name]!);
 			await assertInstalledEntryTarget(preflight.bridgeDir, adopt.name);
 		}
 	} catch (error) {

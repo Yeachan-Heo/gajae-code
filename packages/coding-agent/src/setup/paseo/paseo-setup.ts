@@ -1001,7 +1001,37 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 		}
 		let bridge: SkillsBridgeInstallResult;
 		try {
-			bridge = await installSkillsBridge(bridgePreflight);
+			const persistBridgeProgress = async (
+				update: (payload: ProvenanceLedger) => ProvenanceLedger,
+			): Promise<void> => {
+				const intent = await readIntent(deps.paths.intentRecord);
+				if (intent?.step !== "skills-bridge" || intent.provenancePath !== deps.paths.provenanceLedger) {
+					throw new SkillsBridgeError("Paseo skills bridge progress lost its durable intent authority");
+				}
+				const payload = update(intent.provenancePayload ?? bridgeLedgerAfter ?? bridgeLedger);
+				await writeIntent(deps.paths.intentRecord, {
+					...intent,
+					provenanceExpectedIdentity: provenanceLedgerIdentity(payload),
+					provenancePayload: payload,
+				});
+			};
+			bridge = await installSkillsBridge(bridgePreflight, {
+				onBridgeDirCreated: identity =>
+					persistBridgeProgress(payload => ({
+						...payload,
+						bridgeDirCreated: true,
+						bridgeDirIdentity: identity,
+					})),
+				onBridgeEntryCreated: (name, identity) =>
+					persistBridgeProgress(payload => ({
+						...payload,
+						bridgeEntries: [...new Set([...(payload.bridgeEntries ?? []), name])],
+						bridgeEntryIdentities: {
+							...(payload.bridgeEntryIdentities ?? {}),
+							[name]: identity,
+						},
+					})),
+			});
 		} catch (error) {
 			// A mid-operation bridge failure must not leave the pre-write's
 			// PLAN standing as provenance FACT (#4644 review r9): the failed
