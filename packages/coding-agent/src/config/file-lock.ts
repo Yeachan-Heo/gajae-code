@@ -3,7 +3,7 @@ import type { BigIntStats, Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { NativeDirectoryTreeResult, NativeExactUnlinkResult } from "@gajae-code/natives";
-import { hasFsCode, isEnoent } from "@gajae-code/utils/fs-error";
+import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
 export interface FileLockOptions {
