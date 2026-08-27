@@ -472,6 +472,26 @@ function escapedNonAsciiToolCallShape(message: AssistantMessage): {
 /** Remove transient raw-evidence metadata before any message can become durable. */
 function stripToolCallEvidence<T extends { escapedUnicodeArgumentEvidence?: unknown }>(toolCall: T): T {
 	try {
+		if (nodeUtilTypes.isProxy(toolCall)) {
+			const sanitized = Object.create(null) as T;
+			for (const key of [
+				"type",
+				"id",
+				"name",
+				"arguments",
+				"thoughtSignature",
+				"intent",
+				"customWireName",
+				"escapedNonAsciiArguments",
+				"incompleteArguments",
+				"incompleteArgumentsReason",
+			]) {
+				const read = managedPropertyRead(toolCall, key);
+				if (read.ok && read.value !== undefined)
+					Object.defineProperty(sanitized, key, { value: read.value, enumerable: true });
+			}
+			return sanitized;
+		}
 		const descriptor = Object.getOwnPropertyDescriptor(toolCall, "escapedUnicodeArgumentEvidence");
 		if (!descriptor) return toolCall;
 		if (descriptor.configurable && Reflect.deleteProperty(toolCall, "escapedUnicodeArgumentEvidence"))
@@ -2759,9 +2779,15 @@ class ManagedAttemptTransaction {
 		if (snapshot.role !== "assistant") return snapshot;
 		for (let index = 0; index < message.content.length; index += 1) {
 			const sourceBlock = message.content[index];
-			const snapshotBlock = snapshot.content[index];
-			if (sourceBlock?.type !== "toolCall" || snapshotBlock?.type !== "toolCall") continue;
+			if (sourceBlock?.type !== "toolCall") continue;
 			const metadata = sourceMetadata[index];
+			let snapshotBlock = snapshot.content[index];
+			if (snapshotBlock?.type !== "toolCall") {
+				const normalized = managedAssistantContent(sourceBlock);
+				if (normalized?.type !== "toolCall") continue;
+				snapshotBlock = normalized;
+				snapshot.content[index] = snapshotBlock;
+			}
 			if (metadata) {
 				if (metadata.malformed) {
 					const marked = {
