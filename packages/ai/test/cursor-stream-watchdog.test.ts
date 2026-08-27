@@ -7,6 +7,8 @@ import {
 	AgentServerMessageSchema,
 	ConversationStateStructureSchema,
 	ExecServerMessageSchema,
+	ExecServerAbortSchema,
+	ExecServerControlMessageSchema,
 	HeartbeatUpdateSchema,
 	InteractionUpdateSchema,
 	PiReadExecArgsSchema,
@@ -701,6 +703,40 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		expect(result.stopReason).toBe("stop");
+	});
+
+	it("does not refresh the watchdog for unhandled control envelopes", async () => {
+		let controlTimer: ReturnType<typeof setInterval> | undefined;
+		const baseUrl = await createCursorServer(stream => {
+			stream.on("error", () => {});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendInteractionUpdate(stream, {
+					case: "heartbeat",
+					value: create(HeartbeatUpdateSchema, {}),
+				});
+				controlTimer = setInterval(() => {
+					sendServerMessage(stream, {
+						case: "execServerControlMessage",
+						value: create(ExecServerControlMessageSchema, {
+							message: { case: "abort", value: create(ExecServerAbortSchema, { id: 1 }) },
+						}),
+					});
+				}, 5);
+			}, 5);
+			stream.on("close", () => {
+				if (controlTimer) clearInterval(controlTimer);
+			});
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 30,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for the next event");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
 	it("does not time out while a Cursor exec handler is still running", async () => {

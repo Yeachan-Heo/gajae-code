@@ -676,10 +676,6 @@ function isMeaningfulCursorServerMessage(msg: AgentServerMessage): boolean {
 			return msg.message.value.message.case !== undefined;
 		case "execServerMessage":
 			return msg.message.value.message.case !== undefined;
-		case "execServerControlMessage":
-			return msg.message.value.message.case !== undefined;
-		case "interactionQuery":
-			return msg.message.value.query.case !== undefined;
 		case "kvServerMessage":
 			return msg.message.value.message.case !== undefined;
 		case "conversationCheckpointUpdate":
