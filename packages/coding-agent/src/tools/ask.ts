@@ -73,7 +73,7 @@ import {
 export { askSchema } from "./ask-contract";
 
 import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
-import { ToolAbortError } from "./tool-errors";
+import { ToolAbortError, ToolError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 
 /**
@@ -83,6 +83,12 @@ import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
  * forever (gajae-code#5001).
  */
 const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
+
+/**
+ * Names the answering-surface defect explicitly so it is never recorded as a user
+ * cancel (#5001 review B2). Reported through ToolError, which the model can act on.
+ */
+const EMPTY_ANSWER_EXHAUSTED_MESSAGE = `The answering surface returned an empty free-text answer ${MAX_EMPTY_CUSTOM_ATTEMPTS} times for the same question, so the ask stopped re-asking. This is an input-surface failure, not a user cancellation: ask again with explicit options, or continue without this answer.`;
 
 // =============================================================================
 // Types
@@ -470,7 +476,11 @@ async function askSingleQuestion(
 			return ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
 		};
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
-		return { input };
+		// Normalize like promptForClarificationInput below: this fallback serves the
+		// UI contexts that resolve "Other" without the inline editor — exactly the
+		// remote surfaces #5001 was reported from — so forwarding "" here would
+		// reach the model as an empty answer and bypass the inline allowEmpty guard.
+		return { input: input !== undefined && input.trim() === "" ? undefined : input };
 	};
 	const promptForClarificationInput = async (): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
@@ -1137,6 +1147,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					navigation: undefined as NavigationControls | undefined,
 					cancelled: false,
 					timedOut: false,
+					surfaceExhausted: false,
 				};
 			}
 			try {
@@ -1265,7 +1276,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 													: { kind: "resolve_without_commit", reason: "cancelled" };
 					await settleActiveRemote(settlement);
 					activeRemoteRequest = undefined;
-					if (settlement.kind === "invalid") {
+					if (settlement.kind === "invalid" && settlement.reason === "empty_custom") {
 						// An answering surface that keeps producing empty free text used to spin
 						// this question forever. Bound the re-asks and then let the ask settle as
 						// cancelled so the caller sees a terminal outcome instead of a live lock.
@@ -1277,8 +1288,9 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 								customInput: undefined,
 								clarificationQuestion: undefined,
 								navigation: undefined,
-								cancelled: true,
+								cancelled: false,
 								timedOut: false,
+								surfaceExhausted: true,
 							};
 						return askQuestion(q, { ...options, emptyCustomAttempt: attempt });
 					}
@@ -1292,6 +1304,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					navigation,
 					cancelled,
 					timedOut,
+					surfaceExhausted: false,
 				};
 			} catch (error) {
 				await settleActiveRemote(
@@ -1312,9 +1325,21 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		if (params.questions.length === 1) {
 			const [q] = params.questions;
-			const { optionLabels, selectedOptions, customInput, clarificationQuestion, cancelled, timedOut } =
-				await askQuestion(q);
+			const {
+				optionLabels,
+				selectedOptions,
+				customInput,
+				clarificationQuestion,
+				cancelled,
+				timedOut,
+				surfaceExhausted,
+			} = await askQuestion(q);
 
+			// #5001: exhausting the empty-answer bound is an answering-surface defect,
+			// not a user cancel. Naming it separately keeps the two distinguishable in
+			// session records, and a ToolError leaves the turn alive so the model can
+			// re-ask differently instead of dying on an input-layer fault.
+			if (surfaceExhausted) throw new ToolError(EMPTY_ANSWER_EXHAUSTED_MESSAGE);
 			if (
 				!timedOut &&
 				(cancelled ||
@@ -1371,6 +1396,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		const resultsByIndex: Array<QuestionResult | undefined> = Array.from({ length: params.questions.length });
 		let questionIndex = 0;
+		let exhaustedAtIndex: number | undefined;
 		while (questionIndex < params.questions.length) {
 			const q = params.questions[questionIndex]!;
 			const previous = resultsByIndex[questionIndex];
@@ -1387,8 +1413,16 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 				navigation: navAction,
 				cancelled,
 				timedOut,
+				surfaceExhausted,
 			} = await askQuestion(q, { previous, navigation });
 
+			// #5001 review B2.3: throwing here used to discard every answer already
+			// collected in resultsByIndex. Stop the loop instead and return the partial
+			// set, with the surface defect named in the tool output.
+			if (surfaceExhausted) {
+				exhaustedAtIndex = questionIndex;
+				break;
+			}
 			if (cancelled && !timedOut) {
 				context?.abort();
 				throw new ToolAbortError("Ask tool was cancelled by the user");
@@ -1433,7 +1467,12 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		const details: AskToolDetails = { results };
 		const responseLines = results.map(formatQuestionResult);
-		const responseText = `User answers:\n${responseLines.join("\n")}`;
+		const answered = exhaustedAtIndex === undefined ? results.length : exhaustedAtIndex;
+		const exhaustionNote =
+			exhaustedAtIndex === undefined
+				? ""
+				: `\n\n${EMPTY_ANSWER_EXHAUSTED_MESSAGE} Stopped at question ${exhaustedAtIndex + 1} of ${params.questions.length}; the ${answered} answer(s) above were collected before that.`;
+		const responseText = `User answers:\n${responseLines.join("\n")}${exhaustionNote}`;
 
 		return { content: [{ type: "text" as const, text: responseText }], details };
 	}

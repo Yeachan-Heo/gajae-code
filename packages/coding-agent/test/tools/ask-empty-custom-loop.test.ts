@@ -58,8 +58,8 @@ describe("AskTool empty free-text answers", () => {
 		};
 		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
 
-		// The bounded path ends on the existing terminal outcome for an answerless
-		// ask rather than looping: ToolAbortError instead of a live lock.
+		// The bounded path names the surface defect instead of looping, and it must not
+		// be reported as a user cancellation (#5001 review B2).
 		await expect(
 			tool.execute(
 				"empty-custom-loop",
@@ -68,11 +68,50 @@ describe("AskTool empty free-text answers", () => {
 				undefined,
 				neverResolvingContext() as never,
 			),
-		).rejects.toThrow("Ask tool was cancelled by the user");
+		).rejects.toThrow(/empty free-text answer 3 times/);
 
 		// Bounded: the same question is asked a small, fixed number of times.
 		expect(questions.length).toBeLessThanOrEqual(3);
 		expect(new Set(questions).size).toBe(1);
 		expect(settlements.every(s => (s as { kind?: string }).kind === "invalid")).toBe(true);
+	});
+});
+
+describe("multi-question exhaustion", () => {
+	it("keeps answers collected before the exhausted question", async () => {
+		let call = 0;
+		const source: AskAnswerSource = {
+			awaitAnswer: async () => undefined,
+			awaitAnswerRequest: () => {
+				call += 1;
+				// First question answers normally; the second is stuck on whitespace.
+				const value = call === 1 ? "a" : "   ";
+				return Promise.resolve({
+					source: "remote" as const,
+					interaction: { kind: "value" as const, value },
+					settle: async () => ({ kind: "resolved_without_commit" as const }),
+				});
+			},
+		};
+		const tool = new AskTool(createSession({ getAskAnswerSource: () => source }));
+
+		const result = await tool.execute(
+			"multi-exhaustion",
+			{
+				questions: [
+					{ id: "first", question: "First?", options: [{ label: "a" }, { label: "b" }] },
+					{ id: "second", question: "Second?", options: [{ label: "c" }, { label: "d" }] },
+				],
+			},
+			undefined,
+			undefined,
+			neverResolvingContext() as never,
+		);
+
+		// #5001 review B2.3: the first answer survives instead of being discarded.
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("a");
+		expect(text).toMatch(/Stopped at question 2 of 2/);
+		expect(result.details?.results?.[0]?.selectedOptions).toEqual(["a"]);
 	});
 });

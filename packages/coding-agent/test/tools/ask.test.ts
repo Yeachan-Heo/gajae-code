@@ -1378,7 +1378,11 @@ describe("AskTool custom input", () => {
 		expect(abort).not.toHaveBeenCalled();
 	});
 
-	it("treats explicit empty-string custom input as submitted input", async () => {
+	it("does not treat an explicit empty-string custom input as an answer", async () => {
+		// #5001: the fallback editor path used to forward "" as a submitted answer, so
+		// the model received `User provided custom input: ` with nothing in it and could
+		// only ask again. An empty submit is now no answer at all, which lands on the
+		// existing answerless terminal path instead of pretending an answer arrived.
 		const tool = new AskTool(createSession());
 		const abort = vi.fn();
 		const editor = vi.fn(async () => "");
@@ -1388,31 +1392,24 @@ describe("AskTool custom input", () => {
 			abort,
 		});
 
-		const result = await tool.execute(
-			"call-empty-custom",
-			{
-				questions: [
-					{
-						id: "details",
-						question: "Share details",
-						options: [{ label: "yes" }, { label: "no" }],
-					},
-				],
-			},
-			undefined,
-			undefined,
-			context,
-		);
-
-		expect(result.content[0]?.type).toBe("text");
-		if (result.content[0]?.type !== "text") {
-			throw new Error("Expected text result");
-		}
-		expect(result.content[0].text).toContain("User provided custom input:");
-		expect(result.details?.customInput).toBe("");
-		expect(result.details?.selectedOptions).toEqual([]);
+		await expect(
+			tool.execute(
+				"call-empty-custom",
+				{
+					questions: [
+						{
+							id: "details",
+							question: "Share details",
+							options: [{ label: "yes" }, { label: "no" }],
+						},
+					],
+				},
+				undefined,
+				undefined,
+				context,
+			),
+		).rejects.toThrow("Ask tool was cancelled by the user");
 		expect(editor).toHaveBeenCalledTimes(1);
-		expect(abort).not.toHaveBeenCalled();
 	});
 
 	it("renders checked options together with custom text in multi-select answers", async () => {
