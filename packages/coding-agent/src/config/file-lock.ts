@@ -629,9 +629,7 @@ async function quarantineReleasedLock(lockPath: string, owner: FileLockOwnerToke
 			return false;
 		} catch (error) {
 			if (isEnoent(error)) {
-				await fs.rm(removed.detachedPath, { recursive: true, force: true }).catch(cleanupError => {
-					if (!isTransientReleaseError(cleanupError)) throw cleanupError;
-				});
+				nativeFileLockBindings().exactRemoveDirectoryTree(removed.detachedPath, captured.snapshot);
 				return true;
 			}
 			throw error;

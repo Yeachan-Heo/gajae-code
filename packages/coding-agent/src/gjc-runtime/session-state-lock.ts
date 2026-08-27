@@ -57,9 +57,28 @@ const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 const LINUX_PROC_START_TIME_FORMAT = "linux-proc-v1";
 const PORTABLE_START_TIME_FORMAT = "ps-utc-v1";
 const TRANSIENT_LOCK_ERROR_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const pendingTransitionReleases = new Map<string, string>();
 
 function isTransientLockError(error: unknown): boolean {
-	return TRANSIENT_LOCK_ERROR_CODES.has((error as NodeJS.ErrnoException).code ?? "");
+	if (
+		error !== null &&
+		typeof error === "object" &&
+		TRANSIENT_LOCK_ERROR_CODES.has((error as NodeJS.ErrnoException).code ?? "")
+	)
+		return true;
+	return error instanceof Error && isTransientLockError(error.cause);
+}
+
+async function removeTransitionDir(transitionDir: string): Promise<void> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			await fs.rmdir(transitionDir);
+			return;
+		} catch (error) {
+			if (!isTransientLockError(error) || attempt >= 4) throw error;
+			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
+		}
+	}
 }
 
 interface SessionStateLockOwner {
@@ -977,14 +996,12 @@ async function releaseTransitionClaim(
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
 	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
-	for (let attempt = 0; ; attempt++) {
-		try {
-			await fs.rmdir(transitionDir);
-			return;
-		} catch (error) {
-			if (!isTransientLockError(error) || attempt >= 4) throw error;
-			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
-		}
+	try {
+		await removeTransitionDir(transitionDir);
+	} catch (error) {
+		const owner = JSON.parse(held.bytes) as Partial<SessionStateLockOwner>;
+		if (owner.token) pendingTransitionReleases.set(transitionDir, owner.token);
+		throw error;
 	}
 }
 
@@ -1013,6 +1030,19 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 	const ownerFile = `${transitionDir}.owner`;
 	const owner = await newLockOwner();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
+		const pendingToken = pendingTransitionReleases.get(transitionDir);
+		if (pendingToken) {
+			try {
+				const pendingOwner = JSON.parse(await fs.readFile(ownerFile, "utf8")) as Partial<SessionStateLockOwner>;
+				if (pendingOwner.token === pendingToken && pendingOwner.released === true) {
+					await removeTransitionDir(transitionDir);
+					pendingTransitionReleases.delete(transitionDir);
+				}
+			} catch (error) {
+				const code = (error as NodeJS.ErrnoException).code;
+				if (!isTransientLockError(error) && code !== "ENOENT") throw error;
+			}
+		}
 		try {
 			await fs.mkdir(transitionDir);
 		} catch (error) {
@@ -1026,7 +1056,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 		try {
 			held = await acquireOwnerLock(ownerFile, owner);
 		} catch (error) {
-			await fs.rmdir(transitionDir).catch(() => undefined);
+			await removeTransitionDir(transitionDir).catch(() => undefined);
 			throw error;
 		}
 		const outcome = await transition().then(
