@@ -2682,12 +2682,22 @@ export class AgentSession {
 			const allowArtifact = ownedCompletion === undefined || isOwnedCompletionEnvelopeAllowed(ownedCompletion);
 			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact)
 				.then(formattedResult => {
+					const manager = this.#ownedAsyncJobManager;
+					if (manager?.isDeliverySuppressed(job.id, job.generation)) {
+						manager.clearParkedDelivery(job.generation);
+						return;
+					}
 					if (!this.#foldCoordinator.claimCompletionDelivery(job)) {
-						this.#ownedAsyncJobManager?.clearParkedDelivery(job.generation);
+						manager?.clearParkedDelivery(job.generation);
 						return;
 					}
 					try {
-						this.#ownedAsyncJobManager?.retainDeliveryClaim(job);
+						manager?.retainDeliveryClaim(job);
+						if (manager?.isDeliverySuppressed(job.id, job.generation)) {
+							manager.releaseDeliveryClaim(job.generation);
+							manager.clearParkedDelivery(job.generation);
+							return;
+						}
 						this.yieldQueue.enqueue("async-result", {
 							jobId: disposition.receipt.jobId,
 							generation: disposition.receipt.jobGeneration,
@@ -2695,9 +2705,9 @@ export class AgentSession {
 							job,
 							durationMs: undefined,
 							ownedCompletion,
-						});
+					}
 					} finally {
-						this.#ownedAsyncJobManager?.clearParkedDelivery(job.generation);
+						manager?.clearParkedDelivery(job.generation);
 					}
 				})
 				.catch(error => {

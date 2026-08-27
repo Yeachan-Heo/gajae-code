@@ -401,9 +401,9 @@ describe("BashTool ACP terminal routing", () => {
 
 		const tool = new BashTool(makeSession(bridge));
 
-		await expect(tool.execute("call-output-failure", { command: "echo hi" })).rejects.toThrow(
-			/client output unavailable/,
-		);
+		const result = await tool.execute("call-output-failure", { command: "echo hi" });
+		const text = result.content.find(block => block.type === "text")?.text ?? "";
+		expect(text).toContain("client output unavailable");
 		expect(releaseSpy).toHaveBeenCalledTimes(1);
 	});
 

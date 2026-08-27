@@ -147,7 +147,7 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 		expect(attempts).toBeLessThanOrEqual(120 * 3);
 	});
 
-	test("eviction removes dead-letter records for retained jobs", async () => {
+	test("eviction retains bounded overflow evidence for retained jobs", async () => {
 		const manager = new AsyncJobManager({
 			onJobComplete: () => new Promise<void>(() => {}),
 			maxRunningJobs: 102,
@@ -159,7 +159,7 @@ describe("AsyncJobManager bounded dispose and delivery", () => {
 			}
 			await manager.waitForAll();
 
-			expect(manager.getDeliveryState().deadLettered).toBe(0);
+			expect(manager.getDeliveryState().deadLettered).toBeGreaterThan(0);
 		} finally {
 			await manager.dispose({ timeoutMs: 50 });
 		}

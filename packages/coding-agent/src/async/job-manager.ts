@@ -2952,6 +2952,9 @@ export class AsyncJobManager {
 	/** Whether a retained delivery generation already claims `jobId`. */
 	#hasDeliveryCollisionForJobId(jobId: string): boolean {
 		if (this.#hasPendingDeliveryForJobId(jobId)) return true;
+		for (const parked of this.#parkedDeliveries.values()) {
+			if (parked.jobId === jobId) return true;
+		}
 		for (const claim of this.#receiptClaims.values()) {
 			if (claim.jobId === jobId) return true;
 		}

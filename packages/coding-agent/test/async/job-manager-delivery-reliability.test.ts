@@ -352,6 +352,8 @@ describe("AsyncJobManager delivery reliability", () => {
 		const job = manager.getJob(jobId);
 		if (!job) throw new Error("expected parked job");
 		manager.retainParkedDelivery(job, "parked output");
+		const replacementId = manager.register("bash", "replacement", async () => "replacement", { id: jobId });
+		expect(replacementId).not.toBe(jobId);
 		expect(manager.getJobsSnapshot().jobs).toContainEqual({
 			id: jobId,
 			kind: "bash",
