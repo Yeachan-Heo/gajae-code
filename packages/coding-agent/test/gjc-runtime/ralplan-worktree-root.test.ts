@@ -930,6 +930,25 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 	});
 
+	it("accepts a valid SHA-256 commit worktree", async () => {
+		const session = "wt-sha256";
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const target = await tempDir("gjc-ralplan-sha256-");
+		await git(["init", "--object-format=sha256"], target);
+		await git(
+			["-c", "user.email=test@gjc.local", "-c", "user.name=gjc-test", "commit", "--allow-empty", "-m", "init"],
+			target,
+		);
+
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "sha256 head"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(0);
+		expect(await pathExists(path.join(target, ".gjc"))).toBe(true);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
 	it("rejects a forged ref HEAD that does not resolve in the object database", async () => {
 		const session = "wt-forged-ref";
 		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");

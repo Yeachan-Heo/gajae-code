@@ -758,7 +758,7 @@ export async function resolveRalplanTargetRoot(
 	});
 	const [verifiedStatus, verifiedOutput] = await Promise.all([verified.exited, new Response(verified.stdout).text()]);
 	const headObject = verifiedOutput.trim();
-	if (verifiedStatus !== 0 || !/^[0-9a-f]{40}$/u.test(headObject)) {
+	if (verifiedStatus !== 0 || !/^[0-9a-f]{40,64}$/u.test(headObject)) {
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
 	}
 	const objectType = Bun.spawn(["git", "-C", canonical, "cat-file", "-t", headObject], {
