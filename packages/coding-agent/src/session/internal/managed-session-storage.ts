@@ -3333,7 +3333,11 @@ export function publishManagedFileNoReplaceSync(
 			try {
 				secureFileDescriptor(destination, destinationFd, "verify");
 				const terminal = fs.fstatSync(destinationFd, { bigint: true });
-				publishedIdentity = identity(terminal, publishedIdentity?.sha256 ?? createHash("sha256").update(bytes).digest("hex"));
+				const digest = publishedIdentity?.sha256 ?? createHash("sha256").update(bytes).digest("hex");
+				if (terminal.dev !== stagingIdentity?.dev || terminal.ino !== stagingIdentity?.ino) {
+					throw new Error("destination_identity_changed");
+				}
+				publishedIdentity = identity(terminal, digest);
 			} finally {
 				fs.closeSync(destinationFd);
 			}
