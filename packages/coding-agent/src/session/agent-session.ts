@@ -2661,6 +2661,10 @@ export class AgentSession {
 				? AsyncJobManager.endpointIdOf(this.#ownedAsyncJobManager)
 				: undefined;
 			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
+			if (this.#ownedAsyncJobManager?.isDeliverySuppressed(job.id, job.generation)) {
+				this.#ownedAsyncJobManager.clearParkedDelivery(job.generation);
+				return;
+			}
 			if (this.#foldCoordinator.claimCompletionNotice(job)) {
 				this.emitNotice(
 					"info",

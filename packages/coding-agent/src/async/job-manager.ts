@@ -2219,6 +2219,10 @@ export class AsyncJobManager {
 		const deliveries = this.#filterDeliveries(filter);
 		const inFlightDeliveries = this.#filterInFlightDeliveries(filter);
 		const ownerId = filter?.ownerId;
+		const parked = Array.from(this.#parkedDeliveries.values()).filter(
+			delivery => !ownerId || delivery.ownerId === ownerId,
+		);
+		const claims = Array.from(this.#receiptClaims.values()).filter(claim => !ownerId || claim.ownerId === ownerId);
 		const evictedDeadLettered = ownerId
 			? Array.from(this.#evictedDeadLetters.values()).filter(entry => entry.ownerId === ownerId).length
 			: this.#evictedDeadLetters.size;
@@ -2234,10 +2238,14 @@ export class AsyncJobManager {
 		}, undefined);
 
 		return {
-			queued: deliveries.length + inFlightDeliveries.length,
-			delivering: inFlightDeliveries.length > 0 || (this.#deliveryLoop !== undefined && deliveries.length > 0),
+			queued: deliveries.length + inFlightDeliveries.length + parked.length + claims.length,
+			delivering:
+				inFlightDeliveries.length > 0 ||
+				parked.length > 0 ||
+				claims.length > 0 ||
+				(this.#deliveryLoop !== undefined && deliveries.length > 0),
 			nextRetryAt,
-			pendingJobIds: deliveries.concat(inFlightDeliveries).map(delivery => delivery.jobId),
+			pendingJobIds: [...deliveries, ...inFlightDeliveries, ...parked, ...claims].map(delivery => delivery.jobId),
 			deadLettered,
 		};
 	}
@@ -2475,6 +2483,18 @@ export class AsyncJobManager {
 			if (currentJob) this.#suppressedDeliveries.add(currentJob.generation);
 			for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
 				if (delivery.jobId === jobId) this.#suppressedDeliveries.add(delivery.generation);
+			}
+			for (const parked of this.#parkedDeliveries.values()) {
+				if (parked.jobId === jobId) this.#suppressedDeliveries.add(parked.generation);
+			}
+			for (const claim of this.#receiptClaims.values()) {
+				if (claim.jobId === jobId) this.#suppressedDeliveries.add(claim.generation);
+			}
+			for (const [generation, parked] of this.#parkedDeliveries) {
+				if (parked.jobId === jobId) this.#parkedDeliveries.delete(generation);
+			}
+			for (const [generation, claim] of this.#receiptClaims) {
+				if (claim.jobId === jobId) this.#receiptClaims.delete(generation);
 			}
 		}
 		const before = this.#deliveries.length;

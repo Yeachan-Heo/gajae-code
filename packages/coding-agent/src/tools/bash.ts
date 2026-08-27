@@ -981,9 +981,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 */
 	#resolveOwnedJobManager(): AsyncJobManager | undefined {
 		const endpointId = this.session.getSessionId?.() ?? undefined;
-		return (
-			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
-		);
+		if (this.session.getAsyncJobManager) return this.session.getAsyncJobManager();
+		return AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
 	}
 
 	async #waitForManagedBashJob(
