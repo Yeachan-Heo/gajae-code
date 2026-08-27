@@ -407,10 +407,13 @@ function escapedToolCallMetadata(block: Extract<AssistantMessage["content"][numb
 	guarded: boolean;
 	malformed: boolean;
 	evidence: UnicodeEscapeEvidence | undefined;
+	incompleteArguments: boolean;
+	incompleteArgumentsReason: unknown;
 } {
 	const guardRead = managedOwnPropertyRead(block, "escapedNonAsciiArguments");
 	const evidenceRead = managedOwnPropertyRead(block, "escapedUnicodeArgumentEvidence");
 	const incompleteRead = managedPropertyRead(block, "incompleteArguments");
+	const incompleteReasonRead = managedPropertyRead(block, "incompleteArgumentsReason");
 	const inheritedGuard = managedInheritedProperty(block, "escapedNonAsciiArguments");
 	const inheritedEvidence = managedInheritedProperty(block, "escapedUnicodeArgumentEvidence");
 	let evidence: UnicodeEscapeEvidence | undefined;
@@ -423,6 +426,7 @@ function escapedToolCallMetadata(block: Extract<AssistantMessage["content"][numb
 		!guardRead.ok ||
 		!evidenceRead.ok ||
 		!incompleteRead.ok ||
+		!incompleteReasonRead.ok ||
 		inheritedGuard ||
 		inheritedEvidence ||
 		(evidenceRead.present && (evidenceRead.value === undefined || evidence === undefined || evidence.malformed));
@@ -434,6 +438,8 @@ function escapedToolCallMetadata(block: Extract<AssistantMessage["content"][numb
 			(evidenceRead.present && evidenceRead.value !== undefined),
 		malformed: malformedMetadata || incomplete,
 		evidence,
+		incompleteArguments: incomplete,
+		incompleteArgumentsReason: incompleteReasonRead.ok ? incompleteReasonRead.value : "malformed",
 	};
 }
 
@@ -5123,15 +5129,13 @@ async function executeToolCalls(
 				const escapedUnicodeArgumentEvidence = metadata.evidence;
 				const escapedArgumentsGuarded = metadata.guarded;
 				if (escapedArgumentsGuarded) record.toolCall = stripToolCallEvidence(record.toolCall);
-				const incompleteRead = managedPropertyRead(toolCall, "incompleteArguments");
-				const incompleteArguments = metadata.malformed || (incompleteRead.ok && incompleteRead.value === true);
+				const incompleteArguments = metadata.malformed || metadata.incompleteArguments;
 				if (incompleteArguments) {
 					record.argumentValidationFailed = true;
 					// The provider flagged this call's arguments as unsafe to execute.
 					// The typed reason selects accurate recovery guidance; callers that
 					// only read the boolean still get a safe, actionable rejection.
-					const reasonRead = managedPropertyRead(toolCall, "incompleteArgumentsReason");
-					const reason = reasonRead.ok ? reasonRead.value : "malformed";
+					const reason = metadata.incompleteArgumentsReason;
 					const detail =
 						reason === "malformed"
 							? `The terminal arguments for tool call "${toolCall.name}" did not decode to a valid JSON object. The arguments cannot be executed. Re-issue the call with valid, complete arguments.`
