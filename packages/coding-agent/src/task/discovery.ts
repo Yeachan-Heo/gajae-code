@@ -68,8 +68,10 @@ export async function discoverAgents(
 	const resolvedCwd = path.resolve(cwd);
 	const resolvedAgentDir = agentDir ?? activeSettings?.getAgentDir();
 	const profileAuthority =
-		resolvedAgentDir && path.resolve(resolvedAgentDir) !== path.resolve(path.join(home, getConfigDirName(), "agent"))
-			? "custom"
+		resolvedAgentDir !== undefined
+			? path.resolve(resolvedAgentDir) === path.resolve(path.join(home, getConfigDirName(), "agent"))
+				? "default"
+				: "custom"
 			: getAgentProfileAuthority();
 	const agentSources = Array.from(
 		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
