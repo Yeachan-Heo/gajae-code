@@ -666,6 +666,15 @@ function managedOwnPropertyRead(value: unknown, key: string): { present: boolean
 	}
 }
 
+function managedInheritedProperty(value: unknown, key: string): boolean {
+	if (!value || typeof value !== "object") return false;
+	try {
+		return !Object.hasOwn(value, key) && key in value;
+	} catch {
+		return true;
+	}
+}
+
 function managedTransportFailure(failure: unknown) {
 	const facts = managedProperty(failure, "transportFailure");
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
@@ -2132,16 +2141,19 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 		const evidenceReads = matches.map(candidate =>
 			managedOwnPropertyRead(candidate, "escapedUnicodeArgumentEvidence"),
 		);
+		const inheritedEvidence = matches.map(candidate =>
+			managedInheritedProperty(candidate, "escapedUnicodeArgumentEvidence"),
+		);
 		if (matches.length !== 1) {
-			if (evidenceReads.some(read => read.present)) {
+			if (evidenceReads.some(read => read.present) || inheritedEvidence.some(Boolean)) {
 				destination.incompleteArguments = true;
 				destination.incompleteArgumentsReason = "malformed";
 			}
 			continue;
 		}
 		const evidenceRead = evidenceReads[0]!;
-		if (!evidenceRead.present || !evidenceRead.ok || evidenceRead.value === undefined) {
-			if (evidenceRead.present) {
+		if (!evidenceRead.present || !evidenceRead.ok || evidenceRead.value === undefined || inheritedEvidence[0]) {
+			if (evidenceRead.present || inheritedEvidence[0]) {
 				destination.incompleteArguments = true;
 				destination.incompleteArgumentsReason = "malformed";
 			}
@@ -2184,15 +2196,8 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
 	const escapedGuardRead = managedOwnPropertyRead(value, "escapedNonAsciiArguments");
 	const evidenceRead = managedOwnPropertyRead(value, "escapedUnicodeArgumentEvidence");
-	const inheritedGuard =
-		!escapedGuardRead.present &&
-		(() => {
-			try {
-				return "escapedNonAsciiArguments" in value;
-			} catch {
-				return true;
-			}
-		})();
+	const inheritedGuard = managedInheritedProperty(value, "escapedNonAsciiArguments");
+	const inheritedEvidence = managedInheritedProperty(value, "escapedUnicodeArgumentEvidence");
 	const escapedNonAsciiArguments = escapedGuardRead.value;
 	const rawEscapedUnicodeArgumentEvidence = evidenceRead.value;
 	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
@@ -2203,7 +2208,8 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 				escapedUnicodeArgumentEvidence === undefined ||
 				escapedUnicodeArgumentEvidence.malformed)) ||
 		!escapedGuardRead.ok ||
-		inheritedGuard;
+		inheritedGuard ||
+		inheritedEvidence;
 	const escapedArgumentsGuarded =
 		invalidEscapedUnicodeEvidence ||
 		(escapedGuardRead.present && escapedGuardRead.ok && escapedNonAsciiArguments === true) ||
