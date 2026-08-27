@@ -1233,7 +1233,6 @@ export class ManagedSessionDescendantStore {
 		if (process.platform === "linux") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
-			authority.retainManagedRecoveryDirectory();
 			const retained = authority.identity();
 			if (
 				!retained.ok ||
@@ -1244,6 +1243,7 @@ export class ManagedSessionDescendantStore {
 				authority.close();
 				throw new Error("Managed descendant root identity changed");
 			}
+			authority.retainManagedRecoveryDirectory();
 			this.#authority = authority;
 			this.#ownsAuthority = true;
 		}
