@@ -147,29 +147,115 @@ function parseReleaseRunJobs(output: string, runId: number): ReleaseRunJobObserv
 	});
 }
 
+/**
+ * A read-only CI observation could not be completed.
+ *
+ * Distinct from a CI verdict: the release refs may already be published and the
+ * workflow may be perfectly healthy. Only the observer failed, so the operator
+ * must re-observe rather than cut a new version.
+ */
+export class ReleaseObservationError extends Error {
+	override readonly name = "ReleaseObservationError";
+}
+
+/** Bounded attempt budget for a single read-only CI observation command. */
+export const RELEASE_OBSERVATION_ATTEMPTS = 8;
+
+/**
+ * Backoff before re-attempting a failed observation: 2s doubling to a 30s ceiling.
+ *
+ * The whole budget spans roughly four minutes, which outlasts an ordinary network
+ * blip or GitHub API hiccup without stalling a genuinely broken watch for long.
+ */
+export function releaseObservationRetryDelayMs(attempt: number): number {
+	if (!Number.isInteger(attempt) || attempt < 1) throw new Error(`Observation attempt must be a positive integer, received ${attempt}`);
+	return Math.min(30_000, 2_000 * 2 ** (attempt - 1));
+}
+
+/** Whether a failed observation attempt gets another try, and how long to wait first. */
+export type ObservationRetryDecision = { action: "retry"; delayMs: number } | { action: "fail" };
+
+/**
+ * Decide what follows a failed observation attempt.
+ *
+ * Split from the command runner so the budget and backoff are provable without
+ * spending the real wall-clock delays.
+ */
+export function decideObservationRetry(attempt: number): ObservationRetryDecision {
+	if (!Number.isInteger(attempt) || attempt < 1) throw new Error(`Observation attempt must be a positive integer, received ${attempt}`);
+	if (attempt >= RELEASE_OBSERVATION_ATTEMPTS) return { action: "fail" };
+	return { action: "retry", delayMs: releaseObservationRetryDelayMs(attempt) };
+}
+
+/**
+ * Run a read-only observation command, retrying every non-zero exit.
+ *
+ * The observation phase runs after the release refs are pushed, so a transient
+ * `gh`/network failure must never be reported as a release failure. Retrying every
+ * failure keeps the decision off brittle error-message matching; only exhausting
+ * the budget is authoritative.
+ */
+export async function observeWithRetry<T>(
+	description: string,
+	run: () => Promise<{ exitCode: number | null; stdout: Uint8Array; stderr: Uint8Array }>,
+	parse: (stdout: string) => T,
+	sleep: (ms: number) => Promise<void> = ms => Bun.sleep(ms),
+): Promise<T> {
+	let lastFailure = "";
+	for (let attempt = 1; attempt <= RELEASE_OBSERVATION_ATTEMPTS; attempt++) {
+		const result = await run();
+		if (result.exitCode === 0) {
+			try {
+				return parse(result.stdout.toString());
+			} catch (error) {
+				// A zero exit with unusable output is still an observation failure:
+				// truncated or mis-shaped responses are as transient as any network
+				// error, and only a trustworthy verdict may leave this loop.
+				lastFailure = `unusable response: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		} else {
+			lastFailure = outputOf(result) || `exit ${result.exitCode ?? "unknown"}`;
+		}
+		const decision = decideObservationRetry(attempt);
+		if (decision.action === "fail") break;
+		console.log(`  ${description} failed (attempt ${attempt}/${RELEASE_OBSERVATION_ATTEMPTS}), retrying in ${Math.round(decision.delayMs / 1000)}s: ${lastFailure}`);
+		await sleep(decision.delayMs);
+	}
+	throw new ReleaseObservationError(`${description} failed ${RELEASE_OBSERVATION_ATTEMPTS} times: ${lastFailure}`);
+}
+
 async function queryReleaseRuns(commitSha: string, expectedTag?: string): Promise<ReleaseRunObservation[]> {
-	const result = expectedTag === undefined
-		? await $`gh run list --workflow ci.yml --commit ${commitSha} --json databaseId,status,conclusion,name,headSha,headBranch,event`.quiet().nothrow()
-		: await $`gh run list --workflow ci.yml --branch ${expectedTag} --commit ${commitSha} --json databaseId,status,conclusion,name,headSha,headBranch,event`.quiet().nothrow();
-	if (result.exitCode !== 0) throw new Error(`Cannot query CI runs for ${commitSha}: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
-	return parseReleaseRuns(result.stdout.toString(), commitSha, expectedTag);
+	return observeWithRetry(`Querying CI runs for ${commitSha.slice(0, 8)}`, () =>
+		expectedTag === undefined
+			? $`gh run list --workflow ci.yml --commit ${commitSha} --json databaseId,status,conclusion,name,headSha,headBranch,event`.quiet().nothrow()
+			: $`gh run list --workflow ci.yml --branch ${expectedTag} --commit ${commitSha} --json databaseId,status,conclusion,name,headSha,headBranch,event`.quiet().nothrow(),
+		stdout => parseReleaseRuns(stdout, commitSha, expectedTag),
+	);
 }
 
 async function queryReleaseRunJobs(runId: number): Promise<ReleaseRunJobObservation[]> {
-	const result = await $`gh run view ${runId} --json jobs`.quiet().nothrow();
-	if (result.exitCode !== 0) throw new Error(`Cannot query jobs for CI run ${runId}: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
-	return parseReleaseRunJobs(result.stdout.toString(), runId);
+	return observeWithRetry(`Querying jobs for CI run ${runId}`, () => $`gh run view ${runId} --json jobs`.quiet().nothrow(), stdout => parseReleaseRunJobs(stdout, runId));
 }
 
 async function failedJobLog(jobId: number): Promise<string> {
 	const result = await $`gh run view --job ${jobId} --log-failed`.quiet().nothrow();
-	if (result.exitCode !== 0) throw new Error(`Cannot query failed log for CI job ${jobId}: ${outputOf(result) || `exit ${result.exitCode ?? "unknown"}`}`);
+	if (result.exitCode !== 0) return "";
 	return result.stdout.toString().trim();
 }
 
+/**
+ * Print the tail of a failed job's log, best effort.
+ *
+ * The log is diagnostic context for a verdict that has already been decided, and
+ * GitHub drops job logs on its own retention schedule (an expired log answers with
+ * `BlobNotFound`). An unavailable log must never mask the failure it explains.
+ */
 async function printFailedJobLog(job: ReleaseRunJobObservation): Promise<void> {
 	const log = await failedJobLog(job.databaseId);
-	if (!log) return;
+	if (!log) {
+		console.error(`  (no log available for ${job.name}; job ${job.databaseId})`);
+		return;
+	}
 	const tail = log.split("\n").slice(-20).join("\n");
 	console.error(`\n--- Last 20 lines of ${job.name} ---\n${tail}\n`);
 }
@@ -347,8 +433,15 @@ export function releasedBunLockContent(content: string, previousVersion: string,
 
 async function cmdWatch(): Promise<void> {
 	console.log("\n=== Watching CI ===\n");
-	const success = await watchCI();
-	process.exit(success ? 0 : 1);
+	try {
+		const success = await watchCI();
+		process.exit(success ? 0 : 1);
+	} catch (error) {
+		if (!(error instanceof ReleaseObservationError)) throw error;
+		console.error(`\nCI observation unavailable: ${error.message}`);
+		console.error("  No CI verdict was observed. Retry once connectivity returns.");
+		process.exit(1);
+	}
 }
 
 export function isStableReleaseVersion(version: string): boolean {
@@ -805,9 +898,22 @@ async function cmdRelease(version: string): Promise<void> {
 	await pushReleaseRefsAtomically(version);
 	console.log();
 
-	// 9. Watch CI
+	// 9. Watch CI. The refs are published from here on, so an observer that cannot
+	// reach GitHub is reported as an observation gap — never as a CI verdict, and
+	// never as a reason to cut another version.
 	console.log("Watching CI...");
-	const success = await watchCI(`v${version}`);
+	let success: boolean;
+	try {
+		success = await watchCI(`v${version}`);
+	} catch (error) {
+		if (!(error instanceof ReleaseObservationError)) throw error;
+		console.error(`\nCI observation unavailable: ${error.message}`);
+		console.error(`  v${version} and its release commit are already pushed; this reports the observer, not the release.`);
+		console.error("  Keep the published tag immutable; do not retag, delete, or force-push it.");
+		console.error("  Do not cut a newer version for this failure. Re-observe once connectivity returns:");
+		console.error("  bun scripts/release.ts watch");
+		process.exit(1);
+	}
 
 	if (success) {
 		console.log(`=== Released v${version} ===`);

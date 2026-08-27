@@ -4,9 +4,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	decideObservationRetry,
 	localRollbackCommands,
+	observeWithRetry,
 	planAtomicPushRollback,
 	pushReleaseRefsAtomically,
+	ReleaseObservationError,
+	RELEASE_OBSERVATION_ATTEMPTS,
+	releaseObservationRetryDelayMs,
 	reconcileAtomicPushFailure,
 } from "./release";
 
@@ -219,5 +224,97 @@ describe("accepted remote transaction with a client-side failed push", () => {
 		expect(tagCheck.exitCode).toBe(0);
 		const remoteTag = (await git(work, ["ls-remote", "origin", "refs/tags/v9.9.9"])).split("\t")[0]?.trim();
 		expect(remoteTag).toBe(head);
+	});
+});
+
+describe("post-push CI observation retry policy", () => {
+	test("backs off exponentially from 2s and holds a 30s ceiling", () => {
+		expect([1, 2, 3, 4, 5, 6].map(releaseObservationRetryDelayMs)).toEqual([2_000, 4_000, 8_000, 16_000, 30_000, 30_000]);
+	});
+
+	test("rejects a non-positive or fractional attempt instead of inventing a delay", () => {
+		expect(() => releaseObservationRetryDelayMs(0)).toThrow("positive integer");
+		expect(() => releaseObservationRetryDelayMs(-1)).toThrow("positive integer");
+		expect(() => releaseObservationRetryDelayMs(1.5)).toThrow("positive integer");
+		expect(() => decideObservationRetry(0)).toThrow("positive integer");
+	});
+
+	test("retries every attempt before the budget and fails only on exhaustion", () => {
+		for (let attempt = 1; attempt < RELEASE_OBSERVATION_ATTEMPTS; attempt++) {
+			expect(decideObservationRetry(attempt)).toEqual({ action: "retry", delayMs: releaseObservationRetryDelayMs(attempt) });
+		}
+		expect(decideObservationRetry(RELEASE_OBSERVATION_ATTEMPTS)).toEqual({ action: "fail" });
+		expect(decideObservationRetry(RELEASE_OBSERVATION_ATTEMPTS + 1)).toEqual({ action: "fail" });
+	});
+
+	test("spends a bounded wall-clock budget so a broken watch still terminates", () => {
+		let total = 0;
+		for (let attempt = 1; attempt < RELEASE_OBSERVATION_ATTEMPTS; attempt++) {
+			const decision = decideObservationRetry(attempt);
+			if (decision.action === "retry") total += decision.delayMs;
+		}
+		expect(total).toBeGreaterThanOrEqual(60_000);
+		expect(total).toBeLessThanOrEqual(300_000);
+	});
+});
+
+describe("observation command classification", () => {
+	const noSleep = () => Promise.resolve();
+	const zeroExitCommand = () => Promise.resolve({ exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+
+	test("classifies a zero exit with unusable output as an observation failure, not a verdict", async () => {
+		let attempts = 0;
+		let caught: unknown;
+		try {
+			await observeWithRetry(
+				"probe",
+				zeroExitCommand,
+				() => {
+					attempts++;
+					throw new Error("Unexpected end of JSON input");
+				},
+				noSleep,
+			);
+		} catch (error) {
+			caught = error;
+		}
+		expect(caught).toBeInstanceOf(ReleaseObservationError);
+		expect(attempts).toBe(RELEASE_OBSERVATION_ATTEMPTS);
+		expect((caught as ReleaseObservationError).message).toContain("failed 8 times: unusable response: Unexpected end of JSON input");
+	});
+
+	test("retries a truncated response within the same bounded budget and recovers", async () => {
+		let attempts = 0;
+		const command = () => Promise.resolve({ exitCode: 0, stdout: Buffer.from("[]"), stderr: Buffer.alloc(0) });
+		const delays: number[] = [];
+		const result = await observeWithRetry(
+			"probe",
+			command,
+			stdout => {
+				attempts++;
+				if (attempts === 1) throw new Error("Cannot parse CI run query");
+				return JSON.parse(stdout) as unknown[];
+			},
+			ms => {
+				delays.push(ms);
+				return Promise.resolve();
+			},
+		);
+		expect(result).toEqual([]);
+		expect(attempts).toBe(2);
+		expect(delays).toEqual([releaseObservationRetryDelayMs(1)]);
+	});
+
+	test("reports the malformed-output reason, not a silent success or failure", async () => {
+		const command = () => Promise.resolve({ exitCode: 0, stdout: Buffer.from("not json"), stderr: Buffer.alloc(0) });
+		try {
+			await observeWithRetry("probe", command, () => {
+				throw new Error("did not return an array");
+			}, noSleep);
+			throw new Error("expected rejection");
+		} catch (error) {
+			expect(error).toBeInstanceOf(ReleaseObservationError);
+			expect((error as ReleaseObservationError).message).toContain("unusable response: did not return an array");
+		}
 	});
 });
