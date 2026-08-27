@@ -17,12 +17,12 @@
 ### Fixed
 
 - Path autocomplete matches decomposed (NFD) file names against composed (NFC) input. Composer keystrokes are NFC-normalized while macOS volumes commonly return Hangul and other composed scripts in NFD, so `@한` found nothing even though `한글.txt` existed; both the directory-listing prefix match and the fuzzy filter now compare NFC forms while completion values keep the on-disk name. The native fuzzy finder applies the same normalization to queries and candidates.
+- Same-width TUI frames no longer scan the full raw transcript with `visibleWidth()` to decide whether a width reflow is required. That check is only consulted on an actual column change, so loader shimmer / layout-only ticks no longer remeasure every historical row 60 times a second. Resize admission is unchanged: a width change still walks raw rows until one exceeds the old/new width, then takes the existing reflow or no-reflow path.
 
 ## [0.15.3] - 2026-08-27
 
 ### Fixed
 
-- Same-width TUI frames no longer scan the full raw transcript with `visibleWidth()` to decide whether a width reflow is required. That check is only consulted on an actual column change, so loader shimmer / layout-only ticks no longer remeasure every historical row 60 times a second. Resize admission is unchanged: a width change still walks raw rows until one exceeds the old/new width, then takes the existing reflow or no-reflow path.
 - Loader instances can opt into layout-only repaint requests so transient status animation does not force unchanged transcript subtree reconstruction.
 
 ## [0.15.2] - 2026-08-25
