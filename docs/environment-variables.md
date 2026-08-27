@@ -506,9 +506,9 @@ LSP project configuration may control declarative matching, activation, and capa
 | `GJC_CONFIG_DIR`       | Config root dirname under home (default `.gjc`)                               |
 | `GJC_CODING_AGENT_DIR` | Full override for agent directory (default `~/<GJC_CONFIG_DIR or .gjc>/agent`). `gjc setup hermes --coding-agent-dir <abs-path>` renders it into the coordinator server env so bridge-spawned sessions share that broker; it is distinct from `GJC_COORDINATOR_MCP_STATE_ROOT`, which never selects the agent directory. |
 | `PWD`                 | Used when matching canonical current working directory in path helpers        |
-| `GJC_WORKTREE_DIR`     | Directory holding `--worktree` launch worktrees (default `{repo}.gajae-code-worktrees`) |
+| `GJC_WORKTREE_DIR`     | Directory holding `--worktree` launch worktrees (default `{repo}/.worktrees`) |
 
-`GJC_WORKTREE_DIR` is a path template. `{repo}` expands to the repository directory name, which keeps one exported value repo-scoped so two repositories that share a branch name never resolve to the same worktree. A relative value resolves against the repository's parent directory — the default's own shape — so `{repo}.worktrees` adopts an existing sibling bucket and `.worktrees` parks a hidden bucket beside the repository; an absolute value (or a leading `~/`) is used as given. An unset or blank value keeps the default bucket.
+`GJC_WORKTREE_DIR` is a path template. `{repo}` expands to the repository directory name, which keeps one exported value repo-scoped so two repositories that share a branch name never resolve to the same worktree. The default `{repo}/.worktrees` places managed worktrees inside the repository; the bucket must already be ignored by Git. A relative override resolves against the repository's parent directory, so `{repo}.worktrees` adopts an existing sibling bucket and `.worktrees` parks a hidden bucket beside the repository; an absolute value (or a leading `~/`) is used as given. An unset or blank value keeps the default bucket.
 
 ```sh
 # Reuse an existing <repo>.worktrees convention instead of a second bucket

@@ -12,6 +12,7 @@
 
 - The `ask` tool now rejects empty or whitespace-only custom answers on every local and remote input path. Remote invalid answers receive a visible explanation and are retried at most three times with an event-loop yield between attempts before the ask is cancelled; local empty custom input is never returned as a valid answer. (#5001)
 - GJC-managed launch worktrees now default to `<repo>/.worktrees/<slug>` instead of a `<repo>.gajae-code-worktrees` sibling beside the checkout, keeping each repository's isolated branches in one predictable local folder. Launch fails with an actionable diagnostic unless an in-repository bucket is ignored by Git, preventing nested worktrees from polluting the source checkout; external `GJC_WORKTREE_DIR` buckets and already registered sibling worktrees are unchanged.
+- Launch worktree reuse now revalidates Git-registered paths before adoption and reports locked or replaced stale entries instead of running Git commands in an unavailable or occupied directory; coordinator policy and Stream Deck project grouping use the repository-local default while retaining legacy sibling-path recognition.
 
 ### Fixed
 

@@ -461,6 +461,21 @@ describe("default launch worktrees", () => {
 		expect(() => ensureLaunchWorktree(planned)).toThrow(/worktree_path_conflict/);
 	});
 
+	it("rejects a missing locked worktree instead of running status in its absent path", async () => {
+		const repo = await createRepo("gjc-launch-locked-worktree-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		const ensured = ensureLaunchWorktree(planned);
+		if (!ensured.enabled) throw new Error("expected enabled worktree");
+
+		run("git", ["worktree", "lock", "--reason", "regression test", ensured.worktreePath], repo);
+		await fs.rm(ensured.worktreePath, { recursive: true, force: true });
+
+		expect(() => ensureLaunchWorktree(planned)).toThrow(
+			/worktree_path_unavailable[\s\S]*still registered by Git[\s\S]*inspect the worktree lock/,
+		);
+		run("git", ["worktree", "unlock", ensured.worktreePath], repo);
+	});
+
 	it("keeps launch worktree slugs collision-resistant for similar branch names", async () => {
 		const repo = await createRepo("gjc-launch-collision-worktree-");
 		const slashPlan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });

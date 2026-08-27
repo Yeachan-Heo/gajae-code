@@ -76,9 +76,9 @@ describe("Hermes MCP safety policy", () => {
 		);
 	});
 
-	it("authorizes GJC-managed sibling worktrees under the repository bucket", async () => {
+	it("authorizes GJC-managed repository-local worktrees under the repository bucket", async () => {
 		const root = await tempRoot();
-		const bucket = `${root}.gajae-code-worktrees`;
+		const bucket = path.join(root, ".worktrees");
 		const worktree = path.join(bucket, "feature-session");
 		await fs.mkdir(worktree, { recursive: true });
 		const config = buildCoordinatorMcpConfig({

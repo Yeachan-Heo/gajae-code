@@ -112,7 +112,7 @@ function parseRootList(value: string | undefined): string[] {
 }
 
 function resolveManagedWorktreeRoot(root: string, configured: string | undefined): string {
-	const template = (configured?.trim() || "{repo}.gajae-code-worktrees").replace(/^~(?=\/|$)/, os.homedir());
+	const template = (configured?.trim() || "{repo}/.worktrees").replace(/^~(?=\/|$)/, os.homedir());
 	const resolved = template.replaceAll("{repo}", path.basename(root));
 	return path.resolve(path.isAbsolute(resolved) ? resolved : path.join(path.dirname(root), resolved));
 }

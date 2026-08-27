@@ -130,7 +130,7 @@ async function discoverEndpoints() {
 }
 
 function canonicalProjectPath(value) {
-  return String(value || "").replace(/\.gajae-code-worktrees\/[^/]+$/, "");
+  return String(value || "").replace(/(?:\.gajae-code-worktrees|\.worktrees)\/[^/]+$/, "");
 }
 
 async function discoverFrequentProjects() {

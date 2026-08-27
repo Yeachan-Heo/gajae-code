@@ -181,7 +181,7 @@ Do not prompt for a model profile here. Apply the profile after the GJC session 
 
 #### Frequent GJC project controls
 
-Bind the first two project keys from GJC session history, not operator-specific absolute paths. Merge `gjc sdk session list` with saved top-level session headers under the agent session store, canonicalize managed worktree paths such as `<repo>.gajae-code-worktrees/<name>` back to `<repo>`, discard non-existent and non-Git directories outside the user's home, count sessions per canonical repository, and display the top two repositories. The third key always opens `$HOME`.
+Bind the first two project keys from GJC session history, not operator-specific absolute paths. Merge `gjc sdk session list` with saved top-level session headers under the agent session store, canonicalize managed worktree paths such as `<repo>/.worktrees/<name>` (and legacy `<repo>.gajae-code-worktrees/<name>`) back to `<repo>`, discard non-existent and non-Git directories outside the user's home, count sessions per canonical repository, and display the top two repositories. The third key always opens `$HOME`.
 
 Each project key shows the repository basename and session count. Pressing it creates a terminal surface in that repository. The `HOME` key creates a terminal surface in the user's home directory. Leave the cmux tab name automatic so a later `gjc` launch can publish its authoritative `GJC:` title.
 
@@ -326,7 +326,7 @@ Every top-level GJC session publishes a loopback SDK discovery file:
 
 The file contains the session WebSocket URL and token. Connect with the token as a query parameter and never persist or log it elsewhere.
 
-Do not assume repositories are only one directory below a fixed workspace root. Resolve each live `gjc` process PID to its TTY and current working directory, then inspect that exact `<cwd>/.gjc/state/sdk/` directory. This includes managed `.gajae-code-worktrees` sessions.
+Do not assume repositories are only one directory below a fixed workspace root. Resolve each live `gjc` process PID to its TTY and current working directory, then inspect that exact `<cwd>/.gjc/state/sdk/` directory. This includes managed `.worktrees` sessions and legacy `.gajae-code-worktrees` sessions.
 
 When the focused session emits:
 

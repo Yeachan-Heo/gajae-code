@@ -402,6 +402,7 @@ export function planLaunchWorktree(
 	if (branchName) validateBranchName(repoRoot, branchName);
 	const worktreeSlug = mode.detached ? resolveSourceBranchSlug(repoRoot, baseRef) : sanitizePathToken(mode.name);
 	const worktreePath = path.join(resolveWorktreeBucket(repoRoot), worktreeSlug);
+	if (path.resolve(worktreePath) === path.resolve(repoRoot)) throw new Error(`worktree_path_conflict:${worktreePath}`);
 	return { enabled: true, repoRoot, worktreePath, detached: mode.detached, baseRef, branchName };
 }
 
@@ -419,9 +420,19 @@ export function ensureLaunchWorktree(
 		allWorktrees = listWorktrees(plan.repoRoot);
 	}
 
-	const existingAtPath =
-		findWorktreeByPath(allWorktrees, plan.worktreePath) ??
-		readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
+	const listedAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
+	const existingAtPath = readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
+	if (listedAtPath && !existingAtPath) {
+		if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+		throw new Error(
+			[
+				"worktree_path_unavailable",
+				"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
+				`Path: ${formatBucketPath(plan.worktreePath)}`,
+				"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
+			].join("\n"),
+		);
+	}
 	const expectedBranchRef = plan.branchName ? `refs/heads/${plan.branchName}` : null;
 
 	if (existingAtPath) {
