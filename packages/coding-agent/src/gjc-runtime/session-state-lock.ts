@@ -995,11 +995,11 @@ async function releaseTransitionClaim(
 	if (!current || !sameLockOwnerSnapshot(current, held))
 		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
 	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
-	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
+	const released = await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
 	try {
 		await removeTransitionDir(transitionDir);
 	} catch (error) {
-		const owner = JSON.parse(held.bytes) as Partial<SessionStateLockOwner>;
+		const owner = JSON.parse(released.bytes) as Partial<SessionStateLockOwner>;
 		if (owner.token) pendingTransitionReleases.set(transitionDir, owner.token);
 		throw error;
 	}

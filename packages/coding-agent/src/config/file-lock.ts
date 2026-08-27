@@ -535,7 +535,7 @@ async function tryAcquireLock(
 			onAcquired?.();
 			return await writeLockInfo(lockPath, lockInfo(undefined, ownerToken));
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+			if ((error as NodeJS.ErrnoException).code === "EEXIST" || isTransientReleaseError(error)) return null;
 			throw error;
 		}
 	}
@@ -557,6 +557,7 @@ async function tryAcquireLock(
 					await fs.stat(lockPath);
 					return null;
 				} catch (statError) {
+					if (isTransientReleaseError(statError)) return null;
 					if (!isEnoent(statError)) throw statError;
 				}
 			}
