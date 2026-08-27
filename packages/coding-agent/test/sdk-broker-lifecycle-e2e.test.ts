@@ -2952,7 +2952,12 @@ test("broker records the resolved worktree state root and preserves pre-child pr
 			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
 		}
 		await fs.writeFile(path.join(repo, "README"), "fixture\n");
-		const committed = Bun.spawnSync(["git", "add", "README"], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+		await fs.writeFile(path.join(repo, ".gitignore"), "/.worktrees\n");
+		const committed = Bun.spawnSync(["git", "add", "README", ".gitignore"], {
+			cwd: repo,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
 		if (committed.exitCode !== 0) throw new Error(committed.stderr.toString());
 		const commit = Bun.spawnSync(["git", "commit", "-m", "fixture"], { cwd: repo, stdout: "pipe", stderr: "pipe" });
 		if (commit.exitCode !== 0) throw new Error(commit.stderr.toString());

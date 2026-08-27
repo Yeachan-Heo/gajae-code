@@ -11,6 +11,7 @@
 - `gjc update` now recognizes an already verified standalone binary during package-manager shim migration, avoiding repeated downloads and post-update work while clearly explaining the required PATH ordering.
 
 - The `ask` tool now rejects empty or whitespace-only custom answers on every local and remote input path. Remote invalid answers receive a visible explanation and are retried at most three times with an event-loop yield between attempts before the ask is cancelled; local empty custom input is never returned as a valid answer. (#5001)
+- GJC-managed launch worktrees now default to `<repo>/.worktrees/<slug>` instead of a `<repo>.gajae-code-worktrees` sibling beside the checkout, keeping each repository's isolated branches in one predictable local folder. Launch fails with an actionable diagnostic unless an in-repository bucket is ignored by Git, preventing nested worktrees from polluting the source checkout; external `GJC_WORKTREE_DIR` buckets and already registered sibling worktrees are unchanged.
 
 ### Fixed
 

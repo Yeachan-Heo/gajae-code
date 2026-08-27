@@ -55,14 +55,15 @@ async function createRepo(prefix: string): Promise<string> {
 	run("git", ["config", "user.email", "test@example.com"], root);
 	run("git", ["config", "user.name", "Test User"], root);
 	await Bun.write(path.join(root, "README.md"), "hello\n");
-	run("git", ["add", "README.md"], root);
+	await Bun.write(path.join(root, ".gitignore"), "/.worktrees\n");
+	run("git", ["add", "README.md", ".gitignore"], root);
 	run("git", ["commit", "-m", "init"], root);
 	return root;
 }
 
 afterEach(async () => {
 	for (const root of cleanupRoots.splice(0)) {
-		const bucket = path.join(path.dirname(root), `${path.basename(root)}.gajae-code-worktrees`);
+		const bucket = path.join(root, ".worktrees");
 		const branchSlug = testSlug(run("git", ["branch", "--show-current"], root));
 		Bun.spawnSync(["git", "worktree", "remove", "--force", path.join(bucket, branchSlug)], {
 			cwd: root,
@@ -75,7 +76,6 @@ afterEach(async () => {
 			stderr: "ignore",
 		});
 		await fs.rm(root, { recursive: true, force: true });
-		await fs.rm(bucket, { recursive: true, force: true });
 	}
 	for (const cleanupPath of cleanupPaths.splice(0)) await fs.rm(cleanupPath, { recursive: true, force: true });
 });
@@ -117,13 +117,13 @@ describe("default launch worktrees", () => {
 		});
 	});
 
-	it("creates and reuses a detached launch worktree beside the source repo", async () => {
+	it("creates and reuses a detached launch worktree inside the source repo", async () => {
 		const repo = await createRepo("gjc-launch-worktree-");
 		await fs.mkdir(path.join(repo, "node_modules"));
 
 		const first = prepareLaunchWorktree(repo, ["--worktree", "--", "hello"]);
 		const branchSlug = testSlug(run("git", ["branch", "--show-current"], repo));
-		const expectedPath = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`, branchSlug);
+		const expectedPath = path.join(repo, ".worktrees", branchSlug);
 
 		expect(await fs.realpath(first.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(first.args).toEqual(["--", "hello"]);
@@ -226,22 +226,18 @@ describe("default launch worktrees", () => {
 		expect(await fs.realpath(target)).toBe(externalModules);
 	});
 
-	it("creates launch worktrees beside the canonical source repo when launched from an existing worktree", async () => {
+	it("creates launch worktrees under the canonical source repo when launched from an existing worktree", async () => {
 		const repo = await fs.realpath(await createRepo("gjc-launch-nested-source-worktree-"));
 		const first = prepareLaunchWorktree(repo, ["--worktree"]);
 		expect(first.worktree.enabled && first.worktree.created).toBe(true);
 
 		const second = prepareLaunchWorktree(first.cwd, ["--worktree", "feature/nested"]);
-		const expectedPath = path.join(
-			path.dirname(repo),
-			`${path.basename(repo)}.gajae-code-worktrees`,
-			testSlug("feature/nested"),
-		);
+		const expectedPath = path.join(repo, ".worktrees", testSlug("feature/nested"));
 
 		expect(second.worktree.enabled && second.worktree.repoRoot).toBe(repo);
 		expect(await fs.realpath(second.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(
-			second.cwd.includes(`.gajae-code-worktrees${path.sep}${path.basename(first.cwd)}.gajae-code-worktrees`),
+			second.cwd.includes(`${path.sep}.worktrees${path.sep}${path.basename(first.cwd)}${path.sep}.worktrees`),
 		).toBe(false);
 	});
 
@@ -291,11 +287,7 @@ describe("default launch worktrees", () => {
 		await Bun.write(path.join(detached.cwd, "dirty.txt"), "dirty\n");
 
 		const named = prepareLaunchWorktree(repo, ["--worktree", "feat/hud-ui-alignment"]);
-		const expectedPath = path.join(
-			path.dirname(repo),
-			`${path.basename(repo)}.gajae-code-worktrees`,
-			testSlug("feat/hud-ui-alignment"),
-		);
+		const expectedPath = path.join(repo, ".worktrees", testSlug("feat/hud-ui-alignment"));
 
 		expect(await fs.realpath(named.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(named.worktree.enabled && named.worktree.branchName).toBe("feat/hud-ui-alignment");
@@ -304,7 +296,7 @@ describe("default launch worktrees", () => {
 
 	it("reports a private, platform-neutral error for a broken bucket symlink without deleting it", async () => {
 		const repo = await createRepo("gjc launch 'broken-bucket-symlink-");
-		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const bucket = path.join(repo, ".worktrees");
 		const missingTarget = path.join(path.dirname(repo), "private-missing-cold-storage-target");
 		await fs.symlink(missingTarget, bucket, process.platform === "win32" ? "junction" : "dir");
 
@@ -324,7 +316,7 @@ describe("default launch worktrees", () => {
 
 	it("reclassifies a broken symlink racing the bucket mkdir instead of leaking raw EEXIST", async () => {
 		const repo = await createRepo("gjc-launch-bucket-mkdir-race-");
-		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const bucket = path.join(repo, ".worktrees");
 		const missingTarget = path.join(path.dirname(repo), "racing-missing-bucket-target");
 		const mkdirSpy = spyOn(fsSync, "mkdirSync").mockImplementationOnce((targetPath: fsSync.PathLike) => {
 			expect(path.resolve(String(targetPath))).toBe(path.resolve(bucket));
@@ -344,7 +336,7 @@ describe("default launch worktrees", () => {
 
 	it("does not treat non-ENOENT bucket inspection failures as a missing directory", async () => {
 		const repo = await createRepo("gjc-launch-bucket-inspection-failure-");
-		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const bucket = path.join(repo, ".worktrees");
 		const lstatSpy = spyOn(fsSync, "lstatSync").mockImplementationOnce(() => {
 			throw Object.assign(new Error("permission denied"), { code: "EACCES" });
 		});
@@ -361,7 +353,7 @@ describe("default launch worktrees", () => {
 
 	it("allows a valid directory symlink or Windows junction as the worktree bucket", async () => {
 		const repo = await createRepo("gjc-launch-valid-bucket-symlink-");
-		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const bucket = path.join(repo, ".worktrees");
 		const target = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-target-"));
 		cleanupPaths.push(target);
 		await fs.symlink(target, bucket, process.platform === "win32" ? "junction" : "dir");
@@ -378,7 +370,7 @@ describe("default launch worktrees", () => {
 
 	it("reports a symlink to a non-directory target without disclosing or deleting the target", async () => {
 		const repo = await createRepo("gjc-launch-bucket-file-symlink-");
-		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const bucket = path.join(repo, ".worktrees");
 		const target = path.join(path.dirname(repo), "private-bucket-target-file");
 		cleanupPaths.push(target);
 		await Bun.write(target, "preserve-me\n");
@@ -398,7 +390,7 @@ describe("default launch worktrees", () => {
 
 	it("reports a regular-file bucket without shell text or deletion side effects", async () => {
 		const repo = await createRepo("gjc-launch-bucket-not-directory-");
-		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+		const bucket = path.join(repo, ".worktrees");
 		await Bun.write(bucket, "not-a-directory\n");
 
 		let message = "";
@@ -416,7 +408,7 @@ describe("default launch worktrees", () => {
 	if (process.platform !== "win32") {
 		it("reports a FIFO bucket as a non-directory without deleting it", async () => {
 			const repo = await createRepo("gjc-launch-bucket-fifo-");
-			const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+			const bucket = path.join(repo, ".worktrees");
 			const created = Bun.spawnSync(["mkfifo", bucket], { stdout: "pipe", stderr: "pipe" });
 			expect(created.exitCode).toBe(0);
 
@@ -428,7 +420,7 @@ describe("default launch worktrees", () => {
 
 		it("reports a Unix socket bucket as a non-directory without deleting it", async () => {
 			const repo = await createRepo("gjc-launch-bucket-socket-");
-			const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`);
+			const bucket = path.join(repo, ".worktrees");
 			const server = net.createServer();
 			const ready = Promise.withResolvers<void>();
 			server.once("error", ready.reject);
@@ -452,15 +444,21 @@ describe("default launch worktrees", () => {
 		const repo = await createRepo("gjc-launch-named-worktree-");
 		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
 		const ensured = ensureLaunchWorktree(planned);
-		const expectedPath = path.join(
-			path.dirname(repo),
-			`${path.basename(repo)}.gajae-code-worktrees`,
-			testSlug("feature/demo"),
-		);
+		const expectedPath = path.join(repo, ".worktrees", testSlug("feature/demo"));
 
 		expect(ensured.enabled && (await fs.realpath(ensured.worktreePath))).toBe(await fs.realpath(expectedPath));
 		expect(ensured.enabled && ensured.branchName).toBe("feature/demo");
 		expect(run("git", ["branch", "--show-current"], expectedPath)).toBe("feature/demo");
+	});
+
+	it("rejects an occupied nested path instead of adopting the source repository", async () => {
+		const repo = await createRepo("gjc-launch-occupied-worktree-");
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" });
+		if (!planned.enabled) throw new Error("expected enabled worktree plan");
+		await fs.mkdir(planned.worktreePath, { recursive: true });
+		await Bun.write(path.join(planned.worktreePath, "occupied"), "conflict\n");
+
+		expect(() => ensureLaunchWorktree(planned)).toThrow(/worktree_path_conflict/);
 	});
 
 	it("keeps launch worktree slugs collision-resistant for similar branch names", async () => {
@@ -500,9 +498,7 @@ describe("default launch worktrees", () => {
 		expect(run("git", ["branch", "--show-current"], path.join(bucket, testSlug("feature/demo")))).toBe(
 			"feature/demo",
 		);
-		expect(fsSync.existsSync(path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`))).toBe(
-			false,
-		);
+		expect(fsSync.existsSync(path.join(repo, ".worktrees"))).toBe(false);
 	});
 
 	it("keeps the template repo-scoped so two repos never share one worktree path", async () => {
@@ -530,9 +526,19 @@ describe("default launch worktrees", () => {
 		);
 
 		expect(homePlan.enabled && path.dirname(homePlan.worktreePath)).toBe(path.join(os.homedir(), "gjc-worktrees"));
-		expect(blankPlan.enabled && path.dirname(blankPlan.worktreePath)).toBe(
-			path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`),
+		expect(blankPlan.enabled && path.dirname(blankPlan.worktreePath)).toBe(path.join(repo, ".worktrees"));
+	});
+
+	it("rejects the repository-local bucket when Git does not ignore it", async () => {
+		const repo = await createRepo("gjc-launch-bucket-unignored-");
+		await fs.rm(path.join(repo, ".gitignore"));
+		run("git", ["add", ".gitignore"], repo);
+		run("git", ["commit", "-m", "remove ignore"], repo);
+
+		expect(() => prepareLaunchWorktree(repo, ["--worktree", "feature/demo"])).toThrow(
+			/worktree_bucket_not_ignored[\s\S]*add \/.worktrees/,
 		);
+		expect(await Bun.file(path.join(repo, ".worktrees")).exists()).toBe(false);
 	});
 
 	it("uses the launch worktree as the generated tmux cwd", async () => {
@@ -657,7 +663,7 @@ describe("resolveWorktreeBucketForPath Windows semantics", () => {
 	it("keeps UNC repos on their share for the default and relative templates", () => {
 		const uncRepo = "\\\\server\\share\\app";
 		expect(resolveWorktreeBucketForPath(uncRepo, undefined, home, path.win32)).toBe(
-			"\\\\server\\share\\app.gajae-code-worktrees",
+			"\\\\server\\share\\app\\.worktrees",
 		);
 		expect(resolveWorktreeBucketForPath(uncRepo, "{repo}.worktrees", home, path.win32)).toBe(
 			"\\\\server\\share\\app.worktrees",
@@ -668,6 +674,6 @@ describe("resolveWorktreeBucketForPath Windows semantics", () => {
 		expect(resolveWorktreeBucketForPath("C:\\repos\\App", "{repo}.worktrees", home, path.win32)).toBe(
 			"C:\\repos\\App.worktrees",
 		);
-		expect(resolveWorktreeBucketForPath(repo, "   ", home, path.win32)).toBe("C:\\repos\\app.gajae-code-worktrees");
+		expect(resolveWorktreeBucketForPath(repo, "   ", home, path.win32)).toBe("C:\\repos\\app\\.worktrees");
 	});
 });
