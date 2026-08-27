@@ -303,6 +303,31 @@ function getLockPath(filePath: string): string {
 	return `${filePath}.lock`;
 }
 
+async function ensureLockParent(directory: string): Promise<void> {
+	const missing: string[] = [];
+	let current = path.resolve(directory);
+	for (;;) {
+		try {
+			await fs.lstat(current);
+			break;
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+			missing.push(current);
+			const parent = path.dirname(current);
+			if (parent === current) throw error;
+			current = parent;
+		}
+	}
+	for (const created of missing.reverse()) {
+		try {
+			await fs.mkdir(created, { mode: 0o700 });
+			await fs.chmod(created, 0o700);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+	}
+}
+
 async function localLockKey(lockPath: string): Promise<string> {
 	try {
 		return normalizeLockKey(await fs.realpath(lockPath));
@@ -531,12 +556,13 @@ async function tryAcquireLock(
 	ownerToken = crypto.randomUUID(),
 	onAcquired?: () => void,
 ): Promise<LockInfo | null> {
-	await fs.mkdir(path.dirname(lockPath), { recursive: true });
+	await ensureLockParent(path.dirname(lockPath));
 	const afterParentMkdir = FileLockTestHooks.afterParentMkdir;
 	if (afterParentMkdir) await afterParentMkdir(lockPath);
 	if (ownerHostId === undefined) {
 		try {
-			await fs.mkdir(lockPath);
+			await fs.mkdir(lockPath, { mode: 0o700 });
+			await fs.chmod(lockPath, 0o700);
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code === "EEXIST") return null;
@@ -557,7 +583,8 @@ async function tryAcquireLock(
 	const pendingPath = `${lockPath}.pending.${process.pid}.${crypto.randomUUID()}`;
 	const owner = lockInfo(ownerHostId, ownerToken);
 	try {
-		await fs.mkdir(pendingPath);
+		await fs.mkdir(pendingPath, { mode: 0o700 });
+		await fs.chmod(pendingPath, 0o700);
 		await writeLockInfo(pendingPath, owner);
 		try {
 			await fs.rename(pendingPath, lockPath);
@@ -790,7 +817,7 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
-	await fs.mkdir(path.dirname(lockPath), { recursive: true });
+	await ensureLockParent(path.dirname(lockPath));
 	const ownerToken = crypto.randomUUID();
 	const contentionStartTimes = new Map<string, string | null>();
 	for (let attempt = 0; attempt < opts.retries; attempt++) {

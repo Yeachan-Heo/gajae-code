@@ -94,6 +94,34 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect((await fs.readdir(`${file}.lock`)).length).toBe(0);
 	});
 
+	test("publishes nested lock directories with private modes under restrictive umask", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "nested", "deeper", "state.json");
+		const previousUmask = process.umask(0o277);
+		try {
+			await withFileLock(
+				file,
+				async () => undefined,
+				{
+					onAcquired: async () => {
+						for (const directory of [path.join(root, "nested"), path.join(root, "nested", "deeper"), `${file}.lock`]) {
+							expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
+						}
+					},
+				},
+			);
+			const qualifiedFile = path.join(root, "qualified", "state.json");
+			await withFileLock(qualifiedFile, async () => undefined, {
+				ownerHostId: "test-host",
+				onAcquired: async () => {
+					expect((await fs.stat(`${qualifiedFile}.lock`)).mode & 0o777).toBe(0o700);
+				},
+			});
+		} finally {
+			process.umask(previousUmask);
+		}
+	});
+
 	test("keeps process identity stable across caller locale and timezone", () => {
 		if (process.platform === "win32") return;
 		const original = { TZ: process.env.TZ, LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };
