@@ -2386,6 +2386,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			!options.bashRestrictionProfile &&
 			(options.bashAllowedPrefixes ?? []).length === 0 &&
 			!options.mcpManager &&
+			!options.inheritedMcpManager &&
 			explicitMcpConfigPath === undefined;
 		const rescopeSessionCwdParticipant: AgentSessionRescopeParticipant | undefined = canAgentRescopeSessionCwd
 			? {
