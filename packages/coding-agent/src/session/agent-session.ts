@@ -5241,6 +5241,9 @@ export class AgentSession {
 				try {
 					await this.refreshSshTool({ activateIfAvailable: true });
 				} catch (error) {
+					this.#toolRegistry.delete("ssh");
+					this.#selectedDiscoveredToolNames.delete("ssh");
+					await this.#applyActiveToolsByName(this.getActiveToolNames().filter(name => name !== "ssh"));
 					// Non-fatal: the session has moved; the SSH tool refreshes
 					// on its next activation attempt.
 					logger.warn("Committed session rescope could not refresh the SSH tool", {
