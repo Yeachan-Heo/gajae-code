@@ -1021,6 +1021,8 @@ async function installPaseoSetup(flags: PaseoSetupFlags, deps: PaseoSetupDepende
 						...payload,
 						bridgeDirCreated: true,
 						bridgeDirIdentity: identity,
+						bridgeEntries: isMigration ? [] : (bridgeLedger.bridgeEntries ?? []),
+						bridgeEntryIdentities: isMigration ? {} : (bridgeLedger.bridgeEntryIdentities ?? {}),
 					})),
 				onBridgeEntryCreated: (name, identity) =>
 					persistBridgeProgress(payload => ({
