@@ -2769,6 +2769,7 @@ export class AsyncJobManager {
 			}
 		}
 		this.#jobs.delete(jobId);
+		if (job) this.#parkedDeliveries.delete(job.generation);
 		this.#settledJobIds.delete(jobId);
 		this.#lifecycles.delete(jobId);
 		this.#lifecyclePhases.delete(jobId);
