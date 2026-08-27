@@ -2705,7 +2705,7 @@ export class AgentSession {
 							job,
 							durationMs: undefined,
 							ownedCompletion,
-					}
+						});
 					} finally {
 						manager?.clearParkedDelivery(job.generation);
 					}
