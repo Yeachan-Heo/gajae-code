@@ -403,6 +403,12 @@ export declare class RecoveryFsRoot {
   /** Return the stable identity of the retained root descriptor. */
   identity(): RecoveryFsResult
   /**
+   * Retain the managed recovery directory for this root authority. Generic
+   * root opening remains read-only; managed callers explicitly opt into this
+   * namespace creation before performing cleanup or mutations.
+   */
+  retainManagedRecoveryDirectory(): void
+  /**
    * Reap aged zero-byte write-protocol remnants through the retained recovery
    * directory descriptor. The descriptor keeps nested-store cleanup bound to
    * the authority captured when this root was retained; no mutable pathname
@@ -410,6 +416,12 @@ export declare class RecoveryFsRoot {
    * current managed root through its existing expected-identity path.
    */
   reapScrubbedProtocolRemnants(minAgeMs: number): RecoveryFsRemnantReapResult
+  /**
+   * Asynchronous twin of [`Self::reap_scrubbed_protocol_remnants`]. The
+   * retained descriptor is cloned before work is submitted so the blocking
+   * scan and cleanup never run on the JavaScript event loop.
+   */
+  reapScrubbedProtocolRemnantsAsync(minAgeMs: number): Promise<RecoveryFsRemnantReapResult>
   /**
    * Derive a retained child-directory capability from this root and exact
    * identity evidence.

@@ -1233,6 +1233,7 @@ export class ManagedSessionDescendantStore {
 		if (process.platform === "linux") {
 			const before = fs.lstatSync(this.#baseDir, { bigint: true });
 			const authority = nativeSessionStorage().openRecoveryFsRoot(this.#baseDir);
+			authority.retainManagedRecoveryDirectory();
 			const retained = authority.identity();
 			if (
 				!retained.ok ||
@@ -1666,7 +1667,7 @@ export class ManagedSessionDescendantStore {
 			void Promise.resolve()
 				.then(async () => {
 					const [nativeResult, pathResult] = await Promise.all([
-						Promise.resolve(authority.reapScrubbedProtocolRemnants(SCRUBBED_REMNANT_MIN_AGE_MS)),
+						authority.reapScrubbedProtocolRemnantsAsync(SCRUBBED_REMNANT_MIN_AGE_MS),
 						reapScrubbedProtocolRemnants(this.#baseDir, SCRUBBED_REMNANT_MIN_AGE_MS, this.#subtreeRoot),
 					]);
 					const failures = nativeResult.failures + pathResult.failures;

@@ -1401,6 +1401,28 @@ impl RecoveryFsRoot {
 		RecoveryFsResult::failure("unsupported_platform")
 	}
 
+	/// Retain the managed recovery directory for this root authority. Generic
+	/// root opening remains read-only; managed callers explicitly opt into this
+	/// namespace creation before performing cleanup or mutations.
+	#[napi]
+	pub fn retain_managed_recovery_directory(&self) -> napi::Result<()> {
+		#[cfg(target_os = "linux")]
+		{
+			let root_guard = self.root.lock();
+			let Some(root) = root_guard.as_ref() else {
+				return Err(napi::Error::from_reason("closed"));
+			};
+			let mut recovery_guard = self.recovery.lock();
+			if recovery_guard.is_none() {
+				*recovery_guard =
+					Some(recovery_directory(root, None).map_err(napi::Error::from_reason)?);
+			}
+			Ok(())
+		}
+		#[cfg(not(target_os = "linux"))]
+		Err(napi::Error::from_reason("unsupported_platform"))
+	}
+
 	/// Reap aged zero-byte write-protocol remnants through the retained recovery
 	/// directory descriptor. The descriptor keeps nested-store cleanup bound to
 	/// the authority captured when this root was retained; no mutable pathname
@@ -1515,6 +1537,37 @@ impl RecoveryFsRoot {
 			let _ = min_age_ms;
 			RecoveryFsRemnantReapResult { reaped: 0, failures: 0 }
 		}
+	}
+
+	/// Asynchronous twin of [`Self::reap_scrubbed_protocol_remnants`]. The
+	/// retained descriptor is cloned before work is submitted so the blocking
+	/// scan and cleanup never run on the JavaScript event loop.
+	#[napi]
+	pub fn reap_scrubbed_protocol_remnants_async(
+		&self,
+		min_age_ms: i64,
+	) -> crate::task::Promise<RecoveryFsRemnantReapResult> {
+		#[cfg(target_os = "linux")]
+		{
+			let recovery = self
+				.recovery
+				.lock()
+				.as_ref()
+				.and_then(|value| value.try_clone().ok());
+			crate::task::blocking("reap_scrubbed_protocol_remnants", (), move |_| {
+				let Some(recovery) = recovery else {
+					return Ok(RecoveryFsRemnantReapResult { reaped: 0, failures: 1 });
+				};
+				let authority =
+					Self { root: Mutex::new(None), recovery: Mutex::new(Some(recovery)) };
+				Ok(authority.reap_scrubbed_protocol_remnants(min_age_ms))
+			})
+		}
+		#[cfg(not(target_os = "linux"))]
+		crate::task::blocking("reap_scrubbed_protocol_remnants", (), move |_| {
+			let _ = min_age_ms;
+			Ok(RecoveryFsRemnantReapResult { reaped: 0, failures: 0 })
+		})
 	}
 
 	/// Derive a retained child-directory capability from this root and exact
@@ -2159,8 +2212,7 @@ pub fn open_recovery_fs_root(path: String) -> napi::Result<RecoveryFsRoot> {
 	#[cfg(target_os = "linux")]
 	{
 		let root = open_root(Path::new(&path)).map_err(napi::Error::from_reason)?;
-		let recovery = recovery_directory(&root, None).map_err(napi::Error::from_reason)?;
-		Ok(RecoveryFsRoot { root: Mutex::new(Some(root)), recovery: Mutex::new(Some(recovery)) })
+		Ok(RecoveryFsRoot { root: Mutex::new(Some(root)), recovery: Mutex::new(None) })
 	}
 	#[cfg(not(target_os = "linux"))]
 	{

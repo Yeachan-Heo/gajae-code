@@ -210,6 +210,7 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			const aged = await seedRemnant(recovery, ".gjc-replace-retry-bound", 60 * 60 * 1000);
 			const authority = native.openRecoveryFsRoot(dir);
 			try {
+				authority.retainManagedRecoveryDirectory();
 				const result = authority.reapScrubbedProtocolRemnants(0);
 
 				expect(result).toEqual({ reaped: 1, failures: 0 });
@@ -228,6 +229,7 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			await fsp.mkdir(recovery, { mode: 0o700 });
 			const aged = await seedRemnant(recovery, ".gjc-replace-retry-inherited", 60 * 60 * 1000);
 			const root = native.openRecoveryFsRoot(dir);
+			root.retainManagedRecoveryDirectory();
 			const session = await fsp.lstat(sessionDir, { bigint: true });
 			const retained = root.retainManagedDirectory("session", session.dev.toString(), session.ino.toString());
 			try {
