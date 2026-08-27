@@ -10,12 +10,14 @@ import {
 	ExecServerAbortSchema,
 	ExecServerControlMessageSchema,
 	HeartbeatUpdateSchema,
+	InteractionQuerySchema,
 	InteractionUpdateSchema,
 	PiReadExecArgsSchema,
 	PiWriteExecArgsSchema,
 	TextDeltaUpdateSchema,
 	TokenDeltaUpdateSchema,
 	TurnEndedUpdateSchema,
+	WebSearchRequestQuerySchema,
 } from "../src/providers/cursor/gen/agent_pb";
 import { stream as streamModel } from "../src/stream";
 import type { AssistantMessage, Context, CursorExecHandlers, Model } from "../src/types";
@@ -726,6 +728,40 @@ describe("Cursor raw transport watchdog", () => {
 			}, 5);
 			stream.on("close", () => {
 				if (controlTimer) clearInterval(controlTimer);
+			});
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 30,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for the next event");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("does not refresh the watchdog for unhandled interaction queries", async () => {
+		let queryTimer: ReturnType<typeof setInterval> | undefined;
+		const baseUrl = await createCursorServer(stream => {
+			stream.on("error", () => {});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendInteractionUpdate(stream, {
+					case: "heartbeat",
+					value: create(HeartbeatUpdateSchema, {}),
+				});
+				queryTimer = setInterval(() => {
+					sendServerMessage(stream, {
+						case: "interactionQuery",
+						value: create(InteractionQuerySchema, {
+							query: { case: "webSearchRequestQuery", value: create(WebSearchRequestQuerySchema, {}) },
+						}),
+					});
+				}, 5);
+			}, 5);
+			stream.on("close", () => {
+				if (queryTimer) clearInterval(queryTimer);
 			});
 		});
 
