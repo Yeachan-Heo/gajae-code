@@ -1231,6 +1231,14 @@ export class AuthStorage {
 	#data: Map<string, StoredCredential[]> = new Map();
 	#runtimeOverrides: Map<string, string> = new Map();
 	#configOverrides: Map<string, string> = new Map();
+	/**
+	 * Providers whose config override was resolved from a models.yml `apiKeyEnv`
+	 * indirection rather than a literal `apiKey` pin. An env pointer is not a
+	 * pinned secret: the pointed-to value (shell env, trusted env files) can go
+	 * stale silently, and the 401 rotation machinery cannot repair it. A stored
+	 * api_key credential from `auth login` therefore outranks it.
+	 */
+	#configOverrideEnvSourced: Set<string> = new Set();
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
 	/** Soft runtime credential preference per provider; quota failures may rotate away from it. */
 	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
@@ -1926,10 +1934,22 @@ export class AuthStorage {
 	 *
 	 * Lower priority than {@link setRuntimeApiKey} so a CLI `--api-key`
 	 * still wins for the duration of a single invocation.
+	 *
+	 * `options.envSourced` marks the value as resolved from a models.yml
+	 * `apiKeyEnv` indirection. Unlike a literal pin, an env pointer only says
+	 * where to look for a key; when the user has since run `auth login`, the
+	 * stored api_key credential is the fresher, actively-managed secret and
+	 * wins over the indirection (stored OAuth credentials still yield, so a
+	 * custom-endpoint bearer is never replaced by an upstream OAuth token).
 	 */
-	setConfigApiKey(provider: string, apiKey: string): void {
+	setConfigApiKey(provider: string, apiKey: string, options: { envSourced?: boolean } = {}): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		this.#configOverrides.set(storageProvider, apiKey);
+		if (options.envSourced) {
+			this.#configOverrideEnvSourced.add(storageProvider);
+		} else {
+			this.#configOverrideEnvSourced.delete(storageProvider);
+		}
 		this.#bumpGeneration("set-config-api-key", storageProvider);
 	}
 
@@ -1938,6 +1958,7 @@ export class AuthStorage {
 	 */
 	removeConfigApiKey(provider: string): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		this.#configOverrideEnvSourced.delete(storageProvider);
 		if (this.#configOverrides.delete(storageProvider)) this.#bumpGeneration("remove-config-api-key", storageProvider);
 	}
 
@@ -1947,6 +1968,7 @@ export class AuthStorage {
 	 */
 	clearConfigApiKeys(): void {
 		const providers = [...this.#configOverrides.keys()];
+		this.#configOverrideEnvSourced.clear();
 		if (providers.length === 0) return;
 		this.#configOverrides.clear();
 		for (const provider of providers) this.#bumpGeneration("clear-config-api-keys", provider);
@@ -5165,9 +5187,16 @@ export class AuthStorage {
 		if (runtimeKey) return runtimeKey;
 
 		const configKey = this.#configOverrides.get(provider);
-		if (configKey) return configKey;
+		if (configKey && !this.#configOverrideEnvSourced.has(provider)) return configKey;
 
 		const selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);
+		if (configKey) {
+			// Env-sourced (`apiKeyEnv`) override: same precedence as getApiKey —
+			// a stored api_key credential from `auth login` wins, stored OAuth
+			// still yields to the indirection.
+			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, undefined);
+			return storedApiKey ?? configKey;
+		}
 		if (selectedCredential?.credential.type === "api_key") {
 			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
@@ -5217,13 +5246,16 @@ export class AuthStorage {
 	 * Get API key for a provider.
 	 * Priority:
 	 * 1. Runtime override (CLI --api-key)
-	 * 2. Config override (models.yml `providers.<name>.apiKey`)
-	 * 3. Session-selected OAuth credential, when present
-	 * 4. Usable or unresolved API key from storage
-	 * 5. OAuth token from storage (auto-refreshed)
-	 * 6. Previously unusable command-backed API key retry
-	 * 7. Environment variable
-	 * 8. Fallback resolver (models.yml custom providers, last-resort)
+	 * 2. Config override (models.yml `providers.<name>.apiKey` literal pin)
+	 * 3. Stored api_key credential from `auth login`, when the config override
+	 *    is only an `apiKeyEnv` indirection
+	 * 4. Config override sourced from models.yml `providers.<name>.apiKeyEnv`
+	 * 5. Session-selected OAuth credential, when present
+	 * 6. Usable or unresolved API key from storage
+	 * 7. OAuth token from storage (auto-refreshed)
+	 * 8. Previously unusable command-backed API key retry
+	 * 9. Environment variable
+	 * 10. Fallback resolver (models.yml custom providers, last-resort)
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
@@ -5239,7 +5271,17 @@ export class AuthStorage {
 		// honor it instead of forwarding an upstream OAuth token that the proxy
 		// won't accept.
 		const configKey = this.#configOverrides.get(provider);
-		if (configKey) return configKey;
+		if (configKey) {
+			if (!this.#configOverrideEnvSourced.has(provider)) return configKey;
+			// The override is an `apiKeyEnv` indirection, not a pinned value. A
+			// stored api_key credential from `auth login` is actively managed
+			// (validated at login, rotated on 401), while the pointed-to env
+			// value can go stale with no recovery path — prefer the stored
+			// credential. Stored OAuth credentials still yield to the override.
+			const storedApiKey = await this.#resolveStoredApiKeyOverEnvConfig(provider, selectedCredential, sessionId);
+			if (storedApiKey) return storedApiKey;
+			return configKey;
+		}
 
 		if (selectedCredential?.credential.type === "api_key") {
 			this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
@@ -5293,6 +5335,38 @@ export class AuthStorage {
 		const envKey = getEnvApiKey(provider);
 		if (envKey) return envKey;
 		return this.#fallbackResolver?.(provider) ?? undefined;
+	}
+
+	/**
+	 * Resolve a stored api_key credential that outranks an env-sourced config
+	 * override (`apiKeyEnv`). Mirrors the api_key branches of {@link getApiKey}:
+	 * the selector-pinned credential first, then the round-robin/session pool.
+	 * Returns undefined when no stored api_key credential resolves, leaving the
+	 * env-sourced override in effect.
+	 */
+	async #resolveStoredApiKeyOverEnvConfig(
+		provider: string,
+		selectedCredential: ({ index: number } & StoredCredential) | undefined,
+		sessionId?: string,
+	): Promise<string | undefined> {
+		if (selectedCredential?.credential.type === "api_key") {
+			const resolved = await this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
+			if (resolved) {
+				this.#recordSessionCredential(provider, sessionId, "api_key", selectedCredential.index);
+				return resolved;
+			}
+		}
+		const attemptedApiKeyIndices = new Set<number>();
+		for (;;) {
+			const apiKeySelection = this.#selectApiKeyCredential(provider, sessionId, attemptedApiKeyIndices);
+			if (!apiKeySelection) return undefined;
+			attemptedApiKeyIndices.add(apiKeySelection.index);
+			const resolved = await this.#resolveStoredApiKey(provider, apiKeySelection.credential.key);
+			if (resolved) {
+				this.#recordSessionCredential(provider, sessionId, "api_key", apiKeySelection.index);
+				return resolved;
+			}
+		}
 	}
 
 	/**
@@ -5621,7 +5695,9 @@ export class AuthStorage {
 	 *
 	 * Surfaces four layers, highest precedence first:
 	 *   1. Runtime override (`--api-key`).
-	 *   2. Config override (`models.yml` `providers.<name>.apiKey`).
+	 *   2. Config override (`models.yml` `providers.<name>.apiKey` literal pin,
+	 *      or an `apiKeyEnv` indirection when no stored api_key credential
+	 *      outranks it).
 	 *   3. Stored credential (the one this session is currently sticky to, or the
 	 *      one round-robin would pick next when no session id is supplied).
 	 *   4. Env var / fallback resolver — when no stored credential exists.
@@ -5633,7 +5709,12 @@ export class AuthStorage {
 			return "runtime override (--api-key)";
 		}
 		if (this.#configOverrides.has(provider)) {
-			return "config override (models.yml)";
+			// An `apiKeyEnv` indirection loses to a stored api_key credential
+			// (see getApiKey); describe the credential that actually wins.
+			const shadowed = this.#getStoredCredentials(provider).some(entry => entry.credential.type === "api_key");
+			if (!this.#configOverrideEnvSourced.has(provider) || !shadowed) {
+				return "config override (models.yml)";
+			}
 		}
 
 		const baseLabel = this.#sourceLabel ?? "local store";

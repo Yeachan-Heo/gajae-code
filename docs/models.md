@@ -732,10 +732,14 @@ Extensions can register providers at runtime (`pi.registerProvider(...)`), inclu
 When requesting a key for a provider, effective order is:
 
 1. Runtime override (CLI `--api-key`)
-2. Stored API key credential in `agent.db`
-3. Stored OAuth credential in `agent.db` (with refresh)
-4. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
-5. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
+2. `models.yml` `providers.<name>.apiKey` literal pin
+3. Stored API key credential in `agent.db` (written by `auth login`)
+4. `models.yml` `providers.<name>.apiKeyEnv` indirection — a pointer to a key,
+   not a pinned value, so a stored login credential outranks it; it still
+   outranks stored OAuth credentials
+5. Stored OAuth credential in `agent.db` (with refresh)
+6. Environment variable mapping (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.)
+7. ModelRegistry fallback resolver (provider `apiKey` from `models.yml`, env-name-or-literal semantics)
 
 `models.yml` `apiKey` behavior:
 

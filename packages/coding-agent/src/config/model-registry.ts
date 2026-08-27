@@ -2154,7 +2154,9 @@ export class ModelRegistry {
 				});
 				if (localCompatResolvedKey) {
 					this.#customProviderApiKeys.set(providerName, localCompatResolvedKey);
-					this.authStorage.setConfigApiKey(providerName, localCompatResolvedKey);
+					this.authStorage.setConfigApiKey(providerName, localCompatResolvedKey, {
+						envSourced: !localOpenAICompat.apiKey,
+					});
 				} else {
 					keylessProviders.add(providerName);
 					this.#optionalAuthProviders.add(providerName);
@@ -2216,7 +2218,9 @@ export class ModelRegistry {
 						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
-				if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
+				if (resolved) {
+					this.authStorage.setConfigApiKey(providerName, resolved, { envSourced: !providerConfig.apiKey });
+				}
 			}
 
 			// Parse per-model overrides
@@ -3806,7 +3810,9 @@ export class ModelRegistry {
 						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
-				if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
+				if (resolved) {
+					this.authStorage.setConfigApiKey(providerName, resolved, { envSourced: !providerConfig.apiKey });
+				}
 			}
 			for (const modelDef of modelDefs) {
 				const providerCompat = providerConfig.disableStrictTools
@@ -4547,7 +4553,7 @@ export class ModelRegistry {
 			return;
 		}
 		this.#customProviderApiKeys.set(provider, resolved);
-		this.authStorage.setConfigApiKey(provider, resolved);
+		this.authStorage.setConfigApiKey(provider, resolved, { envSourced: true });
 	}
 
 	async #peekApiKeyForProvider(
