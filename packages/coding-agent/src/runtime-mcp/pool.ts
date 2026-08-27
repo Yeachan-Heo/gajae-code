@@ -852,7 +852,15 @@ export class MCPConnectionPool {
 			}, this.#sharedPoolIdleMs);
 			return;
 		}
-		await this.closeEntry(entry);
+		try {
+			await this.closeEntry(entry);
+		} catch (error) {
+			entry.leases.add(lease);
+			entry.rootsByLease.set(lease, []);
+			this.#allLeases.add(lease);
+			entry.refCount = 1;
+			throw error;
+		}
 	}
 
 	private closeEntry(entry: PoolEntry): Promise<void> {
@@ -877,18 +885,27 @@ export class MCPConnectionPool {
 			entry.state = "closing";
 			this.record(entry, "closing");
 			if (this.#entries.get(entry.key) === entry) this.#entries.delete(entry.key);
+			let closed = false;
 			try {
 				await entry.connection.transport.close();
+				closed = true;
 			} catch (error) {
 				this.record(entry, "error", error);
 				throw error;
 			} finally {
-				entry.state = "closed";
-				entry.resourceSubscriptionCounts.clear();
-				this.record(entry, "closed");
+				if (closed) {
+					entry.state = "closed";
+					entry.resourceSubscriptionCounts.clear();
+					this.record(entry, "closed");
+				} else {
+					entry.transportCloseStarted = false;
+					entry.state = "connected";
+					if (!this.#entries.has(entry.key)) this.#entries.set(entry.key, entry);
+				}
 			}
 		});
 		entry.closePromise = closePromise.finally(() => {
+			entry.closePromise = undefined;
 			this.#retiredEntries.delete(entry);
 		});
 		return entry.closePromise;

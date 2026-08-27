@@ -5794,10 +5794,11 @@ export class AgentSession {
 
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
-		this.#toolSessionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
-		for (const result of results) {
-			if (result.status === "rejected") logger.warn("Tool session cleanup failed", { error: String(result.reason) });
+		for (const [index, result] of results.entries()) {
+			const cleanup = cleanups[index];
+			if (result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanup);
+			else logger.warn("Tool session cleanup failed", { error: String(result.reason) });
 		}
 	}
 
