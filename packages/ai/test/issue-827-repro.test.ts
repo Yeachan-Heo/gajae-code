@@ -128,7 +128,7 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 		})) as CompletionsBody;
 
 		expect(body.tool_choice).toMatchObject({ type: "function", function: { name: "echo" } });
-		expect(body.thinking).toBeUndefined();
+		expect(body.thinking).toEqual({ type: "disabled" });
 		expect(body.reasoning).toBeUndefined();
 		expect(body.reasoning_effort).toBeUndefined();
 	});
@@ -163,11 +163,7 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 			api: "openai-completions",
 			id: "gpt-5-mini",
 			reasoning: true,
-			compat: {
-				...getBundledModel("openai", "gpt-4o-mini").compat,
-				disableReasoningOnForcedToolChoice: false,
-				supportsReasoningEffort: true,
-			},
+			compat: { supportsReasoningEffort: true },
 		};
 
 		const body = (await captureBody(model, {
