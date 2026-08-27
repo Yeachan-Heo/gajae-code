@@ -458,9 +458,33 @@ function escapedNonAsciiToolCallShape(message: AssistantMessage): {
 }
 
 /** Remove transient raw-evidence metadata before any message can become durable. */
+function stripToolCallEvidence<T extends { escapedUnicodeArgumentEvidence?: unknown }>(toolCall: T): T {
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(toolCall, "escapedUnicodeArgumentEvidence");
+		if (!descriptor) return toolCall;
+		if (descriptor.configurable && Reflect.deleteProperty(toolCall, "escapedUnicodeArgumentEvidence"))
+			return toolCall;
+		const sanitized = Object.create(null) as T;
+		for (const key of Reflect.ownKeys(toolCall)) {
+			if (key === "escapedUnicodeArgumentEvidence") continue;
+			const own = Object.getOwnPropertyDescriptor(toolCall, key);
+			if (!own?.enumerable || !("value" in own)) continue;
+			try {
+				Object.defineProperty(sanitized, key, own);
+			} catch {
+				// Skip hostile descriptors; required fields are already captured in the record.
+			}
+		}
+		return sanitized;
+	} catch {
+		return Object.create(null) as T;
+	}
+}
+
 function stripUnicodeEscapeEvidence(message: AssistantMessage): void {
-	for (const block of message.content) {
-		if (block.type === "toolCall") delete block.escapedUnicodeArgumentEvidence;
+	for (let index = 0; index < message.content.length; index += 1) {
+		const block = message.content[index];
+		if (block?.type === "toolCall") message.content[index] = stripToolCallEvidence(block);
 	}
 }
 
@@ -4875,19 +4899,23 @@ async function executeToolCalls(
 	let steeringMessages: AgentMessage[] | undefined;
 	let steeringCheck: Promise<void> | null = null;
 
-	const records = toolCalls.map(toolCall => ({
-		toolCall,
-		tool: findActiveTool(tools, toolCall.name),
-		args: toolCall.arguments as Record<string, unknown>,
-		eventFields: undefined as { toolCallId: string; toolName: string; intent: string | undefined } | undefined,
-		started: false,
-		result: undefined as AgentToolResult<any> | undefined,
-		isError: false,
-		skipped: false,
-		toolResultMessage: undefined as ToolResultMessage | undefined,
-		resultEmitted: false,
-		argumentValidationFailed: false,
-	}));
+	const records = toolCalls.map(toolCall => {
+		const metadata = escapedToolCallMetadata(toolCall);
+		return {
+			toolCall: stripToolCallEvidence(toolCall),
+			metadata,
+			tool: findActiveTool(tools, toolCall.name),
+			args: toolCall.arguments as Record<string, unknown>,
+			eventFields: undefined as { toolCallId: string; toolName: string; intent: string | undefined } | undefined,
+			started: false,
+			result: undefined as AgentToolResult<any> | undefined,
+			isError: false,
+			skipped: false,
+			toolResultMessage: undefined as ToolResultMessage | undefined,
+			resultEmitted: false,
+			argumentValidationFailed: false,
+		};
+	});
 	const checkSteering = async (): Promise<void> => {
 		// Never consume steering once the run's own signal is aborted: an aborted
 		// run cannot deliver it (the loop hands drained steering back and ends), and
@@ -4915,8 +4943,8 @@ async function executeToolCalls(
 
 	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
 		if (record.resultEmitted) return;
+		record.toolCall = stripToolCallEvidence(record.toolCall);
 		const { toolCall } = record;
-		delete toolCall.escapedUnicodeArgumentEvidence;
 		const eventFields =
 			record.eventFields ?? ({ toolCallId: toolCall.id, toolName: toolCall.name, intent: toolCall.intent } as const);
 		// A call that was skipped or aborted before dispatch still owes the stream a
@@ -4970,7 +4998,7 @@ async function executeToolCalls(
 		stream.push({ type: "message_end", message: toolResultMessage, scope });
 	};
 	const isInvalidEscapedRecord = (record: (typeof records)[number]): boolean => {
-		const metadata = escapedToolCallMetadata(record.toolCall);
+		const metadata = record.metadata;
 		if (metadata.malformed) return true;
 		if (!metadata.guarded) return false;
 		return !(
@@ -4983,7 +5011,7 @@ async function executeToolCalls(
 		for (const record of records) {
 			if (isInvalidEscapedRecord(record)) continue;
 			record.skipped = true;
-			delete record.toolCall.escapedUnicodeArgumentEvidence;
+			record.toolCall = stripToolCallEvidence(record.toolCall);
 			emitToolResult(record, createSkippedToolResult(), true);
 		}
 	}
@@ -5053,6 +5081,7 @@ async function executeToolCalls(
 			return;
 		}
 
+		record.toolCall = stripToolCallEvidence(record.toolCall);
 		const { toolCall, tool } = record;
 		let argsForExecution = toolCall.arguments as Record<string, unknown>;
 		if (intentTracing) {
@@ -5090,10 +5119,10 @@ async function executeToolCalls(
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
-				const metadata = escapedToolCallMetadata(toolCall);
+				const metadata = record.metadata;
 				const escapedUnicodeArgumentEvidence = metadata.evidence;
 				const escapedArgumentsGuarded = metadata.guarded;
-				if (escapedArgumentsGuarded) delete toolCall.escapedUnicodeArgumentEvidence;
+				if (escapedArgumentsGuarded) record.toolCall = stripToolCallEvidence(record.toolCall);
 				const incompleteRead = managedPropertyRead(toolCall, "incompleteArguments");
 				const incompleteArguments = metadata.malformed || (incompleteRead.ok && incompleteRead.value === true);
 				if (incompleteArguments) {
@@ -5410,7 +5439,7 @@ function createAbortedToolResult(
 	reason: "aborted" | "error",
 	errorMessage?: string,
 ): ToolResultMessage {
-	delete toolCall.escapedUnicodeArgumentEvidence;
+	toolCall = stripToolCallEvidence(toolCall);
 	const message = reason === "aborted" ? "Tool execution was aborted" : "Tool execution failed due to an error";
 	const result: AgentToolResult<any> = {
 		content: [{ type: "text", text: errorMessage ? `${message}: ${errorMessage}` : `${message}.` }],
