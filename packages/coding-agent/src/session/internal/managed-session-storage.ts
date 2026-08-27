@@ -1978,7 +1978,11 @@ export class ManagedSessionDescendantStore {
 				this.#subtreeRoot,
 				this.#policy,
 			);
-			this.#assertBound();
+			try {
+				this.#assertBound();
+			} catch (error) {
+				throw new ManagedCommittedMutationError("append", error, appended);
+			}
 			return managedAppendReceiptFromIdentity(appended);
 		}
 		const relative = this.#relative(this.#resolve(relativePath));
@@ -1995,10 +1999,14 @@ export class ManagedSessionDescendantStore {
 		if (!appended.ok) throw managedAppendFailure(appended);
 		if (!appended.identity)
 			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
-		this.#assertBound();
 		const receipt = managedFileIdentityFromNative(appended.identity);
 		if (!isDescriptorBoundManagedIdentity(receipt))
 			throw new ManagedCommittedMutationError("append", new Error("managed_append_identity_unavailable"));
+		try {
+			this.#assertBound();
+		} catch (error) {
+			throw new ManagedCommittedMutationError("append", error, receipt);
+		}
 		return managedAppendReceiptFromIdentity(receipt);
 	}
 

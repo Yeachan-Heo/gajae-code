@@ -3946,7 +3946,9 @@ fn replace_managed(
 		Ok(named) => named,
 		Err(code) => return committed_failure(code, "terminal_identity"),
 	};
-	if terminal_digest != expected_digest
+	if terminal_identity.dev != staged_identity.dev
+		|| terminal_identity.ino != staged_identity.ino
+		|| terminal_digest != expected_digest
 		|| !stat_matches_regular_identity(&named_final, &terminal_identity)
 	{
 		return committed_failure("identity_mismatch", "terminal_identity");
