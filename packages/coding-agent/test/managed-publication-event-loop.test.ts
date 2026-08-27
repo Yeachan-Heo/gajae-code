@@ -218,6 +218,26 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 		});
 	});
 
+	it("reaps inherited recovery debris for a retained descendant authority", async () => {
+		await withTempDir("gjc-inherited-recovery-reap-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+			const recovery = path.join(dir, ".gjc-recovery");
+			await fsp.mkdir(recovery, { mode: 0o700 });
+			const aged = await seedRemnant(recovery, ".gjc-replace-retry-inherited", 60 * 60 * 1000);
+			const root = native.openRecoveryFsRoot(dir);
+			const session = await fsp.lstat(sessionDir, { bigint: true });
+			const retained = root.retainManagedDirectory("session", session.dev.toString(), session.ino.toString());
+			try {
+				expect(retained.reapScrubbedProtocolRemnants(0)).toEqual({ reaped: 1, failures: 0 });
+				expect(fs.existsSync(aged)).toBe(false);
+			} finally {
+				retained.close();
+				root.close();
+			}
+		});
+	});
+
 	it("matches the sync reaper's result on the same directory shape", async () => {
 		await withTempDir("gjc-remnant-parity-", async dir => {
 			for (let index = 0; index < 4; index++) {
