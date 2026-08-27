@@ -72,6 +72,7 @@ export interface HookSelectorOptions {
 	customInput?: {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
+		allowEmpty?: boolean;
 	};
 	clarificationInput?: {
 		optionLabel: string;
@@ -390,7 +391,7 @@ export class HookSelectorComponent extends Container {
 	#outline: boolean;
 	#scrollTitleRows: number | undefined;
 	#inlineEditorMaxHeight: number | undefined;
-	#customInput: { optionLabel: string; onSubmit: (text: string) => void } | undefined;
+	#customInput: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#clarificationInput: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#activeInput: { onSubmit: (text: string) => void; allowEmpty?: boolean } | undefined;
 	#inputArea: Container;

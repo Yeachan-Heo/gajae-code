@@ -155,6 +155,11 @@ export interface ExtensionUIDialogOptions {
 	customInput?: {
 		optionLabel: string;
 		onSubmit: (text: string) => void;
+		/**
+		 * When false, the selector refuses an empty/whitespace-only submit instead
+		 * of forwarding it, so a stray Enter cannot answer the question with "".
+		 */
+		allowEmpty?: boolean;
 	};
 	/**
 	 * Inline free-text input for a non-answer clarification action. It is

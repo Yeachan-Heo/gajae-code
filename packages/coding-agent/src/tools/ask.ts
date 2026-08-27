@@ -76,6 +76,14 @@ import { formatErrorMessage, formatMeta, formatTitle } from "./render-utils";
 import { ToolAbortError } from "./tool-errors";
 import { assertUltragoalAskAllowed } from "./ultragoal-ask-guard";
 
+/**
+ * How many times one question may be re-asked after an empty/whitespace-only
+ * free-text answer before the ask settles as cancelled. Without a bound, an
+ * answering surface that keeps submitting "" re-asks the identical question
+ * forever (gajae-code#5001).
+ */
+const MAX_EMPTY_CUSTOM_ATTEMPTS = 3;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -324,7 +332,7 @@ interface UIContext {
 			onLeft?: () => void;
 			onRight?: () => void;
 			helpText?: string;
-			customInput?: { optionLabel: string; onSubmit: (text: string) => void };
+			customInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 			clarificationInput?: { optionLabel: string; onSubmit: (text: string) => void; allowEmpty?: boolean };
 		},
 	): Promise<string | undefined>;
@@ -400,6 +408,7 @@ async function askSingleQuestion(
 			helpText,
 			customInput: {
 				optionLabel: otherOptionLabel,
+				allowEmpty: false,
 				onSubmit: (text: string) => {
 					inlineInput = text;
 				},
@@ -1100,7 +1109,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 
 		const askQuestion = async (
 			q: AskParams["questions"][number],
-			options?: { previous?: QuestionResult; navigation?: NavigationControls },
+			options?: { previous?: QuestionResult; navigation?: NavigationControls; emptyCustomAttempt?: number },
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
 			const questionIndex = params.questions.indexOf(q);
@@ -1256,7 +1265,23 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 													: { kind: "resolve_without_commit", reason: "cancelled" };
 					await settleActiveRemote(settlement);
 					activeRemoteRequest = undefined;
-					if (settlement.kind === "invalid") return askQuestion(q, options);
+					if (settlement.kind === "invalid") {
+						// An answering surface that keeps producing empty free text used to spin
+						// this question forever. Bound the re-asks and then let the ask settle as
+						// cancelled so the caller sees a terminal outcome instead of a live lock.
+						const attempt = (options?.emptyCustomAttempt ?? 0) + 1;
+						if (attempt >= MAX_EMPTY_CUSTOM_ATTEMPTS)
+							return {
+								optionLabels: rawOptionLabels,
+								selectedOptions: [] as string[],
+								customInput: undefined,
+								clarificationQuestion: undefined,
+								navigation: undefined,
+								cancelled: true,
+								timedOut: false,
+							};
+						return askQuestion(q, { ...options, emptyCustomAttempt: attempt });
+					}
 				}
 				activeRemoteRequest = undefined;
 				return {
