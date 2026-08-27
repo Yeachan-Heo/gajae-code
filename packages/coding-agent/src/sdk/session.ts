@@ -2122,6 +2122,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										}
 									: {}),
 							});
+							if (job) asyncJobManager?.retainDeliveryClaim(job);
 						},
 					})
 				: options.inheritedAsyncJobManager;
@@ -4327,7 +4328,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
-				isStale: entry => sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation),
+				isStale: entry => {
+					const stale = sessionAsyncJobManager.isDeliverySuppressed(entry.jobId, entry.generation);
+					if (stale) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					return stale;
+				},
 				// Build one message per ownership origin so an owned-scope drop of
 				// one turn's message never suppresses other turns'/ordinary
 				// completions batched in the same flush (review thread P2).
@@ -4335,7 +4340,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					entry.ownedCompletion
 						? `${entry.ownedCompletion.lineageIdHash}\u0000${entry.ownedCompletion.promptAttemptEpoch}`
 						: "ordinary",
-				build: buildAsyncResultBatchMessage,
+				build: entries => {
+					try {
+						return buildAsyncResultBatchMessage(entries);
+					} finally {
+						for (const entry of entries) sessionAsyncJobManager.releaseDeliveryClaim(entry.generation);
+					}
+				},
 			});
 		}
 		session.yieldQueue.register<McpNotificationEntry>("mcp-notification", {

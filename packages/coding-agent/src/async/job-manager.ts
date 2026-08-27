@@ -280,6 +280,16 @@ interface AsyncJobDelivery {
 	promise?: Promise<void>;
 }
 
+interface AsyncJobReceiptClaim {
+	jobId: string;
+	generation: string;
+	kind: AsyncJob["type"];
+	label: string;
+	status: AsyncJob["status"];
+	backgrounded: boolean;
+	ownerId?: string;
+}
+
 interface DeadLetteredDelivery {
 	jobId: string;
 	generation: string;
@@ -664,6 +674,7 @@ export class AsyncJobManager {
 	/** Retry-cap failures whose job record was already evicted, keyed by the unique generation. */
 	readonly #evictedDeadLetters = new Map<string, EvictedDeadLetteredDelivery>();
 	readonly #parkedDeliveries = new Map<string, AsyncJobDelivery>();
+	readonly #receiptClaims = new Map<string, AsyncJobReceiptClaim>();
 	/** Generations settled by failNow, so the runner's later terminal path is a no-op. */
 	readonly #externallySettled = new Set<string>();
 	/** Closed before #disposed so owner cleanups can settle work but cannot register more. */
@@ -2311,6 +2322,21 @@ export class AsyncJobManager {
 				deliveryState: "pending",
 			});
 		}
+		for (const claim of this.#receiptClaims.values()) {
+			if (ownerId && claim.ownerId !== ownerId) continue;
+			const key = `${claim.jobId}:${claim.generation}`;
+			if (projectedKeys.has(key)) continue;
+			projectedKeys.add(key);
+			jobs.push({
+				id: claim.jobId,
+				kind: claim.kind,
+				label: claim.label,
+				status: claim.status,
+				generation: claim.generation,
+				backgrounded: claim.backgrounded,
+				deliveryState: "pending",
+			});
+		}
 
 		const deadLettered: DeadLetteredJobSnapshotEntry[] = [];
 		for (const entry of this.#deadLetteredDeliveries.values()) {
@@ -2363,6 +2389,24 @@ export class AsyncJobManager {
 			ownerId: job.ownerId,
 		});
 		this.#notifyChange();
+	}
+
+	retainDeliveryClaim(job: AsyncJob): void {
+		if (this.#disposed) return;
+		this.#receiptClaims.set(job.generation, {
+			jobId: job.id,
+			generation: job.generation,
+			kind: job.type,
+			label: job.label,
+			status: job.status,
+			backgrounded: job.metadata?.backgrounded === true,
+			ownerId: job.ownerId,
+		});
+		this.#notifyChange();
+	}
+
+	releaseDeliveryClaim(generation: string): void {
+		if (this.#receiptClaims.delete(generation)) this.#notifyChange();
 	}
 
 	clearParkedDelivery(generation: string): void {
@@ -2655,6 +2699,7 @@ export class AsyncJobManager {
 		this.#deadLetteredDeliveries.clear();
 		this.#evictedDeadLetters.clear();
 		this.#parkedDeliveries.clear();
+		this.#receiptClaims.clear();
 		this.#externallySettled.clear();
 		this.#deadLetteredDeliveryOwners.clear();
 		this.#deadLetterOverflowByOwner.clear();
@@ -2887,6 +2932,9 @@ export class AsyncJobManager {
 	/** Whether a retained delivery generation already claims `jobId`. */
 	#hasDeliveryCollisionForJobId(jobId: string): boolean {
 		if (this.#hasPendingDeliveryForJobId(jobId)) return true;
+		for (const claim of this.#receiptClaims.values()) {
+			if (claim.jobId === jobId) return true;
+		}
 		if (this.#suppressedDeliveries.has(jobId)) return true;
 		if (this.#deadLetteredDeliveries.has(jobId)) return true;
 		for (const entry of this.#evictedDeadLetters.values()) {

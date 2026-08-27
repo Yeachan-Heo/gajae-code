@@ -369,4 +369,17 @@ describe("AsyncJobManager delivery reliability", () => {
 		await manager.waitForAll();
 		await manager.dispose({ timeoutMs: 250 });
 	});
+
+	test("receipt claims prevent job-id reuse until wake consumption", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		const originalId = manager.register("bash", "claimed", async () => "done", { id: "claimed-job" });
+		const original = manager.getJob(originalId);
+		if (!original) throw new Error("expected claimed job");
+		manager.retainDeliveryClaim(original);
+		const replacement = manager.register("bash", "replacement", async () => "replacement", { id: originalId });
+		expect(replacement).not.toBe(originalId);
+		manager.releaseDeliveryClaim(original.generation);
+		await manager.waitForAll();
+		await manager.dispose({ timeoutMs: 250 });
+	});
 });

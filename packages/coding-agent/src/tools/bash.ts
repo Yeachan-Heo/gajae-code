@@ -1674,6 +1674,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			let latestText = "";
 			let bridgeJobId!: string;
+			let bridgeBackgrounded = false;
 			let retainedAcpSnapshot = "";
 			const ACP_RAW_OVERLAP_BYTES = 512 * 1024;
 			const appendAcpSnapshot = (snapshot: string): void => {
@@ -1912,17 +1913,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								: summary.output;
 						latestText = pollText;
 						appendAcpSnapshot(pollOutput.output);
-						try {
-							onUpdate?.({
-								content: [{ type: "text", text: pollText }],
-								details: { terminalId: handle.terminalId },
-							});
-						} catch (error) {
-							await boundedKill();
-							const diagnostic = boundArtifactSaveDiagnostic(error);
-							const recoveredOutput = retainedAcpOutput();
-							const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
-							throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
+						if (!bridgeBackgrounded) {
+							try {
+								onUpdate?.({
+									content: [{ type: "text", text: pollText }],
+									details: { terminalId: handle.terminalId },
+								});
+							} catch (error) {
+								await boundedKill();
+								const diagnostic = boundArtifactSaveDiagnostic(error);
+								const recoveredOutput = retainedAcpOutput();
+								const prepared = await prepareClientTerminalOutput(this.session, recoveredOutput);
+								throw new ToolError(formatClientTerminalReadFailure(prepared, diagnostic, pendingNotices));
+							}
 						}
 					}
 				} finally {
@@ -2021,7 +2024,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const bridgeEndpointId = this.session.getSessionId?.() ?? "local";
 			const bridgeLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
 			const bridgeCompletion = Promise.withResolvers<ManagedBashJobCompletion>();
-			let bridgeBackgrounded = false;
 			let bridgeForegroundSettled = false;
 			const settleBridgeForeground = (): "resolved" | "already-settled" => {
 				if (bridgeForegroundSettled) return "already-settled";
