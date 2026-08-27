@@ -280,9 +280,10 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
 	const customProcessProfile = getAgentProfileAuthority() === "custom";
 	const selectedAgentDir = options.agentDir || settingsAgentDir;
+	const canonicalDefaultAgentDir = path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
 	const selectedProfileAuthority =
 		options.profileAuthority ??
-		(selectedAgentDir && path.resolve(selectedAgentDir) !== path.resolve(getAgentDir())
+		(selectedAgentDir && path.resolve(selectedAgentDir) !== path.resolve(canonicalDefaultAgentDir)
 			? "custom"
 			: customProcessProfile
 				? "custom"
