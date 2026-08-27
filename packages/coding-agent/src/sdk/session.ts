@@ -2303,11 +2303,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						nextManager.setAuthStorage(authStorage);
 						wireMcpManagerCallbacks(nextManager);
 						nextManager.setOnToolsChanged(tools => {
-							if (publishOwnedConventionalMcpTools) {
-								void syncConventionalToolsForManager?.(tools as CustomTool[]);
-							} else if (!ownsMcpManager) {
-								void session.refreshMCPTools(tools as CustomTool[]);
-							}
+							void session.refreshMCPTools(tools as CustomTool[]);
 						});
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
 						nextCustomTools.push(...(result.tools as CustomTool[]));

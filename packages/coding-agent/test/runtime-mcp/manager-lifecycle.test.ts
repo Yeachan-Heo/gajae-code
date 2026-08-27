@@ -1054,7 +1054,7 @@ setInterval(() => {}, 1000);
 		} finally {
 			closeRelease.resolve();
 			if (load) await load.catch(() => undefined);
-			await manager.disconnectAll();
+			await expect(manager.disconnectAll()).rejects.toBeInstanceOf(AggregateError);
 			vi.restoreAllMocks();
 			await rm(cwd, { recursive: true, force: true });
 		}

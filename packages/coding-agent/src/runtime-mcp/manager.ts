@@ -670,6 +670,20 @@ export class MCPManager {
 		}
 	}
 
+	async #drainRetryableLeaseReleases(): Promise<unknown[]> {
+		const failures: unknown[] = [];
+		for (const [lease, retained] of [...this.#retryableLeaseReleases]) {
+			try {
+				await lease.release();
+				this.#retryableLeaseReleases.delete(lease);
+				this.#leaseByConnection.delete(retained.connection);
+			} catch (error) {
+				failures.push(this.#logLeaseReleaseFailure(retained.name, retained.connection, error, lease.key));
+			}
+		}
+		return failures;
+	}
+
 	async #shutdownScopedOperations(reason: Error): Promise<unknown[]> {
 		const operations = [...this.#scopedOperations.values()];
 		for (const operation of operations) operation.controller.abort(reason);
@@ -1771,6 +1785,7 @@ export class MCPManager {
 			// They captured the old epoch; after increment they'll detect staleness.
 			this.#epoch++;
 			const scopedReleaseFailures = await this.#shutdownScopedOperations(new Error("MCP manager disconnected"));
+			const retryableLeaseFailures = await this.#drainRetryableLeaseReleases();
 			const releaseResults = await Promise.allSettled(
 				[...this.#leases.keys()].map(async name => {
 					const lease = this.#leases.get(name);
@@ -1803,6 +1818,7 @@ export class MCPManager {
 			this.#subscribedResources.clear();
 			const releaseFailures = [
 				...scopedReleaseFailures,
+				...retryableLeaseFailures,
 				...releaseResults
 					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
 					.map(result => result.reason),
