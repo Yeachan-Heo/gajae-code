@@ -748,6 +748,7 @@ function sanitizeProviderSafetyStopProvenance(
 	if (isManagedPlainRecord(detached)) {
 		const rebuilt = { ...detached } as AssistantMessage;
 		delete rebuilt.errorKind;
+		restoreTransientUnicodeEscapeEvidence(rebuilt.content, message);
 		return rebuilt;
 	}
 	const rebuilt = managedAssistantShell(message, model);
