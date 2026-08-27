@@ -5792,13 +5792,15 @@ export class AgentSession {
 		}
 	}
 
-	async #runToolSessionCleanups(): Promise<void> {
+	async #runToolSessionCleanups(clearBeforeRun = false): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
+		if (clearBeforeRun) this.#toolSessionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
 		for (const [index, result] of results.entries()) {
 			const cleanup = cleanups[index];
-			if (result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanup);
-			else logger.warn("Tool session cleanup failed", { error: String(result.reason) });
+			if (!clearBeforeRun && result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanup);
+			else if (result.status === "rejected")
+				logger.warn("Tool session cleanup failed", { error: String(result.reason) });
 		}
 	}
 
@@ -9395,7 +9397,7 @@ export class AgentSession {
 			// one here left signal exit orphaning the subprocess. Each runner clears
 			// its set, so a graceful dispose running first makes this a no-op rather
 			// than a double free.
-			this.#runToolSessionCleanups().catch((error: unknown) =>
+			this.#runToolSessionCleanups(true).catch((error: unknown) =>
 				logger.warn("signal teardown: tool session cleanups failed", { error }),
 			),
 			this.#runToolSessionTransitionCleanups().catch((error: unknown) =>

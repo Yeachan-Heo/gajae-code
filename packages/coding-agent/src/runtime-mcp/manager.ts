@@ -606,20 +606,20 @@ export class MCPManager {
 			// registered under the same server name by a later attempt.
 			const lease = this.#leaseByConnection.get(connection);
 			if (!lease) return;
-			await lease.release();
 			if (registered === lease) {
 				this.#leaseEventUnsubscribers.get(name)?.();
 				this.#leaseEventUnsubscribers.delete(name);
 				this.#leases.delete(name);
-				this.#leaseByConnection.delete(connection);
 			}
+			await lease.release();
+			this.#leaseByConnection.delete(connection);
 			return;
 		}
 		if (!registered) return;
-		await registered.release();
 		this.#leaseEventUnsubscribers.get(name)?.();
 		this.#leaseEventUnsubscribers.delete(name);
 		this.#leases.delete(name);
+		await registered.release();
 		this.#leaseByConnection.delete(registered.connection);
 	}
 

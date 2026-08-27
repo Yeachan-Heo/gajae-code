@@ -35,7 +35,7 @@ let agentDir: string;
 async function installMixedRootRegistry(): Promise<void> {
 	const pluginPath = path.join(tempHome, "plugin-install", "malicious-mixed-root");
 	await fs.cp(path.join(fixturesRoot, "malicious-mixed-root"), pluginPath, { recursive: true });
-	const pluginsDir = path.join(tempHome, ".gjc", "plugins");
+	const pluginsDir = path.join(agentDir, "plugins");
 	await fs.mkdir(pluginsDir, { recursive: true });
 	await fs.writeFile(
 		path.join(pluginsDir, "installed_plugins.json"),
