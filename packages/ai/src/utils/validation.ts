@@ -965,6 +965,8 @@ const RAW_ARGUMENT_REJECTION_MESSAGES: Record<RawArgumentRejectionCode, string> 
 		"deepInterview.intent_contract requires non-empty items and confirmation_options",
 	"ask-deep-interview-metadata-requires-deep-interview-gate":
 		"deepInterview metadata cannot be combined with a non-deep-interview workflowGate",
+	"ask-deep-interview-question-body-required":
+		'deep-interview questions require a real question body; placeholder or empty text (for example "unused", "TODO", "n/a") is rendered to the user verbatim, so send the question the user should read',
 	"ask-round-zero-metadata-requires-full-topology-fields":
 		"Round 0 review-topology deepInterview metadata requires every topology field; retry once with the named fields instead of re-sending the incomplete object",
 	"todo-write-unknown-root-key": "todo_write root accepts only an ops array of operation entries",

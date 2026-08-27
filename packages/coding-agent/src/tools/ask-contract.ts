@@ -433,6 +433,39 @@ function normalizeRoundZeroOptionalNulls(arguments_: Record<string, unknown>): R
 	return changed ? { ...arguments_, questions: [normalizedQuestion] } : arguments_;
 }
 
+/**
+ * Placeholder bodies a model ships when it treats the visible question as
+ * derived from metadata. Mirrors the ultragoal placeholder screen
+ * (`ultragoal-runtime.ts`) and adds `unused`, the token reported from the field.
+ */
+const PLACEHOLDER_QUESTION_BODIES = ["unused", "todo", "tbd", "n/a", "na", "none", "placeholder", "empty", "stub"];
+
+function isPlaceholderQuestionBody(value: unknown): boolean {
+	if (typeof value !== "string") return false;
+	const trimmed = value.trim();
+	if (trimmed.length === 0) return true;
+	return PLACEHOLDER_QUESTION_BODIES.includes(trimmed.toLowerCase());
+}
+
+/**
+ * #5002: a placeholder body satisfied `question: z.string()` and was rendered to
+ * the user as the entire question, with a fully numbered option list, so the
+ * screen looked legitimate while saying nothing. The only rational move left was
+ * the free-text option, which then hit the unbounded empty re-ask loop of #5001 —
+ * the two field reports arrived together for that reason.
+ */
+function placeholderQuestionBodyRejection(
+	arguments_: Record<string, unknown>,
+): RawArgumentValidationResult | undefined {
+	if (!isPlainRecord(arguments_) || !Array.isArray(arguments_.questions)) return undefined;
+	for (const question of arguments_.questions) {
+		if (!isPlainRecord(question) || !isPlainRecord(question.deepInterview)) continue;
+		if (isPlaceholderQuestionBody(question.question))
+			return { outcome: "reject", code: "ask-deep-interview-question-body-required" };
+	}
+	return undefined;
+}
+
 function knownIntentRejection(arguments_: Record<string, unknown>): RawArgumentValidationResult | undefined {
 	if (!isPlainRecord(arguments_) || !Array.isArray(arguments_.questions) || arguments_.questions.length !== 1)
 		return undefined;
@@ -469,6 +502,11 @@ export function recoverRoundZeroIntentContract(
 	// and no correction — the repeat-invalid-bisect loop. Non-candidates get the
 	// targeted correction here; candidates get it only after the stricter known
 	// intent rejections below, so every previously-covered verdict is unchanged.
+	// #5002: screen the human-visible body before any round-specific routing. A
+	// placeholder body reached the user on every round, not just Round 0, and the
+	// round-zero recovery branch below returns early for other rounds.
+	const placeholderRejection = placeholderQuestionBodyRejection(arguments_);
+	if (placeholderRejection) return placeholderRejection;
 	if (!isRoundZeroRecoveryCandidate(arguments_))
 		return roundZeroMetadataRejection(arguments_, stage) ?? { outcome: "passthrough" };
 	const normalizedArguments = normalizeRoundZeroOptionalNulls(arguments_);
