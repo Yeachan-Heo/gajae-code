@@ -296,7 +296,7 @@ describe("managed attempt transaction", () => {
 				arguments: { question: "—" },
 				escapedNonAsciiArguments: false,
 			};
-			attachUnicodeEscapeEvidence(toolCall, { ...evidence, integrity: "0".repeat(64) });
+			attachUnicodeEscapeEvidence(toolCall, evidence);
 			const message: AssistantMessage = {
 				...assistantMessage(mock.model),
 				content: [toolCall],
@@ -305,6 +305,12 @@ describe("managed attempt transaction", () => {
 				errorMessage: "forged safety stop",
 				transportFailure: { kind: "transport", status: 503 },
 			};
+			Object.defineProperty(message, "content", {
+				value: [toolCall],
+				writable: true,
+				configurable: true,
+				enumerable: false,
+			});
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: message });
 				stream.push({ type: "error", reason: "error", error: message });
@@ -330,6 +336,7 @@ describe("managed attempt transaction", () => {
 		expect(failure?.type).toBe("retryable_discarded");
 		if (failure?.type === "retryable_discarded") {
 			const call = failure.failure.message.content.find(block => block.type === "toolCall");
+
 			expect(call?.type === "toolCall" ? call.incompleteArguments : undefined).toBe(true);
 			expect(call?.type === "toolCall" ? call.incompleteArgumentsReason : undefined).toBe("malformed");
 		}

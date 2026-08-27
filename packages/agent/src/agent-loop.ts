@@ -748,6 +748,11 @@ function sanitizeProviderSafetyStopProvenance(
 	if (isManagedPlainRecord(detached)) {
 		const rebuilt = { ...detached } as AssistantMessage;
 		delete rebuilt.errorKind;
+		if (!Array.isArray(rebuilt.content)) {
+			const repaired = managedAssistantShell(message, model);
+			delete repaired.errorKind;
+			return repaired;
+		}
 		restoreTransientUnicodeEscapeEvidence(rebuilt.content, message);
 		return rebuilt;
 	}
@@ -1948,7 +1953,11 @@ function managedAssistantShell(
 	//   `message.role === "assistant"` check passes while the detached
 	//   snapshot retains none of the message identity.
 	const source =
-		snapshotRecord !== undefined && managedProperty(snapshotRecord, "role") === "assistant" ? snapshotRecord : value;
+		snapshotRecord !== undefined &&
+		managedProperty(snapshotRecord, "role") === "assistant" &&
+		(managedProperty(snapshotRecord, "content") !== undefined || managedProperty(value, "content") === undefined)
+			? snapshotRecord
+			: value;
 	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError("shell.role");
 	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
 	// Providers may deliver `content` as a string, missing value, or a primitive
@@ -2114,7 +2123,7 @@ function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["conten
 		const rawEvidence = managedProperty(matches[0], "escapedUnicodeArgumentEvidence");
 		if (rawEvidence === undefined) continue;
 		const evidence = managedUnicodeEscapeEvidence(rawEvidence);
-		if (evidence) attachUnicodeEscapeEvidence(destination, evidence);
+		if (evidence && !evidence.malformed) attachUnicodeEscapeEvidence(destination, evidence);
 		else {
 			destination.incompleteArguments = true;
 			destination.incompleteArgumentsReason = "malformed";
@@ -2151,7 +2160,8 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const rawEscapedUnicodeArgumentEvidence = managedProperty(value, "escapedUnicodeArgumentEvidence");
 	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
 	const invalidEscapedUnicodeEvidence =
-		rawEscapedUnicodeArgumentEvidence !== undefined && escapedUnicodeArgumentEvidence === undefined;
+		rawEscapedUnicodeArgumentEvidence !== undefined &&
+		(escapedUnicodeArgumentEvidence === undefined || escapedUnicodeArgumentEvidence.malformed);
 	const escapedArgumentsGuarded = escapedNonAsciiArguments === true || rawEscapedUnicodeArgumentEvidence !== undefined;
 	return {
 		type,
@@ -4777,7 +4787,6 @@ async function executeToolCalls(
 		resultEmitted: false,
 		argumentValidationFailed: false,
 	}));
-
 	const checkSteering = async (): Promise<void> => {
 		// Never consume steering once the run's own signal is aborted: an aborted
 		// run cannot deliver it (the loop hands drained steering back and ends), and
@@ -4858,6 +4867,25 @@ async function executeToolCalls(
 		stream.push({ type: "message_start", message: toolResultMessage, scope });
 		stream.push({ type: "message_end", message: toolResultMessage, scope });
 	};
+	const hasInvalidEscapedCall = records.some(({ toolCall, tool, args }) => {
+		const guarded =
+			toolCall.escapedNonAsciiArguments === true || toolCall.escapedUnicodeArgumentEvidence !== undefined;
+		if (!guarded) return false;
+		return !(
+			isDisplaySafeEscapedArguments(tool, args) &&
+			isDisplaySafeRawEscapeEvidence(tool, args, toolCall.escapedUnicodeArgumentEvidence)
+		);
+	});
+	if (hasInvalidEscapedCall) {
+		for (const record of records) {
+			const guarded =
+				record.toolCall.escapedNonAsciiArguments === true ||
+				record.toolCall.escapedUnicodeArgumentEvidence !== undefined;
+			if (guarded) continue;
+			record.skipped = true;
+			emitToolResult(record, createSkippedToolResult(), true);
+		}
+	}
 
 	/**
 	 * Prepare every value needed to publish and invoke one dispatch before claiming that it
