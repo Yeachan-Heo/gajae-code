@@ -343,7 +343,8 @@ export class MCPManager {
 	readonly #sessionId: string;
 	readonly #leases = new Map<string, MCPPoolLease>();
 	readonly #leaseEventUnsubscribers = new Map<string, () => void>();
-	readonly #leaseByConnection = new WeakMap<MCPServerConnection, MCPPoolLease>();
+	readonly #leaseByConnection = new Map<MCPServerConnection, MCPPoolLease>();
+	readonly #retryableLeaseReleases = new Map<MCPPoolLease, { name: string; connection: MCPServerConnection }>();
 	readonly #scopedOperations = new Map<number, ScopedOperation>();
 	readonly #retiredLeaseReleases = new Set<RetiredLeaseRelease>();
 	#nextScopedOperationId = 1;
@@ -507,15 +508,16 @@ export class MCPManager {
 		}
 		this.#leaseEventUnsubscribers.get(name)?.();
 		this.#leaseEventUnsubscribers.delete(name);
-		previous?.release().catch(error => {
-			const diagnostic = new MCPPoolLeaseReleaseError(name, previous.key, error);
-			logger.error("MCP stale lease release failed", {
-				path: `mcp:${name}`,
-				serverName: name,
-				poolKey: previous.key,
-				error: diagnostic,
+		previous &&
+			this.#releaseLease(name, previous.connection).catch(error => {
+				const diagnostic = new MCPPoolLeaseReleaseError(name, previous.key, error);
+				logger.error("MCP stale lease release failed", {
+					path: `mcp:${name}`,
+					serverName: name,
+					poolKey: previous.key,
+					error: diagnostic,
+				});
 			});
-		});
 		this.#leases.set(name, lease);
 		if (!this.#toolsOnly) lease.updateRoots(this.#getRoots().roots);
 		this.#leaseEventUnsubscribers.set(
@@ -598,7 +600,7 @@ export class MCPManager {
 	 * lease still belongs to that connection; a stale connect/reconnect task must
 	 * never tear down a newer lease registered under the same server name.
 	 */
-	async #releaseLease(name: string, connection?: MCPServerConnection): Promise<void> {
+	async #releaseLease(name: string, connection?: MCPServerConnection, retainFailure = true): Promise<void> {
 		const registered = this.#leases.get(name);
 		if (connection) {
 			// Release exactly the lease that belongs to this connection, whether or
@@ -611,22 +613,41 @@ export class MCPManager {
 				this.#leaseEventUnsubscribers.delete(name);
 				this.#leases.delete(name);
 			}
-			await lease.release();
-			this.#leaseByConnection.delete(connection);
+			try {
+				await lease.release();
+				this.#retryableLeaseReleases.delete(lease);
+				this.#leaseByConnection.delete(connection);
+			} catch (error) {
+				if (retainFailure) this.#retryableLeaseReleases.set(lease, { name, connection });
+				throw error;
+			}
 			return;
 		}
 		if (!registered) return;
 		this.#leaseEventUnsubscribers.get(name)?.();
 		this.#leaseEventUnsubscribers.delete(name);
 		this.#leases.delete(name);
-		await registered.release();
-		this.#leaseByConnection.delete(registered.connection);
+		try {
+			await registered.release();
+			this.#retryableLeaseReleases.delete(registered);
+			this.#leaseByConnection.delete(registered.connection);
+		} catch (error) {
+			if (retainFailure) this.#retryableLeaseReleases.set(registered, { name, connection: registered.connection });
+			throw error;
+		}
 	}
 
 	async #releaseScopedLease(operation: ScopedOperation): Promise<void> {
 		if (!operation.releasePromise) {
 			operation.releasePromise = operation.leaseReady.then(async lease => {
-				if (lease) await lease.release();
+				if (!lease) return;
+				try {
+					await lease.release();
+					this.#retryableLeaseReleases.delete(lease);
+				} catch (error) {
+					this.#retryableLeaseReleases.set(lease, { name: operation.name, connection: lease.connection });
+					throw error;
+				}
 			});
 		}
 		return operation.releasePromise;
@@ -1880,7 +1901,7 @@ export class MCPManager {
 		const oldLease = this.#leases.get(name);
 		if (oldLease) this.#pool.retireLease(oldLease);
 		if (oldConnection) {
-			const releasePromise = this.#releaseLease(name, oldConnection).catch(error => {
+			const releasePromise = this.#releaseLease(name, oldConnection, false).catch(error => {
 				throw this.#logLeaseReleaseFailure(name, oldConnection, error);
 			});
 			if (oldConnection.transport.closeBeforeReconnect !== false) {

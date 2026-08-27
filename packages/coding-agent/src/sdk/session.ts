@@ -2216,6 +2216,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const ownedConventionalMcpServerNames = new Set<string>();
 		let ownedConventionalMcpToolNames: string[] = [];
 		let publishOwnedConventionalMcpTools = false;
+		let syncConventionalToolsForManager: ((tools: CustomTool[]) => Promise<void>) | undefined;
 		let ownedPluginServersConnected = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const stagedMcpCleanup = new Map<MCPManager, () => void>();
@@ -2301,6 +2302,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						);
 						nextManager.setAuthStorage(authStorage);
 						wireMcpManagerCallbacks(nextManager);
+						nextManager.setOnToolsChanged(tools => {
+							if (publishOwnedConventionalMcpTools) {
+								void syncConventionalToolsForManager?.(tools as CustomTool[]);
+							} else if (!ownsMcpManager) {
+								void session.refreshMCPTools(tools as CustomTool[]);
+							}
+						});
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
 						nextCustomTools.push(...(result.tools as CustomTool[]));
 						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
@@ -4765,7 +4773,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Each link swallows (and logs) its own failure so one bad
 				// publication cannot kill the chain for every later one.
 				let conventionalToolsSync: Promise<void> = Promise.resolve();
-				const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
+				syncConventionalToolsForManager = (tools: CustomTool[]): Promise<void> => {
 					conventionalToolsSync = conventionalToolsSync
 						.then(async () => {
 							if (session.isDisposed) return;
@@ -4803,9 +4811,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return conventionalToolsSync;
 				};
 				mcpManager.setOnToolsChanged(tools => {
-					void syncConventionalTools(tools as CustomTool[]);
+					void syncConventionalToolsForManager?.(tools as CustomTool[]);
 				});
-				void syncConventionalTools(mcpManager.getTools() as CustomTool[]);
+				void syncConventionalToolsForManager(mcpManager.getTools() as CustomTool[]);
 			} else if (!ownsMcpManager) {
 				mcpManager.setOnToolsChanged(tools => {
 					void session.refreshMCPTools(tools);
