@@ -39,6 +39,7 @@ type CursorExecEventEmitter = (event: AgentEvent, dispatchedTool?: AgentTool) =>
 
 interface CursorExecBridgeOptions {
 	cwd: string;
+	getCwd?: () => string;
 	tools: Map<string, AgentTool>;
 	getEditReplaceTool?: () => AgentTool | undefined;
 	createSearchTool?: (options: { context?: number; totalMatchLimit?: number }) => AgentTool | undefined;
@@ -135,7 +136,7 @@ async function executeDelete(options: CursorExecBridgeOptions, pathArg: string, 
 	const toolName = "delete";
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
 
-	const absolutePath = resolveToCwd(pathArg, options.cwd);
+	const absolutePath = resolveToCwd(pathArg, options.getCwd?.() ?? options.cwd);
 	let isError = false;
 	let result: AgentToolResult<unknown>;
 
