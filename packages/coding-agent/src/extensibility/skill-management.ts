@@ -95,6 +95,15 @@ export class SkillFrontmatterError extends Error {
 	}
 }
 
+/** Raised when a valid skill cannot be safely persisted by the native writer. */
+export class SkillNativeWriteError extends Error {
+	readonly code = "SKILL_NATIVE_WRITE_FAILED";
+	constructor(message: string) {
+		super(message);
+		this.name = "SkillNativeWriteError";
+	}
+}
+
 /** Raised when the descriptor-relative native skill writer is unavailable. */
 export class SkillNativeWriteUnavailableError extends Error {
 	readonly code = "SKILL_NATIVE_WRITE_UNAVAILABLE";
@@ -323,7 +332,7 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 			throw new SkillNativeWriteUnavailableError();
 		if (result.code === "reparse_point")
 			throw new SkillFrontmatterError("secure native skill write rejected a symbolic link");
-		throw new SkillFrontmatterError(`secure native skill write failed: ${result.code ?? "unknown"}`);
+		throw new SkillNativeWriteError(`secure native skill write failed: ${result.code ?? "unknown"}`);
 	}
 	const filePath = result.path;
 	if (!filePath) throw new SkillNativeWriteUnavailableError("secure native skill writer returned no path");

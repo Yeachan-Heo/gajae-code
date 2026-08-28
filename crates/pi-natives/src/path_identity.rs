@@ -4720,6 +4720,7 @@ pub(crate) mod platform {
 				return Err(skill_write_error(&error));
 			}
 			if unsafe { libc::fchmod(fd, file_mode as libc::mode_t) } != 0 {
+				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 				unsafe { libc::close(fd) };
 				return Err(skill_write_error(&std::io::Error::last_os_error()));
 			}
@@ -4928,12 +4929,13 @@ pub(crate) mod platform {
 		if file_mode == 0o600 {
 			#[cfg(target_os = "linux")]
 			if let Err(code) = secure_created_owner_only_file(&file) {
+				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 				drop(file);
 				unsafe {
 					libc::close(skill_fd);
 					libc::close(skills_fd);
 				}
-				return NativeSecureSkillWriteResult::failure(code);
+				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 			}
 			#[cfg(target_os = "macos")]
 			if clear_and_verify_macos_acl(file.as_raw_fd()).is_err() {

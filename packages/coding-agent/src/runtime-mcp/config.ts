@@ -161,7 +161,9 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		// must not abort discovery of valid servers in the other scope (the
 		// capability loader itself is already per-file tolerant).
 		const [userDisabled, projectDisabled] = await Promise.all([
-			readDisabledServers(getMCPConfigPath("user", cwd, options?.agentDir)).catch(() => []),
+			readDisabledServers(
+				getMCPConfigPath("user", cwd, options?.agentDir ?? options?.settings?.getAgentDir?.()),
+			).catch(() => []),
 			readDisabledServers(getMCPConfigPath("project", cwd)).catch(() => []),
 		]);
 		disabledServers = new Set([...userDisabled, ...projectDisabled]);

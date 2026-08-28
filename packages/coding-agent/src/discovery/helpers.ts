@@ -9,6 +9,7 @@ import {
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
+	normalizePathForComparison,
 	parseFrontmatter,
 	tryParseJson,
 } from "@gajae-code/utils";
@@ -128,7 +129,10 @@ export function resolveUserAgentDir(home: string, userAgentDir?: string): string
 
 export function getUserSkillScanDirs(home: string, userAgentDir?: string): string[] {
 	const resolvedAgentDir = resolveUserAgentDir(home, userAgentDir);
-	if (resolvedAgentDir !== path.resolve(path.join(home, SOURCE_PATHS.native.userAgent))) {
+	if (
+		normalizePathForComparison(resolvedAgentDir) !==
+		normalizePathForComparison(path.join(home, SOURCE_PATHS.native.userAgent))
+	) {
 		return [path.join(resolvedAgentDir, "skills")];
 	}
 	return [
