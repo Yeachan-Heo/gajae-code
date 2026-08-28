@@ -917,7 +917,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// history/blob/protobuf serialization. Synchronous setup cannot be
 			// interrupted by a timer; the remaining-budget check below prevents a
 			// credential-bearing request after serialization already exhausted it.
-			stream.push({ type: "start", partial: output });
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 			const clearTransportWatchdog = () => {
 				if (transportWatchdog) {
@@ -1707,7 +1706,7 @@ async function handleShellStreamArgs(
 	const handler = streamHandler
 		? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks, execSignal, markNonAbortable)
 		: batchHandler
-			? (shellArgs: ShellArgs) => batchHandler(shellArgs, execSignal)
+			? (shellArgs: ShellArgs) => batchHandler(shellArgs, execSignal, markNonAbortable)
 			: undefined;
 
 	const { execResult } = await resolveExecHandler(
@@ -2124,7 +2123,7 @@ async function handleExecServerMessage(
 				command: args.command,
 				timeout: piTimeout(args.timeout),
 			});
-			const call = { args, toolCallId, signal: execSignal };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piBash?.bind(execHandlers),

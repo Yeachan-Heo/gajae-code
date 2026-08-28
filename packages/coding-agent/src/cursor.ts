@@ -94,6 +94,8 @@ async function executeTool(
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
+	const toolContext = options.getToolContext?.();
+	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 
 	const onUpdate: AgentToolUpdateCallback<unknown> | undefined = options.emitEvent
 		? partialResult => {
@@ -121,7 +123,7 @@ async function executeTool(
 			// publish the terminal while the mutation is still running.
 			tool.nonAbortable ? undefined : (execSignal ?? undefined),
 			onUpdate,
-			options.getToolContext?.(),
+			toolContext,
 		);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -469,14 +471,10 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 
 		try {
 			const nonAbortable = tool.nonAbortable === true;
+			const toolContext = options.getToolContext?.();
+			if (signal?.aborted) throw cursorAbortError(signal);
 			if (nonAbortable) markNonAbortable?.();
-			result = await tool.execute(
-				toolCallId,
-				toolArgs,
-				nonAbortable ? undefined : signal,
-				onUpdate,
-				options.getToolContext?.(),
-			);
+			result = await tool.execute(toolCallId, toolArgs, nonAbortable ? undefined : signal, onUpdate, toolContext);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);
