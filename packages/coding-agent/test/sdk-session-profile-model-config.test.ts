@@ -150,4 +150,48 @@ describe("createAgentSession model profile authority", () => {
 			await settings.close();
 		}
 	});
+
+	test("allows explicit agentDir with injected settings using the default agentDir", async () => {
+		await fs.writeFile(
+			path.join(profileDir, "models.yml"),
+			[
+				"providers:",
+				"  profile-provider:",
+				"    baseUrl: http://127.0.0.1:1/v1",
+				"    apiKey: profile-key",
+				"    api: openai-completions",
+				"    models:",
+				"      - id: profile-model",
+				"        name: Profile Model",
+				"        contextWindow: 32768",
+				"        maxTokens: 4096",
+			].join("\n"),
+		);
+		setAgentDir(ambientDir);
+		const settings = Settings.isolated({});
+		const { session } = await createAgentSession({
+			cwd: root,
+			agentDir: profileDir,
+			settings,
+			modelPattern: "profile-provider/profile-model",
+			sessionManager: SessionManager.inMemory(root),
+			disableExtensionDiscovery: true,
+			extensions: [],
+			skills: [],
+			rules: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			toolNames: ["__none__"],
+		});
+		try {
+			expect(session.model?.provider).toBe("profile-provider");
+			expect(session.model?.id).toBe("profile-model");
+		} finally {
+			await session.dispose();
+			await settings.close();
+		}
+	});
 });
