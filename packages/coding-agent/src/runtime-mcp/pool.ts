@@ -901,7 +901,12 @@ export class MCPConnectionPool {
 				} else {
 					entry.transportCloseStarted = false;
 					entry.state = wasRetired || !entry.connection.transport.connected ? "error" : "connected";
-					if (entry.state === "connected" && !this.#entries.has(entry.key)) this.#entries.set(entry.key, entry);
+					if (
+						entry.state === "connected" &&
+						this.#entryGenerations.get(entry.key) === entry.generation &&
+						!this.#entries.has(entry.key)
+					)
+						this.#entries.set(entry.key, entry);
 				}
 			}
 		});

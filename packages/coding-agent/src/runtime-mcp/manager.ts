@@ -768,6 +768,8 @@ export class MCPManager {
 			for (const [index, result] of results.entries()) {
 				if (result.status !== "rejected") continue;
 				const item = retired[index];
+				const lease = item?.connection ? this.#leaseByConnection.get(item.connection) : undefined;
+				if (lease && this.#retryableLeaseReleases.has(lease)) continue;
 				failures.push(
 					result.reason instanceof MCPPoolLeaseReleaseError
 						? result.reason
@@ -1789,7 +1791,6 @@ export class MCPManager {
 			// They captured the old epoch; after increment they'll detect staleness.
 			this.#epoch++;
 			const scopedReleaseFailures = await this.#shutdownScopedOperations(new Error("MCP manager disconnected"));
-			const retryableLeaseFailures = await this.#drainRetryableLeaseReleases();
 			const releaseResults = await Promise.allSettled(
 				[...this.#leases.keys()].map(async name => {
 					const lease = this.#leases.get(name);
@@ -1813,6 +1814,7 @@ export class MCPManager {
 			this.#reconnectBackoffs.clear();
 			this.#pendingReconnections.clear();
 			const retiredReleaseFailures = await this.#drainRetiredLeaseReleases();
+			const retryableLeaseFailures = await this.#drainRetryableLeaseReleases();
 			this.#deferredSharedRebinds.clear();
 			this.#pendingResourceRefresh.clear();
 			this.#sources.clear();

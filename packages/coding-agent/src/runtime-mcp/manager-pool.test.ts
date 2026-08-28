@@ -644,7 +644,7 @@ test("manager disconnectAll aggregates a rejecting retired HTTP-style close", as
 			}),
 		]),
 	);
-	expect(transports[0]?.closeCount).toBe(1);
+	expect(transports[0]?.closeCount).toBe(2);
 	expect(transports[1]?.closeCount).toBe(1);
 });
 
