@@ -2001,7 +2001,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 
 		// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
-		const { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
+		let { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
 			const ttsrSettings = settings.getGroup("ttsr");
 			const ttsrManager = new TtsrManager(ttsrSettings);
 			const rulesResult =
@@ -2444,6 +2444,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (!options.parentTaskPrefix) setActiveSkills([]);
 					await session?.replaceSkills([]);
 					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
+				}
+			}
+			if (options.rules === undefined) {
+				try {
+					const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd: to, agentDir, settings });
+					const nextTtsrManager = new TtsrManager(settings.getGroup("ttsr"));
+					const nextRulebookRules: Rule[] = [];
+					const nextAlwaysApplyRules: Rule[] = [];
+					for (const rule of rulesResult.items) {
+						if (rule.condition && rule.condition.length > 0 && nextTtsrManager.addRule(rule)) continue;
+						if (rule.alwaysApply === true) nextAlwaysApplyRules.push(rule);
+						else if (rule.description) nextRulebookRules.push(rule);
+					}
+					ttsrManager = nextTtsrManager;
+					rulebookRules = nextRulebookRules;
+					alwaysApplyRules = nextAlwaysApplyRules;
+					session?.setTtsrManager(ttsrManager);
+				} catch (error) {
+					logger.warn("Failed to reload rules after session rescope", {
+						error: safeErrorForLog(error),
+						cwd: to,
+					});
 				}
 			}
 			try {

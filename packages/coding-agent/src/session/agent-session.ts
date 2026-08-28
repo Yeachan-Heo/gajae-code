@@ -5699,6 +5699,11 @@ export class AgentSession {
 		return this.#ttsrManager;
 	}
 
+	/** Replace cwd-scoped TTSR state after a committed session rescope. */
+	setTtsrManager(ttsrManager: TtsrManager | undefined): void {
+		this.#ttsrManager = ttsrManager;
+	}
+
 	/** Whether a TTSR abort is pending (stream was aborted to inject rules) */
 	get isTtsrAbortPending(): boolean {
 		return this.#ttsrAbortPending;
