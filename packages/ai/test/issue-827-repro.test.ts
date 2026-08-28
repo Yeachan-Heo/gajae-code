@@ -121,7 +121,7 @@ describe("issue #827 lineage — kimi reasoning models avoid incompatible forced
 			baseUrl: "https://api.moonshot.ai/v1",
 			id: "kimi-k2.6",
 			name: "Kimi K2.6",
-			reasoning: false,
+			reasoning: true,
 		};
 		const body = (await captureBody(model, {
 			toolChoice: { type: "tool", name: "echo" },
