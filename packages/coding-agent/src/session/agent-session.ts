@@ -11573,8 +11573,26 @@ export class AgentSession {
 
 	/** Replace project-scoped settings after a committed cwd rescope. */
 	setSettings(settings: Settings): void {
+		this.#unregisterSessionMemorySettings?.();
+		this.#unregisterSessionMemorySettings = undefined;
+		this.#unregisterResourceGc?.();
+		this.#unregisterResourceGc = undefined;
 		this.settings = settings;
 		this.#skillsSettings = settings.getGroup("skills");
+		this.sessionManager.setSessionMemoryMode(settings.get("sessionMemory.mode"));
+		this.#unregisterSessionMemorySettings = settings.onChanged(settingPath => {
+			if (settingPath === "sessionMemory.mode") {
+				this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
+			}
+		});
+		const resourceGcSessionId = this.sessionManager.getSessionId();
+		if (resourceGcSessionId) {
+			this.#unregisterResourceGc = registerResourceGcSession({
+				sessionId: resourceGcSessionId,
+				settings,
+				cwd: () => this.sessionManager.getCwd(),
+			});
+		}
 	}
 
 	/** Replace cwd-scoped secret masking state after a committed rescope. */
