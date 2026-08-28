@@ -2272,6 +2272,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				secretsEnabled = false;
 				session.setObfuscator(undefined);
 			}
+			modelRegistry.setScopedSettings(settings);
+			modelRegistry.applyConfiguredModelBindings(settings);
 			for (const timer of notificationDebounceTimers.values()) clearTimeout(timer);
 			notificationDebounceTimers.clear();
 			let replacementReady = false;
