@@ -2318,19 +2318,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						nativeOnly: true,
 						settings,
 					});
-					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to, agentDir });
+					const { configs: pluginConfigs, sources: pluginSources } = await buildPluginMcpConfigs({
+						cwd: to,
+						agentDir,
+					});
 					const pluginNames = new Set(Object.keys(pluginConfigs));
 					replacementPluginNames = pluginNames;
 					replacementConventionalNames = new Set(Object.keys(loaded.configs));
 					const mergedConfigs = { ...loaded.configs, ...pluginConfigs };
 					const mergedSources = {
 						...loaded.sources,
-						...Object.fromEntries(
-							Object.keys(pluginConfigs).map(name => [
-								name,
-								{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
-							]),
-						),
+						...pluginSources,
 					};
 					if (Object.keys(mergedConfigs).length > 0) {
 						nextManager = new MCPManager(to, null, {
@@ -3342,7 +3340,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// tools are surfaced as always-on tools rather than gated behind MCP
 			// selection.
 			try {
-				const { configs, quarantine } = await buildPluginMcpConfigs({ cwd, agentDir });
+				const { configs, sources: pluginSources, quarantine } = await buildPluginMcpConfigs({ cwd, agentDir });
 				for (const q of quarantine) {
 					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
@@ -3351,12 +3349,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const mergedConfigs = { ...conventionalConfigs, ...configs };
 				const mergedSources = {
 					...conventionalSources,
-					...Object.fromEntries(
-						Object.keys(configs).map(name => [
-							name,
-							{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
-						]),
-					),
+					...pluginSources,
 				};
 				if (Object.keys(mergedConfigs).length > 0) {
 					const owned = new MCPManager(cwd, null, {

@@ -437,16 +437,22 @@ export async function renderSkillAdvertisement(input: {
  */
 export async function buildPluginMcpConfigs(input: { cwd: string; agentDir?: string }): Promise<{
 	configs: Record<string, any>;
+	sources: Record<string, { provider: string; providerName: string; level: "user" | "project"; path: string }>;
 	quarantine: SessionQuarantine[];
 }> {
 	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
-	if (effective.length === 0) return { configs: {}, quarantine: [] };
+	if (effective.length === 0) return { configs: {}, sources: {}, quarantine: [] };
 	const { assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed } = await import("./mcp-policy");
 	const nodePath = await import("node:path");
 
 	// A manifest-controlled MCP name such as "constructor" or "toString" must
 	// remain an ordinary own key rather than interacting with Object.prototype.
 	const configs: Record<string, any> = Object.create(null) as Record<string, any>;
+	const sources: Record<string, { provider: string; providerName: string; level: "user" | "project"; path: string }> =
+		Object.create(null) as Record<
+			string,
+			{ provider: string; providerName: string; level: "user" | "project"; path: string }
+		>;
 	for (const entry of active) {
 		const disabled = new Set(entry.disabledSurfaceIds);
 		for (const m of entry.surfaces.mcps) {
@@ -474,6 +480,12 @@ export async function buildPluginMcpConfigs(input: { cwd: string; agentDir?: str
 					// servers connect without bundle-declared headers.
 					configs[m.name] = bindPluginMcpToPublicNetwork({ type: cfg.transport, url: url.toString() });
 				}
+				sources[m.name] = {
+					provider: "gjc-plugins",
+					providerName: "GJC plugin bundle",
+					level: entry.scope === "user" ? "user" : "project",
+					path: entry.manifestPath,
+				};
 			} catch (error) {
 				quarantine.push({
 					identity: bundleIdentity(entry.scope, entry.name),
@@ -485,5 +497,5 @@ export async function buildPluginMcpConfigs(input: { cwd: string; agentDir?: str
 			}
 		}
 	}
-	return { configs, quarantine };
+	return { configs, sources, quarantine };
 }
