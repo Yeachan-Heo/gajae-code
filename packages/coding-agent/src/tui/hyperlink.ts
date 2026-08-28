@@ -7,12 +7,7 @@
  */
 import { TERMINAL } from "@gajae-code/tui";
 import { settings } from "../config/settings";
-import {
-	LocalProtocolHandler,
-	parseInternalUrl,
-	resolveLocalUrlToPath,
-	resolveMemoryUrlToPath,
-} from "../internal-urls";
+import { parseInternalUrl, resolveLocalUrlToPath, resolveMemoryUrlToPath } from "../internal-urls";
 import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 
 const OSC = "\x1b]";
@@ -106,7 +101,7 @@ export function tryResolveInternalUrlSync(
 ): string | undefined {
 	try {
 		if (input.startsWith("local://")) {
-			const opts = options?.localProtocolOptions ?? LocalProtocolHandler.resolveOptions();
+			const opts = options?.localProtocolOptions;
 			if (!opts) return undefined;
 			return resolveLocalUrlToPath(input, opts);
 		}
