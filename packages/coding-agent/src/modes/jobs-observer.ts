@@ -249,7 +249,7 @@ export class JobsObserver {
 			});
 		}
 
-		const activeMonitors = monitors.filter(monitor => monitor.status === "running");
+		const activeMonitors = monitors.filter(monitor => monitor.status === "running" && !monitor.backgrounded);
 		const cronSnapshots = listCronSnapshots(this.#ownerId);
 		const crons: CronJobView[] = cronSnapshots
 			.map(snapshot => ({

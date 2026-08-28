@@ -63,6 +63,25 @@ describe("JobsObserver", () => {
 		await manager.dispose();
 	});
 
+	test("does not count a backgrounded monitor that is also surfaced as folded work", async () => {
+		const manager = makeManager();
+		const observer = new JobsObserver(manager, OWNER);
+		const backgroundedId = registerMonitor(manager, "folded monitor");
+		const backgrounded = manager.getJob(backgroundedId);
+		if (!backgrounded) throw new Error("expected backgrounded monitor job");
+		manager.markBackgrounded(backgroundedId, backgrounded.generation);
+		registerMonitor(manager, "active monitor");
+
+		const snapshot = observer.getSnapshot();
+		expect(snapshot.activeMonitorCount).toBe(1);
+		expect(snapshot.foldedJobs).toEqual(
+			expect.arrayContaining([expect.objectContaining({ id: backgroundedId, backgrounded: true })]),
+		);
+
+		observer.dispose();
+		await manager.dispose();
+	});
+
 	test("cancelMonitor rejects a foreign owner's monitor id", async () => {
 		const manager = makeManager();
 		const observer = new JobsObserver(manager, OWNER);

@@ -47,7 +47,7 @@ export interface AsyncJob {
 	/** Safe, bounded summary of a terminal local (non-provider) failure kind. */
 	localErrorSummary?: LocalErrorSummary;
 	/** Compact delivery-failure marker retained while the job row remains live. */
-	deliveryFailure?: { attempt: number; lastError?: string };
+	deliveryFailure?: { attempt: number; lastError?: string; recordedAt: number };
 	metadata?: AsyncJobMetadata;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "0-Main",
@@ -295,6 +295,7 @@ interface DeadLetteredDelivery {
 	generation: string;
 	attempt: number;
 	lastError?: string;
+	recordedAt: number;
 }
 
 /**
@@ -629,6 +630,8 @@ export class AsyncJobManager {
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
+	/** Job ids retained by suppressed generations after terminal-event eviction. */
+	readonly #suppressedDeliveryJobIds = new Map<string, string>();
 	readonly #deliveryAckOwners = new Map<string, string>();
 	readonly #watchedJobs = new Map<string, number>();
 	readonly #watchedGenerations = new Map<string, number>();
@@ -932,7 +935,7 @@ export class AsyncJobManager {
 					const owner = this.#deliveryAckOwners.get(event.generation);
 					if (owner && owner !== state.token) continue;
 					this.#deliveryAckOwners.set(event.generation, state.token);
-					this.#suppressedDeliveries.add(event.generation);
+					this.#suppressDelivery(event.jobId, event.generation);
 				}
 				this.#deliveries.splice(
 					0,
@@ -2360,7 +2363,7 @@ export class AsyncJobManager {
 				backgrounded: currentJob?.generation === entry.generation && currentJob.metadata?.backgrounded === true,
 				attempt: entry.attempt,
 				lastError: entry.lastError,
-				recordedAt: Date.now(),
+				recordedAt: entry.recordedAt,
 			});
 		}
 		for (const entry of this.#evictedDeadLetters.values()) {
@@ -2482,15 +2485,15 @@ export class AsyncJobManager {
 		if (uniqueJobIds.length === 0) return 0;
 		for (const jobId of uniqueJobIds) {
 			const currentJob = this.#jobs.get(jobId);
-			if (currentJob) this.#suppressedDeliveries.add(currentJob.generation);
+			if (currentJob) this.#suppressDelivery(currentJob.id, currentJob.generation);
 			for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
-				if (delivery.jobId === jobId) this.#suppressedDeliveries.add(delivery.generation);
+				if (delivery.jobId === jobId) this.#suppressDelivery(delivery.jobId, delivery.generation);
 			}
 			for (const parked of this.#parkedDeliveries.values()) {
-				if (parked.jobId === jobId) this.#suppressedDeliveries.add(parked.generation);
+				if (parked.jobId === jobId) this.#suppressDelivery(parked.jobId, parked.generation);
 			}
 			for (const claim of this.#receiptClaims.values()) {
-				if (claim.jobId === jobId) this.#suppressedDeliveries.add(claim.generation);
+				if (claim.jobId === jobId) this.#suppressDelivery(claim.jobId, claim.generation);
 			}
 			for (const [generation, parked] of this.#parkedDeliveries) {
 				if (parked.jobId === jobId) this.#parkedDeliveries.delete(generation);
@@ -2726,6 +2729,7 @@ export class AsyncJobManager {
 		this.#deadLetteredDeliveryOwners.clear();
 		this.#deadLetterOverflowByOwner.clear();
 		this.#suppressedDeliveries.clear();
+		this.#suppressedDeliveryJobIds.clear();
 		this.#deliveryAckOwners.clear();
 		this.#waitGenerationAliases.clear();
 		this.#watchedJobs.clear();
@@ -2842,7 +2846,6 @@ export class AsyncJobManager {
 		this.#lifecyclePhases.delete(jobId);
 		this.#deadLetteredDeliveries.delete(jobId);
 		this.#deadLetteredDeliveryOwners.delete(jobId);
-		this.#suppressedDeliveries.delete(jobId);
 		if (job) this.#publishedTerminalGenerations.delete(job.generation);
 		this.#outputState.delete(jobId);
 	}
@@ -2926,6 +2929,11 @@ export class AsyncJobManager {
 		);
 	}
 
+	#suppressDelivery(jobId: string | null, generation: string): void {
+		this.#suppressedDeliveries.add(generation);
+		if (jobId !== null) this.#suppressedDeliveryJobIds.set(generation, jobId);
+	}
+
 	isDeliverySuppressed(jobId: string, generation?: string): boolean {
 		const watchedGeneration = generation ?? this.#jobs.get(jobId)?.generation;
 		return (
@@ -2960,16 +2968,12 @@ export class AsyncJobManager {
 		for (const claim of this.#receiptClaims.values()) {
 			if (claim.jobId === jobId) return true;
 		}
-		if (this.#suppressedDeliveries.has(jobId)) return true;
+		for (const suppressedJobId of this.#suppressedDeliveryJobIds.values()) {
+			if (suppressedJobId === jobId) return true;
+		}
 		if (this.#deadLetteredDeliveries.has(jobId)) return true;
 		for (const entry of this.#evictedDeadLetters.values()) {
 			if (entry.jobId === jobId) return true;
-		}
-		// Acknowledged deliveries are removed from #deliveries, so resolve their
-		// job id through the retained terminal event while the suppressed generation
-		// remains observable.
-		for (const event of this.#terminalEvents.values()) {
-			if (event.jobId === jobId && this.#suppressedDeliveries.has(event.generation)) return true;
 		}
 		return false;
 	}
@@ -3006,7 +3010,8 @@ export class AsyncJobManager {
 		this.#pruneEvictedDeadLetters();
 		const currentJob = this.#jobs.get(delivery.jobId);
 		if (!currentJob || currentJob.generation !== delivery.generation) return;
-		currentJob.deliveryFailure = { attempt: delivery.attempt, lastError: delivery.lastError };
+		const recordedAt = Date.now();
+		currentJob.deliveryFailure = { attempt: delivery.attempt, lastError: delivery.lastError, recordedAt };
 		this.#deadLetteredDeliveries.delete(delivery.jobId);
 		this.#deadLetteredDeliveryOwners.delete(delivery.jobId);
 		this.#deadLetteredDeliveries.set(delivery.jobId, {
@@ -3014,6 +3019,7 @@ export class AsyncJobManager {
 			generation: delivery.generation,
 			attempt: delivery.attempt,
 			lastError: delivery.lastError,
+			recordedAt,
 		});
 		this.#deadLetteredDeliveryOwners.set(delivery.jobId, delivery.ownerId);
 		// The dead-lettered delivery never injects a message and has no later

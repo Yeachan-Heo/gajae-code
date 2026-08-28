@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import {
 	lookupOwnedRegistration,
@@ -86,6 +86,35 @@ describe("AsyncJobManager delivery reliability", () => {
 			expect(delivered).toEqual([first, second]);
 		} finally {
 			releaseDelivery.resolve();
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
+
+	test("does not reuse a suppressed job id after its terminal event expires", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const originalNow = Date.now;
+		try {
+			const originalId = manager.register("task", "suppressed", async () => "done", {
+				id: "expired-terminal",
+			});
+			const target = manager.resolveSubagentWaitTarget(originalId);
+			if (!target) throw new Error("expected terminal wait target");
+			const wait = manager.subscribeTerminalWait([target], "all_terminal");
+			await manager.getJob(originalId)?.promise;
+			expect((await wait.result).outcome).toBe("completed");
+			expect(wait.acknowledge()).toEqual({ acknowledged: true, jobIds: [originalId] });
+
+			const expiredNow = originalNow() + 300_001;
+			vi.spyOn(Date, "now").mockReturnValue(expiredNow);
+			// This prunes the terminal event. The suppressed generation must still
+			// reserve its original id through the independent generation projection.
+			manager.getJobsSnapshot();
+			const replacementId = manager.register("task", "replacement", async () => "replacement", {
+				id: originalId,
+			});
+			expect(replacementId).toBe(`${originalId}-2`);
+		} finally {
+			vi.restoreAllMocks();
 			await manager.dispose({ timeoutMs: 250 });
 		}
 	});
@@ -216,6 +245,7 @@ describe("AsyncJobManager delivery reliability", () => {
 			await waitFor(() => manager.getJobsSnapshot().deadLettered.length === 1, 2_000);
 
 			const liveDeadLetter = manager.getJobsSnapshot().deadLettered[0];
+			const recordedAt = liveDeadLetter.recordedAt;
 			expect(liveDeadLetter).toMatchObject({
 				jobId,
 				generation,
@@ -223,6 +253,8 @@ describe("AsyncJobManager delivery reliability", () => {
 				attempt: 3,
 				lastError: "delivery always fails while retained",
 			});
+			await Bun.sleep(20);
+			expect(manager.getJobsSnapshot().deadLettered[0]?.recordedAt).toBe(recordedAt);
 
 			await waitFor(() => manager.getJob(jobId) === undefined, 4_000);
 			const evictedDeadLetter = manager.getJobsSnapshot().deadLettered[0];
