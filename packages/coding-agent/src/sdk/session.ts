@@ -2486,14 +2486,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				session?.setObfuscator(undefined);
 			}
 			extensionRunner?.rebindScope(to, settings);
-			try {
-				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, settings });
-				contextFiles = rediscovered.contextFiles;
-			} catch (error) {
-				contextFiles = [];
-				logger.warn("Failed to re-discover context files after session rescope", {
-					error: safeErrorForLog(error),
-				});
+			if (options.contextFiles === undefined) {
+				try {
+					const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, settings });
+					contextFiles = rediscovered.contextFiles;
+				} catch (error) {
+					contextFiles = [];
+					logger.warn("Failed to re-discover context files after session rescope", {
+						error: safeErrorForLog(error),
+					});
+				}
 			}
 			if (options.skills === undefined && settings.get("skills.enabled")) {
 				try {
@@ -2513,6 +2515,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await session?.replaceSkills([]);
 					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
 				}
+			} else if (options.skills === undefined) {
+				skills = [];
+				if (!options.parentTaskPrefix) setActiveSkills([]);
+				await session?.replaceSkills([]);
 			}
 			if (options.rules === undefined) {
 				try {
@@ -2550,14 +2556,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			// The launch-bound tree is retired immediately: a stale root-scoped tree is
 			// worse than none, and the next turn re-scans at the new cwd.
-			liveWorkspaceTree = undefined;
-			workspaceTreePromise = Promise.resolve({
-				rootPath: to,
-				rendered: "",
-				truncated: false,
-				totalLines: 0,
-				agentsMdFiles: [],
-			});
+			if (options.workspaceTree === undefined) {
+				liveWorkspaceTree = undefined;
+				workspaceTreePromise = Promise.resolve({
+					rootPath: to,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				});
+			}
 			workspaceTreePromise.catch(() => {});
 			try {
 				session?.retireWorkspaceTreeForRescope();
