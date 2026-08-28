@@ -2577,6 +2577,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					ttsrManager = nextTtsrManager;
 					rulebookRules = nextRulebookRules;
 					alwaysApplyRules = nextAlwaysApplyRules;
+					if (!options.parentTaskPrefix) setActiveRules([...rulebookRules, ...alwaysApplyRules]);
 					session?.setTtsrManager(ttsrManager);
 				} catch (error) {
 					logger.warn("Failed to reload rules after session rescope", {
