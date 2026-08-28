@@ -2284,6 +2284,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				pluginMcpToolNames.length = 0;
 				conventionalMcpToolNames.length = 0;
 				let nextManager: MCPManager | undefined;
+				let replacementPluginNames = new Set<string>();
+				let replacementConventionalNames = new Set<string>();
 				try {
 					const loaded = await loadAllMCPConfigs(to, {
 						agentDir,
@@ -2296,6 +2298,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					});
 					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to, agentDir });
 					const pluginNames = new Set(Object.keys(pluginConfigs));
+					replacementPluginNames = pluginNames;
+					replacementConventionalNames = new Set(Object.keys(loaded.configs));
 					const mergedConfigs = { ...loaded.configs, ...pluginConfigs };
 					const mergedSources = {
 						...loaded.sources,
@@ -2414,6 +2418,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						throw error;
 					}
 				}
+				if (nextManager) {
+					pluginMcpManagerServers.set(nextManager, replacementPluginNames);
+					conventionalMcpManagerServers.set(nextManager, replacementConventionalNames);
+				} else {
+					await session.rebindMCPSelectionMetadata({ mandatoryToolNames: [], defaultSelectedToolNames: [] });
+				}
 				mcpManager = nextManager;
 				ownsMcpManager = Boolean(nextManager);
 				await session.replaceOwnedMcpManager(nextManager);
@@ -2424,8 +2434,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					pendingReplacementTools = undefined;
 					replacementMcpToolsSync = replacementMcpToolsSync
 						.then(() => {
-							if (generation !== replacementMcpGeneration) return;
+							if (generation !== replacementMcpGeneration || mcpManager !== nextManager) return;
 							return session.refreshMCPTools(pending);
+						})
+						.then(() => {
+							if (generation !== replacementMcpGeneration || mcpManager !== nextManager) return;
+							return session.rebindMCPSelectionMetadata({
+								mandatoryToolNames: pending
+									.filter(
+										tool =>
+											tool.mcpServerName !== undefined && replacementPluginNames.has(tool.mcpServerName),
+									)
+									.map(tool => tool.name),
+								defaultSelectedToolNames: pending.map(tool => tool.name),
+							});
 						})
 						.catch(error => {
 							logger.warn("Failed to refresh relocated MCP tools", { error: safeErrorForLog(error) });
