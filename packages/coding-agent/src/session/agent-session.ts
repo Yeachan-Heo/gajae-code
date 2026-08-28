@@ -11575,6 +11575,11 @@ export class AgentSession {
 		this.settings = settings;
 	}
 
+	/** Replace cwd-scoped secret masking state after a committed rescope. */
+	setObfuscator(obfuscator: SecretObfuscator | undefined): void {
+		this.#obfuscator = obfuscator;
+	}
+
 	/** Replace cwd-scoped prompt templates after a committed session rescope. */
 	setPromptTemplates(promptTemplates: PromptTemplate[]): void {
 		this.#promptTemplates = [...promptTemplates];

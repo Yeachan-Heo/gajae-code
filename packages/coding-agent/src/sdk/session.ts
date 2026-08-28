@@ -149,6 +149,7 @@ import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state"
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
+import * as secretApi from "../secrets";
 import { AgentSession, type AgentSessionRescopeParticipant, type ForkContextSeed } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
@@ -1717,7 +1718,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				obfuscator = secrets.createSecretObfuscator(allEntries);
 			}
 		}
-		const secretsEnabled = obfuscator?.hasSecrets() === true;
+		let secretsEnabled = obfuscator?.hasSecrets() === true;
 
 		// Check if session has existing data to restore
 		const existingSession = logger.time("loadSessionContext", () =>
@@ -2447,6 +2448,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					toolSession.settings = settings;
 				} catch (error) {
 					logger.warn("Failed to reload settings after session rescope", {
+						error: safeErrorForLog(error),
+						cwd: to,
+					});
+				}
+			}
+			if (settings.get("secrets.enabled")) {
+				try {
+					const entries = [...secretApi.collectEnvSecrets(), ...(await secretApi.loadSecrets(to, agentDir))];
+					obfuscator = entries.length > 0 ? secretApi.createSecretObfuscator(entries) : undefined;
+					secretsEnabled = obfuscator?.hasSecrets() === true;
+					session?.setObfuscator(obfuscator);
+				} catch (error) {
+					logger.warn("Failed to reload secrets after session rescope", {
 						error: safeErrorForLog(error),
 						cwd: to,
 					});
