@@ -11191,6 +11191,7 @@ export class SessionManager {
 		const managedMove = this.destination.kind === "managed" && nextDestination.kind === "managed";
 		let managedSourceStore: ManagedSessionDescendantStore | undefined;
 		let managedDestinationStore: ManagedSessionDescendantStore | undefined;
+		let managedPublishedIdentity: ManagedFileIdentity | undefined;
 		let rollbackManagedMove: (() => Promise<void>) | undefined;
 		let residentTransition: PreparedResidentStoreTransition | undefined;
 		const hadPersistedSession = this.#ensuredOnDisk;
@@ -11318,8 +11319,16 @@ export class SessionManager {
 								managedPublishedArtifacts,
 							);
 						}
-						if (managedTranscript && !managedSourceStore.readExpected(path.basename(oldSessionFile)))
-							await managedSourceStore.publishNoReplace(path.basename(oldSessionFile), managedTranscript.bytes);
+						if (managedTranscript) {
+							const source = managedSourceStore.readExpected(path.basename(oldSessionFile));
+							if (source && !managedFileSnapshotEquals(source, managedTranscript))
+								throw new Error("managed_move_source_replaced");
+							if (!source)
+								await managedSourceStore.publishNoReplace(
+									path.basename(oldSessionFile),
+									managedTranscript.bytes,
+								);
+						}
 					};
 					managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
 					hadSessionFile = managedTranscript !== null;
@@ -11350,6 +11359,7 @@ export class SessionManager {
 						const terminalTranscript = managedDestinationStore.readExpected(path.basename(newSessionFile));
 						if (!managedFileSnapshotEquals(terminalTranscript, managedPublishedTranscript))
 							throw new Error("managed_move_destination_transcript_changed");
+						managedPublishedIdentity = { ...managedPublishedTranscript.identity };
 					}
 					if (managedPublishedArtifacts) {
 						const terminalArtifacts = managedDestinationStore.captureTree(path.basename(newArtifactDir));
@@ -11504,7 +11514,8 @@ export class SessionManager {
 		// have no destination transcript yet, so adopting a strict expected identity here
 		// would invent identity for a nonexistent file; defer adoption until the first real
 		// publication (#writeEntriesAtomicallySync / #appendManagedRecordsSync) instead.
-		if (hadSessionFile) this.#adoptManagedPersistIdentity(this.#sessionFile);
+		if (hadSessionFile && managedPublishedIdentity) this.#managedPersistExpectedIdentity = managedPublishedIdentity;
+		else if (hadSessionFile) this.#adoptManagedPersistIdentity(this.#sessionFile);
 		else this.#managedPersistExpectedIdentity = undefined;
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
