@@ -1,7 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, normalizePathForComparison } from "@gajae-code/utils";
 import {
 	type GjcBundleTransactionDecision,
 	GjcPluginSourceUnavailableError,
@@ -376,7 +376,10 @@ function resolveUninstallTarget(
 
 	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot, ctx.agentDir);
 	if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
-	if (root !== expectedInstalledRoot(identity.scope, ctx.cwd, entry, ctx.agentDir))
+	if (
+		normalizePathForComparison(root) !==
+		normalizePathForComparison(expectedInstalledRoot(identity.scope, ctx.cwd, entry, ctx.agentDir))
+	)
 		return { ok: false, error: uninstallFailure(identity, "metadata") };
 	return { ok: true, value: { entry, root } };
 }
