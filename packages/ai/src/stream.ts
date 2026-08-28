@@ -706,7 +706,10 @@ export function streamSimple<TApi extends Api>(
 	// Check custom API registry (extension-provided APIs)
 	const customApiProvider = getCustomApi(model.api);
 	if (customApiProvider) {
-		const events = customApiProvider.streamSimple(model, context, { ...options, maxTokens: resolvedRequestMaxTokens });
+		const events = customApiProvider.streamSimple(model, context, {
+			...options,
+			maxTokens: resolvedRequestMaxTokens,
+		});
 		if (!options?.onStreamCreated) return events;
 		const forwarded = new AssistantMessageEventStream();
 		pipeAssistantStream(forwarded, events, options.signal, options.onStreamCreated);
