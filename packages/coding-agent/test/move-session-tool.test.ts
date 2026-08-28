@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
+import * as capability from "@gajae-code/coding-agent/capability";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
@@ -1162,6 +1163,28 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 			await managerA.close();
+		}
+	});
+
+	it("resets capability caches for a non-process-cwd owner move", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const owner = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const sibling = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		expect(SessionManager.claimProcessCwdOwnership(owner)).toBe(true);
+		expect(SessionManager.claimProcessCwdOwnership(sibling)).toBe(false);
+		const reset = vi.spyOn(capability, "reset");
+		const { session } = await makeSession(cwdA, sibling, { toolNames: ["move_session"] });
+		try {
+			await session.getToolByName("move_session")!.execute("move-cache-reset", { path: repoB });
+			expect(reset).toHaveBeenCalled();
+		} finally {
+			reset.mockRestore();
+			await session.dispose();
+			await owner.close();
 		}
 	});
 
