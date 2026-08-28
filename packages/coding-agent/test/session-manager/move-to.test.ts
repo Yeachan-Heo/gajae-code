@@ -225,6 +225,35 @@ describe("SessionManager.moveTo", () => {
 		await session.close();
 	});
 
+	it("rejects a replaced target before adopting an in-memory session cwd", async () => {
+		const session = SessionManager.inMemory(cwdA);
+		const replacement = path.join(testAgentDir, "in-memory-replacement");
+		fs.mkdirSync(replacement);
+		const opened = fs.statSync(cwdB, { bigint: true });
+		let statCalls = 0;
+		const targetHandle = {
+			stat: async () => {
+				statCalls++;
+				if (statCalls === 2) {
+					fs.rmdirSync(cwdB);
+					fs.symlinkSync(replacement, cwdB);
+				}
+				return opened;
+			},
+		};
+
+		await expect(
+			session.moveTo(cwdB, {
+				expectedIdentity: { dev: opened.dev, ino: opened.ino },
+				targetHandle,
+			}),
+		).rejects.toThrow(/replaced path|identity changed/);
+		expect(statCalls).toBe(2);
+		expect(session.getCwd()).toBe(cwdA);
+		expect(fs.lstatSync(cwdB).isSymbolicLink()).toBe(true);
+		await session.close();
+	});
+
 	it("detaches the active session before deleting its transcript", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "delete me", timestamp: 1 });

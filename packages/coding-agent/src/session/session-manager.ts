@@ -11469,6 +11469,12 @@ export class SessionManager {
 			}
 		}
 
+		// Non-persistent managers have no publication rollback boundary, so perform
+		// the same final handle identity check before adopting the target cwd.
+		if (!(this.persist && this.#sessionFile) && (options?.expectedIdentity || options?.targetHandle)) {
+			await this.#assertCwdTargetIdentity(resolvedCwd, options);
+		}
+
 		// Update cwd and sessionDir after physical publication succeeds. Metadata failures restore the source
 		// authority but deliberately retain any destination publication evidence rather than deleting it.
 		if (!targetIdentityRevalidated && (options?.expectedIdentity || options?.targetHandle)) {
@@ -11555,7 +11561,6 @@ export class SessionManager {
 			throw error;
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
-
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
 			writeTerminalBreadcrumb(resolvedCwd, this.#sessionFile);
