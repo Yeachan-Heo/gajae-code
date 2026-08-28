@@ -1075,18 +1075,18 @@ export class Agent {
 		}
 		const shell = source.shell?.bind(source);
 		if (shell) {
-			guarded.shell = async (args, signal) => {
+			guarded.shell = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await shell(args, signal);
+				const result = await shell(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const shellStream = source.shellStream?.bind(source);
 		if (shellStream) {
-			guarded.shellStream = async (args, callbacks, signal) => {
+			guarded.shellStream = async (args, callbacks, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await shellStream(args, callbacks, signal);
+				const result = await shellStream(args, callbacks, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};

@@ -86,11 +86,11 @@ async function executeTool(
 		const result = buildToolErrorResult(`Tool "${toolName}" not available`);
 		return createToolResultMessage(toolCallId, toolName, result, true);
 	}
-	if (tool.nonAbortable) markNonAbortable?.();
-
 	// `tool` is the object this call will run; pass it so the start event carries proven
 	// provenance instead of a name a consumer would have to re-resolve later.
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args }, tool);
+	if (execSignal?.aborted) throw cursorAbortError(execSignal);
+	if (tool.nonAbortable) markNonAbortable?.();
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
@@ -149,6 +149,7 @@ async function executeDelete(
 	const toolName = "delete";
 	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
+	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 	// Delete is a filesystem mutation with no cooperative cancellation point:
 	// mark it non-abortable so the settlement fence publishes the exec terminal
 	// only once the unlink is final, matching write/edit dispatch.
@@ -375,7 +376,11 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		return toolResultMessage;
 	}
 
-	async shell(args: Parameters<NonNullable<ICursorExecHandlers["shell"]>>[0], signal?: AbortSignal) {
+	async shell(
+		args: Parameters<NonNullable<ICursorExecHandlers["shell"]>>[0],
+		signal?: AbortSignal,
+		markNonAbortable?: () => void,
+	) {
 		const toolCallId = decodeToolCallId(args.toolCallId);
 		const timeoutSeconds = shellTimeoutSeconds(args.timeout);
 		const toolResultMessage = await executeTool(
@@ -389,6 +394,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			},
 			undefined,
 			signal,
+			markNonAbortable,
 		);
 		return toolResultMessage;
 	}
@@ -417,6 +423,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		};
 
 		options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: toolArgs }, tool);
+		if (signal?.aborted) throw cursorAbortError(signal);
 
 		let result: AgentToolResult<unknown>;
 		let isError = false;
@@ -532,6 +539,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			},
 			undefined,
 			call.signal,
+			call.markNonAbortable,
 		);
 	}
 

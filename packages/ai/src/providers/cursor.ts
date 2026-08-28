@@ -1988,6 +1988,7 @@ async function handleExecServerMessage(
 				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
 				execSignal,
+				markNonAbortable,
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
