@@ -905,43 +905,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
-			// Watchdog scaffolding is declared before the proxy handshake so the
-			// first-event deadline can cover setup too: Cursor is a watchdog owner
-			// (the lazy wrapper's first-event timer is disabled for it), and the
-			// proxy tunnel connect below waits up to its own 30s timeout before any
-			// watchdog would otherwise be armed. A caller-supplied
-			// streamFirstEventTimeoutMs shorter than that must still bound setup.
-			if (proxyUrl) {
-				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
-					signal: options?.signal,
-					timeoutMs: 30_000,
-				});
-				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
-			} else {
-				h2Client = http2.connect(baseUrl);
-			}
-			// Recheck after the (possibly async) proxy handshake, immediately before
-			// the bearer-authenticated request is created.
-			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
-			h2ClientErrorHandler = error => settleH2(error);
-			h2Client.on("error", h2ClientErrorHandler);
 
-			options?.onStreamCreated?.();
-			h2Request = h2Client.request({
-				":method": "POST",
-				":path": "/agent.v1.AgentService/Run",
-				"content-type": "application/connect+proto",
-				"connect-protocol-version": "1",
-				te: "trailers",
-				authorization: `Bearer ${apiKey}`,
-				"x-ghost-mode": "true",
-				"x-cursor-client-version": CURSOR_CLIENT_VERSION,
-				"x-cursor-client-type": "cli",
-				"x-request-id": crypto.randomUUID(),
-			});
-			h2RequestErrorHandler = error => settleH2(error);
-			h2Request.on("error", h2RequestErrorHandler);
-			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			// Cursor owns the first-event watchdog, so its budget starts before
 			// history/blob/protobuf serialization. Synchronous setup cannot be
 			// interrupted by a timer; the remaining-budget check below prevents a
@@ -977,19 +941,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				);
 			};
 			let firstEventWatchdogArmed = false;
-			remainingFirstEventTimeoutMs =
-				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
-					? firstEventTimeoutMs
-					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
-			if (
-				remainingFirstEventTimeoutMs !== undefined &&
-				firstEventTimeoutMs !== undefined &&
-				firstEventTimeoutMs > 0 &&
-				remainingFirstEventTimeoutMs <= 0
-			) {
-				throw createFirstEventTimeoutError();
-			}
-			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
 			remainingFirstEventTimeoutMs =
 				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
 					? firstEventTimeoutMs
@@ -1068,6 +1019,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			h2Client.on("close", h2ClientCloseHandler);
 
+			options?.onStreamCreated?.();
 			h2Request = h2Client.request({
 				":method": "POST",
 				":path": "/agent.v1.AgentService/Run",
