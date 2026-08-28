@@ -11553,6 +11553,11 @@ export class AgentSession {
 		return this.#promptTemplates;
 	}
 
+	/** Replace cwd-scoped prompt templates after a committed session rescope. */
+	setPromptTemplates(promptTemplates: PromptTemplate[]): void {
+		this.#promptTemplates = [...promptTemplates];
+	}
+
 	/** Replace file-based slash commands used for prompt expansion. */
 	setSlashCommands(slashCommands: FileSlashCommand[]): void {
 		this.#slashCommands = [...slashCommands];

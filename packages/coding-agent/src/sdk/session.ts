@@ -2446,6 +2446,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
 				}
 			}
+			try {
+				promptTemplates =
+					options.promptTemplates === undefined
+						? await discoverPromptTemplates(to, agentDir)
+						: options.promptTemplates;
+				session?.setPromptTemplates(promptTemplates);
+			} catch (error) {
+				logger.warn("Failed to reload prompt templates after session rescope", {
+					error: safeErrorForLog(error),
+					cwd: to,
+				});
+			}
 			// The launch-bound tree is retired immediately: a stale root-scoped tree is
 			// worse than none, and the next turn re-scans at the new cwd.
 			liveWorkspaceTree = undefined;
@@ -4277,7 +4289,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			toolRegistry,
 		);
 
-		const promptTemplates = await promptTemplatesPromise;
+		let promptTemplates = await promptTemplatesPromise;
 		toolSession.promptTemplates = promptTemplates;
 
 		const slashCommands = await slashCommandsPromise;
