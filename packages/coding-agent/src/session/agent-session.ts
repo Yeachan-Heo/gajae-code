@@ -10613,9 +10613,10 @@ export class AgentSession {
 		mandatoryToolNames?: readonly string[];
 		defaultSelectedToolNames?: readonly string[];
 	}): Promise<void> {
-		for (const name of options.mandatoryToolNames ?? []) this.#mandatoryMCPToolNames.add(name.toLowerCase());
-		for (const name of options.defaultSelectedToolNames ?? [])
-			this.#defaultSelectedMCPToolNames.add(name.toLowerCase());
+		this.#mandatoryMCPToolNames = new Set((options.mandatoryToolNames ?? []).map(name => name.toLowerCase()));
+		this.#defaultSelectedMCPToolNames = new Set(
+			(options.defaultSelectedToolNames ?? []).map(name => name.toLowerCase()),
+		);
 		const active = [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()];
 		await this.#applyActiveToolsByName(active);
 	}

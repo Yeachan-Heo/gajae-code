@@ -2330,19 +2330,32 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 							replacementMcpToolsSync = replacementMcpToolsSync
 								.then(() => {
-									if (generation !== replacementMcpGeneration) return;
+									if (generation !== replacementMcpGeneration || mcpManager !== nextManager) return;
 									return session.refreshMCPTools(tools as CustomTool[]);
 								})
-								.then(() =>
-									session.rebindMCPSelectionMetadata({
+								.then(() => {
+									if (generation !== replacementMcpGeneration || mcpManager !== nextManager) return;
+									return session.rebindMCPSelectionMetadata({
 										mandatoryToolNames: (tools as CustomTool[])
 											.filter(
 												tool => tool.mcpServerName !== undefined && pluginNames.has(tool.mcpServerName),
 											)
 											.map(tool => tool.name),
 										defaultSelectedToolNames: (tools as CustomTool[]).map(tool => tool.name),
-									}),
-								)
+									});
+								})
+								.then(() => {
+									if (
+										generation === replacementMcpGeneration &&
+										mcpManager === nextManager &&
+										pluginNames.size > 0 &&
+										!Object.keys(loaded.configs).some(
+											name => nextManager?.getConnectionStatus(name) === "connecting",
+										)
+									) {
+										nextManager?.sealConnectionSet();
+									}
+								})
 								.catch(error => {
 									logger.warn("Failed to refresh relocated MCP tools", { error: safeErrorForLog(error) });
 								});
