@@ -4,6 +4,9 @@
  * Internal URLs (agent://, artifact://, memory://, rule://, gjc://, local://) are resolved by tools like read,
  * providing access to agent outputs and server resources without exposing filesystem paths.
  */
+import type { Rule } from "../capability/rule";
+import type { Skill } from "../extensibility/skills";
+import type { MCPManager } from "../runtime-mcp/manager";
 
 /**
  * Raw resource payload returned by protocol handlers. The `immutable` flag is
@@ -66,7 +69,11 @@ export interface ResolveContext {
 	/** Caller's abort signal. */
 	signal?: AbortSignal;
 	/** Scope-held MCP facade used for mcp:// resolution; never inferred from process-global state. */
-	mcpManager?: import("../runtime-mcp/manager").MCPManager;
+	mcpManager?: MCPManager;
+	/** Skills loaded by the calling session. */
+	skills?: readonly Skill[];
+	/** Rules loaded by the calling session. */
+	rules?: readonly Rule[];
 }
 
 /**

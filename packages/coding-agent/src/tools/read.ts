@@ -11,7 +11,7 @@ import * as z from "zod/v4";
 import { getFileReadCache } from "../edit/file-read-cache";
 import { isNotebookPath, readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import { getActiveSkills } from "../extensibility/skills";
+
 import { formatHashLine, formatHashLines, formatLineHash, HL_BODY_SEP } from "../hashline/hash";
 import { InternalUrlRouter } from "../internal-urls";
 import { parseInternalUrl } from "../internal-urls/parse";
@@ -2686,7 +2686,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		const internalRouter = InternalUrlRouter.instance();
 		if (internalRouter.canHandle(readPath)) {
 			const internalTarget = splitInternalUrlSel(readPath, {
-				activeSkillNames: getActiveSkills().map(skill => skill.name),
+				activeSkillNames: (this.session.skills ?? []).map(skill => skill.name),
 			});
 			const parsed = parseSel(internalTarget.sel);
 			if (internalTarget.sel !== undefined && parsed.kind === "none") {
@@ -3501,6 +3501,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			settings: this.session.settings,
 			signal,
 			mcpManager: this.session.getMcpManager?.(),
+			skills: this.session.skills,
+			rules: this.session.rules,
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
 
