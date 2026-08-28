@@ -583,6 +583,38 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
+	it("refuses a Hindsight bank-scope change before publication", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+
+		const settings = Settings.isolated(
+			{
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "",
+			},
+			{ agentDir: path.dirname(cwdA) },
+		);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const moveSpy = vi.spyOn(sessionManager, "moveTo");
+		const { session } = await makeSession(cwdA, sessionManager, {
+			settings,
+			toolNames: ["move_session"],
+		});
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			await expect(moveTool.execute("move-hindsight-scope", { path: cwdB })).rejects.toThrow(
+				/Hindsight bank scope and queued retains are launch-bound/,
+			);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(moveSpy).not.toHaveBeenCalled();
+		} finally {
+			await session.dispose();
+			moveSpy.mockRestore();
+		}
+	});
 
 	it("rejects a missing directory instead of moving", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));

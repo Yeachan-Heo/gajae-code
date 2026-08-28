@@ -3276,6 +3276,21 @@ function retainedTreeSnapshotEqualsAfterRename(
 	);
 }
 
+/** Compare a copied tree's durable contents without requiring copied inode identities. */
+function retainedTreeContentEquals(
+	left: native.NativeDirectoryTreeSnapshot,
+	right: native.NativeDirectoryTreeSnapshot,
+): boolean {
+	const comparable = (tree: native.NativeDirectoryTreeSnapshot) =>
+		tree.entries.map(entry => ({
+			relativePath: entry.relativePath,
+			kind: entry.kind,
+			size: entry.size,
+			sha256: entry.sha256,
+		}));
+	return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right));
+}
+
 /**
  * True when a cleanup error only reports the authorized POSIX quarantine.
  *
@@ -11410,7 +11425,7 @@ export class SessionManager {
 									managedPublishedArtifacts,
 								);
 								const restored = managedSourceStore.captureTree(path.basename(oldArtifactDir));
-								if (!retainedTreeSnapshotEqualsAfterRename(restored, managedArtifacts))
+								if (!retainedTreeContentEquals(restored, managedArtifacts))
 									throw new Error("managed_move_source_restore_mismatch");
 							}
 						}

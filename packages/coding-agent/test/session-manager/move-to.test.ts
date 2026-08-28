@@ -181,6 +181,50 @@ describe("SessionManager.moveTo", () => {
 		expect(fs.existsSync(sourceFile)).toBe(true);
 	});
 
+	it("rolls back publication when the target is replaced before the final identity check", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sourceFile = session.getSessionFile()!;
+		const artifactId = await session.saveArtifact("authoritative artifact", "bash");
+		if (!artifactId) throw new Error("Expected artifact id");
+		const sourceArtifact = path.join(sourceFile.slice(0, -6), `${artifactId}.bash.log`);
+		const destinationFile = path.join(SessionManager.getDefaultSessionDir(cwdB), path.basename(sourceFile));
+		const replacement = path.join(testAgentDir, "replacement");
+		fs.mkdirSync(replacement);
+		const opened = fs.statSync(cwdB, { bigint: true });
+		let statCalls = 0;
+		const targetHandle = {
+			stat: async () => {
+				statCalls++;
+				if (statCalls === 2) {
+					fs.rmdirSync(cwdB);
+					fs.symlinkSync(replacement, cwdB);
+				}
+				return opened;
+			},
+		};
+
+		await expect(
+			session.moveTo(cwdB, {
+				expectedIdentity: { dev: opened.dev, ino: opened.ino },
+				targetHandle,
+			}),
+		).rejects.toThrow(/replaced path|identity changed/);
+		expect(statCalls).toBe(2);
+		expect(session.getCwd()).toBe(cwdA);
+		expect(session.getSessionFile()).toBe(sourceFile);
+		expect(fs.existsSync(sourceFile)).toBe(true);
+		expect(fs.existsSync(destinationFile)).toBe(true);
+		expect(fs.readFileSync(sourceFile, "utf8")).toBe(fs.readFileSync(destinationFile, "utf8"));
+		expect(fs.readFileSync(sourceArtifact, "utf8")).toBe("authoritative artifact");
+		expect(fs.readFileSync(path.join(destinationFile.slice(0, -6), path.basename(sourceArtifact)), "utf8")).toBe(
+			"authoritative artifact",
+		);
+		await session.close();
+	});
+
 	it("detaches the active session before deleting its transcript", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "delete me", timestamp: 1 });

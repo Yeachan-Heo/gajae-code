@@ -124,6 +124,7 @@ import { getMemoryRootForSession } from "../internal-urls/memory-protocol";
 import type { LspStartupServerInfo } from "../lsp";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
+import { getMemoryBackendRescopeError } from "../memory-backend/service";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
@@ -1424,6 +1425,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig)));
 	const ownsScopedSettings = options.settings === undefined;
 	let settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
+	let preparedRescopeSettings: { cwd: string; settings: Settings } | undefined;
 	const initialOwnedSettings = ownsScopedSettings ? settings : undefined;
 	const modelRegistry =
 		options.modelRegistry ??
@@ -2277,8 +2279,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const rebindCwdCapturingAuthority = async (to: string): Promise<void> => {
 			if (!session) return;
 			const generation = ++replacementMcpGeneration;
+			const prepared = preparedRescopeSettings?.cwd === to ? preparedRescopeSettings.settings : undefined;
+			preparedRescopeSettings = undefined;
 			if (settings.getCwd() !== to) {
-				settings = await settings.cloneForCwd(to);
+				settings = prepared ?? (await settings.cloneForCwd(to));
 				session.setSettings(settings);
 				toolSession.settings = settings;
 			}
@@ -2702,6 +2706,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 							);
 						}
+					},
+					prepareRescope: async (to: string): Promise<void> => {
+						const targetSettings = settings.getCwd() === to ? settings : await settings.cloneForCwd(to);
+						const memoryError = await getMemoryBackendRescopeError(settings, targetSettings);
+						if (memoryError) throw memoryError;
+						preparedRescopeSettings = { cwd: to, settings: targetSettings };
 					},
 					rebindCwdCapturingAuthority,
 					applyRescopedReadState,
