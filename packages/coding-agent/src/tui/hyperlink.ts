@@ -9,11 +9,11 @@ import { TERMINAL } from "@gajae-code/tui";
 import { settings } from "../config/settings";
 import {
 	LocalProtocolHandler,
-	memoryRootsFromRegistry,
 	parseInternalUrl,
 	resolveLocalUrlToPath,
 	resolveMemoryUrlToPath,
 } from "../internal-urls";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 
 const OSC = "\x1b]";
 const ST = "\x1b\\";
@@ -100,24 +100,20 @@ export function fileHyperlink(absPath: string, displayText: string, opts?: { lin
  * `gjc://`) are not handled here — those rely on `details.resolvedPath` set
  * by the read tool's router resolution.
  */
-export function tryResolveInternalUrlSync(input: string): string | undefined {
+export function tryResolveInternalUrlSync(
+	input: string,
+	options?: { localProtocolOptions?: LocalProtocolOptions; memoryRoot?: string },
+): string | undefined {
 	try {
 		if (input.startsWith("local://")) {
-			const opts = LocalProtocolHandler.resolveOptions();
+			const opts = options?.localProtocolOptions ?? LocalProtocolHandler.resolveOptions();
 			if (!opts) return undefined;
 			return resolveLocalUrlToPath(input, opts);
 		}
 		if (input.startsWith("memory://")) {
+			if (!options?.memoryRoot) return undefined;
 			const url = parseInternalUrl(input);
-			const roots = memoryRootsFromRegistry();
-			for (const root of roots) {
-				try {
-					return resolveMemoryUrlToPath(url, root);
-				} catch {
-					// Try the next root; some sessions may not have this namespace mounted.
-				}
-			}
-			return undefined;
+			return resolveMemoryUrlToPath(url, options.memoryRoot);
 		}
 	} catch {
 		return undefined;
