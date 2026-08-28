@@ -55,12 +55,14 @@ if (!isCrossCompile && !Bun.env.RUSTFLAGS) {
 }
 
 async function cleanupStaleTemps(dir: string): Promise<void> {
+	const staleBefore = Date.now() - 60 * 60 * 1000;
 	try {
 		const entries = await fs.readdir(dir);
 		for (const entry of entries) {
-			if (entry.includes(".tmp.") || entry.includes(".old.") || entry.includes(".new.")) {
-				await fs.unlink(path.join(dir, entry)).catch(() => {});
-			}
+			if (!entry.includes(".tmp.") && !entry.includes(".old.") && !entry.includes(".new.")) continue;
+			const entryPath = path.join(dir, entry);
+			const stat = await fs.stat(entryPath).catch(() => undefined);
+			if (stat?.isFile() && stat.mtimeMs < staleBefore) await fs.unlink(entryPath).catch(() => {});
 		}
 	} catch {
 		// Directory might not exist yet
