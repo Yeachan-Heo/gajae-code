@@ -4996,6 +4996,9 @@ pub(crate) mod platform {
 			match open_or_create_skill_directory(skills_fd, &skill_component) {
 				Ok(fd) => fd,
 				Err(code) => {
+					// SAFETY: `skills_fd` is the private duplicate owned by this
+					// function; `SkillRootAuthority` retains and closes the original.
+					unsafe { libc::close(skills_fd) };
 					return NativeSecureSkillWriteResult::failure(code);
 				},
 			};
