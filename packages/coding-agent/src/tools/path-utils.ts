@@ -694,6 +694,7 @@ export interface ToolScopeOptions {
 	skills?: readonly Skill[];
 	rules?: readonly Rule[];
 	localProtocolOptions?: LocalProtocolOptions;
+	memoryRoot?: string;
 	/** Verb used in the "Cannot {action} internal URL without a backing file: …" message. */
 	internalUrlAction: string;
 	/** Collect absolute paths flagged immutable by their internal-URL handler. */
@@ -748,6 +749,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 			skills: opts.skills,
 			rules: opts.rules,
 			localProtocolOptions: opts.localProtocolOptions,
+			memoryRoot: opts.memoryRoot,
 		});
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);

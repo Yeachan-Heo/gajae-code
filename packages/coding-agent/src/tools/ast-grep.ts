@@ -163,6 +163,7 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				skills: this.session.skills,
 				rules: this.session.rules,
 				localProtocolOptions: this.session.localProtocolOptions,
+				memoryRoot: this.session.memoryRoot,
 				internalUrlAction: "search",
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;

@@ -3,12 +3,12 @@ import * as path from "node:path";
 import { getAgentDir, getMemoriesDir, isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { validateRelativePath } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 const DEFAULT_MEMORY_FILE = "memory_summary.md";
 const MEMORY_NAMESPACE = "root";
 
-function getMemoryRoot(agentDir: string, cwd: string): string {
+export function getMemoryRootForSession(agentDir: string, cwd: string): string {
 	return path.join(getMemoriesDir(agentDir), encodeProjectPath(cwd));
 }
 
@@ -27,7 +27,7 @@ export function memoryRootsFromRegistry(): string[] {
 		const sm = session?.sessionManager;
 		if (!sm) continue;
 		const agentDir = session.settings?.getAgentDir() ?? getAgentDir();
-		const root = getMemoryRoot(agentDir, sm.getCwd());
+		const root = getMemoryRootForSession(agentDir, sm.getCwd());
 		if (root && !roots.includes(root)) roots.push(root);
 	}
 	return roots;
@@ -138,8 +138,8 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 	readonly scheme = "memory";
 	readonly immutable = true;
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const roots = memoryRootsFromRegistry();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const roots = context?.memoryRoot ? [context.memoryRoot] : memoryRootsFromRegistry();
 
 		if (roots.length === 0) {
 			throw new Error(

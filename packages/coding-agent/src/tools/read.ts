@@ -3504,6 +3504,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			skills: this.session.skills,
 			rules: this.session.rules,
 			localProtocolOptions: this.session.localProtocolOptions,
+			memoryRoot: this.session.memoryRoot,
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
 

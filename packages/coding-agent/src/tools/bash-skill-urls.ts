@@ -28,6 +28,7 @@ export interface InternalUrlExpansionOptions {
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
 	rules?: ResolveContext["rules"];
+	memoryRoot?: ResolveContext["memoryRoot"];
 	ensureLocalParentDirs?: boolean;
 }
 
@@ -152,6 +153,7 @@ async function resolveInternalUrlToPath(
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
 	rules?: ResolveContext["rules"],
+	memoryRoot?: ResolveContext["memoryRoot"],
 	ensureLocalParentDirs?: boolean,
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
@@ -201,6 +203,7 @@ async function resolveInternalUrlToPath(
 			rules,
 			skills,
 			localProtocolOptions: localOptions,
+			memoryRoot,
 		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -256,6 +259,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.internalRouter,
 			options.localOptions,
 			options.rules,
+			options.memoryRoot,
 			options.ensureLocalParentDirs,
 		);
 		const replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);

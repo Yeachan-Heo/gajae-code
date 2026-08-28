@@ -202,6 +202,8 @@ export interface ToolSession {
 	rules?: Rule[];
 	/** Local artifact authority for this session */
 	localProtocolOptions?: LocalProtocolOptions;
+	/** Memory artifact root owned by this session. */
+	memoryRoot?: string;
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
 	/** Get the active skill prompt's current phase so the skill tool can apply

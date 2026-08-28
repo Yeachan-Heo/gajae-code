@@ -77,6 +77,8 @@ export interface ResolveContext {
 	rules?: readonly Rule[];
 	/** Local artifact authority of the calling session. */
 	localProtocolOptions?: LocalProtocolOptions;
+	/** Memory artifact root owned by the calling session. */
+	memoryRoot?: string;
 }
 
 /**

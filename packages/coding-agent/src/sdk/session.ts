@@ -120,6 +120,7 @@ import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
+import { getMemoryRootForSession } from "../internal-urls/memory-protocol";
 import type { LspStartupServerInfo } from "../lsp";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
@@ -2528,6 +2529,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						getSessionId: () => sessionManager.getSessionId(),
 					}
 				);
+			},
+			get memoryRoot() {
+				return getMemoryRootForSession(agentDir, sessionManager.getCwd());
 			},
 			eventBus,
 			outputSchema: options.outputSchema,

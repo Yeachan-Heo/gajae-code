@@ -190,6 +190,7 @@ export class FindTool implements AgentTool<typeof findSchema, FindToolDetails> {
 					skills: this.session.skills,
 					rules: this.session.rules,
 					localProtocolOptions: this.session.localProtocolOptions,
+					memoryRoot: this.session.memoryRoot,
 				});
 				if (!resource.sourcePath) {
 					throw new ToolError(`Cannot find internal URL without a backing file: ${rawPattern}`);
