@@ -875,6 +875,8 @@ export class MCPManager {
 		connection: MCPServerConnection,
 		uris: string[],
 		notificationEpoch: number,
+		globalEpoch = this.#epoch,
+		disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0,
 	): Promise<void> {
 		const lease = this.#leaseByConnection.get(connection);
 		if (!lease) return;
@@ -884,6 +886,7 @@ export class MCPManager {
 			logger.error("Failed to subscribe to MCP resources", { path: `mcp:${name}`, error });
 			return;
 		}
+		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 		const action = resolveSubscriptionPostAction(
 			this.#notificationsEnabled,
 			this.#notificationsEpoch,
@@ -2105,6 +2108,8 @@ export class MCPManager {
 	 */
 	async #loadServerResourcesAndPrompts(name: string, connection: MCPServerConnection): Promise<void> {
 		if (this.#toolsOnly) return;
+		const globalEpoch = this.#epoch;
+		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 		if (serverSupportsResources(connection.capabilities)) {
 			try {
 				const facade = this.#connectionForLease(connection);
@@ -2113,7 +2118,7 @@ export class MCPManager {
 				if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
 					const uris = resources.map(r => r.uri);
 					const notificationEpoch = this.#notificationsEpoch;
-					this.#subscribeAndTrack(name, connection, uris, notificationEpoch);
+					this.#subscribeAndTrack(name, connection, uris, notificationEpoch, globalEpoch, disconnectEpoch);
 				}
 			} catch (error) {
 				logger.debug("Failed to load MCP resources", { path: `mcp:${name}`, error });
@@ -2123,6 +2128,7 @@ export class MCPManager {
 		if (serverSupportsPrompts(connection.capabilities)) {
 			try {
 				await listPrompts(this.#connectionForLease(connection));
+				if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 				this.#onPromptsChanged?.(name);
 			} catch (error) {
 				logger.debug("Failed to load MCP prompts", { path: `mcp:${name}`, error });
@@ -2182,6 +2188,8 @@ export class MCPManager {
 		if (existing && existing.connection === connection) return existing.promise;
 
 		const doRefresh = async (): Promise<void> => {
+			const globalEpoch = this.#epoch;
+			const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 			// Clear cached resources
 			connection.resources = undefined;
 			connection.resourceTemplates = undefined;
@@ -2189,6 +2197,7 @@ export class MCPManager {
 			// Reload
 			const facade = this.#connectionForLease(connection);
 			const [resources] = await Promise.all([listResources(facade), listResourceTemplates(facade)]);
+			if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 			if (this.#notificationsEnabled && connection.capabilities.resources?.subscribe) {
 				const lease = this.#leaseByConnection.get(connection);
 				if (!lease) return;
@@ -2237,7 +2246,10 @@ export class MCPManager {
 		if (!connection || !serverSupportsPrompts(connection.capabilities)) return;
 
 		connection.prompts = undefined;
+		const globalEpoch = this.#epoch;
+		const disconnectEpoch = this.#disconnectEpochs.get(name) ?? 0;
 		await listPrompts(this.#connectionForLease(connection));
+		if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) return;
 
 		this.#onPromptsChanged?.(name);
 	}
