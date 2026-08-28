@@ -116,7 +116,7 @@ import {
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import { discoverAndLoadHookExtensions } from "../extensibility/hooks/loader";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
-import type { FileSlashCommand } from "../extensibility/slash-commands";
+import { type FileSlashCommand, loadSlashCommands } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
@@ -798,8 +798,12 @@ export async function discoverPromptTemplates(cwd?: string, agentDir?: string): 
 /**
  * Discover file-based slash commands from commands/ directories.
  */
-export async function discoverSlashCommands(_cwd?: string): Promise<FileSlashCommand[]> {
-	return [];
+export async function discoverSlashCommands(
+	cwd?: string,
+	agentDir?: string,
+	settings?: Settings,
+): Promise<FileSlashCommand[]> {
+	return await loadSlashCommands({ cwd: cwd ?? getProjectDir(), agentDir, settings });
 }
 
 /**
@@ -1593,8 +1597,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? Promise.resolve(options.promptTemplates)
 			: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
 		promptTemplatesPromise.catch(() => {});
-		const slashCommandsPromise = options.slashCommands ? Promise.resolve(options.slashCommands) : Promise.resolve([]);
+		const slashCommandsPromise = options.slashCommands
+			? Promise.resolve(options.slashCommands)
+			: logger.time("discoverSlashCommands", loadSlashCommands, { cwd, agentDir, settings });
 		slashCommandsPromise.catch(() => {});
+		let slashCommands: FileSlashCommand[] = [];
 
 		// Initialize provider preferences from settings
 		const { getConfiguredSearchProviderPreference, setPreferredSearchProvider, setSearchFallbackProviders } =
@@ -2597,6 +2604,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					error: safeErrorForLog(error),
 					cwd: to,
 				});
+			}
+			if (options.slashCommands === undefined) {
+				try {
+					slashCommands = await loadSlashCommands({ cwd: to, agentDir, settings });
+					session?.setSlashCommands(slashCommands);
+				} catch (error) {
+					slashCommands = [];
+					session?.setSlashCommands([]);
+					logger.warn("Failed to reload slash commands after session rescope", {
+						error: safeErrorForLog(error),
+						cwd: to,
+					});
+				}
 			}
 			// The launch-bound tree is retired immediately: a stale root-scoped tree is
 			// worse than none, and the next turn re-scans at the new cwd.
@@ -4429,7 +4449,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let promptTemplates = await promptTemplatesPromise;
 		toolSession.promptTemplates = promptTemplates;
 
-		const slashCommands = await slashCommandsPromise;
+		slashCommands = await slashCommandsPromise;
 
 		// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 		const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {

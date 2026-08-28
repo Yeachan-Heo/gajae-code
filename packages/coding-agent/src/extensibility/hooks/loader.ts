@@ -89,6 +89,8 @@ export interface LoadedHook {
 	setSendMessageHandler: (handler: SendMessageHandler) => void;
 	/** Set the append entry handler for this hook's pi.appendEntry() */
 	setAppendEntryHandler: (handler: AppendEntryHandler) => void;
+	/** Update the session cwd used by api.exec after a committed rescope. */
+	setCwd?: (cwd: string) => void;
 	/** Canonical discovery descriptor when loaded from a known hook convention. */
 	normalization?: NormalizedHook;
 }
@@ -121,9 +123,11 @@ async function createHookAPI(
 	commands: Map<string, RegisteredCommand>;
 	setSendMessageHandler: (handler: SendMessageHandler) => void;
 	setAppendEntryHandler: (handler: AppendEntryHandler) => void;
+	setCwd: (cwd: string) => void;
 }> {
 	let sendMessageHandler: SendMessageHandler | null = null;
 	let appendEntryHandler: AppendEntryHandler | null = null;
+	let currentCwd = cwd;
 	const messageRenderers = new Map<string, HookMessageRenderer>();
 	const commands = new Map<string, RegisteredCommand>();
 
@@ -158,7 +162,7 @@ async function createHookAPI(
 			commands.set(name, { name, ...options });
 		},
 		exec(command: string, args: string[], options?: ExecOptions) {
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			return execCommand(command, args, options?.cwd ?? currentCwd, options);
 		},
 		logger,
 		typebox,
@@ -175,6 +179,9 @@ async function createHookAPI(
 		},
 		setAppendEntryHandler: (handler: AppendEntryHandler) => {
 			appendEntryHandler = handler;
+		},
+		setCwd: (nextCwd: string) => {
+			currentCwd = nextCwd;
 		},
 	};
 }
@@ -196,10 +203,8 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 
 		// Create handlers map and API
 		const handlers = new Map<string, HandlerFn[]>();
-		const { api, messageRenderers, commands, setSendMessageHandler, setAppendEntryHandler } = await createHookAPI(
-			handlers,
-			cwd,
-		);
+		const { api, messageRenderers, commands, setSendMessageHandler, setAppendEntryHandler, setCwd } =
+			await createHookAPI(handlers, cwd);
 
 		// Call factory to register handlers
 		factory(api);
@@ -213,6 +218,7 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 				commands,
 				setSendMessageHandler,
 				setAppendEntryHandler,
+				setCwd,
 			},
 			error: null,
 		};
@@ -367,6 +373,8 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 			for (const handler of handlers) {
 				const normalized = hook.normalization;
 				const adapted: HandlerFn = async (...args: unknown[]) => {
+					const context = args[1] as ExtensionContext | undefined;
+					if (context?.cwd) hook.setCwd?.(context.cwd);
 					const payload = args[0] as { toolName?: string };
 					if (
 						normalized &&
@@ -390,7 +398,10 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 		for (const command of hook.commands.values()) {
 			api.registerCommand(command.name, {
 				description: command.description,
-				handler: (args, context) => command.handler(args, toHookCommandContext(context)),
+				handler: (args, context) => {
+					hook.setCwd?.(context.cwd);
+					return command.handler(args, toHookCommandContext(context));
+				},
 			});
 		}
 	};
