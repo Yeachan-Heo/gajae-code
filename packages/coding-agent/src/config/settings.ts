@@ -1130,7 +1130,9 @@ export class Settings implements NotificationSettingsReader {
 		cloned.#rawNotificationConfig = structuredClone(this.#rawNotificationConfig);
 		cloned.#durableRawNotificationConfig = structuredClone(this.#durableRawNotificationConfig);
 		cloned.#durableNotificationFingerprint = this.#durableNotificationFingerprint;
-		cloned.#project = this.#persist ? await cloned.#loadProjectSettings() : structuredClone(this.#project);
+		// Project policy is cwd-scoped even for in-memory/read-only settings. A
+		// relocation must not carry the launch project's project layer forward.
+		cloned.#project = await cloned.#loadProjectSettings();
 		cloned.#overrides = structuredClone(this.#overrides);
 		if (cloned.#hasRecoveredConfigSyntax) {
 			cloned.#sanitizeModelSelectorRecords();
