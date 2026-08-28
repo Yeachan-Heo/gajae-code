@@ -254,6 +254,42 @@ describe("SessionManager.moveTo", () => {
 		await session.close();
 	});
 
+	it("rejects a recreated source transcript instead of accepting it during rollback", async () => {
+		const session = SessionManager.create(cwdA);
+		session.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sourceFile = session.getSessionFile()!;
+		const destinationFile = path.join(SessionManager.getDefaultSessionDir(cwdB), path.basename(sourceFile));
+		const replacement = path.join(testAgentDir, "source-race-target");
+		fs.mkdirSync(replacement);
+		const opened = fs.statSync(cwdB, { bigint: true });
+		let statCalls = 0;
+		const targetHandle = {
+			stat: async () => {
+				statCalls++;
+				if (statCalls === 2) {
+					fs.writeFileSync(sourceFile, "successor transcript\n");
+					fs.rmdirSync(cwdB);
+					fs.symlinkSync(replacement, cwdB);
+				}
+				return opened;
+			},
+		};
+
+		await expect(
+			session.moveTo(cwdB, {
+				expectedIdentity: { dev: opened.dev, ino: opened.ino },
+				targetHandle,
+			}),
+		).rejects.toThrow(/managed_move_source_replaced|Failed to rollback managed move/);
+		expect(session.getCwd()).toBe(cwdA);
+		expect(session.getSessionFile()).toBe(sourceFile);
+		expect(fs.readFileSync(sourceFile, "utf8")).toBe("successor transcript\n");
+		expect(fs.readFileSync(destinationFile, "utf8")).not.toBe("successor transcript\n");
+		await session.close();
+	});
+
 	it("detaches the active session before deleting its transcript", async () => {
 		const session = SessionManager.create(cwdA);
 		session.appendMessage({ role: "user", content: "delete me", timestamp: 1 });
