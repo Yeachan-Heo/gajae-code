@@ -5241,14 +5241,38 @@ export class AgentSession {
 				// Cwd-derived read-only state the prompt and subagents consume.
 				// Best-effort by design: the move is committed, and a failed
 				// re-discovery must not present a committed move as a failure.
-				await participant.applyRescopedReadState(this.sessionManager.getCwd());
+				try {
+					await participant.applyRescopedReadState(this.sessionManager.getCwd());
+				} catch (error) {
+					// Hosts should make this callback non-throwing, but keep the
+					// transaction boundary defensive so a replacement implementation
+					// cannot turn a committed move into a false failure.
+					logger.warn("Committed session rescope could not refresh post-move read state", {
+						error: error instanceof Error ? error.message : String(error),
+						cwd: this.sessionManager.getCwd(),
+					});
+				}
 				try {
 					await this.refreshSshTool({ activateIfAvailable: true });
 				} catch (error) {
-					this.agent.setTools(this.agent.state.tools.filter(tool => tool.name !== "ssh"));
+					try {
+						this.agent.setTools(this.agent.state.tools.filter(tool => tool.name !== "ssh"));
+					} catch (cleanupError) {
+						logger.warn("Failed to remove stale SSH tool after session rescope", {
+							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+							cwd: this.sessionManager.getCwd(),
+						});
+					}
 					this.#toolRegistry.delete("ssh");
 					this.#selectedDiscoveredToolNames.delete("ssh");
-					await this.#applyActiveToolsByName(this.getActiveToolNames().filter(name => name !== "ssh"));
+					try {
+						await this.#applyActiveToolsByName(this.getActiveToolNames().filter(name => name !== "ssh"));
+					} catch (cleanupError) {
+						logger.warn("Failed to rebuild tools after SSH refresh failure", {
+							error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+							cwd: this.sessionManager.getCwd(),
+						});
+					}
 					// Non-fatal: the session has moved; the SSH tool refreshes
 					// on its next activation attempt.
 					logger.warn("Committed session rescope could not refresh the SSH tool", {

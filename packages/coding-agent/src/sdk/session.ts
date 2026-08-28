@@ -2511,51 +2511,96 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
+			const warnRefreshFailure = (message: string, error: unknown, details?: Record<string, unknown>): void => {
+				logger.warn(message, {
+					error: safeErrorForLog(error),
+					cwd: to,
+					...details,
+				});
+			};
+			const replaceObfuscator = (next: SecretObfuscator | undefined): void => {
+				try {
+					const nextHasSecrets = next?.hasSecrets() === true;
+					obfuscator = next;
+					secretsEnabled = nextHasSecrets;
+					session?.setObfuscator(next);
+				} catch (error) {
+					obfuscator = undefined;
+					secretsEnabled = false;
+					try {
+						session?.setObfuscator(undefined);
+					} catch (clearError) {
+						warnRefreshFailure("Failed to clear secret masking after session rescope", clearError);
+					}
+					warnRefreshFailure("Failed to apply secret masking after session rescope", error);
+				}
+			};
 			try {
 				if (settings.getCwd() !== to) settings = await settings.cloneForCwd(to);
 				session?.setSettings(settings);
 				toolSession.settings = settings;
 			} catch (error) {
-				logger.warn("Failed to reload settings after session rescope", {
-					error: safeErrorForLog(error),
-					cwd: to,
-				});
-				throw error;
+				warnRefreshFailure("Failed to reload settings after session rescope", error);
 			}
-			if (settings.get("secrets.enabled")) {
+			try {
+				// Capability providers that do not receive an explicit Settings object
+				// resolve their policy from this cwd-keyed scope. Re-register the cloned
+				// settings only after the durable move has committed; pre-commit authority
+				// failures still roll back without publishing a target scope.
+				initializeWithSettings(settings);
+			} catch (error) {
+				warnRefreshFailure("Failed to rebind capability settings scope after session rescope", error);
+			}
+			let secretsEnabledForScope = false;
+			try {
+				secretsEnabledForScope = settings.get("secrets.enabled");
+			} catch (error) {
+				warnRefreshFailure("Failed to read secret settings after session rescope", error);
+			}
+			if (secretsEnabledForScope) {
 				try {
 					const entries = [...secretApi.collectEnvSecrets(), ...(await secretApi.loadSecrets(to, agentDir))];
-					obfuscator = entries.length > 0 ? secretApi.createSecretObfuscator(entries) : undefined;
-					secretsEnabled = obfuscator?.hasSecrets() === true;
-					session?.setObfuscator(obfuscator);
+					replaceObfuscator(entries.length > 0 ? secretApi.createSecretObfuscator(entries) : undefined);
 				} catch (error) {
-					obfuscator = undefined;
-					secretsEnabled = false;
-					session?.setObfuscator(undefined);
-					logger.warn("Failed to reload secrets after session rescope", {
-						error: safeErrorForLog(error),
-						cwd: to,
-					});
-					throw error;
+					replaceObfuscator(undefined);
+					warnRefreshFailure("Failed to reload secrets after session rescope", error);
 				}
 			} else {
-				obfuscator = undefined;
-				secretsEnabled = false;
-				session?.setObfuscator(undefined);
+				replaceObfuscator(undefined);
 			}
-			extensionRunner?.rebindScope(to, settings);
+			try {
+				extensionRunner?.rebindScope(to, settings);
+			} catch (error) {
+				warnRefreshFailure("Failed to rebind extension scope after session rescope", error);
+			}
 			if (options.contextFiles === undefined) {
 				try {
 					const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, settings });
 					contextFiles = rediscovered.contextFiles;
 				} catch (error) {
 					contextFiles = [];
-					logger.warn("Failed to re-discover context files after session rescope", {
-						error: safeErrorForLog(error),
-					});
+					warnRefreshFailure("Failed to re-discover context files after session rescope", error);
 				}
 			}
-			if (options.skills === undefined && settings.get("skills.enabled")) {
+			const replaceSkillsBestEffort = async (nextSkills: Skill[]): Promise<void> => {
+				try {
+					if (!options.parentTaskPrefix) setActiveSkills(nextSkills);
+				} catch (error) {
+					warnRefreshFailure("Failed to publish skills after session rescope", error);
+				}
+				try {
+					await session?.replaceSkills(nextSkills);
+				} catch (error) {
+					warnRefreshFailure("Failed to replace skills after session rescope", error);
+				}
+			};
+			let skillsEnabledForScope = false;
+			try {
+				skillsEnabledForScope = options.skills === undefined && settings.get("skills.enabled");
+			} catch (error) {
+				warnRefreshFailure("Failed to read skills settings after session rescope", error);
+			}
+			if (skillsEnabledForScope) {
 				try {
 					const reloaded = await loadSkills({
 						...settings.getGroup("skills"),
@@ -2565,18 +2610,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						settings,
 					});
 					skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
-					if (!options.parentTaskPrefix) setActiveSkills(skills);
-					await session?.replaceSkills(skills);
+					await replaceSkillsBestEffort(skills);
 				} catch (error) {
 					skills = [];
-					if (!options.parentTaskPrefix) setActiveSkills([]);
-					await session?.replaceSkills([]);
-					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
+					await replaceSkillsBestEffort([]);
+					warnRefreshFailure("Failed to reload skills after session rescope", error);
 				}
 			} else if (options.skills === undefined) {
 				skills = [];
-				if (!options.parentTaskPrefix) setActiveSkills([]);
-				await session?.replaceSkills([]);
+				await replaceSkillsBestEffort([]);
 			}
 			if (options.rules === undefined) {
 				try {
@@ -2595,10 +2637,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (!options.parentTaskPrefix) setActiveRules([...rulebookRules, ...alwaysApplyRules]);
 					session?.setTtsrManager(ttsrManager);
 				} catch (error) {
-					logger.warn("Failed to reload rules after session rescope", {
-						error: safeErrorForLog(error),
-						cwd: to,
-					});
+					warnRefreshFailure("Failed to reload rules after session rescope", error);
 				}
 			}
 			try {
@@ -2608,10 +2647,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: options.promptTemplates;
 				session?.setPromptTemplates(promptTemplates);
 			} catch (error) {
-				logger.warn("Failed to reload prompt templates after session rescope", {
-					error: safeErrorForLog(error),
-					cwd: to,
-				});
+				warnRefreshFailure("Failed to reload prompt templates after session rescope", error);
 			}
 			if (options.slashCommands === undefined) {
 				try {
@@ -2619,11 +2655,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					session?.setSlashCommands(slashCommands);
 				} catch (error) {
 					slashCommands = [];
-					session?.setSlashCommands([]);
-					logger.warn("Failed to reload slash commands after session rescope", {
-						error: safeErrorForLog(error),
-						cwd: to,
-					});
+					try {
+						session?.setSlashCommands([]);
+					} catch (clearError) {
+						warnRefreshFailure("Failed to clear slash commands after session rescope", clearError);
+					}
+					warnRefreshFailure("Failed to reload slash commands after session rescope", error);
 				}
 			}
 			// The launch-bound tree is retired immediately: a stale root-scoped tree is

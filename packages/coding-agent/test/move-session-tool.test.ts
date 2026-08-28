@@ -7,6 +7,7 @@ import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import * as capability from "@gajae-code/coding-agent/capability";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import * as secretApi from "@gajae-code/coding-agent/secrets";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "@gajae-code/coding-agent/session/messages";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { postmortem, Snowflake } from "@gajae-code/utils";
@@ -51,15 +52,19 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 	});
 
 	async function makeSession(cwd: string, sessionManager: SessionManager, overrides: Record<string, unknown> = {}) {
+		const settingsAgentDir = typeof overrides.agentDir === "string" ? overrides.agentDir : path.dirname(cwd);
 		return createAgentSession({
 			cwd,
 			agentDir: path.dirname(cwd),
 			sessionManager,
-			settings: Settings.isolated({
-				"async.enabled": false,
-				"bash.autoBackground.enabled": false,
-				"bashInterceptor.enabled": false,
-			}),
+			settings: Settings.isolated(
+				{
+					"async.enabled": false,
+					"bash.autoBackground.enabled": false,
+					"bashInterceptor.enabled": false,
+				},
+				{ agentDir: settingsAgentDir },
+			),
 			model: getBundledModel("openai", "gpt-4o-mini"),
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -1293,11 +1298,14 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
 		const { session } = await makeSession(cwdA, sessionManager, {
 			toolNames: ["move_session", "bash"],
-			settings: Settings.isolated({
-				"async.enabled": true,
-				"bash.autoBackground.enabled": false,
-				"bashInterceptor.enabled": false,
-			}),
+			settings: Settings.isolated(
+				{
+					"async.enabled": true,
+					"bash.autoBackground.enabled": false,
+					"bashInterceptor.enabled": false,
+				},
+				{ agentDir: path.dirname(cwdA) },
+			),
 		});
 		try {
 			const bashTool = session.getToolForExecution("bash")!;
@@ -1594,6 +1602,43 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			};
 			const moveTool = session.getToolByName("move_session")!;
 			const result = await moveTool.execute("move-ssh-fail", { path: "repo-b" });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			expect(textContent(result)).toContain("repo-b");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("does not fail the committed move when post-move secret refresh throws", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const settings = Settings.isolated(
+			{
+				"async.enabled": false,
+				"bash.autoBackground.enabled": false,
+				"bashInterceptor.enabled": false,
+				"secrets.enabled": true,
+			},
+			{ agentDir: path.dirname(cwdA) },
+		);
+		let loadCount = 0;
+		vi.spyOn(secretApi, "loadSecrets").mockImplementation(async (_cwd, _agentDir) => {
+			loadCount += 1;
+			if (loadCount === 3) throw new Error("post-move secret refresh exploded");
+			return [];
+		});
+		const { session } = await makeSession(cwdA, sessionManager, {
+			toolNames: ["move_session"],
+			settings,
+		});
+		try {
+			const moveTool = session.getToolByName("move_session")!;
+			const result = await moveTool.execute("move-secret-refresh-fail", { path: "repo-b" });
+			expect(loadCount).toBe(3);
 			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
 			expect(textContent(result)).toContain("repo-b");
 		} finally {
