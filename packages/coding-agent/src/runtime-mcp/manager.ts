@@ -1921,7 +1921,7 @@ export class MCPManager {
 		const oldLease = this.#leases.get(name);
 		if (oldLease) this.#pool.retireLease(oldLease);
 		if (oldConnection) {
-			const releasePromise = this.#releaseLease(name, oldConnection, false).catch(error => {
+			const releasePromise = this.#releaseLease(name, oldConnection).catch(error => {
 				throw this.#logLeaseReleaseFailure(name, oldConnection, error);
 			});
 			if (oldConnection.transport.closeBeforeReconnect !== false) {

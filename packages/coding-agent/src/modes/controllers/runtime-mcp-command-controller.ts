@@ -1875,7 +1875,7 @@ export class MCPCommandController {
 		try {
 			const apiKey = await this.#waitForSmitheryCliApiKey(session.sessionId, abortController.signal);
 			await this.#validateSmitheryApiKey(apiKey);
-			await saveSmitheryApiKey(apiKey);
+			await saveSmitheryApiKey(apiKey, this.ctx.session.getSessionAgentDir());
 			this.ctx.showStatus("Smithery API key saved.");
 			return true;
 		} finally {
