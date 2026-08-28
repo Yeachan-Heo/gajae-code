@@ -240,9 +240,9 @@ describe("coordinator session state lock", () => {
 			};
 			await withSessionStateFileLock(stateFile, async () => {
 				if (process.platform !== "win32") {
-				for (const directory of [path.dirname(stateFile), path.dirname(path.dirname(stateFile))]) {
-					expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
-				}
+					for (const directory of [path.dirname(stateFile), path.dirname(path.dirname(stateFile))]) {
+						expect((await fs.stat(directory)).mode & 0o777).toBe(0o700);
+					}
 					expect((await fs.stat(`${stateFile}.lock`)).mode & 0o777).toBe(0o600);
 				}
 			});
@@ -2122,7 +2122,8 @@ describe("coordinator session state lock", () => {
 			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
 			expect(fsSync.existsSync(`${lockFile}.transition.owner`)).toBe(false);
 
-			SessionStateLockTestHooks.ownerAccessStrategy = process.platform === "win32" ? "windows-validated" : "posix-nofollow";
+			SessionStateLockTestHooks.ownerAccessStrategy =
+				process.platform === "win32" ? "windows-validated" : "posix-nofollow";
 			await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
 		});
 	});

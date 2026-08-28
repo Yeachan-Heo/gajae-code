@@ -197,10 +197,7 @@ async function removeTransitionDir(transitionDir: string): Promise<void> {
 	}
 }
 
-function removeOwnedTransitionClaim(
-	nativePath: string,
-	generation: TransitionDirectoryGeneration,
-): boolean {
+function removeOwnedTransitionClaim(nativePath: string, generation: TransitionDirectoryGeneration): boolean {
 	const native = nativeSessionStateLock();
 	const captured = native.snapshotDirectoryTree(nativePath);
 	if (!captured.ok || !captured.snapshot) return captured.code === "not_found";
@@ -1960,9 +1957,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// is no longer ours is left for its owner rather than unlinked by name.
 			let releaseFailure: { error: unknown } | undefined;
 			try {
-				await withLockPathTransition(lockFile, async () =>
-				releaseOwnerLock(lockFile, record),
-				);
+				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record));
 			} catch (error) {
 				releaseFailure = { error };
 			}
