@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { createLspWritethrough, writethroughNoop } from "@gajae-code/coding-agent/lsp";
+import { createLspWritethrough, FileFormatResult, writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import * as lspConfig from "@gajae-code/coding-agent/lsp/config";
 import { TempDir } from "@gajae-code/utils";
 import type { ServerConfig } from "../../src/lsp/types";
@@ -66,6 +66,61 @@ describe("createLspWritethrough batching", () => {
 		expect(getServersSpy).toHaveBeenCalledTimes(1);
 		expect(loadConfigSpy).toHaveBeenCalledTimes(1);
 		expect(await Bun.file(filePath).text()).toBe("const single = true;\n");
+	});
+
+	it("resolves LSP config and custom clients from the live cwd and profile", async () => {
+		const cwdA = path.join(tempDir.path(), "workspace-a");
+		const cwdB = path.join(tempDir.path(), "workspace-b");
+		const profileA = path.join(tempDir.path(), "profile-a");
+		const profileB = path.join(tempDir.path(), "profile-b");
+		await Promise.all([
+			Bun.write(path.join(cwdA, "a.ts"), "original-a\n"),
+			Bun.write(path.join(cwdB, "b.ts"), "original-b\n"),
+		]);
+
+		const loadedScopes: Array<{ cwd: string; agentDir: string | undefined }> = [];
+		const loadConfigSpy = vi.spyOn(lspConfig, "loadConfig").mockImplementation((cwd, agentDir) => {
+			loadedScopes.push({ cwd, agentDir });
+			const suffix = path.basename(agentDir ?? "ambient");
+			return {
+				servers: {
+					fixture: {
+						command: "fixture-linter",
+						fileTypes: ["ts"],
+						rootMarkers: [],
+						createClient: () => ({
+							format: async () => `formatted-${suffix}\n`,
+							lint: async () => [],
+						}),
+					},
+				},
+				idleTimeoutMs: undefined,
+			};
+		});
+		vi.spyOn(lspConfig, "getServersForFile").mockImplementation(config => Object.entries(config.servers));
+
+		let liveCwd = cwdA;
+		let liveAgentDir: string | undefined = profileA;
+		const writethrough = createLspWritethrough(() => liveCwd, {
+			enableFormat: true,
+			enableDiagnostics: true,
+			agentDir: () => liveAgentDir,
+		});
+
+		const first = await writethrough(path.join(cwdA, "a.ts"), "raw-a\n");
+		expect(first?.formatter).toBe(FileFormatResult.FORMATTED);
+		expect(await Bun.file(path.join(cwdA, "a.ts")).text()).toBe("formatted-profile-a\n");
+
+		liveCwd = cwdB;
+		liveAgentDir = profileB;
+		const second = await writethrough(path.join(cwdB, "b.ts"), "raw-b\n");
+		expect(second?.formatter).toBe(FileFormatResult.FORMATTED);
+		expect(await Bun.file(path.join(cwdB, "b.ts")).text()).toBe("formatted-profile-b\n");
+		expect(loadedScopes).toEqual([
+			{ cwd: cwdA, agentDir: profileA },
+			{ cwd: cwdB, agentDir: profileB },
+		]);
+		expect(loadConfigSpy).toHaveBeenCalledTimes(2);
 	});
 
 	it("honors the exported BunFile writethrough target", async () => {

@@ -2596,7 +2596,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 			let skillsEnabledForScope = false;
 			try {
-				skillsEnabledForScope = options.skills === undefined && settings.get("skills.enabled");
+				skillsEnabledForScope = options.skills === undefined && settings.get("skills.enabled") === true;
 			} catch (error) {
 				warnRefreshFailure("Failed to read skills settings after session rescope", error);
 			}

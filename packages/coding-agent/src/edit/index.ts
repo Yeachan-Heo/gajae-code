@@ -164,7 +164,13 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableLsp = session.enableLsp ?? true;
 	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
 	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
-	return enableLsp ? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics }) : writethroughNoop;
+	return enableLsp
+		? createLspWritethrough(() => session.cwd, {
+				enableFormat,
+				enableDiagnostics,
+				agentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
+			})
+		: writethroughNoop;
 }
 
 /** Run apply_patch file operations and aggregate their multi-file result. */

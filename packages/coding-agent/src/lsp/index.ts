@@ -191,6 +191,7 @@ async function syncFileContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	agentDir?: string,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -199,7 +200,7 @@ async function syncFileContent(
 			if (serverConfig.createClient) {
 				return;
 			}
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
 			throwIfAborted(signal);
 			await syncContent(client, absolutePath, content, signal);
 		}),
@@ -219,6 +220,7 @@ async function notifyFileSaved(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	agentDir?: string,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -227,7 +229,7 @@ async function notifyFileSaved(
 			if (serverConfig.createClient) {
 				return;
 			}
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
 			await notifySaved(client, absolutePath, signal);
 		}),
 	);
@@ -504,6 +506,12 @@ interface GetDiagnosticsForFileOptions {
 	allowUnversionedLspDiagnostics?: boolean;
 }
 
+/** Keep custom linter clients isolated when profiles define the same server name. */
+function getScopedLinterClient(serverName: string, config: ServerConfig, cwd: string, agentDir?: string) {
+	const scopedName = agentDir ? `${serverName}\0${path.resolve(agentDir)}` : serverName;
+	return getLinterClient(scopedName, config, cwd);
+}
+
 /**
  * Capture current diagnostic versions for all LSP servers.
  * Call this BEFORE syncing content to detect stale diagnostics later.
@@ -511,12 +519,13 @@ interface GetDiagnosticsForFileOptions {
 async function captureDiagnosticVersions(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
+	agentDir?: string,
 ): Promise<ServerVersionMap> {
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
 			if (serverConfig.createClient) return;
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
 			versions.set(serverName, client.diagnosticsVersion);
 		}),
 	);
@@ -527,12 +536,13 @@ async function captureOpenFileVersions(
 	absolutePath: string,
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
+	agentDir?: string,
 ): Promise<ServerVersionMap> {
 	const uri = fileToUri(absolutePath);
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
 			const version = client.openFiles.get(uri)?.version;
 			if (version !== undefined) {
 				versions.set(serverName, version);
@@ -556,6 +566,7 @@ async function getDiagnosticsForFile(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	options: GetDiagnosticsForFileOptions = {},
+	agentDir?: string,
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { signal, minVersions, expectedDocumentVersions, allowUnversionedLspDiagnostics = true } = options;
 	if (servers.length === 0) {
@@ -573,13 +584,13 @@ async function getDiagnosticsForFile(
 			throwIfAborted(signal);
 			// Use custom linter client if configured
 			if (serverConfig.createClient) {
-				const linterClient = getLinterClient(serverName, serverConfig, cwd);
+				const linterClient = getScopedLinterClient(serverName, serverConfig, cwd, agentDir);
 				const diagnostics = await linterClient.lint(absolutePath);
 				return { serverName, diagnostics };
 			}
 
 			// Default: use LSP
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
 			throwIfAborted(signal);
 			if (isProjectAwareLspServer(serverConfig)) {
 				await waitForProjectLoaded(client, signal);
@@ -673,6 +684,7 @@ async function formatContent(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
+	agentDir?: string,
 ): Promise<string> {
 	if (servers.length === 0) {
 		return content;
@@ -685,12 +697,12 @@ async function formatContent(
 			throwIfAborted(signal);
 			// Use custom linter client if configured
 			if (serverConfig.createClient) {
-				const linterClient = getLinterClient(serverName, serverConfig, cwd);
+				const linterClient = getScopedLinterClient(serverName, serverConfig, cwd, agentDir);
 				return await linterClient.format(absolutePath, content);
 			}
 
 			// Default: use LSP
-			const client = await getOrCreateClient(serverConfig, cwd);
+			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
 			throwIfAborted(signal);
 
 			const caps = client.serverCapabilities;
@@ -727,6 +739,8 @@ export interface WritethroughOptions {
 	enableFormat?: boolean;
 	/** Whether to get LSP diagnostics after writing */
 	enableDiagnostics?: boolean;
+	/** Effective agent directory, resolved for each write when supplied as a getter. */
+	agentDir?: string | (() => string | undefined);
 	/** Called when diagnostics arrive after the main timeout. */
 	onDeferredDiagnostics?: (diagnostics: FileDiagnosticsResult) => void;
 	/** Signal to cancel a pending deferred diagnostics fetch. */
@@ -785,24 +799,40 @@ interface LspWritethroughBatchRequest {
 }
 
 interface LspWritethroughBatchState {
+	id: string;
+	cwd: string;
+	agentDir?: string;
 	entries: Map<string, PendingWritethrough>;
 	options: ResolvedWritethroughOptions;
 }
 
 const writethroughBatches = new Map<string, LspWritethroughBatchState>();
 
-function getOrCreateWritethroughBatch(id: string, options: ResolvedWritethroughOptions): LspWritethroughBatchState {
-	const existing = writethroughBatches.get(id);
+function getWritethroughBatchKey(id: string, cwd: string, agentDir?: string): string {
+	return JSON.stringify([id, cwd, agentDir ? path.resolve(agentDir) : ""]);
+}
+
+function getOrCreateWritethroughBatch(
+	id: string,
+	cwd: string,
+	agentDir: string | undefined,
+	options: ResolvedWritethroughOptions,
+): LspWritethroughBatchState {
+	const key = getWritethroughBatchKey(id, cwd, agentDir);
+	const existing = writethroughBatches.get(key);
 	if (existing) {
 		existing.options.enableFormat ||= options.enableFormat;
 		existing.options.enableDiagnostics ||= options.enableDiagnostics;
 		return existing;
 	}
 	const batch: LspWritethroughBatchState = {
+		id,
+		cwd,
+		agentDir,
 		entries: new Map<string, PendingWritethrough>(),
 		options: { ...options },
 	};
-	writethroughBatches.set(id, batch);
+	writethroughBatches.set(key, batch);
 	return batch;
 }
 
@@ -810,13 +840,30 @@ export async function flushLspWritethroughBatch(
 	id: string,
 	cwd: string,
 	signal?: AbortSignal,
+	agentDir?: string,
 ): Promise<FileDiagnosticsResult | undefined> {
-	const state = writethroughBatches.get(id);
+	let key = getWritethroughBatchKey(id, cwd, agentDir);
+	let state = writethroughBatches.get(key);
+	if (!state && agentDir === undefined) {
+		const matches = Array.from(writethroughBatches.entries()).filter(
+			([, candidate]) => candidate.id === id && candidate.cwd === cwd,
+		);
+		if (matches.length === 1) {
+			[key, state] = matches[0]!;
+		}
+	}
 	if (!state) {
 		return undefined;
 	}
-	writethroughBatches.delete(id);
-	return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal);
+	writethroughBatches.delete(key);
+	return flushWritethroughBatch(
+		Array.from(state.entries.values()),
+		cwd,
+		state.options,
+		signal,
+		undefined,
+		state.agentDir,
+	);
 }
 
 function summarizeDiagnosticMessages(messages: string[]): { summary: string; errored: boolean } {
@@ -899,6 +946,7 @@ function mergeDiagnostics(
 async function scheduleDeferredDiagnosticsFetch(args: {
 	dst: string;
 	cwd: string;
+	agentDir?: string;
 	servers: Array<[string, ServerConfig]>;
 	minVersions: ServerVersionMap | undefined;
 	expectedDocumentVersions: ServerVersionMap | undefined;
@@ -908,11 +956,17 @@ async function scheduleDeferredDiagnosticsFetch(args: {
 	try {
 		const deferredTimeout = AbortSignal.timeout(25_000);
 		const combined = AbortSignal.any([args.signal, deferredTimeout]);
-		const diagnostics = await getDiagnosticsForFile(args.dst, args.cwd, args.servers, {
-			signal: combined,
-			minVersions: args.minVersions,
-			expectedDocumentVersions: args.expectedDocumentVersions,
-		});
+		const diagnostics = await getDiagnosticsForFile(
+			args.dst,
+			args.cwd,
+			args.servers,
+			{
+				signal: combined,
+				minVersions: args.minVersions,
+				expectedDocumentVersions: args.expectedDocumentVersions,
+			},
+			args.agentDir,
+		);
 		if (args.signal.aborted || diagnostics === undefined) return;
 		args.callback(diagnostics);
 	} catch {
@@ -927,13 +981,14 @@ async function runLspWritethrough(
 	options: ResolvedWritethroughOptions,
 	signal?: AbortSignal,
 	file?: BunFile,
+	agentDir?: string,
 	deferred?: {
 		onDeferredDiagnostics: (diagnostics: FileDiagnosticsResult) => void;
 		signal: AbortSignal;
 	},
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { enableFormat, enableDiagnostics } = options;
-	const config = getConfig(cwd);
+	const config = getConfig(cwd, agentDir);
 	const servers = getServersForFile(config, dst);
 	if (servers.length === 0) {
 		return writethroughNoop(dst, content, signal, file);
@@ -964,7 +1019,7 @@ async function runLspWritethrough(
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 
 	// Capture diagnostic versions BEFORE syncing to detect stale diagnostics
-	const minVersions = enableDiagnostics ? await captureDiagnosticVersions(cwd, servers) : undefined;
+	const minVersions = enableDiagnostics ? await captureDiagnosticVersions(cwd, servers, agentDir) : undefined;
 	let expectedDocumentVersions: ServerVersionMap | undefined;
 
 	let formatter: FileFormatResult | undefined;
@@ -984,23 +1039,23 @@ async function runLspWritethrough(
 			if (useCustomFormatter) {
 				// Custom linters (e.g. Biome CLI) require on-disk input.
 				await writeContent(content);
-				finalContent = await formatContent(dst, content, cwd, customLinterServers, operationSignal);
+				finalContent = await formatContent(dst, content, cwd, customLinterServers, operationSignal, agentDir);
 				formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				await writeContent(finalContent);
-				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, agentDir);
 			} else {
 				// 1. Sync original content to LSP servers
-				await syncFileContent(dst, content, cwd, lspServers, operationSignal);
+				await syncFileContent(dst, content, cwd, lspServers, operationSignal, agentDir);
 
 				// 2. Format in-memory via LSP
 				if (enableFormat) {
-					finalContent = await formatContent(dst, content, cwd, lspServers, operationSignal);
+					finalContent = await formatContent(dst, content, cwd, lspServers, operationSignal, agentDir);
 					formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				}
 
 				// 3. If formatted, sync formatted content to LSP servers
 				if (finalContent !== content) {
-					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal);
+					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, agentDir);
 				}
 
 				// 4. Write to disk
@@ -1008,20 +1063,26 @@ async function runLspWritethrough(
 			}
 
 			if (enableDiagnostics) {
-				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers);
+				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, agentDir);
 			}
 
 			// 5. Notify saved to LSP servers
-			await notifyFileSaved(dst, cwd, lspServers, operationSignal);
+			await notifyFileSaved(dst, cwd, lspServers, operationSignal, agentDir);
 
 			// 6. Get diagnostics from all servers (wait for fresh results)
 			if (enableDiagnostics) {
-				diagnostics = await getDiagnosticsForFile(dst, cwd, servers, {
-					signal: operationSignal,
-					minVersions,
-					expectedDocumentVersions,
-					allowUnversionedLspDiagnostics: false,
-				});
+				diagnostics = await getDiagnosticsForFile(
+					dst,
+					cwd,
+					servers,
+					{
+						signal: operationSignal,
+						minVersions,
+						expectedDocumentVersions,
+						allowUnversionedLspDiagnostics: false,
+					},
+					agentDir,
+				);
 			}
 		});
 	} catch (error) {
@@ -1031,9 +1092,10 @@ async function runLspWritethrough(
 			diagnostics = undefined;
 			// Schedule background diagnostic fetch if caller wants deferred results
 			if (deferred && !deferred.signal.aborted && enableDiagnostics) {
-				void scheduleDeferredDiagnosticsFetch({
+				scheduleDeferredDiagnosticsFetch({
 					dst,
 					cwd,
+					agentDir,
 					servers,
 					minVersions,
 					expectedDocumentVersions,
@@ -1064,6 +1126,7 @@ async function flushWritethroughBatch(
 	options: ResolvedWritethroughOptions,
 	signal?: AbortSignal,
 	getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
+	agentDir?: string,
 ): Promise<FileDiagnosticsResult | undefined> {
 	if (batch.length === 0) {
 		return undefined;
@@ -1077,7 +1140,16 @@ async function flushWritethroughBatch(
 				onDeferredDiagnostics: bundle.onDeferredDiagnostics,
 				signal: bundle.signal,
 			} as const);
-		const diag = await runLspWritethrough(entry.dst, entry.content, cwd, options, signal, entry.file, deferredInner);
+		const diag = await runLspWritethrough(
+			entry.dst,
+			entry.content,
+			cwd,
+			options,
+			signal,
+			entry.file,
+			agentDir,
+			deferredInner,
+		);
 		bundle?.finalize(diag);
 		results.push(diag);
 	}
@@ -1085,11 +1157,18 @@ async function flushWritethroughBatch(
 }
 
 /** Create a writethrough callback for LSP aware write operations */
-export function createLspWritethrough(cwd: string, options?: WritethroughOptions): WritethroughCallback {
+export function createLspWritethrough(
+	cwd: string | (() => string),
+	options?: WritethroughOptions,
+): WritethroughCallback {
 	const resolvedOptions: ResolvedWritethroughOptions = {
 		enableFormat: options?.enableFormat ?? false,
 		enableDiagnostics: options?.enableDiagnostics ?? false,
 	};
+	const resolveCwd = typeof cwd === "function" ? cwd : () => cwd;
+	const agentDirOption = options?.agentDir;
+	const resolveAgentDir: () => string | undefined =
+		typeof agentDirOption === "function" ? agentDirOption : () => agentDirOption;
 	if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
 		return writethroughNoop;
 	}
@@ -1101,6 +1180,8 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 		batch?: LspWritethroughBatchRequest,
 		getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 	) => {
+		const liveCwd = resolveCwd();
+		const agentDir = resolveAgentDir();
 		if (!batch) {
 			const bundle = getDeferred?.(dst);
 			const deferredInner =
@@ -1109,12 +1190,21 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 					onDeferredDiagnostics: bundle.onDeferredDiagnostics,
 					signal: bundle.signal,
 				} as const);
-			const diagnostics = await runLspWritethrough(dst, content, cwd, resolvedOptions, signal, file, deferredInner);
+			const diagnostics = await runLspWritethrough(
+				dst,
+				content,
+				liveCwd,
+				resolvedOptions,
+				signal,
+				file,
+				agentDir,
+				deferredInner,
+			);
 			bundle?.finalize(diagnostics);
 			return diagnostics;
 		}
 
-		const state = getOrCreateWritethroughBatch(batch.id, resolvedOptions);
+		const state = getOrCreateWritethroughBatch(batch.id, liveCwd, agentDir, resolvedOptions);
 		state.entries.set(dst, { dst, content, file });
 
 		if (!batch.flush) {
@@ -1122,8 +1212,15 @@ export function createLspWritethrough(cwd: string, options?: WritethroughOptions
 			return undefined;
 		}
 
-		writethroughBatches.delete(batch.id);
-		return flushWritethroughBatch(Array.from(state.entries.values()), cwd, state.options, signal, getDeferred);
+		writethroughBatches.delete(getWritethroughBatchKey(batch.id, liveCwd, agentDir));
+		return flushWritethroughBatch(
+			Array.from(state.entries.values()),
+			liveCwd,
+			state.options,
+			signal,
+			getDeferred,
+			agentDir,
+		);
 	};
 }
 
@@ -1260,7 +1357,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 					try {
 						throwIfAborted(signal);
 						if (serverConfig.createClient) {
-							const linterClient = getLinterClient(serverName, serverConfig, this.session.cwd);
+							const linterClient = getScopedLinterClient(serverName, serverConfig, this.session.cwd, agentDir);
 							const diagnostics = await linterClient.lint(resolved);
 							allDiagnostics.push(...diagnostics);
 							continue;

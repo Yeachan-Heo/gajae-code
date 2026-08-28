@@ -200,7 +200,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 		const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnWrite");
 		this.#writethrough = enableLsp
-			? createLspWritethrough(session.cwd, { enableFormat, enableDiagnostics })
+			? createLspWritethrough(() => session.cwd, {
+					enableFormat,
+					enableDiagnostics,
+					agentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
+				})
 			: writethroughNoop;
 		this.description = prompt.render(writeDescription);
 	}
