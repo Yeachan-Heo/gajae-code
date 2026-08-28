@@ -1495,6 +1495,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const ownsScopedSettings = options.settings === undefined;
 		let settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
+		const initialOwnedSettings = ownsScopedSettings ? settings : undefined;
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		closeOwnedSettings = async (): Promise<void> => {
@@ -1503,6 +1504,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				await settings.close();
 			} finally {
 				releaseSettingsScope(settings);
+				if (initialOwnedSettings && initialOwnedSettings !== settings) {
+					await initialOwnedSettings.close();
+					releaseSettingsScope(initialOwnedSettings);
+				}
 			}
 		};
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
