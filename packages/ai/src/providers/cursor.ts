@@ -853,7 +853,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// Cursor owns the first-event watchdog, so its budget starts before
 			// history/blob/protobuf serialization. Synchronous setup cannot be
 			// interrupted by a timer; the remaining-budget check below prevents a
-			credential-bearing request after serialization already exhausted it.
+			// credential-bearing request after serialization already exhausted it.
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
@@ -871,6 +871,34 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			conversationStateCache.set(conversationId, conversationState);
 			touchCursorConversation(conversationId);
+			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
+				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
+					requestBytes: requestBytes.length,
+					firstEventElapsedMs: Date.now() - firstEventStartedAt,
+					firstEventTimeoutMs,
+					endpointClass,
+				});
+			let remainingFirstEventTimeoutMs =
+				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
+					? firstEventTimeoutMs
+					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
+			if (
+				remainingFirstEventTimeoutMs !== undefined &&
+				firstEventTimeoutMs !== undefined &&
+				firstEventTimeoutMs > 0 &&
+				remainingFirstEventTimeoutMs <= 0
+			) {
+				throw createFirstEventTimeoutError();
+			}
+			// A capped non-abortable mutation remains the conversation's admission
+			// lock until its actual handler settles. Wait before opening another
+			// authenticated transport request.
+			await waitForCursorMutationLock(
+				conversationId,
+				options?.signal,
+				remainingFirstEventTimeoutMs,
+				createFirstEventTimeoutError,
+			);
 			// Recheck immediately before any network work: the caller may have
 			// aborted while the payload was being constructed.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
@@ -920,16 +948,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// credential-bearing request after serialization already exhausted it.
 			stream.push({ type: "start", partial: output });
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
-			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
-			const firstEventStartedAt = Date.now();
-			const endpointClass = model.baseUrl ? "custom" : "canonical";
-			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
-				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
-					requestBytes: requestBytes.length,
-					firstEventElapsedMs: Date.now() - firstEventStartedAt,
-					firstEventTimeoutMs,
-					endpointClass,
-				});
 			const clearTransportWatchdog = () => {
 				if (transportWatchdog) {
 					clearTimeout(transportWatchdog);
@@ -959,7 +977,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				);
 			};
 			let firstEventWatchdogArmed = false;
-			let remainingFirstEventTimeoutMs =
+			remainingFirstEventTimeoutMs =
 				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
 					? firstEventTimeoutMs
 					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
@@ -972,16 +990,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				throw createFirstEventTimeoutError();
 			}
 			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
-			// A previous bounded non-abortable exec may still be mutating local state
-			// after its provider wrapper published a capped terminal. Do not admit a
-			// retry or later turn for this conversation until that actual operation
-			// settles, but keep the same first-event budget governing the wait.
-			await waitForCursorMutationLock(
-				conversationId,
-				options?.signal,
-				remainingFirstEventTimeoutMs,
-				createFirstEventTimeoutError,
-			);
 			remainingFirstEventTimeoutMs =
 				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
 					? firstEventTimeoutMs
