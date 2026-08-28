@@ -2264,6 +2264,8 @@ export class AsyncJobManager {
 		const pending = new Set<string>();
 		for (const delivery of this.#deliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
 		for (const delivery of this.#inFlightDeliveries) pending.add(`${delivery.jobId}:${delivery.generation}`);
+		for (const delivery of this.#parkedDeliveries.values()) pending.add(`${delivery.jobId}:${delivery.generation}`);
+		for (const claim of this.#receiptClaims.values()) pending.add(`${claim.jobId}:${claim.generation}`);
 
 		const failedVisible = new Set<string>();
 		for (const entry of this.#deadLetteredDeliveries.values()) {

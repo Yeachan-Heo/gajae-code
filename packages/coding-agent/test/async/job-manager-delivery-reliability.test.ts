@@ -392,4 +392,32 @@ describe("AsyncJobManager delivery reliability", () => {
 		expect(automaticManager.register("bash", "automatic replacement", async () => "replacement")).toBe("bg_2");
 		await automaticManager.dispose({ timeoutMs: 250 });
 	});
+
+	test("terminal parked and claimed deliveries remain pending in snapshots", async () => {
+		const manager = new AsyncJobManager({ onJobComplete: () => {}, retentionMs: 0 });
+		try {
+			const parkedId = manager.register("bash", "parked terminal", async () => "parked", { id: "parked-terminal" });
+			const parked = manager.getJob(parkedId);
+			if (!parked) throw new Error("expected parked terminal job");
+			await parked.promise;
+			manager.retainParkedDelivery(parked, "parked output");
+
+			const claimedId = manager.register("bash", "claimed terminal", async () => "claimed", {
+				id: "claimed-terminal",
+			});
+			const claimed = manager.getJob(claimedId);
+			if (!claimed) throw new Error("expected claimed terminal job");
+			await claimed.promise;
+			manager.retainDeliveryClaim(claimed);
+
+			expect(manager.getJobsSnapshot().jobs).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({ id: parkedId, status: "completed", deliveryState: "pending" }),
+					expect.objectContaining({ id: claimedId, status: "completed", deliveryState: "pending" }),
+				]),
+			);
+		} finally {
+			await manager.dispose({ timeoutMs: 250 });
+		}
+	});
 });
