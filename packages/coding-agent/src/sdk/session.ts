@@ -2337,6 +2337,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								});
 						});
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
+						if (
+							pluginNames.size > 0 &&
+							!Object.keys(loaded.configs).some(name => nextManager?.getConnectionStatus(name) === "connecting")
+						) {
+							nextManager.sealConnectionSet();
+						}
 						nextCustomTools.push(...(result.tools as CustomTool[]));
 						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
 						for (const tool of result.tools) {
