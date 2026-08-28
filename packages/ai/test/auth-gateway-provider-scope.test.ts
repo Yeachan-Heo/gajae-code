@@ -505,6 +505,31 @@ describe("provider-scoped auth-gateway catalogs", () => {
 		}
 	});
 
+	it("fails closed when scoped usage is unavailable", async () => {
+		const provider = "scope-usage-unavailable-provider";
+		const scopedModel = model("scope-usage-unavailable-model", provider, "openai-codex-responses");
+		const gateway = startAuthGateway({
+			bind: "127.0.0.1:0",
+			providerScope: { provider },
+			...testAuthority(provider),
+			bearerTokens: [],
+			version: "test",
+			storage: {
+				exportSnapshot: () => ({ credentials: [{ provider }] }),
+				fetchUsageReports: async () => null,
+			} as unknown as AuthStorage,
+			resolveModel: () => scopedModel,
+			listModels: () => [scopedModel],
+		});
+		try {
+			const usage = await fetch(`${gateway.url}/v1/usage`);
+			expect(usage.status).toBe(503);
+			expect(await usage.text()).not.toContain("reports");
+		} finally {
+			await gateway.close();
+		}
+	});
+
 	it("does not turn broker reload failures into false-zero diagnostics", async () => {
 		const provider = "scope-reload-failure-provider";
 		const scopedModel = model("scope-reload-failure-model", provider, "openai-codex-responses");

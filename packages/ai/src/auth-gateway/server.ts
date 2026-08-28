@@ -1107,9 +1107,11 @@ async function handlePiNative(
  * surfaces the same data to HTTP callers (notably the macOS usage widget).
  */
 async function handleUsage(storage: AuthStorage, provider: Provider, signal: AbortSignal): Promise<Response> {
-	const reports = ((await storage.fetchUsageReports?.({ provider, signal })) ?? []).filter(
-		report => report.provider === provider,
-	);
+	const fetchedReports = await storage.fetchUsageReports?.({ provider, signal });
+	if (fetchedReports === null || fetchedReports === undefined) {
+		throw new Error("Usage unavailable.");
+	}
+	const reports = fetchedReports.filter(report => report.provider === provider);
 	// Drop the heavy provider-specific `raw` payload — UI consumers only need
 	// `limits` + `metadata`. Match the broker's `/v1/usage` shape so a single
 	// client struct (Swift widget, llm-git, ...) works against either endpoint.
