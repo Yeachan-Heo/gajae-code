@@ -11,6 +11,7 @@ import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-ag
 import type { LoadContext } from "@gajae-code/coding-agent/capability/types";
 import { runMigrate } from "@gajae-code/coding-agent/cli/migrate-cli";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { loadHooks } from "@gajae-code/coding-agent/extensibility/hooks/loader";
 import {
 	discoverRuntimeSkills,
 	findRuntimeSkillByName,
@@ -25,6 +26,7 @@ import {
 	buildSystemPrompt as buildSdkSystemPrompt,
 	createAgentSession,
 	discoverContextFiles as discoverSdkContextFiles,
+	discoverSlashCommands as discoverSdkSlashCommands,
 } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
@@ -342,5 +344,30 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 
 		const commands = await loadSlashCommands({ cwd: project, agentDir: profile });
 		expect(commands.map(command => command.name)).toEqual(["profile-command", "init"]);
+		const destination = path.join(tempDir, "destination-slash");
+		await writeFile(
+			path.join(destination, ".gjc", "commands", "destination-command.md"),
+			["---", "description: destination command", "---", "", "destination body"].join("\n"),
+		);
+		const destinationCommands = await discoverSdkSlashCommands(destination, profile);
+		expect(destinationCommands.map(command => command.name)).toContain("destination-command");
+		expect(destinationCommands.map(command => command.name)).not.toContain("decoy-command");
+	});
+
+	test("loaded hook exec follows the destination cwd supplied after rescope", async () => {
+		const destination = path.join(tempDir, "destination");
+		await fs.mkdir(destination, { recursive: true });
+		const hookPath = path.join(tempDir, "cwd-hook.ts");
+		await writeFile(
+			hookPath,
+			'export default api => { api.on("agent_start", async (_event, _context) => api.exec("pwd", [])); };\n',
+		);
+		const loaded = await loadHooks([hookPath], project);
+		loaded.hooks[0]?.setCwd?.(destination);
+		const handler = loaded.hooks[0]?.handlers.get("agent_start")?.[0];
+		expect(handler).toBeDefined();
+		const result = (await handler!({}, { cwd: destination } as never)) as { code: number; stdout: string };
+		expect(result).toMatchObject({ code: 0 });
+		expect(result.stdout.trim()).toBe(destination);
 	});
 });
