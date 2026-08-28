@@ -2465,7 +2465,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						cwd: to,
 					});
 				}
+			} else {
+				obfuscator = undefined;
+				secretsEnabled = false;
+				session?.setObfuscator(undefined);
 			}
+			extensionRunner?.rebindScope(to, settings);
 			try {
 				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, settings });
 				contextFiles = rediscovered.contextFiles;

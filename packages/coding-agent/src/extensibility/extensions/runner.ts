@@ -276,16 +276,22 @@ export class ExtensionRunner {
 	constructor(
 		private readonly extensions: Extension[],
 		private readonly runtime: ExtensionRuntime,
-		private readonly cwd: string,
+		private cwd: string,
 		private readonly sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
 		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
-		private readonly settings?: Settings,
+		private settings?: Settings,
 		credentialSessionIdGetter?: () => string,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getCredentialSessionId = credentialSessionIdGetter ?? (() => "");
 		this.#handlersByEvent = ExtensionRunner.#indexHandlers(extensions);
+	}
+
+	/** Rebind cwd-scoped context authority after a committed session rescope. */
+	rebindScope(cwd: string, settings?: Settings): void {
+		this.cwd = cwd;
+		this.settings = settings;
 	}
 
 	static #indexHandlers(extensions: Extension[]): Map<string, IndexedHandler[]> {
