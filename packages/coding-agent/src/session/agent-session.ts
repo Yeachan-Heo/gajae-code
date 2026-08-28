@@ -11574,6 +11574,7 @@ export class AgentSession {
 	/** Replace project-scoped settings after a committed cwd rescope. */
 	setSettings(settings: Settings): void {
 		this.settings = settings;
+		this.#skillsSettings = settings.getGroup("skills");
 	}
 
 	/** Replace cwd-scoped secret masking state after a committed rescope. */
