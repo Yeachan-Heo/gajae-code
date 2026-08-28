@@ -1372,7 +1372,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			skills: this.session.skills ?? [],
 			rules: this.session.rules,
 			internalRouter: InternalUrlRouter.instance(),
-			localOptions: this.session.localProtocolOptions,
+			localOptions: this.session.localProtocolOptions ?? {
+				getArtifactsDir: this.session.getArtifactsDir,
+				isManagedDestination: this.session.isManagedSessionDestination,
+				getSessionId: this.session.getSessionId,
+			},
 		};
 		command = await expandInternalUrls(command, {
 			...internalUrlOptions,
