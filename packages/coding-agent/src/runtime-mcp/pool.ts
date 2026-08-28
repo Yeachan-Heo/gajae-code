@@ -865,6 +865,7 @@ export class MCPConnectionPool {
 
 	private closeEntry(entry: PoolEntry): Promise<void> {
 		if (entry.closePromise) return entry.closePromise;
+		const wasRetired = this.#retiredEntries.has(entry);
 		const closePromise = Promise.resolve().then(async () => {
 			if (entry.idleTimer) {
 				clearTimeout(entry.idleTimer);
@@ -899,8 +900,8 @@ export class MCPConnectionPool {
 					this.record(entry, "closed");
 				} else {
 					entry.transportCloseStarted = false;
-					entry.state = "connected";
-					if (!this.#entries.has(entry.key)) this.#entries.set(entry.key, entry);
+					entry.state = wasRetired || !entry.connection.transport.connected ? "error" : "connected";
+					if (entry.state === "connected" && !this.#entries.has(entry.key)) this.#entries.set(entry.key, entry);
 				}
 			}
 		});

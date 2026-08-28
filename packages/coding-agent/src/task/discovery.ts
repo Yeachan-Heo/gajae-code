@@ -10,7 +10,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentProfileAuthority, getConfigDirName, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, getConfigDirName, getTrustedHomeDir, logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
@@ -66,7 +66,10 @@ export async function discoverAgents(
 	agentDir?: string,
 ): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
-	const resolvedAgentDir = agentDir ?? activeSettings?.getAgentDir();
+	const resolvedAgentDir =
+		agentDir ??
+		activeSettings?.getAgentDir() ??
+		(getAgentProfileAuthority() === "custom" ? getAgentDir() : undefined);
 	const profileAuthority =
 		resolvedAgentDir !== undefined
 			? path.resolve(resolvedAgentDir) === path.resolve(path.join(home, getConfigDirName(), "agent"))
