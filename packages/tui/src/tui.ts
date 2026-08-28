@@ -4421,7 +4421,7 @@ export class TUI extends Container {
 			const skipAnchorPush = reuseTranscriptPrefix && child === this.#viewportAnchorComponent;
 			if (child === this.#viewportAnchorComponent && rendered.anchors.some(anchor => anchor !== null)) {
 				anchorFrame = {
-					startRow: skipAnchorPush ? renderedLines.length : renderedLines.length,
+					startRow: renderedLines.length,
 					anchors: rendered.anchors,
 				};
 			}

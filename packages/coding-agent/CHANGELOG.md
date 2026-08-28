@@ -48,8 +48,7 @@
 
 - The `ask` tool now rejects empty or whitespace-only custom answers on every local and remote input path. Remote invalid answers receive a visible explanation and are retried at most three times with an event-loop yield between attempts before the ask is cancelled; local empty custom input is never returned as a valid answer. (#5001)
 - Executor and Python kernel hot paths reuse the process Settings singleton via `Settings.currentOrInit()` instead of calling `Settings.init()` with empty options on every tool run, which logged a reinit warning on each invocation in a long interactive session.
-- Managed file replacement now awaits `exactReplacePathAsync` on the native blocking pool instead of calling synchronous `exactReplacePath` from the async `replaceManagedFile` path, so session persistence no longer stalls the interactive event loop on SHA-256 and the namespace exchange.
-- Interactive managed session persistence now queues transcript appends and rewrites on the persist chain and awaits `exactReplacePathAsync` instead of calling synchronous `exactReplacePath` from `_persist`. Loader shimmer can keep painting while a 1–2 MiB JSONL is hashed on the native pool; `flush()` / `close()` still drain the chain.
+- Interactive managed session persistence queues transcript appends and rewrites on the persist chain. `replaceManagedFile` awaits `exactReplacePathAsync` instead of calling synchronous `exactReplacePath` on the JS thread. `flush()` / `close()` still drain the chain.
 
 ## [0.15.3] - 2026-08-27
 
