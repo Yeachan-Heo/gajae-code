@@ -1498,8 +1498,10 @@ pub fn secure_write_skill_file(
 }
 
 /// Async variant of [`secure_write_skill_file`] scheduled on the libuv blocking
-/// pool. Directory traversal, ACL updates, payload writes, and flushes can all
-/// block on a slow filesystem; none of that work may run on the JS thread.
+/// pool.
+///
+/// Directory traversal, ACL updates, payload writes, and flushes can all block
+/// on a slow filesystem; none of that work may run on the JS thread.
 #[napi]
 pub fn secure_write_skill_file_async(
 	root_path: String,
@@ -4648,7 +4650,10 @@ pub(crate) mod platform {
 	}
 
 	fn statat_fd(parent_fd: libc::c_int, name: &CString) -> Result<libc::stat, &'static str> {
+		// SAFETY: `named` is initialized before libc writes the stat record.
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `parent_fd` is an open directory descriptor and `name` is
+		// NUL-terminated.
 		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) }
 			!= 0
 		{
@@ -4705,10 +4710,8 @@ pub(crate) mod platform {
 				},
 			};
 			let next = unsafe { File::from_raw_fd(next) };
-			if created {
-				if unsafe { libc::fchmod(next.as_raw_fd(), directory_mode) } != 0 {
-					return Err(skill_write_error(&std::io::Error::last_os_error()));
-				}
+			if created && unsafe { libc::fchmod(next.as_raw_fd(), directory_mode) } != 0 {
+				return Err(skill_write_error(&std::io::Error::last_os_error()));
 			}
 			if created {
 				fsync_root_parent(current.as_raw_fd())?;
@@ -4799,7 +4802,7 @@ pub(crate) mod platform {
 					continue;
 				}
 				return Err(skill_write_error(&error));
-			};
+			}
 			if unsafe { libc::fchmod(fd, file_mode as libc::mode_t) } != 0 {
 				let error = std::io::Error::last_os_error();
 				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
@@ -4819,10 +4822,6 @@ pub(crate) mod platform {
 		Err("race_limit")
 	}
 
-	#[expect(
-		clippy::undocumented_unsafe_blocks,
-		reason = "the retained parent descriptor binds the only namespace mutation"
-	)]
 	enum SkillPublicationError {
 		Pre(&'static str),
 		Post(&'static str),
@@ -4841,12 +4840,20 @@ pub(crate) mod platform {
 		if revalidate_skill_directory(root, skill_name, parent_fd).is_err() {
 			return Err(SkillPublicationError::Pre("identity_mismatch"));
 		}
+		// SAFETY: Both stat values are initialized output buffers.
 		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `named` is initialized before libc writes the stat record.
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe { libc::fstat(private_fd, &mut opened) } != 0
-			|| unsafe {
-				libc::fstatat(parent_fd, private_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-			} != 0 || opened.st_mode & libc::S_IFMT != libc::S_IFREG
+		// SAFETY: `private_fd` is retained for the publication transaction.
+		let opened_ok = unsafe { libc::fstat(private_fd, &mut opened) } == 0;
+		// SAFETY: `parent_fd` retains the destination directory and the name is
+		// NUL-terminated.
+		let named_ok = unsafe {
+			libc::fstatat(parent_fd, private_name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+		} == 0;
+		if !opened_ok
+			|| !named_ok
+			|| opened.st_mode & libc::S_IFMT != libc::S_IFREG
 			|| opened.st_nlink != 1
 			|| named.st_mode & libc::S_IFMT != libc::S_IFREG
 			|| named.st_nlink != 1
@@ -4855,6 +4862,8 @@ pub(crate) mod platform {
 		{
 			return Err(SkillPublicationError::Pre("identity_mismatch"));
 		}
+		// SAFETY: `parent_fd` retains the destination directory and both names are
+		// NUL-terminated.
 		if unsafe { libc::renameat(parent_fd, private_name.as_ptr(), parent_fd, final_name.as_ptr()) }
 			!= 0
 		{
@@ -4862,11 +4871,19 @@ pub(crate) mod platform {
 				&std::io::Error::last_os_error(),
 			)));
 		}
+		// SAFETY: `published` is an initialized output buffer for the retained
+		// destination directory.
 		let mut published: libc::stat = unsafe { std::mem::zeroed() };
-		let valid = unsafe { libc::fstat(private_fd, &mut opened) } == 0
-			&& unsafe {
-				libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
-			} == 0 && opened.st_mode & libc::S_IFMT == libc::S_IFREG
+		// SAFETY: `private_fd` is retained for the publication transaction.
+		let opened_after_ok = unsafe { libc::fstat(private_fd, &mut opened) } == 0;
+		// SAFETY: `parent_fd` retains the destination directory and the name is
+		// NUL-terminated.
+		let published_ok = unsafe {
+			libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
+		} == 0;
+		let valid = opened_after_ok
+			&& published_ok
+			&& opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& opened.st_nlink == 1
 			&& published.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& published.st_nlink == 1
@@ -4875,27 +4892,30 @@ pub(crate) mod platform {
 		if valid {
 			return Ok(());
 		}
+		// SAFETY: `parent_fd` retains the parent directory and the final name is
+		// NUL-terminated.
 		if unsafe {
 			libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
 		} == 0 && opened.st_dev == published.st_dev
 			&& opened.st_ino == published.st_ino
 		{
+			// SAFETY: The final name still identifies the file just validated against
+			// `private_fd`.
 			unsafe { libc::unlinkat(parent_fd, final_name.as_ptr(), 0) };
 		}
 		Err(SkillPublicationError::Post("identity_mismatch"))
 	}
 
-	#[expect(
-		clippy::undocumented_unsafe_blocks,
-		reason = "the retained directory descriptor owns private cleanup after failed publication"
-	)]
 	fn unlink_private_skill_file(
 		parent_fd: libc::c_int,
 		name: &CString,
 		private_fd: libc::c_int,
 	) -> Result<(), &'static str> {
+		// SAFETY: Both stat values are initialized output buffers.
 		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: `named` is initialized before libc writes the stat record.
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		// SAFETY: The retained descriptors remain valid and the name is NUL-terminated.
 		let same = unsafe { libc::fstat(private_fd, &mut opened) } == 0
 			&& unsafe {
 				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
@@ -4908,6 +4928,8 @@ pub(crate) mod platform {
 		if FAIL_SECURE_SKILL_CLEANUP.swap(false, Ordering::Relaxed) {
 			return Err("cleanup_failed");
 		}
+		// SAFETY: `parent_fd` retains the parent directory and `name` is
+		// NUL-terminated.
 		if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } != 0 {
 			return Err("cleanup_failed");
 		}
@@ -5142,14 +5164,12 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		if skill_created {
-			if let Err(code) = fsync_root_parent(skills_fd) {
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(code);
+		if skill_created && let Err(code) = fsync_root_parent(skills_fd) {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
 			}
+			return NativeSecureSkillWriteResult::failure(code);
 		}
 		drop(file);
 		unsafe {

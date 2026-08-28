@@ -1597,9 +1597,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? Promise.resolve(options.promptTemplates)
 			: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
 		promptTemplatesPromise.catch(() => {});
-		const slashCommandsPromise = options.slashCommands
-			? Promise.resolve(options.slashCommands)
-			: logger.time("discoverSlashCommands", loadSlashCommands, { cwd, agentDir, settings });
+		// SDK sessions do not implicitly activate local customization commands. Hosts
+		// that want file-backed commands must provide them explicitly, keeping utility
+		// surfaces free of ambient profile discovery.
+		const slashCommandsPromise = Promise.resolve(options.slashCommands ?? []);
 		slashCommandsPromise.catch(() => {});
 		let slashCommands: FileSlashCommand[] = [];
 
