@@ -2257,6 +2257,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const rebindCwdCapturingAuthority = async (to: string): Promise<void> => {
 			if (!session) return;
 			const generation = ++replacementMcpGeneration;
+			if (settings.getCwd() !== to) {
+				settings = await settings.cloneForCwd(to);
+				session.setSettings(settings);
+				toolSession.settings = settings;
+			}
 			for (const timer of notificationDebounceTimers.values()) clearTimeout(timer);
 			notificationDebounceTimers.clear();
 			let replacementReady = false;
@@ -2477,7 +2482,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
 			try {
-				settings = await settings.cloneForCwd(to);
+				if (settings.getCwd() !== to) settings = await settings.cloneForCwd(to);
 				session?.setSettings(settings);
 				toolSession.settings = settings;
 			} catch (error) {
