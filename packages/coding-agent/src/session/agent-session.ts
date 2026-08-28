@@ -407,7 +407,7 @@ import {
 	selectRestorableDiscoveredBuiltinToolNames,
 } from "../tool-discovery/tool-index";
 import type { AskAnswerSource, ToolSession } from "../tools";
-import { computeEssentialBuiltinNames } from "../tools";
+import { computeEssentialBuiltinNames, resolveEffectiveDiscoveryMode } from "../tools";
 import { AskTool } from "../tools/ask";
 import {
 	getAskAnswerSource as getAskAnswerSourceFromRegistry,
@@ -11579,6 +11579,8 @@ export class AgentSession {
 		this.#unregisterResourceGc = undefined;
 		this.settings = settings;
 		this.#skillsSettings = settings.getGroup("skills");
+		this.#discoveryMode = resolveEffectiveDiscoveryMode(settings);
+		this.#mcpDiscoveryEnabled = this.#discoveryMode !== "off";
 		this.sessionManager.setSessionMemoryMode(settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = settings.onChanged(settingPath => {
 			if (settingPath === "sessionMemory.mode") {
