@@ -1615,7 +1615,7 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		if (!this.#authority) {
-			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
+			const current = await captureManagedFileIdentityStreamingNoFollowAsync(resolved);
 			if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
 			await replaceManagedFile(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
 			this.#assertBound();
@@ -1846,7 +1846,7 @@ export class ManagedSessionDescendantStore {
 		this.#beforeMutation();
 		this.#assertBound();
 		if (!this.#authority) {
-			const current = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+			const current = await captureManagedFileIdentityStreamingNoFollowAsync(this.#resolve(relativePath));
 			if (
 				current.dev.toString() !== bounded.dev ||
 				current.ino.toString() !== bounded.ino ||
@@ -2958,27 +2958,81 @@ export function inspectManagedFileNoFollow(pathname: string, prefixLimit: number
 	}
 }
 
+const MANAGED_HASH_YIELD_BYTES = 64 * 1024;
+
+async function yieldManagedHashProgress(): Promise<void> {
+	await Bun.sleep(0);
+}
+
 function captureManagedFileIdentityStreamingNoFollow(pathname: string): ManagedFileSnapshot["identity"] {
 	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
 	try {
-		const before = fs.fstatSync(fd, { bigint: true });
-		if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
-		const hash = createHash("sha256");
-		const chunk = Buffer.alloc(64 * 1024);
-		for (;;) {
-			const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
-			if (count === 0) break;
-			hash.update(chunk.subarray(0, count));
-		}
-		const after = fs.fstatSync(fd, { bigint: true });
-		if (!sameIdentity(identity(before), identity(after))) throw new Error("source_changed");
-		const named = fs.lstatSync(pathname, { bigint: true });
-		if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
-			throw new Error("source_changed");
-		return identity(before, hash.digest("hex"));
+		return hashOpenManagedIdentity(pathname, fd);
 	} finally {
 		fs.closeSync(fd);
 	}
+}
+
+async function captureManagedFileIdentityStreamingNoFollowAsync(
+	pathname: string,
+): Promise<ManagedFileSnapshot["identity"]> {
+	const fd = fs.openSync(pathname, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0));
+	try {
+		return await hashOpenManagedIdentityAsync(pathname, fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
+
+function hashOpenManagedIdentity(pathname: string, fd: number): ManagedFileSnapshot["identity"] {
+	const before = fs.fstatSync(fd, { bigint: true });
+	if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+	const hash = createHash("sha256");
+	const chunk = Buffer.alloc(MANAGED_HASH_YIELD_BYTES);
+	for (;;) {
+		const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+		if (count === 0) break;
+		hash.update(chunk.subarray(0, count));
+	}
+	const after = fs.fstatSync(fd, { bigint: true });
+	if (!sameIdentity(identity(before), identity(after))) throw new Error("source_changed");
+	const named = fs.lstatSync(pathname, { bigint: true });
+	if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
+		throw new Error("source_changed");
+	return identity(before, hash.digest("hex"));
+}
+
+async function hashOpenManagedIdentityAsync(pathname: string, fd: number): Promise<ManagedFileSnapshot["identity"]> {
+	const before = fs.fstatSync(fd, { bigint: true });
+	if (!before.isFile() || before.nlink > 1) throw new Error("source_changed");
+	const hash = createHash("sha256");
+	const chunk = Buffer.alloc(MANAGED_HASH_YIELD_BYTES);
+	for (;;) {
+		const count = fs.readSync(fd, chunk, 0, chunk.byteLength, null);
+		if (count === 0) break;
+		hash.update(chunk.subarray(0, count));
+		await yieldManagedHashProgress();
+	}
+	const after = fs.fstatSync(fd, { bigint: true });
+	if (!sameIdentity(identity(before), identity(after))) throw new Error("source_changed");
+	const named = fs.lstatSync(pathname, { bigint: true });
+	if (!named.isFile() || named.isSymbolicLink() || !sameIdentity(identity(before), identity(named)))
+		throw new Error("source_changed");
+	return identity(before, hash.digest("hex"));
+}
+
+async function writeHashedBytesAsync(fd: number, bytes: Uint8Array): Promise<{ size: number; sha256: string }> {
+	const hash = createHash("sha256");
+	let offset = 0;
+	while (offset < bytes.byteLength) {
+		const amount = Math.min(MANAGED_HASH_YIELD_BYTES, bytes.byteLength - offset);
+		const written = fs.writeSync(fd, bytes, offset, amount);
+		if (written === 0) throw new Error("managed_replace_short_write");
+		hash.update(bytes.subarray(offset, offset + written));
+		offset += written;
+		await yieldManagedHashProgress();
+	}
+	return { size: offset, sha256: hash.digest("hex") };
 }
 
 /** Atomically publishes bytes without replacing an existing destination. */
@@ -3361,10 +3415,10 @@ function replaceManagedFileGeneratedSync(
 	return publishedIdentity;
 }
 
-/** Async twin of {@link replaceManagedFileGeneratedSync}; keep in lockstep except the native replace boundary. */
+/** Async twin of {@link replaceManagedFileGeneratedSync}; keep in lockstep except yielding write/hash and the native replace boundary. */
 async function replaceManagedFileGenerated(
 	destination: string,
-	writeContent: (fd: number) => { size: number; sha256: string },
+	writeContent: (fd: number) => { size: number; sha256: string } | Promise<{ size: number; sha256: string }>,
 	root: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy = "default",
 	assertFence?: () => void,
@@ -3401,7 +3455,7 @@ async function replaceManagedFileGenerated(
 		secureFileDescriptor(staging, fd, "apply");
 		const initiallyStaged = fs.fstatSync(fd, { bigint: true });
 		stagedIdentity = { dev: initiallyStaged.dev, ino: initiallyStaged.ino };
-		const generated = writeContent(fd);
+		const generated = await writeContent(fd);
 		fs.fsyncSync(fd);
 		secureFileDescriptor(staging, fd, "verify");
 		const staged = fs.fstatSync(fd, { bigint: true });
@@ -3671,12 +3725,12 @@ async function appendManagedFileStreaming(
 	root: ManagedDirectoryRoot,
 	policy: ManagedSessionSecurityPolicy,
 ): Promise<ManagedFileSnapshot["identity"]> {
-	const predecessor = captureManagedFileIdentityStreamingNoFollow(destination);
+	const predecessor = await captureManagedFileIdentityStreamingNoFollowAsync(destination);
 	if (predecessor.size > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
 		throw new Error("content_too_large");
 	return await replaceManagedFileGenerated(
 		destination,
-		stagingFd => {
+		async stagingFd => {
 			const sourceFd = fs.openSync(
 				destination,
 				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
@@ -3686,7 +3740,7 @@ async function appendManagedFileStreaming(
 				if (!sameReplacementIdentity(identity(before, predecessor.sha256), predecessor))
 					throw new Error("managed_replace_identity_mismatch");
 				const hash = createHash("sha256");
-				const chunk = Buffer.alloc(64 * 1024);
+				const chunk = Buffer.alloc(MANAGED_HASH_YIELD_BYTES);
 				let total = 0;
 				for (;;) {
 					const count = fs.readSync(sourceFd, chunk, 0, chunk.byteLength, null);
@@ -3699,6 +3753,7 @@ async function appendManagedFileStreaming(
 					}
 					hash.update(chunk.subarray(0, count));
 					total += count;
+					await yieldManagedHashProgress();
 				}
 				const after = fs.fstatSync(sourceFd, { bigint: true });
 				const named = fs.lstatSync(destination, { bigint: true });
@@ -3712,10 +3767,15 @@ async function appendManagedFileStreaming(
 					throw new Error("content_too_large");
 				let appended = 0;
 				while (appended < appendedBytes.byteLength) {
-					const amount = fs.writeSync(stagingFd, appendedBytes, appended, appendedBytes.byteLength - appended);
-					if (amount === 0) throw new Error("managed_replace_short_write");
-					hash.update(appendedBytes.subarray(appended, appended + amount));
-					appended += amount;
+					const amount = Math.min(
+						MANAGED_HASH_YIELD_BYTES,
+						appendedBytes.byteLength - appended,
+					);
+					const written = fs.writeSync(stagingFd, appendedBytes, appended, amount);
+					if (written === 0) throw new Error("managed_replace_short_write");
+					hash.update(appendedBytes.subarray(appended, appended + written));
+					appended += written;
+					await yieldManagedHashProgress();
 				}
 				return { size: total + appended, sha256: hash.digest("hex") };
 			} finally {
@@ -3742,17 +3802,7 @@ export async function replaceManagedFile(
 	if (bytes.byteLength > MANAGED_ARTIFACT_MAX_FILE_BYTES) throw new Error("content_too_large");
 	await replaceManagedFileGenerated(
 		destination,
-		fd => {
-			const hash = createHash("sha256");
-			let offset = 0;
-			while (offset < bytes.byteLength) {
-				const written = fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-				if (written === 0) throw new Error("managed_replace_short_write");
-				hash.update(bytes.subarray(offset, offset + written));
-				offset += written;
-			}
-			return { size: offset, sha256: hash.digest("hex") };
-		},
+		fd => writeHashedBytesAsync(fd, bytes),
 		root,
 		policy,
 		assertFence,

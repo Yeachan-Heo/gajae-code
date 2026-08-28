@@ -382,6 +382,13 @@ export interface AgentOptions {
 	beforeToolCall?: AgentLoopConfig["beforeToolCall"];
 
 	/**
+	 * Called immediately before each model call, after the loop yields to
+	 * listeners. Reassign to wait for durable work (session persist) without
+	 * awaiting every Agent subscriber.
+	 */
+	syncContextBeforeModelCall?: AgentLoopConfig["syncContextBeforeModelCall"];
+
+	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and the tool-result
 	 * message are emitted. See {@link AgentLoopConfig.afterToolCall} for full semantics.
 	 */
@@ -557,6 +564,12 @@ export class Agent {
 	 */
 	beforeToolCall?: AgentLoopConfig["beforeToolCall"];
 	/**
+	 * Hook invoked after the listener yield and before each model call.
+	 * Reassign at any time. The loop still refreshes system prompt and tools
+	 * from live state after this hook returns.
+	 */
+	syncContextBeforeModelCall?: AgentLoopConfig["syncContextBeforeModelCall"];
+	/**
 	 * Hook invoked after tool execution and before `tool_execution_end` / tool-result
 	 * message emission. Reassign at any time to swap the implementation.
 	 */
@@ -608,6 +621,7 @@ export class Agent {
 		this.#onHarmonyLeak = opts.onHarmonyLeak;
 		this.#shouldPause = opts.shouldPause;
 		this.beforeToolCall = opts.beforeToolCall;
+		this.syncContextBeforeModelCall = opts.syncContextBeforeModelCall;
 		this.onFollowUpConsumed = opts.onFollowUpConsumed;
 		this.onSteeringConsumed = opts.onSteeringConsumed;
 		this.afterToolCall = opts.afterToolCall;
@@ -1887,6 +1901,7 @@ export class Agent {
 				if (this.#listeners.size > 0) {
 					await Bun.sleep(0);
 				}
+				await this.syncContextBeforeModelCall?.(context);
 				context.systemPrompt = this.#state.systemPrompt;
 				context.tools = this.#state.tools;
 			},

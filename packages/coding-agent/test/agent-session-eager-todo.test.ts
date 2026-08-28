@@ -719,9 +719,8 @@ describe("AgentSession eager todo enforcement", () => {
 			const realManagedIdentityAppend = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
 			const realManagedIdentityAppendAsync = ManagedSessionDescendantStore.prototype.appendExpectedIdentity;
 			let rejectedSuccessfulTodo = false;
-			// Records the successful todo_write append as committed-then-failed. The manager
-			// only takes the unbound `appendSync` for the FIRST append of a transcript; every
-			// later append carries the expected identity, which is where the todo lands.
+			// Records the successful todo_write as committed-then-failed. Identity-bearing
+			// appends and rewrites both go through the async expected-identity path.
 			const rejectCommittedTodo = (staged: string): boolean => {
 				if (rejectedSuccessfulTodo) return false;
 				if (!staged.includes('"toolName":"todo_write"')) return false;
@@ -789,10 +788,7 @@ describe("AgentSession eager todo enforcement", () => {
 
 			expect(rejectedSuccessfulTodo).toBe(true);
 			expect(abort).toHaveBeenCalled();
-			// Persist now yields on exactReplacePathAsync, and Agent listeners are not
-			// awaited, so a follow-up stream can start before abort is observed.
-			expect(providerCallCount).toBeGreaterThanOrEqual(1);
-			expect(providerCallCount).toBeLessThanOrEqual(2);
+			expect(providerCallCount).toBe(1);
 			expect(session.getTodoPhases()).toEqual([
 				{ name: "Work", tasks: [{ content: "Persist this task", status: "in_progress" }] },
 			]);

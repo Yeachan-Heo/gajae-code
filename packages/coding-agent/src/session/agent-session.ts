@@ -4319,7 +4319,9 @@ export class AgentSession {
 		// intentionally survive the tool call: resumed registrations re-use the
 		// original tool call id and must retain the same owned-completion origin.
 		// They are superseded by a rebind on the same id or by bounded eviction.
-		this.agent.beforeToolCall = ctx => {
+		this.agent.beforeToolCall = async (ctx, signal) => {
+			await this.#awaitDurablePersistBeforeAdmission();
+			if (signal?.aborted) return { block: true, reason: "Session persistence failed" };
 			const lineageIdHash = this.#turnLineageIdHash;
 			if (lineageIdHash) {
 				bindToolLineage(ctx.toolCall.id, {
@@ -4338,6 +4340,9 @@ export class AgentSession {
 				});
 			}
 			return undefined;
+		};
+		this.agent.syncContextBeforeModelCall = async () => {
+			await this.#awaitDurablePersistBeforeAdmission();
 		};
 		// A queued owned-completion follow-up is consumed by the agent loop
 		// DIRECTLY (getFollowUpMessages), never through #promptWithMessage, so
@@ -5946,8 +5951,9 @@ export class AgentSession {
 				try {
 					this.sessionManager.appendMessage(event.message);
 					// Managed transcripts hash and swap the JSONL off the JS thread.
-					// Await the persist chain so a durable failure still aborts before
-					// tool execution, while TUI timers can run during exactReplacePathAsync.
+					// Await the persist chain so a durable failure still aborts this
+					// handler; tool and model admission wait for handlers via
+					// `#awaitDurablePersistBeforeAdmission`.
 					await this.sessionManager.flush();
 				} catch (error) {
 					// Typed near-limit append (#4566): the transcript hit the managed
@@ -8697,6 +8703,33 @@ export class AgentSession {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
 		await this.sessionManager.flush();
+	}
+
+	/**
+	 * Wait for in-flight Agent event handlers (and their persist) without waiting
+	 * for the live prompt. Agent listeners are not awaited, so tool execution
+	 * and the next model call must gate here or they race message_end flush.
+	 */
+	async #awaitDurablePersistBeforeAdmission(): Promise<void> {
+		while (this.#agentEventHandlersInFlight > 0) {
+			const wake = Promise.withResolvers<void>();
+			const check = () => {
+				if (this.#agentEventHandlersInFlight === 0) wake.resolve();
+			};
+			this.#scopedSettlementWaiters.add(check);
+			check();
+			try {
+				await wake.promise;
+			} finally {
+				this.#scopedSettlementWaiters.delete(check);
+			}
+		}
+		try {
+			await this.sessionManager.flush();
+		} catch (error) {
+			this.agent.abort();
+			throw error;
+		}
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {

@@ -404,6 +404,29 @@ describe("async native exact-replace boundary", () => {
 			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("successor\n");
 		});
 	});
+
+	it("yields the event loop while replaceManagedFile hashes a large transcript", async () => {
+		await withTempDir("gjc-replace-hash-yield-", async dir => {
+			const root = managedDirectoryRoot(dir);
+			const destination = path.join(dir, "session.jsonl");
+			const predecessor = new Uint8Array(256 * 1024).fill(0x61);
+			const successor = new Uint8Array(256 * 1024).fill(0x62);
+			await fsp.writeFile(destination, predecessor, { mode: 0o600 });
+			const expected = captureManagedFileNoFollow(destination).identity;
+
+			let ticks = 0;
+			const timer = setInterval(() => {
+				ticks += 1;
+			}, 1);
+			try {
+				await replaceManagedFile(destination, successor, root, "default", undefined, expected);
+			} finally {
+				clearInterval(timer);
+			}
+			expect(ticks).toBeGreaterThan(0);
+			expect(await fsp.readFile(destination)).toEqual(Buffer.from(successor));
+		});
+	});
 });
 
 describe("scrubbed protocol remnant reaping (issue #4394)", () => {

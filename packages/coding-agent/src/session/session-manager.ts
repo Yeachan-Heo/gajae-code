@@ -11082,7 +11082,7 @@ export class SessionManager {
 		// actually present and moved (hadSessionFile). Absent/fresh/deleted-source sessions
 		// have no destination transcript yet, so adopting a strict expected identity here
 		// would invent identity for a nonexistent file; defer adoption until the first real
-		// publication (#writeEntriesAtomicallySync / #appendManagedRecordsSync) instead.
+		// publication (#writeEntriesAtomically / #appendManagedRecords) instead.
 		if (hadSessionFile) this.#adoptManagedPersistIdentity(this.#sessionFile);
 		else this.#managedPersistExpectedIdentity = undefined;
 
@@ -11343,7 +11343,7 @@ export class SessionManager {
 	/**
 	 * Compares a captured preparation snapshot against live state. A lifecycle/session
 	 * switch aborts (throws); a revision change returns false so the caller discards
-	 * the prepared bytes and re-prepares. A stale snapshot is never published.
+	 * the prepared bytes and re-prepares before publication.
 	 */
 	#persistenceInputTokenMatches(token: PersistenceInputToken): boolean {
 		const live = this.#capturePersistenceInputToken();
@@ -15184,8 +15184,10 @@ export class SessionManager {
 		// Bounded freshness loop: prepare whole-session bytes, then enter the
 		// non-yielding fence with a live-token check. A revision change discards the
 		// prepared bytes and re-prepares (≤ 2 re-preparations); a lifecycle switch
-		// aborts. A stale snapshot is never published.
+		// aborts. A successful publish is never rolled back: if inputs moved during
+		// the await, mark a follow-up rewrite instead of throwing stale.
 		let written = false;
+		let followUpRewrite = false;
 		for (let attempt = 0; attempt <= 2 && !written; attempt++) {
 			this.#ensureFullHotView();
 			const token = this.#capturePersistenceInputToken();
@@ -15200,14 +15202,14 @@ export class SessionManager {
 			)
 				continue;
 			await this.#writeEntriesAtomically(entries);
+			written = true;
 			if (
 				!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))
 			)
-				continue;
-			written = true;
+				followUpRewrite = true;
 		}
 		if (!written) throw new Error("session_persistence_input_stale");
-		this.#needsFullRewriteOnNextPersist = false;
+		this.#needsFullRewriteOnNextPersist = followUpRewrite;
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
 		if (this.#effectiveSessionMemoryMode() !== "off") {
@@ -16693,7 +16695,7 @@ export class SessionManager {
 				return;
 			}
 		} else {
-			this.#appendManagedRecordsSync(records);
+			await this.#rewriteFileContents();
 			return;
 		}
 		this.#withSessionPersistenceFenceSync(() => {
