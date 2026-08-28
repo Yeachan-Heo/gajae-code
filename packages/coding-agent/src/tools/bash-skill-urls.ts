@@ -25,6 +25,7 @@ interface InternalUrlResolver {
 export interface InternalUrlExpansionOptions {
 	skills: readonly Skill[];
 	cwd?: string;
+	settings?: ResolveContext["settings"];
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
@@ -152,6 +153,7 @@ async function resolveInternalUrlToPath(
 	rawUrl: string,
 	skills: readonly Skill[],
 	cwd?: string,
+	settings?: ResolveContext["settings"],
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
 	rules?: ResolveContext["rules"],
@@ -203,6 +205,7 @@ async function resolveInternalUrlToPath(
 	try {
 		resource = await internalRouter.resolve(url, {
 			cwd,
+			settings,
 			rules,
 			skills,
 			localProtocolOptions: localOptions,
@@ -260,6 +263,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			url,
 			options.skills,
 			options.cwd,
+			options.settings,
 			options.internalRouter,
 			options.localOptions,
 			options.rules,
