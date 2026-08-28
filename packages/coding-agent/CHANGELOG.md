@@ -135,6 +135,10 @@
 
 ### Fixed
 
+- Fold control operations now report success only after the foreground fold transaction commits, while rejected fold requests follow the existing warning path; cleanup-triggered delivery failures remain eligible for bounded retry and visible dead-letter recording during manager disposal, and folded jobs expose read-only detail rows in the jobs overlay.
+- Native skill, context, hook, plugin, MCP, and task-agent discovery now consistently follows the session's selected agent-directory profile instead of leaking across profiles.
+- Generic file-lock release now retries transient Windows sharing denials and quarantines a verified self-owned lock when deletion remains unavailable, using an in-process acquisition generation rather than reclaiming every live lock with the same PID. Terminal `agent_end` publication remains independent of coordinator sidecar persistence, and a repeated interactive exit escalates through bounded postmortem cleanup. (#4943)
+
 - A one-shot `gjc sdk` command no longer idles for five seconds after its response is written. `SessionRouter` bounded four waits with `Bun.sleep` inside `Promise.race`; the race settles on the winner but does not cancel the loser, and a pending `Bun.sleep` keeps the event loop alive, so work that finished in milliseconds still owed the rest of the budget before the process could exit. `gjc sdk session list` wrote its result at 0.50s and exited at 5.51s. The startup attach budget, shutdown timeout, bounded notification work, and replay backoff now use the existing `cancellableSleep` helper with an `AbortController` cancelled once the race settles, and the reconcile interval is unref'd so a Router started without a matching `stop()` does not hold a host process open. The same command now exits at 1.65s, and every command routed through `withRouter` (`session.list`, `session.create`, `session.delete`, `session.fork`, `turn.prompt`, `turn.result`, `queue.*`, `compaction.*`) is affected.
 
 ## [0.15.4] - 2026-08-29

@@ -11,7 +11,7 @@ GJC has two canonical persistence scopes:
 - **Project:** `<project>/.gjc/` (the repository's project root, or the opened
   project directory when there is no repository root).
 - **User:** the agent directory printed by `gjc config path` (`~/.gjc/agent/` by
-  default; `--agent-dir` / `GJC_CODING_AGENT_DIR` move it). The configured
+  default; `GJC_CODING_AGENT_DIR` selects an alternate profile). The configured
   home-relative GJC config root and its legacy skill roots are described in
   [Skills](./skills.md).
 

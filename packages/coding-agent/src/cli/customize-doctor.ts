@@ -16,13 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	getMCPConfigPath,
-	getPluginsLockfile,
-	getPluginsNodeModules,
-	getPluginsPackageJson,
-	getProjectDir,
-} from "@gajae-code/utils";
+import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { findRepoRoot } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
@@ -41,6 +35,7 @@ import { scanSkillsFromDir } from "../discovery/helpers";
 import { summarizeGjcPluginObservability } from "../extensibility/gjc-plugins/observability";
 import { loadEffectiveGjcPluginRegistry } from "../extensibility/gjc-plugins/registry";
 import { getEnabledPlugins } from "../extensibility/plugins/loader";
+import { getProfilePluginsDir } from "../extensibility/plugins/marketplace/registry";
 import { loadSkills } from "../extensibility/skills";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import { loadAllMCPConfigs } from "../runtime-mcp/config";
@@ -1090,9 +1085,10 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 async function collectPluginBundles(cwd: string, agentDir: string): Promise<CustomizeDoctorSurface> {
 	// npm plugin packages (convention "plugin") — the startup consumer is
 	// getEnabledPlugins(cwd); the lockfile provides the disabled set.
-	const enabledNames = new Set((await getEnabledPlugins(cwd)).map(p => p.name));
+	const enabledNames = new Set((await getEnabledPlugins(cwd, agentDir)).map(p => p.name));
 	const lockNames = new Map<string, { enabled?: boolean }>();
-	const pkgPath = getPluginsPackageJson();
+	const pluginsDir = getProfilePluginsDir(agentDir);
+	const pkgPath = path.join(pluginsDir, "package.json");
 	let depNames: string[] = [];
 	try {
 		const pkg = (await Bun.file(pkgPath).json()) as { dependencies?: Record<string, string> };
@@ -1101,7 +1097,9 @@ async function collectPluginBundles(cwd: string, agentDir: string): Promise<Cust
 		// No plugin package.json — no npm plugins installed.
 	}
 	try {
-		const lock = (await Bun.file(getPluginsLockfile()).json()) as { plugins?: Record<string, { enabled?: boolean }> };
+		const lock = (await Bun.file(path.join(pluginsDir, "gjc-plugins.lock.json")).json()) as {
+			plugins?: Record<string, { enabled?: boolean }>;
+		};
 		for (const [name, state] of Object.entries(lock.plugins ?? {})) lockNames.set(name, state);
 	} catch {
 		// No lockfile — no disabled npm plugins to report.
@@ -1119,7 +1117,7 @@ async function collectPluginBundles(cwd: string, agentDir: string): Promise<Cust
 			provider: "plugin",
 			providerName: "Plugin",
 			scope: "user",
-			path: path.join(getPluginsNodeModules(), name),
+			path: path.join(pluginsDir, "node_modules", name),
 			trust: TRUST_BY_KIND["plugin-bundle"],
 			restartRequired: true,
 			precedence: { priority: 0 },

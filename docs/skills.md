@@ -20,7 +20,7 @@ Project scope (trusted from the repository you open):
 
 User scope (installed once, available in every project). The canonical root is
 the **agent directory** printed by `gjc config path` (`~/.gjc/agent` by default;
-`--agent-dir` / `GJC_CODING_AGENT_DIR` move it) — the same directory
+`GJC_CODING_AGENT_DIR` selects an alternate profile) — the same directory
 `gjc migrate` writes user skills into:
 
 | Location | Scope notes |
@@ -31,7 +31,7 @@ the **agent directory** printed by `gjc config path` (`~/.gjc/agent` by default;
 | `~/.gjc/skills/<name>/SKILL.md` | Historical legacy user location (still honored) |
 
 An agent-directory profile is a **separate user scope** (the same contract as
-MCP user config): under `--agent-dir` / `GJC_CODING_AGENT_DIR`, only
+`GJC_CODING_AGENT_DIR`, which selects the profile), only
 `<agentDir>/skills` is scanned — the default profile's home-relative roots are
 not read into a profile, and a profile's skills never leak into the default
 profile. The legacy roots above apply in the default profile, exactly as

@@ -69,7 +69,7 @@ export interface SessionReaper {
 export function createSessionReaper(deps: SessionReaperDeps, policy: SessionReaperPolicy): SessionReaper {
 	const idleTtlMs = Math.max(MIN_SESSION_IDLE_TTL_MS, policy.idleTtlMs);
 	const sweepIntervalMs = Math.max(MIN_SESSION_SWEEP_INTERVAL_MS, policy.sweepIntervalMs);
-	let timer: ReturnType<typeof setTimeout> | null = null;
+	let timer: NodeJS.Timeout | null = null;
 	let generation = 0;
 	let inProgress = false;
 

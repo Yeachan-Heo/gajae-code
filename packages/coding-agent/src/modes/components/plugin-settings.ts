@@ -434,9 +434,10 @@ export class PluginSettingsComponent extends Container {
 	constructor(
 		cwd: string,
 		private readonly callbacks: PluginSettingsCallbacks,
+		agentDir?: string,
 	) {
 		super();
-		this.#manager = new PluginManager(cwd);
+		this.#manager = new PluginManager(cwd, agentDir);
 		this.#showPluginList();
 	}
 

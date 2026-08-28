@@ -749,16 +749,28 @@ export async function resolveRalplanTargetRoot(
 	}
 	// Do not pass the caret-containing `HEAD^{commit}` revision here. On Windows,
 	// Bun may dispatch git through a `.cmd` shim, where `^` is interpreted by the
-	// command shell before git receives the argument. HEAD is sufficient after
-	// resolving a repository root: an unborn or non-commit HEAD still fails the
-	// same validation, while the argv remains shell-safe on every platform.
+	// command shell before git receives the argument. Resolve HEAD first, then
+	// inspect the resulting object with cat-file so detached object IDs and
+	// SHA-1/SHA-256 repositories are handled without shell metacharacters.
 	const verified = Bun.spawn(["git", "-C", canonical, "rev-parse", "--verify", "HEAD"], {
 		stdout: "pipe",
 		stderr: "pipe",
 	});
-	const [verifiedType, verifiedExit] = await Promise.all([new Response(verified.stdout).text(), verified.exited]);
-	if (verifiedExit !== 0 || verifiedType.trim() !== "commit") {
+	const [verifiedOutput, verifiedExit] = await Promise.all([new Response(verified.stdout).text(), verified.exited]);
+	const headObject = verifiedOutput.trim();
+	if (verifiedExit !== 0 || !/^[0-9a-f]{40,64}$/u.test(headObject)) {
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
+	}
+	const objectType = Bun.spawn(["git", "-C", canonical, "cat-file", "-t", headObject], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [objectTypeOutput, objectTypeExit] = await Promise.all([
+		new Response(objectType.stdout).text(),
+		objectType.exited,
+	]);
+	if (objectTypeExit !== 0 || objectTypeOutput.trim() !== "commit") {
+		throw new RalplanCommandError(2, `ralplan --worktree-root is not a commit worktree: ${canonical}`);
 	}
 	let worktreeRoot: string;
 	try {

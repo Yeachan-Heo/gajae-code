@@ -146,6 +146,7 @@ export class MCPAddWizard extends Container {
 	#healthCheckTimeout?: NodeJS.Timeout;
 	#asyncGeneration = 0;
 	readonly #agentDir?: string;
+	readonly #cwd: string;
 
 	constructor(
 		onComplete: (name: string, config: MCPServerConfig, scope: Scope) => void,
@@ -166,6 +167,7 @@ export class MCPAddWizard extends Container {
 		agentDir?: string,
 		onOAuthCredentialCleanup?: (credentialId: string) => Promise<void> | void,
 		onOAuthCredentialCleanupError?: (credentialId: string, error: unknown) => void,
+		cwd?: string,
 	) {
 		super();
 		this.#onCompleteCallback = onComplete;
@@ -175,6 +177,7 @@ export class MCPAddWizard extends Container {
 		this.#onRenderCallback = onRender ?? null;
 		this.#onCommandPaletteCallback = onCommandPalette ?? null;
 		this.#agentDir = agentDir;
+		this.#cwd = cwd ?? getProjectDir();
 		this.#onOAuthCredentialCleanupCallback = onOAuthCredentialCleanup ?? null;
 		this.#onOAuthCredentialCleanupErrorCallback = onOAuthCredentialCleanupError ?? null;
 		if (initialName && initialName.trim().length > 0) {
@@ -460,7 +463,7 @@ export class MCPAddWizard extends Container {
 		this.#contentContainer.addChild(new Text(theme.fg("accent", "Step: Configuration Scope")));
 		this.#contentContainer.addChild(new Spacer(1));
 
-		const cwd = getProjectDir();
+		const cwd = this.#cwd;
 
 		const userPathLabel = shortenPath(getMCPConfigPath("user", cwd, this.#agentDir));
 		const projectPathLabel = shortenPath(getMCPConfigPath("project", cwd));

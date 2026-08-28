@@ -6,6 +6,7 @@
 import * as path from "node:path";
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
+import type { Settings } from "../config/settings";
 import { loadCapability } from "../discovery";
 // Embed command markdown files at build time
 import initMd from "../prompts/agents/init.md" with { type: "text" };
@@ -67,11 +68,19 @@ export function loadBundledCommands(): WorkflowCommand[] {
  *
  * Precedence (highest wins): .gjc project, .gjc user, then bundled
  */
-export async function discoverCommands(cwd: string): Promise<WorkflowCommand[]> {
+export async function discoverCommands(
+	cwd: string,
+	settings?: Settings,
+	agentDir?: string,
+): Promise<WorkflowCommand[]> {
 	const resolvedCwd = path.resolve(cwd);
 
 	// Load slash commands from capability API
-	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: resolvedCwd });
+	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, {
+		cwd: resolvedCwd,
+		agentDir: agentDir ?? settings?.getAgentDir(),
+		settings,
+	});
 
 	const commands: WorkflowCommand[] = [];
 	const seen = new Set<string>();

@@ -1497,6 +1497,21 @@ pub fn secure_write_skill_file(
 	platform::secure_write_skill_file(Path::new(&root_path), &skill_name, &content, file_mode)
 }
 
+/// Async variant of [`secure_write_skill_file`] scheduled on the libuv blocking
+/// pool. Directory traversal, ACL updates, payload writes, and flushes can all
+/// block on a slow filesystem; none of that work may run on the JS thread.
+#[napi]
+pub fn secure_write_skill_file_async(
+	root_path: String,
+	skill_name: String,
+	content: String,
+	file_mode: Option<u32>,
+) -> task::Promise<NativeSecureSkillWriteResult> {
+	task::blocking("secure_write_skill_file", (), move |_| {
+		Ok(secure_write_skill_file(root_path, skill_name, content, file_mode))
+	})
+}
+
 /// Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking
 /// pool.
 ///
@@ -1934,7 +1949,7 @@ pub(crate) mod platform {
 		fs::{self, File},
 		io::Write as IoWrite,
 		os::{
-			fd::{AsRawFd, FromRawFd},
+			fd::{AsRawFd, FromRawFd, IntoRawFd},
 			unix::ffi::OsStrExt,
 		},
 		path::{Component, Path, PathBuf},
@@ -4536,6 +4551,10 @@ pub(crate) mod platform {
 			Some(libc::ENOTDIR) => "not_directory",
 			Some(libc::EISDIR) => "not_regular_file",
 			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::EROFS) => "permission_denied",
+			Some(libc::EEXIST) => "already_exists",
+			Some(libc::EINVAL) => "invalid_request",
+			Some(libc::EINTR) => "interrupted",
 			Some(libc::ENOSPC) => "no_space",
 			Some(libc::ENAMETOOLONG) => "name_too_long",
 			Some(libc::EFBIG) => "content_too_large",
@@ -4580,6 +4599,67 @@ pub(crate) mod platform {
 		Ok((reopened, created))
 	}
 
+	/// Retained authority for a skills root.  Holding every traversed edge lets
+	/// the final publication re-check that the descriptor still has the same
+	/// pathname reachability it had when opened; a caller must not publish into
+	/// a directory that has since been detached and replaced at its public path.
+	struct SkillRootAuthority {
+		file:      libc::c_int,
+		canonical: PathBuf,
+		edges:     Vec<AuthorityEdge>,
+	}
+
+	fn revalidate_skill_root(authority: &SkillRootAuthority) -> Result<(), &'static str> {
+		for edge in &authority.edges {
+			let parent = fstat(edge.parent.as_raw_fd()).map_err(|_| "identity_mismatch")?;
+			let child = fstat(edge.child.as_raw_fd()).map_err(|_| "identity_mismatch")?;
+			let named = statat(&edge.parent, &edge.name).map_err(|_| "identity_mismatch")?;
+			if !stat_same_object(&edge.parent_initial, &parent)
+				|| !stat_same_object(&edge.child_initial, &child)
+				|| !stat_same_object(&edge.child_initial, &named)
+			{
+				return Err("identity_mismatch");
+			}
+		}
+		if let Some(edge) = authority.edges.last() {
+			let root = fstat(authority.file).map_err(|_| "identity_mismatch")?;
+			if !stat_same_object(&edge.child_initial, &root) {
+				return Err("identity_mismatch");
+			}
+		}
+		Ok(())
+	}
+
+	fn revalidate_skill_directory(
+		authority: &SkillRootAuthority,
+		name: &CString,
+		directory_fd: libc::c_int,
+	) -> Result<(), &'static str> {
+		revalidate_skill_root(authority)?;
+		let named = statat_fd(authority.file, name).map_err(|_| "identity_mismatch")?;
+		let actual = fstat(directory_fd).map_err(|_| "identity_mismatch")?;
+		if named.st_mode & libc::S_IFMT != libc::S_IFDIR
+			|| actual.st_mode & libc::S_IFMT != libc::S_IFDIR
+			|| !stat_same_object(&named, &actual)
+		{
+			return Err("identity_mismatch");
+		}
+		Ok(())
+	}
+
+	fn statat_fd(parent_fd: libc::c_int, name: &CString) -> Result<libc::stat, &'static str> {
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
+			return Err("identity_mismatch");
+		}
+		if named.st_mode & libc::S_IFMT == libc::S_IFLNK {
+			return Err("reparse_point");
+		}
+		Ok(named)
+	}
+
 	/// Descriptor-walk an absolute path, creating missing directories along the
 	/// way. The returned path is the no-alias spelling used by the walk (not a
 	/// second, race-prone `realpath` lookup).
@@ -4590,12 +4670,12 @@ pub(crate) mod platform {
 	fn open_or_create_skill_root(
 		path: &Path,
 		directory_mode: libc::mode_t,
-	) -> Result<(libc::c_int, PathBuf), &'static str> {
+	) -> Result<SkillRootAuthority, &'static str> {
 		let walk_path = descriptor_walk_path(path);
 		if !walk_path.is_absolute() {
 			return Err("invalid_request");
 		}
-		let mut current = unsafe {
+		let current = unsafe {
 			libc::open(
 				c"/".as_ptr(),
 				libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
@@ -4604,46 +4684,57 @@ pub(crate) mod platform {
 		if current < 0 {
 			return Err(skill_write_error(&std::io::Error::last_os_error()));
 		}
+		let mut current = unsafe { File::from_raw_fd(current) };
 		let mut canonical = PathBuf::from("/");
+		let mut edges = Vec::new();
 		for component in walk_path.components() {
 			let segment = match component {
 				Component::Normal(segment) => segment,
 				Component::RootDir | Component::CurDir => continue,
 				Component::ParentDir | Component::Prefix(_) => {
-					unsafe { libc::close(current) };
 					return Err("invalid_request");
 				},
 			};
 			let Ok(name) = CString::new(segment.as_bytes()) else {
-				unsafe { libc::close(current) };
 				return Err("invalid_request");
 			};
-			let (next, created) = match open_or_create_skill_directory(current, &name) {
+			let (next, created) = match open_or_create_skill_directory(current.as_raw_fd(), &name) {
 				Ok(next) => next,
 				Err(code) => {
-					unsafe { libc::close(current) };
 					return Err(code);
 				},
 			};
-			if created && unsafe { libc::fchmod(next, directory_mode) } != 0 {
-				unsafe {
-					libc::close(next);
-					libc::close(current);
+			let next = unsafe { File::from_raw_fd(next) };
+			if created {
+				if unsafe { libc::fchmod(next.as_raw_fd(), directory_mode) } != 0 {
+					return Err(skill_write_error(&std::io::Error::last_os_error()));
 				}
-				return Err(skill_write_error(&std::io::Error::last_os_error()));
 			}
-			if let Err(code) = fsync_root_parent(current) {
-				unsafe {
-					libc::close(next);
-					libc::close(current);
-				}
-				return Err(code);
+			if created {
+				fsync_root_parent(current.as_raw_fd())?;
 			}
-			unsafe { libc::close(current) };
+			let parent_initial = fstat(current.as_raw_fd()).map_err(|_| "io_error")?;
+			let child_initial = fstat(next.as_raw_fd()).map_err(|_| "io_error")?;
+			let named = statat(&current, &name).map_err(|_| "identity_mismatch")?;
+			if !stat_same_object(&child_initial, &named) {
+				return Err("identity_mismatch");
+			}
+			let child = next.try_clone().map_err(|_| "io_error")?;
+			edges.push(AuthorityEdge {
+				parent: current,
+				parent_initial,
+				name,
+				child,
+				child_initial,
+			});
 			current = next;
 			canonical.push(segment);
 		}
-		Ok((current, canonical))
+		Ok(SkillRootAuthority {
+			file: current.into_raw_fd(),
+			canonical,
+			edges,
+		})
 	}
 
 	#[expect(
@@ -4718,11 +4809,12 @@ pub(crate) mod platform {
 					continue;
 				}
 				return Err(skill_write_error(&error));
-			}
+			};
 			if unsafe { libc::fchmod(fd, file_mode as libc::mode_t) } != 0 {
+				let error = std::io::Error::last_os_error();
 				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 				unsafe { libc::close(fd) };
-				return Err(skill_write_error(&std::io::Error::last_os_error()));
+				return Err(skill_write_error(&error));
 			}
 			let mut information: libc::stat = unsafe { std::mem::zeroed() };
 			let valid = unsafe { libc::fstat(fd, &mut information) } == 0
@@ -4741,14 +4833,24 @@ pub(crate) mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained parent descriptor binds the only namespace mutation"
 	)]
+	enum SkillPublicationError {
+		Pre(&'static str),
+		Post(&'static str),
+	}
+
 	fn replace_skill_file_name(
 		parent_fd: libc::c_int,
 		private_name: &CString,
 		final_name: &CString,
 		private_fd: libc::c_int,
-	) -> Result<(), &'static str> {
+		root: &SkillRootAuthority,
+		skill_name: &CString,
+	) -> Result<(), SkillPublicationError> {
 		#[cfg(test)]
 		pause_secure_skill_write_before_rename_for_test();
+		if revalidate_skill_directory(root, skill_name, parent_fd).is_err() {
+			return Err(SkillPublicationError::Pre("identity_mismatch"));
+		}
 		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe { libc::fstat(private_fd, &mut opened) } != 0
@@ -4761,12 +4863,14 @@ pub(crate) mod platform {
 			|| opened.st_dev != named.st_dev
 			|| opened.st_ino != named.st_ino
 		{
-			return Err("identity_mismatch");
+			return Err(SkillPublicationError::Pre("identity_mismatch"));
 		}
 		if unsafe { libc::renameat(parent_fd, private_name.as_ptr(), parent_fd, final_name.as_ptr()) }
 			!= 0
 		{
-			return Err(skill_write_error(&std::io::Error::last_os_error()));
+			return Err(SkillPublicationError::Pre(skill_write_error(
+				&std::io::Error::last_os_error(),
+			)));
 		}
 		let mut published: libc::stat = unsafe { std::mem::zeroed() };
 		let valid = unsafe { libc::fstat(private_fd, &mut opened) } == 0
@@ -4788,7 +4892,7 @@ pub(crate) mod platform {
 		{
 			unsafe { libc::unlinkat(parent_fd, final_name.as_ptr(), 0) };
 		}
-		Err("identity_mismatch")
+		Err(SkillPublicationError::Post("identity_mismatch"))
 	}
 
 	#[expect(
@@ -4847,10 +4951,12 @@ pub(crate) mod platform {
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
 		let directory_mode = if file_mode == 0o600 { 0o700 } else { 0o755 };
-		let (skills_fd, canonical_root) = match open_or_create_skill_root(root_path, directory_mode) {
+		let root = match open_or_create_skill_root(root_path, directory_mode) {
 			Ok(value) => value,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
+		let skills_fd = root.file;
+		let canonical_root = root.canonical.clone();
 		let Ok(skill_component) = CString::new(skill_name.as_bytes()) else {
 			unsafe { libc::close(skills_fd) };
 			return NativeSecureSkillWriteResult::failure("invalid_request");
@@ -4859,7 +4965,6 @@ pub(crate) mod platform {
 			match open_or_create_skill_directory(skills_fd, &skill_component) {
 				Ok(fd) => fd,
 				Err(code) => {
-					unsafe { libc::close(skills_fd) };
 					return NativeSecureSkillWriteResult::failure(code);
 				},
 			};
@@ -4871,6 +4976,13 @@ pub(crate) mod platform {
 			return NativeSecureSkillWriteResult::failure(skill_write_error(
 				&std::io::Error::last_os_error(),
 			));
+		}
+		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("identity_mismatch");
 		}
 		if file_mode == 0o600 {
 			#[cfg(target_os = "linux")]
@@ -4902,6 +5014,13 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure("acl_verify_failed");
 			}
 		}
+		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("identity_mismatch");
+		}
 		let Ok(final_name) = CString::new("SKILL.md") else {
 			unsafe {
 				libc::close(skill_fd);
@@ -4916,7 +5035,11 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		let (mut file, private_name) = match create_private_skill_file(skill_fd, file_mode) {
+		// Keep the staging name owner-only regardless of the requested published
+		// mode. Project skills are eventually 0644, but exposing their plaintext
+		// while the private name is live would permit an observer to retain a
+		// second hard link and defeat the single-link publication invariant.
+		let (mut file, private_name) = match create_private_skill_file(skill_fd, 0o600) {
 			Ok(value) => value,
 			Err(code) => {
 				unsafe {
@@ -4968,14 +5091,59 @@ pub(crate) mod platform {
 			);
 		}
 		let private_fd = file.as_raw_fd();
-		if let Err(code) = replace_skill_file_name(skill_fd, &private_name, &final_name, private_fd) {
-			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
+		match replace_skill_file_name(
+			skill_fd,
+			&private_name,
+			&final_name,
+			private_fd,
+			&root,
+			&skill_component,
+		) {
+			Ok(()) => {},
+			Err(SkillPublicationError::Pre(code)) => {
+				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+			},
+			Err(SkillPublicationError::Post(code)) => {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
+			},
+		}
+		if file_mode != 0o600 {
+			if unsafe { libc::fchmod(private_fd, file_mode as libc::mode_t) } != 0 {
+				let code = skill_write_error(&std::io::Error::last_os_error());
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
+			}
+			if file.sync_all().is_err() {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure("durability_failed");
+			}
+		}
+		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
 			drop(file);
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
-			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+			return NativeSecureSkillWriteResult::failure("identity_mismatch");
 		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
 			unsafe {
@@ -4984,12 +5152,14 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		if let Err(code) = fsync_root_parent(skills_fd) {
+		if skill_created {
+			if let Err(code) = fsync_root_parent(skills_fd) {
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
 			return NativeSecureSkillWriteResult::failure(code);
+			}
 		}
 		drop(file);
 		unsafe {
@@ -6774,7 +6944,7 @@ mod platform {
 	#[cfg(test)]
 	use std::sync::{Mutex, OnceLock, mpsc};
 	use std::{
-		ffi::{OsString, c_void},
+		ffi::{OsStr, OsString, c_void},
 		mem::{align_of, size_of},
 		os::windows::ffi::{OsStrExt, OsStringExt},
 		path::{Component, Path, PathBuf},
@@ -9493,7 +9663,7 @@ mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained volume and directory handles own every component of the walk"
 	)]
-	fn open_or_create_skill_root(path: &Path) -> Result<(HeldExact, String), &'static str> {
+	fn open_or_create_skill_root(path: &Path) -> Result<(HeldExact, String, Vec<OsString>), &'static str> {
 		let (root, names) = absolute_components(path)?;
 		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)?;
 		let root_attributes = match handle_attributes(root_handle) {
@@ -9530,7 +9700,51 @@ mod platform {
 			}
 			authority.retain_child(child);
 		}
-		Ok((authority, canonical_volume))
+		Ok((authority, canonical_volume, names))
+	}
+
+	/// Re-open every retained root component from its already-held parent handle
+	/// and compare it with the retained child.  A replacement at any public
+	/// component therefore fails closed instead of publishing into a detached
+	/// directory that is no longer reachable from `root_path`.
+	fn revalidate_skill_root(authority: &HeldExact, names: &[OsString]) -> Result<(), &'static str> {
+		if names.len() != authority.ancestors.len() {
+			return Err("identity_mismatch");
+		}
+		let mut parent = authority
+			.ancestors
+			.first()
+			.copied()
+			.ok_or("identity_mismatch")?;
+		for (index, name) in names.iter().enumerate() {
+			let child = open_relative(parent, name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true)?;
+			let expected = if index + 1 == names.len() {
+				authority.target
+			} else {
+				authority.ancestors[index + 1]
+			};
+			let same = handles_same_object_checked(child, expected).unwrap_or(false);
+			unsafe { CloseHandle(child) };
+			if !same {
+				return Err("identity_mismatch");
+			}
+			parent = expected;
+		}
+		Ok(())
+	}
+
+	fn revalidate_skill_directory(
+		authority: &HeldExact,
+		names: &[OsString],
+		skill_name: &OsString,
+		skill_handle: HANDLE,
+	) -> Result<(), &'static str> {
+		revalidate_skill_root(authority, names)?;
+		let parent = authority.parent().ok_or("identity_mismatch")?;
+		let rebound = open_relative(parent, skill_name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true)?;
+		let same = handles_same_object_checked(rebound, skill_handle).unwrap_or(false);
+		unsafe { CloseHandle(rebound) };
+		if same { Ok(()) } else { Err("identity_mismatch") }
 	}
 
 	#[expect(
@@ -9656,11 +9870,29 @@ mod platform {
 		handle: HANDLE,
 		parent: HANDLE,
 		final_name: &[u16],
+		authority: &HeldExact,
+		path_names: &[OsString],
 	) -> Result<(), &'static str> {
 		#[cfg(test)]
 		pause_secure_skill_write_before_rename_for_test();
+		revalidate_skill_root(authority, path_names)?;
 		validate_skill_file_handle(handle)?;
-		rename_handle(handle, parent, final_name, true)
+		rename_handle(handle, parent, final_name, true)?;
+		let published = open_relative_with_share(
+			parent,
+			OsStr::new("SKILL.md"),
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+			false,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		)?;
+		let same = handles_same_object_checked(handle, published).unwrap_or(false);
+		let validated = same && validate_skill_file_handle(published).is_ok();
+		unsafe { CloseHandle(published) };
+		if validated {
+			Ok(())
+		} else {
+			Err("identity_mismatch")
+		}
 	}
 
 	fn cleanup_private_skill_file(handle: HANDLE) -> Result<(), &'static str> {
@@ -9691,7 +9923,7 @@ mod platform {
 		content: &str,
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
-		let (mut skills, canonical_volume) = match open_or_create_skill_root(root_path) {
+		let (mut skills, canonical_volume, mut path_names) = match open_or_create_skill_root(root_path) {
 			Ok(value) => value,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
@@ -9728,6 +9960,10 @@ mod platform {
 			}
 		}
 		skills.retain_child(skill_handle);
+		path_names.push(skill_name.clone());
+		if revalidate_skill_root(&skills, &path_names).is_err() {
+			return NativeSecureSkillWriteResult::failure("identity_mismatch");
+		}
 		let file_name = std::ffi::OsStr::new("SKILL.md");
 		if let Err(code) = inspect_existing_skill_file(skills.target, file_name) {
 			return NativeSecureSkillWriteResult::failure(code);
@@ -9777,7 +10013,7 @@ mod platform {
 			}
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
-		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {
+		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names) {
 			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));

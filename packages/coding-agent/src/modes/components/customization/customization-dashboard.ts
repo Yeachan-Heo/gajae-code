@@ -96,22 +96,25 @@ export class CustomizationDashboard extends Container {
 	#wizard: ImportWizard | null = null;
 	#confirmRemove: InventoryRow | null = null;
 	#homeDir: string;
+	#agentDir: string | undefined;
 	#statusMessage: string | null = null;
 
 	/** Use `create()` — async inventory load runs before chrome construction. */
-	constructor(cwd: string, settings: CustomizationSettingsSlice | undefined, homeDir: string) {
+	constructor(cwd: string, settings: CustomizationSettingsSlice | undefined, homeDir: string, agentDir?: string) {
 		super();
 		this.#cwd = cwd;
 		this.#settings = settings;
 		this.#homeDir = homeDir;
+		this.#agentDir = agentDir;
 	}
 
 	static async create(
 		cwd: string,
 		settings?: CustomizationSettingsSlice,
 		homeDir?: string,
+		agentDir?: string,
 	): Promise<CustomizationDashboard> {
-		const dashboard = new CustomizationDashboard(cwd, settings, homeDir ?? getTrustedHomeDir());
+		const dashboard = new CustomizationDashboard(cwd, settings, homeDir ?? getTrustedHomeDir(), agentDir);
 		await dashboard.#reload();
 		dashboard.#buildChrome();
 		return dashboard;
@@ -150,7 +153,7 @@ export class CustomizationDashboard extends Container {
 		this.#inventory = await loadCustomizationInventory({
 			cwd: this.#cwd,
 			home: this.#homeDir,
-			agentDir: this.#settings?.getAgentDir?.(),
+			agentDir: this.#agentDir ?? this.#settings?.getAgentDir?.(),
 			policy: this.#skillPolicy(),
 			disabledExtensions: this.#getStringArray("disabledExtensions"),
 		});
@@ -293,7 +296,7 @@ export class CustomizationDashboard extends Container {
 			this.#settings.set("disabledExtensions", result.disabledExtensions);
 			await this.#applyMutation(async () => ({ ok: true }) as { ok: true });
 		} else if (row.surface === "mcps") {
-			const paths = resolveScopePaths(row.scope, this.#cwd, this.#settings?.getAgentDir?.());
+			const paths = resolveScopePaths(row.scope, this.#cwd, this.#agentDir ?? this.#settings?.getAgentDir?.());
 			const result = await setMcpServerEnabled(
 				paths.mcpConfigPath,
 				row.name,
@@ -335,7 +338,12 @@ export class CustomizationDashboard extends Container {
 	}
 
 	#openImportWizard(): void {
-		const wizard = new ImportWizard(this.#cwd, this.#scope, this.#homeDir, this.#settings?.getAgentDir?.());
+		const wizard = new ImportWizard(
+			this.#cwd,
+			this.#scope,
+			this.#homeDir,
+			this.#agentDir ?? this.#settings?.getAgentDir?.(),
+		);
 		this.#wizard = wizard;
 		wizard.onRequestRender = () => this.onRequestRender?.();
 		wizard.onClose = applied => {

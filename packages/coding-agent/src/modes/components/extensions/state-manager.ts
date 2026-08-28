@@ -311,8 +311,8 @@ export async function loadAllExtensions(
  * Build sidebar tree from extensions.
  * Groups by provider → kind.
  */
-export function buildSidebarTree(extensions: Extension[]): TreeNode[] {
-	const providers = getAllProvidersInfo();
+export function buildSidebarTree(extensions: Extension[], settings?: Settings): TreeNode[] {
+	const providers = getAllProvidersInfo(settings);
 	const tree: TreeNode[] = [];
 
 	// Group extensions by provider and kind

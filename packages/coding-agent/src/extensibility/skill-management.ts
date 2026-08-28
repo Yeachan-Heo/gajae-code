@@ -15,6 +15,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import * as natives from "@gajae-code/natives";
 import { getAgentDir, getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
@@ -125,13 +126,11 @@ let secureWriteSkillFileNative: SecureWriteSkillFile | undefined;
 
 function getSecureWriteSkillFileNative(): SecureWriteSkillFile {
 	if (secureWriteSkillFileNative !== undefined) return secureWriteSkillFileNative;
-	const natives = require("@gajae-code/natives") as {
-		secureWriteSkillFile?: SecureWriteSkillFile;
-	};
-	if (typeof natives.secureWriteSkillFile !== "function") {
+	const candidate = natives.secureWriteSkillFile;
+	if (typeof candidate !== "function") {
 		throw new SkillNativeWriteUnavailableError("native bindings do not export secureWriteSkillFile");
 	}
-	secureWriteSkillFileNative = natives.secureWriteSkillFile;
+	secureWriteSkillFileNative = candidate;
 	return secureWriteSkillFileNative;
 }
 
@@ -321,7 +320,7 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const secureWriteSkillFile = getSecureWriteSkillFileNative();
-	const result = secureWriteSkillFile(
+	const result = await secureWriteSkillFile(
 		directory,
 		effectiveName,
 		`${input.content.trimEnd()}\n`,

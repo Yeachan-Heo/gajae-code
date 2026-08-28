@@ -2180,7 +2180,12 @@ export class SelectorController {
 	async showCustomizationDashboard(): Promise<void> {
 		let dashboard: CustomizationDashboard;
 		try {
-			dashboard = await CustomizationDashboard.create(this.ctx.sessionManager.getCwd(), this.ctx.settings);
+			dashboard = await CustomizationDashboard.create(
+				this.ctx.sessionManager.getCwd(),
+				this.ctx.settings,
+				undefined,
+				this.ctx.session.getSessionAgentDir?.(),
+			);
 		} catch (error) {
 			this.ctx.showError(`Failed to open /extensions: ${error instanceof Error ? error.message : String(error)}`);
 			return;

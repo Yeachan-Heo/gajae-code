@@ -581,6 +581,7 @@ export class MCPCommandController {
 						error instanceof Error ? error.message : String(error)
 					}`,
 				),
+			this.ctx.sessionManager.getCwd(),
 		);
 
 		// Replace editor with wizard

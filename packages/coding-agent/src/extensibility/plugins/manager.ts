@@ -1,15 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import {
-	getPluginsDir,
-	getPluginsLockfile,
-	getPluginsNodeModules,
-	getPluginsPackageJson,
-	getProjectDir,
-	getProjectPluginOverridesPath,
-	isEnoent,
-	logger,
-} from "@gajae-code/utils";
+import { getProjectDir, getProjectPluginOverridesPath, isEnoent, logger } from "@gajae-code/utils";
+import { getProfilePluginsDir } from "./marketplace/registry";
 import { extractPackageName, parsePluginSpec } from "./parser";
 import type {
 	DoctorCheck,
@@ -51,9 +43,27 @@ function validatePackageName(name: string): void {
 export class PluginManager {
 	#runtimeConfig: PluginRuntimeConfig | null = null;
 	#cwd: string;
+	#agentDir: string | undefined;
 
-	constructor(cwd: string = getProjectDir()) {
+	constructor(cwd: string = getProjectDir(), agentDir?: string) {
 		this.#cwd = cwd;
+		this.#agentDir = agentDir;
+	}
+
+	#getPluginsDir(): string {
+		return getProfilePluginsDir(this.#agentDir);
+	}
+
+	#getPluginsNodeModules(): string {
+		return path.join(this.#getPluginsDir(), "node_modules");
+	}
+
+	#getPluginsPackageJson(): string {
+		return path.join(this.#getPluginsDir(), "package.json");
+	}
+
+	#getPluginsLockfile(): string {
+		return path.join(this.#getPluginsDir(), "gjc-plugins.lock.json");
 	}
 
 	// ==========================================================================
@@ -61,7 +71,7 @@ export class PluginManager {
 	// ==========================================================================
 
 	async #loadRuntimeConfig(): Promise<PluginRuntimeConfig> {
-		const lockPath = getPluginsLockfile();
+		const lockPath = this.#getPluginsLockfile();
 		try {
 			return await Bun.file(lockPath).json();
 		} catch (err) {
@@ -80,7 +90,7 @@ export class PluginManager {
 
 	async #saveRuntimeConfig(): Promise<void> {
 		await this.#ensureConfigLoaded();
-		await Bun.write(getPluginsLockfile(), JSON.stringify(this.#runtimeConfig, null, 2));
+		await Bun.write(this.#getPluginsLockfile(), JSON.stringify(this.#runtimeConfig, null, 2));
 	}
 
 	async #loadProjectOverrides(): Promise<ProjectPluginOverrides> {
@@ -99,12 +109,12 @@ export class PluginManager {
 	// ==========================================================================
 
 	async #ensurePluginsDir(): Promise<void> {
-		await fs.promises.mkdir(getPluginsDir(), { recursive: true });
-		await fs.promises.mkdir(getPluginsNodeModules(), { recursive: true });
+		await fs.promises.mkdir(this.#getPluginsDir(), { recursive: true });
+		await fs.promises.mkdir(this.#getPluginsNodeModules(), { recursive: true });
 	}
 
 	async #ensurePackageJson(): Promise<void> {
-		const pkgJsonPath = getPluginsPackageJson();
+		const pkgJsonPath = this.#getPluginsPackageJson();
 		try {
 			await Bun.file(pkgJsonPath).json();
 		} catch (err) {
@@ -157,7 +167,7 @@ export class PluginManager {
 
 		// Run npm install
 		const proc = Bun.spawn(["bun", "install", spec.packageName], {
-			cwd: getPluginsDir(),
+			cwd: this.#getPluginsDir(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -172,7 +182,7 @@ export class PluginManager {
 
 		// Resolve actual package name (strip version specifier)
 		const actualName = extractPackageName(spec.packageName);
-		const pkgPath = path.join(getPluginsNodeModules(), actualName, "package.json");
+		const pkgPath = path.join(this.#getPluginsNodeModules(), actualName, "package.json");
 
 		let pkg: { name: string; version: string; gjc?: PluginManifest; pi?: PluginManifest };
 		try {
@@ -223,7 +233,7 @@ export class PluginManager {
 		return {
 			name: pkg.name,
 			version: pkg.version,
-			path: path.join(getPluginsNodeModules(), actualName),
+			path: path.join(this.#getPluginsNodeModules(), actualName),
 			manifest,
 			enabledFeatures,
 			enabled: true,
@@ -249,7 +259,7 @@ export class PluginManager {
 		await this.#ensurePackageJson();
 
 		const proc = Bun.spawn(["bun", "uninstall", name], {
-			cwd: getPluginsDir(),
+			cwd: this.#getPluginsDir(),
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -272,7 +282,7 @@ export class PluginManager {
 	 * List all installed plugins.
 	 */
 	async list(): Promise<InstalledPlugin[]> {
-		const pkgJsonPath = getPluginsPackageJson();
+		const pkgJsonPath = this.#getPluginsPackageJson();
 		let pkg: { dependencies?: Record<string, string> };
 		try {
 			pkg = await Bun.file(pkgJsonPath).json();
@@ -287,7 +297,7 @@ export class PluginManager {
 		const plugins: InstalledPlugin[] = [];
 
 		for (const [name] of Object.entries(deps)) {
-			const pluginPkgPath = path.join(getPluginsNodeModules(), name, "package.json");
+			const pluginPkgPath = path.join(this.#getPluginsNodeModules(), name, "package.json");
 			let pluginPkg: { version: string; gjc?: PluginManifest; pi?: PluginManifest };
 			try {
 				pluginPkg = await Bun.file(pluginPkgPath).json();
@@ -311,7 +321,7 @@ export class PluginManager {
 			plugins.push({
 				name,
 				version: pluginPkg.version,
-				path: path.join(getPluginsNodeModules(), name),
+				path: path.join(this.#getPluginsNodeModules(), name),
 				manifest,
 				enabledFeatures: projectFeatures ?? runtimeState.enabledFeatures,
 				enabled: runtimeState.enabled && !isDisabledInProject,
@@ -341,11 +351,11 @@ export class PluginManager {
 
 		await this.#ensurePluginsDir();
 
-		const linkPath = path.join(getPluginsNodeModules(), pkg.name);
+		const linkPath = path.join(this.#getPluginsNodeModules(), pkg.name);
 
 		// Handle scoped packages
 		if (pkg.name.startsWith("@")) {
-			const scopeDir = path.join(getPluginsNodeModules(), pkg.name.split("/")[0]);
+			const scopeDir = path.join(this.#getPluginsNodeModules(), pkg.name.split("/")[0]);
 			await fs.promises.mkdir(scopeDir, { recursive: true });
 		}
 
@@ -490,7 +500,7 @@ export class PluginManager {
 		const checks: DoctorCheck[] = [];
 
 		// Check 1: Plugins directory exists
-		const pluginsDir = getPluginsDir();
+		const pluginsDir = this.#getPluginsDir();
 		const pluginsDirExists = fs.existsSync(pluginsDir);
 		checks.push({
 			name: "plugins_directory",
@@ -499,7 +509,7 @@ export class PluginManager {
 		});
 
 		// Check 2: package.json exists
-		const pkgJsonPath = getPluginsPackageJson();
+		const pkgJsonPath = this.#getPluginsPackageJson();
 		let pkg: { dependencies?: Record<string, string> };
 		let hasPkgJson = true;
 		try {
@@ -519,7 +529,7 @@ export class PluginManager {
 		});
 
 		// Check 3: node_modules exists
-		const nodeModulesPath = getPluginsNodeModules();
+		const nodeModulesPath = this.#getPluginsNodeModules();
 		const hasNodeModules = fs.existsSync(nodeModulesPath);
 		checks.push({
 			name: "node_modules",
@@ -646,7 +656,7 @@ export class PluginManager {
 	async #fixMissingPlugin(): Promise<boolean> {
 		try {
 			const proc = Bun.spawn(["bun", "install"], {
-				cwd: getPluginsDir(),
+				cwd: this.#getPluginsDir(),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
