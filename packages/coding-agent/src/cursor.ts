@@ -397,6 +397,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		args: Parameters<NonNullable<ICursorExecHandlers["shellStream"]>>[0],
 		callbacks: CursorShellStreamCallbacks,
 		signal?: AbortSignal,
+		markNonAbortable?: () => void,
 	) {
 		if (signal?.aborted) throw cursorAbortError(signal);
 		const options = this.#optionsForCall();
@@ -460,7 +461,15 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 		};
 
 		try {
-			result = await tool.execute(toolCallId, toolArgs, signal, onUpdate, options.getToolContext?.());
+			const nonAbortable = tool.nonAbortable === true;
+			if (nonAbortable) markNonAbortable?.();
+			result = await tool.execute(
+				toolCallId,
+				toolArgs,
+				nonAbortable ? undefined : signal,
+				onUpdate,
+				options.getToolContext?.(),
+			);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);

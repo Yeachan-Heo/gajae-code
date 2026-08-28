@@ -889,6 +889,8 @@ export interface CursorExecHandlers {
 		args: ShellArgs,
 		callbacks: CursorShellStreamCallbacks,
 		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	diagnostics?: (args: DiagnosticsArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
 	mcp?: (
