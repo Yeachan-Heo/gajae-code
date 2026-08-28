@@ -22,6 +22,8 @@ export function pythonKernelOwnerId(sessionId: string): string {
 export interface SessionPythonToolInput {
 	/** Working directory for kernel execution (session cwd). */
 	cwd: string;
+	/** Return the current session cwd after a rescope. */
+	getCwd?: () => string;
 	/** Session settings used for Python runtime policy. */
 	settings?: SettingsType;
 	/** Resolve the GJC session id used for the kernel owner and transcript paths. */
@@ -74,6 +76,7 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 	let armedForSession: string | null = null;
 	const seenOwnerIds = new Set<string>();
 	let currentTranscript: PythonKernelTranscript | null = null;
+	let activeCwd = input.cwd;
 
 	const armCleanupForSession = (sessionId: string): void => {
 		if (armedForSession === sessionId) return;
@@ -93,7 +96,7 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 	): Promise<string | undefined> => {
 		if (currentTranscript === null) {
 			currentTranscript = openPythonKernelTranscript({
-				cwd: input.cwd,
+				cwd: activeCwd,
 				sessionId,
 				kernelInstanceId: crypto.randomUUID(),
 			});
@@ -137,6 +140,12 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 			}
 			armCleanupForSession(sessionId);
 			const ownerId = pythonKernelOwnerId(sessionId);
+			const cwd = input.getCwd?.() ?? input.cwd;
+			if (cwd !== activeCwd) {
+				await disposeKernelSessionsByOwner(ownerId);
+				currentTranscript = null;
+				activeCwd = cwd;
+			}
 			if (params.action === "clear") {
 				await disposeKernelSessionsByOwner(ownerId);
 				currentTranscript = null;
@@ -156,17 +165,17 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 			try {
 				const activeSettings = input.settings ?? Settings.instance;
 				const result = await executePython(code, {
-					cwd: input.cwd,
+					cwd,
 					settings: activeSettings,
 					kernelMode: "session",
 					sessionId: ownerId,
 					kernelOwnerId: ownerId,
-					artifactsDir: sessionIpykernelsArtifactsDir(input.cwd, sessionId),
+					artifactsDir: sessionIpykernelsArtifactsDir(cwd, sessionId),
 					signal,
 					onKernelStart: kernelInstanceId => {
 						if (currentTranscript?.kernelInstanceId !== kernelInstanceId) {
 							currentTranscript = openPythonKernelTranscript({
-								cwd: input.cwd,
+								cwd,
 								sessionId,
 								kernelInstanceId,
 							});
