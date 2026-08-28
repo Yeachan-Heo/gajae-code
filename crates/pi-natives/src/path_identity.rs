@@ -4720,21 +4720,11 @@ pub(crate) mod platform {
 				return Err("identity_mismatch");
 			}
 			let child = next.try_clone().map_err(|_| "io_error")?;
-			edges.push(AuthorityEdge {
-				parent: current,
-				parent_initial,
-				name,
-				child,
-				child_initial,
-			});
+			edges.push(AuthorityEdge { parent: current, parent_initial, name, child, child_initial });
 			current = next;
 			canonical.push(segment);
 		}
-		Ok(SkillRootAuthority {
-			file: current.into_raw_fd(),
-			canonical,
-			edges,
-		})
+		Ok(SkillRootAuthority { file: current.into_raw_fd(), canonical, edges })
 	}
 
 	#[expect(
@@ -5154,11 +5144,11 @@ pub(crate) mod platform {
 		}
 		if skill_created {
 			if let Err(code) = fsync_root_parent(skills_fd) {
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure(code);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
 			}
 		}
 		drop(file);
@@ -9663,7 +9653,9 @@ mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained volume and directory handles own every component of the walk"
 	)]
-	fn open_or_create_skill_root(path: &Path) -> Result<(HeldExact, String, Vec<OsString>), &'static str> {
+	fn open_or_create_skill_root(
+		path: &Path,
+	) -> Result<(HeldExact, String, Vec<OsString>), &'static str> {
 		let (root, names) = absolute_components(path)?;
 		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)?;
 		let root_attributes = match handle_attributes(root_handle) {
@@ -9744,7 +9736,11 @@ mod platform {
 		let rebound = open_relative(parent, skill_name, FILE_READ_ATTRIBUTES | FILE_TRAVERSE, true)?;
 		let same = handles_same_object_checked(rebound, skill_handle).unwrap_or(false);
 		unsafe { CloseHandle(rebound) };
-		if same { Ok(()) } else { Err("identity_mismatch") }
+		if same {
+			Ok(())
+		} else {
+			Err("identity_mismatch")
+		}
 	}
 
 	#[expect(
@@ -9923,10 +9919,11 @@ mod platform {
 		content: &str,
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
-		let (mut skills, canonical_volume, mut path_names) = match open_or_create_skill_root(root_path) {
-			Ok(value) => value,
-			Err(code) => return NativeSecureSkillWriteResult::failure(code),
-		};
+		let (mut skills, canonical_volume, mut path_names) =
+			match open_or_create_skill_root(root_path) {
+				Ok(value) => value,
+				Err(code) => return NativeSecureSkillWriteResult::failure(code),
+			};
 		let skill_name = std::ffi::OsString::from(skill_name);
 		let skill_handle = match open_or_create_skill_directory(skills.target, &skill_name, true) {
 			Ok(handle) => handle,
@@ -10013,7 +10010,9 @@ mod platform {
 			}
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
-		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names) {
+		if let Err(code) =
+			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
+		{
 			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
