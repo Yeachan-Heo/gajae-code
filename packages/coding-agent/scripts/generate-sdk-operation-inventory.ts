@@ -270,14 +270,11 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal profile and fallback-chain state, not a user-facing SDK control seam",
 	"agent_session:setDefaultFallbackRuntimeModel":
 		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
-	"agent_session:setTtsrManager":
-		"internal cwd-rescope rules-state rebinding, not a user-facing SDK control seam",
+	"agent_session:setTtsrManager": "internal cwd-rescope rules-state rebinding, not a user-facing SDK control seam",
 	"agent_session:rebindMCPSelectionMetadata":
 		"internal cwd-rescope MCP selection rebinding, not a user-facing SDK control seam",
-	"agent_session:setSettings":
-		"internal cwd-rescope settings rebinding, not a user-facing SDK control seam",
-	"agent_session:setObfuscator":
-		"internal cwd-rescope secret-mask rebinding, not a user-facing SDK control seam",
+	"agent_session:setSettings": "internal cwd-rescope settings rebinding, not a user-facing SDK control seam",
+	"agent_session:setObfuscator": "internal cwd-rescope secret-mask rebinding, not a user-facing SDK control seam",
 	"agent_session:setPromptTemplates":
 		"internal cwd-rescope prompt-template rebinding, not a user-facing SDK control seam",
 	"agent_session:setCredentialPin":
