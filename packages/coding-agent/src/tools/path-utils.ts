@@ -3,7 +3,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as url from "node:url";
 import { isEnoent } from "@gajae-code/utils/fs-error";
+import type { Rule } from "../capability/rule";
+import type { Skill } from "../extensibility/skills";
 import { InternalUrlRouter } from "../internal-urls";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 import type { MCPManager } from "../runtime-mcp/manager";
 import { ToolError } from "./tool-errors";
 
@@ -688,6 +691,9 @@ export interface ToolScopeOptions {
 	mcpManager?: MCPManager;
 	getArtifactsDir?: () => string | null;
 	getAuthorizedArtifactsDirs?: () => readonly string[];
+	skills?: readonly Skill[];
+	rules?: readonly Rule[];
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Verb used in the "Cannot {action} internal URL without a backing file: …" message. */
 	internalUrlAction: string;
 	/** Collect absolute paths flagged immutable by their internal-URL handler. */
@@ -739,6 +745,9 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 			getArtifactsDir,
 			getAuthorizedArtifactsDirs,
 			mcpManager: opts.mcpManager,
+			skills: opts.skills,
+			rules: opts.rules,
+			localProtocolOptions: opts.localProtocolOptions,
 		});
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);

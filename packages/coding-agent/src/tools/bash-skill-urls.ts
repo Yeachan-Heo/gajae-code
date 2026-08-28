@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { Skill } from "../extensibility/skills";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { validateRelativePath } from "../internal-urls/skill-protocol";
-import type { InternalResource } from "../internal-urls/types";
+import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import { normalizeLocalScheme } from "./path-utils";
 import { ToolError } from "./tool-errors";
 
@@ -19,7 +19,7 @@ type SupportedInternalScheme = (typeof SUPPORTED_INTERNAL_SCHEMES)[number];
 
 interface InternalUrlResolver {
 	canHandle(input: string): boolean;
-	resolve(input: string): Promise<InternalResource>;
+	resolve(input: string, context?: ResolveContext): Promise<InternalResource>;
 }
 
 export interface InternalUrlExpansionOptions {
@@ -27,6 +27,7 @@ export interface InternalUrlExpansionOptions {
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
+	rules?: ResolveContext["rules"];
 	ensureLocalParentDirs?: boolean;
 }
 
@@ -150,6 +151,7 @@ async function resolveInternalUrlToPath(
 	skills: readonly Skill[],
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
+	rules?: ResolveContext["rules"],
 	ensureLocalParentDirs?: boolean,
 ): Promise<string> {
 	const url = normalizeLocalScheme(rawUrl);
@@ -195,7 +197,11 @@ async function resolveInternalUrlToPath(
 
 	let resource: InternalResource;
 	try {
-		resource = await internalRouter.resolve(url);
+		resource = await internalRouter.resolve(url, {
+			rules,
+			skills,
+			localProtocolOptions: localOptions,
+		});
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ToolError(`Failed to resolve ${scheme}:// URL in bash command: ${url}\n${message}`);
@@ -249,6 +255,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 			options.skills,
 			options.internalRouter,
 			options.localOptions,
+			options.rules,
 			options.ensureLocalParentDirs,
 		);
 		const replacement = options.noEscape ? resolvedPath : shellEscape(resolvedPath);

@@ -160,6 +160,9 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 				getArtifactsDir: this.session.getArtifactsDir,
 				mcpManager: this.session.getMcpManager?.(),
 				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
+				skills: this.session.skills,
+				rules: this.session.rules,
+				localProtocolOptions: this.session.localProtocolOptions,
 				internalUrlAction: "search",
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;

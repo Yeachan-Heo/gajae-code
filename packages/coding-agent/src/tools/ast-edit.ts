@@ -213,6 +213,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				getArtifactsDir: this.session.getArtifactsDir,
 				mcpManager: this.session.getMcpManager?.(),
 				getAuthorizedArtifactsDirs: this.session.getAuthorizedArtifactsDirs,
+				skills: this.session.skills,
+				rules: this.session.rules,
+				localProtocolOptions: this.session.localProtocolOptions,
 				internalUrlAction: "rewrite",
 			});
 			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
