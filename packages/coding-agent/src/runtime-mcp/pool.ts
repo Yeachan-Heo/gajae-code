@@ -907,7 +907,7 @@ export class MCPConnectionPool {
 		});
 		entry.closePromise = closePromise.finally(() => {
 			entry.closePromise = undefined;
-			this.#retiredEntries.delete(entry);
+			if (entry.state === "closed") this.#retiredEntries.delete(entry);
 		});
 		return entry.closePromise;
 	}

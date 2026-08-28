@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@gajae-code/agent-core";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { getActiveSkills, setActiveSkills } from "@gajae-code/coding-agent/extensibility/skills";
 import { InternalUrlRouter } from "@gajae-code/coding-agent/internal-urls";
 import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridge";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
@@ -185,9 +184,9 @@ describe("read tool ACP fs routing", () => {
 			content: "one\ntwo\nthree\n",
 			contentType: "text/plain",
 		});
-		const tool = new ReadTool(createSession(tmpDir));
-		const previousSkills = getActiveSkills();
-		setActiveSkills([
+		const session = createSession(tmpDir);
+		const tool = new ReadTool(session);
+		session.skills = [
 			{
 				name: "superpowers:brainstorming",
 				description: "",
@@ -195,7 +194,7 @@ describe("read tool ACP fs routing", () => {
 				baseDir: "",
 				source: "test",
 			},
-		]);
+		];
 
 		try {
 			await expect(tool.execute("agent-unknown", { path: "agent://0:bogus" })).rejects.toThrow(
@@ -228,7 +227,6 @@ describe("read tool ACP fs routing", () => {
 			resolveSpy.mockRestore();
 			if (previousSkillHandler) router.register(previousSkillHandler);
 			else router.unregister("skill");
-			setActiveSkills(previousSkills);
 		}
 	});
 

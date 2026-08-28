@@ -661,6 +661,8 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 		const result = await loadSkills({
 			...activeSettings.getGroup("skills"),
 			cwd,
+			agentDir: activeSettings.getAgentDir(),
+			settings: activeSettings,
 			disabledExtensions: activeSettings.get("disabledExtensions"),
 		});
 		for (const skill of result.skills) loadedNames.add(skill.name);
@@ -1022,7 +1024,9 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// Exact session-startup consumer (interactive/print modes).
 	const loadedNames = new Set(
-		(await loadSlashCommands({ cwd, agentDir: activeSettings.getAgentDir() })).map(cmd => cmd.name),
+		(await loadSlashCommands({ cwd, agentDir: activeSettings.getAgentDir(), settings: activeSettings })).map(
+			cmd => cmd.name,
+		),
 	);
 
 	const items: CustomizeDoctorItem[] = entries.map(entry => {
