@@ -294,7 +294,7 @@ export async function loadCapabilityForHome<T>(
 		? path.resolve(options.agentDir)
 		: path.join(resolvedHome, getConfigDirName(), "agent");
 
-	const cwd = options.cwd ?? getProjectDir();
+	const cwd = path.resolve(options.cwd ?? getProjectDir());
 	const repoRoot = await findRepoRoot(cwd);
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: isolatedOptions.settings };
