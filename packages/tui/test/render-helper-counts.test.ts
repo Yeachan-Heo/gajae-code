@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { type Component, TUI } from "@gajae-code/tui";
+import { type Component, Container, TUI } from "@gajae-code/tui";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { VirtualTerminal } from "./virtual-terminal";
 
@@ -236,6 +236,106 @@ describe("TUI render helper counters", () => {
 			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(1);
 			widthReflowEvidence.resizeOverflowReflowVisibleWidthCalls =
 				TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not remeasure unchanged viewport rows with visibleWidths", async () => {
+		const lineCount = 80;
+		const layoutFrames = 8;
+		const lines = Array.from(
+			{ length: lineCount },
+			(_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`,
+		);
+		const term = new VirtualTerminal(48, 12);
+		const component = new MutableLinesComponent(lines);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		tui.addChild(component);
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			for (let i = 0; i < layoutFrames; i++) {
+				tui.requestLayoutRender("loader");
+				await settle(term);
+			}
+
+			expect(TUI.getRenderCountersForTest().emitVisibleWidthsLineCount).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("measures only the dirty viewport row when one raw line changes", async () => {
+		const lineCount = 80;
+		const edits = 8;
+		const lines = Array.from(
+			{ length: lineCount },
+			(_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`,
+		);
+		const term = new VirtualTerminal(48, 12);
+		const component = new MutableLinesComponent(lines);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		tui.addChild(component);
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			for (let i = 0; i < edits; i++) {
+				const next = [...lines];
+				next[lineCount - 1] = `\x1b[38;2;80;160;255m${"漢".repeat(8)}-edit-${i}\x1b[0m`;
+				component.setLines(next);
+				tui.requestLayoutRender("loader");
+				await settle(term);
+			}
+
+			expect(TUI.getRenderCountersForTest().emitVisibleWidthsLineCount).toBe(edits);
+			expect(visible(term).some(line => line.includes("edit-7"))).toBe(true);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("does not copy the transcript prefix on layout-only ticks when the viewport-anchor cache hits", async () => {
+		const transcriptLines = 80;
+		const layoutFrames = 8;
+		const term = new VirtualTerminal(48, 12);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const transcript = new Container();
+		for (let index = 0; index < transcriptLines; index++) {
+			transcript.addChild(new MutableLinesComponent([`line-${index}`]));
+		}
+		const suffix = new MutableLinesComponent(["status-0"]);
+		tui.addChild(transcript);
+		tui.addChild(suffix);
+		tui.setBottomPinnedComponent(suffix);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setViewportOutputSource({ identity: "session:layout-reuse", revision: 0n });
+
+		try {
+			tui.start();
+			await settle(term);
+
+			suffix.setLines(["status-warmup"]);
+			tui.requestLayoutRender("layout-reuse-warmup");
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			for (let index = 1; index <= layoutFrames; index++) {
+				suffix.setLines([`status-${index}`]);
+				tui.requestLayoutRender("layout-reuse");
+				await settle(term);
+			}
+
+			const counters = TUI.getRenderCountersForTest();
+			expect(counters.offscreenPrefixCompares).toBe(0);
+			expect(counters.layoutFrameLineCopies).toBe(0);
+			expect(visible(term).some(line => line.includes("status-8"))).toBe(true);
 		} finally {
 			tui.stop();
 		}
