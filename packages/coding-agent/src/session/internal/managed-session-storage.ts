@@ -1610,6 +1610,20 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
+	async replaceExpectedIdentity(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): Promise<void> {
+		this.#beforeMutation();
+		this.#assertBound();
+		const resolved = this.#resolve(relativePath);
+		if (!this.#authority) {
+			const current = captureManagedFileIdentityStreamingNoFollow(resolved);
+			if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
+			await replaceManagedFile(resolved, bytes, this.#subtreeRoot, this.#policy, undefined, current);
+			this.#assertBound();
+			return;
+		}
+		this.replaceExpectedIdentitySync(relativePath, bytes, expected);
+	}
+
 	replaceExpectedIdentitySync(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): void {
 		this.#beforeMutation();
 		this.#assertBound();
@@ -1810,6 +1824,46 @@ export class ManagedSessionDescendantStore {
 				bounded.sha256 !== expected.sha256
 			)
 				throw new Error("managed_append_identity_mismatch");
+		}
+		return this.appendExpectedSync(relativePath, bytes, bounded);
+	}
+
+	async appendExpectedIdentity(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedFileIdentity,
+	): Promise<ManagedAppendReceipt> {
+		const bounded = this.captureBoundedAppendExpectation(relativePath);
+		if (
+			!bounded ||
+			bounded.dev !== expected.dev.toString() ||
+			bounded.ino !== expected.ino.toString() ||
+			bounded.size !== String(expected.size) ||
+			bounded.mtimeNs !== expected.mtimeNs.toString() ||
+			bounded.ctimeNs !== expected.ctimeNs.toString()
+		)
+			throw new Error("managed_append_identity_mismatch");
+		this.#beforeMutation();
+		this.#assertBound();
+		if (!this.#authority) {
+			const current = captureManagedFileIdentityStreamingNoFollow(this.#resolve(relativePath));
+			if (
+				current.dev.toString() !== bounded.dev ||
+				current.ino.toString() !== bounded.ino ||
+				current.size.toString() !== bounded.size ||
+				current.mtimeNs.toString() !== bounded.mtimeNs ||
+				current.ctimeNs.toString() !== bounded.ctimeNs ||
+				current.sha256 !== bounded.sha256
+			)
+				throw new Error("managed_append_identity_mismatch");
+			const appended = await appendManagedFileStreaming(
+				this.#resolve(relativePath),
+				bytes,
+				this.#subtreeRoot,
+				this.#policy,
+			);
+			this.#assertBound();
+			return managedAppendReceiptFromIdentity(appended);
 		}
 		return this.appendExpectedSync(relativePath, bytes, bounded);
 	}
@@ -3555,6 +3609,72 @@ function appendManagedFileStreamingSync(
 	if (predecessor.size > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
 		throw new Error("content_too_large");
 	return replaceManagedFileGeneratedSync(
+		destination,
+		stagingFd => {
+			const sourceFd = fs.openSync(
+				destination,
+				fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | (fs.constants.O_NOFOLLOW ?? 0),
+			);
+			try {
+				const before = fs.fstatSync(sourceFd, { bigint: true });
+				if (!sameReplacementIdentity(identity(before, predecessor.sha256), predecessor))
+					throw new Error("managed_replace_identity_mismatch");
+				const hash = createHash("sha256");
+				const chunk = Buffer.alloc(64 * 1024);
+				let total = 0;
+				for (;;) {
+					const count = fs.readSync(sourceFd, chunk, 0, chunk.byteLength, null);
+					if (count === 0) break;
+					let written = 0;
+					while (written < count) {
+						const amount = fs.writeSync(stagingFd, chunk, written, count - written);
+						if (amount === 0) throw new Error("managed_replace_short_write");
+						written += amount;
+					}
+					hash.update(chunk.subarray(0, count));
+					total += count;
+				}
+				const after = fs.fstatSync(sourceFd, { bigint: true });
+				const named = fs.lstatSync(destination, { bigint: true });
+				if (
+					!sameReplacementIdentity(identity(after, predecessor.sha256), predecessor) ||
+					!sameReplacementIdentity(identity(named, predecessor.sha256), predecessor)
+				)
+					throw new Error("managed_replace_identity_mismatch");
+				if (hash.copy().digest("hex") !== predecessor.sha256) throw new Error("managed_replace_identity_mismatch");
+				if (total > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
+					throw new Error("content_too_large");
+				let appended = 0;
+				while (appended < appendedBytes.byteLength) {
+					const amount = fs.writeSync(stagingFd, appendedBytes, appended, appendedBytes.byteLength - appended);
+					if (amount === 0) throw new Error("managed_replace_short_write");
+					hash.update(appendedBytes.subarray(appended, appended + amount));
+					appended += amount;
+				}
+				return { size: total + appended, sha256: hash.digest("hex") };
+			} finally {
+				fs.closeSync(sourceFd);
+			}
+		},
+		root,
+		policy,
+		undefined,
+		predecessor,
+		true,
+		"append",
+	);
+}
+
+async function appendManagedFileStreaming(
+	destination: string,
+	appendedBytes: Uint8Array,
+	root: ManagedDirectoryRoot,
+	policy: ManagedSessionSecurityPolicy,
+): Promise<ManagedFileSnapshot["identity"]> {
+	const predecessor = captureManagedFileIdentityStreamingNoFollow(destination);
+	if (predecessor.size > MANAGED_ARTIFACT_MAX_FILE_BYTES - appendedBytes.byteLength)
+		throw new Error("content_too_large");
+	return await replaceManagedFileGenerated(
 		destination,
 		stagingFd => {
 			const sourceFd = fs.openSync(

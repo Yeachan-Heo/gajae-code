@@ -5945,6 +5945,10 @@ export class AgentSession {
 			) {
 				try {
 					this.sessionManager.appendMessage(event.message);
+					// Managed transcripts hash and swap the JSONL off the JS thread.
+					// Await the persist chain so a durable failure still aborts before
+					// tool execution, while TUI timers can run during exactReplacePathAsync.
+					await this.sessionManager.flush();
 				} catch (error) {
 					// Typed near-limit append (#4566): the transcript hit the managed
 					// per-file cap and even the live-entry rewrite could not hold this

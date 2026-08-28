@@ -7293,6 +7293,12 @@ export class SessionManager {
 	#persistChain: Promise<void> = Promise.resolve();
 	#persistError: Error | undefined;
 	#persistErrorReported = false;
+	/** Coalesce managed hot-path persists onto `#persistChain` so SHA-256/`exactReplacePath` can yield. */
+	#managedPersistDrainQueued = false;
+	#managedNeedsFullRewrite = false;
+	#queuedManagedHotRecords: SessionEntry[] = [];
+	#managedPublishResumeBreadcrumb = false;
+	#pendingNearLimitError: SessionNearLimitAppendError | undefined;
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
@@ -8026,6 +8032,7 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
+		this.#resetManagedPersistQueue();
 		const managedTransition =
 			this.destination.kind === "managed"
 				? this.#prepareManagedDestinationTransition(path.resolve(path.dirname(snapshot.coldRestoreFile)))
@@ -8102,6 +8109,7 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
+		this.#resetManagedPersistQueue();
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
@@ -8138,6 +8146,7 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
+		this.#resetManagedPersistQueue();
 		this.#sessionId = state.sessionId;
 		this.#sessionName = state.header.title;
 		this.#titleSource = state.header.titleSource;
@@ -10072,6 +10081,7 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
+		this.#resetManagedPersistQueue();
 		this.#sessionId = stage.sessionId;
 		this.#sessionName = stage.sessionName;
 		this.#titleSource = stage.titleSource;
@@ -10296,6 +10306,7 @@ export class SessionManager {
 		this.#persistChain = Promise.resolve();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
+		this.#resetManagedPersistQueue();
 		let forkArtifactPublication: ForkArtifactPublication | undefined;
 		let forkTranscriptPublication: ForkTranscriptPublication | undefined;
 		let transition: PreparedResidentStoreTransition | undefined;
@@ -10840,6 +10851,7 @@ export class SessionManager {
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
 			this.#persistErrorReported = false;
+			this.#resetManagedPersistQueue();
 
 			const oldSessionFile = this.#sessionFile;
 			const newSessionFile = path.join(newSessionDir, path.basename(oldSessionFile));
@@ -11091,6 +11103,7 @@ export class SessionManager {
 			this.#persistChain = Promise.resolve();
 			this.#persistError = undefined;
 			this.#persistErrorReported = false;
+			this.#resetManagedPersistQueue();
 			if (rollbackManagedMove) {
 				try {
 					await rollbackManagedMove();
@@ -11288,6 +11301,14 @@ export class SessionManager {
 			this.#recordPersistError(err);
 		});
 		return next;
+	}
+
+	#resetManagedPersistQueue(): void {
+		this.#managedPersistDrainQueued = false;
+		this.#managedNeedsFullRewrite = false;
+		this.#queuedManagedHotRecords.length = 0;
+		this.#managedPublishResumeBreadcrumb = false;
+		this.#pendingNearLimitError = undefined;
 	}
 	/**
 	 * Non-yielding same-session persistence fence. One owner serializes the critical
@@ -14991,6 +15012,34 @@ export class SessionManager {
 		}
 	}
 
+	async #writeEntriesAtomically(entries: FileEntry[]): Promise<void> {
+		this.#ensureFullHotView();
+		const sessionFile = this.#sessionFile;
+		if (!sessionFile) return;
+		if (this.destination.kind !== "managed") {
+			this.#writeEntriesAtomicallySync(entries);
+			return;
+		}
+		const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
+		const store = this.#managedTranscriptStore(sessionFile);
+		const relativePath = path.basename(sessionFile);
+		if (this.#managedPersistExpectedIdentity) {
+			try {
+				await store.replaceExpectedIdentity(relativePath, bytes, this.#managedPersistExpectedIdentity);
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+				this.#managedPersistExpectedIdentity = undefined;
+				await store.replace(relativePath, bytes);
+			}
+		} else await store.replace(relativePath, bytes);
+		this.#withSessionPersistenceFenceSync(() => {
+			const descriptor = store.descriptorExpected(relativePath);
+			if (!descriptor) throw new Error("managed_replace_identity_unavailable");
+			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
+			this.#publishCommitMarkerFromCurrentTranscriptSync();
+		});
+	}
+
 	#writeEntriesAtomicallySync(entries: FileEntry[]): void {
 		// A full rewrite must see the complete transcript; rehydrate retired cold
 		// entries into the hot view before materializing the persisted bytes.
@@ -15146,11 +15195,16 @@ export class SessionManager {
 					prepareEntryForPersistence(entry, this.#blobStore),
 				),
 			);
-			written = this.#withSessionPersistenceFenceSync(() => {
-				if (!this.#persistenceInputTokenMatches(token)) return false;
-				this.#writeEntriesAtomicallySync(entries);
-				return true;
-			});
+			if (
+				!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))
+			)
+				continue;
+			await this.#writeEntriesAtomically(entries);
+			if (
+				!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))
+			)
+				continue;
+			written = true;
 		}
 		if (!written) throw new Error("session_persistence_input_stale");
 		this.#needsFullRewriteOnNextPersist = false;
@@ -15499,6 +15553,9 @@ export class SessionManager {
 				await this.#persistWriter.fsync();
 			}
 		});
+		const nearLimit = this.#pendingNearLimitError;
+		this.#pendingNearLimitError = undefined;
+		if (nearLimit) throw nearLimit;
 		if (this.#persistError) throw this.#persistError;
 	}
 
@@ -16614,6 +16671,37 @@ export class SessionManager {
 		await this.#persistPatch({ type: "header_patch", patch });
 	}
 
+	async #appendManagedRecords(records: readonly (FileEntry | SessionPatchRecord)[]): Promise<void> {
+		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
+		const sessionFile = this.#sessionFile;
+		const store = this.#managedTranscriptStore(sessionFile);
+		const relativePath = path.basename(sessionFile);
+		const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
+		let receipt: ManagedAppendReceipt;
+		if (this.#managedPersistExpectedIdentity) {
+			try {
+				receipt = await store.appendExpectedIdentity(relativePath, bytes, this.#managedPersistExpectedIdentity);
+			} catch (err) {
+				const predecessorMissing = store.descriptorExpected(relativePath) === null;
+				if (
+					!isEnoent(err) &&
+					(!(err instanceof Error) || err.message !== "managed_append_identity_mismatch" || !predecessorMissing)
+				)
+					throw err;
+				this.#managedPersistExpectedIdentity = undefined;
+				await this.#rewriteFileContents();
+				return;
+			}
+		} else {
+			this.#appendManagedRecordsSync(records);
+			return;
+		}
+		this.#withSessionPersistenceFenceSync(() => {
+			this.#managedPersistExpectedIdentity = receipt.identity;
+			this.#publishSessionCommitMarkerSync(receipt.descriptor);
+		});
+	}
+
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
 		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
 		this.#withSessionPersistenceFenceSync(() => {
@@ -16681,14 +16769,17 @@ export class SessionManager {
 						: record,
 				);
 				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
+				if (this.destination.kind === "managed") {
+					if (!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token)))
+						continue;
+					await this.#appendManagedRecords(persistedRecords);
+					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
+					this.#readOnlyResume = false;
+					return;
+				}
 				let persisted = false;
 				const written = this.#withSessionPersistenceFenceSync(() => {
 					if (!this.#persistenceInputTokenMatches(token)) return false;
-					if (this.destination.kind === "managed") {
-						this.#appendManagedRecordsSync(persistedRecords);
-						persisted = true;
-						return true;
-					}
 					const writer = this.#ensurePersistWriter();
 					if (!writer) {
 						void this.#rewriteFile()
@@ -16712,6 +16803,111 @@ export class SessionManager {
 			throw new Error("session_persistence_input_stale");
 		});
 	}
+
+	#scheduleManagedPersist(entry: SessionEntry, publishResumeBreadcrumb: boolean): void {
+		if (publishResumeBreadcrumb) this.#managedPublishResumeBreadcrumb = true;
+		if (this.#needsFullRewriteOnNextPersist || !this.#flushed || this.#managedNeedsFullRewrite) {
+			this.#managedNeedsFullRewrite = true;
+			this.#queuedManagedHotRecords.length = 0;
+		} else this.#queuedManagedHotRecords.push(entry);
+		if (this.#managedPersistDrainQueued) return;
+		this.#managedPersistDrainQueued = true;
+		void this.#queuePersistTask(async () => {
+			this.#managedPersistDrainQueued = false;
+			try {
+				await this.#drainManagedPersist();
+			} catch (err) {
+				// Near-limit is a typed caller-facing outcome, not a sticky persist
+				// poison: the entry stays resident and a later rewrite after compact
+				// can still succeed. Surface it on flush() without blocking close().
+				if (err instanceof SessionNearLimitAppendError) {
+					this.#pendingNearLimitError = err;
+					return;
+				}
+				throw err instanceof SessionAppendPersistenceError
+					? err
+					: new SessionAppendPersistenceError("current_append", this.#leafId, toError(err));
+			}
+		});
+	}
+
+	async #drainManagedPersist(): Promise<void> {
+		const publishResumeBreadcrumb = this.#managedPublishResumeBreadcrumb;
+		this.#managedPublishResumeBreadcrumb = false;
+		const sessionFile = this.#sessionFile;
+		if (
+			this.#managedNeedsFullRewrite ||
+			!this.#flushed ||
+			this.#needsFullRewriteOnNextPersist
+		) {
+			this.#managedNeedsFullRewrite = false;
+			this.#queuedManagedHotRecords.length = 0;
+			await this.#rewriteFileContents();
+			if (publishResumeBreadcrumb && sessionFile) writeTerminalBreadcrumb(this.cwd, sessionFile);
+			this.#readOnlyResume = false;
+			return;
+		}
+		const batch = this.#queuedManagedHotRecords.splice(0);
+		if (batch.length === 0) return;
+		const last = batch[batch.length - 1]!;
+		try {
+			const persistedEntries = batch.map(record =>
+				prepareEntryForPersistenceSync(
+					materializeResidentEntryForPersistenceSync(record, this.#residentBlobStores(), new Map()),
+					this.#blobStore,
+				),
+			);
+			await this.#appendManagedRecords(persistedEntries);
+			if (publishResumeBreadcrumb && sessionFile) writeTerminalBreadcrumb(this.cwd, sessionFile);
+			this.#readOnlyResume = false;
+		} catch (err) {
+			if (!(err instanceof Error) || err.message !== "content_too_large") throw err;
+			const entryBytes = (() => {
+				try {
+					const materialized = materializeResidentEntryForPersistenceSync(
+						last,
+						this.#residentBlobStores(),
+						new Map(),
+					);
+					return Buffer.byteLength(
+						`${JSON.stringify(prepareEntryForPersistenceSync(materialized, this.#blobStore))}\n`,
+						"utf8",
+					);
+				} catch {
+					return 0;
+				}
+			})();
+			const liveBytesBefore = this.getTranscriptFileBytes();
+			try {
+				await this.#rewriteFileContents();
+			} catch (rewriteError) {
+				if (rewriteError instanceof Error && rewriteError.message === "content_too_large") {
+					this.#needsFullRewriteOnNextPersist = true;
+					throw new SessionNearLimitAppendError({
+						entryBytes,
+						liveBytes: liveBytesBefore,
+						capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+						entryRetained: this.#byId.has(last.id),
+					});
+				}
+				throw rewriteError;
+			}
+			if (publishResumeBreadcrumb && sessionFile) writeTerminalBreadcrumb(this.cwd, sessionFile);
+			this.#readOnlyResume = false;
+			const liveBytesAfter = this.getTranscriptFileBytes();
+			const entryRetained = liveBytesAfter <= MANAGED_ARTIFACT_MAX_FILE_BYTES && this.#byId.has(last.id);
+			if (!entryRetained) {
+				this.#needsFullRewriteOnNextPersist = true;
+				throw new SessionNearLimitAppendError({
+					entryBytes,
+					liveBytes: liveBytesAfter || liveBytesBefore,
+					capBytes: MANAGED_ARTIFACT_MAX_FILE_BYTES,
+					entryRetained: this.#byId.has(last.id),
+				});
+			}
+		}
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
 		const publishResumeBreadcrumb = this.#readOnlyResume;
@@ -16729,6 +16925,11 @@ export class SessionManager {
 				this.#ensuredOnDisk = false;
 				return;
 			}
+		}
+
+		if (this.destination.kind === "managed") {
+			this.#scheduleManagedPersist(entry, publishResumeBreadcrumb);
+			return;
 		}
 
 		if (this.#needsFullRewriteOnNextPersist || !this.#flushed) {
@@ -16752,21 +16953,12 @@ export class SessionManager {
 		// bytes are in the kernel page cache, so the entry survives an OOM/SIGKILL
 		// landing immediately after this call. Image externalization (rare) runs via
 		// the synchronous blob-store path so blob bytes are durable before the JSONL
-		// line referencing them is written.
+		// line referencing them is written. Managed destinations queue the same work
+		// onto `#persistChain` (`#scheduleManagedPersist`) so `exactReplacePathAsync`
+		// can yield instead of hashing the whole JSONL on the TUI thread.
 		let persisted = false;
 		try {
 			this.#withSessionPersistenceFenceSync(() => {
-				if (this.destination.kind === "managed") {
-					const materializedEntry = materializeResidentEntryForPersistenceSync(
-						entry,
-						this.#residentBlobStores(),
-						new Map(),
-					);
-					const persistedEntry = prepareEntryForPersistenceSync(materializedEntry, this.#blobStore);
-					this.#appendManagedRecordsSync([persistedEntry]);
-					persisted = true;
-					return;
-				}
 				const writer = this.#ensurePersistWriter();
 				if (!writer) {
 					// The cached writer is closing. Preserve the appended in-memory entry for

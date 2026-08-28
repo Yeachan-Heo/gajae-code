@@ -408,19 +408,32 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 			const TEST_CAP = 6000; // far below the post-open transcript size
 			const overCap = (bytes: Uint8Array): boolean => fs.statSync(sessionFile).size > TEST_CAP - bytes.byteLength;
 			const proto = ManagedSessionDescendantStore.prototype as unknown as Record<string, unknown>;
-			const realAppendExpectedIdentity = proto.appendExpectedIdentitySync as (
+			const realAppendExpectedIdentitySync = proto.appendExpectedIdentitySync as (
 				this: unknown,
 				p: string,
 				b: Uint8Array,
 				...r: unknown[]
 			) => unknown;
+			const realAppendExpectedIdentity = proto.appendExpectedIdentity as (
+				this: unknown,
+				p: string,
+				b: Uint8Array,
+				...r: unknown[]
+			) => Promise<unknown>;
 			const realAppendSync = proto.appendSync as (this: unknown, p: string, b: Uint8Array) => unknown;
-			proto.appendExpectedIdentitySync = function (this: unknown, p: string, b: Uint8Array, ...r: unknown[]) {
+			const rejectIfOverCap = (b: Uint8Array): void => {
 				if (overCap(b)) throw new Error("content_too_large");
-				return realAppendExpectedIdentity.call(this, p, b, ...r);
+			};
+			proto.appendExpectedIdentitySync = function (this: unknown, p: string, b: Uint8Array, ...r: unknown[]) {
+				rejectIfOverCap(b);
+				return realAppendExpectedIdentitySync.call(this, p, b, ...r);
+			};
+			proto.appendExpectedIdentity = async function (this: unknown, p: string, b: Uint8Array, ...r: unknown[]) {
+				rejectIfOverCap(b);
+				return await realAppendExpectedIdentity.call(this, p, b, ...r);
 			};
 			proto.appendSync = function (this: unknown, p: string, b: Uint8Array) {
-				if (overCap(b)) throw new Error("content_too_large");
+				rejectIfOverCap(b);
 				return realAppendSync.call(this, p, b);
 			};
 
@@ -450,6 +463,7 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 					timestamp: Date.now(),
 				}),
 			).not.toThrow();
+			await manager.flush();
 
 			const transcript = fs.readFileSync(sessionFile, "utf8");
 			// Effect + receipt are both durable: the edit result entry exists with
@@ -472,7 +486,8 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 			expect(details?.diff).toBeDefined();
 
 			// The session is not poisoned: the next append after recovery succeeds.
-			proto.appendExpectedIdentitySync = realAppendExpectedIdentity;
+			proto.appendExpectedIdentitySync = realAppendExpectedIdentitySync;
+			proto.appendExpectedIdentity = realAppendExpectedIdentity;
 			proto.appendSync = realAppendSync;
 			manager.appendMessage({ role: "user", content: [{ type: "text", text: "continue" }], timestamp: 3 });
 			await manager.flush();
@@ -525,56 +540,77 @@ describe("near-limit edit append after committed mutation (#4566)", () => {
 			// exactly the state where the old code either aborted with an
 			// unclassified error or silently succeeded without the receipt.
 			const proto = ManagedSessionDescendantStore.prototype as unknown as Record<string, unknown>;
-			const realAppendExpectedIdentity = proto.appendExpectedIdentitySync as (
+			const realAppendExpectedIdentitySync = proto.appendExpectedIdentitySync as (
 				this: unknown,
 				p: string,
 				b: Uint8Array,
 				...r: unknown[]
 			) => unknown;
+			const realAppendExpectedIdentity = proto.appendExpectedIdentity as (
+				this: unknown,
+				p: string,
+				b: Uint8Array,
+				...r: unknown[]
+			) => Promise<unknown>;
 			const realAppendSync = proto.appendSync as (this: unknown, p: string, b: Uint8Array) => unknown;
 			const realReplaceSync = proto.replaceSync as (this: unknown, p: string, b: Uint8Array) => unknown;
-			const realReplaceExpectedIdentity = proto.replaceExpectedIdentitySync as (
+			const realReplaceExpectedIdentitySync = proto.replaceExpectedIdentitySync as (
 				this: unknown,
 				p: string,
 				b: Uint8Array,
 				...r: unknown[]
 			) => unknown;
+			const realReplaceExpectedIdentity = proto.replaceExpectedIdentity as (
+				this: unknown,
+				p: string,
+				b: Uint8Array,
+				...r: unknown[]
+			) => Promise<unknown>;
 			let appendCalls = 0;
-			proto.appendExpectedIdentitySync = function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
+			const rejectTooLarge = (): never => {
 				appendCalls++;
 				throw new Error("content_too_large");
+			};
+			proto.appendExpectedIdentitySync = function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
+				return rejectTooLarge();
+			};
+			proto.appendExpectedIdentity = async function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
+				return rejectTooLarge();
 			};
 			proto.appendSync = function (this: unknown, _p: string, _b: Uint8Array) {
-				appendCalls++;
-				throw new Error("content_too_large");
+				return rejectTooLarge();
 			};
 			proto.replaceSync = function (this: unknown, _p: string, _b: Uint8Array) {
-				appendCalls++;
-				throw new Error("content_too_large");
+				return rejectTooLarge();
 			};
 			proto.replaceExpectedIdentitySync = function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
-				appendCalls++;
-				throw new Error("content_too_large");
+				return rejectTooLarge();
 			};
+			proto.replaceExpectedIdentity = async function (this: unknown, _p: string, _b: Uint8Array, ..._r: unknown[]) {
+				return rejectTooLarge();
+			};
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-0",
+				toolName: "edit",
+				content: result.content,
+				details: result.details,
+				isError: false,
+				timestamp: Date.now(),
+			});
 			let thrown: unknown;
 			try {
-				manager.appendMessage({
-					role: "toolResult",
-					toolCallId: "call-0",
-					toolName: "edit",
-					content: result.content,
-					details: result.details,
-					isError: false,
-					timestamp: Date.now(),
-				});
+				await manager.flush();
 			} catch (error) {
 				thrown = error;
 			}
 
-			proto.appendExpectedIdentitySync = realAppendExpectedIdentity;
+			proto.appendExpectedIdentitySync = realAppendExpectedIdentitySync;
+			proto.appendExpectedIdentity = realAppendExpectedIdentity;
 			proto.appendSync = realAppendSync;
 			proto.replaceSync = realReplaceSync;
-			proto.replaceExpectedIdentitySync = realReplaceExpectedIdentity;
+			proto.replaceExpectedIdentitySync = realReplaceExpectedIdentitySync;
+			proto.replaceExpectedIdentity = realReplaceExpectedIdentity;
 
 			expect(thrown).toBeInstanceOf(SessionNearLimitAppendErrorValue);
 			const typed = thrown as InstanceType<typeof SessionNearLimitAppendErrorValue>;
