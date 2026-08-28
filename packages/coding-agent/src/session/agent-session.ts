@@ -5188,8 +5188,12 @@ export class AgentSession {
 				}
 				let rescopeFailure: unknown;
 				try {
+					// Capability filesystem caches are process-wide and may retain the
+					// source cwd's instructions when a non-process-cwd-owned session moves.
+					// Clear them before destination discovery regardless of cwd ownership;
+					// this does not mutate the process cwd or sibling session authority.
+					resetCapabilities();
 					if (ownsProcessCwd) {
-						resetCapabilities();
 						const projectRegistry = await resolveActiveProjectRegistryPath(canonicalTarget);
 						clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
 					}
