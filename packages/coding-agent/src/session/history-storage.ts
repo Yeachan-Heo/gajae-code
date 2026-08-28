@@ -62,8 +62,8 @@ class AsyncDrain<T> {
 
 export class HistoryStorage {
 	#db: Database;
-	static #instance?: HistoryStorage;
-	static #opening?: Promise<HistoryStorage>;
+	static #instances = new Map<string, HistoryStorage>();
+	static #openings = new Map<string, Promise<HistoryStorage>>();
 	#drain = new AsyncDrain<Pick<HistoryEntry, "prompt" | "cwd">>(100);
 
 	// Prepared statements
@@ -140,32 +140,41 @@ CREATE TRIGGER IF NOT EXISTS history_ai AFTER INSERT ON history BEGIN
 	}
 
 	static open(dbPath: string = getHistoryDbPath()): HistoryStorage {
-		if (!HistoryStorage.#instance) {
-			fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-			HistoryStorage.#instance = new HistoryStorage(dbPath);
-		}
-		return HistoryStorage.#instance;
+		const instance = HistoryStorage.#instances.get(dbPath);
+		if (instance) return instance;
+		fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+		const storage = new HistoryStorage(dbPath);
+		HistoryStorage.#instances.set(dbPath, storage);
+		return storage;
 	}
 
 	static async openAsync(dbPath: string = getHistoryDbPath()): Promise<HistoryStorage> {
-		if (HistoryStorage.#instance) return HistoryStorage.#instance;
-		if (!HistoryStorage.#opening) {
-			HistoryStorage.#opening = (async () => {
-				await fsPromises.mkdir(path.dirname(dbPath), { recursive: true });
-				const storage = new HistoryStorage(dbPath);
-				HistoryStorage.#instance ??= storage;
-				return HistoryStorage.#instance;
-			})().finally(() => {
-				HistoryStorage.#opening = undefined;
-			});
-		}
-		return await HistoryStorage.#opening;
+		const instance = HistoryStorage.#instances.get(dbPath);
+		if (instance) return instance;
+
+		const opening = HistoryStorage.#openings.get(dbPath);
+		if (opening) return await opening;
+
+		const nextOpening = (async () => {
+			await fsPromises.mkdir(path.dirname(dbPath), { recursive: true });
+			const existing = HistoryStorage.#instances.get(dbPath);
+			if (existing) return existing;
+			const storage = new HistoryStorage(dbPath);
+			HistoryStorage.#instances.set(dbPath, storage);
+			return storage;
+		})().finally(() => {
+			if (HistoryStorage.#openings.get(dbPath) === nextOpening) {
+				HistoryStorage.#openings.delete(dbPath);
+			}
+		});
+		HistoryStorage.#openings.set(dbPath, nextOpening);
+		return await nextOpening;
 	}
 
-	/** @internal Reset the singleton — test-only. */
+	/** @internal Reset cached instances — test-only. */
 	static resetInstance(): void {
-		HistoryStorage.#instance = undefined;
-		HistoryStorage.#opening = undefined;
+		HistoryStorage.#instances.clear();
+		HistoryStorage.#openings.clear();
 	}
 
 	#insertBatch(rows: Array<Pick<HistoryEntry, "prompt" | "cwd">>): void {

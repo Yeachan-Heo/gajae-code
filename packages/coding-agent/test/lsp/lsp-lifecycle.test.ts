@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getOrCreateClient,
+	releaseLspScope,
+	retainLspScope,
 	sendNotification,
 	sendRequest,
 	shutdownAll,
@@ -89,6 +91,39 @@ describe("LSP lifecycle behavior", () => {
 			const secondExitCode = await second.proc.exited;
 			expect(secondExitCode).not.toBeNull();
 			expect(first.pendingRequests.size).toBe(0);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("releasing one retained profile scope preserves a sibling client's pending requests", async () => {
+		const cwd = await tempDir("gjc-lsp-scope-release-");
+		const profileA = path.join(cwd, "profile-a");
+		const profileB = path.join(cwd, "profile-b");
+		try {
+			const script = await writeFakeLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			retainLspScope(cwd, profileA);
+			retainLspScope(cwd, profileB);
+			const first = await getOrCreateClient(config, cwd, 1_000, profileA);
+			const second = await getOrCreateClient(config, cwd, 1_000, profileB);
+			const firstPending = sendRequest(first, "workspace/neverResponds", null, undefined, 60_000).catch(
+				error => error,
+			);
+			const secondPending = sendRequest(second, "workspace/neverResponds", null, undefined, 60_000).catch(
+				error => error,
+			);
+			expect(first.pendingRequests.size).toBe(1);
+			expect(second.pendingRequests.size).toBe(1);
+
+			await releaseLspScope(cwd, profileA);
+			expect(await firstPending).toBeInstanceOf(Error);
+			expect(first.proc.exitCode).not.toBeNull();
+			expect(second.proc.exitCode).toBeNull();
+			expect(second.pendingRequests.size).toBe(1);
+
+			await releaseLspScope(cwd, profileB);
+			expect(await secondPending).toBeInstanceOf(Error);
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}

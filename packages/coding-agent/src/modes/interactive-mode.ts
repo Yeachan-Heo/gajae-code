@@ -13,7 +13,15 @@ import {
 	Text,
 	TUI,
 } from "@gajae-code/tui";
-import { APP_NAME, adjustHsv, getProjectDir, logger, postmortem, sanitizeText } from "@gajae-code/utils";
+import {
+	APP_NAME,
+	adjustHsv,
+	getHistoryDbPath,
+	getProjectDir,
+	logger,
+	postmortem,
+	sanitizeText,
+} from "@gajae-code/utils";
 import chalk from "chalk";
 import { AsyncJobManager } from "../async";
 import {
@@ -1146,7 +1154,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.settings.get("history.enabled") === false) return undefined;
 		if (!this.#historyStorageLoad) {
 			this.#historyStorageLoad = import("../session/history-storage")
-				.then(({ HistoryStorage }) => HistoryStorage.openAsync())
+				.then(({ HistoryStorage }) => HistoryStorage.openAsync(getHistoryDbPath(this.session.getSessionAgentDir())))
 				.then(storage => {
 					this.historyStorage = storage;
 					if (!this.#stopped) this.editor.setHistoryStorage(storage);

@@ -170,3 +170,23 @@ describe("HistoryStorage cwd filtering", () => {
 		expect(storage.search("commit", 10).length).toBe(2);
 	});
 });
+
+describe("HistoryStorage profile isolation", () => {
+	it("opens independent databases for concurrent profiles", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-history-profile-"));
+		const profileAPath = path.join(tempDir, "profile-a", "history.db");
+		const profileBPath = path.join(tempDir, "profile-b", "history.db");
+		const [profileA, profileB] = await Promise.all([
+			HistoryStorage.openAsync(profileAPath),
+			HistoryStorage.openAsync(profileBPath),
+		]);
+
+		expect(profileA).not.toBe(profileB);
+		const writes = [profileA.add("profile A prompt", "/profile/a"), profileB.add("profile B prompt", "/profile/b")];
+		vi.advanceTimersByTime(100);
+		await Promise.all(writes);
+
+		expect(profileA.getRecent(10).map(entry => entry.prompt)).toEqual(["profile A prompt"]);
+		expect(profileB.getRecent(10).map(entry => entry.prompt)).toEqual(["profile B prompt"]);
+	});
+});

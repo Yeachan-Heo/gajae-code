@@ -19,7 +19,7 @@ import { HistoryStorage } from "@gajae-code/coding-agent/session/history-storage
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import * as titleGenerator from "@gajae-code/coding-agent/utils/title-generator";
 import { setKeybindings } from "@gajae-code/tui";
-import { TempDir } from "@gajae-code/utils";
+import { getHistoryDbPath, TempDir } from "@gajae-code/utils";
 import { ModelRegistry } from "../src/config/model-registry";
 
 interface InteractivePaletteHost {
@@ -208,6 +208,7 @@ async function createHost(): Promise<InteractivePaletteHost> {
 			}),
 			sessionManager,
 			settings: Settings.isolated(STARTUP_OVERRIDES),
+			agentDir: tempDir.path(),
 			modelRegistry,
 			extensionRunner,
 			customCommands,
@@ -215,7 +216,7 @@ async function createHost(): Promise<InteractivePaletteHost> {
 		});
 		partialHost.session = session;
 		HistoryStorage.resetInstance();
-		const historyStorage = HistoryStorage.open(path.join(tempDir.path(), "history.db"));
+		const historyStorage = HistoryStorage.open(getHistoryDbPath(tempDir.path()));
 		initializingHost = partialHost;
 		const mode = new InteractiveMode(session, "test");
 		partialHost.mode = mode;

@@ -4979,7 +4979,14 @@ pub(crate) mod platform {
 			Ok(value) => value,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
-		let skills_fd = root.file;
+		// Keep the authority walk's descriptor owned solely by `SkillRootAuthority`.
+		// The writer uses a separate descriptor because its existing error paths close
+		// the skill-root handle after private-file cleanup.
+		// SAFETY: `root.file` is an open directory descriptor owned by `root`.
+		let skills_fd = unsafe { libc::fcntl(root.file, libc::F_DUPFD_CLOEXEC, 0) };
+		if skills_fd < 0 {
+			return NativeSecureSkillWriteResult::failure("io_error");
+		}
 		let canonical_root = root.canonical.clone();
 		let Ok(skill_component) = CString::new(skill_name.as_bytes()) else {
 			unsafe { libc::close(skills_fd) };

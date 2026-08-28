@@ -26,6 +26,11 @@ const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
 const initializingClients = new Set<LspClient>();
 let shutdownGeneration = 0;
+// Session lifetimes retain the workspace/profile scope they may use. A scoped
+// release only tears down its clients after the last session releases that
+// scope; process teardown continues to use shutdownAll() below.
+const scopeReferences = new Map<string, number>();
+const scopeShutdownGenerations = new Map<string, number>();
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
 let lspCleanupOwner: (() => void) | undefined;
@@ -33,6 +38,34 @@ let lspCleanupOwner: (() => void) | undefined;
 function ensureLspCleanup(): void {
 	if (lspCleanupOwner) return;
 	lspCleanupOwner = registerResourceOwner("lsp:clients", shutdownAll);
+}
+
+function normalizedAgentDir(agentDir?: string): string {
+	return agentDir ? path.resolve(agentDir) : "";
+}
+
+function lspScopeKey(cwd: string, agentDir?: string): string {
+	return JSON.stringify([path.resolve(cwd), normalizedAgentDir(agentDir)]);
+}
+
+function scopeKeyFromClientKey(key: string): string | undefined {
+	try {
+		const value: unknown = JSON.parse(key);
+		if (!Array.isArray(value) || typeof value[1] !== "string") return undefined;
+		return lspScopeKey(value[1], typeof value[2] === "string" && value[2] ? value[2] : undefined);
+	} catch {
+		return undefined;
+	}
+}
+
+function scopeGeneration(scopeKey: string): number {
+	return scopeShutdownGenerations.get(scopeKey) ?? 0;
+}
+
+/** Retain a workspace/profile LSP scope for one live session. */
+export function retainLspScope(cwd: string, agentDir?: string): void {
+	const key = lspScopeKey(cwd, agentDir);
+	scopeReferences.set(key, (scopeReferences.get(key) ?? 0) + 1);
 }
 
 // Idle timeout configuration (disabled by default)
@@ -505,7 +538,8 @@ export async function getOrCreateClient(
 	// A language server process is scoped to both its workspace and effective
 	// profile. Same-cwd sessions using different profiles must not share the
 	// process (or its open files, diagnostics, and initialization state).
-	const key = JSON.stringify([config.command, cwd, agentDir ? path.resolve(agentDir) : ""]);
+	const key = JSON.stringify([config.command, cwd, normalizedAgentDir(agentDir)]);
+	const scopeKey = lspScopeKey(cwd, agentDir);
 
 	// Check if client already exists
 	const existingClient = clients.get(key);
@@ -527,6 +561,7 @@ export async function getOrCreateClient(
 	let clientPromise!: Promise<LspClient>;
 	clientPromise = (async () => {
 		const creationGeneration = shutdownGeneration;
+		const creationScopeGeneration = scopeGeneration(scopeKey);
 		const baseCommand = config.resolvedCommand ?? config.command;
 		const baseArgs = config.args ?? [];
 
@@ -534,7 +569,7 @@ export async function getOrCreateClient(
 		const { command, args, env } = isLspmuxSupported(baseCommand)
 			? await getLspmuxCommand(baseCommand, baseArgs, cwd)
 			: { command: baseCommand, args: baseArgs };
-		if (creationGeneration !== shutdownGeneration) {
+		if (creationGeneration !== shutdownGeneration || creationScopeGeneration !== scopeGeneration(scopeKey)) {
 			throw new Error("LSP client shutdown");
 		}
 
@@ -583,7 +618,7 @@ export async function getOrCreateClient(
 			return originalKill(...args);
 		};
 		initializingClients.add(client);
-		if (creationGeneration !== shutdownGeneration) {
+		if (creationGeneration !== shutdownGeneration || creationScopeGeneration !== scopeGeneration(scopeKey)) {
 			initializingClients.delete(client);
 			await shutdownClientInstance(client);
 			throw new Error("LSP client shutdown");
@@ -662,7 +697,7 @@ export async function getOrCreateClient(
 			ensureLspCleanup();
 			const terminalError = transportClosedErrors.get(client);
 			if (terminalError) throw terminalError;
-			if (creationGeneration !== shutdownGeneration) {
+			if (creationGeneration !== shutdownGeneration || creationScopeGeneration !== scopeGeneration(scopeKey)) {
 				throw new Error("LSP client shutdown");
 			}
 
@@ -915,6 +950,48 @@ export async function shutdownClient(key: string): Promise<void> {
 	if (!client) return;
 	clients.delete(key);
 	await shutdownClientInstance(client);
+}
+
+/**
+ * Release one session's workspace/profile LSP scope.
+ *
+ * Clients remain alive while another session retains the same scope. Once the
+ * final holder releases it, cached and in-flight clients for that exact scope
+ * are shut down without touching sibling profiles or workspaces.
+ */
+export async function releaseLspScope(cwd: string, agentDir?: string): Promise<void> {
+	const scopeKey = lspScopeKey(cwd, agentDir);
+	const references = scopeReferences.get(scopeKey);
+	if (references === undefined) return;
+	if (references > 1) {
+		scopeReferences.set(scopeKey, references - 1);
+		return;
+	}
+	scopeReferences.delete(scopeKey);
+	scopeShutdownGenerations.set(scopeKey, scopeGeneration(scopeKey) + 1);
+
+	const clientsToShutdown: LspClient[] = [];
+	for (const [key, client] of Array.from(clients.entries())) {
+		if (scopeKeyFromClientKey(key) !== scopeKey) continue;
+		clients.delete(key);
+		clientsToShutdown.push(client);
+	}
+
+	const initializingToShutdown = Array.from(initializingClients).filter(
+		client => scopeKeyFromClientKey(client.name) === scopeKey,
+	);
+	const inFlightPromises: Promise<LspClient>[] = [];
+	for (const [key, promise] of Array.from(clientLocks.entries())) {
+		if (scopeKeyFromClientKey(key) !== scopeKey) continue;
+		clientLocks.delete(key);
+		inFlightPromises.push(promise);
+	}
+
+	await Promise.allSettled([
+		...clientsToShutdown.map(client => shutdownClientInstance(client)),
+		...initializingToShutdown.map(client => shutdownClientInstance(client)),
+		...inFlightPromises,
+	]);
 }
 
 // =============================================================================

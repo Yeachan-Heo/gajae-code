@@ -353,7 +353,7 @@ import {
 	type WorkflowSkillActivationSeed,
 } from "../hooks/skill-state";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
-import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
+import { releaseLspScope, retainLspScope } from "../lsp/client";
 import { resolveMemoryBackendId } from "../memory-backend/resolve";
 import { createMemoryBackendService } from "../memory-backend/service";
 import type { MemoryBackend } from "../memory-backend/types";
@@ -861,7 +861,9 @@ export interface AgentSessionRescopeParticipant {
 	assertCanRescope?: () => void;
 	/** Rebind cwd-capturing plugin, MCP, and other host tool authority. */
 	rebindCwdCapturingAuthority: (cwd: string) => Promise<void>;
-	/** Re-discover cwd-derived context, skills, and workspace state after commit. */
+	/** Release any predecessor runtime services after the durable move commits. */
+	finalizeRescope?: () => Promise<void>;
+	/** Re-discover the cwd-derived context, skills, and workspace state after commit. */
 	applyRescopedReadState: (cwd: string) => Promise<void>;
 }
 
@@ -2406,7 +2408,7 @@ export class AgentSession {
 	getSessionAgentDir(): string {
 		return this.#requestedAgentDir ?? this.settings.getAgentDir();
 	}
-	readonly memoryBackend: LazyService<MemoryBackend>;
+	memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
 	#workflowGatePublication: "endpoint" | "local";
@@ -4357,6 +4359,7 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
+		retainLspScope(this.sessionManager.getCwd(), this.getSessionAgentDir());
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
 			if (settingPath === "sessionMemory.mode") {
@@ -5088,6 +5091,7 @@ export class AgentSession {
 				);
 			}
 			const from = this.sessionManager.getCwd();
+			const lspAgentDir = this.getSessionAgentDir();
 			const resolvedPath = path.resolve(from, target);
 			let canonicalFrom: string;
 			let canonicalTarget: string;
@@ -5229,14 +5233,25 @@ export class AgentSession {
 					});
 				}
 				if (enforceOneShot) this.#rescopeSessionCwdConsumed = true;
-				if (ownsProcessCwd) {
-					try {
-						await shutdownAllLspClients();
-					} catch (error) {
-						logger.warn("Failed to reset launch-root LSP clients after session rescope", {
-							error: error instanceof Error ? error.message : String(error),
-						});
-					}
+				try {
+					await participant.finalizeRescope?.();
+				} catch (error) {
+					// The move is already durable. Runtime-service cleanup is best effort
+					// and must not turn a committed move into a false rejection.
+					logger.warn("Committed session rescope could not finalize runtime services", {
+						error: error instanceof Error ? error.message : String(error),
+						cwd: this.sessionManager.getCwd(),
+					});
+				}
+				// Drop only this session's previous workspace/profile clients. A global
+				// shutdown here would terminate sibling sessions' pending LSP requests.
+				retainLspScope(this.sessionManager.getCwd(), lspAgentDir);
+				try {
+					await releaseLspScope(from, lspAgentDir);
+				} catch (error) {
+					logger.warn("Failed to release previous session LSP scope after rescope", {
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
 				// Cwd-derived read-only state the prompt and subagents consume.
 				// Best-effort by design: the move is committed, and a failed
@@ -9327,7 +9342,15 @@ export class AgentSession {
 				MCPManager.setInstance(undefined);
 			}
 		}
-		await shutdownAllLspClients();
+		// Release only this session's workspace/profile clients. Other sessions may
+		// share the default profile and must retain their transports and requests.
+		try {
+			await releaseLspScope(this.sessionManager.getCwd(), this.getSessionAgentDir());
+		} catch (error) {
+			logger.warn("Failed to release session LSP scope during dispose", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		// F13: release only THIS session's browser tabs on dispose (kill:false → remote
 		// browsers disconnect, headless close gracefully). Scoped by the session id the
 		// browser tool tagged tabs with, so other live sessions' tabs are untouched.
