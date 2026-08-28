@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { isEnoent, isKnownSinkPeerClosedError, logger, untilAborted } from "@gajae-code/utils";
 import { formatCrashDiagnosticNotice, writeCrashReport } from "../debug/crash-diagnostics";
 import { registerResourceOwner, spawnOwnedProcess } from "../runtime/process-lifecycle";
@@ -495,8 +496,16 @@ const PROJECT_LOAD_TIMEOUT_MS = 15_000;
  * @param cwd - Working directory
  * @param initTimeoutMs - Optional timeout for the initialize request (defaults to 30s)
  */
-export async function getOrCreateClient(config: ServerConfig, cwd: string, initTimeoutMs?: number): Promise<LspClient> {
-	const key = `${config.command}:${cwd}`;
+export async function getOrCreateClient(
+	config: ServerConfig,
+	cwd: string,
+	initTimeoutMs?: number,
+	agentDir?: string,
+): Promise<LspClient> {
+	// A language server process is scoped to both its workspace and effective
+	// profile. Same-cwd sessions using different profiles must not share the
+	// process (or its open files, diagnostics, and initialization state).
+	const key = JSON.stringify([config.command, cwd, agentDir ? path.resolve(agentDir) : ""]);
 
 	// Check if client already exists
 	const existingClient = clients.get(key);

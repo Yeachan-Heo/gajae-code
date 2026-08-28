@@ -11,6 +11,7 @@ import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-ag
 import type { LoadContext } from "@gajae-code/coding-agent/capability/types";
 import { runMigrate } from "@gajae-code/coding-agent/cli/migrate-cli";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { discoverCustomCommands } from "@gajae-code/coding-agent/extensibility/custom-commands/loader";
 import { loadHooks } from "@gajae-code/coding-agent/extensibility/hooks/loader";
 import {
 	discoverRuntimeSkills,
@@ -352,6 +353,29 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 		const destinationCommands = await discoverSdkSlashCommands(destination, profile);
 		expect(destinationCommands.map(command => command.name)).toContain("destination-command");
 		expect(destinationCommands.map(command => command.name)).not.toContain("decoy-command");
+	});
+
+	test("custom command discovery stays on the explicit profile while including project commands", async () => {
+		const ambientAgentDir = path.join(home, ".gjc", "agent");
+		const writeCommand = async (root: string, name: string): Promise<void> => {
+			await writeFile(path.join(root, name, "index.ts"), "export default () => [];\n");
+		};
+
+		await writeCommand(path.join(profile, "commands"), "profile-custom");
+		await writeCommand(path.join(ambientAgentDir, "commands"), "ambient-custom");
+		await writeCommand(path.join(project, ".gjc", "commands"), "project-custom");
+
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		const result = await discoverCustomCommands({ cwd: project, agentDir: profile });
+		const discovered = result.paths.map(entry => entry.path).sort();
+
+		expect(discovered).toEqual(
+			[
+				path.join(profile, "commands", "profile-custom", "index.ts"),
+				path.join(project, ".gjc", "commands", "project-custom", "index.ts"),
+			].sort(),
+		);
+		expect(discovered).not.toContain(path.join(ambientAgentDir, "commands", "ambient-custom", "index.ts"));
 	});
 
 	test("loaded hook exec follows the destination cwd supplied after rescope", async () => {

@@ -7,7 +7,7 @@ import { TempDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
 import * as discoveryHelpers from "../../src/discovery/helpers";
 import { createLspWritethrough, LspTool } from "../../src/lsp";
-import { shutdownAll } from "../../src/lsp/client";
+import { getOrCreateClient, shutdownAll } from "../../src/lsp/client";
 import { loadConfig } from "../../src/lsp/config";
 import { detectLspmux, getLspmuxCommand, resetLspmuxStateForTesting } from "../../src/lsp/lspmux";
 import { isProjectControlledPath } from "../../src/lsp/path-trust";
@@ -160,6 +160,87 @@ describe("LSP repository command trust", () => {
 		);
 
 		expect(loadConfig(cwd).servers["repository-custom-server"]).toBeUndefined();
+	});
+
+	it("loads user LSP configuration from the selected agent profile only", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-profile-config-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const profileRoot = path.join("/var/tmp", `.gjc-lsp-profile-${process.pid}-${Date.now()}`);
+		const forgetProfileRoot = registerOwnedDeletionRoot(profileRoot);
+		const profileA = path.join(profileRoot, "profile-a");
+		const profileB = path.join(profileRoot, "profile-b");
+		const serverDir = path.join("/var/tmp", `.gjc-lsp-server-${process.pid}-${Date.now()}`);
+		const forgetServerRoot = registerOwnedDeletionRoot(serverDir);
+		const serverA = path.join(serverDir, "server-a");
+		const serverB = path.join(serverDir, "server-b");
+		try {
+			await Promise.all([
+				fs.promises.mkdir(cwd, { recursive: true }),
+				fs.promises.mkdir(profileA, { recursive: true }),
+				fs.promises.mkdir(profileB, { recursive: true }),
+				fs.promises.mkdir(serverDir, { recursive: true }),
+				Bun.write(serverA, ""),
+				Bun.write(serverB, ""),
+			]);
+			await Promise.all([
+				Bun.write(
+					path.join(profileA, "lsp.json"),
+					JSON.stringify({
+						servers: {
+							"profile-a-server": {
+								command: serverA,
+								fileTypes: [".profile-a"],
+								rootMarkers: ["."],
+							},
+						},
+					}),
+				),
+				Bun.write(
+					path.join(profileB, "lsp.json"),
+					JSON.stringify({
+						servers: {
+							"profile-b-server": {
+								command: serverB,
+								fileTypes: [".profile-b"],
+								rootMarkers: ["."],
+							},
+						},
+					}),
+				),
+			]);
+
+			const configA = loadConfig(cwd, profileA);
+			const configB = loadConfig(cwd, profileB);
+			expect(configA.servers["profile-a-server"]?.command).toBe(serverA);
+			expect(configA.servers["profile-b-server"]).toBeUndefined();
+			expect(configB.servers["profile-b-server"]?.command).toBe(serverB);
+			expect(configB.servers["profile-a-server"]).toBeUndefined();
+		} finally {
+			await safeRm(profileRoot, { recursive: true, force: true });
+			forgetProfileRoot();
+			await safeRm(serverDir, { recursive: true, force: true });
+			forgetServerRoot();
+		}
+	});
+
+	it("does not share same-cwd LSP clients across effective agent profiles", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-profile-client-");
+		const cwd = tempDir.path();
+		const profileA = path.join(cwd, "profile-a");
+		const profileB = path.join(cwd, "profile-b");
+		const script = await writeCanaryLspServer(cwd);
+		const canaryPath = path.join(cwd, "client-started");
+		const config = {
+			command: process.execPath,
+			args: [script, canaryPath],
+			fileTypes: [".ts"],
+			rootMarkers: [],
+		};
+
+		const first = await getOrCreateClient(config, cwd, 1_000, profileA);
+		const second = await getOrCreateClient(config, cwd, 1_000, profileB);
+		expect(second).not.toBe(first);
+		expect(second.name).not.toBe(first.name);
 	});
 
 	it("does not trust project-scoped plugin launch fields even when the root claims user scope", async () => {

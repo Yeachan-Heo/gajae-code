@@ -99,7 +99,7 @@ export async function discoverCustomCommands(
 		}
 	}
 
-	for (const entry of getConfigDirs("commands", { cwd, existingOnly: true })) {
+	for (const entry of getConfigDirs("commands", { cwd, existingOnly: true, userAgentDir: agentDir })) {
 		const source = entry.level === "user" ? "user" : "project";
 		if (!commandDirs.some(d => d.path === entry.path)) {
 			commandDirs.push({ path: entry.path, source });

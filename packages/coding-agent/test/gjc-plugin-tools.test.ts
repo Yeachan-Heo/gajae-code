@@ -2,6 +2,9 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { Settings } from "../src/config/settings";
+import { discoverAndLoadCustomTools } from "../src/extensibility/custom-tools/loader";
 import {
 	installGjcBundle,
 	resolveSubskillActivationForSkillInvocation,
@@ -42,6 +45,40 @@ export default factory;
 	return toolPath;
 }
 
+async function writeInstalledPlugin(agentDir: string, pluginName: string, toolName: string): Promise<void> {
+	const pluginsDir = path.join(agentDir, "plugins");
+	const pluginDir = path.join(pluginsDir, "node_modules", pluginName);
+	await fs.mkdir(path.join(pluginDir, "tools"), { recursive: true });
+	await fs.writeFile(
+		path.join(pluginsDir, "package.json"),
+		JSON.stringify({ dependencies: { [pluginName]: "1.0.0" } }),
+	);
+	await fs.writeFile(
+		path.join(pluginDir, "package.json"),
+		JSON.stringify({
+			version: "1.0.0",
+			gjc: { kind: "gajae-code-plugin", name: pluginName, version: "1.0.0", tools: ["tools/index.ts"] },
+		}),
+	);
+	await fs.writeFile(
+		path.join(pluginDir, "tools", "index.ts"),
+		`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
+
+const factory: CustomToolFactory = pi => ({
+	name: ${JSON.stringify(toolName)},
+	label: ${JSON.stringify(toolName)},
+	description: "profile isolation fixture tool",
+	parameters: pi.zod.object({}),
+	async execute() {
+		return { content: [{ type: "text", text: ${JSON.stringify(toolName)} }] };
+	},
+});
+
+export default factory;
+`,
+	);
+}
+
 const TEST_SESSION_ID = "gjc-plugin-tools-test";
 
 async function writeActiveSubskill(cwd: string, toolPaths: string[]): Promise<void> {
@@ -73,6 +110,28 @@ afterEach(async () => {
 });
 
 describe("GJC plugin sub-skill tools", () => {
+	test("binds capability and plugin discovery to the selected agent profile", async () => {
+		const cwd = await makeTempRoot();
+		const profileAgentDir = path.join(cwd, "selected-profile");
+		const ambientAgentDir = path.join(cwd, "ambient-profile");
+		const originalAgentDir = getAgentDir();
+		await writeTool(profileAgentDir, "profile-native.ts", "profile_native");
+		await writeTool(ambientAgentDir, "ambient-native.ts", "ambient_native");
+		await writeInstalledPlugin(profileAgentDir, "profile-plugin", "profile_plugin");
+		await writeInstalledPlugin(ambientAgentDir, "ambient-plugin", "ambient_plugin");
+
+		try {
+			setAgentDir(ambientAgentDir);
+			const settings = Settings.isolated({}, { agentDir: profileAgentDir });
+			const loaded = await discoverAndLoadCustomTools([], cwd, [], undefined, profileAgentDir, settings);
+
+			expect(loaded.tools.map(({ tool }) => tool.name)).toEqual(["profile_native", "profile_plugin"]);
+			expect(loaded.tools.every(({ resolvedPath }) => !resolvedPath.startsWith(ambientAgentDir))).toBe(true);
+		} finally {
+			setAgentDir(originalAgentDir);
+		}
+	});
+
 	test("rechecks the subskill tool digest immediately before import", async () => {
 		const cwd = await makeTempRoot();
 		const fixture = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-skill-plugin");

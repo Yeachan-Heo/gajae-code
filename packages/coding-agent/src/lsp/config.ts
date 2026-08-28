@@ -2,7 +2,15 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
-import { isRecord, logger, pathIsWithin } from "@gajae-code/utils";
+import {
+	$which,
+	getConfigDirName,
+	getTrustedHomeDir,
+	isRecord,
+	logger,
+	normalizePathForComparison,
+	pathIsWithin,
+} from "@gajae-code/utils";
 import { YAML } from "bun";
 import { getConfigDirPaths } from "../config";
 import { type ClaudePluginRoot, getPreloadedPluginRoots } from "../discovery/helpers";
@@ -444,9 +452,12 @@ function pluginCanOverrideProcess(root: ClaudePluginRoot, cwd: string): boolean 
  * Configuration sources in priority order.
  * Supports both visible and hidden variants at each config location.
  */
-function getConfigSources(cwd: string): ConfigSource[] {
+function getConfigSources(cwd: string, agentDir?: string): ConfigSource[] {
 	const filenames = ["lsp.json", ".lsp.json", "lsp.yaml", ".lsp.yaml", "lsp.yml", ".lsp.yml"];
 	const sources: ConfigSource[] = [];
+	const defaultAgentDir = path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
+	const isScopedProfile =
+		agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(defaultAgentDir);
 
 	// Project root files (highest priority)
 	for (const filename of filenames) {
@@ -462,7 +473,11 @@ function getConfigSources(cwd: string): ConfigSource[] {
 	}
 
 	// User config directories (~/.gjc/agent/, ~/.gemini/)
-	const userDirs = getConfigDirPaths("", { user: true, project: false });
+	const userDirs = getConfigDirPaths("", {
+		user: true,
+		project: false,
+		...(isScopedProfile ? { userAgentDir: agentDir } : {}),
+	});
 	for (const dir of userDirs) {
 		for (const filename of filenames) {
 			sources.push(fileConfigSource(path.join(dir, filename), cwd, true));
@@ -470,7 +485,13 @@ function getConfigSources(cwd: string): ConfigSource[] {
 	}
 
 	// Plugin LSP configs
-	const pluginRoots = getPreloadedPluginRoots();
+	const pluginRoots = getPreloadedPluginRoots().filter(root => {
+		if (!isScopedProfile) return true;
+		// Preloaded roots are process-global. Keep project roots and roots owned by
+		// the selected profile, but never let another profile's ambient plugins
+		// contribute LSP configuration.
+		return root.scope === "project" || pathIsWithin(agentDir!, root.path);
+	});
 	for (const root of pluginRoots) {
 		const allowProcessOverrides = pluginCanOverrideProcess(root, cwd);
 		for (const filename of filenames) {
@@ -479,9 +500,12 @@ function getConfigSources(cwd: string): ConfigSource[] {
 		sources.push(marketplaceConfigSource(root, cwd, allowProcessOverrides));
 	}
 
-	// User home root files (lowest priority fallback)
-	for (const filename of filenames) {
-		sources.push(fileConfigSource(path.join(os.homedir(), filename), cwd, true));
+	// User home root files (lowest priority fallback). A scoped profile must not
+	// inherit ambient home-root configuration from the default profile.
+	if (!isScopedProfile) {
+		for (const filename of filenames) {
+			sources.push(fileConfigSource(path.join(os.homedir(), filename), cwd, true));
+		}
 	}
 
 	return sources;
@@ -518,10 +542,10 @@ function getConfigSources(cwd: string): ConfigSource[] {
  * }
  * ```
  */
-export function loadConfig(cwd: string): LspConfig {
+export function loadConfig(cwd: string, agentDir?: string): LspConfig {
 	let mergedServers = coerceServerConfigs(DEFAULTS);
 
-	const configSources = getConfigSources(cwd).reverse();
+	const configSources = getConfigSources(cwd, agentDir).reverse();
 	let hasOverrides = false;
 
 	let idleTimeoutMs: number | undefined;

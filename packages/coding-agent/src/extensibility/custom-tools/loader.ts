@@ -9,6 +9,7 @@ import type { AgentToolResult } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { toolCapability } from "../../capability/tool";
+import type { Settings } from "../../config/settings";
 import { type CustomTool, loadCapability } from "../../discovery";
 import type { ExecOptions } from "../../exec/exec";
 import { execCommand } from "../../exec/exec";
@@ -207,6 +208,8 @@ export async function loadCustomTools(
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
  * @param builtInToolNames - Names of built-in tools to check for conflicts
+ * @param agentDir - Effective user profile directory for capability and plugin discovery
+ * @param settings - Effective session settings for capability provider policy
  */
 export async function discoverAndLoadCustomTools(
 	configuredPaths: string[],
@@ -218,6 +221,8 @@ export async function discoverAndLoadCustomTools(
 		apply(reason: string): Promise<AgentToolResult<unknown>>;
 		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
 	}) => void,
+	agentDir?: string,
+	settings?: Settings,
 ) {
 	const allPathsWithSources: ToolPathWithSource[] = [];
 	const seen = new Set<string>();
@@ -232,7 +237,7 @@ export async function discoverAndLoadCustomTools(
 	};
 
 	// 1. Discover tools via capability system (user + project from all providers)
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd });
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd, agentDir, settings });
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {
 			provider: tool._source.provider,
@@ -242,7 +247,7 @@ export async function discoverAndLoadCustomTools(
 	}
 
 	// 2. Plugin tools: ~/.gjc/plugins/node_modules/*/
-	for (const pluginPath of await getAllPluginToolPaths(cwd)) {
+	for (const pluginPath of await getAllPluginToolPaths(cwd, agentDir)) {
 		addPath(pluginPath, { provider: "plugin", providerName: "Plugin", level: "user" });
 	}
 

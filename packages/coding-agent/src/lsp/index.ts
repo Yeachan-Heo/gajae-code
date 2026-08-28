@@ -99,8 +99,8 @@ export interface LspWarmupOptions {
 	onConnecting?: (serverNames: string[]) => void;
 }
 
-export function discoverStartupLspServers(cwd: string): LspStartupServerInfo[] {
-	const config = loadConfig(cwd);
+export function discoverStartupLspServers(cwd: string, agentDir?: string): LspStartupServerInfo[] {
+	const config = loadConfig(cwd, agentDir);
 	return getLspServers(config).map(([name, serverConfig]) => ({
 		name,
 		status: "idle",
@@ -116,8 +116,12 @@ export function discoverStartupLspServers(cwd: string): LspStartupServerInfo[] {
  * @param options - Optional callbacks for progress reporting
  * @returns Status of each server that was started
  */
-export async function warmupLspServers(cwd: string, options?: LspWarmupOptions): Promise<LspWarmupResult> {
-	const config = loadConfig(cwd);
+export async function warmupLspServers(
+	cwd: string,
+	options?: LspWarmupOptions,
+	agentDir?: string,
+): Promise<LspWarmupResult> {
+	const config = loadConfig(cwd, agentDir);
 	setIdleTimeout(config.idleTimeoutMs);
 	const servers: LspWarmupResult["servers"] = [];
 	const lspServers = getLspServers(config);
@@ -131,7 +135,12 @@ export async function warmupLspServers(cwd: string, options?: LspWarmupOptions):
 	// Servers that don't respond quickly will be initialized lazily on first use
 	const results = await Promise.allSettled(
 		lspServers.map(async ([name, serverConfig]) => {
-			const client = await getOrCreateClient(serverConfig, cwd, serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS);
+			const client = await getOrCreateClient(
+				serverConfig,
+				cwd,
+				serverConfig.warmupTimeoutMs ?? WARMUP_TIMEOUT_MS,
+				agentDir,
+			);
 			return { name, client, fileTypes: serverConfig.fileTypes };
 		}),
 	);
@@ -224,15 +233,25 @@ async function notifyFileSaved(
 	);
 }
 
-// Cache config per cwd to avoid repeated file I/O
+// Cache config per cwd and effective profile to avoid repeated file I/O without
+// allowing same-cwd sessions to reuse another profile's ambient configuration.
 const configCache = new Map<string, LspConfig>();
 
-function getConfig(cwd: string): LspConfig {
-	let config = configCache.get(cwd);
+function getConfigCacheKey(cwd: string, agentDir?: string): string {
+	return JSON.stringify([cwd, agentDir ? path.resolve(agentDir) : ""]);
+}
+
+function getSessionAgentDir(session: ToolSession): string | undefined {
+	return session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.();
+}
+
+function getConfig(cwd: string, agentDir?: string): LspConfig {
+	const key = getConfigCacheKey(cwd, agentDir);
+	let config = configCache.get(key);
 	if (!config) {
-		config = loadConfig(cwd);
+		config = loadConfig(cwd, agentDir);
 		setIdleTimeout(config.idleTimeoutMs);
-		configCache.set(cwd, config);
+		configCache.set(key, config);
 	}
 	return config;
 }
@@ -1146,7 +1165,8 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		signal = callerSignal ? AbortSignal.any([callerSignal, timeoutSignal]) : timeoutSignal;
 		throwIfAborted(signal);
 
-		const config = getConfig(this.session.cwd);
+		const agentDir = getSessionAgentDir(this.session);
+		const config = getConfig(this.session.cwd, agentDir);
 
 		// Status action doesn't need a file
 		if (action === "status") {
@@ -1245,7 +1265,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 							allDiagnostics.push(...diagnostics);
 							continue;
 						}
-						const client = await getOrCreateClient(serverConfig, this.session.cwd);
+						const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, agentDir);
 						if (isProjectAwareLspServer(serverConfig)) {
 							await waitForProjectLoaded(client, signal);
 							throwIfAborted(signal);
@@ -1400,7 +1420,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [serverName, serverConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd);
+					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, agentDir);
 					if (isProjectAwareLspServer(serverConfig)) {
 						await waitForProjectLoaded(client, signal);
 					}
@@ -1547,7 +1567,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 
 			for (const [serverName, serverConfig] of servers) {
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd);
+					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, agentDir);
 					for (const { oldUri } of pairs) {
 						if (client.openFiles.has(oldUri)) {
 							await sendNotification(client, "textDocument/didClose", {
@@ -1610,7 +1630,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [serverName, serverConfig] of serverList) {
 				throwIfAborted(signal);
 				try {
-					const client = await getOrCreateClient(serverConfig, this.session.cwd);
+					const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, agentDir);
 					respondingServers.add(serverName);
 					const caps = client.serverCapabilities ?? {};
 					sections.push(`${serverName}:`);
@@ -1696,7 +1716,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			}
 
 			try {
-				const client = await getOrCreateClient(chosenConfig, this.session.cwd);
+				const client = await getOrCreateClient(chosenConfig, this.session.cwd, undefined, agentDir);
 				if (resolvedTarget) {
 					await ensureFileOpen(client, resolvedTarget, signal);
 				}
@@ -1760,7 +1780,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const workspaceClient = await getOrCreateClient(workspaceServerConfig, this.session.cwd);
+					const workspaceClient = await getOrCreateClient(
+						workspaceServerConfig,
+						this.session.cwd,
+						undefined,
+						agentDir,
+					);
 					const workspaceResult = (await sendRequest(
 						workspaceClient,
 						"workspace/symbol",
@@ -1824,7 +1849,12 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 			for (const [workspaceServerName, workspaceServerConfig] of servers) {
 				throwIfAborted(signal);
 				try {
-					const workspaceClient = await getOrCreateClient(workspaceServerConfig, this.session.cwd);
+					const workspaceClient = await getOrCreateClient(
+						workspaceServerConfig,
+						this.session.cwd,
+						undefined,
+						agentDir,
+					);
 					outputs.push(await reloadServer(workspaceClient, workspaceServerName, signal));
 				} catch (err) {
 					if (err instanceof ToolAbortError || signal?.aborted) {
@@ -1851,7 +1881,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		const [serverName, serverConfig] = serverInfo;
 
 		try {
-			const client = await getOrCreateClient(serverConfig, this.session.cwd);
+			const client = await getOrCreateClient(serverConfig, this.session.cwd, undefined, agentDir);
 			const targetFile = resolvedFile;
 
 			if (targetFile) {

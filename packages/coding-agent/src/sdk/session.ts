@@ -1412,16 +1412,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
 	const ownsModelRegistry = options.modelRegistry === undefined;
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
+	const authStorage =
+		options.modelRegistry?.authStorage ??
+		options.authStorage ??
+		(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig)));
+	const ownsScopedSettings = options.settings === undefined;
+	let settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
+	const initialOwnedSettings = ownsScopedSettings ? settings : undefined;
 	const modelRegistry =
 		options.modelRegistry ??
-		new ModelRegistry(
-			options.authStorage ??
-				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
-			path.join(agentDir, "models.yml"),
-			undefined,
-			{ agentDir },
-		);
-	const authStorage = modelRegistry.authStorage;
+		new ModelRegistry(authStorage, path.join(agentDir, "models.yml"), settings, { agentDir });
 	const authStorageOwner = modelRegistry.getAuthStorageOwner();
 	if (options.authStorage && options.authStorage !== authStorage) {
 		throw new Error(
@@ -1521,6 +1521,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let liveSessionManager: SessionManager | undefined;
 		const getLiveCwd = (): string => liveSessionManager?.getCwd() ?? cwd;
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd: getLiveCwd });
+		modelRegistry.setScopedSettings(settings);
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		const startupModelReference =
@@ -4953,7 +4954,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// LSP-backed write operations create clients on demand through `getOrCreateClient`.
 		const lspServers =
 			enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")
-				? (await import("../lsp")).discoverStartupLspServers(cwd)
+				? (await import("../lsp")).discoverStartupLspServers(cwd, agentDir)
 				: undefined;
 
 		let memoryStartupTask: Promise<void> | undefined;
