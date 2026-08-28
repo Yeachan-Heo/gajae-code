@@ -878,18 +878,23 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					firstEventTimeoutMs,
 					endpointClass,
 				});
-			let remainingFirstEventTimeoutMs =
+			const getRemainingFirstEventTimeoutMs = (): number | undefined =>
 				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
 					? firstEventTimeoutMs
 					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
-			if (
-				remainingFirstEventTimeoutMs !== undefined &&
-				firstEventTimeoutMs !== undefined &&
-				firstEventTimeoutMs > 0 &&
-				remainingFirstEventTimeoutMs <= 0
-			) {
-				throw createFirstEventTimeoutError();
-			}
+			const assertFirstEventBudget = (): number | undefined => {
+				const remaining = getRemainingFirstEventTimeoutMs();
+				if (
+					remaining !== undefined &&
+					firstEventTimeoutMs !== undefined &&
+					firstEventTimeoutMs > 0 &&
+					remaining <= 0
+				) {
+					throw createFirstEventTimeoutError();
+				}
+				return remaining;
+			};
+			let remainingFirstEventTimeoutMs = assertFirstEventBudget();
 			// A capped non-abortable mutation remains the conversation's admission
 			// lock until its actual handler settles. Wait before opening another
 			// authenticated transport request.
@@ -899,12 +904,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				remainingFirstEventTimeoutMs,
 				createFirstEventTimeoutError,
 			);
+			remainingFirstEventTimeoutMs = assertFirstEventBudget();
 			// Recheck immediately before any network work: the caller may have
 			// aborted while the payload was being constructed.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
+			remainingFirstEventTimeoutMs = assertFirstEventBudget();
 
 			// Cursor owns the first-event watchdog, so its budget starts before
 			// history/blob/protobuf serialization. Synchronous setup cannot be
@@ -940,23 +947,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					() => new Error("Cursor stream stalled while waiting for the next event"),
 				);
 			};
-			let firstEventWatchdogArmed = false;
-			remainingFirstEventTimeoutMs =
-				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
-					? firstEventTimeoutMs
-					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
-			if (
-				remainingFirstEventTimeoutMs !== undefined &&
-				firstEventTimeoutMs !== undefined &&
-				firstEventTimeoutMs > 0 &&
-				remainingFirstEventTimeoutMs <= 0
-			) {
-				throw createFirstEventTimeoutError();
-			}
 			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
 			if (proxyUrl) {
-				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
-				firstEventWatchdogArmed = true;
 				// The watchdog settles the h2 promise but cannot interrupt the
 				// handshake await below: race the tunnel connect against the same
 				// first-event deadline so setup is actually bounded, and destroy the
@@ -968,7 +960,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				let tunnelDeadline: NodeJS.Timeout | undefined;
 				const deadline = Promise.withResolvers<never>();
 				const boundedTunnel =
-					firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
+					remainingFirstEventTimeoutMs !== undefined && remainingFirstEventTimeoutMs > 0
 						? Promise.race([
 								tunnel,
 								deadline.promise.catch(error => {
@@ -980,7 +972,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					// The rejection may never be observed when the tunnel wins the
 					// race; keep it handled so it cannot surface as unhandled.
 					deadline.promise.catch(() => {});
-					tunnelDeadline = setTimeout(() => deadline.reject(createFirstEventTimeoutError()), firstEventTimeoutMs);
+					tunnelDeadline = setTimeout(
+						() => deadline.reject(createFirstEventTimeoutError()),
+						remainingFirstEventTimeoutMs,
+					);
 				}
 				try {
 					proxiedSocket = await (boundedTunnel ?? tunnel);
@@ -1001,11 +996,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					proxiedSocket.destroy();
 					await h2Completion.promise;
 				}
+				assertFirstEventBudget();
 				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
 			} else {
 				h2Client = http2.connect(baseUrl);
 			}
 			if (h2Settled) await h2Completion.promise;
+			assertFirstEventBudget();
 			// Recheck after the (possibly async) proxy handshake, immediately before
 			// the bearer-authenticated request is created.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
@@ -1342,11 +1339,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-			// Already armed before the proxy handshake: do not restart the clock,
-			// or setup time would be refunded into the first-event budget.
-			if (!firstEventWatchdogArmed) {
-				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
-			}
+			// The watchdog was armed before setup; never restart it after request creation.
 			await h2Completion.promise;
 
 			if (state.currentTextBlock) {
