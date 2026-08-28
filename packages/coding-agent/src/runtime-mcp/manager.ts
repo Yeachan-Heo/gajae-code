@@ -2209,12 +2209,22 @@ export class MCPManager {
 					logger.error("Failed to re-subscribe to MCP resources", { path: `mcp:${name}`, error });
 					return;
 				}
+				if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection)) {
+					try {
+						await lease.setResourceSubscriptions([]);
+					} catch (error) {
+						logger.error("Failed to rollback stale MCP resource subscription", { path: `mcp:${name}`, error });
+					}
+					return;
+				}
 				const action = resolveSubscriptionPostAction(
 					this.#notificationsEnabled,
 					this.#notificationsEpoch,
 					notificationEpoch,
 				);
 				if (action === "rollback") {
+					if (!this.#isCurrentConnection(name, connection.config, globalEpoch, disconnectEpoch, connection))
+						return;
 					try {
 						await lease.setResourceSubscriptions([]);
 					} catch (error) {
