@@ -9856,7 +9856,7 @@ mod platform {
 					| WRITE_OWNER
 					| 0x0001_0000,
 				false,
-				0,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				FILE_CREATE,
 			) {
 				Ok(file) => file,
