@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
-import type { NonSharedBuffer } from "node:buffer";
+import type * as buffer from "node:buffer";
 import type * as nfs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -181,7 +181,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			| (nfs.ObjectEncodingOptions & { withFileTypes?: boolean; recursive?: boolean })
 			| BufferEncoding
 			| null;
-		type ReaddirResult = string[] | NonSharedBuffer[] | nfs.Dirent[];
+		type ReaddirResult = string[] | buffer.NonSharedBuffer[] | nfs.Dirent[];
 		const passthroughReaddir = realReaddir.bind(fs) as unknown as (
 			t: nfs.PathLike,
 			options?: ReaddirOptions,
