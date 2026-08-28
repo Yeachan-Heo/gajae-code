@@ -24,6 +24,7 @@ interface InternalUrlResolver {
 
 export interface InternalUrlExpansionOptions {
 	skills: readonly Skill[];
+	cwd?: string;
 	noEscape?: boolean;
 	internalRouter?: InternalUrlResolver;
 	localOptions?: LocalProtocolOptions;
@@ -150,6 +151,7 @@ function shellEscape(p: string): string {
 async function resolveInternalUrlToPath(
 	rawUrl: string,
 	skills: readonly Skill[],
+	cwd?: string,
 	internalRouter?: InternalUrlResolver,
 	localOptions?: LocalProtocolOptions,
 	rules?: ResolveContext["rules"],
@@ -200,6 +202,7 @@ async function resolveInternalUrlToPath(
 	let resource: InternalResource;
 	try {
 		resource = await internalRouter.resolve(url, {
+			cwd,
 			rules,
 			skills,
 			localProtocolOptions: localOptions,
@@ -256,6 +259,7 @@ export async function expandInternalUrls(command: string, options: InternalUrlEx
 		const resolvedPath = await resolveInternalUrlToPath(
 			url,
 			options.skills,
+			options.cwd,
 			options.internalRouter,
 			options.localOptions,
 			options.rules,
