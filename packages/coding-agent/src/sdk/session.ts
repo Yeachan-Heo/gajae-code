@@ -2441,17 +2441,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
-			if (options.settings === undefined) {
-				try {
-					settings = await settings.cloneForCwd(to);
-					session?.setSettings(settings);
-					toolSession.settings = settings;
-				} catch (error) {
-					logger.warn("Failed to reload settings after session rescope", {
-						error: safeErrorForLog(error),
-						cwd: to,
-					});
-				}
+			try {
+				settings = await settings.cloneForCwd(to);
+				session?.setSettings(settings);
+				toolSession.settings = settings;
+			} catch (error) {
+				logger.warn("Failed to reload settings after session rescope", {
+					error: safeErrorForLog(error),
+					cwd: to,
+				});
 			}
 			if (settings.get("secrets.enabled")) {
 				try {
