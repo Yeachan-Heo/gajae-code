@@ -89,13 +89,9 @@ async function executeTool(
 	// `tool` is the object this call will run; pass it so the start event carries proven
 	// provenance instead of a name a consumer would have to re-resolve later.
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args }, tool);
-	if (execSignal?.aborted) throw cursorAbortError(execSignal);
-	if (tool.nonAbortable) markNonAbortable?.();
 
 	let result: AgentToolResult<unknown>;
 	let isError = false;
-	const toolContext = options.getToolContext?.();
-	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 
 	const onUpdate: AgentToolUpdateCallback<unknown> | undefined = options.emitEvent
 		? partialResult => {
@@ -114,6 +110,10 @@ async function executeTool(
 		: undefined;
 
 	try {
+		if (execSignal?.aborted) throw cursorAbortError(execSignal);
+		const toolContext = options.getToolContext?.();
+		if (execSignal?.aborted) throw cursorAbortError(execSignal);
+		if (tool.nonAbortable) markNonAbortable?.();
 		result = await tool.execute(
 			toolCallId,
 			args as Record<string, unknown>,
