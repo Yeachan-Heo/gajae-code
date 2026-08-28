@@ -15,7 +15,14 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { getConfigRootDir, getPluginsDir, isEnoent, logger, tryParseJson } from "@gajae-code/utils";
+import {
+	getConfigRootDir,
+	getPluginsDir,
+	isEnoent,
+	logger,
+	normalizePathForComparison,
+	tryParseJson,
+} from "@gajae-code/utils";
 
 import type {
 	InstalledPluginEntry,
@@ -29,14 +36,14 @@ import type {
 export function getProfilePluginsDir(agentDir?: string): string {
 	if (!agentDir) return getPluginsDir();
 	const defaultAgentDir = path.join(getConfigRootDir(), "agent");
-	if (path.resolve(agentDir) === path.resolve(defaultAgentDir)) return getPluginsDir();
+	if (normalizePathForComparison(agentDir) === normalizePathForComparison(defaultAgentDir)) return getPluginsDir();
 	return path.join(agentDir, "plugins");
 }
 
 export function getMarketplacesRegistryPath(agentDir?: string): string {
 	return path.join(
 		agentDir
-			? path.resolve(agentDir) === path.resolve(path.join(getConfigRootDir(), "agent"))
+			? normalizePathForComparison(agentDir) === normalizePathForComparison(path.join(getConfigRootDir(), "agent"))
 				? getConfigRootDir()
 				: agentDir
 			: getConfigRootDir(),
