@@ -463,7 +463,7 @@ class DirResolver {
 		// the parent reading `$XDG_STATE_HOME/gjc/python-gateway` while the child
 		// read `<agentDir>/python-gateway`. Splitting a live store in half is worse
 		// than the narrower complaint it was meant to answer.
-		const isDefault = this.agentDir === defaultAgent;
+		const isDefault = normalizePathForComparison(this.agentDir) === normalizePathForComparison(defaultAgent);
 		// That decision is then *sticky*. Recomputing it later from path shape is
 		// what let a pinned agent directory silently change storage lane when a home
 		// refresh made it coincide with the new default: `getAgentDir()` looked
