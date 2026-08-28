@@ -78,6 +78,18 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	}
 }
 
+async function initializeTestRepository(root: string): Promise<void> {
+	const result = Bun.spawn(["git", "init", "--quiet"], {
+		cwd: root,
+		stdout: "ignore",
+		stderr: "pipe",
+	});
+	const exitCode = await result.exited;
+	if (exitCode !== 0) {
+		throw new Error(`Failed to initialize E2E repository: ${await new Response(result.stderr).text()}`);
+	}
+}
+
 describe("SDK session CLI", () => {
 	let root: string;
 	let agentDir: string;
@@ -118,6 +130,7 @@ describe("SDK session CLI", () => {
 		transcriptRows = [];
 		lastReplayPayload = "";
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
+		await initializeTestRepository(root);
 		agentDir = path.join(root, "agent");
 		stateRoot = path.join(root, ".gjc", "state");
 		const token = "session-token";
@@ -1215,7 +1228,7 @@ describe("SDK session CLI", () => {
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
 
-		const result = await runCli(root, agentDir, ["list"]);
+		const result = await runCli(root, agentDir, ["list", "--scope", "all"]);
 		expect(result.exitCode).toBe(0);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: true,
@@ -1237,7 +1250,7 @@ describe("SDK session CLI", () => {
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
 
-		const result = await runCli(root, agentDir, ["list"]);
+		const result = await runCli(root, agentDir, ["list", "--scope", "all"]);
 		expect(result.exitCode).toBe(1);
 		const output = JSON.parse(result.stdout);
 		expect(output).toMatchObject({ ok: false, error: { code: "continuation_failed", message: "page two failed" } });
@@ -1259,7 +1272,7 @@ describe("SDK session CLI", () => {
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
 
-		const result = await runCli(root, agentDir, ["list"]);
+		const result = await runCli(root, agentDir, ["list", "--scope", "all"]);
 
 		expect(result.exitCode).toBe(1);
 		const output = JSON.parse(result.stdout);
@@ -1284,7 +1297,7 @@ describe("SDK session CLI", () => {
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
 
-		const result = await runCli(root, agentDir, ["list"]);
+		const result = await runCli(root, agentDir, ["list", "--scope", "all"]);
 
 		expect(result.exitCode).toBe(1);
 		const output = JSON.parse(result.stdout);
@@ -1310,7 +1323,7 @@ describe("SDK session CLI", () => {
 				endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,
 			});
 
-			const result = await runCli(root, agentDir, ["list", "--agent-dir", alternateAgentDir]);
+			const result = await runCli(root, agentDir, ["list", "--scope", "all", "--agent-dir", alternateAgentDir]);
 			expect(result.exitCode).toBe(0);
 			expect(
 				(JSON.parse(result.stdout).result.sessions as Array<{ sessionId: string }>).map(
