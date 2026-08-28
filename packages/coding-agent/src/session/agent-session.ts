@@ -2395,7 +2395,7 @@ export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
 	sessionManager: SessionManager;
-	readonly settings: Settings;
+	settings: Settings;
 	readonly #requestedAgentDir: string | undefined;
 
 	/**
@@ -11568,6 +11568,11 @@ export class AgentSession {
 
 	get promptTemplates(): ReadonlyArray<PromptTemplate> {
 		return this.#promptTemplates;
+	}
+
+	/** Replace project-scoped settings after a committed cwd rescope. */
+	setSettings(settings: Settings): void {
+		this.settings = settings;
 	}
 
 	/** Replace cwd-scoped prompt templates after a committed session rescope. */

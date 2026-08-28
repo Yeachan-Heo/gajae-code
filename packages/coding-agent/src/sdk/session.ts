@@ -1492,7 +1492,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
 		const ownsScopedSettings = options.settings === undefined;
-		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
+		let settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
@@ -2440,6 +2440,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
+			if (options.settings === undefined) {
+				try {
+					settings = await settings.cloneForCwd(to);
+					session?.setSettings(settings);
+					toolSession.settings = settings;
+				} catch (error) {
+					logger.warn("Failed to reload settings after session rescope", {
+						error: safeErrorForLog(error),
+						cwd: to,
+					});
+				}
+			}
 			try {
 				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, settings });
 				contextFiles = rediscovered.contextFiles;
