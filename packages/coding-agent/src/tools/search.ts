@@ -324,6 +324,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					rules: this.session.rules,
 					localProtocolOptions: this.session.localProtocolOptions,
 					memoryRoot: this.session.memoryRoot,
+					settings: this.session.settings,
 					internalUrlAction: "search",
 					trackImmutableSources: true,
 					surfaceExactFilePaths: true,
