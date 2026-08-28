@@ -1399,6 +1399,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
+	if (options.agentDir !== undefined && options.settings !== undefined) {
+		const settingsAgentDir = path.resolve(options.settings.getAgentDir());
+		if (path.resolve(options.agentDir) !== settingsAgentDir) {
+			throw new Error("options.agentDir and options.settings must resolve to the same profile");
+		}
+	}
 	const eventBus = options.eventBus ?? new EventBus();
 	const hasInjectedAuth = options.authStorage !== undefined || options.modelRegistry !== undefined;
 

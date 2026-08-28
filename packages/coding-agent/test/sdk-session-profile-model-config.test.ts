@@ -124,4 +124,30 @@ describe("createAgentSession model profile authority", () => {
 			relocateSpy.mockRestore();
 		}
 	});
+
+	test("rejects an agent directory that conflicts with supplied settings", async () => {
+		const settings = await Settings.loadForScope({ cwd: root, agentDir: ambientDir });
+		try {
+			await expect(
+				createAgentSession({
+					cwd: root,
+					agentDir: profileDir,
+					settings,
+					sessionManager: SessionManager.inMemory(root),
+					disableExtensionDiscovery: true,
+					extensions: [],
+					skills: [],
+					rules: [],
+					contextFiles: [],
+					promptTemplates: [],
+					slashCommands: [],
+					enableMCP: false,
+					enableLsp: false,
+					toolNames: ["__none__"],
+				}),
+			).rejects.toThrow("options.agentDir and options.settings must resolve to the same profile");
+		} finally {
+			await settings.close();
+		}
+	});
 });

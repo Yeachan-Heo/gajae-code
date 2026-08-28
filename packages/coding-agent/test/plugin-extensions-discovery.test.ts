@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { discoverAndLoadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import { getAgentDir, getPluginsDir, setAgentDir, TempDir } from "@gajae-code/utils";
 
@@ -74,6 +75,75 @@ describe("plugin extension discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(extension).toBeDefined();
 		expect(extension?.commands.has("plugin-ext")).toBe(true);
+	});
+
+	it("loads plugin extensions only from the selected agent profile", async () => {
+		const ambientAgentDir = path.join(projectDir.path(), "ambient-agent");
+		const selectedAgentDir = path.join(projectDir.path(), "selected-agent");
+		const ambientNativeExtensionPath = path.join(ambientAgentDir, "extensions", "ambient.ts");
+		const selectedNativeExtensionPath = path.join(selectedAgentDir, "extensions", "selected.ts");
+		const selectedPluginsDir = path.join(selectedAgentDir, "plugins");
+		const selectedPluginDir = path.join(selectedPluginsDir, "node_modules", "@selected", "plugin");
+		const selectedExtensionPath = path.join(selectedPluginDir, "dist", "extension.ts");
+		const nativeExtension = (command: string) => `
+			export default function(pi) {
+				pi.registerCommand("${command}", { handler: async () => {} });
+			}
+		`;
+		fs.mkdirSync(path.dirname(ambientNativeExtensionPath), { recursive: true });
+		fs.mkdirSync(path.dirname(selectedNativeExtensionPath), { recursive: true });
+		fs.writeFileSync(ambientNativeExtensionPath, nativeExtension("ambient-profile-ext"));
+		fs.writeFileSync(selectedNativeExtensionPath, nativeExtension("selected-native-ext"));
+		setAgentDir(ambientAgentDir);
+		fs.mkdirSync(path.dirname(selectedExtensionPath), { recursive: true });
+		fs.writeFileSync(
+			path.join(selectedPluginsDir, "package.json"),
+			JSON.stringify({
+				name: "gjc-plugins",
+				private: true,
+				dependencies: {
+					"@selected/plugin": "1.0.0",
+				},
+			}),
+		);
+		fs.writeFileSync(
+			path.join(selectedPluginDir, "package.json"),
+			JSON.stringify({
+				name: "@selected/plugin",
+				version: "1.0.0",
+				gjc: {
+					extensions: ["./dist/extension.ts"],
+				},
+			}),
+		);
+		fs.writeFileSync(
+			selectedExtensionPath,
+			`
+				export default function(pi) {
+					pi.registerCommand("selected-profile-ext", { handler: async () => {} });
+				}
+			`,
+		);
+
+		const ambientExtensionPath = path.join(
+			getPluginsDir(),
+			"node_modules",
+			"@demo",
+			"plugin",
+			"dist",
+			"extension.ts",
+		);
+		const settings = Settings.isolated({}, { agentDir: selectedAgentDir });
+		const result = await discoverAndLoadExtensions([], projectDir.path(), undefined, [], undefined, settings);
+
+		expect(result.errors).toHaveLength(0);
+		expect(result.extensions.some(ext => ext.path === selectedExtensionPath)).toBe(true);
+		expect(result.extensions.some(ext => ext.path === selectedNativeExtensionPath)).toBe(true);
+		expect(result.extensions.some(ext => ext.path === ambientExtensionPath)).toBe(false);
+		expect(result.extensions.some(ext => ext.path === ambientNativeExtensionPath)).toBe(false);
+		expect(
+			result.extensions.find(ext => ext.path === selectedExtensionPath)?.commands.has("selected-profile-ext"),
+		).toBe(true);
 	});
 
 	it("loads installed legacy Pi plugin extensions from Windows drive-letter paths", async () => {

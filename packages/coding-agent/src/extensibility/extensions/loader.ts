@@ -10,6 +10,7 @@ import type { KeyId } from "@gajae-code/tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
+import type { Settings } from "../../config/settings";
 import { loadCapability } from "../../discovery";
 import { getExtensionNameFromPath } from "../../discovery/helpers";
 import type { ExecOptions } from "../../exec/exec";
@@ -680,16 +681,26 @@ async function discoverExtensionsInDir(dir: string): Promise<string[]> {
 
 /**
  * Discover and load extensions from standard locations.
+ *
+ * @param configuredPaths - Explicit paths from settings.json and CLI extension flags
+ * @param cwd - Current working directory
+ * @param eventBus - Event bus shared by loaded extensions
+ * @param disabledExtensionIds - Extension IDs disabled by settings
+ * @param agentDir - Effective user profile directory for capability and plugin discovery
+ * @param settings - Effective session settings for capability provider policy
  */
 export async function discoverAndLoadExtensions(
 	configuredPaths: string[],
 	cwd: string,
 	eventBus?: EventBus,
 	disabledExtensionIds: string[] = [],
+	agentDir?: string,
+	settings?: Settings,
 ): Promise<LoadExtensionsResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds);
+	const selectedAgentDir = agentDir ?? settings?.getAgentDir();
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
@@ -709,7 +720,11 @@ export async function discoverAndLoadExtensions(
 	};
 
 	// 1. Discover extension modules via capability API (native .gjc/.pi only)
-	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, { cwd });
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
+		cwd,
+		agentDir: selectedAgentDir,
+		settings,
+	});
 	for (const ext of discovered.items) {
 		if (ext._source.provider !== "native") continue;
 		if (isDisabledName(ext.name)) continue;
@@ -717,7 +732,7 @@ export async function discoverAndLoadExtensions(
 	}
 
 	// 2. Discover extension entry points from installed plugins
-	addPaths(await getAllPluginExtensionPaths(cwd));
+	addPaths(await getAllPluginExtensionPaths(cwd, selectedAgentDir));
 
 	// 3. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {

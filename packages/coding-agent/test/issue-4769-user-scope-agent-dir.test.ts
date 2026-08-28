@@ -251,15 +251,12 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 		await writeFile(path.join(decoy, "AGENTS.md"), "process-global decoy agents");
 
 		setAgentDir(decoy);
+		const scopedSettings = await Settings.loadForScope({ cwd: project, agentDir: profile });
 		const { session } = await createAgentSession({
 			cwd: project,
 			agentDir: profile,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({
-				"skills.enabled": true,
-				"skills.trustProjectSkills": true,
-				"skills.trustUserSkills": true,
-			}),
+			settings: scopedSettings,
 			enableMCP: false,
 			enableLsp: false,
 		});
@@ -273,6 +270,7 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 			expect(prompt).not.toContain("process-global decoy agents");
 		} finally {
 			await session.dispose();
+			await scopedSettings.close();
 		}
 	});
 
