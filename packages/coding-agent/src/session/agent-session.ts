@@ -860,7 +860,7 @@ export interface AgentSessionRescopeParticipant {
 	/** Reject relocation when the host still owns an incompatible authority. */
 	assertCanRescope?: () => void;
 	/** Validate cwd-derived policy before process cwd or session publication. */
-	prepareRescope?: (cwd: string) => Promise<void>;
+	prepareRescope?: (cwd: string, memoryBackend: LazyService<MemoryBackend>) => Promise<void>;
 	/** Rebind cwd-capturing plugin, MCP, and other host tool authority. */
 	rebindCwdCapturingAuthority: (cwd: string) => Promise<void>;
 	/** Release any predecessor runtime services after the durable move commits. */
@@ -5143,7 +5143,7 @@ export class AgentSession {
 			// session and process cwd still point at the source. A refusal here is
 			// therefore clean: no physical publication has happened yet.
 			try {
-				await participant.prepareRescope?.(canonicalTarget);
+				await participant.prepareRescope?.(canonicalTarget, this.memoryBackend);
 			} catch (error) {
 				await targetHandle.close().catch(() => {});
 				throw error;

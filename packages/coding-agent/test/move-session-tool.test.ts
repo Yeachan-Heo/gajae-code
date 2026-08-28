@@ -593,7 +593,8 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		const settings = Settings.isolated(
 			{
 				"memory.backend": "hindsight",
-				"hindsight.apiUrl": "",
+				"hindsight.apiUrl": "http://localhost:8888",
+				"hindsight.mentalModelsEnabled": false,
 			},
 			{ agentDir: path.dirname(cwdA) },
 		);
@@ -604,11 +605,15 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			toolNames: ["move_session"],
 		});
 		try {
+			const residentState = session.getHindsightSessionState();
+			expect(residentState).toBeDefined();
+			settings.set("memory.backend", "off");
 			const moveTool = session.getToolByName("move_session")!;
 			await expect(moveTool.execute("move-hindsight-scope", { path: cwdB })).rejects.toThrow(
 				/Hindsight bank scope and queued retains are launch-bound/,
 			);
 			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(session.getHindsightSessionState()).toBe(residentState);
 			expect(moveSpy).not.toHaveBeenCalled();
 		} finally {
 			await session.dispose();

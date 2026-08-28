@@ -2707,9 +2707,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							);
 						}
 					},
-					prepareRescope: async (to: string): Promise<void> => {
+					prepareRescope: async (to: string, memoryBackend): Promise<void> => {
 						const targetSettings = settings.getCwd() === to ? settings : await settings.cloneForCwd(to);
-						const memoryError = await getMemoryBackendRescopeError(settings, targetSettings);
+						const memoryError = await getMemoryBackendRescopeError(settings, targetSettings, memoryBackend);
 						if (memoryError) throw memoryError;
 						preparedRescopeSettings = { cwd: to, settings: targetSettings };
 					},
