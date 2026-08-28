@@ -2332,11 +2332,27 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (generation !== replacementMcpGeneration) return;
 									return session.refreshMCPTools(tools as CustomTool[]);
 								})
+								.then(() =>
+									session.rebindMCPSelectionMetadata({
+										mandatoryToolNames: (tools as CustomTool[])
+											.filter(
+												tool => tool.mcpServerName !== undefined && pluginNames.has(tool.mcpServerName),
+											)
+											.map(tool => tool.name),
+										defaultSelectedToolNames: (tools as CustomTool[]).map(tool => tool.name),
+									}),
+								)
 								.catch(error => {
 									logger.warn("Failed to refresh relocated MCP tools", { error: safeErrorForLog(error) });
 								});
 						});
 						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
+						await session.rebindMCPSelectionMetadata({
+							mandatoryToolNames: result.tools
+								.filter(tool => tool.mcpServerName !== undefined && pluginNames.has(tool.mcpServerName))
+								.map(tool => tool.name),
+							defaultSelectedToolNames: result.tools.map(tool => tool.name),
+						});
 						if (
 							pluginNames.size > 0 &&
 							!Object.keys(loaded.configs).some(name => nextManager?.getConnectionStatus(name) === "connecting")

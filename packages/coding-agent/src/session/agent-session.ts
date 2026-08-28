@@ -10608,6 +10608,18 @@ export class AgentSession {
 		});
 	}
 
+	/** Rebind startup MCP selection authority after a cwd-scoped manager replacement. */
+	async rebindMCPSelectionMetadata(options: {
+		mandatoryToolNames?: readonly string[];
+		defaultSelectedToolNames?: readonly string[];
+	}): Promise<void> {
+		for (const name of options.mandatoryToolNames ?? []) this.#mandatoryMCPToolNames.add(name.toLowerCase());
+		for (const name of options.defaultSelectedToolNames ?? [])
+			this.#defaultSelectedMCPToolNames.add(name.toLowerCase());
+		const active = [...this.#getActiveNonMCPToolNames(), ...this.getSelectedMCPToolNames()];
+		await this.#applyActiveToolsByName(active);
+	}
+
 	async #hasActiveGjcSubskillTools(parent: string, sessionId: string | undefined): Promise<boolean> {
 		if (!parent.trim()) return false;
 		const cwd = this.sessionManager.getCwd();
