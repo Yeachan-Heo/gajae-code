@@ -3503,6 +3503,7 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			mcpManager: this.session.getMcpManager?.(),
 			skills: this.session.skills,
 			rules: this.session.rules,
+			localProtocolOptions: this.session.localProtocolOptions,
 		});
 		const details: ReadToolDetails = { resolvedPath: resource.sourcePath, contentType: resource.contentType };
 

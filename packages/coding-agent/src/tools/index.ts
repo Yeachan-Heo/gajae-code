@@ -8,6 +8,7 @@ import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import type { HindsightSessionState } from "../hindsight/state";
+import type { LocalProtocolOptions } from "../internal-urls/local-protocol";
 import type { WorkflowGateEmitter } from "../modes/shared/agent-wire/workflow-gate-broker";
 import type { PlanModeState } from "../plan-mode/state";
 import type { AgentRegistry } from "../registry/agent-registry";
@@ -199,6 +200,8 @@ export interface ToolSession {
 	skills?: Skill[];
 	/** Rules loaded for this session */
 	rules?: Rule[];
+	/** Local artifact authority for this session */
+	localProtocolOptions?: LocalProtocolOptions;
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;
 	/** Get the active skill prompt's current phase so the skill tool can apply

@@ -9,7 +9,7 @@ import { isEnoent } from "@gajae-code/utils";
 import { AgentRegistry } from "../registry/agent-registry";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext } from "./types";
 
 type NativeLocalBindings = Pick<
 	typeof import("@gajae-code/natives"),
@@ -725,8 +725,8 @@ export class LocalProtocolHandler implements ProtocolHandler {
 		};
 	}
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const opts = LocalProtocolHandler.resolveOptions();
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const opts = context?.localProtocolOptions ?? LocalProtocolHandler.resolveOptions();
 		if (!opts) {
 			throw new Error("No session - local:// unavailable");
 		}

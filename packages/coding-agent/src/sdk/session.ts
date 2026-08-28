@@ -2518,6 +2518,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			get rules() {
 				return [...rulebookRules, ...alwaysApplyRules];
 			},
+			get localProtocolOptions() {
+				return (
+					options.localProtocolOptions ?? {
+						getArtifactsDir: () => sessionManager.getArtifactsDir(),
+						isManagedDestination: () => sessionManager.isManagedDestination(),
+						getManagedLegacyLocalMigrationSource: () => sessionManager.getManagedLegacyLocalMigrationSource(),
+						getCredentialSessionId: () => credentialSessionId,
+						getSessionId: () => sessionManager.getSessionId(),
+					}
+				);
+			},
 			eventBus,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,

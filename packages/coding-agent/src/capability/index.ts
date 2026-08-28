@@ -14,6 +14,7 @@ import {
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
+	normalizePathForComparison,
 } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
@@ -286,10 +287,10 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		options.profileAuthority ??
 		(customProcessProfile &&
 		selectedAgentDir !== undefined &&
-		path.resolve(selectedAgentDir) === path.resolve(processAgentDir)
+		normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(processAgentDir)
 			? "custom"
 			: selectedAgentDir !== undefined
-				? path.resolve(selectedAgentDir) === path.resolve(canonicalDefaultAgentDir)
+				? normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
 					? "default"
 					: "custom"
 				: customProcessProfile
@@ -331,9 +332,9 @@ export async function loadCapabilityForHome<T>(
 			isolateAmbientPolicy: true,
 			profileAuthority:
 				options.profileAuthority ??
-				(path.resolve(
+				(normalizePathForComparison(
 					options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
-				) === path.resolve(path.join(resolvedHome, getConfigDirName(), "agent"))
+				) === normalizePathForComparison(path.join(resolvedHome, getConfigDirName(), "agent"))
 					? "default"
 					: "custom"),
 		},

@@ -7,6 +7,7 @@
 import type { Rule } from "../capability/rule";
 import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../runtime-mcp/manager";
+import type { LocalProtocolOptions } from "./local-protocol";
 
 /**
  * Raw resource payload returned by protocol handlers. The `immutable` flag is
@@ -74,6 +75,8 @@ export interface ResolveContext {
 	skills?: readonly Skill[];
 	/** Rules loaded by the calling session. */
 	rules?: readonly Rule[];
+	/** Local artifact authority of the calling session. */
+	localProtocolOptions?: LocalProtocolOptions;
 }
 
 /**
