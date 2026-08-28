@@ -65,7 +65,7 @@ describe("MemoryProtocolHandler", () => {
 			await Bun.write(path.join(memoryRoot, "memory_summary.md"), "summary");
 
 			const router = InternalUrlRouter.instance();
-			const resource = await router.resolve("memory://root");
+			const resource = await router.resolve("memory://root", { memoryRoot });
 
 			expect(resource.content).toBe("summary");
 			expect(resource.contentType).toBe("text/markdown");
@@ -106,7 +106,7 @@ describe("MemoryProtocolHandler", () => {
 			});
 
 			const router = InternalUrlRouter.instance();
-			const resource = await router.resolve("memory://root");
+			const resource = await router.resolve("memory://root", { memoryRoot: sessionMemoryRoot });
 
 			expect(resource.content).toBe("session-agent summary");
 			const sourcePath = resource.sourcePath;
@@ -126,7 +126,7 @@ describe("MemoryProtocolHandler", () => {
 			await Bun.write(skillPath, "demo skill");
 
 			const router = InternalUrlRouter.instance();
-			const resource = await router.resolve("memory://root/skills/demo/SKILL.md");
+			const resource = await router.resolve("memory://root/skills/demo/SKILL.md", { memoryRoot });
 
 			expect(resource.content).toBe("demo skill");
 			expect(resource.contentType).toBe("text/markdown");
@@ -134,30 +134,30 @@ describe("MemoryProtocolHandler", () => {
 	});
 
 	it("throws for unknown memory namespace", async () => {
-		await withMemoryFixture(async () => {
+		await withMemoryFixture(async ({ memoryRoot }) => {
 			const router = InternalUrlRouter.instance();
-			await expect(router.resolve("memory://other/memory_summary.md")).rejects.toThrow(
+			await expect(router.resolve("memory://other/memory_summary.md", { memoryRoot })).rejects.toThrow(
 				"Unknown memory namespace: other. Supported: root",
 			);
 		});
 	});
 
 	it("blocks path traversal attempts", async () => {
-		await withMemoryFixture(async () => {
+		await withMemoryFixture(async ({ memoryRoot }) => {
 			const router = InternalUrlRouter.instance();
-			await expect(router.resolve("memory://root/../secret.md")).rejects.toThrow(
+			await expect(router.resolve("memory://root/../secret.md", { memoryRoot })).rejects.toThrow(
 				"Path traversal (..) is not allowed in memory:// URLs",
 			);
-			await expect(router.resolve("memory://root/%2E%2E/secret.md")).rejects.toThrow(
+			await expect(router.resolve("memory://root/%2E%2E/secret.md", { memoryRoot })).rejects.toThrow(
 				"Path traversal (..) is not allowed in memory:// URLs",
 			);
 		});
 	});
 
 	it("throws clear error for missing files", async () => {
-		await withMemoryFixture(async () => {
+		await withMemoryFixture(async ({ memoryRoot }) => {
 			const router = InternalUrlRouter.instance();
-			await expect(router.resolve("memory://root/missing.md")).rejects.toThrow(
+			await expect(router.resolve("memory://root/missing.md", { memoryRoot })).rejects.toThrow(
 				"Memory file not found: memory://root/missing.md",
 			);
 		});
@@ -173,7 +173,7 @@ describe("MemoryProtocolHandler", () => {
 			await fs.symlink(outsideDir, path.join(memoryRoot, "linked"));
 
 			const router = InternalUrlRouter.instance();
-			await expect(router.resolve("memory://root/linked/secret.md")).rejects.toThrow(
+			await expect(router.resolve("memory://root/linked/secret.md", { memoryRoot })).rejects.toThrow(
 				"memory:// URL escapes memory root",
 			);
 		});

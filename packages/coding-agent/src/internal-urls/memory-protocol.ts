@@ -139,7 +139,10 @@ export class MemoryProtocolHandler implements ProtocolHandler {
 	readonly immutable = true;
 
 	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
-		const roots = context?.memoryRoot ? [context.memoryRoot] : memoryRootsFromRegistry();
+		if (!context?.memoryRoot) {
+			throw new Error("memory:// resolution requires an originating session memory root");
+		}
+		const roots = [context.memoryRoot];
 
 		if (roots.length === 0) {
 			throw new Error(
