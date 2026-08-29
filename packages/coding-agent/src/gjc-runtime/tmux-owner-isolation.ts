@@ -1823,8 +1823,9 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 	const deadline = Date.now() + VERDICT_LOCK_WAIT_TIMEOUT_MS;
 	let token: string | null = null;
 	while (!token) {
-		const current = await readJson<{ generation?: string }>(paths.generationFile);
-		if (current?.generation !== request.owner_generation) throw new Error("generation_mismatch");
+		const current = await readJson<unknown>(paths.generationFile);
+		if (!isValidGenerationRecord(current, request.session_id, request.owner_generation))
+			throw new Error("generation_mismatch");
 		token = await acquireVerdictLock(paths, request.socket_key);
 		if (token) break;
 		if (Date.now() >= deadline) throw new Error("verdict_lock_contended");
@@ -1832,8 +1833,9 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 	}
 	if (!token) throw new Error("verdict_lock_contended");
 	try {
-		const current = await readJson<{ generation?: string }>(paths.generationFile);
-		if (current?.generation !== request.owner_generation) throw new Error("generation_mismatch");
+		const current = await readJson<unknown>(paths.generationFile);
+		if (!isValidGenerationRecord(current, request.session_id, request.owner_generation))
+			throw new Error("generation_mismatch");
 		const published = await readJson<OwnerVerdict>(paths.verdictFile);
 		if (
 			published &&
