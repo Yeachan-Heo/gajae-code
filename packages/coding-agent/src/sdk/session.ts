@@ -2210,7 +2210,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							if (
 								asyncJobManager!.isDeliverySuppressed(jobId, job?.generation) ||
 								session.isDisposed ||
-								session.isSessionTransitioning
+								session.isAsyncDeliverySuppressed
 							) {
 								if (ownedCompletion) unregisterOwnedRegistration(ownedCompletion.registration);
 								return;
