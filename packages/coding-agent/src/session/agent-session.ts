@@ -2958,6 +2958,7 @@ export class AgentSession {
 				: undefined;
 			const registration = lookupOwnedRegistration(job.id, job.generation, endpointId);
 			if (this.#ownedAsyncJobManager?.isDeliverySuppressed(job.id, job.generation)) {
+				if (registration) unregisterOwnedRegistration(registration);
 				this.#ownedAsyncJobManager.clearParkedDelivery(job.generation);
 				return;
 			}
@@ -2989,6 +2990,7 @@ export class AgentSession {
 						return;
 					}
 					if (!this.#foldCoordinator.claimCompletionDelivery(job)) {
+						if (registration) unregisterOwnedRegistration(registration);
 						manager?.clearParkedDelivery(job.generation);
 						return;
 					}
@@ -23636,6 +23638,7 @@ export class AgentSession {
 					}
 					this.#quarantineQueuedAsyncResults();
 				}
+				if (didReloadConversationChange && !switchingToDifferentSession) this.#quarantineQueuedAsyncResults();
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
 				// teardown. The previous runtime waits for those continuations to settle;
