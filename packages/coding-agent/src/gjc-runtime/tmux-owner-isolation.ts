@@ -1514,13 +1514,23 @@ async function renameIntentIfCurrent(
  * died between publishing the intent and renaming it leaves a `pending` record that can never
  * reach a verdict, so an elapsed or unreadable deadline is archived rather than honored forever.
  */
-async function pendingIntentBlocksRetry(intentFile: string): Promise<boolean> {
-	if (!(await intentMarkerExists(intentFile))) return false;
-	const pending = await readOwnerIntentStrict(intentFile);
+async function pendingIntentBlocksRetry(
+	paths: LifecyclePaths,
+	input: Pick<OwnerIntent, "session_id" | "generation" | "server_key">,
+): Promise<boolean> {
+	if (!(await intentMarkerExists(paths.intentFile))) return false;
+	const pending = await readOwnerIntentStrict(paths.intentFile);
+	if (
+		!pending ||
+		pending.session_id !== input.session_id ||
+		pending.generation !== input.generation ||
+		pending.server_key !== input.server_key
+	)
+		throw new Error("owner_intent_replay");
 	const deadline = pending ? Date.parse(pending.expires_at) : Number.NaN;
 	if (Number.isFinite(deadline) && deadline > Date.now()) return true;
-	await archiveSupersededIntent(intentFile);
-	return await intentMarkerExists(intentFile);
+	await archiveSupersededIntent(paths.intentFile);
+	return await intentMarkerExists(paths.intentFile);
 }
 
 export async function createOwnerIntent(
@@ -1556,7 +1566,7 @@ export async function createOwnerIntent(
 		// fails closed on the same condition for the un-suffixed file.
 		if (await intentMarkerExists(marker)) throw new Error("owner_intent_replay");
 	}
-	if (await pendingIntentBlocksRetry(paths.intentFile)) throw new Error("owner_intent_replay");
+	if (await pendingIntentBlocksRetry(paths, input)) throw new Error("owner_intent_replay");
 	const handle = await fs.open(paths.intentFile, "wx", 0o600).catch(error => {
 		if (isCode(error, "EEXIST")) throw new Error("owner_intent_replay");
 		throw error;
