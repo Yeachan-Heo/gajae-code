@@ -1393,6 +1393,17 @@ export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: 
 	};
 }
 
+function readDescriptorBoundedSync(fd: number): Buffer {
+	const buffer = Buffer.alloc(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1);
+	let offset = 0;
+	while (offset < buffer.byteLength) {
+		const bytesRead = fsSync.readSync(fd, buffer, offset, buffer.byteLength - offset, offset);
+		if (bytesRead === 0) break;
+		offset += bytesRead;
+	}
+	return buffer.subarray(0, offset);
+}
+
 export function readNoFollowJsonSync(file: string): unknown | null {
 	let before: fsSync.Stats;
 	try {
@@ -1414,7 +1425,7 @@ export function readNoFollowJsonSync(file: string): unknown | null {
 		const after = fsSync.fstatSync(fd);
 		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino)
 			throw new Error("baseline_generation_corrupt");
-		const content = fsSync.readFileSync(fd, "utf8");
+		const content = readDescriptorBoundedSync(fd);
 		const final = fsSync.fstatSync(fd);
 		const pathFinal = fsSync.lstatSync(file);
 		if (
@@ -1429,7 +1440,8 @@ export function readNoFollowJsonSync(file: string): unknown | null {
 			pathFinal.ino !== before.ino
 		)
 			throw new Error("baseline_generation_corrupt");
-		return JSON.parse(content) as unknown;
+		if (content.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("baseline_generation_corrupt");
+		return JSON.parse(content.toString("utf8")) as unknown;
 	} catch {
 		throw new Error("baseline_generation_corrupt");
 	} finally {
@@ -1550,6 +1562,17 @@ export function __setIntentEvidenceReadHooksForTests(hooks: IntentEvidenceReadTe
 	intentEvidenceReadTestHooks = hooks;
 }
 
+async function readDescriptorBounded(handle: fs.FileHandle): Promise<Buffer> {
+	const buffer = Buffer.alloc(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1);
+	let offset = 0;
+	while (offset < buffer.byteLength) {
+		const { bytesRead } = await handle.read(buffer, offset, buffer.byteLength - offset, offset);
+		if (bytesRead === 0) break;
+		offset += bytesRead;
+	}
+	return buffer.subarray(0, offset);
+}
+
 async function intentMarkerExists(file: string): Promise<boolean> {
 	try {
 		await fs.lstat(file);
@@ -1584,7 +1607,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 		const before = await handle.stat({ bigint: true });
 		if (!before.isFile() || before.dev !== pathBefore.dev || before.ino !== pathBefore.ino)
 			throw new Error("changed_file");
-		const content = await handle.readFile("utf8");
+		const content = await readDescriptorBounded(handle);
 		const after = await handle.stat({ bigint: true });
 		let pathAfter: fsSync.BigIntStats;
 		try {
@@ -1605,7 +1628,8 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 			before.ctimeNs !== after.ctimeNs
 		)
 			throw new Error("changed_file");
-		return JSON.parse(content);
+		if (content.byteLength > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("lifecycle_record_too_large");
+		return JSON.parse(content.toString("utf8"));
 	} finally {
 		await handle.close();
 	}
