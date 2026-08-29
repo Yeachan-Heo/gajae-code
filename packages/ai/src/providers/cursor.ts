@@ -626,6 +626,9 @@ export type CursorHttp2WriteStream = {
 	writableEnded: boolean;
 	writable?: boolean;
 	write: (chunk: Uint8Array, cb?: (error?: Error | null) => void) => unknown;
+	on?: (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void) => unknown;
+	off?: (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void) => unknown;
+	removeListener?: (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void) => unknown;
 };
 
 function isCursorHttp2WriteClosedError(error: unknown): boolean {
@@ -656,36 +659,94 @@ export function writeCursorHttp2Frame(
 		onComplete?.(new Error("write after end"));
 		return false;
 	}
+	let settled = false;
+	let writeReturned = false;
+	let callbackSettled = false;
+	let callbackError: unknown;
+	let promiseSettled = false;
+	let promiseError: unknown;
+	let drainRequired = false;
+	let drainSeen = false;
+	const listeners: Array<["drain" | "error" | "close", (...args: unknown[]) => void]> = [];
+	const canObserveEvents =
+		typeof stream.on === "function" &&
+		(typeof stream.off === "function" || typeof stream.removeListener === "function");
+	const removeListener = (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void): void => {
+		if (typeof stream.off === "function") stream.off(event, listener);
+		else stream.removeListener?.(event, listener);
+	};
+	const cleanup = (): void => {
+		for (const [event, listener] of listeners.splice(0)) removeListener(event, listener);
+	};
+	const finish = (error: unknown): void => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		if (!error) {
+			onComplete?.(null);
+			return;
+		}
+		if (isCursorHttp2WriteClosedError(error)) {
+			onComplete?.(error instanceof Error ? error : new Error(String(error)));
+			return;
+		}
+		if (!onComplete) {
+			log("error", "http2Write", { error: String(error) });
+			return;
+		}
+		onComplete(error instanceof Error ? error : new Error(String(error)));
+	};
+	const maybeFinish = (): void => {
+		if (settled || !writeReturned || (!callbackSettled && !promiseSettled)) return;
+		const error = callbackError ?? promiseError;
+		if (error) {
+			finish(error);
+			return;
+		}
+		if (drainRequired && !drainSeen) return;
+		finish(null);
+	};
+	const onDrain = (): void => {
+		drainSeen = true;
+		maybeFinish();
+	};
+	const onError = (error: unknown): void => finish(error ?? new Error("Cursor HTTP/2 stream write failed"));
+	const onClose = (): void => finish(new Error("Cursor HTTP/2 stream closed during write"));
 	try {
-		let settled = false;
-		const finish = (error: unknown) => {
-			if (settled) return;
-			settled = true;
-			if (!error) {
-				onComplete?.(null);
-				return;
-			}
-			if (isCursorHttp2WriteClosedError(error)) {
-				onComplete?.(error instanceof Error ? error : new Error(String(error)));
-				return;
-			}
-			if (!onComplete) {
-				log("error", "http2Write", { error: String(error) });
-				return;
-			}
-			onComplete(error instanceof Error ? error : new Error(String(error)));
-		};
-		const result = stream.write(bytes, error => finish(error ?? null));
+		if (canObserveEvents) {
+			stream.on!("drain", onDrain);
+			listeners.push(["drain", onDrain]);
+			stream.on!("error", onError);
+			listeners.push(["error", onError]);
+			stream.on!("close", onClose);
+			listeners.push(["close", onClose]);
+		}
+		const result = stream.write(bytes, error => {
+			callbackSettled = true;
+			callbackError = error ?? undefined;
+			maybeFinish();
+		});
+		writeReturned = true;
+		drainRequired = result === false && canObserveEvents;
+		maybeFinish();
 		if (result !== undefined && result !== null && typeof (result as { then?: unknown }).then === "function") {
 			void Promise.resolve(result).then(
-				() => finish(null),
-				(error: unknown) => finish(error),
+				() => {
+					promiseSettled = true;
+					maybeFinish();
+				},
+				(error: unknown) => {
+					promiseSettled = true;
+					promiseError = error;
+					maybeFinish();
+				},
 			);
 		}
 		return true;
 	} catch (error) {
+		cleanup();
 		if (isCursorHttp2WriteClosedError(error)) {
-			onComplete?.(error instanceof Error ? error : new Error(String(error)));
+			finish(error);
 			return false;
 		}
 		throw error;
