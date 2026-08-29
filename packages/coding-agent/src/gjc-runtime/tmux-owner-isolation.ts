@@ -1069,6 +1069,29 @@ export async function replaceOwnerGeneration(
 	}
 }
 
+/**
+ * Serialize a caller's read/modify/write transaction with owner-generation publication.
+ *
+ * The owner lifecycle SQLite lock is intentionally kept private: callers only receive
+ * the operation-level boundary, so the lock schema, token, and release protocol remain
+ * one implementation. The operation must acquire any state-file locks inside this
+ * boundary; owner publication follows the same outer-to-inner ordering.
+ */
+export async function withOwnerGenerationLock<T>(
+	stateDir: string,
+	sessionId: string,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const paths = lifecyclePaths(stateDir, sessionId, "baseline");
+	const token = await acquireOwnerGenerationLock(paths, sessionId);
+	if (!token) throw new Error("generation_lock_contended");
+	try {
+		return await operation();
+	} finally {
+		await releaseVerdictLock(token);
+	}
+}
+
 export type OwnerGenerationBaseline =
 	| { state: "absent" }
 	| {
