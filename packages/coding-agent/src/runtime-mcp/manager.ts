@@ -2474,11 +2474,13 @@ export async function createMCPManager(
 					sharedPoolIdleMs: options?.sharedPoolIdleMs,
 					agentDir: options?.agentDir,
 					settings: options?.settings,
+					profileAuthority: options?.profileAuthority,
 				})
 			: new MCPManager(cwd, null, {
 					sharedPoolIdleMs: options?.sharedPoolIdleMs,
 					agentDir: options?.agentDir,
 					settings: options?.settings,
+					profileAuthority: options?.profileAuthority,
 				});
 	const result = await manager.discoverAndConnect(options);
 	return { manager, result };

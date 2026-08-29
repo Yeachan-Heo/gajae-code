@@ -265,6 +265,7 @@ export async function discoverAndLoadHooks(
 	cwd: string,
 	agentDir?: string,
 	settings?: Settings,
+	profileAuthority?: "default" | "custom",
 ): Promise<LoadHooksResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
@@ -288,6 +289,7 @@ export async function discoverAndLoadHooks(
 		cwd,
 		agentDir,
 		settings,
+		profileAuthority,
 		providers: ["native"],
 	});
 	for (const hook of discovered.items) {
@@ -413,8 +415,9 @@ export async function discoverAndLoadHookExtensions(
 	cwd: string,
 	agentDir?: string,
 	settings?: Settings,
+	profileAuthority?: "default" | "custom",
 ): Promise<LoadHookExtensionsResult> {
-	const loaded = await discoverAndLoadHooks(configuredPaths, cwd, agentDir, settings);
+	const loaded = await discoverAndLoadHooks(configuredPaths, cwd, agentDir, settings, profileAuthority);
 	return {
 		factories: loaded.hooks.map(hook => ({
 			factory: createHookExtensionFactory(hook),

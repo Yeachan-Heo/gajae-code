@@ -69,8 +69,81 @@ export class PlanModeController {
 	#hasEntered = false;
 	#reviewContainer: Container | undefined;
 	#planApprovalDispatchPending = false;
+	/**
+	 * Invalidated when AgentSession commits a session/context transition. Plan
+	 * operations may yield for provider/model work, so checking only the live
+	 * mode flag is not sufficient: a predecessor operation can resume after the
+	 * successor is already visible.
+	 */
+	#lifecycleEpoch = 0;
 
-	constructor(private readonly ctx: PlanModeControllerContext) {}
+	constructor(private readonly ctx: PlanModeControllerContext) {
+		this.#registerTransitionCleanup();
+	}
+
+	#registerTransitionCleanup(): void {
+		this.ctx.session.registerToolSessionTransitionCleanup(() => {
+			// Fork and handoff intentionally preserve the active workflow state. The
+			// identity/context transitions that must drop plan state clear the session
+			// projection before invoking transition cleanups below.
+			if (this.ctx.session.getPlanModeState?.()?.enabled) {
+				if (!this.ctx.session.isDisposed) this.#registerTransitionCleanup();
+				return;
+			}
+			this.#lifecycleEpoch++;
+			this.ctx.modeGate.exit("plan");
+			this.ctx.session.setStandingResolveHandler?.(null);
+			this.#enabled = false;
+			this.#paused = false;
+			this.#planFilePath = undefined;
+			this.#previousTools = undefined;
+			this.#previousModelState = undefined;
+			this.#pendingModelSwitch = undefined;
+			this.#providerSessionScope = undefined;
+			this.#hasEntered = false;
+			this.#reviewContainer = undefined;
+			this.#planApprovalDispatchPending = false;
+			this.ctx.updatePlanModeStatus(undefined);
+			if (!this.ctx.session.isDisposed) this.#registerTransitionCleanup();
+		});
+	}
+
+	#captureSessionIdentity(): ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined {
+		const session = this.ctx.session as AgentSession & {
+			captureSessionIdentityForMode?: () => ReturnType<AgentSession["captureSessionIdentityForMode"]>;
+		};
+		return session.captureSessionIdentityForMode?.();
+	}
+
+	#isSessionIdentityCurrent(identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined): boolean {
+		const session = this.ctx.session as AgentSession & {
+			isSessionIdentityCurrentForMode?: (
+				admission: ReturnType<AgentSession["captureSessionIdentityForMode"]>,
+			) => boolean;
+		};
+		return identity === undefined
+			? !this.ctx.session.isSessionTransitioning
+			: (session.isSessionIdentityCurrentForMode?.(identity) ?? !this.ctx.session.isSessionTransitioning);
+	}
+
+	#captureLifecycle(): {
+		epoch: number;
+		identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
+	} {
+		return { epoch: this.#lifecycleEpoch, identity: this.#captureSessionIdentity() };
+	}
+
+	#isLifecycleCurrent(lifecycle: {
+		epoch: number;
+		identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
+	}): boolean {
+		return (
+			lifecycle.epoch === this.#lifecycleEpoch &&
+			this.#isSessionIdentityCurrent(lifecycle.identity) &&
+			!this.ctx.session.isDisposed
+		);
+	}
+
 	get enabled(): boolean {
 		return this.#enabled;
 	}
@@ -98,6 +171,7 @@ export class PlanModeController {
 	}
 
 	async restoreFromSession(sessionContext: SessionContext): Promise<void> {
+		if (this.ctx.session.isSessionTransitioning) return;
 		if (this.ctx.session.isExplicitEmptyToolSelection()) return;
 		if (!this.ctx.session.settings.get("plan.enabled")) {
 			if (sessionContext.mode === "plan" || sessionContext.mode === "plan_paused")
@@ -115,46 +189,87 @@ export class PlanModeController {
 	}
 
 	async enter(options?: { planFilePath?: string; workflow?: "parallel" | "iterative" }): Promise<void> {
-		if (this.#enabled) return;
+		if (this.enabled) return;
+		if (this.ctx.session.isSessionTransitioning) return;
 		if (this.ctx.session.isExplicitEmptyToolSelection()) {
 			this.ctx.showWarning("Plan mode requires built-in tools and is unavailable in a --no-tools session.");
 			return;
 		}
 		if (!this.ctx.modeGate.enter("plan")) return this.ctx.showWarning("Exit goal mode first.");
-		this.#paused = false;
+		const lifecycle = this.#captureLifecycle();
 		const planFilePath = options?.planFilePath ?? "local://PLAN.md";
 		const previousTools = this.ctx.session.getActiveToolNames();
-		this.#previousTools = previousTools;
-		this.#planFilePath = planFilePath;
-		this.#enabled = true;
 		const planTools = this.ctx.session.isExplicitEmptyToolSelection()
 			? previousTools
 			: this.ctx.session.getToolByName("resolve")
 				? [...new Set([...previousTools, "resolve"])]
 				: previousTools;
-		await this.ctx.session.setActiveToolsByName(planTools);
-		this.ctx.session.setPlanModeState({
-			enabled: true,
-			planFilePath,
-			workflow: options?.workflow ?? "parallel",
-			reentry: this.#hasEntered,
-		});
-		this.ctx.session.setStandingResolveHandler?.(input => this.#runApprovalResolve(input));
-		if (this.ctx.session.isStreaming) await this.ctx.session.sendPlanModeContext({ deliverAs: "steer" });
-		this.#hasEntered = true;
-		await this.#applyModel();
-		this.#updateStatus();
-		this.ctx.sessionManager.appendModeChange("plan", { planFilePath });
-		this.ctx.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+		try {
+			await this.ctx.session.setActiveToolsByName(planTools);
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
+			this.#previousTools = previousTools;
+			this.#planFilePath = planFilePath;
+			this.#enabled = true;
+			this.#paused = false;
+			this.ctx.session.setPlanModeState({
+				enabled: true,
+				planFilePath,
+				workflow: options?.workflow ?? "parallel",
+				reentry: this.#hasEntered,
+			});
+			this.ctx.session.setStandingResolveHandler?.(input => this.#runApprovalResolve(input));
+			if (this.ctx.session.isStreaming) {
+				await this.ctx.session.sendPlanModeContext({ deliverAs: "steer" });
+				if (!this.#isLifecycleCurrent(lifecycle)) return;
+			}
+			this.#hasEntered = true;
+			await this.#applyModel(lifecycle);
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
+			this.#updateStatus();
+			this.ctx.sessionManager.appendModeChange("plan", { planFilePath });
+			this.ctx.showStatus(`Plan mode enabled. Plan file: ${planFilePath}`);
+		} catch (error) {
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
+			this.ctx.session.setStandingResolveHandler?.(null);
+			try {
+				this.ctx.session.setPlanModeState(undefined);
+			} catch {
+				// A transition may have taken ownership between the lifecycle check and
+				// this synchronous cleanup; its transition cleanup will clear the state.
+			}
+			this.#enabled = false;
+			this.#paused = false;
+			this.#planFilePath = undefined;
+			this.#previousTools = undefined;
+			this.#previousModelState = undefined;
+			this.#pendingModelSwitch = undefined;
+			this.#providerSessionScope = undefined;
+			this.ctx.modeGate.exit("plan");
+			this.#updateStatus();
+			try {
+				await this.ctx.session.setActiveToolsByName(previousTools);
+			} catch {
+				// The session is already being rejected as a failed entry; leave the
+				// mode state cleared rather than exposing a half-entered plan mode.
+			}
+			throw error;
+		}
 	}
 
 	async exit(options?: { silent?: boolean; paused?: boolean }): Promise<void> {
-		if (!this.#enabled) return;
+		if (!this.enabled) return;
+		if (this.ctx.session.isSessionTransitioning) return;
+		const lifecycle = this.#captureLifecycle();
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
-		if (this.#previousTools !== undefined) await this.ctx.session.setActiveToolsByName(this.#previousTools);
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
+		if (this.#previousTools !== undefined) {
+			await this.ctx.session.setActiveToolsByName(this.#previousTools);
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
+		}
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
 			if (await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
 				this.#providerSessionScope = undefined;
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 		} else if (this.#previousModelState) {
 			const previous = this.#previousModelState;
 			if (modelsAreEqual(this.ctx.session.model, previous.model))
@@ -165,6 +280,7 @@ export class PlanModeController {
 					cause: "restore",
 					reason: "plan-mode",
 				});
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 		}
 		const pending = this.#pendingModelSwitch;
 		const planModel = this.ctx.session.resolveRoleModelWithThinking("plan").model;
@@ -183,8 +299,10 @@ export class PlanModeController {
 	}
 
 	async flushPendingModelSwitch(): Promise<void> {
+		if (this.ctx.session.isSessionTransitioning) return;
 		const pending = this.#pendingModelSwitch;
 		if (!pending) return;
+		const lifecycle = this.#captureLifecycle();
 		this.#pendingModelSwitch = undefined;
 		try {
 			this.#providerSessionScope ??= this.ctx.session.beginTemporaryProviderSessionScope("plan-mode");
@@ -193,7 +311,9 @@ export class PlanModeController {
 				reason: "plan-mode",
 				providerSessionScope: this.#providerSessionScope,
 			});
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 		} catch (error) {
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			if (this.#providerSessionScope)
 				await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope);
 			this.#providerSessionScope = undefined;
@@ -204,7 +324,8 @@ export class PlanModeController {
 	}
 
 	async handleCommand(initialPrompt?: string): Promise<void> {
-		if (this.#enabled) {
+		if (this.ctx.session.isSessionTransitioning) return;
+		if (this.enabled) {
 			if (await this.ctx.showHookConfirm("Exit plan mode?", "This exits plan mode without approving a plan."))
 				await this.exit({ paused: true });
 			return;
@@ -212,13 +333,16 @@ export class PlanModeController {
 		if (!this.ctx.session.settings.get("plan.enabled"))
 			return this.ctx.showWarning("Plan mode is disabled. Enable it in settings (plan.enabled).");
 		await this.enter();
-		if (initialPrompt && this.ctx.inputCallback)
+		if (initialPrompt && this.enabled && this.ctx.inputCallback)
 			this.ctx.inputCallback(this.ctx.startPendingSubmission({ text: initialPrompt }));
 	}
 
 	async handleApproval(details: PlanApprovalDetails): Promise<void> {
-		if (!this.#enabled) return this.ctx.showWarning("Plan mode is not active.");
+		if (this.ctx.session.isSessionTransitioning) return;
+		if (!this.enabled) return this.ctx.showWarning("Plan mode is not active.");
+		const lifecycle = this.#captureLifecycle();
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		const planFilePath = details.planFilePath || this.#planFilePath || "local://PLAN.md";
 		this.#planFilePath = planFilePath;
 		const review = await this.ctx.showPlanPreview(await this.#readFile(planFilePath), {
@@ -226,9 +350,11 @@ export class PlanModeController {
 			externalEditorKeys: this.ctx.externalEditorKeys,
 			onExternalEditor: () => this.#openEditor(planFilePath),
 		});
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		if (!review.action) return;
 
 		const latestPlanContent = await this.#readFile(planFilePath);
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		if (review.snapshotHash !== planSnapshotHash(latestPlanContent ?? "")) {
 			this.ctx.showWarning(
 				"Plan changed while reviewing; comments and notes were discarded. Confirm the decision again.",
@@ -246,7 +372,7 @@ export class PlanModeController {
 			true,
 		);
 		if (review.action === "Refine plan") {
-			if (commentBlock)
+			if (commentBlock && this.#isLifecycleCurrent(lifecycle))
 				await this.ctx.session.prompt(`${commentBlock}\n\nPlease refine the plan using these review comments.`);
 			return;
 		}
@@ -267,7 +393,11 @@ export class PlanModeController {
 		}
 	}
 
-	async #applyModel(): Promise<void> {
+	async #applyModel(lifecycle: {
+		epoch: number;
+		identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
+	}): Promise<void> {
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		const resolved = this.ctx.session.resolveRoleModelWithThinking("plan");
 		if (!resolved.model) return;
 		const current = this.ctx.session.model;
@@ -290,7 +420,9 @@ export class PlanModeController {
 				reason: "plan-mode",
 				providerSessionScope: this.#providerSessionScope,
 			});
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 		} catch (error) {
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			if (this.#providerSessionScope)
 				await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope);
 			this.#providerSessionScope = undefined;
@@ -444,16 +576,21 @@ export class PlanModeController {
 			reviewerComments?: string;
 		},
 	): Promise<void> {
+		const lifecycle = this.#captureLifecycle();
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
 		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
 		try {
 			await this.exit({ silent: true });
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			if (!options.preserveContext) {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
-				if (sessionSwitchCompleted)
+				if (!this.#isLifecycleCurrent(lifecycle)) return;
+				if (sessionSwitchCompleted) {
 					await Bun.write(
 						resolveLocalUrlToPath(options.finalPlanFilePath, {
 							getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
@@ -462,6 +599,8 @@ export class PlanModeController {
 						}),
 						planContent,
 					);
+					if (!this.#isLifecycleCurrent(lifecycle)) return;
+				}
 			} else if (options.compactBeforeExecute) {
 				this.ctx.session.setPlanReferencePath(options.finalPlanFilePath);
 				this.#planApprovalDispatchPending = true;
@@ -469,16 +608,21 @@ export class PlanModeController {
 					compactOutcome = await this.ctx.handleCompactCommand(
 						prompt.render(planModeCompactInstructionsPrompt, { planFilePath: options.finalPlanFilePath }),
 					);
+					if (!this.#isLifecycleCurrent(lifecycle)) return;
 				} catch (error) {
 					this.#planApprovalDispatchPending = false;
-					await this.ctx.flushCompactionQueue({ willRetry: false });
+					if (this.#isLifecycleCurrent(lifecycle)) await this.ctx.flushCompactionQueue({ willRetry: false });
 					throw error;
 				}
 			}
 		} finally {
 			this.ctx.session.clearPlanCompactAbortPending();
 		}
-		if (previousTools.length) await this.ctx.session.setActiveToolsByName(previousTools);
+		if (!this.#isLifecycleCurrent(lifecycle)) return;
+		if (previousTools.length) {
+			await this.ctx.session.setActiveToolsByName(previousTools);
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
+		}
 		if (!sessionSwitchCompleted)
 			return this.ctx.showWarning(
 				"Plan approved, but the new session could not be created — execution was not dispatched.",
@@ -486,7 +630,7 @@ export class PlanModeController {
 		this.ctx.session.setPlanReferencePath(options.finalPlanFilePath);
 		if (compactOutcome === "cancelled") {
 			this.#planApprovalDispatchPending = false;
-			await this.ctx.flushCompactionQueue({ willRetry: false });
+			if (this.#isLifecycleCurrent(lifecycle)) await this.ctx.flushCompactionQueue({ willRetry: false });
 			return this.ctx.showWarning(
 				"Plan approved, but compaction was cancelled — execution not dispatched. Submit a turn to continue.",
 			);
@@ -497,10 +641,12 @@ export class PlanModeController {
 			!this.ctx.sessionManager.getSessionName() &&
 			(await this.ctx.sessionManager.setSessionName(name, "auto"))
 		) {
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 			this.ctx.updateEditorChrome();
 		}
 		try {
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			await this.ctx.session.prompt(
 				prompt.render(planModeApprovedPrompt, {
 					planContent,
@@ -511,9 +657,10 @@ export class PlanModeController {
 				}),
 				{ synthetic: true },
 			);
+			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			this.ctx.session.markPlanReferenceSent();
 		} finally {
-			if (this.#planApprovalDispatchPending) {
+			if (this.#planApprovalDispatchPending && this.#isLifecycleCurrent(lifecycle)) {
 				this.#planApprovalDispatchPending = false;
 				await this.ctx.flushCompactionQueue({ willRetry: false });
 			}

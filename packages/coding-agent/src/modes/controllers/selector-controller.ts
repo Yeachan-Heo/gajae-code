@@ -14,14 +14,7 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
-import {
-	getAgentDbPath,
-	getAgentDir,
-	getAgentProfileAuthority,
-	logger,
-	normalizePathForComparison,
-	VERSION,
-} from "@gajae-code/utils";
+import { getAgentDbPath, logger, VERSION } from "@gajae-code/utils";
 import {
 	type AutoroutingProvenance,
 	type AutoroutingSetup,
@@ -2227,6 +2220,7 @@ export class SelectorController {
 				activeModelPattern,
 				defaultModelPattern: selectorHead(defaultModelPattern),
 				agentDir: this.ctx.session.getSessionAgentDir(),
+				profileAuthority: this.ctx.session.getSessionProfileAuthority?.(),
 			},
 		);
 		this.showSelector(done => {
@@ -2975,12 +2969,7 @@ export class SelectorController {
 
 	async showPluginSelector(mode: "install" | "uninstall" = "install"): Promise<void> {
 		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.();
-		const resolverAuthority = getAgentProfileAuthority();
-		const profileAuthority =
-			resolverAuthority === "custom" ||
-			(agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir()))
-				? "custom"
-				: "default";
+		const profileAuthority = this.ctx.session.getSessionProfileAuthority?.();
 		const mgr = new MarketplaceManager({
 			marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir, profileAuthority),
 			installedRegistryPath: getInstalledPluginsRegistryPath(agentDir, profileAuthority),

@@ -906,6 +906,10 @@ export class EventController {
 		if (event.toolName === "resolve" && !event.isError) {
 			const details = event.result.details as ResolveToolDetails | undefined;
 			if (details?.sourceToolName === "plan_approval" && details.action === "apply") {
+				// A resolve result from the predecessor may still be queued while a
+				// session/context transition commits. Never open a review against the
+				// successor or let it dispatch execution after that boundary.
+				if (this.ctx.session.isSessionTransitioning) return;
 				const planDetails = details.sourceResultDetails as PlanApprovalDetails | undefined;
 				if (planDetails) {
 					await this.ctx.planModeController.handleApproval(planDetails);
@@ -923,6 +927,10 @@ export class EventController {
 			this.ctx.streamingComponent = undefined;
 			this.ctx.streamingMessage = undefined;
 		}
+		// agent_end can be delivered after a transition has begun. The plan
+		// controller also fences internally, but keep this event boundary closed so
+		// test/host implementations cannot flush predecessor state into a successor.
+		if (this.ctx.session.isSessionTransitioning) return;
 		await this.ctx.planModeController.flushPendingModelSwitch();
 		if (this.ctx.isStopped?.()) return;
 		for (const toolCallId of Array.from(this.ctx.pendingTools.keys())) {

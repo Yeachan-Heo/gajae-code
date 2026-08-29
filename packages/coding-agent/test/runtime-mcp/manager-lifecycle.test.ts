@@ -6,6 +6,7 @@ import { logger } from "@gajae-code/utils";
 import * as configValue from "../../src/config/resolve-config-value";
 import { loadMCPJsonFile } from "../../src/discovery/mcp-json";
 import * as mcpClient from "../../src/runtime-mcp/client";
+import * as mcpConfig from "../../src/runtime-mcp/config";
 import { createMCPManager, MCPManager, resolveExactConfigStartupTimeoutMs } from "../../src/runtime-mcp/manager";
 import { legacyEraObservation } from "../../src/runtime-mcp/protocol";
 import { MCPTool } from "../../src/runtime-mcp/tool-bridge";
@@ -88,6 +89,32 @@ setInterval(() => {}, 1000);
 }
 
 describe("MCP manager lifecycle cleanup", () => {
+	test("forwards profile authority while creating a manager", async () => {
+		const loadSpy = vi.spyOn(mcpConfig, "loadAllMCPConfigs").mockResolvedValue({
+			configs: {},
+			exaApiKeys: [],
+			sources: {},
+			configurationWarning: false,
+			warnings: [],
+		});
+		const manager = (
+			await createMCPManager("/tmp/gjc-mcp-profile", {
+				agentDir: "/tmp/gjc-mcp-agent",
+				profileAuthority: "custom",
+			})
+		).manager;
+
+		try {
+			expect(loadSpy).toHaveBeenCalledWith(
+				"/tmp/gjc-mcp-profile",
+				expect.objectContaining({ agentDir: "/tmp/gjc-mcp-agent", profileAuthority: "custom" }),
+			);
+		} finally {
+			loadSpy.mockRestore();
+			await manager.disconnectAll();
+		}
+	});
+
 	test("initial listTools failure closes transport and does not register server", async () => {
 		const manager = new MCPManager(process.cwd());
 		const result = await manager.connectServers(

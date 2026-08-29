@@ -124,8 +124,9 @@ export async function warmupLspServers(
 	cwd: string,
 	options?: LspWarmupOptions,
 	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<LspWarmupResult> {
-	const config = loadConfig(cwd, agentDir);
+	const config = loadConfig(cwd, agentDir, profileAuthority);
 	setIdleTimeout(config.idleTimeoutMs, cwd, agentDir);
 	const servers: LspWarmupResult["servers"] = [];
 	const lspServers = getLspServers(config);

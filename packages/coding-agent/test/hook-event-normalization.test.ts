@@ -1,9 +1,10 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { hookCapability } from "../src/capability/hook";
 import { Settings } from "../src/config/settings";
+import * as discoveryModule from "../src/discovery";
 import { getProviderInfo, loadCapability } from "../src/discovery";
 import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
 import { discoverAndLoadHooks } from "../src/extensibility/hooks/loader";
@@ -361,6 +362,28 @@ describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", 
 });
 
 describe("production discovery integration", () => {
+	it("passes the captured profile authority to native hook discovery", async () => {
+		const settings = Settings.isolated();
+		const loadSpy = vi.spyOn(discoveryModule, "loadCapability").mockResolvedValue({
+			items: [],
+			all: [],
+			warnings: [],
+			providers: [],
+		});
+		try {
+			await discoverAndLoadHooks([], "/tmp/gjc-hook-profile", "/tmp/gjc-agent", settings, "custom");
+			expect(loadSpy).toHaveBeenCalledWith(hookCapability.id, {
+				cwd: "/tmp/gjc-hook-profile",
+				agentDir: "/tmp/gjc-agent",
+				settings,
+				profileAuthority: "custom",
+				providers: ["native"],
+			});
+		} finally {
+			loadSpy.mockRestore();
+		}
+	});
+
 	it("keeps Claude and Codex providers available for import diagnostics", async () => {
 		expect(getProviderInfo("claude")?.capabilities).toEqual(["hooks"]);
 		expect(getProviderInfo("codex")?.capabilities).toEqual(["hooks"]);

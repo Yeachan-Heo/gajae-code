@@ -345,7 +345,7 @@ import {
 	type WorkflowRecoveryZeroProgressMemory,
 } from "../gjc-runtime/workflow-recovery-projection";
 import { GoalRuntime } from "../goals/runtime";
-import type { Goal, GoalModeState } from "../goals/state";
+import { type Goal, type GoalModeState, normalizeGoal } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import {
 	buildSkillStopOutput,
@@ -2449,6 +2449,14 @@ export class AgentSession {
 	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
+	// Transition-owned abort accounting must settle the predecessor goal after the
+	// transition fence is claimed. Keep this exception async-local so unrelated goal
+	// mutations cannot bypass the identity fence while that await is in flight.
+	#goalAccountingTransitionContext = new AsyncLocalStorage<number>();
+	// Lifecycle hooks are allowed to append successor context while the transition
+	// lease is held. Keep that exception in async-local state: a mutable boolean
+	// would also exempt unrelated work that runs concurrently while the hook awaits.
+	#internalTransitionEmissionContext = new AsyncLocalStorage<InternalTransitionEmissionToken>();
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#pendingSelectionFences = 0;
@@ -2507,6 +2515,8 @@ export class AgentSession {
 
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
+	/** Admission identity captured when an agent/session event entered this session. */
+	readonly #sessionEventAdmissions = new WeakMap<object, SessionIdentityAdmission>();
 	#unsubscribeAppendOnly?: () => void;
 	/** Last (enable, providerId) tuple resolved by `#syncAppendOnlyContext` — used to skip no-op invalidations. */
 	#lastAppendOnlyResolution?: { enable: boolean; providerId: string | undefined };
@@ -3139,6 +3149,10 @@ export class AgentSession {
 	#skillsSettings: SkillsSettings | undefined;
 	#activeSkillState: { skill: string; sessionId?: string } | undefined;
 	#restoredWorkflowSkillState: { skill: string; sessionId: string } | undefined;
+	/** Identity admission for each custom skill prompt currently in flight. A
+	 * prompt can finish after a session transition; retaining its admission
+	 * prevents the late inactive callback from mutating the successor's state. */
+	#skillPromptAdmissions = new WeakMap<object, SessionIdentityAdmission>();
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
@@ -3486,7 +3500,9 @@ export class AgentSession {
 	}
 
 	#assertSessionIdentityAdmission(admission: SessionIdentityAdmission): void {
-		this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: this.#isInternalTransitionEmission() });
+		this.#assertNoSessionTransitionAdmission({
+			allowInternalTransitionEmission: this.#isInternalTransitionEmission(),
+		});
 		if (!this.#sessionIdentityAdmissionMatches(admission)) {
 			throw new Error("Session changed while selecting model");
 		}
@@ -4411,6 +4427,55 @@ export class AgentSession {
 		}
 	}
 
+	#createGoalRuntime(): GoalRuntime {
+		return new GoalRuntime({
+			getState: () => this.#goalModeState,
+			setState: state => this.#applyGoalModeState(state),
+			assertMutationAllowed: () => {
+				const accountingGeneration = this.#goalAccountingTransitionContext.getStore();
+				if (
+					accountingGeneration !== undefined &&
+					this.#sessionTransitionKind !== undefined &&
+					accountingGeneration === this.#coordinatorPersistGeneration
+				)
+					return;
+				this.#assertSessionIdentityAdmission(this.#captureSessionIdentityAdmission());
+			},
+			getCurrentUsage: () => {
+				const usage = this.getSessionStats().tokens;
+				return {
+					input: usage.input,
+					output: usage.output,
+					cacheRead: usage.cacheRead,
+					cacheWrite: usage.cacheWrite,
+				};
+			},
+			emit: event => {
+				if (event.type === "goal_updated") {
+					return this.#emitSessionEvent({ type: "goal_updated", goal: event.goal, state: event.state });
+				}
+			},
+			persist: (mode, state) => {
+				if (mode === "none") {
+					this.sessionManager.appendModeChange("none");
+				} else if (state) {
+					this.sessionManager.appendModeChange(mode, { goal: state.goal });
+				}
+			},
+			sendHiddenMessage: async message => {
+				await this.sendCustomMessage(
+					{
+						customType: message.customType,
+						content: message.content,
+						display: false,
+						attribution: "agent",
+					},
+					{ deliverAs: message.deliverAs },
+				);
+			},
+		});
+	}
+
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
 		this.agent.setProvisionalAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
@@ -4983,45 +5048,7 @@ export class AgentSession {
 		this.#removeEphemeralCustomMessages();
 
 		this.#syncTodoPhasesFromBranch();
-		this.#goalRuntime = new GoalRuntime({
-			getState: () => this.#goalModeState,
-			setState: state => this.#applyGoalModeState(state),
-			assertMutationAllowed: () => {
-				this.#assertSessionIdentityAdmission(this.#captureSessionIdentityAdmission());
-			},
-			getCurrentUsage: () => {
-				const usage = this.getSessionStats().tokens;
-				return {
-					input: usage.input,
-					output: usage.output,
-					cacheRead: usage.cacheRead,
-					cacheWrite: usage.cacheWrite,
-				};
-			},
-			emit: event => {
-				if (event.type === "goal_updated") {
-					return this.#emitSessionEvent({ type: "goal_updated", goal: event.goal, state: event.state });
-				}
-			},
-			persist: (mode, state) => {
-				if (mode === "none") {
-					this.sessionManager.appendModeChange("none");
-				} else if (state) {
-					this.sessionManager.appendModeChange(mode, { goal: state.goal });
-				}
-			},
-			sendHiddenMessage: async message => {
-				await this.sendCustomMessage(
-					{
-						customType: message.customType,
-						content: message.content,
-						display: false,
-						attribution: "agent",
-					},
-					{ deliverAs: message.deliverAs },
-				);
-			},
-		});
+		this.#goalRuntime = this.#createGoalRuntime();
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, hooks, auto-compaction, retry logic)
@@ -5118,10 +5145,15 @@ export class AgentSession {
 
 	/** Current skill prompt executing in this session, if any. */
 	getActiveSkillState(): { skill: string; session_id?: string } | undefined {
-		if (!this.#activeSkillState) return undefined;
+		const active = this.#activeSkillState;
+		if (!active) return undefined;
+		// A transition can replace the session manager while a predecessor prompt's
+		// finally callback is still unwinding. Never expose that predecessor state
+		// to successor-scoped tools.
+		if (active.sessionId && active.sessionId !== this.sessionManager.getSessionId()) return undefined;
 		return {
-			skill: this.#activeSkillState.skill,
-			...(this.#activeSkillState.sessionId ? { session_id: this.#activeSkillState.sessionId } : {}),
+			skill: active.skill,
+			...(active.sessionId ? { session_id: active.sessionId } : {}),
 		};
 	}
 	/**
@@ -5446,13 +5478,14 @@ export class AgentSession {
 	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
-	 *  its persisted mode-state file. Used by the `skill` tool to enforce the
-	 *  terminal-phase chain guard. Returns undefined when no active skill is
-	 *  recorded or the mode-state file is missing/unreadable; callers should
-	 *  treat undefined as a non-terminal phase (refuses to chain). */
+	 * its persisted mode-state file. Used by the `skill` tool to enforce the
+	 * terminal-phase chain guard. Returns undefined when no active skill is
+	 * recorded or the mode-state file is missing/unreadable; callers should
+	 * treat undefined as a non-terminal phase (refuses to chain). */
 	getActiveSkillPhase(): string | undefined {
 		const active = this.#activeSkillState;
 		if (!active) return undefined;
+		if (active.sessionId && active.sessionId !== this.sessionManager.getSessionId()) return undefined;
 		if (!isCanonicalGjcWorkflowSkill(active.skill)) return undefined;
 		const sessionId = active.sessionId ?? this.sessionManager.getSessionId();
 		try {
@@ -6510,6 +6543,9 @@ export class AgentSession {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
+		if (!this.#sessionEventAdmissions.has(event)) {
+			this.#sessionEventAdmissions.set(event, this.#captureSessionIdentityAdmission());
+		}
 		const attemptScope = (event as AgentSessionEvent & { scope?: AttemptScope }).scope;
 		if (event.type === "turn_start") {
 			this.#extensionTurnGeneration++;
@@ -6664,6 +6700,9 @@ export class AgentSession {
 		canonicalAdmission?: CanonicalMessageAdmission,
 		eventLease?: RunResourceProducerLease,
 	): Promise<void> => {
+		if (!this.#sessionEventAdmissions.has(event)) {
+			this.#sessionEventAdmissions.set(event, this.#captureSessionIdentityAdmission());
+		}
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
 		if (
@@ -10906,13 +10945,18 @@ export class AgentSession {
 	async refreshGjcSubskillTools(): Promise<void> {
 		const identityAdmission = this.#captureSessionIdentityAdmission();
 		this.#assertSessionIdentityAdmission(identityAdmission);
+		const activeSkillInMemory =
+			this.#activeSkillState &&
+			(!this.#activeSkillState.sessionId || this.#activeSkillState.sessionId === identityAdmission.sessionId)
+				? this.#activeSkillState.skill
+				: undefined;
 		const activeState = await readVisibleSkillActiveState(
 			this.sessionManager.getCwd(),
 			this.sessionManager.getSessionId(),
 		);
 		this.#assertSessionIdentityAdmission(identityAdmission);
 		const activeSkill =
-			this.#activeSkillState?.skill ??
+			activeSkillInMemory ??
 			activeState?.skill ??
 			activeState?.active_skills?.find(entry => entry.active !== false)?.skill;
 		const parent = activeSkill?.trim();
@@ -10934,7 +10978,11 @@ export class AgentSession {
 
 		const cwd = this.sessionManager.getCwd();
 		const sessionId =
-			this.#activeSkillState?.sessionId ?? activeState?.session_id ?? this.sessionManager.getSessionId();
+			(this.#activeSkillState?.sessionId === identityAdmission.sessionId
+				? this.#activeSkillState.sessionId
+				: undefined) ??
+			activeState?.session_id ??
+			this.sessionManager.getSessionId();
 		if (this.#gjcSubskillToolNames.size === 0 && !(await this.#hasActiveGjcSubskillTools(parent, sessionId))) return;
 
 		const phase = await resolveCurrentPhaseForParent({ cwd, sessionId, parent });
@@ -11365,6 +11413,19 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Drop predecessor plan state while an identity/context transition owns the
+	 * session fence. Public setPlanModeState intentionally rejects during this
+	 * window; transition cleanup must still prevent the old plan prompt and
+	 * standing resolve handler from leaking into the successor.
+	 */
+	clearPlanModeStateForSessionTransition(): void {
+		if (this.#sessionTransitionKind === undefined)
+			throw new AgentBusyError("Plan mode transition cleanup requires an active session transition.");
+		this.#planModeState = undefined;
+		this.#standingResolveHandler = undefined;
+	}
+
 	async invokeSkill(
 		name: string,
 		args = "",
@@ -11555,6 +11616,52 @@ export class AgentSession {
 
 	getGoalModeState(): GoalModeState | undefined {
 		return this.#goalModeState;
+	}
+
+	/** Capture the current session identity for an async mode operation. */
+	captureSessionIdentityForMode(): SessionIdentityAdmission {
+		return this.#captureSessionIdentityAdmission();
+	}
+
+	/** Return whether an async mode operation still belongs to this live session. */
+	isSessionIdentityCurrentForMode(admission: SessionIdentityAdmission): boolean {
+		return this.#sessionIdentityAdmissionMatches(admission) && this.#sessionTransitionKind === undefined;
+	}
+
+	/** Return whether an event was admitted by the current session identity. */
+	isSessionEventCurrent(event: AgentSessionEvent): boolean {
+		const admission = this.#sessionEventAdmissions.get(event);
+		return admission !== undefined && this.#sessionIdentityAdmissionMatches(admission);
+	}
+
+	/** Replace goal accounting and publish the successor's durable goal state. */
+	async #rehydrateGoalModeStateForTransition(sessionContext?: SessionContext): Promise<void> {
+		const mode = sessionContext?.mode;
+		const goal =
+			(mode === "goal" || mode === "goal_paused") && sessionContext
+				? normalizeGoal(sessionContext.modeData?.goal)
+				: undefined;
+		this.#applyGoalModeState(
+			goal
+				? {
+						enabled: mode === "goal" && goal.status === "active",
+						mode: goal.status === "complete" ? "exiting" : "active",
+						...(goal.status === "complete" ? { reason: "completed" as const } : {}),
+						goal,
+					}
+				: undefined,
+		);
+		this.#goalRuntime = this.#createGoalRuntime();
+		if (this.#goalModeState && !this.#explicitEmptyToolSelection && !this.getActiveToolNames().includes("goal")) {
+			await this.#applyActiveToolsByName([...this.getActiveToolNames(), "goal"], { persistMCPSelection: false });
+		}
+		await this.#emitInternalTransitionEvent(async () => {
+			if (this.#goalModeState) {
+				await this.#goalRuntime.onThreadResumed();
+				return;
+			}
+			await this.#emitSessionEvent({ type: "goal_updated", goal: null });
+		});
 	}
 
 	#applyGoalModeState(state: GoalModeState | undefined): void {
@@ -12414,6 +12521,11 @@ export class AgentSession {
 		);
 	}
 
+	#clearInMemorySkillState(): void {
+		this.#activeSkillState = undefined;
+		this.#restoredWorkflowSkillState = undefined;
+	}
+
 	async #syncSkillPromptActiveState(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
@@ -12425,6 +12537,14 @@ export class AgentSession {
 		const name = (details as { name?: unknown }).name;
 		if (typeof name !== "string" || !name.trim()) return;
 		const skill = name.trim();
+		const messageIdentity = message as object;
+		const identityAdmission = !active
+			? (this.#skillPromptAdmissions.get(messageIdentity) ?? this.#captureSessionIdentityAdmission())
+			: this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
+		if (active && !this.#skillPromptAdmissions.has(messageIdentity)) {
+			this.#skillPromptAdmissions.set(messageIdentity, identityAdmission);
+		}
 		// Functional tool availability must not depend on the best-effort
 		// observational state-sync below (whose failures are swallowed by
 		// #syncSkillPromptActiveStateSafely): attach ask first so canonical
@@ -12469,9 +12589,11 @@ export class AgentSession {
 				});
 			}
 		}
+		this.#assertSessionIdentityAdmission(identityAdmission);
 		// In-memory tracking keeps `getActiveSkillState` accurate for the chain guard.
 		this.#restoredWorkflowSkillState = undefined;
 		this.#activeSkillState = active ? { skill, sessionId } : undefined;
+		if (!active) this.#skillPromptAdmissions.delete(messageIdentity);
 		if (active) {
 			await this.refreshGjcSubskillTools();
 		}
@@ -15040,7 +15162,18 @@ export class AgentSession {
 				outcome = await cleanup;
 			}
 			try {
-				await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
+				const goalAbort = this.#goalAccountingTransitionContext.run(this.#coordinatorPersistGeneration, () =>
+					this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" }),
+				);
+				try {
+					await goalAbort;
+				} catch (error) {
+					// A pre-existing abort may have entered before the transition fence and
+					// finish after it. Its predecessor accounting callback cannot be
+					// admitted against the fenced successor; do not let that bookkeeping
+					// race reject the transition itself.
+					if (!(this.#sessionTransitionKind !== undefined && this.#isAgentBusyError(error))) throw error;
+				}
 				if (managedLogicalRunId !== undefined)
 					this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
 				this.#flushPendingBackgroundExchanges();
@@ -15095,6 +15228,11 @@ export class AgentSession {
 	}): Promise<void> {
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
+	}
+
+	/** Abort owned by an identity transition, allowing only its predecessor accounting write. */
+	#abortForSessionTransition(): Promise<void> {
+		return this.#goalAccountingTransitionContext.run(this.#coordinatorPersistGeneration, () => this.abort());
 	}
 	/**
 	 * Private terminal-abort seam: read the CURRENT turn's attempt epoch WITHOUT
@@ -15738,7 +15876,7 @@ export class AgentSession {
 
 		if (!lease) {
 			this.#disconnectFromAgent();
-			await this.abort();
+			await this.#abortForSessionTransition();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) {
@@ -15770,6 +15908,7 @@ export class AgentSession {
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity, noLeasePreviousSessionFile);
 				endpointReservation?.finalize();
+				this.clearPlanModeStateForSessionTransition();
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				if (this.sessionManager.getSessionId() !== prepared.sessionId) endpointReservation?.release();
@@ -15803,7 +15942,7 @@ export class AgentSession {
 		try {
 			try {
 				manager.runOwnerProducerCleanupsStrict({ ownerId });
-				await this.abort();
+				await this.#abortForSessionTransition();
 				if (this.isCompacting) {
 					this.abortCompaction();
 					while (this.isCompacting) {
@@ -15853,6 +15992,7 @@ export class AgentSession {
 				// aborts classify in the successor session (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionIdentityFile);
 				endpointReservation?.finalize();
+				this.clearPlanModeStateForSessionTransition();
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				if (this.sessionManager.getSessionId() !== prepared.sessionId) endpointReservation?.release();
@@ -15898,6 +16038,9 @@ export class AgentSession {
 		nextDiscoverySessionToolNames: string[] | undefined,
 		previousSessionFile: string | undefined,
 	): Promise<void> {
+		// This method runs only after the successor identity is committed. Do not
+		// let a predecessor skill prompt remain visible to the new session.
+		this.#clearInMemorySkillState();
 		this.#resetInjectedContextSignatures();
 		this.#resetIrcRosterDeliveryState();
 		// The successor session must not inherit the predecessor's profile marker
@@ -15962,6 +16105,7 @@ export class AgentSession {
 		this.#todoReminderCount = 0;
 		this.#planReferenceSent = false;
 		this.#planReferencePath = "local://PLAN.md";
+		await this.#rehydrateGoalModeStateForTransition();
 		this.#reconnectToAgent();
 		this.#resetIrcRosterDeliveryState();
 		if (this.#extensionRunner) {
@@ -15984,7 +16128,7 @@ export class AgentSession {
 			await this.#awaitSessionTransitionAdmission();
 			const sessionId = this.sessionId;
 			this.#disconnectFromAgent();
-			await this.abort();
+			await this.#abortForSessionTransition();
 			this.#cancelOwnAsyncJobs();
 			this.#sessionTransitionDropsAsync = true;
 			this.#suppressOwnAsyncJobDeliveries();
@@ -15998,6 +16142,7 @@ export class AgentSession {
 			this.agent.reset();
 			await this.sessionManager.flush();
 			this.sessionManager.appendContextClearEntry({ sessionId });
+			await this.#rehydrateGoalModeStateForTransition(this.sessionManager.buildSessionContext());
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId(sessionId);
 			this.#steeringMessages = [];
@@ -16017,6 +16162,9 @@ export class AgentSession {
 			this.#resetInjectedContextSignatures();
 			this.#resetIrcRosterDeliveryState();
 			this.#resetHindsightConversationTrackingIfHindsight();
+			this.#clearInMemorySkillState();
+			this.clearPlanModeStateForSessionTransition();
+			await this.#runToolSessionTransitionCleanups();
 			this.#reconnectToAgent();
 			return true;
 		} finally {
@@ -16059,6 +16207,13 @@ export class AgentSession {
 				}
 			}
 
+			// Match newSession/switchSession: stop an active response before flushing
+			// and copying the predecessor transcript into the successor.
+			await this.#abortForSessionTransition();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
+			}
 			// Flush current session to ensure all entries are written
 			await this.sessionManager.flush();
 
@@ -16166,6 +16321,7 @@ export class AgentSession {
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
+			this.#clearInMemorySkillState();
 
 			this.#resetIrcRosterDeliveryState();
 
@@ -18129,7 +18285,7 @@ export class AgentSession {
 				throw new Error("Compaction already in progress");
 			}
 			this.#disconnectFromAgent();
-			await this.abort();
+			await this.#abortForSessionTransition();
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
 			// Take this invocation's state snapshot for the summarizer context.
@@ -23697,7 +23853,7 @@ export class AgentSession {
 				ownerShutdownManager = asyncManager;
 				ownerShutdownLease = lease;
 			}
-			await this.abort();
+			await this.#abortForSessionTransition();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) await Bun.sleep(10);
@@ -23719,9 +23875,12 @@ export class AgentSession {
 			const previousModel = this.model;
 			const previousThinkingLevel = this.#thinkingLevel;
 			const previousActiveModelProfile = this.#activeModelProfile;
+			const previousActiveSkillState = this.#activeSkillState;
+			const previousRestoredWorkflowSkillState = this.#restoredWorkflowSkillState;
 			const previousServiceTier = this.agent.serviceTier;
 			const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 			const previousTools = [...this.agent.state.tools];
+			const previousGoalModeState = this.#goalModeState;
 			const previousBaseSystemPrompt = this.#baseSystemPrompt;
 			const previousSystemPrompt = this.agent.state.systemPrompt;
 			const previousAgentSteeringQueue = this.agent.snapshotSteering();
@@ -23791,6 +23950,7 @@ export class AgentSession {
 				} else {
 					this.agent.replaceMessages(sessionContext.messages);
 				}
+				await this.#rehydrateGoalModeStateForTransition(sessionContext);
 				this.#resetInjectedContextSignatures();
 				this.#syncTodoPhasesFromBranch();
 				if (switchingToDifferentSession || didReloadConversationChange) {
@@ -23903,6 +24063,7 @@ export class AgentSession {
 					this.#resetHindsightConversationTrackingIfHindsight();
 					this.#resetIrcRosterDeliveryState();
 				}
+				if (switchingToDifferentSession || didReloadConversationChange) this.#clearInMemorySkillState();
 
 				if (switchingToDifferentSession) {
 					const predecessorEndpointId = this.#asyncJobEndpointId(
@@ -23958,6 +24119,8 @@ export class AgentSession {
 				successorEndpointReservation?.finalize();
 				transitionCleanupCommitted = true;
 				ownerShutdownTransitionCommitted = true;
+				this.clearPlanModeStateForSessionTransition();
+				await this.#runToolSessionTransitionCleanups();
 				if (didReloadConversationChange && !switchingToDifferentSession) this.#quarantineQueuedAsyncResults();
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
@@ -23993,6 +24156,8 @@ export class AgentSession {
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;
+				this.#activeSkillState = previousActiveSkillState;
+				this.#restoredWorkflowSkillState = previousRestoredWorkflowSkillState;
 				this.#restoreWorkflowGateEmitter(suspendedWorkflowGateEmitter);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				let restoreMcpError: unknown;
@@ -24026,6 +24191,12 @@ export class AgentSession {
 				this.#activeSdkRunToken = previousActiveSdkRunToken;
 				this.#activeAttemptScope = previousActiveAttemptScope;
 				this.#activeLogicalRunId = previousActiveLogicalRunId;
+				try {
+					await this.#rehydrateGoalModeStateForTransition(previousSessionContext);
+				} catch {
+					this.#goalModeState = previousGoalModeState;
+					this.#goalRuntime = this.#createGoalRuntime();
+				}
 				this.agent.clearAllQueues();
 				this.agent.restoreSteering(previousAgentSteeringQueue);
 				this.agent.restoreFollowUp(previousAgentFollowUpQueue);
@@ -24112,6 +24283,13 @@ export class AgentSession {
 				skipConversationRestore = result?.skipConversationRestore ?? false;
 			}
 
+			// Match newSession/switchSession: stop an active response before flushing
+			// and preparing the successor transcript.
+			await this.#abortForSessionTransition();
+			if (this.isCompacting) {
+				this.abortCompaction();
+				while (this.isCompacting) await Bun.sleep(10);
+			}
 			// Flush pending writes before preparing the successor.
 			await this.sessionManager.flush();
 			const prepared = selectedEntry.parentId
@@ -24154,6 +24332,7 @@ export class AgentSession {
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
+			this.#clearInMemorySkillState();
 			this.#closeAllProviderSessions("session branch");
 			this.#rebindProviderSessionState(new Map());
 
@@ -24219,7 +24398,7 @@ export class AgentSession {
 			// Stop an active response before collecting or rewriting the branch. The
 			// active stream may otherwise append predecessor events after the new leaf
 			// is published, just as with newSession/switchSession.
-			await this.abort();
+			await this.#abortForSessionTransition();
 			if (this.isCompacting) {
 				this.abortCompaction();
 				while (this.isCompacting) await Bun.sleep(10);

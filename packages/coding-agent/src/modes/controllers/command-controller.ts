@@ -1176,14 +1176,31 @@ export class CommandController {
 	}
 
 	async handleRenameCommand(title: string): Promise<void> {
+		// Keep the explicit rename bound to the identity that received the
+		// command. A concurrent session transition may complete while persistence
+		// is awaiting; in that case do not repaint the successor with predecessor
+		// terminal/UI state.
+		const session = this.ctx.session;
+		const sessionManager = this.ctx.sessionManager;
+		const liveManager = (): typeof sessionManager => session.sessionManager ?? this.ctx.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const sessionFile = sessionManager.getSessionFile();
+		const cwd = sessionManager.getCwd();
+		const isCurrentIdentity = (): boolean =>
+			liveManager() === sessionManager &&
+			sessionManager.getSessionId() === sessionId &&
+			sessionManager.getSessionFile() === sessionFile &&
+			sessionManager.getCwd() === cwd &&
+			!session.isSessionTransitioning;
 		try {
-			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
+			const stored = await sessionManager.setSessionName(title, "user");
 			if (!stored) {
 				this.ctx.showError("Session name cannot be empty.");
 				return;
 			}
-			const name = this.ctx.sessionManager.getSessionName()!;
-			setSessionTerminalTitle(name, this.ctx.sessionManager.getCwd());
+			if (!isCurrentIdentity()) return;
+			const name = sessionManager.getSessionName()!;
+			setSessionTerminalTitle(name, cwd);
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			this.ctx.showStatus(`Session renamed to "${name}".`);

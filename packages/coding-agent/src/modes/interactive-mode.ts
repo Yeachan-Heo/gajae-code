@@ -469,6 +469,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	skillCommands: Map<string, Skill> = new Map();
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
 	promptSuggestion: PromptSuggestionController;
+	#slashCommandRefreshGeneration = 0;
 
 	#baseSlashCommands: SlashCommand[] = [];
 	#resolvedSlashCommands: SlashCommand[] = [];
@@ -1172,14 +1173,31 @@ export class InteractiveMode implements InteractiveModeContext {
 	async refreshSlashCommandState(cwd?: string): Promise<void> {
 		if (this.#stopped) return;
 		this.settings = this.session.settings;
-		const basePath = cwd ?? this.sessionManager.getCwd();
+		const refreshGeneration = ++this.#slashCommandRefreshGeneration;
+		const session = this.session;
+		const sessionManager = session.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const sessionFile = sessionManager.getSessionFile();
+		const basePath = cwd ?? sessionManager.getCwd();
+		const agentDir = session.getSessionAgentDir();
+		const profileAuthority = session.getSessionProfileAuthority?.();
+		const isCurrentRefresh = (): boolean =>
+			refreshGeneration === this.#slashCommandRefreshGeneration &&
+			this.session === session &&
+			session.sessionManager === sessionManager &&
+			sessionManager.getSessionId() === sessionId &&
+			sessionManager.getSessionFile() === sessionFile &&
+			sessionManager.getCwd() === basePath &&
+			session.getSessionAgentDir() === agentDir &&
+			session.getSessionProfileAuthority?.() === profileAuthority &&
+			!session.isSessionTransitioning;
 		const fileCommands = await loadSlashCommands({
 			cwd: basePath,
-			agentDir: this.session.getSessionAgentDir(),
-			settings: this.session.settings,
-			profileAuthority: this.session.getSessionProfileAuthority?.(),
+			agentDir,
+			settings: session.settings,
+			profileAuthority,
 		});
-		if (this.#stopped) return;
+		if (this.#stopped || !isCurrentRefresh()) return;
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
 		this.fileSlashCommands = fileCommandNames;
 		const fileSlashCommands: SlashCommand[] = fileCommands.map(cmd => ({
@@ -1193,7 +1211,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			basePath,
 		);
 		this.editor.setAutocompleteProvider(autocompleteProvider);
-		this.session.setSlashCommands(fileCommands);
+		session.setSlashCommands(fileCommands);
 	}
 
 	#rebuildSkillSlashCommands(fileCommandNames: ReadonlySet<string> = new Set()): SlashCommand[] {

@@ -85,6 +85,8 @@ interface AgentDashboardModelContext {
 	defaultModelPattern?: string;
 	/** Explicit session-owned user agent directory, if one was selected. */
 	agentDir?: string;
+	/** Stable resolver-owned profile authority captured by the session. */
+	profileAuthority?: "default" | "custom";
 }
 
 export function resolveAgentCreationModel(
@@ -393,6 +395,7 @@ export class AgentDashboard extends Container {
 				undefined,
 				this.#settingsManager ?? undefined,
 				this.modelContext.agentDir,
+				this.modelContext.profileAuthority,
 			);
 			const disabled = new Set((this.#settingsManager?.get("task.disabledAgents") as string[] | undefined) ?? []);
 			const overrides = this.#settingsManager?.get("task.agentModelOverrides") ?? {};

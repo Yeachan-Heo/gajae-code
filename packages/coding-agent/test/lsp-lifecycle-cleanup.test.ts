@@ -1,9 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { type ptree, TempDir } from "@gajae-code/utils";
-import { createLspWritethrough } from "../src/lsp";
+import { createLspWritethrough, warmupLspServers } from "../src/lsp";
 import * as lspClient from "../src/lsp/client";
-import { getActiveClients, isIdleCheckerActiveForTests, setIdleTimeout, shutdownAll } from "../src/lsp/client";
+import {
+	getActiveClients,
+	isIdleCheckerActiveForTests,
+	setIdleTimeout,
+	shutdownAll,
+	WARMUP_TIMEOUT_MS,
+} from "../src/lsp/client";
 import * as lspConfig from "../src/lsp/config";
 import DEFAULT_LSP_SERVERS from "../src/lsp/defaults.json" with { type: "json" };
 import type { LspClient, ServerConfig } from "../src/lsp/types";
@@ -77,5 +83,21 @@ describe("LSP lifecycle cleanup", () => {
 	});
 	it("gives rust-analyzer a longer startup warmup window than the generic LSP default", () => {
 		expect(DEFAULT_LSP_SERVERS["rust-analyzer"].warmupTimeoutMs).toBeGreaterThan(5000);
+	});
+	it("passes the captured profile authority through LSP warmup", async () => {
+		const cwd = "/tmp/gjc-lsp-warmup-profile";
+		const agentDir = "/tmp/gjc-lsp-warmup-agent";
+		const client = createClient(cwd);
+		const loadConfigSpy = vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+			servers: { "test-lsp": TEST_SERVER },
+			idleTimeoutMs: undefined,
+		});
+		const getClientSpy = vi.spyOn(lspClient, "getOrCreateClient").mockResolvedValue(client);
+
+		await expect(warmupLspServers(cwd, undefined, agentDir, "custom")).resolves.toEqual({
+			servers: [{ name: "test-lsp", status: "ready", fileTypes: ["ts"] }],
+		});
+		expect(loadConfigSpy).toHaveBeenCalledWith(cwd, agentDir, "custom");
+		expect(getClientSpy).toHaveBeenCalledWith(TEST_SERVER, cwd, WARMUP_TIMEOUT_MS, agentDir);
 	});
 });

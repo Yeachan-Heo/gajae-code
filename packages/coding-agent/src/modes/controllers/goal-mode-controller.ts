@@ -55,6 +55,8 @@ export class GoalModeController {
 	#paused = false;
 	#previousTools: string[] | undefined;
 	#continuationTimer: NodeJS.Timeout | undefined;
+	#continuationGeneration = 0;
+	#lifecycleGeneration = 0;
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
 	#suppressNextContinuation = false;
@@ -84,6 +86,43 @@ export class GoalModeController {
 		this.#paused = paused;
 	}
 
+	#captureSessionIdentity(): ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined {
+		const session = this.ctx.session as AgentSession & {
+			captureSessionIdentityForMode?: () => ReturnType<AgentSession["captureSessionIdentityForMode"]>;
+		};
+		return session.captureSessionIdentityForMode?.();
+	}
+
+	#isSessionIdentityCurrent(identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined): boolean {
+		const session = this.ctx.session as AgentSession & {
+			isSessionIdentityCurrentForMode?: (
+				admission: ReturnType<AgentSession["captureSessionIdentityForMode"]>,
+			) => boolean;
+		};
+		return identity === undefined
+			? !this.ctx.session.isSessionTransitioning
+			: (session.isSessionIdentityCurrentForMode?.(identity) ?? !this.ctx.session.isSessionTransitioning);
+	}
+
+	#isCurrentSessionEvent(event: AgentSessionEvent): boolean {
+		const session = this.ctx.session as AgentSession & {
+			isSessionEventCurrent?: (candidate: AgentSessionEvent) => boolean;
+		};
+		return session.isSessionEventCurrent?.(event) ?? true;
+	}
+
+	#resetLocalState(): void {
+		this.#lifecycleGeneration++;
+		this.#enabled = false;
+		this.#paused = false;
+		this.#previousTools = undefined;
+		this.#continuationTurnInFlight = false;
+		this.#resetContinuationSuppression();
+		this.cancelContinuation();
+		this.ctx.modeGate.exit("goal");
+		this.#updateStatus();
+	}
+
 	async beforeGetUserInput(): Promise<void> {
 		if (this.ctx.session.getGoalModeState()?.mode === "exiting") {
 			await this.exit({ reason: "completed", silent: true });
@@ -100,9 +139,19 @@ export class GoalModeController {
 		if (!state?.enabled || state.goal.status !== "active") return;
 		const prompt = this.ctx.session.goalRuntime.buildContinuationPrompt();
 		if (!prompt) return;
+		const continuationGeneration = ++this.#continuationGeneration;
+		const sessionIdentity = this.#captureSessionIdentity();
 		this.#continuationTimer = setTimeout(() => {
 			this.#continuationTimer = undefined;
-			if (!this.ctx.inputCallback || !this.#enabled || this.#paused) return;
+			if (
+				continuationGeneration !== this.#continuationGeneration ||
+				!this.#isSessionIdentityCurrent(sessionIdentity) ||
+				this.ctx.session.isSessionTransitioning ||
+				!this.ctx.inputCallback ||
+				!this.#enabled ||
+				this.#paused
+			)
+				return;
 			if (this.ctx.hasPendingSubmission || this.ctx.editorText.trim() || this.ctx.hasPendingImages) return;
 			if (this.ctx.session.isStreaming || this.ctx.session.isCompacting) {
 				this.scheduleContinuation();
@@ -118,6 +167,7 @@ export class GoalModeController {
 	}
 
 	cancelContinuation(): void {
+		this.#continuationGeneration++;
 		if (this.#continuationTimer) clearTimeout(this.#continuationTimer);
 		this.#continuationTimer = undefined;
 	}
@@ -131,6 +181,7 @@ export class GoalModeController {
 	}
 
 	async handleSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (!this.#isCurrentSessionEvent(event)) return;
 		if (event.type === "agent_start") {
 			this.#turnHadToolCalls = false;
 			this.#goalTurnToolStarts.clear();
@@ -178,6 +229,13 @@ export class GoalModeController {
 			if (this.#goalHeldSnapshotKey !== undefined && this.#goalHeldSnapshotKey !== snapshotKey)
 				this.#resetContinuationSuppression();
 			if (event.state?.enabled && !this.#previousTools) this.#previousTools = this.ctx.session.getActiveToolNames();
+			if (event.state?.goal.status === "paused") this.#previousTools = this.ctx.session.getActiveToolNames();
+			if (this.ctx.session.isSessionTransitioning && event.state?.goal)
+				this.#previousTools = this.ctx.session.getActiveToolNames();
+			if (!event.state) {
+				this.#resetLocalState();
+				return;
+			}
 			this.#enabled = event.state?.enabled === true;
 			this.#paused = event.state?.enabled !== true && event.state?.goal?.status === "paused";
 			if (this.#enabled || this.#paused) this.ctx.modeGate.enter("goal");
@@ -315,24 +373,45 @@ export class GoalModeController {
 		silent?: boolean;
 	}): Promise<void> {
 		if (this.#enabled) return;
+		if (this.ctx.session.isSessionTransitioning)
+			throw new Error("Cannot enter goal mode during a session transition.");
 		if (!this.ctx.modeGate.enter("goal")) return this.ctx.showWarning("Exit plan mode first.");
-		this.#previousTools = this.ctx.session.getActiveToolNames();
-		this.#paused = false;
-		const state = options.resume
-			? await this.ctx.session.goalRuntime.resumeGoal()
-			: await this.ctx.session.goalRuntime.createGoal({
-					objective: options.objective ?? "",
-					provenance: options.provenance,
-				});
-		if (!this.ctx.session.isExplicitEmptyToolSelection()) {
-			await this.ctx.session.setActiveToolsByName([...new Set([...this.#previousTools, "goal"])]);
+		const lifecycleGeneration = ++this.#lifecycleGeneration;
+		const sessionIdentity = this.#captureSessionIdentity();
+		const previousTools = this.ctx.session.getActiveToolNames();
+		try {
+			const state = options.resume
+				? await this.ctx.session.goalRuntime.resumeGoal()
+				: await this.ctx.session.goalRuntime.createGoal({
+						objective: options.objective ?? "",
+						provenance: options.provenance,
+					});
+			if (lifecycleGeneration !== this.#lifecycleGeneration || !this.#isSessionIdentityCurrent(sessionIdentity))
+				throw new Error("Goal mode entry was superseded by a session transition.");
+			if (!this.ctx.session.isExplicitEmptyToolSelection()) {
+				await this.ctx.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
+			}
+			if (lifecycleGeneration !== this.#lifecycleGeneration || !this.#isSessionIdentityCurrent(sessionIdentity))
+				throw new Error("Goal mode entry was superseded by a session transition.");
+			this.#previousTools = previousTools;
+			this.#paused = false;
+			this.ctx.session.setGoalModeState(state);
+			this.#enabled = true;
+			this.#resetContinuationSuppression();
+			this.#updateStatus();
+			if (this.ctx.session.isStreaming) await this.ctx.session.sendGoalModeContext({ deliverAs: "steer" });
+			if (!options.silent) this.ctx.showStatus(options.resume ? "Goal mode resumed." : "Goal mode enabled.");
+		} catch (error) {
+			this.ctx.modeGate.exit("goal");
+			if (lifecycleGeneration === this.#lifecycleGeneration) {
+				this.#enabled = false;
+				this.#paused = false;
+				this.#previousTools = undefined;
+				this.cancelContinuation();
+				this.#updateStatus();
+			}
+			throw error;
 		}
-		this.ctx.session.setGoalModeState(state);
-		this.#enabled = true;
-		this.#resetContinuationSuppression();
-		this.#updateStatus();
-		if (this.ctx.session.isStreaming) await this.ctx.session.sendGoalModeContext({ deliverAs: "steer" });
-		if (!options.silent) this.ctx.showStatus(options.resume ? "Goal mode resumed." : "Goal mode enabled.");
 	}
 
 	async exit(options?: {
@@ -340,39 +419,56 @@ export class GoalModeController {
 		paused?: boolean;
 		reason?: "completed" | "paused" | "dropped";
 	}): Promise<void> {
+		const lifecycleGeneration = ++this.#lifecycleGeneration;
+		const sessionIdentity = this.#captureSessionIdentity();
+		const previousEnabled = this.#enabled;
+		const previousPaused = this.#paused;
+		const previousTools = this.#previousTools;
+		this.cancelContinuation();
 		const shouldRestoreTools =
-			this.#previousTools &&
+			previousTools &&
 			options?.reason !== "dropped" &&
 			(this.#enabled || options?.reason === "completed" || options?.paused);
-		if (shouldRestoreTools && this.#previousTools) await this.ctx.session.setActiveToolsByName(this.#previousTools);
-		const currentState = this.ctx.session.getGoalModeState();
-		if (options?.reason === "completed") {
-			this.ctx.session.setGoalModeState(undefined);
-			this.ctx.sessionManager.appendModeChange("none");
-			this.ctx.sessionManager.appendCustomEntry("goal-completed", {
-				objective: currentState?.goal?.objective,
-				tokensUsed: currentState?.goal?.tokensUsed,
-				timeUsedSeconds: currentState?.goal?.timeUsedSeconds,
-			});
+		try {
+			if (shouldRestoreTools && previousTools) await this.ctx.session.setActiveToolsByName(previousTools);
+			if (lifecycleGeneration !== this.#lifecycleGeneration || !this.#isSessionIdentityCurrent(sessionIdentity))
+				throw new Error("Goal mode exit was superseded by a session transition.");
+			const currentState = this.ctx.session.getGoalModeState();
+			if (options?.reason === "completed") {
+				this.ctx.session.setGoalModeState(undefined);
+				this.ctx.sessionManager.appendModeChange("none");
+				this.ctx.sessionManager.appendCustomEntry("goal-completed", {
+					objective: currentState?.goal?.objective,
+					tokensUsed: currentState?.goal?.tokensUsed,
+					timeUsedSeconds: currentState?.goal?.timeUsedSeconds,
+				});
+			}
+			this.#enabled = false;
+			this.#paused = options?.paused ?? false;
+			this.#previousTools = undefined;
+			this.#continuationTurnInFlight = false;
+			this.#resetContinuationSuppression();
+			if (!this.#paused) this.ctx.modeGate.exit("goal");
+			this.#updateStatus();
+			if (!options?.silent)
+				this.ctx.showStatus(
+					options?.reason === "completed"
+						? "Goal mode completed."
+						: options?.reason === "dropped"
+							? "Goal dropped."
+							: options?.paused
+								? "Goal mode paused."
+								: "Goal mode disabled.",
+				);
+		} catch (error) {
+			if (lifecycleGeneration === this.#lifecycleGeneration) {
+				this.#enabled = previousEnabled;
+				this.#paused = previousPaused;
+				this.#previousTools = previousTools;
+				this.#updateStatus();
+			}
+			throw error;
 		}
-		this.#enabled = false;
-		this.#paused = options?.paused ?? false;
-		this.#previousTools = undefined;
-		this.#continuationTurnInFlight = false;
-		this.#resetContinuationSuppression();
-		this.cancelContinuation();
-		if (!this.#paused) this.ctx.modeGate.exit("goal");
-		this.#updateStatus();
-		if (!options?.silent)
-			this.ctx.showStatus(
-				options?.reason === "completed"
-					? "Goal mode completed."
-					: options?.reason === "dropped"
-						? "Goal dropped."
-						: options?.paused
-							? "Goal mode paused."
-							: "Goal mode disabled.",
-			);
 	}
 
 	#getPausedState(): GoalModeState | undefined {

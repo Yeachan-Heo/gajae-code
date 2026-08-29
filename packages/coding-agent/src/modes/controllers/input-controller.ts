@@ -1186,6 +1186,21 @@ export class InputController {
 		// Generate session title on first message
 		const hasUserMessages = this.ctx.session.messages.some((m: AgentMessage) => m.role === "user");
 		if (!hasUserMessages && !this.ctx.sessionManager.getSessionName() && !$pickenv("GJC_NO_TITLE", "PI_NO_TITLE")) {
+			// Title generation is detached from prompt delivery. Pin the manager and
+			// identity at submission time so a late result cannot rename or retitle a
+			// successor session after /new, /clear, /resume, or /move.
+			const titleSession = this.ctx.session;
+			const titleManager = this.ctx.sessionManager;
+			const liveManager = (): typeof titleManager => titleSession.sessionManager ?? this.ctx.sessionManager;
+			const titleSessionId = titleManager.getSessionId();
+			const titleSessionFile = titleManager.getSessionFile();
+			const titleCwd = titleManager.getCwd();
+			const isTitleIdentityCurrent = (): boolean =>
+				liveManager() === titleManager &&
+				titleManager.getSessionId() === titleSessionId &&
+				titleManager.getSessionFile() === titleSessionFile &&
+				titleManager.getCwd() === titleCwd &&
+				!titleSession.isSessionTransitioning;
 			const registry = this.ctx.session.modelRegistry;
 			generateSessionTitle(
 				text,
@@ -1196,13 +1211,10 @@ export class InputController {
 				provider => this.ctx.session.agent.metadataForProvider(provider),
 			)
 				.then(async title => {
-					if (title) {
-						const applied = await this.ctx.sessionManager.setSessionName(title, "auto");
-						if (applied) {
-							setSessionTerminalTitle(
-								this.ctx.sessionManager.getSessionName()!,
-								this.ctx.sessionManager.getCwd(),
-							);
+					if (title && isTitleIdentityCurrent()) {
+						const applied = await titleManager.setSessionName(title, "auto");
+						if (applied && isTitleIdentityCurrent()) {
+							setSessionTerminalTitle(titleManager.getSessionName()!, titleCwd);
 							this.ctx.updateEditorBorderColor();
 						}
 					}
