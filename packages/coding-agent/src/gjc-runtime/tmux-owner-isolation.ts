@@ -2220,7 +2220,7 @@ async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, gen
 	return isValidGenerationRecord(record, sessionId, generation);
 }
 
-function isValidGenerationRecord(value: unknown, sessionId: string, generation: string): boolean {
+export function isValidGenerationRecord(value: unknown, sessionId: string, generation: string): boolean {
 	return (
 		isRecord(value) &&
 		hasOnlyKeys(value, ["schema_version", "generation", "session_id", "published_at"]) &&
