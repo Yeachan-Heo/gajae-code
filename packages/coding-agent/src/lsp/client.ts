@@ -33,6 +33,24 @@ const scopeReferences = new Map<string, number>();
 const scopeShutdownGenerations = new Map<string, number>();
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
+
+async function withFileOperationLock<T>(
+	key: string,
+	signal: AbortSignal | undefined,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const previous = fileOperationLocks.get(key);
+	const current = (async () => {
+		if (previous) await untilAborted(signal, () => previous);
+		return operation();
+	})();
+	fileOperationLocks.set(key, current as Promise<void>);
+	try {
+		return await current;
+	} finally {
+		if (fileOperationLocks.get(key) === current) fileOperationLocks.delete(key);
+	}
+}
 let lspCleanupOwner: (() => void) | undefined;
 
 function ensureLspCleanup(): void {
@@ -811,12 +829,7 @@ export async function syncContent(
 	const lockKey = `${client.name}:${uri}`;
 	throwIfAborted(signal);
 
-	const existingLock = fileOperationLocks.get(lockKey);
-	if (existingLock) {
-		await untilAborted(signal, () => existingLock);
-	}
-
-	const syncPromise = (async () => {
+	const syncPromise = withFileOperationLock(lockKey, signal, async () => {
 		// Clear stale diagnostics before syncing new content
 		client.diagnostics.delete(uri);
 
@@ -846,14 +859,8 @@ export async function syncContent(
 			contentChanges: [{ text: content }],
 		});
 		client.lastActivity = Date.now();
-	})();
-
-	fileOperationLocks.set(lockKey, syncPromise);
-	try {
-		await syncPromise;
-	} finally {
-		fileOperationLocks.delete(lockKey);
-	}
+	});
+	await syncPromise;
 }
 
 /**
@@ -881,12 +888,7 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
 	const uri = fileToUri(filePath);
 	const lockKey = `${client.name}:${uri}`;
 
-	const existingLock = fileOperationLocks.get(lockKey);
-	if (existingLock) {
-		await untilAborted(signal, () => existingLock);
-	}
-
-	const refreshPromise = (async () => {
+	const refreshPromise = withFileOperationLock(lockKey, signal, async () => {
 		throwIfAborted(signal);
 		// Drop cached diagnostics for this URI before asking the server to recompute.
 		// Otherwise an unrelated publishDiagnostics notification can advance the global
@@ -922,14 +924,8 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
 		});
 
 		client.lastActivity = Date.now();
-	})();
-
-	fileOperationLocks.set(lockKey, refreshPromise);
-	try {
-		await refreshPromise;
-	} finally {
-		fileOperationLocks.delete(lockKey);
-	}
+	});
+	await refreshPromise;
 }
 
 /**

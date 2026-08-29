@@ -10075,8 +10075,10 @@ mod platform {
 			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
 		{
 			if let SkillPublicationError::Published { code, target_verified } = error {
-				let cleanup_failed = cleanup_private_skill_file(file).is_err();
-				if cleanup_failed && target_verified {
+				// `file` names the post-rename public object now. Never route it
+				// through private cleanup: that helper truncates before deleting.
+				let removed = delete_handle(file).is_ok();
+				if !removed && target_verified {
 					unsafe { CloseHandle(file) };
 					return NativeSecureSkillWriteResult::success(
 						root_path
@@ -10087,7 +10089,7 @@ mod platform {
 					);
 				}
 				unsafe { CloseHandle(file) };
-				if cleanup_failed {
+				if !removed {
 					return NativeSecureSkillWriteResult::failure("published_unverified");
 				}
 				return NativeSecureSkillWriteResult::failure(code);
