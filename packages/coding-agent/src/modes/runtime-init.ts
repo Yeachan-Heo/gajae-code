@@ -161,16 +161,25 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			withSdkControlMutation: body => session.withSdkControlMutation(body),
 			cycleThinkingLevel: () => session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
+				const admission = session.captureSessionIdentityForMode();
+				const assertCurrent = (): void => {
+					if (!session.isSessionIdentityCurrentForMode(admission))
+						throw new Error("Queue mode update was superseded by a session transition.");
+				};
+				assertCurrent();
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
 					session.setSteeringMode(mode);
+					assertCurrent();
 					return true;
 				}
 				if (kind === "follow_up" && (mode === "all" || mode === "one-at-a-time")) {
 					session.setFollowUpMode(mode);
+					assertCurrent();
 					return true;
 				}
 				if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
 					session.setToolInterruptPolicy(mode);
+					assertCurrent();
 					return true;
 				}
 				return false;

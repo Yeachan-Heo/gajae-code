@@ -16383,6 +16383,7 @@ export class AgentSession {
 			this.#clearInMemorySkillState();
 
 			this.#resetIrcRosterDeliveryState();
+			await this.#refreshBaseSystemPromptAfterTransition();
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
@@ -18794,6 +18795,7 @@ export class AgentSession {
 				this.#resetIrcRosterDeliveryState();
 				this.#planReferenceSent = false;
 				this.#planReferencePath = "local://PLAN.md";
+				await this.#refreshBaseSystemPromptAfterTransition();
 				// The successor identity/emitter/provider state is now fully live and
 				// predecessor deliveries are suppressed, so release the turn-admission
 				// fence BEFORE publishing session_switch. Successor turns (e.g. a
