@@ -179,6 +179,10 @@
 
 - Explicit-home capability discovery now validates only the selected provider roots, isolates plugin-root caching from ordinary loads, and rejects configured extension paths that escape the canonical home.
 
+- `loadCapabilityForHome` no longer falls back to the process-global agent directory when an explicit home is supplied. The user agent directory is derived from the supplied home (`<home>/<configDir>/agent`) unless the caller passes an explicit `agentDir`, and a non-absolute home fails closed instead of silently resolving against the process profile. Explicit-home loads can no longer read another profile's SYSTEM.md/RULES.md/AGENTS.md, skills, commands, hooks, settings, or custom-tool descriptors; a decoy-process-profile test instruments every filesystem read across all eight surfaces to prove zero reads escape the supplied home (#4834).
+- An explicit `agentDir` redirect now applies uniformly to native user-scope surfaces instead of only to MCP: `loadCapability`/`loadCapabilityForHome` set the context user scope only for an explicit agent directory, and the native SYSTEM.md, RULES.md, skills, config-dir, and AGENTS.md loaders resolve user paths from it. The process-default (no explicit `agentDir`) layout is unchanged (#4834 review).
+- `loadCapability` keeps `getAgentDir()` as the DEFAULT context user scope for native surfaces, so a process-selected non-default profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / setAgentDir()) is never split across two directories: an explicit `options.agentDir` still wins, and `loadCapabilityForHome` still derives its scope from the supplied home (#4834 review).
+
 - Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
 
 - Auth metadata remains session-only when a compatibility registry has auth storage but no owner accessor, preventing an unscoped OAuth account lookup from attributing a registry-scoped API-key request to the wrong account.
@@ -271,9 +275,6 @@
 ### Added
 
 - `gjc auth-gateway serve` verifies an enabled broker credential before binding and reports only redacted provider-scoped status/check information.
-- `loadCapabilityForHome` no longer falls back to the process-global agent directory when an explicit home is supplied. The user agent directory is derived from the supplied home (`<home>/<configDir>/agent`) unless the caller passes an explicit `agentDir`, and a non-absolute home fails closed instead of silently resolving against the process profile. Explicit-home loads can no longer read another profile's SYSTEM.md/RULES.md/AGENTS.md, skills, commands, hooks, settings, or custom-tool descriptors; a decoy-process-profile test instruments every filesystem read across all eight surfaces to prove zero reads escape the supplied home (#4834).
-- An explicit `agentDir` redirect now applies uniformly to native user-scope surfaces instead of only to MCP: `loadCapability`/`loadCapabilityForHome` set the context user scope only for an explicit agent directory, and the native SYSTEM.md, RULES.md, skills, config-dir, and AGENTS.md loaders resolve user paths from it. The process-default (no explicit `agentDir`) layout is unchanged (#4834 review).
-- `loadCapability` keeps `getAgentDir()` as the DEFAULT context user scope for native surfaces, so a process-selected non-default profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / setAgentDir()) is never split across two directories: an explicit `options.agentDir` still wins, and `loadCapabilityForHome` still derives its scope from the supplied home (#4834 review).
 
 ## [0.15.2] - 2026-08-25
 
