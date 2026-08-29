@@ -108,7 +108,8 @@ function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: stri
 	const stopIsAncestor =
 		!resolvedStop ||
 		resolvedStop === resolvedCwd ||
-		(!path.relative(resolvedStop, resolvedCwd).startsWith(`..${path.sep}`) &&
+		(path.relative(resolvedStop, resolvedCwd) !== ".." &&
+			!path.relative(resolvedStop, resolvedCwd).startsWith(`..${path.sep}`) &&
 			!path.isAbsolute(path.relative(resolvedStop, resolvedCwd)));
 	const effectiveStop = stopIsAncestor ? resolvedStop : resolvedCwd;
 	let current = resolvedCwd;

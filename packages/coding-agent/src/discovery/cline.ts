@@ -21,7 +21,8 @@ async function findClinerules(startDir: string, stopAt: string): Promise<{ path:
 	const resolvedStop = path.resolve(stopAt);
 	const relativeStop = path.relative(resolvedStop, current);
 	const effectiveStop =
-		relativeStop === "" || (!relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+		relativeStop === "" ||
+		(relativeStop !== ".." && !relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
 			? resolvedStop
 			: current;
 

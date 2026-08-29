@@ -49,7 +49,8 @@ export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]
 	const stopDirectory = ctx.repoRoot ?? ctx.home;
 	const relativeStop = path.relative(stopDirectory, ctx.cwd);
 	const effectiveStopDirectory =
-		relativeStop === "" || (!relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+		relativeStop === "" ||
+		(relativeStop !== ".." && !relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
 			? stopDirectory
 			: ctx.cwd;
 	while (true) {

@@ -812,7 +812,7 @@ export async function resolveActiveProjectRegistryPath(cwd: string, homeDir?: st
 	const effectiveStop =
 		!explicitHome ||
 		relativeHome === "" ||
-		(!relativeHome.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeHome))
+		(relativeHome !== ".." && !relativeHome.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeHome))
 			? homeDir
 			: canonicalCwd;
 	let dir = canonicalCwd;
