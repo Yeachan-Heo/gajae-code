@@ -2215,7 +2215,7 @@ async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, gen
 export function isValidGenerationRecord(value: unknown, sessionId: string, generation: string): boolean {
 	return (
 		isRecord(value) &&
-		hasOnlyKeys(value, ["schema_version", "generation", "session_id", "published_at"]) &&
+		hasExactKeys(value, ["schema_version", "generation", "session_id", "published_at"]) &&
 		value.schema_version === 1 &&
 		value.generation === generation &&
 		value.session_id === sessionId &&
@@ -2507,6 +2507,10 @@ function isTerminalObserver(value: unknown): value is TerminalObserver {
 }
 function hasOnlyKeys(record: Record<string, unknown>, allowed: string[]): boolean {
 	return Object.keys(record).every(key => allowed.includes(key));
+}
+function hasExactKeys(record: Record<string, unknown>, expected: string[]): boolean {
+	const keys = Object.keys(record);
+	return keys.length === expected.length && keys.every(key => expected.includes(key));
 }
 function nonEmpty(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0;
