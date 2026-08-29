@@ -873,11 +873,9 @@ export async function syncContent(
  */
 export async function notifySaved(client: LspClient, filePath: string, signal?: AbortSignal): Promise<void> {
 	const uri = fileToUri(filePath);
-	const info = client.openFiles.get(uri);
-	if (!info) return; // File not open, nothing to notify
-
 	throwIfAborted(signal);
 	await withFileOperationLock(fileOperationLockKey(client, uri), signal, async () => {
+		throwIfAborted(signal);
 		if (!client.openFiles.has(uri)) return;
 		await sendNotification(client, "textDocument/didSave", {
 			textDocument: { uri },

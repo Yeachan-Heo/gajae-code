@@ -218,6 +218,7 @@ export class HindsightSessionState {
 	/** One auto-retain may run at a time; one later agent_end is coalesced. */
 	#autoRetainInFlight?: Promise<void>;
 	#autoRetainPending = false;
+	#trackingGeneration = 0;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -241,6 +242,7 @@ export class HindsightSessionState {
 	}
 
 	resetConversationTracking(): void {
+		this.#trackingGeneration++;
 		this.lastRetainedTurn = 0;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
@@ -302,6 +304,8 @@ export class HindsightSessionState {
 	}
 
 	async retainSession(messages: HindsightMessage[]): Promise<boolean> {
+		const trackingGeneration = this.#trackingGeneration;
+		const sessionId = this.sessionId;
 		const retainFullWindow = this.config.retainMode === "full-session";
 		let target: HindsightMessage[];
 		let documentId: string;
@@ -309,22 +313,23 @@ export class HindsightSessionState {
 		if (retainFullWindow) {
 			target = sliceMessagesAfterUserTurns(messages, this.lastRetainedTurn);
 			if (target.length === 0) return false;
-			documentId = this.sessionId;
+			documentId = sessionId;
 		} else {
 			const windowTurns = this.config.retainEveryNTurns + this.config.retainOverlapTurns;
 			target = sliceLastTurnsByUserBoundary(messages, windowTurns);
-			documentId = `${this.sessionId}-${Date.now()}`;
+			documentId = `${sessionId}-${Date.now()}`;
 		}
 
 		const { transcript } = prepareRetentionTranscript(target, true);
 		if (!transcript) return false;
 
 		await ensureBankMission(this.client, this.bankId, this.config, this.missionsSet);
+		if (trackingGeneration !== this.#trackingGeneration) return false;
 		await this.client.retain(this.bankId, transcript, {
 			documentId,
 			updateMode: "append",
 			context: this.config.retainContext,
-			metadata: { session_id: this.sessionId },
+			metadata: { session_id: sessionId },
 			tags: this.retainTags,
 			async: true,
 		});
@@ -356,10 +361,12 @@ export class HindsightSessionState {
 		if (messages.length === 0) return;
 		const userTurns = messages.filter(m => m.role === "user").length;
 		if (userTurns - this.lastRetainedTurn < this.config.retainEveryNTurns) return;
+		const trackingGeneration = this.#trackingGeneration;
 
 		try {
 			const retained = await this.retainSession(messages);
 			if (!retained) return;
+			if (trackingGeneration !== this.#trackingGeneration) return;
 			this.lastRetainedTurn = userTurns;
 			if (this.config.debug) {
 				logger.debug("Hindsight: auto-retain succeeded", {
@@ -379,12 +386,15 @@ export class HindsightSessionState {
 	}
 
 	async forceRetainCurrentSession(): Promise<void> {
+		const trackingGeneration = this.#trackingGeneration;
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
 		try {
 			const retained = await this.retainSession(messages);
 			if (!retained) return;
-			this.lastRetainedTurn = messages.filter(m => m.role === "user").length;
+			if (trackingGeneration === this.#trackingGeneration) {
+				this.lastRetainedTurn = messages.filter(m => m.role === "user").length;
+			}
 		} catch (err) {
 			logger.warn("Hindsight: forced retain failed", {
 				sessionId: this.sessionId,
@@ -402,8 +412,9 @@ export class HindsightSessionState {
 
 		const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		const trackingGeneration = this.#trackingGeneration;
 		const { context, ok } = await this.recallForContext(truncated);
-		if (!ok) return;
+		if (!ok || trackingGeneration !== this.#trackingGeneration) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;
@@ -425,8 +436,9 @@ export class HindsightSessionState {
 		const queryMessages = [...history, { role: "user" as const, content: latestPrompt }];
 		const query = composeRecallQuery(latestPrompt, queryMessages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
+		const trackingGeneration = this.#trackingGeneration;
 		const { context, ok } = await this.recallForContext(truncated);
-		if (!ok) return undefined;
+		if (!ok || trackingGeneration !== this.#trackingGeneration) return undefined;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return undefined;
