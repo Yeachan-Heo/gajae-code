@@ -177,6 +177,8 @@
 
 ## [0.15.6] - 2026-08-30
 
+- Explicit-home capability discovery now validates only the selected provider roots, isolates plugin-root caching from ordinary loads, and rejects configured extension paths that escape the canonical home.
+
 - Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
 
 - Auth metadata remains session-only when a compatibility registry has auth storage but no owner accessor, preventing an unscoped OAuth account lookup from attributing a registry-scoped API-key request to the wrong account.
