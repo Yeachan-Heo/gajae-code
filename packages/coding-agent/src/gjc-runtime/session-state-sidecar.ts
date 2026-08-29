@@ -2692,7 +2692,8 @@ async function observeOwnerTerminalPostmortem(
 	sessionId: string,
 ): Promise<OwnerVerdict | null> {
 	try {
-		if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" && !owner.operatorDispatchId) return null;
+		if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" && (!owner.operatorDispatchId || !owner.operatorIntentId))
+			return null;
 		const now = new Date().toISOString();
 		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> = {
 			schema_version: 1,
