@@ -2743,14 +2743,22 @@ async function observeOwnerTerminalPostmortem(
 	}
 }
 
-type PendingOwnerIntentStatus = "none" | "matching" | "foreign";
+type PendingOwnerIntentStatus = "none" | "matching" | "foreign" | "unavailable";
 
 async function pendingOwnerIntentStatus(
 	owner: OwnerTerminalContext,
 	sessionId: string,
 ): Promise<PendingOwnerIntentStatus> {
+	const intentFile = lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile;
 	try {
-		const intent = await readNoFollowJson(lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile);
+		try {
+			await fs.lstat(intentFile);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "none";
+			return "unavailable";
+		}
+		const intent = await readNoFollowJson(intentFile);
+		if (intent === null) return "unavailable";
 		if (
 			!isValidOwnerIntent(intent) ||
 			intent.session_id !== sessionId ||
@@ -2761,7 +2769,7 @@ async function pendingOwnerIntentStatus(
 			return "none";
 		return intent.server_key === owner.socketKey ? "matching" : "foreign";
 	} catch {
-		return "none";
+		return "unavailable";
 	}
 }
 
