@@ -13545,6 +13545,7 @@ export class AgentSession {
 				skipPostPromptRecoveryWait: true,
 				preflightSignal: signal,
 			});
+			this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
 		} catch (error) {
 			if (this.#isDisposed || this.#sessionAdmissionClosing || this.#disposeAbortController.signal.aborted) {
 				this.#settleDeliveredOwnedRegistrations(reclassified.map(entry => entry.message));
@@ -15900,8 +15901,8 @@ export class AgentSession {
 				if (!prepared) return false;
 				try {
 					await initializeLocalRoot(this.#localProtocolOptions(prepared));
-					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 					this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 					this.sessionManager.commitPreparedNewSession(prepared);
 					this.#quarantineQueuedAsyncResults();
 					// Fork commits a successor endpoint identity; re-register the
@@ -18232,11 +18233,11 @@ export class AgentSession {
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
+				committed = true;
 				this.#quarantineQueuedAsyncResults();
 				// Handoff commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
-				committed = true;
 				await this.#runToolSessionTransitionCleanups();
 				this.#terminalizeQueuedSdkWorkForSessionTransition([
 					...rollbackAgentSteeringQueue,
@@ -18274,13 +18275,6 @@ export class AgentSession {
 				this.#resetIrcRosterDeliveryState();
 				this.#planReferenceSent = false;
 				this.#planReferencePath = "local://PLAN.md";
-				// The predecessor's fenced async-job results (queued while the
-				// transition held the delivery fence) belong to the handed-off session,
-				// not the successor. Suppress and drop ONLY the async-result kind so they
-				// never flush into the new session; MCP resource notifications are
-				// server-scoped and are preserved for the successor.
-				this.#quarantineQueuedAsyncResults();
-
 				// The successor identity/emitter/provider state is now fully live and
 				// predecessor deliveries are suppressed, so release the turn-admission
 				// fence BEFORE publishing session_switch. Successor turns (e.g. a
@@ -23574,7 +23568,7 @@ export class AgentSession {
 				await this.sessionManager.ensureOnDisk();
 				if (!switchingToDifferentSession) await this.#initializeLocalRootForLoadedSession();
 
-				if (switchingToDifferentSession) {
+				if (switchingToDifferentSession || didReloadConversationChange) {
 					// The local:// migration gate for this successor already ran above,
 					// before the identity was published (#2797 / #2925).
 					this.#resetHindsightConversationTrackingIfHindsight();
@@ -23812,8 +23806,8 @@ export class AgentSession {
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.sessionManager.commitPreparedNewSession(prepared);
 				this.#quarantineQueuedAsyncResults();
 				// Branch commits a successor endpoint identity; re-register the
@@ -24044,6 +24038,10 @@ export class AgentSession {
 			// work at this boundary; cancelled or failed preparation above preserves it.
 			const queuedSdkWork = this.#queuedMessagesForSessionTransition();
 			this.#terminalizeQueuedSdkWorkForSessionTransition(queuedSdkWork);
+			this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#quarantineQueuedAsyncResults();
 			this.#deferredSdkFollowUps = [];
 			this.agent.clearAllQueues();
 			this.#steeringMessages = [];
