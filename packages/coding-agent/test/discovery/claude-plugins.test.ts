@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
-import { clearCache as clearFsCache } from "@gajae-code/coding-agent/capability/fs";
+import { clearCache as clearFsCache, readFile as readDiscoveryFile } from "@gajae-code/coding-agent/capability/fs";
 import {
 	clearClaudePluginRootsCache,
 	listClaudePluginRoots,
@@ -14,6 +14,7 @@ import { safeRm } from "../../../../scripts/safe-cleanup";
 import "@gajae-code/coding-agent/discovery/claude-plugins";
 import type { Skill } from "@gajae-code/coding-agent/capability/skill";
 import type { SlashCommand } from "@gajae-code/coding-agent/capability/slash-command";
+import type { MCPServer } from "../../src/capability/mcp";
 
 describe("parseClaudePluginsRegistry", () => {
 	test("parses valid registry", () => {
@@ -491,6 +492,99 @@ describe("listClaudePluginRoots", () => {
 		const result = await listClaudePluginRoots(tempDir);
 		expect(result.roots).toHaveLength(1);
 		expect(result.roots[0].scope).toBe("user");
+	});
+
+	test("isolated manifest reads bypass a poisoned same-lexical cache entry", async () => {
+		const profileHome = path.join(tempDir, "isolated-manifest-home");
+		const project = path.join(profileHome, "project");
+		const pluginsDir = path.join(profileHome, ".gjc", "plugins");
+		const pluginPath = path.join(profileHome, "plugins", "manifest-cache-swap");
+		const safeManifest = path.join(pluginPath, "safe-plugin.json");
+		const externalManifest = path.join(tempDir, "external-plugin.json");
+		const manifestPath = path.join(pluginPath, ".claude-plugin", "plugin.json");
+		await fs.mkdir(path.join(project, ".git"), { recursive: true });
+		await fs.mkdir(path.join(pluginsDir), { recursive: true });
+		await fs.mkdir(path.dirname(manifestPath), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, "skills", "safe-skill"), { recursive: true });
+		await fs.writeFile(safeManifest, JSON.stringify({ skills: "./skills" }));
+		await fs.writeFile(externalManifest, JSON.stringify({ skills: "./external-skills" }));
+		await fs.writeFile(
+			path.join(pluginPath, "skills", "safe-skill", "SKILL.md"),
+			"---\nname: safe-skill\ndescription: Safe skill\n---\nSafe\n",
+		);
+		await fs.symlink(externalManifest, manifestPath, "file");
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"manifest-cache-swap@market": [
+						{
+							scope: "user",
+							installPath: pluginPath,
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+
+		expect(await readDiscoveryFile(manifestPath)).toContain("external-skills");
+		await fs.rm(manifestPath);
+		await fs.symlink(safeManifest, manifestPath, "file");
+
+		const result = await loadCapabilityForHome<Skill>("skills", profileHome, {
+			cwd: project,
+			providers: ["claude-plugins"],
+		});
+		expect(result.items.map(skill => skill.name)).toEqual(["manifest-cache-swap:safe-skill"]);
+		expect(result.items[0]?._source.path).toBe(path.join(pluginPath, "skills", "safe-skill", "SKILL.md"));
+	});
+
+	test("isolated plugin MCP reads bypass a poisoned same-lexical cache entry", async () => {
+		const profileHome = path.join(tempDir, "isolated-mcp-home");
+		const project = path.join(profileHome, "project");
+		const pluginsDir = path.join(profileHome, ".gjc", "plugins");
+		const pluginPath = path.join(profileHome, "plugins", "mcp-cache-swap");
+		const safeMcp = path.join(pluginPath, "safe.mcp.json");
+		const externalMcp = path.join(tempDir, "external.mcp.json");
+		const mcpPath = path.join(pluginPath, ".mcp.json");
+		await fs.mkdir(path.join(project, ".git"), { recursive: true });
+		await fs.mkdir(pluginsDir, { recursive: true });
+		await fs.mkdir(pluginPath, { recursive: true });
+		await fs.writeFile(safeMcp, JSON.stringify({ safe: { command: "safe-command" } }));
+		await fs.writeFile(externalMcp, JSON.stringify({ poisoned: { command: "poisoned-command" } }));
+		await fs.symlink(externalMcp, mcpPath, "file");
+		await fs.writeFile(
+			path.join(pluginsDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"mcp-cache-swap@market": [
+						{
+							scope: "user",
+							installPath: pluginPath,
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+
+		expect(await readDiscoveryFile(mcpPath)).toContain("poisoned-command");
+		await fs.rm(mcpPath);
+		await fs.symlink(safeMcp, mcpPath, "file");
+
+		const result = await loadCapabilityForHome<MCPServer>("mcps", profileHome, {
+			cwd: project,
+			providers: ["claude-plugins"],
+		});
+		expect(result.items.map(server => server.name)).toEqual(["mcp-cache-swap:safe"]);
+		expect(result.items[0]?._source.path).toBe(safeMcp);
 	});
 	test("reads skills directory from plugin manifest skills field", async () => {
 		const pluginsDir = path.join(tempDir, ".gjc", "plugins");

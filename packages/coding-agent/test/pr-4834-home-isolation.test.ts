@@ -211,6 +211,28 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.warnings).toEqual([]);
 	});
 
+	test("isolated Cline reads bypass a poisoned same-lexical cache entry", async () => {
+		const decoyFile = path.join(tempDir, "process-decoy", "clinerules");
+		const safeFile = path.join(project, "safe-clinerules");
+		const lexicalPath = path.join(project, ".clinerules");
+		await writeFile(decoyFile, "# decoy clinerules");
+		await writeFile(safeFile, "# safe clinerules");
+		await fs.symlink(decoyFile, lexicalPath, "file");
+
+		// Seed the ordinary lexical cache with the external target, then replace
+		// the same lexical entry with an in-home target before isolated discovery.
+		expect(await readFile(lexicalPath)).toBe("# decoy clinerules");
+		await fs.rm(lexicalPath);
+		await fs.symlink(safeFile, lexicalPath, "file");
+
+		const result = await loadCapabilityForHome<Rule>(ruleCapability.id, home, {
+			cwd: project,
+			providers: ["cline"],
+		});
+		expect(result.items.map(item => item.content)).toEqual(["# safe clinerules"]);
+		expect(result.items[0]?._source.path).toBe(safeFile);
+	});
+
 	test("explicit home native project discovery stays on the fixed .gjc root", async () => {
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;

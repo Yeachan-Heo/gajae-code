@@ -6,6 +6,7 @@ import {
 	cursorExecDeadlineMsForTest,
 	disposeCursorConversation,
 	streamCursor,
+	waitForCursorWritesForTest,
 	writeCursorFrameForTest,
 } from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
@@ -214,6 +215,42 @@ describe("Cursor raw transport watchdog", () => {
 		closeDuringWrite = true;
 		expect(writeCursorFrameForTest(request, Buffer.from("late"))).toBe(false);
 		expect(writeCount).toBe(2);
+	});
+
+	it("waits for accepted outbound frames before successful request teardown", async () => {
+		const listeners = new Map<string, Set<() => void>>();
+		let writeCompletion: (() => void) | undefined;
+		const request = {
+			closed: false,
+			destroyed: false,
+			writableEnded: false,
+			writableFinished: false,
+			once(event: string, listener: () => void) {
+				const eventListeners = listeners.get(event) ?? new Set<() => void>();
+				eventListeners.add(listener);
+				listeners.set(event, eventListeners);
+				return this;
+			},
+			removeListener(event: string, listener: () => void) {
+				listeners.get(event)?.delete(listener);
+				return this;
+			},
+			write(_frame: Uint8Array, callback: () => void) {
+				writeCompletion = callback;
+				return true;
+			},
+		} as unknown as http2.ClientHttp2Stream;
+
+		expect(writeCursorFrameForTest(request, Buffer.from("response"))).toBe(true);
+		let settled = false;
+		const wait = waitForCursorWritesForTest(request).then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+		writeCompletion?.();
+		await wait;
+		expect(settled).toBe(true);
 	});
 
 	it("preserves a caller-supplied AbortError diagnostic", async () => {

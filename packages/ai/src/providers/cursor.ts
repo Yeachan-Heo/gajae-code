@@ -640,6 +640,24 @@ function isClosedCursorRequest(request: http2.ClientHttp2Stream): boolean {
 	return request.closed || request.destroyed || request.writableEnded || request.writableFinished;
 }
 
+const pendingCursorWrites = new WeakMap<object, Set<Promise<void>>>();
+
+/** Wait until every frame accepted by a request has reached the HTTP/2 writer. */
+async function waitForCursorWrites(request: http2.ClientHttp2Stream | null): Promise<void> {
+	if (!request) return;
+	const pending = pendingCursorWrites.get(request);
+	if (!pending) return;
+	while (pending.size > 0) {
+		await Promise.all([...pending]);
+	}
+	pendingCursorWrites.delete(request);
+}
+
+/** Exported for deterministic coverage of successful writer teardown ordering. */
+export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | null): Promise<void> {
+	return waitForCursorWrites(request);
+}
+
 /**
  * Late exec/stream handlers can finish after the bounded settlement fence has
  * closed the HTTP/2 request. Treat those writes as dropped transport output;
@@ -647,10 +665,36 @@ function isClosedCursorRequest(request: http2.ClientHttp2Stream): boolean {
  */
 function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
 	if (isClosedCursorRequest(request)) return false;
+	let resolveWrite!: () => void;
+	let completed = false;
+	let completion!: Promise<void>;
+	const pending = pendingCursorWrites.get(request) ?? new Set<Promise<void>>();
+	pendingCursorWrites.set(request, pending);
+	completion = new Promise<void>(resolve => {
+		resolveWrite = resolve;
+	});
+	pending.add(completion);
+	const finish = () => {
+		if (completed) return;
+		completed = true;
+		pending.delete(completion);
+		if (typeof request.removeListener === "function") {
+			request.removeListener("close", finish);
+			request.removeListener("error", finish);
+		}
+		resolveWrite();
+	};
 	try {
-		request.write(frame);
+		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
+		// test seam tolerant of a minimal writer stub as well.
+		if (typeof request.once === "function") {
+			request.once("close", finish);
+			request.once("error", finish);
+		}
+		request.write(frame, finish);
 		return true;
 	} catch (error) {
+		finish();
 		if (isClosedCursorRequest(request)) return false;
 		const code = (error as NodeJS.ErrnoException).code;
 		if (
@@ -1921,6 +1965,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// late writes must fail quietly on the closed stream instead of crashing
 			// the process with ERR_STREAM_WRITE_AFTER_END.
 			h2Request?.on("error", () => {});
+			// `write()` only queues the frame. Await each accepted frame's completion
+			// callback before tearing down a successful HTTP/2 request, otherwise the
+			// final exec response can be lost when close wins the writer race.
+			await waitForCursorWrites(h2Request);
 			h2Request?.close();
 			h2Client?.close();
 			proxiedSocket?.destroy();

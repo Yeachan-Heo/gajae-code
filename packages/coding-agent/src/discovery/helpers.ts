@@ -391,7 +391,26 @@ export const SKILL_FRONTMATTER_SCAN_BYTES = 4 * 1024;
 /** Maximum total bytes read while seeking the frontmatter closing delimiter. */
 export const SKILL_FRONTMATTER_SCAN_TOTAL_BYTES = 64 * 1024;
 
-async function readSkillFrontmatter(skillPath: string): Promise<SkillFrontmatter | null> {
+async function readSkillFrontmatter(
+	skillPath: string,
+	readOptions?: ReadFileOptions,
+): Promise<SkillFrontmatter | null> {
+	// Explicit-home reads must go through the scope-aware filesystem seam. The
+	// incremental Bun.file path below is retained for ordinary discovery so the
+	// frontmatter scan remains bounded without changing its historical behavior.
+	if (readOptions?.isolatedHome) {
+		const content = await readFile(skillPath, readOptions);
+		if (content === null) return null;
+		const prefix = content.slice(0, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
+		const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
+		if (!opening) return null;
+		const afterOpening = prefix.slice(opening[0].length);
+		const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
+		if (!closing || closing.index === undefined) return null;
+		const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
+		return parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter;
+	}
+
 	const file = Bun.file(skillPath);
 	const size = (await fs.promises.stat(skillPath)).size;
 	const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
@@ -440,7 +459,7 @@ export async function scanSkillsFromDir(
 	}
 	const loadSkill = async (skillPath: string) => {
 		try {
-			const frontmatter = await readSkillFrontmatter(skillPath);
+			const frontmatter = await readSkillFrontmatter(skillPath, readOptions);
 			if (!frontmatter) {
 				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
 					warnings.push(
