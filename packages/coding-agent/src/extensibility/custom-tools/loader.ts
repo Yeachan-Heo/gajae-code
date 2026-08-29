@@ -223,6 +223,7 @@ export async function discoverAndLoadCustomTools(
 	}) => void,
 	agentDir?: string,
 	settings?: Settings,
+	profileAuthority?: "default" | "custom",
 ) {
 	const allPathsWithSources: ToolPathWithSource[] = [];
 	const seen = new Set<string>();
@@ -237,7 +238,12 @@ export async function discoverAndLoadCustomTools(
 	};
 
 	// 1. Discover tools via capability system (user + project from all providers)
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd, agentDir, settings });
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, {
+		cwd,
+		agentDir,
+		settings,
+		profileAuthority,
+	});
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {
 			provider: tool._source.provider,

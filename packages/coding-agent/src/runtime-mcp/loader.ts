@@ -45,6 +45,7 @@ export interface MCPToolsLoadOptions {
 	sharedPoolIdleMs?: number;
 	agentDir?: string;
 	settings?: Settings;
+	profileAuthority?: "default" | "custom";
 }
 
 async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
@@ -71,6 +72,7 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 		sharedPoolIdleMs: options?.sharedPoolIdleMs,
 		agentDir: options?.agentDir,
 		settings: options?.settings,
+		profileAuthority: options?.profileAuthority,
 	});
 	if (options?.authStorage) {
 		manager.setAuthStorage(options.authStorage);

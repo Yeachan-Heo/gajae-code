@@ -210,6 +210,7 @@ async function withPreparedMcpConnection<T>(
 		sharedPoolIdleMs: runtime.settings.get("mcp.sharedPoolIdleMs"),
 		agentDir: runtimeAgentDir(runtime),
 		settings: runtime.settings,
+		profileAuthority: runtime.session.getSessionProfileAuthority?.(),
 	});
 	// Auth storage must be wired in before the prepared lease so OAuth-backed
 	// servers can refresh credentials and inject Authorization headers.

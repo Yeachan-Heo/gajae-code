@@ -115,6 +115,12 @@ export const hindsightBackend: MemoryBackend = {
 		const state = session?.getHindsightSessionState();
 		state?.beginDispose();
 		if (state) await state.flushRetainQueue();
+		// A session transition may replace the Hindsight state while the retain
+		// queue drains. Never detach the successor state on behalf of the old one.
+		if (session?.getHindsightSessionState() !== state) {
+			await state?.dispose();
+			return;
+		}
 		const previous = session?.setHindsightSessionState(undefined);
 		await previous?.dispose();
 		logger.warn(

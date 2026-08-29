@@ -286,6 +286,8 @@ export interface MCPDiscoverOptions {
 	agentDir?: string;
 	/** Selected session settings for capability policy. */
 	settings?: Settings;
+	/** Stable resolver-owned profile authority for user-scope provider selection. */
+	profileAuthority?: "default" | "custom";
 }
 
 export interface MCPManagerOptions {
@@ -310,6 +312,8 @@ export interface MCPManagerOptions {
 	afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
 	agentDir?: string;
 	settings?: Settings;
+	/** Stable resolver-owned profile authority for user-scope provider selection. */
+	profileAuthority?: "default" | "custom";
 }
 
 /**
@@ -811,6 +815,7 @@ export class MCPManager {
 	readonly #afterLeaseAcquiredForTests?: (name: string, lease: MCPPoolLease) => void | Promise<void>;
 	readonly #agentDir: string | undefined;
 	readonly #settings: Settings | undefined;
+	readonly #profileAuthority: "default" | "custom" | undefined;
 
 	constructor(
 		private cwd: string,
@@ -823,6 +828,7 @@ export class MCPManager {
 		this.#afterLeaseAcquiredForTests = options.afterLeaseAcquiredForTests;
 		this.#agentDir = options.agentDir;
 		this.#settings = options.settings;
+		this.#profileAuthority = options.profileAuthority;
 		this.cwd = canonicalMCPWorkingDirectory(this.cwd);
 		this.#pool = options.pool ?? new MCPConnectionPool({ sharedPoolIdleMs: options.sharedPoolIdleMs });
 		this.#sessionId = options.sessionId ?? crypto.randomUUID();
@@ -980,6 +986,7 @@ export class MCPManager {
 			configPath: options?.configPath,
 			agentDir: options?.agentDir ?? this.#agentDir,
 			settings: options?.settings ?? this.#settings,
+			profileAuthority: options?.profileAuthority ?? this.#profileAuthority,
 		});
 		const result = await this.#connectServers(configs, sources, options?.onConnecting);
 		if (configurationWarning) result.errors.set("$config", "MCP configuration unavailable");

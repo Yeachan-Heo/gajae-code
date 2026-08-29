@@ -43,6 +43,8 @@ export interface LoadMCPConfigsOptions {
 	 * so discovery and `gjc mcp add --scope user` read and write the same file.
 	 */
 	agentDir?: string;
+	/** Stable resolver-owned profile authority for user-scope provider selection. */
+	profileAuthority?: "default" | "custom";
 }
 
 /** Result of loading MCP configs */
@@ -151,6 +153,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 			cwd,
 			agentDir: options?.agentDir,
 			settings: options?.settings,
+			profileAuthority: options?.profileAuthority,
 			providers: options?.nativeOnly === true ? ["native"] : undefined,
 		});
 		// Filter out project-level configs if disabled

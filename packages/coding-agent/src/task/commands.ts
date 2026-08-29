@@ -72,6 +72,7 @@ export async function discoverCommands(
 	cwd: string,
 	settings?: Settings,
 	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<WorkflowCommand[]> {
 	const resolvedCwd = path.resolve(cwd);
 
@@ -80,6 +81,7 @@ export async function discoverCommands(
 		cwd: resolvedCwd,
 		agentDir: agentDir ?? settings?.getAgentDir(),
 		settings,
+		profileAuthority,
 	});
 
 	const commands: WorkflowCommand[] = [];
