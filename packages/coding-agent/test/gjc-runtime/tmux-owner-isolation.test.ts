@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -27,6 +27,8 @@ import {
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
+	readNoFollowJson,
+	readNoFollowJsonSync,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
@@ -239,6 +241,64 @@ describe("tmux owner isolation", () => {
 		expect(ownerProcessStartTime("linux", `1 (owner) ${fields.join(" ")}`)).toBe("1234");
 		expect(ownerProcessStartTime("linux", null)).toBeNull();
 		expect(ownerProcessStartTime("linux", "malformed")).toBeNull();
+	});
+
+	it("distinguishes a lifecycle file that grows after async preflight from ENOENT", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-bounded-read-"));
+		const file = path.join(state, "record.json");
+		try {
+			await fs.writeFile(file, "{}\n");
+			let grew = false;
+			__setIntentEvidenceReadHooksForTests({
+				platform: process.platform,
+				afterPathStat: async target => {
+					if (target !== file || grew) return;
+					grew = true;
+					await fs.appendFile(file, "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES));
+				},
+			});
+			await expect(readNoFollowJson(file)).rejects.toThrow("lifecycle_record_too_large");
+			expect(grew).toBe(true);
+			await expect(readNoFollowJson(path.join(state, "missing.json"))).resolves.toBeNull();
+		} finally {
+			__setIntentEvidenceReadHooksForTests(null);
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
+	it("bounds synchronous descriptor reads when a lifecycle file grows after preflight", () => {
+		const state = fsSync.mkdtempSync(path.join(os.tmpdir(), "gjc-owner-bounded-read-sync-"));
+		const file = path.join(state, "record.json");
+		try {
+			fsSync.writeFileSync(file, "{}\n");
+			const originalReadSync = fsSync.readSync;
+			let grew = false;
+			let requestedLength: number | undefined;
+			const readSpy = spyOn(fsSync, "readSync").mockImplementation(((
+				descriptor: number,
+				buffer: NodeJS.ArrayBufferView,
+				offset: number,
+				length: number,
+				position: number | null,
+			) => {
+				requestedLength = length;
+				if (!grew) {
+					grew = true;
+					fsSync.appendFileSync(file, "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES));
+				}
+				return originalReadSync(descriptor, buffer, offset, length, position);
+			}) as never);
+			try {
+				expect(() => readNoFollowJsonSync(file)).toThrow("baseline_generation_corrupt");
+			} finally {
+				readSpy.mockRestore();
+			}
+			expect(grew).toBe(true);
+			expect(requestedLength).toBe(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES + 1);
+			expect(() => readNoFollowJsonSync(path.join(state, "missing.json"))).not.toThrow();
+		} finally {
+			fsSync.rmSync(state, { recursive: true, force: true });
+		}
 	});
 
 	it.each(ownerIsolationEntries)(

@@ -25,6 +25,7 @@ import {
 } from "./session-state-sidecar";
 import {
 	assertGjcTmuxMutationAuthoritySync,
+	assertSafeGjcTmuxSessionName,
 	bindGjcTmuxProviderAuthority,
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
@@ -301,8 +302,17 @@ function runTmux(
 	if (result.exitCode === 0) return result.stdout?.toString() ?? "";
 	throw new Error(result.stderr?.toString().trim() || `${tmuxCommand} ${args.join(" ")} failed`);
 }
+function safeNativeTmuxSessionId(sessionTarget: string): string {
+	// Native tmux session IDs are immutable `$N` handles. psmux has no native
+	// numeric ID, so its session name must satisfy the human-name boundary.
+	return /^\$\d+$/.test(sessionTarget) ? sessionTarget : assertSafeGjcTmuxSessionName(sessionTarget);
+}
+
 function normalizeExactTmuxTarget(sessionTarget: string, env: NodeJS.ProcessEnv, kind: "session" | "option"): string {
-	if (sessionTarget.startsWith("$")) return sessionTarget;
+	// Native tmux session IDs are immutable `$N` handles, not user-controlled
+	// session names. Preserve those handles for exact reads while routing every
+	// other value through the bounded session-name target builders.
+	if (/^\$\d+$/.test(sessionTarget)) return sessionTarget;
 	return kind === "option"
 		? buildGjcTmuxExactOptionTarget(sessionTarget, { env })
 		: buildGjcTmuxExactSessionTarget(sessionTarget, { env });
@@ -349,6 +359,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 	] = line.split("\t");
 
 	if (!name) return null;
+	assertSafeGjcTmuxSessionName(name);
 	return {
 		name,
 		attached: parseBooleanFlag(attached),
@@ -421,6 +432,7 @@ function envWithoutInheritedTmux(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 interface ListedTmuxSessions {
 	lines: string[];
 	env: NodeJS.ProcessEnv;
+	synthetic?: boolean;
 }
 
 function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): ListedTmuxSessions {
@@ -449,8 +461,8 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 	}
 	const lines = output
 		.split("\n")
-		.map(line => line.trim())
-		.filter(Boolean);
+		.map(line => line.replace(/\r$/, ""))
+		.filter(line => line.trim().length > 0);
 	// psmux 3.3.0 silently ignores the tmux `-F` format flag and returns its
 	// default `name: N windows (created ...)` shape. Detect that case and
 	// synthesize a tab-separated row so downstream parseSessionLine /
@@ -472,6 +484,7 @@ function runListSessions(format: string, env: NodeJS.ProcessEnv = process.env): 
 					);
 				}),
 				env: effectiveEnv,
+				synthetic: true,
 			};
 		}
 	}
@@ -487,7 +500,15 @@ function listSessionLines(env: NodeJS.ProcessEnv = process.env): ListedTmuxSessi
 }
 
 function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[] {
-	return runListSessions("#{session_name}", env).lines.map(line => line.split("\t")[0] ?? line);
+	const listed = runListSessions("#{session_name}", env);
+	return listed.lines.map(line => {
+		// psmux may ignore `-F` and return its prose shape. runListSessions
+		// synthesizes a tabular row for that case; only unwrap that known shape,
+		// while rejecting literal tabs from a native provider's session name.
+		const name = listed.synthetic ? (line.split("\t")[0] ?? line) : line;
+		assertSafeGjcTmuxSessionName(name);
+		return name;
+	});
 }
 
 function assertMutationAuthority(session: GjcTmuxSessionStatus): void {
@@ -641,6 +662,7 @@ export function findGjcTmuxSessionByName(
 	sessionName: string,
 	env: NodeJS.ProcessEnv = process.env,
 ): GjcTmuxSessionStatus | undefined {
+	assertSafeGjcTmuxSessionName(sessionName);
 	return listGjcTmuxSessions(env).find(session => session.name === sessionName);
 }
 
@@ -654,6 +676,7 @@ export function findGjcTmuxSessionByScope(
 	);
 }
 export function statusGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): GjcTmuxSessionStatus {
+	assertSafeGjcTmuxSessionName(sessionName);
 	const session = listGjcTmuxSessions(env).find(candidate => candidate.name === sessionName);
 	if (session) return session;
 	if (listRawTmuxSessionNames(env).includes(sessionName)) {
@@ -1129,14 +1152,16 @@ function guardedTmuxSessionPredicate(
 	expectedOwnerGeneration?: string,
 	expectedPsmuxIncarnation?: string,
 ): string {
+	const safeNativeSessionId = safeNativeTmuxSessionId(nativeSessionId);
+	const safeSessionName = assertSafeGjcTmuxSessionName(sessionName);
 	const ownerGenerationPredicate = expectedOwnerGeneration
 		? `#{==:#{${GJC_TMUX_OWNER_GENERATION_OPTION}},${expectedOwnerGeneration}}`
 		: "1";
 	const serverPidPredicate = expectedServer.pidProven === false ? "1" : `#{==:#{pid},${expectedServer.pid}}`;
 	if (!expectedPsmuxIncarnation)
-		return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},${ownerGenerationPredicate}}}}`;
+		return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${safeNativeSessionId}},#{&&:#{==:#{session_name},${safeSessionName}},${ownerGenerationPredicate}}}}`;
 	const psmuxIncarnationPredicate = `#{==:#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}},${expectedPsmuxIncarnation}}`;
-	return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${nativeSessionId}},#{&&:#{==:#{session_name},${sessionName}},#{&&:${ownerGenerationPredicate},${psmuxIncarnationPredicate}}}}}`;
+	return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${safeNativeSessionId}},#{&&:#{==:#{session_name},${safeSessionName}},#{&&:${ownerGenerationPredicate},${psmuxIncarnationPredicate}}}}}`;
 }
 
 function runGuardedTmuxSessionCommand(
@@ -1189,12 +1214,13 @@ function tagCreatedTmuxSession(
 	tmuxCommand: string,
 	provisionalAuthority?: ProviderAuthority,
 ): void {
-	const target = `${nativeSessionId}:`;
+	const safeNativeSessionId = safeNativeTmuxSessionId(nativeSessionId);
+	const target = `${safeNativeSessionId}:`;
 	const commands = buildGjcTmuxProfileCommands(target, env, metadata, { tmuxCommand })
 		.map(command => command.args.map(tmuxCommandArgument).join(" "))
 		.join(" ; ");
 	runGuardedTmuxSessionCommand(
-		nativeSessionId,
+		safeNativeSessionId,
 		sessionName,
 		expectedServer,
 		env,
@@ -1278,6 +1304,7 @@ export function proveGjcTmuxSessionMutationTarget(
 	env: NodeJS.ProcessEnv = process.env,
 	provisionalAuthority?: ProviderAuthority,
 ): ProvenTmuxSessionIdentity {
+	assertSafeGjcTmuxSessionName(sessionName);
 	const target = provisionalAuthority ? sessionName : statusGjcTmuxSession(sessionName, env).name;
 	if (readProfileForExactTarget(target, env, provisionalAuthority) !== GJC_TMUX_PROFILE_VALUE)
 		throw new Error(`gjc_tmux_session_not_managed:${sessionName}`);
@@ -1474,6 +1501,7 @@ export function readTmuxSessionTagsForGc(
 	sessionName: string,
 	env: NodeJS.ProcessEnv = process.env,
 ): GjcTmuxSessionTagsForGc {
+	assertSafeGjcTmuxSessionName(sessionName);
 	const session = listGjcTmuxSessions(env).find(candidate => candidate.name === sessionName);
 	const sessionEnv = session ? (effectiveSessionEnvironments.get(session) ?? env) : env;
 	return {
@@ -1498,6 +1526,7 @@ export function removeGjcTmuxSession(
 	env: NodeJS.ProcessEnv = process.env,
 	expectedIdentity?: ExpectedGjcTmuxSessionIdentity,
 ): GjcTmuxSessionStatus {
+	assertSafeGjcTmuxSessionName(sessionName);
 	const session = statusGjcTmuxSession(sessionName, env);
 	assertMutationAuthority(session);
 	if (session.providerAuthority?.kind === "windows-psmux" && !session.psmuxIncarnation)
@@ -1588,42 +1617,15 @@ function signalManagedOwnerTerm(supervisor: Process, pid: number): boolean {
 async function readCurrentGeneration(stateDir: string, sessionId: string): Promise<string | null> {
 	try {
 		const file = path.join(stateDir, sessionId, "owner-lifecycle", "generation.json");
-		const before = await fs.lstat(file, { bigint: true });
-		if (!before.isFile()) return null;
-		const handle = await fs.open(
-			file,
-			fsSync.constants.O_RDONLY |
-				(process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK),
-		);
-		try {
-			const opened = await handle.stat({ bigint: true });
-			if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return null;
-			const value: unknown = JSON.parse(await handle.readFile("utf8"));
-			const after = await handle.stat({ bigint: true });
-			const pathAfter = await fs.lstat(file, { bigint: true });
-			if (
-				!after.isFile() ||
-				!pathAfter.isFile() ||
-				after.dev !== before.dev ||
-				after.ino !== before.ino ||
-				after.size !== before.size ||
-				after.mtimeNs !== before.mtimeNs ||
-				after.ctimeNs !== before.ctimeNs ||
-				pathAfter.dev !== before.dev ||
-				pathAfter.ino !== before.ino
-			)
-				return null;
-			if (
-				typeof value !== "object" ||
-				value === null ||
-				typeof (value as { generation?: unknown }).generation !== "string" ||
-				!isValidGenerationRecord(value, sessionId, (value as { generation: string }).generation)
-			)
-				return null;
-			return (value as { generation: string }).generation;
-		} finally {
-			await handle.close();
-		}
+		const value: unknown = await readNoFollowJson(file);
+		if (
+			typeof value !== "object" ||
+			value === null ||
+			typeof (value as { generation?: unknown }).generation !== "string" ||
+			!isValidGenerationRecord(value, sessionId, (value as { generation: string }).generation)
+		)
+			return null;
+		return (value as { generation: string }).generation;
 	} catch {
 		return null;
 	}
@@ -1809,6 +1811,7 @@ export async function forceCloseGjcTmuxSession(
 	expectedStateFile?: string,
 	deps: Partial<ForceCloseOwnerDependencies> = {},
 ): Promise<GjcTmuxSessionStatus> {
+	assertSafeGjcTmuxSessionName(sessionName);
 	if (deps.expectedManagedProof && verifyManagedGjcTmuxSession(deps.expectedManagedProof, env) !== "verified")
 		throw new Error(`gjc_tmux_owner_changed:${sessionName}`);
 	const session = statusGjcTmuxSession(sessionName, env);
@@ -1948,6 +1951,7 @@ export async function forceCloseGjcTmuxSession(
 }
 
 export function attachGjcTmuxSession(sessionName: string, env: NodeJS.ProcessEnv = process.env): never {
+	assertSafeGjcTmuxSessionName(sessionName);
 	const session = statusGjcTmuxSession(sessionName, env);
 	assertMutationAuthority(session);
 	const sessionEnv =
