@@ -2207,6 +2207,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 
 							const durationMs = job ? jobElapsedMs(job) : undefined;
+							if (
+								asyncJobManager!.isDeliverySuppressed(jobId, job?.generation) ||
+								session.isDisposed ||
+								session.isSessionTransitioning
+							) {
+								return;
+							}
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {
 								jobId,
 								generation: job?.generation ?? "",

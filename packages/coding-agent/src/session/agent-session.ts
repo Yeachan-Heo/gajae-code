@@ -5834,6 +5834,10 @@ export class AgentSession {
 		return this.#isDisposed;
 	}
 
+	get isSessionTransitioning(): boolean {
+		return this.#sessionTransitionKind !== undefined;
+	}
+
 	registerToolSessionCleanup(cleanup: () => Promise<void> | void): () => void {
 		if (this.#isDisposed) throw new Error("Cannot register tool cleanup after session disposal has started.");
 		this.#toolSessionCleanups.add(cleanup);
