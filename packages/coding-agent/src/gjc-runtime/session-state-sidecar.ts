@@ -922,7 +922,7 @@ export async function readTerminalRuntimeStateMarker(input: {
 		return { terminal: false, reason: "missing_state_file" };
 	let value: unknown;
 	try {
-		value = JSON.parse(await Bun.file(stateFile).text());
+		value = await readNoFollowJson(stateFile);
 	} catch (error) {
 		const code = (error as { code?: unknown }).code;
 		return {
