@@ -1,5 +1,6 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, test, vi } from "bun:test";
 import { crc32, decodeMessage } from "../src/providers/aws-eventstream";
+import { pollForToken } from "../src/utils/oauth/kiro";
 
 // ---- Frame builder (shared with aws-eventstream.test.ts) ----
 
@@ -263,6 +264,65 @@ describe("kiro OAuth — SSO OIDC flow", () => {
 					expires: Date.now() - 1000,
 				}),
 			).rejects.toThrow();
+		}
+	});
+
+	test("pollForToken keeps polling through HTTP 400 authorization_pending", async () => {
+		const fetchMock = mock(() =>
+			Promise.resolve(mockResponse({ error: "authorization_pending", error_description: "pending" }, 400)),
+		);
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(fetchMock as unknown as typeof globalThis.fetch);
+
+		try {
+			fetchMock.mockImplementationOnce(() =>
+				Promise.resolve(mockResponse({ error: "authorization_pending", error_description: "pending" }, 400)),
+			);
+			fetchMock.mockImplementationOnce(() =>
+				Promise.resolve(
+					mockResponse({
+						accessToken: "device-access-token",
+						refreshToken: "device-refresh-token",
+						tokenType: "Bearer",
+						expiresIn: 3600,
+					}),
+				),
+			);
+
+			const token = await pollForToken(
+				"us-east-1",
+				{ clientId: "test-client-id", clientSecret: "test-client-secret", expiresAt: Date.now() + 86_400_000 },
+				"device-code",
+				1,
+				10,
+			);
+
+			expect(token.accessToken).toBe("device-access-token");
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
+	test("pollForToken fails closed on an HTTP error without an OIDC error payload", async () => {
+		const fetchMock = mock(() => Promise.resolve(mockResponse({ message: "Internal Server Error" }, 500)));
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(fetchMock as unknown as typeof globalThis.fetch);
+
+		try {
+			await expect(
+				pollForToken(
+					"us-east-1",
+					{ clientId: "test-client-id", clientSecret: "test-client-secret", expiresAt: Date.now() + 86_400_000 },
+					"device-code",
+					1,
+					10,
+				),
+			).rejects.toThrow(/failed: 500/);
+		} finally {
+			fetchSpy.mockRestore();
 		}
 	});
 });
