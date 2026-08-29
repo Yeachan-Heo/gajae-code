@@ -1835,11 +1835,7 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 		}
 		const dispatchId = observation.operator_dispatch_id;
 		if (dispatchId !== undefined) {
-			if (intent && intent.dispatch_id !== dispatchId) {
-				// A mismatched dispatch is terminal evidence of an unexpected owner loss,
-				// not authority to consume the current intent.
-				observation = { ...observation, operator_dispatch_id: undefined, operator_intent_id: undefined };
-			}
+			if (intent && intent.dispatch_id !== dispatchId) throw new Error("stale_terminal_observation");
 			if (
 				intent &&
 				observation.operator_intent_id === undefined &&
