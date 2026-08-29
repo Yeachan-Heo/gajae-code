@@ -263,7 +263,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	childExited = true;
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
-	const terminalObservedAt = relayedAt as string | null;
+	const terminalObservedAt = new Date().toISOString();
 	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
 		await observeOwnerTerminal({
 			schema_version: 1,
