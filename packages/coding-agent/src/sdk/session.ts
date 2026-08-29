@@ -2707,6 +2707,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const rescopeSessionCwdParticipant: AgentSessionRescopeParticipant | undefined = canAgentRescopeSessionCwd
 			? {
 					assertCanRescope: () => {
+						if (options.modelRegistry !== undefined) {
+							throw new Error(
+								"Cannot rescope a session with caller-owned model registry; recreate the session at the target cwd.",
+							);
+						}
 						if (options.mcpManager && !ownsMcpManager) {
 							throw new Error(
 								"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
