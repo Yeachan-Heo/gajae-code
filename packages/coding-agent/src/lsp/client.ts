@@ -43,7 +43,7 @@ async function withFileOperationLock<T>(
 	const current = (async () => {
 		// The shared tail is failure-absorbing: a cancelled or failed operation
 		// must not poison work queued behind it.
-		if (previous) await previous;
+		if (previous) await previous.catch(() => undefined);
 		return operation();
 	})();
 	const tail = current.then(
