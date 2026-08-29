@@ -9655,16 +9655,18 @@ mod platform {
 			} else {
 				0
 			};
-		let create_access = access | FILE_ADD_SUBDIRECTORY;
-		let handle = open_relative_with_disposition_status(
-			parent,
-			name,
-			create_access,
-			true,
-			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-			FILE_OPEN_IF,
-		)
-		.map_err(ntstatus_code)?;
+		let handle = match open_relative(parent, name, access, true) {
+			Ok(handle) => handle,
+			Err(_) => open_relative_with_disposition_status(
+				parent,
+				name,
+				access | FILE_ADD_SUBDIRECTORY,
+				true,
+				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+				FILE_OPEN_IF,
+			)
+			.map_err(ntstatus_code)?,
+		};
 		let attributes = match handle_attributes(handle) {
 			Ok(attributes) => attributes,
 			Err(code) => {
@@ -9704,8 +9706,7 @@ mod platform {
 		path: &Path,
 	) -> Result<(HeldExact, String, Vec<OsString>), &'static str> {
 		let (root, names) = absolute_components(path)?;
-		let root_handle =
-			open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_ADD_SUBDIRECTORY)?;
+		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)?;
 		let root_attributes = match handle_attributes(root_handle) {
 			Ok(attributes) => attributes,
 			Err(code) => {
