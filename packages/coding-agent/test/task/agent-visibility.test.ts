@@ -202,9 +202,12 @@ describe("task agent visibility", () => {
 		try {
 			const settings = Settings.isolated({}, { agentDir: settingsProfile });
 			const result = await discoverAgents(project, home, settings, resolverDefault);
+			const settingsResult = await discoverAgents(project, home, settings);
 
 			expect(result.agents.map(agent => agent.name)).toContain("resolver-plugin-agent");
 			expect(result.agents.map(agent => agent.name)).not.toContain("settings-plugin-agent");
+			expect(settingsResult.agents.map(agent => agent.name)).toContain("settings-plugin-agent");
+			expect(settingsResult.agents.map(agent => agent.name)).not.toContain("resolver-plugin-agent");
 		} finally {
 			setAgentDir(previousAgentDir);
 		}

@@ -951,6 +951,8 @@ export interface AgentSessionConfig {
 	reloadSshTool?: () => Promise<AgentTool | null>;
 	/** Host participation for the session-owned cwd relocation transaction. */
 	rescopeSessionCwdParticipant?: AgentSessionRescopeParticipant;
+	/** Notify the host when a committed fork replaces the session manager. */
+	onSessionManagerReplaced?: (previous: SessionManager, next: SessionManager) => void;
 	requestedToolNames?: ReadonlySet<string>;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
@@ -3057,6 +3059,7 @@ export class AgentSession {
 	readonly #disposeAsyncJobManager: boolean;
 	#ownedMcpManager: MCPManager | undefined;
 	readonly #rescopeSessionCwdParticipant: AgentSessionRescopeParticipant | undefined;
+	readonly #onSessionManagerReplaced: ((previous: SessionManager, next: SessionManager) => void) | undefined;
 	#rescopeSessionCwdConsumed = false;
 	#startupTurnBarrier: Promise<void> | undefined;
 	#startupTurnBarrierPending = false;
@@ -4511,6 +4514,7 @@ export class AgentSession {
 			this.extendStartupTurnBarrier(recoverCoordinatorRuntimeStateRescope(rescopeRecoveryContext));
 		}
 		this.#rescopeSessionCwdParticipant = config.rescopeSessionCwdParticipant;
+		this.#onSessionManagerReplaced = config.onSessionManagerReplaced;
 		this.#scopedModels = config.scopedModels ?? [];
 		this.#thinkingLevel = config.thinkingLevel;
 		this.#promptTemplates = config.promptTemplates ?? [];
@@ -12085,6 +12089,10 @@ export class AgentSession {
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		// Extension commands execute immediately and may mutate session state. They
+		// must observe the same identity-transition fence as ordinary prompt
+		// admission, before any command handler can reach predecessor state.
+		this.#assertNoSessionTransitionAdmission();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		if (
@@ -15990,6 +15998,10 @@ export class AgentSession {
 					throw error;
 				}
 				this.sessionManager = forkedManager;
+				// Publish the replacement before closing the predecessor. Hosts may hold
+				// manager-scoped authority (including process cwd ownership) outside this
+				// class; updating it here keeps the handoff atomic with manager adoption.
+				this.#onSessionManagerReplaced?.(previousManager, forkedManager);
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 				endpointReservation?.finalize();
 				this.#quarantineQueuedAsyncResults();

@@ -2,14 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
-import {
-	getAgentDir,
-	getAgentProfileAuthority,
-	isRecord,
-	logger,
-	normalizePathForComparison,
-	pathIsWithin,
-} from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, isRecord, logger, pathIsWithin } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { getConfigDirPaths } from "../config";
 import { type ClaudePluginRoot, getPreloadedPluginRoots } from "../discovery/helpers";
@@ -454,16 +447,14 @@ function pluginCanOverrideProcess(root: ClaudePluginRoot, cwd: string): boolean 
 function getConfigSources(cwd: string, agentDir?: string): ConfigSource[] {
 	const filenames = ["lsp.json", ".lsp.json", "lsp.yaml", ".lsp.yaml", "lsp.yml", ".lsp.yml"];
 	const sources: ConfigSource[] = [];
-	const profileAuthority = getAgentProfileAuthority();
-	const selectedAgentDir = agentDir;
-	// Resolver authority is sticky across HOME refreshes. An explicit directory
-	// is custom only when it differs from the resolver's current default; a
-	// resolver-owned custom profile remains scoped even when its path later
-	// coincides with a newly derived default.
-	const isScopedProfile =
-		agentDir !== undefined &&
-		(profileAuthority === "custom" ||
-			normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir()));
+	const resolverAuthority = getAgentProfileAuthority();
+	const selectedAgentDir = agentDir ?? (resolverAuthority === "custom" ? getAgentDir() : undefined);
+	const profileAuthority =
+		resolverAuthority === "custom" ||
+		(agentDir !== undefined && path.resolve(agentDir) !== path.resolve(getAgentDir()))
+			? "custom"
+			: "default";
+	const isScopedProfile = profileAuthority === "custom";
 
 	// Project root files (highest priority)
 	for (const filename of filenames) {
@@ -491,7 +482,7 @@ function getConfigSources(cwd: string, agentDir?: string): ConfigSource[] {
 	}
 
 	// Plugin LSP configs
-	const pluginRoots = getPreloadedPluginRoots().filter(root => {
+	const pluginRoots = getPreloadedPluginRoots(cwd, selectedAgentDir, profileAuthority).filter(root => {
 		if (!isScopedProfile) return true;
 		// Preloaded roots are process-global. Keep project roots and roots owned by
 		// the selected profile, but never let another profile's ambient plugins

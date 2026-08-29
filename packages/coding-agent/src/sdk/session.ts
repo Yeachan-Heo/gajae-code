@@ -1443,6 +1443,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let sessionManager!: SessionManager;
 	let hasSession = false;
 	let processCwdClaimed = false;
+	// Keep SDK-owned manager references aligned when AgentSession adopts a cold
+	// fork successor. The callback runs synchronously before the predecessor is
+	// closed so process-cwd ownership can move without an unowned window.
+	const onSessionManagerReplaced = (previous: SessionManager, next: SessionManager): void => {
+		if (processCwdClaimed) {
+			processCwdClaimed = SessionManager.transferProcessCwdOwnership(previous, next);
+		}
+		sessionManager = next;
+	};
 	let hasRegistered = false;
 	let registeredAgentRef: AgentRef | undefined;
 	let asyncJobManager: AsyncJobManager | undefined;
@@ -4860,6 +4869,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			},
 			reloadSshTool,
 			rescopeSessionCwdParticipant,
+			onSessionManagerReplaced,
 			requestedToolNames: requestedToolNameSet,
 			explicitEmptyToolSelection: hasExplicitEmptyToolSelection,
 			discoverableToolAllowedNames: options.discoverableToolAllowedNames,

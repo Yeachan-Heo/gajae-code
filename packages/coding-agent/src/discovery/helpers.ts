@@ -18,6 +18,7 @@ import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../ca
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
+import { getProfilePluginsDir } from "../extensibility/plugins/marketplace/registry";
 import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
 
@@ -913,7 +914,11 @@ export async function listClaudePluginRoots(
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	const userPluginsDir =
-		profileAuthority === "custom" && userAgentDir ? path.join(userAgentDir, "plugins") : getPluginsDir(home);
+		profileAuthority === "custom" && userAgentDir
+			? path.join(userAgentDir, "plugins")
+			: home === getTrustedHomeDir()
+				? getProfilePluginsDir()
+				: getPluginsDir(home);
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {
@@ -1011,10 +1016,16 @@ export async function listClaudePluginRoots(
  */
 export function clearClaudePluginRootsCache(): void {
 	pluginRootsCache.clear();
+	preloadedPluginRootsByProfile.clear();
 	preloadedPluginRoots = [];
 	// Re-warm preloaded roots asynchronously so sync LSP config reads stay valid
 	if (lastPreloadHome) {
-		void preloadPluginRoots(lastPreloadHome, getProjectDir());
+		void preloadPluginRoots(
+			lastPreloadHome,
+			lastPreloadCwd ?? getProjectDir(),
+			lastPreloadAgentDir,
+			lastPreloadAuthority,
+		);
 	}
 }
 
@@ -1034,16 +1045,33 @@ export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void 
 // getPreloadedPluginRoots(). Safe degradation: empty array if not warmed.
 
 let preloadedPluginRoots: ClaudePluginRoot[] = [];
+const preloadedPluginRootsByProfile = new Map<string, ClaudePluginRoot[]>();
 let lastPreloadHome: string | undefined;
+let lastPreloadCwd: string | undefined;
+let lastPreloadAgentDir: string | undefined;
+let lastPreloadAuthority: "default" | "custom" = "default";
+
+function preloadedRootsKey(cwd: string | undefined, userAgentDir: string | undefined, authority: "default" | "custom") {
+	return JSON.stringify([cwd ? path.resolve(cwd) : "", userAgentDir ? path.resolve(userAgentDir) : "", authority]);
+}
 
 /**
  * Populate the module-level plugin roots cache for sync consumers.
  * Call during session initialization, after dir resolution completes
  * but before any LSP config is read.
  */
-export async function preloadPluginRoots(home: string, cwd?: string): Promise<void> {
+export async function preloadPluginRoots(
+	home: string,
+	cwd?: string,
+	userAgentDir?: string,
+	profileAuthority: "default" | "custom" = "default",
+): Promise<void> {
 	lastPreloadHome = home;
-	const { roots } = await listClaudePluginRoots(home, cwd);
+	lastPreloadCwd = cwd;
+	lastPreloadAgentDir = userAgentDir;
+	lastPreloadAuthority = profileAuthority;
+	const { roots } = await listClaudePluginRoots(home, cwd, userAgentDir, profileAuthority);
+	preloadedPluginRootsByProfile.set(preloadedRootsKey(cwd, userAgentDir, profileAuthority), roots);
 	preloadedPluginRoots = roots;
 }
 
@@ -1051,6 +1079,17 @@ export async function preloadPluginRoots(home: string, cwd?: string): Promise<vo
  * Get pre-loaded plugin roots synchronously.
  * Returns empty array if preloadPluginRoots() hasn't been called.
  */
-export function getPreloadedPluginRoots(): readonly ClaudePluginRoot[] {
+export function getPreloadedPluginRoots(
+	cwd?: string,
+	userAgentDir?: string,
+	profileAuthority: "default" | "custom" = "default",
+): readonly ClaudePluginRoot[] {
+	if (cwd !== undefined || userAgentDir !== undefined || profileAuthority !== "default") {
+		return (
+			preloadedPluginRootsByProfile.get(preloadedRootsKey(cwd, userAgentDir, profileAuthority)) ??
+			preloadedPluginRootsByProfile.get(preloadedRootsKey(undefined, userAgentDir, profileAuthority)) ??
+			[]
+		);
+	}
 	return preloadedPluginRoots;
 }

@@ -11057,6 +11057,20 @@ export class SessionManager {
 		return SessionManager.#processCwdOwner?.deref() === manager;
 	}
 
+	/**
+	 * Transfer process-cwd authority when a session replaces its manager during
+	 * a committed identity transition (currently the cold-retired fork path).
+	 * The ownership slot is updated in one synchronous operation so closing the
+	 * predecessor cannot briefly release the claim for a sibling to acquire.
+	 */
+	static transferProcessCwdOwnership(previous: SessionManager, next: SessionManager): boolean {
+		const current = SessionManager.#processCwdOwner?.deref();
+		if (current === next) return true;
+		if (current !== previous) return false;
+		SessionManager.#processCwdOwner = new WeakRef(next);
+		return true;
+	}
+
 	static releaseProcessCwdOwnership(manager: SessionManager): void {
 		if (SessionManager.#processCwdOwner?.deref() === manager) SessionManager.#processCwdOwner = undefined;
 	}

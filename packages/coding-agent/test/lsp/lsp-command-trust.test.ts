@@ -223,6 +223,118 @@ describe("LSP repository command trust", () => {
 		}
 	});
 
+	it("preloads plugin LSP configuration from the selected custom agent profile", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-profile-plugin-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const profile = path.join("/var/tmp", `.gjc-lsp-profile-plugin-${process.pid}-${Date.now()}`);
+		const pluginRoot = path.join(profile, "plugins", "profile-plugin");
+		const forgetProfileRoot = registerOwnedDeletionRoot(profile);
+		const originalAgentDir = getAgentDir();
+		const originalAgentDirEnv = process.env.GJC_CODING_AGENT_DIR;
+		try {
+			await Promise.all([
+				fs.promises.mkdir(cwd, { recursive: true }),
+				fs.promises.mkdir(pluginRoot, { recursive: true }),
+			]);
+			await Bun.write(
+				path.join(pluginRoot, "lsp.json"),
+				JSON.stringify({
+					servers: {
+						"profile-plugin-server": {
+							command: process.execPath,
+							fileTypes: [".profile-plugin"],
+							rootMarkers: ["."],
+						},
+					},
+				}),
+			);
+			await Bun.write(
+				path.join(profile, "plugins", "installed_plugins.json"),
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						"profile-plugin@local": [
+							{
+								scope: "user",
+								installPath: pluginRoot,
+								version: "1.0.0",
+							},
+						],
+					},
+				}),
+			);
+
+			setAgentDir(profile);
+			await discoveryHelpers.preloadPluginRoots(os.homedir(), cwd, profile, "custom");
+			const config = loadConfig(cwd);
+			expect(config.servers["profile-plugin-server"]?.command).toBe(process.execPath);
+		} finally {
+			setAgentDir(originalAgentDir);
+			if (originalAgentDirEnv === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalAgentDirEnv;
+			discoveryHelpers.clearClaudePluginRootsCache();
+			await safeRm(profile, { recursive: true, force: true });
+			forgetProfileRoot();
+		}
+	});
+
+	it("keeps no-argument LSP config scoped to a custom setAgentDir profile", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-no-arg-profile-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const profile = path.join("/var/tmp", `.gjc-lsp-no-arg-profile-${process.pid}-${Date.now()}`);
+		const ambientHome = path.join("/var/tmp", `.gjc-lsp-no-arg-home-${process.pid}-${Date.now()}`);
+		const forgetProfileRoot = registerOwnedDeletionRoot(profile);
+		const forgetAmbientRoot = registerOwnedDeletionRoot(ambientHome);
+		const originalAgentDir = getAgentDir();
+		const originalAgentDirEnv = process.env.GJC_CODING_AGENT_DIR;
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(ambientHome);
+		try {
+			await fs.promises.mkdir(cwd, { recursive: true });
+			await fs.promises.mkdir(profile, { recursive: true });
+			await fs.promises.mkdir(ambientHome, { recursive: true });
+			await Promise.all([
+				Bun.write(
+					path.join(profile, "lsp.json"),
+					JSON.stringify({
+						servers: {
+							"custom-profile-server": {
+								command: process.execPath,
+								fileTypes: [".custom-profile"],
+								rootMarkers: ["."],
+							},
+						},
+					}),
+				),
+				Bun.write(
+					path.join(ambientHome, "lsp.json"),
+					JSON.stringify({
+						servers: {
+							"ambient-home-server": {
+								command: process.execPath,
+								fileTypes: [".ambient-home"],
+								rootMarkers: ["."],
+							},
+						},
+					}),
+				),
+			]);
+
+			setAgentDir(profile);
+			const config = loadConfig(cwd);
+			expect(config.servers["custom-profile-server"]?.command).toBe(process.execPath);
+			expect(config.servers["ambient-home-server"]).toBeUndefined();
+		} finally {
+			homeSpy.mockRestore();
+			setAgentDir(originalAgentDir);
+			if (originalAgentDirEnv === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalAgentDirEnv;
+			await safeRm(profile, { recursive: true, force: true });
+			await safeRm(ambientHome, { recursive: true, force: true });
+			forgetProfileRoot();
+			forgetAmbientRoot();
+		}
+	});
+
 	it("keeps a custom profile scoped when HOME refresh makes its path canonical", async () => {
 		using tempDir = TempDir.createSync("@gjc-lsp-sticky-profile-");
 		const cwd = path.join(tempDir.path(), "workspace");
@@ -675,10 +787,13 @@ describe("LSP repository command trust", () => {
 		const forgetGrant = registerOwnedDeletionRoot(userConfigDir);
 		const userAgentDir = path.join(userConfigDir, "agent");
 		const trustedServer = path.join(userConfigDir, "typescript-language-server");
+		const originalAgentDir = getAgentDir();
+		const originalAgentDirEnv = process.env.GJC_CODING_AGENT_DIR;
 		fs.mkdirSync(userAgentDir, { recursive: true });
 		fs.writeFileSync(trustedServer, "#!/bin/sh\nexit 0\n");
 		fs.chmodSync(trustedServer, 0o755);
 		process.env.GJC_CONFIG_DIR = configDirName;
+		setAgentDir(userAgentDir);
 		await Bun.write(
 			path.join(userAgentDir, "lsp.json"),
 			JSON.stringify({
@@ -720,6 +835,9 @@ describe("LSP repository command trust", () => {
 		} finally {
 			safeRmSync(userConfigDir, { recursive: true, force: true });
 			forgetGrant();
+			setAgentDir(originalAgentDir);
+			if (originalAgentDirEnv === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalAgentDirEnv;
 		}
 	});
 });

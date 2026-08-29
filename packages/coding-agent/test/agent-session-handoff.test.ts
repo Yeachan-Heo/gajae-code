@@ -12,6 +12,7 @@ import { asyncJobEndpointId } from "@gajae-code/coding-agent/async/support";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
+import type { Extension } from "@gajae-code/coding-agent/extensibility/extensions/types";
 import * as internalUrls from "@gajae-code/coding-agent/internal-urls";
 import { AgentSession, type AgentSessionEvent } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
@@ -1064,6 +1065,68 @@ describe("AgentSession handoff", () => {
 		await expect(session.steer("steer during fork")).rejects.toThrow(/session transition is in progress/i);
 		await expect(session.followUp("follow-up during fork")).rejects.toThrow(/session transition is in progress/i);
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		prepareGate.resolve();
+		await expect(transition).resolves.toBe(true);
+	});
+
+	it("fences extension commands before a session transition can reach the predecessor", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected model to be set");
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const commandRan = vi.fn();
+		const probeExtension = {
+			path: "probe-extension",
+			resolvedPath: "probe-extension",
+			handlers: new Map(),
+			tools: new Map(),
+			messageRenderers: new Map(),
+			commands: new Map([
+				[
+					"probe",
+					{
+						name: "probe",
+						handler: async () => {
+							commandRan();
+						},
+					},
+				],
+			]),
+			flags: new Map(),
+			shortcuts: new Map(),
+		} as unknown as Extension;
+		const extensionRunner = new ExtensionRunner(
+			[probeExtension],
+			{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				appendOnlyContext: createAppendOnlyContextManager(model.provider),
+			}),
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			extensionRunner,
+		});
+
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const originalPrepare = sessionManager.prepareNewSession.bind(sessionManager);
+		vi.spyOn(sessionManager, "prepareNewSession").mockImplementation(async options => {
+			prepareStarted.resolve();
+			await prepareGate.promise;
+			return originalPrepare(options);
+		});
+
+		const transition = session.newSession();
+		await prepareStarted.promise;
+		await expect(session.prompt("/probe")).rejects.toMatchObject({ code: "busy" });
+		expect(commandRan).not.toHaveBeenCalled();
 
 		prepareGate.resolve();
 		await expect(transition).resolves.toBe(true);

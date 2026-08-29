@@ -77,13 +77,15 @@ export async function discoverAgents(
 		activeSettings?.getAgentDir() ??
 		(getAgentProfileAuthority() === "custom" ? getAgentDir() : undefined);
 	const resolverAuthority = getAgentProfileAuthority();
+	const selectedAgentDir = agentDir ?? activeSettings?.getAgentDir();
 	// Resolver authority is sticky across HOME refreshes. An explicit directory
 	// is custom only when it differs from the resolver's current default; a
 	// resolver-owned custom profile remains custom even when its path later
 	// coincides with a newly derived default.
 	const profileAuthority =
 		resolverAuthority === "custom" ||
-		(agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir()))
+		(selectedAgentDir !== undefined &&
+			normalizePathForComparison(selectedAgentDir) !== normalizePathForComparison(getAgentDir()))
 			? "custom"
 			: resolverAuthority;
 	const agentSources = Array.from(
