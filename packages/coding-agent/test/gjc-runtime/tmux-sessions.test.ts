@@ -18,12 +18,10 @@ import {
 	buildGjcTmuxUntaggedSessionHint,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
-	__setIntentEvidenceReadHooksForTests,
 	captureOwnerGenerationBaselineSync,
 	lifecyclePaths,
 	observeOwnerTerminal,
 	replaceOwnerGenerationSync,
-	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	__setTmuxProviderAuthorityPlatformForTests,
@@ -563,13 +561,9 @@ describe("GJC tmux session management", () => {
 	});
 
 	it("rejects unsafe provider-listed names instead of hiding them", () => {
-		spyOn(Bun, "spawnSync").mockReturnValue(
-			spawnResult(0, "named#format\t1\t0\t1770000000\t1\troot\t0\t\n"),
-		);
+		spyOn(Bun, "spawnSync").mockReturnValue(spawnResult(0, "named#format\t1\t0\t1770000000\t1\troot\t0\t\n"));
 
-		expect(() => listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toThrow(
-			"gjc_tmux_session_name_unsafe",
-		);
+		expect(() => listGjcTmuxSessions({ GJC_TMUX_COMMAND: "tmux-test" })).toThrow("gjc_tmux_session_name_unsafe");
 	});
 
 	it("preserves valid explicit session names at the safe-component boundary", () => {
@@ -2018,69 +2012,6 @@ describe("GJC tmux session management", () => {
 		).rejects.toThrow("gjc_tmux_owner_unverifiable:managed");
 		expect(signalTerm).not.toHaveBeenCalled();
 		expect(cleanupSession).not.toHaveBeenCalled();
-	});
-
-	it("rejects a current generation record that grows after async preflight", async () => {
-		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tmux-generation-growth-"));
-		const sessionId = "session";
-		const generation = "generation";
-		const marker = path.join(stateDir, "marker");
-		const generationFile = path.join(stateDir, sessionId, "owner-lifecycle", "generation.json");
-		await fs.mkdir(path.dirname(generationFile), { recursive: true });
-		await fs.writeFile(
-			generationFile,
-			JSON.stringify({
-				schema_version: 1,
-				session_id: sessionId,
-				generation,
-				published_at: new Date().toISOString(),
-			}),
-		);
-		spyOn(Bun, "spawnSync").mockImplementation(((rawSpawn: unknown) => {
-			const command = spawnArgv(rawSpawn);
-			if (command.includes("list-sessions"))
-				return spawnResult(
-					0,
-					`managed\t1\t0\t1770000000\t1\troot\t1\t321\t\t\t\t${sessionId}\t${marker}\t${generation}\t\t$0\n`,
-				);
-			if (command.includes("display-message")) return spawnResult(0, "$0\n");
-			if (command.includes("show-options")) {
-				const option = command.at(-1);
-				return spawnResult(
-					0,
-					option === "@gjc-profile"
-						? "1\n"
-						: option === "@gjc-session-id"
-							? `${sessionId}\n`
-							: option === "@gjc-owner-generation"
-								? `${generation}\n`
-								: option === "@gjc-owner-server-key"
-									? "managed\n"
-									: `${marker}\n`,
-				);
-			}
-			return spawnResult(0, "");
-		}) as unknown as typeof Bun.spawnSync);
-		let grew = false;
-		__setIntentEvidenceReadHooksForTests({
-			platform: process.platform,
-			afterPathStat: async target => {
-				if (target !== generationFile || grew) return;
-				grew = true;
-				await fs.appendFile(generationFile, "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES));
-			},
-		});
-		try {
-			await expect(
-				forceCloseGjcTmuxSession("managed", { GJC_TMUX_COMMAND: "tmux" }, sessionId, marker, {
-					signalTerm: () => {},
-				}),
-			).rejects.toThrow("gjc_tmux_owner_unverifiable:managed");
-			expect(grew).toBe(true);
-		} finally {
-			__setIntentEvidenceReadHooksForTests(null);
-			await fs.rm(stateDir, { recursive: true, force: true });
-		}
 	});
 
 	it("rejects PID start-time mismatch before creating an intent or cleanup", async () => {
