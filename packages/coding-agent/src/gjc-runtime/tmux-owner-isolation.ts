@@ -1835,6 +1835,7 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 		}
 		const dispatchId = observation.operator_dispatch_id;
 		if (dispatchId !== undefined) {
+			if (intent && intent.server_key !== observation.socket_key) throw new Error("stale_terminal_observation");
 			if (intent && intent.dispatch_id !== dispatchId) throw new Error("stale_terminal_observation");
 			if (
 				intent &&
