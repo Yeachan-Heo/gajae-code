@@ -1402,7 +1402,7 @@ async function intentMarkerExists(file: string): Promise<boolean> {
 async function readNoFollowJson(file: string): Promise<unknown | null> {
 	const platform = intentEvidenceReadTestHooks?.platform ?? process.platform;
 	const noFollow = platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK;
-	let pathBefore;
+	let pathBefore: fsSync.BigIntStats;
 	try {
 		pathBefore = await fs.lstat(file, { bigint: true });
 	} catch (error) {
