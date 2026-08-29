@@ -1560,12 +1560,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
 						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage && !sawTurnEnded) continue;
 						if (terminalDrainMode) {
-							if (isExecServerMessage) continue;
-							applyBufferedNonExecMessage(serverMessage);
+							if (terminalBoundarySeen || isExecServerMessage) continue;
 							if (isTurnEnded) {
 								sawTurnEnded = true;
+								terminalBoundarySeen = true;
 								closeTerminalAdmission();
+								continue;
 							}
+							applyBufferedNonExecMessage(serverMessage);
 							continue;
 						}
 						const isExecutable = isExecServerMessage && isMeaningful;
