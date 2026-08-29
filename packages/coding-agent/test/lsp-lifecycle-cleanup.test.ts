@@ -68,7 +68,8 @@ describe("LSP lifecycle cleanup", () => {
 			});
 			await writethrough(filePath, "export const value = 1;\n");
 
-			expect(getClientSpy).toHaveBeenCalledWith(TEST_SERVER, tempDir.path());
+			expect(getClientSpy).toHaveBeenCalledTimes(1);
+			expect(getClientSpy).toHaveBeenCalledWith(TEST_SERVER, tempDir.path(), undefined, undefined);
 			expect(await Bun.file(filePath).text()).toBe("export const value = 1;\n");
 		} finally {
 			tempDir.removeSync();

@@ -1526,7 +1526,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let liveSessionManager: SessionManager | undefined;
 		const getLiveCwd = (): string => liveSessionManager?.getCwd() ?? cwd;
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd: getLiveCwd });
-		modelRegistry.setScopedSettings(settings);
+		modelRegistry.setScopedSettings(settings, { reload: options.modelRegistry === undefined });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		const startupModelReference =
@@ -5156,6 +5156,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							}
 						}
 						deferredMcpTurnReady?.resolve();
+						if (!cancelled && !session.isDisposed) void session.yieldQueue.flush("idle");
 						const hasErrors = result.errors.size > 0 || result.tools.length === 0;
 						if (hasErrors) logger.warn(DEFERRED_MCP_CONFIG_STARTUP_ERROR);
 						return { loadedToolCount: cancelled || session.isDisposed ? 0 : resultTools.length, hasErrors };

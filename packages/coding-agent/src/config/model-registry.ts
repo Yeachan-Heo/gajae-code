@@ -1824,9 +1824,10 @@ export class ModelRegistry {
 	}
 
 	/** Replace the read-only settings snapshot used by profile-scoped resolution. */
-	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">): void {
+	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">, options: { reload?: boolean } = {}): void {
 		this.#catalogRefreshGeneration++;
 		this.#settings = settingsReader;
+		if (options.reload === false) return;
 		this.#staticModelsLoaded = false;
 		this.#reloadStaticModels();
 		this.#rebuildCanonicalIndex();

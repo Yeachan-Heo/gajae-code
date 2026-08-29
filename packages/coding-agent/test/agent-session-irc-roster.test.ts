@@ -57,7 +57,11 @@ function createHarness(
 		agent,
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false, "retry.enabled": options.retryEnabled ?? true }),
-		modelRegistry: { getApiKey: options.getApiKey ?? (async () => "test-key"), getAvailable: () => [model] } as never,
+		modelRegistry: {
+			getApiKey: options.getApiKey ?? (async () => "test-key"),
+			getAvailable: () => [model],
+			getAuthStorageOwner: () => ({}),
+		} as never,
 		agentId: "0-Main",
 		agentRegistry: registry,
 		convertToLlm: async messages => {

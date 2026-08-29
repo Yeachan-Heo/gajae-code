@@ -61,7 +61,7 @@ describe("AgentSession transcript persistence", () => {
 			agent,
 			sessionManager,
 			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry: { getApiKey: async () => "test-key" } as never,
+			modelRegistry: { getApiKey: async () => "test-key", getAuthStorageOwner: () => ({}) } as never,
 		});
 
 		const prompt = session.prompt("persist this turn");

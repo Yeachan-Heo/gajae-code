@@ -71,7 +71,8 @@ describe("InteractiveMode LSP startup events", () => {
 				parentTaskPrefix: "test",
 			});
 
-			expect(discoverSpy).toHaveBeenCalledWith(tempDir.path());
+			expect(discoverSpy).toHaveBeenCalledTimes(1);
+			expect(discoverSpy).toHaveBeenCalledWith(tempDir.path(), tempDir.path());
 			expect(lspServers).toEqual([{ name: "rust-analyzer", status: "idle", fileTypes: [".rs"] }]);
 			expect(warmupSpy).not.toHaveBeenCalled();
 

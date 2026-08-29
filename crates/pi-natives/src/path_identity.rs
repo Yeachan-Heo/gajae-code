@@ -10068,7 +10068,9 @@ mod platform {
 			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
 		{
 			let code = match error {
-				SkillPublicationError::Pre(code) => cleanup_private_skill_file(file).err().unwrap_or(code),
+				SkillPublicationError::Pre(code) => {
+					cleanup_private_skill_file(file).err().unwrap_or(code)
+				},
 				SkillPublicationError::Published(code) => code,
 			};
 			unsafe { CloseHandle(file) };

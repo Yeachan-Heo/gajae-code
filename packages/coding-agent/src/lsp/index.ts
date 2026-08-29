@@ -192,6 +192,7 @@ async function syncFileContent(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 	agentDir?: string,
+	clientCache?: LspClientAdmissionCache,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -200,7 +201,9 @@ async function syncFileContent(
 			if (serverConfig.createClient) {
 				return;
 			}
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+			const client = await (clientCache
+				? getCachedLspClient(serverConfig, cwd, agentDir, clientCache)
+				: getOrCreateClient(serverConfig, cwd, undefined, agentDir));
 			throwIfAborted(signal);
 			await syncContent(client, absolutePath, content, signal);
 		}),
@@ -221,6 +224,7 @@ async function notifyFileSaved(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 	agentDir?: string,
+	clientCache?: LspClientAdmissionCache,
 ): Promise<void> {
 	throwIfAborted(signal);
 	await Promise.allSettled(
@@ -229,7 +233,9 @@ async function notifyFileSaved(
 			if (serverConfig.createClient) {
 				return;
 			}
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+			const client = await (clientCache
+				? getCachedLspClient(serverConfig, cwd, agentDir, clientCache)
+				: getOrCreateClient(serverConfig, cwd, undefined, agentDir));
 			await notifySaved(client, absolutePath, signal);
 		}),
 	);
@@ -498,6 +504,20 @@ export interface FileDiagnosticsResult {
 }
 
 type ServerVersionMap = Map<string, number>;
+type LspClientAdmissionCache = Map<ServerConfig, Promise<LspClient>>;
+
+function getCachedLspClient(
+	serverConfig: ServerConfig,
+	cwd: string,
+	agentDir: string | undefined,
+	cache: LspClientAdmissionCache,
+): Promise<LspClient> {
+	const existing = cache.get(serverConfig);
+	if (existing) return existing;
+	const admission = getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+	cache.set(serverConfig, admission);
+	return admission;
+}
 
 interface GetDiagnosticsForFileOptions {
 	signal?: AbortSignal;
@@ -520,12 +540,15 @@ async function captureDiagnosticVersions(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	agentDir?: string,
+	clientCache?: LspClientAdmissionCache,
 ): Promise<ServerVersionMap> {
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
 			if (serverConfig.createClient) return;
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+			const client = await (clientCache
+				? getCachedLspClient(serverConfig, cwd, agentDir, clientCache)
+				: getOrCreateClient(serverConfig, cwd, undefined, agentDir));
 			versions.set(serverName, client.diagnosticsVersion);
 		}),
 	);
@@ -537,12 +560,15 @@ async function captureOpenFileVersions(
 	cwd: string,
 	servers: Array<[string, ServerConfig]>,
 	agentDir?: string,
+	clientCache?: LspClientAdmissionCache,
 ): Promise<ServerVersionMap> {
 	const uri = fileToUri(absolutePath);
 	const versions = new Map<string, number>();
 	await Promise.allSettled(
 		servers.map(async ([serverName, serverConfig]) => {
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+			const client = await (clientCache
+				? getCachedLspClient(serverConfig, cwd, agentDir, clientCache)
+				: getOrCreateClient(serverConfig, cwd, undefined, agentDir));
 			const version = client.openFiles.get(uri)?.version;
 			if (version !== undefined) {
 				versions.set(serverName, version);
@@ -567,6 +593,7 @@ async function getDiagnosticsForFile(
 	servers: Array<[string, ServerConfig]>,
 	options: GetDiagnosticsForFileOptions = {},
 	agentDir?: string,
+	clientCache?: LspClientAdmissionCache,
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { signal, minVersions, expectedDocumentVersions, allowUnversionedLspDiagnostics = true } = options;
 	if (servers.length === 0) {
@@ -590,7 +617,9 @@ async function getDiagnosticsForFile(
 			}
 
 			// Default: use LSP
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+			const client = await (clientCache
+				? getCachedLspClient(serverConfig, cwd, agentDir, clientCache)
+				: getOrCreateClient(serverConfig, cwd, undefined, agentDir));
 			throwIfAborted(signal);
 			if (isProjectAwareLspServer(serverConfig)) {
 				await waitForProjectLoaded(client, signal);
@@ -685,6 +714,7 @@ async function formatContent(
 	servers: Array<[string, ServerConfig]>,
 	signal?: AbortSignal,
 	agentDir?: string,
+	clientCache?: LspClientAdmissionCache,
 ): Promise<string> {
 	if (servers.length === 0) {
 		return content;
@@ -702,7 +732,9 @@ async function formatContent(
 			}
 
 			// Default: use LSP
-			const client = await getOrCreateClient(serverConfig, cwd, undefined, agentDir);
+			const client = await (clientCache
+				? getCachedLspClient(serverConfig, cwd, agentDir, clientCache)
+				: getOrCreateClient(serverConfig, cwd, undefined, agentDir));
 			throwIfAborted(signal);
 
 			const caps = client.serverCapabilities;
@@ -994,6 +1026,7 @@ async function runLspWritethrough(
 		return writethroughNoop(dst, content, signal, file);
 	}
 	const { lspServers, customLinterServers } = splitServers(servers);
+	const clientCache: LspClientAdmissionCache = new Map();
 
 	let finalContent = content;
 	let publishedContent = false;
@@ -1019,7 +1052,9 @@ async function runLspWritethrough(
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 
 	// Capture diagnostic versions BEFORE syncing to detect stale diagnostics
-	const minVersions = enableDiagnostics ? await captureDiagnosticVersions(cwd, servers, agentDir) : undefined;
+	const minVersions = enableDiagnostics
+		? await captureDiagnosticVersions(cwd, servers, agentDir, clientCache)
+		: undefined;
 	let expectedDocumentVersions: ServerVersionMap | undefined;
 
 	let formatter: FileFormatResult | undefined;
@@ -1039,23 +1074,39 @@ async function runLspWritethrough(
 			if (useCustomFormatter) {
 				// Custom linters (e.g. Biome CLI) require on-disk input.
 				await writeContent(content);
-				finalContent = await formatContent(dst, content, cwd, customLinterServers, operationSignal, agentDir);
+				finalContent = await formatContent(
+					dst,
+					content,
+					cwd,
+					customLinterServers,
+					operationSignal,
+					agentDir,
+					clientCache,
+				);
 				formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				await writeContent(finalContent);
-				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, agentDir);
+				await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, agentDir, clientCache);
 			} else {
 				// 1. Sync original content to LSP servers
-				await syncFileContent(dst, content, cwd, lspServers, operationSignal, agentDir);
+				await syncFileContent(dst, content, cwd, lspServers, operationSignal, agentDir, clientCache);
 
 				// 2. Format in-memory via LSP
 				if (enableFormat) {
-					finalContent = await formatContent(dst, content, cwd, lspServers, operationSignal, agentDir);
+					finalContent = await formatContent(
+						dst,
+						content,
+						cwd,
+						lspServers,
+						operationSignal,
+						agentDir,
+						clientCache,
+					);
 					formatter = finalContent !== content ? FileFormatResult.FORMATTED : FileFormatResult.UNCHANGED;
 				}
 
 				// 3. If formatted, sync formatted content to LSP servers
 				if (finalContent !== content) {
-					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, agentDir);
+					await syncFileContent(dst, finalContent, cwd, lspServers, operationSignal, agentDir, clientCache);
 				}
 
 				// 4. Write to disk
@@ -1063,11 +1114,11 @@ async function runLspWritethrough(
 			}
 
 			if (enableDiagnostics) {
-				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, agentDir);
+				expectedDocumentVersions = await captureOpenFileVersions(dst, cwd, lspServers, agentDir, clientCache);
 			}
 
 			// 5. Notify saved to LSP servers
-			await notifyFileSaved(dst, cwd, lspServers, operationSignal, agentDir);
+			await notifyFileSaved(dst, cwd, lspServers, operationSignal, agentDir, clientCache);
 
 			// 6. Get diagnostics from all servers (wait for fresh results)
 			if (enableDiagnostics) {
@@ -1082,6 +1133,7 @@ async function runLspWritethrough(
 						allowUnversionedLspDiagnostics: false,
 					},
 					agentDir,
+					clientCache,
 				);
 			}
 		});
