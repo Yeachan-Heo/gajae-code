@@ -2089,10 +2089,12 @@ export function isValidOwnerIntent(intent: unknown, request?: ObserveTerminalReq
 		intent.state !== "pending"
 	)
 		return false;
+	if (!isCanonicalUtcTimestamp(intent.created_at) || !isCanonicalUtcTimestamp(intent.expires_at)) return false;
 	const createdAt = Date.parse(intent.created_at);
 	const expiresAt = Date.parse(intent.expires_at);
 	if (!Number.isFinite(createdAt) || !Number.isFinite(expiresAt) || createdAt > expiresAt) return false;
 	if (!request) return true;
+	if (!isCanonicalUtcTimestamp(request.observed_at)) return false;
 	const observedAt = Date.parse(request.observed_at);
 	return (
 		Number.isFinite(observedAt) &&
@@ -2452,7 +2454,8 @@ function isAttemptCapability(value: unknown): value is AttemptCapability {
 		typeof value.server_absent_before === "boolean" &&
 		isOwnerGenerationBaseline(value.baseline) &&
 		nonEmpty(value.expires_at) &&
-		Number.isFinite(Date.parse(value.expires_at))
+		isCanonicalUtcTimestamp(value.expires_at) &&
+		Date.parse(value.expires_at) > Date.now()
 	);
 }
 
@@ -2504,7 +2507,9 @@ function validPersistedAttempt(value: PersistedAttempt | null, request: Bootstra
 			value.server_absent_before === true &&
 			sameOwnerGenerationBaseline(value.baseline, request.attempt.baseline) &&
 			value.expires_at === request.attempt.expires_at &&
-			nonEmpty(value.created_at),
+			isCanonicalUtcTimestamp(value.created_at) &&
+			Date.parse(value.created_at) <= Date.now() &&
+			Date.parse(value.expires_at) > Date.now(),
 	);
 }
 
