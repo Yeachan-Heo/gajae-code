@@ -1359,6 +1359,170 @@ export function publishOwnerGenerationSync(request: PublishGenerationRequest): P
 	return { schema_version: 1, ok: true, code: "generation_published", generation };
 }
 
+/**
+ * Prior-intent markers that permanently block a new close intent.
+ *
+ * `.consumed` proves the close actually reached its verdict, and `.invalidated` marks a
+ * generation that was superseded by a replacement owner. Neither may be retried.
+ */
+const BLOCKING_INTENT_SUFFIXES = [".consumed", ".invalidated"] as const;
+
+/**
+ * Prior-intent markers that record an attempt which provably did NOT consume the session:
+ * `.cancelled` is written when the generation moved or the SIGTERM dispatch threw, and
+ * `.expired` when the intent lapsed or no matching verdict arrived.
+ *
+ * The intent path is keyed on the owner generation, and that generation does not rotate while
+ * the tmux session lives. Treating these as replay therefore wedged the session permanently:
+ * one transient failure left a marker behind and every later force-close was refused with
+ * `owner_intent_replay` while the owner stayed alive. They are archived instead, so a fresh
+ * attempt can proceed without discarding the audit trail.
+ */
+const RETRYABLE_INTENT_SUFFIXES = [".cancelled", ".expired"] as const;
+interface IntentEvidenceReadTestHooks {
+	platform?: NodeJS.Platform;
+	afterPathStat?: (file: string) => Promise<void>;
+}
+let intentEvidenceReadTestHooks: IntentEvidenceReadTestHooks | null = null;
+
+export function __setIntentEvidenceReadHooksForTests(hooks: IntentEvidenceReadTestHooks | null): void {
+	intentEvidenceReadTestHooks = hooks;
+}
+
+async function intentMarkerExists(file: string): Promise<boolean> {
+	try {
+		await fs.lstat(file);
+		return true;
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return false;
+		throw new Error("owner_intent_replay");
+	}
+}
+
+async function readNoFollowJson(file: string): Promise<unknown | null> {
+	const platform = intentEvidenceReadTestHooks?.platform ?? process.platform;
+	const noFollow = platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK;
+	let pathBefore;
+	try {
+		pathBefore = await fs.lstat(file, { bigint: true });
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return null;
+		throw error;
+	}
+	if (!pathBefore.isFile()) throw new Error("not_regular_file");
+	await intentEvidenceReadTestHooks?.afterPathStat?.(file);
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(file, fsSync.constants.O_RDONLY | noFollow);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return null;
+		throw error;
+	}
+	try {
+		const before = await handle.stat({ bigint: true });
+		if (!before.isFile() || before.dev !== pathBefore.dev || before.ino !== pathBefore.ino)
+			throw new Error("changed_file");
+		const content = await handle.readFile("utf8");
+		const after = await handle.stat({ bigint: true });
+		const pathAfter = await fs.lstat(file, { bigint: true });
+		if (
+			!after.isFile() ||
+			!pathAfter.isFile() ||
+			pathBefore.dev !== pathAfter.dev ||
+			pathBefore.ino !== pathAfter.ino ||
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs ||
+			before.ctimeNs !== after.ctimeNs
+		)
+			throw new Error("changed_file");
+		return JSON.parse(content);
+	} finally {
+		await handle.close();
+	}
+}
+
+/** Reads a live intent only from a regular, non-symlink file; absence is the only empty result. */
+async function readOwnerIntentStrict(file: string): Promise<OwnerIntent | null> {
+	try {
+		const parsed = await readNoFollowJson(file);
+		if (parsed === null) return null;
+		if (!isValidOwnerIntent(parsed)) throw new Error("owner_intent_replay");
+		return parsed;
+	} catch {
+		throw new Error("owner_intent_replay");
+	}
+}
+
+/** Retains a superseded intent marker under a unique name so no audit record is deleted. */
+async function archiveSupersededIntent(file: string): Promise<void> {
+	await fs.rename(file, `${file}.superseded-${Date.now()}-${crypto.randomUUID()}`).catch(() => undefined);
+}
+
+/** Returns whether a dispatch belongs to an archived, non-consuming intent attempt. */
+async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string): Promise<boolean> {
+	let entries: string[];
+	try {
+		entries = await fs.readdir(paths.root);
+	} catch {
+		throw new Error("stale_terminal_evidence_unavailable");
+	}
+	const prefix = `${path.basename(paths.intentFile)}.`;
+	for (const entry of entries) {
+		if (!entry.startsWith(prefix)) continue;
+		try {
+			const archived = await readNoFollowJson(path.join(paths.root, entry));
+			if (archived === null || !isValidOwnerIntent(archived) || !nonEmpty(archived.dispatch_id))
+				throw new Error("stale_terminal_evidence_unavailable");
+			if (archived.dispatch_id === dispatchId) return true;
+		} catch {
+			throw new Error("stale_terminal_evidence_unavailable");
+		}
+	}
+	return false;
+}
+
+/** Renames an intent only while the expected dispatch still owns the live path. */
+async function renameIntentIfCurrent(
+	paths: LifecyclePaths,
+	intentId: string,
+	suffix: ".cancelled" | ".expired",
+	lockToken?: string,
+): Promise<boolean> {
+	const token = lockToken ?? (await acquireOwnerGenerationLock(paths, "intent-transition"));
+	if (!token) return false;
+	try {
+		const current = await readOwnerIntentStrict(paths.intentFile);
+		if (current?.intent_id !== intentId) return false;
+		try {
+			await fs.rename(paths.intentFile, `${paths.intentFile}${suffix}`);
+			return true;
+		} catch (error) {
+			if (!isCode(error, "ENOENT")) return false;
+			return false;
+		}
+	} finally {
+		if (lockToken === undefined) await releaseVerdictLock(token);
+	}
+}
+
+/**
+ * Decides whether the un-suffixed intent file blocks a new attempt.
+ *
+ * A live, unexpired record is a genuine concurrent dispatch and must fail closed. An owner that
+ * died between publishing the intent and renaming it leaves a `pending` record that can never
+ * reach a verdict, so an elapsed or unreadable deadline is archived rather than honored forever.
+ */
+async function pendingIntentBlocksRetry(intentFile: string): Promise<boolean> {
+	if (!(await intentMarkerExists(intentFile))) return false;
+	const pending = await readOwnerIntentStrict(intentFile);
+	const deadline = pending ? Date.parse(pending.expires_at) : Number.NaN;
+	if (Number.isFinite(deadline) && deadline > Date.now()) return true;
+	await archiveSupersededIntent(intentFile);
+	return await intentMarkerExists(intentFile);
+}
+
 export async function createOwnerIntent(
 	stateDir: string,
 	input: Omit<OwnerIntent, "schema_version" | "intent_id" | "state">,
@@ -1372,14 +1536,19 @@ export async function createOwnerIntent(
 	if (!isValidOwnerIntent(intent)) throw new Error("owner_intent_invalid");
 	const paths = lifecyclePaths(stateDir, input.session_id, input.generation);
 	await fs.mkdir(paths.root, { recursive: true });
-	const priorIntent = await Promise.any(
-		["", ".consumed", ".cancelled", ".expired", ".invalidated"].map(suffix =>
-			fs.access(`${paths.intentFile}${suffix}`),
-		),
-	)
-		.then(() => true)
-		.catch(() => false);
-	if (priorIntent) throw new Error("owner_intent_replay");
+	for (const suffix of BLOCKING_INTENT_SUFFIXES) {
+		if (await intentMarkerExists(`${paths.intentFile}${suffix}`)) throw new Error("owner_intent_replay");
+	}
+	for (const suffix of RETRYABLE_INTENT_SUFFIXES) {
+		const marker = `${paths.intentFile}${suffix}`;
+		if (!(await intentMarkerExists(marker))) continue;
+		await archiveSupersededIntent(marker);
+		// Archiving is best-effort. If the record could not be moved, refuse rather than publish
+		// a fresh intent alongside an un-superseded audit record; `pendingIntentBlocksRetry`
+		// fails closed on the same condition for the un-suffixed file.
+		if (await intentMarkerExists(marker)) throw new Error("owner_intent_replay");
+	}
+	if (await pendingIntentBlocksRetry(paths.intentFile)) throw new Error("owner_intent_replay");
 	const handle = await fs.open(paths.intentFile, "wx", 0o600).catch(error => {
 		if (isCode(error, "EEXIST")) throw new Error("owner_intent_replay");
 		throw error;
@@ -1566,12 +1735,18 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			)
 				observation = normalizeTerminalObservation(recovered);
 		}
+		const intent = await readOwnerIntentStrict(paths.intentFile);
+		if (observation.operator_dispatch_id !== undefined) {
+			if (intent && intent.dispatch_id !== observation.operator_dispatch_id)
+				throw new Error("stale_terminal_observation");
+			if (!intent && (await hasArchivedOwnerIntent(paths, observation.operator_dispatch_id)))
+				throw new Error("stale_terminal_observation");
+		}
 		await atomicWrite(paths.journalFile, {
 			schema_version: 1,
 			observation,
 			token,
 		});
-		const intent = await readJson<OwnerIntent>(paths.intentFile);
 		const expected = isExpectedIntent(intent, observation);
 		const verdict: OwnerVerdict = {
 			schema_version: 1,
@@ -1656,7 +1831,7 @@ async function publishCurrentVerdictAlias(paths: LifecyclePaths, verdict: OwnerV
 }
 async function reconcileTerminalArtifacts(paths: LifecyclePaths, verdict: OwnerVerdict): Promise<OwnerVerdict> {
 	if (verdict.classification === "expected_operator_shutdown" && verdict.intent_id) {
-		const intent = await readJson<OwnerIntent>(paths.intentFile);
+		const intent = await readOwnerIntentStrict(paths.intentFile);
 		if (intent?.intent_id === verdict.intent_id) {
 			try {
 				await fs.rename(paths.intentFile, `${paths.intentFile}.consumed`);
@@ -1865,11 +2040,11 @@ export async function closeExactTmuxOwner(
 			expires_at: request.expiresAt,
 		});
 		if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation))) {
-			await fs.rename(paths.intentFile, `${paths.intentFile}.cancelled`).catch(() => undefined);
+			await renameIntentIfCurrent(paths, intent.intent_id, ".cancelled", generationLockToken);
 			throw new Error("owner_generation_mismatch");
 		}
 		if (!Number.isFinite(Date.parse(intent.expires_at)) || Date.parse(intent.expires_at) <= Date.now()) {
-			await fs.rename(paths.intentFile, `${paths.intentFile}.expired`).catch(() => undefined);
+			await renameIntentIfCurrent(paths, intent.intent_id, ".expired", generationLockToken);
 			throw new Error("owner_term_verdict_timeout");
 		}
 		try {
@@ -1880,7 +2055,7 @@ export async function closeExactTmuxOwner(
 				throw new Error("owner_generation_mismatch");
 			await deps.sendSigterm(request.pid);
 		} catch (error: unknown) {
-			await fs.rename(paths.intentFile, `${paths.intentFile}.cancelled`).catch(() => undefined);
+			await renameIntentIfCurrent(paths, intent.intent_id, ".cancelled", generationLockToken);
 			throw error;
 		}
 	} finally {
@@ -1888,7 +2063,7 @@ export async function closeExactTmuxOwner(
 	}
 	const verdict = await deps.waitForVerdict();
 	if (!verdict || verdict.intent_id !== intent.intent_id || verdict.classification !== "expected_operator_shutdown") {
-		await fs.rename(paths.intentFile, `${paths.intentFile}.expired`).catch(() => undefined);
+		await renameIntentIfCurrent(paths, intent.intent_id, ".expired");
 		throw new Error("owner_term_verdict_timeout");
 	}
 	await deps.cleanupSession();
