@@ -1298,6 +1298,7 @@ export function readNoFollowJsonSync(file: string): unknown | null {
 		throw new Error("baseline_generation_corrupt");
 	}
 	if (!before.isFile()) throw new Error("baseline_generation_corrupt");
+	if (before.size > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES) throw new Error("baseline_generation_corrupt");
 	let fd: number;
 	try {
 		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK;
@@ -1466,6 +1467,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 		throw error;
 	}
 	if (!pathBefore.isFile()) throw new Error("not_regular_file");
+	if (pathBefore.size > BigInt(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)) throw new Error("lifecycle_record_too_large");
 	await intentEvidenceReadTestHooks?.afterPathStat?.(file);
 	let handle: fs.FileHandle;
 	try {
