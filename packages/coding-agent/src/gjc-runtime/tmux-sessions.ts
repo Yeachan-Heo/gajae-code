@@ -1162,7 +1162,7 @@ function runGuardedTmuxSessionCommand(
 				expectedOwnerGeneration,
 				expectedPsmuxIncarnation,
 			),
-			`${thenCommand} ; display-message -p __gjc_tmux_guarded_mutation_ok__`,
+			`${thenCommand} && display-message -p __gjc_tmux_guarded_mutation_ok__`,
 			"display-message -p __gjc_tmux_guarded_mutation_refused__",
 		],
 		env,
