@@ -22,6 +22,7 @@ import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./session-state-lock";
 import {
+	captureOwnerGenerationBaseline,
 	isValidOwnerIntent,
 	lifecyclePaths,
 	type ObserveTerminalRequest,
@@ -1623,6 +1624,112 @@ async function writeStateFileSyncConditional(
 			if (!replaced.ok) throw new PreviousRuntimeStateReadError();
 		},
 	});
+}
+
+/**
+ * Publish a launch failure through the same transaction and signing path as runtime events.
+ *
+ * A launch can be attempting to replace a managed owner while the predecessor is still
+ * live. In that case the state file is a compare-and-swap target: only a caller carrying
+ * the currently published owner generation may replace it. Missing, malformed, or stale
+ * owner provenance is deliberately a no-op. A state file with no active owner generation
+ * retains the standalone launch-error behavior.
+ */
+export async function persistCoordinatorLaunchFailureState(input: {
+	stateFile: string;
+	cwd: string;
+	sessionId: string | null;
+	ownerGeneration: string | null;
+	ownerStateDir: string | null;
+	ownerServerKey: string | null;
+	managedLaunch: boolean;
+	payload: Record<string, unknown>;
+	signingRequired: boolean;
+	keyId: string | null;
+}): Promise<void> {
+	const stateFile = input.stateFile.trim();
+	if (!stateFile) return;
+	const sessionId = input.sessionId?.trim() || null;
+	const ownerGeneration = input.ownerGeneration?.trim() || null;
+	const ownerStateDir = input.ownerStateDir?.trim() || null;
+	const ownerServerKey = input.ownerServerKey?.trim() || null;
+	const stateDirectory = path.dirname(path.resolve(stateFile));
+	const ownerMetadataComplete = Boolean(ownerGeneration && ownerStateDir && ownerServerKey);
+	const ownerMetadataValid =
+		ownerMetadataComplete &&
+		path.isAbsolute(ownerStateDir!) &&
+		!ownerStateDir!.split("").some(character => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) &&
+		!ownerServerKey!
+			.split("")
+			.some(character => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) &&
+		path.resolve(ownerStateDir!) === stateDirectory;
+	const keyId = input.signingRequired ? input.keyId?.trim() || null : null;
+	if (input.signingRequired && !keyId) return;
+
+	await serializeStateFileWrite(
+		stateFile,
+		async () =>
+			await withCoordinatorTransactionLock(
+				stateFile,
+				async () =>
+					await withStateFileLock(stateFile, async () => {
+						let previous: Record<string, unknown>;
+						try {
+							previous = await readPreviousPayloadForEvent(stateFile);
+						} catch (error) {
+							// A launch diagnostic must never turn an unreadable shared state
+							// marker into a replacement payload.
+							if (error instanceof PreviousRuntimeStateReadError) return;
+							throw error;
+						}
+						const previousOwner =
+							typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
+								? previous.owner_generation.trim()
+								: null;
+						const baseline = sessionId
+							? await captureOwnerGenerationBaseline(stateDirectory, sessionId).catch(() => undefined)
+							: null;
+						const activeGeneration = baseline?.state === "current" ? baseline.generation : null;
+						const previousManagedEvidence =
+							previousOwner !== null &&
+							(typeof previous.workdir === "string" || typeof previous.sidecar_signature === "string");
+						if (input.managedLaunch && baseline?.state !== "absent") return;
+						if (ownerMetadataComplete && baseline === undefined) return;
+						// Any owner generation already represented by the state file requires an
+						// authenticated, still-current caller. Do not turn an unavailable
+						// lifecycle record into an unowned overwrite.
+						if (previousManagedEvidence && (activeGeneration === null || baseline === undefined)) return;
+						if (activeGeneration !== null) {
+							if (
+								!sessionId ||
+								!ownerMetadataValid ||
+								activeGeneration !== ownerGeneration ||
+								previous.session_id !== sessionId ||
+								(previousOwner !== null && previousOwner !== ownerGeneration)
+							)
+								return;
+						} else if (previousManagedEvidence) {
+							return;
+						}
+						if (sessionId) {
+							try {
+								assertPreviousRuntimeStateIdentity(previous, {
+									sessionId,
+									cwd: path.resolve(input.cwd),
+									workdir: path.resolve(input.cwd),
+									sessionFile: null,
+									platform: process.platform,
+									sidecarKeyId: keyId,
+								});
+							} catch (error) {
+								if (error instanceof PreviousRuntimeStateReadError) return;
+								throw error;
+							}
+						}
+						await writeStateFileSync(stateFile, input.payload, keyId);
+					}),
+			),
+	);
 }
 
 /**

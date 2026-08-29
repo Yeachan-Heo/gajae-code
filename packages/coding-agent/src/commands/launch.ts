@@ -6,7 +6,6 @@ import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
-import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import {
 	asLaunchWorktreeGuardError,
@@ -20,7 +19,12 @@ import { type LaunchWorktreeReservation, reserveLaunchWorktree } from "../gjc-ru
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_SERVER_KEY_ENV,
+	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	persistCoordinatorLaunchFailureState,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
 import { assertMasterLaunchArgs } from "../master-mode/context";
@@ -35,12 +39,13 @@ export async function persistCoordinatorLaunchFailure(
 ): Promise<void> {
 	const stateFile = env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (!stateFile) return;
+	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null;
 	const message = error instanceof Error ? error.message : String(error);
 	const code = message.split(":", 1)[0] || "launch_failed";
 	const now = new Date().toISOString();
 	const payload = {
 		schema_version: 1,
-		session_id: env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null,
+		session_id: sessionId,
 		state: "errored",
 		ready_for_input: false,
 		updated_at: now,
@@ -60,11 +65,20 @@ export async function persistCoordinatorLaunchFailure(
 			truncated: false,
 		},
 		error: { code, message, recoverable: true },
-		...(env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim()
-			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
-			: {}),
+		...(sessionId ? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null } : {}),
 	};
-	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+	await persistCoordinatorLaunchFailureState({
+		stateFile,
+		cwd,
+		sessionId,
+		ownerGeneration: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null,
+		ownerStateDir: env[GJC_TMUX_OWNER_STATE_DIR_ENV] ?? null,
+		ownerServerKey: env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? null,
+		managedLaunch: env.GJC_TMUX_LAUNCHED === "1",
+		payload,
+		signingRequired: env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]?.trim() === "true",
+		keyId: env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV] ?? null,
+	});
 }
 
 function worktreeInUseError(worktreePath: string, occupant?: string): Error {
