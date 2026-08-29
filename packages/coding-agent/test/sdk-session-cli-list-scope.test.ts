@@ -331,6 +331,18 @@ describe("scope exclusion warnings are bounded", () => {
 		expect(warnings).toEqual(["one"]);
 	});
 
+	test("does not report omissions when all ten warnings fit globally", () => {
+		const warnings = boundWarningSources([
+			{
+				entries: Array.from({ length: SESSION_LIST_WARNING_LIMIT }, (_, index) => `warning-${index}`),
+				describeOmitted: count => `${count} omitted`,
+			},
+		]);
+
+		expect(warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(warnings).not.toContain("0 omitted");
+	});
+
 	test("allows an unfiltered all-scope listing outside Git", async () => {
 		const result = await resolveSessionListSelection("all", path.join(tempRoot, "not-a-repository"));
 		expect(result.descriptor).toEqual({ scope: "all", path: path.join(tempRoot, "not-a-repository") });
