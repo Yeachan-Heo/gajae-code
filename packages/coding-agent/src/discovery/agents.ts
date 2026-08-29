@@ -46,13 +46,19 @@ function getUserPathCandidates(ctx: LoadContext, ...segments: string[]): string[
 export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
 	const paths: string[] = [];
 	let current = ctx.cwd;
+	const stopDirectory = ctx.repoRoot ?? ctx.home;
+	const relativeStop = path.relative(stopDirectory, ctx.cwd);
+	const effectiveStopDirectory =
+		relativeStop === "" || (!relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+			? stopDirectory
+			: ctx.cwd;
 	while (true) {
 		if (current !== ctx.home) {
 			for (const baseDir of AGENT_DIR_CANDIDATES) {
 				paths.push(path.join(current, baseDir, ...segments));
 			}
 		}
-		if (current === (ctx.repoRoot ?? ctx.home)) break;
+		if (current === effectiveStopDirectory) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;

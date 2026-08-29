@@ -16,8 +16,14 @@ const PROVIDER_ID = "cline";
 const DISPLAY_NAME = "Cline";
 const PRIORITY = 40;
 
-async function findClinerules(startDir: string): Promise<{ path: string; isDir: boolean } | null> {
+async function findClinerules(startDir: string, stopAt: string): Promise<{ path: string; isDir: boolean } | null> {
 	let current = path.resolve(startDir);
+	const resolvedStop = path.resolve(stopAt);
+	const relativeStop = path.relative(resolvedStop, current);
+	const effectiveStop =
+		relativeStop === "" || (!relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+			? resolvedStop
+			: current;
 
 	while (true) {
 		const entries = await readDirEntries(current);
@@ -29,7 +35,7 @@ async function findClinerules(startDir: string): Promise<{ path: string; isDir: 
 			};
 		}
 		const parent = path.dirname(current);
-		if (parent === current) return null;
+		if (current === effectiveStop || parent === current) return null;
 		current = parent;
 	}
 }
@@ -42,7 +48,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const warnings: string[] = [];
 
 	// Project-level only (Cline uses root-level .clinerules)
-	const found = await findClinerules(ctx.cwd);
+	const found = await findClinerules(ctx.cwd, ctx.repoRoot ?? ctx.home);
 	if (!found) {
 		return { items, warnings };
 	}

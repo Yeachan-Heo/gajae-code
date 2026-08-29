@@ -71,6 +71,12 @@ export async function loadAgentsMd(
 	let aggregateBytes = 0;
 	let omittedOversizedFile = false;
 	let omittedAggregateFile = false;
+	const stopDirectory = ctx.repoRoot ?? ctx.home;
+	const relativeStop = path.relative(stopDirectory, ctx.cwd);
+	const effectiveStopDirectory =
+		relativeStop === "" || (!relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+			? stopDirectory
+			: ctx.cwd;
 
 	while (true) {
 		scannedDirectories += 1;
@@ -98,8 +104,7 @@ export async function loadAgentsMd(
 			}
 		}
 
-		const stopDirectory = ctx.repoRoot ?? ctx.home;
-		if (current === stopDirectory) break;
+		if (current === effectiveStopDirectory) break;
 		if (scannedDirectories === MAX_ANCESTOR_DIRECTORIES) {
 			warnings.push(DIRECTORY_LIMIT_WARNING);
 			break;
