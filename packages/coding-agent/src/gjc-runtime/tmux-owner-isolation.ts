@@ -1082,6 +1082,8 @@ function isOwnerGenerationBaseline(value: unknown): value is OwnerGenerationBase
 				value.schema_version === 1 &&
 				nonEmpty(value.generation) &&
 				nonEmpty(value.session_id) &&
+				isSafePathComponent(value.generation, "owner generation") &&
+				isSafePathComponent(value.session_id, "owner session id") &&
 				isCanonicalUtcTimestamp(value.published_at)))
 	);
 }
@@ -2253,6 +2255,8 @@ function isPlanRequest(request: unknown): request is PlanRequest {
 		typeof request.cwd === "string" &&
 		nonEmpty(request.session_id) &&
 		nonEmpty(request.owner_generation) &&
+		isSafePathComponent(request.session_id, "owner session id") &&
+		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
 		isOwnerGenerationBaseline(request.baseline) &&
@@ -2277,6 +2281,8 @@ function isBootstrapRequest(request: unknown): request is BootstrapRequest {
 		request.op === "bootstrap" &&
 		nonEmpty(request.session_id) &&
 		nonEmpty(request.owner_generation) &&
+		isSafePathComponent(request.session_id, "owner session id") &&
+		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
 		nonEmpty(request.expected_scope) &&
@@ -2295,6 +2301,8 @@ function isPublishGenerationRequest(request: unknown): request is PublishGenerat
 		request.op === "publish_generation" &&
 		nonEmpty(request.session_id) &&
 		nonEmpty(request.owner_generation) &&
+		isSafePathComponent(request.session_id, "owner session id") &&
+		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
 		isOwnerGenerationBaseline(request.baseline)
 	);
@@ -2323,6 +2331,8 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		request.op === "observe_terminal" &&
 		nonEmpty(request.session_id) &&
 		nonEmpty(request.owner_generation) &&
+		isSafePathComponent(request.session_id, "owner session id") &&
+		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
 		isTerminalObserver(request.observer) &&
