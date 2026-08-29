@@ -4,12 +4,62 @@ import * as path from "node:path";
 const contentCache = new Map<string, string | null>();
 const dirCache = new Map<string, fs.Dirent[]>();
 
+export interface ReadFileOptions {
+	/** Canonicalize the file and enforce the supplied home/profile boundary. */
+	readonly isolatedHome?: boolean;
+	readonly home?: string;
+	readonly userAgentDir?: string;
+}
+
 function resolvePath(filePath: string): string {
 	return path.resolve(filePath);
 }
 
-export async function readFile(filePath: string): Promise<string | null> {
-	const abs = resolvePath(filePath);
+function isWithinOrEqual(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
+	const resolved = path.resolve(target);
+	const suffix: string[] = [];
+	let current = resolved;
+
+	while (true) {
+		try {
+			const real = await fs.promises.realpath(current);
+			return suffix.length > 0 ? path.join(real, ...suffix.reverse()) : real;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			const parent = path.dirname(current);
+			if (parent === current) return resolved;
+			suffix.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+async function resolveReadPath(filePath: string, options?: ReadFileOptions): Promise<string | null> {
+		const lexical = resolvePath(filePath);
+		if (!options?.isolatedHome) return lexical;
+		const roots = [options.home, options.userAgentDir].filter((root): root is string => typeof root === "string");
+		if (roots.length === 0) return null;
+		const [canonicalTarget, canonicalRoots] = await Promise.all([
+			canonicalizeThroughExistingAncestor(lexical),
+			Promise.all(roots.map(canonicalizeThroughExistingAncestor)),
+		]);
+		return canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget)) ? canonicalTarget : null;
+}
+
+export async function readFile(filePath: string, options?: ReadFileOptions): Promise<string | null> {
+		let abs: string | null;
+		try {
+			abs = await resolveReadPath(filePath, options);
+		} catch {
+			return null;
+		}
+		if (abs === null) return null;
 	if (contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
 	}

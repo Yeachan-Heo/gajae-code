@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { initializeWithSettings, loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
 import { type ExtensionModule, extensionModuleCapability } from "@gajae-code/coding-agent/capability/extension-module";
-import { clearCache } from "@gajae-code/coding-agent/capability/fs";
+import { clearCache, readFile } from "@gajae-code/coding-agent/capability/fs";
 import { hookCapability } from "@gajae-code/coding-agent/capability/hook";
 import { type Rule, ruleCapability } from "@gajae-code/coding-agent/capability/rule";
 import { settingsCapability } from "@gajae-code/coding-agent/capability/settings";
@@ -188,6 +188,26 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 				filePath => filePath === decoyProject || filePath.startsWith(`${decoyProject}${path.sep}`),
 			),
 		).toEqual([]);
+	});
+
+	test("explicit-home leaf reads bypass a poisoned lexical cache entry", async () => {
+		const decoyFile = path.join(tempDir, "process-decoy", "SYSTEM.md");
+		const isolatedFile = path.join(home, ".gjc", "agent", "SYSTEM.md");
+		await writeFile(decoyFile, "# decoy system");
+		await fs.mkdir(path.dirname(isolatedFile), { recursive: true });
+		await fs.symlink(decoyFile, isolatedFile, "file");
+
+		// An ordinary read intentionally populates the legacy lexical cache with
+		// the symlink target. The isolated provider read must canonicalize at the
+		// leaf seam and reject that target instead of reusing the poisoned entry.
+		expect(await readFile(isolatedFile)).toBe("# decoy system");
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+
+		expect(result.items).toEqual([]);
+		expect(result.warnings).toEqual([]);
 	});
 
 	test("explicit home native project discovery follows the configured config directory", async () => {

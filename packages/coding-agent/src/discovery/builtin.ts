@@ -69,6 +69,15 @@ function resolveUserAgentDir(ctx: LoadContext): string {
 	return ctx.userAgentDir ?? path.join(ctx.home, PATHS.userAgent);
 }
 
+function readBuiltinFile(ctx: LoadContext, filePath: string): Promise<string | null> {
+	return readFile(
+		filePath,
+		ctx.isolatedHome
+			? { isolatedHome: true, home: ctx.home, userAgentDir: ctx.userAgentDir }
+			: undefined,
+	);
+}
+
 function getProjectStopDirectory(ctx: LoadContext): string | undefined {
 	if (ctx.repoRoot) return ctx.repoRoot;
 	const homeRelative = path.relative(ctx.home, ctx.cwd);
@@ -278,7 +287,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 
 	const contents = await Promise.allSettled(
 		paths.map(async p => {
-			const content = await readFile(p.path);
+			const content = await readBuiltinFile(ctx, p.path);
 			if (content) {
 				return { path: p.path, content, level: p.level };
 			}
@@ -310,7 +319,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 
 	for (const userScopeDir of getUserScopeDirs(ctx)) {
 		const userPath = path.join(userScopeDir, "SYSTEM.md");
-		const userContent = await readFile(userPath);
+		const userContent = await readBuiltinFile(ctx, userPath);
 		if (userContent) {
 			items.push({
 				path: userPath,
@@ -324,7 +333,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
-		const projectContent = await readFile(projectPath);
+		const projectContent = await readBuiltinFile(ctx, projectPath);
 		if (projectContent) {
 			items.push({
 				path: projectPath,
@@ -450,12 +459,12 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// User scope:    ~/.gjc/agent/RULES.md
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
-	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	const userRule = await loadStickyRulesFile(ctx, userRulesFile, "user");
 	if (userRule) items.push(userRule);
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
-		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
+		const projectRule = await loadStickyRulesFile(ctx, projectRulesFile, "project");
 		if (projectRule) items.push(projectRule);
 	}
 
@@ -466,8 +475,8 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
  * Read a top-level `RULES.md` and synthesize an always-apply rule.
  * Returns null when the file is absent or empty so callers can short-circuit.
  */
-async function loadStickyRulesFile(filePath: string, level: "user" | "project"): Promise<Rule | null> {
-	const content = await readFile(filePath);
+async function loadStickyRulesFile(ctx: LoadContext, filePath: string, level: "user" | "project"): Promise<Rule | null> {
+	const content = await readBuiltinFile(ctx, filePath);
 	if (!content) return null;
 	const source = createSourceMeta(PROVIDER_ID, filePath, level);
 	const rule = buildRuleFromMarkdown("RULES.md", content, filePath, source, { ruleName: "RULES" });
@@ -537,7 +546,7 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 
 	const [discoveredResults, settingsResults] = await Promise.all([
 		Promise.all(configDirs.map(({ dir }) => discoverExtensionModulePaths(ctx, path.join(dir, "extensions")))),
-		Promise.all(configDirs.map(({ dir }) => readFile(path.join(dir, "settings.json")))),
+		Promise.all(configDirs.map(({ dir }) => readBuiltinFile(ctx, path.join(dir, "settings.json")))),
 	]);
 
 	for (let i = 0; i < configDirs.length; i++) {
@@ -583,7 +592,7 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 
 	const [entriesResults, fileContents] = await Promise.all([
 		Promise.all(settingsExtensions.map(({ resolvedPath }) => readDirEntries(resolvedPath))),
-		Promise.all(settingsExtensions.map(({ resolvedPath }) => readFile(resolvedPath))),
+		Promise.all(settingsExtensions.map(({ resolvedPath }) => readBuiltinFile(ctx, resolvedPath))),
 	]);
 
 	const dirDiscoveryPromises: Array<{
@@ -661,7 +670,9 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 		}
 	}
 
-	const manifestContents = await Promise.all(manifestCandidates.map(({ manifestPath }) => readFile(manifestPath)));
+	const manifestContents = await Promise.all(
+		manifestCandidates.map(({ manifestPath }) => readBuiltinFile(ctx, manifestPath)),
+	);
 
 	for (let i = 0; i < manifestCandidates.length; i++) {
 		const content = manifestContents[i];
@@ -871,7 +882,7 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 
 	const [fileResults, indexContents] = await Promise.all([
 		Promise.all(fileLoadPromises),
-		Promise.all(subDirCandidates.map(({ indexPath }) => readFile(indexPath))),
+		Promise.all(subDirCandidates.map(({ indexPath }) => readBuiltinFile(ctx, indexPath))),
 	]);
 
 	for (const result of fileResults) {
@@ -922,7 +933,7 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 
 	for (const { dir, level } of await getConfigDirs(ctx)) {
 		const settingsPath = path.join(dir, "settings.json");
-		const settingsContent = await readFile(settingsPath);
+		const settingsContent = await readBuiltinFile(ctx, settingsPath);
 		if (settingsContent) {
 			const data = tryParseJson<Record<string, unknown>>(settingsContent);
 			if (data) {
@@ -938,7 +949,7 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 		}
 
 		const configPath = path.join(dir, "config.yml");
-		const configContent = await readFile(configPath);
+		const configContent = await readBuiltinFile(ctx, configPath);
 		if (!configContent) continue;
 
 		const data = parseYamlSettings(configContent, configPath);
@@ -969,7 +980,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const warnings: string[] = [];
 
 	const userPath = path.join(getUserScopeDirs(ctx)[0]!, "AGENTS.md");
-	const userContent = await readFile(userPath);
+	const userContent = await readBuiltinFile(ctx, userPath);
 	if (userContent) {
 		items.push({
 			path: userPath,
@@ -982,7 +993,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
-		const projectContent = await readFile(projectPath);
+		const projectContent = await readBuiltinFile(ctx, projectPath);
 		if (projectContent) {
 			items.push({
 				path: projectPath,
