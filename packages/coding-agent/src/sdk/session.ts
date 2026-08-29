@@ -3104,6 +3104,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolInterruptPolicy: () => agent?.getToolInterruptPolicy() ?? "abort_tools",
 
 			getSessionHome: () => getTrustedHomeDir(),
+			getSessionProfileAuthority: () => profileAuthority,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),

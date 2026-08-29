@@ -80,6 +80,7 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 				cwd: this.#session.cwd,
 				home: this.#session.getSessionHome?.(),
 				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
+				profileAuthority: this.#session.getSessionProfileAuthority?.(),
 				query: input.query,
 				source,
 				limit: input.limit,

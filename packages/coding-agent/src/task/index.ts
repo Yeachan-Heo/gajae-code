@@ -864,7 +864,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	static async create(session: ToolSession, options?: { runSubprocess?: typeof runSubprocess }): Promise<TaskTool> {
 		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
 		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
-		const { agents } = await discoverAgents(session.cwd, undefined, session.settings, session.getSessionAgentDir?.());
+		const { agents } = await discoverAgents(
+			session.cwd,
+			undefined,
+			session.settings,
+			session.getSessionAgentDir?.(),
+			session.getSessionProfileAuthority?.(),
+		);
 		const tool = new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
 		tool.#testRunSubprocess = options?.runSubprocess;
 		return tool;
@@ -940,6 +946,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				undefined,
 				this.session.settings,
 				this.session.getSessionAgentDir?.(),
+				this.session.getSessionProfileAuthority?.(),
 			);
 			this.#discoveredAgents = refreshed.agents;
 		} catch (error) {
@@ -1685,6 +1692,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			undefined,
 			this.session.settings,
 			this.session.getSessionAgentDir?.(),
+			this.session.getSessionProfileAuthority?.(),
 		);
 		const parentAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
 		const { agent: agentName, context, schema: outputSchema } = boundParams;

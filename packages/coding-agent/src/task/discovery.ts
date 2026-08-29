@@ -70,6 +70,7 @@ export async function discoverAgents(
 	home: string = getTrustedHomeDir(),
 	activeSettings?: Settings,
 	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<DiscoveryResult> {
 	const resolvedCwd = path.resolve(cwd);
 	const resolvedAgentDir =
@@ -82,12 +83,13 @@ export async function discoverAgents(
 	// is custom only when it differs from the resolver's current default; a
 	// resolver-owned custom profile remains custom even when its path later
 	// coincides with a newly derived default.
-	const profileAuthority =
-		resolverAuthority === "custom" ||
+	const resolvedProfileAuthority =
+		profileAuthority ??
+		(resolverAuthority === "custom" ||
 		(selectedAgentDir !== undefined &&
 			normalizePathForComparison(selectedAgentDir) !== normalizePathForComparison(getAgentDir()))
 			? "custom"
-			: resolverAuthority;
+			: resolverAuthority);
 	const agentSources = Array.from(
 		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
 	);
@@ -122,7 +124,7 @@ export async function discoverAgents(
 
 	// Load agents from GJC marketplace plugins.
 	const { roots: pluginRoots } = isProviderEnabled("claude-plugins", activeSettings)
-		? await listClaudePluginRoots(home, resolvedCwd, resolvedAgentDir, profileAuthority)
+		? await listClaudePluginRoots(home, resolvedCwd, resolvedAgentDir, resolvedProfileAuthority)
 		: { roots: [] };
 	const nonGjcPluginRoots = [];
 	for (const plugin of pluginRoots) {
