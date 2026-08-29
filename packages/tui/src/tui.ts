@@ -817,8 +817,6 @@ type TuiRenderCounterSnapshot = {
 	emitVisibleWidthsLineCount: number;
 	offscreenPrefixCompares: number;
 	layoutFrameLineCopies: number;
-	footerPatches: number;
-	footerPatchFallbacks: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -982,8 +980,6 @@ export class TUI extends Container {
 	#layoutReuseRaw: string[] = [];
 	#layoutReuseRendered: string[] = [];
 	#layoutReuseReady = false;
-	#pendingFooterComponent: Component | undefined;
-	#childFrameRanges: Array<{ child: Component; start: number; count: number }> = [];
 	#durableLineCount = 0;
 	#durableRenderedLines: string[] = [];
 	#durableRawLines: string[] = [];
@@ -1162,8 +1158,6 @@ export class TUI extends Container {
 		emitVisibleWidthsLineCount: 0,
 		offscreenPrefixCompares: 0,
 		layoutFrameLineCopies: 0,
-		footerPatches: 0,
-		footerPatchFallbacks: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1175,8 +1169,6 @@ export class TUI extends Container {
 			emitVisibleWidthsLineCount: 0,
 			offscreenPrefixCompares: 0,
 			layoutFrameLineCopies: 0,
-			footerPatches: 0,
-			footerPatchFallbacks: 0,
 		};
 	}
 
@@ -2775,8 +2767,6 @@ export class TUI extends Container {
 		this.#layoutReuseRaw = [];
 		this.#layoutReuseRendered = [];
 		this.#layoutReuseReady = false;
-		this.#pendingFooterComponent = undefined;
-		this.#childFrameRanges = [];
 		this.#durableLineCount = 0;
 		this.#nativeScrollbackAdmissionPending = false;
 		this.#durableRenderedLines.length = 0;
@@ -2875,35 +2865,14 @@ export class TUI extends Container {
 	#requestRenderWithScope(force: boolean, source: string, scope: "full" | "layout"): number {
 		const generation = ++this.#nextRenderGeneration;
 		this.#renderRequestedGeneration = Math.max(this.#renderRequestedGeneration, generation);
-		if (scope === "full") {
-			this.#renderScope = "full";
-			this.#pendingFooterComponent = undefined;
-		}
+		if (scope === "full") this.#renderScope = "full";
 		this.#requestRenderCore(force, source, generation);
 		return generation;
 	}
 
 	/** Request a frame whose mutation is known to be outside the viewport-anchor subtree. */
 	requestLayoutRender(source = "layout"): void {
-		this.#pendingFooterComponent = undefined;
 		if (!this.#renderRequested) this.#renderScope = "layout";
-		this.#requestRenderWithScope(false, source, "layout");
-	}
-
-	/**
-	 * Patch a suffix/status component in the last committed frame without walking the
-	 * transcript tree. Falls back to {@link requestLayoutRender} when the last
-	 * frame cannot prove a same-height in-place rewrite (overlays, scrollback,
-	 * missing range, line-count change).
-	 */
-	requestFooterPatch(component: Component, source = "loader"): void {
-		if (this.#renderRequested) {
-			if (this.#renderScope === "full" || this.#pendingFooterComponent === undefined) return;
-			this.#pendingFooterComponent = component;
-			return;
-		}
-		this.#pendingFooterComponent = component;
-		this.#renderScope = "layout";
 		this.#requestRenderWithScope(false, source, "layout");
 	}
 
@@ -3017,7 +2986,7 @@ export class TUI extends Container {
 			this.#lastRenderWriteSucceeded = false;
 			const t0 = renderMetrics.now();
 			this.#renderGenerationInProgress = requestedGeneration;
-			if (!this.#tryCommitFooterPatch()) this.#doRender();
+			this.#doRender();
 			this.#renderGenerationInProgress = 0;
 			this.#commitRenderGeneration(requestedGeneration);
 			if (renderMetrics.enabled) renderMetrics.recordRender(renderMetrics.now() - t0);
@@ -4356,145 +4325,6 @@ export class TUI extends Container {
 		this.#layoutReuseReady = false;
 	}
 
-	#ownsComponent(node: Component, target: Component): boolean {
-		if (node === target) return true;
-		if (node instanceof Container) {
-			for (const child of node.children) {
-				if (this.#ownsComponent(child, target)) return true;
-			}
-		}
-		return false;
-	}
-
-	#directChildOwning(component: Component): Component | undefined {
-		for (const child of this.children) {
-			if (this.#ownsComponent(child, component)) return child;
-		}
-		return undefined;
-	}
-
-	/**
-	 * Rewrite one already-committed direct child's rows in the last frame.
-	 * Same-height, live-viewport only; otherwise {@link #doRender} walks the tree.
-	 */
-	#tryCommitFooterPatch(): boolean {
-		const component = this.#pendingFooterComponent;
-		if (component === undefined) return false;
-		const fallback = (): boolean => {
-			TUI.#renderCounters.footerPatchFallbacks += 1;
-			return false;
-		};
-		if (
-			this.overlayStack.length > 0 ||
-			this.#mouseSelectionActive ||
-			this.#manualViewportTop !== undefined ||
-			this.#resizeRenderQueued ||
-			this.#widthSettleRenderQueued ||
-			this.#forcedRenderQueued ||
-			this.#rasterLeases.size > 0 ||
-			!this.#virtualViewport ||
-			this.#latestRaw.length === 0 ||
-			this.#previousLines.length === 0 ||
-			this.#latestRenderedLines.length !== this.#latestRaw.length ||
-			this.#previousLines.length !== this.#latestRaw.length
-		) {
-			return fallback();
-		}
-		const width = this.terminal.columns;
-		const height = this.terminal.rows;
-		if (width <= 0 || height <= 0 || this.#previousWidth !== width || this.#previousHeight !== height) {
-			return fallback();
-		}
-		const owner = this.#directChildOwning(component);
-		if (owner === undefined) return fallback();
-		const range = this.#childFrameRanges.find(entry => entry.child === owner);
-		if (range === undefined || range.count <= 0 || range.start + range.count > this.#latestRaw.length) {
-			return fallback();
-		}
-		const liveTop = Math.max(0, this.#latestRaw.length - height);
-		if (range.start < liveTop || range.start + range.count > liveTop + height) return fallback();
-		for (const placement of this.#kittyPlacementSpans) {
-			if (placement.row < range.start + range.count && placement.row + placement.rows > range.start) {
-				return fallback();
-			}
-		}
-		const rendered = safeRenderComponentWithViewportAnchors(owner, width, "footer-patch");
-		if (rendered.lines.length !== range.count) return fallback();
-		const nextRawSlice = rendered.lines;
-		for (const line of nextRawSlice) {
-			if (TERMINAL.isImageLine(line) || extractKittyPlacementReferences(line).length > 0) return fallback();
-		}
-		const dirtyIndexes: number[] = [];
-		for (let i = 0; i < range.count; i++) {
-			const row = range.start + i;
-			if (nextRawSlice[i] !== this.#latestRaw[row]) dirtyIndexes.push(row);
-		}
-		this.#pendingFooterComponent = undefined;
-		this.#renderScope = "full";
-		this.#renderMutationQueued = false;
-		if (dirtyIndexes.length === 0) {
-			this.#lastRenderWriteSucceeded = true;
-			TUI.#renderCounters.footerPatches += 1;
-			return true;
-		}
-		const previousDirtyRendered = dirtyIndexes.map(row => this.#latestRenderedLines[row]!);
-		const nextRendered = this.#latestRenderedLines;
-		for (const row of dirtyIndexes) {
-			nextRendered[row] = nextRawSlice[row - range.start]!;
-		}
-		this.#normalizeLinesForEmit(nextRendered, width, 0, dirtyIndexes);
-
-		const firstChanged = dirtyIndexes[0]!;
-		const lastChanged = dirtyIndexes[dirtyIndexes.length - 1]!;
-		const viewportTop = liveTop;
-		let hardwareCursorRow = this.#hardwareCursorRow;
-		const computeLineDiff = (targetRow: number): number => {
-			const currentScreenRow = hardwareCursorRow - viewportTop;
-			const targetScreenRow = targetRow - viewportTop;
-			return targetScreenRow - currentScreenRow;
-		};
-		let buffer = "";
-		const lineDiff = computeLineDiff(firstChanged);
-		if (lineDiff > 0) buffer += `\x1b[${lineDiff}B`;
-		else if (lineDiff < 0) buffer += `\x1b[${-lineDiff}A`;
-		buffer += "\r";
-		for (let i = firstChanged; i <= lastChanged; i++) {
-			if (i > firstChanged) buffer += "\r\n";
-			buffer += "\x1b[2K";
-			buffer += this.#padLineToWidth(nextRendered[i]!, width);
-		}
-		const { seq, toRow } = this.#cursorControlSequence(this.#lastCursorPosition, this.#latestRaw.length, lastChanged);
-		buffer += seq;
-		buffer = this.#frameSynchronizedOutput(buffer);
-		if (
-			!this.#writeRenderBufferAndReanchorImeCursor(buffer, this.#lastCursorPosition, this.#latestRaw.length, () => {
-				this.#hardwareCursorRow = toRow;
-				for (let i = 0; i < range.count; i++) {
-					this.#latestRaw[range.start + i] = nextRawSlice[i]!;
-				}
-				for (const row of dirtyIndexes) {
-					this.#previousLines[row] = nextRendered[row]!;
-				}
-				if (this.#layoutReuseReady && this.#layoutReuseRaw.length === this.#latestRaw.length) {
-					for (let i = 0; i < range.count; i++) {
-						this.#layoutReuseRaw[range.start + i] = nextRawSlice[i]!;
-					}
-					for (const row of dirtyIndexes) {
-						this.#layoutReuseRendered[row] = nextRendered[row]!;
-					}
-				}
-				this.#refreshPaintedLiveViewportObservation(height);
-			})
-		) {
-			for (let i = 0; i < dirtyIndexes.length; i++) {
-				this.#latestRenderedLines[dirtyIndexes[i]!] = previousDirtyRendered[i]!;
-			}
-			return true;
-		}
-		TUI.#renderCounters.footerPatches += 1;
-		return true;
-	}
-
 	#viewportAnchorCacheHits(child: Component, width: number, renderScope: "full" | "layout"): boolean {
 		if (renderScope !== "layout") return false;
 		const componentRevision = child.getRenderRevision?.();
@@ -4540,7 +4370,6 @@ export class TUI extends Container {
 		const renderTreeStart = renderMetrics.now();
 		const renderScope = this.#renderScope;
 		this.#renderScope = "full";
-		this.#pendingFooterComponent = undefined;
 		const renderedLines: string[] = [];
 		const renderedChildren = new Map<Component, string[]>();
 		let anchorFrame: ViewportAnchorFrame | null = null;
@@ -4701,17 +4530,6 @@ export class TUI extends Container {
 			this.#discardLayoutReuseBuffers();
 		}
 
-		this.#childFrameRanges = [];
-		let childRangeRow = 0;
-		for (const child of this.children) {
-			const count =
-				reuseTranscriptPrefix && child === this.#viewportAnchorComponent
-					? skippedAnchorLineCount
-					: (renderedChildren.get(child)?.length ?? 0);
-			this.#childFrameRanges.push({ child, start: childRangeRow, count });
-			childRangeRow += count;
-		}
-
 		// Extract cursor position (marker must be found before diff comparison)
 		const cursorPos = this.#extractCursorPosition(newLines, height);
 		this.#lastCursorPosition = cursorPos;
@@ -4774,9 +4592,7 @@ export class TUI extends Container {
 						this.#layoutReuseReady &&
 						this.#layoutReuseRendered.length === total &&
 						rawLines === this.#layoutReuseRaw;
-					const windowed = reuseBuffers
-						? this.#layoutReuseRendered
-						: this.#latestRenderedLines.slice(0, winTop);
+					const windowed = reuseBuffers ? this.#layoutReuseRendered : this.#latestRenderedLines.slice(0, winTop);
 					if (!reuseBuffers) TUI.#renderCounters.layoutFrameLineCopies += winTop;
 					const dirtyIndexes: number[] = [];
 					for (let i = winTop; i < total; i++) {

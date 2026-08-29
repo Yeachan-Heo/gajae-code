@@ -109,10 +109,7 @@ describe("TUI render helper counters", () => {
 	it("does not scan raw rows with visibleWidth when width is unchanged", async () => {
 		const lineCount = 80;
 		const layoutFrames = 8;
-		const lines = Array.from(
-			{ length: lineCount },
-			(_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`,
-		);
+		const lines = Array.from({ length: lineCount }, (_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`);
 		const term = new VirtualTerminal(48, 12);
 		const component = new MutableLinesComponent(lines);
 		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
@@ -136,10 +133,7 @@ describe("TUI render helper counters", () => {
 
 	it("still walks raw rows on a column change that does not overflow", async () => {
 		const lineCount = 80;
-		const lines = Array.from(
-			{ length: lineCount },
-			(_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`,
-		);
+		const lines = Array.from({ length: lineCount }, (_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`);
 		const term = new VirtualTerminal(48, 12);
 		const component = new MutableLinesComponent(lines);
 		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
@@ -183,10 +177,7 @@ describe("TUI render helper counters", () => {
 	it("does not remeasure unchanged viewport rows with visibleWidths", async () => {
 		const lineCount = 80;
 		const layoutFrames = 8;
-		const lines = Array.from(
-			{ length: lineCount },
-			(_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`,
-		);
+		const lines = Array.from({ length: lineCount }, (_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`);
 		const term = new VirtualTerminal(48, 12);
 		const component = new MutableLinesComponent(lines);
 		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
@@ -211,10 +202,7 @@ describe("TUI render helper counters", () => {
 	it("measures only the dirty viewport row when one raw line changes", async () => {
 		const lineCount = 80;
 		const edits = 8;
-		const lines = Array.from(
-			{ length: lineCount },
-			(_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`,
-		);
+		const lines = Array.from({ length: lineCount }, (_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`);
 		const term = new VirtualTerminal(48, 12);
 		const component = new MutableLinesComponent(lines);
 		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
@@ -275,74 +263,6 @@ describe("TUI render helper counters", () => {
 			expect(counters.offscreenPrefixCompares).toBe(0);
 			expect(counters.layoutFrameLineCopies).toBe(0);
 			expect(visible(term).some(line => line.includes("status-8"))).toBe(true);
-		} finally {
-			tui.stop();
-		}
-	});
-
-	it("patches a footer component without copying the transcript", async () => {
-		const transcriptLines = 80;
-		const term = new VirtualTerminal(48, 12);
-		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
-		const transcript = new Container();
-		for (let index = 0; index < transcriptLines; index++) {
-			transcript.addChild(new MutableLinesComponent([`line-${index}`]));
-		}
-		const suffix = new MutableLinesComponent(["status-0"]);
-		tui.addChild(transcript);
-		tui.addChild(suffix);
-		tui.setBottomPinnedComponent(suffix);
-		tui.setViewportAnchorComponent(transcript);
-		tui.setViewportOutputSource({ identity: "session:footer-patch", revision: 0n });
-
-		try {
-			tui.start();
-			await settle(term);
-			TUI.resetRenderCountersForTest();
-
-			suffix.setLines(["status-patched"]);
-			tui.requestFooterPatch(suffix, "loader");
-			await settle(term);
-
-			const counters = TUI.getRenderCountersForTest();
-			expect(counters.footerPatches).toBeGreaterThan(0);
-			expect(counters.footerPatchFallbacks).toBe(0);
-			expect(counters.layoutFrameLineCopies).toBe(0);
-			expect(visible(term).some(line => line.includes("status-patched"))).toBe(true);
-		} finally {
-			tui.stop();
-		}
-	});
-
-	it("falls back to a layout render when a footer patch would change line count", async () => {
-		const transcriptLines = 80;
-		const term = new VirtualTerminal(48, 12);
-		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
-		const transcript = new Container();
-		for (let index = 0; index < transcriptLines; index++) {
-			transcript.addChild(new MutableLinesComponent([`line-${index}`]));
-		}
-		const suffix = new MutableLinesComponent(["status-0"]);
-		tui.addChild(transcript);
-		tui.addChild(suffix);
-		tui.setBottomPinnedComponent(suffix);
-		tui.setViewportAnchorComponent(transcript);
-		tui.setViewportOutputSource({ identity: "session:footer-fallback", revision: 0n });
-
-		try {
-			tui.start();
-			await settle(term);
-			TUI.resetRenderCountersForTest();
-
-			suffix.setLines(["status-a", "status-b"]);
-			tui.requestFooterPatch(suffix, "loader");
-			await settle(term);
-
-			const counters = TUI.getRenderCountersForTest();
-			expect(counters.footerPatches).toBe(0);
-			expect(counters.footerPatchFallbacks).toBeGreaterThan(0);
-			expect(visible(term).some(line => line.includes("status-a"))).toBe(true);
-			expect(visible(term).some(line => line.includes("status-b"))).toBe(true);
 		} finally {
 			tui.stop();
 		}

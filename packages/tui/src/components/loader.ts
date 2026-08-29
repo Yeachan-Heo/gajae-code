@@ -117,7 +117,7 @@ export class Loader extends Text {
 		this.#lastDisplayed = next;
 		this.setText(next);
 		__loaderPerfCounters.renderRequests += 1;
-		if (this.options.renderScope === "layout") this.#ui?.requestFooterPatch(this, "loader");
+		if (this.options.renderScope === "layout") this.#ui?.requestLayoutRender("loader");
 		else this.#ui?.requestRender(false, "loader");
 	}
 }
