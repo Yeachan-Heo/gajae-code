@@ -2,7 +2,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { shortenPath } from "../tools/render-utils";
+import { redactCrashSecrets } from "@gajae-code/utils";
+import { shortenPath as shortenToolPath } from "../tools/render-utils";
 
 export type GjcLaunchWorktreeMode =
 	| { enabled: false }
@@ -175,6 +176,8 @@ function sanitizePathToken(value: string): string {
  * beside the first.
  */
 const WORKTREE_BUCKET_ENV = "GJC_WORKTREE_DIR";
+const LAUNCH_GUARD_MAX_BYTES = 16 * 1024;
+const LAUNCH_GUARD_TRUNCATION_MARKER = "\n… [launch diagnostic truncated]";
 /**
  * Expands to the repository directory name.
  *
@@ -232,13 +235,11 @@ function ensureRepositoryBucketIgnored(repoRoot: string, bucketPath: string): vo
 		});
 		if (result.exitCode === 0) return;
 	}
-	throw new Error(
-		[
-			"worktree_bucket_not_ignored",
-			"The GJC launch worktree bucket is inside the repository but is not ignored by Git.",
-			`Path: ${formatBucketPath(bucketPath)}`,
-			`Safe remediation: add /${relativeBucket.replaceAll(path.sep, "/")} to ${path.join(repoRoot, ".gitignore")}, then relaunch.`,
-		].join("\n"),
+	throw launchGuardLines(
+		"worktree_bucket_not_ignored",
+		"The GJC launch worktree bucket is inside the repository but is not ignored by Git.",
+		`Path: ${formatBucketPath(bucketPath)}`,
+		`Safe remediation: add /${relativeBucket.replaceAll(path.sep, "/")} to ${path.join(repoRoot, ".gitignore")}, then relaunch.`,
 	);
 }
 
@@ -258,6 +259,7 @@ function branchExists(repoRoot: string, branchName: string): boolean {
 }
 
 function validateBranchName(repoRoot: string, branchName: string): void {
+	if (/^@\{-\d+\}$/.test(branchName)) throw launchGuard("invalid_worktree_branch", branchName);
 	const result = Bun.spawnSync(["git", "check-ref-format", "--branch", branchName], {
 		cwd: repoRoot,
 		stdout: "pipe",
@@ -265,7 +267,7 @@ function validateBranchName(repoRoot: string, branchName: string): void {
 	});
 	if (result.exitCode === 0) return;
 	const stderr = result.stderr.toString().trim();
-	throw new Error(stderr || `invalid_worktree_branch:${branchName}`);
+	throw launchGuard("invalid_worktree_branch", branchName, ...(stderr ? [stderr] : []));
 }
 
 function listWorktrees(repoRoot: string): GitWorktreeEntry[] {
@@ -300,18 +302,74 @@ function findWorktreeByPath(entries: GitWorktreeEntry[], worktreePath: string): 
 	return entries.find(entry => path.resolve(entry.path) === resolved) ?? null;
 }
 
+/**
+ * A classified, user-actionable launch refusal. Never a crash.
+ *
+ * These describe a configuration state the user can fix, so `launch.ts` prints the message and
+ * exits rather than routing them through the uncaught-exception path (stack trace plus a durable
+ * crash record). Construct them with {@link launchGuard} at the refusal site: classification is
+ * structural, not a re-parse of `error.message`, so a newly added guard cannot silently regress
+ * to the crash path by being forgotten in a list.
+ */
+export class LaunchWorktreeGuardError extends Error {
+	readonly code: string;
+
+	constructor(code: string, message: string) {
+		super(message);
+		this.name = "LaunchWorktreeGuardError";
+		this.code = code;
+	}
+}
+
+/**
+ * Builds a launch guard whose message always begins with its code.
+ *
+ * Extra lines are appended verbatim; most guards use them to carry a `Path:` and a
+ * `Safe remediation:` line, but the short codes (`worktree_dirty`, `branch_in_use`,
+ * `worktree_path_conflict`, the dependency-manager codes) carry only their offending value.
+ */
+function launchGuard(code: string, detail?: string, ...lines: string[]): LaunchWorktreeGuardError {
+	const head = detail ? `${code}:${detail}` : code;
+	return new LaunchWorktreeGuardError(code, safeLaunchDiagnostic([head, ...lines].join("\n")));
+}
+
+/** Guard whose message is a code line followed by explanatory lines. */
+function launchGuardLines(code: string, ...lines: string[]): LaunchWorktreeGuardError {
+	return new LaunchWorktreeGuardError(code, safeLaunchDiagnostic([code, ...lines].join("\n")));
+}
+
+function safeLaunchDiagnostic(message: string): string {
+	const redacted = redactCrashSecrets(message);
+	if (Buffer.byteLength(redacted, "utf8") <= LAUNCH_GUARD_MAX_BYTES) return redacted;
+	const budget = LAUNCH_GUARD_MAX_BYTES - Buffer.byteLength(LAUNCH_GUARD_TRUNCATION_MARKER, "utf8");
+	const bytes = Buffer.from(redacted, "utf8");
+	let end = Math.max(0, budget);
+	while (end > 0 && (bytes[end - 1]! & 0xc0) === 0x80) end -= 1;
+	if (end > 0 && bytes[end - 1]! >= 0xc0) end -= 1;
+	return bytes.subarray(0, end).toString("utf8") + LAUNCH_GUARD_TRUNCATION_MARKER;
+}
+
+/** Narrows a caught value to a classified launch guard. */
+export function asLaunchWorktreeGuardError(error: unknown): LaunchWorktreeGuardError | null {
+	return error instanceof LaunchWorktreeGuardError ? error : null;
+}
+
 function describeWorktreeEntry(entry: GitWorktreeEntry): string {
 	return entry.detached ? `detached HEAD ${entry.head}` : (entry.branchRef ?? `HEAD ${entry.head}`);
 }
 
-function formatWorktreeTargetMismatch(plan: GjcLaunchWorktreePlan, existing: GitWorktreeEntry): string {
+function worktreeTargetMismatchGuard(
+	plan: GjcLaunchWorktreePlan,
+	existing: GitWorktreeEntry,
+): LaunchWorktreeGuardError {
 	const expected = plan.detached ? `detached HEAD ${plan.baseRef}` : `branch refs/heads/${plan.branchName ?? ""}`;
-	return [
-		`worktree_target_mismatch:${plan.worktreePath}`,
+	return launchGuard(
+		"worktree_target_mismatch",
+		plan.worktreePath,
 		`GJC launch worktree target is already registered for ${describeWorktreeEntry(existing)}, but this launch expects ${expected}.`,
 		`Path: ${plan.worktreePath}`,
 		"Refusing to delete or reuse the conflicting worktree automatically. Safe remediation: inspect the path, commit/stash any work, then remove or prune the stale worktree with git worktree remove <path> when it is no longer needed, or choose a different --worktree name.",
-	].join("\n");
+	);
 }
 
 function hasBranchInUse(entries: GitWorktreeEntry[], branchName: string, worktreePath: string): boolean {
@@ -327,30 +385,30 @@ function fileSystemErrorCode(error: unknown): string | null {
 }
 
 function formatBucketPath(bucketPath: string): string {
-	return JSON.stringify(shortenPath(bucketPath));
+	return JSON.stringify(shortenToolPath(bucketPath));
 }
 
-function brokenBucketSymlinkError(bucketPath: string): Error {
-	return new Error(
-		[
-			"worktree_bucket_broken_symlink",
+function brokenBucketSymlinkError(bucketPath: string): LaunchWorktreeGuardError {
+	return launchGuardLines(
+		"worktree_bucket_broken_symlink",
+		...[
 			"The GJC launch worktree bucket is a symbolic link whose target cannot be resolved; it may be unmounted or offloaded cold storage.",
 			`Path: ${formatBucketPath(bucketPath)}`,
 			"Safe remediation: restore or remount the link target, or inspect and remove the dangling link with platform-appropriate filesystem tools, then relaunch. GJC did not delete or replace the entry.",
-		].join("\n"),
+		],
 	);
 }
 
-function bucketNotDirectoryError(bucketPath: string, symlinkTarget = false): Error {
-	return new Error(
-		[
-			"worktree_bucket_not_directory",
+function bucketNotDirectoryError(bucketPath: string, symlinkTarget = false): LaunchWorktreeGuardError {
+	return launchGuardLines(
+		"worktree_bucket_not_directory",
+		...[
 			symlinkTarget
 				? "The GJC launch worktree bucket is a symbolic link whose target is not a directory."
 				: "The GJC launch worktree bucket path exists but is not a directory.",
 			`Path: ${formatBucketPath(bucketPath)}`,
 			"Safe remediation: inspect the obstructing entry and move or remove it with platform-appropriate filesystem tools, then relaunch. GJC did not delete or replace the entry.",
-		].join("\n"),
+		],
 	);
 }
 
@@ -360,13 +418,11 @@ function inspectBucketDir(bucketPath: string): "missing" | "usable" {
 		entry = fs.lstatSync(bucketPath);
 	} catch (error) {
 		if (fileSystemErrorCode(error) === "ENOENT") return "missing";
-		throw new Error(
-			[
-				"worktree_bucket_inspection_failed",
-				`GJC could not inspect the launch worktree bucket${fileSystemErrorCode(error) ? ` (${fileSystemErrorCode(error)})` : ""}.`,
-				`Path: ${formatBucketPath(bucketPath)}`,
-				"Safe remediation: verify that the bucket parent is accessible, then relaunch. GJC did not modify the entry.",
-			].join("\n"),
+		throw launchGuardLines(
+			"worktree_bucket_inspection_failed",
+			`GJC could not inspect the launch worktree bucket${fileSystemErrorCode(error) ? ` (${fileSystemErrorCode(error)})` : ""}.`,
+			`Path: ${formatBucketPath(bucketPath)}`,
+			"Safe remediation: verify that the bucket parent is accessible, then relaunch. GJC did not modify the entry.",
 		);
 	}
 	if (entry.isDirectory()) return "usable";
@@ -378,13 +434,11 @@ function inspectBucketDir(bucketPath: string): "missing" | "usable" {
 	} catch (error) {
 		const code = fileSystemErrorCode(error);
 		if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") throw brokenBucketSymlinkError(bucketPath);
-		throw new Error(
-			[
-				"worktree_bucket_target_inspection_failed",
-				`GJC could not inspect the launch worktree bucket link target${code ? ` (${code})` : ""}.`,
-				`Path: ${formatBucketPath(bucketPath)}`,
-				"Safe remediation: verify that the link target is accessible, then relaunch. GJC did not modify the link.",
-			].join("\n"),
+		throw launchGuardLines(
+			"worktree_bucket_target_inspection_failed",
+			`GJC could not inspect the launch worktree bucket link target${code ? ` (${code})` : ""}.`,
+			`Path: ${formatBucketPath(bucketPath)}`,
+			"Safe remediation: verify that the link target is accessible, then relaunch. GJC did not modify the link.",
 		);
 	}
 	if (target.isDirectory()) return "usable";
@@ -400,23 +454,19 @@ function ensureBucketDirUsable(bucketPath: string): void {
 		// racing broken link or non-directory is still reported actionably.
 		inspectBucketDir(bucketPath);
 		const code = fileSystemErrorCode(error);
-		throw new Error(
-			[
-				"worktree_bucket_create_failed",
-				`GJC could not create or reuse the launch worktree bucket${code ? ` (${code})` : ""}.`,
-				`Path: ${formatBucketPath(bucketPath)}`,
-				"Safe remediation: verify parent permissions and bucket accessibility, then relaunch. GJC did not delete or replace any entry.",
-			].join("\n"),
+		throw launchGuardLines(
+			"worktree_bucket_create_failed",
+			`GJC could not create or reuse the launch worktree bucket${code ? ` (${code})` : ""}.`,
+			`Path: ${formatBucketPath(bucketPath)}`,
+			"Safe remediation: verify parent permissions and bucket accessibility, then relaunch. GJC did not delete or replace any entry.",
 		);
 	}
 	if (inspectBucketDir(bucketPath) === "missing") {
-		throw new Error(
-			[
-				"worktree_bucket_changed_during_preflight",
-				"The GJC launch worktree bucket disappeared while launch was preparing it.",
-				`Path: ${formatBucketPath(bucketPath)}`,
-				"Safe remediation: stabilize the bucket mount or parent directory, then relaunch. GJC did not delete or replace any entry.",
-			].join("\n"),
+		throw launchGuardLines(
+			"worktree_bucket_changed_during_preflight",
+			"The GJC launch worktree bucket disappeared while launch was preparing it.",
+			`Path: ${formatBucketPath(bucketPath)}`,
+			"Safe remediation: stabilize the bucket mount or parent directory, then relaunch. GJC did not delete or replace any entry.",
 		);
 	}
 }
@@ -506,7 +556,7 @@ export function planLaunchWorktree(
 	if (branchName) validateBranchName(repoRoot, branchName);
 	const worktreeSlug = mode.detached ? resolveSourceBranchSlug(repoRoot, baseRef) : sanitizePathToken(mode.name);
 	const worktreePath = path.join(resolveWorktreeBucket(repoRoot), worktreeSlug);
-	if (path.resolve(worktreePath) === path.resolve(repoRoot)) throw new Error(`worktree_path_conflict:${worktreePath}`);
+	if (path.resolve(worktreePath) === path.resolve(repoRoot)) throw launchGuard("worktree_path_conflict", worktreePath);
 	return { enabled: true, repoRoot, worktreePath, detached: mode.detached, baseRef, branchName };
 }
 
@@ -537,14 +587,12 @@ function ensureLaunchWorktreeSync(
 	const listedAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
 	const existingAtPath = readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
 	if (listedAtPath && !existingAtPath) {
-		if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
-		throw new Error(
-			[
-				"worktree_path_unavailable",
-				"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
-				`Path: ${formatBucketPath(plan.worktreePath)}`,
-				"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
-			].join("\n"),
+		if (fs.existsSync(plan.worktreePath)) throw launchGuard("worktree_path_conflict", plan.worktreePath);
+		throw launchGuardLines(
+			"worktree_path_unavailable",
+			"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
+			`Path: ${formatBucketPath(plan.worktreePath)}`,
+			"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
 		);
 	}
 	const expectedBranchRef = plan.branchName ? `refs/heads/${plan.branchName}` : null;
@@ -553,15 +601,15 @@ function ensureLaunchWorktreeSync(
 		let dirty = isWorktreeDirty(plan.worktreePath);
 		if (plan.detached) {
 			if (!existingAtPath.detached) {
-				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
+				throw worktreeTargetMismatchGuard(plan, existingAtPath);
 			}
 			if (existingAtPath.head !== plan.baseRef) {
-				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
+				if (dirty) throw launchGuard("worktree_dirty", plan.worktreePath);
 				runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
 				dirty = false;
 			}
 		} else if (existingAtPath.branchRef !== expectedBranchRef) {
-			throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
+			throw worktreeTargetMismatchGuard(plan, existingAtPath);
 		}
 		return {
 			...plan,
@@ -573,9 +621,9 @@ function ensureLaunchWorktreeSync(
 		};
 	}
 
-	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (fs.existsSync(plan.worktreePath)) throw launchGuard("worktree_path_conflict", plan.worktreePath);
 	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
-		throw new Error(`branch_in_use:${plan.branchName}`);
+		throw launchGuard("branch_in_use", plan.branchName);
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
@@ -588,8 +636,8 @@ function ensureLaunchWorktreeSync(
 	const result = Bun.spawnSync(["git", ...args], { cwd: plan.repoRoot, stdout: "pipe", stderr: "pipe" });
 	if (result.exitCode !== 0) {
 		const stderr = sanitizeWorktreeDiagnostic(result.stderr.toString().trim());
-		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
-		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw launchGuard("branch_in_use", plan.branchName);
+		throw launchGuard("worktree_add_failed", stderr || args.join(" "));
 	}
 
 	return {
@@ -674,8 +722,10 @@ export async function ensureLaunchWorktreeCancellable(
 	const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
 	if (result.exitCode !== 0) {
 		const stderr = sanitizeWorktreeDiagnostic(result.stderr.trim());
-		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw new Error(`branch_in_use:${plan.branchName}`);
-		throw new Error(stderr || `worktree_add_failed:${args.join(" ")}`);
+		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw launchGuard("branch_in_use", plan.branchName);
+		// Keep the code prefix even when git supplied a message, so the failure stays a
+		// classified launch guard instead of falling through to the crash path.
+		throw launchGuard("worktree_add_failed", stderr || args.join(" "));
 	}
 
 	return {
@@ -733,7 +783,7 @@ function resolveWorkspacePackageManager(
 		if (declared.name === "bun" || declared.name === "npm" || declared.name === "pnpm") {
 			return { name: declared.name, version: declared.version };
 		}
-		throw new Error(`worktree_dependency_manager_unsupported:${declared.name}`);
+		throw launchGuard("worktree_dependency_manager_unsupported", declared.name);
 	}
 
 	const lockfileManagers: WorkspacePackageManager[] = [];
@@ -748,8 +798,8 @@ function resolveWorkspacePackageManager(
 		lockfileManagers.push("npm");
 	}
 	if (lockfileManagers.length === 1) return { name: lockfileManagers[0] as WorkspacePackageManager, version: null };
-	if (lockfileManagers.length === 0) throw new Error("worktree_dependency_lockfile_missing");
-	throw new Error(`worktree_dependency_manager_ambiguous:${lockfileManagers.join(",")}`);
+	if (lockfileManagers.length === 0) throw launchGuard("worktree_dependency_lockfile_missing");
+	throw launchGuard("worktree_dependency_manager_ambiguous", lockfileManagers.join(","));
 }
 
 function removeLegacySourceNodeModulesLink(sourceRoot: string, worktreePath: string): void {
@@ -771,14 +821,14 @@ function removeLegacySourceNodeModulesLink(sourceRoot: string, worktreePath: str
 	} catch (error) {
 		if (fileSystemErrorCode(error) !== "ENOENT") throw error;
 	}
-	if (!linksToSource) throw new Error(`worktree_node_modules_not_local:${target}`);
+	if (!linksToSource) throw launchGuard("worktree_node_modules_not_local", target);
 	fs.unlinkSync(target);
 }
 
 function workspaceInstallCommand(manager: ResolvedWorkspacePackageManager): string[] {
 	const args = manager.name === "npm" ? ["ci"] : ["install", "--frozen-lockfile"];
 	if (manager.name === "bun" || Bun.which(manager.name) !== null) return [manager.name, ...args];
-	if (manager.version === null) throw new Error(`worktree_dependency_manager_unavailable:${manager.name}`);
+	if (manager.version === null) throw launchGuard("worktree_dependency_manager_unavailable", manager.name);
 	return ["bun", "x", `${manager.name}@${manager.version}`, ...args];
 }
 
@@ -798,13 +848,15 @@ function installWorkspaceDependencies(
 			stderr: "pipe",
 		});
 	} catch (error) {
-		throw new Error(
-			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(String(error))}`,
+		throw launchGuard(
+			"worktree_dependency_install_failed",
+			`${manager.name}:${sanitizeWorktreeDiagnostic(String(error))}`,
 		);
 	}
 	if (result.exitCode !== 0) {
-		throw new Error(
-			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(result.stderr.toString().trim())}`,
+		throw launchGuard(
+			"worktree_dependency_install_failed",
+			`${manager.name}:${sanitizeWorktreeDiagnostic(result.stderr.toString().trim())}`,
 		);
 	}
 	let installed: fs.Stats;
@@ -833,13 +885,15 @@ async function installWorkspaceDependenciesCancellable(
 		result = await spawnProcessGroup(command, worktreePath, options, timeout);
 	} catch (error) {
 		if (error instanceof DependencyPreparationTimeoutError) throw error;
-		throw new Error(
-			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(String(error))}`,
+		throw launchGuard(
+			"worktree_dependency_install_failed",
+			`${manager.name}:${sanitizeWorktreeDiagnostic(String(error))}`,
 		);
 	}
 	if (result.exitCode !== 0) {
-		throw new Error(
-			`worktree_dependency_install_failed:${manager.name}:${sanitizeWorktreeDiagnostic(result.stderr.trim())}`,
+		throw launchGuard(
+			"worktree_dependency_install_failed",
+			`${manager.name}:${sanitizeWorktreeDiagnostic(result.stderr.trim())}`,
 		);
 	}
 	let installed: fs.Stats;
@@ -849,7 +903,8 @@ async function installWorkspaceDependenciesCancellable(
 		if (fileSystemErrorCode(error) === "ENOENT") return;
 		throw error;
 	}
-	if (!installed.isDirectory() || installed.isSymbolicLink()) throw new Error("worktree_dependency_install_not_local");
+	if (!installed.isDirectory() || installed.isSymbolicLink())
+		throw launchGuard("worktree_dependency_install_not_local");
 }
 
 /** Workspace worktrees must own their complete lockfile-resolved dependency graph (#4620). */

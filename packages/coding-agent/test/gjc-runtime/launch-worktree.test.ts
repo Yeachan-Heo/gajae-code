@@ -8,8 +8,10 @@ import * as path from "node:path";
 import type { Args } from "@gajae-code/coding-agent/cli/args";
 import { buildDefaultTmuxLaunchPlan } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import {
+	asLaunchWorktreeGuardError,
 	ensureLaunchWorktree,
 	ensureReusableNodeModules,
+	LaunchWorktreeGuardError,
 	parseLaunchWorktreeMode,
 	planLaunchWorktree,
 	prepareLaunchWorktree,
@@ -690,5 +692,74 @@ describe("resolveWorktreeBucketForPath Windows semantics", () => {
 			"C:\\repos\\App.worktrees",
 		);
 		expect(resolveWorktreeBucketForPath(repo, "   ", home, path.win32)).toBe("C:\\repos\\app\\.worktrees");
+	});
+});
+
+describe("launch guard classification", () => {
+	// Classification is structural: guards are thrown as LaunchWorktreeGuardError at the refusal
+	// site, so a newly added guard cannot regress to the crash path by being forgotten in a list.
+	it("throws a classified guard, code-prefixed, when the bucket is not git-ignored", async () => {
+		const repo = await createRepo("gjc-guard-not-ignored-");
+		// Drop the bucket ignore so the preflight refuses.
+		await fs.rm(path.join(repo, ".gitignore"), { force: true });
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree"]);
+		} catch (error) {
+			caught = error;
+		}
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.code).toBe("worktree_bucket_not_ignored");
+		expect(guard?.message.startsWith("worktree_bucket_not_ignored")).toBe(true);
+		expect(guard?.message).toContain("Safe remediation:");
+	});
+
+	// Regression: validateBranchName threw raw git stderr with no code prefix, so the guard
+	// existed in name only and fell through to the crash path.
+	it("prefixes the guard code even when git supplies its own branch-name diagnostic", async () => {
+		const repo = await createRepo("gjc-guard-badbranch-");
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree=bad..name"]);
+		} catch (error) {
+			caught = error;
+		}
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.code).toBe("invalid_worktree_branch");
+		expect(guard?.message.startsWith("invalid_worktree_branch:")).toBe(true);
+	});
+
+	it("redacts secrets and bounds captured branch diagnostics", async () => {
+		const repo = await createRepo("gjc-guard-diagnostic-bounds-");
+		const secret = "SuperSecretToken123456";
+		const branch = `Bearer ${secret} ${"x".repeat(20_000)}`;
+		let caught: unknown;
+		try {
+			prepareLaunchWorktree(repo, ["--worktree", branch]);
+		} catch (error) {
+			caught = error;
+		}
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.message).not.toContain(secret);
+		expect(guard?.message).toContain("«redacted-auth»");
+		expect(Buffer.byteLength(guard?.message ?? "", "utf8")).toBeLessThanOrEqual(16 * 1024);
+		expect(guard?.message).toContain("[launch diagnostic truncated]");
+	});
+
+	it("leaves a genuine defect unclassified so it keeps full crash diagnostics", () => {
+		expect(asLaunchWorktreeGuardError(new TypeError("cannot read properties of undefined"))).toBeNull();
+		// A plain Error is never promoted by message shape, even if it looks like a guard.
+		expect(asLaunchWorktreeGuardError(new Error("worktree_bucket_not_ignored"))).toBeNull();
+		expect(asLaunchWorktreeGuardError(new Error("ENOENT: no such file"))).toBeNull();
+		expect(asLaunchWorktreeGuardError("worktree_dirty:/repo")).toBeNull();
+		expect(asLaunchWorktreeGuardError(null)).toBeNull();
+	});
+
+	it("passes an already-classified guard through unchanged", () => {
+		const guard = new LaunchWorktreeGuardError("worktree_dirty", "worktree_dirty:/repo");
+		expect(asLaunchWorktreeGuardError(guard)).toBe(guard);
 	});
 });
