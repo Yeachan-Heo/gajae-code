@@ -1242,9 +1242,10 @@ export async function captureOwnerGenerationBaseline(
 ): Promise<OwnerGenerationBaseline> {
 	const file = lifecyclePaths(stateDir, sessionId, "baseline").generationFile;
 	try {
-		await fs.access(file);
-	} catch {
-		return { state: "absent" };
+		await fs.lstat(file);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return { state: "absent" };
+		throw error;
 	}
 	const record = await readJson<unknown>(file);
 	if (
