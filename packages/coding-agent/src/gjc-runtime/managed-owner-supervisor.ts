@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -227,8 +228,15 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		let intentEvidencePresent = false;
 		let expiredIntent = false;
 		try {
-			const candidate: unknown = readNoFollowJsonSync(lifecyclePaths(stateDir, sessionId, generation).intentFile);
-			intentEvidencePresent = candidate !== null;
+			const intentFile = lifecyclePaths(stateDir, sessionId, generation).intentFile;
+			try {
+				fsSync.statSync(intentFile);
+				intentEvidencePresent = true;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
+				else throw error;
+			}
+			const candidate: unknown = intentEvidencePresent ? readNoFollowJsonSync(intentFile) : null;
 			if (
 				isValidOwnerIntent(candidate) &&
 				candidate.session_id === sessionId &&
