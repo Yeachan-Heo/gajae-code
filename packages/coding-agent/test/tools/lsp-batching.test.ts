@@ -68,6 +68,34 @@ describe("createLspWritethrough batching", () => {
 		expect(await Bun.file(filePath).text()).toBe("const single = true;\n");
 	});
 
+	it("resolves format policy when the writethrough runs after a settings rescope", async () => {
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({
+			servers: {
+				fixture: {
+					command: "fixture-linter",
+					fileTypes: ["ts"],
+					rootMarkers: [],
+					createClient: () => ({ format: async () => "formatted-after-rescope\n", lint: async () => [] }),
+				},
+			},
+			idleTimeoutMs: undefined,
+		});
+		vi.spyOn(lspConfig, "getServersForFile").mockImplementation(config => Object.entries(config.servers));
+
+		let formatEnabled = false;
+		const writethrough = createLspWritethrough(tempDir.path(), {
+			enableFormat: () => formatEnabled,
+		});
+		const filePath = path.join(tempDir.path(), "rescope.ts");
+
+		await writethrough(filePath, "before-rescope\n");
+		expect(await Bun.file(filePath).text()).toBe("before-rescope\n");
+
+		formatEnabled = true;
+		await writethrough(filePath, "after-rescope\n");
+		expect(await Bun.file(filePath).text()).toBe("formatted-after-rescope\n");
+	});
+
 	it("resolves LSP config and custom clients from the live cwd and profile", async () => {
 		const cwdA = path.join(tempDir.path(), "workspace-a");
 		const cwdB = path.join(tempDir.path(), "workspace-b");

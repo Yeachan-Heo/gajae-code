@@ -736,9 +736,9 @@ async function formatContent(
 /** Options for creating the LSP writethrough callback */
 export interface WritethroughOptions {
 	/** Whether to format the file using LSP after writing */
-	enableFormat?: boolean;
+	enableFormat?: boolean | (() => boolean);
 	/** Whether to get LSP diagnostics after writing */
-	enableDiagnostics?: boolean;
+	enableDiagnostics?: boolean | (() => boolean);
 	/** Effective agent directory, resolved for each write when supplied as a getter. */
 	agentDir?: string | (() => string | undefined);
 	/** Called when diagnostics arrive after the main timeout. */
@@ -1161,17 +1161,18 @@ export function createLspWritethrough(
 	cwd: string | (() => string),
 	options?: WritethroughOptions,
 ): WritethroughCallback {
-	const resolvedOptions: ResolvedWritethroughOptions = {
-		enableFormat: options?.enableFormat ?? false,
-		enableDiagnostics: options?.enableDiagnostics ?? false,
-	};
+	const resolveOptions = (): ResolvedWritethroughOptions => ({
+		enableFormat:
+			typeof options?.enableFormat === "function" ? options.enableFormat() : (options?.enableFormat ?? false),
+		enableDiagnostics:
+			typeof options?.enableDiagnostics === "function"
+				? options.enableDiagnostics()
+				: (options?.enableDiagnostics ?? false),
+	});
 	const resolveCwd = typeof cwd === "function" ? cwd : () => cwd;
 	const agentDirOption = options?.agentDir;
 	const resolveAgentDir: () => string | undefined =
 		typeof agentDirOption === "function" ? agentDirOption : () => agentDirOption;
-	if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
-		return writethroughNoop;
-	}
 	return async (
 		dst: string,
 		content: string,
@@ -1182,6 +1183,10 @@ export function createLspWritethrough(
 	) => {
 		const liveCwd = resolveCwd();
 		const agentDir = resolveAgentDir();
+		const resolvedOptions = resolveOptions();
+		if (!resolvedOptions.enableFormat && !resolvedOptions.enableDiagnostics) {
+			return writethroughNoop(dst, content, signal, file);
+		}
 		if (!batch) {
 			const bundle = getDeferred?.(dst);
 			const deferredInner =

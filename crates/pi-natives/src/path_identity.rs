@@ -9910,32 +9910,38 @@ mod platform {
 		Ok(())
 	}
 
+	enum SkillPublicationError {
+		Pre(&'static str),
+		Published(&'static str),
+	}
+
 	fn replace_skill_file_name(
 		handle: HANDLE,
 		parent: HANDLE,
 		final_name: &[u16],
 		authority: &HeldExact,
 		path_names: &[OsString],
-	) -> Result<(), &'static str> {
+	) -> Result<(), SkillPublicationError> {
 		#[cfg(test)]
 		pause_secure_skill_write_before_rename_for_test();
-		revalidate_skill_root(authority, path_names)?;
-		validate_skill_file_handle(handle)?;
-		rename_handle(handle, parent, final_name, true)?;
+		revalidate_skill_root(authority, path_names).map_err(SkillPublicationError::Pre)?;
+		validate_skill_file_handle(handle).map_err(SkillPublicationError::Pre)?;
+		rename_handle(handle, parent, final_name, true).map_err(SkillPublicationError::Pre)?;
 		let published = open_relative_with_share(
 			parent,
 			OsStr::new("SKILL.md"),
 			FILE_READ_ATTRIBUTES | FILE_READ_DATA,
 			false,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		)?;
+		)
+		.map_err(SkillPublicationError::Published)?;
 		let same = handles_same_object_checked(handle, published).unwrap_or(false);
 		let validated = same && validate_skill_file_handle(published).is_ok();
 		unsafe { CloseHandle(published) };
 		if validated {
 			Ok(())
 		} else {
-			Err("identity_mismatch")
+			Err(SkillPublicationError::Published("identity_mismatch"))
 		}
 	}
 
@@ -10058,12 +10064,15 @@ mod platform {
 			}
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
-		if let Err(code) =
+		if let Err(error) =
 			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
 		{
-			let cleanup = cleanup_private_skill_file(file);
+			let code = match error {
+				SkillPublicationError::Pre(code) => cleanup_private_skill_file(file).err().unwrap_or(code),
+				SkillPublicationError::Published(code) => code,
+			};
 			unsafe { CloseHandle(file) };
-			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+			return NativeSecureSkillWriteResult::failure(code);
 		}
 		unsafe { CloseHandle(file) };
 		NativeSecureSkillWriteResult::success(

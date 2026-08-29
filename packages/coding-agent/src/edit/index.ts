@@ -162,12 +162,10 @@ function resolveFuzzyThreshold(session: ToolSession, rawValue: string): number {
 
 function createEditWritethrough(session: ToolSession): WritethroughCallback {
 	const enableLsp = session.enableLsp ?? true;
-	const enableDiagnostics = enableLsp && session.settings.get("lsp.diagnosticsOnEdit");
-	const enableFormat = enableLsp && session.settings.get("lsp.formatOnWrite");
 	return enableLsp
 		? createLspWritethrough(() => session.cwd, {
-				enableFormat,
-				enableDiagnostics,
+				enableFormat: () => session.settings.get("lsp.formatOnWrite"),
+				enableDiagnostics: () => session.settings.get("lsp.diagnosticsOnEdit"),
 				agentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
 			})
 		: writethroughNoop;
