@@ -10924,6 +10924,10 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const hasUsableImage =
+			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		const sdkRunToken = readSdkRunCapability(options?.sdkRunCapability);
 		const internalOptions: InternalPromptOptions | undefined = options
 			? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) }
@@ -10988,6 +10992,10 @@ export class AgentSession {
 
 		// Expand file-based prompt templates if requested
 		const expandedText = expandPromptTemplates ? expandPromptTemplate(text, [...this.#promptTemplates]) : text;
+		const expandedHasUsableImage =
+			options?.images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (expandedText.trim().length === 0 && !expandedHasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
@@ -11943,12 +11951,18 @@ export class AgentSession {
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
 	async steer(text: string, images?: ImageContent[]): Promise<void> {
+		const hasUsableImage =
+			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (expandedText.trim().length === 0 && !hasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
 		await this.#queueSteer(expandedText, images, { claimsGenuineUserIntent: true });
 	}
@@ -11961,12 +11975,18 @@ export class AgentSession {
 		images?: ImageContent[],
 		options?: Pick<PromptOptions, "followUpQueuePolicy">,
 	): Promise<void> {
+		const hasUsableImage =
+			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
 
 		const expandedText = expandPromptTemplate(text, [...this.#promptTemplates]);
+		if (expandedText.trim().length === 0 && !hasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		assertImagePlaceholdersHavePayload(expandedText, images);
 		await this.#queueFollowUp(expandedText, images, {
 			forceOneAtATime: options?.followUpQueuePolicy === "sequential",
@@ -12607,7 +12627,15 @@ export class AgentSession {
 			const textParts: string[] = [];
 			images = [];
 			for (const part of content) {
+				if (!part || typeof part !== "object" || Array.isArray(part))
+					throw Object.assign(new Error("sendUserMessage content blocks must be objects."), {
+						code: "invalid_input",
+					});
 				if (part.type === "text") {
+					if (typeof part.text !== "string")
+						throw Object.assign(new Error("sendUserMessage text blocks must contain string text."), {
+							code: "invalid_input",
+						});
 					textParts.push(part.text);
 				} else {
 					images.push(part);
@@ -12616,6 +12644,10 @@ export class AgentSession {
 			text = textParts.join("\n");
 			if (images.length === 0) images = undefined;
 		}
+		const hasUsableImage =
+			images?.some(image => typeof image?.data === "string" && image.data.trim().length > 0) === true;
+		if (text.trim().length === 0 && !hasUsableImage)
+			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 
 		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])

@@ -28,8 +28,35 @@ export type AdapterValidationError = {
 	message: string;
 };
 
+const PROMPT_OPERATIONS = new Set(["turn.prompt", "turn.steer", "turn.follow_up", "turn.abort_and_prompt"]);
+
+function hasUsablePromptImage(value: unknown): boolean {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const image = value as Record<string, unknown>;
+	return (
+		typeof image.data === "string" &&
+		image.data.trim().length > 0 &&
+		(image.mimeType === undefined || (typeof image.mimeType === "string" && image.mimeType.length > 0))
+	);
+}
+
+/** Rejects instruction-bearing controls before correlation or provider work. */
+export function validateRequiredPromptText(operation: string, input: Input): AdapterValidationError | undefined {
+	const hasUsableImage =
+		operation === "turn.prompt" && Array.isArray(input.images) && input.images.some(hasUsablePromptImage);
+	if (
+		PROMPT_OPERATIONS.has(operation) &&
+		(typeof input.text !== "string" || (input.text.trim().length === 0 && !hasUsableImage))
+	) {
+		return { code: "invalid_input", message: "Prompt must not be empty." };
+	}
+	return undefined;
+}
+
 /** Validates controls that adapters must reject before forwarding them to a host. */
 export function validateAdapterControl(operation: string, input: Input): AdapterValidationError | undefined {
+	const promptError = validateRequiredPromptText(operation, input);
+	if (promptError) return promptError;
 	if (operation === "runtime.reload") {
 		if (
 			!Array.isArray(input.components) ||

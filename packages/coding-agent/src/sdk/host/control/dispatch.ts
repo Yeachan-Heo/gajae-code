@@ -3,6 +3,7 @@ import {
 	DEFAULT_MODEL_SELECTION_RECOVERY_MESSAGE,
 	parseDefaultModelSelectionRecovery,
 } from "../../../session/default-model-selection";
+import { validateRequiredPromptText } from "../../protocol/adapter-validation";
 import { OPERATIONS, type Operation } from "../../protocol/operation-registry";
 import type { ControlInput, ControlSurface, ControlValue } from "./operations";
 import { brokerRuntimeCloseCapability, hasBrokerRuntimeCloseCapability } from "./runtime-gate";
@@ -462,6 +463,8 @@ export function dispatchControl(
 		);
 	if (!isInput(request.input))
 		return Promise.resolve(failure(request.id, "invalid_input", "Control input must be an object."));
+	const promptError = validateRequiredPromptText(row.sdkId, request.input);
+	if (promptError) return Promise.resolve(failure(request.id, promptError.code, promptError.message));
 	if ((row.sdkId === "context.clear" || row.sdkId === "session.delete") && request.confirm !== true)
 		return Promise.resolve(
 			failure(request.id, "invalid_input", "confirm: true is required for this destructive operation."),

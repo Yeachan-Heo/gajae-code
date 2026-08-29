@@ -54,6 +54,7 @@ import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
+import { validateRequiredPromptText } from "../../sdk/protocol/adapter-validation";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { resolveAcpAbortScope } from "./abort-scope";
@@ -994,7 +995,6 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 				text.push(block.text);
 				break;
 			case "image":
-				if (block.uri) text.push(`[Image URI: ${block.uri}]`);
 				images.push({ data: block.data, mimeType: block.mimeType });
 				break;
 			case "resource_link":
@@ -1027,7 +1027,6 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 						"unsupported_content",
 						`Unsupported embedded resource MIME type: ${mimeType}`,
 					);
-				text.push(`[Resource: ${resource.uri}]\nMIME: ${mimeType}`);
 				images.push({ data: resource.blob, mimeType });
 				break;
 			}
@@ -1038,7 +1037,7 @@ export function acpPromptPayload(blocks: PromptRequest["prompt"]): {
 		}
 	}
 	if (text.length === 0 && images.length === 0)
-		throw new AcpSdkAdapterError("invalid_input", "ACP prompt must contain at least one supported content block.");
+		throw new AcpSdkAdapterError("invalid_input", "Prompt must not be empty.");
 	return { text: text.join("\n"), images };
 }
 
@@ -1576,10 +1575,17 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
-		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
-		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
 		const skillInvocation = acpSkillInvocation(params.prompt);
+		if (!skillInvocation) {
+			const promptError = validateRequiredPromptText("turn.prompt", {
+				text: payload.text,
+				images: payload.images,
+			});
+			if (promptError) throw new AcpSdkAdapterError(promptError.code, promptError.message);
+		}
+		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
+		record.cancelRequested = false;
 		if (isAcpUnavailableSlashCommand(payload.text)) {
 			await this.#publishSessionUpdate(
 				params.sessionId,

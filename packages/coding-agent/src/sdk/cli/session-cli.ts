@@ -16,7 +16,11 @@ import type {
 	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
-import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
+import {
+	validateAdapterControl,
+	validateAdapterSecretFields,
+	validateRequiredPromptText,
+} from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation, type OperationKind } from "../protocol/operation-registry";
 import { type SessionAttachment, SessionRouter, SessionRouterError, type SessionRouterFrame } from "../router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
@@ -654,6 +658,8 @@ async function runSend(agentDir: string, sessionId: string, args: SdkSessionCliA
 	if (args.text !== undefined && Object.keys(input).length > 0)
 		throw new SdkSessionCliError("usage", "Use either --text or one JSON input source for the prompt, not both.", 2);
 	const promptInput: JsonRecord = args.text === undefined ? { ...input } : { text: args.text };
+	const promptError = validateRequiredPromptText("turn.prompt", promptInput);
+	if (promptError) throw new SdkSessionCliError(promptError.code, promptError.message, 2);
 	const inputRef = clientRefFromInput(promptInput);
 	const clientRef = inputRef ?? args.opRef?.trim() ?? createOperationRef();
 	if (args.opRef !== undefined && inputRef !== undefined && inputRef !== args.opRef.trim())

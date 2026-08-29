@@ -9,7 +9,11 @@ import {
 	type SessionReconcileUncertainTarget,
 	validateSessionReconcileUncertainTarget,
 } from "../lifecycle/service";
-import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
+import {
+	validateAdapterControl,
+	validateAdapterSecretFields,
+	validateRequiredPromptText,
+} from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
 import { ACP_SESSION_RECONNECT, SESSION_ABORT_TIMEOUT_MS } from "../session-reconnect";
@@ -343,7 +347,18 @@ export class AcpSdkAdapter {
 	}
 
 	async prompt(params: JsonObject | string): Promise<unknown> {
-		const text = typeof params === "string" ? params : String(params.prompt ?? params.text ?? "");
+		const rawText =
+			typeof params === "string"
+				? params
+				: params !== null && typeof params === "object"
+					? (params.prompt ?? params.text)
+					: undefined;
+		const text = typeof rawText === "string" ? rawText : "";
+		const invalid = validateRequiredPromptText("turn.prompt", {
+			text,
+			...(typeof params === "object" && Array.isArray(params.images) ? { images: params.images } : {}),
+		});
+		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
 		return await this.#requestSession({
 			type: "control_request",
 			operation: "turn.prompt",

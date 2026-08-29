@@ -8404,6 +8404,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_start_session") {
 				requireCoordinatorMutation(config, "sessions", args);
+				const suppliedPrompt = Object.hasOwn(args, "prompt");
+				if (suppliedPrompt && (typeof args.prompt !== "string" || args.prompt.trim().length === 0))
+					return { ok: false, error: { code: "invalid_input", message: "Prompt must not be empty." } };
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const cwd = await canonicalBrokerWorkspace(await assertCoordinatorWorkdir(config, args.cwd));
 				const mpresetResolution = await resolveCoordinatorMpreset(args.mpreset, loadModelProfiles);
@@ -8426,7 +8429,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						error: { code: "unknown_model", message: modelResolution.error },
 					};
 				}
-				const prompt = typeof args.prompt === "string" && args.prompt.length > 0 ? args.prompt : null;
+				const prompt = suppliedPrompt ? (args.prompt as string) : null;
 				/**
 				 * A prepared session is deliberately not ready for input: its readiness
 				 * is withheld until an operator-supplied thread is bound and activation
@@ -9071,10 +9074,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (name === "gjc_coordinator_send_prompt") {
 				requireCoordinatorMutation(config, "sessions", args);
+				if (typeof args.prompt !== "string" || args.prompt.trim().length === 0)
+					return { ok: false, error: { code: "invalid_input", message: "Prompt must not be empty." } };
 				const idempotencyKey = requiredIdempotencyKey(args);
 				const sessionId = safeExternalId("session", args.session_id);
-				if (typeof args.prompt !== "string" || args.prompt.length === 0)
-					return { ok: false, error: { code: "invalid_input", message: "prompt is required" } };
 				const prompt = args.prompt;
 				return await withToolIdempotency(
 					name,

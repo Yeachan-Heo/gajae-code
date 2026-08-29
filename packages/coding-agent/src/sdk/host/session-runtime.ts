@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai/core";
+import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import {
@@ -49,6 +49,7 @@ import {
 import { projectQ10Models } from "../models.js";
 import { PromptDeadlineManager, type PromptTerminalTransitionEvidence } from "../prompt-deadline-manager";
 import { formatPromptFailureForLocalLog, sanitizePromptFailure } from "../prompt-failure";
+import { validateRequiredPromptText } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
 import {
 	createKindAwareReconciliation,
@@ -1856,6 +1857,22 @@ function createControlSurface(
 	canResolveGate: () => boolean = () => true,
 	trackGateResolution: <T>(resolution: Promise<T>) => Promise<T> = async resolution => await resolution,
 ): ControlSurface {
+	const normalizePromptImages = (value: unknown): ImageContent[] => {
+		if (!Array.isArray(value)) return [];
+		const normalized: ImageContent[] = [];
+		for (const candidate of value) {
+			if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+			const image = candidate as Record<string, unknown>;
+			if (typeof image.data !== "string" || image.data.trim().length === 0) continue;
+			if (image.mimeType !== undefined && typeof image.mimeType !== "string") continue;
+			normalized.push({
+				type: "image",
+				data: image.data,
+				mimeType: typeof image.mimeType === "string" && image.mimeType.length > 0 ? image.mimeType : "image/png",
+			});
+		}
+		return normalized;
+	};
 	type InternalSendOptions = NonNullable<Parameters<ExtensionAPI["sendUserMessage"]>[1]> & {
 		sdkRunCapability?: SdkRunCapability;
 	};
@@ -3115,10 +3132,17 @@ function createControlSurface(
 		}
 	};
 	return {
-		prompt: async (text, images, clientRef) =>
-			submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunCapability, ...options }) =>
+		prompt: async (text, images, clientRef) => {
+			const invalid = validateRequiredPromptText("turn.prompt", { text, images });
+			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
+			return await submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(
-					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
+					typeof images === "undefined"
+						? text
+						: ([{ type: "text", text }, ...normalizePromptImages(images)] as [
+								{ type: "text"; text: string },
+								...ImageContent[],
+							]),
 					{
 						...options,
 						sdkRunCapability,
@@ -3128,8 +3152,11 @@ function createControlSurface(
 						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
 					},
 				),
-			),
+			);
+		},
 		steer: async (text, clientRef) => {
+			const invalid = validateRequiredPromptText("turn.steer", { text });
+			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
 			const retainedClientRef = normalizeClientRef(clientRef);
 			if (retainedClientRef === undefined) {
 				const correlation = newCorrelation();
@@ -3146,8 +3173,10 @@ function createControlSurface(
 				return { accepted: false, ...(await durable.settleSteer(retainedClientRef, "rejected", error)) };
 			}
 		},
-		followUp: async text =>
-			submit(
+		followUp: async text => {
+			const invalid = validateRequiredPromptText("turn.follow_up", { text });
+			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
+			return await submit(
 				"prompt",
 				undefined,
 				({ sdkRunCapability, ...options }) =>
@@ -3160,13 +3189,16 @@ function createControlSurface(
 				false,
 				// Follow-ups never start inline; ownership correlates at promotion.
 				true,
-			),
+			);
+		},
 		abort: async () => {
 			await Promise.resolve(ctx.abort()).catch(() => undefined);
 			return { aborted: true };
 		},
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
+			const invalid = validateRequiredPromptText("turn.abort_and_prompt", { text });
+			if (invalid) throw Object.assign(new Error(invalid.message), { code: invalid.code });
 			await ctx.abort();
 			return await submit("prompt", undefined, ({ sdkRunCapability, ...options }) =>
 				sendSdkUserMessage(text, { ...options, sdkRunCapability }),
