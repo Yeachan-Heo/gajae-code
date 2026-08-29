@@ -4,8 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { SdkSessionRowV1 } from "../src/sdk/cli/rows";
 import {
-	filterSessionRowsByScope,
 	boundWarningSources,
+	filterSessionRowsByScope,
 	parseSessionListScope,
 	resolveSessionListSelection,
 	runSdkSessionCli,
