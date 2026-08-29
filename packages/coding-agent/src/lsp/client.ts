@@ -24,6 +24,8 @@ const clients = new Map<string, LspClient>();
 const killedClients = new WeakSet<LspClient>();
 const clientLocks = new Map<string, Promise<LspClient>>();
 const fileOperationLocks = new Map<string, Promise<void>>();
+const clientOperationIds = new WeakMap<LspClient, number>();
+let nextClientOperationId = 1;
 const initializingClients = new Set<LspClient>();
 let shutdownGeneration = 0;
 // Session lifetimes retain the workspace/profile scope they may use. A scoped
@@ -33,6 +35,15 @@ const scopeReferences = new Map<string, number>();
 const scopeShutdownGenerations = new Map<string, number>();
 const transportClosedErrors = new WeakMap<LspClient, Error>();
 const LSP_TRANSPORT_CLOSED_MESSAGE = "LSP transport closed";
+
+function fileOperationLockKey(client: LspClient, uri: string): string {
+	let id = clientOperationIds.get(client);
+	if (id === undefined) {
+		id = nextClientOperationId++;
+		clientOperationIds.set(client, id);
+	}
+	return `${id}:${uri}`;
+}
 
 async function withFileOperationLock<T>(
 	key: string,
@@ -755,7 +766,7 @@ export async function getOrCreateClient(
 export async function ensureFileOpen(client: LspClient, filePath: string, signal?: AbortSignal): Promise<void> {
 	throwIfAborted(signal);
 	const uri = fileToUri(filePath);
-	const lockKey = `${client.name}:${uri}`;
+	const lockKey = fileOperationLockKey(client, uri);
 
 	// Check if file is already open
 	if (client.openFiles.has(uri)) {
@@ -819,7 +830,7 @@ export async function syncContent(
 	signal?: AbortSignal,
 ): Promise<void> {
 	const uri = fileToUri(filePath);
-	const lockKey = `${client.name}:${uri}`;
+	const lockKey = fileOperationLockKey(client, uri);
 	throwIfAborted(signal);
 
 	const syncPromise = withFileOperationLock(lockKey, signal, async () => {
@@ -866,10 +877,13 @@ export async function notifySaved(client: LspClient, filePath: string, signal?: 
 	if (!info) return; // File not open, nothing to notify
 
 	throwIfAborted(signal);
-	await sendNotification(client, "textDocument/didSave", {
-		textDocument: { uri },
+	await withFileOperationLock(fileOperationLockKey(client, uri), signal, async () => {
+		if (!client.openFiles.has(uri)) return;
+		await sendNotification(client, "textDocument/didSave", {
+			textDocument: { uri },
+		});
+		client.lastActivity = Date.now();
 	});
-	client.lastActivity = Date.now();
 }
 
 /**
@@ -879,7 +893,7 @@ export async function notifySaved(client: LspClient, filePath: string, signal?: 
 export async function refreshFile(client: LspClient, filePath: string, signal?: AbortSignal): Promise<void> {
 	throwIfAborted(signal);
 	const uri = fileToUri(filePath);
-	const lockKey = `${client.name}:${uri}`;
+	const lockKey = fileOperationLockKey(client, uri);
 
 	const refreshPromise = withFileOperationLock(lockKey, signal, async () => {
 		throwIfAborted(signal);

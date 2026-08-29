@@ -4559,6 +4559,10 @@ export class AgentSession {
 			isStreaming: () =>
 				this.isStreaming || this.#handoffTransitionActive || this.#sessionTransitionKind !== undefined,
 			injectStreaming: message => {
+				if (this.#isDisposed || this.#sessionTransitionKind !== undefined) {
+					this.#settleDeliveredOwnedRegistrations([message]);
+					return;
+				}
 				// Mandated boundary comment (corrected turn semantics): turn-scope
 				// abort blocks only deliveries whose origin is a continuation of the
 				// aborted turn. Owned-completion deliveries from work deliberately
