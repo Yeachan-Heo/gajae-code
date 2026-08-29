@@ -3448,6 +3448,51 @@ export class AgentSession {
 	}
 
 	/**
+	 * Reject prompt/selection/continuation admission while a session identity
+	 * transition is rewriting the live session. Handoff keeps its historical
+	 * error because callers use it to distinguish that explicit operation from
+	 * the other transition fences.
+	 */
+	#assertNoSessionTransitionAdmission(options?: { allowInternalTransitionEmission?: boolean }): void {
+		if (this.#handoffTransitionActive) {
+			this.#assertNoHandoffTransition();
+		}
+		if (
+			this.#sessionTransitionKind !== undefined &&
+			!(options?.allowInternalTransitionEmission === true && this.#isInternalTransitionEmission())
+		) {
+			throw Object.assign(new AgentBusyError("Cannot start a turn while a session transition is in progress."), {
+				code: "busy",
+			});
+		}
+	}
+
+	#captureSessionIdentityAdmission(): SessionIdentityAdmission {
+		return {
+			manager: this.sessionManager,
+			sessionId: this.sessionManager.getSessionId(),
+			sessionFile: this.sessionManager.getSessionFile(),
+			transitionGeneration: this.#coordinatorPersistGeneration,
+		};
+	}
+
+	#sessionIdentityAdmissionMatches(admission: SessionIdentityAdmission): boolean {
+		return (
+			this.sessionManager === admission.manager &&
+			this.sessionManager.getSessionId() === admission.sessionId &&
+			this.sessionManager.getSessionFile() === admission.sessionFile &&
+			this.#coordinatorPersistGeneration === admission.transitionGeneration
+		);
+	}
+
+	#assertSessionIdentityAdmission(admission: SessionIdentityAdmission): void {
+		this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: this.#isInternalTransitionEmission() });
+		if (!this.#sessionIdentityAdmissionMatches(admission)) {
+			throw new Error("Session changed while selecting model");
+		}
+	}
+
+	/**
 	 * Single, synchronously-acquired mutex for session-identity transitions
 	 * (handoff, compact, new/switch/branch/clear, fork, tree navigation). Acquired
 	 * BEFORE any await at each transition's entry and released in its finally, so
