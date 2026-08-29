@@ -6,8 +6,9 @@
  * - Registering providers (where to find it)
  * - Loading items for a capability across all providers
  */
-import * as path from "node:path";
+
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { getAgentDir, getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
@@ -259,7 +260,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	// scope from its supplied home (explicit-home contract).
 	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
+	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, isolatedHome: false, settings: options.settings };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
@@ -310,7 +311,14 @@ export async function loadCapabilityForHome<T>(
 		: null;
 	const repoRoot = canonicalRepoRoot && isWithinOrEqual(canonicalHome, canonicalRepoRoot) ? repoRootCandidate : null;
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
-	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: isolatedOptions.settings };
+	const ctx: LoadContext = {
+		cwd,
+		home: resolvedHome,
+		userAgentDir,
+		repoRoot,
+		isolatedHome: true,
+		settings: isolatedOptions.settings,
+	};
 	const providers = filterProviders(capability, isolatedOptions);
 
 	return await loadImpl(capability, providers, ctx, isolatedOptions);
