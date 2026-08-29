@@ -9,6 +9,7 @@ import {
 	resolveSessionListSelection,
 	runSdkSessionCli,
 	type SdkSessionCliArgs,
+	SESSION_LIST_WARNING_LIMIT,
 } from "../src/sdk/cli/session-cli";
 
 const tempRoot = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-session-scope-"));
@@ -217,5 +218,92 @@ describe("sdk session list scope filtering", () => {
 		const selection = await resolveSessionListSelection("repo", main);
 		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
 		expect(filtered.sessions.map(candidate => candidate.sessionId)).toEqual(["p-late"]);
+	});
+});
+
+describe("scope exclusion warnings are bounded", () => {
+	/** Non-Git workspaces are what produce exclusion warnings. */
+	async function nonGitRows(count: number, prefix: string): Promise<SdkSessionRowV1[]> {
+		const rows: SdkSessionRowV1[] = [];
+		for (let index = 0; index < count; index++) {
+			const workspace = path.join(tempRoot, `${prefix}-${index}`);
+			await mkdir(workspace, { recursive: true });
+			rows.push(row(`s-${prefix}-${index}`, workspace));
+		}
+		return rows;
+	}
+
+	test("emits every warning while at or below the limit", async () => {
+		const repo = await makeRepo("warn-at-limit");
+		const selection = await resolveSessionListSelection("repo", repo);
+		const rows = await nonGitRows(SESSION_LIST_WARNING_LIMIT, "atlimit");
+
+		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
+
+		expect(filtered.sessions).toEqual([]);
+		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		// No summary line is added when nothing was omitted.
+		expect(filtered.warnings.every(warning => warning.startsWith("Session "))).toBe(true);
+	});
+
+	test("collapses the tail into one summary carrying the exact total", async () => {
+		const repo = await makeRepo("warn-over-limit");
+		const selection = await resolveSessionListSelection("repo", repo);
+		const excluded = SESSION_LIST_WARNING_LIMIT + 7;
+		const rows = await nonGitRows(excluded, "overlimit");
+
+		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
+
+		// Bounded regardless of how many sessions exist on the machine.
+		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT + 1);
+		const summary = filtered.warnings.at(-1) ?? "";
+		expect(summary).toBe(
+			`7 further session workspaces outside Git were excluded by scope repo; ${excluded} excluded in total.`,
+		);
+		// The retained sample is still individual, credential-free exclusion text.
+		for (const warning of filtered.warnings.slice(0, SESSION_LIST_WARNING_LIMIT)) {
+			expect(warning).toContain("is outside Git; excluded by scope repo.");
+		}
+	});
+
+	test("uses singular wording when exactly one warning is omitted", async () => {
+		const repo = await makeRepo("warn-one-over");
+		const selection = await resolveSessionListSelection("repo", repo);
+		const rows = await nonGitRows(SESSION_LIST_WARNING_LIMIT + 1, "oneover");
+
+		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
+
+		expect(filtered.warnings.at(-1)).toBe(
+			`1 further session workspace outside Git was excluded by scope repo; ${SESSION_LIST_WARNING_LIMIT + 1} excluded in total.`,
+		);
+	});
+
+	test("scope all filters nothing and therefore warns about nothing", async () => {
+		const repo = await makeRepo("warn-scope-all");
+		const selection = await resolveSessionListSelection("all", repo);
+		const rows = await nonGitRows(SESSION_LIST_WARNING_LIMIT + 5, "scopeall");
+
+		const filtered = await filterSessionRowsByScope(rows, "all", selection);
+
+		expect(filtered.sessions).toHaveLength(rows.length);
+		expect(filtered.warnings).toEqual([]);
+	});
+
+	// Regression: bounding the concatenated array a second time counted the inner summary as a
+	// warning, reported the collapsed length as the total, and could truncate the inner summary
+	// away entirely — destroying the exact excluded count it exists to carry.
+	test("keeps the scope summary and its exact total when many warnings are excluded", async () => {
+		const repo = await makeRepo("warn-exact-total");
+		const selection = await resolveSessionListSelection("repo", repo);
+		const excluded = SESSION_LIST_WARNING_LIMIT * 20;
+		const rows = await nonGitRows(excluded, "exacttotal");
+
+		const filtered = await filterSessionRowsByScope(rows, "repo", selection);
+
+		expect(filtered.warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT + 1);
+		const summary = filtered.warnings.at(-1) ?? "";
+		// The stated total must be the real number excluded, never the collapsed length.
+		expect(summary).toContain(`${excluded} excluded in total.`);
+		expect(summary).not.toContain(`${SESSION_LIST_WARNING_LIMIT + 1} excluded in total.`);
 	});
 });
