@@ -18,6 +18,8 @@ import {
 	type ReadScope,
 	readDirEntries,
 	readFile,
+	readFileSize,
+	readFileSlice,
 } from "../capability/fs";
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
@@ -395,31 +397,16 @@ async function readSkillFrontmatter(
 	skillPath: string,
 	readOptions?: ReadFileOptions,
 ): Promise<SkillFrontmatter | null> {
-	// Explicit-home reads must go through the scope-aware filesystem seam. The
-	// incremental Bun.file path below is retained for ordinary discovery so the
-	// frontmatter scan remains bounded without changing its historical behavior.
-	if (readOptions?.isolatedHome) {
-		const content = await readFile(skillPath, readOptions);
-		if (content === null) return null;
-		const prefix = content.slice(0, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
-		const opening = prefix.match(/^---[ \t]*(?:\r?\n|$)/);
-		if (!opening) return null;
-		const afterOpening = prefix.slice(opening[0].length);
-		const closing = afterOpening.match(/\r?\n---[ \t]*(?:\r?\n|$)/);
-		if (!closing || closing.index === undefined) return null;
-		const bounded = prefix.slice(0, opening[0].length + closing.index + closing[0].length);
-		return parseFrontmatter(bounded, { source: skillPath }).frontmatter as SkillFrontmatter;
-	}
-
-	const file = Bun.file(skillPath);
-	const size = (await fs.promises.stat(skillPath)).size;
+	const size = await readFileSize(skillPath, readOptions);
+	if (size === null) return null;
 	const scanLimit = Math.min(size, SKILL_FRONTMATTER_SCAN_TOTAL_BYTES);
 	let offset = 0;
 	let prefix = "";
 	const decoder = new TextDecoder();
 	while (offset < scanLimit) {
 		const end = Math.min(offset + SKILL_FRONTMATTER_SCAN_BYTES, scanLimit);
-		const bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+		const bytes = await readFileSlice(skillPath, offset, end, readOptions);
+		if (bytes === null) return null;
 		const chunk = decoder.decode(bytes, { stream: end < scanLimit });
 		if (!chunk) break;
 		prefix += chunk;
@@ -461,7 +448,8 @@ export async function scanSkillsFromDir(
 		try {
 			const frontmatter = await readSkillFrontmatter(skillPath, readOptions);
 			if (!frontmatter) {
-				if (fs.statSync(skillPath).size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
+				const size = await readFileSize(skillPath, readOptions);
+				if (size !== null && size > SKILL_FRONTMATTER_SCAN_TOTAL_BYTES) {
 					warnings.push(
 						`Skill frontmatter exceeded ${SKILL_FRONTMATTER_SCAN_TOTAL_BYTES} byte scan cap: ${skillPath}`,
 					);
@@ -508,7 +496,7 @@ export async function scanSkillsFromDir(
 			scope,
 		);
 		if (!skillPath) continue;
-		if (fs.existsSync(skillPath)) {
+		if ((await readFileSize(skillPath, readOptions)) !== null) {
 			work.push(loadSkill(skillPath));
 		}
 	}
@@ -1097,12 +1085,15 @@ export async function listClaudePluginRoots(
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
+	const registryReadOptions: ReadFileOptions | undefined = isolatedHome
+		? { isolatedHome: true, home: canonicalHome, scope: "project", bypassCache: true }
+		: undefined;
 
 	// ── GJC installed plugins registry ───────────────────────────────────────
 	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const gjcContent = gjcRegistryPath ? await readFile(gjcRegistryPath) : null;
+	const gjcContent = gjcRegistryPath ? await readFile(gjcRegistryPath, registryReadOptions) : null;
 	if (isolatedHome && !gjcRegistryPath) {
 		warnings.push(`Ignoring GJC plugin registry outside the isolated home: ${rawGjcRegistryPath}`);
 	}
@@ -1155,7 +1146,7 @@ export async function listClaudePluginRoots(
 	// Loaded from the nearest .gjc/plugins/installed_plugins.json relative to cwd.
 	// Project entries take precedence over user entries for the same plugin ID.
 	if (resolvedProjectPath) {
-		const projectContent = projectRegistryPath ? await readFile(projectRegistryPath) : null;
+		const projectContent = projectRegistryPath ? await readFile(projectRegistryPath, registryReadOptions) : null;
 		if (isolatedHome && !projectRegistryPath) {
 			warnings.push(`Ignoring project plugin registry outside the isolated home: ${resolvedProjectPath}`);
 		}

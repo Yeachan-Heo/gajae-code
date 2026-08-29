@@ -69,6 +69,22 @@ async function resolveReadPath(filePath: string, options?: ReadFileOptions): Pro
 	return canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget)) ? canonicalTarget : null;
 }
 
+/**
+ * Re-check an isolated path immediately before opening it. Canonicalizing the
+ * lexical path once prevents cache poisoning, while this second check also
+ * fails closed when an existing leaf is swapped for a symlink between the
+ * initial resolution and the actual read.
+ */
+async function isCurrentIsolatedPath(abs: string, options?: ReadFileOptions): Promise<boolean> {
+	if (!options?.isolatedHome) return true;
+	try {
+		const current = await resolveReadPath(abs, options);
+		return current === abs;
+	} catch {
+		return false;
+	}
+}
+
 export async function readFile(filePath: string, options?: ReadFileOptions): Promise<string | null> {
 	let abs: string | null;
 	try {
@@ -77,6 +93,7 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		return null;
 	}
 	if (abs === null) return null;
+	if (!(await isCurrentIsolatedPath(abs, options))) return null;
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
 	if (useCache && contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
@@ -92,6 +109,43 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	}
 }
 
+/** Read one byte range through the same canonical authority as readFile. */
+export async function readFileSlice(
+	filePath: string,
+	start: number,
+	end: number,
+	options?: ReadFileOptions,
+): Promise<Uint8Array | null> {
+	let abs: string | null;
+	try {
+		abs = await resolveReadPath(filePath, options);
+	} catch {
+		return null;
+	}
+	if (abs === null || !(await isCurrentIsolatedPath(abs, options))) return null;
+	try {
+		return new Uint8Array(await Bun.file(abs).slice(start, end).arrayBuffer());
+	} catch {
+		return null;
+	}
+}
+
+/** Read file size through the same canonical authority as readFile. */
+export async function readFileSize(filePath: string, options?: ReadFileOptions): Promise<number | null> {
+	let abs: string | null;
+	try {
+		abs = await resolveReadPath(filePath, options);
+	} catch {
+		return null;
+	}
+	if (abs === null || !(await isCurrentIsolatedPath(abs, options))) return null;
+	try {
+		return (await fs.promises.stat(abs)).size;
+	} catch {
+		return null;
+	}
+}
+
 export async function readDirEntries(dirPath: string, options?: ReadFileOptions): Promise<fs.Dirent[]> {
 	let abs: string | null;
 	try {
@@ -100,6 +154,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		return [];
 	}
 	if (abs === null) return [];
+	if (!(await isCurrentIsolatedPath(abs, options))) return [];
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
 	if (useCache && dirCache.has(abs)) {
 		return dirCache.get(abs) ?? [];
