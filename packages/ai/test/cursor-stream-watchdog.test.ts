@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { cursorExecDeadlineMsForTest, disposeCursorConversation, streamCursor } from "../src/providers/cursor";
+import { createCursorMessageQueueForTest, cursorExecDeadlineMsForTest, disposeCursorConversation, streamCursor } from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
 import {
 	AgentServerMessageSchema,
@@ -1676,5 +1676,12 @@ describe("Cursor raw transport watchdog", () => {
 		const { events, result } = await pending;
 		expect(result.errorMessage).toBe("caller cancelled quick write");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("does not resume frame admission before queued work decrements pending", async () => {
+		const queue = createCursorMessageQueueForTest();
+		const completed = queue.enqueue(() => undefined);
+		await completed;
+		expect(queue.pending()).toBe(0);
 	});
 });

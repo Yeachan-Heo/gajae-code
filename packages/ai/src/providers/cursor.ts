@@ -2418,7 +2418,7 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 				.finally(() => {
 					pending -= 1;
 				});
-			return result;
+			return chain;
 		},
 		drain() {
 			return chain;
