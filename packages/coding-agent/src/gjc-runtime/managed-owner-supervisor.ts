@@ -230,7 +230,9 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				candidate.generation === generation &&
 				candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV]
 			) {
-				if (Date.parse(candidate.expires_at) > Date.now()) candidateIntent = candidate;
+				const now = Date.now();
+				if (Date.parse(candidate.created_at) <= now && Date.parse(candidate.expires_at) > now)
+					candidateIntent = candidate;
 				else expiredIntent = true;
 			}
 		} catch (error) {
