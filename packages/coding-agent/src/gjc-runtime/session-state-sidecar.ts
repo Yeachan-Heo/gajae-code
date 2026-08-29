@@ -2759,6 +2759,7 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 ): Promise<void> {
 	const owner = context.ownerTerminal;
 	if (!owner) return;
+	let payload: Record<string, unknown> | null = null;
 	try {
 		if (!verdict) {
 			if (
@@ -2773,7 +2774,7 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 		const now = new Date().toISOString();
 		const expected = verdict.classification === "expected_operator_shutdown";
 		const state: RuntimeState = expected ? "completed" : "errored";
-		const payload = {
+		payload = {
 			...basePayload({
 				context,
 				previous,
@@ -2802,8 +2803,8 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 					}),
 			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
 		};
-		await writeStateFileSync(stateFile, payload);
 	} catch {
+		if (verdict) return;
 		const now = new Date().toISOString();
 		await writeStateFileSync(stateFile, {
 			...basePayload({
@@ -2830,8 +2831,8 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
 		});
 	}
+	if (payload) await writeStateFileSync(stateFile, payload);
 }
-
 export async function persistCoordinatorRuntimeStateFromPostmortem(
 	reason: postmortem.Reason,
 	context: RuntimeStateContext,
