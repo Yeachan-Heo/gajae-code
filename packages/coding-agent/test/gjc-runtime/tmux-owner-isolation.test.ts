@@ -16,6 +16,7 @@ import {
 	executeTmuxOwnerIsolationPlanSync,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
+	isTrustedOwnerIsolationProtocolRequest,
 	isValidOwnerVerdict,
 	lifecyclePaths,
 	observeOwnerTerminal,
@@ -26,7 +27,6 @@ import {
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
-	isTrustedOwnerIsolationProtocolRequest,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
