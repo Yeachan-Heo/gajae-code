@@ -15,6 +15,7 @@ export interface GoalRuntimeHost {
 	getCurrentUsage(): GoalTokenUsage;
 	emit(event: GoalRuntimeEvent): void | Promise<void>;
 	persist(mode: "goal" | "goal_paused" | "none", state?: GoalModeState): void;
+	assertMutationAllowed?(): void;
 	sendHiddenMessage(message: {
 		customType: string;
 		content: string;
@@ -165,6 +166,7 @@ export class GoalRuntime {
 		state: GoalModeState | undefined,
 		options?: { persist?: "goal" | "goal_paused" | "none"; emit?: boolean },
 	): Promise<void> {
+		this.#host.assertMutationAllowed?.();
 		this.#host.setState(state ? cloneState(state) : undefined);
 		if (options?.persist) {
 			this.#host.persist(options.persist, state);

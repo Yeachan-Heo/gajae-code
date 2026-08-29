@@ -158,6 +158,7 @@ export interface LoadSlashCommandsOptions {
 	agentDir?: string;
 	/** Settings authority for this session-scoped discovery. */
 	settings?: Settings;
+	profileAuthority?: "default" | "custom";
 }
 
 /**
@@ -169,6 +170,7 @@ export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}):
 		cwd: options.cwd,
 		agentDir: options.agentDir,
 		settings: options.settings,
+		profileAuthority: options.profileAuthority,
 	});
 
 	const fileCommands: FileSlashCommand[] = result.items.map(cmd => {

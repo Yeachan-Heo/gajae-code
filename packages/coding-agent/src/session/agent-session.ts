@@ -4937,6 +4937,9 @@ export class AgentSession {
 		this.#goalRuntime = new GoalRuntime({
 			getState: () => this.#goalModeState,
 			setState: state => this.#applyGoalModeState(state),
+			assertMutationAllowed: () => {
+				this.#assertSessionIdentityAdmission(this.#captureSessionIdentityAdmission());
+			},
 			getCurrentUsage: () => {
 				const usage = this.getSessionStats().tokens;
 				return {

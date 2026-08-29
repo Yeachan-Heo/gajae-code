@@ -239,6 +239,8 @@ export interface LoadContextFilesOptions {
 	agentDir?: string;
 	/** Settings authority for session-scoped capability discovery. */
 	settings?: Settings;
+	/** Resolver-owned profile classification for user-scope discovery. */
+	profileAuthority?: "default" | "custom";
 }
 
 function dedupeExactContextFiles(
@@ -273,6 +275,7 @@ export async function loadProjectContextFilesResult(
 		cwd: resolvedCwd,
 		agentDir: options.agentDir,
 		settings: options.settings,
+		profileAuthority: options.profileAuthority,
 	});
 	const items = result.items as ContextFile[];
 
@@ -323,6 +326,7 @@ export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {
 		cwd: resolvedCwd,
 		agentDir: options.agentDir,
 		settings: options.settings,
+		profileAuthority: options.profileAuthority,
 	});
 
 	if (result.items.length === 0) return null;
@@ -388,6 +392,8 @@ export interface BuildSystemPromptOptions {
 	agentDir?: string;
 	/** Settings authority for session-scoped prompt discovery. */
 	settings?: Settings;
+	/** Resolver-owned profile classification for user-scope discovery. */
+	profileAuthority?: "default" | "custom";
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
@@ -618,6 +624,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		cwd: resolvedCwd,
 		agentDir: options.agentDir,
 		settings: options.settings,
+		profileAuthority: options.profileAuthority,
 	});
 	const contextFilesPromise = providedContextFiles
 		? Promise.resolve({ contextFiles: providedContextFiles, warnings: [] })
@@ -625,6 +632,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				cwd: resolvedCwd,
 				agentDir: options.agentDir,
 				settings: options.settings,
+				profileAuthority: options.profileAuthority,
 			});
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined

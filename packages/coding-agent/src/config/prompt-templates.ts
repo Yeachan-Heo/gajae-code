@@ -260,6 +260,7 @@ export interface LoadPromptTemplatesOptions {
 	cwd?: string;
 	/** Agent config directory for global templates. Default: from getPromptsDir() */
 	agentDir?: string;
+	profileAuthority?: "default" | "custom";
 }
 
 /**

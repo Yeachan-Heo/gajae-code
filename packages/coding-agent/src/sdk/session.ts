@@ -790,10 +790,15 @@ export async function discoverContextFiles(
 /**
  * Discover prompt templates from cwd and agentDir.
  */
-export async function discoverPromptTemplates(cwd?: string, agentDir?: string): Promise<PromptTemplate[]> {
+export async function discoverPromptTemplates(
+	cwd?: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
+): Promise<PromptTemplate[]> {
 	return await loadPromptTemplatesInternal({
 		cwd: cwd ?? getProjectDir(),
 		agentDir: agentDir ?? getDefaultAgentDir(),
+		profileAuthority,
 	});
 }
 
@@ -825,6 +830,7 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
 	agentDir?: string;
+	profileAuthority?: "default" | "custom";
 	settings?: Settings;
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
@@ -840,6 +846,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
 		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
 		settings: options.settings,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
@@ -2610,7 +2617,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			if (options.contextFiles === undefined) {
 				try {
-					const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir, settings });
+					const rediscovered = await loadContextFilesResultInternal({
+						cwd: to,
+						agentDir,
+						settings,
+						profileAuthority,
+					});
 					contextFiles = rediscovered.contextFiles;
 				} catch (error) {
 					contextFiles = [];
@@ -2658,7 +2670,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			if (options.rules === undefined) {
 				try {
-					const rulesResult = await loadCapability<Rule>(ruleCapability.id, { cwd: to, agentDir, settings });
+					const rulesResult = await loadCapability<Rule>(ruleCapability.id, {
+						cwd: to,
+						agentDir,
+						settings,
+						profileAuthority,
+					});
 					const nextTtsrManager = new TtsrManager(settings.getGroup("ttsr"));
 					const nextRulebookRules: Rule[] = [];
 					const nextAlwaysApplyRules: Rule[] = [];
@@ -2679,7 +2696,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				promptTemplates =
 					options.promptTemplates === undefined
-						? await discoverPromptTemplates(to, agentDir)
+						? await discoverPromptTemplates(to, agentDir, profileAuthority)
 						: options.promptTemplates;
 				session?.setPromptTemplates(promptTemplates);
 			} catch (error) {
@@ -2687,7 +2704,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 			if (options.slashCommands === undefined) {
 				try {
-					slashCommands = await loadSlashCommands({ cwd: to, agentDir, settings });
+					slashCommands = await loadSlashCommands({ cwd: to, agentDir, settings, profileAuthority });
 					session?.setSlashCommands(slashCommands);
 				} catch (error) {
 					slashCommands = [];
@@ -4318,6 +4335,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				alwaysApplyRules,
 				skillsSettings: settings.getGroup("skills"),
 				appendSystemPrompt: appendPrompt,
+				profileAuthority,
 				pluginAppendices: pluginSystemAppendices,
 				repeatToolDescriptions,
 				intentField,
