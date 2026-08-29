@@ -1858,7 +1858,6 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 			: new Date().toISOString();
 	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
-	context = contextWithManagedOwnerGeneration(context);
 	const state = stateForEvent(event);
 	if (!stateFile) return;
 	const beforePersistFromEvent = __sessionStateSidecarTestHooks.beforePersistFromEvent;
@@ -1866,9 +1865,10 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	if (!state) {
 		const activityPhase = toolActivityPhaseForEvent(event);
 		if (!activityPhase) return;
+		const activityContext = contextWithManagedOwnerGeneration(context);
 		await persistCoordinatorRuntimeToolActivity(
 			event,
-			context,
+			activityContext,
 			stateFile,
 			activityPhase,
 			observation?.label,
@@ -1876,6 +1876,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 		);
 		return;
 	}
+	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
 		stateFile,
