@@ -29,7 +29,7 @@ let bootstrapSigtermPending = false;
 const captureBootstrapSigterm = () => {
 	bootstrapSigtermPending = true;
 };
-if (process.argv.includes(MANAGED_OWNER_SUPERVISOR_ARG)) {
+if (process.argv.at(-1) === MANAGED_OWNER_SUPERVISOR_ARG) {
 	process.removeAllListeners("SIGTERM");
 	process.on("SIGTERM", captureBootstrapSigterm);
 }
