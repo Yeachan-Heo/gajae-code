@@ -1480,7 +1480,13 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 			throw new Error("changed_file");
 		const content = await handle.readFile("utf8");
 		const after = await handle.stat({ bigint: true });
-		const pathAfter = await fs.lstat(file, { bigint: true });
+		let pathAfter: fsSync.BigIntStats;
+		try {
+			pathAfter = await fs.lstat(file, { bigint: true });
+		} catch (error) {
+			if (isCode(error, "ENOENT")) throw new Error("changed_file");
+			throw error;
+		}
 		if (
 			!after.isFile() ||
 			!pathAfter.isFile() ||
