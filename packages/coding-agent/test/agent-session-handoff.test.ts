@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Agent } from "@gajae-code/agent-core";
+import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
 import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
@@ -1286,6 +1286,18 @@ describe("AgentSession handoff", () => {
 			const move = moveSession.rescopeSessionCwd(target, { scope: "any" });
 			await prepareStarted.promise;
 			await expect(Promise.resolve().then(() => moveSession.newSession())).rejects.toMatchObject({ code: "busy" });
+			await expect(moveSession.setModel(model)).rejects.toThrow(/session transition is in progress/i);
+			await expect(moveSession.setModelTemporary(model)).rejects.toThrow(/session transition is in progress/i);
+			await expect(moveSession.activateModelProfileForControl("missing-profile")).rejects.toThrow(
+				/session transition is in progress/i,
+			);
+			await expect(moveSession.setActiveToolsByName([])).rejects.toThrow(/session transition is in progress/i);
+			await expect(moveSession.refreshMCPTools([])).rejects.toThrow(/session transition is in progress/i);
+			expect(() => moveSession.setThinkingLevel(ThinkingLevel.Off)).toThrow(/session transition is in progress/i);
+			expect(() => moveSession.setThinkingVisibility("hidden")).toThrow(/session transition is in progress/i);
+			expect(() => moveSession.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" })).toThrow(
+				/session transition is in progress/i,
+			);
 
 			prepareGate.resolve();
 			await expect(move).resolves.toMatchObject({ from: source, to: target });
@@ -1294,6 +1306,75 @@ describe("AgentSession handoff", () => {
 			await moveSession.dispose();
 			await moveSessionManager.close();
 		}
+	});
+
+	it("fences model and control mutations during new, switch, and clear transitions", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected model to be set");
+
+		const expectFenced = async (): Promise<void> => {
+			await expect(session.setModel(model)).rejects.toThrow(/session transition is in progress/i);
+			await expect(session.setModelTemporary(model)).rejects.toThrow(/session transition is in progress/i);
+			await expect(session.activateModelProfileForControl("missing-profile")).rejects.toThrow(
+				/session transition is in progress/i,
+			);
+			await expect(session.setModelTemporaryForControl(model)).resolves.toBe(false);
+			await expect(session.setThinkingLevelForControl(ThinkingLevel.Off, false)).rejects.toThrow(
+				/session transition is in progress/i,
+			);
+			await expect(session.setThinkingVisibilityForControl("hidden", false)).rejects.toThrow(
+				/session transition is in progress/i,
+			);
+			await expect(session.setActiveToolsByName([])).rejects.toThrow(/session transition is in progress/i);
+			await expect(session.refreshMCPTools([])).rejects.toThrow(/session transition is in progress/i);
+			await expect(
+				session.setCredentialPin("anthropic", { kind: "email", value: "test@example.com" }),
+			).rejects.toThrow(/session transition is in progress/i);
+			await expect(session.setCredentialAuto("anthropic")).rejects.toThrow(/session transition is in progress/i);
+			expect(() => session.setThinkingLevel(ThinkingLevel.Off)).toThrow(/session transition is in progress/i);
+			expect(() => session.setThinkingVisibility("hidden")).toThrow(/session transition is in progress/i);
+			expect(() => session.setPlanModeState({ enabled: true, planFilePath: "local://PLAN.md" })).toThrow(
+				/session transition is in progress/i,
+			);
+		};
+
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const prepareNewSession = sessionManager.prepareNewSession.bind(sessionManager);
+		const prepareSpy = vi.spyOn(sessionManager, "prepareNewSession").mockImplementation(async options => {
+			prepareStarted.resolve();
+			await prepareGate.promise;
+			return prepareNewSession(options);
+		});
+		const newSession = session.newSession();
+		await prepareStarted.promise;
+		await expectFenced();
+		prepareGate.resolve();
+		await expect(newSession).resolves.toBe(true);
+		prepareSpy.mockRestore();
+
+		const switchStarted = Promise.withResolvers<void>();
+		const switchSession = session.switchSession(session.sessionFile!, {
+			onTransitionMutationStarted: () => switchStarted.resolve(),
+		});
+		await switchStarted.promise;
+		await expectFenced();
+		await expect(switchSession).resolves.toBe(true);
+
+		const flushGate = Promise.withResolvers<void>();
+		const flushStarted = Promise.withResolvers<void>();
+		const flush = sessionManager.flush.bind(sessionManager);
+		const flushSpy = vi.spyOn(sessionManager, "flush").mockImplementation(async () => {
+			flushStarted.resolve();
+			await flushGate.promise;
+			return flush();
+		});
+		const clear = session.clearContext();
+		await flushStarted.promise;
+		await expectFenced();
+		flushGate.resolve();
+		await expect(clear).resolves.toBe(true);
+		flushSpy.mockRestore();
 	});
 
 	it("rekeys the owned async endpoint when a provider transcript moves", async () => {

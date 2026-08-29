@@ -249,7 +249,13 @@ export class HindsightSessionState {
 
 	/** Whether this state may publish recall, retention, or mental-model results. */
 	get isActive(): boolean {
-		return !this.#disposing && !this.#disposed && !this.#sessionIsDisposed() && this.isAttachedToSession();
+		return (
+			!this.#disposing &&
+			!this.#disposed &&
+			!this.#sessionIsDisposed() &&
+			this.isAttachedToSession() &&
+			(!this.aliasOf || this.aliasOf.isActive)
+		);
 	}
 
 	/** Queue draining is allowed during teardown, while replacement ownership is not. */
@@ -285,10 +291,12 @@ export class HindsightSessionState {
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
 	getRecallSnippet(): string | undefined {
+		if (!this.isActive) return undefined;
 		return this.aliasOf ? this.aliasOf.getRecallSnippet() : this.lastRecallSnippet;
 	}
 	/** Return the current recall payload without consuming its one-shot injection eligibility. */
 	getRecallSnippetForInjection(): string | undefined {
+		if (!this.isActive) return undefined;
 		if (this.aliasOf) return this.aliasOf.getRecallSnippetForInjection();
 		const snippet = this.lastRecallSnippet;
 		if (!snippet) return undefined;
@@ -298,6 +306,7 @@ export class HindsightSessionState {
 
 	/** Mark a recall payload consumed only after it has been accepted for provider injection. */
 	markRecallSnippetInjected(snippet: string): boolean {
+		if (!this.isActive) return false;
 		if (this.aliasOf) return this.aliasOf.markRecallSnippetInjected(snippet);
 		if (snippet !== this.lastRecallSnippet) return false;
 		const hash = createHash("sha256").update(snippet).digest("hex");

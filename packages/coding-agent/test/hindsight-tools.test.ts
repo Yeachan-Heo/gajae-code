@@ -144,6 +144,49 @@ describe("Hindsight recall injection", () => {
 		registeredState!.lastRecallSnippet = "<memories>updated fact</memories>";
 		expect(registeredState!.getRecallSnippetForInjection()).toBe("<memories>updated fact</memories>");
 	});
+
+	it("fails closed for stale snippets and alias children after parent disposal", () => {
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		registerState(client);
+		const parent = registeredState!;
+		parent.lastRecallSnippet = "<memories>parent fact</memories>";
+
+		let child!: HindsightSessionState;
+		child = new HindsightSessionState({
+			sessionId: "alias-session-id",
+			client: parent.client,
+			bankId: parent.bankId,
+			retainTags: parent.retainTags,
+			recallTags: parent.recallTags,
+			recallTagsMatch: parent.recallTagsMatch,
+			config: parent.config,
+			session: { getHindsightSessionState: () => child } as never,
+			missionsSet: parent.missionsSet,
+			aliasOf: parent,
+		});
+
+		expect(child.isActive).toBe(true);
+		expect(child.getRecallSnippet()).toBe("<memories>parent fact</memories>");
+		parent.beginDispose();
+
+		expect(child.isActive).toBe(false);
+		expect(child.getRecallSnippet()).toBeUndefined();
+		expect(child.getRecallSnippetForInjection()).toBeUndefined();
+		expect(child.markRecallSnippetInjected("<memories>parent fact</memories>")).toBe(false);
+	});
+
+	it("fails closed for a detached primary state's recall snippet", () => {
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		registerState(client);
+		const state = registeredState!;
+		state.lastRecallSnippet = "<memories>detached fact</memories>";
+		registeredState = undefined;
+
+		expect(state.isActive).toBe(false);
+		expect(state.getRecallSnippet()).toBeUndefined();
+		expect(state.getRecallSnippetForInjection()).toBeUndefined();
+		expect(state.markRecallSnippetInjected("<memories>detached fact</memories>")).toBe(false);
+	});
 });
 
 describe("retain.execute", () => {
@@ -337,6 +380,29 @@ describe("recall.execute", () => {
 		const tool = HindsightRecallTool.createIf(makeSession(settings))!;
 		await expect(tool.execute("call-5", { query: "anything" })).rejects.toThrow(/HTTP 503/);
 	});
+
+	it("discards a recall result when the state is disposed while the request is in flight", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(HindsightApi.prototype, "recall").mockImplementation(async () => {
+			started.resolve();
+			await release.promise;
+			return { results: [{ text: "stale memory" }] } as never;
+		});
+		registerState(client, settings);
+
+		const tool = HindsightRecallTool.createIf(makeSession(settings))!;
+		const recall = tool.execute("call-stale-recall", { query: "anything" });
+		await started.promise;
+		registeredState!.beginDispose();
+		release.resolve();
+
+		const result = await recall;
+		expect(result.content[0]).toEqual({ type: "text", text: "No relevant memories found." });
+		expect((result.content[0] as { text: string }).text).not.toContain("stale memory");
+	});
 });
 
 describe("reflect.execute", () => {
@@ -377,5 +443,31 @@ describe("reflect.execute", () => {
 		const tool = HindsightReflectTool.createIf(makeSession(settings))!;
 		const result = await tool.execute("call-7", { query: "anything" });
 		expect((result.content[0] as { text: string }).text).toBe("No relevant information found to reflect on.");
+	});
+
+	it("discards a reflect result when the state is disposed while the request is in flight", async () => {
+		const settings = Settings.isolated({ "memory.backend": "hindsight" });
+		const client = new HindsightApi({ baseUrl: "http://localhost:8888" });
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		vi.spyOn(HindsightApi.prototype, "reflect").mockImplementation(async () => {
+			started.resolve();
+			await release.promise;
+			return { text: "stale reflection" } as never;
+		});
+		registerState(client, settings);
+
+		const tool = HindsightReflectTool.createIf(makeSession(settings))!;
+		const reflect = tool.execute("call-stale-reflect", { query: "anything" });
+		await started.promise;
+		registeredState!.beginDispose();
+		release.resolve();
+
+		const result = await reflect;
+		expect(result.content[0]).toEqual({
+			type: "text",
+			text: "No relevant information found to reflect on.",
+		});
+		expect((result.content[0] as { text: string }).text).not.toContain("stale reflection");
 	});
 });

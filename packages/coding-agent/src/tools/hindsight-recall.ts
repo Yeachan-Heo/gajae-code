@@ -31,8 +31,12 @@ export class HindsightRecallTool implements AgentTool<typeof hindsightRecallSche
 			if (!state) {
 				throw new Error("Hindsight backend is not initialised for this session.");
 			}
+			if (!state.isActive) {
+				throw new Error("Hindsight backend is not active for this session.");
+			}
 
 			try {
+				if (!state.isActive) return noRelevantMemoriesResult();
 				const response = await state.client.recall(state.bankId, params.query, {
 					budget: state.config.recallBudget,
 					maxTokens: state.config.recallMaxTokens,
@@ -40,12 +44,10 @@ export class HindsightRecallTool implements AgentTool<typeof hindsightRecallSche
 					tags: state.recallTags,
 					tagsMatch: state.recallTagsMatch,
 				});
+				if (!state.isActive) return noRelevantMemoriesResult();
 				const results = response.results ?? [];
 				if (results.length === 0) {
-					return {
-						content: [{ type: "text", text: "No relevant memories found." }],
-						details: {},
-					};
+					return noRelevantMemoriesResult();
 				}
 				const formatted = formatMemories(results);
 				return {
@@ -63,4 +65,11 @@ export class HindsightRecallTool implements AgentTool<typeof hindsightRecallSche
 			}
 		});
 	}
+}
+
+function noRelevantMemoriesResult(): AgentToolResult {
+	return {
+		content: [{ type: "text", text: "No relevant memories found." }],
+		details: {},
+	};
 }

@@ -655,6 +655,33 @@ describe("hindsightBackend first-turn injection", () => {
 		expect(prompt).not.toContain("<memories>\nrecalled fact");
 	});
 
+	it("does not read a mental-model snippet from a disposing or detached state", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.mentalModelsEnabled": true,
+		});
+		const session = makeFakeSession({ sessionId: "s-stale-mm" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+
+		const state = session.getHindsightSessionState()!;
+		state.mentalModelsSnippet = "<mental_models>stale model</mental_models>";
+		state.beginDispose();
+		const disposingPrompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
+		expect(disposingPrompt).not.toContain("stale model");
+
+		state.mentalModelsSnippet = "<mental_models>detached model</mental_models>";
+		session.setHindsightSessionState(undefined);
+		const detachedPrompt = await hindsightBackend.buildDeveloperInstructions("/tmp", settings, session as never);
+		expect(detachedPrompt).not.toContain("detached model");
+	});
+
 	it("reloadMentalModelsForSession refreshes the cached snippet and base prompt", async () => {
 		// Defends the TTL/manual reload contract: a fresh `listMentalModels`
 		// must update both `mentalModelsSnippet` and `mentalModelsLoadedAt`,

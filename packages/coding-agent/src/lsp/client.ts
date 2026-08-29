@@ -102,33 +102,61 @@ export function retainLspScope(cwd: string, agentDir?: string): void {
 	scopeReferences.set(key, (scopeReferences.get(key) ?? 0) + 1);
 }
 
-// Idle timeout configuration (disabled by default)
+// Idle timeout configuration (disabled by default). The unscoped value keeps
+// the original one-argument API working for callers that do not have a
+// workspace/profile scope. Config-loaded policies are keyed by the same
+// workspace/profile identity used by the client cache.
 let idleTimeoutMs: number | null = null;
+const scopedIdleTimeouts = new Map<string, number | null>();
 let idleCheckInterval: NodeJS.Timeout | null = null;
 const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 
 /**
  * Configure the idle timeout for LSP clients.
  * @param ms - Timeout in milliseconds, or null/undefined to disable
+ * @param cwd - Optional workspace scope. When provided, the policy only
+ * applies to clients for this workspace/profile.
+ * @param agentDir - Optional profile directory for the workspace scope.
  */
-export function setIdleTimeout(ms: number | null | undefined): void {
-	idleTimeoutMs = ms ?? null;
+export function setIdleTimeout(ms: number | null | undefined, cwd?: string, agentDir?: string): void {
+	const timeoutMs = ms ?? null;
+	if (cwd === undefined) {
+		idleTimeoutMs = timeoutMs;
+	} else {
+		scopedIdleTimeouts.set(lspScopeKey(cwd, agentDir), timeoutMs);
+	}
 
-	if (idleTimeoutMs && idleTimeoutMs > 0) {
+	if (hasIdleTimeoutPolicy()) {
 		startIdleChecker();
 	} else {
 		stopIdleChecker();
 	}
 }
 
+function hasIdleTimeoutPolicy(): boolean {
+	if (idleTimeoutMs !== null && idleTimeoutMs > 0) return true;
+	for (const timeoutMs of scopedIdleTimeouts.values()) {
+		if (timeoutMs !== null && timeoutMs > 0) return true;
+	}
+	return false;
+}
+
+function getIdleTimeoutForClient(key: string): number | null {
+	const scopeKey = scopeKeyFromClientKey(key);
+	if (scopeKey !== undefined && scopedIdleTimeouts.has(scopeKey)) {
+		return scopedIdleTimeouts.get(scopeKey) ?? null;
+	}
+	return idleTimeoutMs;
+}
+
 function startIdleChecker(): void {
 	if (idleCheckInterval) return;
 	idleCheckInterval = setInterval(() => {
-		if (!idleTimeoutMs) return;
 		const now = Date.now();
 		for (const [key, client] of Array.from(clients.entries())) {
-			if (now - client.lastActivity > idleTimeoutMs) {
-				void shutdownClient(key);
+			const timeoutMs = getIdleTimeoutForClient(key);
+			if (timeoutMs !== null && timeoutMs > 0 && now - client.lastActivity > timeoutMs) {
+				void shutdownClient(key, client);
 			}
 		}
 	}, IDLE_CHECK_INTERVAL_MS);
@@ -961,9 +989,9 @@ async function shutdownClientInstance(client: LspClient): Promise<void> {
 	await Promise.race([client.proc.exited.catch(() => undefined), Bun.sleep(1_000)]);
 }
 
-export async function shutdownClient(key: string): Promise<void> {
+export async function shutdownClient(key: string, expectedClient?: LspClient): Promise<void> {
 	const client = clients.get(key);
-	if (!client) return;
+	if (!client || (expectedClient !== undefined && client !== expectedClient)) return;
 	clients.delete(key);
 	await shutdownClientInstance(client);
 }

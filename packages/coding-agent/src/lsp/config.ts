@@ -45,7 +45,8 @@ function parseConfigContent(content: string, filePath: string): unknown {
 function normalizeConfig(value: unknown): NormalizedConfig | null {
 	if (!isRecord(value)) return null;
 
-	const idleTimeoutMs = typeof value.idleTimeoutMs === "number" ? value.idleTimeoutMs : undefined;
+	const idleTimeoutMs =
+		typeof value.idleTimeoutMs === "number" && Number.isFinite(value.idleTimeoutMs) ? value.idleTimeoutMs : undefined;
 	const rawServers = value.servers;
 
 	if (isRecord(rawServers)) {

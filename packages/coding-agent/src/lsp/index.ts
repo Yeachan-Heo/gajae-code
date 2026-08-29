@@ -122,7 +122,7 @@ export async function warmupLspServers(
 	agentDir?: string,
 ): Promise<LspWarmupResult> {
 	const config = loadConfig(cwd, agentDir);
-	setIdleTimeout(config.idleTimeoutMs);
+	setIdleTimeout(config.idleTimeoutMs, cwd, agentDir);
 	const servers: LspWarmupResult["servers"] = [];
 	const lspServers = getLspServers(config);
 
@@ -258,7 +258,7 @@ function getConfig(cwd: string, agentDir?: string): LspConfig {
 	let config = configCache.get(key);
 	if (!config) {
 		config = loadConfig(cwd, agentDir);
-		setIdleTimeout(config.idleTimeoutMs);
+		setIdleTimeout(config.idleTimeoutMs, cwd, agentDir);
 		configCache.set(key, config);
 	}
 	return config;

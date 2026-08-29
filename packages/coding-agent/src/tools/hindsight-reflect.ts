@@ -32,18 +32,24 @@ export class HindsightReflectTool implements AgentTool<typeof hindsightReflectSc
 			if (!state) {
 				throw new Error("Hindsight backend is not initialised for this session.");
 			}
+			if (!state.isActive) {
+				throw new Error("Hindsight backend is not active for this session.");
+			}
 
 			try {
+				if (!state.isActive) return noRelevantReflectionResult();
 				await ensureBankMission(state.client, state.bankId, state.config, state.missionsSet);
+				if (!state.isActive) return noRelevantReflectionResult();
 				const response = await state.client.reflect(state.bankId, params.query, {
 					context: params.context,
 					budget: state.config.recallBudget,
 					tags: state.recallTags,
 					tagsMatch: state.recallTagsMatch,
 				});
-				const text = response.text?.trim() || "No relevant information found to reflect on.";
+				if (!state.isActive) return noRelevantReflectionResult();
+				const text = response.text?.trim();
 				return {
-					content: [{ type: "text", text }],
+					content: [{ type: "text", text: text || "No relevant information found to reflect on." }],
 					details: {},
 				};
 			} catch (err) {
@@ -52,4 +58,11 @@ export class HindsightReflectTool implements AgentTool<typeof hindsightReflectSc
 			}
 		});
 	}
+}
+
+function noRelevantReflectionResult(): AgentToolResult {
+	return {
+		content: [{ type: "text", text: "No relevant information found to reflect on." }],
+		details: {},
+	};
 }

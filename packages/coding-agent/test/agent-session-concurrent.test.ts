@@ -992,10 +992,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		authStorages.push(authStorage);
 		authStorage.setRuntimeApiKey("anthropic", "test-key");
 		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-switch-hook.yml"));
+		const hookStarted = Promise.withResolvers<void>();
+		const hookGate = Promise.withResolvers<void>();
 		const extensionRunner = {
 			hasHandlers: vi.fn(() => false),
 			emit: vi.fn(async (event: { type: string }) => {
 				if (event.type === "session_switch") {
+					hookStarted.resolve();
+					await hookGate.promise;
 					await session.sendUserMessage("queued by switch hook", { deliverAs: "steer" });
 				}
 			}),
@@ -1018,7 +1022,16 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(session.getQueuedMessages().followUp).toEqual(["pre-switch steering"]);
 		expect(agent.snapshotFollowUp()).toHaveLength(1);
 
-		expect(await session.switchSession(targetSessionFile)).toBe(true);
+		const transition = session.switchSession(targetSessionFile);
+		await hookStarted.promise;
+		await expect(
+			session.sendCustomMessage(
+				{ customType: "external-next-turn", content: "must remain fenced", display: false },
+				{ triggerTurn: false, deliverAs: "nextTurn" },
+			),
+		).rejects.toThrow(/session transition is in progress/i);
+		hookGate.resolve();
+		expect(await transition).toBe(true);
 		expect(appendOnly?.log.length).toBe(0);
 
 		expect(session.getQueuedMessages().followUp).toEqual(["queued by switch hook"]);

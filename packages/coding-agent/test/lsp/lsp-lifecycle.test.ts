@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +10,7 @@ import {
 	retainLspScope,
 	sendNotification,
 	sendRequest,
+	setIdleTimeout,
 	shutdownAll,
 	waitForProjectLoaded,
 } from "../../src/lsp/client";
@@ -81,6 +82,7 @@ async function writeFakeLspServer(dir: string, options?: { initDelayMs?: number 
 afterEach(async () => {
 	await shutdownAll();
 	await disposeAllOwnedProcesses();
+	vi.restoreAllMocks();
 	delete Bun.env.PI_DISABLE_LSPMUX;
 	if (ORIGINAL_XDG_CONFIG_HOME === undefined) {
 		delete Bun.env.XDG_CONFIG_HOME;
@@ -95,6 +97,41 @@ afterEach(async () => {
 });
 
 describe("LSP lifecycle behavior", () => {
+	it("keeps idle cleanup isolated when a sibling profile disables its timeout", async () => {
+		const cwd = await tempDir("gjc-lsp-idle-scope-");
+		const profileA = path.join(cwd, "profile-a");
+		const profileB = path.join(cwd, "profile-b");
+		let idleSweep: (() => void) | undefined;
+		const intervalSpy = vi.spyOn(globalThis, "setInterval").mockImplementation(((
+			callback: (...args: never[]) => void,
+		) => {
+			if (typeof callback === "function") idleSweep = callback as () => void;
+			return {} as NodeJS.Timeout;
+		}) as unknown as typeof setInterval);
+		try {
+			const script = await writeFakeLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			const clientA = await getOrCreateClient(config, cwd, 1_000, profileA);
+			const clientB = await getOrCreateClient(config, cwd, 1_000, profileB);
+
+			clientA.lastActivity = Date.now() - 2_000;
+			clientB.lastActivity = Date.now();
+			setIdleTimeout(1_000, cwd, profileA);
+			setIdleTimeout(undefined, cwd, profileB);
+			expect(idleSweep).toBeDefined();
+
+			idleSweep?.();
+			await Bun.sleep(50);
+			expect(clientA.proc.exitCode).not.toBeNull();
+			expect(clientB.proc.exitCode).toBeNull();
+		} finally {
+			setIdleTimeout(undefined, cwd, profileA);
+			setIdleTimeout(undefined, cwd, profileB);
+			intervalSpy.mockRestore();
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	it("kill-then-immediately-reacquire evicts the dead cached client before async cleanup", async () => {
 		const cwd = await tempDir("gjc-lsp-reload-");
 		try {

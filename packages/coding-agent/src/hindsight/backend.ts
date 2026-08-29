@@ -90,7 +90,7 @@ export const hindsightBackend: MemoryBackend = {
 
 		const state = session?.getHindsightSessionState();
 		const primary = state?.aliasOf ?? state;
-		const mentalModelsSnippet = primary?.mentalModelsSnippet;
+		const mentalModelsSnippet = state?.isActive && primary?.isActive ? primary.mentalModelsSnippet : undefined;
 
 		// Static instructions and curated mental models are prefix-stable. Recall
 		// is injected by AgentSession as volatile user-role context instead.
