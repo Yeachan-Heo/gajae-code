@@ -227,14 +227,12 @@ export async function pollForToken(
 			deviceCode,
 		};
 
-		const response = await fetchOidc(url, {
+		const data = await createTokenOnce(url, {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
 			signal,
 		});
-
-		const data = (await response.json()) as CreateTokenSuccess | CreateTokenError;
 
 		if ("accessToken" in data && typeof data.accessToken === "string") {
 			return data;
@@ -440,9 +438,35 @@ async function fetchOidc(url: string, init: RequestInit & { signal?: AbortSignal
 		try {
 			errorBody = await response.text();
 		} catch {}
-		throw new Error(
-			`SSO OIDC request to ${url} failed: ${response.status} ${response.statusText}: ${errorBody.slice(0, 500)}`,
-		);
+		throw new Error(oidcRequestFailure(url, response, errorBody));
 	}
 	return response;
+}
+
+function oidcRequestFailure(url: string, response: Response, body: string): string {
+	return `SSO OIDC request to ${url} failed: ${response.status} ${response.statusText}: ${body.slice(0, 500)}`;
+}
+
+/**
+ * `CreateToken` reports the in-progress device-code states (`authorization_pending`,
+ * `slow_down`) as HTTP 400 responses whose body carries the error code, so the poll
+ * loop must read the payload instead of treating a non-2xx status as fatal.
+ * Non-2xx responses without an `error` field still fail closed.
+ */
+async function createTokenOnce(
+	url: string,
+	init: RequestInit & { signal?: AbortSignal },
+): Promise<CreateTokenSuccess | CreateTokenError> {
+	const response = await fetch(url, init);
+	const rawBody = await response.text();
+	let data: CreateTokenSuccess | CreateTokenError;
+	try {
+		data = JSON.parse(rawBody) as CreateTokenSuccess | CreateTokenError;
+	} catch {
+		throw new Error(oidcRequestFailure(url, response, rawBody));
+	}
+	if (!response.ok && !("error" in data)) {
+		throw new Error(oidcRequestFailure(url, response, rawBody));
+	}
+	return data;
 }
