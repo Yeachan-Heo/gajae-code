@@ -1624,11 +1624,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session-context build, tool creation, MCP discovery, and extension discovery.
 		const contextFilesResultPromise = options.contextFiles
 			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
-			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd, agentDir, settings });
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, {
+					cwd,
+					agentDir,
+					settings,
+					profileAuthority,
+				});
 		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
-			: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir);
+			: logger.time("discoverPromptTemplates", discoverPromptTemplates, cwd, agentDir, profileAuthority);
 		promptTemplatesPromise.catch(() => {});
 		// SDK sessions do not implicitly activate local customization commands. Hosts
 		// that want file-backed commands must provide them explicitly, keeping utility
@@ -2055,7 +2060,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir, settings });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir, settings, profileAuthority });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
