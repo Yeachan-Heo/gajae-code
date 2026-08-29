@@ -751,6 +751,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		const closeTerminalAdmission = (): void => {
 			terminalAdmissionMode = "closed";
 			pendingBuffer = Buffer.alloc(0);
+			transportWatchdogClosed = true;
+			if (transportWatchdog) {
+				clearTimeout(transportWatchdog);
+				transportWatchdog = null;
+			}
 			h2Request?.pause();
 		};
 		const sealExecAdmissionAtRawEof = (): void => {

@@ -808,10 +808,20 @@ export async function resolveActiveProjectRegistryPath(
 			return path.resolve(value);
 		}
 	};
+	const trustedHome = await canonicalize(getTrustedHomeDir());
 	homeDir = await canonicalize(homeDir);
 	const canonicalCwd = await canonicalize(cwd);
+	const relativeHome = path.relative(homeDir, canonicalCwd);
+	const explicitHome = homeDir !== trustedHome;
+	const effectiveStop =
+		!explicitHome ||
+		relativeHome === "" ||
+		(!relativeHome.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeHome))
+			? homeDir
+			: canonicalCwd;
 	let dir = canonicalCwd;
-	while (dir !== homeDir) {
+	while (true) {
+		if (dir === effectiveStop && effectiveStop === homeDir) break;
 		try {
 			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
 			if (stat.isDirectory()) {
@@ -820,6 +830,7 @@ export async function resolveActiveProjectRegistryPath(
 		} catch {
 			// not found at this level — continue up
 		}
+		if (dir === effectiveStop) break;
 		const parent = path.dirname(dir);
 		if (parent === dir) break; // filesystem root
 		dir = parent;
@@ -827,13 +838,15 @@ export async function resolveActiveProjectRegistryPath(
 
 	// Pass 2: walk up looking for .git as a fallback anchor.
 	dir = canonicalCwd;
-	while (dir !== homeDir) {
+	while (true) {
+		if (dir === effectiveStop && effectiveStop === homeDir) break;
 		try {
 			await fs.promises.stat(path.join(dir, ".git"));
 			return path.join(dir, getConfigDirName(), "plugins", "installed_plugins.json");
 		} catch {
 			// not found at this level — continue up
 		}
+		if (dir === effectiveStop) break;
 		const parent = path.dirname(dir);
 		if (parent === dir) break; // filesystem root
 		dir = parent;
@@ -859,7 +872,11 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// Home directory must not be treated as a project root: the fallback path would alias
 	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
 	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (path.resolve(cwd) === getTrustedHomeDir()) return undefined;
+	const [canonicalCwd, canonicalHome] = await Promise.all([
+		fs.promises.realpath(cwd).catch(() => path.resolve(cwd)),
+		fs.promises.realpath(getTrustedHomeDir()).catch(() => path.resolve(getTrustedHomeDir())),
+	]);
+	if (canonicalCwd === canonicalHome) return undefined;
 	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
 }
 
