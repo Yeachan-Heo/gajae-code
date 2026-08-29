@@ -521,6 +521,11 @@ export function writeCursorFrameForTest(request: http2.ClientHttp2Stream, frame:
 	return writeCursorFrame(request, frame);
 }
 
+interface CursorRequestWriter extends http2.ClientHttp2Stream {
+	isActive(): boolean;
+	registerShellGate(close: () => void): () => void;
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
 	try {
 		const payload = JSON.parse(new TextDecoder().decode(data));
@@ -775,6 +780,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
+		const shellGates = new Set<() => void>();
 		let proxiedSocket: tls.TLSSocket | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
 		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
@@ -864,6 +870,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		};
 		const terminalize = (error: unknown): void => {
 			transportTerminalized = true;
+			for (const close of shellGates) close();
+			shellGates.clear();
 			activeExecAbort?.(error instanceof Error ? error : new Error(String(error)));
 			activeExecAbort = undefined;
 			closeTerminalAdmission();
@@ -1077,6 +1085,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
+			const writer = h2Request as CursorRequestWriter;
+			writer.isActive = () => !h2Settled && !transportTerminalized && !writer.closed;
+			writer.registerShellGate = close => {
+				if (!writer.isActive()) {
+					close();
+					return () => {};
+				}
+				shellGates.add(close);
+				return () => shellGates.delete(close);
+			};
 			h2RequestErrorHandler = error => {
 				terminalize(error);
 			};
@@ -1274,7 +1292,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										stream,
 										state,
 										blobStore,
-										h2Request!,
+										writer,
 										options?.execHandlers,
 										options?.onToolResult,
 										usageState,
@@ -1413,15 +1431,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (h2Settled) {
 				await h2Completion.promise;
 			}
-			writeCursorFrame(h2Request, frameConnectMessage(requestBytes));
+			writeCursorFrame(writer, frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
-				if (!coordinator.isActive()) return;
+				if (h2Settled || isClosedCursorRequest(writer)) return;
 				const heartbeatMessage = create(AgentClientMessageSchema, {
 					message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
 				});
 				const heartbeatBytes = toBinary(AgentClientMessageSchema, heartbeatMessage);
-				writeCursorFrame(h2Request, frameConnectMessage(heartbeatBytes));
+				writeCursorFrame(writer, frameConnectMessage(heartbeatBytes));
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
@@ -1610,7 +1628,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
+		writeCursorFrame(writer, frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
@@ -1631,7 +1649,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
+		writeCursorFrame(writer, frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
