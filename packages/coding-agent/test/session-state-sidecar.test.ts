@@ -1918,7 +1918,7 @@ describe("coordinator runtime state sidecar", () => {
 		const stateFile = path.join(root, "state.json");
 		const sessionId = "preserved-owner-session";
 		const generation = await replaceOwnerGeneration(root, sessionId, "preserved-owner-generation");
-		await createOwnerIntent(root, {
+		const ownerIntent = await createOwnerIntent(root, {
 			generation,
 			session_id: sessionId,
 			server_key: "opaque-owner",
@@ -1951,6 +1951,7 @@ describe("coordinator runtime state sidecar", () => {
 				stateDir: root,
 				socketKey: "opaque-owner",
 				operatorDispatchId: "operator-dispatch",
+				operatorIntentId: ownerIntent.intent_id,
 			},
 		});
 

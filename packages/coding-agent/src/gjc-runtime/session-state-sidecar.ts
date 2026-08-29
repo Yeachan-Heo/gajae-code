@@ -2663,7 +2663,7 @@ async function operatorDispatchIdForOwner(
 	const dispatchId = owner.operatorDispatchId;
 	if (!dispatchId) return undefined;
 	const intentId = owner.operatorIntentId;
-	if (intentId !== undefined && intentId !== null && !intentId) return undefined;
+	if (!intentId) return undefined;
 	try {
 		const intent = JSON.parse(
 			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
