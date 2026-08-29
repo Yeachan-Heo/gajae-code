@@ -41,25 +41,25 @@ async function canonicalizeThroughExistingAncestor(target: string): Promise<stri
 }
 
 async function resolveReadPath(filePath: string, options?: ReadFileOptions): Promise<string | null> {
-		const lexical = resolvePath(filePath);
-		if (!options?.isolatedHome) return lexical;
-		const roots = [options.home, options.userAgentDir].filter((root): root is string => typeof root === "string");
-		if (roots.length === 0) return null;
-		const [canonicalTarget, canonicalRoots] = await Promise.all([
-			canonicalizeThroughExistingAncestor(lexical),
-			Promise.all(roots.map(canonicalizeThroughExistingAncestor)),
-		]);
-		return canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget)) ? canonicalTarget : null;
+	const lexical = resolvePath(filePath);
+	if (!options?.isolatedHome) return lexical;
+	const roots = [options.home, options.userAgentDir].filter((root): root is string => typeof root === "string");
+	if (roots.length === 0) return null;
+	const [canonicalTarget, canonicalRoots] = await Promise.all([
+		canonicalizeThroughExistingAncestor(lexical),
+		Promise.all(roots.map(canonicalizeThroughExistingAncestor)),
+	]);
+	return canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget)) ? canonicalTarget : null;
 }
 
 export async function readFile(filePath: string, options?: ReadFileOptions): Promise<string | null> {
-		let abs: string | null;
-		try {
-			abs = await resolveReadPath(filePath, options);
-		} catch {
-			return null;
-		}
-		if (abs === null) return null;
+	let abs: string | null;
+	try {
+		abs = await resolveReadPath(filePath, options);
+	} catch {
+		return null;
+	}
+	if (abs === null) return null;
 	if (contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
 	}

@@ -72,9 +72,7 @@ function resolveUserAgentDir(ctx: LoadContext): string {
 function readBuiltinFile(ctx: LoadContext, filePath: string): Promise<string | null> {
 	return readFile(
 		filePath,
-		ctx.isolatedHome
-			? { isolatedHome: true, home: ctx.home, userAgentDir: ctx.userAgentDir }
-			: undefined,
+		ctx.isolatedHome ? { isolatedHome: true, home: ctx.home, userAgentDir: ctx.userAgentDir } : undefined,
 	);
 }
 
@@ -475,7 +473,11 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
  * Read a top-level `RULES.md` and synthesize an always-apply rule.
  * Returns null when the file is absent or empty so callers can short-circuit.
  */
-async function loadStickyRulesFile(ctx: LoadContext, filePath: string, level: "user" | "project"): Promise<Rule | null> {
+async function loadStickyRulesFile(
+	ctx: LoadContext,
+	filePath: string,
+	level: "user" | "project",
+): Promise<Rule | null> {
 	const content = await readBuiltinFile(ctx, filePath);
 	if (!content) return null;
 	const source = createSourceMeta(PROVIDER_ID, filePath, level);
