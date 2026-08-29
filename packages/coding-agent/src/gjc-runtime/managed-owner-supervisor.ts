@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
-import { lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
+import { isValidOwnerIntent, lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 export const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -208,15 +208,22 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	let relayedIntent: OwnerIntent | null = null;
 	let relayedAt: string | null = null;
 	const relaySigterm = () => {
-		if (childExited || sigtermRelayed) return;
+		if (childExited) return;
 		let candidateIntent: OwnerIntent | null = null;
 		try {
-			const candidate = JSON.parse(
+			const candidate: unknown = JSON.parse(
 				fsSync.readFileSync(lifecyclePaths(stateDir, sessionId, generation).intentFile, "utf8"),
-			) as Partial<OwnerIntent>;
-			candidateIntent = typeof candidate.dispatch_id === "string" ? (candidate as OwnerIntent) : null;
+			);
+			if (isValidOwnerIntent(candidate) && candidate.session_id === sessionId && candidate.generation === generation)
+				candidateIntent = candidate;
 		} catch {
 			candidateIntent = null;
+		}
+		// One relay is enough for one exact intent. A replacement intent (including one
+		// that reuses the dispatch id) must be allowed to re-arm the child relay.
+		if (sigtermRelayed) {
+			if (candidateIntent?.intent_id === relayedIntent?.intent_id) return;
+			if (!candidateIntent && relayedIntent) return;
 		}
 		try {
 			if (!childProcess.signalRoot(15)) return;
@@ -253,6 +260,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			exit_kind: "supervisor_child_exit",
 			reason: "managed_owner_supervisor_exit",
 			operator_dispatch_id: terminalIntent.dispatch_id,
+			operator_intent_id: terminalIntent.intent_id,
 		});
 	}
 	if (child.signalCode === "SIGABRT") {

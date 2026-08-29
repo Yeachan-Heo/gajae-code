@@ -585,13 +585,9 @@ const workspaceIdentityCache = new Map<string, WorkspaceIdentity>();
 /** Resolves (and caches) the Git identity of one workspace locator. */
 async function workspaceIdentity(target: string): Promise<WorkspaceIdentity> {
 	const canonicalPath = await canonicalWorkspacePath(target);
+	if (target === "unknown") return { canonicalPath, repoRoot: null, commonDir: null };
 	const cached = workspaceIdentityCache.get(canonicalPath);
 	if (cached) return cached;
-	if (target === "unknown") {
-		const unavailable = { canonicalPath, repoRoot: null, commonDir: null };
-		workspaceIdentityCache.set(canonicalPath, unavailable);
-		return unavailable;
-	}
 	try {
 		if (!(await fs.stat(target)).isDirectory()) throw new Error("workspace is not a directory");
 	} catch {

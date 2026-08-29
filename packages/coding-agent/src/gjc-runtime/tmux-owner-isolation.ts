@@ -27,6 +27,7 @@ function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openR
 
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
+import { assertSafePathComponent } from "./session-layout";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -968,6 +969,8 @@ export interface ObserveTerminalRequest {
 	exit_kind: string;
 	reason: string;
 	operator_dispatch_id?: string;
+	/** Optional exact intent identity for relays that can carry it. */
+	operator_intent_id?: string;
 }
 export interface LifecyclePaths {
 	root: string;
@@ -982,6 +985,12 @@ export interface LifecyclePaths {
 	journalFile: string;
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
+	try {
+		assertSafePathComponent(sessionId, "owner session id");
+		assertSafePathComponent(generation, "owner generation");
+	} catch {
+		throw new Error("owner_lifecycle_path_unsafe");
+	}
 	const root = path.join(stateDir, sessionId, "owner-lifecycle");
 	return {
 		root,
@@ -1459,11 +1468,14 @@ async function readOwnerIntentStrict(file: string): Promise<OwnerIntent | null> 
 async function archiveSupersededIntent(file: string, expectedIntentId: string): Promise<void> {
 	const current = await readOwnerIntentStrict(file);
 	if (!current || current.intent_id !== expectedIntentId) throw new Error("owner_intent_replay");
-	await fs.rename(file, `${file}.superseded-${Date.now()}-${crypto.randomUUID()}`).catch(() => undefined);
+	const archivedFile = `${file}.superseded-${Date.now()}-${crypto.randomUUID()}`;
+	await fs.rename(file, archivedFile).catch(() => undefined);
+	const archived = await readOwnerIntentStrict(archivedFile);
+	if (!archived || archived.intent_id !== expectedIntentId) throw new Error("owner_intent_replay");
 }
 
 /** Returns whether a dispatch belongs to an archived, non-consuming intent attempt. */
-async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string): Promise<boolean> {
+async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string, intentId?: string): Promise<boolean> {
 	let entries: string[];
 	try {
 		entries = await fs.readdir(paths.root);
@@ -1477,7 +1489,8 @@ async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string)
 			const archived = await readNoFollowJson(path.join(paths.root, entry));
 			if (archived === null || !isValidOwnerIntent(archived) || !nonEmpty(archived.dispatch_id))
 				throw new Error("stale_terminal_evidence_unavailable");
-			if (archived.dispatch_id === dispatchId) return true;
+			if (archived.dispatch_id === dispatchId && (intentId === undefined || archived.intent_id === intentId))
+				return true;
 		} catch {
 			throw new Error("stale_terminal_evidence_unavailable");
 		}
@@ -1508,13 +1521,17 @@ async function renameIntentIfCurrentWithoutLock(
 ): Promise<boolean> {
 	const current = await readOwnerIntentStrict(paths.intentFile);
 	if (current?.intent_id !== intentId) return false;
+	const destination = `${paths.intentFile}${suffix}`;
+	if (await intentMarkerExists(destination)) return false;
 	try {
-		await fs.rename(paths.intentFile, `${paths.intentFile}${suffix}`);
-		return true;
+		await fs.rename(paths.intentFile, destination);
 	} catch (error) {
 		if (!isCode(error, "ENOENT")) return false;
 		return false;
 	}
+	const moved = await readOwnerIntentStrict(destination);
+	if (moved?.intent_id !== intentId) throw new Error("owner_intent_consumption_failed");
+	return true;
 }
 
 /**
@@ -1543,6 +1560,29 @@ async function pendingIntentBlocksRetry(
 	return await intentMarkerExists(paths.intentFile);
 }
 
+/** A terminal verdict is immutable authority for a generation; never mint a retry beside it. */
+async function existingOwnerVerdictBlocksIntent(
+	paths: LifecyclePaths,
+	input: Pick<OwnerIntent, "session_id" | "generation" | "server_key">,
+): Promise<boolean> {
+	if (!(await intentMarkerExists(paths.verdictFile))) return false;
+	let verdict: unknown;
+	try {
+		verdict = await readNoFollowJson(paths.verdictFile);
+	} catch {
+		throw new Error("owner_intent_replay");
+	}
+	if (
+		!verdict ||
+		!isValidOwnerVerdict(verdict) ||
+		verdict.session_id !== input.session_id ||
+		verdict.generation !== input.generation ||
+		verdict.server_key !== input.server_key
+	)
+		throw new Error("owner_intent_replay");
+	return true;
+}
+
 export async function createOwnerIntent(
 	stateDir: string,
 	input: Omit<OwnerIntent, "schema_version" | "intent_id" | "state">,
@@ -1556,6 +1596,7 @@ export async function createOwnerIntent(
 	if (!isValidOwnerIntent(intent)) throw new Error("owner_intent_invalid");
 	const paths = lifecyclePaths(stateDir, input.session_id, input.generation);
 	await fs.mkdir(paths.root, { recursive: true });
+	if (await existingOwnerVerdictBlocksIntent(paths, input)) throw new Error("owner_intent_replay");
 	for (const suffix of BLOCKING_INTENT_SUFFIXES) {
 		if (await intentMarkerExists(`${paths.intentFile}${suffix}`)) throw new Error("owner_intent_replay");
 	}
@@ -1715,7 +1756,12 @@ const liveOwnerTerminalObservations = new Map<string, Promise<OwnerVerdict>>();
 export async function observeOwnerTerminal(request: ObserveTerminalRequest): Promise<OwnerVerdict> {
 	if (!isObserveTerminalRequest(request)) throw new Error("terminal_observation_invalid");
 	const paths = lifecyclePaths(request.state_dir, request.session_id, request.owner_generation);
-	const observationKey = JSON.stringify([paths.verdictFile, request.socket_key]);
+	const observationKey = JSON.stringify([
+		paths.verdictFile,
+		request.socket_key,
+		request.operator_dispatch_id ?? null,
+		request.operator_intent_id ?? null,
+	]);
 	const existing = liveOwnerTerminalObservations.get(observationKey);
 	if (existing) return existing;
 	const observation = observeOwnerTerminalExclusive(request);
@@ -1748,31 +1794,73 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 		const current = await readJson<{ generation?: string }>(paths.generationFile);
 		if (current?.generation !== request.owner_generation) throw new Error("generation_mismatch");
 		const published = await readJson<OwnerVerdict>(paths.verdictFile);
-		if (published && isValidOwnerVerdict(published, request)) return reconcileTerminalArtifacts(paths, published);
+		if (
+			published &&
+			isValidOwnerVerdict(published) &&
+			published.generation === request.owner_generation &&
+			published.session_id === request.session_id &&
+			published.server_key === request.socket_key
+		)
+			return reconcileTerminalArtifacts(paths, published);
+		const intent = await readOwnerIntentStrict(paths.intentFile);
 		const recoveredJournal = await readJson<{
 			schema_version?: number;
 			observation?: unknown;
+			intent_id?: unknown;
 		}>(paths.journalFile);
 		if (recoveredJournal?.schema_version === 1 && isObserveTerminalRequest(recoveredJournal.observation)) {
 			const recovered = recoveredJournal.observation;
-			if (
+			const recoveredIntentId = recoveredJournal.intent_id;
+			const sameStableAuthority =
 				recovered.session_id === request.session_id &&
 				recovered.owner_generation === request.owner_generation &&
 				recovered.state_dir === request.state_dir &&
-				recovered.socket_key === request.socket_key
+				recovered.socket_key === request.socket_key;
+			const sameDispatch =
+				recovered.operator_dispatch_id !== undefined &&
+				recovered.operator_dispatch_id === request.operator_dispatch_id;
+			const sameIntent =
+				typeof recoveredIntentId === "string" &&
+				recoveredIntentId === intent?.intent_id &&
+				(request.operator_intent_id === undefined || request.operator_intent_id === recoveredIntentId);
+			if (
+				sameStableAuthority &&
+				sameDispatch &&
+				sameIntent &&
+				intent?.dispatch_id === recovered.operator_dispatch_id
 			)
 				observation = normalizeTerminalObservation(recovered);
-		}
-		const intent = await readOwnerIntentStrict(paths.intentFile);
-		if (observation.operator_dispatch_id !== undefined) {
-			if (intent && intent.dispatch_id !== observation.operator_dispatch_id)
-				throw new Error("stale_terminal_observation");
-			if (!intent && (await hasArchivedOwnerIntent(paths, observation.operator_dispatch_id)))
+			else if (sameStableAuthority && sameDispatch && request.operator_intent_id === undefined)
 				throw new Error("stale_terminal_observation");
 		}
+		const dispatchId = observation.operator_dispatch_id;
+		if (dispatchId !== undefined) {
+			if (intent && intent.dispatch_id !== dispatchId) {
+				// A mismatched dispatch is terminal evidence of an unexpected owner loss,
+				// not authority to consume the current intent.
+				observation = { ...observation, operator_dispatch_id: undefined, operator_intent_id: undefined };
+			}
+			if (
+				intent &&
+				observation.operator_intent_id === undefined &&
+				(await hasArchivedOwnerIntent(paths, dispatchId))
+			)
+				throw new Error("stale_terminal_observation");
+			if (
+				intent &&
+				observation.operator_intent_id !== undefined &&
+				intent.intent_id !== observation.operator_intent_id
+			)
+				throw new Error("stale_terminal_observation");
+			if (!intent && (await hasArchivedOwnerIntent(paths, dispatchId, observation.operator_intent_id)))
+				throw new Error("stale_terminal_observation");
+		}
+		if (observation.operator_intent_id !== undefined && !observation.operator_dispatch_id)
+			throw new Error("stale_terminal_observation");
 		await atomicWrite(paths.journalFile, {
 			schema_version: 1,
 			observation,
+			intent_id: intent?.intent_id ?? null,
 			token,
 		});
 		const expected = isExpectedIntent(intent, observation);
@@ -1812,8 +1900,7 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			throw error;
 		}
 		if (winner !== verdict) return reconcileTerminalArtifacts(paths, winner);
-		if (expected && intent && !(await renameIntentIfCurrentWithoutLock(paths, intent.intent_id, ".consumed")))
-			throw new Error("owner_intent_consumption_failed");
+		if (expected && intent) await reconcileConsumedIntent(paths, intent.intent_id);
 
 		if (verdict.classification === "unexpected_owner_loss")
 			await publishImmutableIncident(paths.incidentFile, {
@@ -1849,14 +1936,41 @@ async function publishCurrentVerdictAlias(paths: LifecyclePaths, verdict: OwnerV
 		owner_generation: verdict.generation,
 	});
 }
+
+/** Reconcile a verdict after a crash without ever consuming a newer intent. */
+async function reconcileConsumedIntent(paths: LifecyclePaths, intentId: string): Promise<void> {
+	const current = await readOwnerIntentStrict(paths.intentFile);
+	if (current) {
+		if (current.intent_id !== intentId) return;
+		if (!(await renameIntentIfCurrentWithoutLock(paths, intentId, ".consumed")))
+			throw new Error("owner_intent_consumption_failed");
+		return;
+	}
+	const consumedFile = `${paths.intentFile}.consumed`;
+	if (await intentMarkerExists(consumedFile)) {
+		const consumed = await readOwnerIntentStrict(consumedFile);
+		if (consumed?.intent_id !== intentId) throw new Error("owner_intent_consumption_failed");
+		return;
+	}
+	for (const suffix of RETRYABLE_INTENT_SUFFIXES) {
+		const marker = `${paths.intentFile}${suffix}`;
+		if (!(await intentMarkerExists(marker))) continue;
+		const retry = await readOwnerIntentStrict(marker);
+		if (retry?.intent_id !== intentId) continue;
+		if (await intentMarkerExists(consumedFile)) throw new Error("owner_intent_consumption_failed");
+		try {
+			await fs.rename(marker, consumedFile);
+		} catch {
+			throw new Error("owner_intent_consumption_failed");
+		}
+		const moved = await readOwnerIntentStrict(consumedFile);
+		if (moved?.intent_id !== intentId) throw new Error("owner_intent_consumption_failed");
+		return;
+	}
+}
 async function reconcileTerminalArtifacts(paths: LifecyclePaths, verdict: OwnerVerdict): Promise<OwnerVerdict> {
 	if (verdict.classification === "expected_operator_shutdown" && verdict.intent_id) {
-		const intent = await readOwnerIntentStrict(paths.intentFile);
-		if (
-			intent?.intent_id === verdict.intent_id &&
-			!(await renameIntentIfCurrentWithoutLock(paths, intent.intent_id, ".consumed"))
-		)
-			throw new Error("owner_intent_consumption_failed");
+		await reconcileConsumedIntent(paths, verdict.intent_id);
 	}
 	if (verdict.classification === "unexpected_owner_loss")
 		await publishImmutableIncident(paths.incidentFile, {
@@ -1917,6 +2031,7 @@ export function isValidOwnerIntent(intent: unknown, request?: ObserveTerminalReq
 		intent.server_key === request.socket_key &&
 		request.operator_dispatch_id !== undefined &&
 		intent.dispatch_id === request.operator_dispatch_id &&
+		(request.operator_intent_id === undefined || intent.intent_id === request.operator_intent_id) &&
 		request.signal === "SIGTERM"
 	);
 }
@@ -2003,7 +2118,8 @@ export function isValidOwnerVerdict(verdict: unknown, request?: ObserveTerminalR
 		!request ||
 		(verdict.generation === request.owner_generation &&
 			verdict.session_id === request.session_id &&
-			verdict.server_key === request.socket_key)
+			verdict.server_key === request.socket_key &&
+			(request.operator_intent_id === undefined || verdict.intent_id === request.operator_intent_id))
 	);
 }
 
@@ -2203,6 +2319,7 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 			"exit_kind",
 			"reason",
 			"operator_dispatch_id",
+			"operator_intent_id",
 		]) &&
 		request.schema_version === 1 &&
 		request.op === "observe_terminal" &&
@@ -2218,7 +2335,9 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		nonEmpty(request.reason) &&
 		request.reason.length <= 64 &&
 		(request.exit_code === null || Number.isSafeInteger(request.exit_code)) &&
-		(request.operator_dispatch_id === undefined || nonEmpty(request.operator_dispatch_id))
+		(request.operator_dispatch_id === undefined || nonEmpty(request.operator_dispatch_id)) &&
+		(request.operator_intent_id === undefined || nonEmpty(request.operator_intent_id)) &&
+		(request.operator_intent_id === undefined || request.operator_dispatch_id !== undefined)
 	);
 }
 function isAttemptCapability(value: unknown): value is AttemptCapability {
