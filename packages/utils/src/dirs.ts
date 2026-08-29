@@ -724,7 +724,14 @@ export function getPluginsDir(home?: string): string {
 	if (home !== undefined) {
 		const explicitPath = () => path.join(home, resolveConfigDirName(dirs.trustSnapshot), "plugins");
 		try {
-			if (home !== dirs.trustedHome) return explicitPath();
+			const canonical = (value: string): string => {
+				try {
+					return fs.realpathSync.native(value);
+				} catch {
+					return path.resolve(value);
+				}
+			};
+			if (canonical(home) !== canonical(dirs.trustedHome)) return explicitPath();
 		} catch {
 			// An explicit home is the caller's documented escape hatch. If the
 			// authoritative home is unavailable, do not let its fail-closed resolver
