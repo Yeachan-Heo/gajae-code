@@ -693,6 +693,12 @@ describe("resolveWorktreeBucketForPath Windows semantics", () => {
 		);
 		expect(resolveWorktreeBucketForPath(repo, "   ", home, path.win32)).toBe("C:\\repos\\app\\.worktrees");
 	});
+
+	it("preserves replacement-token characters in the repository basename", () => {
+		expect(resolveWorktreeBucketForPath("C:\\repos\\$&`$'", "{repo}.worktrees", home, path.win32)).toBe(
+			"C:\\repos\\$&`$'.worktrees",
+		);
+	});
 });
 
 describe("launch guard classification", () => {

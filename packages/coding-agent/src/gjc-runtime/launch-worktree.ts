@@ -208,7 +208,7 @@ export function resolveWorktreeBucketForPath(
 	const template = expandHomePrefix(configured || DEFAULT_WORKTREE_BUCKET, home, pathApi);
 	return pathApi.resolve(
 		pathApi.dirname(repoRoot),
-		template.replaceAll(REPO_NAME_PLACEHOLDER, pathApi.basename(repoRoot)),
+		template.replaceAll(REPO_NAME_PLACEHOLDER, () => pathApi.basename(repoRoot)),
 	);
 }
 
