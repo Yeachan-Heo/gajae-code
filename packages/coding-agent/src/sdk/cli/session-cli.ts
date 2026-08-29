@@ -641,6 +641,37 @@ export async function resolveSessionListSelection(
 }
 
 /**
+ * Per-call ceiling on scope-exclusion warnings.
+ *
+ * One warning per excluded non-Git session made the list response grow with the number of
+ * sessions on the machine, not with the result: a `--scope repo` call on a developer machine
+ * returned 317 sessions alongside 314 warnings, roughly 52 KB of warning text inside a 196 KB
+ * response. The signal a caller needs is "some workspaces were excluded and how many", so a
+ * bounded sample plus an exact total carries it without the bloat.
+ */
+export const SESSION_LIST_WARNING_LIMIT = 10;
+
+/** Collapses the tail of a warning list into one exact-count summary. */
+function boundWarnings(warnings: readonly string[], describeOmitted: (omitted: number) => string): string[] {
+	if (warnings.length <= SESSION_LIST_WARNING_LIMIT) return [...warnings];
+	return [
+		...warnings.slice(0, SESSION_LIST_WARNING_LIMIT),
+		describeOmitted(warnings.length - SESSION_LIST_WARNING_LIMIT),
+	];
+}
+
+/** Bounds the excluded-workspace warnings produced by one scope filter. */
+function boundScopeWarnings(warnings: readonly string[], scope: SdkSessionListScope): string[] {
+	return boundWarnings(
+		warnings,
+		omitted =>
+			`${omitted} further session workspace${omitted === 1 ? "" : "s"} outside Git ${
+				omitted === 1 ? "was" : "were"
+			} excluded by scope ${scope}; ${warnings.length} excluded in total.`,
+	);
+}
+
+/**
  * Filters fully traversed broker rows by the selection scope. Row workspaces
  * are canonicalized and cached per distinct locator; `repo` matches the shared
  * common dir across the main checkout and linked worktrees, `worktree` the
@@ -650,8 +681,8 @@ export async function filterSessionRowsByScope(
 	rows: readonly SdkSessionRowV1[],
 	scope: SdkSessionListScope,
 	selection: SdkSessionListSelection,
-): Promise<{ sessions: SdkSessionRowV1[]; warnings: string[] }> {
-	if (scope === "all") return { sessions: [...rows], warnings: [] };
+): Promise<{ sessions: SdkSessionRowV1[]; warnings: string[]; warningEntries: string[] }> {
+	if (scope === "all") return { sessions: [...rows], warnings: [], warningEntries: [] };
 	const warnings: string[] = [];
 	const sessions: SdkSessionRowV1[] = [];
 	for (const row of rows) {
@@ -667,7 +698,24 @@ export async function filterSessionRowsByScope(
 				`Session ${row.sessionId} workspace "${row.locator.cwd}" is outside Git; excluded by scope ${scope}.`,
 			);
 	}
-	return { sessions, warnings };
+	return { sessions, warnings: boundScopeWarnings(warnings, scope), warningEntries: warnings };
+}
+
+/** Bounds all warning sources together while retaining each source's exact omitted count. */
+function boundWarningSources(
+	sources: readonly { entries: readonly string[]; describeOmitted: (omitted: number) => string }[],
+): string[] {
+	const samples: string[] = [];
+	const summaries: string[] = [];
+	let remaining = SESSION_LIST_WARNING_LIMIT;
+	for (const source of sources) {
+		const retained = source.entries.slice(0, remaining);
+		samples.push(...retained);
+		remaining -= retained.length;
+		if (source.entries.length > retained.length)
+			summaries.push(source.describeOmitted(source.entries.length - retained.length));
+	}
+	return [...samples, ...summaries];
 }
 
 async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unknown> {
@@ -684,7 +732,20 @@ async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unkno
 			selection: descriptor,
 			...(listing.indexSeq === undefined ? {} : { indexSeq: listing.indexSeq }),
 			sessions: filtered.sessions,
-			warnings: [...listing.warnings, ...filtered.warnings],
+			warnings: boundWarningSources([
+				{
+					entries: listing.warnings.map(String),
+					describeOmitted: omitted =>
+						`${omitted} further warning${omitted === 1 ? "" : "s"} omitted; ${listing.warnings.length} in total.`,
+				},
+				{
+					entries: filtered.warningEntries,
+					describeOmitted: omitted =>
+						`${omitted} further session workspace${omitted === 1 ? "" : "s"} outside Git ${
+							omitted === 1 ? "was" : "were"
+						} excluded by scope ${scope}; ${filtered.warningEntries.length} excluded in total.`,
+				},
+			]),
 		},
 	};
 }

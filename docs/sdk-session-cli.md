@@ -57,6 +57,16 @@ For a path outside Git, `repo` and `worktree` fail with the typed
 exact canonical path match. Unreadable or removed row workspaces are excluded
 from Git scopes deterministically and reported in `warnings`.
 
+`warnings` is bounded: at most 10 individual warnings are emitted per call, and
+any remainder from each warning source is collapsed into a summary line carrying
+that source's exact total count. This applies to both halves of the array — broker
+traversal warnings and scope-exclusion warnings — so neither can grow with the
+size of the index.
+Without the bound the array grew with the number of sessions on the machine
+rather than with the result (a measured `--scope repo` call returned 317
+sessions alongside 314 warnings, about 52 KB of the 196 KB response).
+`--scope all` performs no filtering and therefore emits no exclusion warnings.
+
 The raw global `session.list` route remains unfiltered, and `inspect`, `send`,
 `status`, `tail`, `retire`, and raw control/query behavior is unchanged.
 
