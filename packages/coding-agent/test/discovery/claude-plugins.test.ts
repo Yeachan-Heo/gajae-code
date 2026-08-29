@@ -340,6 +340,134 @@ describe("listClaudePluginRoots", () => {
 		expect(isolated.warnings).toEqual([expect.stringContaining("escapes the isolated home")]);
 	});
 
+	test("canonicalizes registry reads when a plugin cache symlink is replaced", async () => {
+		const profileHome = path.join(tempDir, "profile-home-cache-swap");
+		const pluginsLink = path.join(profileHome, ".gjc", "plugins");
+		const poisonedRegistryDir = path.join(tempDir, "poisoned-registry");
+		const safeRegistryDir = path.join(profileHome, "safe-registry");
+		const safePluginPath = path.join(profileHome, "safe-plugin");
+		await fs.mkdir(path.dirname(pluginsLink), { recursive: true });
+		await fs.mkdir(poisonedRegistryDir, { recursive: true });
+		await fs.mkdir(safeRegistryDir, { recursive: true });
+
+		await fs.writeFile(
+			path.join(poisonedRegistryDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"poisoned@market": [
+						{
+							scope: "user",
+							installPath: safePluginPath,
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.writeFile(
+			path.join(safeRegistryDir, "installed_plugins.json"),
+			JSON.stringify({ version: 2, plugins: {} }),
+		);
+		await fs.symlink(poisonedRegistryDir, pluginsLink, "dir");
+
+		const ordinary = await listClaudePluginRoots(profileHome);
+		expect(ordinary.roots.map(root => root.id)).toEqual(["poisoned@market"]);
+
+		await fs.rm(pluginsLink, { recursive: true, force: true });
+		await fs.symlink(safeRegistryDir, pluginsLink, "dir");
+
+		const isolated = await listClaudePluginRoots(profileHome, undefined, true);
+		expect(isolated.roots).toEqual([]);
+		expect(isolated.warnings).toEqual([]);
+	});
+
+	test("isolated discovery rejects a registry symlink outside the supplied home", async () => {
+		const profileHome = path.join(tempDir, "profile-home-registry-escape");
+		const pluginsLink = path.join(profileHome, ".gjc", "plugins");
+		const outsideRegistryDir = path.join(tempDir, "outside-registry");
+		await fs.mkdir(path.dirname(pluginsLink), { recursive: true });
+		await fs.mkdir(outsideRegistryDir, { recursive: true });
+		await fs.writeFile(
+			path.join(outsideRegistryDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"outside-registry@market": [
+						{
+							scope: "user",
+							installPath: path.join(profileHome, "allowed-plugin"),
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.symlink(outsideRegistryDir, pluginsLink, "dir");
+
+		const result = await listClaudePluginRoots(profileHome, undefined, true);
+		expect(result.roots).toEqual([]);
+		expect(result.warnings).toEqual([expect.stringContaining("outside the isolated home")]);
+	});
+
+	test("isolated registry reads do not poison a later ordinary load", async () => {
+		const profileHome = path.join(tempDir, "profile-home-isolated-first");
+		const pluginsLink = path.join(profileHome, ".gjc", "plugins");
+		const safeRegistryDir = path.join(profileHome, "safe-registry");
+		const ordinaryRegistryDir = path.join(tempDir, "ordinary-registry");
+		await fs.mkdir(path.dirname(pluginsLink), { recursive: true });
+		await fs.mkdir(safeRegistryDir, { recursive: true });
+		await fs.mkdir(ordinaryRegistryDir, { recursive: true });
+		await fs.writeFile(
+			path.join(safeRegistryDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"isolated-only@market": [
+						{
+							scope: "user",
+							installPath: path.join(profileHome, "isolated-plugin"),
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.writeFile(
+			path.join(ordinaryRegistryDir, "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"ordinary-only@market": [
+						{
+							scope: "user",
+							installPath: path.join(tempDir, "ordinary-plugin"),
+							version: "2.0.0",
+							installedAt: "2025-01-02T00:00:00Z",
+							lastUpdated: "2025-01-02T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.symlink(safeRegistryDir, pluginsLink, "dir");
+
+		const isolated = await listClaudePluginRoots(profileHome, undefined, true);
+		expect(isolated.roots.map(root => root.id)).toEqual(["isolated-only@market"]);
+
+		await fs.rm(pluginsLink, { recursive: true, force: true });
+		await fs.symlink(ordinaryRegistryDir, pluginsLink, "dir");
+
+		const ordinary = await listClaudePluginRoots(profileHome);
+		expect(ordinary.roots.map(root => root.id)).toEqual(["ordinary-only@market"]);
+	});
+
 	test("defaults scope to user when not specified", async () => {
 		const pluginsDir = path.join(tempDir, ".gjc", "plugins");
 		await fs.mkdir(pluginsDir, { recursive: true });

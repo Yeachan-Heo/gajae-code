@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
-	CONFIG_DIR_NAME,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
@@ -50,7 +49,9 @@ export const SOURCE_PATHS = {
 		get userAgent() {
 			return `${getConfigDirName()}/agent`;
 		},
-		projectDir: CONFIG_DIR_NAME,
+		get projectDir() {
+			return getConfigDirName();
+		},
 	},
 	claude: {
 		userBase: ".claude",
@@ -682,9 +683,11 @@ export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string
 				)?.name;
 				resolvedExtPath = pluginFilePath ? path.join(resolvedExtPath, pluginFilePath) : resolvedExtPath;
 			}
-			const content = await readFile(resolvedExtPath);
+			const canonicalExtPath = await canonicalizePathWithinHome(ctx, resolvedExtPath);
+			if (!canonicalExtPath) continue;
+			const content = await readFile(canonicalExtPath);
 			if (content !== null) {
-				discovered.add(resolvedExtPath);
+				discovered.add(canonicalExtPath);
 			}
 		}
 	}
@@ -946,6 +949,19 @@ function isWithinOrEqual(root: string, candidate: string): boolean {
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
+async function canonicalizePluginRegistryPath(
+	home: string,
+	registryPath: string,
+	isolatedHome: boolean,
+): Promise<string | undefined> {
+	const canonical = await canonicalizeThroughExistingAncestor(registryPath);
+	if (isolatedHome) {
+		const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+		if (!isWithinOrEqual(canonicalHome, canonical)) return undefined;
+	}
+	return canonical;
+}
+
 /**
  * Resolve a configured path through existing symlinks when an explicit-home
  * load is active. Ordinary discovery keeps its historical lexical path
@@ -998,7 +1014,13 @@ export async function listClaudePluginRoots(
 	isolatedHome = false,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
-	const cacheKey = `${home}:${resolvedProjectPath ?? ""}`;
+	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+	const rawGjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
+	const gjcRegistryPath = await canonicalizePluginRegistryPath(canonicalHome, rawGjcRegistryPath, isolatedHome);
+	const projectRegistryPath = resolvedProjectPath
+		? await canonicalizePluginRegistryPath(canonicalHome, resolvedProjectPath, isolatedHome)
+		: undefined;
+	const cacheKey = `${canonicalHome}:${gjcRegistryPath ?? ""}:${projectRegistryPath ?? ""}`;
 	if (!isolatedHome) {
 		const cached = pluginRootsCache.get(cacheKey);
 		if (cached) return cached;
@@ -1012,8 +1034,10 @@ export async function listClaudePluginRoots(
 	// In production `home` is the provenance-checked home, so `getPluginsDir(home)` resolves to the
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
-	const gjcRegistryPath = path.join(getPluginsDir(home), "installed_plugins.json");
-	const gjcContent = await readFile(gjcRegistryPath);
+	const gjcContent = gjcRegistryPath ? await readFile(gjcRegistryPath) : null;
+	if (isolatedHome && !gjcRegistryPath) {
+		warnings.push(`Ignoring GJC plugin registry outside the isolated home: ${rawGjcRegistryPath}`);
+	}
 	if (gjcContent) {
 		const gjcRegistry = parseClaudePluginsRegistry(gjcContent);
 		if (gjcRegistry) {
@@ -1063,7 +1087,10 @@ export async function listClaudePluginRoots(
 	// Loaded from the nearest .gjc/plugins/installed_plugins.json relative to cwd.
 	// Project entries take precedence over user entries for the same plugin ID.
 	if (resolvedProjectPath) {
-		const projectContent = await readFile(resolvedProjectPath);
+		const projectContent = projectRegistryPath ? await readFile(projectRegistryPath) : null;
+		if (isolatedHome && !projectRegistryPath) {
+			warnings.push(`Ignoring project plugin registry outside the isolated home: ${resolvedProjectPath}`);
+		}
 		if (projectContent) {
 			const projectRegistry = parseClaudePluginsRegistry(projectContent);
 			if (projectRegistry) {
@@ -1100,7 +1127,7 @@ export async function listClaudePluginRoots(
 					}
 				}
 			} else {
-				warnings.push(`Failed to parse project plugin registry: ${resolvedProjectPath}`);
+				warnings.push(`Failed to parse project plugin registry: ${projectRegistryPath}`);
 			}
 		}
 	}

@@ -57,7 +57,7 @@ const EXPLICIT_HOME_PROVIDER_ROOTS = [
 	{ providerIds: ["opencode"], user: null, project: "opencode.json" },
 	{ providerIds: ["cursor"], user: ".cursor", project: ".cursor" },
 	{ providerIds: ["windsurf"], user: path.join(".codeium", "windsurf"), project: ".windsurf" },
-	{ providerIds: ["cline"], user: ".cline", project: ".clinerules" },
+	{ providerIds: ["cline"], user: null, project: ".clinerules" },
 	{ providerIds: ["github"], user: null, project: ".github" },
 	{ providerIds: ["agents"], user: ".agent", project: ".agent" },
 	{ providerIds: ["agents"], user: ".agents", project: ".agents" },

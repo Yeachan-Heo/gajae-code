@@ -190,6 +190,33 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		).toEqual([]);
 	});
 
+	test("explicit home native project discovery follows the configured config directory", async () => {
+		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		try {
+			process.env.GJC_CONFIG_DIR = ".gjc-alt";
+			delete process.env.PI_CONFIG_DIR;
+
+			const decoyProject = path.join(tempDir, "process-decoy", "project");
+			await writeFile(path.join(decoyProject, ".gjc", "SYSTEM.md"), "# decoy system");
+			await fs.symlink(path.join(decoyProject, ".gjc"), path.join(project, ".gjc"), "dir");
+			await writeFile(path.join(project, ".gjc-alt", "SYSTEM.md"), "# configured project system");
+
+			const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+				cwd: project,
+				providers: ["native"],
+			});
+
+			expect(result.items.map(item => item.content)).toEqual(["# configured project system"]);
+			expect(result.items.some(item => item.content.includes("decoy"))).toBe(false);
+		} finally {
+			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
+		}
+	});
+
 	test("explicit home fails closed when its .gjc root redirects outside the profile", async () => {
 		const decoyRoot = path.join(tempDir, "decoy-profile", ".gjc");
 		await seedProfile(path.join(decoyRoot, "agent"), "decoy");
