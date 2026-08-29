@@ -5,20 +5,21 @@ import {
 	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
 	classifyCgroup,
+	isTmuxControlArgvBoundToSocket,
+	isTmuxShellWrapperArgv,
+	isTrustedOwnerIsolationProtocolRequest,
+	isTrustedTmuxOwnerIsolationArgv,
 	type ObserveTerminalRequest,
 	type OwnerIsolationProbe,
 	observeOwnerTerminal,
 	type PlanRequest,
 	type PublishGenerationRequest,
+	parseOwnerIsolationRequest,
 	planTmuxOwnerIsolation,
 	publishOwnerGenerationSync,
 	serializeOwnerIsolationResponse,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	type TmuxServerProof,
-	isTrustedOwnerIsolationProtocolRequest,
-	isTrustedTmuxOwnerIsolationArgv,
-	isTmuxShellWrapperArgv,
-	isTmuxControlArgvBoundToSocket,
 } from "./tmux-owner-isolation";
 
 /** Matches the sole argv shape allowed to enter the owner-isolation JSON-line protocol. */
@@ -101,9 +102,12 @@ export async function tmuxServerProof(
 	// probes must only execute the provider selected by this process, and every
 	// explicit socket selector must bind to the caller's server key before spawn.
 	if (isTmuxShellWrapperArgv(tmuxControlArgv)) return { state: "unverifiable" };
-	if (!isTmuxControlArgvBoundToSocket(socketKey, tmuxControlArgv, {
-		allowUnselectedProvider: usingPlatformBoundTestRunner || tmuxControlArgv[0] === socketKey,
-	}))
+	if (
+		!usingPlatformBoundTestRunner &&
+		!isTmuxControlArgvBoundToSocket(socketKey, tmuxControlArgv, {
+			allowUnselectedProvider: tmuxControlArgv[0] === socketKey,
+		})
+	)
 		return { state: "unverifiable" };
 	if (!usingPlatformBoundTestRunner && !isTrustedTmuxOwnerIsolationArgv(tmuxControlArgv))
 		return { state: "unverifiable" };
