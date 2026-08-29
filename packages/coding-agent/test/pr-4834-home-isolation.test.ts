@@ -83,7 +83,7 @@ beforeEach(async () => {
 	clearCache();
 	tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4834-home-isolation-"));
 	home = path.join(tempDir, "supplied-home");
-	project = path.join(tempDir, "project");
+	project = path.join(home, "project");
 	await fs.mkdir(home, { recursive: true });
 	await fs.mkdir(project, { recursive: true });
 	await fs.mkdir(path.join(project, ".git"), { recursive: true });
@@ -145,6 +145,18 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.items.map(item => item.content)).toEqual(["# project system"]);
 	});
 
+	test("explicit home rejects a cwd whose canonical path is outside the supplied home", async () => {
+		const outside = path.join(tempDir, "outside-project");
+		await fs.mkdir(outside, { recursive: true });
+
+		await expect(
+			loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+				cwd: outside,
+				providers: ["native"],
+			}),
+		).rejects.toThrow(/cwd is outside the supplied home/);
+	});
+
 	test("explicit home rejects a cwd symlink that escapes into a decoy project", async () => {
 		const decoyProject = path.join(tempDir, "process-decoy", "project");
 		await writeFile(path.join(decoyProject, ".gjc", "SYSTEM.md"), "# decoy system");
@@ -175,6 +187,43 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 				filePath => filePath === decoyProject || filePath.startsWith(`${decoyProject}${path.sep}`),
 			),
 		).toEqual([]);
+	});
+
+	test("explicit home fails closed when its .gjc root redirects outside the profile", async () => {
+		const decoyRoot = path.join(tempDir, "decoy-profile", ".gjc");
+		await seedProfile(path.join(decoyRoot, "agent"), "decoy");
+		await fs.symlink(decoyRoot, path.join(home, ".gjc"), "dir");
+
+		await expect(
+			loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+				cwd: project,
+				providers: ["native"],
+			}),
+		).rejects.toThrow(/config root|user agent directory/);
+	});
+
+	test("explicit home fails closed when its agent or plugin roots redirect outside the profile", async () => {
+		const decoyRoot = path.join(tempDir, "decoy-profile", ".gjc");
+		await fs.mkdir(path.join(home, ".gjc"), { recursive: true });
+		await seedProfile(path.join(decoyRoot, "agent"), "decoy");
+		await fs.symlink(path.join(decoyRoot, "agent"), path.join(home, ".gjc", "agent"), "dir");
+
+		await expect(
+			loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+				cwd: project,
+				providers: ["native"],
+			}),
+		).rejects.toThrow(/user agent directory/);
+
+		await fs.rm(path.join(home, ".gjc", "agent"), { recursive: true, force: true });
+		await fs.mkdir(path.join(decoyRoot, "plugins"), { recursive: true });
+		await fs.symlink(path.join(decoyRoot, "plugins"), path.join(home, ".gjc", "plugins"), "dir");
+		await expect(
+			loadCapabilityForHome<Skill>(skillCapability.id, home, {
+				cwd: project,
+				providers: ["claude-plugins"],
+			}),
+		).rejects.toThrow(/plugin registry root/);
 	});
 
 	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {

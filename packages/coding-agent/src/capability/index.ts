@@ -71,6 +71,54 @@ async function canonicalizeThroughExistingAncestor(target: string): Promise<stri
 	}
 }
 
+async function canonicalizeContainedPath(root: string, target: string, label: string): Promise<string> {
+	const canonical = await canonicalizeThroughExistingAncestor(target);
+	if (!isWithinOrEqual(root, canonical)) {
+		throw new Error(
+			`loadCapabilityForHome ${label} escapes the supplied home through a symlink: "${target}" resolves to "${canonical}" outside "${root}".`,
+		);
+	}
+	return canonical;
+}
+
+/**
+ * Validate every config root that explicit-home discovery can use before any
+ * provider is invoked. A symlinked `.gjc`/`agent`/`plugins` directory would
+ * otherwise make a path that is lexically inside the supplied home read an
+ * unrelated profile.
+ */
+async function assertExplicitHomeRoots(canonicalHome: string, cwd: string): Promise<void> {
+	await canonicalizeContainedPath(canonicalHome, path.join(canonicalHome, getConfigDirName()), "config root");
+	await canonicalizeContainedPath(
+		canonicalHome,
+		path.join(canonicalHome, getConfigDirName(), "agent"),
+		"user agent directory",
+	);
+	await canonicalizeContainedPath(
+		canonicalHome,
+		path.join(canonicalHome, getConfigDirName(), "plugins"),
+		"plugin registry root",
+	);
+
+	// Project plugin discovery walks from cwd toward the home boundary. Check
+	// each candidate `.gjc` root so an internal symlink cannot redirect a
+	// project registry outside the explicit profile.
+	let current = cwd;
+	while (true) {
+		const projectConfigRoot = path.join(current, getConfigDirName());
+		await canonicalizeContainedPath(canonicalHome, projectConfigRoot, "project registry root");
+		await canonicalizeContainedPath(
+			canonicalHome,
+			path.join(projectConfigRoot, "plugins"),
+			"project plugin registry root",
+		);
+		if (current === canonicalHome) break;
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+}
+
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
 /** Session-local settings keyed by normalized working directory. */
@@ -339,18 +387,23 @@ export async function loadCapabilityForHome<T>(
 		canonicalizeThroughExistingAncestor(resolvedHome),
 		canonicalizeThroughExistingAncestor(lexicalCwd),
 	]);
-	// A cwd that lexically appears below the supplied home but resolves outside
-	// it is an ambiguous authority boundary. Refuse the load before repository
-	// or provider discovery can traverse the escaped target.
-	if (isWithinOrEqual(resolvedHome, lexicalCwd) && !isWithinOrEqual(canonicalHome, cwd)) {
+	// Every explicit-home cwd must resolve inside the supplied physical home.
+	// Allowing an outside cwd would let repository and plugin-registry discovery
+	// walk unrelated ancestors before the isolated boundary can take effect.
+	if (!isWithinOrEqual(canonicalHome, cwd)) {
 		throw new Error(
-			`loadCapabilityForHome cwd escapes the supplied home through a symlink: "${lexicalCwd}" resolves to "${cwd}" outside "${canonicalHome}".`,
+			`loadCapabilityForHome cwd is outside the supplied home: "${lexicalCwd}" resolves to "${cwd}" outside "${canonicalHome}".`,
 		);
 	}
 
 	const userAgentDir = options.agentDir
-		? path.resolve(options.agentDir)
-		: path.join(canonicalHome, getConfigDirName(), "agent");
+		? await canonicalizeThroughExistingAncestor(path.resolve(options.agentDir))
+		: await canonicalizeContainedPath(
+			canonicalHome,
+			path.join(canonicalHome, getConfigDirName(), "agent"),
+			"user agent directory",
+		);
+	await assertExplicitHomeRoots(canonicalHome, cwd);
 	const repoRootCandidate = await findRepoRoot(cwd);
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
