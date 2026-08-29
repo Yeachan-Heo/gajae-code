@@ -649,7 +649,12 @@ export async function planTmuxOwnerIsolation(request: PlanRequest, probe: OwnerI
 	if (!isPlanRequest(request)) return failure("scope_unavailable", "invalid_plan_request");
 	const attemptSession = tmuxAttemptSession(request.tmux_argv);
 	if (!attemptSession) return failure("scope_unavailable", "attempt_session_missing");
-	const currentBaseline = await captureOwnerGenerationBaseline(request.state_dir, request.session_id);
+	let currentBaseline: OwnerGenerationBaseline;
+	try {
+		currentBaseline = await captureOwnerGenerationBaseline(request.state_dir, request.session_id);
+	} catch {
+		return failure("scope_unavailable", "owner_generation_unavailable");
+	}
 	if (!sameOwnerGenerationBaseline(currentBaseline, request.baseline))
 		return failure("scope_unavailable", "owner_generation_stale");
 	try {
