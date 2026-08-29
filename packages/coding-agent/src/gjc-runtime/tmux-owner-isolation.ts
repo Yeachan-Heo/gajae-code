@@ -2234,7 +2234,13 @@ export async function closeExactTmuxOwner(
 			await renameIntentIfCurrent(paths, intent.intent_id, ".cancelled", generationLockToken);
 			throw new Error("owner_generation_mismatch");
 		}
-		if (!Number.isFinite(Date.parse(intent.expires_at)) || Date.parse(intent.expires_at) <= Date.now()) {
+		const now = Date.now();
+		if (
+			!Number.isFinite(Date.parse(intent.created_at)) ||
+			Date.parse(intent.created_at) > now ||
+			!Number.isFinite(Date.parse(intent.expires_at)) ||
+			Date.parse(intent.expires_at) <= now
+		) {
 			await renameIntentIfCurrent(paths, intent.intent_id, ".expired", generationLockToken);
 			throw new Error("owner_term_verdict_timeout");
 		}
