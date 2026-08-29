@@ -2193,6 +2193,7 @@ export class SelectorController {
 				this.ctx.settings,
 				undefined,
 				this.ctx.session.getSessionAgentDir?.(),
+				this.ctx.session.getSessionProfileAuthority?.(),
 			);
 		} catch (error) {
 			this.ctx.showError(`Failed to open /extensions: ${error instanceof Error ? error.message : String(error)}`);

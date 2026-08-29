@@ -97,15 +97,23 @@ export class CustomizationDashboard extends Container {
 	#confirmRemove: InventoryRow | null = null;
 	#homeDir: string;
 	#agentDir: string | undefined;
+	#profileAuthority: "default" | "custom" | undefined;
 	#statusMessage: string | null = null;
 
 	/** Use `create()` — async inventory load runs before chrome construction. */
-	constructor(cwd: string, settings: CustomizationSettingsSlice | undefined, homeDir: string, agentDir?: string) {
+	constructor(
+		cwd: string,
+		settings: CustomizationSettingsSlice | undefined,
+		homeDir: string,
+		agentDir?: string,
+		profileAuthority?: "default" | "custom",
+	) {
 		super();
 		this.#cwd = cwd;
 		this.#settings = settings;
 		this.#homeDir = homeDir;
 		this.#agentDir = agentDir;
+		this.#profileAuthority = profileAuthority;
 	}
 
 	static async create(
@@ -113,8 +121,15 @@ export class CustomizationDashboard extends Container {
 		settings?: CustomizationSettingsSlice,
 		homeDir?: string,
 		agentDir?: string,
+		profileAuthority?: "default" | "custom",
 	): Promise<CustomizationDashboard> {
-		const dashboard = new CustomizationDashboard(cwd, settings, homeDir ?? getTrustedHomeDir(), agentDir);
+		const dashboard = new CustomizationDashboard(
+			cwd,
+			settings,
+			homeDir ?? getTrustedHomeDir(),
+			agentDir,
+			profileAuthority,
+		);
 		await dashboard.#reload();
 		dashboard.#buildChrome();
 		return dashboard;
@@ -154,6 +169,7 @@ export class CustomizationDashboard extends Container {
 			cwd: this.#cwd,
 			home: this.#homeDir,
 			agentDir: this.#agentDir ?? this.#settings?.getAgentDir?.(),
+			profileAuthority: this.#profileAuthority,
 			policy: this.#skillPolicy(),
 			disabledExtensions: this.#getStringArray("disabledExtensions"),
 		});

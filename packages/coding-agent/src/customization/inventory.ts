@@ -35,6 +35,8 @@ export interface LoadCustomizationInventoryOptions {
 	home?: string;
 	/** Owning session agent directory for global customization surfaces. */
 	agentDir?: string;
+	/** Resolver-owned profile classification captured at session creation. */
+	profileAuthority?: "default" | "custom";
 	/** Skill management policy snapshot (trust, include/ignore, disabledExtensions). */
 	policy?: SkillManagementPolicy;
 	/** Disabled extension ids (`skill:<name>` / `mcp:<name>`) from settings. */
@@ -96,6 +98,7 @@ async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnin
 		cwd: options.cwd,
 		home: options.home,
 		agentDir: options.agentDir,
+		profileAuthority: options.profileAuthority,
 		policy: options.policy,
 	});
 	const managedPaths = new Set<string>();

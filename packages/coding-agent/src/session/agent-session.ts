@@ -22496,6 +22496,8 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; onPersisted?: () => void },
 	): Promise<BashResult> {
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
 		const excludeFromContext = options?.excludeFromContext === true;
 		this.#markRetryReplayUnsafe();
 
@@ -22509,6 +22511,7 @@ export class AgentSession {
 				cwd,
 			});
 			if (hookResult?.result) {
+				this.#assertSessionIdentityAdmission(identityAdmission);
 				this.recordBashResult(command, hookResult.result, options);
 				if (hookResult.result.exitCode === 0 && !hookResult.result.cancelled) {
 					await this.#activatePendingGjcGoalModeRequest();
@@ -22536,6 +22539,7 @@ export class AgentSession {
 				onMinimizedSave: originalText => this.#saveBashOriginalArtifact(originalText),
 			});
 
+			this.#assertSessionIdentityAdmission(identityAdmission);
 			this.recordBashResult(command, result, options);
 			if (result.exitCode === 0 && !result.cancelled) {
 				await this.#activatePendingGjcGoalModeRequest();
