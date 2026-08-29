@@ -8,6 +8,7 @@ import { getBundledModel } from "@gajae-code/ai/models";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { createAppendOnlyContextManager } from "@gajae-code/coding-agent/append-only-mode";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
+import { asyncJobEndpointId } from "@gajae-code/coding-agent/async/support";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { ExtensionRunner, loadExtensions } from "@gajae-code/coding-agent/extensibility/extensions";
@@ -1109,6 +1110,183 @@ describe("AgentSession handoff", () => {
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 
 		await expect(transition).resolves.toBe(true);
+	});
+
+	it("rejects custom-message admission during a fork transition", async () => {
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const originalPrepare = sessionManager.prepareFork.bind(sessionManager);
+		vi.spyOn(sessionManager, "prepareFork").mockImplementation(async () => {
+			prepareStarted.resolve();
+			await prepareGate.promise;
+			return originalPrepare();
+		});
+
+		const transition = session.fork();
+		await prepareStarted.promise;
+		await expect(
+			session.sendCustomMessage({ customType: "external", content: "during fork", display: false }),
+		).rejects.toThrow(/session transition is in progress/i);
+
+		session.agent.state.isStreaming = true;
+		try {
+			await expect(
+				session.promptCustomMessage(
+					{ customType: "external", content: "during fork", display: false },
+					{ streamingBehavior: "steer" },
+				),
+			).rejects.toThrow(/session transition is in progress/i);
+		} finally {
+			session.agent.state.isStreaming = false;
+		}
+
+		prepareGate.resolve();
+		await expect(transition).resolves.toBe(true);
+	});
+
+	it("allows a post-commit lifecycle hook to append successor context", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected model to be set");
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const agent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			extensionRunner,
+		});
+
+		vi.spyOn(extensionRunner, "emit").mockImplementation(async event => {
+			if (event.type === "session_switch") {
+				await expect(
+					session.sendCustomMessage(
+						{ customType: "transition-trigger", content: "must reject", display: false },
+						{ triggerTurn: true },
+					),
+				).rejects.toThrow(/session transition is in progress/i);
+				await session.sendCustomMessage({ customType: "transition-context", content: "successor", display: false });
+			}
+			return undefined as never;
+		});
+
+		await expect(session.fork()).resolves.toBe(true);
+		expect(
+			sessionManager
+				.getBranch()
+				.some(entry => entry.type === "custom_message" && entry.customType === "transition-context"),
+		).toBe(true);
+	});
+
+	it("serializes cwd rescope against session identity transitions", async () => {
+		const source = path.join(tempDir.path(), "rescope-source");
+		const target = path.join(source, "rescope-target");
+		await fs.mkdir(target, { recursive: true });
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const moveSessionManager = SessionManager.create(source, source);
+		const moveAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
+		});
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const moveSession = new AgentSession({
+			agent: moveAgent,
+			sessionManager: moveSessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			agentId: "owner",
+			rescopeSessionCwdParticipant: {
+				prepareRescope: async () => {
+					prepareStarted.resolve();
+					await prepareGate.promise;
+				},
+				rebindCwdCapturingAuthority: async () => {},
+				applyRescopedReadState: async () => {},
+			},
+		});
+
+		try {
+			const move = moveSession.rescopeSessionCwd(target, { scope: "any" });
+			await prepareStarted.promise;
+			await expect(Promise.resolve().then(() => moveSession.newSession())).rejects.toMatchObject({ code: "busy" });
+
+			prepareGate.resolve();
+			await expect(move).resolves.toMatchObject({ from: source, to: target });
+		} finally {
+			prepareGate.resolve();
+			await moveSession.dispose();
+			await moveSessionManager.close();
+		}
+	});
+
+	it("rekeys the owned async endpoint when a provider transcript moves", async () => {
+		const source = path.join(tempDir.path(), "endpoint-source");
+		const target = path.join(source, "endpoint-target");
+		const agentDir = path.join(tempDir.path(), "endpoint-agent");
+		await fs.mkdir(target, { recursive: true });
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const destination = SessionManager.managedDestination(source, agentDir);
+		const moveSessionManager = SessionManager.create(source, destination);
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const providerSessionId = "provider-affinity";
+		const oldEndpoint = asyncJobEndpointId(
+			providerSessionId,
+			moveSessionManager.getSessionId(),
+			moveSessionManager.getSessionFile(),
+		);
+		AsyncJobManager.registerForEndpoint(oldEndpoint, manager);
+		const moveAgent = new Agent({
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			appendOnlyContext: createAppendOnlyContextManager(model.provider),
+		});
+		const moveSession = new AgentSession({
+			agent: moveAgent,
+			sessionManager: moveSessionManager,
+			settings: Settings.isolated({ "compaction.enabled": true, "compaction.autoContinue": false }),
+			modelRegistry,
+			agentId: "owner",
+			providerSessionId,
+			asyncJobProviderSessionId: providerSessionId,
+			ownedAsyncJobManager: manager,
+			rescopeSessionCwdParticipant: {
+				rebindCwdCapturingAuthority: async () => {},
+				applyRescopedReadState: async () => {},
+			},
+		});
+
+		try {
+			await expect(moveSession.rescopeSessionCwd(target, { scope: "any" })).resolves.toMatchObject({
+				from: source,
+				to: target,
+			});
+			const newEndpoint = asyncJobEndpointId(
+				providerSessionId,
+				moveSessionManager.getSessionId(),
+				moveSessionManager.getSessionFile(),
+			);
+			expect(newEndpoint).not.toBe(oldEndpoint);
+			expect(AsyncJobManager.endpointIdOf(manager)).toBe(newEndpoint);
+			expect(AsyncJobManager.forEndpoint(oldEndpoint)).toBeUndefined();
+		} finally {
+			await moveSession.dispose();
+			await moveSessionManager.close();
+			await manager.dispose({ timeoutMs: 100 });
+		}
 	});
 
 	it("retains the generated document when a turn starts during generation (late busy)", async () => {

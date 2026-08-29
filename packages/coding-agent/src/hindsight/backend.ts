@@ -27,6 +27,37 @@ const STATIC_INSTRUCTIONS = [
 	"",
 ].join("\n");
 
+/**
+ * A backend start can outlive the session identity that admitted it (for
+ * example, deferred startup racing `/new` or `/resume`). Keep this fence
+ * local to the backend rather than introducing a process-global session
+ * registry: AgentSession remains the owner of the published state.
+ */
+const startEpochBySession = new WeakMap<object, number>();
+
+type StartGuard = () => boolean;
+
+function nextStartEpoch(session: AgentSession): number {
+	const epoch = (startEpochBySession.get(session) ?? 0) + 1;
+	startEpochBySession.set(session, epoch);
+	return epoch;
+}
+
+function isSessionDisposed(session: AgentSession): boolean {
+	return (session as AgentSession & { isDisposed?: boolean }).isDisposed === true;
+}
+
+function makeStartGuard(session: AgentSession, epoch: number, sessionId: string): StartGuard {
+	const managerSessionId = session.sessionManager.getSessionId();
+	const managerSessionFile = session.sessionManager.getSessionFile();
+	return () =>
+		startEpochBySession.get(session) === epoch &&
+		!isSessionDisposed(session) &&
+		session.sessionId === sessionId &&
+		session.sessionManager.getSessionId() === managerSessionId &&
+		session.sessionManager.getSessionFile() === managerSessionFile;
+}
+
 /** Reload the active session's mental-model cache and prompt. */
 export async function reloadMentalModelsForSession(session: AgentSession): Promise<boolean> {
 	const state = session.getHindsightSessionState();
@@ -37,12 +68,20 @@ export const hindsightBackend: MemoryBackend = {
 	id: "hindsight",
 
 	async start(options: MemoryBackendStartOptions): Promise<void> {
+		const sessionId = options.session.sessionId;
+		if (!sessionId) return;
+		const epoch = nextStartEpoch(options.session);
+		const guard = makeStartGuard(options.session, epoch, sessionId);
+
 		// Session cwd transitions acquire the exclusive writer only after all
 		// existing read leases drain. Hold this lease across the complete Hindsight
 		// startup boundary so a deferred startup that wins the race is observed as
 		// resident by the move's admission check, while a startup that loses the
 		// race initializes only after the committed move's target cwd is active.
-		await options.session.sessionManager.runWithCwdReadLease(() => startHindsight(options));
+		await options.session.sessionManager.runWithCwdReadLease(() => {
+			if (!guard()) return Promise.resolve();
+			return startHindsight(options, guard);
+		});
 	},
 
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
@@ -72,7 +111,9 @@ export const hindsightBackend: MemoryBackend = {
 		// operators who want to delete the upstream bank should use the Hindsight
 		// UI / `deleteBank` directly. Drain pending tool-initiated retains first
 		// so we don't lose them.
+		if (session) nextStartEpoch(session);
 		const state = session?.getHindsightSessionState();
+		state?.beginDispose();
 		if (state) await state.flushRetainQueue();
 		const previous = session?.setHindsightSessionState(undefined);
 		await previous?.dispose();
@@ -106,10 +147,10 @@ export const hindsightBackend: MemoryBackend = {
 	},
 };
 
-async function startHindsight(options: MemoryBackendStartOptions): Promise<void> {
+async function startHindsight(options: MemoryBackendStartOptions, guard: StartGuard): Promise<void> {
 	const { session, settings } = options;
 	const sessionId = session.sessionId;
-	if (!sessionId) return;
+	if (!sessionId || !guard()) return;
 
 	// Subagents alias the parent's state so recall/retain/reflect tool calls
 	// persist to the same Hindsight bank. Auto-recall and auto-retain stay
@@ -117,7 +158,7 @@ async function startHindsight(options: MemoryBackendStartOptions): Promise<void>
 	// pollute the bank with internal exploration transcripts.
 	if (options.taskDepth > 0) {
 		const parent = options.parentHindsightSessionState;
-		if (!parent) return;
+		if (!parent || parent.isDisposed || !guard()) return;
 		const replacement = new HindsightSessionState({
 			sessionId,
 			client: parent.client,
@@ -134,6 +175,10 @@ async function startHindsight(options: MemoryBackendStartOptions): Promise<void>
 		});
 		const previous = session.getHindsightSessionState();
 		await previous?.dispose();
+		if (!guard() || parent.isDisposed || session.getHindsightSessionState() !== previous) {
+			void replacement.dispose();
+			return;
+		}
 		session.setHindsightSessionState(replacement);
 		return;
 	}
@@ -166,14 +211,22 @@ async function startHindsight(options: MemoryBackendStartOptions): Promise<void>
 	// and replacement.
 	const previous = session.getHindsightSessionState();
 	await previous?.dispose();
+	if (!guard() || session.getHindsightSessionState() !== previous) {
+		void state.dispose();
+		return;
+	}
 	session.setHindsightSessionState(state);
+	if (!guard() || session.getHindsightSessionState() !== state) {
+		void state.dispose();
+		return;
+	}
 	state.attachSessionListeners();
 
 	// Kick off mental-model bootstrap. Resolves asynchronously; the first
 	// turn races and is covered in `beforeAgentStartPrompt` via
 	// `mentalModelsLoadPromise`. Subsequent turns see the populated cache
 	// because `runMentalModelLoad` calls `refreshBaseSystemPrompt`.
-	if (config.mentalModelsEnabled) {
+	if (config.mentalModelsEnabled && guard() && session.getHindsightSessionState() === state) {
 		state.mentalModelsLoadPromise = state.runMentalModelLoad(scope).catch(err => {
 			logger.debug("Hindsight: mental-model bootstrap failed", { bankId: state.bankId, error: String(err) });
 		});

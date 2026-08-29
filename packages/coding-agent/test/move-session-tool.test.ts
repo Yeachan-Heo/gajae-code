@@ -701,6 +701,51 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
+	it("does not resurrect Hindsight state when deferred startup races session disposal", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		fs.mkdirSync(cwdA, { recursive: true });
+
+		const settings = Settings.isolated(
+			{
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "http://localhost:8888",
+				"hindsight.mentalModelsEnabled": false,
+			},
+			{ agentDir: path.dirname(cwdA) },
+		);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session, startDeferredMemoryBackend } = await makeSession(cwdA, sessionManager, {
+			settings,
+			toolNames: ["move_session"],
+			deferMemoryBackendStartup: true,
+		});
+		const startupEntered = Promise.withResolvers<void>();
+		const releaseStartup = Promise.withResolvers<void>();
+		const runWithCwdReadLease = sessionManager.runWithCwdReadLease.bind(sessionManager);
+		const readLeaseSpy = vi.spyOn(sessionManager, "runWithCwdReadLease").mockImplementation(async callback => {
+			return await runWithCwdReadLease(async () => {
+				startupEntered.resolve();
+				await releaseStartup.promise;
+				return await callback();
+			});
+		});
+		try {
+			expect(startDeferredMemoryBackend).toBeFunction();
+			const startup = startDeferredMemoryBackend!();
+			await startupEntered.promise;
+			const disposed = session.dispose();
+			releaseStartup.resolve();
+			await Promise.all([startup, disposed]);
+			expect(session.getHindsightSessionState()).toBeUndefined();
+			expect(session.memoryBackend.status().state).toBe("disposed");
+		} finally {
+			readLeaseSpy.mockRestore();
+			if (!session.isDisposed) await session.dispose();
+		}
+	});
+
 	it("refuses a resident Hindsight service even when the target policy is unchanged", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

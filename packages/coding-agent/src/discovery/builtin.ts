@@ -419,16 +419,16 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// User scope:    <agentDir>/RULES.md (a profile is a separate user scope;
 	//                the default profile's home-relative copy is not read)
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
-	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
-	const userRule = await loadStickyRulesFile(userRulesFile, "user");
-	if (userRule) items.push(userRule);
-
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot, ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
 		if (projectRule) items.push(projectRule);
 	}
+
+	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
+	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	if (userRule) items.push(userRule);
 
 	return { items, warnings };
 }

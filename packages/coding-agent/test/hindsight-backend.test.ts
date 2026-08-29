@@ -19,6 +19,7 @@ interface FakeSessionDeps {
 	sessionId: string | null;
 	cwd?: string;
 	entries?: Array<{ role: "user" | "assistant"; text: string }>;
+	runWithCwdReadLease?: <T>(callback: () => Promise<T>) => Promise<T>;
 }
 
 function makeFakeSession(deps: FakeSessionDeps) {
@@ -27,8 +28,13 @@ function makeFakeSession(deps: FakeSessionDeps) {
 	let hindsightState: HindsightSessionState | undefined;
 	const session = {
 		sessionId: deps.sessionId,
+		isDisposed: false,
 		settings: Settings.isolated(),
 		sessionManager: {
+			// Production startup holds this lease across backend publication. The
+			// fixture supplies the explicit no-op equivalent so these tests model
+			// the contract without requiring a real SessionManager.
+			runWithCwdReadLease: deps.runWithCwdReadLease ?? (async <T>(callback: () => Promise<T>) => callback()),
 			getEntries: () =>
 				entries.map((e, i) => ({
 					id: `e${i}`,
@@ -95,6 +101,141 @@ describe("hindsightBackend.start", () => {
 			taskDepth: 0,
 		});
 
+		expect(session.getHindsightSessionState()).toBeUndefined();
+	});
+
+	it("does not publish startup state after a session identity transition", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const session = makeFakeSession({
+			sessionId: "startup-predecessor",
+			runWithCwdReadLease: async callback => {
+				entered.resolve();
+				await release.promise;
+				return callback();
+			},
+		});
+		const startup = hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		await entered.promise;
+		(session as { sessionId: string }).sessionId = "startup-successor";
+		release.resolve();
+		await startup;
+
+		expect(session.getHindsightSessionState()).toBeUndefined();
+	});
+
+	it("lets the latest concurrent startup own publication", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		let leaseCalls = 0;
+		const session = makeFakeSession({
+			sessionId: "concurrent-start",
+			runWithCwdReadLease: async callback => {
+				leaseCalls++;
+				if (leaseCalls === 1) {
+					firstEntered.resolve();
+					await releaseFirst.promise;
+				}
+				return callback();
+			},
+		});
+		const first = hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		await firstEntered.promise;
+		const second = hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		await second;
+		const published = session.getHindsightSessionState();
+		releaseFirst.resolve();
+		await first;
+
+		expect(published).toBeDefined();
+		expect(session.getHindsightSessionState()).toBe(published);
+	});
+
+	it("does not resurrect state when disposal wins a deferred startup race", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const session = makeFakeSession({
+			sessionId: "startup-disposed",
+			runWithCwdReadLease: async callback => {
+				entered.resolve();
+				await release.promise;
+				return callback();
+			},
+		});
+		const startup = hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		await entered.promise;
+		(session as { isDisposed: boolean }).isDisposed = true;
+		release.resolve();
+		await startup;
+
+		expect(session.getHindsightSessionState()).toBeUndefined();
+	});
+
+	it("drops a mental-model completion after the session is stopped", async () => {
+		const settings = Settings.isolated({
+			"memory.backend": "hindsight",
+			"hindsight.apiUrl": "http://localhost:8888",
+			"hindsight.mentalModelsEnabled": true,
+		});
+		const listed = Promise.withResolvers<void>();
+		const releaseList = Promise.withResolvers<void>();
+		vi.spyOn(HindsightApi.prototype, "listMentalModels").mockImplementation(async () => {
+			listed.resolve();
+			await releaseList.promise;
+			return { items: [{ id: "stale", bank_id: "stale-bank", name: "Stale", content: "old" }] } as never;
+		});
+		const session = makeFakeSession({ sessionId: "mm-stop" });
+		await hindsightBackend.start({
+			session: session as never,
+			settings,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
+			agentDir: "/tmp",
+			taskDepth: 0,
+		});
+		const state = session.getHindsightSessionState()!;
+		await listed.promise;
+		const load = state.mentalModelsLoadPromise;
+		await hindsightBackend.clear("/tmp", "/tmp", session as never);
+		releaseList.resolve();
+		await load;
+
+		expect(state.mentalModelsSnippet).toBeUndefined();
 		expect(session.getHindsightSessionState()).toBeUndefined();
 	});
 

@@ -11,7 +11,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getCapability } from "@gajae-code/coding-agent/capability";
+import { getCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { type Rule, ruleCapability } from "@gajae-code/coding-agent/capability/rule";
 import type { LoadContext } from "@gajae-code/coding-agent/capability/types";
@@ -96,6 +96,26 @@ test("project RULES.md is found walking up from a sub-package cwd", async () => 
 	expect(projectRule).toBeDefined();
 	expect(projectRule?.alwaysApply).toBe(true);
 	expect(projectRule?.path).toBe(path.join(project, ".gjc", "RULES.md"));
+});
+
+test("project RULES.md wins a same-name collision with user RULES.md", async () => {
+	writeFile(path.join(home, ".gjc", "agent", "RULES.md"), "User sticky rule\n");
+	writeFile(path.join(project, ".gjc", "RULES.md"), "Project sticky rule\n");
+
+	const result = await loadCapabilityForHome<Rule>(ruleCapability.id, home, {
+		cwd: project,
+		agentDir: path.join(home, ".gjc", "agent"),
+		providers: ["native"],
+	});
+
+	expect(result.items).toHaveLength(1);
+	expect(result.items[0]?.name).toBe("RULES");
+	expect(result.items[0]?._source.level).toBe("project");
+	expect(result.items[0]?.content).toContain("Project sticky rule");
+	expect(result.all.filter(rule => rule.name === "RULES").map(rule => rule._source.level)).toEqual([
+		"project",
+		"user",
+	]);
 });
 
 test("alwaysApply is forced even when frontmatter says false", async () => {

@@ -83,7 +83,7 @@ export class HindsightRetainQueue {
 	}
 
 	enqueue(content: string, context?: string): void {
-		if (this.#closed) {
+		if (this.#closed || this.#state.isDisposed) {
 			throw new Error("Hindsight retain queue is closed.");
 		}
 		this.#items.push({ content, context, sessionId: this.#state.sessionId });
@@ -136,7 +136,7 @@ export class HindsightRetainQueue {
 
 	async #doFlush(items: PendingRetainItem[]): Promise<void> {
 		const state = this.#state;
-		if (state.session.getHindsightSessionState() !== state) {
+		if (!state.isAttachedToSession()) {
 			// Session went away before we could flush. We can't notify anyone, so
 			// log and drop — these are best-effort facts, not transactional writes.
 			logger.warn("Hindsight retain queue: session vanished, dropping batch", {
@@ -148,12 +148,14 @@ export class HindsightRetainQueue {
 
 		try {
 			await ensureBankMission(state.client, state.bankId, state.config, state.missionsSet);
+			if (!state.isAttachedToSession()) return;
 			const batch: MemoryItemInput[] = items.map(item => ({
 				content: item.content,
 				context: item.context ?? state.config.retainContext,
 				metadata: { session_id: item.sessionId },
 				tags: state.retainTags,
 			}));
+			if (!state.isAttachedToSession()) return;
 			await state.client.retainBatch(state.bankId, batch, { async: true });
 			if (state.config.debug) {
 				logger.debug("Hindsight retain queue: batch flushed", {
@@ -219,6 +221,9 @@ export class HindsightSessionState {
 	#autoRetainInFlight?: Promise<void>;
 	#autoRetainPending = false;
 	#trackingGeneration = 0;
+	#disposing = false;
+	#disposed = false;
+	#disposePromise?: Promise<void>;
 	readonly retainQueue: HindsightRetainQueue;
 
 	constructor(options: HindsightSessionStateOptions) {
@@ -237,13 +242,35 @@ export class HindsightSessionState {
 		this.retainQueue = new HindsightRetainQueue(this);
 	}
 
+	/** True as soon as teardown starts; asynchronous work must not publish after this point. */
+	get isDisposed(): boolean {
+		return this.#disposing || this.#disposed;
+	}
+
+	/** Whether this state may publish recall, retention, or mental-model results. */
+	get isActive(): boolean {
+		return !this.#disposing && !this.#disposed && !this.#sessionIsDisposed() && this.isAttachedToSession();
+	}
+
+	/** Queue draining is allowed during teardown, while replacement ownership is not. */
+	isAttachedToSession(): boolean {
+		const owner = this.session as AgentSession & { getHindsightSessionState?: () => unknown };
+		const getState = owner.getHindsightSessionState;
+		return typeof getState !== "function" || getState.call(owner) === this;
+	}
+
+	#sessionIsDisposed(): boolean {
+		return (this.session as AgentSession & { isDisposed?: boolean }).isDisposed === true;
+	}
+
 	setSessionId(sessionId: string): void {
-		if (sessionId === this.sessionId) return;
+		if (this.isDisposed || sessionId === this.sessionId) return;
 		this.sessionId = sessionId;
 		this.#advanceTrackingGeneration();
 	}
 
 	resetConversationTracking(): void {
+		if (this.isDisposed) return;
 		this.#advanceTrackingGeneration();
 		this.lastRetainedTurn = 0;
 		this.hasRecalledForFirstTurn = false;
@@ -288,6 +315,7 @@ export class HindsightSessionState {
 	}
 
 	async recallForContext(query: string, signal?: AbortSignal): Promise<RecallOutcome> {
+		if (!this.isActive) return { context: null, ok: false };
 		try {
 			const response = await this.client.recall(this.bankId, query, {
 				budget: this.config.recallBudget,
@@ -296,7 +324,7 @@ export class HindsightSessionState {
 				tags: this.recallTags,
 				tagsMatch: this.recallTagsMatch,
 			});
-			if (signal?.aborted) return { context: null, ok: false };
+			if (signal?.aborted || !this.isActive) return { context: null, ok: false };
 			const results = response.results ?? [];
 			if (results.length === 0) return { context: null, ok: true };
 			const formatted = formatMemories(results);
@@ -311,6 +339,7 @@ export class HindsightSessionState {
 	}
 
 	async retainSession(messages: HindsightMessage[]): Promise<boolean> {
+		if (!this.isActive) return false;
 		const trackingGeneration = this.#trackingGeneration;
 		const sessionId = this.sessionId;
 		const retainFullWindow = this.config.retainMode === "full-session";
@@ -331,7 +360,7 @@ export class HindsightSessionState {
 		if (!transcript) return false;
 
 		await ensureBankMission(this.client, this.bankId, this.config, this.missionsSet);
-		if (trackingGeneration !== this.#trackingGeneration) return false;
+		if (!this.isActive || trackingGeneration !== this.#trackingGeneration) return false;
 		await this.client.retain(this.bankId, transcript, {
 			documentId,
 			updateMode: "append",
@@ -340,10 +369,11 @@ export class HindsightSessionState {
 			tags: this.retainTags,
 			async: true,
 		});
-		return trackingGeneration === this.#trackingGeneration;
+		return this.isActive && trackingGeneration === this.#trackingGeneration;
 	}
 
 	async maybeRetainOnAgentEnd(): Promise<void> {
+		if (!this.isActive) return;
 		if (this.#autoRetainInFlight) {
 			this.#autoRetainPending = true;
 			return;
@@ -373,7 +403,7 @@ export class HindsightSessionState {
 		try {
 			const retained = await this.retainSession(messages);
 			if (!retained) return;
-			if (trackingGeneration !== this.#trackingGeneration) return;
+			if (!this.isActive || trackingGeneration !== this.#trackingGeneration) return;
 			this.lastRetainedTurn = userTurns;
 			if (this.config.debug) {
 				logger.debug("Hindsight: auto-retain succeeded", {
@@ -393,13 +423,14 @@ export class HindsightSessionState {
 	}
 
 	async forceRetainCurrentSession(): Promise<void> {
+		if (!this.isActive) return;
 		const trackingGeneration = this.#trackingGeneration;
 		const messages = extractMessages(this.session.sessionManager);
 		if (messages.length === 0) return;
 		try {
 			const retained = await this.retainSession(messages);
 			if (!retained) return;
-			if (trackingGeneration === this.#trackingGeneration) {
+			if (this.isActive && trackingGeneration === this.#trackingGeneration) {
 				this.lastRetainedTurn = messages.filter(m => m.role === "user").length;
 			}
 		} catch (err) {
@@ -412,6 +443,7 @@ export class HindsightSessionState {
 	}
 
 	async maybeRecallOnAgentStart(): Promise<void> {
+		if (!this.isActive) return;
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return;
 		const messages = extractMessages(this.session.sessionManager);
 		const lastUser = messages.findLast(m => m.role === "user");
@@ -421,7 +453,7 @@ export class HindsightSessionState {
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		const trackingGeneration = this.#trackingGeneration;
 		const { context, ok } = await this.recallForContext(truncated);
-		if (!ok || trackingGeneration !== this.#trackingGeneration) return;
+		if (!ok || !this.isActive || trackingGeneration !== this.#trackingGeneration) return;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return;
@@ -433,6 +465,7 @@ export class HindsightSessionState {
 		if (this.config.mentalModelsEnabled && this.mentalModelsLoadPromise && this.mentalModelsLoadedAt === undefined) {
 			await Promise.race([this.mentalModelsLoadPromise, Bun.sleep(MENTAL_MODEL_FIRST_TURN_DEADLINE_MS)]);
 		}
+		if (!this.isActive) return undefined;
 
 		if (!this.config.autoRecall || this.hasRecalledForFirstTurn) return undefined;
 
@@ -445,7 +478,7 @@ export class HindsightSessionState {
 		const truncated = truncateRecallQuery(query, latestPrompt, this.config.recallMaxQueryChars);
 		const trackingGeneration = this.#trackingGeneration;
 		const { context, ok } = await this.recallForContext(truncated);
-		if (!ok || trackingGeneration !== this.#trackingGeneration) return undefined;
+		if (!ok || !this.isActive || trackingGeneration !== this.#trackingGeneration) return undefined;
 
 		this.hasRecalledForFirstTurn = true;
 		if (!context) return undefined;
@@ -455,6 +488,7 @@ export class HindsightSessionState {
 	}
 
 	async recallForCompaction(messages: HindsightMessage[]): Promise<string | undefined> {
+		if (!this.isActive) return undefined;
 		const lastUser = messages.findLast(m => m.role === "user");
 		if (!lastUser) return undefined;
 
@@ -462,12 +496,12 @@ export class HindsightSessionState {
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
 		const trackingGeneration = this.#trackingGeneration;
 		const { context } = await this.recallForContext(truncated);
-		if (trackingGeneration !== this.#trackingGeneration) return undefined;
+		if (!this.isActive || trackingGeneration !== this.#trackingGeneration) return undefined;
 		return context ?? undefined;
 	}
 
 	async runMentalModelLoad(scope: BankScope): Promise<void> {
-		if (!this.config.mentalModelsEnabled) return;
+		if (!this.config.mentalModelsEnabled || !this.isActive) return;
 
 		// Seeding is opt-in (`hindsight.mentalModelAutoSeed`). Default behaviour is
 		// read-only: we surface whatever models the operator has curated on the
@@ -477,15 +511,18 @@ export class HindsightSessionState {
 			const seeds = resolveSeedsForScope(scope, this.config.scoping);
 			if (seeds.length > 0) {
 				await ensureMentalModels(this.client, this.bankId, seeds, this.config.debug);
+				if (!this.isActive) return;
 			}
 		}
 
 		const changed = await this.refreshMentalModelsSnippet();
-		if (changed) await this.#refreshBaseSystemPromptAfter("MM load");
+		if (changed && this.isActive) await this.#refreshBaseSystemPromptAfter("MM load");
 	}
 
 	async refreshMentalModelsSnippet(): Promise<boolean> {
+		if (!this.isActive) return false;
 		const snippet = await loadMentalModelsBlock(this.client, this.bankId, this.config.mentalModelMaxRenderChars);
+		if (!this.isActive) return false;
 		const changed = contentHash(snippet) !== contentHash(this.mentalModelsSnippet);
 		this.mentalModelsSnippet = snippet;
 		this.mentalModelsLoadedAt = Date.now();
@@ -493,14 +530,15 @@ export class HindsightSessionState {
 	}
 
 	async reloadMentalModels(): Promise<boolean> {
-		if (this.aliasOf) return false;
-		if (!this.config.mentalModelsEnabled) return false;
+		if (this.aliasOf || !this.config.mentalModelsEnabled || !this.isActive) return false;
 		const changed = await this.refreshMentalModelsSnippet();
+		if (!this.isActive) return false;
 		if (changed) await this.#refreshBaseSystemPromptAfter("MM reload");
 		return true;
 	}
 
 	attachSessionListeners(): void {
+		if (!this.isActive) return;
 		this.unsubscribe?.();
 		this.unsubscribe = this.session.subscribe(event => {
 			if (event.type === "agent_start") {
@@ -527,12 +565,28 @@ export class HindsightSessionState {
 	}
 
 	async dispose(): Promise<void> {
+		if (this.#disposePromise) return this.#disposePromise;
+		this.beginDispose();
+		this.#disposePromise = (async () => {
+			try {
+				await this.retainQueue.dispose();
+			} finally {
+				this.#disposed = true;
+			}
+		})();
+		await this.#disposePromise;
+	}
+
+	/** Mark this state unavailable to new work while an admitted queue drains. */
+	beginDispose(): void {
+		if (this.#disposing || this.#disposed) return;
+		this.#disposing = true;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
-		await this.retainQueue.dispose();
 	}
 
 	async #refreshBaseSystemPromptAfter(reason: "MM load" | "MM reload" | "MM TTL reload"): Promise<void> {
+		if (!this.isActive) return;
 		try {
 			await this.session.refreshBaseSystemPrompt();
 		} catch (err) {

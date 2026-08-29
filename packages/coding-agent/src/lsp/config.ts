@@ -2,7 +2,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
-import { getAgentDir, getAgentProfileAuthority, isRecord, logger, pathIsWithin } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	isRecord,
+	logger,
+	normalizePathForComparison,
+	pathIsWithin,
+} from "@gajae-code/utils";
 import { YAML } from "bun";
 import { getConfigDirPaths } from "../config";
 import { type ClaudePluginRoot, getPreloadedPluginRoots } from "../discovery/helpers";
@@ -448,12 +455,15 @@ function getConfigSources(cwd: string, agentDir?: string): ConfigSource[] {
 	const filenames = ["lsp.json", ".lsp.json", "lsp.yaml", ".lsp.yaml", "lsp.yml", ".lsp.yml"];
 	const sources: ConfigSource[] = [];
 	const profileAuthority = getAgentProfileAuthority();
-	const selectedAgentDir = agentDir ?? (profileAuthority === "custom" ? getAgentDir() : undefined);
-	// An explicit agentDir is a scoped selection even when it currently happens
-	// to spell the canonical default. Resolver authority is sticky across HOME
-	// refreshes, so a custom profile must remain scoped when its path coincides
-	// with a newly derived default.
-	const isScopedProfile = agentDir !== undefined || profileAuthority === "custom";
+	const selectedAgentDir = agentDir;
+	// Resolver authority is sticky across HOME refreshes. An explicit directory
+	// is custom only when it differs from the resolver's current default; a
+	// resolver-owned custom profile remains scoped even when its path later
+	// coincides with a newly derived default.
+	const isScopedProfile =
+		agentDir !== undefined &&
+		(profileAuthority === "custom" ||
+			normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir()));
 
 	// Project root files (highest priority)
 	for (const filename of filenames) {

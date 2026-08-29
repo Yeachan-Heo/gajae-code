@@ -10,7 +10,13 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, getAgentProfileAuthority, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getTrustedHomeDir,
+	logger,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
@@ -70,10 +76,16 @@ export async function discoverAgents(
 		agentDir ??
 		activeSettings?.getAgentDir() ??
 		(getAgentProfileAuthority() === "custom" ? getAgentDir() : undefined);
-	// An explicit discovery profile is a scoped selection. When discovery follows
-	// the active settings implicitly, retain the resolver's sticky authority rather
-	// than reclassifying every Settings-owned agent directory as custom.
-	const profileAuthority = agentDir !== undefined ? "custom" : getAgentProfileAuthority();
+	const resolverAuthority = getAgentProfileAuthority();
+	// Resolver authority is sticky across HOME refreshes. An explicit directory
+	// is custom only when it differs from the resolver's current default; a
+	// resolver-owned custom profile remains custom even when its path later
+	// coincides with a newly derived default.
+	const profileAuthority =
+		resolverAuthority === "custom" ||
+		(agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir()))
+			? "custom"
+			: resolverAuthority;
 	const agentSources = Array.from(
 		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
 	);
