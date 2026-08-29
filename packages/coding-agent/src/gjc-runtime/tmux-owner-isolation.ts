@@ -2199,9 +2199,19 @@ export interface ExactOwnerCloseDependencies {
 }
 
 async function isCurrentOwnerGeneration(stateDir: string, sessionId: string, generation: string): Promise<boolean> {
+	const record = await readJson<unknown>(lifecyclePaths(stateDir, sessionId, generation).generationFile);
+	return isValidGenerationRecord(record, sessionId, generation);
+}
+
+function isValidGenerationRecord(value: unknown, sessionId: string, generation: string): boolean {
 	return (
-		(await readJson<{ generation?: string }>(lifecyclePaths(stateDir, sessionId, generation).generationFile))
-			?.generation === generation
+		isRecord(value) &&
+		hasOnlyKeys(value, ["schema_version", "generation", "session_id", "published_at"]) &&
+		value.schema_version === 1 &&
+		value.generation === generation &&
+		value.session_id === sessionId &&
+		isSafePathComponent(value.generation, "owner generation") &&
+		isCanonicalUtcTimestamp(value.published_at)
 	);
 }
 
