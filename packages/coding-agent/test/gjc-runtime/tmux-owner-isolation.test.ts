@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	__setIntentEvidenceReadHooksForTests,
 	type AttemptCapability,
 	type BootstrapRequest,
 	bootstrapTmuxOwnerIsolation,
@@ -12,7 +13,6 @@ import {
 	classifyCgroup,
 	closeExactTmuxOwner,
 	createOwnerIntent,
-	__setIntentEvidenceReadHooksForTests,
 	executeTmuxOwnerIsolationPlanSync,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
