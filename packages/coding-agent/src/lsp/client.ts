@@ -41,7 +41,10 @@ async function withFileOperationLock<T>(
 ): Promise<T> {
 	const previous = fileOperationLocks.get(key);
 	const current = (async () => {
-		if (previous) await untilAborted(signal, () => previous);
+		// The shared chain must not inherit a waiter's abort signal: an aborted
+		// waiter cannot poison operations queued behind it. The operation itself
+		// remains abort-aware once its turn begins.
+		if (previous) await previous;
 		return operation();
 	})();
 	fileOperationLocks.set(key, current as Promise<void>);
@@ -758,15 +761,9 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 	}
 
 	// Check if another operation is already opening this file
-	while (true) {
-		const existingLock = fileOperationLocks.get(lockKey);
-		if (!existingLock) break;
-		await untilAborted(signal, () => existingLock);
-		if (client.openFiles.has(uri)) return;
-	}
-
-	// Lock and open file
-	const openPromise = (async () => {
+	// Serialize open with sync/refresh and retain the client identity represented
+	// by this promise through scope replacement.
+	const openPromise = withFileOperationLock(lockKey, signal, async () => {
 		throwIfAborted(signal);
 		// Double-check after acquiring lock
 		if (client.openFiles.has(uri)) {
@@ -795,14 +792,8 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 
 		client.openFiles.set(uri, { version: 1, languageId });
 		client.lastActivity = Date.now();
-	})();
-
-	fileOperationLocks.set(lockKey, openPromise);
-	try {
-		await openPromise;
-	} finally {
-		fileOperationLocks.delete(lockKey);
-	}
+	});
+	await openPromise;
 }
 
 /**
@@ -897,7 +888,20 @@ export async function refreshFile(client: LspClient, filePath: string, signal?: 
 		const info = client.openFiles.get(uri);
 
 		if (!info) {
-			await ensureFileOpen(client, filePath, signal);
+			let content: string;
+			try {
+				content = await Bun.file(filePath).text();
+				throwIfAborted(signal);
+			} catch (err) {
+				if (isEnoent(err)) return;
+				throw err;
+			}
+			const languageId = detectLanguageId(filePath);
+			await sendNotification(client, "textDocument/didOpen", {
+				textDocument: { uri, languageId, version: 1, text: content },
+			});
+			client.openFiles.set(uri, { version: 1, languageId });
+			client.lastActivity = Date.now();
 			return;
 		}
 

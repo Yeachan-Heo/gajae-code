@@ -9969,6 +9969,24 @@ mod platform {
 		}
 	}
 
+	fn remove_published_skill_file_if_exact(handle: HANDLE, parent: HANDLE) -> bool {
+		let Ok(published) = open_relative_with_share(
+			parent,
+			OsStr::new("SKILL.md"),
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+			false,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+		) else {
+			return false;
+		};
+		let same = handles_same_object_checked(handle, published).unwrap_or(false);
+		unsafe { CloseHandle(published) };
+		if !same {
+			return false;
+		}
+		delete_handle(handle).is_ok()
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "all writes use the retained no-follow authority and are preceded by identity \
@@ -10077,7 +10095,7 @@ mod platform {
 			if let SkillPublicationError::Published { code, target_verified } = error {
 				// `file` names the post-rename public object now. Never route it
 				// through private cleanup: that helper truncates before deleting.
-				let removed = delete_handle(file).is_ok();
+				let removed = remove_published_skill_file_if_exact(file, skills.target);
 				if !removed && target_verified {
 					unsafe { CloseHandle(file) };
 					return NativeSecureSkillWriteResult::success(
