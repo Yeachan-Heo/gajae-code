@@ -136,7 +136,8 @@ export class HindsightRetainQueue {
 
 	async #doFlush(items: PendingRetainItem[]): Promise<void> {
 		const state = this.#state;
-		if (!state.isAttachedToSession()) {
+		const canPublish = (): boolean => state.isAttachedToSession() && (!state.aliasOf || state.aliasOf.isActive);
+		if (!canPublish()) {
 			// Session went away before we could flush. We can't notify anyone, so
 			// log and drop — these are best-effort facts, not transactional writes.
 			logger.warn("Hindsight retain queue: session vanished, dropping batch", {
@@ -148,14 +149,14 @@ export class HindsightRetainQueue {
 
 		try {
 			await ensureBankMission(state.client, state.bankId, state.config, state.missionsSet);
-			if (!state.isAttachedToSession()) return;
+			if (!canPublish()) return;
 			const batch: MemoryItemInput[] = items.map(item => ({
 				content: item.content,
 				context: item.context ?? state.config.retainContext,
 				metadata: { session_id: item.sessionId },
 				tags: state.retainTags,
 			}));
-			if (!state.isAttachedToSession()) return;
+			if (!canPublish()) return;
 			await state.client.retainBatch(state.bankId, batch, { async: true });
 			if (state.config.debug) {
 				logger.debug("Hindsight retain queue: batch flushed", {

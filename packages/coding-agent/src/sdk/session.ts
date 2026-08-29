@@ -30,6 +30,7 @@ import {
 	$flag,
 	getAgentDbPath,
 	getAgentDir,
+	getAgentProfileAuthority,
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
@@ -1400,6 +1401,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
+	const profileAuthority: "default" | "custom" =
+		getAgentProfileAuthority() === "custom" || path.resolve(agentDir) !== path.resolve(getDefaultAgentDir())
+			? "custom"
+			: "default";
 	if (options.agentDir !== undefined && options.settings?.isAgentDirExplicit()) {
 		const settingsAgentDir = path.resolve(options.settings.getAgentDir());
 		if (path.resolve(options.agentDir) !== settingsAgentDir) {
@@ -2021,6 +2026,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				...settings.getGroup("skills"),
 				cwd,
 				agentDir,
+				profileAuthority,
 				disabledExtensions: settings.get("disabledExtensions"),
 				settings,
 			});
@@ -2635,6 +2641,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						...settings.getGroup("skills"),
 						cwd: to,
 						agentDir,
+						profileAuthority,
 						disabledExtensions: settings.get("disabledExtensions"),
 						settings,
 					});

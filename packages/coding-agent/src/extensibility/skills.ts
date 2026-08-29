@@ -115,6 +115,8 @@ export interface LoadSkillsOptions extends SkillsSettings {
 	agentDir?: string;
 	/** Settings authority for session-scoped capability discovery. */
 	settings?: Settings;
+	/** Resolver-owned profile classification, stable across HOME refreshes. */
+	profileAuthority?: "default" | "custom";
 }
 
 /**
@@ -141,6 +143,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		includeSkills = [],
 		disabledExtensions = [],
 		settings,
+		profileAuthority,
 	} = options;
 
 	// Early return if skills are disabled
@@ -174,6 +177,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		providers: ["native"],
 		disabledExtensions,
 		settings,
+		profileAuthority,
 	};
 	const result = await (home === undefined
 		? loadCapability<CapabilitySkill>(skillCapability.id, loadOptions)
