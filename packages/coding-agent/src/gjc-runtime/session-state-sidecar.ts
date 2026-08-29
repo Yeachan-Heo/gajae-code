@@ -2692,7 +2692,11 @@ async function observeOwnerTerminalPostmortem(
 	sessionId: string,
 ): Promise<OwnerVerdict | null> {
 	try {
-		if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" && (!owner.operatorDispatchId || !owner.operatorIntentId))
+		if (
+			process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" &&
+			reason === postmortem.Reason.SIGTERM &&
+			(!owner.operatorDispatchId || !owner.operatorIntentId)
+		)
 			return null;
 		const now = new Date().toISOString();
 		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> = {
@@ -2720,6 +2724,7 @@ async function observeOwnerTerminalPostmortem(
 }
 
 async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
+	reason: postmortem.Reason,
 	context: RuntimeStateContext,
 	stateFile: string,
 	sessionId: string,
@@ -2730,7 +2735,7 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 	if (!owner) return;
 	try {
 		if (!verdict) {
-			if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1") return;
+			if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" && reason === postmortem.Reason.SIGTERM) return;
 			throw new Error("owner terminal verdict unavailable");
 		}
 		const now = new Date().toISOString();
@@ -2831,6 +2836,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 						}
 						if (context.ownerTerminal) {
 							await persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
+								reason,
 								context,
 								stateFile,
 								identity.sessionId,
