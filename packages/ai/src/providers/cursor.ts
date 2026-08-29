@@ -1529,7 +1529,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					pendingBuffer.consume(5 + msgLen);
 					bufferedObservationOffset = 0;
 					bufferedObservationTurnEnded = false;
-					if (terminalAdmissionMode === "closed" && !(flags & CONNECT_END_STREAM_FLAG) && !terminalDrainMode) continue;
+					if (terminalAdmissionMode === "closed" && !(flags & CONNECT_END_STREAM_FLAG) && !terminalDrainMode)
+						continue;
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						closeTerminalAdmission();

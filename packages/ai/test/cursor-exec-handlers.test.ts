@@ -1154,10 +1154,7 @@ describe("Cursor request lifecycle", () => {
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
 		const server = http2.createServer();
 		server.on("stream", (stream: http2.ServerHttp2Stream) => {
-			stream.respond(
-				{ ":status": 200, "content-type": "application/connect+proto" },
-				{ waitForTrailers: true },
-			);
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
 			stream.once("wantTrailers", () => {
 				stream.sendTrailers({ "grpc-status": "13", "grpc-message": "buffered progress failure" });
 			});
