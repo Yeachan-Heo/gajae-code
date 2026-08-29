@@ -10787,6 +10787,21 @@ export class AgentSession {
 		this.#pendingAppliedToolSignature = undefined;
 	}
 
+	/**
+	 * Rebuild the base prompt after a session transition has committed its
+	 * successor state. Transition-local callers intentionally cannot use the
+	 * ordinary admission assertion while the transition lease is held; the
+	 * refresh itself fences publication, and this check verifies that the
+	 * successor identity remained current across the asynchronous rebuild.
+	 */
+	async #refreshBaseSystemPromptAfterTransition(): Promise<void> {
+		const successorIdentity = this.#captureSessionIdentityAdmission();
+		await this.refreshBaseSystemPrompt();
+		if (!this.#sessionIdentityAdmissionMatches(successorIdentity)) {
+			throw new Error("Session changed while refreshing successor system prompt");
+		}
+	}
+
 	async #buildSystemPromptForAgentStart(promptText: string): Promise<string[]> {
 		const backend = await this.memoryBackend.get("agent-start-prompt");
 		if (!backend.beforeAgentStartPrompt) return this.#baseSystemPrompt;
@@ -16148,6 +16163,7 @@ export class AgentSession {
 		await this.#rehydrateGoalModeStateForTransition();
 		this.#reconnectToAgent();
 		this.#resetIrcRosterDeliveryState();
+		await this.#refreshBaseSystemPromptAfterTransition();
 		if (this.#extensionRunner) {
 			await this.#extensionRunner.emit({
 				type: "session_switch",
@@ -16207,6 +16223,7 @@ export class AgentSession {
 			this.clearPlanModeStateForSessionTransition();
 			await this.#runToolSessionTransitionCleanups();
 			this.#reconnectToAgent();
+			await this.#refreshBaseSystemPromptAfterTransition();
 			return true;
 		} finally {
 			this.#endSessionTransition();
@@ -24152,6 +24169,10 @@ export class AgentSession {
 					}
 					this.#quarantineQueuedAsyncResults();
 				}
+				// Rebuild against the fully restored successor while the temporary endpoint
+				// claim is still rollback-safe. The tool signature may be unchanged even
+				// though cwd, session identity, model, or profile inputs changed.
+				await this.#refreshBaseSystemPromptAfterTransition();
 				// All fallible post-load work, including owner-job settlement and
 				// predecessor cleanup, has completed. Publish the successor endpoint
 				// only now; rollback can therefore leave predecessor identity/jobs
@@ -24395,6 +24416,7 @@ export class AgentSession {
 			}
 
 			this.#resetIrcRosterDeliveryState();
+			await this.#refreshBaseSystemPromptAfterTransition();
 			// session_branch is the post-commit identity signal. Publish it only after
 			// the successor's messages and MCP selections are restored.
 			if (this.#extensionRunner) {
@@ -24610,6 +24632,7 @@ export class AgentSession {
 			this.#resetHindsightConversationTrackingIfHindsight();
 			this.#syncTodoPhasesFromBranch();
 			this.#closeCodexProviderSessionsForHistoryRewrite();
+			await this.#refreshBaseSystemPromptAfterTransition();
 
 			this.#branchSummaryAbortController = undefined;
 
