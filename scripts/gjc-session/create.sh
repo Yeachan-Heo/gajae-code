@@ -97,7 +97,9 @@ except (KeyError, OSError, TypeError, ValueError):
     raise SystemExit(1)
 PY
   then
-    local deadline=$((SECONDS + ${GJC_SESSION_PENDING_VERDICT_GRACE_SECONDS:-3}))
+    local grace_seconds="${GJC_SESSION_PENDING_VERDICT_GRACE_SECONDS:-3}"
+    if [[ ! "$grace_seconds" =~ ^[0-9]+$ ]] || (( 10#$grace_seconds > 300 )); then grace_seconds=3; fi
+    local deadline=$((SECONDS + 10#$grace_seconds))
     while (( SECONDS < deadline )) && [[ ! -f "$LIFECYCLE_DIR/verdict-$prior_generation.json" ]]; do sleep 0.1; done
   fi
 
