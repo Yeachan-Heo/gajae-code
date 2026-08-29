@@ -775,6 +775,80 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("drains a held exec when a coalesced late exec follows turnEnded", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let executions = 0;
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const prefix = buildServerMessageFrame({
+					case: "interactionUpdate",
+					value: create(InteractionUpdateSchema, {
+						message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "validated prefix" }) },
+					}),
+				});
+				const heldExec = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/held" }) },
+					}),
+				});
+				const turnEnded = buildServerMessageFrame({
+					case: "interactionUpdate",
+					value: create(InteractionUpdateSchema, {
+						message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+					}),
+				});
+				const lateExec = buildServerMessageFrame({
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 2,
+						message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/late" }) },
+					}),
+				});
+				stream.end(
+					Buffer.concat([
+						prefix,
+						heldExec,
+						turnEnded,
+						lateExec,
+						frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG),
+					]),
+				);
+			}, 10);
+		});
+
+		const pending = collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 500,
+			streamIdleTimeoutMs: 100,
+			execHandlers: {
+				piRead: async call => {
+					executions += 1;
+					started.resolve();
+					await release.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "read",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		release.resolve();
+		const { events, result } = await pending;
+
+		expect(executions).toBe(1);
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "validated prefix" }));
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("preserves accumulated Cursor content and usage in exactly one terminal on a silent transport timeout", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });

@@ -1044,6 +1044,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		// parser. Close new exec admission immediately, but leave the validated
 		// prefix available for ordered processing once that handler settles.
 		let terminalBoundaryObserved = false;
+		// When lookahead observes turnEnded in a coalesced buffer, retain its byte
+		// offset so processPendingBuffer can drain the validated prefix without
+		// admitting executable frames from the tail after that boundary.
+		let bufferedTerminalBoundaryOffset: number | undefined;
 		let processPendingBuffer: (() => void) | undefined;
 		let activeExecAbort: ((reason?: Error) => void) | undefined;
 		const closeTransportLocally = (): void => {
@@ -1514,6 +1518,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							observedTurnEnded = true;
 							sawTurnEnded = true;
 							terminalBoundaryObserved = true;
+							bufferedTerminalBoundaryOffset = offset;
 							closeTerminalAdmission();
 							bufferedObservationOffset = offset + 5 + msgLen;
 							bufferedObservationTurnEnded = true;
@@ -1588,15 +1593,25 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					}
 					if (pendingBuffer.length < 5 + msgLen) break;
 
+					// Lookahead may have found turnEnded later in this same buffer while
+					// an earlier exec was held. Track the boundary as frames are consumed;
+					// once it is reached, normal parsing handles turnEnded and then drops
+					// the entire tail. This keeps late execs from setting the exec pause.
+					const reachesBufferedTerminalBoundary = terminalBoundaryObserved && bufferedTerminalBoundaryOffset === 0;
+					const consumedFrameLength = 5 + msgLen;
 					const messageBytes = pendingBuffer.subarray(5, msgLen);
-					pendingBuffer.consume(5 + msgLen);
+					pendingBuffer.consume(consumedFrameLength);
+					if (bufferedTerminalBoundaryOffset !== undefined) {
+						bufferedTerminalBoundaryOffset = Math.max(0, bufferedTerminalBoundaryOffset - consumedFrameLength);
+					}
 					bufferedObservationOffset = 0;
 					bufferedObservationTurnEnded = false;
 					if (
 						terminalAdmissionMode === "closed" &&
 						!(flags & CONNECT_END_STREAM_FLAG) &&
 						!terminalDrainMode &&
-						!terminalBoundaryObserved
+						!terminalBoundaryObserved &&
+						!reachesBufferedTerminalBoundary
 					)
 						continue;
 
@@ -1647,13 +1662,23 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
-							if (transportTerminalized && !(terminalDrainMode && !isExecServerMessage)) return;
+							const dropExecutable = (): void => {
+								if (!isExecutable) return;
+								processingPausedForExec = false;
+								processPendingBuffer?.();
+							};
+							if (transportTerminalized && !(terminalDrainMode && !isExecServerMessage)) {
+								dropExecutable();
+								return;
+							}
 							if (
 								isExecServerMessage &&
 								terminalAdmissionMode === "closed" &&
 								!(terminalBoundaryObserved && !terminalBoundarySeen)
-							)
+							) {
+								dropExecutable();
 								return;
+							}
 							// An exec frame asks this process to perform work before Cursor can
 							// response. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
@@ -1945,6 +1970,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			pendingBuffer.clear();
 			bufferedObservationOffset = 0;
 			bufferedObservationTurnEnded = false;
+			bufferedTerminalBoundaryOffset = undefined;
 			terminalBoundaryObserved = false;
 			transportWatchdogClosed = true;
 			if (transportWatchdog) {

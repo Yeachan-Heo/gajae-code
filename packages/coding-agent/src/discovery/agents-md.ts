@@ -6,6 +6,7 @@
  * like .OpenAI code backend/ or .gemini/, which are handled by their respective providers).
  */
 import * as fs from "node:fs/promises";
+import type { Stats } from "node:fs";
 import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
@@ -25,17 +26,45 @@ const AGGREGATE_LIMIT_WARNING = "Skipped one or more AGENTS.md files that exceed
 export type AgentsMdReader = (
 	filePath: string,
 	maxBytes: number,
+	options?: { noFollow?: boolean },
 ) => Promise<{ content: string | null; byteLength: number; tooLarge: boolean }>;
+
+function sameFileIdentity(left: Stats, right: Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
 
 async function readBoundedAgentsMdFile(
 	filePath: string,
 	maxBytes: number,
+	options?: { noFollow?: boolean },
 ): Promise<{ content: string | null; byteLength: number; tooLarge: boolean }> {
+	const noFollow = options?.noFollow === true;
+	let before: Stats | undefined;
 	try {
-		const file = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		if (noFollow) {
+			// `loadAgentsMd` canonicalizes the candidate before calling the reader,
+			// but that pathname can be swapped before open. Recheck the canonical
+			// target immediately before opening and bracket the descriptor with
+			// identity checks so explicit-home reads cannot follow a raced link.
+			const canonicalPath = await fs.realpath(filePath);
+			if (canonicalPath !== path.resolve(filePath)) return { content: null, byteLength: 0, tooLarge: false };
+			before = await fs.lstat(filePath);
+			if (before.isSymbolicLink() || !before.isFile()) return { content: null, byteLength: 0, tooLarge: false };
+		}
+		const flags =
+			fs.constants.O_RDONLY |
+			(typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0) |
+			(noFollow && typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
+		const file = await fs.open(filePath, flags);
 		try {
 			const stats = await file.stat();
 			if (!stats.isFile()) return { content: null, byteLength: 0, tooLarge: false };
+			if (before && !sameFileIdentity(before, stats)) return { content: null, byteLength: 0, tooLarge: false };
+			if (before) {
+				const after = await fs.lstat(filePath);
+				if (after.isSymbolicLink() || !sameFileIdentity(before, after))
+					return { content: null, byteLength: 0, tooLarge: false };
+			}
 			const bytes = Buffer.alloc(maxBytes + 1);
 			let bytesRead = 0;
 			while (bytesRead < bytes.length) {
@@ -94,7 +123,7 @@ export async function loadAgentsMd(
 			const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
 			const authorizedCandidate = await canonicalizePathWithinHome(ctx, candidate, undefined, "project");
 			const result = authorizedCandidate
-				? await readCandidate(authorizedCandidate, allowedBytes)
+				? await readCandidate(authorizedCandidate, allowedBytes, { noFollow: ctx.isolatedHome === true })
 				: { content: null, byteLength: 0, tooLarge: false };
 			if (result.tooLarge) {
 				if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;
