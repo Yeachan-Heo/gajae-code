@@ -1597,7 +1597,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					// an earlier exec was held. Track the boundary as frames are consumed;
 					// once it is reached, normal parsing handles turnEnded and then drops
 					// the entire tail. This keeps late execs from setting the exec pause.
-					const reachesBufferedTerminalBoundary = terminalBoundaryObserved && bufferedTerminalBoundaryOffset === 0;
+					const atBufferedTerminalBoundary = terminalBoundaryObserved && bufferedTerminalBoundaryOffset === 0;
 					const consumedFrameLength = 5 + msgLen;
 					const messageBytes = pendingBuffer.subarray(5, msgLen);
 					pendingBuffer.consume(consumedFrameLength);
@@ -1610,8 +1610,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						terminalAdmissionMode === "closed" &&
 						!(flags & CONNECT_END_STREAM_FLAG) &&
 						!terminalDrainMode &&
-						!terminalBoundaryObserved &&
-						!reachesBufferedTerminalBoundary
+						!terminalBoundaryObserved
 					)
 						continue;
 
@@ -1640,6 +1639,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
+						if (atBufferedTerminalBoundary && !isTurnEnded) continue;
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						const isExecServerMessage = serverMessage.message.case === "execServerMessage";

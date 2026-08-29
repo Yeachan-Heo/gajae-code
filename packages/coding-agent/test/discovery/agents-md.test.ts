@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { LoadContext } from "@gajae-code/coding-agent/capability/types";
@@ -162,4 +163,37 @@ describe("AGENTS.md discovery bounds", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	test.skipIf(process.platform === "win32")(
+		"rejects a leaf symlink swap after explicit-home canonicalization",
+		async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-race-"));
+			const home = path.join(tempDir, "home");
+			const project = path.join(home, "project");
+			const candidate = path.join(project, "AGENTS.md");
+			const outside = path.join(tempDir, "outside.md");
+			const backup = path.join(project, "AGENTS.safe.md");
+			await fsPromises.mkdir(project, { recursive: true });
+			await fsPromises.writeFile(candidate, "safe instructions");
+			await fsPromises.writeFile(outside, "outside instructions");
+			let swapped = false;
+			const realOpen = fsPromises.open.bind(fsPromises);
+			const openSpy = spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+				const [filePath] = args;
+				if (!swapped && String(filePath) === candidate) {
+					swapped = true;
+					await fsPromises.rename(candidate, backup);
+					await fsPromises.symlink(outside, candidate);
+				}
+				return await realOpen(...args);
+			});
+			try {
+				const result = await loadAgentsMd({ cwd: project, home, repoRoot: project, isolatedHome: true });
+				expect(swapped).toBe(true);
+				expect(result.items).toEqual([]);
+			} finally {
+				openSpy.mockRestore();
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
 });

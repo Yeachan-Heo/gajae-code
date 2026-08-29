@@ -5,8 +5,8 @@
  * This handles AGENTS.md files that live in project root (not in config directories
  * like .OpenAI code backend/ or .gemini/, which are handled by their respective providers).
  */
-import * as fs from "node:fs/promises";
 import type { Stats } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
