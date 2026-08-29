@@ -1914,6 +1914,7 @@ async function runtimeStateOwnerGenerationFence(
 	} catch {
 		return false;
 	}
+	if (current.state === "absent") return previousGeneration === null;
 	if (
 		current.state !== "current" ||
 		current.session_id !== identity.sessionId ||
