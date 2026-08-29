@@ -813,6 +813,7 @@ type TuiRenderCounterSnapshot = {
 	debugRedrawEnvReads: number;
 	debugRedrawAppendWrites: number;
 	differentialGuardVisibleWidthCalls: number;
+	widthReflowVisibleWidthCalls: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -1147,6 +1148,7 @@ export class TUI extends Container {
 		debugRedrawEnvReads: 0,
 		debugRedrawAppendWrites: 0,
 		differentialGuardVisibleWidthCalls: 0,
+		widthReflowVisibleWidthCalls: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1154,6 +1156,7 @@ export class TUI extends Container {
 			debugRedrawEnvReads: 0,
 			debugRedrawAppendWrites: 0,
 			differentialGuardVisibleWidthCalls: 0,
+			widthReflowVisibleWidthCalls: 0,
 		};
 	}
 
@@ -4831,11 +4834,21 @@ export class TUI extends Container {
 			return;
 		}
 		const useViewportRepaintPath = this.#viewportRepaintHost();
-		const widthReflowRequired =
-			this.#previousWidth > 0 &&
-			rawLines.some(
-				line => !TERMINAL.isImageLine(line) && visibleWidth(line) > Math.min(this.#previousWidth, width),
-			);
+		// Same-width frames (loader shimmer, layout-only ticks) never consult this
+		// bit. Measuring every raw row with visibleWidth() was the 16ms idle hot
+		// path: the result was discarded whenever widthChanged was false.
+		let widthReflowRequired = false;
+		if (widthChanged && this.#previousWidth > 0) {
+			const reflowWidth = Math.min(this.#previousWidth, width);
+			for (const line of rawLines) {
+				if (TERMINAL.isImageLine(line)) continue;
+				TUI.#renderCounters.widthReflowVisibleWidthCalls += 1;
+				if (visibleWidth(line) > reflowWidth) {
+					widthReflowRequired = true;
+					break;
+				}
+			}
+		}
 		if (
 			widthChanged &&
 			!this.#legacyMultiplexerFullRender &&

@@ -344,7 +344,7 @@ export async function runInteractiveBashPty(
 		onOutput?: (chunk: string) => void;
 	},
 ): Promise<BashInteractiveResult> {
-	const settings = options.settings ?? (await Settings.init());
+	const settings = options.settings ?? (await Settings.currentOrInit());
 	const { shell: resolvedShell } = settings.getShellConfig();
 	const sink = new OutputSink({
 		artifactPath: options.artifactPath,

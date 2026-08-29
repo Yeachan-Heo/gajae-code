@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
@@ -6,6 +7,7 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
 import {
+	captureManagedFileNoFollow,
 	MANAGED_ARTIFACT_MAX_FILES,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
@@ -13,6 +15,7 @@ import {
 	publishManagedFileNoReplaceSync,
 	reapScrubbedProtocolRemnants,
 	reapScrubbedProtocolRemnantsSync,
+	replaceManagedFile,
 } from "../src/session/internal/managed-session-storage";
 
 const REMNANT_PREFIX = ".gjc-exact-unlink-placeholder-";
@@ -46,6 +49,25 @@ async function waitFor(condition: () => Promise<boolean>, timeoutMs = 10_000): P
 		await Bun.sleep(25);
 	}
 	throw new Error("condition not met before timeout");
+}
+
+function sha256(contents: string | Uint8Array): string {
+	return createHash("sha256").update(contents).digest("hex");
+}
+
+async function exactIdentity(pathname: string, contents: string | Uint8Array): Promise<native.NativeExactFileIdentity> {
+	const stat = await fsp.stat(pathname, { bigint: true });
+	const parent = await fsp.stat(path.dirname(pathname), { bigint: true });
+	return {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: sha256(contents),
+	};
 }
 
 describe("async native no-replace publication boundary (issue #4394)", () => {
@@ -142,6 +164,224 @@ describe("async native no-replace publication boundary (issue #4394)", () => {
 			await Bun.sleep(0);
 			await Promise.all(publications);
 			expect(settled).toBe(8);
+		});
+	});
+});
+
+describe("async native exact-replace boundary", () => {
+	it("exactReplacePathAsync commits and never settles from a microtask", async () => {
+		await withTempDir("gjc-async-exact-replace-", async dir => {
+			const source = path.join(dir, "staging");
+			const destination = path.join(dir, "published");
+			await fsp.writeFile(source, "successor");
+			await fsp.writeFile(destination, "predecessor");
+			const expectedSource = await exactIdentity(source, "successor");
+			const expectedDestination = await exactIdentity(destination, "predecessor");
+
+			let settled = false;
+			const pending = native
+				.exactReplacePathAsync(source, destination, expectedSource, expectedDestination)
+				.then(result => {
+					settled = true;
+					return result;
+				});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(settled).toBe(false);
+
+			const result = await pending;
+			expect(result.ok).toBe(true);
+			expect(await fsp.readFile(destination, "utf8")).toBe("successor");
+			expect(fs.existsSync(source)).toBe(false);
+		});
+	});
+
+	it("sync exactReplacePath fulfills from a microtask while exactReplacePathAsync stays on the pool", async () => {
+		await withTempDir("gjc-exact-replace-microtask-contrast-", async dir => {
+			async function seed(name: string): Promise<{
+				source: string;
+				destination: string;
+				expectedSource: native.NativeExactFileIdentity;
+				expectedDestination: native.NativeExactFileIdentity;
+			}> {
+				const source = path.join(dir, `${name}-source`);
+				const destination = path.join(dir, `${name}-dest`);
+				await fsp.writeFile(source, "successor");
+				await fsp.writeFile(destination, "predecessor");
+				return {
+					source,
+					destination,
+					expectedSource: await exactIdentity(source, "successor"),
+					expectedDestination: await exactIdentity(destination, "predecessor"),
+				};
+			}
+
+			const syncPair = await seed("sync");
+			let syncSettled = false;
+			const syncPending = (async () =>
+				native.exactReplacePath(
+					syncPair.source,
+					syncPair.destination,
+					syncPair.expectedSource,
+					syncPair.expectedDestination,
+				))().then(() => {
+				syncSettled = true;
+			});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(syncSettled).toBe(true);
+			await syncPending;
+
+			const asyncPair = await seed("async");
+			let asyncSettled = false;
+			const asyncPending = native
+				.exactReplacePathAsync(
+					asyncPair.source,
+					asyncPair.destination,
+					asyncPair.expectedSource,
+					asyncPair.expectedDestination,
+				)
+				.then(() => {
+					asyncSettled = true;
+				});
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(asyncSettled).toBe(false);
+			await asyncPending;
+			expect(await fsp.readFile(asyncPair.destination, "utf8")).toBe("successor");
+		});
+	});
+
+	it("yields macrotask turns to the event loop while exactReplacePathAsync is in flight", async () => {
+		await withTempDir("gjc-async-exact-replace-liveness-", async dir => {
+			const payload = new Uint8Array(16 * 1024 * 1024).fill(0x61);
+			const digest = sha256(payload);
+			async function identityOf(pathname: string): Promise<native.NativeExactFileIdentity> {
+				const stat = await fsp.stat(pathname, { bigint: true });
+				const parent = await fsp.stat(path.dirname(pathname), { bigint: true });
+				return {
+					dev: stat.dev,
+					ino: stat.ino,
+					nlink: stat.nlink,
+					parentDev: parent.dev,
+					parentIno: parent.ino,
+					size: stat.size,
+					mtimeNs: stat.mtimeNs,
+					sha256: digest,
+				};
+			}
+
+			let settled = 0;
+			const replacements = [];
+			for (let index = 0; index < 8; index++) {
+				const source = path.join(dir, `staging-${index}`);
+				const destination = path.join(dir, `published-${index}`);
+				await fsp.writeFile(source, payload);
+				await fsp.writeFile(destination, payload);
+				replacements.push(
+					native
+						.exactReplacePathAsync(source, destination, await identityOf(source), await identityOf(destination))
+						.then(() => {
+							settled += 1;
+						}),
+				);
+			}
+			// Same liveness contract as renameNoReplacePathAsync / issue #4394: a
+			// zero-delay timer must fire while pool-bound SHA-256 and namespace exchange
+			// work is still in flight. Individual fast local replacements may complete
+			// before that turn, so assert remaining work rather than scheduler ordering.
+			// The pre-fix exactReplacePath ran all eight calls on the JS thread and
+			// starved the timer until every replacement finished.
+			await Bun.sleep(0);
+			expect(settled).toBeLessThan(8);
+			await Bun.sleep(0);
+			await Promise.all(replacements);
+			expect(settled).toBe(8);
+		});
+	});
+
+	it("exactReplacePathAsync refuses a mismatched destination without replacing it", async () => {
+		await withTempDir("gjc-async-exact-replace-mismatch-", async dir => {
+			const source = path.join(dir, "staging");
+			const destination = path.join(dir, "published");
+			await fsp.writeFile(source, "successor");
+			await fsp.writeFile(destination, "predecessor");
+			const expectedSource = await exactIdentity(source, "successor");
+			const expectedDestination = await exactIdentity(destination, "predecessor");
+			expectedDestination.sha256 = sha256("not-the-predecessor");
+
+			const result = await native.exactReplacePathAsync(source, destination, expectedSource, expectedDestination);
+			expect(result.ok).toBe(false);
+			expect(result.code).toBe("identity_mismatch");
+			expect(await fsp.readFile(destination, "utf8")).toBe("predecessor");
+			expect(await fsp.readFile(source, "utf8")).toBe("successor");
+		});
+	});
+
+	it("exactReplacePathAsync matches exactReplacePath success and refusal codes", async () => {
+		await withTempDir("gjc-async-exact-replace-parity-", async dir => {
+			const source = path.join(dir, "staging-ok");
+			const destination = path.join(dir, "published-ok");
+			await fsp.writeFile(source, "successor");
+			await fsp.writeFile(destination, "predecessor");
+			const expectedSource = await exactIdentity(source, "successor");
+			const expectedDestination = await exactIdentity(destination, "predecessor");
+			expect(await native.exactReplacePathAsync(source, destination, expectedSource, expectedDestination)).toEqual({
+				ok: true,
+			});
+
+			const refusedSource = path.join(dir, "staging-refused");
+			const refusedDestination = path.join(dir, "published-refused");
+			await fsp.writeFile(refusedSource, "successor");
+			await fsp.writeFile(refusedDestination, "predecessor");
+			const refusedExpectedSource = await exactIdentity(refusedSource, "successor");
+			const refusedExpectedDestination = await exactIdentity(refusedDestination, "predecessor");
+			refusedExpectedDestination.sha256 = sha256("not-the-predecessor");
+			const syncRefused = native.exactReplacePath(
+				refusedSource,
+				refusedDestination,
+				refusedExpectedSource,
+				refusedExpectedDestination,
+			);
+			const asyncSource = path.join(dir, "staging-refused-async");
+			const asyncDestination = path.join(dir, "published-refused-async");
+			await fsp.writeFile(asyncSource, "successor");
+			await fsp.writeFile(asyncDestination, "predecessor");
+			const asyncExpectedSource = await exactIdentity(asyncSource, "successor");
+			const asyncExpectedDestination = await exactIdentity(asyncDestination, "predecessor");
+			asyncExpectedDestination.sha256 = sha256("not-the-predecessor");
+			const asyncRefused = await native.exactReplacePathAsync(
+				asyncSource,
+				asyncDestination,
+				asyncExpectedSource,
+				asyncExpectedDestination,
+			);
+			expect(asyncRefused.ok).toBe(false);
+			expect(asyncRefused.code).toBe(syncRefused.code);
+			expect(syncRefused.code).toBe("identity_mismatch");
+		});
+	});
+
+	it("yields the event loop while replaceManagedFile hashes a large transcript", async () => {
+		await withTempDir("gjc-replace-hash-yield-", async dir => {
+			const root = managedDirectoryRoot(dir);
+			const destination = path.join(dir, "session.jsonl");
+			const predecessor = new Uint8Array(256 * 1024).fill(0x61);
+			const successor = new Uint8Array(256 * 1024).fill(0x62);
+			await fsp.writeFile(destination, predecessor, { mode: 0o600 });
+			const expected = captureManagedFileNoFollow(destination).identity;
+
+			let ticks = 0;
+			const timer = setInterval(() => {
+				ticks += 1;
+			}, 1);
+			try {
+				await replaceManagedFile(destination, successor, root, "default", undefined, expected);
+			} finally {
+				clearInterval(timer);
+			}
+			expect(ticks).toBeGreaterThan(0);
+			expect(await fsp.readFile(destination)).toEqual(Buffer.from(successor));
 		});
 	});
 });

@@ -606,7 +606,7 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
-	const settings = options?.settings ?? (await Settings.init());
+	const settings = options?.settings ?? (await Settings.currentOrInit());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,

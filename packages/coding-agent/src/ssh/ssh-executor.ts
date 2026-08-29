@@ -87,7 +87,7 @@ export async function executeSSH(
 		stderr: "full",
 	});
 
-	const settings = options?.settings ?? (await Settings.init());
+	const settings = options?.settings ?? (await Settings.currentOrInit());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,

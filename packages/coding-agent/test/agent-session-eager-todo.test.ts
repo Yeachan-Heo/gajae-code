@@ -108,6 +108,7 @@ describe("AgentSession eager todo enforcement", () => {
 	let settings: Settings;
 	let managedAppendSpy: ReturnType<typeof spyOn> | undefined;
 	let managedIdentityAppendSpy: ReturnType<typeof spyOn> | undefined;
+	let managedIdentityAppendAsyncSpy: ReturnType<typeof spyOn> | undefined;
 	let fileWriterSpy: ReturnType<typeof spyOn> | undefined;
 
 	let authStorage: AuthStorage | undefined;
@@ -214,6 +215,8 @@ describe("AgentSession eager todo enforcement", () => {
 		managedAppendSpy = undefined;
 		managedIdentityAppendSpy?.mockRestore();
 		managedIdentityAppendSpy = undefined;
+		managedIdentityAppendAsyncSpy?.mockRestore();
+		managedIdentityAppendAsyncSpy = undefined;
 		fileWriterSpy?.mockRestore();
 		fileWriterSpy = undefined;
 		if (session) {
@@ -536,9 +539,23 @@ describe("AgentSession eager todo enforcement", () => {
 				deliveredToolResults.push(event.message);
 			}
 		});
-		const replace = spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(() => {
+		const failRewrite = () => {
 			throw new Error("cold managed rewrite failed");
+		};
+		const replace = spyOn(ManagedSessionDescendantStore.prototype, "replace").mockImplementation(async () => {
+			failRewrite();
 		});
+		const replaceSync = spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(failRewrite);
+		const replaceExpectedIdentity = spyOn(
+			ManagedSessionDescendantStore.prototype,
+			"replaceExpectedIdentity",
+		).mockImplementation(async () => {
+			failRewrite();
+		});
+		const replaceExpectedIdentitySync = spyOn(
+			ManagedSessionDescendantStore.prototype,
+			"replaceExpectedIdentitySync",
+		).mockImplementation(failRewrite);
 		try {
 			const assistantMessage = createToolCallAssistantMessage("todo_write", {
 				ops: [{ op: "init", list: [{ phase: "Persist", items: ["Write transcript"] }] }],
@@ -547,6 +564,7 @@ describe("AgentSession eager todo enforcement", () => {
 			if (!handleAgentEvent) throw new Error("Expected AgentSession to subscribe to agent events");
 			await handleAgentEvent({ type: "message_end", message: assistantMessage });
 
+			expect(replace).toHaveBeenCalled();
 			expect(abort).toHaveBeenCalledTimes(1);
 			expect(coldSession.getTodoPhases()).toEqual([]);
 			expect(deliveredToolResults).toEqual([]);
@@ -559,6 +577,9 @@ describe("AgentSession eager todo enforcement", () => {
 			expect(storage.existsSync(sessionFile)).toBe(false);
 		} finally {
 			replace.mockRestore();
+			replaceSync.mockRestore();
+			replaceExpectedIdentity.mockRestore();
+			replaceExpectedIdentitySync.mockRestore();
 			unsubscribe();
 			await coldSession.dispose().catch(() => {});
 		}
@@ -696,10 +717,10 @@ describe("AgentSession eager todo enforcement", () => {
 			const sendCustomMessage = spyOn(session, "sendCustomMessage").mockResolvedValue();
 			const realManagedAppend = ManagedSessionDescendantStore.prototype.appendSync;
 			const realManagedIdentityAppend = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
+			const realManagedIdentityAppendAsync = ManagedSessionDescendantStore.prototype.appendExpectedIdentity;
 			let rejectedSuccessfulTodo = false;
-			// Records the successful todo_write append as committed-then-failed. The manager
-			// only takes the unbound `appendSync` for the FIRST append of a transcript; every
-			// later append carries the expected identity, which is where the todo lands.
+			// Records the successful todo_write as committed-then-failed. Identity-bearing
+			// appends and rewrites both go through the async expected-identity path.
 			const rejectCommittedTodo = (staged: string): boolean => {
 				if (rejectedSuccessfulTodo) return false;
 				if (!staged.includes('"toolName":"todo_write"')) return false;
@@ -727,6 +748,16 @@ describe("AgentSession eager todo enforcement", () => {
 					throw new Error("managed append reported failure after commit");
 				}
 				return realManagedIdentityAppend.call(this, relativePath, bytes, identity);
+			});
+			managedIdentityAppendAsyncSpy = spyOn(
+				ManagedSessionDescendantStore.prototype,
+				"appendExpectedIdentity",
+			).mockImplementation(async function (this: ManagedSessionDescendantStore, relativePath, bytes, identity) {
+				if (rejectCommittedTodo(new TextDecoder().decode(bytes))) {
+					await realManagedIdentityAppendAsync.call(this, relativePath, bytes, identity);
+					throw new Error("managed append reported failure after commit");
+				}
+				return await realManagedIdentityAppendAsync.call(this, relativePath, bytes, identity);
 			});
 
 			scriptedResponses = [
@@ -1036,16 +1067,24 @@ describe("AgentSession eager todo enforcement", () => {
 		if (!sessionFile) throw new Error("Expected managed session file path");
 		manager.appendMessage({ role: "user", content: "first append is lazy", timestamp: 1 });
 
-		const replace = spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(() => {
+		const failFirstPersist = () => {
 			throw new Error("first managed persist failed");
+		};
+		const replace = spyOn(ManagedSessionDescendantStore.prototype, "replace").mockImplementation(async () => {
+			failFirstPersist();
 		});
+		const replaceSync = spyOn(ManagedSessionDescendantStore.prototype, "replaceSync").mockImplementation(
+			failFirstPersist,
+		);
 		let assistantFailure: unknown;
 		try {
 			manager.appendMessage(createToolCallAssistantMessage("todo_write", { ops: [] }));
+			await manager.flush();
 		} catch (error) {
 			assistantFailure = error;
 		}
 		replace.mockRestore();
+		replaceSync.mockRestore();
 
 		expect(assistantFailure).toBeInstanceOf(SessionAppendPersistenceError);
 		expect((assistantFailure as SessionAppendPersistenceError).phase).toBe("current_append");

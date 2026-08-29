@@ -410,14 +410,19 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 		}
 		this.#writing = true;
 		try {
-			this.#request.write(frame, error => {
+			if (
+				!writeCursorHttp2Frame(this.#request, frame, error => {
+					this.#writing = false;
+					if (error) {
+						this.fail(error);
+						return;
+					}
+					this.#writeNext();
+				})
+			) {
 				this.#writing = false;
-				if (error) {
-					this.fail(error);
-					return;
-				}
-				this.#writeNext();
-			});
+				this.fail(new Error("Cursor HTTP/2 stream is not writable"));
+			}
 		} catch (error) {
 			this.#writing = false;
 			this.fail(error instanceof Error ? error : new Error(String(error)));
@@ -612,6 +617,140 @@ export function mapH2TransportError(error: unknown, baseUrl: string): unknown {
 		`Cursor HTTP/2 is not supported by ${baseUrl}. Use an HTTP/2-capable endpoint, configure a proxy tunnel that preserves ALPN h2, or set providers.cursor.baseUrl to an HTTP/2 endpoint.`,
 		{ cause: error },
 	);
+}
+
+/** Structural write surface for Cursor's Connect HTTP/2 request stream. */
+export type CursorHttp2WriteStream = {
+	closed: boolean;
+	destroyed: boolean;
+	writableEnded: boolean;
+	writable?: boolean;
+	write: (chunk: Uint8Array, cb?: (error?: Error | null) => void) => unknown;
+	on?: (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void) => unknown;
+	off?: (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void) => unknown;
+	removeListener?: (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void) => unknown;
+};
+
+function isCursorHttp2WriteClosedError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const candidate = error as { code?: unknown; message?: unknown };
+	if (candidate.code === "ERR_STREAM_WRITE_AFTER_END" || candidate.code === "ERR_STREAM_DESTROYED") return true;
+	return (
+		typeof candidate.message === "string" &&
+		(/write after end/i.test(candidate.message) || /stream was destroyed/i.test(candidate.message))
+	);
+}
+
+function cursorHttp2StreamIsWritable(stream: CursorHttp2WriteStream): boolean {
+	return !stream.closed && !stream.destroyed && !stream.writableEnded && stream.writable !== false;
+}
+
+/**
+ * Write a Connect frame. Returns false when the request stream is already closed.
+ * Swallows write-after-end / destroyed errors (including Bun's promise-returning
+ * `write()`), so a late coordinator flush cannot escape as uncaughtException.
+ */
+export function writeCursorHttp2Frame(
+	stream: CursorHttp2WriteStream,
+	bytes: Uint8Array,
+	onComplete?: (error: Error | null) => void,
+): boolean {
+	if (!cursorHttp2StreamIsWritable(stream)) {
+		onComplete?.(new Error("write after end"));
+		return false;
+	}
+	let settled = false;
+	let writeReturned = false;
+	let callbackSettled = false;
+	let callbackError: unknown;
+	let promiseSettled = false;
+	let promiseError: unknown;
+	let drainRequired = false;
+	let drainSeen = false;
+	const listeners: Array<["drain" | "error" | "close", (...args: unknown[]) => void]> = [];
+	const canObserveEvents =
+		typeof stream.on === "function" &&
+		(typeof stream.off === "function" || typeof stream.removeListener === "function");
+	const removeListener = (event: "drain" | "error" | "close", listener: (...args: unknown[]) => void): void => {
+		if (typeof stream.off === "function") stream.off(event, listener);
+		else stream.removeListener?.(event, listener);
+	};
+	const cleanup = (): void => {
+		for (const [event, listener] of listeners.splice(0)) removeListener(event, listener);
+	};
+	const finish = (error: unknown): void => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		if (!error) {
+			onComplete?.(null);
+			return;
+		}
+		if (isCursorHttp2WriteClosedError(error)) {
+			onComplete?.(error instanceof Error ? error : new Error(String(error)));
+			return;
+		}
+		if (!onComplete) {
+			log("error", "http2Write", { error: String(error) });
+			return;
+		}
+		onComplete(error instanceof Error ? error : new Error(String(error)));
+	};
+	const maybeFinish = (): void => {
+		if (settled || !writeReturned || (!callbackSettled && !promiseSettled)) return;
+		const error = callbackError ?? promiseError;
+		if (error) {
+			finish(error);
+			return;
+		}
+		if (drainRequired && !drainSeen) return;
+		finish(null);
+	};
+	const onDrain = (): void => {
+		drainSeen = true;
+		maybeFinish();
+	};
+	const onError = (error: unknown): void => finish(error ?? new Error("Cursor HTTP/2 stream write failed"));
+	const onClose = (): void => finish(new Error("Cursor HTTP/2 stream closed during write"));
+	try {
+		if (canObserveEvents) {
+			stream.on!("drain", onDrain);
+			listeners.push(["drain", onDrain]);
+			stream.on!("error", onError);
+			listeners.push(["error", onError]);
+			stream.on!("close", onClose);
+			listeners.push(["close", onClose]);
+		}
+		const result = stream.write(bytes, error => {
+			callbackSettled = true;
+			callbackError = error ?? undefined;
+			maybeFinish();
+		});
+		writeReturned = true;
+		drainRequired = result === false && canObserveEvents;
+		maybeFinish();
+		if (result !== undefined && result !== null && typeof (result as { then?: unknown }).then === "function") {
+			void Promise.resolve(result).then(
+				() => {
+					promiseSettled = true;
+					maybeFinish();
+				},
+				(error: unknown) => {
+					promiseSettled = true;
+					promiseError = error;
+					maybeFinish();
+				},
+			);
+		}
+		return true;
+	} catch (error) {
+		cleanup();
+		if (isCursorHttp2WriteClosedError(error)) {
+			finish(error);
+			return false;
+		}
+		throw error;
+	}
 }
 
 export const streamCursor: StreamFunction<"cursor-agent"> = (

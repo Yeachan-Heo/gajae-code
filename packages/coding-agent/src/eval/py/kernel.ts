@@ -164,7 +164,7 @@ export async function checkPythonKernelAvailability(
 	try {
 		const settings =
 			settingsOverride ??
-			(await waitForLifecycle(Settings.init(), lifecycle, "Python kernel settings initialization"));
+			(await waitForLifecycle(Settings.currentOrInit(), lifecycle, "Python kernel settings initialization"));
 		const { env } = settings.getShellConfig();
 		const baseEnv = filterEnv(env);
 		const runtime = await ensurePythonRuntime(cwd, baseEnv, runtimeOptions, lifecycle);
@@ -267,7 +267,7 @@ export class PythonKernel {
 			throw new Error(availability.reason ?? "Python kernel unavailable");
 		}
 
-		const settings = options.settings ?? (await Settings.init());
+		const settings = options.settings ?? (await Settings.currentOrInit());
 		const { env: shellEnv } = settings.getShellConfig();
 		const baseEnv = filterEnv(shellEnv);
 		const runtime = await ensurePythonRuntime(options.cwd, baseEnv, options.runtimeOptions, {

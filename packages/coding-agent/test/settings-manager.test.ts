@@ -4,7 +4,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Effort } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
-import { onAppendOnlyModeChanged, resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	onAppendOnlyModeChanged,
+	resetSettingsForTest,
+	Settings,
+	SettingsMigrationTestHooks,
+} from "@gajae-code/coding-agent/config/settings";
 import { resolveImageRoleModel } from "@gajae-code/coding-agent/tools/image-gen";
 import {
 	getCustomThemesDir,
@@ -91,6 +96,148 @@ describe("Settings", () => {
 			expect(logged).not.toContain(initialSecret);
 			expect(logged).not.toContain(requestedSecret);
 			expect(logged).toContain("auth.broker.token");
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("blank currentOrInit after cwd init stays silent while blank Settings.init still warns", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const reinitCalls = () =>
+			warning.mock.calls.filter(([message]) => String(message).includes("called again with different options"));
+		try {
+			const first = await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
+
+			for (let i = 0; i < 20; i++) {
+				expect(await Settings.init()).toBe(first);
+			}
+			expect(reinitCalls()).toHaveLength(20);
+
+			warning.mockClear();
+			for (let i = 0; i < 20; i++) {
+				expect(await Settings.currentOrInit()).toBe(first);
+			}
+			expect(reinitCalls()).toHaveLength(0);
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it("currentOrInit initializes the singleton when none exists", async () => {
+		const created = await Settings.currentOrInit({ inMemory: true, cwd: projectDir, agentDir });
+		expect(created).toBe(Settings.instance);
+	});
+
+	it("does not republish an in-flight initialization after reset", async () => {
+		const pending = Settings.init({ inMemory: true, cwd: projectDir, agentDir });
+		resetSettingsForTest();
+
+		expect(() => Settings.instance).toThrow("Settings not initialized");
+		const stale = await pending;
+		expect(stale.get("theme.dark")).toBe("red-claw");
+		expect(() => Settings.instance).toThrow("Settings not initialized");
+
+		const replacement = await Settings.currentOrInit({ inMemory: true, cwd: projectDir, agentDir });
+		expect(replacement).toBe(Settings.instance);
+		expect(replacement).not.toBe(stale);
+	});
+
+	it("allows a fresh initialization after the first attempt fails", async () => {
+		const invalidAgentDir = path.join(testDir, "agent-file");
+		await Bun.write(invalidAgentDir, "not a directory");
+
+		await expect(Settings.init({ cwd: projectDir, agentDir: invalidAgentDir })).rejects.toThrow();
+		const retried = await Settings.init({ cwd: projectDir, agentDir });
+
+		expect(retried).toBe(Settings.instance);
+		expect(retried.getAgentDir()).toBe(path.normalize(agentDir));
+	});
+
+	it("does not close replacement storage when a reset stale init shares its agent dir", async () => {
+		const secondProjectDir = path.join(testDir, "second-project");
+		fs.mkdirSync(getProjectAgentDir(secondProjectDir), { recursive: true });
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "settings.json"),
+			JSON.stringify({ "gjc.ralplan.maxIterations": 7 }),
+		);
+		const { promise: migrationPaused, resolve: markMigrationPaused } = Promise.withResolvers<void>();
+		let release!: () => void;
+		const releaseGate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let firstMigration = true;
+		SettingsMigrationTestHooks.beforeProjectMarkerMerge = async () => {
+			if (!firstMigration) return;
+			firstMigration = false;
+			markMigrationPaused();
+			await releaseGate;
+		};
+		try {
+			const stalePending = Settings.init({ cwd: projectDir, agentDir });
+			await migrationPaused;
+			resetSettingsForTest();
+			const replacement = await Settings.init({ cwd: secondProjectDir, agentDir });
+			release();
+			await stalePending;
+
+			const storage = replacement.getStorage();
+			expect(storage).not.toBeNull();
+			expect(() => storage?.getSettings()).not.toThrow();
+		} finally {
+			release();
+			SettingsMigrationTestHooks.beforeProjectMarkerMerge = undefined;
+		}
+	});
+
+	it("does not close replacement storage when a reset stale init rejects", async () => {
+		const secondProjectDir = path.join(testDir, "second-project-rejection");
+		fs.mkdirSync(getProjectAgentDir(secondProjectDir), { recursive: true });
+		const { promise: projectLoadPaused, resolve: markProjectLoadPaused } = Promise.withResolvers<void>();
+		let release!: () => void;
+		const releaseGate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let firstProjectLoad = true;
+		SettingsMigrationTestHooks.beforeProjectSettingsLoad = async () => {
+			if (!firstProjectLoad) return;
+			firstProjectLoad = false;
+			markProjectLoadPaused();
+			await releaseGate;
+			throw new Error("injected stale project load failure");
+		};
+		try {
+			const stalePending = Settings.init({ cwd: projectDir, agentDir });
+			await projectLoadPaused;
+			resetSettingsForTest();
+			const replacement = await Settings.init({ cwd: secondProjectDir, agentDir });
+			const staleOutcome = stalePending.then(
+				() => "resolved",
+				() => "rejected",
+			);
+			release();
+			expect(await staleOutcome).toBe("rejected");
+
+			const storage = replacement.getStorage();
+			expect(storage).not.toBeNull();
+			expect(() => storage?.getSettings()).not.toThrow();
+		} finally {
+			release();
+			SettingsMigrationTestHooks.beforeProjectSettingsLoad = undefined;
+		}
+	});
+
+	it("currentOrInit still warns when a later request changes overrides", async () => {
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
+			await Settings.currentOrInit({
+				inMemory: true,
+				cwd: projectDir,
+				agentDir,
+				overrides: { "auth.broker.token": "later-token" },
+			});
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(String(warning.mock.calls[0]?.[0])).toContain("called again with different options");
 		} finally {
 			warning.mockRestore();
 		}

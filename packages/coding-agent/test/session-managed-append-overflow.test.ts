@@ -24,8 +24,7 @@ function makeTempDir(): string {
  *
  * We spy on the descendant store's append path so it throws content_too_large
  * on the next append without needing 64 MiB of real data. The SessionManager's
- * #rewriteFileSync fallback should recover by rewriting only the live
- * in-memory entries.
+ * `#rewriteFileContents` recovery should rewrite only the live in-memory entries.
  */
 describe("SessionManager managed append overflow recovery", () => {
 	it("recovers from content_too_large via full-rewrite instead of poisoning", async () => {
@@ -47,15 +46,20 @@ describe("SessionManager managed append overflow recovery", () => {
 			// Mock the store's appendExpectedSync to throw content_too_large,
 			// simulating a transcript that has grown to the 64 MiB limit.
 			const appendSpy = vi
+				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentity")
+				.mockRejectedValue(new Error("content_too_large"));
+			const appendSyncSpy = vi
 				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedSync")
 				.mockImplementation(() => {
 					throw new Error("content_too_large");
 				});
 
-			// This append should hit content_too_large and recover via #rewriteFileSync.
+			// This append should hit content_too_large and recover via rewrite.
 			expect(() => manager.appendMessage({ role: "user", content: "after-overflow", timestamp: 2 })).not.toThrow();
+			await manager.flush();
 
 			appendSpy.mockRestore();
+			appendSyncSpy.mockRestore();
 
 			// The session must NOT be poisoned — further appends must work.
 			manager.appendMessage({ role: "user", content: "third", timestamp: 3 });
@@ -106,21 +110,19 @@ describe("SessionManager managed append overflow recovery", () => {
 			await manager.ensureOnDisk();
 
 			const appendSpy = vi
+				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentity")
+				.mockRejectedValue(new Error("some_other_error"));
+			const appendSyncSpy = vi
 				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedSync")
 				.mockImplementation(() => {
 					throw new Error("some_other_error");
 				});
 
-			// A non-content_too_large error should poison the session and throw.
-			let threw = false;
-			try {
-				manager.appendMessage({ role: "user", content: "fail", timestamp: 2 });
-			} catch {
-				threw = true;
-			}
-			expect(threw).toBe(true);
+			manager.appendMessage({ role: "user", content: "fail", timestamp: 2 });
+			await expect(manager.flush()).rejects.toThrow();
 
 			appendSpy.mockRestore();
+			appendSyncSpy.mockRestore();
 		} finally {
 			// Suppress the poisoned close error.
 			try {

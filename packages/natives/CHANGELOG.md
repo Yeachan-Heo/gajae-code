@@ -2,11 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- `exactReplacePathAsync`, an async variant of `exactReplacePath` scheduled on the native blocking-work pool so managed session replacement can await identity hashing and the checked namespace exchange without blocking the host event loop.
+- `digestExactRegularFile` / `digestExactRegularFileAsync`, a no-follow regular-file SHA-256 plus stable descriptor identity observed before and after hashing, so managed session persistence can hash on the native pool without accepting an in-place mutation race. Native loading fails fast when the required path-identity ABI is absent.
+
 ## [0.15.5] - 2026-08-29
 
 ### Added
 
 - `fuzzyFind` subsequence scoring supports Hangul chosung (초성) matching: a bare consonant jamo in the query matches any syllable with that initial consonant. Exact, prefix, and contains tiers are unchanged, so literal matches keep outranking chosung matches.
+
 ## [0.15.4] - 2026-08-29
 
 ### Fixed
