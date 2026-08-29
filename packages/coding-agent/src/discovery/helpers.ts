@@ -616,7 +616,7 @@ async function readExtensionModuleManifest(
  * No recursion beyond one level. Complex packages must use package.json manifest.
  * Uses native glob for fast filesystem scanning with gitignore support.
  */
-export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: string): Promise<string[]> {
+export async function discoverExtensionModulePaths(ctx: LoadContext, dir: string): Promise<string[]> {
 	const discovered = new Set<string>();
 	const { FileType } = await discoveryNatives();
 	// Find all candidate files in parallel using glob
@@ -639,14 +639,17 @@ export async function discoverExtensionModulePaths(_ctx: LoadContext, dir: strin
 	for (const match of packageJsonFiles) {
 		const subdir = path.dirname(match.path); // e.g., "my-extension"
 		const packageJsonPath = path.join(dir, match.path);
-		const manifest = await readExtensionModuleManifest(_ctx, packageJsonPath);
+		const manifest = await readExtensionModuleManifest(ctx, packageJsonPath);
 		const declaredExtensions =
 			manifest?.extensions?.filter((extPath): extPath is string => typeof extPath === "string") ?? [];
 		if (declaredExtensions.length === 0) continue;
 		subdirsWithDeclaredExtensions.add(subdir);
 		const subdirPath = path.join(dir, subdir);
 		for (const extPath of declaredExtensions) {
-			let resolvedExtPath = path.resolve(subdirPath, extPath);
+			const configuredPath = path.resolve(subdirPath, extPath);
+			const resolvedConfiguredPath = await canonicalizePathWithinHome(ctx, configuredPath);
+			if (!resolvedConfiguredPath) continue;
+			let resolvedExtPath = resolvedConfiguredPath;
 			const entries = await readDirEntries(resolvedExtPath);
 			if (entries.length !== 0) {
 				const pluginFilePath = entries.find(
@@ -892,11 +895,52 @@ export async function invalidateClaudePluginRoots(home: string, cwd?: string, is
 	pluginRootsCache.delete(`${home}:${resolvedProjectPath ?? ""}`);
 }
 
+async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
+	const resolved = path.resolve(target);
+	const suffix: string[] = [];
+	let current = resolved;
+
+	while (true) {
+		try {
+			const real = await fs.promises.realpath(current);
+			return suffix.length > 0 ? path.join(real, ...suffix.reverse()) : real;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			const parent = path.dirname(current);
+			if (parent === current) return resolved;
+			suffix.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
+function isWithinOrEqual(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve a configured path through existing symlinks when an explicit-home
+ * load is active. Ordinary discovery keeps its historical lexical path
+ * handling; isolated discovery must reject paths that leave the supplied
+ * physical home, including paths that escape through an existing symlink.
+ */
+export async function canonicalizePathWithinHome(
+	ctx: Pick<LoadContext, "home" | "isolatedHome">,
+	target: string,
+): Promise<string | undefined> {
+	if (!ctx.isolatedHome) return target;
+	const canonicalHome = await canonicalizeThroughExistingAncestor(ctx.home);
+	const canonicalTarget = await canonicalizeThroughExistingAncestor(target);
+	return isWithinOrEqual(canonicalHome, canonicalTarget) ? canonicalTarget : undefined;
+}
+
 async function resolveIsolatedPluginPath(home: string, value: string): Promise<string | undefined> {
-	const resolved = path.resolve(home, value);
-	const canonical = await fs.promises.realpath(resolved).catch(() => resolved);
-	const relative = path.relative(home, canonical);
-	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
+	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
+	const resolved = path.resolve(canonicalHome, value);
+	const canonical = await canonicalizeThroughExistingAncestor(resolved);
+	if (!isWithinOrEqual(canonicalHome, canonical)) return undefined;
 	return canonical;
 }
 
@@ -904,7 +948,10 @@ async function resolveIsolatedPluginPath(home: string, value: string): Promise<s
  * List installed GJC plugin roots from the GJC plugin registry and, when present,
  * the nearest project-scoped registry resolved from `cwd`.
  *
- * Results are cached per `home:resolvedProjectPath` key to avoid repeated parsing.
+ * Ordinary results are cached per `home:resolvedProjectPath` key to avoid
+ * repeated parsing. Isolated results intentionally bypass the shared cache:
+ * an ordinary load may contain external install roots that an isolated load
+ * must reject, and reusing that result would cross the home boundary.
  */
 
 export async function listClaudePluginRoots(
@@ -914,8 +961,10 @@ export async function listClaudePluginRoots(
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
 	const cacheKey = `${home}:${resolvedProjectPath ?? ""}`;
-	const cached = pluginRootsCache.get(cacheKey);
-	if (cached) return cached;
+	if (!isolatedHome) {
+		const cached = pluginRootsCache.get(cacheKey);
+		if (cached) return cached;
+	}
 
 	const roots: ClaudePluginRoot[] = [];
 	const warnings: string[] = [];
@@ -1027,7 +1076,7 @@ export async function listClaudePluginRoots(
 	}
 
 	const result = { roots, warnings };
-	pluginRootsCache.set(cacheKey, result);
+	if (!isolatedHome) pluginRootsCache.set(cacheKey, result);
 	return result;
 }
 

@@ -49,14 +49,23 @@ const disabledProviders = new Set<string>();
 
 /** User/project roots used by providers that derive paths from LoadContext.home/cwd. */
 const EXPLICIT_HOME_PROVIDER_ROOTS = [
-	{ id: "claude", user: ".claude", project: ".claude" },
-	{ id: "codex", user: ".codex", project: ".codex" },
-	{ id: "gemini", user: ".gemini", project: ".gemini" },
-	{ id: "opencode", user: path.join(".config", "opencode"), project: ".opencode" },
-	{ id: "cursor", user: ".cursor", project: ".cursor" },
-	{ id: "windsurf", user: path.join(".codeium", "windsurf"), project: ".windsurf" },
-	{ id: "cline", user: ".cline", project: null },
-	{ id: "github", user: null, project: ".github" },
+	// `claude` and `codex` are import aliases for the registered hook providers.
+	{ providerIds: ["claude", "claude-hooks"], user: null, project: ".claude" },
+	{ providerIds: ["codex", "codex-hooks"], user: null, project: ".codex" },
+	{ providerIds: ["gemini"], user: ".gemini", project: ".gemini" },
+	{ providerIds: ["opencode"], user: path.join(".config", "opencode"), project: ".opencode" },
+	{ providerIds: ["opencode"], user: null, project: "opencode.json" },
+	{ providerIds: ["cursor"], user: ".cursor", project: ".cursor" },
+	{ providerIds: ["windsurf"], user: path.join(".codeium", "windsurf"), project: ".windsurf" },
+	{ providerIds: ["cline"], user: ".cline", project: ".clinerules" },
+	{ providerIds: ["github"], user: null, project: ".github" },
+	{ providerIds: ["agents"], user: ".agent", project: ".agent" },
+	{ providerIds: ["agents"], user: ".agents", project: ".agents" },
+	{ providerIds: ["agents-md"], user: null, project: "AGENTS.md" },
+	{ providerIds: ["mcp-json"], user: null, project: "mcp.json" },
+	{ providerIds: ["mcp-json"], user: null, project: ".mcp.json" },
+	{ providerIds: ["ssh-json"], user: null, project: "ssh.json" },
+	{ providerIds: ["ssh-json"], user: null, project: ".ssh.json" },
 ] as const;
 
 function isWithinOrEqual(root: string, candidate: string): boolean {
@@ -106,34 +115,44 @@ async function canonicalizeContainedPath(root: string, target: string, label: st
  * otherwise make a path that is lexically inside the supplied home read an
  * unrelated profile.
  */
-async function assertExplicitHomeRoots(canonicalHome: string, cwd: string, explicitAgentDir: boolean): Promise<void> {
+async function assertExplicitHomeRoots(
+	canonicalHome: string,
+	cwd: string,
+	explicitAgentDir: boolean,
+	providerIds: ReadonlySet<string>,
+): Promise<void> {
 	const userRoots = new Map<string, string>();
 	const projectRoots = new Map<string, string>();
 	const addRoot = (roots: Map<string, string>, root: string, label: string): void => {
 		if (!roots.has(root)) roots.set(root, label);
 	};
 
-	// Validate every non-native provider root as a set instead of relying on
-	// individual providers to remember the explicit-home boundary.
+	// Resolve aliases before selecting roots. For example, the registered
+	// `claude-hooks` provider uses the `.claude` root shared by the `claude`
+	// import convention, while only its project scope is actually loaded.
 	for (const source of EXPLICIT_HOME_PROVIDER_ROOTS) {
-		if (source.user) addRoot(userRoots, path.join(canonicalHome, source.user), `${source.id} user root`);
-		if (source.project) addRoot(projectRoots, source.project, `${source.id} project root`);
+		if (!source.providerIds.some(providerId => providerIds.has(providerId))) continue;
+		const label = source.providerIds.join("/");
+		if (source.user) addRoot(userRoots, path.join(canonicalHome, source.user), `${label} user root`);
+		if (source.project) addRoot(projectRoots, source.project, `${label} project root`);
 	}
-	if (!explicitAgentDir)
-		addRoot(userRoots, path.join(canonicalHome, getConfigDirName(), "agent"), "user agent directory");
-	addRoot(projectRoots, getConfigDirName(), "project registry root");
 
-	// The standard Agents provider has two user/project roots outside
-	// SOURCE_PATHS, while the marketplace provider derives its registry from
-	// the XDG-aware helper rather than a fixed `<home>/.gjc/plugins` path.
-	for (const baseDir of [".agent", ".agents"]) {
-		addRoot(userRoots, path.join(canonicalHome, baseDir), `agents user root (${baseDir})`);
-		addRoot(projectRoots, baseDir, `agents project root (${baseDir})`);
+	// Native and SSH providers use the managed agent directory for user scope,
+	// while native, SSH, and project-scoped SSH config also read the project
+	// config root. An explicit agent directory is intentionally allowed outside
+	// the supplied home and is validated separately by the caller.
+	const usesNative = providerIds.has("native");
+	const usesSsh = providerIds.has("ssh-json");
+	if ((usesNative || usesSsh) && !explicitAgentDir)
+		addRoot(userRoots, path.join(canonicalHome, getConfigDirName(), "agent"), "user agent directory");
+	if (usesNative || usesSsh) addRoot(projectRoots, getConfigDirName(), "project registry root");
+
+	// The marketplace provider derives its user registry from the XDG-aware
+	// helper rather than a fixed `<home>/.gjc/plugins` path.
+	if (providerIds.has("claude-plugins")) {
+		addRoot(projectRoots, path.join(getConfigDirName(), "plugins"), "project plugin registry root");
+		addRoot(userRoots, getPluginsDir(canonicalHome), "plugin registry root");
 	}
-	addRoot(projectRoots, path.join(getConfigDirName(), "plugins"), "project plugin registry root");
-	for (const file of ["AGENTS.md", ".clinerules", "mcp.json", ".mcp.json", "opencode.json", "ssh.json", ".ssh.json"])
-		addRoot(projectRoots, file, `project file (${file})`);
-	addRoot(userRoots, getPluginsDir(canonicalHome), "plugin registry root");
 
 	await Promise.all(
 		[...userRoots.entries()].map(([root, label]) => canonicalizeContainedPath(canonicalHome, root, label)),
@@ -433,21 +452,26 @@ export async function loadCapabilityForHome<T>(
 		);
 	}
 
+	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
+	const providers = filterProviders(capability, isolatedOptions);
+	const effectiveProviderIds = new Set(providers.map(provider => provider.id));
+	const usesAgentScope = effectiveProviderIds.has("native") || effectiveProviderIds.has("ssh-json");
 	const userAgentDir = options.agentDir
 		? await canonicalizeThroughExistingAncestor(path.resolve(options.agentDir))
-		: await canonicalizeContainedPath(
-				canonicalHome,
-				path.join(canonicalHome, getConfigDirName(), "agent"),
-				"user agent directory",
-			);
-	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir));
+		: usesAgentScope
+			? await canonicalizeContainedPath(
+					canonicalHome,
+					path.join(canonicalHome, getConfigDirName(), "agent"),
+					"user agent directory",
+				)
+			: path.join(canonicalHome, getConfigDirName(), "agent");
+	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir), effectiveProviderIds);
 	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome);
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
 		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
 			? canonicalRepoRoot
 			: null;
-	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = {
 		cwd,
 		home: canonicalHome,
@@ -456,7 +480,6 @@ export async function loadCapabilityForHome<T>(
 		isolatedHome: true,
 		settings: isolatedOptions.settings,
 	};
-	const providers = filterProviders(capability, isolatedOptions);
 
 	return await loadImpl(capability, providers, ctx, isolatedOptions);
 }

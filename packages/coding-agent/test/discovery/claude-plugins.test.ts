@@ -310,6 +310,36 @@ describe("listClaudePluginRoots", () => {
 		expect(result3.roots).toHaveLength(2);
 	});
 
+	test("does not reuse ordinary external roots for an isolated load", async () => {
+		const profileHome = path.join(tempDir, "profile-home");
+		const pluginsDir = path.join(profileHome, ".gjc", "plugins");
+		const outsidePlugin = path.join(tempDir, "outside-plugin");
+		await fs.mkdir(pluginsDir, { recursive: true });
+		await fs.mkdir(outsidePlugin, { recursive: true });
+		const registry = {
+			version: 2,
+			plugins: {
+				"external-plugin@market": [
+					{
+						scope: "user",
+						installPath: outsidePlugin,
+						version: "1.0.0",
+						installedAt: "2025-01-01T00:00:00Z",
+						lastUpdated: "2025-01-01T00:00:00Z",
+					},
+				],
+			},
+		};
+		await fs.writeFile(path.join(pluginsDir, "installed_plugins.json"), JSON.stringify(registry));
+
+		const ordinary = await listClaudePluginRoots(profileHome);
+		expect(ordinary.roots.map(root => root.path)).toEqual([outsidePlugin]);
+
+		const isolated = await listClaudePluginRoots(profileHome, undefined, true);
+		expect(isolated.roots).toEqual([]);
+		expect(isolated.warnings).toEqual([expect.stringContaining("escapes the isolated home")]);
+	});
+
 	test("defaults scope to user when not specified", async () => {
 		const pluginsDir = path.join(tempDir, ".gjc", "plugins");
 		await fs.mkdir(pluginsDir, { recursive: true });

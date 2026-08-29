@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { initializeWithSettings, loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
+import { type ExtensionModule, extensionModuleCapability } from "@gajae-code/coding-agent/capability/extension-module";
 import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { hookCapability } from "@gajae-code/coding-agent/capability/hook";
 import { type Rule, ruleCapability } from "@gajae-code/coding-agent/capability/rule";
@@ -252,6 +253,59 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 				providers: ["opencode"],
 			}),
 		).rejects.toThrow(/opencode project root/);
+	});
+
+	test("explicit home validates only effective providers", async () => {
+		const decoyGemini = path.join(tempDir, "decoy-profile", ".gemini");
+		await writeFile(path.join(decoyGemini, "GEMINI.md"), "# decoy gemini");
+		await fs.symlink(decoyGemini, path.join(home, ".gemini"), "dir");
+
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+			excludeProviders: ["gemini"],
+		});
+
+		expect(result.items).toEqual([]);
+	});
+
+	test("explicit home rejects absolute and parent-escaping extension settings paths", async () => {
+		const outsideAbsolute = path.join(tempDir, "outside-absolute.ts");
+		const outsideRelative = path.join(tempDir, "outside-relative.ts");
+		await writeFile(outsideAbsolute, "export default {};\n");
+		await writeFile(outsideRelative, "export default {};\n");
+		await writeFile(
+			path.join(home, ".gjc", "agent", "settings.json"),
+			JSON.stringify({ extensions: [outsideAbsolute, path.relative(project, outsideRelative)] }),
+		);
+
+		const result = await loadCapabilityForHome<ExtensionModule>(extensionModuleCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+
+		expect(result.items).toEqual([]);
+		expect(result.warnings).toHaveLength(2);
+		expect(result.warnings.every(warning => warning.includes("escapes isolated home"))).toBe(true);
+	});
+
+	test("explicit home ignores absolute and parent-escaping manifest extension paths", async () => {
+		const outsideAbsolute = path.join(tempDir, "manifest-outside-absolute.ts");
+		const outsideRelative = path.join(tempDir, "manifest-outside-relative.ts");
+		await writeFile(outsideAbsolute, "export default {};\n");
+		await writeFile(outsideRelative, "export default {};\n");
+		const manifestDir = path.join(home, ".gjc", "agent", "extensions", "declared");
+		await writeFile(
+			path.join(manifestDir, "package.json"),
+			JSON.stringify({ gjc: { extensions: [outsideAbsolute, path.relative(manifestDir, outsideRelative)] } }),
+		);
+
+		const result = await loadCapabilityForHome<ExtensionModule>(extensionModuleCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+
+		expect(result.items).toEqual([]);
 	});
 
 	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {

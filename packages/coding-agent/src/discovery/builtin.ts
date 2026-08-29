@@ -25,6 +25,7 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import { expandTilde } from "../tools/path-utils";
 import {
 	buildRuleFromMarkdown,
+	canonicalizePathWithinHome,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
@@ -519,12 +520,10 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	const items: ExtensionModule[] = [];
 	const warnings: string[] = [];
 
-	const resolveExtensionPath = (rawPath: string): string => {
+	const resolveExtensionPath = async (rawPath: string): Promise<string | undefined> => {
 		const expanded = expandTilde(rawPath, ctx.home);
-		if (path.isAbsolute(expanded)) {
-			return expanded;
-		}
-		return path.resolve(ctx.cwd, expanded);
+		const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(ctx.cwd, expanded);
+		return await canonicalizePathWithinHome(ctx, resolved);
 	};
 
 	const createExtensionModule = (extPath: string, level: "user" | "project"): ExtensionModule => ({
@@ -569,8 +568,13 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 				warnings.push(`Invalid extension path in ${settingsPath}: ${String(entry)}`);
 				continue;
 			}
+			const resolvedPath = await resolveExtensionPath(entry);
+			if (!resolvedPath) {
+				warnings.push(`Extension path escapes isolated home in ${settingsPath}: ${entry}`);
+				continue;
+			}
 			settingsExtensions.push({
-				resolvedPath: resolveExtensionPath(entry),
+				resolvedPath,
 				settingsPath,
 				level,
 			});
