@@ -103,11 +103,19 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 
 function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: string; depth: number }> {
 	const ancestors: Array<{ dir: string; depth: number }> = [];
-	let current = cwd;
+	const resolvedCwd = path.resolve(cwd);
+	const resolvedStop = stopAt ? path.resolve(stopAt) : null;
+	const stopIsAncestor =
+		!resolvedStop ||
+		resolvedStop === resolvedCwd ||
+		(!path.relative(resolvedStop, resolvedCwd).startsWith(`..${path.sep}`) &&
+			!path.isAbsolute(path.relative(resolvedStop, resolvedCwd)));
+	const effectiveStop = stopIsAncestor ? resolvedStop : resolvedCwd;
+	let current = resolvedCwd;
 	let depth = 0;
 	while (true) {
 		ancestors.push({ dir: current, depth });
-		if (stopAt && current === stopAt) break;
+		if (effectiveStop && current === effectiveStop) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
@@ -302,7 +310,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 		}
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot ?? ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
 		const projectContent = await readFile(projectPath);
@@ -433,7 +441,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
 	if (userRule) items.push(userRule);
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot ?? ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
@@ -957,7 +965,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot ?? ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
 		const projectContent = await readFile(projectPath);

@@ -38,6 +38,11 @@ const providerMeta = new Map<string, { displayName: string; description: string 
 /** Disabled providers (by ID) */
 const disabledProviders = new Set<string>();
 
+function isWithinOrEqual(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
 /** Session-local settings keyed by normalized working directory. */
@@ -295,7 +300,8 @@ export async function loadCapabilityForHome<T>(
 		: path.join(resolvedHome, getConfigDirName(), "agent");
 
 	const cwd = path.resolve(options.cwd ?? getProjectDir());
-	const repoRoot = await findRepoRoot(cwd);
+	const repoRootCandidate = await findRepoRoot(cwd);
+	const repoRoot = repoRootCandidate && isWithinOrEqual(home, repoRootCandidate) ? repoRootCandidate : null;
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = { cwd, home: resolvedHome, userAgentDir, repoRoot, settings: isolatedOptions.settings };
 	const providers = filterProviders(capability, isolatedOptions);

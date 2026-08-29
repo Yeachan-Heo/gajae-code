@@ -145,6 +145,16 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.items.map(item => item.content)).toEqual(["# project system"]);
 	});
 
+	test("explicit home does not walk a no-repo cwd into unrelated ancestors", async () => {
+		await writeFile(path.join(tempDir, ".gjc", "SYSTEM.md"), "# unrelated ancestor system");
+		clearCache();
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+		expect(result.items).toEqual([]);
+	});
+
 	test("explicit home performs zero reads of the decoy process profile across every user-scope surface", async () => {
 		const homeAgentDir = path.join(home, ".gjc", "agent");
 		const decoyAgentDir = path.join(tempDir, "process-decoy", ".gjc", "agent");
