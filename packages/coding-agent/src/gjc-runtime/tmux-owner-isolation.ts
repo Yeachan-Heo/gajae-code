@@ -1378,8 +1378,8 @@ export function replaceOwnerGenerationSync(
 		if (previous.state === "current" && previous.generation !== generation) {
 			const priorIntent = lifecyclePaths(stateDir, sessionId, previous.generation).intentFile;
 			try {
-				const intent = JSON.parse(fsSync.readFileSync(priorIntent, "utf8")) as { state?: unknown };
-				if (intent.state === "pending") fsSync.renameSync(priorIntent, `${priorIntent}.invalidated`);
+				const intent = readNoFollowJsonSync(priorIntent) as { state?: unknown } | null;
+				if (intent?.state === "pending") fsSync.renameSync(priorIntent, `${priorIntent}.invalidated`);
 			} catch {}
 		}
 		db.exec("COMMIT");
@@ -1636,7 +1636,7 @@ export async function createOwnerIntent(
 	};
 	if (!isValidOwnerIntent(intent)) throw new Error("owner_intent_invalid");
 	const paths = lifecyclePaths(stateDir, input.session_id, input.generation);
-	await fs.mkdir(paths.root, { recursive: true });
+	await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
 	if (await existingOwnerVerdictBlocksIntent(paths, input)) throw new Error("owner_intent_replay");
 	for (const suffix of BLOCKING_INTENT_SUFFIXES) {
 		if (await intentMarkerExists(`${paths.intentFile}${suffix}`)) throw new Error("owner_intent_replay");
@@ -2602,13 +2602,12 @@ function ensureGenerationMarkerSync(
 		publishImmutableGenerationMarkerSync(file, generation);
 	} catch (error) {
 		if ((error as Error).message !== "generation_replay") throw error;
-		let existing: unknown;
 		try {
-			existing = JSON.parse(fsSync.readFileSync(file, "utf8"));
+			const existing = readNoFollowJsonSync(file);
+			if (existing === null || JSON.stringify(existing) !== JSON.stringify(generation)) throw error;
 		} catch {
 			throw error;
 		}
-		if (JSON.stringify(existing) !== JSON.stringify(generation)) throw error;
 	}
 }
 
