@@ -643,11 +643,9 @@ export async function resolveSessionListSelection(
 /**
  * Per-call ceiling on scope-exclusion warnings.
  *
- * One warning per excluded non-Git session made the list response grow with the number of
- * sessions on the machine, not with the result: a `--scope repo` call on a developer machine
- * returned 317 sessions alongside 314 warnings, roughly 52 KB of warning text inside a 196 KB
- * response. The signal a caller needs is "some workspaces were excluded and how many", so a
- * bounded sample plus an exact total carries it without the bloat.
+ * One warning per excluded non-Git session can make the list response grow with the number of
+ * sessions on the machine. The signal a caller needs is "some workspaces were excluded and how
+ * many", so a bounded sample plus exact totals carries it without unbounded warning output.
  */
 export const SESSION_LIST_WARNING_LIMIT = 10;
 
@@ -708,16 +706,23 @@ export function boundWarningSources(
 	const omitted = sources
 		.map(source => ({ source, count: source.entries.length }))
 		.filter(item => item.count > 0)
-		.map(item => ({ ...item, summary: item.source.describeOmitted(item.count) }));
+		.map(item => ({ ...item }));
 	const summaryCount = Math.min(omitted.length, SESSION_LIST_WARNING_LIMIT);
 	const samples: string[] = [];
+	const retainedCounts = new Map<(typeof sources)[number], number>();
 	let remaining = SESSION_LIST_WARNING_LIMIT - summaryCount;
 	for (const source of sources) {
 		const retained = source.entries.slice(0, remaining);
 		samples.push(...retained);
 		remaining -= retained.length;
+		retainedCounts.set(source, retained.length);
 	}
-	return [...samples, ...omitted.slice(0, summaryCount).map(item => item.summary)];
+	return [
+		...samples,
+		...omitted
+			.slice(0, summaryCount)
+			.map(item => item.source.describeOmitted(item.count - (retainedCounts.get(item.source) ?? 0))),
+	];
 }
 
 async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unknown> {
