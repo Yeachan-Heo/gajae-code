@@ -1294,7 +1294,7 @@ export function readNoFollowJsonSync(file: string): unknown | null {
 	if (!before.isFile()) throw new Error("baseline_generation_corrupt");
 	let fd: number;
 	try {
-		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
+		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK;
 		fd = fsSync.openSync(file, fsSync.constants.O_RDONLY | noFollow);
 	} catch {
 		throw new Error("baseline_generation_corrupt");
