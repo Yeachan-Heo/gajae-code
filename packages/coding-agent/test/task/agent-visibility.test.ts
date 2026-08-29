@@ -128,11 +128,11 @@ describe("task agent visibility", () => {
 		});
 		const session = createProfileSession(agentDir);
 		const tool = await TaskTool.create(session);
-		expect(discover).toHaveBeenLastCalledWith(session.cwd, undefined, session.settings, agentDir);
+		expect(discover).toHaveBeenLastCalledWith(session.cwd, undefined, session.settings, agentDir, undefined);
 
 		discover.mockClear();
 		await tool.execute("profile-refresh", { agent: "executor", tasks: [] } as TaskParams);
-		expect(discover).toHaveBeenLastCalledWith(session.cwd, undefined, session.settings, agentDir);
+		expect(discover).toHaveBeenLastCalledWith(session.cwd, undefined, session.settings, agentDir, undefined);
 	});
 
 	it("isolates settings-owned and explicit task agent profiles without cross-session bleed", async () => {

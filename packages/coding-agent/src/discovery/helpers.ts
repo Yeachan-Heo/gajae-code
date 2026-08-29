@@ -18,7 +18,6 @@ import { invalidate as invalidateFsCache, readDirEntries, readFile } from "../ca
 import { parseRuleConditionAndScope, type Rule, type RuleFrontmatter } from "../capability/rule";
 import type { Skill, SkillFrontmatter } from "../capability/skill";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { getProfilePluginsDir } from "../extensibility/plugins/marketplace/registry";
 import type { ForkContextPolicy } from "../task/types";
 import { parseThinkingLevel } from "../thinking";
 
@@ -925,11 +924,7 @@ export async function listClaudePluginRoots(
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	const userPluginsDir =
-		profileAuthority === "custom" && userAgentDir
-			? path.join(userAgentDir, "plugins")
-			: home === getTrustedHomeDir()
-				? getProfilePluginsDir()
-				: getPluginsDir(home);
+		profileAuthority === "custom" && userAgentDir ? path.join(userAgentDir, "plugins") : getPluginsDir(home);
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {

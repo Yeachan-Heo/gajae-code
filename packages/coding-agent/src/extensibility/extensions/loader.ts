@@ -696,11 +696,13 @@ export async function discoverAndLoadExtensions(
 	disabledExtensionIds: string[] = [],
 	agentDir?: string,
 	settings?: Settings,
+	profileAuthority?: "default" | "custom",
 ): Promise<LoadExtensionsResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds);
 	const selectedAgentDir = agentDir ?? settings?.getAgentDir();
+	const selectedProfileAuthority = profileAuthority ?? (selectedAgentDir ? "custom" : "default");
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
@@ -724,6 +726,7 @@ export async function discoverAndLoadExtensions(
 		cwd,
 		agentDir: selectedAgentDir,
 		settings,
+		profileAuthority: selectedProfileAuthority,
 	});
 	for (const ext of discovered.items) {
 		if (ext._source.provider !== "native") continue;
@@ -732,7 +735,7 @@ export async function discoverAndLoadExtensions(
 	}
 
 	// 2. Discover extension entry points from installed plugins
-	addPaths(await getAllPluginExtensionPaths(cwd, selectedAgentDir));
+	addPaths(await getAllPluginExtensionPaths(cwd, selectedAgentDir, selectedProfileAuthority));
 
 	// 3. Explicitly configured paths
 	for (const configuredPath of configuredPaths) {

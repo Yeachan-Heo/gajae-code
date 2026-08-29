@@ -21,8 +21,11 @@ installLegacyPiSpecifierShim();
 /**
  * Load plugin runtime config from lock file.
  */
-async function loadRuntimeConfig(agentDir?: string): Promise<PluginRuntimeConfig> {
-	const lockPath = path.join(getProfilePluginsDir(agentDir), "gjc-plugins.lock.json");
+async function loadRuntimeConfig(
+	agentDir?: string,
+	profileAuthority: "default" | "custom" = agentDir ? "custom" : "default",
+): Promise<PluginRuntimeConfig> {
+	const lockPath = path.join(getProfilePluginsDir(agentDir, profileAuthority), "gjc-plugins.lock.json");
 	try {
 		return await Bun.file(lockPath).json();
 	} catch (err) {
@@ -49,8 +52,12 @@ async function loadProjectOverrides(cwd: string): Promise<ProjectPluginOverrides
  * Get list of enabled plugins with their resolved configurations.
  * Respects both global runtime config and project overrides.
  */
-export async function getEnabledPlugins(cwd: string, agentDir?: string): Promise<InstalledPlugin[]> {
-	const pluginsDir = getProfilePluginsDir(agentDir);
+export async function getEnabledPlugins(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority: "default" | "custom" = agentDir ? "custom" : "default",
+): Promise<InstalledPlugin[]> {
+	const pluginsDir = getProfilePluginsDir(agentDir, profileAuthority);
 	const pkgJsonPath = path.join(pluginsDir, "package.json");
 	let pkg: { dependencies?: Record<string, string> };
 	try {
@@ -66,7 +73,7 @@ export async function getEnabledPlugins(cwd: string, agentDir?: string): Promise
 	}
 
 	const deps = pkg.dependencies || {};
-	const runtimeConfig = await loadRuntimeConfig(agentDir);
+	const runtimeConfig = await loadRuntimeConfig(agentDir, profileAuthority);
 	const projectOverrides = await loadProjectOverrides(cwd);
 	const plugins: InstalledPlugin[] = [];
 	for (const [name] of Object.entries(deps)) {
@@ -222,8 +229,12 @@ export function resolvePluginExtensionPaths(plugin: InstalledPlugin): string[] {
 /**
  * Get all tool paths from all enabled plugins.
  */
-export async function getAllPluginToolPaths(cwd: string, agentDir?: string): Promise<string[]> {
-	const plugins = await getEnabledPlugins(cwd, agentDir);
+export async function getAllPluginToolPaths(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
+): Promise<string[]> {
+	const plugins = await getEnabledPlugins(cwd, agentDir, profileAuthority ?? (agentDir ? "custom" : "default"));
 	const paths: string[] = [];
 
 	for (const plugin of plugins) {
@@ -236,8 +247,12 @@ export async function getAllPluginToolPaths(cwd: string, agentDir?: string): Pro
 /**
  * Get all hook paths from all enabled plugins.
  */
-export async function getAllPluginHookPaths(cwd: string, agentDir?: string): Promise<string[]> {
-	const plugins = await getEnabledPlugins(cwd, agentDir);
+export async function getAllPluginHookPaths(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
+): Promise<string[]> {
+	const plugins = await getEnabledPlugins(cwd, agentDir, profileAuthority ?? (agentDir ? "custom" : "default"));
 	const paths: string[] = [];
 
 	for (const plugin of plugins) {
@@ -250,8 +265,12 @@ export async function getAllPluginHookPaths(cwd: string, agentDir?: string): Pro
 /**
  * Get all command paths from all enabled plugins.
  */
-export async function getAllPluginCommandPaths(cwd: string, agentDir?: string): Promise<string[]> {
-	const plugins = await getEnabledPlugins(cwd, agentDir);
+export async function getAllPluginCommandPaths(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
+): Promise<string[]> {
+	const plugins = await getEnabledPlugins(cwd, agentDir, profileAuthority ?? (agentDir ? "custom" : "default"));
 	const paths: string[] = [];
 
 	for (const plugin of plugins) {
@@ -264,8 +283,12 @@ export async function getAllPluginCommandPaths(cwd: string, agentDir?: string): 
 /**
  * Get all extension module paths from all enabled plugins.
  */
-export async function getAllPluginExtensionPaths(cwd: string, agentDir?: string): Promise<string[]> {
-	const plugins = await getEnabledPlugins(cwd, agentDir);
+export async function getAllPluginExtensionPaths(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
+): Promise<string[]> {
+	const plugins = await getEnabledPlugins(cwd, agentDir, profileAuthority ?? (agentDir ? "custom" : "default"));
 	const paths: string[] = [];
 
 	for (const plugin of plugins) {
