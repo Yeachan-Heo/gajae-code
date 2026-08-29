@@ -238,15 +238,22 @@ export class HindsightSessionState {
 	}
 
 	setSessionId(sessionId: string): void {
+		if (sessionId === this.sessionId) return;
 		this.sessionId = sessionId;
+		this.#advanceTrackingGeneration();
 	}
 
 	resetConversationTracking(): void {
-		this.#trackingGeneration++;
+		this.#advanceTrackingGeneration();
 		this.lastRetainedTurn = 0;
 		this.hasRecalledForFirstTurn = false;
 		this.lastRecallSnippet = undefined;
 		this.lastInjectedRecallSnippetHash = undefined;
+	}
+
+	#advanceTrackingGeneration(): void {
+		this.#trackingGeneration++;
+		this.#autoRetainPending = false;
 	}
 
 	/** Return the current recall payload, resolving subagent aliases to their primary state. */
@@ -333,7 +340,7 @@ export class HindsightSessionState {
 			tags: this.retainTags,
 			async: true,
 		});
-		return true;
+		return trackingGeneration === this.#trackingGeneration;
 	}
 
 	async maybeRetainOnAgentEnd(): Promise<void> {
@@ -453,7 +460,9 @@ export class HindsightSessionState {
 
 		const query = composeRecallQuery(lastUser.content, messages, this.config.recallContextTurns);
 		const truncated = truncateRecallQuery(query, lastUser.content, this.config.recallMaxQueryChars);
+		const trackingGeneration = this.#trackingGeneration;
 		const { context } = await this.recallForContext(truncated);
+		if (trackingGeneration !== this.#trackingGeneration) return undefined;
 		return context ?? undefined;
 	}
 

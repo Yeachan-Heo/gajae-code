@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getOrCreateClient,
+	notifySaved,
+	refreshFile,
 	releaseLspScope,
 	retainLspScope,
 	sendNotification,
@@ -11,7 +13,7 @@ import {
 	shutdownAll,
 	waitForProjectLoaded,
 } from "../../src/lsp/client";
-import type { ServerConfig } from "../../src/lsp/types";
+import type { LspClient, ServerConfig } from "../../src/lsp/types";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 
 const BUN = process.execPath;
@@ -39,6 +41,32 @@ function serverConfig(command: string, args: string[] = []): ServerConfig {
 		fileTypes: ["ts"],
 		rootMarkers: [],
 	};
+}
+
+function createTestClient(stdin: { write: (message: string) => unknown; flush: () => Promise<void> }): LspClient {
+	return {
+		name: "test-lsp",
+		cwd: "/tmp/test-lsp",
+		config: serverConfig("test-lsp"),
+		proc: { stdin } as unknown as LspClient["proc"],
+		requestId: 0,
+		diagnostics: new Map(),
+		diagnosticsVersion: 0,
+		openFiles: new Map(),
+		pendingRequests: new Map(),
+		messageBuffer: new Uint8Array(),
+		isReading: false,
+		lastActivity: Date.now(),
+		writeQueue: Promise.resolve(),
+		activeProgressTokens: new Set(),
+		projectLoaded: Promise.resolve(),
+		resolveProjectLoaded: () => {},
+	};
+}
+
+function parseWrittenMessage(message: string): { method?: string; params?: unknown } {
+	const separator = message.indexOf("\r\n\r\n");
+	return JSON.parse(message.slice(separator + 4)) as { method?: string; params?: unknown };
 }
 
 async function writeFakeLspServer(dir: string, options?: { initDelayMs?: number }): Promise<string> {
@@ -204,6 +232,143 @@ describe("LSP lifecycle behavior", () => {
 
 		await waitForProjectLoaded(client, controller.signal);
 		expect(activeAbortListeners).toBe(0);
+	});
+
+	it("serializes refresh/save and skips a save after the URI is closed for a replacement client", async () => {
+		const cwd = await tempDir("gjc-lsp-save-replacement-");
+		try {
+			const filePath = path.join(cwd, "example.ts");
+			await Bun.write(filePath, "export const value = 1;\n");
+			const uri = `file://${filePath}`;
+			const writes: Array<{ method?: string; params?: unknown }> = [];
+			let releaseRefresh!: () => void;
+			const refreshGate = new Promise<void>(resolve => {
+				releaseRefresh = resolve;
+			});
+			let refreshStarted!: () => void;
+			const refreshWriteStarted = new Promise<void>(resolve => {
+				refreshStarted = resolve;
+			});
+			const stdin = {
+				write: async (message: string) => {
+					const parsed = parseWrittenMessage(message);
+					writes.push(parsed);
+					if (parsed.method === "textDocument/didChange") {
+						refreshStarted();
+						await refreshGate;
+					}
+				},
+				flush: async () => {},
+			};
+			const client = createTestClient(stdin);
+			client.openFiles.set(uri, { version: 1, languageId: "typescript" });
+
+			const refreshPromise = refreshFile(client, filePath);
+			await refreshWriteStarted;
+			const savePromise = notifySaved(client, filePath);
+			const replacementWrites: Array<{ method?: string; params?: unknown }> = [];
+			const replacementStdin = {
+				write: async (message: string) => {
+					replacementWrites.push(parseWrittenMessage(message));
+				},
+				flush: async () => {},
+			};
+			const replacementClient = createTestClient(replacementStdin);
+			replacementClient.openFiles.set(uri, { version: 1, languageId: "typescript" });
+			await notifySaved(replacementClient, filePath);
+
+			// The old generation is closed while its save waits behind refresh. A
+			// replacement client may track the same URI, but must not make the old
+			// client's queued save eligible to send.
+			client.openFiles.delete(uri);
+			releaseRefresh();
+
+			await Promise.all([refreshPromise, savePromise]);
+			expect(writes.filter(message => message.method === "textDocument/didSave")).toHaveLength(1);
+			expect(replacementWrites.filter(message => message.method === "textDocument/didSave")).toHaveLength(1);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("checks cancellation again immediately before sending didSave", async () => {
+		const cwd = await tempDir("gjc-lsp-save-abort-before-write-");
+		try {
+			const filePath = path.join(cwd, "example.ts");
+			await Bun.write(filePath, "export const value = 1;\n");
+			const uri = `file://${filePath}`;
+			const controller = new AbortController();
+			const writes: Array<{ method?: string; params?: unknown }> = [];
+			const stdin = {
+				write: async (message: string) => {
+					writes.push(parseWrittenMessage(message));
+				},
+				flush: async () => {},
+			};
+			const client = createTestClient(stdin);
+			class AbortOnHasMap extends Map<string, { version: number; languageId: string }> {
+				has(key: string) {
+					const present = super.has(key);
+					controller.abort();
+					return present;
+				}
+			}
+			client.openFiles = new AbortOnHasMap([[uri, { version: 1, languageId: "typescript" }]]);
+
+			await expect(notifySaved(client, filePath, controller.signal)).rejects.toThrow();
+			await Bun.sleep(0);
+			expect(writes.filter(message => message.method === "textDocument/didSave")).toHaveLength(0);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("returns a cancelled save without waiting for a stalled predecessor", async () => {
+		const cwd = await tempDir("gjc-lsp-save-cancel-");
+		try {
+			const filePath = path.join(cwd, "example.ts");
+			await Bun.write(filePath, "export const value = 1;\n");
+			const uri = `file://${filePath}`;
+			let releaseRefresh!: () => void;
+			const refreshGate = new Promise<void>(resolve => {
+				releaseRefresh = resolve;
+			});
+			let refreshStarted!: () => void;
+			const refreshWriteStarted = new Promise<void>(resolve => {
+				refreshStarted = resolve;
+			});
+			const stdin = {
+				write: async (message: string) => {
+					if (parseWrittenMessage(message).method === "textDocument/didChange") {
+						refreshStarted();
+						await refreshGate;
+					}
+				},
+				flush: async () => {},
+			};
+			const client = createTestClient(stdin);
+			client.openFiles.set(uri, { version: 1, languageId: "typescript" });
+
+			const refreshPromise = refreshFile(client, filePath);
+			await refreshWriteStarted;
+			const controller = new AbortController();
+			const savePromise = notifySaved(client, filePath, controller.signal);
+			controller.abort();
+
+			const outcome = await Promise.race([
+				savePromise.then(
+					() => "resolved" as const,
+					() => "rejected" as const,
+				),
+				Bun.sleep(100).then(() => "timeout" as const),
+			]);
+			expect(outcome).toBe("rejected");
+
+			releaseRefresh();
+			await refreshPromise;
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it("lspmux status probe clears its timeout and reaps the probe process when status hangs", async () => {

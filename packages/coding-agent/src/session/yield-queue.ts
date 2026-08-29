@@ -31,6 +31,21 @@ interface StoredDispatcher {
 	build: (survivors: unknown[]) => AgentMessage | null;
 }
 
+interface BuiltMessage {
+	message: AgentMessage;
+	kind: string;
+	dispatcher: StoredDispatcher;
+	entries: unknown[];
+}
+
+interface DeferredIdleMessage {
+	message: AgentMessage;
+	/** Raw queue provenance. Legacy callers may provide only a built message. */
+	kind?: string;
+	dispatcher?: StoredDispatcher;
+	entries?: unknown[];
+}
+
 function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -40,7 +55,8 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, unknown[]>();
 	#idleFlushPending = false;
-	#deferredIdleMessages: AgentMessage[] = [];
+	#deferredIdleMessages: DeferredIdleMessage[] = [];
+	readonly #messageProvenance = new WeakMap<AgentMessage, DeferredIdleMessage>();
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -57,6 +73,7 @@ export class YieldQueue {
 			if (this.#dispatchers.get(kind) !== stored) return;
 			this.#dispatchers.delete(kind);
 			this.#entries.delete(kind);
+			this.#deferredIdleMessages = this.#deferredIdleMessages.filter(entry => entry.kind !== kind);
 		};
 	}
 
@@ -77,7 +94,11 @@ export class YieldQueue {
 	}
 
 	has(kind?: string): boolean {
-		if (kind !== undefined) return (this.#entries.get(kind)?.length ?? 0) > 0;
+		if (kind !== undefined) {
+			if ((this.#entries.get(kind)?.length ?? 0) > 0) return true;
+			return this.#deferredIdleMessages.some(entry => entry.kind === kind);
+		}
+		if (this.#deferredIdleMessages.length > 0) return true;
 		for (const entries of this.#entries.values()) {
 			if (entries.length > 0) return true;
 		}
@@ -90,9 +111,9 @@ export class YieldQueue {
 			this.#idleFlushPending = false;
 		}
 		if (mode === "streaming" && this.#options.isTransitionFenced?.()) return;
-		const messages =
-			mode === "idle" ? [...this.#deferredIdleMessages, ...this.drainMessages()] : this.drainMessages();
-		if (mode === "idle") this.#deferredIdleMessages = [];
+		// Deferred idle deliveries stay idle-only: a streaming flush must not turn a
+		// transition-held completion into a prompt for the active turn.
+		const messages = this.#drainMessages(false, mode === "idle");
 		if (mode === "streaming") {
 			for (const message of messages) {
 				try {
@@ -114,25 +135,74 @@ export class YieldQueue {
 
 	deferIdle(messages: AgentMessage[]): void {
 		if (messages.length === 0) return;
-		this.#deferredIdleMessages.push(...messages);
+		for (const message of messages) {
+			const provenance = this.#messageProvenance.get(message);
+			this.#deferredIdleMessages.push(provenance ? { ...provenance } : { message });
+		}
 		this.#scheduleIdleFlush();
 	}
 
 	drainMessages(includeStale = false): AgentMessage[] {
-		const messages: AgentMessage[] = [];
+		return this.#drainMessages(includeStale, true);
+	}
+
+	drainKindMessages(kind: string, includeStale = false): AgentMessage[] {
+		const messages = this.#drainDeferredMessages(includeStale, kind);
+		const dispatcher = this.#dispatchers.get(kind);
+		if (!dispatcher) return messages;
+		const entries = this.#drain(kind);
+		if (entries.length > 0) messages.push(...this.#recordBuiltMessages(kind, dispatcher, entries, includeStale));
+		return messages;
+	}
+
+	#drainMessages(includeStale: boolean, includeDeferred: boolean): AgentMessage[] {
+		const messages = includeDeferred ? this.#drainDeferredMessages(includeStale) : [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
-			messages.push(...(this.#build(kind, dispatcher, entries, includeStale) ?? []));
+			messages.push(...this.#recordBuiltMessages(kind, dispatcher, entries, includeStale));
 		}
 		return messages;
 	}
 
-	drainKindMessages(kind: string, includeStale = false): AgentMessage[] {
-		const dispatcher = this.#dispatchers.get(kind);
-		if (!dispatcher) return [];
-		const entries = this.#drain(kind);
-		return entries.length === 0 ? [] : (this.#build(kind, dispatcher, entries, includeStale) ?? []);
+	#recordBuiltMessages(
+		kind: string,
+		dispatcher: StoredDispatcher,
+		entries: unknown[],
+		includeStale: boolean,
+	): AgentMessage[] {
+		const built = this.#build(kind, dispatcher, entries, includeStale) ?? [];
+		for (const item of built) {
+			this.#messageProvenance.set(item.message, {
+				message: item.message,
+				kind: item.kind,
+				dispatcher: item.dispatcher,
+				entries: item.entries,
+			});
+		}
+		return built.map(item => item.message);
+	}
+
+	#drainDeferredMessages(includeStale: boolean, kind?: string): AgentMessage[] {
+		if (this.#deferredIdleMessages.length === 0) return [];
+		const selected: DeferredIdleMessage[] = [];
+		const retained: DeferredIdleMessage[] = [];
+		for (const deferred of this.#deferredIdleMessages) {
+			if (kind === undefined || deferred.kind === kind) selected.push(deferred);
+			else retained.push(deferred);
+		}
+		this.#deferredIdleMessages = retained;
+		const messages: AgentMessage[] = [];
+		for (const deferred of selected) {
+			if (deferred.kind === undefined || deferred.dispatcher === undefined || deferred.entries === undefined) {
+				messages.push(deferred.message);
+				continue;
+			}
+			messages.push(
+				...this.#recordBuiltMessages(deferred.kind, deferred.dispatcher, deferred.entries, includeStale),
+			);
+		}
+		return messages;
 	}
 
 	clear(): void {
@@ -144,6 +214,7 @@ export class YieldQueue {
 	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
 	clearKind(kind: string): void {
 		this.#entries.delete(kind);
+		this.#deferredIdleMessages = this.#deferredIdleMessages.filter(entry => entry.kind !== kind);
 		this.#idleFlushPending = false;
 		this.rearmIdle();
 	}
@@ -189,7 +260,7 @@ export class YieldQueue {
 		return entries;
 	}
 
-	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[], includeStale = false): AgentMessage[] | null {
+	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[], includeStale = false): BuiltMessage[] | null {
 		// Corrected turn semantics (terminal abort): turn-scope abort blocks only
 		// deliveries whose origin is a continuation of the aborted turn.
 		// Owned-completion deliveries from work deliberately left running are
@@ -233,11 +304,11 @@ export class YieldQueue {
 				currentGroupKey = key;
 			}
 		}
-		const messages: AgentMessage[] = [];
+		const messages: BuiltMessage[] = [];
 		for (const group of groups.values()) {
 			try {
 				const message = dispatcher.build(group);
-				if (message) messages.push(message);
+				if (message) messages.push({ message, kind, dispatcher, entries: group });
 			} catch (error) {
 				logger.warn("Yield queue build failed", { kind, error: formatError(error) });
 			}
