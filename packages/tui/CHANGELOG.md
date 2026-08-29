@@ -20,6 +20,7 @@
 - Same-width TUI frames no longer scan the full raw transcript with `visibleWidth()` to decide whether a width reflow is required. That check is only consulted on an actual column change, so loader shimmer / layout-only ticks no longer remeasure every historical row 60 times a second. Resize admission is unchanged: a width change still walks raw rows until one exceeds the old/new width, then takes the existing reflow or no-reflow path.
 - Viewport-windowed emit reuses already-normalized rows whose raw bytes did not change, so `visibleWidths` only measures dirty lines in the live window (loader shimmer, edited composer rows) instead of remeasuring the whole `height + 8` overscan every frame. Prefix reuse, truncation, and byte-identical output vs a full normalize are unchanged.
 - Layout-only ticks no longer copy the full transcript array when the revisioned viewport-anchor cache hits and the suffix line count is unchanged. The renderer stitches only the before/after dirty window into a double buffer, so 60fps loader shimmer does not clone every historical row on each frame.
+- Layout-scoped loader ticks patch only the already-committed footer child's rows in the last frame (same height, live viewport) instead of walking the transcript tree through `#doRender`. Overlays, scrollback, line-count changes, and missing ranges still fall back to a layout render.
 
 ## [0.15.3] - 2026-08-27
 

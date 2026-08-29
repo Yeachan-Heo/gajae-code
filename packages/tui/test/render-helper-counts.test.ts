@@ -280,6 +280,74 @@ describe("TUI render helper counters", () => {
 		}
 	});
 
+	it("patches a footer component without copying the transcript", async () => {
+		const transcriptLines = 80;
+		const term = new VirtualTerminal(48, 12);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const transcript = new Container();
+		for (let index = 0; index < transcriptLines; index++) {
+			transcript.addChild(new MutableLinesComponent([`line-${index}`]));
+		}
+		const suffix = new MutableLinesComponent(["status-0"]);
+		tui.addChild(transcript);
+		tui.addChild(suffix);
+		tui.setBottomPinnedComponent(suffix);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setViewportOutputSource({ identity: "session:footer-patch", revision: 0n });
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			suffix.setLines(["status-patched"]);
+			tui.requestFooterPatch(suffix, "loader");
+			await settle(term);
+
+			const counters = TUI.getRenderCountersForTest();
+			expect(counters.footerPatches).toBeGreaterThan(0);
+			expect(counters.footerPatchFallbacks).toBe(0);
+			expect(counters.layoutFrameLineCopies).toBe(0);
+			expect(visible(term).some(line => line.includes("status-patched"))).toBe(true);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("falls back to a layout render when a footer patch would change line count", async () => {
+		const transcriptLines = 80;
+		const term = new VirtualTerminal(48, 12);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const transcript = new Container();
+		for (let index = 0; index < transcriptLines; index++) {
+			transcript.addChild(new MutableLinesComponent([`line-${index}`]));
+		}
+		const suffix = new MutableLinesComponent(["status-0"]);
+		tui.addChild(transcript);
+		tui.addChild(suffix);
+		tui.setBottomPinnedComponent(suffix);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setViewportOutputSource({ identity: "session:footer-fallback", revision: 0n });
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			suffix.setLines(["status-a", "status-b"]);
+			tui.requestFooterPatch(suffix, "loader");
+			await settle(term);
+
+			const counters = TUI.getRenderCountersForTest();
+			expect(counters.footerPatches).toBe(0);
+			expect(counters.footerPatchFallbacks).toBeGreaterThan(0);
+			expect(visible(term).some(line => line.includes("status-a"))).toBe(true);
+			expect(visible(term).some(line => line.includes("status-b"))).toBe(true);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("treats empty differential rows as zero-width without measuring them", async () => {
 		const term = new VirtualTerminal(12, 8);
 		const component = new MutableLinesComponent(["before", "", ""]);

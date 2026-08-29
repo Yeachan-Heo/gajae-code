@@ -136,21 +136,21 @@ describe("Loader component", () => {
 		tui.stop();
 	});
 
-	it("routes layout-scoped updates through requestLayoutRender", () => {
+	it("routes layout-scoped updates through requestFooterPatch", () => {
 		const term = new VirtualTerminal(40, 4);
 		const tui = new TUI(term);
 		let fullRequests = 0;
-		let layoutRequests = 0;
+		let footerRequests = 0;
 		const realRequestRender = tui.requestRender.bind(tui);
-		const realRequestLayoutRender = tui.requestLayoutRender.bind(tui);
+		const realRequestFooterPatch = tui.requestFooterPatch.bind(tui);
 		tui.requestRender = ((force?: boolean, source?: string) => {
 			if (source === "loader") fullRequests += 1;
 			return realRequestRender(force, source);
 		}) as typeof tui.requestRender;
-		tui.requestLayoutRender = ((source?: string) => {
-			if (source === "loader") layoutRequests += 1;
-			return realRequestLayoutRender(source);
-		}) as typeof tui.requestLayoutRender;
+		tui.requestFooterPatch = ((component, source?: string) => {
+			if (source === "loader") footerRequests += 1;
+			return realRequestFooterPatch(component, source);
+		}) as typeof tui.requestFooterPatch;
 
 		const loader = new Loader(
 			tui,
@@ -163,11 +163,11 @@ describe("Loader component", () => {
 			},
 		);
 		expect(fullRequests).toBe(0);
-		expect(layoutRequests).toBe(1);
+		expect(footerRequests).toBe(1);
 
 		loader.setMessage("Still working");
 		expect(fullRequests).toBe(0);
-		expect(layoutRequests).toBe(2);
+		expect(footerRequests).toBe(2);
 
 		loader.stop();
 		tui.stop();
@@ -198,11 +198,13 @@ describe("Loader component", () => {
 			await term.waitForRender();
 			expect(transcript.renderCount).toBe(1);
 
+			TUI.resetRenderCountersForTest();
 			loader.setMessage("Still working");
 			await term.waitForRender();
 
 			expect(transcript.renderCount).toBe(1);
 			expect(term.getViewport().join("\n")).toContain("Still working");
+			expect(TUI.getRenderCountersForTest().footerPatches).toBeGreaterThan(0);
 		} finally {
 			loader.stop();
 			tui.stop();
