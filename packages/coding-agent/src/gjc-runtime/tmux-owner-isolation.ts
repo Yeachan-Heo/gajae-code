@@ -2282,6 +2282,7 @@ function isBootstrapRequest(request: unknown): request is BootstrapRequest {
 		validArgv(request.tmux_argv) &&
 		isAttemptCapability(request.attempt) &&
 		request.attempt.socket_key === request.socket_key &&
+		isSafePathComponent(request.attempt.token, "attempt token") &&
 		request.attempt.server_absent_before
 	);
 }
@@ -2341,6 +2342,7 @@ function isAttemptCapability(value: unknown): value is AttemptCapability {
 		isRecord(value) &&
 		hasOnlyKeys(value, ["token", "session_name", "socket_key", "server_absent_before", "baseline", "expires_at"]) &&
 		nonEmpty(value.token) &&
+		isSafePathComponent(value.token, "attempt token") &&
 		nonEmpty(value.session_name) &&
 		nonEmpty(value.socket_key) &&
 		typeof value.server_absent_before === "boolean" &&
@@ -2348,6 +2350,15 @@ function isAttemptCapability(value: unknown): value is AttemptCapability {
 		nonEmpty(value.expires_at) &&
 		Number.isFinite(Date.parse(value.expires_at))
 	);
+}
+
+function isSafePathComponent(value: string, label: string): boolean {
+	try {
+		assertSafePathComponent(value, label);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function isPlatform(value: unknown): value is NodeJS.Platform {

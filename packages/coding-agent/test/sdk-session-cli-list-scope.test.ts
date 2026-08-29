@@ -329,4 +329,21 @@ describe("scope exclusion warnings are bounded", () => {
 		const result = await resolveSessionListSelection("all", path.join(tempRoot, "not-a-repository"));
 		expect(result.descriptor).toEqual({ scope: "all", path: path.join(tempRoot, "not-a-repository") });
 	});
+
+	test("never matches the unknown locator to cwd", async () => {
+		const repo = await makeRepo("unknown-cwd");
+		const unknownPath = path.join(repo, "unknown");
+		await mkdir(unknownPath);
+		const selection = await resolveSessionListSelection("cwd", unknownPath);
+		const row = {
+			sessionId: "unknown-row",
+			locator: { repo: "unknown", stateRoot: path.join(repo, ".gjc") },
+		} as SdkSessionRowV1;
+		const filtered = await filterSessionRowsByScope([row], "cwd", {
+			scope: "cwd",
+			selection: selection.selection,
+			descriptor: selection.descriptor,
+		});
+		expect(filtered.sessions).toEqual([]);
+	});
 });
