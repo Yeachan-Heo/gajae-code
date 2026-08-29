@@ -1283,7 +1283,7 @@ export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: 
 	};
 }
 
-function readNoFollowJsonSync(file: string): unknown | null {
+export function readNoFollowJsonSync(file: string): unknown | null {
 	let before: fsSync.Stats;
 	try {
 		before = fsSync.lstatSync(file);
