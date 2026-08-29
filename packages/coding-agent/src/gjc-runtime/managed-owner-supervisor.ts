@@ -227,7 +227,8 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				isValidOwnerIntent(candidate) &&
 				candidate.session_id === sessionId &&
 				candidate.generation === generation &&
-				candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV]
+				candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] &&
+				Date.parse(candidate.expires_at) > Date.now()
 			)
 				candidateIntent = candidate;
 		} catch (error) {
@@ -278,7 +279,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			operator_dispatch_id: terminalIntent.dispatch_id,
 			operator_intent_id: terminalIntent.intent_id,
 		});
-	} else if (child.signalCode || exitCode !== 0) {
+	} else if (sigtermRelayed || child.signalCode || (exitCode !== 0 && exitCode !== 75)) {
 		await observeOwnerTerminal({
 			schema_version: 1,
 			op: "observe_terminal",
@@ -288,7 +289,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
 			observer: "raw_monitor",
 			observed_at: new Date().toISOString(),
-			signal: (child.signalCode ?? "SIGTERM") as TerminalSignal,
+			signal: normalizeTerminalSignal(child.signalCode),
 			exit_code: exitCode,
 			exit_kind: child.signalCode ?? "supervisor_child_exit",
 			reason: "managed_owner_supervisor_unexpected_exit",
@@ -319,4 +320,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		return;
 	}
 	process.exitCode = exitCode;
+}
+
+function normalizeTerminalSignal(signal: NodeJS.Signals | null): TerminalSignal {
+	if (signal === "SIGTERM" || signal === "SIGHUP" || signal === "SIGINT" || signal === "SIGKILL") return signal;
+	if (signal === null) return "EXIT";
+	return "UNKNOWN";
 }
