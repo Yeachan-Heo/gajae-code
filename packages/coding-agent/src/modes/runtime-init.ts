@@ -214,6 +214,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
+				const withSdkControlMutation = <T>(body: () => Promise<T>): Promise<T> =>
+					session.withSdkControlMutation(body);
 				switch (operation) {
 					case "model.set": {
 						const selector = typeof input.id === "string" ? input.id : "";
@@ -309,8 +311,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 								code: "invalid_input",
 							});
 						}
-						session.setTodoPhases(phases as TodoPhase[]);
-						return { replaced: session.getTodoPhases() };
+						return await withSdkControlMutation(async () => {
+							session.setTodoPhases(phases as TodoPhase[]);
+							return { replaced: session.getTodoPhases() };
+						});
 					}
 					case "permission_mode.set": {
 						const requested = input.mode;
@@ -326,8 +330,10 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 							throw Object.assign(new Error("permission_mode.set requires prompt, allow, or deny."), {
 								code: "invalid_input",
 							});
-						session.setSdkPermissionMode(mode);
-						return { changed: true, mode: session.sdkPermissionMode };
+						return await withSdkControlMutation(async () => {
+							session.setSdkPermissionMode(mode);
+							return { changed: true, mode: session.sdkPermissionMode };
+						});
 					}
 					case "bash.execute": {
 						if (typeof input.cmd !== "string" || input.cmd.trim() === "")
@@ -346,17 +352,21 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { aborted: true };
 					}
 					case "retry.last": {
-						if (!(await session.retry()))
-							throw Object.assign(new Error("There is no failed or interrupted turn to retry."), {
-								code: "nothing_to_retry",
-							});
-						return { retried: true };
+						return await withSdkControlMutation(async () => {
+							if (!(await session.retry()))
+								throw Object.assign(new Error("There is no failed or interrupted turn to retry."), {
+									code: "nothing_to_retry",
+								});
+							return { retried: true };
+						});
 					}
 					case "retry.now": {
-						if (!session.isRetrying)
-							throw Object.assign(new Error("No retry backoff is pending."), { code: "retry_not_pending" });
-						session.retryNow();
-						return { retried: true, immediate: true };
+						return await withSdkControlMutation(async () => {
+							if (!session.isRetrying)
+								throw Object.assign(new Error("No retry backoff is pending."), { code: "retry_not_pending" });
+							session.retryNow();
+							return { retried: true, immediate: true };
+						});
 					}
 					case "bash.background": {
 						const outcome = await session.requestForegroundBashBackgroundOutcome("sdk_control");
@@ -364,14 +374,20 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { backgrounded: true, jobId: outcome.jobId };
 					}
 					case "compaction.auto.set":
-						session.setAutoCompactionEnabled(input.on === true);
-						return { changed: true };
+						return await withSdkControlMutation(async () => {
+							session.setAutoCompactionEnabled(input.on === true);
+							return { changed: true };
+						});
 					case "retry.auto.set":
-						session.setAutoRetryEnabled(input.on === true);
-						return { changed: true };
+						return await withSdkControlMutation(async () => {
+							session.setAutoRetryEnabled(input.on === true);
+							return { changed: true };
+						});
 					case "retry.abort":
-						session.abortRetry();
-						return { aborted: true };
+						return await withSdkControlMutation(async () => {
+							session.abortRetry();
+							return { aborted: true };
+						});
 					case "session.rename": {
 						const identityAdmission = session.captureSessionIdentityForMode();
 						const assertCurrentIdentity = (): void => {
@@ -406,59 +422,96 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						await session.reload();
 						return { reloaded: true };
 					case "service_tier.set":
-						session.setServiceTier(input.tier as never);
-						return { changed: true };
+						return await withSdkControlMutation(async () => {
+							session.setServiceTier(input.tier as never);
+							return { changed: true };
+						});
+					case "queue.steering_mode.set":
+						return await withSdkControlMutation(async () => {
+							if (input.mode !== "all" && input.mode !== "one-at-a-time")
+								throw Object.assign(new Error("Queue steering mode is unavailable."), { code: "unavailable" });
+							session.setSteeringMode(input.mode);
+							return { changed: true };
+						});
+					case "queue.follow_up_mode.set":
+						return await withSdkControlMutation(async () => {
+							if (input.mode !== "all" && input.mode !== "one-at-a-time")
+								throw Object.assign(new Error("Queue follow-up mode is unavailable."), { code: "unavailable" });
+							session.setFollowUpMode(input.mode);
+							return { changed: true };
+						});
+					case "queue.interrupt_mode.set":
+						return await withSdkControlMutation(async () => {
+							if (input.mode !== "immediate" && input.mode !== "wait")
+								throw Object.assign(new Error("Queue interrupt mode is unavailable."), { code: "unavailable" });
+							session.setInterruptMode(input.mode);
+							return { changed: true };
+						});
 					case "queue.message.remove": {
-						const removed = session.removeQueuedMessageForEditing(String(input.id));
-						if (removed === undefined)
-							throw Object.assign(new Error("Queued message was not found."), { code: "resource_gone" });
-						return { removed };
+						return await withSdkControlMutation(async () => {
+							const removed = session.removeQueuedMessageForEditing(String(input.id));
+							if (removed === undefined)
+								throw Object.assign(new Error("Queued message was not found."), { code: "resource_gone" });
+							return { removed };
+						});
 					}
 					case "queue.message.move": {
-						const id = String(input.id);
-						const moved =
-							input.before !== undefined
-								? session.moveQueuedMessageForEditing(id, "up")
-								: session.moveQueuedMessageForEditing(id, "down");
-						if (!moved)
-							throw Object.assign(new Error("Queue position is invalid."), { code: "invalid_position" });
-						return { moved };
+						return await withSdkControlMutation(async () => {
+							const id = String(input.id);
+							const moved =
+								input.before !== undefined
+									? session.moveQueuedMessageForEditing(id, "up")
+									: session.moveQueuedMessageForEditing(id, "down");
+							if (!moved)
+								throw Object.assign(new Error("Queue position is invalid."), { code: "invalid_position" });
+							return { moved };
+						});
 					}
 					case "queue.message.update": {
 						const id = String(input.id);
-						const old = session.removeQueuedMessageForEditing(id);
-						const patch = input.patch as { text?: unknown };
-						if (old === undefined || typeof patch?.text !== "string")
-							throw Object.assign(new Error("Queued message update is invalid."), { code: "invalid_message" });
-						await session.sendUserMessage(patch.text, {
-							deliverAs: id.startsWith("steer:") ? "steer" : "followUp",
+						const updated = await withSdkControlMutation(async () => {
+							const old = session.removeQueuedMessageForEditing(id);
+							const patch = input.patch as { text?: unknown };
+							if (old === undefined || typeof patch?.text !== "string")
+								throw Object.assign(new Error("Queued message update is invalid."), {
+									code: "invalid_message",
+								});
+							await session.sendUserMessage(patch.text, {
+								deliverAs: id.startsWith("steer:") ? "steer" : "followUp",
+								allowSdkControlMutationReentry: true,
+							});
+							return true;
 						});
+						if (!updated)
+							throw Object.assign(new Error("Queued message update is invalid."), { code: "invalid_message" });
 						return { updated: true };
 					}
 					case "extension.set_enabled": {
-						const id = String(input.id);
-						const disabled = [...(session.settings.get("disabledExtensions") ?? [])];
-						const on = input.on === true;
-						const next = on ? disabled.filter(value => value !== id) : [...new Set([...disabled, id])];
-						if (!session.settings.canWriteDurableConfig()) {
-							throw Object.assign(
-								new Error(
-									"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-								),
-								{ code: "invalid_request" },
-							);
-						}
-						try {
-							session.settings.set("disabledExtensions", next);
-						} catch (error) {
+						return await withSdkControlMutation(async () => {
+							const id = String(input.id);
+							const disabled = [...(session.settings.get("disabledExtensions") ?? [])];
+							const on = input.on === true;
+							const next = on ? disabled.filter(value => value !== id) : [...new Set([...disabled, id])];
 							if (!session.settings.canWriteDurableConfig()) {
-								throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), {
-									code: "invalid_request",
-								});
+								throw Object.assign(
+									new Error(
+										"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+									),
+									{ code: "invalid_request" },
+								);
 							}
-							throw error;
-						}
-						return { changed: true, enabled: on };
+							try {
+								session.settings.set("disabledExtensions", next);
+							} catch (error) {
+								if (!session.settings.canWriteDurableConfig()) {
+									throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), {
+										code: "invalid_request",
+									});
+								}
+								throw error;
+							}
+							return { changed: true, enabled: on };
+						});
 					}
 					case "session.cwd.move": {
 						const rescopeSessionCwd = session.rescopeSessionCwd;

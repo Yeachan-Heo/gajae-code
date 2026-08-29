@@ -3669,8 +3669,7 @@ function createControlSurface(
 		cycleThinking: () =>
 			ctx.cycleThinkingLevel ? { level: ctx.cycleThinkingLevel() } : unavailable("thinking.cycle")(),
 		setPermissionMode: mode => typed("permission_mode.set", { mode }),
-		setQueueMode: (kind, mode) =>
-			ctx.setQueueMode(kind as never, mode) ? { changed: true } : unavailable(`queue.${kind}_mode.set`)(),
+		setQueueMode: (kind, mode) => typed(`queue.${kind}_mode.set`, { mode }),
 		runCompaction: async () => {
 			await ctx.compact();
 			return { started: true };
