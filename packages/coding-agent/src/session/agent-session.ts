@@ -9180,6 +9180,41 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Reserve a successor endpoint while a transition performs fallible work.
+	 * The predecessor mapping remains in place until the synchronous commit/rekey
+	 * boundary, so a concurrent session cannot claim the successor after an
+	 * admission check and before owner-job settlement. A reservation that installed
+	 * a new mapping is released only on a pre-commit failure.
+	 */
+	#reserveJobManagerEndpoint(
+		successorSessionId: string,
+		successorSessionFile: string | undefined,
+	): { endpointId: string; release: () => void } | undefined {
+		const endpointId = this.#asyncJobEndpointId(successorSessionId, successorSessionFile);
+		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (!ownManager) return undefined;
+		this.#assertJobManagerEndpointAdmission(successorSessionId, successorSessionFile);
+		if (AsyncJobManager.forEndpoint(endpointId) === ownManager) {
+			return { endpointId, release: () => {} };
+		}
+		if (!AsyncJobManager.registerForEndpoint(endpointId, ownManager)) {
+			throw new Error(
+				`Session identity transition rejected: endpoint "${endpointId}" is owned by another live session's job manager.`,
+			);
+		}
+		let released = false;
+		return {
+			endpointId,
+			release: () => {
+				if (released) return;
+				released = true;
+				if (AsyncJobManager.forEndpoint(endpointId) === ownManager)
+					AsyncJobManager.unregisterForEndpoint(endpointId);
+			},
+		};
+	}
+
 	#rekeyJobManagerForSessionIdentity(
 		previousSessionId: string,
 		previousSessionFile: string | undefined,
@@ -15565,10 +15600,11 @@ export class AgentSession {
 			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const noLeasePreviousSessionFile = this.sessionManager.getSessionFile();
 			const prepared = await this.sessionManager.prepareNewSession(options);
+			let endpointReservation: { endpointId: string; release: () => void } | undefined;
 			try {
+				endpointReservation = this.#reserveJobManagerEndpoint(prepared.sessionId, prepared.sessionFile);
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
@@ -15576,6 +15612,7 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity, noLeasePreviousSessionFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				if (this.sessionManager.getSessionId() !== prepared.sessionId) endpointReservation?.release();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.setTodoPhases([]);
@@ -15642,10 +15679,11 @@ export class AgentSession {
 				throw new Error("Owned async jobs did not settle before session replacement.");
 			}
 			const prepared = await this.sessionManager.prepareNewSession(options);
+			let endpointReservation: { endpointId: string; release: () => void } | undefined;
 			try {
+				endpointReservation = this.#reserveJobManagerEndpoint(prepared.sessionId, prepared.sessionFile);
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
 				// Endpoint identity committed to the successor: re-register the
 				// manager so post-transition lineage bindings resolve and owned
@@ -15653,6 +15691,7 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionIdentityFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				if (this.sessionManager.getSessionId() !== prepared.sessionId) endpointReservation?.release();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#disconnectFromAgent();
@@ -15869,16 +15908,21 @@ export class AgentSession {
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
 				);
+				let endpointReservation: { endpointId: string; release: () => void } | undefined;
 				try {
+					endpointReservation = this.#reserveJobManagerEndpoint(
+						forkedManager.getSessionId(),
+						forkedManager.getSessionFile(),
+					);
 					await initializeLocalRoot({
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
 						isManagedDestination: () => forkedManager.isManagedDestination(),
 						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
 						getSessionId: () => forkedManager.getSessionId(),
 					});
-					this.#assertJobManagerEndpointAdmission(forkedManager.getSessionId(), forkedManager.getSessionFile());
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				} catch (error) {
+					endpointReservation?.release();
 					const forkedFile = forkedManager.getSessionFile();
 					const cleanupErrors: unknown[] = [];
 					try {
@@ -15923,9 +15967,10 @@ export class AgentSession {
 				// public manager getters remain bound to the predecessor.
 				const prepared = await this.sessionManager.prepareFork();
 				if (!prepared) return false;
+				let endpointReservation: { endpointId: string; release: () => void } | undefined;
 				try {
+					endpointReservation = this.#reserveJobManagerEndpoint(prepared.sessionId, prepared.sessionFile);
 					await initializeLocalRoot(this.#localProtocolOptions(prepared));
-					this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 					this.sessionManager.commitPreparedNewSession(prepared);
 					this.#quarantineQueuedAsyncResults();
@@ -15934,6 +15979,7 @@ export class AgentSession {
 					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 					await this.#runToolSessionTransitionCleanups();
 				} catch (error) {
+					if (this.sessionManager.getSessionId() !== prepared.sessionId) endpointReservation?.release();
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 				}
 			}
@@ -18230,6 +18276,7 @@ export class AgentSession {
 			let savedPath: string | undefined;
 			let committed = false;
 			let prepared: PreparedNewSession | undefined;
+			let endpointReservation: { endpointId: string; release: () => void } | undefined;
 			try {
 				// Prepare successor entries, persistence, display state, and gate
 				// construction without publishing manager identity. Managed local-root
@@ -18248,12 +18295,12 @@ export class AgentSession {
 					undefined,
 					"agent",
 				);
+				endpointReservation = this.#reserveJobManagerEndpoint(prepared.sessionId, prepared.sessionFile);
 				await this.sessionManager.ensurePreparedNewSessionOnDisk(prepared);
 				const sessionContext = this.buildPreparedDisplaySessionContext(prepared);
 				const successorGateEmitter = this.#constructWorkflowGateEmitter(prepared.sessionId);
 				// Last fallible action: verified local:// readiness from immutable staged options.
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
@@ -18331,6 +18378,7 @@ export class AgentSession {
 				// failure is non-destructive. Predecessor gate emitter, provider
 				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
 				// were never mutated before commit, so they survive intact.
+				if (!committed) endpointReservation?.release();
 				await this.sessionManager.restoreRollbackState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -23282,6 +23330,10 @@ export class AgentSession {
 	}
 
 	#flushOrSchedulePendingBackgroundExchanges(): void {
+		if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+			this.#scheduleBackgroundExchangeFlush();
+			return;
+		}
 		if (!this.isStreaming) {
 			this.#flushPendingBackgroundExchanges();
 			return;
@@ -23296,6 +23348,11 @@ export class AgentSession {
 			if (this.#pendingBackgroundExchanges.length === 0 || this.#isDisposed) {
 				this.#pendingBackgroundExchanges = [];
 				this.#scheduledBackgroundExchangeFlush = false;
+				return;
+			}
+			if (this.#sessionTransitionKind !== undefined || this.#handoffTransitionActive) {
+				const pollTimer = setTimeout(attempt, 50);
+				pollTimer.unref?.();
 				return;
 			}
 			if (this.isStreaming) {
@@ -23360,6 +23417,7 @@ export class AgentSession {
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
 		let ownerShutdownTransitionCommitted = false;
 		let ownerShutdownFinalizationDeferred = false;
+		let successorEndpointReservation: { endpointId: string; release: () => void } | undefined;
 		this.#beginSessionTransition("switch-session");
 		try {
 			const previousSessionFile = this.sessionManager.getSessionFile();
@@ -23446,13 +23504,13 @@ export class AgentSession {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
-				// setSessionFile rotated the endpoint identity to the successor;
-				// re-register the manager under it so post-transition lineage
-				// bindings resolve and owned aborts classify in the successor
-				// session (review thread P1).
-				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, previousSessionState.sessionFile, {
-					retirePredecessorRegistrations: false,
-				});
+				// Keep the predecessor endpoint registered while all post-load awaits
+				// and owner-job settlement run. This closes the admission window that
+				// otherwise lets a peer claim the successor after setSessionFile succeeds.
+				successorEndpointReservation = this.#reserveJobManagerEndpoint(
+					this.sessionManager.getSessionId(),
+					this.sessionManager.getSessionFile(),
+				);
 				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
@@ -23634,9 +23692,7 @@ export class AgentSession {
 							);
 						}
 					}
-					transitionCleanupCommitted = true;
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
-					ownerShutdownTransitionCommitted = true;
 					if (ownerShutdownSettled) {
 						// Every predecessor job/delivery has settled. Only now can its
 						// tuple evidence be retired; doing this immediately after rekey
@@ -23647,6 +23703,15 @@ export class AgentSession {
 					}
 					this.#quarantineQueuedAsyncResults();
 				}
+				// All fallible post-load work, including owner-job settlement and
+				// predecessor cleanup, has completed. Publish the successor endpoint
+				// only now; rollback can therefore leave predecessor identity/jobs
+				// untouched on any earlier failure.
+				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, previousSessionState.sessionFile, {
+					retirePredecessorRegistrations: false,
+				});
+				transitionCleanupCommitted = true;
+				ownerShutdownTransitionCommitted = true;
 				if (didReloadConversationChange && !switchingToDifferentSession) this.#quarantineQueuedAsyncResults();
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime
@@ -23675,35 +23740,9 @@ export class AgentSession {
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
-				// The switch never committed: rotate the manager's endpoint
-				// registration back to the predecessor before restoring it
-				// (review thread P1 — the map key must track the session id).
-				const successorEndpointId = this.#asyncJobEndpointId(
-					this.sessionManager.getSessionId(),
-					this.sessionManager.getSessionFile(),
-				);
-				const predecessorEndpointId = this.#asyncJobEndpointId(
-					previousSessionState.sessionId,
-					previousSessionState.sessionFile,
-				);
-				const rekeyed = AsyncJobManager.rekeyForEndpoint(
-					successorEndpointId,
-					predecessorEndpointId,
-					AsyncJobManager.forEndpoint(successorEndpointId),
-				);
-				if (!rekeyed) {
-					// Another top-level session claimed the freed predecessor endpoint
-					// while the switch's cleanup was in flight: restoring the old
-					// identity would leave this manager registered under the successor
-					// while tool lookups for the restored identity resolve the foreign
-					// manager, so same-ID jobs could be queried or cancelled across
-					// sessions and owned aborts lose their causal set (review thread
-					// P1). Fail the rollback instead of restoring into misattributed
-					// ownership; the caller surfaces the switch failure.
-					throw new Error(
-						`Session switch rollback aborted: predecessor endpoint "${previousSessionState.sessionId}" is no longer owned by this session.`,
-					);
-				}
+				// The predecessor mapping was deliberately never rekeyed. Release only
+				// the temporary successor claim before restoring the manager state.
+				successorEndpointReservation?.release();
 				await this.sessionManager.restoreRollbackState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
@@ -23831,9 +23870,10 @@ export class AgentSession {
 			const prepared = selectedEntry.parentId
 				? await this.sessionManager.prepareBranchedSession(selectedEntry.parentId)
 				: await this.sessionManager.prepareNewSession({ parentSession: previousSessionFile });
+			let endpointReservation: { endpointId: string; release: () => void } | undefined;
 			try {
+				endpointReservation = this.#reserveJobManagerEndpoint(prepared.sessionId, prepared.sessionFile);
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				this.sessionManager.commitPreparedNewSession(prepared);
 				this.#quarantineQueuedAsyncResults();
@@ -23842,6 +23882,7 @@ export class AgentSession {
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
+				if (this.sessionManager.getSessionId() !== prepared.sessionId) endpointReservation?.release();
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 			}
 			this.#pendingNextTurnMessages = [];

@@ -574,6 +574,85 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		await ownerManager.getJob(foreignJobId)?.promise;
 	});
 
+	it("reserves the successor endpoint while branch settlement cancels predecessor jobs", async () => {
+		const ownerManager = installOwnerManager();
+		const predecessorEndpoint = sessionManager.getSessionId();
+		expect(AsyncJobManager.registerForEndpoint(predecessorEndpoint, ownerManager)).toBe(true);
+		const userEntryId = sessionManager.appendMessage({
+			role: "user",
+			content: "branch reservation target",
+			timestamp: Date.now(),
+		});
+		await sessionManager.flush();
+		const ownerJobId = ownerManager.register(
+			"task",
+			"branch reservation predecessor",
+			async ({ signal }) => {
+				await waitForAbort(signal);
+				return "cancelled";
+			},
+			{ ownerId: "owner" },
+		);
+		let successorEndpoint: string | undefined;
+		const originalPrepare = sessionManager.prepareNewSession.bind(sessionManager);
+		vi.spyOn(sessionManager, "prepareNewSession").mockImplementation(async options => {
+			const prepared = await originalPrepare(options);
+			successorEndpoint = prepared.sessionId;
+			return prepared;
+		});
+		const foreignManager = new AsyncJobManager({ onJobComplete: async () => {} });
+		let successorClaim: boolean | undefined;
+		const originalSettle = ownerManager.cancelAndSettleOwnerJobs.bind(ownerManager);
+		vi.spyOn(ownerManager, "cancelAndSettleOwnerJobs").mockImplementation(async ownerId => {
+			if (!successorEndpoint) throw new Error("Successor endpoint was not prepared");
+			successorClaim = AsyncJobManager.registerForEndpoint(successorEndpoint, foreignManager);
+			return originalSettle(ownerId);
+		});
+
+		try {
+			await expect(session.branch(userEntryId)).resolves.toMatchObject({ cancelled: false });
+			expect(successorClaim).toBe(false);
+			expect(successorEndpoint).toBeDefined();
+			expect(ownerManager.getJob(ownerJobId)?.status).toBe("cancelled");
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBe(ownerManager);
+		} finally {
+			await foreignManager.dispose({ timeoutMs: 100 });
+		}
+	});
+
+	it("keeps predecessor endpoint identity when switch fails after successor load", async () => {
+		const ownerManager = installOwnerManager();
+		const predecessorEndpoint = sessionManager.getSessionId();
+		expect(AsyncJobManager.registerForEndpoint(predecessorEndpoint, ownerManager)).toBe(true);
+		const predecessorFile = session.sessionFile;
+		if (!predecessorFile) throw new Error("Expected a persisted predecessor session");
+		const targetManager = SessionManager.create(tempDir.path(), tempDir.path());
+		targetManager.appendMessage({ role: "user", content: "switch target", timestamp: Date.now() });
+		await targetManager.flush();
+		const targetFile = targetManager.getSessionFile();
+		const targetEndpoint = targetManager.getSessionId();
+		if (!targetFile) throw new Error("Expected a persisted switch target");
+		await targetManager.close();
+		vi.spyOn(sessionManager, "ensureOnDisk").mockRejectedValueOnce(new Error("post-load switch failure"));
+		const ownerGate = Promise.withResolvers<string>();
+		const ownerJobId = ownerManager.register("task", "switch predecessor", async () => ownerGate.promise, {
+			ownerId: "owner",
+		});
+
+		try {
+			await expect(session.switchSession(targetFile)).rejects.toThrow("post-load switch failure");
+			expect(session.sessionFile).toBe(predecessorFile);
+			expect(session.sessionId).toBe(predecessorEndpoint);
+			expect(ownerManager.getJob(ownerJobId)?.status).toBe("running");
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBe(ownerManager);
+			expect(AsyncJobManager.forEndpoint(targetEndpoint)).toBeUndefined();
+		} finally {
+			ownerGate.resolve("finished after rollback");
+			await ownerManager.getJob(ownerJobId)?.promise;
+		}
+	});
+
 	it("fences late same-owner generic admission while leaving foreign jobs isolated", async () => {
 		const ownerManager = installOwnerManager();
 		const foreignGate = Promise.withResolvers<void>();
