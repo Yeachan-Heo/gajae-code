@@ -27,6 +27,7 @@ import {
 	ShellSuccessSchema,
 	StepTimingSchema,
 	TextDeltaUpdateSchema,
+	TokenDeltaUpdateSchema,
 	TurnEndedUpdateSchema,
 } from "../src/providers/cursor/gen/agent_pb";
 import type { AssistantMessageEvent, Context, CursorShellStreamCallbacks, Model } from "../src/types";
@@ -1142,6 +1143,97 @@ describe("Cursor request lifecycle", () => {
 			releaseHandler();
 			await handlerFinished;
 			expect(clientChunks).toHaveLength(framesAtTerminal);
+		} finally {
+			releaseHandler();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("drains coalesced progress before a trailer terminal while an exec is held", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		server.on("stream", stream => {
+			stream.respond(
+				{ ":status": 200, "content-type": "application/connect+proto" },
+				{ waitForTrailers: true },
+			);
+			stream.once("wantTrailers", () => {
+				stream.sendTrailers({ "grpc-status": "13", "grpc-message": "buffered progress failure" });
+			});
+			stream.once("data", () => {
+				const text = create(AgentServerMessageSchema, {
+					message: {
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "partial" }) },
+						}),
+					},
+				});
+				const tokens = create(AgentServerMessageSchema, {
+					message: {
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 17 }) },
+						}),
+					},
+				});
+				const checkpoint = create(AgentServerMessageSchema, {
+					message: {
+						case: "conversationCheckpointUpdate",
+						value: create(ConversationStateStructureSchema, {
+							tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens: 99 }),
+						}),
+					},
+				});
+				stream.end(
+					Buffer.concat([
+						frameServerMessage(createReadExecMessage()),
+						frameServerMessage(text),
+						frameServerMessage(tokens),
+						frameServerMessage(checkpoint),
+					]),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: AssistantMessageEvent[] = [];
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						execHandlers: {
+							async read() {
+								markHandlerStarted();
+								await releasePromise;
+								return { result: createReadSuccessResult("late"), toolResult: undefined };
+							},
+						},
+					},
+				)) {
+					events.push(event);
+				}
+			})();
+
+			await handlerStarted;
+			await consume;
+			const terminalEvents = events.filter(event => event.type === "done" || event.type === "error");
+			expect(terminalEvents).toHaveLength(1);
+			const terminal = terminalEvents[0];
+			if (terminal.type !== "error") throw new Error("Expected terminal Cursor error");
+			expect(terminal.error.errorMessage).toContain("buffered progress failure");
+			expect(terminal.error.content).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }));
+			expect(terminal.error.usage.output).toBe(17);
+			releaseHandler();
 		} finally {
 			releaseHandler();
 			await new Promise<void>(resolve => server.close(() => resolve()));
