@@ -167,6 +167,7 @@ function createEditWritethrough(session: ToolSession): WritethroughCallback {
 				enableFormat: () => session.settings.get("lsp.formatOnWrite"),
 				enableDiagnostics: () => session.settings.get("lsp.diagnosticsOnEdit"),
 				agentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
+				profileAuthority: () => session.getSessionProfileAuthority?.(),
 			})
 		: writethroughNoop;
 }

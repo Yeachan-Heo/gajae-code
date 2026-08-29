@@ -464,6 +464,7 @@ export class VimTool implements AgentTool<typeof vimSchema, VimToolDetails> {
 					enableFormat: () => session.settings.get("lsp.formatOnWrite"),
 					enableDiagnostics: () => session.settings.get("lsp.diagnosticsOnWrite"),
 					agentDir: () => session.getSessionAgentDir?.() ?? session.settings.getAgentDir(),
+					profileAuthority: () => session.getSessionProfileAuthority?.(),
 				})
 			: writethroughNoop;
 		this.description = prompt.render(vimDescription);

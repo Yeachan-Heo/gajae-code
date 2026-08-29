@@ -445,10 +445,10 @@ function pluginCanOverrideProcess(root: ClaudePluginRoot, cwd: string): boolean 
  * Configuration sources in priority order.
  * Supports both visible and hidden variants at each config location.
  */
-function getConfigSources(cwd: string, agentDir?: string): ConfigSource[] {
+function getConfigSources(cwd: string, agentDir?: string, capturedAuthority?: "default" | "custom"): ConfigSource[] {
 	const filenames = ["lsp.json", ".lsp.json", "lsp.yaml", ".lsp.yaml", "lsp.yml", ".lsp.yml"];
 	const sources: ConfigSource[] = [];
-	const resolverAuthority = getAgentProfileAuthority();
+	const resolverAuthority = capturedAuthority ?? getAgentProfileAuthority();
 	const selectedAgentDir = agentDir ?? (resolverAuthority === "custom" ? getAgentDir() : undefined);
 	const profileAuthority =
 		resolverAuthority === "custom" ||
@@ -540,10 +540,10 @@ function getConfigSources(cwd: string, agentDir?: string): ConfigSource[] {
  * }
  * ```
  */
-export function loadConfig(cwd: string, agentDir?: string): LspConfig {
+export function loadConfig(cwd: string, agentDir?: string, profileAuthority?: "default" | "custom"): LspConfig {
 	let mergedServers = coerceServerConfigs(DEFAULTS);
 
-	const configSources = getConfigSources(cwd, agentDir).reverse();
+	const configSources = getConfigSources(cwd, agentDir, profileAuthority).reverse();
 	let hasOverrides = false;
 
 	let idleTimeoutMs: number | undefined;

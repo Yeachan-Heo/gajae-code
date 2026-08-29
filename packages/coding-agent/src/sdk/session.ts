@@ -5070,7 +5070,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// LSP-backed write operations create clients on demand through `getOrCreateClient`.
 		const lspServers =
 			enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")
-				? await discoverStartupLspServers(cwd, agentDir)
+				? await discoverStartupLspServers(cwd, agentDir, profileAuthority)
 				: undefined;
 
 		let memoryStartupTask: Promise<void> | undefined;

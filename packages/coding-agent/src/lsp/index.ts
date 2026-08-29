@@ -99,8 +99,12 @@ export interface LspWarmupOptions {
 	onConnecting?: (serverNames: string[]) => void;
 }
 
-export function discoverStartupLspServers(cwd: string, agentDir?: string): LspStartupServerInfo[] {
-	const config = loadConfig(cwd, agentDir);
+export function discoverStartupLspServers(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
+): LspStartupServerInfo[] {
+	const config = loadConfig(cwd, agentDir, profileAuthority);
 	return getLspServers(config).map(([name, serverConfig]) => ({
 		name,
 		status: "idle",
@@ -245,19 +249,19 @@ async function notifyFileSaved(
 // allowing same-cwd sessions to reuse another profile's ambient configuration.
 const configCache = new Map<string, LspConfig>();
 
-function getConfigCacheKey(cwd: string, agentDir?: string): string {
-	return JSON.stringify([cwd, agentDir ? path.resolve(agentDir) : ""]);
+function getConfigCacheKey(cwd: string, agentDir?: string, profileAuthority?: "default" | "custom"): string {
+	return JSON.stringify([cwd, agentDir ? path.resolve(agentDir) : "", profileAuthority ?? ""]);
 }
 
 function getSessionAgentDir(session: ToolSession): string | undefined {
 	return session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.();
 }
 
-function getConfig(cwd: string, agentDir?: string): LspConfig {
-	const key = getConfigCacheKey(cwd, agentDir);
+function getConfig(cwd: string, agentDir?: string, profileAuthority?: "default" | "custom"): LspConfig {
+	const key = getConfigCacheKey(cwd, agentDir, profileAuthority);
 	let config = configCache.get(key);
 	if (!config) {
-		config = loadConfig(cwd, agentDir);
+		config = loadConfig(cwd, agentDir, profileAuthority);
 		setIdleTimeout(config.idleTimeoutMs, cwd, agentDir);
 		configCache.set(key, config);
 	}
@@ -773,6 +777,8 @@ export interface WritethroughOptions {
 	enableDiagnostics?: boolean | (() => boolean);
 	/** Effective agent directory, resolved for each write when supplied as a getter. */
 	agentDir?: string | (() => string | undefined);
+	/** Stable resolver-owned profile authority for config-source selection. */
+	profileAuthority?: "default" | "custom" | (() => "default" | "custom" | undefined);
 	/** Called when diagnostics arrive after the main timeout. */
 	onDeferredDiagnostics?: (diagnostics: FileDiagnosticsResult) => void;
 	/** Signal to cancel a pending deferred diagnostics fetch. */
@@ -783,6 +789,7 @@ export interface WritethroughOptions {
 type ResolvedWritethroughOptions = {
 	enableFormat: boolean;
 	enableDiagnostics: boolean;
+	profileAuthority?: "default" | "custom";
 };
 
 /** Per-file deferred LSP diagnostics wiring for {@link WritethroughCallback}. */
@@ -1027,7 +1034,7 @@ async function runLspWritethrough(
 	},
 ): Promise<FileDiagnosticsResult | undefined> {
 	const { enableFormat, enableDiagnostics } = options;
-	const config = getConfig(cwd, agentDir);
+	const config = getConfig(cwd, agentDir, options.profileAuthority);
 	const servers = getServersForFile(config, dst);
 	if (servers.length === 0) {
 		return writethroughNoop(dst, content, signal, file);
@@ -1227,6 +1234,8 @@ export function createLspWritethrough(
 			typeof options?.enableDiagnostics === "function"
 				? options.enableDiagnostics()
 				: (options?.enableDiagnostics ?? false),
+		profileAuthority:
+			typeof options?.profileAuthority === "function" ? options.profileAuthority() : options?.profileAuthority,
 	});
 	const resolveCwd = typeof cwd === "function" ? cwd : () => cwd;
 	const agentDirOption = options?.agentDir;
@@ -1328,7 +1337,7 @@ export class LspTool implements AgentTool<typeof lspSchema, LspToolDetails, Them
 		throwIfAborted(signal);
 
 		const agentDir = getSessionAgentDir(this.session);
-		const config = getConfig(this.session.cwd, agentDir);
+		const config = getConfig(this.session.cwd, agentDir, this.session.getSessionProfileAuthority?.());
 
 		// Status action doesn't need a file
 		if (action === "status") {

@@ -187,6 +187,7 @@ import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	$pickCredentialEnv,
 	extractRetryHint,
+	getAgentDir,
 	hasFsCode,
 	isEacces,
 	isEnoent,
@@ -4392,7 +4393,10 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
-		this.#profileAuthority = config.profileAuthority ?? "default";
+		const resolverDefaultAgentDir = path.resolve(getAgentDir());
+		const effectiveAgentDir = this.#requestedAgentDir ?? path.resolve(this.settings.getAgentDir());
+		this.#profileAuthority =
+			config.profileAuthority === "custom" || effectiveAgentDir !== resolverDefaultAgentDir ? "custom" : "default";
 		retainLspScope(this.sessionManager.getCwd(), this.getSessionAgentDir());
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
