@@ -461,6 +461,8 @@ describe("tmux owner isolation", () => {
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, tmux_argv: ["tmux", ""] }))?.op).toBe("plan");
 		expect(parseOwnerIsolationRequest(`${JSON.stringify(request)}\nextra`)).toBeNull();
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, extra: true }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, session_id: "../escape" }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, owner_generation: "..\\escape" }))).toBeNull();
 		expect(parseOwnerIsolationRequest("x".repeat(16 * 1024 + 1))).toBeNull();
 		expect(
 			await planTmuxOwnerIsolation(request, {
