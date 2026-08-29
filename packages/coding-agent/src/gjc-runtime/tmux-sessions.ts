@@ -1581,14 +1581,44 @@ function signalManagedOwnerTerm(supervisor: Process, pid: number): boolean {
 
 async function readCurrentGeneration(stateDir: string, sessionId: string): Promise<string | null> {
 	try {
-		const value: unknown = JSON.parse(
-			await fs.readFile(path.join(stateDir, sessionId, "owner-lifecycle", "generation.json"), "utf8"),
+		const file = path.join(stateDir, sessionId, "owner-lifecycle", "generation.json");
+		const before = await fs.lstat(file, { bigint: true });
+		if (!before.isFile()) return null;
+		const handle = await fs.open(
+			file,
+			fsSync.constants.O_RDONLY | (process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW),
 		);
-		return typeof value === "object" &&
-			value !== null &&
-			typeof (value as { generation?: unknown }).generation === "string"
-			? (value as { generation: string }).generation
-			: null;
+		try {
+			const opened = await handle.stat({ bigint: true });
+			if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) return null;
+			const value: unknown = JSON.parse(await handle.readFile("utf8"));
+			const after = await handle.stat({ bigint: true });
+			const pathAfter = await fs.lstat(file, { bigint: true });
+			if (
+				!after.isFile() ||
+				!pathAfter.isFile() ||
+				after.dev !== before.dev ||
+				after.ino !== before.ino ||
+				after.size !== before.size ||
+				after.mtimeNs !== before.mtimeNs ||
+				after.ctimeNs !== before.ctimeNs ||
+				pathAfter.dev !== before.dev ||
+				pathAfter.ino !== before.ino
+			)
+				return null;
+			if (
+				typeof value !== "object" ||
+				value === null ||
+				(value as { schema_version?: unknown }).schema_version !== 1 ||
+				(value as { session_id?: unknown }).session_id !== sessionId ||
+				typeof (value as { generation?: unknown }).generation !== "string" ||
+				typeof (value as { published_at?: unknown }).published_at !== "string"
+			)
+				return null;
+			return (value as { generation: string }).generation;
+		} finally {
+			await handle.close();
+		}
 	} catch {
 		return null;
 	}
