@@ -202,4 +202,30 @@ describe("digestExactRegularFile", () => {
 			code: "not_found",
 		});
 	});
+
+	it.skipIf(process.platform !== "linux")("rejects an in-place mutation that races an async digest", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "large");
+		const size = 256 * 1024 * 1024;
+		const initial = await fs.open(file, "w");
+		try {
+			await initial.truncate(size);
+		} finally {
+			await initial.close();
+		}
+
+		const digest = digestExactRegularFileAsync(file);
+		await Bun.sleep(2);
+		const handle = await fs.open(file, "r+");
+		const chunk = Buffer.alloc(4 * 1024 * 1024, 0x62);
+		try {
+			for (let offset = 0; offset < size; offset += chunk.length) {
+				await handle.write(chunk, 0, chunk.length, offset);
+			}
+		} finally {
+			await handle.close();
+		}
+
+		expect(await digest).toEqual({ ok: false, code: "identity_mismatch" });
+	});
 });

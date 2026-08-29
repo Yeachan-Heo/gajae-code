@@ -5,7 +5,7 @@
 ### Added
 
 - `exactReplacePathAsync`, an async variant of `exactReplacePath` scheduled on the native blocking-work pool so managed session replacement can await identity hashing and the checked namespace exchange without blocking the host event loop.
-- `digestExactRegularFile` / `digestExactRegularFileAsync`, a no-follow regular-file SHA-256 plus the descriptor identity observed with that digest, so managed session persistence can hash on the native pool instead of `createHash` on the JS thread.
+- `digestExactRegularFile` / `digestExactRegularFileAsync`, a no-follow regular-file SHA-256 plus stable descriptor identity observed before and after hashing, so managed session persistence can hash on the native pool without accepting an in-place mutation race. Native loading fails fast when the required path-identity ABI is absent.
 
 ## [0.15.5] - 2026-08-29
 

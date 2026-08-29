@@ -753,6 +753,15 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 	if (typeof bindings.currentExecutablePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required executable identity capability \`currentExecutablePath\`.`);
 	}
+	for (const capability of [
+		"digestExactRegularFile",
+		"digestExactRegularFileAsync",
+		"exactReplacePathAsync",
+	]) {
+		if (typeof bindings[capability] !== "function") {
+			throw new Error(`Loaded ${candidate} but it lacks required path identity capability \`${capability}\`.`);
+		}
+	}
 }
 
 function buildHelpMessage(ctx) {

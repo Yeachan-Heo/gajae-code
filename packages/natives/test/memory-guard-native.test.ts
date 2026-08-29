@@ -76,4 +76,33 @@ describe("probeWindowsJobMemory", () => {
 			),
 		).toThrow("currentExecutablePath");
 	});
+
+	it("rejects stale bindings without the path-identity capabilities", () => {
+		const required = {
+			__piNativesVCurrent: () => undefined,
+			__piNativesPublishOutcomeV1: () => undefined,
+			renameNoReplacePath: () => undefined,
+			probeWindowsJobMemory: () => undefined,
+			currentExecutablePath: () => undefined,
+			digestExactRegularFile: () => undefined,
+			digestExactRegularFileAsync: () => undefined,
+			exactReplacePathAsync: () => undefined,
+		};
+
+		for (const capability of [
+			"digestExactRegularFile",
+			"digestExactRegularFileAsync",
+			"exactReplacePathAsync",
+		] as const) {
+			const bindings: Record<string, unknown> = { ...required };
+			delete bindings[capability];
+			expect(() =>
+				validateLoadedBindings(
+					{ versionSentinelExport: "__piNativesVCurrent", packageVersion: "current" },
+					bindings,
+					"cached-addon.node",
+				),
+			).toThrow(capability);
+		}
+	});
 });

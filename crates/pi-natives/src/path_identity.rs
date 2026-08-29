@@ -348,26 +348,26 @@ pub struct NativeExactFileDigest {
 impl NativeExactFileDigest {
 	fn failure(code: &str) -> Self {
 		Self {
-			ok: false,
-			code: Some(code.to_owned()),
-			sha256: None,
-			size: None,
-			dev: None,
-			ino: None,
-			nlink: None,
+			ok:       false,
+			code:     Some(code.to_owned()),
+			sha256:   None,
+			size:     None,
+			dev:      None,
+			ino:      None,
+			nlink:    None,
 			mtime_ns: None,
 		}
 	}
 
 	fn success(digest: [u8; 32], size: u64, dev: u64, ino: u64, nlink: u64, mtime_ns: i128) -> Self {
 		Self {
-			ok: true,
-			code: None,
-			sha256: Some(hex_sha256(digest)),
-			size: Some(size.to_string()),
-			dev: Some(dev.to_string()),
-			ino: Some(ino.to_string()),
-			nlink: Some(nlink.to_string()),
+			ok:       true,
+			code:     None,
+			sha256:   Some(hex_sha256(digest)),
+			size:     Some(size.to_string()),
+			dev:      Some(dev.to_string()),
+			ino:      Some(ino.to_string()),
+			nlink:    Some(nlink.to_string()),
 			mtime_ns: Some(mtime_ns.to_string()),
 		}
 	}
@@ -1367,9 +1367,7 @@ pub fn digest_exact_regular_file(path: String) -> NativeExactFileDigest {
 /// SHA-256 a no-follow regular file on the libuv blocking pool.
 #[napi]
 pub fn digest_exact_regular_file_async(path: String) -> task::Promise<NativeExactFileDigest> {
-	task::blocking("digest_exact_regular_file", (), move |_| {
-		Ok(digest_exact_regular_file(path))
-	})
+	task::blocking("digest_exact_regular_file", (), move |_| Ok(digest_exact_regular_file(path)))
 }
 
 fn dispatch_exact_replace_path(
@@ -3774,7 +3772,7 @@ pub(crate) mod platform {
 				}
 				// SAFETY: `fd` is live; the returned descriptor is checked before ownership
 				// transfer.
-				let duplicated = unsafe { libc::dup(fd) };
+				let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
 				if duplicated < 0 {
 					return Err(security_code(&std::io::Error::last_os_error()));
 				}
@@ -5324,7 +5322,7 @@ pub(crate) mod platform {
 
 	fn digest_fd(fd: libc::c_int) -> Result<[u8; 32], &'static str> {
 		// SAFETY: `fd` is live; this function owns the returned duplicate.
-		let duplicate = unsafe { libc::dup(fd) };
+		let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
 		if duplicate < 0 {
 			return Err(security_code(&std::io::Error::last_os_error()));
 		}
@@ -5346,7 +5344,10 @@ pub(crate) mod platform {
 		result
 	}
 
-	fn digest_exact_regular_file_at(parent_fd: libc::c_int, name: &CString) -> NativeExactFileDigest {
+	fn digest_exact_regular_file_at(
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> NativeExactFileDigest {
 		// SAFETY: the retained parent descriptor and NUL-terminated name are live;
 		// O_NOFOLLOW rejects a substituted symlink and O_NONBLOCK avoids blocking on
 		// a substituted special file before fstat rejects it.
@@ -5374,6 +5375,22 @@ pub(crate) mod platform {
 				Ok(digest) => digest,
 				Err(code) => return NativeExactFileDigest::failure(code),
 			};
+			// The descriptor remains live while hashing, but another writer may still
+			// mutate its contents in place. Re-stat it after the read and reject any
+			// change to stable descriptor metadata. ctime is not part of the returned DTO,
+			// but it closes the write-then-restore-mtime race that could otherwise produce
+			// a successful mixed digest paired with apparently unchanged metadata.
+			let mut after_digest: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe { libc::fstat(fd, &mut after_digest) } != 0
+				|| after_digest.st_dev != opened.st_dev
+				|| after_digest.st_ino != opened.st_ino
+				|| after_digest.st_size != opened.st_size
+				|| after_digest.st_nlink != opened.st_nlink
+				|| stat_mtime_ns(&after_digest) != stat_mtime_ns(&opened)
+				|| stat_ctime_ns(&after_digest) != stat_ctime_ns(&opened)
+			{
+				return NativeExactFileDigest::failure("identity_mismatch");
+			}
 			// SAFETY: zero is a valid initialized representation for fstatat output.
 			let mut named: libc::stat = unsafe { std::mem::zeroed() };
 			// SAFETY: parent_fd is live, name is NUL-terminated, and named is writable.
@@ -5384,8 +5401,12 @@ pub(crate) mod platform {
 				return NativeExactFileDigest::failure(security_code(&std::io::Error::last_os_error()));
 			}
 			if named.st_mode & libc::S_IFMT != libc::S_IFREG
-				|| named.st_dev != opened.st_dev
-				|| named.st_ino != opened.st_ino
+				|| named.st_dev != after_digest.st_dev
+				|| named.st_ino != after_digest.st_ino
+				|| named.st_size != after_digest.st_size
+				|| named.st_nlink != after_digest.st_nlink
+				|| stat_mtime_ns(&named) != stat_mtime_ns(&after_digest)
+				|| stat_ctime_ns(&named) != stat_ctime_ns(&after_digest)
 			{
 				return NativeExactFileDigest::failure("identity_mismatch");
 			}
@@ -6830,6 +6851,20 @@ mod platform {
 		}
 	}
 
+	fn digest_handle_identity_stable(
+		before: &BY_HANDLE_FILE_INFORMATION,
+		after: &BY_HANDLE_FILE_INFORMATION,
+	) -> bool {
+		before.dwVolumeSerialNumber == after.dwVolumeSerialNumber
+			&& before.nFileIndexHigh == after.nFileIndexHigh
+			&& before.nFileIndexLow == after.nFileIndexLow
+			&& before.nFileSizeHigh == after.nFileSizeHigh
+			&& before.nFileSizeLow == after.nFileSizeLow
+			&& before.nNumberOfLinks == after.nNumberOfLinks
+			&& before.ftLastWriteTime.dwHighDateTime == after.ftLastWriteTime.dwHighDateTime
+			&& before.ftLastWriteTime.dwLowDateTime == after.ftLastWriteTime.dwLowDateTime
+	}
+
 	pub(super) fn digest_exact_regular_file(path: &Path) -> NativeExactFileDigest {
 		let path = match lexical_absolute_path(path) {
 			Ok(path) => path,
@@ -6848,8 +6883,7 @@ mod platform {
 		};
 		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
 		if unsafe { GetFileInformationByHandle(held.target, &mut information) } == 0
-			|| information.dwFileAttributes
-				& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+			|| information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
 				!= 0
 		{
 			return NativeExactFileDigest::failure("identity_mismatch");
@@ -6858,6 +6892,25 @@ mod platform {
 			Ok(digest) => digest,
 			Err(code) => return NativeExactFileDigest::failure(code),
 		};
+		let mut after_digest: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(held.target, &mut after_digest) } == 0
+			|| !digest_handle_identity_stable(&information, &after_digest)
+		{
+			return NativeExactFileDigest::failure("identity_mismatch");
+		}
+		let rebound =
+			match open_exact_with_share(&path, "file", FILE_READ_ATTRIBUTES, FILE_SHARE_READ) {
+				Ok(handle) => handle,
+				Err(_) => return NativeExactFileDigest::failure("identity_mismatch"),
+			};
+		let mut rebound_information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		let path_matches =
+			unsafe { GetFileInformationByHandle(rebound.target, &mut rebound_information) } != 0
+				&& handles_same_object(held.target, rebound.target)
+				&& digest_handle_identity_stable(&after_digest, &rebound_information);
+		if !path_matches {
+			return NativeExactFileDigest::failure("identity_mismatch");
+		}
 		let ino =
 			(u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
 		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
