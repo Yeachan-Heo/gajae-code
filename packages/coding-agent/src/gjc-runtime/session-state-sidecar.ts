@@ -2749,7 +2749,8 @@ async function hasPendingOwnerIntent(owner: OwnerTerminalContext, sessionId: str
 			isValidOwnerIntent(intent) &&
 			intent.session_id === sessionId &&
 			intent.generation === owner.generation &&
-			intent.server_key === owner.socketKey
+			intent.server_key === owner.socketKey &&
+			Date.parse(intent.expires_at) > Date.now()
 		);
 	} catch {
 		return false;

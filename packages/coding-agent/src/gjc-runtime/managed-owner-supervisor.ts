@@ -218,6 +218,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		if (childExited) return;
 		let candidateIntent: OwnerIntent | null = null;
 		let intentEvidencePresent = false;
+		let expiredIntent = false;
 		try {
 			intentEvidencePresent = true;
 			const candidate: unknown = JSON.parse(
@@ -227,15 +228,16 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				isValidOwnerIntent(candidate) &&
 				candidate.session_id === sessionId &&
 				candidate.generation === generation &&
-				candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] &&
-				Date.parse(candidate.expires_at) > Date.now()
-			)
-				candidateIntent = candidate;
+				candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV]
+			) {
+				if (Date.parse(candidate.expires_at) > Date.now()) candidateIntent = candidate;
+				else expiredIntent = true;
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
 			candidateIntent = null;
 		}
-		if (intentEvidencePresent && !candidateIntent) return;
+		if (intentEvidencePresent && !candidateIntent && !expiredIntent) return;
 		// One relay is enough for one exact intent. A replacement intent (including one
 		// that reuses the dispatch id) must be allowed to re-arm the child relay.
 		if (sigtermRelayed) {
