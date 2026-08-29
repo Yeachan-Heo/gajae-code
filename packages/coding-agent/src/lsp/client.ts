@@ -41,18 +41,20 @@ async function withFileOperationLock<T>(
 ): Promise<T> {
 	const previous = fileOperationLocks.get(key);
 	const current = (async () => {
-		// The shared chain must not inherit a waiter's abort signal: an aborted
-		// waiter cannot poison operations queued behind it. The operation itself
-		// remains abort-aware once its turn begins.
+		// The shared tail is failure-absorbing: a cancelled or failed operation
+		// must not poison work queued behind it.
 		if (previous) await previous;
 		return operation();
 	})();
-	fileOperationLocks.set(key, current as Promise<void>);
-	try {
-		return await current;
-	} finally {
-		if (fileOperationLocks.get(key) === current) fileOperationLocks.delete(key);
-	}
+	const tail = current.then(
+		() => undefined,
+		() => undefined,
+	);
+	fileOperationLocks.set(key, tail);
+	void tail.finally(() => {
+		if (fileOperationLocks.get(key) === tail) fileOperationLocks.delete(key);
+	});
+	return untilAborted(signal, () => current);
 }
 let lspCleanupOwner: (() => void) | undefined;
 
