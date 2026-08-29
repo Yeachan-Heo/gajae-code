@@ -42,6 +42,7 @@ export class ExtensionDashboard extends Container {
 		private readonly cwd: string,
 		private readonly settings: Settings | null,
 		private readonly agentDir: string | undefined,
+		private readonly profileAuthority: "default" | "custom" | undefined,
 		private readonly terminalHeight: number,
 	) {
 		super();
@@ -52,8 +53,15 @@ export class ExtensionDashboard extends Container {
 		settings: Settings | null = null,
 		terminalHeight?: number,
 		agentDir?: string,
+		profileAuthority?: "default" | "custom",
 	): Promise<ExtensionDashboard> {
-		const dashboard = new ExtensionDashboard(cwd, settings, agentDir, terminalHeight ?? process.stdout.rows ?? 24);
+		const dashboard = new ExtensionDashboard(
+			cwd,
+			settings,
+			agentDir,
+			profileAuthority,
+			terminalHeight ?? process.stdout.rows ?? 24,
+		);
 		await dashboard.#init();
 		return dashboard;
 	}
@@ -61,7 +69,7 @@ export class ExtensionDashboard extends Container {
 	async #init(): Promise<void> {
 		const sm = this.settings ?? (await Settings.init());
 		const disabledIds = sm ? ((sm.get("disabledExtensions") as string[]) ?? []) : [];
-		this.#state = await createInitialState(this.cwd, disabledIds, sm, this.agentDir);
+		this.#state = await createInitialState(this.cwd, disabledIds, sm, this.agentDir, this.profileAuthority);
 
 		// Calculate max visible items based on terminal height
 		// Reserve ~10 lines for header, tabs, help text, borders
@@ -196,7 +204,14 @@ export class ExtensionDashboard extends Container {
 
 		const sm = this.settings ?? Settings.instance;
 		const disabledIds = sm ? ((sm.get("disabledExtensions") as string[]) ?? []) : [];
-		const nextState = await refreshState(this.#state, this.cwd, disabledIds, sm, this.agentDir);
+		const nextState = await refreshState(
+			this.#state,
+			this.cwd,
+			disabledIds,
+			sm,
+			this.agentDir,
+			this.profileAuthority,
+		);
 		if (refreshToken !== this.#refreshToken) return;
 		this.#state = nextState;
 

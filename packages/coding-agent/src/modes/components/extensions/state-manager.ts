@@ -49,6 +49,7 @@ export async function loadAllExtensions(
 	disabledIds?: string[],
 	settings?: Settings,
 	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<Extension[]> {
 	const extensions: Extension[] = [];
 	const disabledExtensions = new Set<string>(disabledIds ?? []);
@@ -108,6 +109,7 @@ export async function loadAllExtensions(
 		includeDisabled: true,
 		...(settings ? { settings } : {}),
 		...(agentDir ? { agentDir } : {}),
+		...(profileAuthority ? { profileAuthority } : {}),
 	};
 
 	// Load skills
@@ -573,8 +575,9 @@ export async function createInitialState(
 	disabledIds?: string[],
 	settings?: Settings,
 	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir);
+	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir, profileAuthority);
 	const tabs = buildProviderTabs(extensions, settings);
 	const tabFiltered = extensions; // "all" tab by default
 	const searchFiltered = tabFiltered;
@@ -614,8 +617,9 @@ export async function refreshState(
 	disabledIds?: string[],
 	settings?: Settings,
 	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir);
+	const extensions = await loadAllExtensions(cwd, disabledIds, settings, agentDir, profileAuthority);
 	const tabs = buildProviderTabs(extensions, settings);
 
 	// Get current provider from tabs

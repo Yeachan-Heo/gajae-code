@@ -876,6 +876,8 @@ export interface AgentSessionConfig {
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
 	agentDir?: string;
+	/** Resolver-owned profile classification captured at session creation. */
+	profileAuthority?: "default" | "custom";
 	/** Lazy memory backend service; omitted callers receive a session-local default. */
 	memoryBackend?: LazyService<MemoryBackend>;
 	/** Lazy workspace-tree service; omitted callers retain the legacy direct-scan path. */
@@ -2403,6 +2405,7 @@ export class AgentSession {
 	sessionManager: SessionManager;
 	settings: Settings;
 	readonly #requestedAgentDir: string | undefined;
+	readonly #profileAuthority: "default" | "custom";
 
 	/**
 	 * The session's effective agent directory: its REQUESTED directory when
@@ -2411,6 +2414,10 @@ export class AgentSession {
 	 */
 	getSessionAgentDir(): string {
 		return this.#requestedAgentDir ?? this.settings.getAgentDir();
+	}
+
+	getSessionProfileAuthority(): "default" | "custom" {
+		return this.#profileAuthority;
 	}
 	memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
@@ -3521,7 +3528,8 @@ export class AgentSession {
 		}
 		this.#sessionTransitionKind = kind;
 		this.#sessionTransitionDropsAsync = false;
-		this.#sessionTransitionAdmissionBarrier = this.#activeSessionAdmission?.settled.promise;
+		this.#sessionTransitionAdmissionBarrier =
+			this.#activeSessionAdmission?.kind === "selection" ? this.#activeSessionAdmission.settled.promise : undefined;
 		this.#coordinatorPersistGeneration += 1;
 	}
 
@@ -4384,6 +4392,7 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
+		this.#profileAuthority = config.profileAuthority ?? "default";
 		retainLspScope(this.sessionManager.getCwd(), this.getSessionAgentDir());
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
