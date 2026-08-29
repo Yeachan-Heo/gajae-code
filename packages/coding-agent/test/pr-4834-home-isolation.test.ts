@@ -308,6 +308,33 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.items).toEqual([]);
 	});
 
+	test("explicit home excludes symlinked native extension candidates outside the profile", async () => {
+		const extensionsDir = path.join(home, ".gjc", "agent", "extensions");
+		const directTarget = path.join(tempDir, "outside-direct.ts");
+		const indexTarget = path.join(tempDir, "outside-index.ts");
+		const manifestTarget = path.join(tempDir, "outside-manifest.ts");
+		await writeFile(directTarget, "export default {};");
+		await writeFile(indexTarget, "export default {};");
+		await writeFile(manifestTarget, "export default {};");
+		await fs.mkdir(path.join(extensionsDir, "indexed"), { recursive: true });
+		await fs.mkdir(path.join(extensionsDir, "declared"), { recursive: true });
+		await fs.symlink(directTarget, path.join(extensionsDir, "direct.ts"), "file");
+		await fs.symlink(indexTarget, path.join(extensionsDir, "indexed", "index.ts"), "file");
+		await fs.symlink(manifestTarget, path.join(extensionsDir, "declared", "outside.ts"), "file");
+		await writeFile(
+			path.join(extensionsDir, "declared", "package.json"),
+			JSON.stringify({ gjc: { extensions: ["./outside.ts"] } }),
+		);
+
+		const result = await loadCapabilityForHome<ExtensionModule>(extensionModuleCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+
+		expect(result.items).toEqual([]);
+		expect(result.warnings).toEqual([]);
+	});
+
 	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {
 		const physicalHome = path.join(tempDir, "physical-home");
 		const symlinkedHome = path.join(tempDir, "symlinked-home");

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadCapability } from "@gajae-code/coding-agent/capability";
+import { loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { clearCache as clearFsCache } from "@gajae-code/coding-agent/capability/fs";
 import {
 	clearClaudePluginRootsCache,
@@ -596,6 +596,130 @@ describe("listClaudePluginRoots", () => {
 		const found = result.all.find(command => command.name === "manifest-commands-outside:ship");
 
 		expect(found).toBeUndefined();
+	});
+
+	test("isolated plugin discovery excludes symlinked skill, command, hook, and tool files outside home", async () => {
+		const profileHome = path.join(tempDir, "isolated-home");
+		const project = path.join(profileHome, "project");
+		const pluginPath = path.join(profileHome, "plugins", "manifest-symlinks");
+		const outsideRoot = path.join(tempDir, "outside-plugin-content");
+		const outsideSkills = path.join(outsideRoot, "skills");
+		const outsideCommands = path.join(outsideRoot, "commands");
+		const outsideHooks = path.join(outsideRoot, "hooks", "pre");
+		const outsideTools = path.join(outsideRoot, "tools");
+		await fs.mkdir(path.join(profileHome, ".gjc", "plugins"), { recursive: true });
+		await fs.mkdir(path.join(project, ".git"), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, ".claude-plugin"), { recursive: true });
+		await fs.mkdir(outsideSkills, { recursive: true });
+		await fs.mkdir(outsideCommands, { recursive: true });
+		await fs.mkdir(outsideHooks, { recursive: true });
+		await fs.mkdir(outsideTools, { recursive: true });
+		await fs.mkdir(path.join(outsideSkills, "outside-skill"), { recursive: true });
+		await fs.writeFile(
+			path.join(outsideSkills, "outside-skill", "SKILL.md"),
+			"---\nname: outside-skill\ndescription: Outside skill\n---\nBody\n",
+		);
+		await fs.writeFile(path.join(outsideCommands, "outside.md"), "Outside command\n");
+		await fs.writeFile(path.join(outsideHooks, "outside.sh"), "#!/bin/sh\n");
+		await fs.writeFile(path.join(outsideTools, "outside.ts"), "export default {};\n");
+		await fs.symlink(outsideSkills, path.join(pluginPath, "linked-skills"), "dir");
+		await fs.symlink(outsideCommands, path.join(pluginPath, "linked-commands"), "dir");
+		await fs.symlink(path.join(outsideRoot, "hooks"), path.join(pluginPath, "hooks"), "dir");
+		await fs.symlink(outsideTools, path.join(pluginPath, "tools"), "dir");
+
+		const registry = {
+			version: 2,
+			plugins: {
+				"manifest-symlinks@market": [
+					{
+						scope: "user",
+						installPath: pluginPath,
+						version: "1.0.0",
+						installedAt: "2025-01-01T00:00:00Z",
+						lastUpdated: "2025-01-01T00:00:00Z",
+					},
+				],
+			},
+		};
+		await fs.writeFile(path.join(profileHome, ".gjc", "plugins", "installed_plugins.json"), JSON.stringify(registry));
+		await fs.writeFile(
+			path.join(pluginPath, ".claude-plugin", "plugin.json"),
+			JSON.stringify({ skills: "./linked-skills", commands: "./linked-commands" }),
+		);
+
+		const options = { cwd: project, providers: ["claude-plugins"] as string[] };
+		const [skills, commands, hooks, tools] = await Promise.all([
+			loadCapabilityForHome<Skill>("skills", profileHome, options),
+			loadCapabilityForHome<SlashCommand>("slash-commands", profileHome, options),
+			loadCapabilityForHome("hooks", profileHome, options),
+			loadCapabilityForHome("tools", profileHome, options),
+		]);
+
+		expect(skills.items).toEqual([]);
+		expect(commands.items).toEqual([]);
+		expect(hooks.items).toEqual([]);
+		expect(tools.items).toEqual([]);
+	});
+
+	test("isolated plugin discovery excludes symlinked leaf files outside home", async () => {
+		const profileHome = path.join(tempDir, "isolated-home-leaves");
+		const project = path.join(profileHome, "project");
+		const pluginPath = path.join(profileHome, "plugins", "leaf-symlinks");
+		const outsideRoot = path.join(tempDir, "outside-plugin-leaves");
+		const outsideSkill = path.join(outsideRoot, "outside-skill.md");
+		const outsideCommand = path.join(outsideRoot, "outside-command.md");
+		const outsideHook = path.join(outsideRoot, "outside-hook.sh");
+		const outsideTool = path.join(outsideRoot, "outside-tool.ts");
+		await fs.mkdir(path.join(profileHome, ".gjc", "plugins"), { recursive: true });
+		await fs.mkdir(path.join(project, ".git"), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, ".claude-plugin"), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, "skills", "leaf-skill"), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, "commands"), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, "hooks", "pre"), { recursive: true });
+		await fs.mkdir(path.join(pluginPath, "tools"), { recursive: true });
+		await fs.mkdir(outsideRoot, { recursive: true });
+		await fs.writeFile(outsideSkill, "---\nname: outside-skill\ndescription: Outside skill\n---\nBody\n");
+		await fs.writeFile(outsideCommand, "Outside command\n");
+		await fs.writeFile(outsideHook, "#!/bin/sh\n");
+		await fs.writeFile(outsideTool, "export default {};\n");
+		await fs.symlink(outsideSkill, path.join(pluginPath, "skills", "leaf-skill", "SKILL.md"), "file");
+		await fs.symlink(outsideCommand, path.join(pluginPath, "commands", "leaf.md"), "file");
+		await fs.symlink(outsideHook, path.join(pluginPath, "hooks", "pre", "leaf.sh"), "file");
+		await fs.symlink(outsideTool, path.join(pluginPath, "tools", "leaf.ts"), "file");
+		await fs.writeFile(
+			path.join(profileHome, ".gjc", "plugins", "installed_plugins.json"),
+			JSON.stringify({
+				version: 2,
+				plugins: {
+					"leaf-symlinks@market": [
+						{
+							scope: "user",
+							installPath: pluginPath,
+							version: "1.0.0",
+							installedAt: "2025-01-01T00:00:00Z",
+							lastUpdated: "2025-01-01T00:00:00Z",
+						},
+					],
+				},
+			}),
+		);
+		await fs.writeFile(
+			path.join(pluginPath, ".claude-plugin", "plugin.json"),
+			JSON.stringify({ skills: "./skills", commands: "./commands" }),
+		);
+
+		const options = { cwd: project, providers: ["claude-plugins"] as string[] };
+		const [skills, commands, hooks, tools] = await Promise.all([
+			loadCapabilityForHome<Skill>("skills", profileHome, options),
+			loadCapabilityForHome<SlashCommand>("slash-commands", profileHome, options),
+			loadCapabilityForHome("hooks", profileHome, options),
+			loadCapabilityForHome("tools", profileHome, options),
+		]);
+
+		expect(skills.items).toEqual([]);
+		expect(commands.items).toEqual([]);
+		expect(hooks.items).toEqual([]);
+		expect(tools.items).toEqual([]);
 	});
 });
 
