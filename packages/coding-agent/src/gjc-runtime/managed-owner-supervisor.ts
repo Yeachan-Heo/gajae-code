@@ -230,7 +230,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		try {
 			const intentFile = lifecyclePaths(stateDir, sessionId, generation).intentFile;
 			try {
-				fsSync.statSync(intentFile);
+				fsSync.lstatSync(intentFile);
 				intentEvidencePresent = true;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
