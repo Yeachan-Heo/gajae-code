@@ -3,6 +3,7 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	fmt::Write as _,
 	path::{Component, Path, PathBuf},
 	sync::{
 		Arc,
@@ -327,6 +328,57 @@ pub struct NativeExactUnlinkResult {
 	/// always absent on success, on non-Windows platforms, and after any
 	/// namespace mutation.
 	pub windows_error_code: Option<String>,
+}
+
+/// SHA-256 of a no-follow regular file, plus the descriptor identity observed
+/// with that digest. Managed session persistence uses this instead of hashing
+/// on the JS thread.
+#[napi(object)]
+pub struct NativeExactFileDigest {
+	pub ok:       bool,
+	pub code:     Option<String>,
+	pub sha256:   Option<String>,
+	pub size:     Option<String>,
+	pub dev:      Option<String>,
+	pub ino:      Option<String>,
+	pub nlink:    Option<String>,
+	pub mtime_ns: Option<String>,
+}
+
+impl NativeExactFileDigest {
+	fn failure(code: &str) -> Self {
+		Self {
+			ok: false,
+			code: Some(code.to_owned()),
+			sha256: None,
+			size: None,
+			dev: None,
+			ino: None,
+			nlink: None,
+			mtime_ns: None,
+		}
+	}
+
+	fn success(digest: [u8; 32], size: u64, dev: u64, ino: u64, nlink: u64, mtime_ns: i128) -> Self {
+		Self {
+			ok: true,
+			code: None,
+			sha256: Some(hex_sha256(digest)),
+			size: Some(size.to_string()),
+			dev: Some(dev.to_string()),
+			ino: Some(ino.to_string()),
+			nlink: Some(nlink.to_string()),
+			mtime_ns: Some(mtime_ns.to_string()),
+		}
+	}
+}
+
+fn hex_sha256(bytes: [u8; 32]) -> String {
+	let mut digest = String::with_capacity(64);
+	for byte in bytes {
+		let _ = write!(&mut digest, "{byte:02x}");
+	}
+	digest
 }
 
 /// Bounded, path-free evidence for one publish operation.
@@ -1290,6 +1342,36 @@ pub fn exact_replace_path_async(
 	})
 }
 
+/// SHA-256 a no-follow regular file on the calling thread.
+///
+/// Managed session persistence uses this (and the async twin) so staging
+/// copy, successor identity, and post-publish verify do not `createHash` on
+/// the JS thread. Identity fields are decimal strings so JS can match `lstat`
+/// without a second full-file hash.
+#[napi]
+pub fn digest_exact_regular_file(path: String) -> NativeExactFileDigest {
+	if path.contains('\0') {
+		return NativeExactFileDigest::failure("invalid_request");
+	}
+	#[cfg(any(unix, windows))]
+	{
+		platform::digest_exact_regular_file(Path::new(&path))
+	}
+	#[cfg(not(any(unix, windows)))]
+	{
+		let _ = path;
+		NativeExactFileDigest::failure("unsupported_platform")
+	}
+}
+
+/// SHA-256 a no-follow regular file on the libuv blocking pool.
+#[napi]
+pub fn digest_exact_regular_file_async(path: String) -> task::Promise<NativeExactFileDigest> {
+	task::blocking("digest_exact_regular_file", (), move |_| {
+		Ok(digest_exact_regular_file(path))
+	})
+}
+
 fn dispatch_exact_replace_path(
 	source_path: String,
 	destination_path: String,
@@ -1813,8 +1895,9 @@ pub(crate) mod platform {
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, digest_reader, io_code, security_io_code, sha256,
+		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactFileDigest,
+		NativeExactUnlinkResult, NativeOwnerOnlySecurityResult, digest_reader, io_code,
+		security_io_code, sha256,
 	};
 
 	/// Bound on EINTR restarts for the no-replace rename primitive. A signal
@@ -5250,6 +5333,76 @@ pub(crate) mod platform {
 		digest_reader(&mut file).map_err(|_| "io_error")
 	}
 
+	pub(super) fn digest_exact_regular_file(path: &Path) -> NativeExactFileDigest {
+		let (parent_fd, name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => {
+				return NativeExactFileDigest::failure(result.code.as_deref().unwrap_or("io_error"));
+			},
+		};
+		let result = digest_exact_regular_file_at(parent_fd, &name);
+		// SAFETY: this function owns parent_fd exactly once.
+		unsafe { libc::close(parent_fd) };
+		result
+	}
+
+	fn digest_exact_regular_file_at(parent_fd: libc::c_int, name: &CString) -> NativeExactFileDigest {
+		// SAFETY: the retained parent descriptor and NUL-terminated name are live;
+		// O_NOFOLLOW rejects a substituted symlink and O_NONBLOCK avoids blocking on
+		// a substituted special file before fstat rejects it.
+		let fd = unsafe {
+			libc::openat(
+				parent_fd,
+				name.as_ptr(),
+				libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+			)
+		};
+		if fd < 0 {
+			return NativeExactFileDigest::failure(security_code(&std::io::Error::last_os_error()));
+		}
+		let result = (|| {
+			// SAFETY: zero is a valid initialized representation for fstat output.
+			let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: fd is live and opened is writable.
+			if unsafe { libc::fstat(fd, &mut opened) } != 0 {
+				return NativeExactFileDigest::failure(security_code(&std::io::Error::last_os_error()));
+			}
+			if opened.st_mode & libc::S_IFMT != libc::S_IFREG {
+				return NativeExactFileDigest::failure("identity_mismatch");
+			}
+			let digest = match digest_fd(fd) {
+				Ok(digest) => digest,
+				Err(code) => return NativeExactFileDigest::failure(code),
+			};
+			// SAFETY: zero is a valid initialized representation for fstatat output.
+			let mut named: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is live, name is NUL-terminated, and named is writable.
+			if unsafe {
+				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} != 0
+			{
+				return NativeExactFileDigest::failure(security_code(&std::io::Error::last_os_error()));
+			}
+			if named.st_mode & libc::S_IFMT != libc::S_IFREG
+				|| named.st_dev != opened.st_dev
+				|| named.st_ino != opened.st_ino
+			{
+				return NativeExactFileDigest::failure("identity_mismatch");
+			}
+			NativeExactFileDigest::success(
+				digest,
+				opened.st_size as u64,
+				opened.st_dev as u64,
+				opened.st_ino as u64,
+				opened.st_nlink as u64,
+				stat_mtime_ns(&opened),
+			)
+		})();
+		// SAFETY: this function owns fd exactly once.
+		unsafe { libc::close(fd) };
+		result
+	}
+
 	fn open_tree_entry(
 		parent_fd: libc::c_int,
 		name: &CString,
@@ -5959,10 +6112,10 @@ mod platform {
 	use super::{
 		EXACT_REPLACE_DESTINATION_OPEN_RETRY_DELAY_MS, EXACT_REPLACE_DESTINATION_OPEN_RETRY_LIMIT,
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeEntry,
-		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactUnlinkResult,
-		NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER, STATUS_SHARING_VIOLATION,
-		is_retryable_exact_replace_status, native_windows_error_code, open_with_transient_retry,
-		sha256,
+		NativeDirectoryTreeResult, NativeDirectoryTreeSnapshot, NativeExactFileDigest,
+		NativeExactUnlinkResult, NativeOwnerOnlySecurityResult, STATUS_INVALID_PARAMETER,
+		STATUS_SHARING_VIOLATION, is_retryable_exact_replace_status, native_windows_error_code,
+		open_with_transient_retry, sha256,
 	};
 
 	type UvGetOsfhandle = unsafe extern "C" fn(fd: i32) -> isize;
@@ -6675,6 +6828,50 @@ mod platform {
 				return Ok(hasher.finalize().into());
 			}
 		}
+	}
+
+	pub(super) fn digest_exact_regular_file(path: &Path) -> NativeExactFileDigest {
+		let path = match lexical_absolute_path(path) {
+			Ok(path) => path,
+			Err(code) => return NativeExactFileDigest::failure(code),
+		};
+		let held = match open_exact_with_share(
+			&path,
+			"file",
+			FILE_READ_ATTRIBUTES | FILE_READ_DATA,
+			FILE_SHARE_READ,
+		) {
+			Ok(held) => held,
+			Err(result) => {
+				return NativeExactFileDigest::failure(result.code.as_deref().unwrap_or("io_error"));
+			},
+		};
+		let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+		if unsafe { GetFileInformationByHandle(held.target, &mut information) } == 0
+			|| information.dwFileAttributes
+				& (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+				!= 0
+		{
+			return NativeExactFileDigest::failure("identity_mismatch");
+		}
+		let digest = match digest_handle(held.target) {
+			Ok(digest) => digest,
+			Err(code) => return NativeExactFileDigest::failure(code),
+		};
+		let ino =
+			(u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+		let size = (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+		let filetime = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+			| u64::from(information.ftLastWriteTime.dwLowDateTime);
+		let mtime_ns = i128::from(filetime) * 100 - 11_644_473_600_000_000_000i128;
+		NativeExactFileDigest::success(
+			digest,
+			size,
+			u64::from(information.dwVolumeSerialNumber),
+			ino,
+			u64::from(information.nNumberOfLinks),
+			mtime_ns,
+		)
 	}
 
 	fn lexical_absolute_path(path: &Path) -> Result<PathBuf, &'static str> {
@@ -8492,7 +8689,8 @@ mod platform {
 
 	use super::{
 		ExactFileIdentity, NativeCanonicalDirectoryIdentity, NativeDirectoryTreeResult,
-		NativeDirectoryTreeSnapshot, NativeExactUnlinkResult, NativeOwnerOnlySecurityResult,
+		NativeDirectoryTreeSnapshot, NativeExactFileDigest, NativeExactUnlinkResult,
+		NativeOwnerOnlySecurityResult,
 	};
 
 	pub(super) fn canonical_existing_directory_identity(
@@ -8518,6 +8716,9 @@ mod platform {
 		_: &ExactFileIdentity,
 	) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
+	pub(super) fn digest_exact_regular_file(_: &Path) -> NativeExactFileDigest {
+		NativeExactFileDigest::failure("unsupported_platform")
 	}
 	pub(super) fn snapshot_directory_tree(_: &Path) -> NativeDirectoryTreeResult {
 		NativeDirectoryTreeResult::failure("tree_authority_unavailable")

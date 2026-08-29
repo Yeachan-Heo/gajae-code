@@ -6,6 +6,8 @@ import * as path from "node:path";
 import {
 	applyOwnerOnlyPathSecurity,
 	canonicalExistingDirectoryIdentity,
+	digestExactRegularFile,
+	digestExactRegularFileAsync,
 	exactReplacePath,
 	exactReplacePathAsync,
 	type NativeExactFileIdentity,
@@ -165,5 +167,39 @@ describe("exactReplacePathAsync", () => {
 		expect(syncRefused).toMatchObject({ ok: false, code: "identity_mismatch" });
 		expect(await fs.readFile(refusedDestination, "utf8")).toBe("old-state");
 		expect(await fs.readFile(asyncDestination, "utf8")).toBe("old-state");
+	});
+});
+
+describe("digestExactRegularFile", () => {
+	it("returns known SHA-256 answers and rejects a symlink", async () => {
+		const root = await temporaryDirectory();
+		const empty = path.join(root, "empty");
+		const abc = path.join(root, "abc");
+		const alias = path.join(root, "alias");
+		await fs.writeFile(empty, "");
+		await fs.writeFile(abc, "abc");
+		await fs.symlink(abc, alias);
+
+		const emptyDigest = digestExactRegularFile(empty);
+		expect(emptyDigest).toMatchObject({
+			ok: true,
+			sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		});
+		const emptyStat = await fs.lstat(empty, { bigint: true });
+		expect(emptyDigest.size).toBe(emptyStat.size.toString());
+		expect(emptyDigest.dev).toBe(emptyStat.dev.toString());
+		expect(emptyDigest.ino).toBe(emptyStat.ino.toString());
+
+		expect(digestExactRegularFile(abc)).toMatchObject({
+			ok: true,
+			sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+		});
+		expect(await digestExactRegularFileAsync(abc)).toEqual(digestExactRegularFile(abc));
+
+		expect(digestExactRegularFile(alias).ok).toBe(false);
+		expect(digestExactRegularFile(path.join(root, "missing"))).toMatchObject({
+			ok: false,
+			code: "not_found",
+		});
 	});
 });

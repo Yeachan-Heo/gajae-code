@@ -868,6 +868,19 @@ export declare function detectMacOSAppearance(): MacOSAppearance | null
  */
 export declare function diffLines(oldStr: string, newStr: string): Array<LineDiffPart>
 
+/**
+ * SHA-256 a no-follow regular file on the calling thread.
+ *
+ * Managed session persistence uses this (and the async twin) so staging
+ * copy, successor identity, and post-publish verify do not `createHash` on
+ * the JS thread. Identity fields are decimal strings so JS can match `lstat`
+ * without a second full-file hash.
+ */
+export declare function digestExactRegularFile(path: string): NativeExactFileDigest
+
+/** SHA-256 a no-follow regular file on the libuv blocking pool. */
+export declare function digestExactRegularFileAsync(path: string): Promise<NativeExactFileDigest>
+
 /** Ellipsis strategy for [`truncate_to_width`]. */
 export declare enum Ellipsis {
   /** Use a single Unicode ellipsis character ("…"). */
@@ -1789,6 +1802,22 @@ export interface NativeDirectoryTreeSnapshot {
   rootDev: string
   rootIno: string
   entries: Array<NativeDirectoryTreeEntry>
+}
+
+/**
+ * SHA-256 of a no-follow regular file, plus the descriptor identity observed
+ * with that digest. Managed session persistence uses this instead of hashing
+ * on the JS thread.
+ */
+export interface NativeExactFileDigest {
+  ok: boolean
+  code?: string
+  sha256?: string
+  size?: string
+  dev?: string
+  ino?: string
+  nlink?: string
+  mtimeNs?: string
 }
 
 /**
