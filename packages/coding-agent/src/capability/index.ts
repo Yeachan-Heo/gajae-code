@@ -57,7 +57,6 @@ const EXPLICIT_HOME_PROVIDER_ROOTS = [
 	{ id: "windsurf", user: path.join(".codeium", "windsurf"), project: ".windsurf" },
 	{ id: "cline", user: ".cline", project: null },
 	{ id: "github", user: null, project: ".github" },
-	{ id: "vscode", user: ".vscode", project: ".vscode" },
 ] as const;
 
 function isWithinOrEqual(root: string, candidate: string): boolean {
@@ -132,6 +131,8 @@ async function assertExplicitHomeRoots(canonicalHome: string, cwd: string, expli
 		addRoot(projectRoots, baseDir, `agents project root (${baseDir})`);
 	}
 	addRoot(projectRoots, path.join(getConfigDirName(), "plugins"), "project plugin registry root");
+	for (const file of ["AGENTS.md", ".clinerules", "mcp.json", ".mcp.json", "opencode.json", "ssh.json", ".ssh.json"])
+		addRoot(projectRoots, file, `project file (${file})`);
 	addRoot(userRoots, getPluginsDir(canonicalHome), "plugin registry root");
 
 	await Promise.all(
@@ -440,7 +441,7 @@ export async function loadCapabilityForHome<T>(
 				"user agent directory",
 			);
 	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir));
-	const repoRootCandidate = await findRepoRoot(cwd);
+	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome);
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
 		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
