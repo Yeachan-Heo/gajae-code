@@ -990,6 +990,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let pendingNonAbortableExec: CursorNonAbortableSettlement | undefined;
 		let localTransportCloseRequested = false;
 		let transportTerminalized = false;
+		let terminalDrainMode = false;
+		let terminalDrain: (() => void) | undefined;
+		let terminalDrainStarted = false;
+		let terminalPendingError: unknown;
+		let processPendingBuffer: (() => void) | undefined;
 		let activeExecAbort: ((reason?: Error) => void) | undefined;
 		const closeTransportLocally = (): void => {
 			localTransportCloseRequested = true;
@@ -1018,12 +1023,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		};
 		const terminalize = (error: unknown): void => {
 			transportTerminalized = true;
+			terminalDrainMode = true;
+			terminalPendingError = error;
 			for (const close of shellGates) close();
 			shellGates.clear();
 			activeExecAbort?.(error instanceof Error ? error : new Error(String(error)));
 			activeExecAbort = undefined;
 			closeTerminalAdmission();
 			closeTransportLocally();
+			processPendingBuffer?.();
+			if (terminalDrain) {
+				terminalDrain();
+			}
 			settleBehindFence(() => settleH2(error));
 		};
 		const closeForCallerAbort = () => {
@@ -1331,6 +1342,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				log("error", "handleServerMessage", { error: String(error) });
 				terminalize(error);
 			});
+			terminalDrain = (): void => {
+				if (terminalDrainStarted) return;
+				terminalDrainStarted = true;
+				void messageQueue.drain().then(
+					() => {
+						queueDrained = true;
+						settleBehindFence(() => settleH2(terminalPendingError));
+					},
+					error => {
+						queueDrained = true;
+						settleBehindFence(() => settleH2(error));
+					},
+				);
+			};
 			const drainMessageQueue = (): void => {
 				void messageQueue.drain().then(
 					() => {
@@ -1356,7 +1381,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// True while any exec server message handler is running; suppresses
 			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
 			let execInFlight = false;
-			let processPendingBuffer: (() => void) | undefined;
 			/**
 			 * Inspect buffered protocol frames while normal parsing is paused behind an
 			 * exec. This deliberately shares the Connect/protobuf framing rules with the
@@ -1434,7 +1458,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				drainMessageQueue();
 			};
 			processPendingBuffer = () => {
-				if (processingPausedForExec || processingPausedForQueue) {
+				if ((processingPausedForExec || processingPausedForQueue) && !terminalDrainMode) {
 					observeBufferedTerminal(responseEnded);
 					return;
 				}
@@ -1488,7 +1512,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
-							if (transportTerminalized) return;
+							if (transportTerminalized && !(terminalDrainMode && !isExecServerMessage)) return;
 							if (isExecServerMessage && terminalAdmissionMode === "closed") return;
 							// An exec frame asks this process to perform work before Cursor can
 							// response. Its deadline is independent from raw transport
