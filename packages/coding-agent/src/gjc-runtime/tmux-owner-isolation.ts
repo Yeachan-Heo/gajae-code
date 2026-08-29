@@ -1294,7 +1294,8 @@ function readNoFollowJsonSync(file: string): unknown | null {
 	if (!before.isFile()) throw new Error("baseline_generation_corrupt");
 	let fd: number;
 	try {
-		fd = fsSync.openSync(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		const noFollow = process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW;
+		fd = fsSync.openSync(file, fsSync.constants.O_RDONLY | noFollow);
 	} catch {
 		throw new Error("baseline_generation_corrupt");
 	}
@@ -1302,7 +1303,22 @@ function readNoFollowJsonSync(file: string): unknown | null {
 		const after = fsSync.fstatSync(fd);
 		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino)
 			throw new Error("baseline_generation_corrupt");
-		return JSON.parse(fsSync.readFileSync(fd, "utf8")) as unknown;
+		const content = fsSync.readFileSync(fd, "utf8");
+		const final = fsSync.fstatSync(fd);
+		const pathFinal = fsSync.lstatSync(file);
+		if (
+			!final.isFile() ||
+			!pathFinal.isFile() ||
+			final.dev !== before.dev ||
+			final.ino !== before.ino ||
+			final.size !== before.size ||
+			final.mtimeMs !== before.mtimeMs ||
+			final.ctimeMs !== before.ctimeMs ||
+			pathFinal.dev !== before.dev ||
+			pathFinal.ino !== before.ino
+		)
+			throw new Error("baseline_generation_corrupt");
+		return JSON.parse(content) as unknown;
 	} catch {
 		throw new Error("baseline_generation_corrupt");
 	} finally {
