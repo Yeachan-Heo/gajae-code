@@ -9,7 +9,14 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, getConfigDirName, getProjectDir, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getConfigDirName,
+	getPluginsDir,
+	getProjectDir,
+	getTrustedHomeDir,
+	logger,
+} from "@gajae-code/utils";
 
 import type { Settings } from "../config/settings";
 import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
@@ -39,6 +46,19 @@ const providerMeta = new Map<string, { displayName: string; description: string 
 
 /** Disabled providers (by ID) */
 const disabledProviders = new Set<string>();
+
+/** User/project roots used by providers that derive paths from LoadContext.home/cwd. */
+const EXPLICIT_HOME_PROVIDER_ROOTS = [
+	{ id: "claude", user: ".claude", project: ".claude" },
+	{ id: "codex", user: ".codex", project: ".codex" },
+	{ id: "gemini", user: ".gemini", project: ".gemini" },
+	{ id: "opencode", user: path.join(".config", "opencode"), project: ".opencode" },
+	{ id: "cursor", user: ".cursor", project: ".cursor" },
+	{ id: "windsurf", user: path.join(".codeium", "windsurf"), project: ".windsurf" },
+	{ id: "cline", user: ".cline", project: null },
+	{ id: "github", user: null, project: ".github" },
+	{ id: "vscode", user: ".vscode", project: ".vscode" },
+] as const;
 
 function isWithinOrEqual(root: string, candidate: string): boolean {
 	const relative = path.relative(root, candidate);
@@ -87,30 +107,46 @@ async function canonicalizeContainedPath(root: string, target: string, label: st
  * otherwise make a path that is lexically inside the supplied home read an
  * unrelated profile.
  */
-async function assertExplicitHomeRoots(canonicalHome: string, cwd: string): Promise<void> {
-	await canonicalizeContainedPath(canonicalHome, path.join(canonicalHome, getConfigDirName()), "config root");
-	await canonicalizeContainedPath(
-		canonicalHome,
-		path.join(canonicalHome, getConfigDirName(), "agent"),
-		"user agent directory",
-	);
-	await canonicalizeContainedPath(
-		canonicalHome,
-		path.join(canonicalHome, getConfigDirName(), "plugins"),
-		"plugin registry root",
+async function assertExplicitHomeRoots(canonicalHome: string, cwd: string, explicitAgentDir: boolean): Promise<void> {
+	const userRoots = new Map<string, string>();
+	const projectRoots = new Map<string, string>();
+	const addRoot = (roots: Map<string, string>, root: string, label: string): void => {
+		if (!roots.has(root)) roots.set(root, label);
+	};
+
+	// Validate every non-native provider root as a set instead of relying on
+	// individual providers to remember the explicit-home boundary.
+	for (const source of EXPLICIT_HOME_PROVIDER_ROOTS) {
+		if (source.user) addRoot(userRoots, path.join(canonicalHome, source.user), `${source.id} user root`);
+		if (source.project) addRoot(projectRoots, source.project, `${source.id} project root`);
+	}
+	if (!explicitAgentDir)
+		addRoot(userRoots, path.join(canonicalHome, getConfigDirName(), "agent"), "user agent directory");
+	addRoot(projectRoots, getConfigDirName(), "project registry root");
+
+	// The standard Agents provider has two user/project roots outside
+	// SOURCE_PATHS, while the marketplace provider derives its registry from
+	// the XDG-aware helper rather than a fixed `<home>/.gjc/plugins` path.
+	for (const baseDir of [".agent", ".agents"]) {
+		addRoot(userRoots, path.join(canonicalHome, baseDir), `agents user root (${baseDir})`);
+		addRoot(projectRoots, baseDir, `agents project root (${baseDir})`);
+	}
+	addRoot(projectRoots, path.join(getConfigDirName(), "plugins"), "project plugin registry root");
+	addRoot(userRoots, getPluginsDir(canonicalHome), "plugin registry root");
+
+	await Promise.all(
+		[...userRoots.entries()].map(([root, label]) => canonicalizeContainedPath(canonicalHome, root, label)),
 	);
 
-	// Project plugin discovery walks from cwd toward the home boundary. Check
-	// each candidate `.gjc` root so an internal symlink cannot redirect a
-	// project registry outside the explicit profile.
+	// Project discovery walks from cwd toward the home boundary. Validate every
+	// provider root at each ancestor so a symlinked non-native project registry
+	// cannot redirect a read outside the explicit profile.
 	let current = cwd;
 	while (true) {
-		const projectConfigRoot = path.join(current, getConfigDirName());
-		await canonicalizeContainedPath(canonicalHome, projectConfigRoot, "project registry root");
-		await canonicalizeContainedPath(
-			canonicalHome,
-			path.join(projectConfigRoot, "plugins"),
-			"project plugin registry root",
+		await Promise.all(
+			[...projectRoots.entries()].map(([relativeRoot, label]) =>
+				canonicalizeContainedPath(canonicalHome, path.join(current, relativeRoot), label),
+			),
 		);
 		if (current === canonicalHome) break;
 		const parent = path.dirname(current);
@@ -403,7 +439,7 @@ export async function loadCapabilityForHome<T>(
 				path.join(canonicalHome, getConfigDirName(), "agent"),
 				"user agent directory",
 			);
-	await assertExplicitHomeRoots(canonicalHome, cwd);
+	await assertExplicitHomeRoots(canonicalHome, cwd, options.agentDir !== undefined);
 	const repoRootCandidate = await findRepoRoot(cwd);
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =

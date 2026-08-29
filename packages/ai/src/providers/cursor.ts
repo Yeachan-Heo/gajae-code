@@ -295,6 +295,148 @@ const CURSOR_NON_ABORTABLE_GRACE_MIN_MS = 5_000;
 const CURSOR_NON_ABORTABLE_GRACE_DIVISOR = 4;
 const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
 
+interface CursorPendingChunk {
+	bytes: Buffer;
+	offset: number;
+	next: CursorPendingChunk | null;
+}
+
+/**
+ * Bounded response staging for Connect frames. Incoming HTTP/2 chunks are
+ * retained by reference and consumed from the head; a frame split across
+ * chunks is copied once for protobuf decoding instead of repeatedly growing a
+ * single Buffer with Buffer.concat.
+ */
+class CursorPendingBuffer {
+	private head: CursorPendingChunk | null = null;
+	private tail: CursorPendingChunk | null = null;
+	private byteLength = 0;
+	private lookup: {
+		logicalOffset: number;
+		chunk: CursorPendingChunk;
+		chunkOffset: number;
+	} | null = null;
+
+	get length(): number {
+		return this.byteLength;
+	}
+
+	append(bytes: Uint8Array): void {
+		if (bytes.length === 0) return;
+		const chunk: CursorPendingChunk = {
+			bytes: Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes),
+			offset: 0,
+			next: null,
+		};
+		if (this.tail) this.tail.next = chunk;
+		else this.head = chunk;
+		this.tail = chunk;
+		this.byteLength += chunk.bytes.length;
+	}
+
+	clear(): void {
+		this.head = null;
+		this.tail = null;
+		this.byteLength = 0;
+		this.lookup = null;
+	}
+
+	consume(length: number): void {
+		if (!Number.isInteger(length) || length < 0 || length > this.byteLength) {
+			throw new RangeError(`Cannot consume ${length} bytes from a ${this.byteLength}-byte buffer`);
+		}
+		let remaining = length;
+		while (remaining > 0) {
+			const chunk = this.head;
+			if (!chunk) throw new RangeError("Pending buffer ended while consuming bytes");
+			const available = chunk.bytes.length - chunk.offset;
+			const consumed = Math.min(remaining, available);
+			chunk.offset += consumed;
+			remaining -= consumed;
+			if (chunk.offset === chunk.bytes.length) {
+				this.head = chunk.next;
+				chunk.next = null;
+				if (!this.head) this.tail = null;
+			}
+		}
+		this.byteLength -= length;
+		this.lookup = null;
+	}
+
+	private locate(offset: number): { chunk: CursorPendingChunk; chunkOffset: number } {
+		if (!Number.isInteger(offset) || offset < 0 || offset >= this.byteLength) {
+			throw new RangeError(`Pending buffer offset ${offset} is outside ${this.byteLength} bytes`);
+		}
+
+		let chunk: CursorPendingChunk | null;
+		let chunkOffset: number;
+		let logicalOffset: number;
+		if (this.lookup && offset >= this.lookup.logicalOffset) {
+			chunk = this.lookup.chunk;
+			chunkOffset = this.lookup.chunkOffset;
+			logicalOffset = this.lookup.logicalOffset;
+		} else {
+			chunk = this.head;
+			chunkOffset = chunk?.offset ?? 0;
+			logicalOffset = 0;
+		}
+
+		while (chunk) {
+			const available = chunk.bytes.length - chunkOffset;
+			if (offset < logicalOffset + available) {
+				this.lookup = { logicalOffset: offset, chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
+				return { chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
+			}
+			logicalOffset += available;
+			chunk = chunk.next;
+			chunkOffset = chunk?.offset ?? 0;
+		}
+
+		throw new RangeError(`Pending buffer offset ${offset} is outside ${this.byteLength} bytes`);
+	}
+
+	byteAt(offset: number): number {
+		const location = this.locate(offset);
+		return location.chunk.bytes[location.chunkOffset];
+	}
+
+	readUInt32BE(offset: number): number {
+		if (!Number.isInteger(offset) || offset < 0 || offset + 4 > this.byteLength) {
+			throw new RangeError(`Cannot read a 32-bit value at offset ${offset}`);
+		}
+		return (
+			((this.byteAt(offset) << 24) |
+				(this.byteAt(offset + 1) << 16) |
+				(this.byteAt(offset + 2) << 8) |
+				this.byteAt(offset + 3)) >>>
+			0
+		);
+	}
+
+	subarray(offset: number, length: number): Buffer {
+		if (!Number.isInteger(length) || length < 0 || offset < 0 || offset + length > this.byteLength) {
+			throw new RangeError(`Cannot slice ${length} bytes at offset ${offset}`);
+		}
+		if (length === 0) return Buffer.alloc(0);
+		const first = this.locate(offset);
+		const contiguous = first.chunk.bytes.length - first.chunkOffset;
+		if (length <= contiguous) return first.chunk.bytes.subarray(first.chunkOffset, first.chunkOffset + length);
+
+		const result = Buffer.allocUnsafe(length);
+		let written = 0;
+		let chunk: CursorPendingChunk | null = first.chunk;
+		let chunkOffset = first.chunkOffset;
+		while (chunk && written < length) {
+			const available = Math.min(length - written, chunk.bytes.length - chunkOffset);
+			chunk.bytes.copy(result, written, chunkOffset, chunkOffset + available);
+			written += available;
+			chunk = chunk.next;
+			chunkOffset = chunk?.offset ?? 0;
+		}
+		return result;
+	}
+}
+
 function cursorAbortError(signal: AbortSignal): Error {
 	const reason = signal.reason;
 	if (reason instanceof Error) {
@@ -804,7 +946,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let responseEnded = false;
 		let queueDrained = false;
 		let endStreamError: Error | null = null;
-		let pendingBuffer = Buffer.alloc(0);
+		const pendingBuffer = new CursorPendingBuffer();
 		let bufferedObservationOffset = 0;
 		let bufferedObservationTurnEnded = false;
 		const closeTerminalAdmission = (): void => {
@@ -1226,7 +1368,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				let offset = bufferedObservationOffset;
 				let observedTurnEnded = sawTurnEnded || bufferedObservationTurnEnded;
 				while (pendingBuffer.length - offset >= 5) {
-					const flags = pendingBuffer[offset];
+					const flags = pendingBuffer.byteAt(offset);
 					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
 					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
 						const error = new Error("Cursor HTTP/2 frame exceeds the maximum message length");
@@ -1236,7 +1378,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						return true;
 					}
 					if (pendingBuffer.length - offset < 5 + msgLen) break;
-					const messageBytes = pendingBuffer.subarray(offset + 5, offset + 5 + msgLen);
+					const messageBytes = pendingBuffer.subarray(offset + 5, msgLen);
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						const error = parseConnectEndStream(messageBytes);
 						if (error) {
@@ -1297,7 +1439,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					return;
 				}
 				while (pendingBuffer.length >= 5) {
-					const flags = pendingBuffer[0];
+					const flags = pendingBuffer.byteAt(0);
 					const msgLen = pendingBuffer.readUInt32BE(1);
 					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
 						endStreamError = new Error("Cursor HTTP/2 frame exceeds the maximum message length");
@@ -1307,8 +1449,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					}
 					if (pendingBuffer.length < 5 + msgLen) break;
 
-					const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
+					const messageBytes = pendingBuffer.subarray(5, msgLen);
+					pendingBuffer.consume(5 + msgLen);
 					bufferedObservationOffset = 0;
 					bufferedObservationTurnEnded = false;
 					if (terminalAdmissionMode === "closed" && !(flags & CONNECT_END_STREAM_FLAG)) continue;
@@ -1523,7 +1665,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						return;
 					}
 					const length = Math.min(available, chunk.length - offset);
-					pendingBuffer = Buffer.concat([pendingBuffer, chunk.subarray(offset, offset + length)]);
+					pendingBuffer.append(chunk.subarray(offset, offset + length));
 					offset += length;
 					processPendingBuffer?.();
 				}
@@ -1612,7 +1754,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				clearTimeout(gracefulCloseCheckTimer);
 				gracefulCloseCheckTimer = undefined;
 			}
-			pendingBuffer = Buffer.alloc(0);
+			pendingBuffer.clear();
 			bufferedObservationOffset = 0;
 			bufferedObservationTurnEnded = false;
 			transportWatchdogClosed = true;

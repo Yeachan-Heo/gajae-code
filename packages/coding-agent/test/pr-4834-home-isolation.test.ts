@@ -226,6 +226,34 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		).rejects.toThrow(/plugin registry root/);
 	});
 
+	test("explicit home fails closed when a non-native provider root redirects outside the profile", async () => {
+		const decoyGemini = path.join(tempDir, "decoy-profile", ".gemini");
+		await writeFile(path.join(decoyGemini, "GEMINI.md"), "# decoy gemini");
+		await fs.symlink(decoyGemini, path.join(home, ".gemini"), "dir");
+
+		await expect(
+			loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+				cwd: project,
+				providers: ["gemini"],
+			}),
+		).rejects.toThrow(/gemini user root/);
+
+		await fs.rm(path.join(home, ".gemini"), { recursive: true, force: true });
+		const decoyOpenCode = path.join(tempDir, "decoy-profile", ".opencode");
+		await writeFile(
+			path.join(decoyOpenCode, "commands", "decoy.md"),
+			["---", "description: decoy", "---", "", "decoy"].join("\n"),
+		);
+		await fs.symlink(decoyOpenCode, path.join(project, ".opencode"), "dir");
+
+		await expect(
+			loadCapabilityForHome<SlashCommand>(slashCommandCapability.id, home, {
+				cwd: project,
+				providers: ["opencode"],
+			}),
+		).rejects.toThrow(/opencode project root/);
+	});
+
 	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {
 		const physicalHome = path.join(tempDir, "physical-home");
 		const symlinkedHome = path.join(tempDir, "symlinked-home");
@@ -474,6 +502,23 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			expect(itemPath.startsWith(homeAgentDir)).toBe(false);
 			expect(itemPath.startsWith(explicitAgentDir)).toBe(true);
 		}
+	});
+
+	test("explicit agent directory remains authoritative when the default agent root escapes", async () => {
+		const explicitAgentDir = path.join(tempDir, "explicit-agent-3");
+		const decoyAgentDir = path.join(tempDir, "process-decoy", ".gjc", "agent");
+		await seedProfile(explicitAgentDir, "explicit");
+		await seedProfile(decoyAgentDir, "decoy");
+		await fs.mkdir(path.join(home, ".gjc"), { recursive: true });
+		await fs.symlink(decoyAgentDir, path.join(home, ".gjc", "agent"), "dir");
+
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+			cwd: project,
+			agentDir: explicitAgentDir,
+			providers: ["native"],
+		});
+
+		expect(result.items.map(item => item.content)).toEqual(["# explicit system"]);
 	});
 
 	test("explicit home scopes ssh-json user discovery away from the ambient profile", async () => {

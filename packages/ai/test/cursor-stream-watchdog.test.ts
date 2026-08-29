@@ -934,8 +934,10 @@ describe("Cursor raw transport watchdog", () => {
 
 	it("applies bounded backpressure while a local exec blocks frame handling", async () => {
 		let serverStream: http2.ServerHttp2Stream | undefined;
+		const streamReady = Promise.withResolvers<void>();
 		const baseUrl = await createCursorServer(stream => {
 			serverStream = stream;
+			streamReady.resolve();
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
 			setTimeout(() => {
 				sendServerMessage(stream, {
@@ -955,14 +957,20 @@ describe("Cursor raw transport watchdog", () => {
 		});
 		const neverSettles = Promise.withResolvers<never>();
 
-		const { result } = await collectTerminal(baseUrl, {
+		const pending = collectTerminal(baseUrl, {
 			streamIdleTimeoutMs: 40,
 			streamFirstEventTimeoutMs: 200,
 			execHandlers: { piRead: async () => neverSettles.promise },
 		});
+		await streamReady.promise;
+		const concatSpy = vi.spyOn(Buffer, "concat");
+		const { result } = await pending;
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("Cursor local exec exceeded its 160ms deadline");
+		const providerConcats = concatSpy.mock.calls.filter(call => Array.isArray(call[0]) && call[0].length === 2);
+		expect(providerConcats).toHaveLength(0);
+
 		for (let tick = 0; tick < 20 && !serverStream?.closed; tick += 1) await Bun.sleep(1);
 		expect(serverStream?.closed).toBe(true);
 	});
