@@ -5,7 +5,6 @@ import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
-import { GJC_TMUX_OWNER_SERVER_KEY_ENV } from "./session-state-sidecar";
 import {
 	isValidOwnerIntent,
 	lifecyclePaths,
@@ -24,6 +23,7 @@ export const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
+const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
 
 let bootstrapSigtermPending = false;
 const captureBootstrapSigterm = () => {
