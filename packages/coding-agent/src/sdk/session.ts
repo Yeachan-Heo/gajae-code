@@ -121,7 +121,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import { getMemoryRootForSession } from "../internal-urls/memory-protocol";
-import type { LspStartupServerInfo } from "../lsp";
+import { discoverStartupLspServers, type LspStartupServerInfo } from "../lsp";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
 import { getMemoryBackendRescopeError } from "../memory-backend/service";
@@ -5026,7 +5026,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// LSP-backed write operations create clients on demand through `getOrCreateClient`.
 		const lspServers =
 			enableLsp && options.hasUI && settings.get("lsp.diagnosticsOnWrite")
-				? (await import("../lsp")).discoverStartupLspServers(cwd, agentDir)
+				? await discoverStartupLspServers(cwd, agentDir)
 				: undefined;
 
 		let memoryStartupTask: Promise<void> | undefined;

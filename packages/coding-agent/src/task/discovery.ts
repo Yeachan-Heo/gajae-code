@@ -10,14 +10,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import {
-	getAgentDir,
-	getAgentProfileAuthority,
-	getConfigDirName,
-	getTrustedHomeDir,
-	logger,
-	normalizePathForComparison,
-} from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, getTrustedHomeDir, logger } from "@gajae-code/utils";
 import { isProviderEnabled } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
@@ -78,12 +71,7 @@ export async function discoverAgents(
 		activeSettings?.getAgentDir() ??
 		(getAgentProfileAuthority() === "custom" ? getAgentDir() : undefined);
 	const profileAuthority =
-		resolvedAgentDir !== undefined
-			? normalizePathForComparison(resolvedAgentDir) ===
-				normalizePathForComparison(path.join(home, getConfigDirName(), "agent"))
-				? "default"
-				: "custom"
-			: getAgentProfileAuthority();
+		agentDir !== undefined || activeSettings?.getAgentDir() !== undefined ? "custom" : getAgentProfileAuthority();
 	const agentSources = Array.from(
 		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
 	);
