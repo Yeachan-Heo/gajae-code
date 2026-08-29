@@ -997,6 +997,10 @@ impl NativeCanonicalDirectoryIdentity {
 }
 
 impl NativeOwnerOnlySecurityResult {
+	const fn is_ok(&self) -> bool {
+		self.ok
+	}
+
 	#[allow(dead_code, reason = "used by non-Linux platform implementations")]
 	const fn success() -> Self {
 		Self {
@@ -5021,12 +5025,12 @@ pub(crate) mod platform {
 		if file_mode == 0o600 {
 			#[cfg(target_os = "linux")]
 			let directory_security = apply_owner_only_fd_security(&canonical_root, "directory", skills_fd)
-				.ok && apply_owner_only_fd_security(
+				.is_ok() && apply_owner_only_fd_security(
 				&canonical_root.join(skill_name),
 				"directory",
 				skill_fd,
 			)
-			.ok;
+			.is_ok();
 			#[cfg(not(target_os = "linux"))]
 			let directory_security = unsafe { libc::fchmod(skills_fd, 0o700) } == 0
 				&& unsafe { libc::fchmod(skill_fd, 0o700) } == 0;
@@ -9740,6 +9744,14 @@ mod platform {
 			}
 			authority.retain_child(child);
 		}
+		let sid = current_user_sid().map_err(|_| "acl_unavailable")?;
+		let applied = set_owner_only_acl(authority.target, "directory", &sid, true);
+		if !applied.ok {
+			return Err("acl_apply_failed");
+		}
+		if !verify_owner_only_handle(authority.target, "directory").ok {
+			return Err("acl_verify_failed");
+		}
 		Ok((authority, canonical_volume, names))
 	}
 
@@ -10067,11 +10079,25 @@ mod platform {
 		if let Err(error) =
 			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
 		{
+			if let SkillPublicationError::Published(code) = error {
+				if cleanup_private_skill_file(file).is_err() {
+					unsafe { CloseHandle(file) };
+					return NativeSecureSkillWriteResult::success(
+						root_path
+							.join(&skill_name)
+							.join(&file_name)
+							.to_string_lossy()
+							.into_owned(),
+					);
+				}
+				unsafe { CloseHandle(file) };
+				return NativeSecureSkillWriteResult::failure(code);
+			}
 			let code = match error {
 				SkillPublicationError::Pre(code) => {
 					cleanup_private_skill_file(file).err().unwrap_or(code)
 				},
-				SkillPublicationError::Published(code) => code,
+				SkillPublicationError::Published(_) => unreachable!(),
 			};
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(code);

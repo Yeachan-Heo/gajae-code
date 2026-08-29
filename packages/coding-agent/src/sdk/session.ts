@@ -1504,7 +1504,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector, authStorageOwner);
 		};
-		if (ownsModelRegistry) modelRegistry.setScopedSettings(settings);
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		closeOwnedSettings = async (): Promise<void> => {
@@ -2293,7 +2292,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				secretsEnabled = false;
 				session.setObfuscator(undefined);
 			}
-			modelRegistry.setScopedSettings(settings);
+			modelRegistry.setScopedSettings(settings, { reload: options.modelRegistry === undefined });
 			modelRegistry.applyConfiguredModelBindings(settings);
 			for (const timer of notificationDebounceTimers.values()) clearTimeout(timer);
 			notificationDebounceTimers.clear();
