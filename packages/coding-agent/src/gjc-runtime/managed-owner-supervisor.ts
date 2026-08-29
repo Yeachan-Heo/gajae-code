@@ -232,7 +232,8 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				const now = Date.now();
 				const active = Date.parse(candidate.created_at) <= now && Date.parse(candidate.expires_at) > now;
 				if (!active && Date.parse(candidate.expires_at) <= now) expiredIntent = true;
-				else if (candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV]) candidateIntent = candidate;
+				else if (active && candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV])
+					candidateIntent = candidate;
 			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
