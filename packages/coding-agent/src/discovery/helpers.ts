@@ -806,11 +806,13 @@ export async function resolveActiveProjectRegistryPath(cwd: string, homeDir?: st
 		}
 	};
 	const explicitHome = homeDir !== undefined;
+	const trustedHome = await canonicalize(getTrustedHomeDir()).catch(() => null);
 	homeDir = await canonicalize(homeDir ?? getTrustedHomeDir());
 	const canonicalCwd = await canonicalize(cwd);
 	const relativeHome = path.relative(homeDir, canonicalCwd);
+	const explicitBoundary = explicitHome && homeDir !== trustedHome;
 	const effectiveStop =
-		!explicitHome ||
+		!explicitBoundary ||
 		relativeHome === "" ||
 		(relativeHome !== ".." && !relativeHome.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeHome))
 			? homeDir
