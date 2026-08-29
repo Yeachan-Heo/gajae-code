@@ -45,6 +45,7 @@
 ### Fixed
 
 - Path autocomplete matches decomposed (NFD) file names against composed (NFC) input. Composer keystrokes are NFC-normalized while macOS volumes commonly return Hangul and other composed scripts in NFD, so `@한` found nothing even though `한글.txt` existed; both the directory-listing prefix match and the fuzzy filter now compare NFC forms while completion values keep the on-disk name. The native fuzzy finder applies the same normalization to queries and candidates.
+- `fuzzyFilter` / `fuzzyMatch` now handle Hangul the same way path autocomplete does, so the command palette, model selector, OAuth selector, and session selector stop silently hiding entries. That matcher had no Hangul or normalization handling at all: a chosung query returned nothing (`ㅎㄱ` against `한글경로 설정` matched 0 items), and a composed query matched only composed entries (1 of 2 when both NFC and NFD spellings were present) — which on macOS means filesystem-derived text was routinely invisible. Both sides are now NFC-folded before comparison and a bare consonant matches a syllable's initial. The initial-jamo table, the character comparison, and the folding step moved into a single shared `hangul` module that both matchers import instead of keeping a second copy; scoring, word-boundary rewards, whitespace token semantics, and the alphanumeric-swap fallback are unchanged, and a decomposed target now scores identically to its composed form.
 
 ## [0.15.3] - 2026-08-27
 

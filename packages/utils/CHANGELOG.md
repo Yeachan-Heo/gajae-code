@@ -17,6 +17,7 @@
 ## [0.15.5] - 2026-08-29
 
 ## [0.15.4] - 2026-08-29
+- A fatal error whose message spans multiple lines no longer prints its body twice. `formatFatalError` and `writeCrashRecord` both dropped a single line from `stack` to skip V8's `Name: message` header, but that header spans as many lines as the message does, so lines 2..N survived as pretend stack frames while the message had already been rendered in full — visible on stderr and in `gjc-crash.log` for any multi-line guard. The header is now stripped by exact `name: message` prefix, falling back to the single-line drop when the captured message no longer matches the stack (a serialized payload can replace it). Real frames are preserved.
 
 ## [0.15.3] - 2026-08-27
 
