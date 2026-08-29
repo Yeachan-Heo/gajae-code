@@ -1592,7 +1592,8 @@ async function readCurrentGeneration(stateDir: string, sessionId: string): Promi
 		if (!before.isFile()) return null;
 		const handle = await fs.open(
 			file,
-			fsSync.constants.O_RDONLY | (process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW),
+			fsSync.constants.O_RDONLY |
+				(process.platform === "win32" ? 0 : fsSync.constants.O_NOFOLLOW | fsSync.constants.O_NONBLOCK),
 		);
 		try {
 			const opened = await handle.stat({ bigint: true });
