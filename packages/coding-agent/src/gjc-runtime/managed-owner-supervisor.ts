@@ -29,10 +29,6 @@ let bootstrapSigtermPending = false;
 const captureBootstrapSigterm = () => {
 	bootstrapSigtermPending = true;
 };
-if (process.argv.at(-1) === MANAGED_OWNER_SUPERVISOR_ARG) {
-	process.removeAllListeners("SIGTERM");
-	process.on("SIGTERM", captureBootstrapSigterm);
-}
 
 export interface ManagedOwnerBinding {
 	schema_version: 2;
@@ -133,6 +129,11 @@ function childCommand(): string[] {
 
 export function isManagedOwnerSupervisorArgv(args: readonly string[]): boolean {
 	return args.length === 1 && args[0] === MANAGED_OWNER_SUPERVISOR_ARG;
+}
+
+if (isManagedOwnerSupervisorArgv(process.argv.slice(2))) {
+	process.removeAllListeners("SIGTERM");
+	process.on("SIGTERM", captureBootstrapSigterm);
 }
 
 /** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
