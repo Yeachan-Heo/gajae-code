@@ -127,6 +127,17 @@ export class YieldQueue {
 		return messages;
 	}
 
+	drainKindMessages(kind: string, includeStale = false): AgentMessage[] {
+		const dispatcher = this.#dispatchers.get(kind);
+		if (!dispatcher) return [];
+		const entries = this.#drain(kind);
+		return entries.length === 0 ? [] : (this.#build(kind, dispatcher, entries, includeStale) ?? []);
+	}
+
+	clear(): void {
+		this.#entries.clear();
+		this.#idleFlushPending = false;
+	}
 	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
 	clearKind(kind: string): void {
 		this.#entries.delete(kind);
