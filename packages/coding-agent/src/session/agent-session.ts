@@ -4625,36 +4625,45 @@ export class AgentSession {
 					return true;
 				};
 				try {
-					await this.#withSessionAdmission(
-						"prompt",
-						async () => {
-							if (settleIfDisposing()) return;
-							if (this.isStreaming) {
-								await awaitPromptInvocationPreflight(this.agent.waitForIdle(), signal);
-								if (settleIfDisposing()) return;
-							}
-							if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
-								this.#resumeFromOwnedCompletion();
-							if (survivors.length === 1) {
-								await this.agent.prompt(first, {
-									...this.#managedFallbackPromptOptions(),
-									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle);
-									},
-								});
-							} else {
-								await this.agent.prompt(survivors, {
-									...this.#managedFallbackPromptOptions(),
-									onRunAccepted: (handle: AttemptRunHandle) => {
-										if (handle) this.#acceptSdkAttemptRun(handle);
-									},
-								});
-							}
-						},
-						signal,
-						undefined,
-						{ idleDelivery: true },
-					);
+					await this.#awaitStartupTurnBarrier();
+					if (
+						this.#isDisposed ||
+						this.#sessionTransitionKind !== undefined ||
+						this.#coordinatorPersistGeneration !== admissionGeneration
+					) {
+						if (this.#isDisposed || this.#sessionTransitionDropsAsync)
+							this.#settleDeliveredOwnedRegistrations(survivors);
+						else this.yieldQueue.deferIdle(survivors);
+						return;
+					}
+					// A user prompt may have started during the barrier/scheduling
+					// delay: if the session is now streaming, mutating the epoch and
+					// lineage here would corrupt the ACTIVE user turn (and
+					// agent.prompt would then reject as busy, losing the drained
+					// completion). Route the survivors through followUp — the
+					// streaming injector's path — which allocates the fresh resume
+					// lineage at actual admission (review thread P1).
+					if (this.isStreaming) {
+						for (const message of survivors) this.agent.followUp(message);
+						return;
+					}
+					if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
+						this.#resumeFromOwnedCompletion();
+					if (survivors.length === 1) {
+						await this.agent.prompt(first, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
+					} else {
+						await this.agent.prompt(survivors, {
+							...this.#managedFallbackPromptOptions(),
+							onRunAccepted: (handle: AttemptRunHandle) => {
+								if (handle) this.#acceptSdkAttemptRun(handle);
+							},
+						});
+					}
 				} finally {
 					// The owned completions were delivered OR the prompt attempt
 					// failed (e.g. provider rejection): either way the yield

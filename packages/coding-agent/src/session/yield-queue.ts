@@ -19,9 +19,8 @@ export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	isTransitionFenced?: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
-	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
-	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
-	getIdleFlushSignal?(): AbortSignal | undefined;
+	injectIdle(messages: AgentMessage[]): Promise<void>;
+	scheduleIdleFlush(run: () => Promise<void>): void;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -41,7 +40,7 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, unknown[]>();
 	#idleFlushPending = false;
-	#idleFlushPendingOwner: symbol | undefined;
+	#deferredIdleMessages: AgentMessage[] = [];
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -85,13 +84,15 @@ export class YieldQueue {
 		return false;
 	}
 
-	async flush(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
+	async flush(mode: YieldFlushMode): Promise<void> {
 		if (mode === "idle") {
+			if (this.#options.isTransitionFenced?.()) return;
 			this.#idleFlushPending = false;
-			this.#idleFlushPendingOwner = undefined;
 		}
 		if (mode === "streaming" && this.#options.isTransitionFenced?.()) return;
-		const messages = this.drainMessages();
+		const messages =
+			mode === "idle" ? [...this.#deferredIdleMessages, ...this.drainMessages()] : this.drainMessages();
+		if (mode === "idle") this.#deferredIdleMessages = [];
 		if (mode === "streaming") {
 			for (const message of messages) {
 				try {
@@ -104,21 +105,19 @@ export class YieldQueue {
 		}
 		if (messages.length > 0) {
 			try {
-				await this.#options.injectIdle(messages, signal ?? this.#options.getIdleFlushSignal?.());
+				await this.#options.injectIdle(messages);
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
 		}
 	}
 
-	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
-		if (onDrop) {
-			for (const [kind, entries] of this.#entries) onDrop(kind, entries);
-		}
-		this.#entries.clear();
-		this.#idleFlushPending = false;
-		this.#idleFlushPendingOwner = undefined;
+	deferIdle(messages: AgentMessage[]): void {
+		if (messages.length === 0) return;
+		this.#deferredIdleMessages.push(...messages);
+		this.#scheduleIdleFlush();
 	}
+
 	drainMessages(includeStale = false): AgentMessage[] {
 		const messages: AgentMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
@@ -138,8 +137,10 @@ export class YieldQueue {
 
 	clear(): void {
 		this.#entries.clear();
+		this.#deferredIdleMessages = [];
 		this.#idleFlushPending = false;
 	}
+
 	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
 	clearKind(kind: string): void {
 		this.#entries.delete(kind);
@@ -154,6 +155,10 @@ export class YieldQueue {
 	 */
 	rearmIdle(): void {
 		if (this.#options.isStreaming()) return;
+		if (this.#deferredIdleMessages.length > 0) {
+			this.#scheduleIdleFlush();
+			return;
+		}
 		for (const entries of this.#entries.values()) {
 			if (entries.length > 0) {
 				this.#scheduleIdleFlush();
@@ -165,21 +170,14 @@ export class YieldQueue {
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
-		const owner = Symbol("idle-flush");
-		this.#idleFlushPendingOwner = owner;
-		const releaseOwner = () => {
-			if (this.#idleFlushPendingOwner !== owner) return;
-			this.#idleFlushPendingOwner = undefined;
-			this.#idleFlushPending = false;
-		};
 		try {
-			this.#options.scheduleIdleFlush(async signal => {
-				releaseOwner();
+			this.#options.scheduleIdleFlush(async () => {
+				this.#idleFlushPending = false;
 				if (this.#options.isStreaming()) return;
-				await this.flush("idle", signal);
-			}, releaseOwner);
+				await this.flush("idle");
+			});
 		} catch (error) {
-			releaseOwner();
+			this.#idleFlushPending = false;
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
