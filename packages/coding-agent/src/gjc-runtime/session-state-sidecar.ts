@@ -1664,7 +1664,7 @@ export async function persistCoordinatorLaunchFailureState(input: {
 			.some(character => character.charCodeAt(0) < 0x20 || character.charCodeAt(0) === 0x7f) &&
 		path.resolve(ownerStateDir!) === stateDirectory;
 	const keyId = input.signingRequired ? input.keyId?.trim() || null : null;
-	if (input.signingRequired && !keyId) return;
+	if (input.signingRequired && (!keyId || !/^[a-f0-9]{64}$/.test(keyId))) return;
 
 	await serializeStateFileWrite(
 		stateFile,
