@@ -2133,7 +2133,7 @@ export interface ExactOwnerCloseRequest {
 }
 export interface ExactOwnerCloseDependencies {
 	readStartTime(pid: number): Promise<string | null>;
-	sendSigterm(pid: number): Promise<void>;
+	sendSigterm(pid: number, intent: OwnerIntent): Promise<void>;
 	waitForVerdict(): Promise<OwnerVerdict | null>;
 	cleanupSession(): Promise<void>;
 }
@@ -2184,7 +2184,7 @@ export async function closeExactTmuxOwner(
 				throw new Error("owner_pid_identity_mismatch");
 			if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
 				throw new Error("owner_generation_mismatch");
-			await deps.sendSigterm(request.pid);
+			await deps.sendSigterm(request.pid, intent);
 		} catch (error: unknown) {
 			await renameIntentIfCurrent(paths, intent.intent_id, ".cancelled", generationLockToken);
 			throw error;
