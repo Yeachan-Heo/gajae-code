@@ -1819,7 +1819,7 @@ export async function forceCloseGjcTmuxSession(
 		},
 		{
 			readStartTime: deps.readProcessStartTime ?? readProcessStartTime,
-			sendSigterm: async pid => {
+			sendSigterm: async (pid, intent) => {
 				if ((await (deps.readProcessStartTime ?? readProcessStartTime)(pid)) !== identity.startTime)
 					throw new Error("owner_pid_identity_mismatch");
 				if (deps.signalTerm) {
@@ -1845,6 +1845,7 @@ export async function forceCloseGjcTmuxSession(
 								exit_kind: "exact_owner_exit_observed",
 								reason: "operator_observed_owner_exit",
 								operator_dispatch_id: dispatchId,
+								operator_intent_id: intent.intent_id,
 							});
 						});
 				}
