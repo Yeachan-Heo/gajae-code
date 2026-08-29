@@ -301,7 +301,7 @@ export class RootHelpCommand extends Command {
 		`# Include files in initial message\n  ${APP_NAME} @prompt.md @image.png "What color is the sky?"`,
 		`# Non-interactive mode (process and exit)\n  ${APP_NAME} -p "List all .ts files in src/"`,
 		`# Continue previous session\n  ${APP_NAME} --continue "What did we discuss?"`,
-		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
+		`# Launch in a repo-local git worktree (git-ignored {repo}/.worktrees)\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
 		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,

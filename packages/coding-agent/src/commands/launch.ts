@@ -9,6 +9,7 @@ import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
 import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
 import {
+	asLaunchWorktreeGuardError,
 	type GjcLaunchWorktreePlan,
 	type PreparedLaunchWorktree,
 	parseLaunchWorktreeMode,
@@ -134,7 +135,7 @@ export default class Index extends Command {
 		`# Include files in initial message\n  ${APP_NAME} @prompt.md @image.png "What color is the sky?"`,
 		`# Non-interactive mode (process and exit)\n  ${APP_NAME} -p "List all .ts files in src/"`,
 		`# Continue previous session\n  ${APP_NAME} --continue "What did we discuss?"`,
-		`# Launch in a sibling git worktree\n  ${APP_NAME} --worktree`,
+		`# Launch in a repo-local git worktree (git-ignored {repo}/.worktrees)\n  ${APP_NAME} --worktree`,
 		`# Use different model (fuzzy matching)\n  ${APP_NAME} --model opus "Help me refactor this code"`,
 		`# Limit model cycling to specific models\n  ${APP_NAME} --models claude-sonnet,claude-haiku,gpt-4o`,
 		`# Pin a stored credential for this session\n  ${APP_NAME} --credential email:me@example.com`,
@@ -165,6 +166,20 @@ export default class Index extends Command {
 			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {
 			await reservation?.release();
+			const guard = asLaunchWorktreeGuardError(error);
+			// A user-fixable launch refusal exits with only its actionable message: no stack
+			// trace, and no durable crash record for a configuration state the user can fix.
+			if (guard) {
+				try {
+					await persistCoordinatorLaunchFailure(error, process.cwd());
+				} catch {
+					// Persistence is diagnostic only; never replace the actionable refusal.
+				}
+				process.stderr.write(`${guard.message}\n`);
+				process.exit(1);
+			}
+			await persistCoordinatorLaunchFailure(error, process.cwd());
+			throw error;
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
 		}
