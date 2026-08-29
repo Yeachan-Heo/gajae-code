@@ -1682,10 +1682,13 @@ export async function persistCoordinatorLaunchFailureState(input: {
 							if (error instanceof PreviousRuntimeStateReadError) return;
 							throw error;
 						}
+						if (Object.hasOwn(previous, "owner_generation") && typeof previous.owner_generation !== "string")
+							return;
 						const previousOwner =
 							typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
 								? previous.owner_generation.trim()
 								: null;
+						if (previousOwner !== null && !sessionId) return;
 						const baseline = sessionId
 							? await captureOwnerGenerationBaseline(stateDirectory, sessionId).catch(() => undefined)
 							: null;
