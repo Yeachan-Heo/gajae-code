@@ -51,6 +51,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			secureWriteSkillFile: () => undefined,
+			secureWriteSkillFileAsync: () => Promise.resolve(undefined),
 			renameNoReplacePath: () => undefined,
 		};
 		expect(() =>
@@ -67,6 +68,7 @@ describe("probeWindowsJobMemory", () => {
 			__piNativesVCurrent: () => undefined,
 			__piNativesPublishOutcomeV1: () => undefined,
 			secureWriteSkillFile: () => undefined,
+			secureWriteSkillFileAsync: () => Promise.resolve(undefined),
 			renameNoReplacePath: () => undefined,
 			probeWindowsJobMemory: () => undefined,
 		};
