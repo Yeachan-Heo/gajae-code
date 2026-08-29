@@ -1250,7 +1250,7 @@ export async function captureOwnerGenerationBaseline(
 	const record = await readJson<unknown>(file);
 	if (
 		!isRecord(record) ||
-		!hasOnlyKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
+		!hasExactKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
 		record.schema_version !== 1 ||
 		record.session_id !== sessionId ||
 		!nonEmpty(record.generation) ||
@@ -1273,7 +1273,7 @@ export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: 
 	if (record === null) return { state: "absent" };
 	if (
 		!isRecord(record) ||
-		!hasOnlyKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
+		!hasExactKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
 		record.schema_version !== 1 ||
 		record.session_id !== sessionId ||
 		!nonEmpty(record.generation) ||
