@@ -1867,6 +1867,23 @@ describe("tmux owner isolation", () => {
 			}
 		});
 
+		it("does not archive an expired pending intent from another server", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-pending-authority-"));
+			try {
+				const marker = await seedMarker(state, "", new Date(Date.now() - 600_000).toISOString());
+				const prior = JSON.parse(await fs.readFile(marker, "utf8")) as Record<string, unknown>;
+				prior.server_key = "other";
+				await fs.writeFile(marker, `${JSON.stringify(prior)}\n`);
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(await Bun.file(marker).exists()).toBe(true);
+				expect(await Bun.file(intentFile(state)).exists()).toBe(true);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
 		// An owner that died between publishing the intent and renaming it leaves a `pending`
 		// record that can never reach a verdict; honoring it forever is the same wedge.
 		it("supersedes an abandoned pending intent whose deadline has elapsed", async () => {
