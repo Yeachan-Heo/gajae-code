@@ -2418,7 +2418,7 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 			chain = accounting.catch(error => {
 				onError?.(error);
 			});
-		return accounting;
+			return accounting;
 		},
 		drain() {
 			return chain;

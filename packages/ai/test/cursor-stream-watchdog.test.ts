@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as http2 from "node:http2";
 import { create, toBinary } from "@bufbuild/protobuf";
-import { createCursorMessageQueueForTest, cursorExecDeadlineMsForTest, disposeCursorConversation, streamCursor } from "../src/providers/cursor";
+import {
+	createCursorMessageQueueForTest,
+	cursorExecDeadlineMsForTest,
+	disposeCursorConversation,
+	streamCursor,
+} from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
 import {
 	AgentServerMessageSchema,
