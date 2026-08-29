@@ -1456,7 +1456,9 @@ async function readOwnerIntentStrict(file: string): Promise<OwnerIntent | null> 
 }
 
 /** Retains a superseded intent marker under a unique name so no audit record is deleted. */
-async function archiveSupersededIntent(file: string): Promise<void> {
+async function archiveSupersededIntent(file: string, expectedIntentId: string): Promise<void> {
+	const current = await readOwnerIntentStrict(file);
+	if (!current || current.intent_id !== expectedIntentId) throw new Error("owner_intent_replay");
 	await fs.rename(file, `${file}.superseded-${Date.now()}-${crypto.randomUUID()}`).catch(() => undefined);
 }
 
@@ -1487,23 +1489,31 @@ async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string)
 async function renameIntentIfCurrent(
 	paths: LifecyclePaths,
 	intentId: string,
-	suffix: ".cancelled" | ".expired",
+	suffix: ".cancelled" | ".expired" | ".consumed",
 	lockToken?: string,
 ): Promise<boolean> {
 	const token = lockToken ?? (await acquireOwnerGenerationLock(paths, "intent-transition"));
 	if (!token) return false;
 	try {
-		const current = await readOwnerIntentStrict(paths.intentFile);
-		if (current?.intent_id !== intentId) return false;
-		try {
-			await fs.rename(paths.intentFile, `${paths.intentFile}${suffix}`);
-			return true;
-		} catch (error) {
-			if (!isCode(error, "ENOENT")) return false;
-			return false;
-		}
+		return await renameIntentIfCurrentWithoutLock(paths, intentId, suffix);
 	} finally {
 		if (lockToken === undefined) await releaseVerdictLock(token);
+	}
+}
+
+async function renameIntentIfCurrentWithoutLock(
+	paths: LifecyclePaths,
+	intentId: string,
+	suffix: ".cancelled" | ".expired" | ".consumed",
+): Promise<boolean> {
+	const current = await readOwnerIntentStrict(paths.intentFile);
+	if (current?.intent_id !== intentId) return false;
+	try {
+		await fs.rename(paths.intentFile, `${paths.intentFile}${suffix}`);
+		return true;
+	} catch (error) {
+		if (!isCode(error, "ENOENT")) return false;
+		return false;
 	}
 }
 
@@ -1529,7 +1539,7 @@ async function pendingIntentBlocksRetry(
 		throw new Error("owner_intent_replay");
 	const deadline = pending ? Date.parse(pending.expires_at) : Number.NaN;
 	if (Number.isFinite(deadline) && deadline > Date.now()) return true;
-	await archiveSupersededIntent(paths.intentFile);
+	await archiveSupersededIntent(paths.intentFile, pending.intent_id);
 	return await intentMarkerExists(paths.intentFile);
 }
 
@@ -1560,7 +1570,7 @@ export async function createOwnerIntent(
 			prior.server_key !== input.server_key
 		)
 			throw new Error("owner_intent_replay");
-		await archiveSupersededIntent(marker);
+		await archiveSupersededIntent(marker, prior.intent_id);
 		// Archiving is best-effort. If the record could not be moved, refuse rather than publish
 		// a fresh intent alongside an un-superseded audit record; `pendingIntentBlocksRetry`
 		// fails closed on the same condition for the un-suffixed file.
@@ -1802,16 +1812,8 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			throw error;
 		}
 		if (winner !== verdict) return reconcileTerminalArtifacts(paths, winner);
-		if (expected && intent) {
-			try {
-				await fs.rename(paths.intentFile, `${paths.intentFile}.consumed`);
-			} catch (error) {
-				if (!isCode(error, "ENOENT")) throw new Error("owner_intent_consumption_failed");
-				const consumed = await readJson<OwnerIntent>(`${paths.intentFile}.consumed`);
-				if (!consumed || !isValidOwnerIntent(consumed, observation))
-					throw new Error("owner_intent_consumption_failed");
-			}
-		}
+		if (expected && intent && !(await renameIntentIfCurrentWithoutLock(paths, intent.intent_id, ".consumed")))
+			throw new Error("owner_intent_consumption_failed");
 
 		if (verdict.classification === "unexpected_owner_loss")
 			await publishImmutableIncident(paths.incidentFile, {
@@ -1850,13 +1852,11 @@ async function publishCurrentVerdictAlias(paths: LifecyclePaths, verdict: OwnerV
 async function reconcileTerminalArtifacts(paths: LifecyclePaths, verdict: OwnerVerdict): Promise<OwnerVerdict> {
 	if (verdict.classification === "expected_operator_shutdown" && verdict.intent_id) {
 		const intent = await readOwnerIntentStrict(paths.intentFile);
-		if (intent?.intent_id === verdict.intent_id) {
-			try {
-				await fs.rename(paths.intentFile, `${paths.intentFile}.consumed`);
-			} catch {
-				throw new Error("owner_intent_consumption_failed");
-			}
-		}
+		if (
+			intent?.intent_id === verdict.intent_id &&
+			!(await renameIntentIfCurrentWithoutLock(paths, intent.intent_id, ".consumed"))
+		)
+			throw new Error("owner_intent_consumption_failed");
 	}
 	if (verdict.classification === "unexpected_owner_loss")
 		await publishImmutableIncident(paths.incidentFile, {
