@@ -249,7 +249,8 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 					candidateIntent = candidate;
 			}
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") intentEvidencePresent = false;
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+			intentEvidencePresent = false;
 			candidateIntent = null;
 		}
 		if (intentEvidencePresent && !candidateIntent && !expiredIntent) return;
