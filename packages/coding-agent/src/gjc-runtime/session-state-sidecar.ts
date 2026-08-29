@@ -637,6 +637,7 @@ export interface OwnerTerminalContext {
 	ownerPid?: number | null;
 	ownerName?: string | null;
 	operatorDispatchId?: string | null;
+	operatorIntentId?: string | null;
 }
 
 export interface RuntimeStateContext {
@@ -2657,17 +2658,29 @@ async function persistInvalidOwnerTerminalMetadata(
 
 async function operatorDispatchIdForOwner(
 	owner: OwnerTerminalContext,
-	request: Omit<ObserveTerminalRequest, "operator_dispatch_id">,
-): Promise<string | undefined> {
+	request: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id">,
+): Promise<Pick<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> | undefined> {
+	const dispatchId = owner.operatorDispatchId;
+	if (!dispatchId) return undefined;
+	const intentId = owner.operatorIntentId;
+	if (intentId !== undefined && intentId !== null && !intentId) return undefined;
 	try {
 		const intent = JSON.parse(
 			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
 		) as unknown;
 		if (!isValidOwnerIntent(intent)) return undefined;
-		const dispatchId = owner.operatorDispatchId ?? intent.dispatch_id;
-		return isValidOwnerIntent(intent as OwnerIntent, { ...request, operator_dispatch_id: dispatchId })
-			? dispatchId
-			: undefined;
+		if (
+			!isValidOwnerIntent(intent as OwnerIntent, {
+				...request,
+				operator_dispatch_id: dispatchId,
+				...(intentId !== undefined && intentId !== null ? { operator_intent_id: intentId } : {}),
+			})
+		)
+			return undefined;
+		return {
+			operator_dispatch_id: dispatchId,
+			...(intentId !== undefined && intentId !== null ? { operator_intent_id: intentId } : {}),
+		};
 	} catch {
 		return undefined;
 	}
@@ -2680,7 +2693,7 @@ async function observeOwnerTerminalPostmortem(
 ): Promise<OwnerVerdict | null> {
 	try {
 		const now = new Date().toISOString();
-		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id"> = {
+		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> = {
 			schema_version: 1,
 			op: "observe_terminal",
 			session_id: sessionId,
@@ -2694,10 +2707,10 @@ async function observeOwnerTerminalPostmortem(
 			exit_kind: String(reason),
 			reason: "process_postmortem",
 		};
-		const operatorDispatchId = await operatorDispatchIdForOwner(owner, observation);
+		const operatorIdentity = await operatorDispatchIdForOwner(owner, observation);
 		return await observeOwnerTerminal({
 			...observation,
-			...(operatorDispatchId ? { operator_dispatch_id: operatorDispatchId } : {}),
+			...(operatorIdentity ?? {}),
 		});
 	} catch {
 		return null;

@@ -1173,6 +1173,88 @@ describe("tmux owner isolation", () => {
 		await fs.rm(state, { recursive: true, force: true });
 	});
 
+	it("blocks retries beside a valid verdict and ignores a journal from an older dispatch", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-verdict-retry-"));
+		try {
+			const generation = await replaceOwnerGeneration(state, "session", "generation");
+			const first = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch-one",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			});
+			const paths = lifecyclePaths(state, "session", generation);
+			await fs.writeFile(
+				paths.journalFile,
+				JSON.stringify({
+					schema_version: 1,
+					intent_id: first.intent_id,
+					observation: {
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: "session",
+						owner_generation: generation,
+						state_dir: state,
+						socket_key: "socket",
+						observer: "sidecar",
+						observed_at: "2026-01-01T00:00:01.000Z",
+						signal: "SIGTERM",
+						exit_code: 0,
+						exit_kind: "exit",
+						reason: "test",
+						operator_dispatch_id: "dispatch-one",
+					},
+				}),
+			);
+			await fs.rename(paths.intentFile, `${paths.intentFile}.expired`);
+			const second = await createOwnerIntent(state, {
+				generation,
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "dispatch-one",
+				created_at: "2026-01-01T00:00:02.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			});
+			const verdict = await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: "session",
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: "2026-01-01T00:00:03.000Z",
+				signal: "SIGTERM",
+				exit_code: 0,
+				exit_kind: "exit",
+				reason: "test",
+				operator_dispatch_id: "dispatch-one",
+				operator_intent_id: second.intent_id,
+			});
+			expect(verdict.classification).toBe("expected_operator_shutdown");
+			expect(verdict.intent_id).toBe(second.intent_id);
+			await expect(fs.access(`${paths.intentFile}.consumed`)).resolves.toBeNull();
+
+			await expect(
+				createOwnerIntent(state, {
+					generation,
+					session_id: "session",
+					server_key: "socket",
+					expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+					dispatch_id: "dispatch-three",
+					created_at: "2026-01-01T00:00:04.000Z",
+					expires_at: "2099-01-01T00:00:00.000Z",
+				}),
+			).rejects.toThrow("owner_intent_replay");
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects a foreign generation while using the shared SQLite lock database", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
 		try {

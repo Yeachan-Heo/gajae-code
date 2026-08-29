@@ -1946,7 +1946,12 @@ describe("coordinator runtime state sidecar", () => {
 			sessionId,
 			cwd: root,
 			sessionFile: null,
-			ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
+			ownerTerminal: {
+				generation,
+				stateDir: root,
+				socketKey: "opaque-owner",
+				operatorDispatchId: "operator-dispatch",
+			},
 		});
 
 		expect(await readPayload(stateFile)).toMatchObject({
@@ -2098,7 +2103,7 @@ describe("coordinator runtime state sidecar", () => {
 			exit_kind: "sigterm",
 			reason: "raw_terminal",
 		});
-		expect(rawVerdict.classification).toBe("expected_operator_shutdown");
+		expect(rawVerdict.classification).toBe("unexpected_owner_loss");
 		expect(rawVerdict.observer).toBe("sidecar");
 		let payload: RuntimePayload | null = null;
 		for (let attempt = 0; attempt < 20; attempt++) {
@@ -2123,7 +2128,7 @@ describe("coordinator runtime state sidecar", () => {
 			classification: rawVerdict.classification,
 			dedupe_key: rawVerdict.dedupe_key,
 		});
-		expect(payload?.state).toBe(rawVerdict.classification === "expected_operator_shutdown" ? "completed" : "errored");
+		expect(payload?.state).toBe("errored");
 		const serialized = JSON.stringify(payload);
 		expect(serialized).not.toContain("raw_terminal");
 		expect(serialized).not.toContain("operator-dispatch");
@@ -2209,11 +2214,12 @@ describe("coordinator runtime state sidecar", () => {
 				ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
 			});
 			const payload = await readPayload(stateFile);
+			const expectedReason = kind === "malformed" ? "owner_verdict_unavailable" : "unexpected_owner_loss";
 			expect(payload).toMatchObject({
 				owner_generation: generation,
 				state: "errored",
-				reason: "unexpected_owner_loss",
-				error: { code: "unexpected_owner_loss", recoverable: true },
+				reason: expectedReason,
+				error: { code: expectedReason, recoverable: true },
 				recovery: { action: "recover_or_resume_session" },
 			});
 		}
