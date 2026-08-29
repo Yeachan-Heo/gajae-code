@@ -1540,8 +1540,19 @@ export class ExtensionUiController {
 	}
 
 	async #updateSessionName(name: string): Promise<void> {
-		await this.ctx.sessionManager.setSessionName(name, "user");
-		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		const session = this.ctx.session;
+		const identityAdmission = session.captureSessionIdentityForMode();
+		const assertCurrentIdentity = (): void => {
+			if (!session.isSessionIdentityCurrentForMode(identityAdmission)) {
+				throw new Error("Session changed while renaming session");
+			}
+		};
+		await session.withSdkControlMutation(async () => {
+			assertCurrentIdentity();
+			await this.ctx.sessionManager.setSessionName(name, "user");
+			assertCurrentIdentity();
+			setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		});
 	}
 
 	#sendExtensionUserMessage: SendUserMessageHandler = (content, options) => {

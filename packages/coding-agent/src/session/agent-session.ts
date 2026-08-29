@@ -2834,6 +2834,10 @@ export class AgentSession {
 	#allowAcpAgentInitiatedTurns = false;
 	/** Per-session memory of allow_always / reject_always decisions for gated tools. */
 	#acpPermissionDecisions: Map<string, "allow_always" | "reject_always"> = new Map();
+	/** Clear cached ACP decisions whenever the live session/context identity changes. */
+	#resetAcpPermissionDecisions(): void {
+		this.#acpPermissionDecisions.clear();
+	}
 	/** SDK-controlled permission policy applied before ACP client prompting. Defaults to `allow` so callers
 	 * without a reverse permission provider (TUI, print/headless) run guarded tools; ACP/SDK set this explicitly. */
 	#sdkPermissionMode: "prompt" | "allow" | "deny" = "allow";
@@ -3259,6 +3263,9 @@ export class AgentSession {
 	#silentAbortPending = false;
 	/** In-flight `abort()` unwind. Fresh prompts wait so they cannot steer into the dying turn. */
 	#abortUnwind: Promise<void> | undefined;
+	/** Per-unwind goal accounting result, retained so a transition that piggybacks
+	 * on an existing abort can repair an accounting callback rejected by its fence. */
+	readonly #abortGoalAccounting = new WeakMap<Promise<void>, { skippedByTransitionFence: boolean }>();
 	#abortForceRecoveryStarted = false;
 	#abortEpoch = 0;
 	/**
@@ -10097,7 +10104,7 @@ export class AgentSession {
 			| undefined,
 	): void {
 		this.#sdkPermissionProvider = provider;
-		this.#acpPermissionDecisions.clear();
+		this.#resetAcpPermissionDecisions();
 		this.#acpPermissionWrapperVersion++;
 		const activeTools = this.getActiveToolNames()
 			.map(name => this.#toolRegistry.get(name))
@@ -11860,7 +11867,7 @@ export class AgentSession {
 
 	setClientBridge(bridge: ClientBridge | undefined): void {
 		this.#clientBridge = bridge;
-		this.#acpPermissionDecisions.clear();
+		this.#resetAcpPermissionDecisions();
 		this.#acpPermissionWrapperVersion++;
 		const activeToolNames = this.getActiveToolNames();
 		const activeTools = activeToolNames
@@ -15096,9 +15103,10 @@ export class AgentSession {
 			// Abort visibility is per-request: a later real abort must not inherit an
 			// earlier silent abort's suppression and swallow the user-visible notice.
 			if (options?.silent !== true) this.#silentAbortPending = false;
-			// Capture the unwind: the field clears once the first abort settles, and
-			// the awaits below must keep watching THIS unwind, not a successor's.
-			const sharedUnwind = Promise.all([this.#abortUnwind, overlappingPostPromptDrain]).then(() => {});
+			// Capture the unwind: the field clears once the first abort settles, and the
+			// awaits below must keep watching THIS unwind, not a successor's.
+			const sharedUnwind = this.#abortUnwind;
+			const sharedGoalAccounting = this.#abortGoalAccounting.get(sharedUnwind);
 			if (options?.timeoutMs !== undefined) {
 				const timeoutMs = Math.max(0, options.timeoutMs);
 				const deadline = Date.now() + timeoutMs;
@@ -15122,9 +15130,23 @@ export class AgentSession {
 				return { kind: forced === "settled" ? "settled" : "timeout" };
 			}
 			await sharedUnwind;
+			const accountingGeneration = this.#goalAccountingTransitionContext.getStore();
+			if (sharedGoalAccounting?.skippedByTransitionFence && accountingGeneration !== undefined) {
+				// The original abort entered before the transition fence but reached
+				// GoalRuntime after the fence was claimed. Its predecessor accounting
+				// callback was rejected and deliberately swallowed below; the
+				// transition owner must perform that write before it can publish the
+				// successor, otherwise elapsed usage is lost.
+				const goalAbort = this.#goalAccountingTransitionContext.run(accountingGeneration, () =>
+					this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" }),
+				);
+				await goalAbort;
+			}
 			return { kind: "settled" };
 		}
 		const unwind = Promise.withResolvers<void>();
+		const goalAccounting = { skippedByTransitionFence: false };
+		this.#abortGoalAccounting.set(unwind.promise, goalAccounting);
 		this.#abortForceRecoveryStarted = false;
 		this.#abortUnwind = unwind.promise;
 		try {
@@ -15173,6 +15195,7 @@ export class AgentSession {
 					// admitted against the fenced successor; do not let that bookkeeping
 					// race reject the transition itself.
 					if (!(this.#sessionTransitionKind !== undefined && this.#isAgentBusyError(error))) throw error;
+					goalAccounting.skippedByTransitionFence = true;
 				}
 				if (managedLogicalRunId !== undefined)
 					this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
@@ -16041,6 +16064,7 @@ export class AgentSession {
 		// This method runs only after the successor identity is committed. Do not
 		// let a predecessor skill prompt remain visible to the new session.
 		this.#clearInMemorySkillState();
+		this.#resetAcpPermissionDecisions();
 		this.#resetInjectedContextSignatures();
 		this.#resetIrcRosterDeliveryState();
 		// The successor session must not inherit the predecessor's profile marker
@@ -16142,6 +16166,7 @@ export class AgentSession {
 			this.agent.reset();
 			await this.sessionManager.flush();
 			this.sessionManager.appendContextClearEntry({ sessionId });
+			this.#resetAcpPermissionDecisions();
 			await this.#rehydrateGoalModeStateForTransition(this.sessionManager.buildSessionContext());
 			this.setTodoPhases([]);
 			this.#syncAgentSessionId(sessionId);
@@ -16317,6 +16342,7 @@ export class AgentSession {
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
 				}
 			}
+			this.#resetAcpPermissionDecisions();
 			this.#syncAgentSessionId();
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
@@ -16408,6 +16434,7 @@ export class AgentSession {
 		// otherwise prefer the model's configured defaultLevel, then preserve the current level.
 		this.setThinkingLevel(options?.thinkingLevel ?? model.thinking?.defaultLevel ?? this.thinkingLevel);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
+		this.#assertSessionIdentityAdmission(identityAdmission);
 	}
 
 	setActiveModelProfile(name: string | undefined): void {
@@ -24119,6 +24146,7 @@ export class AgentSession {
 				successorEndpointReservation?.finalize();
 				transitionCleanupCommitted = true;
 				ownerShutdownTransitionCommitted = true;
+				if (switchingToDifferentSession) this.#resetAcpPermissionDecisions();
 				this.clearPlanModeStateForSessionTransition();
 				await this.#runToolSessionTransitionCleanups();
 				if (didReloadConversationChange && !switchingToDifferentSession) this.#quarantineQueuedAsyncResults();
@@ -24332,6 +24360,7 @@ export class AgentSession {
 			this.#bindWorkflowGateEmitter(previousWorkflowGateSessionId);
 			this.#rekeyHindsightMemoryForCurrentSessionId();
 			this.#resetHindsightConversationTrackingIfHindsight();
+			this.#resetAcpPermissionDecisions();
 			this.#clearInMemorySkillState();
 			this.#closeAllProviderSessions("session branch");
 			this.#rebindProviderSessionState(new Map());

@@ -16,6 +16,15 @@ import type { ModeGate } from "./mode-gate";
 
 type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop";
 
+type GoalAsyncMutationKind = "pause" | "drop" | "replace";
+
+type GoalAsyncMutationFence = {
+	kind: GoalAsyncMutationKind;
+	lifecycleGeneration: number;
+	continuationGeneration: number;
+	identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
+};
+
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop"]);
 
 interface GoalModeControllerContext {
@@ -57,6 +66,7 @@ export class GoalModeController {
 	#continuationTimer: NodeJS.Timeout | undefined;
 	#continuationGeneration = 0;
 	#lifecycleGeneration = 0;
+	#goalAsyncMutation: GoalAsyncMutationFence | undefined;
 	#turnHadToolCalls = false;
 	#continuationTurnInFlight = false;
 	#suppressNextContinuation = false;
@@ -113,6 +123,7 @@ export class GoalModeController {
 
 	#resetLocalState(): void {
 		this.#lifecycleGeneration++;
+		this.#goalAsyncMutation = undefined;
 		this.#enabled = false;
 		this.#paused = false;
 		this.#previousTools = undefined;
@@ -121,6 +132,44 @@ export class GoalModeController {
 		this.cancelContinuation();
 		this.ctx.modeGate.exit("goal");
 		this.#updateStatus();
+	}
+
+	#beginGoalAsyncMutation(kind: GoalAsyncMutationKind): GoalAsyncMutationFence {
+		this.cancelContinuation();
+		const fence: GoalAsyncMutationFence = {
+			kind,
+			lifecycleGeneration: this.#lifecycleGeneration,
+			continuationGeneration: this.#continuationGeneration,
+			identity: this.#captureSessionIdentity(),
+		};
+		this.#goalAsyncMutation = fence;
+		return fence;
+	}
+
+	#isGoalAsyncMutationFenceCurrent(fence: GoalAsyncMutationFence): boolean {
+		return (
+			fence.lifecycleGeneration === this.#lifecycleGeneration &&
+			fence.continuationGeneration === this.#continuationGeneration &&
+			this.#isSessionIdentityCurrent(fence.identity)
+		);
+	}
+
+	#isGoalAsyncMutationCurrent(fence: GoalAsyncMutationFence): boolean {
+		return this.#goalAsyncMutation === fence && this.#isGoalAsyncMutationFenceCurrent(fence);
+	}
+
+	#assertGoalAsyncMutationCurrent(fence: GoalAsyncMutationFence): void {
+		if (!this.#isGoalAsyncMutationCurrent(fence))
+			throw new Error(`Goal ${fence.kind} was superseded by a session transition.`);
+	}
+
+	#isOwnGoalAsyncMutationEvent(kind: GoalAsyncMutationKind): boolean {
+		const mutation = this.#goalAsyncMutation;
+		return (
+			mutation?.kind === kind &&
+			mutation.lifecycleGeneration === this.#lifecycleGeneration &&
+			this.#isSessionIdentityCurrent(mutation.identity)
+		);
 	}
 
 	async beforeGetUserInput(): Promise<void> {
@@ -221,6 +270,7 @@ export class GoalModeController {
 		}
 		if (event.type === "goal_updated") {
 			if (event.state?.goal?.status === "dropped") {
+				if (this.#isOwnGoalAsyncMutationEvent("drop")) return;
 				await this.exit({ reason: "dropped", silent: true });
 				return;
 			}
@@ -242,7 +292,7 @@ export class GoalModeController {
 			else this.ctx.modeGate.exit("goal");
 			if (!event.state?.enabled) {
 				this.#resetContinuationSuppression();
-				this.cancelContinuation();
+				if (!this.#isOwnGoalAsyncMutationEvent("pause")) this.cancelContinuation();
 			}
 			this.#updateStatus();
 			return;
@@ -542,7 +592,13 @@ export class GoalModeController {
 
 	async #pause(): Promise<void> {
 		if (!this.#enabled) return this.ctx.showWarning("No active goal to pause.");
-		await this.ctx.session.goalRuntime.pauseGoal();
+		const fence = this.#beginGoalAsyncMutation("pause");
+		try {
+			await this.ctx.session.goalRuntime.pauseGoal();
+			this.#assertGoalAsyncMutationCurrent(fence);
+		} finally {
+			if (this.#goalAsyncMutation === fence) this.#goalAsyncMutation = undefined;
+		}
 		await this.exit({ paused: true, reason: "paused" });
 	}
 
@@ -555,6 +611,12 @@ export class GoalModeController {
 
 	async #drop(): Promise<void> {
 		if (!this.#enabled && !this.#getPausedState()) return this.ctx.showWarning("No goal to drop.");
+		const admission: GoalAsyncMutationFence = {
+			kind: "drop",
+			lifecycleGeneration: this.#lifecycleGeneration,
+			continuationGeneration: this.#continuationGeneration,
+			identity: this.#captureSessionIdentity(),
+		};
 		if (
 			!(await this.ctx.showHookConfirm(
 				"Drop goal?",
@@ -562,7 +624,15 @@ export class GoalModeController {
 			))
 		)
 			return;
-		await this.ctx.session.goalRuntime.dropGoal();
+		if (!this.#isGoalAsyncMutationFenceCurrent(admission))
+			throw new Error("Goal drop was superseded by a session transition.");
+		const fence = this.#beginGoalAsyncMutation("drop");
+		try {
+			await this.ctx.session.goalRuntime.dropGoal();
+			this.#assertGoalAsyncMutationCurrent(fence);
+		} finally {
+			if (this.#goalAsyncMutation === fence) this.#goalAsyncMutation = undefined;
+		}
 		await this.exit({ reason: "dropped" });
 	}
 
@@ -573,22 +643,44 @@ export class GoalModeController {
 	}
 
 	async #replaceFromObjective(objective: string): Promise<void> {
-		const state = await this.ctx.session.goalRuntime.replaceGoal({ objective });
+		const fence = this.#beginGoalAsyncMutation("replace");
+		let state: GoalModeState;
+		try {
+			state = await this.ctx.session.goalRuntime.replaceGoal({ objective });
+			this.#assertGoalAsyncMutationCurrent(fence);
+		} finally {
+			if (this.#goalAsyncMutation === fence) this.#goalAsyncMutation = undefined;
+		}
 		this.ctx.session.setGoalModeState(state);
 		this.#enabled = true;
 		this.#paused = false;
 		this.#resetContinuationSuppression();
 		this.#updateStatus();
-		if (this.ctx.session.isStreaming) await this.ctx.session.sendGoalModeContext({ deliverAs: "steer" });
+		if (this.ctx.session.isStreaming) {
+			await this.ctx.session.sendGoalModeContext({ deliverAs: "steer" });
+			if (!this.#isGoalAsyncMutationFenceCurrent(fence))
+				throw new Error("Goal replace was superseded by a session transition.");
+		}
 		this.ctx.inputCallback?.(this.ctx.startPendingSubmission({ text: objective }));
 	}
 
 	async #set(rest: string): Promise<void> {
 		if (!this.#enabled && this.#getPausedState())
 			return this.ctx.showWarning("Resume the current goal first, or drop it before setting a new objective.");
+		const replaceAdmission: GoalAsyncMutationFence | undefined = this.#enabled
+			? {
+					kind: "replace",
+					lifecycleGeneration: this.#lifecycleGeneration,
+					continuationGeneration: this.#continuationGeneration,
+					identity: this.#captureSessionIdentity(),
+				}
+			: undefined;
 		const objective = rest.trim() || (await this.ctx.showHookEditor("Goal objective", { promptStyle: true }))?.trim();
 		if (!objective) return;
-		if (this.#enabled) await this.#replaceFromObjective(objective);
-		else await this.#startFromObjective(objective);
+		if (this.#enabled) {
+			if (replaceAdmission && !this.#isGoalAsyncMutationFenceCurrent(replaceAdmission))
+				throw new Error("Goal replace was superseded by a session transition.");
+			await this.#replaceFromObjective(objective);
+		} else await this.#startFromObjective(objective);
 	}
 }

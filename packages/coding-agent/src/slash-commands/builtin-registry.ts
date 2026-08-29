@@ -494,6 +494,41 @@ function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: st
 		.join("\n\n");
 }
 
+type SlashModelControlSession = SlashCommandRuntime["session"] & {
+	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
+	activateModelProfileForControl?: (profileName: string) => Promise<boolean>;
+	captureSessionIdentityForMode?: () => unknown;
+	isSessionIdentityCurrentForMode?: (admission: unknown) => boolean;
+	isSessionTransitioning?: boolean;
+};
+
+function slashModelSession(runtime: SlashCommandRuntime): SlashModelControlSession {
+	return runtime.session as SlashModelControlSession;
+}
+
+function captureSlashModelIdentity(runtime: SlashCommandRuntime): unknown {
+	return slashModelSession(runtime).captureSessionIdentityForMode?.();
+}
+
+function assertSlashModelIdentity(runtime: SlashCommandRuntime, admission: unknown): void {
+	const session = slashModelSession(runtime);
+	if (
+		admission !== undefined &&
+		session.isSessionIdentityCurrentForMode &&
+		!session.isSessionIdentityCurrentForMode(admission)
+	) {
+		throw new Error("Session changed while selecting model");
+	}
+	if (admission === undefined && session.isSessionTransitioning === true) {
+		throw new Error("Session changed while selecting model");
+	}
+}
+
+async function withSlashModelControlMutation<T>(runtime: SlashCommandRuntime, body: () => Promise<T>): Promise<T> {
+	const session = slashModelSession(runtime);
+	return session.withSdkControlMutation ? session.withSdkControlMutation(body) : body();
+}
+
 /** Opt into the paste-a-code OAuth login for browsers that cannot reach this machine. */
 const MANUAL_LOGIN_FLAG = "--manual";
 
@@ -941,6 +976,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			if (command.args) {
+				const identityAdmission = captureSlashModelIdentity(runtime);
 				const parsedArgs = parseModelCommandArgs(command.args);
 				if (parsedArgs.kind === "summary") {
 					await runtime.output(formatModelAssignmentSummary(runtime));
@@ -964,18 +1000,27 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					const presetName = resolvePresetSelector(modelId, runtime.session.modelRegistry);
 					if (presetName) {
 						try {
+							assertSlashModelIdentity(runtime, identityAdmission);
 							const profileLabel = formatModelProfileDisplayLabel(
 								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
 							);
-							await activateModelProfile(
-								{
-									session: runtime.session,
-									modelRegistry: runtime.session.modelRegistry,
-									settings: runtime.settings,
-									profileName: presetName,
-								},
-								{ persistDefault: false },
-							);
+							const session = slashModelSession(runtime);
+							if (session.activateModelProfileForControl) {
+								await session.activateModelProfileForControl(presetName);
+							} else {
+								// Lightweight command runtimes used by embedders may not expose
+								// the control helper; preserve the established activation path.
+								await activateModelProfile(
+									{
+										session: runtime.session,
+										modelRegistry: runtime.session.modelRegistry,
+										settings: runtime.settings,
+										profileName: presetName,
+									},
+									{ persistDefault: false },
+								);
+							}
+							assertSlashModelIdentity(runtime, identityAdmission);
 							await runtime.output(`Model profile: ${profileLabel}`);
 							await runtime.notifyTitleChanged?.();
 							await runtime.notifyConfigChanged?.();
@@ -986,6 +1031,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					}
 				}
 				const resolution = await resolveModelCommandSelection(runtime, modelId);
+				assertSlashModelIdentity(runtime, identityAdmission);
 				if (!resolution.ok) {
 					return usage(modelSelectionUsage(runtime, resolution.failure.message), runtime);
 				}
@@ -1003,73 +1049,80 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					);
 				}
 				try {
-					const includesDefault = targetIds.includes("default");
-					const includesRoleAgent = targetIds.some(role => role !== "default");
-					if (includesRoleAgent) {
-						const apiKey = await runtime.session.modelRegistry.getApiKey(
-							selection.model,
-							runtime.session.credentialSessionId,
-						);
-						if (!apiKey) {
-							throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
-						}
-					}
-
-					const overrides = runtime.settings.get("task.agentModelOverrides");
-					const assignments = new Map<GjcModelAssignmentTargetId, string>();
-					const existingDefaultThinkingLevel =
-						selection.thinkingLevel !== undefined
-							? selection.thinkingLevel
-							: runtime.session.getActiveModelProfile?.()
-								? undefined
-								: extractExplicitThinkingSelector(runtime.settings.getModelRole("default"), runtime.settings);
-					const persistedSelector = formatModelSelectorValue(selection.selector, existingDefaultThinkingLevel);
-					for (const targetId of targetIds) {
-						if (targetId === "default") {
-							assignments.set(targetId, persistedSelector);
-							continue;
-						}
-						const thinkingLevel =
-							selection.thinkingLevel ?? extractExplicitThinkingSelector(overrides[targetId], runtime.settings);
-						assignments.set(targetId, formatModelSelectorValue(selection.selector, thinkingLevel));
-					}
-
-					if (includesDefault) {
-						await runtime.session.setModel(selection.model, "default", {
-							selector: selection.selector,
-							thinkingLevel: existingDefaultThinkingLevel,
-							cause: "user-selection",
-						});
-						if (existingDefaultThinkingLevel) {
-							runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
-						}
-					}
-
-					const materializedProfile = materializeActiveModelProfileAssignments({
-						session: runtime.session,
-						settings: runtime.settings,
-						assignments,
-					});
-					if (!materializedProfile) {
-						for (const [targetId, selector] of assignments) {
-							const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
-							if (target.settingsPath === "modelRoles") {
-								runtime.settings.setModelRole(targetId, selector);
-							} else {
-								runtime.settings.setAgentModelOverride(targetId, selector);
+					return await withSlashModelControlMutation(runtime, async () => {
+						assertSlashModelIdentity(runtime, identityAdmission);
+						const includesDefault = targetIds.includes("default");
+						const includesRoleAgent = targetIds.some(role => role !== "default");
+						if (includesRoleAgent) {
+							const apiKey = await runtime.session.modelRegistry.getApiKey(
+								selection.model,
+								runtime.session.credentialSessionId,
+							);
+							if (!apiKey) {
+								throw new Error(`No API key for ${selection.model.provider}/${selection.model.id}`);
 							}
 						}
-					}
-					runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
-					await runtime.output(
-						formatModelAssignmentSuccess(
-							parsedArgs.targetId,
-							assignments.get(targetIds[0] ?? "default") ?? persistedSelector,
-						),
-					);
-					if (includesDefault) await runtime.notifyTitleChanged?.();
-					await runtime.notifyConfigChanged?.();
-					return commandConsumed();
+
+						const overrides = runtime.settings.get("task.agentModelOverrides");
+						const assignments = new Map<GjcModelAssignmentTargetId, string>();
+						const existingDefaultThinkingLevel =
+							selection.thinkingLevel !== undefined
+								? selection.thinkingLevel
+								: runtime.session.getActiveModelProfile?.()
+									? undefined
+									: extractExplicitThinkingSelector(
+											runtime.settings.getModelRole("default"),
+											runtime.settings,
+										);
+						const persistedSelector = formatModelSelectorValue(selection.selector, existingDefaultThinkingLevel);
+						for (const targetId of targetIds) {
+							if (targetId === "default") {
+								assignments.set(targetId, persistedSelector);
+								continue;
+							}
+							const thinkingLevel =
+								selection.thinkingLevel ??
+								extractExplicitThinkingSelector(overrides[targetId], runtime.settings);
+							assignments.set(targetId, formatModelSelectorValue(selection.selector, thinkingLevel));
+						}
+
+						if (includesDefault) {
+							await runtime.session.setModel(selection.model, "default", {
+								selector: selection.selector,
+								thinkingLevel: existingDefaultThinkingLevel,
+								cause: "user-selection",
+							});
+							if (existingDefaultThinkingLevel) {
+								runtime.session.setThinkingLevel(existingDefaultThinkingLevel);
+							}
+						}
+
+						const materializedProfile = materializeActiveModelProfileAssignments({
+							session: runtime.session,
+							settings: runtime.settings,
+							assignments,
+						});
+						if (!materializedProfile) {
+							for (const [targetId, selector] of assignments) {
+								const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetId];
+								if (target.settingsPath === "modelRoles") {
+									runtime.settings.setModelRole(targetId, selector);
+								} else {
+									runtime.settings.setAgentModelOverride(targetId, selector);
+								}
+							}
+						}
+						runtime.settings.getStorage()?.recordModelUsage(`${selection.model.provider}/${selection.model.id}`);
+						await runtime.output(
+							formatModelAssignmentSuccess(
+								parsedArgs.targetId,
+								assignments.get(targetIds[0] ?? "default") ?? persistedSelector,
+							),
+						);
+						if (includesDefault) await runtime.notifyTitleChanged?.();
+						await runtime.notifyConfigChanged?.();
+						return commandConsumed();
+					});
 				} catch (err) {
 					return usage(`Failed to set model: ${errorMessage(err)}`, runtime);
 				}

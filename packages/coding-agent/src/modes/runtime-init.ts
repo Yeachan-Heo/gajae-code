@@ -114,7 +114,17 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getThinkingScopeForControl: () => session.getThinkingScopeForControl(),
 			getSessionName: () => session.sessionManager.getSessionName(),
 			setSessionName: async name => {
-				await session.sessionManager.setSessionName(name, "user");
+				const identityAdmission = session.captureSessionIdentityForMode();
+				const assertCurrentIdentity = (): void => {
+					if (!session.isSessionIdentityCurrentForMode(identityAdmission)) {
+						throw new Error("Session changed while renaming session");
+					}
+				};
+				await session.withSdkControlMutation(async () => {
+					assertCurrentIdentity();
+					await session.sessionManager.setSessionName(name, "user");
+					assertCurrentIdentity();
+				});
 			},
 		},
 		// ExtensionContextActions
@@ -362,8 +372,21 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					case "retry.abort":
 						session.abortRetry();
 						return { aborted: true };
-					case "session.rename":
-						return { renamed: await session.setSessionName(String(input.name), "user") };
+					case "session.rename": {
+						const identityAdmission = session.captureSessionIdentityForMode();
+						const assertCurrentIdentity = (): void => {
+							if (!session.isSessionIdentityCurrentForMode(identityAdmission)) {
+								throw new Error("Session changed while renaming session");
+							}
+						};
+						const renamed = await session.withSdkControlMutation(async () => {
+							assertCurrentIdentity();
+							const result = await session.setSessionName(String(input.name), "user");
+							assertCurrentIdentity();
+							return result;
+						});
+						return { renamed };
+					}
 					case "session.export_html":
 						try {
 							return {

@@ -26,6 +26,12 @@ interface SetModelCapableSession {
 	credentialSessionId?: string;
 	modelRegistry: { getApiKey(model: Model, sessionId?: string): Promise<string | undefined> };
 	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
+	/** Capture the session identity before an asynchronous extension mutation. */
+	captureSessionIdentityForMode?(): unknown;
+	/** Reject materialization when the extension mutation crossed a session transition. */
+	isSessionIdentityCurrentForMode?(admission: unknown): boolean;
+	/** Legacy fallback for adapters that expose only the transition flag. */
+	isSessionTransitioning?: boolean;
 	/** Persist effective profile roles and clear its marker for a concrete default selection. */
 	materializeActiveDefaultModelProfileAssignment?(model: Model): boolean;
 	/** Drop a session-only profile marker and its runtime role overrides. */
@@ -40,9 +46,29 @@ interface SetModelCapableSession {
  * Returns false when no API key is available for the requested model.
  */
 export async function runExtensionSetModel(session: SetModelCapableSession, model: Model): Promise<boolean> {
+	const identityAdmission = session.captureSessionIdentityForMode?.();
+	const assertCurrentIdentity = (): void => {
+		if (
+			identityAdmission !== undefined &&
+			session.isSessionIdentityCurrentForMode &&
+			!session.isSessionIdentityCurrentForMode(identityAdmission)
+		) {
+			throw new Error("Session changed while selecting model");
+		}
+		if (identityAdmission === undefined && session.isSessionTransitioning === true) {
+			throw new Error("Session changed while selecting model");
+		}
+	};
+	assertCurrentIdentity();
 	const key = await session.modelRegistry.getApiKey(model, session.credentialSessionId);
+	assertCurrentIdentity();
 	if (!key) return false;
 	await session.setModel(model, "default", { cause: "user-selection" });
+	// setModel performs its own admission checks, but an extension adapter may
+	// implement only the structural contract above. Revalidate before the
+	// synchronous profile materialization so a transition cannot leak the
+	// predecessor's effective assignment into its successor.
+	assertCurrentIdentity();
 	// A durable profile is replaced by materializing its effective assignments
 	// (otherwise a restart reapplies modelProfile.default and restores the
 	// profile the caller just replaced); a session-only marker is dropped

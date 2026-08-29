@@ -1260,6 +1260,53 @@ export class SelectorController {
 		this.#credentialAutoImportStateStore = credentialAutoImportStateStore;
 	}
 
+	#modelControlSession(): InteractiveModeContext["session"] & {
+		withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
+		activateModelProfileForControl?: (profileName: string) => Promise<boolean>;
+		setDefaultModelProfileForControl?: (
+			profileName: string,
+			options?: { persistDefault?: boolean },
+		) => Promise<{ changed: boolean; id: string }>;
+		captureSessionIdentityForMode?: () => unknown;
+		isSessionIdentityCurrentForMode?: (admission: unknown) => boolean;
+		isSessionTransitioning?: boolean;
+	} {
+		return this.ctx.session as InteractiveModeContext["session"] & {
+			withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
+			activateModelProfileForControl?: (profileName: string) => Promise<boolean>;
+			setDefaultModelProfileForControl?: (
+				profileName: string,
+				options?: { persistDefault?: boolean },
+			) => Promise<{ changed: boolean; id: string }>;
+			captureSessionIdentityForMode?: () => unknown;
+			isSessionIdentityCurrentForMode?: (admission: unknown) => boolean;
+			isSessionTransitioning?: boolean;
+		};
+	}
+
+	#captureModelIdentity(): unknown {
+		return this.#modelControlSession().captureSessionIdentityForMode?.();
+	}
+
+	#assertModelIdentity(admission: unknown): void {
+		const session = this.#modelControlSession();
+		if (
+			admission !== undefined &&
+			session.isSessionIdentityCurrentForMode &&
+			!session.isSessionIdentityCurrentForMode(admission)
+		) {
+			throw new Error("Session changed while selecting model");
+		}
+		if (admission === undefined && session.isSessionTransitioning === true) {
+			throw new Error("Session changed while selecting model");
+		}
+	}
+
+	async #withModelControlMutation<T>(body: () => Promise<T>): Promise<T> {
+		const session = this.#modelControlSession();
+		return session.withSdkControlMutation ? session.withSdkControlMutation(body) : body();
+	}
+
 	#captureDefaultAssignmentRollback(): DefaultAssignmentRollbackSnapshot {
 		return {
 			model: this.ctx.session.model,
@@ -2469,19 +2516,32 @@ export class SelectorController {
 	 * default) then refresh the status surfaces. Rethrows so callers surface errors.
 	 */
 	async #applyModelProfile(profileName: string, persistDefault: boolean): Promise<void> {
+		const identityAdmission = this.#captureModelIdentity();
+		this.#assertModelIdentity(identityAdmission);
 		const profileLabel = formatModelProfileDisplayLabel(
 			this.ctx.session.modelRegistry.getModelProfile(profileName) ?? { name: profileName },
 		);
-		await activateModelProfile(
-			{
-				session: this.ctx.session,
-				modelRegistry: this.ctx.session.modelRegistry,
-				settings: this.ctx.settings,
-				profileName,
-			},
-			{ persistDefault },
-		);
-		this.ctx.statusLine.invalidate();
+		const session = this.#modelControlSession();
+		if (persistDefault && session.setDefaultModelProfileForControl) {
+			await session.setDefaultModelProfileForControl(profileName, { persistDefault: true });
+		} else if (!persistDefault && session.activateModelProfileForControl) {
+			await session.activateModelProfileForControl(profileName);
+		} else {
+			// Lightweight interactive test hosts may expose only the shared
+			// activation primitive; retain the same persistence semantics there.
+			await activateModelProfile(
+				{
+					session: this.ctx.session,
+					modelRegistry: this.ctx.session.modelRegistry,
+					settings: this.ctx.settings,
+					profileName,
+				},
+				{ persistDefault },
+			);
+		}
+		this.#assertModelIdentity(identityAdmission);
+		await this.ctx.session.syncEagerDelegation?.();
+		this.#assertModelIdentity(identityAdmission);
 		this.ctx.updateEditorBorderColor();
 		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
 	}
@@ -2728,6 +2788,7 @@ export class SelectorController {
 					}
 					const isTrackedSingleAssignment =
 						selection.kind === "assignment" && selection.role !== null && selection.roles === undefined;
+					const identityAdmission = this.#captureModelIdentity();
 					try {
 						if (selection.kind === "createProfile") {
 							done();
@@ -2751,13 +2812,17 @@ export class SelectorController {
 						const { model, role, thinkingLevel, selector: selectedSelector } = selection;
 						if (role === null) {
 							// Temporary: update agent state but don't persist to settings
-							await this.ctx.session.setModelTemporary(model, thinkingLevel, {
-								cause: "temporary-operation",
-								reason: "other",
+							await this.#withModelControlMutation(async () => {
+								this.#assertModelIdentity(identityAdmission);
+								await this.ctx.session.setModelTemporary(model, thinkingLevel, {
+									cause: "temporary-operation",
+									reason: "other",
+								});
+								this.#assertModelIdentity(identityAdmission);
+								this.ctx.session.setDefaultFallbackRuntimeModel(
+									selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
+								);
 							});
-							this.ctx.session.setDefaultFallbackRuntimeModel(
-								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel),
-							);
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Temporary model: ${selectedSelector ?? model.id}`);
@@ -2767,73 +2832,82 @@ export class SelectorController {
 							const targetRoles: readonly GjcModelAssignmentTargetId[] = selection.roles;
 							const includesDefault = targetRoles.includes("default");
 							const includesRoleAgent = targetRoles.some(targetRole => targetRole !== "default");
-							if (includesRoleAgent) {
-								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
-									model,
-									this.ctx.session.credentialSessionId,
-								);
-								if (!apiKey) {
-									throw new Error(`No API key for ${model.provider}/${model.id}`);
-								}
-							}
-							if (includesDefault && !includesRoleAgent) {
-								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
-									model,
-									this.ctx.session.credentialSessionId,
-								);
-								if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-							}
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>();
-							for (const targetRole of targetRoles) assignments.set(targetRole, value);
-							const defaultSelector =
-								selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
-									? selectedSelector.slice(0, -thinkingLevel.length - 1)
-									: selectedSelector;
-
-							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
-							let defaultMutationStarted = false;
-							let assignmentMutationStarted = false;
-							let materializedProfile = false;
-							try {
-								if (includesDefault) {
-									await this.ctx.session.setModel(model, "default", {
-										selector: defaultSelector,
-										thinkingLevel,
-										cause: "user-selection",
-										onMutationStarted: () => {
-											defaultMutationStarted = true;
-										},
-									});
-									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-										this.ctx.session.setThinkingLevel(thinkingLevel);
+							await this.#withModelControlMutation(async () => {
+								this.#assertModelIdentity(identityAdmission);
+								if (includesRoleAgent) {
+									const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+										model,
+										this.ctx.session.credentialSessionId,
+									);
+									this.#assertModelIdentity(identityAdmission);
+									if (!apiKey) {
+										throw new Error(`No API key for ${model.provider}/${model.id}`);
 									}
 								}
-								assignmentMutationStarted = true;
-								materializedProfile = materializeActiveModelProfileAssignments({
-									session: this.ctx.session,
-									settings: this.ctx.settings,
-									assignments,
-								});
-								if (!materializedProfile) {
-									for (const targetRole of targetRoles) {
-										const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
-										if (target.settingsPath === "modelRoles") {
-											this.ctx.settings.setModelRole(targetRole, value);
-										} else {
-											this.ctx.settings.setAgentModelOverride(targetRole, value);
+								if (includesDefault && !includesRoleAgent) {
+									const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+										model,
+										this.ctx.session.credentialSessionId,
+									);
+									this.#assertModelIdentity(identityAdmission);
+									if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+								}
+								const assignments = new Map<GjcModelAssignmentTargetId, string>();
+								for (const targetRole of targetRoles) assignments.set(targetRole, value);
+								const defaultSelector =
+									selectedSelector && thinkingLevel && selectedSelector.endsWith(`:${thinkingLevel}`)
+										? selectedSelector.slice(0, -thinkingLevel.length - 1)
+										: selectedSelector;
+
+								const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
+								let defaultMutationStarted = false;
+								let assignmentMutationStarted = false;
+								let materializedProfile = false;
+								try {
+									if (includesDefault) {
+										await this.ctx.session.setModel(model, "default", {
+											selector: defaultSelector,
+											thinkingLevel,
+											cause: "user-selection",
+											onMutationStarted: () => {
+												defaultMutationStarted = true;
+											},
+										});
+										this.#assertModelIdentity(identityAdmission);
+										if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+											this.ctx.session.setThinkingLevel(thinkingLevel);
 										}
 									}
+									assignmentMutationStarted = true;
+									materializedProfile = materializeActiveModelProfileAssignments({
+										session: this.ctx.session,
+										settings: this.ctx.settings,
+										assignments,
+									});
+									if (!materializedProfile) {
+										for (const targetRole of targetRoles) {
+											const target = GJC_MODEL_ASSIGNMENT_TARGETS[targetRole];
+											if (target.settingsPath === "modelRoles") {
+												this.ctx.settings.setModelRole(targetRole, value);
+											} else {
+												this.ctx.settings.setAgentModelOverride(targetRole, value);
+											}
+										}
+									}
+								} catch (error) {
+									this.#assertModelIdentity(identityAdmission);
+									await this.#restoreDefaultAssignmentRollback(
+										rollbackSnapshot,
+										error,
+										defaultMutationStarted,
+										defaultMutationStarted || assignmentMutationStarted,
+									);
 								}
-							} catch (error) {
-								await this.#restoreDefaultAssignmentRollback(
-									rollbackSnapshot,
-									error,
-									defaultMutationStarted,
-									defaultMutationStarted || assignmentMutationStarted,
-								);
-							}
+								this.#assertModelIdentity(identityAdmission);
+							});
+							this.#assertModelIdentity(identityAdmission);
 							modelSelector.refreshRoleAssignments({
 								currentModel: this.ctx.session.model,
 								currentThinkingLevel: this.ctx.session.thinkingLevel,
@@ -2856,77 +2930,89 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
 							// Default: update agent state and persist as the active default model.
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
-								model,
-								this.ctx.session.credentialSessionId,
-							);
-							if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
-							const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
-							let defaultMutationStarted = false;
-							let assignmentMutationStarted = false;
 							const value = formatModelSelectorValue(
 								selectedSelector ?? `${model.provider}/${model.id}`,
 								thinkingLevel,
 							);
-							try {
-								await this.ctx.session.setModel(model, role, {
-									selector: selectedSelector,
-									thinkingLevel,
-									cause: "user-selection",
-									onMutationStarted: () => {
-										defaultMutationStarted = true;
-									},
-								});
-								assignmentMutationStarted = true;
-								const materializedProfile = materializeActiveModelProfileAssignment({
-									session: this.ctx.session,
-									settings: this.ctx.settings,
-									role,
-									selector: value,
-								});
-								if (!materializedProfile) {
-									this.ctx.settings.setModelRole(role, value);
-								}
-								if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
-									this.ctx.session.setThinkingLevel(thinkingLevel);
-								}
-							} catch (error) {
-								await this.#restoreDefaultAssignmentRollback(
-									rollbackSnapshot,
-									error,
-									defaultMutationStarted,
-									defaultMutationStarted || assignmentMutationStarted,
+							await this.#withModelControlMutation(async () => {
+								this.#assertModelIdentity(identityAdmission);
+								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+									model,
+									this.ctx.session.credentialSessionId,
 								);
-							}
+								this.#assertModelIdentity(identityAdmission);
+								if (!apiKey) throw new Error(`No API key for ${model.provider}/${model.id}`);
+								const rollbackSnapshot = this.#captureDefaultAssignmentRollback();
+								let defaultMutationStarted = false;
+								let assignmentMutationStarted = false;
+								try {
+									await this.ctx.session.setModel(model, role, {
+										selector: selectedSelector,
+										thinkingLevel,
+										cause: "user-selection",
+										onMutationStarted: () => {
+											defaultMutationStarted = true;
+										},
+									});
+									this.#assertModelIdentity(identityAdmission);
+									assignmentMutationStarted = true;
+									const materializedProfile = materializeActiveModelProfileAssignment({
+										session: this.ctx.session,
+										settings: this.ctx.settings,
+										role,
+										selector: value,
+									});
+									if (!materializedProfile) {
+										this.ctx.settings.setModelRole(role, value);
+									}
+									if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
+										this.ctx.session.setThinkingLevel(thinkingLevel);
+									}
+								} catch (error) {
+									this.#assertModelIdentity(identityAdmission);
+									await this.#restoreDefaultAssignmentRollback(
+										rollbackSnapshot,
+										error,
+										defaultMutationStarted,
+										defaultMutationStarted || assignmentMutationStarted,
+									);
+								}
+							});
+							this.#assertModelIdentity(identityAdmission);
 							refreshRoleAssignments();
 							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
 							this.ctx.showStatus(`Default model: ${selectedSelector ?? model.id}`);
 							this.ctx.ui.requestRender();
 						} else {
-							const apiKey = await this.ctx.session.modelRegistry.getApiKey(
-								model,
-								this.ctx.session.credentialSessionId,
-							);
-							if (!apiKey) {
-								throw new Error(`No API key for ${model.provider}/${model.id}`);
-							}
 							const value =
 								selectedSelector ?? formatModelSelectorValue(`${model.provider}/${model.id}`, thinkingLevel);
-							const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
-							const materializedProfile = materializeActiveModelProfileAssignments({
-								session: this.ctx.session,
-								settings: this.ctx.settings,
-								assignments,
-							});
-							if (!materializedProfile) {
-								const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
-								if (target.settingsPath === "modelRoles") {
-									this.ctx.settings.setModelRole(role, value);
-								} else {
-									this.ctx.settings.setAgentModelOverride(role, value);
+							await this.#withModelControlMutation(async () => {
+								this.#assertModelIdentity(identityAdmission);
+								const apiKey = await this.ctx.session.modelRegistry.getApiKey(
+									model,
+									this.ctx.session.credentialSessionId,
+								);
+								this.#assertModelIdentity(identityAdmission);
+								if (!apiKey) {
+									throw new Error(`No API key for ${model.provider}/${model.id}`);
 								}
-							}
+								const assignments = new Map<GjcModelAssignmentTargetId, string>([[role, value]]);
+								const materializedProfile = materializeActiveModelProfileAssignments({
+									session: this.ctx.session,
+									settings: this.ctx.settings,
+									assignments,
+								});
+								if (!materializedProfile) {
+									const target = GJC_MODEL_ASSIGNMENT_TARGETS[role];
+									if (target.settingsPath === "modelRoles") {
+										this.ctx.settings.setModelRole(role, value);
+									} else {
+										this.ctx.settings.setAgentModelOverride(role, value);
+									}
+								}
+								this.#assertModelIdentity(identityAdmission);
+							});
+							this.#assertModelIdentity(identityAdmission);
 							refreshRoleAssignments();
 							this.ctx.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 							this.ctx.statusLine.invalidate();
@@ -3543,12 +3629,20 @@ export class SelectorController {
 			return;
 		}
 
-		await activateModelProfile({
-			session: this.ctx.session,
-			modelRegistry: this.ctx.session.modelRegistry,
-			settings: this.ctx.settings,
-			profileName: recommendedProfile.name,
-		});
+		const identityAdmission = this.#captureModelIdentity();
+		this.#assertModelIdentity(identityAdmission);
+		const session = this.#modelControlSession();
+		if (session.activateModelProfileForControl) {
+			await session.activateModelProfileForControl(recommendedProfile.name);
+		} else {
+			await activateModelProfile({
+				session: this.ctx.session,
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				profileName: recommendedProfile.name,
+			});
+		}
+		this.#assertModelIdentity(identityAdmission);
 	}
 
 	async #handleOAuthLogin(providerId: string, options?: OAuthSelectorOptions): Promise<void> {
