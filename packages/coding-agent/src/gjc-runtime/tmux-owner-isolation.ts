@@ -1471,7 +1471,7 @@ export async function readNoFollowJson(file: string): Promise<unknown | null> {
 	try {
 		handle = await fs.open(file, fsSync.constants.O_RDONLY | noFollow);
 	} catch (error) {
-		if (isCode(error, "ENOENT")) return null;
+		if (isCode(error, "ENOENT")) throw new Error("changed_file");
 		throw error;
 	}
 	try {
