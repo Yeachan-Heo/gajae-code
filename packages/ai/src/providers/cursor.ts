@@ -973,6 +973,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 		};
 		const settleH2WhenReady = (): void => {
+			if (terminalDrainMode) return;
 			if (!queueDrained) return;
 			if (endStreamError) {
 				settleBehindFence(() => settleH2(endStreamError));
@@ -981,7 +982,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				// may leave the HTTP/2 response open after sending it.
 				settleBehindFence(() => settleH2());
 			} else if (responseEnded) {
-				settleBehindFence(() => settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded")));
+				settleBehindFence(() => settleH2(new Error("Cursor stream ended before turnEnded")));
 			}
 		};
 		let transportWatchdog: NodeJS.Timeout | null = null;
@@ -994,6 +995,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let terminalDrain: (() => void) | undefined;
 		let terminalDrainStarted = false;
 		let terminalPendingError: unknown;
+		let terminalBoundarySeen = false;
 		let processPendingBuffer: (() => void) | undefined;
 		let activeExecAbort: ((reason?: Error) => void) | undefined;
 		const closeTransportLocally = (): void => {
@@ -1021,9 +1023,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 			publish();
 		};
-		const terminalize = (error: unknown): void => {
+		const terminalize = (error: unknown, mode: "hard" | "drainable" = "hard"): void => {
+			if (transportTerminalized) {
+				if (callerAbortError) {
+					terminalPendingError = callerAbortError;
+					terminalDrainMode = false;
+					settleBehindFence(() => settleH2(callerAbortError));
+				}
+				return;
+			}
 			transportTerminalized = true;
-			terminalDrainMode = true;
+			terminalDrainMode = mode === "drainable" && !callerAbortError;
 			if (callerAbortError) terminalPendingError = callerAbortError;
 			else if (terminalPendingError === undefined) terminalPendingError = error;
 			for (const close of shellGates) close();
@@ -1032,11 +1042,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			activeExecAbort = undefined;
 			closeTerminalAdmission();
 			closeTransportLocally();
-			processPendingBuffer?.();
-			if (terminalDrain) {
-				terminalDrain();
+			if (terminalDrainMode) {
+				processPendingBuffer?.();
+				terminalDrain?.();
+			} else {
+				settleBehindFence(() => settleH2(error));
 			}
-			settleBehindFence(() => settleH2(error));
 		};
 		const closeForCallerAbort = () => {
 			terminalize(callerAbortError!);
@@ -1222,12 +1233,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// the bearer-authenticated request is created.
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			h2ClientErrorHandler = error => {
-				terminalize(error);
+				terminalize(error, "drainable");
 			};
 			h2Client.on("error", h2ClientErrorHandler);
 			h2ClientCloseHandler = () => {
 				if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
-				terminalize(new Error("Cursor HTTP/2 session closed before turnEnded"));
+				terminalize(new Error("Cursor HTTP/2 session closed before turnEnded"), "drainable");
 			};
 			h2Client.on("close", h2ClientCloseHandler);
 
@@ -1256,7 +1267,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				return () => shellGates.delete(close);
 			};
 			h2RequestErrorHandler = error => {
-				terminalize(error);
+				terminalize(error, "drainable");
 			};
 			h2Request.on("error", h2RequestErrorHandler);
 			const handleUnexpectedRequestClose = (kind: "closed" | "aborted"): void => {
@@ -1275,13 +1286,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					gracefulCloseCheckTimer = setTimeout(() => {
 						gracefulCloseCheckTimer = undefined;
 						if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
-						const error = new Error(`Cursor HTTP/2 request ${kind} before turnEnded`);
+						const error = new Error("Cursor stream ended before turnEnded");
 						if (pendingBuffer.length === 0 && !processingPausedForQueue) {
 							responseEnded = true;
-							terminalize(error);
+							terminalize(error, "drainable");
 							return;
 						}
 						responseEnded = true;
+						observeBufferedTerminal(true);
+						if (transportTerminalized) return;
+						if (!sawTurnEnded) {
+							terminalize(
+								pendingBuffer.length > 0 ? new Error("Cursor HTTP/2 stream ended before turnEnded") : error,
+								"drainable",
+							);
+							return;
+						}
 						sealExecAdmissionAtRawEof();
 						processPendingBuffer?.();
 						finishResponseAfterParsing();
@@ -1289,7 +1309,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					return;
 				}
 				responseEnded = true;
-				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`));
+				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), "drainable");
 			};
 			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
 			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
@@ -1346,7 +1366,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			terminalDrain = (): void => {
 				if (terminalDrainStarted) return;
 				terminalDrainStarted = true;
-				void messageQueue.drain().then(
+				// A transport terminal can preempt an abortable exec whose handler ignores
+				// its signal. Do not wait on that queue chain; the bounded settlement fence
+				// below still protects any mutation that explicitly became non-abortable.
+				const queueCompletion = processingPausedForExec || execInFlight ? Promise.resolve() : messageQueue.drain();
+				void queueCompletion.then(
 					() => {
 						queueDrained = true;
 						settleBehindFence(() => settleH2(terminalPendingError));
@@ -1373,7 +1397,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
-					terminalize(new Error(`gRPC error ${status}: ${decodeGrpcMessage(msg)}`));
+					terminalize(new Error(`gRPC error ${status}: ${decodeGrpcMessage(msg)}`), "drainable");
 				}
 			});
 
@@ -1405,18 +1429,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					if (pendingBuffer.length - offset < 5 + msgLen) break;
 					const messageBytes = pendingBuffer.subarray(offset + 5, msgLen);
 					if (flags & CONNECT_END_STREAM_FLAG) {
+						terminalBoundarySeen = true;
 						const error = parseConnectEndStream(messageBytes);
 						if (error) {
 							endStreamError = error;
 							responseEnded = true;
-							terminalize(error);
+							terminalize(error, "drainable");
 							return true;
 						}
 						if (!observedTurnEnded) {
 							const missingTurnEnded = new Error("Cursor HTTP/2 stream ended before turnEnded");
 							endStreamError = missingTurnEnded;
 							responseEnded = true;
-							terminalize(missingTurnEnded);
+							terminalize(missingTurnEnded, "drainable");
 							return true;
 						}
 						bufferedObservationOffset = offset + 5 + msgLen;
@@ -1451,6 +1476,27 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 				return false;
 			};
+			const applyBufferedNonExecMessage = (serverMessage: AgentServerMessage): void => {
+				log("serverMessage", serverMessage.message.case, serverMessage.message.value);
+				switch (serverMessage.message.case) {
+					case "interactionUpdate":
+						processInteractionUpdate(serverMessage.message.value, output, stream, state, usageState);
+						return;
+					case "kvServerMessage":
+						handleKvServerMessage(serverMessage.message.value as KvServerMessage, blobStore, writer);
+						return;
+					case "conversationCheckpointUpdate":
+						handleConversationCheckpointUpdate(
+							serverMessage.message.value,
+							output,
+							usageState,
+							onConversationCheckpoint,
+						);
+						return;
+					default:
+						return;
+				}
+			};
 			const finishResponseAfterParsing = (): void => {
 				if (!responseEnded || processingPausedForExec || processingPausedForQueue) return;
 				if (pendingBuffer.length > 0) {
@@ -1464,6 +1510,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					return;
 				}
 				while (pendingBuffer.length >= 5) {
+					if (terminalBoundarySeen) {
+						pendingBuffer.clear();
+						bufferedObservationOffset = 0;
+						bufferedObservationTurnEnded = false;
+						break;
+					}
 					const flags = pendingBuffer.byteAt(0);
 					const msgLen = pendingBuffer.readUInt32BE(1);
 					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
@@ -1483,11 +1535,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						closeTerminalAdmission();
 						responseEnded = true;
+						terminalBoundarySeen = true;
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
 							endStreamError = endError;
-							terminalize(endError);
+							terminalize(endError, "drainable");
 						}
+						pendingBuffer.clear();
 						break;
 					}
 
@@ -1506,6 +1560,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// request on turnEnded before prior handlers finish loses their responses.
 						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
 						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage && !sawTurnEnded) continue;
+						if (terminalDrainMode) {
+							if (isExecServerMessage) continue;
+							applyBufferedNonExecMessage(serverMessage);
+							if (isTurnEnded) {
+								sawTurnEnded = true;
+								closeTerminalAdmission();
+							}
+							continue;
+						}
 						const isExecutable = isExecServerMessage && isMeaningful;
 						if (isExecutable) {
 							processingPausedForExec = true;
@@ -1665,12 +1728,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					terminalize(endStreamError);
 					return;
 				}
-				if (observeBufferedTerminal(true)) return;
-				if (!sawTurnEnded && !h2Settled) {
-					if (pendingBuffer.length === 0) {
-						terminalize(new Error("Cursor stream ended before turnEnded"));
-						return;
+				if (observeBufferedTerminal(true)) {
+					if (terminalDrainMode) {
+						processPendingBuffer?.();
+						terminalDrain?.();
 					}
+					return;
+				}
+				if (transportTerminalized) return;
+				if (!sawTurnEnded && !h2Settled) {
+					terminalize(
+						pendingBuffer.length > 0
+							? new Error("Cursor HTTP/2 stream ended before turnEnded")
+							: new Error("Cursor stream ended before turnEnded"),
+						"drainable",
+					);
+					return;
 				}
 				sealExecAdmissionAtRawEof();
 				processPendingBuffer?.();
