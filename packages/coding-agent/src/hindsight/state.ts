@@ -83,7 +83,7 @@ export class HindsightRetainQueue {
 	}
 
 	enqueue(content: string, context?: string): void {
-		if (this.#closed || this.#state.isDisposed) {
+		if (this.#closed || !this.#state.isActive) {
 			throw new Error("Hindsight retain queue is closed.");
 		}
 		this.#items.push({ content, context, sessionId: this.#state.sessionId });

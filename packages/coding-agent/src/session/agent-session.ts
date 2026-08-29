@@ -11363,21 +11363,35 @@ export class AgentSession {
 		op: "create" | "get" | "resume" | "pause" | "complete" | "drop",
 		objective?: string,
 	): Promise<unknown> {
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
 		try {
-			switch (op) {
-				case "create":
-					return await this.#goalRuntime.createGoal({ objective: objective ?? "" });
-				case "get":
-					return this.getGoalModeState();
-				case "resume":
-					return await this.#goalRuntime.resumeGoal();
-				case "pause":
-					return await this.#goalRuntime.pauseGoal();
-				case "complete":
-					return await this.#goalRuntime.completeGoalFromTool();
-				case "drop":
-					return await this.#goalRuntime.dropGoal();
-			}
+			return await this.#withSessionAdmission("selection", async () => {
+				this.#assertSessionIdentityAdmission(identityAdmission);
+				let result: unknown;
+				switch (op) {
+					case "create":
+						result = await this.#goalRuntime.createGoal({ objective: objective ?? "" });
+						break;
+					case "get":
+						result = this.getGoalModeState();
+						break;
+					case "resume":
+						result = await this.#goalRuntime.resumeGoal();
+						break;
+					case "pause":
+						result = await this.#goalRuntime.pauseGoal();
+						break;
+					case "complete":
+						result = await this.#goalRuntime.completeGoalFromTool();
+						break;
+					case "drop":
+						result = await this.#goalRuntime.dropGoal();
+						break;
+				}
+				this.#assertSessionIdentityAdmission(identityAdmission);
+				return result;
+			});
 		} catch (error) {
 			throw Object.assign(new Error(error instanceof Error ? error.message : "Goal operation failed."), {
 				code: "invalid_input",
@@ -13997,6 +14011,8 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: {
 			deliverAs?: "steer" | "followUp";
+			/** Allow queue replacement to reuse an enclosing SDK control admission. */
+			allowSdkControlMutationReentry?: boolean;
 			/** Preserve a busy SDK dispatch as queued work across an admission fence. */
 			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
@@ -14013,7 +14029,16 @@ export class AgentSession {
 		const internalOptions = options ? { ...options, ...(sdkRunToken ? { sdkRunToken } : {}) } : undefined;
 		this.#assertRecoveryHydrationPromoted();
 		const owner = this.#sessionAdmissionContext.getStore();
-		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		if (
+			owner &&
+			!owner.released &&
+			!(
+				owner.kind === "selection" &&
+				options?.allowSdkControlMutationReentry === true &&
+				options.deliverAs !== undefined
+			)
+		)
+			throw this.#sessionAdmissionBusyError();
 		this.#assertSessionAdmissionOpen();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		if (typeof content !== "string" && !Array.isArray(content)) {
@@ -16311,10 +16336,14 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
 		// Do not hold selection admission while waiting for a scheduled continuation:
 		// the continuation may need prompt admission to settle the current turn.
 		await this.waitForIdle();
+		this.#assertSessionIdentityAdmission(identityAdmission);
 		const canonicalName = await this.#withSessionAdmission("selection", async () => {
+			this.#assertSessionIdentityAdmission(identityAdmission);
 			const profiles = this.#modelRegistry.getModelProfiles();
 			let canonical: string;
 			try {
@@ -16326,6 +16355,7 @@ export class AgentSession {
 			}
 			const priorModel = this.model;
 			options?.onBeforeActivation?.();
+			this.#assertSessionIdentityAdmission(identityAdmission);
 			await activateModelProfile(
 				{
 					session: this,
@@ -16339,6 +16369,7 @@ export class AgentSession {
 				},
 			);
 			options?.onAfterActivation?.();
+			this.#assertSessionIdentityAdmission(identityAdmission);
 			// A role-only profile has no default model, so the activation never
 			// calls `setModelTemporary` — the only place that consumes the
 			// thinking override. Apply the override to the existing model so the
@@ -16348,6 +16379,7 @@ export class AgentSession {
 			}
 			return canonical;
 		});
+		this.#assertSessionIdentityAdmission(identityAdmission);
 		return { changed: this.getActiveModelProfile() === canonicalName, id: canonicalName };
 	}
 
@@ -16829,6 +16861,19 @@ export class AgentSession {
 						effectiveLevel,
 						{ appendThinkingLevel: true },
 					);
+					try {
+						this.#assertSessionIdentityAdmission(identityAdmission);
+					} catch (error) {
+						try {
+							await this.sessionManager.discardDefaultModelSelectionStage(stage);
+						} catch (cleanupError) {
+							throw new AggregateError(
+								[error, cleanupError],
+								"Session identity changed and staged default model selection cleanup both failed.",
+							);
+						}
+						throw error;
+					}
 					let durableCommit: CasReceipt;
 					try {
 						const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
@@ -16845,6 +16890,15 @@ export class AgentSession {
 							);
 						}
 						throw error;
+					}
+					try {
+						this.#assertSessionIdentityAdmission(identityAdmission);
+					} catch (error) {
+						return await this.#throwDefaultModelSelectionRecovery(
+							error instanceof Error ? error : new Error(String(error)),
+							stage,
+							durableCommit,
+						);
 					}
 					if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
 						await this.#throwDefaultModelSelectionRecovery(
@@ -17364,6 +17418,7 @@ export class AgentSession {
 	 * @returns New level, or undefined if model doesn't support thinking
 	 */
 	cycleThinkingLevel(): ThinkingLevel | undefined {
+		this.#assertNoSessionTransitionAdmission();
 		if (!this.model?.reasoning) return undefined;
 
 		const levels = [ThinkingLevel.Off, ...this.getAvailableThinkingLevels()];

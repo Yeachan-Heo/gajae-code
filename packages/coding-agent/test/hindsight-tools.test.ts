@@ -170,6 +170,7 @@ describe("Hindsight recall injection", () => {
 		parent.beginDispose();
 
 		expect(child.isActive).toBe(false);
+		expect(() => child.enqueueRetain("stale alias retain")).toThrow(/closed/i);
 		expect(child.getRecallSnippet()).toBeUndefined();
 		expect(child.getRecallSnippetForInjection()).toBeUndefined();
 		expect(child.markRecallSnippetInjected("<memories>parent fact</memories>")).toBe(false);
