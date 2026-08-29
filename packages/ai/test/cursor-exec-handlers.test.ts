@@ -1153,7 +1153,7 @@ describe("Cursor request lifecycle", () => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
 		const server = http2.createServer();
-		server.on("stream", stream => {
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
 			stream.respond(
 				{ ":status": 200, "content-type": "application/connect+proto" },
 				{ waitForTrailers: true },

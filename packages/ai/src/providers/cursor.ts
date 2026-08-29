@@ -982,7 +982,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				// may leave the HTTP/2 response open after sending it.
 				settleBehindFence(() => settleH2());
 			} else if (responseEnded) {
-				settleBehindFence(() => settleH2(new Error("Cursor stream ended before turnEnded")));
+				settleBehindFence(() => settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded")));
 			}
 		};
 		let transportWatchdog: NodeJS.Timeout | null = null;
@@ -1429,7 +1429,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					if (pendingBuffer.length - offset < 5 + msgLen) break;
 					const messageBytes = pendingBuffer.subarray(offset + 5, msgLen);
 					if (flags & CONNECT_END_STREAM_FLAG) {
-						terminalBoundarySeen = true;
 						const error = parseConnectEndStream(messageBytes);
 						if (error) {
 							endStreamError = error;
