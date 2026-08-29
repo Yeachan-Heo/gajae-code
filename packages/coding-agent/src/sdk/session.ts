@@ -2212,6 +2212,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								session.isDisposed ||
 								session.isSessionTransitioning
 							) {
+								if (ownedCompletion) unregisterOwnedRegistration(ownedCompletion.registration);
 								return;
 							}
 							session.yieldQueue.enqueue<AsyncResultEntry>("async-result", {

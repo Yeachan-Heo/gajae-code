@@ -2979,8 +2979,13 @@ export class AgentSession {
 			void formatParkedAsyncResult(this.sessionManager, disposition.text, allowArtifact)
 				.then(formattedResult => {
 					const manager = this.#ownedAsyncJobManager;
-					if (manager?.isDeliverySuppressed(job.id, job.generation)) {
-						manager.clearParkedDelivery(job.generation);
+					if (
+						manager?.isDeliverySuppressed(job.id, job.generation) ||
+						this.#isDisposed ||
+						this.#sessionTransitionKind !== undefined
+					) {
+						if (registration) unregisterOwnedRegistration(registration);
+						manager?.clearParkedDelivery(job.generation);
 						return;
 					}
 					if (!this.#foldCoordinator.claimCompletionDelivery(job)) {
@@ -2991,7 +2996,8 @@ export class AgentSession {
 						manager?.retainDeliveryClaim(job);
 						if (manager?.isDeliverySuppressed(job.id, job.generation)) {
 							manager.releaseDeliveryClaim(job.generation);
-							manager.clearParkedDelivery(job.generation);
+							if (registration) unregisterOwnedRegistration(registration);
+							manager?.clearParkedDelivery(job.generation);
 							return;
 						}
 						this.yieldQueue.enqueue("async-result", {
