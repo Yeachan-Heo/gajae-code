@@ -2693,8 +2693,7 @@ async function observeOwnerTerminalPostmortem(
 ): Promise<OwnerVerdict | null> {
 	try {
 		if (
-			(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
-				(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
+			process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" &&
 			reason === postmortem.Reason.SIGTERM &&
 			(!owner.operatorDispatchId || !owner.operatorIntentId) &&
 			(await hasPendingOwnerIntent(owner, sessionId))
@@ -2753,12 +2752,7 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 	if (!owner) return;
 	try {
 		if (!verdict) {
-			if (
-				(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
-					(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
-				reason === postmortem.Reason.SIGTERM
-			)
-				return;
+			if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" && reason === postmortem.Reason.SIGTERM) return;
 			throw new Error("owner terminal verdict unavailable");
 		}
 		const now = new Date().toISOString();
