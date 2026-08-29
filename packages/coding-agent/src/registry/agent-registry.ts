@@ -62,6 +62,14 @@ export class AgentRegistry {
 	readonly #refs = new Map<string, AgentRef>();
 	readonly #listeners = new Set<RegistryListener>();
 
+	allocateId(preferred: string): string {
+		if (!this.#refs.has(preferred)) return preferred;
+		for (let suffix = 2; ; suffix++) {
+			const candidate = `${preferred}-${suffix}`;
+			if (!this.#refs.has(candidate)) return candidate;
+		}
+	}
+
 	register(input: RegisterInput): AgentRef {
 		const now = Date.now();
 		const ref: AgentRef = {
@@ -108,6 +116,11 @@ export class AgentRegistry {
 		if (!ref) return;
 		this.#refs.delete(id);
 		this.#emit({ type: "removed", ref });
+	}
+
+	unregisterIfMatch(id: string, expected: AgentRef): void {
+		if (this.#refs.get(id) !== expected) return;
+		this.unregister(id);
 	}
 
 	get(id: string): AgentRef | undefined {

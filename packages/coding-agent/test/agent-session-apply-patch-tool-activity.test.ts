@@ -45,7 +45,7 @@ describe("apply_patch tool activity resolution", () => {
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings: Settings.isolated(),
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			toolRegistry: new Map([[editTool.name, editTool as AgentTool]]),
 		});
 

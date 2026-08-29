@@ -34,7 +34,7 @@ describe("commit agent prompt attribution", () => {
 			cwd: "/tmp",
 			model,
 			settings: Settings.isolated(),
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			authStorage: {} as never,
 			changelogTargets: [],
 			requireChangelog: false,

@@ -77,7 +77,7 @@ describe("AgentSession SSH tool refresh", () => {
 			sessionManager,
 			settings,
 			agentDir: options?.agentDir,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			toolRegistry,
 			reloadSshTool:
 				options?.reloadSshTool ?? (async () => (await loadSshTool(toolSession)) as unknown as AgentTool | null),

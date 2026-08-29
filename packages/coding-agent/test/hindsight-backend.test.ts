@@ -90,7 +90,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -108,7 +108,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -127,7 +127,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -137,7 +137,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -160,7 +160,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -187,7 +187,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -223,7 +223,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -258,7 +258,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -292,7 +292,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -317,7 +317,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: parentSession as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -329,7 +329,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: subSession as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 1,
 			parentHindsightSessionState: parentState,
@@ -356,7 +356,7 @@ describe("hindsightBackend.start", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 1,
 		});
@@ -390,7 +390,7 @@ describe("hindsightBackend.preCompactionContext", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -415,7 +415,7 @@ describe("hindsightBackend.preCompactionContext", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -448,7 +448,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -477,7 +477,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -500,7 +500,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -531,7 +531,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -582,7 +582,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -614,7 +614,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: parent as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -622,7 +622,7 @@ describe("hindsightBackend first-turn injection", () => {
 		await hindsightBackend.start({
 			session: child as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 1,
 			parentHindsightSessionState: parent.getHindsightSessionState(),
@@ -650,7 +650,7 @@ describe("hindsightBackend.clear", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});
@@ -677,7 +677,7 @@ describe("hindsightBackend.clear", () => {
 		await hindsightBackend.start({
 			session: session as never,
 			settings,
-			modelRegistry: {} as never,
+			modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 			agentDir: "/tmp",
 			taskDepth: 0,
 		});

@@ -968,7 +968,8 @@ export async function releaseLspScope(cwd: string, agentDir?: string): Promise<v
 		return;
 	}
 	scopeReferences.delete(scopeKey);
-	scopeShutdownGenerations.set(scopeKey, scopeGeneration(scopeKey) + 1);
+	const shutdownGeneration = scopeGeneration(scopeKey) + 1;
+	scopeShutdownGenerations.set(scopeKey, shutdownGeneration);
 
 	const clientsToShutdown: LspClient[] = [];
 	for (const [key, client] of Array.from(clients.entries())) {
@@ -992,6 +993,9 @@ export async function releaseLspScope(cwd: string, agentDir?: string): Promise<v
 		...initializingToShutdown.map(client => shutdownClientInstance(client)),
 		...inFlightPromises,
 	]);
+	if (scopeReferences.has(scopeKey) === false && scopeGeneration(scopeKey) === shutdownGeneration) {
+		scopeShutdownGenerations.delete(scopeKey);
+	}
 }
 
 // =============================================================================

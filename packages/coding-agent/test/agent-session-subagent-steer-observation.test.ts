@@ -34,7 +34,7 @@ function createSession(
 		agent: createAgent(),
 		sessionManager: options.sessionManager ?? SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 		agentId: options.agentId,
 		agentRegistry: options.agentRegistry,
 	} satisfies AgentSessionConfig);

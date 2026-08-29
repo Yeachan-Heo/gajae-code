@@ -128,7 +128,7 @@ import { getMemoryBackendRescopeError } from "../memory-backend/service";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
-import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createLazyService } from "../runtime/lazy-service";
 import {
 	createOptionalRuntimeServices,
@@ -1444,12 +1444,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let hasSession = false;
 	let processCwdClaimed = false;
 	let hasRegistered = false;
+	let registeredAgentRef: AgentRef | undefined;
 	let asyncJobManager: AsyncJobManager | undefined;
 	let asyncJobManagerAdmitted = false;
 	let priorAsyncJobManager: AsyncJobManager | undefined;
 	let cleanupOwnedMcpManager: (() => Promise<void>) | undefined;
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
-	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
+	const requestedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
+	const resolvedAgentId =
+		options.agentId === undefined && options.parentTaskPrefix === undefined
+			? agentRegistry.allocateId(requestedAgentId)
+			: requestedAgentId;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isCanonicalSubSession ? "sub" : "main");
 	const resolvedAgentRosterLabel = resolveAgentRosterLabel(
 		options.agentRosterLabel,
@@ -4478,7 +4483,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// so that subagents launched in the same parallel batch can see each other in
 		// their initial `# IRC Peers` block (rendered inside `rebuildSystemPrompt`).
 		// The session reference is attached after construction below.
-		agentRegistry.register({
+		registeredAgentRef = agentRegistry.register({
 			id: resolvedAgentId,
 			displayName: resolvedAgentDisplayName,
 			rosterLabel: resolvedAgentRosterLabel,
@@ -4938,7 +4943,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					await originalDispose();
 				} finally {
 					try {
-						agentRegistry.unregister(resolvedAgentId);
+						if (registeredAgentRef) agentRegistry.unregisterIfMatch(resolvedAgentId, registeredAgentRef);
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
 					} finally {
@@ -5195,7 +5200,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (hasSession) {
 				await session.dispose();
 			} else {
-				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
+				if (hasRegistered && registeredAgentRef) {
+					agentRegistry.unregisterIfMatch(resolvedAgentId, registeredAgentRef);
+				}
 				// Admission happens before session construction. Any later startup
 				// failure must remove THIS manager's endpoint mapping and restore
 				// the prior global only when this manager is still global: otherwise

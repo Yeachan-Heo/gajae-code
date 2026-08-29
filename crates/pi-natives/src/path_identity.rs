@@ -9744,14 +9744,6 @@ mod platform {
 			}
 			authority.retain_child(child);
 		}
-		let sid = current_user_sid().map_err(|_| "acl_unavailable")?;
-		let applied = set_owner_only_acl(authority.target, "directory", &sid, true);
-		if !applied.ok {
-			return Err("acl_apply_failed");
-		}
-		if !verify_owner_only_handle(authority.target, "directory").ok {
-			return Err("acl_verify_failed");
-		}
 		Ok((authority, canonical_volume, names))
 	}
 
@@ -9924,7 +9916,7 @@ mod platform {
 
 	enum SkillPublicationError {
 		Pre(&'static str),
-		Published(&'static str),
+		Published { code: &'static str, target_verified: bool },
 	}
 
 	fn replace_skill_file_name(
@@ -9946,14 +9938,17 @@ mod platform {
 			false,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 		)
-		.map_err(SkillPublicationError::Published)?;
+		.map_err(|code| SkillPublicationError::Published { code, target_verified: false })?;
 		let same = handles_same_object_checked(handle, published).unwrap_or(false);
 		let validated = same && validate_skill_file_handle(published).is_ok();
 		unsafe { CloseHandle(published) };
 		if validated {
 			Ok(())
 		} else {
-			Err(SkillPublicationError::Published("identity_mismatch"))
+			Err(SkillPublicationError::Published {
+				code:            "identity_mismatch",
+				target_verified: same,
+			})
 		}
 	}
 
@@ -10079,8 +10074,9 @@ mod platform {
 		if let Err(error) =
 			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
 		{
-			if let SkillPublicationError::Published(code) = error {
-				if cleanup_private_skill_file(file).is_err() {
+			if let SkillPublicationError::Published { code, target_verified } = error {
+				let cleanup_failed = cleanup_private_skill_file(file).is_err();
+				if cleanup_failed && target_verified {
 					unsafe { CloseHandle(file) };
 					return NativeSecureSkillWriteResult::success(
 						root_path
@@ -10091,13 +10087,16 @@ mod platform {
 					);
 				}
 				unsafe { CloseHandle(file) };
+				if cleanup_failed {
+					return NativeSecureSkillWriteResult::failure("published_unverified");
+				}
 				return NativeSecureSkillWriteResult::failure(code);
 			}
 			let code = match error {
 				SkillPublicationError::Pre(code) => {
 					cleanup_private_skill_file(file).err().unwrap_or(code)
 				},
-				SkillPublicationError::Published(_) => unreachable!(),
+				SkillPublicationError::Published { .. } => unreachable!(),
 			};
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(code);

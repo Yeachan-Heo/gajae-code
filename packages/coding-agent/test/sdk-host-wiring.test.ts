@@ -4691,7 +4691,7 @@ test("ACP permission attachment normalizes decisions through the registered prov
 		}),
 		sessionManager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
-		modelRegistry: {} as never,
+		modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 		toolRegistry: new Map([[bashTool.name, bashTool]]),
 	});
 	agentSession.setSdkPermissionMode("prompt");

@@ -107,7 +107,7 @@ async function createSession(
 		agent,
 		sessionManager,
 		settings,
-		modelRegistry: {} as never,
+		modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
 	});
 
