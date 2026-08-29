@@ -476,6 +476,73 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("drops a malformed frame coalesced after turnEnded", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const text = buildServerMessageFrame({
+					case: "interactionUpdate",
+					value: create(InteractionUpdateSchema, {
+						message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "validated" }) },
+					}),
+				});
+				const malformedTail = frameConnectMessage(new Uint8Array([0x80]));
+				stream.end(
+					Buffer.concat([
+						text,
+						buildServerMessageFrame({
+							case: "interactionUpdate",
+							value: create(InteractionUpdateSchema, {
+								message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+							}),
+						}),
+						malformedTail,
+					]),
+				);
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "validated" }));
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("drops an oversized header coalesced after turnEnded", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				const oversizedTail = Buffer.alloc(5);
+				oversizedTail.writeUInt32BE(16 * 1024 * 1024 + 1, 1);
+				stream.end(
+					Buffer.concat([
+						buildServerMessageFrame({
+							case: "interactionUpdate",
+							value: create(InteractionUpdateSchema, {
+								message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+							}),
+						}),
+						oversizedTail,
+					]),
+				);
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.errorMessage).toBeUndefined();
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("rejects an empty Connect end-stream before turnEnded", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });

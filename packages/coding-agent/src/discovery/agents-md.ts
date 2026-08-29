@@ -10,7 +10,7 @@ import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { calculateDepth, createSourceMeta } from "./helpers";
+import { calculateDepth, canonicalizePathWithinHome, createSourceMeta } from "./helpers";
 
 const PROVIDER_ID = "agents-md";
 const DISPLAY_NAME = "AGENTS.md";
@@ -92,18 +92,22 @@ export async function loadAgentsMd(
 		if (!baseName.startsWith(".")) {
 			const remainingAggregateBytes = MAX_AGGREGATE_BYTES - aggregateBytes;
 			const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
-			const result = await readCandidate(candidate, allowedBytes);
+			const authorizedCandidate = await canonicalizePathWithinHome(ctx, candidate, undefined, "project");
+			const result = authorizedCandidate
+				? await readCandidate(authorizedCandidate, allowedBytes)
+				: { content: null, byteLength: 0, tooLarge: false };
 			if (result.tooLarge) {
 				if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;
 				else omittedOversizedFile = true;
 			} else if (result.content !== null) {
-				const fileDir = path.dirname(candidate);
+				const filePath = authorizedCandidate ?? candidate;
+				const fileDir = path.dirname(filePath);
 				items.push({
-					path: candidate,
+					path: filePath,
 					content: result.content,
 					level: "project",
 					depth: calculateDepth(ctx.cwd, fileDir, path.sep),
-					_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
+					_source: createSourceMeta(PROVIDER_ID, filePath, "project"),
 				});
 				aggregateBytes += result.byteLength;
 			}

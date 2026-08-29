@@ -10,7 +10,7 @@ import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { type Extension, type ExtensionManifest, extensionCapability } from "../capability/extension";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
-import { readDirEntries, readFile } from "../capability/fs";
+import { type ReadScope, readDirEntries, readFile } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
 import { type Instruction, instructionCapability } from "../capability/instruction";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
@@ -30,6 +30,7 @@ import {
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
 	getExtensionNameFromPath,
+	getReadOptions,
 	loadFilesFromDir,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
@@ -69,11 +70,18 @@ function resolveUserAgentDir(ctx: LoadContext): string {
 	return ctx.userAgentDir ?? path.join(ctx.home, PATHS.userAgent);
 }
 
-function readBuiltinFile(ctx: LoadContext, filePath: string): Promise<string | null> {
-	return readFile(
-		filePath,
-		ctx.isolatedHome ? { isolatedHome: true, home: ctx.home, userAgentDir: ctx.userAgentDir } : undefined,
-	);
+function readScopeForLevel(level: "user" | "project"): ReadScope {
+	return level === "user" ? "native" : "project";
+}
+
+async function canonicalBuiltinPath(ctx: LoadContext, filePath: string, scope: ReadScope): Promise<string | null> {
+	return (await canonicalizePathWithinHome(ctx, filePath, undefined, scope)) ?? null;
+}
+
+async function readBuiltinFile(ctx: LoadContext, filePath: string, scope: ReadScope): Promise<string | null> {
+	const canonicalPath = await canonicalBuiltinPath(ctx, filePath, scope);
+	if (!canonicalPath) return null;
+	return readFile(canonicalPath, getReadOptions(ctx, scope));
 }
 
 function getProjectStopDirectory(ctx: LoadContext): string | undefined {
@@ -86,16 +94,17 @@ function getProjectStopDirectory(ctx: LoadContext): string | undefined {
 }
 
 function getProjectConfigDirs(): string[] {
-	return [PATHS.projectDir];
+	// Native project configuration is always rooted at `.gjc`. The configured
+	// config-dir name redirects the user profile only; allowing it to rewrite a
+	// project path would make explicit-home preflight and discovery disagree.
+	return [".gjc"];
 }
 
-async function ifNonEmptyDir(...seg: string[]): Promise<string | null> {
-	let dir = path.join(...seg);
-	const entries = await readDirEntries(dir);
+async function ifNonEmptyDir(ctx: LoadContext, scope: ReadScope, ...seg: string[]): Promise<string | null> {
+	const dir = await canonicalBuiltinPath(ctx, path.join(...seg), scope);
+	if (!dir) return null;
+	const entries = await readDirEntries(dir, getReadOptions(ctx, scope));
 	if (entries.length > 0) {
-		if (!path.isAbsolute(dir)) {
-			dir = path.resolve(dir);
-		}
 		return dir;
 	}
 	return null;
@@ -105,12 +114,12 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	const result: Array<{ dir: string; level: "user" | "project" }> = [];
 
 	for (const projectConfigDir of getProjectConfigDirs()) {
-		const projectDir = await ifNonEmptyDir(ctx.cwd, projectConfigDir);
+		const projectDir = await ifNonEmptyDir(ctx, "project", ctx.cwd, projectConfigDir);
 		if (projectDir) {
 			result.push({ dir: projectDir, level: "project" });
 		}
 	}
-	const userDir = await ifNonEmptyDir(resolveUserAgentDir(ctx));
+	const userDir = await ifNonEmptyDir(ctx, "native", resolveUserAgentDir(ctx));
 	if (userDir) {
 		result.push({ dir: userDir, level: "user" });
 	}
@@ -142,13 +151,10 @@ function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: stri
 	return ancestors;
 }
 
-async function findNearestProjectConfigDir(
-	cwd: string,
-	repoRoot?: string | null,
-): Promise<{ dir: string; depth: number } | null> {
-	for (const ancestor of getAncestorDirs(cwd, repoRoot)) {
+async function findNearestProjectConfigDir(ctx: LoadContext): Promise<{ dir: string; depth: number } | null> {
+	for (const ancestor of getAncestorDirs(ctx.cwd, getProjectStopDirectory(ctx))) {
 		for (const projectConfigDir of getProjectConfigDirs()) {
-			const configDir = await ifNonEmptyDir(ancestor.dir, projectConfigDir);
+			const configDir = await ifNonEmptyDir(ctx, "project", ancestor.dir, projectConfigDir);
 			if (configDir) return { dir: configDir, depth: ancestor.depth };
 		}
 	}
@@ -285,11 +291,11 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 
 	const contents = await Promise.allSettled(
 		paths.map(async p => {
-			const content = await readBuiltinFile(ctx, p.path);
-			if (content) {
-				return { path: p.path, content, level: p.level };
-			}
-			return null;
+			const scope = readScopeForLevel(p.level);
+			const canonicalPath = await canonicalBuiltinPath(ctx, p.path, scope);
+			if (!canonicalPath) return null;
+			const content = await readBuiltinFile(ctx, canonicalPath, scope);
+			return content ? { path: canonicalPath, content, level: p.level } : null;
 		}),
 	);
 
@@ -316,8 +322,9 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 	const items: SystemPrompt[] = [];
 
 	for (const userScopeDir of getUserScopeDirs(ctx)) {
-		const userPath = path.join(userScopeDir, "SYSTEM.md");
-		const userContent = await readBuiltinFile(ctx, userPath);
+		const userPath = await canonicalBuiltinPath(ctx, path.join(userScopeDir, "SYSTEM.md"), "native");
+		if (!userPath) continue;
+		const userContent = await readBuiltinFile(ctx, userPath, "native");
 		if (userContent) {
 			items.push({
 				path: userPath,
@@ -328,10 +335,15 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 		}
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);
 	if (nearestProjectConfigDir) {
-		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
-		const projectContent = await readBuiltinFile(ctx, projectPath);
+		const projectPath = await canonicalBuiltinPath(
+			ctx,
+			path.join(nearestProjectConfigDir.dir, "SYSTEM.md"),
+			"project",
+		);
+		if (!projectPath) return { items, warnings: [] };
+		const projectContent = await readBuiltinFile(ctx, projectPath, "project");
 		if (projectContent) {
 			items.push({
 				path: projectPath,
@@ -365,6 +377,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 				dir: path.join(dir, projectConfigDir, "skills"),
 				providerId: PROVIDER_ID,
 				level: "project",
+				scope: "project",
 				requireDescription: true,
 			}),
 		),
@@ -383,6 +396,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 			dir,
 			providerId: PROVIDER_ID,
 			level: "user",
+			scope: "native",
 			requireDescription: true,
 		}),
 	);
@@ -412,6 +426,7 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 		const commandsDir = path.join(dir, "commands");
 		const result = await loadFilesFromDir<SlashCommand>(ctx, commandsDir, PROVIDER_ID, level, {
 			extensions: ["md"],
+			scope: readScopeForLevel(level),
 			transform: (name, content, path, source) => ({
 				name: name.replace(/\.md$/, ""),
 				path,
@@ -444,6 +459,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		const rulesDir = path.join(dir, "rules");
 		const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
 			extensions: ["md", "mdc"],
+			scope: readScopeForLevel(level),
 			transform: (name, content, path, source) =>
 				buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
 		});
@@ -459,7 +475,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(ctx, userRulesFile, "user");
 	if (userRule) items.push(userRule);
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(ctx, projectRulesFile, "project");
@@ -478,10 +494,13 @@ async function loadStickyRulesFile(
 	filePath: string,
 	level: "user" | "project",
 ): Promise<Rule | null> {
-	const content = await readBuiltinFile(ctx, filePath);
+	const scope = readScopeForLevel(level);
+	const canonicalPath = await canonicalBuiltinPath(ctx, filePath, scope);
+	if (!canonicalPath) return null;
+	const content = await readBuiltinFile(ctx, canonicalPath, scope);
 	if (!content) return null;
-	const source = createSourceMeta(PROVIDER_ID, filePath, level);
-	const rule = buildRuleFromMarkdown("RULES.md", content, filePath, source, { ruleName: "RULES" });
+	const source = createSourceMeta(PROVIDER_ID, canonicalPath, level);
+	const rule = buildRuleFromMarkdown("RULES.md", content, canonicalPath, source, { ruleName: "RULES" });
 	// Force alwaysApply regardless of frontmatter — the whole point of RULES.md
 	// is to be reattached every turn.
 	return { ...rule, alwaysApply: true };
@@ -504,6 +523,7 @@ async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
 		const promptsDir = path.join(dir, "prompts");
 		const result = await loadFilesFromDir<Prompt>(ctx, promptsDir, PROVIDER_ID, level, {
 			extensions: ["md"],
+			scope: readScopeForLevel(level),
 			transform: (name, content, path, source) => ({
 				name: name.replace(/\.md$/, ""),
 				path,
@@ -531,10 +551,10 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	const items: ExtensionModule[] = [];
 	const warnings: string[] = [];
 
-	const resolveExtensionPath = async (rawPath: string): Promise<string | undefined> => {
+	const resolveExtensionPath = async (rawPath: string, scope: ReadScope): Promise<string | undefined> => {
 		const expanded = expandTilde(rawPath, ctx.home);
 		const resolved = path.isAbsolute(expanded) ? expanded : path.resolve(ctx.cwd, expanded);
-		return await canonicalizePathWithinHome(ctx, resolved);
+		return await canonicalizePathWithinHome(ctx, resolved, undefined, scope);
 	};
 
 	const createExtensionModule = (extPath: string, level: "user" | "project"): ExtensionModule => ({
@@ -547,8 +567,18 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	const configDirs = await getConfigDirs(ctx);
 
 	const [discoveredResults, settingsResults] = await Promise.all([
-		Promise.all(configDirs.map(({ dir }) => discoverExtensionModulePaths(ctx, path.join(dir, "extensions")))),
-		Promise.all(configDirs.map(({ dir }) => readBuiltinFile(ctx, path.join(dir, "settings.json")))),
+		Promise.all(
+			configDirs.map(({ dir, level }) =>
+				discoverExtensionModulePaths(ctx, path.join(dir, "extensions"), {
+					scope: readScopeForLevel(level),
+				}),
+			),
+		),
+		Promise.all(
+			configDirs.map(({ dir, level }) =>
+				readBuiltinFile(ctx, path.join(dir, "settings.json"), readScopeForLevel(level)),
+			),
+		),
 	]);
 
 	for (let i = 0; i < configDirs.length; i++) {
@@ -579,7 +609,7 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 				warnings.push(`Invalid extension path in ${settingsPath}: ${String(entry)}`);
 				continue;
 			}
-			const resolvedPath = await resolveExtensionPath(entry);
+			const resolvedPath = await resolveExtensionPath(entry, readScopeForLevel(level));
 			if (!resolvedPath) {
 				warnings.push(`Extension path escapes isolated home in ${settingsPath}: ${entry}`);
 				continue;
@@ -593,8 +623,16 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	}
 
 	const [entriesResults, fileContents] = await Promise.all([
-		Promise.all(settingsExtensions.map(({ resolvedPath }) => readDirEntries(resolvedPath))),
-		Promise.all(settingsExtensions.map(({ resolvedPath }) => readBuiltinFile(ctx, resolvedPath))),
+		Promise.all(
+			settingsExtensions.map(({ resolvedPath, level }) =>
+				readDirEntries(resolvedPath, getReadOptions(ctx, readScopeForLevel(level))),
+			),
+		),
+		Promise.all(
+			settingsExtensions.map(({ resolvedPath, level }) =>
+				readBuiltinFile(ctx, resolvedPath, readScopeForLevel(level)),
+			),
+		),
 	]);
 
 	const dirDiscoveryPromises: Array<{
@@ -609,7 +647,9 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 
 		if (entries.length > 0) {
 			dirDiscoveryPromises.push({
-				promise: discoverExtensionModulePaths(ctx, resolvedPath),
+				promise: discoverExtensionModulePaths(ctx, resolvedPath, {
+					scope: readScopeForLevel(level),
+				}),
 				level,
 			});
 		} else if (content !== null) {
@@ -644,7 +684,11 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 	const warnings: string[] = [];
 
 	const configDirs = await getConfigDirs(ctx);
-	const entriesResults = await Promise.all(configDirs.map(({ dir }) => readDirEntries(path.join(dir, "extensions"))));
+	const entriesResults = await Promise.all(
+		configDirs.map(({ dir, level }) =>
+			readDirEntries(path.join(dir, "extensions"), getReadOptions(ctx, readScopeForLevel(level))),
+		),
+	);
 
 	const manifestCandidates: Array<{
 		extDir: string;
@@ -662,10 +706,14 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 			if (entry.name.startsWith(".")) continue;
 			if (!entry.isDirectory()) continue;
 
-			const extDir = path.join(extensionsDir, entry.name);
+			const scope = readScopeForLevel(level);
+			const extDir = await canonicalBuiltinPath(ctx, path.join(extensionsDir, entry.name), scope);
+			if (!extDir) continue;
+			const manifestPath = await canonicalBuiltinPath(ctx, path.join(extDir, "gemini-extension.json"), scope);
+			if (!manifestPath) continue;
 			manifestCandidates.push({
 				extDir,
-				manifestPath: path.join(extDir, "gemini-extension.json"),
+				manifestPath,
 				entryName: entry.name,
 				level,
 			});
@@ -673,7 +721,7 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 	}
 
 	const manifestContents = await Promise.all(
-		manifestCandidates.map(({ manifestPath }) => readBuiltinFile(ctx, manifestPath)),
+		manifestCandidates.map(({ manifestPath, level }) => readBuiltinFile(ctx, manifestPath, readScopeForLevel(level))),
 	);
 
 	for (let i = 0; i < manifestCandidates.length; i++) {
@@ -716,6 +764,7 @@ async function loadInstructions(ctx: LoadContext): Promise<LoadResult<Instructio
 		const instructionsDir = path.join(dir, "instructions");
 		const result = await loadFilesFromDir<Instruction>(ctx, instructionsDir, PROVIDER_ID, level, {
 			extensions: ["md"],
+			scope: readScopeForLevel(level),
 			transform: (name, content, path, source) => {
 				const { frontmatter, body } = parseFrontmatter(content, { source: path });
 				return {
@@ -757,15 +806,22 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 
 	for (const { dir, level } of configDirs) {
 		for (const hookType of hookTypes) {
+			const scope = readScopeForLevel(level);
+			const typeDir = await canonicalBuiltinPath(ctx, path.join(dir, "hooks", hookType), scope);
+			if (!typeDir) continue;
 			typeDirRequests.push({
-				typeDir: path.join(dir, "hooks", hookType),
+				typeDir,
 				hookType,
 				level,
 			});
 		}
 	}
 
-	const typeEntriesResults = await Promise.all(typeDirRequests.map(({ typeDir }) => readDirEntries(typeDir)));
+	const typeEntriesResults = await Promise.all(
+		typeDirRequests.map(({ typeDir, level }) =>
+			readDirEntries(typeDir, getReadOptions(ctx, readScopeForLevel(level))),
+		),
+	);
 
 	for (let i = 0; i < typeDirRequests.length; i++) {
 		const { typeDir, hookType, level } = typeDirRequests[i];
@@ -775,7 +831,8 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 			if (entry.name.startsWith(".")) continue;
 			if (!entry.isFile()) continue;
 
-			const hookPath = path.join(typeDir, entry.name);
+			const hookPath = await canonicalBuiltinPath(ctx, path.join(typeDir, entry.name), readScopeForLevel(level));
+			if (!hookPath) continue;
 			const baseName = entry.name.includes(".") ? entry.name.slice(0, entry.name.lastIndexOf(".")) : entry.name;
 			const tool = baseName === "*" ? "*" : baseName;
 
@@ -807,7 +864,16 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 	const warnings: string[] = [];
 
 	const configDirs = await getConfigDirs(ctx);
-	const entriesResults = await Promise.all(configDirs.map(({ dir }) => readDirEntries(path.join(dir, "tools"))));
+	const toolsDirs = await Promise.all(
+		configDirs.map(({ dir, level }) => canonicalBuiltinPath(ctx, path.join(dir, "tools"), readScopeForLevel(level))),
+	);
+	const entriesResults = await Promise.all(
+		toolsDirs.map((toolsDir, i) =>
+			toolsDir
+				? readDirEntries(toolsDir, getReadOptions(ctx, readScopeForLevel(configDirs[i].level)))
+				: Promise.resolve([]),
+		),
+	);
 
 	const fileLoadPromises: Array<Promise<{ items: CustomTool[]; warnings?: string[] }>> = [];
 	const subDirCandidates: Array<{
@@ -817,15 +883,15 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 	}> = [];
 
 	for (let i = 0; i < configDirs.length; i++) {
-		const { dir, level } = configDirs[i];
+		const { level } = configDirs[i];
 		const toolEntries = entriesResults[i];
-		if (toolEntries.length === 0) continue;
-
-		const toolsDir = path.join(dir, "tools");
+		const toolsDir = toolsDirs[i];
+		if (toolEntries.length === 0 || !toolsDir) continue;
 
 		fileLoadPromises.push(
 			loadFilesFromDir<CustomTool>(ctx, toolsDir, PROVIDER_ID, level, {
 				extensions: ["json", "md", "ts", "js", "sh", "bash", "py"],
+				scope: readScopeForLevel(level),
 				transform: (name, content, path, source) => {
 					if (name.endsWith(".json")) {
 						const data = tryParseJson<{ name?: string; description?: string }>(content);
@@ -874,8 +940,14 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 			if (entry.name.startsWith(".")) continue;
 			if (!entry.isDirectory()) continue;
 
+			const indexPath = await canonicalBuiltinPath(
+				ctx,
+				path.join(toolsDir, entry.name, "index.ts"),
+				readScopeForLevel(level),
+			);
+			if (!indexPath) continue;
 			subDirCandidates.push({
-				indexPath: path.join(toolsDir, entry.name, "index.ts"),
+				indexPath,
 				entryName: entry.name,
 				level,
 			});
@@ -884,7 +956,9 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 
 	const [fileResults, indexContents] = await Promise.all([
 		Promise.all(fileLoadPromises),
-		Promise.all(subDirCandidates.map(({ indexPath }) => readBuiltinFile(ctx, indexPath))),
+		Promise.all(
+			subDirCandidates.map(({ indexPath, level }) => readBuiltinFile(ctx, indexPath, readScopeForLevel(level))),
+		),
 	]);
 
 	for (const result of fileResults) {
@@ -934,9 +1008,10 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	};
 
 	for (const { dir, level } of await getConfigDirs(ctx)) {
-		const settingsPath = path.join(dir, "settings.json");
-		const settingsContent = await readBuiltinFile(ctx, settingsPath);
-		if (settingsContent) {
+		const scope = readScopeForLevel(level);
+		const settingsPath = await canonicalBuiltinPath(ctx, path.join(dir, "settings.json"), scope);
+		const settingsContent = settingsPath ? await readBuiltinFile(ctx, settingsPath, scope) : null;
+		if (settingsContent && settingsPath) {
 			const data = tryParseJson<Record<string, unknown>>(settingsContent);
 			if (data) {
 				items.push({
@@ -950,8 +1025,9 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 			}
 		}
 
-		const configPath = path.join(dir, "config.yml");
-		const configContent = await readBuiltinFile(ctx, configPath);
+		const configPath = await canonicalBuiltinPath(ctx, path.join(dir, "config.yml"), scope);
+		if (!configPath) continue;
+		const configContent = await readBuiltinFile(ctx, configPath, scope);
 		if (!configContent) continue;
 
 		const data = parseYamlSettings(configContent, configPath);
@@ -981,9 +1057,9 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = path.join(getUserScopeDirs(ctx)[0]!, "AGENTS.md");
-	const userContent = await readBuiltinFile(ctx, userPath);
-	if (userContent) {
+	const userPath = await canonicalBuiltinPath(ctx, path.join(getUserScopeDirs(ctx)[0]!, "AGENTS.md"), "native");
+	const userContent = userPath ? await readBuiltinFile(ctx, userPath, "native") : null;
+	if (userContent && userPath) {
 		items.push({
 			path: userPath,
 			content: userContent,
@@ -992,11 +1068,15 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx);
 	if (nearestProjectConfigDir) {
-		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
-		const projectContent = await readBuiltinFile(ctx, projectPath);
-		if (projectContent) {
+		const projectPath = await canonicalBuiltinPath(
+			ctx,
+			path.join(nearestProjectConfigDir.dir, "AGENTS.md"),
+			"project",
+		);
+		const projectContent = projectPath ? await readBuiltinFile(ctx, projectPath, "project") : null;
+		if (projectContent && projectPath) {
 			items.push({
 				path: projectPath,
 				content: projectContent,

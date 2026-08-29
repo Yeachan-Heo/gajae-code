@@ -18,7 +18,9 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import {
 	buildRuleFromMarkdown,
 	calculateDepth,
+	canonicalizePathWithinHome,
 	createSourceMeta,
+	getReadOptions,
 	loadFilesFromDir,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -192,12 +194,21 @@ registerProvider<SlashCommand>(slashCommandCapability.id, {
 // Context Files (AGENTS.md)
 async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
 	const load = async (filePath: string, level: "user" | "project"): Promise<ContextFile | null> => {
-		const content = await readFile(filePath);
+		const scope = level === "user" ? "user" : "project";
+		const canonicalPath = await canonicalizePathWithinHome(ctx, filePath, undefined, scope);
+		if (!canonicalPath) return null;
+		const content = await readFile(canonicalPath, getReadOptions(ctx, scope));
 		if (!content) return null;
-		// filePath is <ancestor>/.agent(s)/AGENTS.md — go up past the config dir to the ancestor
-		const ancestorDir = path.dirname(path.dirname(filePath));
+		// canonicalPath is <ancestor>/.agent(s)/AGENTS.md — go up past the config dir to the ancestor
+		const ancestorDir = path.dirname(path.dirname(canonicalPath));
 		const depth = level === "project" ? calculateDepth(ctx.cwd, ancestorDir, path.sep) : undefined;
-		return { path: filePath, content, level, depth, _source: createSourceMeta(PROVIDER_ID, filePath, level) };
+		return {
+			path: canonicalPath,
+			content,
+			level,
+			depth,
+			_source: createSourceMeta(PROVIDER_ID, canonicalPath, level),
+		};
 	};
 
 	const results = await Promise.all([
@@ -219,9 +230,12 @@ registerProvider<ContextFile>(contextFileCapability.id, {
 // System Prompt (SYSTEM.md)
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const load = async (filePath: string, level: "user" | "project"): Promise<SystemPrompt | null> => {
-		const content = await readFile(filePath);
+		const scope = level === "user" ? "user" : "project";
+		const canonicalPath = await canonicalizePathWithinHome(ctx, filePath, undefined, scope);
+		if (!canonicalPath) return null;
+		const content = await readFile(canonicalPath, getReadOptions(ctx, scope));
 		if (!content) return null;
-		return { path: filePath, content, level, _source: createSourceMeta(PROVIDER_ID, filePath, level) };
+		return { path: canonicalPath, content, level, _source: createSourceMeta(PROVIDER_ID, canonicalPath, level) };
 	};
 
 	const results = await Promise.all([

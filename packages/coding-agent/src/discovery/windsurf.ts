@@ -17,7 +17,15 @@ import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type Rule, ruleCapability } from "../capability/rule";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { buildRuleFromMarkdown, createSourceMeta, getProjectPath, getUserPath, loadFilesFromDir } from "./helpers";
+import {
+	buildRuleFromMarkdown,
+	canonicalizePathWithinHome,
+	createSourceMeta,
+	getProjectPath,
+	getReadOptions,
+	getUserPath,
+	loadFilesFromDir,
+} from "./helpers";
 
 const PROVIDER_ID = "windsurf";
 const DISPLAY_NAME = "Windsurf";
@@ -32,9 +40,10 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const warnings: string[] = [];
 
 	// User-level: ~/.codeium/windsurf/memories/global_rules.md
-	const userPath = getUserPath(ctx, "windsurf", "memories/global_rules.md");
+	const rawUserPath = getUserPath(ctx, "windsurf", "memories/global_rules.md");
+	const userPath = rawUserPath ? await canonicalizePathWithinHome(ctx, rawUserPath, undefined, "user") : null;
 	if (userPath) {
-		const content = await readFile(userPath);
+		const content = await readFile(userPath, getReadOptions(ctx, "user"));
 		if (content) {
 			const source = createSourceMeta(PROVIDER_ID, userPath, "user");
 			items.push(buildRuleFromMarkdown("global_rules.md", content, userPath, source, { ruleName: "global_rules" }));

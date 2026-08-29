@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { initializeWithSettings, loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
+import { type Extension, extensionCapability } from "@gajae-code/coding-agent/capability/extension";
 import { type ExtensionModule, extensionModuleCapability } from "@gajae-code/coding-agent/capability/extension-module";
 import { clearCache, readFile } from "@gajae-code/coding-agent/capability/fs";
 import { hookCapability } from "@gajae-code/coding-agent/capability/hook";
@@ -210,7 +211,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.warnings).toEqual([]);
 	});
 
-	test("explicit home native project discovery follows the configured config directory", async () => {
+	test("explicit home native project discovery stays on the fixed .gjc root", async () => {
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		try {
@@ -222,13 +223,12 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			await fs.symlink(path.join(decoyProject, ".gjc"), path.join(project, ".gjc"), "dir");
 			await writeFile(path.join(project, ".gjc-alt", "SYSTEM.md"), "# configured project system");
 
-			const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
-				cwd: project,
-				providers: ["native"],
-			});
-
-			expect(result.items.map(item => item.content)).toEqual(["# configured project system"]);
-			expect(result.items.some(item => item.content.includes("decoy"))).toBe(false);
+			await expect(
+				loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+					cwd: project,
+					providers: ["native"],
+				}),
+			).rejects.toThrow(/project registry root/);
 		} finally {
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
@@ -301,6 +301,65 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			}),
 		).rejects.toThrow(/opencode project root/);
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"explicit Gemini leaf reads reject symlinks outside the supplied home",
+		async () => {
+			const outsideGemini = path.join(tempDir, "outside-gemini.md");
+			const suppliedGemini = path.join(home, ".gemini", "GEMINI.md");
+			await writeFile(outsideGemini, "# outside gemini");
+			await fs.mkdir(path.dirname(suppliedGemini), { recursive: true });
+			await fs.symlink(outsideGemini, suppliedGemini, "file");
+
+			const result = await loadCapabilityForHome<ContextFile>(contextFileCapability.id, home, {
+				cwd: project,
+				providers: ["gemini"],
+			});
+
+			expect(result.items).toEqual([]);
+			expect(result.items.some(item => item.content.includes("outside gemini"))).toBe(false);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"explicit Gemini directory reads reject a symlinked extension root",
+		async () => {
+			const outsideExtensions = path.join(tempDir, "outside-gemini-extensions");
+			const suppliedExtensions = path.join(home, ".gemini", "extensions");
+			await writeFile(
+				path.join(outsideExtensions, "external", "gemini-extension.json"),
+				JSON.stringify({ name: "external-extension" }),
+			);
+			await fs.mkdir(path.dirname(suppliedExtensions), { recursive: true });
+			await fs.symlink(outsideExtensions, suppliedExtensions, "dir");
+
+			const result = await loadCapabilityForHome<Extension>(extensionCapability.id, home, {
+				cwd: project,
+				providers: ["gemini"],
+			});
+
+			expect(result.items).toEqual([]);
+			expect(result.items.some(item => item.name === "external-extension")).toBe(false);
+		},
+	);
+
+	test.skipIf(process.platform === "win32")(
+		"project agents reads never authorize an external agent directory",
+		async () => {
+			const externalAgentDir = path.join(tempDir, "external-agent");
+			const externalProjectAgents = path.join(externalAgentDir, ".agent");
+			await writeFile(path.join(externalProjectAgents, "AGENTS.md"), "# external project agents");
+			await fs.symlink(externalProjectAgents, path.join(project, ".agent"), "dir");
+
+			await expect(
+				loadCapabilityForHome<ContextFile>(contextFileCapability.id, home, {
+					cwd: project,
+					agentDir: externalAgentDir,
+					providers: ["agents"],
+				}),
+			).rejects.toThrow(/agents project root/);
+		},
+	);
 
 	test("explicit home validates only effective providers", async () => {
 		const decoyGemini = path.join(tempDir, "decoy-profile", ".gemini");

@@ -4,11 +4,21 @@ import * as path from "node:path";
 const contentCache = new Map<string, string | null>();
 const dirCache = new Map<string, fs.Dirent[]>();
 
+/** Authority used when reading from an explicit-home discovery context. */
+export type ReadScope = "project" | "user" | "native";
+
 export interface ReadFileOptions {
 	/** Canonicalize the file and enforce the supplied home/profile boundary. */
 	readonly isolatedHome?: boolean;
 	readonly home?: string;
 	readonly userAgentDir?: string;
+	/**
+	 * Scope of the read. Foreign user/project providers are home-bound; only
+	 * native/SSH user reads may use an explicitly external agent directory.
+	 */
+	readonly scope?: ReadScope;
+	/** Skip the shared lexical cache for this operation. */
+	readonly bypassCache?: boolean;
 }
 
 function resolvePath(filePath: string): string {
@@ -40,10 +50,17 @@ async function canonicalizeThroughExistingAncestor(target: string): Promise<stri
 	}
 }
 
+function rootsForRead(options: ReadFileOptions): string[] {
+	if (options.scope === "native") {
+		return [options.home, options.userAgentDir].filter((root): root is string => typeof root === "string");
+	}
+	return typeof options.home === "string" ? [options.home] : [];
+}
+
 async function resolveReadPath(filePath: string, options?: ReadFileOptions): Promise<string | null> {
 	const lexical = resolvePath(filePath);
 	if (!options?.isolatedHome) return lexical;
-	const roots = [options.home, options.userAgentDir].filter((root): root is string => typeof root === "string");
+	const roots = rootsForRead(options);
 	if (roots.length === 0) return null;
 	const [canonicalTarget, canonicalRoots] = await Promise.all([
 		canonicalizeThroughExistingAncestor(lexical),
@@ -60,38 +77,46 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		return null;
 	}
 	if (abs === null) return null;
-	if (contentCache.has(abs)) {
+	const useCache = !options?.bypassCache && !options?.isolatedHome;
+	if (useCache && contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
 	}
 
 	try {
 		const content = await Bun.file(abs).text();
-		contentCache.set(abs, content);
+		if (useCache) contentCache.set(abs, content);
 		return content;
 	} catch {
-		contentCache.set(abs, null);
+		if (useCache) contentCache.set(abs, null);
 		return null;
 	}
 }
 
-export async function readDirEntries(dirPath: string): Promise<fs.Dirent[]> {
-	const abs = resolvePath(dirPath);
-	if (dirCache.has(abs)) {
+export async function readDirEntries(dirPath: string, options?: ReadFileOptions): Promise<fs.Dirent[]> {
+	let abs: string | null;
+	try {
+		abs = await resolveReadPath(dirPath, options);
+	} catch {
+		return [];
+	}
+	if (abs === null) return [];
+	const useCache = !options?.bypassCache && !options?.isolatedHome;
+	if (useCache && dirCache.has(abs)) {
 		return dirCache.get(abs) ?? [];
 	}
 
 	try {
 		const entries = await fs.promises.readdir(abs, { withFileTypes: true });
-		dirCache.set(abs, entries);
+		if (useCache) dirCache.set(abs, entries);
 		return entries;
 	} catch {
-		dirCache.set(abs, []);
+		if (useCache) dirCache.set(abs, []);
 		return [];
 	}
 }
 
-export async function readDir(dirPath: string): Promise<string[]> {
-	const entries = await readDirEntries(dirPath);
+export async function readDir(dirPath: string, options?: ReadFileOptions): Promise<string[]> {
+	const entries = await readDirEntries(dirPath, options);
 	return entries.map(entry => entry.name);
 }
 

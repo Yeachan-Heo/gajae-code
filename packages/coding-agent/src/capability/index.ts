@@ -145,7 +145,16 @@ async function assertExplicitHomeRoots(
 	const usesSsh = providerIds.has("ssh-json");
 	if ((usesNative || usesSsh) && !explicitAgentDir)
 		addRoot(userRoots, path.join(canonicalHome, getConfigDirName(), "agent"), "user agent directory");
-	if (usesNative || usesSsh) addRoot(projectRoots, getConfigDirName(), "project registry root");
+	if (usesNative || usesSsh) {
+		// Native project discovery is fixed to `.gjc`, while adapters that still
+		// honor a configured project registry name need their actual root checked
+		// before provider loading as well.
+		addRoot(projectRoots, ".gjc", "native/SSH project registry root");
+		const configuredProjectRoot = getConfigDirName();
+		if (configuredProjectRoot !== ".gjc") {
+			addRoot(projectRoots, configuredProjectRoot, "configured project registry root");
+		}
+	}
 
 	// The marketplace provider derives its user registry from the XDG-aware
 	// helper rather than a fixed `<home>/.gjc/plugins` path.

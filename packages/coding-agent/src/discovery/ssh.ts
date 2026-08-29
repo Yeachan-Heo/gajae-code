@@ -12,7 +12,7 @@ import { type SSHHost, sshCapability } from "../capability/ssh";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
 import { validateSshDestination } from "../ssh/utils";
 import { expandTilde } from "../tools/path-utils";
-import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
+import { canonicalizePathWithinHome, createSourceMeta, expandEnvVarsDeep, getReadOptions } from "./helpers";
 
 const PROVIDER_ID = "ssh-json";
 const DISPLAY_NAME = "SSH Config";
@@ -102,29 +102,32 @@ async function loadSshJsonFile(
 ): Promise<LoadResult<SSHHost>> {
 	const items: SSHHost[] = [];
 	const warnings: string[] = [];
-	const content = await readFile(filePath);
+	const scope = level === "user" ? "native" : "project";
+	const canonicalPath = await canonicalizePathWithinHome(ctx, filePath, undefined, scope);
+	if (!canonicalPath) return { items, warnings };
+	const content = await readFile(canonicalPath, getReadOptions(ctx, scope));
 	if (content === null) {
 		return { items, warnings };
 	}
 	const parsed = tryParseJson<SSHConfigFile>(content);
 	if (!parsed) {
-		warnings.push(`Failed to parse JSON in ${filePath}`);
+		warnings.push(`Failed to parse JSON in ${canonicalPath}`);
 		return { items, warnings };
 	}
 	const config = expandEnvVarsDeep(parsed);
 	if (!config.hosts || typeof config.hosts !== "object") {
-		warnings.push(`Missing hosts in ${filePath}`);
+		warnings.push(`Missing hosts in ${canonicalPath}`);
 		return { items, warnings };
 	}
 
-	const source = createSourceMeta(PROVIDER_ID, filePath, level);
+	const source = createSourceMeta(PROVIDER_ID, canonicalPath, level);
 	for (const [name, rawHost] of Object.entries(config.hosts)) {
 		if (!name.trim()) {
-			warnings.push(`Invalid SSH host name in ${filePath}`);
+			warnings.push(`Invalid SSH host name in ${canonicalPath}`);
 			continue;
 		}
 		if (!rawHost || typeof rawHost !== "object") {
-			warnings.push(`Invalid host entry in ${filePath}: ${name}`);
+			warnings.push(`Invalid host entry in ${canonicalPath}: ${name}`);
 			continue;
 		}
 		const host = normalizeHost(name, rawHost, source, ctx.home, warnings);

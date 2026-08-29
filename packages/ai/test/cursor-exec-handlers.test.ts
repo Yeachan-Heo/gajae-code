@@ -681,6 +681,144 @@ describe("Cursor request lifecycle", () => {
 		}
 	});
 
+	it("settles a clean turnEnded with a held exec while the HTTP/2 stream stays open", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const { promise: responseReceived, resolve: markResponseReceived } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		const clientResponseChunks: Buffer[] = [];
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			let receivedRequest = false;
+			stream.on("data", (chunk: Buffer) => {
+				if (!receivedRequest) {
+					receivedRequest = true;
+					stream.write(
+						Buffer.concat([
+							frameServerMessage(createReadExecMessage()),
+							frameServerMessage(createTurnEndedMessage()),
+						]),
+					);
+					return;
+				}
+				clientResponseChunks.push(chunk);
+				if (
+					decodeClientMessages(clientResponseChunks).some(
+						message =>
+							message.message.case === "execClientMessage" &&
+							message.message.value.message.case === "readResult",
+					)
+				)
+					markResponseReceived();
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const events: string[] = [];
+			const consume = (async () => {
+				for await (const event of streamCursor(
+					{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+					{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+					{
+						apiKey: "test-token",
+						execHandlers: {
+							async read() {
+								markHandlerStarted();
+								await releasePromise;
+								return { result: createReadSuccessResult("ok"), toolResult: undefined };
+							},
+						},
+					},
+				)) {
+					events.push(event.type);
+				}
+			})();
+
+			await handlerStarted;
+			expect(events).not.toContain("done");
+			releaseHandler();
+			await responseReceived;
+			await consume;
+			expect(events.filter(type => type === "done")).toHaveLength(1);
+			expect(events).not.toContain("error");
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("preserves validated progress and drops a malformed tail after a held exec turnEnded", async () => {
+		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
+		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => {
+				const text = create(AgentServerMessageSchema, {
+					message: {
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: "validated" }) },
+						}),
+					},
+				});
+				stream.end(
+					Buffer.concat([
+						frameServerMessage(createReadExecMessage()),
+						frameServerMessage(text),
+						frameServerMessage(createTurnEndedMessage()),
+						frameConnectPayload(Buffer.from([0x80])),
+					]),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const cursorStream = streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "read", timestamp: 0 }] },
+				{
+					apiKey: "test-token",
+					execHandlers: {
+						async read() {
+							markHandlerStarted();
+							await releasePromise;
+							return { result: createReadSuccessResult("ok"), toolResult: undefined };
+						},
+					},
+				},
+			);
+			const events: AssistantMessageEvent[] = [];
+			const consume = (async () => {
+				for await (const event of cursorStream) events.push(event);
+			})();
+
+			await handlerStarted;
+			releaseHandler();
+			await consume;
+			const result = await cursorStream.result();
+			expect(result.stopReason).toBe("stop");
+			expect(result.errorMessage).toBeUndefined();
+			expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "validated" }));
+			expect(events.filter(event => event.type === "done")).toHaveLength(1);
+			expect(events.filter(event => event.type === "error")).toHaveLength(0);
+		} finally {
+			releaseHandler();
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
 	it("serializes multiple admitted exec responses before turn completion", async () => {
 		const { promise: releaseFirst, resolve: resolveFirst } = Promise.withResolvers<void>();
 		const server = http2.createServer();
@@ -1081,7 +1219,7 @@ describe("Cursor request lifecycle", () => {
 		}
 	});
 
-	it("lets terminal failure preempt turnEnded while an admitted exec handler is held", async () => {
+	it("drops an END_STREAM error tail after a validated turnEnded", async () => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();
 		const { promise: handlerFinished, resolve: markHandlerFinished } = Promise.withResolvers<void>();
@@ -1133,16 +1271,13 @@ describe("Cursor request lifecycle", () => {
 			})();
 
 			await handlerStarted;
+			releaseHandler();
 			await consume;
 			const terminalEvents = events.filter(event => event.type === "done" || event.type === "error");
 			expect(terminalEvents).toHaveLength(1);
 			const terminal = terminalEvents[0];
-			if (terminal.type !== "error") throw new Error("Expected terminal Cursor error");
-			expect(terminal.error.errorMessage).toContain("terminal race");
-			const framesAtTerminal = clientChunks.length;
-			releaseHandler();
+			if (terminal.type !== "done") throw new Error("Expected successful Cursor terminal");
 			await handlerFinished;
-			expect(clientChunks).toHaveLength(framesAtTerminal);
 		} finally {
 			releaseHandler();
 			await new Promise<void>(resolve => server.close(() => resolve()));

@@ -30,9 +30,11 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import {
 	buildExtensionModuleItems,
 	calculateDepth,
+	canonicalizePathWithinHome,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	getProjectPath,
+	getReadOptions,
 	getUserPath,
 } from "./helpers";
 
@@ -49,9 +51,12 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const warnings: string[] = [];
 
 	// User-level: ~/.gemini/GEMINI.md
-	const userGeminiMd = getUserPath(ctx, "gemini", "GEMINI.md");
+	const rawUserGeminiMd = getUserPath(ctx, "gemini", "GEMINI.md");
+	const userGeminiMd = rawUserGeminiMd
+		? await canonicalizePathWithinHome(ctx, rawUserGeminiMd, undefined, "user")
+		: null;
 	if (userGeminiMd) {
-		const content = await readFile(userGeminiMd);
+		const content = await readFile(userGeminiMd, getReadOptions(ctx, "user"));
 		if (content) {
 			items.push({
 				path: userGeminiMd,
@@ -63,9 +68,12 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	}
 
 	// Project-level: .gemini/GEMINI.md
-	const projectGeminiMd = getProjectPath(ctx, "gemini", "GEMINI.md");
+	const rawProjectGeminiMd = getProjectPath(ctx, "gemini", "GEMINI.md");
+	const projectGeminiMd = rawProjectGeminiMd
+		? await canonicalizePathWithinHome(ctx, rawProjectGeminiMd, undefined, "project")
+		: null;
 	if (projectGeminiMd) {
-		const content = await readFile(projectGeminiMd);
+		const content = await readFile(projectGeminiMd, getReadOptions(ctx, "project"));
 		if (content) {
 			const projectBase = getProjectPath(ctx, "gemini", "");
 			const depth = projectBase ? calculateDepth(ctx.cwd, projectBase, path.sep) : 0;
@@ -94,7 +102,7 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 	// User-level: ~/.gemini/extensions/*/gemini-extension.json
 	const userExtPath = getUserPath(ctx, "gemini", "extensions");
 	if (userExtPath) {
-		const result = await loadExtensionsFromDir(userExtPath, "user");
+		const result = await loadExtensionsFromDir(ctx, userExtPath, "user");
 		items.push(...result.items);
 		if (result.warnings) warnings.push(...result.warnings);
 	}
@@ -102,7 +110,7 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 	// Project-level: .gemini/extensions/*/gemini-extension.json
 	const projectExtPath = getProjectPath(ctx, "gemini", "extensions");
 	if (projectExtPath) {
-		const result = await loadExtensionsFromDir(projectExtPath, "project");
+		const result = await loadExtensionsFromDir(ctx, projectExtPath, "project");
 		items.push(...result.items);
 		if (result.warnings) warnings.push(...result.warnings);
 	}
@@ -110,15 +118,35 @@ async function loadExtensions(ctx: LoadContext): Promise<LoadResult<Extension>> 
 	return { items, warnings };
 }
 
-async function loadExtensionsFromDir(extensionsDir: string, level: "user" | "project"): Promise<LoadResult<Extension>> {
-	const entries = await readDirEntries(extensionsDir);
+async function loadExtensionsFromDir(
+	ctx: LoadContext,
+	extensionsDir: string,
+	level: "user" | "project",
+): Promise<LoadResult<Extension>> {
+	const scope = level === "user" ? "user" : "project";
+	const readOptions = getReadOptions(ctx, scope);
+	const canonicalExtensionsDir = await canonicalizePathWithinHome(ctx, extensionsDir, undefined, scope);
+	if (!canonicalExtensionsDir) return { items: [], warnings: [] };
+	const entries = await readDirEntries(canonicalExtensionsDir, readOptions);
 	const dirEntries = entries.filter(entry => entry.isDirectory());
 
 	const results = await Promise.all(
 		dirEntries.map(async entry => {
-			const extPath = path.join(extensionsDir, entry.name);
-			const manifestPath = path.join(extPath, "gemini-extension.json");
-			const content = await readFile(manifestPath);
+			const extPath = await canonicalizePathWithinHome(
+				ctx,
+				path.join(canonicalExtensionsDir, entry.name),
+				undefined,
+				scope,
+			);
+			if (!extPath) return { entry, extPath: null, manifestPath: null, content: null };
+			const manifestPath = await canonicalizePathWithinHome(
+				ctx,
+				path.join(extPath, "gemini-extension.json"),
+				undefined,
+				scope,
+			);
+			if (!manifestPath) return { entry, extPath, manifestPath: null, content: null };
+			const content = await readFile(manifestPath, readOptions);
 			return { entry, extPath, manifestPath, content };
 		}),
 	);
@@ -127,7 +155,7 @@ async function loadExtensionsFromDir(extensionsDir: string, level: "user" | "pro
 	const warnings: string[] = [];
 
 	for (const { entry, extPath, manifestPath, content } of results) {
-		if (!content) continue;
+		if (!content || !extPath || !manifestPath) continue;
 
 		const manifest = tryParseJson<ExtensionManifest>(content);
 		if (!manifest) {
@@ -156,8 +184,10 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	const projectExtensionsDir = getProjectPath(ctx, "gemini", "extensions");
 
 	const [userPaths, projectPaths] = await Promise.all([
-		userExtensionsDir ? discoverExtensionModulePaths(ctx, userExtensionsDir) : Promise.resolve([]),
-		projectExtensionsDir ? discoverExtensionModulePaths(ctx, projectExtensionsDir) : Promise.resolve([]),
+		userExtensionsDir ? discoverExtensionModulePaths(ctx, userExtensionsDir, { scope: "user" }) : Promise.resolve([]),
+		projectExtensionsDir
+			? discoverExtensionModulePaths(ctx, projectExtensionsDir, { scope: "project" })
+			: Promise.resolve([]),
 	]);
 
 	const items = buildExtensionModuleItems(PROVIDER_ID, userPaths, projectPaths);
@@ -174,9 +204,10 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const warnings: string[] = [];
 
 	// User-level: ~/.gemini/settings.json
-	const userPath = getUserPath(ctx, "gemini", "settings.json");
+	const rawUserPath = getUserPath(ctx, "gemini", "settings.json");
+	const userPath = rawUserPath ? await canonicalizePathWithinHome(ctx, rawUserPath, undefined, "user") : null;
 	if (userPath) {
-		const content = await readFile(userPath);
+		const content = await readFile(userPath, getReadOptions(ctx, "user"));
 		if (content) {
 			const parsed = tryParseJson<Record<string, unknown>>(content);
 			if (parsed) {
@@ -193,9 +224,12 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	}
 
 	// Project-level: .gemini/settings.json
-	const projectPath = getProjectPath(ctx, "gemini", "settings.json");
+	const rawProjectPath = getProjectPath(ctx, "gemini", "settings.json");
+	const projectPath = rawProjectPath
+		? await canonicalizePathWithinHome(ctx, rawProjectPath, undefined, "project")
+		: null;
 	if (projectPath) {
-		const content = await readFile(projectPath);
+		const content = await readFile(projectPath, getReadOptions(ctx, "project"));
 		if (content) {
 			const parsed = tryParseJson<Record<string, unknown>>(content);
 			if (parsed) {
@@ -234,9 +268,12 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 	const items: SystemPrompt[] = [];
 
 	// User-level: ~/.gemini/system.md
-	const userSystemMd = getUserPath(ctx, "gemini", "system.md");
+	const rawUserSystemMd = getUserPath(ctx, "gemini", "system.md");
+	const userSystemMd = rawUserSystemMd
+		? await canonicalizePathWithinHome(ctx, rawUserSystemMd, undefined, "user")
+		: null;
 	if (userSystemMd) {
-		const content = await readFile(userSystemMd);
+		const content = await readFile(userSystemMd, getReadOptions(ctx, "user"));
 		if (content) {
 			items.push({
 				path: userSystemMd,
@@ -248,9 +285,12 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 	}
 
 	// Project-level: .gemini/system.md
-	const projectSystemMd = getProjectPath(ctx, "gemini", "system.md");
+	const rawProjectSystemMd = getProjectPath(ctx, "gemini", "system.md");
+	const projectSystemMd = rawProjectSystemMd
+		? await canonicalizePathWithinHome(ctx, rawProjectSystemMd, undefined, "project")
+		: null;
 	if (projectSystemMd) {
-		const content = await readFile(projectSystemMd);
+		const content = await readFile(projectSystemMd, getReadOptions(ctx, "project"));
 		if (content) {
 			items.push({
 				path: projectSystemMd,
