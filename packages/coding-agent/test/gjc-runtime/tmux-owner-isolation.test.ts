@@ -25,10 +25,10 @@ import {
 	parseOwnerIsolationRequest,
 	planTmuxOwnerIsolation,
 	planTmuxOwnerIsolationSync,
-	replaceOwnerGeneration,
-	replaceOwnerGenerationSync,
 	readNoFollowJson,
 	readNoFollowJsonSync,
+	replaceOwnerGeneration,
+	replaceOwnerGenerationSync,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";

@@ -155,7 +155,7 @@ export function sanitizeTmuxToken(value: string): string {
  */
 export function assertSafeGjcTmuxSessionName(value: string): string {
 	const normalized = value.trim();
-	if (normalized !== value || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value))
+	if (normalized !== value || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value))
 		throw new Error(`gjc_tmux_session_name_unsafe:${value}`);
 	return value;
 }
