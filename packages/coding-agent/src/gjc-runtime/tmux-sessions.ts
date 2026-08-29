@@ -1499,6 +1499,8 @@ export function removeGjcTmuxSession(
 ): GjcTmuxSessionStatus {
 	const session = statusGjcTmuxSession(sessionName, env);
 	assertMutationAuthority(session);
+	if (session.providerAuthority?.kind === "windows-psmux" && !session.psmuxIncarnation)
+		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	const sessionEnv =
 		effectiveSessionEnvironments.get(session) ?? environmentForProviderAuthority(env, session.providerAuthority);
 	if (session.attached || session.panePids.length > 0) {
@@ -1543,7 +1545,7 @@ export function removeGjcTmuxSession(
 		finalServer,
 		sessionEnv,
 		`kill-session -t '${nativeSessionId}'`,
-		expectedIdentity?.ownerGeneration,
+		expectedIdentity?.ownerGeneration ?? session.ownerGeneration,
 		undefined,
 		session.psmuxIncarnation,
 	);
