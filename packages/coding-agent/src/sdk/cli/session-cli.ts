@@ -722,7 +722,9 @@ export function boundWarningSources(
 		...samples,
 		...omitted
 			.slice(0, summaryCount)
-			.map(item => item.source.describeOmitted(item.count - (retainedCounts.get(item.source) ?? 0))),
+			.map(item => ({ item, count: item.count - (retainedCounts.get(item.source) ?? 0) }))
+			.filter(({ count }) => count > 0)
+			.map(({ item, count }) => item.source.describeOmitted(count)),
 	];
 }
 
