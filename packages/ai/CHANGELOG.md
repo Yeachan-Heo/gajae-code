@@ -83,6 +83,7 @@
 
 ### Fixed
 
+
 - Cursor HTTP/2 streams now drain admitted exec responses before normal teardown and centralize terminal failures, preventing delayed handlers and retained shell callbacks from writing after the request has ended.
 - Auth-gateway boot and dispatch are now provider-scoped: model catalogs reject cross-provider id ambiguity, Codex rows retain `openai-codex-responses`, and requests cannot borrow credentials from another provider.
 - Broker-backed gateway dispatch leases now remain held until the provider's transport-admission boundary, preventing lazy stream construction from releasing authority before outbound dispatch.
