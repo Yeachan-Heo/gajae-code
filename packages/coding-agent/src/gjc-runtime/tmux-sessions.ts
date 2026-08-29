@@ -58,6 +58,7 @@ import {
 	closeExactTmuxOwner,
 	executeTmuxOwnerIsolationPlanSync,
 	isOwnerGenerationBaselineCurrentSync,
+	isValidGenerationRecord,
 	isValidOwnerVerdict,
 	lifecyclePaths,
 	type OwnerIsolationProbeSync,
@@ -1614,10 +1615,8 @@ async function readCurrentGeneration(stateDir: string, sessionId: string): Promi
 			if (
 				typeof value !== "object" ||
 				value === null ||
-				(value as { schema_version?: unknown }).schema_version !== 1 ||
-				(value as { session_id?: unknown }).session_id !== sessionId ||
 				typeof (value as { generation?: unknown }).generation !== "string" ||
-				typeof (value as { published_at?: unknown }).published_at !== "string"
+				!isValidGenerationRecord(value, sessionId, (value as { generation: string }).generation)
 			)
 				return null;
 			return (value as { generation: string }).generation;
