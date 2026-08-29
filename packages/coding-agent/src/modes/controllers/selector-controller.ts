@@ -14,7 +14,14 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
-import { getAgentDbPath, logger, VERSION } from "@gajae-code/utils";
+import {
+	getAgentDbPath,
+	getAgentDir,
+	getAgentProfileAuthority,
+	logger,
+	normalizePathForComparison,
+	VERSION,
+} from "@gajae-code/utils";
 import {
 	type AutoroutingProvenance,
 	type AutoroutingSetup,
@@ -2966,13 +2973,19 @@ export class SelectorController {
 
 	async showPluginSelector(mode: "install" | "uninstall" = "install"): Promise<void> {
 		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir?.();
+		const resolverAuthority = getAgentProfileAuthority();
+		const profileAuthority =
+			resolverAuthority === "custom" ||
+			(agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir()))
+				? "custom"
+				: "default";
 		const mgr = new MarketplaceManager({
-			marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir),
-			installedRegistryPath: getInstalledPluginsRegistryPath(agentDir),
+			marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir, profileAuthority),
+			installedRegistryPath: getInstalledPluginsRegistryPath(agentDir, profileAuthority),
 			projectInstalledRegistryPath:
 				(await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd())) ?? undefined,
-			marketplacesCacheDir: getMarketplacesCacheDir(agentDir),
-			pluginsCacheDir: getPluginsCacheDir(agentDir),
+			marketplacesCacheDir: getMarketplacesCacheDir(agentDir, profileAuthority),
+			pluginsCacheDir: getPluginsCacheDir(agentDir, profileAuthority),
 			clearPluginRootsCache: clearPluginRootsAndCaches,
 		});
 

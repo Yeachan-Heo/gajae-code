@@ -102,6 +102,7 @@ export const SOURCE_PATHS = {
 } as const;
 
 export type SourceId = keyof typeof SOURCE_PATHS;
+export type ProfileAuthority = "default" | "custom";
 
 /**
  * Get user-level path for a source.
@@ -120,20 +121,30 @@ export function getUserPath(ctx: LoadContext, source: SourceId, subpath: string)
  * every user-scope skill writer (`gjc migrate`, `gjc skill`). An agent-directory
  * profile is a *separate* user scope, the same contract as MCP user config
  * (#4768): its legacy home-relative roots are not scanned, so a profile cannot
- * pick up the default profile's skills (and vice versa). In the default
- * profile the agent directory is `<home>/<configDir>/agent` and the configured
- * legacy roots below it are still honored, exactly as before.
+ * pick up the default profile's skills (and vice versa). The resolver-owned
+ * `profileAuthority` classification is authoritative when supplied, so a
+ * custom profile remains isolated even if a later HOME/config-root refresh
+ * makes its path look like the current default. In the default profile the
+ * agent directory is `<home>/<configDir>/agent` and the configured legacy roots
+ * below it are still honored, exactly as before.
  */
 export function resolveUserAgentDir(home: string, userAgentDir?: string): string {
 	return path.resolve(userAgentDir ?? path.join(home, SOURCE_PATHS.native.userAgent));
 }
 
-export function getUserSkillScanDirs(home: string, userAgentDir?: string): string[] {
+export function getUserSkillScanDirs(
+	home: string,
+	userAgentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): string[] {
 	const resolvedAgentDir = resolveUserAgentDir(home, userAgentDir);
-	if (
-		normalizePathForComparison(resolvedAgentDir) !==
-		normalizePathForComparison(path.join(home, SOURCE_PATHS.native.userAgent))
-	) {
+	const defaultAgentDir = path.join(home, SOURCE_PATHS.native.userAgent);
+	const authority =
+		profileAuthority ??
+		(normalizePathForComparison(resolvedAgentDir) === normalizePathForComparison(defaultAgentDir)
+			? "default"
+			: "custom");
+	if (authority === "custom") {
 		return [path.join(resolvedAgentDir, "skills")];
 	}
 	return [

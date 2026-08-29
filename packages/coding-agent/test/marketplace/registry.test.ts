@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -14,6 +14,8 @@ import {
 	buildPluginId,
 	getInstalledPlugin,
 	getMarketplaceEntry,
+	getMarketplacesRegistryPath,
+	getProfilePluginsDir,
 	isValidNameSegment,
 	parsePluginId,
 	readInstalledPluginsRegistry,
@@ -23,6 +25,7 @@ import {
 	writeInstalledPluginsRegistry,
 	writeMarketplacesRegistry,
 } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
+import { getAgentDir, getAgentProfileAuthority, setAgentDir } from "@gajae-code/utils";
 
 // Inline the parseAnthropic modelPluginsRegistry validation logic to avoid pulling
 // in discovery/helpers.ts which transitively imports @gajae-code/natives.
@@ -324,5 +327,50 @@ describe("registry file I/O", () => {
 		const entries = getInstalledPlugin(reg, "plug@mkt");
 		expect(entries).toBeDefined();
 		expect((entries![0] as unknown as Record<string, unknown>).someExtraField).toBe("preserved");
+	});
+});
+
+describe("profile registry paths", () => {
+	it("keeps resolver-owned custom paths after a config-root refresh", async () => {
+		const originalAgentDir = getAgentDir();
+		const originalGjcAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const originalConfigDir = process.env.GJC_CONFIG_DIR;
+		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-registry-home-"));
+		const beforeConfigDir = `gjc-registry-before-${Date.now()}`;
+		const refreshedConfigDir = `gjc-registry-refresh-${Date.now()}`;
+		const customAgentDir = path.join(home, refreshedConfigDir, "agent");
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		try {
+			process.env.GJC_CONFIG_DIR = beforeConfigDir;
+			process.env.PI_CONFIG_DIR = beforeConfigDir;
+			setAgentDir(customAgentDir);
+			expect(getAgentProfileAuthority()).toBe("custom");
+
+			const beforePluginsDir = getProfilePluginsDir(customAgentDir);
+			const beforeMarketplacesPath = getMarketplacesRegistryPath(customAgentDir);
+
+			process.env.GJC_CONFIG_DIR = refreshedConfigDir;
+			process.env.PI_CONFIG_DIR = refreshedConfigDir;
+			expect(getAgentDir()).toBe(customAgentDir);
+			expect(getAgentProfileAuthority()).toBe("custom");
+			expect(getProfilePluginsDir()).toBe(beforePluginsDir);
+			expect(getMarketplacesRegistryPath()).toBe(beforeMarketplacesPath);
+			expect(getProfilePluginsDir(customAgentDir)).toBe(beforePluginsDir);
+			expect(getMarketplacesRegistryPath(customAgentDir)).toBe(beforeMarketplacesPath);
+			expect(beforePluginsDir).toBe(path.join(customAgentDir, "plugins"));
+			expect(beforeMarketplacesPath).toBe(path.join(customAgentDir, "marketplaces.json"));
+		} finally {
+			homeSpy.mockRestore();
+			if (originalConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalConfigDir;
+			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
+			else process.env.PI_CONFIG_DIR = originalPiConfigDir;
+			setAgentDir(originalAgentDir);
+			if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
+			fs.rmSync(home, { recursive: true, force: true });
+		}
 	});
 });

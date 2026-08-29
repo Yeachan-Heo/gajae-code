@@ -340,7 +340,7 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 
 	// User-level scan from the selected agent-directory profile plus documented
 	// default-profile legacy scan roots.
-	const userScans = getUserSkillScanDirs(ctx.home, resolveUserAgentDir(ctx)).map(dir =>
+	const userScans = getUserSkillScanDirs(ctx.home, resolveUserAgentDir(ctx), ctx.profileAuthority).map(dir =>
 		scanSkillsFromDir(ctx, {
 			dir,
 			providerId: PROVIDER_ID,
@@ -401,17 +401,22 @@ registerProvider<SlashCommand>(slashCommandCapability.id, {
 async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const items: Rule[] = [];
 	const warnings: string[] = [];
+	const configDirs = await getConfigDirs(ctx);
+	const projectConfigDirs = configDirs.filter(({ level }) => level === "project");
+	const userConfigDirs = configDirs.filter(({ level }) => level === "user");
 
-	for (const { dir, level } of await getConfigDirs(ctx)) {
-		const rulesDir = path.join(dir, "rules");
-		const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
-			extensions: ["md", "mdc"],
-			transform: (name, content, path, source) =>
-				buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
-		});
-		items.push(...result.items);
-		if (result.warnings) warnings.push(...result.warnings);
-	}
+	const loadRulesFromDirs = async (dirs: Array<{ dir: string; level: "user" | "project" }>) => {
+		for (const { dir, level } of dirs) {
+			const rulesDir = path.join(dir, "rules");
+			const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
+				extensions: ["md", "mdc"],
+				transform: (name, content, path, source) =>
+					buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
+			});
+			items.push(...result.items);
+			if (result.warnings) warnings.push(...result.warnings);
+		}
+	};
 
 	// Top-level RULES.md is a sticky always-apply rule. The context-file
 	// discovery contract treats it as the file "re-injected near the current
@@ -425,10 +430,12 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
 		if (projectRule) items.push(projectRule);
 	}
+	await loadRulesFromDirs(projectConfigDirs);
 
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
 	if (userRule) items.push(userRule);
+	await loadRulesFromDirs(userConfigDirs);
 
 	return { items, warnings };
 }

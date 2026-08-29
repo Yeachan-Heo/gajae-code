@@ -277,7 +277,7 @@ export class ExtensionRunner {
 		private readonly extensions: Extension[],
 		private readonly runtime: ExtensionRuntime,
 		private cwd: string,
-		private readonly sessionManager: SessionManager,
+		private sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
 		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
 		private settings?: Settings,
@@ -292,6 +292,11 @@ export class ExtensionRunner {
 	rebindScope(cwd: string, settings?: Settings): void {
 		this.cwd = cwd;
 		this.settings = settings;
+	}
+
+	/** Rebind the persistence authority after a committed cold-fork adoption. */
+	rebindSessionManager(sessionManager: SessionManager): void {
+		this.sessionManager = sessionManager;
 	}
 
 	static #indexHandlers(extensions: Extension[]): Map<string, IndexedHandler[]> {

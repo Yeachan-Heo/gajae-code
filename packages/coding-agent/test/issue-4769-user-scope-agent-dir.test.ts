@@ -30,7 +30,7 @@ import {
 	discoverSlashCommands as discoverSdkSlashCommands,
 } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 // Register all discovery providers as a side effect.
 import "@gajae-code/coding-agent/discovery";
@@ -235,6 +235,49 @@ describe("issue #4769: user scope follows the agent directory", () => {
 		const { items } = await load({ cwd: project, home, repoRoot: project, userAgentDir: defaultAgentDir });
 
 		expect(items.map(skill => skill.name).sort()).toEqual(["canonical-skill", "legacy-skill"]);
+	});
+
+	test("custom profile authority stays sticky when a HOME refresh makes its path canonical", async () => {
+		const refreshedHome = path.join(tempDir, "refreshed-home");
+		const customProfile = path.join(refreshedHome, ".gjc", "agent");
+		await fs.mkdir(refreshedHome, { recursive: true });
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		setAgentDir(customProfile);
+		expect(getAgentProfileAuthority()).toBe("custom");
+		await makeSkill(path.join(customProfile, "skills"), "profile-after-refresh");
+
+		homeSpy.mockReturnValue(refreshedHome);
+		expect(getAgentDir()).toBe(customProfile);
+		expect(getAgentProfileAuthority()).toBe("custom");
+		await makeSkill(path.join(refreshedHome, ".gjc", "skills"), "default-legacy-decoy");
+
+		const result = await loadCapability<Skill>(skillCapability.id, {
+			cwd: project,
+			agentDir: customProfile,
+			providers: ["native"],
+		});
+		expect(result.items.map(skill => skill.name)).toEqual(["profile-after-refresh"]);
+
+		const profileAuthority = getAgentProfileAuthority();
+		const policy = { enabled: true, trustProjectSkills: true, trustUserSkills: true };
+		const discovered = await discoverRuntimeSkills({
+			cwd: project,
+			home: refreshedHome,
+			agentDir: customProfile,
+			profileAuthority,
+			policy,
+		});
+		expect(discovered.candidates.map(skill => skill.name)).toEqual(["profile-after-refresh"]);
+
+		const managed = await listNativeSkillsForManagement({
+			cwd: project,
+			home: refreshedHome,
+			agentDir: customProfile,
+			profileAuthority,
+			policy,
+		});
+		expect(managed.map(skill => skill.name)).toEqual(["profile-after-refresh"]);
 	});
 });
 

@@ -6,7 +6,10 @@
  *   - installed_plugins.json under getPluginsDir() — which plugins are installed
  *
  * Read/write functions accept explicit file paths so callers control the
- * location. Path helpers compute the default paths from the dir singleton.
+ * location. Path helpers accept the owning profile authority. The default
+ * profile uses the resolver's XDG-aware roots; custom profiles write beside
+ * their supplied agent directory. Authority is never inferred from a mutable
+ * config root.
  *
  * Both use atomic write (tmp + rename). On Windows, rename over existing file
  * can fail with EPERM — fallback: unlink target then rename.
@@ -16,11 +19,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import {
+	getAgentDir,
+	getAgentProfileAuthority,
 	getConfigRootDir,
 	getPluginsDir,
 	isEnoent,
 	logger,
-	normalizePathForComparison,
 	tryParseJson,
 } from "@gajae-code/utils";
 
@@ -33,34 +37,44 @@ import type {
 
 // ── Path helpers ─────────────────────────────────────────────────────
 
-export function getProfilePluginsDir(agentDir?: string): string {
-	if (!agentDir) return getPluginsDir();
-	const defaultAgentDir = path.join(getConfigRootDir(), "agent");
-	if (normalizePathForComparison(agentDir) === normalizePathForComparison(defaultAgentDir)) return getPluginsDir();
-	return path.join(agentDir, "plugins");
+export type ProfileAuthority = "default" | "custom";
+
+function resolveProfileAuthority(
+	agentDir: string | undefined,
+	profileAuthority: ProfileAuthority | undefined,
+): ProfileAuthority {
+	// An explicit agent directory is caller-owned and therefore custom unless
+	// the caller supplies the resolver's default authority explicitly. With no
+	// directory, use the resolver's sticky process profile authority.
+	return profileAuthority ?? (agentDir ? "custom" : getAgentProfileAuthority());
 }
 
-export function getMarketplacesRegistryPath(agentDir?: string): string {
-	return path.join(
-		agentDir
-			? normalizePathForComparison(agentDir) === normalizePathForComparison(path.join(getConfigRootDir(), "agent"))
-				? getConfigRootDir()
-				: agentDir
-			: getConfigRootDir(),
-		"marketplaces.json",
-	);
+function resolveProfileAgentDir(agentDir: string | undefined): string {
+	return agentDir ?? getAgentDir();
 }
 
-export function getInstalledPluginsRegistryPath(agentDir?: string): string {
-	return path.join(getProfilePluginsDir(agentDir), "installed_plugins.json");
+export function getProfilePluginsDir(agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	const authority = resolveProfileAuthority(agentDir, profileAuthority);
+	if (authority === "custom") return path.join(resolveProfileAgentDir(agentDir), "plugins");
+	return getPluginsDir();
 }
 
-export function getMarketplacesCacheDir(agentDir?: string): string {
-	return path.join(getProfilePluginsDir(agentDir), "cache", "marketplaces");
+export function getMarketplacesRegistryPath(agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	const authority = resolveProfileAuthority(agentDir, profileAuthority);
+	if (authority === "custom") return path.join(resolveProfileAgentDir(agentDir), "marketplaces.json");
+	return path.join(getConfigRootDir(), "marketplaces.json");
 }
 
-export function getPluginsCacheDir(agentDir?: string): string {
-	return path.join(getProfilePluginsDir(agentDir), "cache", "plugins");
+export function getInstalledPluginsRegistryPath(agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	return path.join(getProfilePluginsDir(agentDir, profileAuthority), "installed_plugins.json");
+}
+
+export function getMarketplacesCacheDir(agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	return path.join(getProfilePluginsDir(agentDir, profileAuthority), "cache", "marketplaces");
+}
+
+export function getPluginsCacheDir(agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	return path.join(getProfilePluginsDir(agentDir, profileAuthority), "cache", "plugins");
 }
 
 // ── Atomic write ─────────────────────────────────────────────────────

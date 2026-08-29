@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -274,6 +274,88 @@ describe("createAgentSession session storage isolation", () => {
 			// against the gated successor (A11). Repeated /new + fork are covered in
 			// session-manager prepare/commit unit tests without extension session_switch
 			// startup (which can retain identity-rotation work across rotations).
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+	it("rebinds extension session_switch context to a cold-fork successor", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-sdk-cold-fork-extension-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "project");
+		const agentDir = path.join(tempDir, "agent");
+		fs.mkdirSync(cwd, { recursive: true });
+		const destination = SessionManager.managedDestination(cwd, agentDir);
+		const manager = SessionManager.create(cwd, destination);
+		manager.appendMessage({ role: "user", content: "cold-fork seed", timestamp: Date.now() });
+		await manager.flush();
+		const predecessorSessionId = manager.getSessionId();
+		const predecessorSessionFile = manager.getSessionFile();
+		if (!predecessorSessionFile) throw new Error("Expected predecessor session file");
+		await manager.ensureOnDisk();
+		const memoryStats = manager.getSessionMemoryStats();
+		vi.spyOn(manager, "getSessionMemoryStats").mockReturnValue({
+			...memoryStats,
+			coldRetirementActive: true,
+		});
+
+		let predecessorClosed = false;
+		let managerObservedDuringPredecessorClose: { sessionId: string; sessionFile: string | undefined } | undefined;
+		const close = manager.close.bind(manager);
+		vi.spyOn(manager, "close").mockImplementation(async () => {
+			const context = session?.extensionRunner?.createContext();
+			if (context) {
+				managerObservedDuringPredecessorClose = {
+					sessionId: context.sessionManager.getSessionId(),
+					sessionFile: context.sessionManager.getSessionFile(),
+				};
+			}
+			predecessorClosed = true;
+			await close();
+		});
+		const observations: Array<{ sessionId: string; sessionFile: string | undefined; entryCount: number }> = [];
+		const extension: ExtensionFactory = api => {
+			api.on("session_switch", (_event, ctx) => {
+				observations.push({
+					sessionId: ctx.sessionManager.getSessionId(),
+					sessionFile: ctx.sessionManager.getSessionFile(),
+					entryCount: ctx.sessionManager.getEntries().length,
+				});
+			});
+		};
+		const { session } = await createAgentSession({
+			cwd,
+			agentDir,
+			sessionManager: manager,
+			settings: Settings.isolated(),
+			disableExtensionDiscovery: true,
+			extensions: [extension],
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+		});
+
+		try {
+			expect(await session.fork()).toBe(true);
+			const successorSessionId = session.sessionId;
+			const successorSessionFile = session.sessionFile;
+			expect(successorSessionId).not.toBe(predecessorSessionId);
+			expect(successorSessionFile).not.toBe(predecessorSessionFile);
+			expect(predecessorClosed).toBe(true);
+			expect(managerObservedDuringPredecessorClose).toEqual({
+				sessionId: successorSessionId,
+				sessionFile: successorSessionFile,
+			});
+			expect(observations).toEqual([
+				{
+					sessionId: successorSessionId,
+					sessionFile: successorSessionFile,
+					entryCount: expect.any(Number),
+				},
+			]);
+			expect(observations[0]?.entryCount).toBeGreaterThan(0);
 		} finally {
 			await session.dispose();
 		}

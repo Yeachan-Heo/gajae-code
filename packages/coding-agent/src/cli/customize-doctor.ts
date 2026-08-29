@@ -16,7 +16,13 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getMCPConfigPath,
+	getProjectDir,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { findRepoRoot } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
@@ -1083,11 +1089,19 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 }
 
 async function collectPluginBundles(cwd: string, agentDir: string): Promise<CustomizeDoctorSurface> {
+	const resolverAuthority = getAgentProfileAuthority();
+	const profileAuthority =
+		resolverAuthority === "custom" ||
+		normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir())
+			? "custom"
+			: "default";
 	// npm plugin packages (convention "plugin") — the startup consumer is
 	// getEnabledPlugins(cwd); the lockfile provides the disabled set.
-	const enabledNames = new Set((await getEnabledPlugins(cwd, agentDir)).map(p => p.name));
+	const enabledNames = new Set(
+		(await getEnabledPlugins(cwd, profileAuthority === "custom" ? agentDir : undefined)).map(p => p.name),
+	);
 	const lockNames = new Map<string, { enabled?: boolean }>();
-	const pluginsDir = getProfilePluginsDir(agentDir);
+	const pluginsDir = getProfilePluginsDir(agentDir, profileAuthority);
 	const pkgPath = path.join(pluginsDir, "package.json");
 	let depNames: string[] = [];
 	try {

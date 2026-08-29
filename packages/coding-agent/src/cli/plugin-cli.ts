@@ -4,7 +4,7 @@
  * Handles `gjc plugin <command>` subcommands for plugin lifecycle management.
  */
 
-import { APP_NAME, getAgentDir, getProjectDir } from "@gajae-code/utils";
+import { APP_NAME, getAgentDir, getAgentProfileAuthority, getProjectDir } from "@gajae-code/utils";
 import chalk from "chalk";
 import { resolveOrDefaultProjectRegistryPath } from "../discovery/helpers";
 import {
@@ -223,12 +223,13 @@ export async function runPluginCommand(cmd: PluginCommandArgs): Promise<void> {
 
 async function makeMarketplaceManager(): Promise<MarketplaceManager> {
 	const agentDir = getAgentDir();
+	const profileAuthority = getAgentProfileAuthority();
 	return new MarketplaceManager({
-		marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir),
-		installedRegistryPath: getInstalledPluginsRegistryPath(agentDir),
+		marketplacesRegistryPath: getMarketplacesRegistryPath(agentDir, profileAuthority),
+		installedRegistryPath: getInstalledPluginsRegistryPath(agentDir, profileAuthority),
 		projectInstalledRegistryPath: await resolveOrDefaultProjectRegistryPath(getProjectDir()),
-		marketplacesCacheDir: getMarketplacesCacheDir(agentDir),
-		pluginsCacheDir: getPluginsCacheDir(agentDir),
+		marketplacesCacheDir: getMarketplacesCacheDir(agentDir, profileAuthority),
+		pluginsCacheDir: getPluginsCacheDir(agentDir, profileAuthority),
 	});
 }
 

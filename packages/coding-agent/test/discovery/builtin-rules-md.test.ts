@@ -118,6 +118,50 @@ test("project RULES.md wins a same-name collision with user RULES.md", async () 
 	]);
 });
 
+test("project sticky RULES.md wins a same-name collision with project rules/RULES.md", async () => {
+	writeFile(path.join(project, ".gjc", "RULES.md"), "Project sticky rule\n");
+	writeFile(path.join(project, ".gjc", "rules", "RULES.md"), "Project ordinary rule\n");
+
+	const result = await loadCapabilityForHome<Rule>(ruleCapability.id, home, {
+		cwd: project,
+		agentDir: path.join(home, ".gjc", "agent"),
+		providers: ["native"],
+	});
+
+	expect(result.items).toHaveLength(1);
+	expect(result.items[0]?.name).toBe("RULES");
+	expect(result.items[0]?._source.level).toBe("project");
+	expect(result.items[0]?.path).toBe(path.join(project, ".gjc", "RULES.md"));
+	expect(result.items[0]?.content).toContain("Project sticky rule");
+	expect(result.all.filter(rule => rule.name === "RULES").map(rule => rule.path)).toEqual([
+		path.join(project, ".gjc", "RULES.md"),
+		path.join(project, ".gjc", "rules", "RULES.md"),
+	]);
+});
+
+test("project sticky RULES.md wins over user sticky and ordinary RULES.md", async () => {
+	writeFile(path.join(project, ".gjc", "RULES.md"), "Project sticky rule\n");
+	writeFile(path.join(home, ".gjc", "agent", "RULES.md"), "User sticky rule\n");
+	writeFile(path.join(home, ".gjc", "agent", "rules", "RULES.md"), "User ordinary rule\n");
+
+	const result = await loadCapabilityForHome<Rule>(ruleCapability.id, home, {
+		cwd: project,
+		agentDir: path.join(home, ".gjc", "agent"),
+		providers: ["native"],
+	});
+
+	expect(result.items).toHaveLength(1);
+	expect(result.items[0]?.name).toBe("RULES");
+	expect(result.items[0]?._source.level).toBe("project");
+	expect(result.items[0]?.path).toBe(path.join(project, ".gjc", "RULES.md"));
+	expect(result.items[0]?.content).toContain("Project sticky rule");
+	expect(result.all.filter(rule => rule.name === "RULES").map(rule => rule.path)).toEqual([
+		path.join(project, ".gjc", "RULES.md"),
+		path.join(home, ".gjc", "agent", "RULES.md"),
+		path.join(home, ".gjc", "agent", "rules", "RULES.md"),
+	]);
+});
+
 test("alwaysApply is forced even when frontmatter says false", async () => {
 	writeFile(path.join(home, ".gjc", "agent", "RULES.md"), "---\nalwaysApply: false\n---\nStick around anyway.\n");
 

@@ -16,7 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
-import { getAgentDir, getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
@@ -170,8 +170,8 @@ export async function getProjectSkillDirs(
 }
 
 /** Canonical user skill directories in precedence order (same resolution as runtime discovery). */
-export function getUserSkillDirs(home: string, agentDir?: string): string[] {
-	return getUserSkillScanDirs(home, agentDir);
+export function getUserSkillDirs(home: string, agentDir?: string, profileAuthority?: "default" | "custom"): string[] {
+	return getUserSkillScanDirs(home, agentDir, profileAuthority);
 }
 
 /**
@@ -214,11 +214,14 @@ export async function listNativeSkillsForManagement(options: {
 	cwd: string;
 	home?: string;
 	agentDir?: string;
+	/** Resolver-owned profile classification; unlike path comparison, this survives HOME refreshes. */
+	profileAuthority?: "default" | "custom";
 	policy?: SkillManagementPolicy;
 }): Promise<ManagedSkillRecord[]> {
 	const homeWasInjected = options.home !== undefined;
 	const home = options.home ?? getRuntimeHome();
 	const agentDir = options.agentDir ?? (homeWasInjected ? resolveUserAgentDir(home) : getAgentDir());
+	const profileAuthority = options.profileAuthority ?? (!homeWasInjected ? getAgentProfileAuthority() : undefined);
 	const policy = options.policy;
 	const projectTrusted = resolveSkillScopeTrust(policy ?? {}, "project");
 	const userTrusted = resolveSkillScopeTrust(policy ?? {}, "user");
@@ -236,7 +239,7 @@ export async function listNativeSkillsForManagement(options: {
 		}
 	}
 	if (userTrusted) {
-		for (const dir of getUserSkillDirs(home, agentDir)) {
+		for (const dir of getUserSkillDirs(home, agentDir, profileAuthority)) {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: home },
