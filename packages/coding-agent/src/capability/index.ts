@@ -341,9 +341,7 @@ export async function loadCapabilityForHome<T>(
 		? path.resolve(options.agentDir)
 		: path.join(canonicalHome, getConfigDirName(), "agent");
 	const repoRootCandidate = await findRepoRoot(cwd);
-	const canonicalRepoRoot = repoRootCandidate
-		? await canonicalizeThroughExistingAncestor(repoRootCandidate)
-		: null;
+	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
 		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
 			? canonicalRepoRoot

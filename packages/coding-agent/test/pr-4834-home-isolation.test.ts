@@ -170,9 +170,11 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 
 		expect(result?.items ?? []).toEqual([]);
 		const canonicalReads = await Promise.all([...reads].map(filePath => fs.realpath(filePath).catch(() => filePath)));
-		expect(canonicalReads.filter(filePath => filePath === decoyProject || filePath.startsWith(`${decoyProject}${path.sep}`))).toEqual(
-			[],
-		);
+		expect(
+			canonicalReads.filter(
+				filePath => filePath === decoyProject || filePath.startsWith(`${decoyProject}${path.sep}`),
+			),
+		).toEqual([]);
 	});
 
 	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {
