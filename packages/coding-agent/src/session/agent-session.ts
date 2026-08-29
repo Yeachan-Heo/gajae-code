@@ -15851,9 +15851,8 @@ export class AgentSession {
 						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
 						getSessionId: () => forkedManager.getSessionId(),
 					});
-					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-					this.#quarantineQueuedAsyncResults();
 					this.#assertJobManagerEndpointAdmission(forkedManager.getSessionId(), forkedManager.getSessionFile());
+					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				} catch (error) {
 					const forkedFile = forkedManager.getSessionFile();
 					const cleanupErrors: unknown[] = [];
@@ -15885,6 +15884,7 @@ export class AgentSession {
 				}
 				this.sessionManager = forkedManager;
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+				this.#quarantineQueuedAsyncResults();
 				try {
 					await previousManager.close();
 				} catch (error) {
@@ -18227,12 +18227,12 @@ export class AgentSession {
 				const successorGateEmitter = this.#constructWorkflowGateEmitter(prepared.sessionId);
 				// Last fallible action: verified local:// readiness from immutable staged options.
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
-				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-				this.#quarantineQueuedAsyncResults();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
+				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
+				this.#quarantineQueuedAsyncResults();
 				// Handoff commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId, rollbackSessionState.sessionFile);
