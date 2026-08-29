@@ -14063,6 +14063,12 @@ export class AgentSession {
 			)
 		)
 			throw this.#sessionAdmissionBusyError();
+		if (
+			owner?.kind === "selection" &&
+			options?.allowSdkControlMutationReentry === true &&
+			options.deliverAs !== undefined
+		)
+			this.#assertNoSessionTransitionAdmission();
 		this.#assertSessionAdmissionOpen();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		if (typeof content !== "string" && !Array.isArray(content)) {
