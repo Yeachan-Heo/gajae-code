@@ -189,6 +189,43 @@ describe("Settings", () => {
 		}
 	});
 
+	it("does not close replacement storage when a reset stale init rejects", async () => {
+		const secondProjectDir = path.join(testDir, "second-project-rejection");
+		fs.mkdirSync(getProjectAgentDir(secondProjectDir), { recursive: true });
+		const { promise: projectLoadPaused, resolve: markProjectLoadPaused } = Promise.withResolvers<void>();
+		let release!: () => void;
+		const releaseGate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		let firstProjectLoad = true;
+		SettingsMigrationTestHooks.beforeProjectSettingsLoad = async () => {
+			if (!firstProjectLoad) return;
+			firstProjectLoad = false;
+			markProjectLoadPaused();
+			await releaseGate;
+			throw new Error("injected stale project load failure");
+		};
+		try {
+			const stalePending = Settings.init({ cwd: projectDir, agentDir });
+			await projectLoadPaused;
+			resetSettingsForTest();
+			const replacement = await Settings.init({ cwd: secondProjectDir, agentDir });
+			const staleOutcome = stalePending.then(
+				() => "resolved",
+				() => "rejected",
+			);
+			release();
+			expect(await staleOutcome).toBe("rejected");
+
+			const storage = replacement.getStorage();
+			expect(storage).not.toBeNull();
+			expect(() => storage?.getSettings()).not.toThrow();
+		} finally {
+			release();
+			SettingsMigrationTestHooks.beforeProjectSettingsLoad = undefined;
+		}
+	});
+
 	it("currentOrInit still warns when a later request changes overrides", async () => {
 		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
 		try {

@@ -182,6 +182,10 @@ export const SettingsMigrationTestHooks: {
 	 * re-read, after the migrated values already committed: test seams use it
 	 * to make the marker unreadable so the rollback path is exercised. */
 	beforeProjectMarkerMerge?: () => void | Promise<void>;
+	/** Fires after global storage/config loading and immediately before project
+	 * settings load. Tests use it to reject one stale global initialization after
+	 * a replacement generation has adopted the shared storage handle. */
+	beforeProjectSettingsLoad?: () => void | Promise<void>;
 } = {};
 
 type SettingsPatch = {
@@ -658,6 +662,7 @@ export class Settings implements NotificationSettingsReader {
 			},
 			error => {
 				pendingGlobalInits.delete(instance);
+				staleGlobalInits.add(instance);
 				if (initGeneration === globalInitGeneration) {
 					globalInstance = null;
 					globalInstancePromise = null;
@@ -1523,6 +1528,7 @@ export class Settings implements NotificationSettingsReader {
 			if (this.#schemaMigrationPending)
 				this.#recordLegacyFallbackMigrationPatch("configSchemaVersion", CONFIG_SCHEMA_VERSION);
 
+			await SettingsMigrationTestHooks.beforeProjectSettingsLoad?.();
 			this.#project = await this.#loadProjectSettings();
 
 			await this.#normalizeAfterLoad();
@@ -1533,7 +1539,12 @@ export class Settings implements NotificationSettingsReader {
 			}
 			return this;
 		} catch (error) {
-			this.#storage?.close();
+			// Global initialization cleanup is generation-aware: a reset replacement
+			// may adopt the same process-cached AgentStorage handle before this load
+			// rejects. The factory arbitrates that ownership after removing this
+			// instance from pendingGlobalInits. Scoped/isolated loads still own their
+			// storage directly and close it here.
+			if (!pendingGlobalInits.has(this)) this.#storage?.close();
 			throw error;
 		}
 	}
