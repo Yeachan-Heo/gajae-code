@@ -31,6 +31,7 @@ import {
 	observeOwnerTerminal,
 	readNoFollowJson,
 	type TerminalSignal,
+	withOwnerGenerationLock,
 } from "./tmux-owner-isolation";
 
 /** Managed tmux owner provenance propagated only to the launched child process. */
@@ -1666,80 +1667,81 @@ export async function persistCoordinatorLaunchFailureState(input: {
 	const keyId = input.signingRequired ? input.keyId?.trim() || null : null;
 	if (input.signingRequired && (!keyId || !/^[a-f0-9]{64}$/.test(keyId))) return;
 
-	await serializeStateFileWrite(
-		stateFile,
-		async () =>
-			await withCoordinatorTransactionLock(
-				stateFile,
-				async () =>
-					await withStateFileLock(stateFile, async () => {
-						let previous: Record<string, unknown>;
+	const writeTransaction = async () =>
+		await withCoordinatorTransactionLock(
+			stateFile,
+			async () =>
+				await withStateFileLock(stateFile, async () => {
+					let previous: Record<string, unknown>;
+					try {
+						previous = await readPreviousPayloadForEvent(stateFile);
+					} catch (error) {
+						// A launch diagnostic must never turn an unreadable shared state
+						// marker into a replacement payload.
+						if (error instanceof PreviousRuntimeStateReadError) return;
+						throw error;
+					}
+					if (Object.hasOwn(previous, "owner_generation")) {
+						const rawOwnerGeneration = previous.owner_generation;
+						if (
+							rawOwnerGeneration !== null &&
+							(typeof rawOwnerGeneration !== "string" || rawOwnerGeneration.trim().length === 0)
+						)
+							return;
+					}
+					if (!sessionId && typeof previous.session_id === "string" && previous.session_id.trim().length > 0)
+						return;
+					const previousOwner =
+						typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
+							? previous.owner_generation.trim()
+							: null;
+					if (previousOwner !== null && !sessionId) return;
+					const baseline = sessionId
+						? await captureOwnerGenerationBaseline(stateDirectory, sessionId).catch(() => undefined)
+						: null;
+					const activeGeneration = baseline?.state === "current" ? baseline.generation : null;
+					const previousManagedEvidence = previousOwner !== null;
+					if (input.managedLaunch && baseline?.state !== "absent") return;
+					if (ownerMetadataComplete && baseline === undefined) return;
+					// Any owner generation already represented by the state file requires an
+					// authenticated, still-current caller. Do not turn an unavailable
+					// lifecycle record into an unowned overwrite.
+					if (previousManagedEvidence && (activeGeneration === null || baseline === undefined)) return;
+					if (activeGeneration !== null) {
+						if (
+							!sessionId ||
+							!ownerMetadataValid ||
+							activeGeneration !== ownerGeneration ||
+							previous.session_id !== sessionId ||
+							(previousOwner !== null && previousOwner !== ownerGeneration)
+						)
+							return;
+					} else if (previousManagedEvidence) {
+						return;
+					}
+					if (sessionId) {
 						try {
-							previous = await readPreviousPayloadForEvent(stateFile);
+							assertPreviousRuntimeStateIdentity(previous, {
+								sessionId,
+								cwd: path.resolve(input.cwd),
+								workdir: path.resolve(input.cwd),
+								sessionFile: null,
+								platform: process.platform,
+								sidecarKeyId: keyId,
+							});
 						} catch (error) {
-							// A launch diagnostic must never turn an unreadable shared state
-							// marker into a replacement payload.
 							if (error instanceof PreviousRuntimeStateReadError) return;
 							throw error;
 						}
-						if (Object.hasOwn(previous, "owner_generation")) {
-							const rawOwnerGeneration = previous.owner_generation;
-							if (
-								rawOwnerGeneration !== null &&
-								(typeof rawOwnerGeneration !== "string" || rawOwnerGeneration.trim().length === 0)
-							)
-								return;
-						}
-						if (!sessionId && typeof previous.session_id === "string" && previous.session_id.trim().length > 0)
-							return;
-						const previousOwner =
-							typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
-								? previous.owner_generation.trim()
-								: null;
-						if (previousOwner !== null && !sessionId) return;
-						const baseline = sessionId
-							? await captureOwnerGenerationBaseline(stateDirectory, sessionId).catch(() => undefined)
-							: null;
-						const activeGeneration = baseline?.state === "current" ? baseline.generation : null;
-						const previousManagedEvidence =
-							previousOwner !== null &&
-							(typeof previous.workdir === "string" || typeof previous.sidecar_signature === "string");
-						if (input.managedLaunch && baseline?.state !== "absent") return;
-						if (ownerMetadataComplete && baseline === undefined) return;
-						// Any owner generation already represented by the state file requires an
-						// authenticated, still-current caller. Do not turn an unavailable
-						// lifecycle record into an unowned overwrite.
-						if (previousManagedEvidence && (activeGeneration === null || baseline === undefined)) return;
-						if (activeGeneration !== null) {
-							if (
-								!sessionId ||
-								!ownerMetadataValid ||
-								activeGeneration !== ownerGeneration ||
-								previous.session_id !== sessionId ||
-								(previousOwner !== null && previousOwner !== ownerGeneration)
-							)
-								return;
-						} else if (previousManagedEvidence) {
-							return;
-						}
-						if (sessionId) {
-							try {
-								assertPreviousRuntimeStateIdentity(previous, {
-									sessionId,
-									cwd: path.resolve(input.cwd),
-									workdir: path.resolve(input.cwd),
-									sessionFile: null,
-									platform: process.platform,
-									sidecarKeyId: keyId,
-								});
-							} catch (error) {
-								if (error instanceof PreviousRuntimeStateReadError) return;
-								throw error;
-							}
-						}
-						await writeStateFileSync(stateFile, input.payload, keyId);
-					}),
-			),
+					}
+					await writeStateFileSync(stateFile, input.payload, keyId);
+				}),
+		);
+	await serializeStateFileWrite(
+		stateFile,
+		ownerMetadataValid && sessionId && ownerStateDir
+			? () => withOwnerGenerationLock(ownerStateDir, sessionId, writeTransaction)
+			: writeTransaction,
 	);
 }
 
@@ -1870,6 +1872,62 @@ async function withStateFileLocks<T>(stateFiles: readonly string[], operation: (
 	const [stateFile, ...remaining] = stateFiles;
 	if (!stateFile) return await operation();
 	return await withStateFileLock(stateFile, async () => await withStateFileLocks(remaining, operation));
+/**
+ * Owner-bound state writers take the lifecycle lock before either state lock. Owner
+ * replacement uses that same lifecycle lock, so the generation read and the eventual
+ * state write cannot straddle a replacement publication.
+ */
+async function withRuntimeStateWriterLocks<T>(
+	stateFile: string,
+	context: RuntimeStateContext,
+	sessionId: string,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const owner = context.ownerTerminal;
+	const transaction = () => withCoordinatorTransactionLock(stateFile, operation);
+	return owner ? await withOwnerGenerationLock(owner.stateDir, sessionId, transaction) : await transaction();
+}
+
+/**
+ * Validate the ownership fence carried by a previous runtime marker while the writer's
+ * locks are held. An unowned predecessor remains valid for the explicit legacy paths;
+ * once ownership is present, only the authenticated current generation may write.
+ */
+async function runtimeStateOwnerGenerationFence(
+	previous: Record<string, unknown>,
+	context: RuntimeStateContext,
+	identity: RuntimeStateIdentity,
+): Promise<boolean> {
+	const rawPreviousGeneration = previous.owner_generation;
+	if (
+		rawPreviousGeneration !== undefined &&
+		rawPreviousGeneration !== null &&
+		(typeof rawPreviousGeneration !== "string" || rawPreviousGeneration.trim().length === 0)
+	)
+		return false;
+	const previousGeneration = typeof rawPreviousGeneration === "string" ? rawPreviousGeneration.trim() : null;
+	const owner = context.ownerTerminal;
+	if (!owner) return previousGeneration === null;
+	let current: Awaited<ReturnType<typeof captureOwnerGenerationBaseline>>;
+	try {
+		current = await captureOwnerGenerationBaseline(owner.stateDir, identity.sessionId);
+	} catch {
+		return false;
+	}
+	if (
+		current.state !== "current" ||
+		current.session_id !== identity.sessionId ||
+		current.generation !== owner.generation
+	)
+		return false;
+	return previousGeneration === null || previousGeneration === owner.generation;
+}
+
+function stampRuntimeStateOwnerGeneration(
+	previous: Record<string, unknown>,
+	context: RuntimeStateContext,
+): Record<string, unknown> {
+	return context.ownerTerminal ? { ...previous, owner_generation: context.ownerTerminal.generation } : previous;
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
@@ -1902,14 +1960,17 @@ async function persistCoordinatorRuntimeToolActivity(
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
+				context,
+				identity.sessionId,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
-						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						// A tool event that lands after the session settled must never
 						// resurrect it into a live-looking state.
 						if (previous.state === "completed" || previous.state === "errored") return;
@@ -1924,7 +1985,7 @@ async function persistCoordinatorRuntimeToolActivity(
 						await writeStateFileSync(
 							stateFile,
 							{
-								...previous,
+								...stampRuntimeStateOwnerGeneration(previous, context),
 								activity: nextRuntimeToolActivity(priorActivity, {
 									phase,
 									label,
@@ -1983,15 +2044,18 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
+				context,
+				identity.sessionId,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
-						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
 							state === "completed" || state === "errored"
@@ -2055,18 +2119,22 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 ): Promise<void> {
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
+	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
+				context,
+				identity.sessionId,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
-						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						const now = new Date().toISOString();
 						const terminalPersistenceFailed =
 							outcome.kind === "terminal_persistence" && outcome.status !== "completed";
@@ -2083,7 +2151,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 									: "Worker integration failed after terminal publication."),
 						);
 						const payload = {
-							...previous,
+							...stampRuntimeStateOwnerGeneration(previous, context),
 							...(terminalPersistenceFailed
 								? {
 										state: "errored",
@@ -2966,6 +3034,8 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 ): Promise<void> {
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
+	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
+		context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	const ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
 	const ownerTerminalVerdict = context.ownerTerminal
@@ -2974,13 +3044,16 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
-			await withCoordinatorTransactionLock(
+			await withRuntimeStateWriterLocks(
 				stateFile,
+				context,
+				identity.sessionId,
 				async () =>
 					await withStateFileLock(stateFile, async () => {
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = readPreviousPayload(stateFile);
-						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
 						// The immutable owner verdict remains in its lifecycle artifact; never replace a
 						// complete agent terminal payload merely to mirror that verdict here.

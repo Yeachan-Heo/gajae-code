@@ -578,6 +578,7 @@ describe("coordinator runtime state sidecar", () => {
 			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = generation;
 			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = root;
 			process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = "managed-socket";
+			await replaceOwnerGeneration(root, "managed-terminal-session", generation);
 			await persistCoordinatorRuntimeStateFromEvent(assistantEnd("launch failed", "error"), {
 				sessionId: "fallback",
 				cwd: root,
@@ -595,6 +596,38 @@ describe("coordinator runtime state sidecar", () => {
 				else process.env[key] = value;
 			}
 		}
+	});
+
+	it("fences late managed writers after owner generation replacement", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "replacement-generation.json");
+		const sessionId = "replacement-generation-session";
+		const firstGeneration = "replacement-generation-one";
+		const replacementGeneration = "replacement-generation-two";
+		const owner = { generation: firstGeneration, stateDir: root, socketKey: "replacement-owner" };
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+
+		await replaceOwnerGeneration(root, sessionId, firstGeneration);
+		const context = { sessionId, cwd: root, sessionFile: null, ownerTerminal: owner };
+		await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, context);
+		const beforeReplacement = await Bun.file(stateFile).text();
+
+		await replaceOwnerGeneration(root, sessionId, replacementGeneration);
+		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("stale event"), context);
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "tool_execution_start", toolCallId: "stale-tool" },
+			context,
+			{ label: "bash", observedAt: "2026-08-29T00:00:00.000Z" },
+		);
+		await persistCoordinatorWorkerIntegrationOutcome(context, {
+			kind: "worker_integration",
+			status: "failed",
+			error: "stale worker",
+		});
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context);
+
+		expect(await Bun.file(stateFile).text()).toBe(beforeReplacement);
 	});
 
 	it("invalidates the async previous-payload cache after an external state file write", async () => {
@@ -2135,7 +2168,7 @@ describe("coordinator runtime state sidecar", () => {
 		expect(serialized).not.toContain("operator-dispatch");
 		await expect(fs.access(lifecyclePaths(root, sessionId, generation).verdictFile)).resolves.toBeNull();
 	});
-	it("fails closed with public-safe recovery state for invalid metadata or unavailable owner verdicts", async () => {
+	it("fails closed with public-safe recovery for invalid metadata and unavailable owner ownership", async () => {
 		const root = await tempRoot();
 		const sessionId = "owner-fail-closed";
 		const invalidStateFile = path.join(root, "invalid.json");
@@ -2155,21 +2188,16 @@ describe("coordinator runtime state sidecar", () => {
 
 		await Bun.write(invalidStateFile, "not-a-directory");
 		const unavailableSessionId = "owner-verdict-unavailable";
-		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
-			sessionId: unavailableSessionId,
-			cwd: root,
-			ownerTerminal: { generation: "owner-failure", stateDir: invalidStateFile, socketKey: "opaque-owner" },
-		});
-		const unavailable = await readPayload(
-			path.join(sessionRuntimeDir(root, unavailableSessionId), "runtime-state.json"),
-		);
-		expect(unavailable).toMatchObject({
-			state: "errored",
-			reason: "owner_verdict_unavailable",
-			error: { code: "owner_verdict_unavailable", recoverable: true },
-			recovery: { action: "recover_or_resume_session" },
-		});
-		expect(JSON.stringify(unavailable)).not.toContain("not-a-directory");
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, {
+				sessionId: unavailableSessionId,
+				cwd: root,
+				ownerTerminal: { generation: "owner-failure", stateDir: invalidStateFile, socketKey: "opaque-owner" },
+			}),
+		).rejects.toThrow(/generation_lock_contended/);
+		expect(
+			await Bun.file(path.join(sessionRuntimeDir(root, unavailableSessionId), "runtime-state.json")).exists(),
+		).toBe(false);
 	});
 
 	it("fails closed for absent, malformed, mismatched, and expired owner intents", async () => {
