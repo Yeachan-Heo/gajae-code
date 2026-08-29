@@ -47,16 +47,18 @@ describe("submitInteractiveInput", () => {
 		const session = {
 			prompt: vi.fn(async () => {}),
 			promptCustomMessage: vi.fn(async () => {}),
+			continuePersistedHistory: vi.fn(async () => {}),
 		};
 		const input = createInput({ text: "", started: true });
 
 		await submitInteractiveInput(mode, session, input);
 
 		expect(mode.markPendingSubmissionStarted).not.toHaveBeenCalled();
-		expect(session.prompt).toHaveBeenCalledWith("", { images: undefined });
+		expect(session.continuePersistedHistory).toHaveBeenCalledTimes(1);
+		expect(session.prompt).not.toHaveBeenCalled();
 		expect(mode.finishPendingSubmission).toHaveBeenCalledWith(input);
 		expect(mode.showError).not.toHaveBeenCalled();
-		expect(waiter.dispose).toHaveBeenCalledTimes(1);
+		expect(waiter.dispose).not.toHaveBeenCalled();
 	});
 
 	it("skips prompting when optimistic submission was cancelled before start", async () => {

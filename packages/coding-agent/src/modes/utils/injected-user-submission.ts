@@ -17,7 +17,11 @@ import type { InteractiveModeContext } from "../types";
  * (unhandled rejection → resident crash).
  */
 export function extensionUserMessageContentError(content: string | (TextContent | ImageContent)[]): Error | undefined {
-	if (typeof content === "string") return undefined;
+	if (typeof content === "string") {
+		if (content.trim().length === 0)
+			return Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
+		return undefined;
+	}
 	if (!Array.isArray(content)) {
 		return Object.assign(new Error("sendUserMessage requires string or content-array content."), {
 			code: "invalid_input",
@@ -30,6 +34,16 @@ export function extensionUserMessageContentError(content: string | (TextContent 
 			});
 		}
 	}
+	const text = content
+		.filter((part): part is TextContent => part.type === "text")
+		.map(part => part.text)
+		.join("\n");
+	const hasUsableImage = content.some(
+		(part): part is ImageContent =>
+			part.type === "image" && typeof part.data === "string" && part.data.trim().length > 0,
+	);
+	if (text.trim().length === 0 && !hasUsableImage)
+		return Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 	return undefined;
 }
 export function normalizeInjectedUserContent(content: string | (TextContent | ImageContent)[]): {

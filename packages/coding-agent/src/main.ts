@@ -349,7 +349,9 @@ export async function submitInteractiveInput(
 		| "checkShutdownRequested"
 		| "waitForAgentEnd"
 	>,
-	session: Pick<AgentSession, "prompt" | "promptCustomMessage">,
+	session: Pick<AgentSession, "prompt" | "promptCustomMessage"> & {
+		continuePersistedHistory?: AgentSession["continuePersistedHistory"];
+	},
 	input: SubmittedUserInput,
 ): Promise<void> {
 	if (input.cancelled) {
@@ -357,8 +359,13 @@ export async function submitInteractiveInput(
 	}
 
 	try {
+		if (input.started) {
+			if (!session.continuePersistedHistory) throw new Error("Session continuation is unavailable.");
+			await session.continuePersistedHistory();
+			return;
+		}
 		// Continue shortcuts submit an already-started empty prompt with no optimistic user message.
-		if (!input.started && !mode.markPendingSubmissionStarted(input)) {
+		if (!mode.markPendingSubmissionStarted(input)) {
 			return;
 		}
 		const agentEnd = mode.waitForAgentEnd();
