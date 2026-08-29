@@ -2728,7 +2728,10 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 	const owner = context.ownerTerminal;
 	if (!owner) return;
 	try {
-		if (!verdict) throw new Error("owner terminal verdict unavailable");
+		if (!verdict) {
+			if (process.env.GJC_TMUX_LAUNCHED === "1") return;
+			throw new Error("owner terminal verdict unavailable");
+		}
 		const now = new Date().toISOString();
 		const expected = verdict.classification === "expected_operator_shutdown";
 		const state: RuntimeState = expected ? "completed" : "errored";
