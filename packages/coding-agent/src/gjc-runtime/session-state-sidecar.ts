@@ -28,6 +28,7 @@ import {
 	type OwnerIntent,
 	type OwnerVerdict,
 	observeOwnerTerminal,
+	readNoFollowJson,
 	type TerminalSignal,
 } from "./tmux-owner-isolation";
 
@@ -2665,9 +2666,9 @@ async function operatorDispatchIdForOwner(
 	const intentId = owner.operatorIntentId;
 	if (!intentId) return undefined;
 	try {
-		const intent = JSON.parse(
-			await Bun.file(lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile).text(),
-		) as unknown;
+		const intent = await readNoFollowJson(
+			lifecyclePaths(owner.stateDir, request.session_id, owner.generation).intentFile,
+		);
 		if (!isValidOwnerIntent(intent)) return undefined;
 		if (
 			!isValidOwnerIntent(intent as OwnerIntent, {
@@ -2732,9 +2733,7 @@ async function pendingOwnerIntentStatus(
 	sessionId: string,
 ): Promise<PendingOwnerIntentStatus> {
 	try {
-		const intent = JSON.parse(
-			await Bun.file(lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile).text(),
-		) as unknown;
+		const intent = await readNoFollowJson(lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile);
 		if (
 			!isValidOwnerIntent(intent) ||
 			intent.session_id !== sessionId ||
