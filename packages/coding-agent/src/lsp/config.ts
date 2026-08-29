@@ -3,7 +3,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
 import {
-	$which,
 	getConfigDirName,
 	getTrustedHomeDir,
 	isRecord,
