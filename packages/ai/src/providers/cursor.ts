@@ -280,6 +280,11 @@ const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
 // 4 KiB. Keep a finite protocol bound for hostile peers, but do not reject
 // valid server messages merely because they exceed the old debug-text limit.
 const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
+// A held exec cannot be allowed to turn the response stream into an unbounded
+// staging area. One maximum-sized frame plus its envelope is enough to retain
+// a complete frame while parser backpressure is active; additional input is a
+// protocol failure rather than silently dropping raw progress.
+const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
 const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
 // A started non-abortable mutation must settle before the exec terminal is
@@ -1204,48 +1209,70 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			let processingPausedForExec = false;
 			let processingPausedForQueue = false;
-			let terminalPoll: NodeJS.Timeout | undefined;
 			// True while any exec server message handler is running; suppresses
 			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
 			let execInFlight = false;
 			let processPendingBuffer: (() => void) | undefined;
-			const preemptFromPendingTerminal = (): boolean => {
+			/**
+			 * Inspect buffered protocol frames while normal parsing is paused behind an
+			 * exec. This deliberately shares the Connect/protobuf framing rules with the
+			 * main parser: a complete terminal frame can preempt a held handler, while
+			 * malformed, oversized, or EOF-truncated bytes fail immediately instead of
+			 * remaining in an unbounded side buffer.
+			 */
+			const observeBufferedTerminal = (atEof = false): boolean => {
 				let offset = 0;
 				while (pendingBuffer.length - offset >= 5) {
 					const flags = pendingBuffer[offset];
 					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
-					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH || pendingBuffer.length - offset < 5 + msgLen) return false;
+					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
+						const error = new Error("Cursor HTTP/2 frame exceeds the maximum message length");
+						endStreamError = error;
+						responseEnded = true;
+						terminalize(error);
+						return true;
+					}
+					if (pendingBuffer.length - offset < 5 + msgLen) break;
+					const messageBytes = pendingBuffer.subarray(offset + 5, offset + 5 + msgLen);
 					if (flags & CONNECT_END_STREAM_FLAG) {
-						const messageBytes = pendingBuffer.subarray(offset + 5, offset + 5 + msgLen);
 						const error = parseConnectEndStream(messageBytes);
-						if (error) terminalize(error);
+						if (error) {
+							endStreamError = error;
+							responseEnded = true;
+							terminalize(error);
+							return true;
+						}
+						if (!sawTurnEnded) {
+							const missingTurnEnded = new Error("Cursor HTTP/2 stream ended before turnEnded");
+							endStreamError = missingTurnEnded;
+							responseEnded = true;
+							terminalize(missingTurnEnded);
+							return true;
+						}
+						return true;
+					}
+					try {
+						const message = fromBinary(AgentServerMessageSchema, messageBytes);
+						if (
+							message.message.case === "interactionUpdate" &&
+							message.message.value.message?.case === "turnEnded"
+						) {
+							sawTurnEnded = true;
+						}
+					} catch (error) {
+						const parseError = error instanceof Error ? error : new Error(String(error));
+						endStreamError = parseError;
+						responseEnded = true;
+						terminalize(parseError);
 						return true;
 					}
 					offset += 5 + msgLen;
 				}
-				return false;
-			};
-			const pendingContainsTurnEnded = (): boolean => {
-				let offset = 0;
-				while (pendingBuffer.length - offset >= 5) {
-					const flags = pendingBuffer[offset];
-					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
-					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH || pendingBuffer.length - offset < 5 + msgLen) return false;
-					if (flags & CONNECT_END_STREAM_FLAG) return false;
-					try {
-						const message = fromBinary(
-							AgentServerMessageSchema,
-							pendingBuffer.subarray(offset + 5, offset + 5 + msgLen),
-						);
-						if (
-							message.message.case === "interactionUpdate" &&
-							message.message.value.message?.case === "turnEnded"
-						)
-							return true;
-					} catch {
-						return false;
-					}
-					offset += 5 + msgLen;
+				if (atEof && pendingBuffer.length > offset) {
+					const error = new Error("Cursor HTTP/2 stream ended with a truncated Connect frame");
+					endStreamError = error;
+					terminalize(error);
+					return true;
 				}
 				return false;
 			};
@@ -1258,7 +1285,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			processPendingBuffer = () => {
 				if (processingPausedForExec || processingPausedForQueue) {
-					preemptFromPendingTerminal();
+					observeBufferedTerminal(responseEnded);
 					return;
 				}
 				while (pendingBuffer.length >= 5) {
@@ -1301,31 +1328,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
-						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage && !pendingContainsTurnEnded())
-							continue;
+						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage && !sawTurnEnded) continue;
 						const isExecutable = isExecServerMessage && isMeaningful;
 						if (isExecutable) {
 							processingPausedForExec = true;
 							clearTransportWatchdog();
-							terminalPoll ??= setInterval(() => {
-								if (preemptFromPendingTerminal()) {
-									clearInterval(terminalPoll);
-									terminalPoll = undefined;
-								}
-							}, 10);
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
 							if (transportTerminalized) return;
 							if (isExecServerMessage && terminalAdmissionMode === "closed") return;
 							// An exec frame asks this process to perform work before Cursor can
-							// send another frame. Its deadline is independent from raw transport
+							// response. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
 							if (isExecutable) {
-								if (terminalPoll) {
-									clearInterval(terminalPoll);
-									terminalPoll = undefined;
-								}
 								mutationSlotReserved = reserveCursorMutationLock(conversationId);
 								if (!mutationSlotReserved) throw new Error("Cursor mutation lock capacity exhausted");
 								clearTransportWatchdog();
@@ -1451,7 +1467,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						}
 
 						if (isExecutable) {
-							preemptFromPendingTerminal();
+							observeBufferedTerminal(responseEnded);
 							break;
 						}
 					} catch (e) {
@@ -1472,8 +1488,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					terminalize(endStreamError);
 					return;
 				}
-				if (preemptFromPendingTerminal()) return;
-				if (!sawTurnEnded && !pendingContainsTurnEnded() && !h2Settled) {
+				if (observeBufferedTerminal(true)) return;
+				if (!sawTurnEnded && !h2Settled) {
 					if (pendingBuffer.length === 0) {
 						terminalize(new Error("Cursor stream ended before turnEnded"));
 						return;
@@ -1485,8 +1501,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 
 			h2Request.on("data", (chunk: Buffer) => {
-				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
-				processPendingBuffer?.();
+				let offset = 0;
+				while (offset < chunk.length && !h2Settled && !transportTerminalized) {
+					const available = CURSOR_MAX_PENDING_SERVER_BYTES - pendingBuffer.length;
+					if (available <= 0) {
+						processPendingBuffer?.();
+						if (h2Settled) return;
+						const error = new Error("Cursor HTTP/2 response exceeded the maximum pending byte length");
+						endStreamError = error;
+						terminalize(error);
+						return;
+					}
+					const length = Math.min(available, chunk.length - offset);
+					pendingBuffer = Buffer.concat([pendingBuffer, chunk.subarray(offset, offset + length)]);
+					offset += length;
+					processPendingBuffer?.();
+				}
 			});
 
 			if (callerAbortError) throw callerAbortError;
@@ -1572,6 +1602,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				clearTimeout(gracefulCloseCheckTimer);
 				gracefulCloseCheckTimer = undefined;
 			}
+			pendingBuffer = Buffer.alloc(0);
 			transportWatchdogClosed = true;
 			if (transportWatchdog) {
 				clearTimeout(transportWatchdog);
