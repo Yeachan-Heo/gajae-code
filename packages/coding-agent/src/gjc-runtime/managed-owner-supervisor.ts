@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
+import { GJC_TMUX_OWNER_SERVER_KEY_ENV } from "./session-state-sidecar";
 import { isValidOwnerIntent, lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -214,7 +215,12 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			const candidate: unknown = JSON.parse(
 				fsSync.readFileSync(lifecyclePaths(stateDir, sessionId, generation).intentFile, "utf8"),
 			);
-			if (isValidOwnerIntent(candidate) && candidate.session_id === sessionId && candidate.generation === generation)
+			if (
+				isValidOwnerIntent(candidate) &&
+				candidate.session_id === sessionId &&
+				candidate.generation === generation &&
+				candidate.server_key === process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV]
+			)
 				candidateIntent = candidate;
 		} catch {
 			candidateIntent = null;
