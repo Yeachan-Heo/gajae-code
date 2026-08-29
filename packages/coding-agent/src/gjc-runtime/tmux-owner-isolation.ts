@@ -1254,6 +1254,7 @@ export async function captureOwnerGenerationBaseline(
 		record.schema_version !== 1 ||
 		record.session_id !== sessionId ||
 		!nonEmpty(record.generation) ||
+		!isSafePathComponent(record.generation, "owner generation") ||
 		!isCanonicalUtcTimestamp(record.published_at)
 	)
 		throw new Error("baseline_generation_corrupt");
@@ -1277,6 +1278,7 @@ export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: 
 		record.schema_version !== 1 ||
 		record.session_id !== sessionId ||
 		!nonEmpty(record.generation) ||
+		!isSafePathComponent(record.generation, "owner generation") ||
 		!isCanonicalUtcTimestamp(record.published_at)
 	)
 		throw new Error("baseline_generation_corrupt");
