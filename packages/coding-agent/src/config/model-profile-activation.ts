@@ -115,6 +115,8 @@ export interface PrepareModelProfileActivationOptions {
 export interface ApplyModelProfileActivationOptions {
 	persistDefault?: boolean;
 	thinkingLevelOverride?: ThinkingLevel;
+	/** Reject a stale prepared activation before each host-state mutation. */
+	assertCanCommit?: () => void;
 }
 export interface PreparedModelProfileActivation {
 	profileName: string;
@@ -1229,6 +1231,7 @@ export async function applyPreparedModelProfileActivation(
 				: (prepared.previousDefaultChain ??
 					(prepared.previousModel ? [formatModelString(prepared.previousModel)] : []));
 		if (ownedDefaultChain.length > 0) {
+			options.assertCanCommit?.();
 			defaultChainChanged = true;
 			prepared.session.setConfiguredModelChain(
 				"default",
@@ -1245,6 +1248,7 @@ export async function applyPreparedModelProfileActivation(
 			}
 		}
 		if (prepared.defaultModel) {
+			options.assertCanCommit?.();
 			modelMutationStarted = true;
 			await prepared.session.setModelTemporary(
 				prepared.defaultModel,
@@ -1252,6 +1256,7 @@ export async function applyPreparedModelProfileActivation(
 				{ cause: "profile-activation" },
 			);
 		}
+		options.assertCanCommit?.();
 		// Always reinstall the model role layer from the durable base plus the
 		// new profile's roles so omitted roles from the previous profile are dropped.
 		prepared.settings.override("modelRoles", {
@@ -1268,6 +1273,7 @@ export async function applyPreparedModelProfileActivation(
 		});
 		overridesChanged = true;
 		if (options.persistDefault) {
+			options.assertCanCommit?.();
 			persistentMutationStarted = true;
 			prepared.settings.set("modelRoles", {});
 			prepared.settings.set("task.agentModelOverrides", {});
@@ -1277,12 +1283,15 @@ export async function applyPreparedModelProfileActivation(
 			prepared.settings.set("modelProfile.default", prepared.profileName);
 			await prepared.settings.flushOrThrow();
 		}
+		options.assertCanCommit?.();
 		prepared.session.setActiveModelProfile?.(prepared.profileName);
 		if (prepared.defaultModel) {
+			options.assertCanCommit?.();
 			prepared.modelRegistry.seedCanonicalVariant?.(prepared.session.sessionId, prepared.defaultModel);
 			resumeDefaultChanged = true;
 			prepared.session.recordResumeDefaultModel?.(`${prepared.defaultModel.provider}/${prepared.defaultModel.id}`);
 		}
+		options.assertCanCommit?.();
 		prepared.session.noteProfileInstalledOverrides?.(
 			Object.keys(prepared.modelRoles),
 			Object.keys(prepared.agentModelOverrides),

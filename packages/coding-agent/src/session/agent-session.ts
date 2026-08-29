@@ -16329,11 +16329,20 @@ export class AgentSession {
 	 * Session-scoped only: does not persist `modelProfile.default`.
 	 */
 	async activateModelProfileForControl(profileName: string): Promise<boolean> {
-		await activateModelProfile({
-			session: this,
-			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
-			profileName,
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
+		await this.#withSessionAdmission("selection", async () => {
+			this.#assertSessionIdentityAdmission(identityAdmission);
+			await activateModelProfile(
+				{
+					session: this,
+					modelRegistry: this.#modelRegistry,
+					settings: this.settings,
+					profileName,
+				},
+				{ assertCanCommit: () => this.#assertSessionIdentityAdmission(identityAdmission) },
+			);
+			this.#assertSessionIdentityAdmission(identityAdmission);
 		});
 		return this.getActiveModelProfile() === profileName;
 	}
@@ -16399,6 +16408,7 @@ export class AgentSession {
 				{
 					persistDefault: options?.persistDefault ?? false,
 					thinkingLevelOverride: options?.thinkingLevelOverride,
+					assertCanCommit: () => this.#assertSessionIdentityAdmission(identityAdmission),
 				},
 			);
 			options?.onAfterActivation?.();
