@@ -12,6 +12,7 @@ import {
 	classifyCgroup,
 	closeExactTmuxOwner,
 	createOwnerIntent,
+	__setIntentEvidenceReadHooksForTests,
 	executeTmuxOwnerIsolationPlanSync,
 	isExactScopedBootstrapSuccessReceipt,
 	isOwnerGenerationBaselineCurrentSync,
@@ -1626,6 +1627,273 @@ describe("tmux owner isolation", () => {
 			).rejects.toThrow("owner_intent_invalid");
 		} finally {
 			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+	describe("owner intent replay after a non-consuming attempt", () => {
+		const intentInput = (expiresAt: string) => ({
+			generation: "generation",
+			session_id: "session",
+			server_key: "socket",
+			expected_terminal: { signal: "SIGTERM" as const, result: "owner_term_then_session_cleanup" as const },
+			dispatch_id: "dispatch",
+			created_at: "2026-01-01T00:00:00.000Z",
+			expires_at: expiresAt,
+		});
+
+		const intentFile = (state: string) => path.join(state, "session", "owner-lifecycle", "intent-generation.json");
+
+		const futureDeadline = () => new Date(Date.now() + 600_000).toISOString();
+
+		async function seedMarker(state: string, suffix: string, expiresAt: string): Promise<string> {
+			const target = `${intentFile(state)}${suffix}`;
+			await fs.mkdir(path.dirname(target), { recursive: true });
+			await fs.writeFile(
+				target,
+				`${JSON.stringify({ schema_version: 1, intent_id: "prior", state: "pending", ...intentInput(expiresAt) })}\n`,
+			);
+			return target;
+		}
+
+		// A `.cancelled` or `.expired` marker records an attempt that never consumed the session.
+		// The intent path is keyed on the owner generation, which does not rotate while the tmux
+		// session lives, so refusing these wedged force-close forever (observed in dogfooding).
+		for (const suffix of [".cancelled", ".expired"]) {
+			it(`allows a fresh intent after a prior ${suffix} attempt and retains the record`, async () => {
+				const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-retry-"));
+				try {
+					const marker = await seedMarker(state, suffix, futureDeadline());
+
+					const intent = await createOwnerIntent(state, intentInput(futureDeadline()));
+
+					expect(intent.state).toBe("pending");
+					expect(intent.intent_id).not.toBe("prior");
+					expect(await Bun.file(intentFile(state)).exists()).toBe(true);
+					// The prior record is superseded, never deleted.
+					expect(await Bun.file(marker).exists()).toBe(false);
+					const retained = (await fs.readdir(path.dirname(marker))).filter(name =>
+						name.includes(`${suffix}.superseded-`),
+					);
+					expect(retained).toHaveLength(1);
+				} finally {
+					await fs.rm(state, { recursive: true, force: true });
+				}
+			});
+		}
+
+		it("does not let a late observer use a retryable marker to publish owner loss", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-stale-observer-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				await seedMarker(state, ".expired", futureDeadline());
+				await expect(
+					observeOwnerTerminal({
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: "session",
+						owner_generation: "generation",
+						state_dir: state,
+						socket_key: "socket",
+						observer: "sidecar",
+						observed_at: new Date().toISOString(),
+						signal: "SIGTERM",
+						exit_code: 0,
+						exit_kind: "exit",
+						reason: "test",
+						operator_dispatch_id: "dispatch",
+					}),
+				).rejects.toThrow("stale_terminal_observation");
+				await expect(fs.access(lifecyclePaths(state, "session", "generation").verdictFile)).rejects.toThrow();
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("rejects a malformed live intent instead of treating it as absent", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-malformed-"));
+			try {
+				const file = intentFile(state);
+				await fs.mkdir(path.dirname(file), { recursive: true });
+				await fs.writeFile(file, "{}\n");
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("treats a dangling blocking-marker symlink as present", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-symlink-"));
+			try {
+				const marker = `${intentFile(state)}.consumed`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				await fs.symlink("missing-intent", marker);
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("rejects a special archived marker before reading it", async () => {
+			if (process.platform === "win32") return;
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-special-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const marker = `${intentFile(state)}.expired`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				const result = Bun.spawnSync(["mkfifo", marker]);
+				if (result.exitCode !== 0) throw new Error("mkfifo unavailable");
+				await expect(
+					observeOwnerTerminal({
+						schema_version: 1,
+						op: "observe_terminal",
+						session_id: "session",
+						owner_generation: "generation",
+						state_dir: state,
+						socket_key: "socket",
+						observer: "sidecar",
+						observed_at: new Date().toISOString(),
+						signal: "SIGTERM",
+						exit_code: 0,
+						exit_kind: "exit",
+						reason: "test",
+						operator_dispatch_id: "dispatch",
+					}),
+				).rejects.toThrow("stale_terminal_evidence_unavailable");
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("fails closed when a marker is replaced between inspection and open", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-race-"));
+			try {
+				const file = intentFile(state);
+				await fs.mkdir(path.dirname(file), { recursive: true });
+				await fs.writeFile(
+					file,
+					`${JSON.stringify({ schema_version: 1, intent_id: "prior", state: "pending", ...intentInput(futureDeadline()) })}\n`,
+				);
+				let replaced = false;
+				__setIntentEvidenceReadHooksForTests({
+					platform: "win32",
+					afterPathStat: async target => {
+						if (replaced || target !== file) return;
+						replaced = true;
+						await fs.rename(file, `${file}.target`);
+						await fs.symlink(`${file}.target`, file);
+					},
+				});
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(replaced).toBe(true);
+			} finally {
+				__setIntentEvidenceReadHooksForTests(null);
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("still refuses replay after the close was consumed", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-consumed-"));
+			try {
+				await seedMarker(state, ".consumed", futureDeadline());
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("still refuses replay after the generation was invalidated", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-invalidated-"));
+			try {
+				await seedMarker(state, ".invalidated", futureDeadline());
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("refuses replay while an unexpired dispatch is still in flight", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-inflight-"));
+			try {
+				await seedMarker(state, "", futureDeadline());
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		// An owner that died between publishing the intent and renaming it leaves a `pending`
+		// record that can never reach a verdict; honoring it forever is the same wedge.
+		it("supersedes an abandoned pending intent whose deadline has elapsed", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-abandoned-"));
+			try {
+				await seedMarker(state, "", new Date(Date.now() - 600_000).toISOString());
+
+				const intent = await createOwnerIntent(state, intentInput(futureDeadline()));
+
+				expect(intent.intent_id).not.toBe("prior");
+				const retained = (await fs.readdir(path.join(state, "session", "owner-lifecycle"))).filter(name =>
+					name.includes(".superseded-"),
+				);
+				expect(retained).toHaveLength(1);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		// The archive rename is best-effort; if it fails and the record is still present, the
+		// guard must refuse rather than publish a second live intent for the same generation.
+		it("fails closed when a superseded record cannot be archived", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-readonly-"));
+			try {
+				await seedMarker(state, "", new Date(Date.now() - 600_000).toISOString());
+				const lifecycleRoot = path.join(state, "session", "owner-lifecycle");
+				await fs.chmod(lifecycleRoot, 0o500);
+				try {
+					await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+						"owner_intent_replay",
+					);
+				} finally {
+					await fs.chmod(lifecycleRoot, 0o700);
+				}
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		// Review finding A4 (@snowykr): a retryable marker whose archive rename fails must not
+		// leave an un-superseded audit record behind while a fresh intent goes live.
+		for (const suffix of [".cancelled", ".expired"]) {
+			it(`fails closed when a ${suffix} record cannot be archived`, async () => {
+				const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-archive-fail-"));
+				try {
+					const marker = await seedMarker(state, suffix, futureDeadline());
+					const lifecycleRoot = path.join(state, "session", "owner-lifecycle");
+					await fs.chmod(lifecycleRoot, 0o500);
+					try {
+						await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+							"owner_intent_replay",
+						);
+						// The original record is intact and no live intent was published.
+						expect(await Bun.file(marker).exists()).toBe(true);
+						expect(await Bun.file(intentFile(state)).exists()).toBe(false);
+					} finally {
+						await fs.chmod(lifecycleRoot, 0o700);
+					}
+				} finally {
+					await fs.rm(state, { recursive: true, force: true });
+				}
+			});
 		}
 	});
 });
