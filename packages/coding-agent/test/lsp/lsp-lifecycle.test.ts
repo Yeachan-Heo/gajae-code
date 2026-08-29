@@ -242,13 +242,11 @@ describe("LSP lifecycle behavior", () => {
 			const uri = `file://${filePath}`;
 			const writes: Array<{ method?: string; params?: unknown }> = [];
 			let releaseRefresh!: () => void;
-			const refreshGate = new Promise<void>(resolve => {
-				releaseRefresh = resolve;
-			});
+			const refreshGate = Promise.withResolvers<void>();
+			releaseRefresh = refreshGate.resolve;
 			let refreshStarted!: () => void;
-			const refreshWriteStarted = new Promise<void>(resolve => {
-				refreshStarted = resolve;
-			});
+			const refreshWriteStarted = Promise.withResolvers<void>();
+			refreshStarted = refreshWriteStarted.resolve;
 			const stdin = {
 				write: async (message: string) => {
 					const parsed = parseWrittenMessage(message);
@@ -330,13 +328,11 @@ describe("LSP lifecycle behavior", () => {
 			await Bun.write(filePath, "export const value = 1;\n");
 			const uri = `file://${filePath}`;
 			let releaseRefresh!: () => void;
-			const refreshGate = new Promise<void>(resolve => {
-				releaseRefresh = resolve;
-			});
+			const refreshGate = Promise.withResolvers<void>();
+			releaseRefresh = refreshGate.resolve;
 			let refreshStarted!: () => void;
-			const refreshWriteStarted = new Promise<void>(resolve => {
-				refreshStarted = resolve;
-			});
+			const refreshWriteStarted = Promise.withResolvers<void>();
+			refreshStarted = refreshWriteStarted.resolve;
 			const stdin = {
 				write: async (message: string) => {
 					if (parseWrittenMessage(message).method === "textDocument/didChange") {

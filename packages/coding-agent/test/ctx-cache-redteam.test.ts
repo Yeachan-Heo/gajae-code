@@ -36,12 +36,12 @@ describe("ctx-cache adversarial hindsight and reminder behavior", () => {
 	test("coalesces an agent_end storm into one active retain and drops an empty full-session delta", async () => {
 		let release!: () => void;
 		let calls = 0;
+		const retainGate = Promise.withResolvers<void>();
 		const client = {
 			retain: async () => {
 				calls++;
-				await new Promise<void>(resolve => {
-					release = resolve;
-				});
+				release = retainGate.resolve;
+				await retainGate.promise;
 			},
 		} as never;
 		const entries = [
@@ -70,11 +70,12 @@ describe("ctx-cache adversarial hindsight and reminder behavior", () => {
 
 	test("ignores a recall completion from the predecessor generation after reset", async () => {
 		let resolveRecall!: (response: unknown) => void;
+		const recallGate = Promise.withResolvers<unknown>();
 		const client = {
-			recall: async () =>
-				new Promise(resolve => {
-					resolveRecall = resolve;
-				}),
+			recall: async () => {
+				resolveRecall = recallGate.resolve;
+				return recallGate.promise;
+			},
 		} as never;
 		const entries = [{ type: "message", message: { role: "user", content: "current user" } }];
 		const state = new HindsightSessionState({
@@ -104,7 +105,9 @@ describe("ctx-cache adversarial hindsight and reminder behavior", () => {
 		const client = {
 			retain: async () => {
 				calls++;
-				await new Promise<void>(resolve => releaseRetains.push(resolve));
+				const retainGate = Promise.withResolvers<void>();
+				releaseRetains.push(retainGate.resolve);
+				await retainGate.promise;
 			},
 		} as never;
 		const entries = [
