@@ -1812,6 +1812,8 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 				const dispatchMatchesCurrent = currentIntent?.dispatch_id === request.operator_dispatch_id;
 				const intentMatchesCurrent =
 					published.intent_id === undefined || currentIntent?.intent_id === published.intent_id;
+				if (currentIntent && published.intent_id !== undefined && currentIntent.intent_id !== published.intent_id)
+					throw new Error("stale_terminal_observation");
 				if (
 					!dispatchMatchesCurrent &&
 					!(await hasArchivedOwnerIntent(paths, request.operator_dispatch_id, published.intent_id))
