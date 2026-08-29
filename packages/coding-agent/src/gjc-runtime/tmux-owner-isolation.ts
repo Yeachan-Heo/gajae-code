@@ -1542,6 +1542,14 @@ export async function createOwnerIntent(
 	for (const suffix of RETRYABLE_INTENT_SUFFIXES) {
 		const marker = `${paths.intentFile}${suffix}`;
 		if (!(await intentMarkerExists(marker))) continue;
+		const prior = await readOwnerIntentStrict(marker);
+		if (
+			!prior ||
+			prior.session_id !== input.session_id ||
+			prior.generation !== input.generation ||
+			prior.server_key !== input.server_key
+		)
+			throw new Error("owner_intent_replay");
 		await archiveSupersededIntent(marker);
 		// Archiving is best-effort. If the record could not be moved, refuse rather than publish
 		// a fresh intent alongside an un-superseded audit record; `pendingIntentBlocksRetry`

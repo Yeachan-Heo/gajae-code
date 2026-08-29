@@ -1722,6 +1722,41 @@ describe("tmux owner isolation", () => {
 			}
 		});
 
+		it("refuses to archive a malformed retry marker", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-malformed-retry-"));
+			try {
+				const marker = `${intentFile(state)}.expired`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				await fs.writeFile(marker, "{}\n");
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(await Bun.file(marker).exists()).toBe(true);
+				expect(await Bun.file(intentFile(state)).exists()).toBe(false);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("refuses to archive a retry marker from another server", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-cross-server-"));
+			try {
+				const marker = `${intentFile(state)}.expired`;
+				await fs.mkdir(path.dirname(marker), { recursive: true });
+				await fs.writeFile(
+					marker,
+					`${JSON.stringify({ schema_version: 1, intent_id: "prior", state: "pending", ...intentInput(futureDeadline()), server_key: "other" })}\n`,
+				);
+				await expect(createOwnerIntent(state, intentInput(futureDeadline()))).rejects.toThrow(
+					"owner_intent_replay",
+				);
+				expect(await Bun.file(marker).exists()).toBe(true);
+				expect(await Bun.file(intentFile(state)).exists()).toBe(false);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
 		it("treats a dangling blocking-marker symlink as present", async () => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-symlink-"));
 			try {
