@@ -15197,15 +15197,10 @@ export class SessionManager {
 					prepareEntryForPersistence(entry, this.#blobStore),
 				),
 			);
-			if (
-				!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))
-			)
-				continue;
+			if (!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))) continue;
 			await this.#writeEntriesAtomically(entries);
 			written = true;
-			if (
-				!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))
-			)
+			if (!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token)))
 				followUpRewrite = true;
 		}
 		if (!written) throw new Error("session_persistence_input_stale");
@@ -16704,36 +16699,6 @@ export class SessionManager {
 		});
 	}
 
-	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
-		if (!this.#sessionFile) throw new Error("Managed transcript path is unavailable");
-		this.#withSessionPersistenceFenceSync(() => {
-			const sessionFile = this.#sessionFile!;
-			const store = this.#managedTranscriptStore(sessionFile);
-			const relativePath = path.basename(sessionFile);
-			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
-			let receipt: ManagedAppendReceipt;
-			if (this.#managedPersistExpectedIdentity) {
-				try {
-					receipt = store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
-				} catch (err) {
-					const predecessorMissing = store.descriptorExpected(relativePath) === null;
-					if (
-						!isEnoent(err) &&
-						(!(err instanceof Error) || err.message !== "managed_append_identity_mismatch" || !predecessorMissing)
-					)
-						throw err;
-					// Appending only the new records would create a truncated transcript.
-					// Recreate the missing file from the complete resident entry set instead.
-					this.#managedPersistExpectedIdentity = undefined;
-					this.#rewriteFileSync();
-					return;
-				}
-			} else receipt = store.appendSync(relativePath, bytes);
-			this.#managedPersistExpectedIdentity = receipt.identity;
-			this.#publishSessionCommitMarkerSync(receipt.descriptor);
-		});
-	}
-
 	async #persistPatch(record: SessionPatchRecord): Promise<void> {
 		await this.#persistPatches([record]);
 	}
@@ -16772,8 +16737,7 @@ export class SessionManager {
 				);
 				SessionManagerTestHooks.beforePersistPatchFence?.(attempt);
 				if (this.destination.kind === "managed") {
-					if (!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token)))
-						continue;
+					if (!this.#withSessionPersistenceFenceSync(() => this.#persistenceInputTokenMatches(token))) continue;
 					await this.#appendManagedRecords(persistedRecords);
 					if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, sessionFile);
 					this.#readOnlyResume = false;
@@ -16828,7 +16792,7 @@ export class SessionManager {
 				}
 				throw err instanceof SessionAppendPersistenceError
 					? err
-					: new SessionAppendPersistenceError("current_append", this.#leafId, toError(err));
+					: new SessionAppendPersistenceError("current_append", entry.id, toError(err));
 			}
 		});
 	}
@@ -16837,11 +16801,7 @@ export class SessionManager {
 		const publishResumeBreadcrumb = this.#managedPublishResumeBreadcrumb;
 		this.#managedPublishResumeBreadcrumb = false;
 		const sessionFile = this.#sessionFile;
-		if (
-			this.#managedNeedsFullRewrite ||
-			!this.#flushed ||
-			this.#needsFullRewriteOnNextPersist
-		) {
+		if (this.#managedNeedsFullRewrite || !this.#flushed || this.#needsFullRewriteOnNextPersist) {
 			this.#managedNeedsFullRewrite = false;
 			this.#queuedManagedHotRecords.length = 0;
 			await this.#rewriteFileContents();

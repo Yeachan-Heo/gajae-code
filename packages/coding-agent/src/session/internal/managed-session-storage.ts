@@ -1613,7 +1613,11 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 	}
 
-	async replaceExpectedIdentity(relativePath: string, bytes: Uint8Array, expected: ManagedFileIdentity): Promise<void> {
+	async replaceExpectedIdentity(
+		relativePath: string,
+		bytes: Uint8Array,
+		expected: ManagedFileIdentity,
+	): Promise<void> {
 		this.#beforeMutation();
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
@@ -3758,10 +3762,7 @@ async function appendManagedFileStreaming(
 					throw new Error("content_too_large");
 				let appended = 0;
 				while (appended < appendedBytes.byteLength) {
-					const amount = Math.min(
-						MANAGED_HASH_YIELD_BYTES,
-						appendedBytes.byteLength - appended,
-					);
+					const amount = Math.min(MANAGED_HASH_YIELD_BYTES, appendedBytes.byteLength - appended);
 					const written = fs.writeSync(stagingFd, appendedBytes, appended, amount);
 					if (written === 0) throw new Error("managed_replace_short_write");
 					appended += written;

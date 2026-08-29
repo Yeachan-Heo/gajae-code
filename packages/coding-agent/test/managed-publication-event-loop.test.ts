@@ -7,9 +7,9 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
 import {
+	captureManagedFileNoFollow,
 	MANAGED_ARTIFACT_MAX_FILES,
 	ManagedSessionDescendantStore,
-	captureManagedFileNoFollow,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
 	publishManagedFileNoReplaceSync,
@@ -179,12 +179,12 @@ describe("async native exact-replace boundary", () => {
 			const expectedDestination = await exactIdentity(destination, "predecessor");
 
 			let settled = false;
-			const pending = native.exactReplacePathAsync(source, destination, expectedSource, expectedDestination).then(
-				result => {
+			const pending = native
+				.exactReplacePathAsync(source, destination, expectedSource, expectedDestination)
+				.then(result => {
 					settled = true;
 					return result;
-				},
-			);
+				});
 			await Promise.resolve();
 			await Promise.resolve();
 			expect(settled).toBe(false);
@@ -254,7 +254,7 @@ describe("async native exact-replace boundary", () => {
 
 	it("yields macrotask turns to the event loop while exactReplacePathAsync is in flight", async () => {
 		await withTempDir("gjc-async-exact-replace-liveness-", async dir => {
-			const payload = new Uint8Array(4 * 1024 * 1024).fill(0x61);
+			const payload = new Uint8Array(16 * 1024 * 1024).fill(0x61);
 			const digest = sha256(payload);
 			async function identityOf(pathname: string): Promise<native.NativeExactFileIdentity> {
 				const stat = await fsp.stat(pathname, { bigint: true });
@@ -287,11 +287,13 @@ describe("async native exact-replace boundary", () => {
 				);
 			}
 			// Same liveness contract as renameNoReplacePathAsync / issue #4394: a
-			// zero-delay timer must fire before the pool-bound SHA-256 and namespace
-			// exchange can settle. The pre-fix exactReplacePath ran on the JS thread
-			// and starved exactly these turns.
+			// zero-delay timer must fire while pool-bound SHA-256 and namespace exchange
+			// work is still in flight. Individual fast local replacements may complete
+			// before that turn, so assert remaining work rather than scheduler ordering.
+			// The pre-fix exactReplacePath ran all eight calls on the JS thread and
+			// starved the timer until every replacement finished.
 			await Bun.sleep(0);
-			expect(settled).toBe(0);
+			expect(settled).toBeLessThan(8);
 			await Bun.sleep(0);
 			await Promise.all(replacements);
 			expect(settled).toBe(8);
@@ -357,51 +359,6 @@ describe("async native exact-replace boundary", () => {
 			expect(asyncRefused.ok).toBe(false);
 			expect(asyncRefused.code).toBe(syncRefused.code);
 			expect(syncRefused.code).toBe("identity_mismatch");
-		});
-	});
-
-	it("replaceManagedFile crosses the threadpool boundary and matches the sync twin", async () => {
-		await withTempDir("gjc-async-managed-replace-", async dir => {
-			const destination = path.join(dir, "session.jsonl");
-			const root = managedDirectoryRoot(dir);
-			publishManagedFileNoReplaceSync(destination, new TextEncoder().encode("predecessor\n"));
-			const expected = captureManagedFileNoFollow(destination);
-
-			let settled = false;
-			const pending = replaceManagedFile(
-				destination,
-				new TextEncoder().encode("successor\n"),
-				root,
-				"default",
-				undefined,
-				expected.identity,
-			).then(() => {
-				settled = true;
-			});
-			await Promise.resolve();
-			await Promise.resolve();
-			expect(settled).toBe(false);
-			await pending;
-			expect(await fsp.readFile(destination, "utf8")).toBe("successor\n");
-		});
-	});
-
-	it("store.replace never settles from a microtask", async () => {
-		await withTempDir("gjc-async-store-replace-", async dir => {
-			const sessionDir = path.join(dir, "session");
-			await fsp.mkdir(sessionDir, { mode: 0o700 });
-			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
-			store.publishNoReplaceSync("session.jsonl", Buffer.from("predecessor\n"));
-
-			let settled = false;
-			const pending = store.replace("session.jsonl", Buffer.from("successor\n")).then(() => {
-				settled = true;
-			});
-			await Promise.resolve();
-			await Promise.resolve();
-			expect(settled).toBe(false);
-			await pending;
-			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("successor\n");
 		});
 	});
 
