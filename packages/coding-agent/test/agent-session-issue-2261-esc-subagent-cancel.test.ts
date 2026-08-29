@@ -621,6 +621,45 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		}
 	});
 
+	it("removes borrowed-manager successor aliases after a child session commits", async () => {
+		const ownerManager = installOwnerManager();
+		const parentEndpoint = sessionManager.getSessionId();
+		expect(AsyncJobManager.registerForEndpoint(parentEndpoint, ownerManager)).toBe(true);
+		const childManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const child = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: session.model,
+					systemPrompt: ["Child test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: childManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "child",
+			ownedAsyncJobManager: ownerManager,
+			disposeAsyncJobManager: false,
+		});
+		const predecessorEndpoint = child.sessionManager.getSessionId();
+		expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
+
+		try {
+			await expect(child.newSession()).resolves.toBe(true);
+			const successorEndpoint = child.sessionManager.getSessionId();
+			expect(successorEndpoint).not.toBe(predecessorEndpoint);
+			expect(AsyncJobManager.forEndpoint(parentEndpoint)).toBe(ownerManager);
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBeUndefined();
+			expect(AsyncJobManager.forEndpoint(successorEndpoint)).toBeUndefined();
+		} finally {
+			// Avoid inherited-manager disposal code treating the parent's endpoint as
+			// the child's own registration boundary during test teardown.
+			AsyncJobManager.unregisterForEndpoint(parentEndpoint);
+			await child.dispose();
+		}
+	});
+
 	it("keeps predecessor endpoint identity when switch fails after successor load", async () => {
 		const ownerManager = installOwnerManager();
 		const predecessorEndpoint = sessionManager.getSessionId();
