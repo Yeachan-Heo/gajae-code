@@ -27,6 +27,7 @@ const RETAIN_FLUSH_INTERVAL_MS = 5_000;
 interface PendingRetainItem {
 	content: string;
 	context?: string;
+	sessionId: string;
 }
 
 interface RecallOutcome {
@@ -85,7 +86,7 @@ export class HindsightRetainQueue {
 		if (this.#closed) {
 			throw new Error("Hindsight retain queue is closed.");
 		}
-		this.#items.push({ content, context });
+		this.#items.push({ content, context, sessionId: this.#state.sessionId });
 
 		if (this.#items.length >= RETAIN_FLUSH_BATCH_SIZE) {
 			void this.flush();
@@ -135,12 +136,11 @@ export class HindsightRetainQueue {
 
 	async #doFlush(items: PendingRetainItem[]): Promise<void> {
 		const state = this.#state;
-		const sessionId = state.sessionId;
 		if (state.session.getHindsightSessionState() !== state) {
 			// Session went away before we could flush. We can't notify anyone, so
 			// log and drop — these are best-effort facts, not transactional writes.
 			logger.warn("Hindsight retain queue: session vanished, dropping batch", {
-				sessionId,
+				sessionId: items[0]?.sessionId ?? state.sessionId,
 				items: items.length,
 			});
 			return;
@@ -151,13 +151,13 @@ export class HindsightRetainQueue {
 			const batch: MemoryItemInput[] = items.map(item => ({
 				content: item.content,
 				context: item.context ?? state.config.retainContext,
-				metadata: { session_id: sessionId },
+				metadata: { session_id: item.sessionId },
 				tags: state.retainTags,
 			}));
 			await state.client.retainBatch(state.bankId, batch, { async: true });
 			if (state.config.debug) {
 				logger.debug("Hindsight retain queue: batch flushed", {
-					sessionId,
+					sessionId: items[0]?.sessionId ?? state.sessionId,
 					bankId: state.bankId,
 					items: items.length,
 				});
@@ -165,7 +165,7 @@ export class HindsightRetainQueue {
 		} catch (err) {
 			const errorText = err instanceof Error ? err.message : String(err);
 			logger.warn("Hindsight retain queue: batch flush failed", {
-				sessionId,
+				sessionId: items[0]?.sessionId ?? state.sessionId,
 				bankId: state.bankId,
 				items: items.length,
 				error: errorText,
