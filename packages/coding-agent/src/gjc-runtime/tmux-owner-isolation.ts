@@ -1803,8 +1803,25 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			published.generation === request.owner_generation &&
 			published.session_id === request.session_id &&
 			published.server_key === request.socket_key
-		)
+		) {
+			if (request.operator_intent_id !== undefined && published.intent_id !== request.operator_intent_id)
+				throw new Error("stale_terminal_observation");
+
+			if (request.operator_dispatch_id !== undefined) {
+				const currentIntent = await readOwnerIntentStrict(paths.intentFile);
+				const dispatchMatchesCurrent = currentIntent?.dispatch_id === request.operator_dispatch_id;
+				const intentMatchesCurrent =
+					published.intent_id === undefined || currentIntent?.intent_id === published.intent_id;
+				if (
+					!dispatchMatchesCurrent &&
+					!(await hasArchivedOwnerIntent(paths, request.operator_dispatch_id, published.intent_id))
+				)
+					throw new Error("stale_terminal_observation");
+				if (!intentMatchesCurrent && published.intent_id === undefined)
+					throw new Error("stale_terminal_observation");
+			}
 			return reconcileTerminalArtifacts(paths, published);
+		}
 		const intent = await readOwnerIntentStrict(paths.intentFile);
 		const recoveredJournal = await readJson<{
 			schema_version?: number;
