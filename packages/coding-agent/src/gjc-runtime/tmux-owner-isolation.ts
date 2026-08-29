@@ -986,6 +986,7 @@ export interface LifecyclePaths {
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
 	try {
+		if (!path.isAbsolute(stateDir) || /[\u0000-\u001F\u007F]/u.test(stateDir)) throw new Error("unsafe state root");
 		assertSafePathComponent(sessionId, "owner session id");
 		assertSafePathComponent(generation, "owner generation");
 	} catch {
