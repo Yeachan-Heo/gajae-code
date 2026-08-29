@@ -802,7 +802,7 @@ describe("GJC tmux session management", () => {
 				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
 			},
 		});
-		const stateFile = "C:\\Users\\O'Brien\\runtime-state.json";
+		const stateFile = "/tmp/O'Brien/runtime-state.json";
 		expect(() =>
 			createGjcTmuxSession(
 				{
@@ -831,7 +831,7 @@ describe("GJC tmux session management", () => {
 				environment: {
 					GJC_TMUX_LAUNCHED: "1",
 					GJC_TMUX_OWNER_GENERATION: generation,
-					GJC_TMUX_OWNER_STATE_DIR: "C:\\Users\\O'Brien",
+					GJC_TMUX_OWNER_STATE_DIR: "/tmp/O'Brien",
 					GJC_TMUX_OWNER_SERVER_KEY: "tmux",
 					GJC_COORDINATOR_SESSION_ID: "operators-session",
 					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,

@@ -1636,7 +1636,7 @@ async function resolveExactOwner(
 	const ownerServerKey = readExactOptionForGc(session.name, GJC_TMUX_OWNER_SERVER_KEY_OPTION, env);
 
 	if (!sessionId || !stateFile) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
-	if ((!path.isAbsolute(stateFile) && !path.win32.isAbsolute(stateFile)) || /[\u0000-\u001F\u007F]/u.test(stateFile))
+	if (!path.isAbsolute(stateFile) || /[\u0000-\u001F\u007F]/u.test(stateFile))
 		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	const stateDir = path.dirname(stateFile);
 	if (!ownerGeneration) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
