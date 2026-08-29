@@ -1453,7 +1453,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const requestedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentId =
 		options.agentId === undefined && options.parentTaskPrefix === undefined
-			? agentRegistry.allocateId(requestedAgentId)
+			? agentRegistry.reserveId(requestedAgentId)
 			: requestedAgentId;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? (isCanonicalSubSession ? "sub" : "main");
 	const resolvedAgentRosterLabel = resolveAgentRosterLabel(
@@ -2279,6 +2279,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 		const rebindCwdCapturingAuthority = async (to: string): Promise<void> => {
 			if (!session) return;
+			if (options.modelRegistry !== undefined) {
+				throw new Error(
+					"Cannot rescope a session with caller-owned model registry; recreate the session at the target cwd.",
+				);
+			}
 			const generation = ++replacementMcpGeneration;
 			const prepared = preparedRescopeSettings?.cwd === to ? preparedRescopeSettings.settings : undefined;
 			preparedRescopeSettings = undefined;
@@ -5202,6 +5207,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			} else {
 				if (hasRegistered && registeredAgentRef) {
 					agentRegistry.unregisterIfMatch(resolvedAgentId, registeredAgentRef);
+				}
+				if (!hasRegistered && options.agentId === undefined && options.parentTaskPrefix === undefined) {
+					agentRegistry.releaseReservation(resolvedAgentId);
 				}
 				// Admission happens before session construction. Any later startup
 				// failure must remove THIS manager's endpoint mapping and restore

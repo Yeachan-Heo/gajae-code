@@ -60,17 +60,29 @@ export class AgentRegistry {
 	}
 
 	readonly #refs = new Map<string, AgentRef>();
+	readonly #reservations = new Set<string>();
 	readonly #listeners = new Set<RegistryListener>();
 
 	allocateId(preferred: string): string {
-		if (!this.#refs.has(preferred)) return preferred;
+		if (!this.#refs.has(preferred) && !this.#reservations.has(preferred)) return preferred;
 		for (let suffix = 2; ; suffix++) {
 			const candidate = `${preferred}-${suffix}`;
-			if (!this.#refs.has(candidate)) return candidate;
+			if (!this.#refs.has(candidate) && !this.#reservations.has(candidate)) return candidate;
 		}
 	}
 
+	reserveId(preferred: string): string {
+		const id = this.allocateId(preferred);
+		this.#reservations.add(id);
+		return id;
+	}
+
+	releaseReservation(id: string): void {
+		this.#reservations.delete(id);
+	}
+
 	register(input: RegisterInput): AgentRef {
+		this.#reservations.delete(input.id);
 		const now = Date.now();
 		const ref: AgentRef = {
 			id: input.id,

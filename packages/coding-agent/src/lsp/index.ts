@@ -868,6 +868,13 @@ function getOrCreateWritethroughBatch(
 	return batch;
 }
 
+function discardWritethroughBatch(state: LspWritethroughBatchState): void {
+	const key = getWritethroughBatchKey(state.id, state.cwd, state.agentDir);
+	if (writethroughBatches.get(key) !== state) return;
+	writethroughBatches.delete(key);
+	state.entries.clear();
+}
+
 export async function flushLspWritethroughBatch(
 	id: string,
 	cwd: string,
@@ -1265,6 +1272,7 @@ export function createLspWritethrough(
 		state.entries.set(dst, { dst, content, file });
 
 		if (!batch.flush) {
+			signal?.addEventListener("abort", () => discardWritethroughBatch(state), { once: true });
 			await writethroughNoop(dst, content, signal, file);
 			return undefined;
 		}

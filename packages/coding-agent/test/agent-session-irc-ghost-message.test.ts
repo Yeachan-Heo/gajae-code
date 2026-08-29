@@ -55,6 +55,7 @@ function createHarness(
 		modelRegistry: {
 			getApiKey: options.getApiKey ?? (async () => "test-key"),
 			getAvailable: () => [model],
+			getAuthStorageOwner: () => ({}),
 		} as never,
 		agentId: options.agentId ?? "1-Worker",
 		agentRegistry: registry,

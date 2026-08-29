@@ -740,10 +740,11 @@ export async function ensureFileOpen(client: LspClient, filePath: string, signal
 	}
 
 	// Check if another operation is already opening this file
-	const existingLock = fileOperationLocks.get(lockKey);
-	if (existingLock) {
+	while (true) {
+		const existingLock = fileOperationLocks.get(lockKey);
+		if (!existingLock) break;
 		await untilAborted(signal, () => existingLock);
-		return;
+		if (client.openFiles.has(uri)) return;
 	}
 
 	// Lock and open file

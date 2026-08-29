@@ -9947,7 +9947,7 @@ mod platform {
 		} else {
 			Err(SkillPublicationError::Published {
 				code:            "identity_mismatch",
-				target_verified: same,
+				target_verified: validated,
 			})
 		}
 	}
