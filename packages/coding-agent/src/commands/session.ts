@@ -16,12 +16,21 @@ function writeText(lines: string[]): void {
 	process.stdout.write(`${lines.join("\n")}\n`);
 }
 
+/**
+ * Emits the machine-readable failure body and marks the process failed.
+ *
+ * The JSON surface is what scripted callers consume, so a refusal that only appears in the
+ * body — `gjc_tmux_fallback_authority_unconfirmed`, `gjc_tmux_session_not_found`, … — while the
+ * process still exits 0 reports success to every caller that checks the exit status. The human
+ * surface already exits non-zero by rethrowing; both surfaces now agree.
+ */
 function writeJsonFailure(error: unknown): void {
 	const message = error instanceof Error ? error.message : String(error);
 	const [reason = "session_error"] = message.split(":");
 	const hintIndex = message.indexOf(" — ");
 	const detail = hintIndex >= 0 ? message.slice(hintIndex + " — ".length).trim() : "";
 	writeJson(detail ? { ok: false, reason, detail } : { ok: false, reason });
+	process.exitCode = 1;
 }
 
 interface SessionJsonDto {
