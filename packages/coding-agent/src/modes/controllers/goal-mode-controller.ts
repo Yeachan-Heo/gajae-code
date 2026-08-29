@@ -16,7 +16,7 @@ import type { ModeGate } from "./mode-gate";
 
 type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop";
 
-type GoalAsyncMutationKind = "pause" | "drop" | "replace";
+type GoalAsyncMutationKind = "start" | "pause" | "drop" | "replace";
 
 type GoalAsyncMutationFence = {
 	kind: GoalAsyncMutationKind;
@@ -409,8 +409,18 @@ export class GoalModeController {
 					return this.ctx.showWarning("Resume the current goal first, or drop it before setting a new objective.");
 				return await this.#openMenu("paused");
 			}
+			const objectiveAdmission: GoalAsyncMutationFence = {
+				kind: "start",
+				lifecycleGeneration: this.#lifecycleGeneration,
+				continuationGeneration: this.#continuationGeneration,
+				identity: this.#captureSessionIdentity(),
+			};
 			const objective = subRest || (await this.ctx.showHookEditor("Goal objective", { promptStyle: true }))?.trim();
-			if (objective) await this.#startFromObjective(objective);
+			if (objective) {
+				if (!this.#isGoalAsyncMutationFenceCurrent(objectiveAdmission))
+					throw new Error("Goal mode entry was superseded by a session transition.");
+				await this.#startFromObjective(objective);
+			}
 		} catch (error) {
 			this.ctx.showError(error instanceof Error ? error.message : String(error));
 		}
@@ -667,20 +677,22 @@ export class GoalModeController {
 	async #set(rest: string): Promise<void> {
 		if (!this.#enabled && this.#getPausedState())
 			return this.ctx.showWarning("Resume the current goal first, or drop it before setting a new objective.");
-		const replaceAdmission: GoalAsyncMutationFence | undefined = this.#enabled
-			? {
-					kind: "replace",
-					lifecycleGeneration: this.#lifecycleGeneration,
-					continuationGeneration: this.#continuationGeneration,
-					identity: this.#captureSessionIdentity(),
-				}
-			: undefined;
+		const objectiveAdmission: GoalAsyncMutationFence = {
+			kind: this.#enabled ? "replace" : "start",
+			lifecycleGeneration: this.#lifecycleGeneration,
+			continuationGeneration: this.#continuationGeneration,
+			identity: this.#captureSessionIdentity(),
+		};
 		const objective = rest.trim() || (await this.ctx.showHookEditor("Goal objective", { promptStyle: true }))?.trim();
 		if (!objective) return;
 		if (this.#enabled) {
-			if (replaceAdmission && !this.#isGoalAsyncMutationFenceCurrent(replaceAdmission))
+			if (!this.#isGoalAsyncMutationFenceCurrent(objectiveAdmission))
 				throw new Error("Goal replace was superseded by a session transition.");
 			await this.#replaceFromObjective(objective);
-		} else await this.#startFromObjective(objective);
+		} else {
+			if (!this.#isGoalAsyncMutationFenceCurrent(objectiveAdmission))
+				throw new Error("Goal mode entry was superseded by a session transition.");
+			await this.#startFromObjective(objective);
+		}
 	}
 }

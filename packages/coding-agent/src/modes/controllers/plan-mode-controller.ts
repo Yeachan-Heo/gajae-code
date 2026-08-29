@@ -581,7 +581,8 @@ export class PlanModeController {
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
 		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
-		if (options.compactBeforeExecute) this.ctx.session.markPlanCompactAbortPending();
+		const compactAbortMarkerOwner = options.compactBeforeExecute ? this.#captureLifecycle() : undefined;
+		if (compactAbortMarkerOwner) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
 		try {
@@ -616,7 +617,8 @@ export class PlanModeController {
 				}
 			}
 		} finally {
-			this.ctx.session.clearPlanCompactAbortPending();
+			if (compactAbortMarkerOwner && this.#isLifecycleCurrent(compactAbortMarkerOwner))
+				this.ctx.session.clearPlanCompactAbortPending();
 		}
 		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		if (previousTools.length) {

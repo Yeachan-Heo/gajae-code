@@ -1786,12 +1786,16 @@ export class SelectorController {
 	}
 
 	async #deleteCustomModelPreset(profileName: string, modelSelector: ModelSelectorComponent): Promise<void> {
+		const identityAdmission = this.#captureModelIdentity();
+		this.#assertModelIdentity(identityAdmission);
 		const profile = this.ctx.session.modelRegistry.getModelProfile(profileName);
 		const profileLabel = profile ? formatModelProfileDisplayLabel(profile) : profileName;
+		this.#assertModelIdentity(identityAdmission);
 		const confirmed = await this.ctx.showHookConfirm(
 			`Delete custom model preset: ${profileLabel}`,
 			"This removes the preset entry after preserving current role model settings when this preset is active/default.",
 		);
+		this.#assertModelIdentity(identityAdmission);
 		if (!confirmed) {
 			this.ctx.showStatus("Preset delete cancelled.");
 			this.ctx.ui.requestRender();
@@ -1811,53 +1815,73 @@ export class SelectorController {
 			});
 			modelSelector.refreshPresetProfiles(refreshedProfileName);
 		};
+		this.#assertModelIdentity(identityAdmission);
 		try {
-			if (activeProfile === profileName || defaultProfile === profileName) {
-				snapshot = await materializeModelProfileForDeletion({
-					session: this.ctx.session,
-					modelRegistry: this.ctx.session.modelRegistry,
-					settings: this.ctx.settings,
-					profileName,
-				});
-			}
-			deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
-			await this.ctx.session.modelRegistry.refresh("offline");
-			await this.ctx.notifyConfigChanged?.();
-			refreshSelectorState();
-			this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
-			this.ctx.ui.requestRender();
-		} catch (err) {
-			let presetRestoreError: unknown;
-			if (deletedProfile) {
+			await this.#withModelControlMutation(async () => {
+				this.#assertModelIdentity(identityAdmission);
 				try {
-					await this.ctx.session.modelRegistry.saveCustomModelProfile(profileName, deletedProfile);
+					if (activeProfile === profileName || defaultProfile === profileName) {
+						this.#assertModelIdentity(identityAdmission);
+						snapshot = await materializeModelProfileForDeletion({
+							session: this.ctx.session,
+							modelRegistry: this.ctx.session.modelRegistry,
+							settings: this.ctx.settings,
+							profileName,
+						});
+						this.#assertModelIdentity(identityAdmission);
+					}
+					this.#assertModelIdentity(identityAdmission);
+					deletedProfile = await this.ctx.session.modelRegistry.deleteCustomModelProfile(profileName);
+					this.#assertModelIdentity(identityAdmission);
 					await this.ctx.session.modelRegistry.refresh("offline");
-				} catch (restoreErr) {
-					presetRestoreError = restoreErr;
+					this.#assertModelIdentity(identityAdmission);
+					await this.ctx.notifyConfigChanged?.();
+					this.#assertModelIdentity(identityAdmission);
+					refreshSelectorState();
+					this.ctx.showStatus(`Custom model preset deleted: ${profileLabel}`);
+					this.ctx.ui.requestRender();
+				} catch (err) {
+					let presetRestoreError: unknown;
+					if (deletedProfile) {
+						try {
+							this.#assertModelIdentity(identityAdmission);
+							await this.ctx.session.modelRegistry.saveCustomModelProfile(profileName, deletedProfile);
+							this.#assertModelIdentity(identityAdmission);
+							await this.ctx.session.modelRegistry.refresh("offline");
+							this.#assertModelIdentity(identityAdmission);
+						} catch (restoreErr) {
+							presetRestoreError = restoreErr;
+						}
+					}
+					if (snapshot) {
+						try {
+							this.#assertModelIdentity(identityAdmission);
+							await restoreMaterializedModelProfileForDeletion({
+								settings: this.ctx.settings,
+								session: this.ctx.session,
+								snapshot,
+							});
+							this.#assertModelIdentity(identityAdmission);
+						} catch (restoreErr) {
+							refreshSelectorState(deletedProfile ? profileName : undefined);
+							this.ctx.showError(
+								`Preset delete failed and settings rollback failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`,
+							);
+							return;
+						}
+					}
+					if (deletedProfile) refreshSelectorState(profileName);
+					if (presetRestoreError) {
+						this.ctx.showError(
+							`Preset delete failed and preset restore failed: ${presetRestoreError instanceof Error ? presetRestoreError.message : String(presetRestoreError)}`,
+						);
+						return;
+					}
+					this.ctx.showError(`Preset delete failed: ${err instanceof Error ? err.message : String(err)}`);
 				}
-			}
-			if (snapshot) {
-				try {
-					await restoreMaterializedModelProfileForDeletion({
-						settings: this.ctx.settings,
-						session: this.ctx.session,
-						snapshot,
-					});
-				} catch (restoreErr) {
-					refreshSelectorState(deletedProfile ? profileName : undefined);
-					this.ctx.showError(
-						`Preset delete failed and settings rollback failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`,
-					);
-					return;
-				}
-			}
-			if (deletedProfile) refreshSelectorState(profileName);
-			if (presetRestoreError) {
-				this.ctx.showError(
-					`Preset delete failed and preset restore failed: ${presetRestoreError instanceof Error ? presetRestoreError.message : String(presetRestoreError)}`,
-				);
-				return;
-			}
+			});
+			this.#assertModelIdentity(identityAdmission);
+		} catch (err) {
 			this.ctx.showError(`Preset delete failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}

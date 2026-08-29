@@ -26,6 +26,8 @@ interface SetModelCapableSession {
 	credentialSessionId?: string;
 	modelRegistry: { getApiKey(model: Model, sessionId?: string): Promise<string | undefined> };
 	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
+	/** Serialize the complete extension model mutation with session controls. */
+	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
 	/** Capture the session identity before an asynchronous extension mutation. */
 	captureSessionIdentityForMode?(): unknown;
 	/** Reject materialization when the extension mutation crossed a session transition. */
@@ -59,23 +61,26 @@ export async function runExtensionSetModel(session: SetModelCapableSession, mode
 			throw new Error("Session changed while selecting model");
 		}
 	};
-	assertCurrentIdentity();
-	const key = await session.modelRegistry.getApiKey(model, session.credentialSessionId);
-	assertCurrentIdentity();
-	if (!key) return false;
-	await session.setModel(model, "default", { cause: "user-selection" });
-	// setModel performs its own admission checks, but an extension adapter may
-	// implement only the structural contract above. Revalidate before the
-	// synchronous profile materialization so a transition cannot leak the
-	// predecessor's effective assignment into its successor.
-	assertCurrentIdentity();
-	// A durable profile is replaced by materializing its effective assignments
-	// (otherwise a restart reapplies modelProfile.default and restores the
-	// profile the caller just replaced); a session-only marker is dropped
-	// together with its runtime role overrides.
-	if (!session.materializeActiveDefaultModelProfileAssignment?.(model)) {
-		if (session.clearSessionOnlyModelProfileState) session.clearSessionOnlyModelProfileState();
-		else session.setActiveModelProfile?.(undefined);
-	}
-	return true;
+	const runMutation = async (): Promise<boolean> => {
+		assertCurrentIdentity();
+		const key = await session.modelRegistry.getApiKey(model, session.credentialSessionId);
+		assertCurrentIdentity();
+		if (!key) return false;
+		await session.setModel(model, "default", { cause: "user-selection" });
+		// setModel performs its own admission checks, but an extension adapter may
+		// implement only the structural contract above. Revalidate before the
+		// synchronous profile materialization so a transition cannot leak the
+		// predecessor's effective assignment into its successor.
+		assertCurrentIdentity();
+		// A durable profile is replaced by materializing its effective assignments
+		// (otherwise a restart reapplies modelProfile.default and restores the
+		// profile the caller just replaced); a session-only marker is dropped
+		// together with its runtime role overrides.
+		if (!session.materializeActiveDefaultModelProfileAssignment?.(model)) {
+			if (session.clearSessionOnlyModelProfileState) session.clearSessionOnlyModelProfileState();
+			else session.setActiveModelProfile?.(undefined);
+		}
+		return true;
+	};
+	return session.withSdkControlMutation ? session.withSdkControlMutation(runMutation) : runMutation();
 }

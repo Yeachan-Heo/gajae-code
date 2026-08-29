@@ -10373,6 +10373,11 @@ export class AgentSession {
 					if (!permissionIntent) {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
+					// Permission responses may outlive a session/context transition. Admit
+					// the request before entering the provider, then fence every response
+					// side effect and execution against that same identity.
+					const identityAdmission = this.#captureSessionIdentityAdmission();
+					this.#assertSessionIdentityAdmission(identityAdmission);
 					const isShellExecutionTool = isShellExecutionPermissionTool(target.name);
 					const isExecutionTool = isExecutionPermissionTool(target.name);
 					const command =
@@ -10396,6 +10401,7 @@ export class AgentSession {
 					// Short-circuit on persisted decisions.
 					const persisted = this.#acpPermissionDecisions.get(permissionIntent.cacheKey);
 					if (persisted === "allow_always") {
+						this.#assertSessionIdentityAdmission(identityAdmission);
 						return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 					}
 					if (persisted === "reject_always") {
@@ -10445,6 +10451,7 @@ export class AgentSession {
 					if (!selectedOption) {
 						throw new ToolError(`Tool permission response used unknown option ID: ${outcome.optionId}`);
 					}
+					this.#assertSessionIdentityAdmission(identityAdmission);
 					if (selectedOption.kind === "allow_always") {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "allow_always");
 					} else if (selectedOption.kind === "reject_always") {
@@ -10453,6 +10460,7 @@ export class AgentSession {
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
 						throw new ToolError(`Tool call rejected by user (${target.name})`);
 					}
+					this.#assertSessionIdentityAdmission(identityAdmission);
 					return await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
 				};
 			},
@@ -10744,6 +10752,7 @@ export class AgentSession {
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
 		if (!this.#rebuildSystemPrompt) return;
+		const identityAdmission = this.#captureSessionIdentityAdmission();
 		const activeToolNames = this.getActiveToolNames();
 		const generation = this.#reserveBaseSystemPromptGeneration();
 		this.#defaultModelSelectionMutationRevision++;
@@ -10753,12 +10762,19 @@ export class AgentSession {
 				this.#rebuildSystemPrompt!(activeToolNames, this.#toolRegistry),
 			);
 		} catch (error) {
-			if (generation === this.#baseSystemPromptGeneration) {
+			if (
+				generation === this.#baseSystemPromptGeneration &&
+				this.#sessionIdentityAdmissionMatches(identityAdmission)
+			) {
 				this.#pendingAppliedToolSignature = undefined;
 			}
 			throw error;
 		}
-		if (generation !== this.#baseSystemPromptGeneration) return;
+		// Do not use #assertSessionIdentityAdmission here: committed rescope
+		// callbacks rebuild while the transition lease remains held. Matching the
+		// captured identity still drops predecessor work after a transition.
+		if (generation !== this.#baseSystemPromptGeneration || !this.#sessionIdentityAdmissionMatches(identityAdmission))
+			return;
 		this.#baseSystemPrompt = built.systemPrompt;
 		this.agent.setSystemPrompt(this.#baseSystemPrompt);
 		// Refresh the cached signature so a subsequent `#applyActiveToolsByName` with
