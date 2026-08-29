@@ -1994,16 +1994,8 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 }
 
 async function publishCurrentVerdictAlias(paths: LifecyclePaths, verdict: OwnerVerdict): Promise<void> {
-	const current = await readJson<{
-		schema_version?: number;
-		session_id?: string;
-		generation?: string;
-	}>(paths.generationFile);
-	if (
-		current?.schema_version !== 1 ||
-		current.session_id !== verdict.session_id ||
-		current.generation !== verdict.generation
-	)
+	const current = await readJson<unknown>(paths.generationFile);
+	if (!isValidGenerationRecord(current, verdict.session_id, verdict.generation))
 		throw new Error("generation_mismatch");
 	await atomicWrite(paths.verdictAliasFile, {
 		...verdict,
