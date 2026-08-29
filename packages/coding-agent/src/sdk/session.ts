@@ -779,11 +779,13 @@ export async function discoverContextFiles(
 	cwd?: string,
 	agentDir?: string,
 	settings?: Settings,
+	profileAuthority?: "default" | "custom",
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
 		agentDir,
 		settings,
+		profileAuthority,
 	});
 }
 
