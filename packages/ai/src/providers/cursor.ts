@@ -1174,6 +1174,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
+							if (transportTerminalized) return;
 							if (isExecServerMessage && terminalAdmissionMode !== "open") return;
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
@@ -2411,14 +2412,13 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 			}
 			pending += 1;
 			const result = chain.then(handler);
-			chain = result
-				.catch(error => {
-					onError?.(error);
-				})
-				.finally(() => {
-					pending -= 1;
-				});
-			return chain;
+			const accounting = result.finally(() => {
+				pending -= 1;
+			});
+			chain = accounting.catch(error => {
+				onError?.(error);
+			});
+		return accounting;
 		},
 		drain() {
 			return chain;
