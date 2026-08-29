@@ -410,14 +410,19 @@ class CursorRequestCoordinator implements CursorRequestWriter {
 		}
 		this.#writing = true;
 		try {
-			this.#request.write(frame, error => {
+			if (
+				!writeCursorHttp2Frame(this.#request, frame, error => {
+					this.#writing = false;
+					if (error) {
+						this.fail(error);
+						return;
+					}
+					this.#writeNext();
+				})
+			) {
 				this.#writing = false;
-				if (error) {
-					this.fail(error);
-					return;
-				}
-				this.#writeNext();
-			});
+				this.fail(new Error("Cursor HTTP/2 stream is not writable"));
+			}
 		} catch (error) {
 			this.#writing = false;
 			this.fail(error instanceof Error ? error : new Error(String(error)));
@@ -612,6 +617,79 @@ export function mapH2TransportError(error: unknown, baseUrl: string): unknown {
 		`Cursor HTTP/2 is not supported by ${baseUrl}. Use an HTTP/2-capable endpoint, configure a proxy tunnel that preserves ALPN h2, or set providers.cursor.baseUrl to an HTTP/2 endpoint.`,
 		{ cause: error },
 	);
+}
+
+/** Structural write surface for Cursor's Connect HTTP/2 request stream. */
+export type CursorHttp2WriteStream = {
+	closed: boolean;
+	destroyed: boolean;
+	writableEnded: boolean;
+	writable?: boolean;
+	write: (chunk: Uint8Array, cb?: (error?: Error | null) => void) => unknown;
+};
+
+function isCursorHttp2WriteClosedError(error: unknown): boolean {
+	if (!error || typeof error !== "object") return false;
+	const candidate = error as { code?: unknown; message?: unknown };
+	if (candidate.code === "ERR_STREAM_WRITE_AFTER_END" || candidate.code === "ERR_STREAM_DESTROYED") return true;
+	return (
+		typeof candidate.message === "string" &&
+		(/write after end/i.test(candidate.message) || /stream was destroyed/i.test(candidate.message))
+	);
+}
+
+function cursorHttp2StreamIsWritable(stream: CursorHttp2WriteStream): boolean {
+	return !stream.closed && !stream.destroyed && !stream.writableEnded && stream.writable !== false;
+}
+
+/**
+ * Write a Connect frame. Returns false when the request stream is already closed.
+ * Swallows write-after-end / destroyed errors (including Bun's promise-returning
+ * `write()`), so a late coordinator flush cannot escape as uncaughtException.
+ */
+export function writeCursorHttp2Frame(
+	stream: CursorHttp2WriteStream,
+	bytes: Uint8Array,
+	onComplete?: (error: Error | null) => void,
+): boolean {
+	if (!cursorHttp2StreamIsWritable(stream)) {
+		onComplete?.(new Error("write after end"));
+		return false;
+	}
+	try {
+		let settled = false;
+		const finish = (error: unknown) => {
+			if (settled) return;
+			settled = true;
+			if (!error) {
+				onComplete?.(null);
+				return;
+			}
+			if (isCursorHttp2WriteClosedError(error)) {
+				onComplete?.(error instanceof Error ? error : new Error(String(error)));
+				return;
+			}
+			if (!onComplete) {
+				log("error", "http2Write", { error: String(error) });
+				return;
+			}
+			onComplete(error instanceof Error ? error : new Error(String(error)));
+		};
+		const result = stream.write(bytes, error => finish(error ?? null));
+		if (result !== undefined && result !== null && typeof (result as { then?: unknown }).then === "function") {
+			void Promise.resolve(result).then(
+				() => finish(null),
+				(error: unknown) => finish(error),
+			);
+		}
+		return true;
+	} catch (error) {
+		if (isCursorHttp2WriteClosedError(error)) {
+			onComplete?.(error instanceof Error ? error : new Error(String(error)));
+			return false;
+		}
+		throw error;
+	}
 }
 
 export const streamCursor: StreamFunction<"cursor-agent"> = (
