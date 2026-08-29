@@ -1690,6 +1690,8 @@ export async function persistCoordinatorLaunchFailureState(input: {
 							)
 								return;
 						}
+						if (!sessionId && typeof previous.session_id === "string" && previous.session_id.trim().length > 0)
+							return;
 						const previousOwner =
 							typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
 								? previous.owner_generation.trim()
