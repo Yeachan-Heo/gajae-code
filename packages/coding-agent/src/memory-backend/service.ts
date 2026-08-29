@@ -34,7 +34,6 @@ function canonicalizePolicy(value: unknown): string {
 /** Resolve the effective Hindsight and legacy memory policy without loading the backend. */
 function canonicalHindsightPolicy(settings: Settings): string {
 	return canonicalizePolicy({
-		memories: settings.getGroup("memories"),
 		hindsight: {
 			apiUrl: settings.get("hindsight.apiUrl"),
 			apiToken: settings.get("hindsight.apiToken"),

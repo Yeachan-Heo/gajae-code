@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getConfigDirName, getTrustedHomeDir, setAgentDir } from "@gajae-code/utils";
 import { Settings } from "../../src/config/settings";
 import { TaskTool } from "../../src/task";
 import { loadBundledAgents } from "../../src/task/agents";
@@ -164,6 +164,47 @@ describe("task agent visibility", () => {
 			expect(explicitWins.agents.map(agent => agent.name)).not.toContain("profile-a-agent");
 			expect(isolatedA.agents.map(agent => agent.name)).not.toContain("profile-b-agent");
 			expect(isolatedB.agents.map(agent => agent.name)).not.toContain("profile-a-agent");
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
+
+	it("uses resolver profile authority for plugin discovery when settings provide an agent directory", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-task-plugin-authority-"));
+		temporaryRoots.push(root);
+		const home = path.join(root, "home");
+		const project = path.join(root, "project");
+		const settingsProfile = path.join(root, "settings-profile");
+		const defaultPlugin = path.join(root, "default-plugin");
+		const settingsPlugin = path.join(root, "settings-plugin");
+		const writeRegistry = async (agentDir: string, pluginPath: string, pluginName: string) => {
+			await fs.mkdir(path.join(agentDir, "plugins"), { recursive: true });
+			await fs.writeFile(
+				path.join(agentDir, "plugins", "installed_plugins.json"),
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						[`${pluginName}@test-market`]: [{ scope: "user", installPath: pluginPath, version: "1.0.0" }],
+					},
+				}),
+			);
+		};
+
+		await fs.mkdir(project, { recursive: true });
+		await writeAgent(defaultPlugin, "resolver-plugin-agent");
+		await writeAgent(settingsPlugin, "settings-plugin-agent");
+		await writeRegistry(path.join(home, ".gjc"), defaultPlugin, "resolver-plugin");
+		await writeRegistry(settingsProfile, settingsPlugin, "settings-plugin");
+
+		const previousAgentDir = getAgentDir();
+		const resolverDefault = path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
+		setAgentDir(resolverDefault);
+		try {
+			const settings = Settings.isolated({}, { agentDir: settingsProfile });
+			const result = await discoverAgents(project, home, settings);
+
+			expect(result.agents.map(agent => agent.name)).toContain("resolver-plugin-agent");
+			expect(result.agents.map(agent => agent.name)).not.toContain("settings-plugin-agent");
 		} finally {
 			setAgentDir(previousAgentDir);
 		}

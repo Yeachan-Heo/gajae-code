@@ -994,6 +994,123 @@ describe("AgentSession handoff", () => {
 		await handoffPromise;
 	});
 
+	it("rechecks the transition fence when a queued admission activates", async () => {
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const first = session.withSdkControlMutation(async () => {
+			firstEntered.resolve();
+			await releaseFirst.promise;
+		});
+		await firstEntered.promise;
+
+		const secondBody = vi.fn(async () => {});
+		const second = session.withSdkControlMutation(secondBody);
+		await Bun.sleep(0);
+
+		const handoffGate = Promise.withResolvers<void>();
+		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {
+			await handoffGate.promise;
+			return "## Goal\nContinue";
+		});
+		const handoff = session.handoff();
+		await waitFor(() => session.isGeneratingHandoff);
+
+		releaseFirst.resolve();
+		await first;
+		await expect(second).rejects.toMatchObject({ code: "busy" });
+		expect(secondBody).not.toHaveBeenCalled();
+
+		handoffGate.resolve();
+		await handoff;
+	});
+
+	it("rejects direct steer and follow-up during newSession", async () => {
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const originalPrepare = sessionManager.prepareNewSession.bind(sessionManager);
+		vi.spyOn(sessionManager, "prepareNewSession").mockImplementation(async options => {
+			prepareStarted.resolve();
+			await prepareGate.promise;
+			return originalPrepare(options);
+		});
+
+		const transition = session.newSession();
+		await prepareStarted.promise;
+		expect(session.isSessionTransitioning).toBe(true);
+		await expect(session.steer("steer during new session")).rejects.toThrow(/session transition is in progress/i);
+		await expect(session.followUp("follow-up during new session")).rejects.toThrow(
+			/session transition is in progress/i,
+		);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		prepareGate.resolve();
+		await expect(transition).resolves.toBe(true);
+	});
+
+	it("rejects direct steer and follow-up during fork", async () => {
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const originalPrepare = sessionManager.prepareFork.bind(sessionManager);
+		vi.spyOn(sessionManager, "prepareFork").mockImplementation(async () => {
+			prepareStarted.resolve();
+			await prepareGate.promise;
+			return originalPrepare();
+		});
+
+		const transition = session.fork();
+		await prepareStarted.promise;
+		expect(session.isSessionTransitioning).toBe(true);
+		await expect(session.steer("steer during fork")).rejects.toThrow(/session transition is in progress/i);
+		await expect(session.followUp("follow-up during fork")).rejects.toThrow(/session transition is in progress/i);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		prepareGate.resolve();
+		await expect(transition).resolves.toBe(true);
+	});
+
+	it("rejects direct steer and follow-up during branch", async () => {
+		sessionManager.appendMessage({ role: "user", content: "branch target", timestamp: Date.now() });
+		const branchEntry = sessionManager.getBranch().at(-1);
+		if (!branchEntry || branchEntry.type !== "message" || branchEntry.message.role !== "user") {
+			throw new Error("Expected branch target user entry");
+		}
+
+		const prepareGate = Promise.withResolvers<void>();
+		const prepareStarted = Promise.withResolvers<void>();
+		const originalPrepare = sessionManager.prepareBranchedSession.bind(sessionManager);
+		vi.spyOn(sessionManager, "prepareBranchedSession").mockImplementation(async entryId => {
+			prepareStarted.resolve();
+			await prepareGate.promise;
+			return originalPrepare(entryId);
+		});
+
+		const transition = session.branch(branchEntry.id);
+		await prepareStarted.promise;
+		expect(session.isSessionTransitioning).toBe(true);
+		await expect(session.steer("steer during branch")).rejects.toThrow(/session transition is in progress/i);
+		await expect(session.followUp("follow-up during branch")).rejects.toThrow(/session transition is in progress/i);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		prepareGate.resolve();
+		await expect(transition).resolves.toMatchObject({ cancelled: false });
+	});
+
+	it("rejects direct steer and follow-up during switchSession", async () => {
+		const sessionPath = session.sessionFile;
+		if (!sessionPath) throw new Error("Expected persisted session path");
+		const transitionStarted = Promise.withResolvers<void>();
+		const transition = session.switchSession(sessionPath, {
+			onTransitionMutationStarted: () => transitionStarted.resolve(),
+		});
+		await transitionStarted.promise;
+		expect(session.isSessionTransitioning).toBe(true);
+		await expect(session.steer("steer during switch")).rejects.toThrow(/session transition is in progress/i);
+		await expect(session.followUp("follow-up during switch")).rejects.toThrow(/session transition is in progress/i);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		await expect(transition).resolves.toBe(true);
+	});
+
 	it("retains the generated document when a turn starts during generation (late busy)", async () => {
 		const handoffText = "## Goal\nGenerated before the late race";
 		vi.spyOn(compactionModule, "generateHandoff").mockImplementation(async () => {

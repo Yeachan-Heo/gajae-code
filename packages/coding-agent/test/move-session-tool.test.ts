@@ -654,6 +654,53 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	}, 15_000);
 
+	it("serializes deferred Hindsight startup with move admission", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+
+		const settings = Settings.isolated(
+			{
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "",
+				"hindsight.mentalModelsEnabled": false,
+			},
+			{ agentDir: path.dirname(cwdA) },
+		);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session, startDeferredMemoryBackend } = await makeSession(cwdA, sessionManager, {
+			settings,
+			toolNames: ["move_session"],
+			deferMemoryBackendStartup: true,
+		});
+		const startupEntered = Promise.withResolvers<void>();
+		const releaseStartup = Promise.withResolvers<void>();
+		const runWithCwdReadLease = sessionManager.runWithCwdReadLease.bind(sessionManager);
+		const readLeaseSpy = vi.spyOn(sessionManager, "runWithCwdReadLease").mockImplementation(async callback => {
+			return await runWithCwdReadLease(async () => {
+				startupEntered.resolve();
+				await releaseStartup.promise;
+				return await callback();
+			});
+		});
+		try {
+			expect(startDeferredMemoryBackend).toBeFunction();
+			const startup = startDeferredMemoryBackend!();
+			await startupEntered.promise;
+			const move = session.getToolByName("move_session")!.execute("move-deferred-hindsight-race", { path: cwdB });
+			releaseStartup.resolve();
+			await startup;
+			await expect(move).rejects.toThrow(/Hindsight bank scope and queued retains are launch-bound/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(session.memoryBackend.status().state).toBe("ready");
+		} finally {
+			readLeaseSpy.mockRestore();
+			await session.dispose();
+		}
+	});
+
 	it("refuses a resident Hindsight service even when the target policy is unchanged", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

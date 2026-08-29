@@ -107,8 +107,8 @@ export class YieldQueue {
 
 	async flush(mode: YieldFlushMode): Promise<void> {
 		if (mode === "idle") {
-			if (this.#options.isTransitionFenced?.()) return;
 			this.#idleFlushPending = false;
+			if (this.#options.isTransitionFenced?.()) return;
 		}
 		if (mode === "streaming" && this.#options.isTransitionFenced?.()) return;
 		// Deferred idle deliveries stay idle-only: a streaming flush must not turn a

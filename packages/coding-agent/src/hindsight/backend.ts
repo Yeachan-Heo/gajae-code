@@ -37,77 +37,12 @@ export const hindsightBackend: MemoryBackend = {
 	id: "hindsight",
 
 	async start(options: MemoryBackendStartOptions): Promise<void> {
-		const { session, settings } = options;
-		const sessionId = session.sessionId;
-		if (!sessionId) return;
-
-		// Subagents alias the parent's state so recall/retain/reflect tool calls
-		// persist to the same Hindsight bank. Auto-recall and auto-retain stay
-		// with the parent — running them per subagent would double-recall and
-		// pollute the bank with internal exploration transcripts.
-		if (options.taskDepth > 0) {
-			const parent = options.parentHindsightSessionState;
-			if (!parent) return;
-			const replacement = new HindsightSessionState({
-				sessionId,
-				client: parent.client,
-				bankId: parent.bankId,
-				retainTags: parent.retainTags,
-				recallTags: parent.recallTags,
-				recallTagsMatch: parent.recallTagsMatch,
-				config: parent.config,
-				session,
-				missionsSet: parent.missionsSet,
-				lastRetainedTurn: 0,
-				hasRecalledForFirstTurn: true,
-				aliasOf: parent,
-			});
-			const previous = session.getHindsightSessionState();
-			await previous?.dispose();
-			session.setHindsightSessionState(replacement);
-			return;
-		}
-
-		const config = loadHindsightConfig(settings);
-		if (!isHindsightConfigured(config)) {
-			logger.warn("Hindsight: memory.backend=hindsight but hindsight.apiUrl is unset; backend inert.");
-			return;
-		}
-
-		const client = createHindsightClient(config);
-		const scope = computeBankScope(config, session.sessionManager.getCwd());
-
-		const state = new HindsightSessionState({
-			sessionId,
-			client,
-			bankId: scope.bankId,
-			retainTags: scope.retainTags,
-			recallTags: scope.recallTags,
-			recallTagsMatch: scope.recallTagsMatch,
-			config,
-			session,
-			missionsSet: new Set(),
-			lastRetainedTurn: 0,
-			hasRecalledForFirstTurn: false,
-		});
-
-		// Close and drain the old queue while it still owns this session. Closing
-		// rejects concurrent enqueues, so no retain can land between the final flush
-		// and replacement.
-		const previous = session.getHindsightSessionState();
-		await previous?.dispose();
-		session.setHindsightSessionState(state);
-		state.attachSessionListeners();
-
-		// Kick off mental-model bootstrap. Resolves asynchronously; the first
-		// turn races and is covered in `beforeAgentStartPrompt` via
-		// `mentalModelsLoadPromise`. Subsequent turns see the populated cache
-		// because `runMentalModelLoad` calls `refreshBaseSystemPrompt`.
-		if (config.mentalModelsEnabled) {
-			state.mentalModelsLoadPromise = state.runMentalModelLoad(scope).catch(err => {
-				logger.debug("Hindsight: mental-model bootstrap failed", { bankId: state.bankId, error: String(err) });
-			});
-		}
+		// Session cwd transitions acquire the exclusive writer only after all
+		// existing read leases drain. Hold this lease across the complete Hindsight
+		// startup boundary so a deferred startup that wins the race is observed as
+		// resident by the move's admission check, while a startup that loses the
+		// race initializes only after the committed move's target cwd is active.
+		await options.session.sessionManager.runWithCwdReadLease(() => startHindsight(options));
 	},
 
 	async buildDeveloperInstructions(_agentDir, settings, session): Promise<string | undefined> {
@@ -170,6 +105,80 @@ export const hindsightBackend: MemoryBackend = {
 		return await state.recallForCompaction(flat);
 	},
 };
+
+async function startHindsight(options: MemoryBackendStartOptions): Promise<void> {
+	const { session, settings } = options;
+	const sessionId = session.sessionId;
+	if (!sessionId) return;
+
+	// Subagents alias the parent's state so recall/retain/reflect tool calls
+	// persist to the same Hindsight bank. Auto-recall and auto-retain stay
+	// with the parent — running them per subagent would double-recall and
+	// pollute the bank with internal exploration transcripts.
+	if (options.taskDepth > 0) {
+		const parent = options.parentHindsightSessionState;
+		if (!parent) return;
+		const replacement = new HindsightSessionState({
+			sessionId,
+			client: parent.client,
+			bankId: parent.bankId,
+			retainTags: parent.retainTags,
+			recallTags: parent.recallTags,
+			recallTagsMatch: parent.recallTagsMatch,
+			config: parent.config,
+			session,
+			missionsSet: parent.missionsSet,
+			lastRetainedTurn: 0,
+			hasRecalledForFirstTurn: true,
+			aliasOf: parent,
+		});
+		const previous = session.getHindsightSessionState();
+		await previous?.dispose();
+		session.setHindsightSessionState(replacement);
+		return;
+	}
+
+	const config = loadHindsightConfig(settings);
+	if (!isHindsightConfigured(config)) {
+		logger.warn("Hindsight: memory.backend=hindsight but hindsight.apiUrl is unset; backend inert.");
+		return;
+	}
+
+	const client = createHindsightClient(config);
+	const scope = computeBankScope(config, session.sessionManager.getCwd());
+
+	const state = new HindsightSessionState({
+		sessionId,
+		client,
+		bankId: scope.bankId,
+		retainTags: scope.retainTags,
+		recallTags: scope.recallTags,
+		recallTagsMatch: scope.recallTagsMatch,
+		config,
+		session,
+		missionsSet: new Set(),
+		lastRetainedTurn: 0,
+		hasRecalledForFirstTurn: false,
+	});
+
+	// Close and drain the old queue while it still owns this session. Closing
+	// rejects concurrent enqueues, so no retain can land between the final flush
+	// and replacement.
+	const previous = session.getHindsightSessionState();
+	await previous?.dispose();
+	session.setHindsightSessionState(state);
+	state.attachSessionListeners();
+
+	// Kick off mental-model bootstrap. Resolves asynchronously; the first
+	// turn races and is covered in `beforeAgentStartPrompt` via
+	// `mentalModelsLoadPromise`. Subsequent turns see the populated cache
+	// because `runMentalModelLoad` calls `refreshBaseSystemPrompt`.
+	if (config.mentalModelsEnabled) {
+		state.mentalModelsLoadPromise = state.runMentalModelLoad(scope).catch(err => {
+			logger.debug("Hindsight: mental-model bootstrap failed", { bankId: state.bankId, error: String(err) });
+		});
+	}
+}
 
 /** Reduce arbitrary AgentMessages into the Hindsight flat-text shape. */
 function flattenMessagesForRecall(messages: AgentMessage[]): HindsightMessage[] {

@@ -70,8 +70,10 @@ export async function discoverAgents(
 		agentDir ??
 		activeSettings?.getAgentDir() ??
 		(getAgentProfileAuthority() === "custom" ? getAgentDir() : undefined);
-	const profileAuthority =
-		agentDir !== undefined || activeSettings?.getAgentDir() !== undefined ? "custom" : getAgentProfileAuthority();
+	// An explicit discovery profile is a scoped selection. When discovery follows
+	// the active settings implicitly, retain the resolver's sticky authority rather
+	// than reclassifying every Settings-owned agent directory as custom.
+	const profileAuthority = agentDir !== undefined ? "custom" : getAgentProfileAuthority();
 	const agentSources = Array.from(
 		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
 	);

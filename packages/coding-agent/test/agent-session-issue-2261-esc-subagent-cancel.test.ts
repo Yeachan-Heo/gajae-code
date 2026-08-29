@@ -11,7 +11,11 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { ArtifactManager } from "@gajae-code/coding-agent/session/artifacts";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { lookupOwnedRegistration, registerOwnedRegistration } from "@gajae-code/coding-agent/session/terminal-abort";
+import {
+	lookupOwnedRegistration,
+	registerOwnedRegistration,
+	unregisterOwnedRegistration,
+} from "@gajae-code/coding-agent/session/terminal-abort";
 import { TempDir } from "@gajae-code/utils";
 
 const CLEANUP_NOTICE =
@@ -77,12 +81,57 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		return manager;
 	}
 
+	async function replaceWithOwnedManager(ownerManager: AsyncJobManager): Promise<void> {
+		const model = session.model;
+		await session.dispose();
+		sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] } }),
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "owner",
+			ownedAsyncJobManager: ownerManager,
+		});
+	}
+
 	it("replaces the session without a job manager or live children", async () => {
 		const previous = session.sessionFile;
 
 		await expect(session.newSession()).resolves.toBe(true);
 		expect(session.sessionFile).toBeDefined();
 		expect(session.sessionFile).not.toBe(previous);
+	});
+
+	it("does not claim or rekey a fallback manager for a direct session without ownership", async () => {
+		const fallbackManager = installOwnerManager();
+		const predecessorEndpoint = sessionManager.getSessionId();
+		expect(AsyncJobManager.registerForEndpoint(predecessorEndpoint, fallbackManager)).toBe(true);
+		const jobId = fallbackManager.register("task", "direct-session registration", async () => "finished", {
+			ownerId: "foreign",
+		});
+		const job = fallbackManager.getJob(jobId);
+		if (!job) throw new Error("Expected fallback manager job");
+		await job.promise;
+		const registration = {
+			endpointId: predecessorEndpoint,
+			endpointGeneration: 0,
+			lineageIdHash: "direct-session-lineage",
+			promptAttemptEpoch: 1,
+			jobId,
+			jobGeneration: job.generation,
+		};
+		registerOwnedRegistration(registration);
+
+		try {
+			await expect(session.newSession()).resolves.toBe(true);
+			expect(AsyncJobManager.forEndpoint(predecessorEndpoint)).toBe(fallbackManager);
+			expect(AsyncJobManager.forEndpoint(sessionManager.getSessionId())).toBeUndefined();
+			expect(lookupOwnedRegistration(jobId, job.generation, predecessorEndpoint)).toEqual(registration);
+		} finally {
+			unregisterOwnedRegistration(registration);
+			AsyncJobManager.unregisterForEndpoint(predecessorEndpoint);
+		}
 	});
 
 	it("waits for cooperative owned children before replacing identity", async () => {
@@ -576,6 +625,7 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 
 	it("reserves the successor endpoint while branch settlement cancels predecessor jobs", async () => {
 		const ownerManager = installOwnerManager();
+		await replaceWithOwnedManager(ownerManager);
 		const predecessorEndpoint = sessionManager.getSessionId();
 		expect(AsyncJobManager.registerForEndpoint(predecessorEndpoint, ownerManager)).toBe(true);
 		const userEntryId = sessionManager.appendMessage({
@@ -655,6 +705,54 @@ describe("AgentSession Issue #2261 /new owner-subagent cancellation", () => {
 		} finally {
 			// Avoid inherited-manager disposal code treating the parent's endpoint as
 			// the child's own registration boundary during test teardown.
+			AsyncJobManager.unregisterForEndpoint(parentEndpoint);
+			await child.dispose();
+		}
+	});
+
+	it("does not sweep parent registrations when an inherited-manager child is disposed", async () => {
+		const ownerManager = installOwnerManager();
+		const parentEndpoint = sessionManager.getSessionId();
+		expect(AsyncJobManager.registerForEndpoint(parentEndpoint, ownerManager)).toBe(true);
+		const parentJobId = ownerManager.register("task", "parent registration", async () => "finished", {
+			ownerId: "owner",
+		});
+		const parentJob = ownerManager.getJob(parentJobId);
+		if (!parentJob) throw new Error("Expected parent manager job");
+		await parentJob.promise;
+		const registration = {
+			endpointId: parentEndpoint,
+			endpointGeneration: 0,
+			lineageIdHash: "parent-registration-lineage",
+			promptAttemptEpoch: 1,
+			jobId: parentJobId,
+			jobGeneration: parentJob.generation,
+		};
+		registerOwnedRegistration(registration);
+		const childManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const child = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model: session.model,
+					systemPrompt: ["Child test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: childManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage),
+			agentId: "child",
+			ownedAsyncJobManager: ownerManager,
+			disposeAsyncJobManager: false,
+		});
+
+		try {
+			await child.dispose();
+			expect(AsyncJobManager.forEndpoint(parentEndpoint)).toBe(ownerManager);
+			expect(lookupOwnedRegistration(parentJobId, parentJob.generation, parentEndpoint)).toEqual(registration);
+		} finally {
+			unregisterOwnedRegistration(registration);
 			AsyncJobManager.unregisterForEndpoint(parentEndpoint);
 			await child.dispose();
 		}

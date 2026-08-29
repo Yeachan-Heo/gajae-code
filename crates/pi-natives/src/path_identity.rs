@@ -7049,6 +7049,10 @@ mod platform {
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
 	#[cfg(test)]
+	static SECURE_SKILL_WRITE_AFTER_RENAME_HOOK: OnceLock<
+		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+	> = OnceLock::new();
+	#[cfg(test)]
 	static FAIL_SECURE_SKILL_CLEANUP: AtomicBool = AtomicBool::new(false);
 	static NEXT_SECURE_SKILL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -7085,6 +7089,16 @@ mod platform {
 	}
 
 	#[cfg(test)]
+	pub(super) fn set_secure_skill_write_after_rename_hook(
+		hook: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+	) {
+		*SECURE_SKILL_WRITE_AFTER_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
 	pub(super) fn inject_secure_skill_cleanup_failure(enabled: bool) {
 		FAIL_SECURE_SKILL_CLEANUP.store(enabled, Ordering::Relaxed);
 	}
@@ -7099,6 +7113,23 @@ mod platform {
 		{
 			entered.send(()).expect("secure skill write hook receiver");
 			resume.recv().expect("secure skill write hook resume");
+		}
+	}
+
+	#[cfg(test)]
+	fn pause_secure_skill_write_after_rename_for_test() {
+		if let Some((entered, resume)) = SECURE_SKILL_WRITE_AFTER_RENAME_HOOK
+			.get_or_init(|| Mutex::new(None))
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner())
+			.take()
+		{
+			entered
+				.send(())
+				.expect("secure skill write post-rename hook receiver");
+			resume
+				.recv()
+				.expect("secure skill write post-rename hook resume");
 		}
 	}
 
@@ -9928,6 +9959,13 @@ mod platform {
 		revalidate_skill_root(authority, path_names).map_err(SkillPublicationError::Pre)?;
 		validate_skill_file_handle(handle).map_err(SkillPublicationError::Pre)?;
 		rename_handle(handle, parent, final_name, true).map_err(SkillPublicationError::Pre)?;
+		#[cfg(test)]
+		pause_secure_skill_write_after_rename_for_test();
+		// The rename is committed against the retained parent handle, which may
+		// already be detached from `root_path`. Revalidate reachability before
+		// accepting the publication or attempting target inspection.
+		revalidate_skill_root(authority, path_names)
+			.map_err(|code| SkillPublicationError::Published { code, target_verified: false })?;
 		let published = open_relative_with_share(
 			parent,
 			OsStr::new("SKILL.md"),
@@ -9937,7 +9975,9 @@ mod platform {
 		)
 		.map_err(|code| SkillPublicationError::Published { code, target_verified: false })?;
 		let same = handles_same_object_checked(handle, published).unwrap_or(false);
-		let validated = same && validate_skill_file_handle(published).is_ok();
+		let file_valid = validate_skill_file_handle(published).is_ok();
+		let root_reachable = revalidate_skill_root(authority, path_names).is_ok();
+		let validated = same && file_valid && root_reachable;
 		unsafe { CloseHandle(published) };
 		if validated {
 			Ok(())
@@ -10451,6 +10491,45 @@ mod secure_skill_write_windows_tests {
 		assert!(result.ok, "{:?}", result.code);
 		assert_eq!(fs::read_to_string(&outside).expect("read external file"), "outside");
 		assert_eq!(fs::read_to_string(&final_path).expect("read published file"), "after");
+	}
+
+	#[test]
+	fn post_rename_root_reachability_failure_is_reported_and_cleaned() {
+		let _guard = HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let skill = root.join("managed");
+		fs::create_dir_all(&skill).expect("create skill directory");
+
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_secure_skill_write_after_rename_hook(Some((entered_tx, resume_rx)));
+		let root_for_write = root.clone();
+		let writer = thread::spawn(move || {
+			secure_write_skill_file(
+				root_for_write.to_string_lossy().into_owned(),
+				"managed".to_owned(),
+				"detached-payload".to_owned(),
+				0o600,
+			)
+		});
+		entered_rx
+			.recv()
+			.expect("wait for committed private-file rename");
+
+		let detached_root = temporary.0.join("detached-skills");
+		fs::rename(&root, &detached_root).expect("detach published skills root");
+		fs::create_dir(&root).expect("replace published skills root");
+		resume_tx.send(()).expect("release post-rename validation");
+		let result = writer.join().expect("secure skill writer thread");
+		platform::set_secure_skill_write_after_rename_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert!(!root.join("managed").join("SKILL.md").exists());
+		assert!(!detached_root.join("managed").join("SKILL.md").exists());
 	}
 
 	#[test]

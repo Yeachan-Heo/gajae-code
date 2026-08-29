@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as piUtils from "@gajae-code/utils";
-import { TempDir } from "@gajae-code/utils";
+import { getAgentDir, getConfigDirName, setAgentDir, TempDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRm, safeRmSync } from "../../../../scripts/safe-cleanup";
 import * as discoveryHelpers from "../../src/discovery/helpers";
 import { createLspWritethrough, LspTool } from "../../src/lsp";
@@ -220,6 +220,60 @@ describe("LSP repository command trust", () => {
 			forgetProfileRoot();
 			await safeRm(serverDir, { recursive: true, force: true });
 			forgetServerRoot();
+		}
+	});
+
+	it("keeps a custom profile scoped when HOME refresh makes its path canonical", async () => {
+		using tempDir = TempDir.createSync("@gjc-lsp-sticky-profile-");
+		const cwd = path.join(tempDir.path(), "workspace");
+		const firstHome = path.join(tempDir.path(), "first-home");
+		const secondHome = path.join(tempDir.path(), "second-home");
+		const configDirName = getConfigDirName();
+		const profile = path.join(secondHome, configDirName, "agent");
+		const originalAgentDir = getAgentDir();
+		const originalAgentDirEnv = process.env.GJC_CODING_AGENT_DIR;
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(firstHome);
+		try {
+			await fs.promises.mkdir(cwd, { recursive: true });
+			await fs.promises.mkdir(profile, { recursive: true });
+			await Bun.write(
+				path.join(profile, "lsp.json"),
+				JSON.stringify({
+					servers: {
+						"sticky-profile-server": {
+							command: process.execPath,
+							fileTypes: [".sticky"],
+							rootMarkers: ["."],
+						},
+					},
+				}),
+			);
+			await Bun.write(
+				path.join(secondHome, "lsp.json"),
+				JSON.stringify({
+					servers: {
+						"ambient-home-server": {
+							command: process.execPath,
+							fileTypes: [".ambient"],
+							rootMarkers: ["."],
+						},
+					},
+				}),
+			);
+
+			// The selected profile is custom under firstHome. After HOME moves, its
+			// path coincides with the canonical default, but resolver authority stays
+			// custom and must keep ambient home-root config excluded.
+			setAgentDir(profile);
+			homeSpy.mockReturnValue(secondHome);
+			const config = loadConfig(cwd, profile);
+			expect(config.servers["sticky-profile-server"]?.command).toBe(process.execPath);
+			expect(config.servers["ambient-home-server"]).toBeUndefined();
+		} finally {
+			homeSpy.mockRestore();
+			setAgentDir(originalAgentDir);
+			if (originalAgentDirEnv === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalAgentDirEnv;
 		}
 	});
 
