@@ -591,6 +591,38 @@ export class Settings implements NotificationSettingsReader {
 	// Factory Methods
 	// ─────────────────────────────────────────────────────────────────────────
 
+	static #sameStorageScope(left: Settings, right: Settings): boolean {
+		return left.#persist && right.#persist && left.#agentDir === right.#agentDir;
+	}
+
+	static #cleanupStaleGlobalStorage(stale: Settings): void {
+		const storage = stale.#storage;
+		if (!storage) {
+			staleGlobalInits.delete(stale);
+			return;
+		}
+		for (const owner of [globalInstance, ...pendingGlobalInits]) {
+			if (!owner || owner === stale || !Settings.#sameStorageScope(owner, stale)) continue;
+			if (owner.#storage === storage) {
+				// The replacement generation adopted the process-scoped storage handle;
+				// it now owns cleanup, so the stale instance must not close it.
+				staleGlobalInits.delete(stale);
+				return;
+			}
+			if (owner.#storage === null) {
+				// The replacement may still receive this handle from AgentStorage.open;
+				// defer the decision until its load settles.
+				return;
+			}
+		}
+		storage.close();
+		staleGlobalInits.delete(stale);
+	}
+
+	static #cleanupStaleGlobalStorages(): void {
+		for (const stale of staleGlobalInits) Settings.#cleanupStaleGlobalStorage(stale);
+	}
+
 	/**
 	 * Initialize the global singleton.
 	 * Call once at startup before accessing `settings`.
@@ -607,21 +639,37 @@ export class Settings implements NotificationSettingsReader {
 		}
 
 		globalInitOptions = structuredClone(options);
+		const initGeneration = globalInitGeneration;
 		const instance = new Settings(options);
-		const promise = instance.#load();
-		globalInstancePromise = promise;
-
-		return promise.then(
-			instance => {
-				globalInstance = instance;
-				globalInstancePromise = Promise.resolve(instance);
-				return instance;
+		pendingGlobalInits.add(instance);
+		const loadPromise = instance.#load();
+		const promise = loadPromise.then(
+			loaded => {
+				pendingGlobalInits.delete(loaded);
+				if (initGeneration !== globalInitGeneration) {
+					staleGlobalInits.add(loaded);
+					Settings.#cleanupStaleGlobalStorages();
+					return loaded;
+				}
+				globalInstance = loaded;
+				globalInstancePromise = Promise.resolve(loaded);
+				Settings.#cleanupStaleGlobalStorages();
+				return loaded;
 			},
 			error => {
-				globalInstance = null;
+				pendingGlobalInits.delete(instance);
+				if (initGeneration === globalInitGeneration) {
+					globalInstance = null;
+					globalInstancePromise = null;
+					globalInitOptions = null;
+				}
+				Settings.#cleanupStaleGlobalStorages();
 				throw error;
 			},
 		);
+		globalInstancePromise = promise;
+
+		return promise;
 	}
 
 	/**
@@ -6139,6 +6187,9 @@ export function onAppendOnlyModeChanged(cb: (value: string) => void): () => void
 let globalInstance: Settings | null = null;
 let globalInstancePromise: Promise<Settings> | null = null;
 let globalInitOptions: SettingsOptions | null = null;
+let globalInitGeneration = 0;
+const pendingGlobalInits = new Set<Settings>();
+const staleGlobalInits = new Set<Settings>();
 
 export function isSettingsInitialized(): boolean {
 	return globalInstance !== null;
@@ -6149,6 +6200,7 @@ export function isSettingsInitialized(): boolean {
  * @internal
  */
 export function resetSettingsForTest(): void {
+	globalInitGeneration++;
 	globalInstance?.getStorage()?.close();
 	globalInstance = null;
 	globalInstancePromise = null;
