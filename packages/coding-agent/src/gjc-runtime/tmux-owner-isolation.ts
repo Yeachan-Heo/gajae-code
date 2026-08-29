@@ -1263,13 +1263,8 @@ export async function captureOwnerGenerationBaseline(
 /** Captures the full immutable generation record for a planned owner launch. */
 export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: string): OwnerGenerationBaseline {
 	const paths = lifecyclePaths(stateDir, sessionId, "baseline");
-	if (!fsSync.existsSync(paths.generationFile)) return { state: "absent" };
-	let record: unknown;
-	try {
-		record = JSON.parse(fsSync.readFileSync(paths.generationFile, "utf8"));
-	} catch {
-		throw new Error("baseline_generation_corrupt");
-	}
+	const record = readNoFollowJsonSync(paths.generationFile);
+	if (record === null) return { state: "absent" };
 	if (
 		!isRecord(record) ||
 		!hasOnlyKeys(record, ["schema_version", "generation", "session_id", "published_at"]) ||
@@ -1286,6 +1281,33 @@ export function captureOwnerGenerationBaselineSync(stateDir: string, sessionId: 
 		session_id: record.session_id,
 		published_at: record.published_at,
 	};
+}
+
+function readNoFollowJsonSync(file: string): unknown | null {
+	let before: fsSync.Stats;
+	try {
+		before = fsSync.lstatSync(file);
+	} catch (error) {
+		if (isCode(error, "ENOENT")) return null;
+		throw new Error("baseline_generation_corrupt");
+	}
+	if (!before.isFile()) throw new Error("baseline_generation_corrupt");
+	let fd: number;
+	try {
+		fd = fsSync.openSync(file, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+	} catch {
+		throw new Error("baseline_generation_corrupt");
+	}
+	try {
+		const after = fsSync.fstatSync(fd);
+		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino)
+			throw new Error("baseline_generation_corrupt");
+		return JSON.parse(fsSync.readFileSync(fd, "utf8")) as unknown;
+	} catch {
+		throw new Error("baseline_generation_corrupt");
+	} finally {
+		fsSync.closeSync(fd);
+	}
 }
 
 export function isOwnerGenerationBaselineCurrentSync(
