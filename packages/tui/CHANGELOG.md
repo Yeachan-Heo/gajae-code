@@ -29,7 +29,6 @@
 ## [0.16.0] - 2026-09-02
 
 ## [0.15.6] - 2026-08-30
-
 ### Fixed
 
 - Composer file autocomplete now keeps the `@` fuzzy/chosung path reachable from explicit Tab and while Korean query characters are typed, without changing ordinary path-prefix completion.
@@ -40,8 +39,6 @@
 ### Added
 
 - `@` fuzzy file search supports Hangul chosung (초성) matching: a bare consonant matches any syllable with that initial, so `@ㅎㄱ` finds `한글.txt`. Literal and full-syllable matches keep ranking above chosung matches.
-
-### Fixed
 
 ## [0.15.4] - 2026-08-29
 
