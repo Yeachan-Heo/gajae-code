@@ -7542,8 +7542,9 @@ mod platform {
 			absolute_components(path).map_err(NativeOwnerOnlySecurityResult::failure)?;
 		// Every directory retained as ObjectAttributes.RootDirectory needs traversal
 		// authority for the next descriptor-relative NtCreateFile call.
-		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
-			.map_err(NativeOwnerOnlySecurityResult::failure)?;
+		let root_handle =
+			open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_ADD_SUBDIRECTORY)
+				.map_err(NativeOwnerOnlySecurityResult::failure)?;
 		let root_attributes = match handle_attributes(root_handle) {
 			Ok(attributes) => attributes,
 			Err(code) => {
@@ -9619,6 +9620,7 @@ mod platform {
 
 	const FILE_CREATE: u32 = 2;
 	const FILE_OPEN_IF: u32 = 3;
+	const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
 
 	fn skill_write_error() -> &'static str {
 		match unsafe { GetLastError() } {
@@ -9655,6 +9657,7 @@ mod platform {
 	) -> Result<HANDLE, &'static str> {
 		let access = FILE_READ_ATTRIBUTES
 			| FILE_TRAVERSE
+			| FILE_ADD_SUBDIRECTORY
 			| READ_CONTROL
 			| if acl_access {
 				WRITE_DAC | WRITE_OWNER
@@ -9709,7 +9712,8 @@ mod platform {
 		path: &Path,
 	) -> Result<(HeldExact, String, Vec<OsString>), &'static str> {
 		let (root, names) = absolute_components(path)?;
-		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)?;
+		let root_handle =
+			open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_ADD_SUBDIRECTORY)?;
 		let root_attributes = match handle_attributes(root_handle) {
 			Ok(attributes) => attributes,
 			Err(code) => {

@@ -15901,9 +15901,9 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot(this.#localProtocolOptions(prepared));
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-					this.#quarantineQueuedAsyncResults();
 					this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 					this.sessionManager.commitPreparedNewSession(prepared);
+					this.#quarantineQueuedAsyncResults();
 					// Fork commits a successor endpoint identity; re-register the
 					// manager under it (review thread P1).
 					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
@@ -23813,9 +23813,9 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
-				this.#quarantineQueuedAsyncResults();
 				this.#assertJobManagerEndpointAdmission(prepared.sessionId, prepared.sessionFile);
 				this.sessionManager.commitPreparedNewSession(prepared);
+				this.#quarantineQueuedAsyncResults();
 				// Branch commits a successor endpoint identity; re-register the
 				// manager under it (review thread P1).
 				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
