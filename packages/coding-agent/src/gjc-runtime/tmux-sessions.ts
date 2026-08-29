@@ -1606,11 +1606,30 @@ async function resolveExactOwner(
 	const ownerServerKey = readExactOptionForGc(session.name, GJC_TMUX_OWNER_SERVER_KEY_OPTION, env);
 
 	if (!sessionId || !stateFile) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
+	if ((!path.isAbsolute(stateFile) && !path.win32.isAbsolute(stateFile)) || /[\u0000-\u001F\u007F]/u.test(stateFile))
+		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 	const stateDir = path.dirname(stateFile);
-	const generation = await readCurrentGeneration(stateDir, sessionId);
+	if (!ownerGeneration) throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
+	if (
+		sessionId === "." ||
+		sessionId === ".." ||
+		ownerGeneration === "." ||
+		ownerGeneration === ".." ||
+		/[\u0000-\u001F\u007F/\\]/u.test(sessionId) ||
+		/[\u0000-\u001F\u007F/\\]/u.test(ownerGeneration)
+	)
+		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
+	let generation: string | null;
+	try {
+		generation = await readCurrentGeneration(stateDir, sessionId);
+	} catch (error) {
+		if (error instanceof Error && error.message === "owner_lifecycle_path_unsafe")
+			throw new Error(`gjc_tmux_owner_isolation_scope_bootstrap_failed:${sessionName}`);
+		throw error;
+	}
 	const pid = exactPanePid;
 	const startTime = await readProcessStartTime(pid);
-	if (!generation || !ownerGeneration || ownerGeneration !== generation || !ownerServerKey || !startTime)
+	if (!generation || ownerGeneration !== generation || !ownerServerKey || !startTime)
 		throw new Error(`gjc_tmux_owner_unverifiable:${sessionName}`);
 
 	return {
