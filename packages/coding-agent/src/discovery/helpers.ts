@@ -793,10 +793,7 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
  * This is the single source of truth for "active project root" used by install,
  * uninstall, list, upgrade, discovery, and doctor. Deterministic for a given `cwd`.
  */
-export async function resolveActiveProjectRegistryPath(
-	cwd: string,
-	homeDir: string = getTrustedHomeDir(),
-): Promise<string | null> {
+export async function resolveActiveProjectRegistryPath(cwd: string, homeDir?: string): Promise<string | null> {
 	// Pass 1: walk up looking for an existing .gjc/ directory (nearest wins).
 	// Stop before the caller's authoritative home — its .gjc/ is the user-level
 	// config dir, not a project root. Explicit-home capability loading passes
@@ -808,11 +805,10 @@ export async function resolveActiveProjectRegistryPath(
 			return path.resolve(value);
 		}
 	};
-	const trustedHome = await canonicalize(getTrustedHomeDir());
-	homeDir = await canonicalize(homeDir);
+	const explicitHome = homeDir !== undefined;
+	homeDir = await canonicalize(homeDir ?? getTrustedHomeDir());
 	const canonicalCwd = await canonicalize(cwd);
 	const relativeHome = path.relative(homeDir, canonicalCwd);
-	const explicitHome = homeDir !== trustedHome;
 	const effectiveStop =
 		!explicitHome ||
 		relativeHome === "" ||
