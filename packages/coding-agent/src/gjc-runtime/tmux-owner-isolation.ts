@@ -2456,7 +2456,7 @@ function isCode(error: unknown, code: string): boolean {
 }
 async function readJson<T>(file: string): Promise<T | null> {
 	try {
-		const parsed: unknown = JSON.parse(await fs.readFile(file, "utf8"));
+		const parsed: unknown = await readNoFollowJson(file);
 		return isRecord(parsed) ? (parsed as T) : null;
 	} catch {
 		return null;
