@@ -1586,9 +1586,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					const flags = pendingBuffer.byteAt(0);
 					const msgLen = pendingBuffer.readUInt32BE(1);
 					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
-						endStreamError = new Error("Cursor HTTP/2 frame exceeds the maximum message length");
-						responseEnded = true;
-						closeTerminalAdmission();
+						terminalize(new Error("Cursor HTTP/2 frame exceeds the maximum message length"));
 						break;
 					}
 					if (pendingBuffer.length < 5 + msgLen) break;
@@ -1795,7 +1793,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							h2Request!.pause();
 							const resumeAfterDrain = () => {
 								processingPausedForQueue = false;
-								if (processingPausedForExec || transportWatchdogClosed || callerAbortError) return;
+								if (processingPausedForExec || callerAbortError) return;
+								if (transportWatchdogClosed && !terminalBoundaryObserved && !terminalBoundarySeen) return;
 								if (terminalAdmissionMode !== "closed") h2Request!.resume();
 								// A lookahead turnEnded closes admission before the validated
 								// prefix reaches the queue bound. Continue parsing that prefix
