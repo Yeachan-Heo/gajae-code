@@ -23,6 +23,8 @@ export * from "./components/truncated-text";
 export type * from "./editor-component";
 // Fuzzy matching
 export * from "./fuzzy";
+// Hangul matching primitives shared by the fuzzy matchers
+export * from "./hangul";
 // Keybindings
 export * from "./keybindings";
 // Kitty keyboard protocol helpers

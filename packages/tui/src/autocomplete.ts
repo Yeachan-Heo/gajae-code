@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { fuzzyFind as fuzzyFindFn } from "@gajae-code/natives";
 import { getProjectDir } from "@gajae-code/utils";
+import { foldHangulText, hangulFuzzyCharMatches } from "./hangul";
 
 type NativeFuzzyFind = typeof fuzzyFindFn;
 let nativeFuzzyFind: NativeFuzzyFind | undefined;
@@ -122,21 +123,8 @@ function buildCompletionValue(
 	return `${openQuote}${path}${closeQuote}`;
 }
 
-const HANGUL_INITIAL_COMPAT_JAMO = "ㄱㄲㄴㄷㄸㄹㅁㅂㅃㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ";
-
-function hangulInitialJamo(char: string): string | undefined {
-	const offset = char.charCodeAt(0) - 0xac00;
-	if (offset < 0 || offset >= 11172) return undefined;
-	return HANGUL_INITIAL_COMPAT_JAMO[Math.floor(offset / 588)];
-}
-
-function fuzzyCharMatches(queryChar: string, targetChar: string): boolean {
-	return queryChar === targetChar || hangulInitialJamo(targetChar) === queryChar;
-}
-
 export function normalizeFuzzyText(value: string): string {
-	return value
-		.normalize("NFC")
+	return foldHangulText(value)
 		.toLowerCase()
 		.replace(/[\s/\\._-]+/g, "");
 }
@@ -153,7 +141,7 @@ function fuzzyMatch(query: string, target: string): boolean {
 
 	let qi = 0;
 	for (let ti = 0; ti < target.length && qi < query.length; ti++) {
-		if (fuzzyCharMatches(query[qi] as string, target[ti] as string)) qi++;
+		if (hangulFuzzyCharMatches(query[qi] as string, target[ti] as string)) qi++;
 	}
 	return qi === query.length;
 }
@@ -174,7 +162,7 @@ function fuzzyScore(query: string, target: string): number {
 	let gaps = 0;
 	let lastMatchIdx = -1;
 	for (let ti = 0; ti < target.length && qi < query.length; ti++) {
-		if (fuzzyCharMatches(query[qi] as string, target[ti] as string)) {
+		if (hangulFuzzyCharMatches(query[qi] as string, target[ti] as string)) {
 			if (lastMatchIdx >= 0 && ti - lastMatchIdx > 1) gaps++;
 			lastMatchIdx = ti;
 			qi++;
