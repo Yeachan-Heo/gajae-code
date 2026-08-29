@@ -814,9 +814,6 @@ type TuiRenderCounterSnapshot = {
 	debugRedrawAppendWrites: number;
 	differentialGuardVisibleWidthCalls: number;
 	widthReflowVisibleWidthCalls: number;
-	emitVisibleWidthsLineCount: number;
-	offscreenPrefixCompares: number;
-	layoutFrameLineCopies: number;
 };
 type RenderCommitWaiter = {
 	resolve: (committed: boolean) => void;
@@ -977,9 +974,6 @@ export class TUI extends Container {
 	#latestRenderedPlacementOwners = new Map<string, KittyPlacementOwner>();
 	#kittyPlacementSpans: KittyPlacementSpan[] = [];
 	#latestRaw: string[] = [];
-	#layoutReuseRaw: string[] = [];
-	#layoutReuseRendered: string[] = [];
-	#layoutReuseReady = false;
 	#durableLineCount = 0;
 	#durableRenderedLines: string[] = [];
 	#durableRawLines: string[] = [];
@@ -1155,9 +1149,6 @@ export class TUI extends Container {
 		debugRedrawAppendWrites: 0,
 		differentialGuardVisibleWidthCalls: 0,
 		widthReflowVisibleWidthCalls: 0,
-		emitVisibleWidthsLineCount: 0,
-		offscreenPrefixCompares: 0,
-		layoutFrameLineCopies: 0,
 	};
 
 	static resetRenderCountersForTest(): void {
@@ -1166,9 +1157,6 @@ export class TUI extends Container {
 			debugRedrawAppendWrites: 0,
 			differentialGuardVisibleWidthCalls: 0,
 			widthReflowVisibleWidthCalls: 0,
-			emitVisibleWidthsLineCount: 0,
-			offscreenPrefixCompares: 0,
-			layoutFrameLineCopies: 0,
 		};
 	}
 
@@ -2764,9 +2752,6 @@ export class TUI extends Container {
 		this.#latestRenderedLines = [];
 		this.#kittyPlacementSpans = [];
 		this.#latestRaw = [];
-		this.#layoutReuseRaw = [];
-		this.#layoutReuseRendered = [];
-		this.#layoutReuseReady = false;
 		this.#durableLineCount = 0;
 		this.#nativeScrollbackAdmissionPending = false;
 		this.#durableRenderedLines.length = 0;
@@ -3813,30 +3798,24 @@ export class TUI extends Container {
 		};
 	}
 
-	#normalizeLinesForEmit(lines: string[], width: number, start = 0, indexes?: readonly number[]): number {
+	#normalizeLinesForEmit(lines: string[], width: number, start = 0): string[] {
 		const widthCheckIndexes: number[] = [];
 		const widthCheckLines: string[] = [];
-		const consider = (i: number): void => {
+		for (let i = start; i < lines.length; i++) {
 			const line = lines[i];
-			if (line === undefined || TERMINAL.isImageLine(line)) return;
+			if (TERMINAL.isImageLine(line)) continue;
 			const entry = this.#normalizeLineForRender(line);
 			const { normalized, terminated } = entry;
 			if (isPrintableAscii(normalized) && normalized.length <= width) {
 				entry.width = normalized.length;
 				this.#lineEmitWidthCache.set(terminated, normalized.length);
 				lines[i] = terminated;
-				return;
+				continue;
 			}
 			widthCheckIndexes.push(i);
 			widthCheckLines.push(normalized);
-		};
-		if (indexes) {
-			for (const i of indexes) consider(i);
-		} else {
-			for (let i = start; i < lines.length; i++) consider(i);
 		}
 
-		TUI.#renderCounters.emitVisibleWidthsLineCount += widthCheckLines.length;
 		const widths = widthCheckLines.length === 0 ? [] : visibleWidths(widthCheckLines);
 		const truncateIndexes: number[] = [];
 		const truncateLines: string[] = [];
@@ -3874,7 +3853,13 @@ export class TUI extends Container {
 			lines[lineIndex] = terminated;
 		}
 
-		return widthCheckLines.length;
+		return lines;
+	}
+
+	#applyLineResetsAndTruncate(lines: string[], width: number): string[] {
+		this.#normalizeLinesForEmit(lines, width);
+		this.#trimLineCachesForRender(lines.length);
+		return lines;
 	}
 
 	#padLineToWidth(line: string, width: number): string {
@@ -4319,29 +4304,6 @@ export class TUI extends Container {
 		this.#recordPaintedViewportObservation(this.#viewportTopRow, height, false);
 	}
 
-	#discardLayoutReuseBuffers(): void {
-		this.#layoutReuseRaw = [];
-		this.#layoutReuseRendered = [];
-		this.#layoutReuseReady = false;
-	}
-
-	#viewportAnchorCacheHits(child: Component, width: number, renderScope: "full" | "layout"): boolean {
-		if (renderScope !== "layout") return false;
-		const componentRevision = child.getRenderRevision?.();
-		const source = child === this.#viewportAnchorComponent ? this.#viewportOutputSource : null;
-		const cached = this.#viewportAnchorRenderCache;
-		return (
-			componentRevision !== undefined &&
-			source !== null &&
-			cached !== undefined &&
-			cached.component === child &&
-			cached.width === width &&
-			cached.componentRevision === componentRevision &&
-			cached.sourceIdentity === source.identity &&
-			cached.sourceRevision === source.revision
-		);
-	}
-
 	#doRender(): void {
 		if (this.#stopped || !this.terminalAvailable) return;
 		const transcriptIdentityReplaced = this.#transcriptIdentityReplaced;
@@ -4378,32 +4340,27 @@ export class TUI extends Container {
 		const pinnedChildIndex =
 			this.#bottomPinnedComponent === null ? -1 : this.children.indexOf(this.#bottomPinnedComponent);
 		const hasStickySuffix = pinnedChildIndex >= 0;
-		let reuseTranscriptPrefix =
-			renderScope === "layout" &&
-			this.overlayStack.length === 0 &&
-			!this.#mouseSelectionActive &&
-			this.#manualViewportTop === undefined &&
-			this.#virtualViewport &&
-			this.#previousWidth === width &&
-			this.#previousHeight === height &&
-			this.#latestRaw.length > 0 &&
-			this.#viewportAnchorComponent !== null &&
-			this.#viewportAnchorCacheHits(this.#viewportAnchorComponent, width, renderScope);
 		const anchorRenderFailureCountBefore = viewportAnchorRenderFailureCount;
-		let skippedAnchorInsertAt = 0;
-		let skippedAnchorLineCount = 0;
 		for (let childIndex = 0; childIndex < this.children.length; childIndex++) {
 			const child = this.children[childIndex];
 			const componentRevision = child.getRenderRevision?.();
 			const source = child === this.#viewportAnchorComponent ? this.#viewportOutputSource : null;
 			const cached = this.#viewportAnchorRenderCache;
-			const reuseCached = this.#viewportAnchorCacheHits(child, width, renderScope);
+			const reuseCached =
+				renderScope === "layout" &&
+				componentRevision !== undefined &&
+				source !== null &&
+				cached?.component === child &&
+				cached.width === width &&
+				cached.componentRevision === componentRevision &&
+				cached.sourceIdentity === source.identity &&
+				cached.sourceRevision === source.revision;
 			const rendered = reuseCached
-				? cached!.rendered
+				? cached.rendered
 				: safeRenderComponentWithViewportAnchors(child, width, "tui-child");
-			const safeLines = reuseCached ? cached!.safeLines : rendered.lines.map(stripTerminalEraseControls);
+			const safeLines = reuseCached ? cached.safeLines : rendered.lines.map(stripTerminalEraseControls);
 			const kittyPlacements = reuseCached
-				? cached!.kittyPlacements
+				? cached.kittyPlacements
 				: rendered.lines.map(line => [...extractKittyPlacementReferences(line)]);
 			if (!reuseCached && componentRevision !== undefined && source !== null) {
 				this.#viewportAnchorRenderCache = {
@@ -4418,24 +4375,11 @@ export class TUI extends Container {
 				};
 			}
 			renderedChildren.set(child, safeLines);
-			const skipAnchorPush = reuseTranscriptPrefix && child === this.#viewportAnchorComponent;
+			const childStart = renderedLines.length;
 			if (child === this.#viewportAnchorComponent && rendered.anchors.some(anchor => anchor !== null)) {
-				anchorFrame = {
-					startRow: renderedLines.length,
-					anchors: rendered.anchors,
-				};
+				anchorFrame = { startRow: childStart, anchors: rendered.anchors };
 			}
 			const owner: KittyPlacementOwner = hasStickySuffix && childIndex >= pinnedChildIndex ? "suffix" : "transcript";
-			if (skipAnchorPush) {
-				skippedAnchorInsertAt = renderedLines.length;
-				skippedAnchorLineCount = safeLines.length;
-				for (let lineIndex = 0; lineIndex < kittyPlacements.length; lineIndex++) {
-					for (const placement of kittyPlacements[lineIndex] ?? []) {
-						placementOwners.set(this.#kittyPlacementKey(placement), owner);
-					}
-				}
-				continue;
-			}
 			for (let lineIndex = 0; lineIndex < rendered.lines.length; lineIndex++) {
 				for (const placement of kittyPlacements[lineIndex] ?? []) {
 					placementOwners.set(this.#kittyPlacementKey(placement), owner);
@@ -4443,44 +4387,17 @@ export class TUI extends Container {
 				renderedLines.push(safeLines[lineIndex] ?? rendered.lines[lineIndex]!);
 			}
 		}
-		const pinnedSuffixLineCount = hasStickySuffix
+		const sourceTranscriptLineCount = hasStickySuffix
 			? this.children
-					.slice(pinnedChildIndex)
+					.slice(0, pinnedChildIndex)
 					.reduce((count, child) => count + this.#pinnedChildLines(child, renderedChildren).length, 0)
-			: 0;
-		const reusedTrailingCount = reuseTranscriptPrefix ? renderedLines.length - skippedAnchorInsertAt : 0;
-		const reconstructedLength = reuseTranscriptPrefix
-			? skippedAnchorInsertAt + skippedAnchorLineCount + reusedTrailingCount
 			: renderedLines.length;
-		const sourceTranscriptLineCount = reuseTranscriptPrefix
-			? reconstructedLength - pinnedSuffixLineCount
-			: hasStickySuffix
-				? this.children
-						.slice(0, pinnedChildIndex)
-						.reduce((count, child) => count + this.#pinnedChildLines(child, renderedChildren).length, 0)
-				: renderedLines.length;
 		const anchorRenderFailed = viewportAnchorRenderFailureCount !== anchorRenderFailureCountBefore;
-		if (reuseTranscriptPrefix) {
-			const wouldOverflow = hasStickySuffix && pinnedSuffixLineCount > height;
-			const wouldPad = hasStickySuffix && height > 0 && reconstructedLength < height;
-			if (wouldOverflow || wouldPad || reconstructedLength !== this.#latestRaw.length) {
-				const prefix = this.#viewportAnchorRenderCache?.safeLines ?? [];
-				const combined = renderedLines
-					.slice(0, skippedAnchorInsertAt)
-					.concat(prefix, renderedLines.slice(skippedAnchorInsertAt));
-				renderedLines.length = 0;
-				for (const line of combined) renderedLines.push(line);
-				reuseTranscriptPrefix = false;
-				TUI.#renderCounters.layoutFrameLineCopies += prefix.length;
-			}
-		}
-		let newLines = reuseTranscriptPrefix
-			? renderedLines
-			: this.#constrainPinnedSuffix(renderedLines, height, renderedChildren);
+		let newLines = this.#constrainPinnedSuffix(renderedLines, height, renderedChildren);
 		this.#viewportAnchorFrame = anchorFrame;
 		if (renderMetrics.enabled) renderMetrics.recordHelper("renderTree", renderMetrics.now() - renderTreeStart);
 
-		if (!reuseTranscriptPrefix && hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
+		if (hasStickySuffix && height > 0 && this.#manualViewportTop === undefined) {
 			newLines = this.#padBeforeBottomPinnedComponent(
 				newLines,
 				height,
@@ -4488,46 +4405,11 @@ export class TUI extends Container {
 			).lines;
 		}
 		const nextTranscriptLineCount = sourceTranscriptLineCount;
-		const nextSuffixLineCount = reuseTranscriptPrefix
-			? pinnedSuffixLineCount
-			: hasStickySuffix
-				? Math.max(0, newLines.length - nextTranscriptLineCount)
-				: 0;
+		const nextSuffixLineCount = hasStickySuffix ? Math.max(0, newLines.length - nextTranscriptLineCount) : 0;
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.overlayStack.length > 0) {
 			newLines = this.#compositeOverlays(newLines, width, height, placementOwners);
-			this.#discardLayoutReuseBuffers();
-		}
-
-		if (reuseTranscriptPrefix) {
-			const total = reconstructedLength;
-			if (this.#latestRaw.length !== total || this.#latestRenderedLines.length !== total) {
-				const prefix = this.#viewportAnchorRenderCache?.safeLines ?? [];
-				newLines = renderedLines
-					.slice(0, skippedAnchorInsertAt)
-					.concat(prefix, renderedLines.slice(skippedAnchorInsertAt));
-				reuseTranscriptPrefix = false;
-				TUI.#renderCounters.layoutFrameLineCopies += prefix.length;
-				this.#discardLayoutReuseBuffers();
-			} else {
-				if (!this.#layoutReuseReady || this.#layoutReuseRaw.length !== total) {
-					this.#layoutReuseRaw = this.#latestRaw.slice();
-					this.#layoutReuseRendered = this.#latestRenderedLines.slice();
-					this.#layoutReuseReady = true;
-					TUI.#renderCounters.layoutFrameLineCopies += total;
-				}
-				for (let i = 0; i < skippedAnchorInsertAt; i++) {
-					this.#layoutReuseRaw[i] = renderedLines[i]!;
-				}
-				const afterStart = skippedAnchorInsertAt + skippedAnchorLineCount;
-				for (let i = 0; i < reusedTrailingCount; i++) {
-					this.#layoutReuseRaw[afterStart + i] = renderedLines[skippedAnchorInsertAt + i]!;
-				}
-				newLines = this.#layoutReuseRaw;
-			}
-		} else {
-			this.#discardLayoutReuseBuffers();
 		}
 
 		// Extract cursor position (marker must be found before diff comparison)
@@ -4557,16 +4439,13 @@ export class TUI extends Container {
 		// PI_TUI_VIRTUAL_VIEWPORT=0 opts out. When enabled, reuse the previous frame's
 		// normalized prefix when the off-screen raw prefix is unchanged (raw value equality
 		// short-circuit for cached components), so only the visible window is
-		// re-normalized and the diff starts at the window. Inside that window, reuse
-		// already-normalized rows whose raw bytes did not change (loader shimmer, layout
-		// ticks) so visibleWidths only measures dirty lines. Output is byte-identical to the
+		// re-normalized and the diff starts at the window. Output is byte-identical to the
 		// full path (reused entries are deterministic normalizations of identical raw lines).
 		const VIEWPORT_NORMALIZE_OVERSCAN = 8;
-		const rawLines = newLines;
+		const rawLines = newLines.slice();
 		const total = rawLines.length;
 		let diffStart = 0;
 		let usedWindowNormalize = false;
-		let measuredLines = 0;
 		if (
 			this.#virtualViewport &&
 			!widthChanged &&
@@ -4575,37 +4454,19 @@ export class TUI extends Container {
 		) {
 			const winTop = Math.max(0, total - height - VIEWPORT_NORMALIZE_OVERSCAN);
 			if (winTop <= this.#latestRenderedLines.length && winTop <= this.#latestRaw.length) {
-				let stable = reuseTranscriptPrefix && total === this.#latestRaw.length;
-				if (!stable) {
-					stable = true;
-					for (let i = 0; i < winTop; i++) {
-						TUI.#renderCounters.offscreenPrefixCompares += 1;
-						if (rawLines[i] !== this.#latestRaw[i]) {
-							stable = false;
-							break;
-						}
+				let stable = true;
+				for (let i = 0; i < winTop; i++) {
+					if (rawLines[i] !== this.#latestRaw[i]) {
+						stable = false;
+						break;
 					}
 				}
 				if (stable) {
-					const reuseBuffers =
-						reuseTranscriptPrefix &&
-						this.#layoutReuseReady &&
-						this.#layoutReuseRendered.length === total &&
-						rawLines === this.#layoutReuseRaw;
-					const windowed = reuseBuffers ? this.#layoutReuseRendered : this.#latestRenderedLines.slice(0, winTop);
-					if (!reuseBuffers) TUI.#renderCounters.layoutFrameLineCopies += winTop;
-					const dirtyIndexes: number[] = [];
+					const windowed = this.#latestRenderedLines.slice(0, winTop);
 					for (let i = winTop; i < total; i++) {
-						const raw = rawLines[i]!;
-						if (i < this.#latestRaw.length && raw === this.#latestRaw[i]) {
-							windowed[i] = this.#latestRenderedLines[i]!;
-						} else {
-							dirtyIndexes.push(i);
-							windowed[i] = raw;
-						}
+						windowed.push(rawLines[i]);
 					}
-					if (windowed.length > total) windowed.length = total;
-					measuredLines = this.#normalizeLinesForEmit(windowed, width, winTop, dirtyIndexes);
+					this.#normalizeLinesForEmit(windowed, width, winTop);
 					this.#trimLineCachesForRender(total);
 					newLines = windowed;
 					diffStart = winTop;
@@ -4614,28 +4475,19 @@ export class TUI extends Container {
 			}
 		}
 		if (!usedWindowNormalize) {
-			const copy = rawLines.slice();
-			TUI.#renderCounters.layoutFrameLineCopies += copy.length;
-			measuredLines = this.#normalizeLinesForEmit(copy, width);
-			this.#trimLineCachesForRender(copy.length);
-			newLines = copy;
+			newLines = this.#applyLineResetsAndTruncate(rawLines.slice(), width);
 		}
 		if (renderMetrics.enabled) {
 			renderMetrics.recordLineCount("rendered", total);
 			renderMetrics.recordLineCount("normalized", total - diffStart);
-			renderMetrics.recordLineCount("measured", measuredLines);
+			renderMetrics.recordLineCount("measured", total - diffStart);
 			if (usedWindowNormalize) renderMetrics.recordLineCount("offscreenScan", diffStart);
 		}
 		const nextKittyPlacementSpans = this.#kittyPlacementSpansForLines(newLines, placementOwners);
-		const previousLogicalFrame = this.#latestRenderedLines;
-		const previousRawFrame = this.#latestRaw;
+		const previousLogicalFrame = this.#latestRenderedLines.slice();
+		const previousRawFrame = this.#latestRaw.slice();
 		const previousRenderedLength = previousLogicalFrame.length;
 		this.#latestRenderedLines = newLines;
-		if (reuseTranscriptPrefix) {
-			this.#layoutReuseRaw = previousRawFrame;
-			this.#layoutReuseRendered = previousLogicalFrame;
-			this.#layoutReuseReady = previousRawFrame.length === total && previousLogicalFrame.length === total;
-		}
 		this.#latestRenderedTranscriptLineCount = nextTranscriptLineCount;
 		this.#latestRenderedSuffixLineCount = nextSuffixLineCount;
 		this.#latestRenderedPlacementOwners = placementOwners;

@@ -1,7 +1,16 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import { type Component, Container, TUI } from "@gajae-code/tui";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { type Component, TUI } from "@gajae-code/tui";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { VirtualTerminal } from "./virtual-terminal";
+
+const widthReflowEvidence = {
+	lineCount: 0,
+	sameWidthLayoutFrames: 0,
+	sameWidthReflowVisibleWidthCalls: -1,
+	wouldHaveScannedBefore: 0,
+	resizeStillFitsReflowVisibleWidthCalls: -1,
+	resizeOverflowReflowVisibleWidthCalls: -1,
+};
 
 class MutableLinesComponent implements Component {
 	#lines: string[];
@@ -30,6 +39,47 @@ async function settle(term: VirtualTerminal): Promise<void> {
 function visible(term: VirtualTerminal): string[] {
 	return term.getViewport().map(line => line.trimEnd());
 }
+
+afterAll(async () => {
+	const capturedAt = new Date().toISOString();
+	const receipt = {
+		title: "Same-width frames skip the widthReflow visibleWidth scan",
+		capturedAt,
+		contract: {
+			hotPath: "packages/tui/src/tui.ts #doRender widthReflowRequired",
+			before:
+				"every #doRender walked all rawLines with visibleWidth() even when widthChanged was false, then discarded the result",
+			after: "the scan runs only when widthChanged && previousWidth > 0; same-width layout ticks measure 0 reflow rows",
+			counter: "TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls",
+		},
+		measured: widthReflowEvidence,
+		expected: {
+			sameWidthReflowVisibleWidthCalls: 0,
+			resizeStillFitsReflowVisibleWidthCalls: widthReflowEvidence.lineCount,
+			resizeOverflowReflowVisibleWidthCalls: 1,
+			wouldHaveScannedBefore: widthReflowEvidence.lineCount * widthReflowEvidence.sameWidthLayoutFrames,
+		},
+		reproducibleTests: [
+			{
+				command:
+					'bun test packages/tui/test/render-helper-counts.test.ts -t "does not scan raw rows with visibleWidth when width is unchanged"',
+				asserts:
+					"8 same-width requestLayoutRender frames over 80 ANSI/CJK rows -> widthReflowVisibleWidthCalls === 0 (would have been 640 before)",
+			},
+			{
+				command:
+					'bun test packages/tui/test/render-helper-counts.test.ts -t "still walks raw rows on a column change that does not overflow"',
+				asserts: "48->44 resize, rows still fit -> widthReflowVisibleWidthCalls === 80",
+			},
+			{
+				command:
+					'bun test packages/tui/test/render-helper-counts.test.ts -t "stops the width-reflow scan at the first overflowing raw row"',
+				asserts: "80->30 resize, first row overflows -> widthReflowVisibleWidthCalls === 1",
+			},
+		],
+	};
+	await Bun.write("artifacts/width-reflow-visible-width-evidence.json", `${JSON.stringify(receipt, null, "\t")}\n`);
+});
 
 describe("TUI render helper counters", () => {
 	let previousDebugRedraw: string | undefined;
@@ -126,6 +176,11 @@ describe("TUI render helper counters", () => {
 			}
 
 			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(0);
+			widthReflowEvidence.lineCount = lineCount;
+			widthReflowEvidence.sameWidthLayoutFrames = layoutFrames;
+			widthReflowEvidence.sameWidthReflowVisibleWidthCalls =
+				TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+			widthReflowEvidence.wouldHaveScannedBefore = lineCount * layoutFrames;
 		} finally {
 			tui.stop();
 		}
@@ -148,6 +203,8 @@ describe("TUI render helper counters", () => {
 			await settle(term);
 
 			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(lineCount);
+			widthReflowEvidence.resizeStillFitsReflowVisibleWidthCalls =
+				TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
 		} finally {
 			tui.stop();
 		}
@@ -169,100 +226,8 @@ describe("TUI render helper counters", () => {
 			await settle(term);
 
 			expect(TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls).toBe(1);
-		} finally {
-			tui.stop();
-		}
-	});
-
-	it("does not remeasure unchanged viewport rows with visibleWidths", async () => {
-		const lineCount = 80;
-		const layoutFrames = 8;
-		const lines = Array.from({ length: lineCount }, (_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`);
-		const term = new VirtualTerminal(48, 12);
-		const component = new MutableLinesComponent(lines);
-		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
-		tui.addChild(component);
-
-		try {
-			tui.start();
-			await settle(term);
-			TUI.resetRenderCountersForTest();
-
-			for (let i = 0; i < layoutFrames; i++) {
-				tui.requestLayoutRender("loader");
-				await settle(term);
-			}
-
-			expect(TUI.getRenderCountersForTest().emitVisibleWidthsLineCount).toBe(0);
-		} finally {
-			tui.stop();
-		}
-	});
-
-	it("measures only the dirty viewport row when one raw line changes", async () => {
-		const lineCount = 80;
-		const edits = 8;
-		const lines = Array.from({ length: lineCount }, (_v, i) => `\x1b[38;2;80;160;255m${"漢".repeat(8)}-${i}\x1b[0m`);
-		const term = new VirtualTerminal(48, 12);
-		const component = new MutableLinesComponent(lines);
-		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
-		tui.addChild(component);
-
-		try {
-			tui.start();
-			await settle(term);
-			TUI.resetRenderCountersForTest();
-
-			for (let i = 0; i < edits; i++) {
-				const next = [...lines];
-				next[lineCount - 1] = `\x1b[38;2;80;160;255m${"漢".repeat(8)}-edit-${i}\x1b[0m`;
-				component.setLines(next);
-				tui.requestLayoutRender("loader");
-				await settle(term);
-			}
-
-			expect(TUI.getRenderCountersForTest().emitVisibleWidthsLineCount).toBe(edits);
-			expect(visible(term).some(line => line.includes("edit-7"))).toBe(true);
-		} finally {
-			tui.stop();
-		}
-	});
-
-	it("does not copy the transcript prefix on layout-only ticks when the viewport-anchor cache hits", async () => {
-		const transcriptLines = 80;
-		const layoutFrames = 8;
-		const term = new VirtualTerminal(48, 12);
-		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
-		const transcript = new Container();
-		for (let index = 0; index < transcriptLines; index++) {
-			transcript.addChild(new MutableLinesComponent([`line-${index}`]));
-		}
-		const suffix = new MutableLinesComponent(["status-0"]);
-		tui.addChild(transcript);
-		tui.addChild(suffix);
-		tui.setBottomPinnedComponent(suffix);
-		tui.setViewportAnchorComponent(transcript);
-		tui.setViewportOutputSource({ identity: "session:layout-reuse", revision: 0n });
-
-		try {
-			tui.start();
-			await settle(term);
-
-			suffix.setLines(["status-warmup"]);
-			tui.requestLayoutRender("layout-reuse-warmup");
-			await settle(term);
-			TUI.resetRenderCountersForTest();
-
-			for (let index = 1; index <= layoutFrames; index++) {
-				suffix.setLines([`status-${index}`]);
-				tui.requestLayoutRender("layout-reuse");
-				await settle(term);
-			}
-
-			const counters = TUI.getRenderCountersForTest();
-			expect(counters.offscreenPrefixCompares).toBe(0);
-			expect(counters.layoutFrameLineCopies).toBe(0);
-			expect(visible(term).some(line => line.includes("status-8"))).toBe(true);
+			widthReflowEvidence.resizeOverflowReflowVisibleWidthCalls =
+				TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
 		} finally {
 			tui.stop();
 		}

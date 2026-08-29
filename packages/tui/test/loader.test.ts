@@ -198,7 +198,6 @@ describe("Loader component", () => {
 			await term.waitForRender();
 			expect(transcript.renderCount).toBe(1);
 
-			TUI.resetRenderCountersForTest();
 			loader.setMessage("Still working");
 			await term.waitForRender();
 
