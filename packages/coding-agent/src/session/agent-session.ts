@@ -11370,12 +11370,17 @@ export class AgentSession {
 	async setSdkPlanMode(on: boolean): Promise<PlanModeState | undefined> {
 		if (typeof on !== "boolean")
 			throw Object.assign(new Error("mode.plan.set requires a boolean on value."), { code: "invalid_input" });
-		if (!this.#sdkPlanModeHandler) {
-			throw Object.assign(new Error("mode.plan.set requires an active host plan-mode lifecycle."), {
-				code: "unavailable",
-			});
-		}
-		return this.#sdkPlanModeHandler(on);
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
+		return await this.#withSessionAdmission("selection", async () => {
+			this.#assertSessionIdentityAdmission(identityAdmission);
+			if (!this.#sdkPlanModeHandler) {
+				throw Object.assign(new Error("mode.plan.set requires an active host plan-mode lifecycle."), {
+					code: "unavailable",
+				});
+			}
+			return await this.#sdkPlanModeHandler(on);
+		});
 	}
 
 	async operateGoal(
@@ -16985,10 +16990,13 @@ export class AgentSession {
 	 * @returns The new model info, or undefined if only one model available
 	 */
 	async cycleModel(direction: "forward" | "backward" = "forward"): Promise<ModelCycleResult | undefined> {
-		if (this.#scopedModels.length > 0) {
-			return this.#cycleScopedModel(direction);
-		}
-		return this.#cycleAvailableModel(direction);
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
+		return await this.#withSessionAdmission("selection", async () => {
+			this.#assertSessionIdentityAdmission(identityAdmission);
+			if (this.#scopedModels.length > 0) return await this.#cycleScopedModel(direction);
+			return await this.#cycleAvailableModel(direction);
+		});
 	}
 
 	/** Number of configured role-model candidates that can be cycled. */
@@ -22643,6 +22651,8 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		const cwd = this.sessionManager.getCwd();
 		this.assertEvalExecutionAllowed();
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
 
 		const abortController = new AbortController();
 		const execution = (async (): Promise<PythonResult> => {
@@ -22654,7 +22664,9 @@ export class AgentSession {
 					cwd,
 				});
 				this.assertEvalExecutionAllowed();
+				this.#assertSessionIdentityAdmission(identityAdmission);
 				if (hookResult?.result) {
+					this.#assertSessionIdentityAdmission(identityAdmission);
 					this.recordPythonResult(code, hookResult.result, options);
 					return hookResult.result;
 				}
@@ -22672,6 +22684,7 @@ export class AgentSession {
 				onChunk,
 				signal: abortController.signal,
 			});
+			this.#assertSessionIdentityAdmission(identityAdmission);
 			this.recordPythonResult(code, result, options);
 			return result;
 		})();
