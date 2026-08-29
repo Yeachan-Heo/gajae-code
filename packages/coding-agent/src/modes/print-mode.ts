@@ -268,6 +268,7 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 					cwd: session.sessionManager.getCwd(),
 					agentDir: session.getSessionAgentDir(),
 					settings: session.settings,
+					profileAuthority: session.getSessionProfileAuthority?.(),
 				}),
 			);
 		});

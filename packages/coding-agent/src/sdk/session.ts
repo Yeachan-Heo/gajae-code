@@ -809,8 +809,9 @@ export async function discoverSlashCommands(
 	cwd?: string,
 	agentDir?: string,
 	settings?: Settings,
+	profileAuthority?: "default" | "custom",
 ): Promise<FileSlashCommand[]> {
-	return await loadSlashCommands({ cwd: cwd ?? getProjectDir(), agentDir, settings });
+	return await loadSlashCommands({ cwd: cwd ?? getProjectDir(), agentDir, settings, profileAuthority });
 }
 
 /**

@@ -1177,6 +1177,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			cwd: basePath,
 			agentDir: this.session.getSessionAgentDir(),
 			settings: this.session.settings,
+			profileAuthority: this.session.getSessionProfileAuthority?.(),
 		});
 		if (this.#stopped) return;
 		const fileCommandNames = new Set(fileCommands.map(cmd => cmd.name));
