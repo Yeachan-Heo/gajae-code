@@ -1682,8 +1682,14 @@ export async function persistCoordinatorLaunchFailureState(input: {
 							if (error instanceof PreviousRuntimeStateReadError) return;
 							throw error;
 						}
-						if (Object.hasOwn(previous, "owner_generation") && typeof previous.owner_generation !== "string")
-							return;
+						if (Object.hasOwn(previous, "owner_generation")) {
+							const rawOwnerGeneration = previous.owner_generation;
+							if (
+								rawOwnerGeneration !== null &&
+								(typeof rawOwnerGeneration !== "string" || rawOwnerGeneration.trim().length === 0)
+							)
+								return;
+						}
 						const previousOwner =
 							typeof previous.owner_generation === "string" && previous.owner_generation.trim().length > 0
 								? previous.owner_generation.trim()
