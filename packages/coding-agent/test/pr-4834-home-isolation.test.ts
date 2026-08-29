@@ -175,6 +175,23 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		);
 	});
 
+	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {
+		const physicalHome = path.join(tempDir, "physical-home");
+		const symlinkedHome = path.join(tempDir, "symlinked-home");
+		const nestedProject = path.join(physicalHome, "nested-project");
+		await fs.mkdir(path.join(nestedProject, "child"), { recursive: true });
+		await fs.symlink(physicalHome, symlinkedHome, "dir");
+		await writeFile(path.join(nestedProject, ".gjc", "SYSTEM.md"), "# nested project system");
+
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, symlinkedHome, {
+			cwd: path.join(symlinkedHome, "nested-project", "child"),
+			providers: ["native"],
+		});
+
+		expect(result.items.map(item => item.content)).toEqual(["# nested project system"]);
+		expect(result.items[0]?._source.path).toBe(path.join(nestedProject, ".gjc", "SYSTEM.md"));
+	});
+
 	test("explicit home does not walk a no-repo cwd into unrelated ancestors", async () => {
 		await writeFile(path.join(tempDir, ".gjc", "SYSTEM.md"), "# unrelated ancestor system");
 		clearCache();
