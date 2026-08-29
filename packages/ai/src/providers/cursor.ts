@@ -802,7 +802,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let pendingBuffer = Buffer.alloc(0);
 		const closeTerminalAdmission = (): void => {
 			terminalAdmissionMode = "closed";
-			pendingBuffer = Buffer.alloc(0);
 			transportWatchdogClosed = true;
 			if (transportWatchdog) {
 				clearTimeout(transportWatchdog);
@@ -1205,10 +1204,51 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			let processingPausedForExec = false;
 			let processingPausedForQueue = false;
+			let terminalPoll: NodeJS.Timeout | undefined;
 			// True while any exec server message handler is running; suppresses
 			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
 			let execInFlight = false;
 			let processPendingBuffer: (() => void) | undefined;
+			const preemptFromPendingTerminal = (): boolean => {
+				let offset = 0;
+				while (pendingBuffer.length - offset >= 5) {
+					const flags = pendingBuffer[offset];
+					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
+					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH || pendingBuffer.length - offset < 5 + msgLen) return false;
+					if (flags & CONNECT_END_STREAM_FLAG) {
+						const messageBytes = pendingBuffer.subarray(offset + 5, offset + 5 + msgLen);
+						const error = parseConnectEndStream(messageBytes);
+						if (error) terminalize(error);
+						return true;
+					}
+					offset += 5 + msgLen;
+				}
+				return false;
+			};
+			const pendingContainsTurnEnded = (): boolean => {
+				let offset = 0;
+				while (pendingBuffer.length - offset >= 5) {
+					const flags = pendingBuffer[offset];
+					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
+					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH || pendingBuffer.length - offset < 5 + msgLen) return false;
+					if (flags & CONNECT_END_STREAM_FLAG) return false;
+					try {
+						const message = fromBinary(
+							AgentServerMessageSchema,
+							pendingBuffer.subarray(offset + 5, offset + 5 + msgLen),
+						);
+						if (
+							message.message.case === "interactionUpdate" &&
+							message.message.value.message?.case === "turnEnded"
+						)
+							return true;
+					} catch {
+						return false;
+					}
+					offset += 5 + msgLen;
+				}
+				return false;
+			};
 			const finishResponseAfterParsing = (): void => {
 				if (!responseEnded || processingPausedForExec || processingPausedForQueue) return;
 				if (pendingBuffer.length > 0) {
@@ -1217,15 +1257,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				drainMessageQueue();
 			};
 			processPendingBuffer = () => {
-				if (processingPausedForExec || processingPausedForQueue) return;
+				if (processingPausedForExec || processingPausedForQueue) {
+					preemptFromPendingTerminal();
+					return;
+				}
 				while (pendingBuffer.length >= 5) {
-					if (terminalAdmissionMode === "closed") {
-						// A validated turnEnded closes admission. Drop coalesced bytes
-						// behind any terminal frame so a late exec cannot reach the local
-						// handler after terminal bookkeeping has started.
-						closeTerminalAdmission();
-						break;
-					}
 					const flags = pendingBuffer[0];
 					const msgLen = pendingBuffer.readUInt32BE(1);
 					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
@@ -1238,6 +1274,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 					const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
 					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
+					if (terminalAdmissionMode === "closed" && !(flags & CONNECT_END_STREAM_FLAG)) continue;
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						closeTerminalAdmission();
@@ -1245,6 +1282,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
 							endStreamError = endError;
+							terminalize(endError);
 						}
 						break;
 					}
@@ -1263,21 +1301,31 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
 						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
-						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage) continue;
+						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage && !pendingContainsTurnEnded())
+							continue;
 						const isExecutable = isExecServerMessage && isMeaningful;
 						if (isExecutable) {
 							processingPausedForExec = true;
-							h2Request!.pause();
 							clearTransportWatchdog();
+							terminalPoll ??= setInterval(() => {
+								if (preemptFromPendingTerminal()) {
+									clearInterval(terminalPoll);
+									terminalPoll = undefined;
+								}
+							}, 10);
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {
 							if (transportTerminalized) return;
-							if (isExecServerMessage && terminalAdmissionMode !== "open") return;
+							if (isExecServerMessage && terminalAdmissionMode === "closed") return;
 							// An exec frame asks this process to perform work before Cursor can
 							// send another frame. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
 							if (isExecutable) {
+								if (terminalPoll) {
+									clearInterval(terminalPoll);
+									terminalPoll = undefined;
+								}
 								mutationSlotReserved = reserveCursorMutationLock(conversationId);
 								if (!mutationSlotReserved) throw new Error("Cursor mutation lock capacity exhausted");
 								clearTransportWatchdog();
@@ -1402,7 +1450,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							break;
 						}
 
-						if (isExecutable) break;
+						if (isExecutable) {
+							preemptFromPendingTerminal();
+							break;
+						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
 						terminalize(e);
@@ -1417,6 +1468,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			h2Request.on("end", () => {
 				responseEnded = true;
+				if (endStreamError && !h2Settled) {
+					terminalize(endStreamError);
+					return;
+				}
+				if (preemptFromPendingTerminal()) return;
+				if (!sawTurnEnded && !pendingContainsTurnEnded() && !h2Settled) {
+					if (pendingBuffer.length === 0) {
+						terminalize(new Error("Cursor stream ended before turnEnded"));
+						return;
+					}
+				}
 				sealExecAdmissionAtRawEof();
 				processPendingBuffer?.();
 				finishResponseAfterParsing();
@@ -2513,6 +2575,7 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 	let chain = Promise.resolve();
 	let pending = 0;
 	let closed = false;
+	let hasAdmittedTask = false;
 	return {
 		enqueue(handler) {
 			if (closed) return Promise.reject(new Error("Cursor server-message queue is closed"));
@@ -2523,7 +2586,17 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 				return Promise.reject(error);
 			}
 			pending += 1;
-			const result = chain.then(handler);
+			let result: Promise<void>;
+			if (!hasAdmittedTask) {
+				hasAdmittedTask = true;
+				try {
+					result = Promise.resolve(handler());
+				} catch (error) {
+					result = Promise.reject(error);
+				}
+			} else {
+				result = chain.then(handler);
+			}
 			const accounting = result.finally(() => {
 				pending -= 1;
 			});
