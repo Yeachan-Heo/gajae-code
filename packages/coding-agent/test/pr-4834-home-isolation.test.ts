@@ -4,7 +4,7 @@ import type * as nfs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { initializeWithSettings, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
+import { initializeWithSettings, loadCapability, loadCapabilityForHome } from "@gajae-code/coding-agent/capability";
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
 import { clearCache } from "@gajae-code/coding-agent/capability/fs";
 import { hookCapability } from "@gajae-code/coding-agent/capability/hook";
@@ -338,6 +338,38 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			const skills = await loadCapabilityForHome<Skill>(skillCapability.id, home, options);
 			expect(skills.items.map(item => item.name)).toEqual(["home-skill"]);
 			expect(skills.warnings).toEqual([]);
+		} finally {
+			initializeWithSettings(Settings.isolated());
+		}
+	});
+
+	test("public loadCapability cannot use isolatedHome to bypass active provider and extension policy", async () => {
+		await fs.mkdir(path.join(project, ".opencode", "commands"), { recursive: true });
+		await writeFile(
+			path.join(project, ".opencode", "commands", "ordinary-command.md"),
+			["---", "description: ordinary command", "---", "", "ordinary body"].join("\n"),
+		);
+
+		initializeWithSettings(Settings.isolated({ disabledProviders: ["opencode"] }));
+		try {
+			const blockedProvider = await loadCapability<SlashCommand>(slashCommandCapability.id, {
+				cwd: project,
+				providers: ["opencode"],
+				isolatedHome: true,
+			});
+			expect(blockedProvider.items).toEqual([]);
+		} finally {
+			initializeWithSettings(Settings.isolated());
+		}
+
+		initializeWithSettings(Settings.isolated({ disabledExtensions: ["slash-command:ordinary-command"] }));
+		try {
+			const blockedExtension = await loadCapability<SlashCommand>(slashCommandCapability.id, {
+				cwd: project,
+				providers: ["opencode"],
+				isolatedHome: true,
+			});
+			expect(blockedExtension.items).toEqual([]);
 		} finally {
 			initializeWithSettings(Settings.isolated());
 		}

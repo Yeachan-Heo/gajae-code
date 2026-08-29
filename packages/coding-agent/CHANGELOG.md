@@ -278,6 +278,7 @@
 - Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
 
 ## [0.15.1] - 2026-08-25
+
 ### Added
 
 - Added `/language [en|ko]`, the interactive slash command for the persisted `ui.language` selection. Without arguments it reports the current language; with a canonical code, locale tag (`en-US`, `ko-KR`), endonym (`한국어`), English name, or common aliases (`eng`, `kr`, `kor`) it persists the canonical `en`/`ko` value through settings and confirms in the selected language. An unsupported value is rejected with the available list and changes nothing. See `docs/ui-language.md`.
@@ -294,10 +295,7 @@
 
 ### Fixed
 
-- Onboarding language detection (`/tutorial`, first-run onboarding) no longer misreads English or Korean transcripts as French, Spanish, or German. Word evidence for space-delimited languages is matched on token boundaries instead of substrings — `le`/`la`/`el` used to match inside `file`, `please`, `class`, and `help`, so plain English handed French a majority — Korean, Japanese, and Chinese are identified by script instead of particle substrings, script counts and word hits share one ranking so two Hangul or Han characters cannot override a clearly English transcript, a Hangul claimant needs two characters before it may claim mixed han text so one stray Hangul glyph cannot erase dominant han evidence, a language must lead the runner-up outright to beat th…
-
-- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, avoiding a startup provider request; caller-supplied registries, foreign credentials, and unknown models remain fail-closed.
-- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
+- Onboarding language detection (`/tutorial`, first-run onboarding) no longer misreads English or Korean transcripts as French, Spanish, or German. Word evidence for space-delimited languages is matched on token boundaries instead of substrings — `le`/`la`/`el` used to match inside `file`, `please`, `class`, and `help`, so plain English handed French a majority — Korean, Japanese, and Chinese are identified by script instead of particle substrings, script counts and word hits share one ranking so two Hangul or Han characters cannot override a clearly English transcript, a claimant script needs two characters before it may claim mixed han text so one stray Hangul or kana glyph cannot erase dominant han evidence, a language must lead the runner-up outr…
 
 - `ask` question wording and option labels no longer use the post-resample U+2014 display-text exemption because accepted calls enter durable session history and deep-interview rounds; genuinely display-only tool fields retain the existing exemption (#4926).
 - Gajae Pet now treats forwarded `LC_TERMINAL=iTerm2` and `TERM_PROGRAM=iTerm.app` values as probe hints over SSH, enabling iTerm2 only after an active OSC 1337 File-capability reply. Generic SSH, spoofed/noninteractive/CI environments, and unmanaged tmux/screen/zellij nesting remain on the text fallback; verified Kitty and Sixel keep precedence. (#4911)

@@ -277,19 +277,30 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 		throw new Error(`Unknown capability: "${capabilityId}"`);
 	}
 
-	const cwd = options.cwd ?? getProjectDir();
+	// `isolatedHome` is an internal option used only by loadCapabilityForHome.
+	// Public ordinary loads must always apply the active process settings and
+	// disabled-provider/extension policy, even if a caller supplies that field.
+	const ordinaryOptions: LoadOptions = options.isolatedHome ? { ...options, isolatedHome: false } : options;
+	const cwd = ordinaryOptions.cwd ?? getProjectDir();
 	const home = getTrustedHomeDir();
 	// The process agent directory (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR /
 	// setAgentDir()) is the default user scope for EVERY native surface, so a
 	// non-default profile is never split across two directories; an explicit
 	// options.agentDir wins over it. loadCapabilityForHome instead derives the
 	// scope from its supplied home (explicit-home contract).
-	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
+	const userAgentDir = ordinaryOptions.agentDir ? path.resolve(ordinaryOptions.agentDir) : getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, isolatedHome: false, settings: options.settings };
-	const providers = filterProviders(capability, options);
+	const ctx: LoadContext = {
+		cwd,
+		home,
+		userAgentDir,
+		repoRoot,
+		isolatedHome: false,
+		settings: ordinaryOptions.settings,
+	};
+	const providers = filterProviders(capability, ordinaryOptions);
 
-	return await loadImpl(capability, providers, ctx, options);
+	return await loadImpl(capability, providers, ctx, ordinaryOptions);
 }
 
 /**
