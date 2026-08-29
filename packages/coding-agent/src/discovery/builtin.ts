@@ -68,6 +68,15 @@ function resolveUserAgentDir(ctx: LoadContext): string {
 	return ctx.userAgentDir ?? path.join(ctx.home, PATHS.userAgent);
 }
 
+function getProjectStopDirectory(ctx: LoadContext): string | undefined {
+	if (ctx.repoRoot) return ctx.repoRoot;
+	const homeRelative = path.relative(ctx.home, ctx.cwd);
+	const cwdIsWithinHome =
+		homeRelative === "" ||
+		(homeRelative !== ".." && !homeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(homeRelative));
+	return ctx.isolatedHome || cwdIsWithinHome ? ctx.home : undefined;
+}
+
 function getProjectConfigDirs(): string[] {
 	return [PATHS.projectDir];
 }
@@ -311,10 +320,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 		}
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(
-		ctx.cwd,
-		ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : undefined),
-	);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
 		const projectContent = await readFile(projectPath);
@@ -342,7 +348,7 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	// Walk up from cwd finding .gjc/skills/ in ancestors (closest first)
-	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : undefined)).filter(
+	const ancestors = getAncestorDirs(ctx.cwd, getProjectStopDirectory(ctx)).filter(
 		({ dir }) => path.resolve(dir) !== path.resolve(ctx.home),
 	);
 	const projectScans = ancestors.flatMap(({ dir }) =>
@@ -445,10 +451,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
 	if (userRule) items.push(userRule);
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(
-		ctx.cwd,
-		ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : undefined),
-	);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
@@ -972,10 +975,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(
-		ctx.cwd,
-		ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : undefined),
-	);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, getProjectStopDirectory(ctx));
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
 		const projectContent = await readFile(projectPath);

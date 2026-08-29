@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
+import type * as tls from "node:tls";
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { $env, extractHttpStatusFromError, sanitizeText } from "@gajae-code/utils";
@@ -275,7 +276,11 @@ export interface CursorOptions extends StreamOptions {
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
-const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 4096;
+// Connect frames routinely carry tool payloads and checkpoint blobs larger than
+// 4 KiB. Keep a finite protocol bound for hostile peers, but do not reject
+// valid server messages merely because they exceed the old debug-text limit.
+const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
+const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
 // A started non-abortable mutation must settle before the exec terminal is
 // published, but settlement cannot be allowed to hang the turn forever: once
@@ -302,6 +307,14 @@ function cursorAbortError(signal: AbortSignal): Error {
 		return reason;
 	}
 	return new Error("Request was aborted");
+}
+
+/** Marker failures must escape resolveExecHandler instead of becoming a late wire response. */
+class CursorExecAdmissionClosedError extends Error {
+	constructor() {
+		super("Cursor non-abortable exec was marked after wrapper terminalization");
+		this.name = "CursorExecAdmissionClosedError";
+	}
 }
 
 /** Exported for deterministic coverage of the Cursor exec-budget derivation. */
@@ -413,7 +426,7 @@ function runWithCursorExecDeadline<T>(
 	void operation(controller.signal, () => {
 		if (nonAbortableStarted) return;
 		if (settled || transportTerminated?.()) {
-			throw new Error("Cursor non-abortable exec was marked after wrapper terminalization");
+			throw new CursorExecAdmissionClosedError();
 		}
 		nonAbortableStarted = true;
 		// A mutation marked after the deadline already fired starts its grace
@@ -493,9 +506,9 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 
 function decodeGrpcMessage(value: unknown): string {
 	const raw = typeof value === "string" ? value : value == null ? "" : String(value);
-	const boundedRaw = raw.slice(0, CURSOR_MAX_GRPC_MESSAGE_LENGTH);
+	const boundedRaw = raw.slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH);
 	try {
-		return decodeURIComponent(boundedRaw).slice(0, CURSOR_MAX_GRPC_MESSAGE_LENGTH);
+		return decodeURIComponent(boundedRaw).slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH);
 	} catch {
 		return boundedRaw;
 	}
@@ -703,7 +716,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	const firstEventStartedAt = Date.now();
 	const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
 	const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
-	const endpointClass = model.baseUrl ? "custom" : "canonical";
+	const endpointClass = (model.baseUrl || CURSOR_API_URL) === CURSOR_API_URL ? "canonical" : "custom";
 	const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
 	(async () => {
@@ -730,13 +743,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
-		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
+		let proxiedSocket: tls.TLSSocket | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
 		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
 		let h2ClientCloseHandler: (() => void) | undefined;
 		let h2RequestErrorHandler: ((error: Error) => void) | undefined;
 		let h2RequestCloseHandler: (() => void) | undefined;
 		let h2RequestAbortedHandler: (() => void) | undefined;
+		let gracefulCloseCheckTimer: NodeJS.Timeout | undefined;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
 		const h2Completion = Promise.withResolvers<void>();
 		h2Completion.promise.catch(() => {});
@@ -946,10 +960,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				// must not re-arm the watchdog the exec path cleared, or a slow
 				// local tool call would terminalize the stream mid-exec.
 				if (execInFlight) return;
-				armTransportWatchdog(
-					idleTimeoutMs,
-					() => new Error("Cursor stream stalled while waiting for the next event"),
-				);
+				armTransportWatchdog(idleTimeoutMs, () => new Error("stream stalled while waiting for the next event"));
 			};
 			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
 			if (proxyUrl) {
@@ -1038,12 +1049,37 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				terminalize(error);
 			};
 			h2Request.on("error", h2RequestErrorHandler);
-			const handleUnexpectedRequestClose = (_kind: "closed" | "aborted"): void => {
+			const handleUnexpectedRequestClose = (kind: "closed" | "aborted"): void => {
 				if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+				// Node emits `aborted`/`close` with rstCode=0 for a graceful remote
+				// end while a request stream is paused. Preserve the raw-EOF path so
+				// buffered turnEnded frames can still be parsed. A nonzero reset code
+				// is a terminal transport failure: close admission and abort the active
+				// exec before any queued frame can dispatch.
+				if ((h2Request?.rstCode ?? 0) === 0) {
+					// A graceful close can be reported before the final data/end event;
+					// defer one turn so a coalesced turnEnded can establish success. If
+					// no frame arrives, treat a close with no buffered work as terminal
+					// and abort any active exec rather than waiting for the watchdog.
+					if (gracefulCloseCheckTimer) return;
+					gracefulCloseCheckTimer = setTimeout(() => {
+						gracefulCloseCheckTimer = undefined;
+						if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+						const error = new Error(`Cursor HTTP/2 request ${kind} before turnEnded`);
+						if (pendingBuffer.length === 0 && !processingPausedForQueue) {
+							responseEnded = true;
+							terminalize(error);
+							return;
+						}
+						responseEnded = true;
+						sealExecAdmissionAtRawEof();
+						processPendingBuffer?.();
+						finishResponseAfterParsing();
+					}, 0);
+					return;
+				}
 				responseEnded = true;
-				sealExecAdmissionAtRawEof();
-				processPendingBuffer?.();
-				finishResponseAfterParsing();
+				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`));
 			};
 			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
 			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
@@ -1271,6 +1307,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										h2Request!.resume();
 										if (isMeaningful) refreshTransportWatchdog();
 										processPendingBuffer?.();
+									} else if (transportTerminalized || terminalAdmissionMode === "closed") {
+										// A queued exec may be dropped after a trailer/reset or another
+										// earlier terminal closes admission. Do not leave parser state
+										// permanently paused while that dropped promise accounts down.
+										processingPausedForExec = false;
+										processPendingBuffer?.();
 									}
 								}
 							}
@@ -1400,10 +1442,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
 			if (!h2Settled) terminalize(error);
-			const mappedError = h2Failure ?? error;
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			// Caller cancellation remains authoritative even when a transport event
+			// rejected h2Completion first; the abort listener can run while the
+			// settlement fence is awaiting a detached mutation.
+			const mappedError = callerAbortError ?? h2Failure ?? error;
+			output.stopReason = callerAbortError || options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
-			output.transportFailure = transportFailureFacts(error);
+			output.transportFailure = transportFailureFacts(mappedError);
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
@@ -1411,6 +1456,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			stream.end();
 		} finally {
 			options?.signal?.removeEventListener("abort", onCallerAbort);
+			if (gracefulCloseCheckTimer) {
+				clearTimeout(gracefulCloseCheckTimer);
+				gracefulCloseCheckTimer = undefined;
+			}
 			transportWatchdogClosed = true;
 			if (transportWatchdog) {
 				clearTimeout(transportWatchdog);
@@ -2399,6 +2448,7 @@ export async function resolveExecHandler<TArgs, TResult>(
 		}
 		return { execResult: buildRejected("Tool returned no result") };
 	} catch (error) {
+		if (error instanceof CursorExecAdmissionClosedError) throw error;
 		const message = error instanceof Error ? error.message : String(error);
 		return { execResult: buildError(message) };
 	}

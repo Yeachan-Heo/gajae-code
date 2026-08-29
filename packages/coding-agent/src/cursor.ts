@@ -150,12 +150,14 @@ async function executeDelete(
 ) {
 	const toolName = "delete";
 	if (execSignal?.aborted) throw cursorAbortError(execSignal);
+	// Register the non-abortable mutation before notifying observers: a synchronous
+	// tool_execution_start subscriber may abort the run.
+	markNonAbortable?.();
 	options.emitEvent?.({ type: "tool_execution_start", toolCallId, toolName, args: { path: pathArg } });
 	if (execSignal?.aborted) throw cursorAbortError(execSignal);
 	// Delete is a filesystem mutation with no cooperative cancellation point:
 	// mark it non-abortable so the settlement fence publishes the exec terminal
 	// only once the unlink is final, matching write/edit dispatch.
-	markNonAbortable?.();
 
 	const absolutePath = resolveToCwd(pathArg, options.cwd);
 	let isError = false;

@@ -325,6 +325,36 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("accepts a valid Connect frame larger than 4 KiB within the protocol bound", async () => {
+		const largeText = "x".repeat(5_000);
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			const textFrame = buildServerMessageFrame({
+				case: "interactionUpdate",
+				value: create(InteractionUpdateSchema, {
+					message: { case: "textDelta", value: create(TextDeltaUpdateSchema, { text: largeText }) },
+				}),
+			});
+			const terminalFrame = buildServerMessageFrame({
+				case: "interactionUpdate",
+				value: create(InteractionUpdateSchema, {
+					message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+				}),
+			});
+			stream.end(
+				Buffer.concat([textFrame, terminalFrame, frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG)]),
+			);
+		});
+
+		const { result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+		});
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: largeText }));
+	});
+
 	it("records turnEnded when it lands exactly on the coalesced queue boundary", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
@@ -632,7 +662,7 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for the next event");
+		expect(result.errorMessage).toBe("stream stalled while waiting for the next event");
 		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }));
 		expect(result.usage.output).toBe(9);
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
@@ -713,7 +743,7 @@ describe("Cursor raw transport watchdog", () => {
 	});
 
 	it("does not refresh the watchdog for unhandled control envelopes", async () => {
-		let controlTimer: ReturnType<typeof setInterval> | undefined;
+		let controlTimer: NodeJS.Timeout | undefined;
 		const baseUrl = await createCursorServer(stream => {
 			stream.on("error", () => {});
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
@@ -742,12 +772,12 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for the next event");
+		expect(result.errorMessage).toBe("stream stalled while waiting for the next event");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
 	it("does not refresh the watchdog for unhandled interaction queries", async () => {
-		let queryTimer: ReturnType<typeof setInterval> | undefined;
+		let queryTimer: NodeJS.Timeout | undefined;
 		const baseUrl = await createCursorServer(stream => {
 			stream.on("error", () => {});
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
@@ -776,7 +806,7 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Cursor stream stalled while waiting for the next event");
+		expect(result.errorMessage).toBe("stream stalled while waiting for the next event");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
@@ -1244,6 +1274,41 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("aborts an active exec when the request is reset", async () => {
+		const observed = Promise.withResolvers<AbortSignal | undefined>();
+		const baseUrl = await createCursorServer(stream => {
+			stream.on("error", () => {});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendServerMessage(stream, {
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/reset" }) },
+					}),
+				});
+				setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 10);
+			}, 10);
+		});
+
+		const pending = collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 500,
+			streamIdleTimeoutMs: 100,
+			execHandlers: {
+				piRead: call => {
+					observed.resolve(call.signal);
+					return Promise.withResolvers<never>().promise;
+				},
+			},
+		});
+		const signal = await observed.promise;
+		const { events, result } = await pending;
+
+		expect(signal?.aborted).toBe(true);
+		expect(result.stopReason).toBe("error");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("rejects a non-abortable mark that arrives after transport terminalization", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.on("error", () => {});
@@ -1332,6 +1397,59 @@ describe("Cursor raw transport watchdog", () => {
 		expect(signal?.aborted).toBe(true);
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("caller cancelled exec");
+	});
+
+	it("keeps caller-abort priority when a transport failure is already fenced", async () => {
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const baseUrl = await createCursorServer(stream => {
+			stream.on("error", () => {});
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => {
+				sendServerMessage(stream, {
+					case: "execServerMessage",
+					value: create(ExecServerMessageSchema, {
+						id: 1,
+						message: {
+							case: "piWriteArgs",
+							value: create(PiWriteExecArgsSchema, { path: "archive.zip:priority.txt", content: "next" }),
+						},
+					}),
+				});
+				setTimeout(() => stream.close(http2.constants.NGHTTP2_INTERNAL_ERROR), 10);
+			}, 10);
+		});
+
+		const pending = collectTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 500,
+			streamIdleTimeoutMs: 100,
+			execHandlers: {
+				piWrite: async call => {
+					call.markNonAbortable?.();
+					started.resolve();
+					await release.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		await started.promise;
+		await Bun.sleep(30);
+		controller.abort(new Error("caller wins transport reset"));
+		release.resolve();
+		const { events, result } = await pending;
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("caller wins transport reset");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
 	it("caps the settlement fence when a marked non-abortable mutation never settles", async () => {
