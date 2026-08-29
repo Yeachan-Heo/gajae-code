@@ -10,12 +10,15 @@ import {
 	observeOwnerTerminal,
 	type PlanRequest,
 	type PublishGenerationRequest,
-	parseOwnerIsolationRequest,
 	planTmuxOwnerIsolation,
 	publishOwnerGenerationSync,
 	serializeOwnerIsolationResponse,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	type TmuxServerProof,
+	isTrustedOwnerIsolationProtocolRequest,
+	isTrustedTmuxOwnerIsolationArgv,
+	isTmuxShellWrapperArgv,
+	isTmuxControlArgvBoundToSocket,
 } from "./tmux-owner-isolation";
 
 /** Matches the sole argv shape allowed to enter the owner-isolation JSON-line protocol. */
@@ -90,9 +93,20 @@ export async function tmuxServerProof(
 	tmuxControlArgv?: string[],
 	options: TmuxServerProofOptions = {},
 ): Promise<TmuxServerProof> {
-	void socketKey;
 	if (!tmuxControlArgv?.length) return { state: "unverifiable" };
 	const platform = options.platform ?? process.platform;
+	const usingPlatformBoundTestRunner = options.runListSessions !== undefined && platform !== process.platform;
+	if (!usingPlatformBoundTestRunner && platform !== process.platform) return { state: "unverifiable" };
+	// A supplied list-sessions runner is the hermetic test seam. Production
+	// probes must only execute the provider selected by this process, and every
+	// explicit socket selector must bind to the caller's server key before spawn.
+	if (isTmuxShellWrapperArgv(tmuxControlArgv)) return { state: "unverifiable" };
+	if (!isTmuxControlArgvBoundToSocket(socketKey, tmuxControlArgv, {
+		allowUnselectedProvider: usingPlatformBoundTestRunner || tmuxControlArgv[0] === socketKey,
+	}))
+		return { state: "unverifiable" };
+	if (!usingPlatformBoundTestRunner && !isTrustedTmuxOwnerIsolationArgv(tmuxControlArgv))
+		return { state: "unverifiable" };
 	const subprocess = options.runListSessions?.(tmuxControlArgv) ?? runTmuxListSessions(tmuxControlArgv);
 	if (subprocess.exitCode !== 0)
 		return isKnownNoServerDiagnostic(subprocess.stderr) ? { state: "absent" } : { state: "unverifiable" };
@@ -143,6 +157,7 @@ export async function runTmuxOwnerIsolationCli(stdin: string): Promise<string> {
 	if (line.includes("\n")) return cliFailure("invalid_json_line");
 	const request = parseOwnerIsolationRequest(line);
 	if (!request) return cliFailure("invalid_json_line");
+	if (!isTrustedOwnerIsolationProtocolRequest(request)) return cliFailure("invalid_json_line");
 	if (request.op === "plan")
 		return serializeOwnerIsolationResponse(await planTmuxOwnerIsolation(request as PlanRequest, probe()));
 	if (request.op === "bootstrap") {

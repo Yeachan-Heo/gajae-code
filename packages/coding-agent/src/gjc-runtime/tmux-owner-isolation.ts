@@ -27,6 +27,7 @@ function openRecoveryFsRootNative(): typeof import("@gajae-code/natives")["openR
 
 import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
+import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { assertSafePathComponent } from "./session-layout";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
@@ -295,9 +296,39 @@ function failure(code: PlanErrorCode, diagnostic: string): PlanFailure {
 		diagnostic: safeDiagnostic(diagnostic),
 	};
 }
-function tmuxControlArgv(tmuxArgv: string[]): string[] {
+export function tmuxControlArgv(tmuxArgv: string[]): string[] {
 	const command = canonicalNewSession(tmuxArgv);
 	return command ? tmuxArgv.slice(0, command.index) : [];
+}
+
+/**
+ * Bind an extracted tmux control prefix to its requested server selector.
+ * Native tmux has no selector and is intentionally accepted only when its
+ * provider command is itself the server key; namespaced providers must carry
+ * one explicit `-L`/`-S` selector and that selector must match exactly.
+ */
+export function isTmuxControlArgvBoundToSocket(
+	socketKey: string,
+	controlArgv: readonly string[],
+	options: { allowUnselectedProvider?: boolean } = {},
+): boolean {
+	if (!nonEmpty(socketKey) || !validArgv(controlArgv)) return false;
+	let selector: string | undefined;
+	for (let index = 1; index < controlArgv.length; index += 1) {
+		const arg = controlArgv[index]!;
+		if (arg === "-L" || arg === "-S") {
+			const value = controlArgv[index + 1];
+			if (!nonEmpty(value) || selector !== undefined) return false;
+			selector = value;
+			index += 1;
+			continue;
+		}
+		// Do not accept compact selector forms (`-Lfoo`, `-Sfoo`) or a shell
+		// wrapper's option payload as an alternate spelling of the authority.
+		if (arg.startsWith("-L") || arg.startsWith("-S")) return false;
+	}
+	if (selector !== undefined) return selector === socketKey;
+	return options.allowUnselectedProvider === true && controlArgv[0] === socketKey;
 }
 
 /** Accept exactly one tmux new-session command with exactly one explicit session target. */
@@ -329,6 +360,54 @@ function validArgv(argv: unknown): argv is string[] {
 		!argv[0].includes("\0") &&
 		argv.slice(1).every(value => typeof value === "string" && !value.includes("\0"))
 	);
+}
+
+/** Shell entry points are never a tmux provider, even when supplied as argv[0]. */
+const TMUX_SHELL_WRAPPER_NAMES = new Set([
+	"ash",
+	"bash",
+	"cmd",
+	"cmd.exe",
+	"csh",
+	"dash",
+	"env",
+	"fish",
+	"ksh",
+	"powershell",
+	"pwsh",
+	"sh",
+	"tcsh",
+	"zsh",
+]);
+
+function commandBaseName(command: string): string {
+	const normalized = command.replace(/\\/g, "/");
+	return normalized.slice(normalized.lastIndexOf("/") + 1).toLowerCase();
+}
+
+function isShellWrapperCommand(command: string): boolean {
+	const basename = commandBaseName(command);
+	return TMUX_SHELL_WRAPPER_NAMES.has(basename);
+}
+
+export function isTmuxShellWrapperArgv(argv: readonly string[]): boolean {
+	const command = argv[0];
+	return typeof command === "string" && isShellWrapperCommand(command);
+}
+
+/**
+ * Admission check for protocol-supplied tmux argv. Internal launch callers keep
+ * their injectable argv seams; only the JSON-line protocol binds argv[0] to the
+ * provider selected by this process.
+ */
+export function isTrustedTmuxOwnerIsolationArgv(argv: readonly string[]): boolean {
+	if (!validArgv(argv) || isTmuxShellWrapperArgv(argv)) return false;
+	try {
+		const provider = resolveGjcTmuxBinary({ env: process.env, platform: process.platform });
+		return argv[0] === provider.command;
+	} catch {
+		return false;
+	}
 }
 
 export function isSafeServerProof(
@@ -2509,6 +2588,41 @@ function isPlatform(value: unknown): value is NodeJS.Platform {
 		value === "win32" ||
 		value === "cygwin"
 	);
+}
+
+/**
+ * Apply the process-bound admission rules to requests entering the JSON-line
+ * protocol. The public planning functions retain their platform/argv seams for
+ * hermetic callers; the protocol itself must not trust those fields.
+ */
+export function isTrustedOwnerIsolationProtocolRequest(
+	request: PlanRequest | BootstrapRequest | PublishGenerationRequest | ObserveTerminalRequest,
+): boolean {
+	if (request.op === "plan") {
+		if (request.platform !== process.platform) return false;
+		const controlArgv = tmuxControlArgv(request.tmux_argv);
+		if (
+			controlArgv.length > 0 &&
+			!isTmuxControlArgvBoundToSocket(request.socket_key, controlArgv, {
+				allowUnselectedProvider: controlArgv[0] === request.socket_key,
+			})
+		)
+			return false;
+		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
+	}
+	if (request.op === "bootstrap") {
+		if (process.platform !== "linux") return false;
+		const controlArgv = tmuxControlArgv(request.tmux_argv);
+		if (
+			controlArgv.length > 0 &&
+			!isTmuxControlArgvBoundToSocket(request.socket_key, controlArgv, {
+				allowUnselectedProvider: controlArgv[0] === request.socket_key,
+			})
+		)
+			return false;
+		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
+	}
+	return true;
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {
 	return (
