@@ -63,8 +63,8 @@ that source's exact total count. This applies to both halves of the array — br
 traversal warnings and scope-exclusion warnings — so neither can grow with the
 size of the index.
 Without the bound the array grew with the number of sessions on the machine
-rather than with the result (a measured `--scope repo` call returned 317
-sessions alongside 314 warnings, about 52 KB of the 196 KB response).
+rather than with the result. The response now uses a bounded warning sample and
+exact-count summaries.
 `--scope all` performs no filtering and therefore emits no exclusion warnings.
 
 The raw global `session.list` route remains unfiltered, and `inspect`, `send`,

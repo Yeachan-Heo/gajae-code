@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { SdkSessionRowV1 } from "../src/sdk/cli/rows";
 import {
 	filterSessionRowsByScope,
+	boundWarningSources,
 	parseSessionListScope,
 	resolveSessionListSelection,
 	runSdkSessionCli,
@@ -305,5 +306,22 @@ describe("scope exclusion warnings are bounded", () => {
 		// The stated total must be the real number excluded, never the collapsed length.
 		expect(summary).toContain(`${excluded} excluded in total.`);
 		expect(summary).not.toContain(`${SESSION_LIST_WARNING_LIMIT + 1} excluded in total.`);
+	});
+
+	test("counts source summaries inside the global warning cap", () => {
+		const warnings = boundWarningSources([
+			{
+				entries: Array.from({ length: 20 }, (_, index) => `broker-${index}`),
+				describeOmitted: count => `${count} broker warnings omitted`,
+			},
+			{
+				entries: Array.from({ length: 20 }, (_, index) => `scope-${index}`),
+				describeOmitted: count => `${count} scope warnings omitted`,
+			},
+		]);
+
+		expect(warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(warnings.at(-2)).toBe("20 broker warnings omitted");
+		expect(warnings.at(-1)).toBe("20 scope warnings omitted");
 	});
 });

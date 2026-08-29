@@ -702,20 +702,22 @@ export async function filterSessionRowsByScope(
 }
 
 /** Bounds all warning sources together while retaining each source's exact omitted count. */
-function boundWarningSources(
+export function boundWarningSources(
 	sources: readonly { entries: readonly string[]; describeOmitted: (omitted: number) => string }[],
 ): string[] {
+	const omitted = sources
+		.map(source => ({ source, count: source.entries.length }))
+		.filter(item => item.count > 0)
+		.map(item => ({ ...item, summary: item.source.describeOmitted(item.count) }));
+	const summaryCount = Math.min(omitted.length, SESSION_LIST_WARNING_LIMIT);
 	const samples: string[] = [];
-	const summaries: string[] = [];
-	let remaining = SESSION_LIST_WARNING_LIMIT;
+	let remaining = SESSION_LIST_WARNING_LIMIT - summaryCount;
 	for (const source of sources) {
 		const retained = source.entries.slice(0, remaining);
 		samples.push(...retained);
 		remaining -= retained.length;
-		if (source.entries.length > retained.length)
-			summaries.push(source.describeOmitted(source.entries.length - retained.length));
 	}
-	return [...samples, ...summaries];
+	return [...samples, ...omitted.slice(0, summaryCount).map(item => item.summary)];
 }
 
 async function runList(agentDir: string, args: SdkSessionCliArgs): Promise<unknown> {
