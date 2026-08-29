@@ -71,6 +71,15 @@ function buildToolErrorResult(message: string): AgentToolResult<unknown> {
 	};
 }
 
+/** Admission markers are control flow, not user-facing tool failures. */
+function isCursorExecAdmissionClosedError(error: unknown): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		(error as { name?: unknown }).name === "CursorExecAdmissionClosedError"
+	);
+}
+
 async function executeTool(
 	options: CursorExecBridgeOptions,
 	toolName: string,
@@ -126,6 +135,7 @@ async function executeTool(
 			toolContext,
 		);
 	} catch (error) {
+		if (isCursorExecAdmissionClosedError(error)) throw error;
 		const message = error instanceof Error ? error.message : String(error);
 		result = buildToolErrorResult(message);
 		isError = true;
@@ -478,6 +488,7 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 			if (nonAbortable) markNonAbortable?.();
 			result = await tool.execute(toolCallId, toolArgs, nonAbortable ? undefined : signal, onUpdate, toolContext);
 		} catch (error) {
+			if (isCursorExecAdmissionClosedError(error)) throw error;
 			const message = error instanceof Error ? error.message : String(error);
 			result = buildToolErrorResult(message);
 			isError = true;

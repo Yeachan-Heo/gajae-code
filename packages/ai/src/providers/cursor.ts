@@ -489,6 +489,38 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
 	return frame;
 }
 
+function isClosedCursorRequest(request: http2.ClientHttp2Stream): boolean {
+	return request.closed || request.destroyed || request.writableEnded || request.writableFinished;
+}
+
+/**
+ * Late exec/stream handlers can finish after the bounded settlement fence has
+ * closed the HTTP/2 request. Treat those writes as dropped transport output;
+ * never let a synchronous write-after-end error escape into the process.
+ */
+function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
+	if (isClosedCursorRequest(request)) return false;
+	try {
+		request.write(frame);
+		return true;
+	} catch (error) {
+		if (isClosedCursorRequest(request)) return false;
+		const code = (error as NodeJS.ErrnoException).code;
+		if (
+			code === "ERR_STREAM_WRITE_AFTER_END" ||
+			code === "ERR_HTTP2_INVALID_STREAM" ||
+			code === "ERR_HTTP2_STREAM_CLOSED"
+		)
+			return false;
+		throw error;
+	}
+}
+
+/** Exported for deterministic coverage of the post-fence write race. */
+export function writeCursorFrameForTest(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
+	return writeCursorFrame(request, frame);
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
 	try {
 		const payload = JSON.parse(new TextDecoder().decode(data));
@@ -1381,7 +1413,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (h2Settled) {
 				await h2Completion.promise;
 			}
-			h2Request.write(frameConnectMessage(requestBytes));
+			writeCursorFrame(h2Request, frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
 				if (!coordinator.isActive()) return;
@@ -1389,7 +1421,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
 				});
 				const heartbeatBytes = toBinary(AgentClientMessageSchema, heartbeatMessage);
-				coordinator.enqueue(frameConnectMessage(heartbeatBytes));
+				writeCursorFrame(h2Request, frameConnectMessage(heartbeatBytes));
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
@@ -1578,7 +1610,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		writer.enqueue(frameConnectMessage(responseBytes));
+		writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
@@ -1599,7 +1631,7 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		writer.enqueue(frameConnectMessage(responseBytes));
+		writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
@@ -2373,7 +2405,7 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.enqueue(frameConnectMessage(responseBytes));
+	writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
 
 	log("execClientMessage", messageCase, value);
 }
@@ -2393,7 +2425,7 @@ function sendExecClientThrow(
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "execClientControlMessage", value: controlMessage },
 	});
-	h2Request.enqueue(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	writeCursorFrame(h2Request, frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	sendExecClientStreamClose(h2Request, execMsg);
 }
 
@@ -2410,7 +2442,7 @@ function sendExecClientStreamClose(h2Request: CursorRequestWriter, execMsg: Exec
 		message: { case: "execClientControlMessage", value: closeMessage },
 	});
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.enqueue(frameConnectMessage(responseBytes));
+	writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
 	log("execClientControl", "streamClose", { id: execMsg.id, execId: execMsg.execId });
 }
 

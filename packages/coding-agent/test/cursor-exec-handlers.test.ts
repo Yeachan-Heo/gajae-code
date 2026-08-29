@@ -105,6 +105,22 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		);
 		expect(marked).toBe(true);
 	});
+	it("propagates a closed admission marker instead of returning a tool error", async () => {
+		const writeTool = { ...makeTool("write"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const marker = new Error("Cursor non-abortable exec was marked after wrapper terminalization");
+		marker.name = "CursorExecAdmissionClosedError";
+
+		await expect(
+			handlers.write(
+				create(WriteArgsSchema, { path: "native.txt", fileText: "body", toolCallId: "closed-admission" }),
+				undefined,
+				() => {
+					throw marker;
+				},
+			),
+		).rejects.toBe(marker);
+	});
 
 	it("marks a production non-abortable Pi edit before dispatch", async () => {
 		const editTool = { ...makeTool("edit"), nonAbortable: true };

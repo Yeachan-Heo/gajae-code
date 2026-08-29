@@ -45,6 +45,32 @@ function isWithinOrEqual(root: string, candidate: string): boolean {
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
 }
 
+/**
+ * Resolve a path through the real path of its deepest existing ancestor,
+ * re-appending any not-yet-created suffix. Explicit-home discovery accepts
+ * fresh project paths, but must not let a symlinked existing ancestor alias a
+ * directory outside the supplied home.
+ */
+async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
+	const resolved = path.resolve(target);
+	const suffix: string[] = [];
+	let current = resolved;
+
+	while (true) {
+		try {
+			const real = await fs.realpath(current);
+			return suffix.length > 0 ? path.join(real, ...suffix.reverse()) : real;
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+			const parent = path.dirname(current);
+			if (parent === current) return resolved;
+			suffix.push(path.basename(current));
+			current = parent;
+		}
+	}
+}
+
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
 /** Session-local settings keyed by normalized working directory. */
@@ -297,21 +323,30 @@ export async function loadCapabilityForHome<T>(
 	// getAgentDir() is deliberately not consulted: an explicit home must never
 	// read another profile's SYSTEM/RULES/AGENTS, skills, commands, hooks,
 	// settings, or executable descriptors.
+	const lexicalCwd = path.resolve(options.cwd ?? getProjectDir());
+	const [canonicalHome, cwd] = await Promise.all([
+		canonicalizeThroughExistingAncestor(resolvedHome),
+		canonicalizeThroughExistingAncestor(lexicalCwd),
+	]);
+	// A cwd that lexically appears below the supplied home but resolves outside
+	// it is an ambiguous authority boundary. Refuse the load before repository
+	// or provider discovery can traverse the escaped target.
+	if (isWithinOrEqual(resolvedHome, lexicalCwd) && !isWithinOrEqual(canonicalHome, cwd)) {
+		throw new Error(
+			`loadCapabilityForHome cwd escapes the supplied home through a symlink: "${lexicalCwd}" resolves to "${cwd}" outside "${canonicalHome}".`,
+		);
+	}
+
 	const userAgentDir = options.agentDir
 		? path.resolve(options.agentDir)
-		: path.join(resolvedHome, getConfigDirName(), "agent");
-
-	const cwd = path.resolve(options.cwd ?? getProjectDir());
-	const [canonicalHome, repoRootCandidate] = await Promise.all([
-		fs.realpath(resolvedHome).catch(() => resolvedHome),
-		findRepoRoot(cwd),
-	]);
+		: path.join(canonicalHome, getConfigDirName(), "agent");
+	const repoRootCandidate = await findRepoRoot(cwd);
 	const canonicalRepoRoot = repoRootCandidate
-		? await fs.realpath(repoRootCandidate).catch(() => path.resolve(repoRootCandidate))
+		? await canonicalizeThroughExistingAncestor(repoRootCandidate)
 		: null;
 	const repoRoot =
 		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
-			? repoRootCandidate
+			? canonicalRepoRoot
 			: null;
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = {

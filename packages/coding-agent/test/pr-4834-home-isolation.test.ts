@@ -145,6 +145,36 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.items.map(item => item.content)).toEqual(["# project system"]);
 	});
 
+	test("explicit home rejects a cwd symlink that escapes into a decoy project", async () => {
+		const decoyProject = path.join(tempDir, "process-decoy", "project");
+		await writeFile(path.join(decoyProject, ".gjc", "SYSTEM.md"), "# decoy system");
+		const symlinkedCwd = path.join(home, "project-link");
+		await fs.symlink(decoyProject, symlinkedCwd, "dir");
+
+		const reads = new Set<string>();
+		const realReaddir = fs.readdir.bind(fs);
+		vi.spyOn(fs, "readdir").mockImplementation(((target: nfs.PathLike, options?: nfs.ObjectEncodingOptions) => {
+			reads.add(path.resolve(String(target)));
+			return realReaddir(target, options);
+		}) as unknown as typeof fs.readdir);
+		const realBunFile = Bun.file.bind(Bun) as (target: string | URL | number) => Bun.BunFile;
+		vi.spyOn(Bun, "file").mockImplementation(((target: string | URL | number) => {
+			if (typeof target !== "number") reads.add(path.resolve(String(target)));
+			return realBunFile(target);
+		}) as unknown as typeof Bun.file);
+
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+			cwd: symlinkedCwd,
+			providers: ["native"],
+		}).catch(() => undefined);
+
+		expect(result?.items ?? []).toEqual([]);
+		const canonicalReads = await Promise.all([...reads].map(filePath => fs.realpath(filePath).catch(() => filePath)));
+		expect(canonicalReads.filter(filePath => filePath === decoyProject || filePath.startsWith(`${decoyProject}${path.sep}`))).toEqual(
+			[],
+		);
+	});
+
 	test("explicit home does not walk a no-repo cwd into unrelated ancestors", async () => {
 		await writeFile(path.join(tempDir, ".gjc", "SYSTEM.md"), "# unrelated ancestor system");
 		clearCache();
