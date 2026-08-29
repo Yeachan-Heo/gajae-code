@@ -1543,6 +1543,8 @@ export function removeGjcTmuxSession(
 		sessionEnv,
 		`kill-session -t '${nativeSessionId}'`,
 		expectedIdentity?.ownerGeneration,
+		undefined,
+		session.psmuxIncarnation,
 	);
 	return session;
 }
