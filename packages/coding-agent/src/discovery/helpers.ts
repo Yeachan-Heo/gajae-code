@@ -892,6 +892,14 @@ export async function invalidateClaudePluginRoots(home: string, cwd?: string, is
 	pluginRootsCache.delete(`${home}:${resolvedProjectPath ?? ""}`);
 }
 
+async function resolveIsolatedPluginPath(home: string, value: string): Promise<string | undefined> {
+	const resolved = path.resolve(home, value);
+	const canonical = await fs.promises.realpath(resolved).catch(() => resolved);
+	const relative = path.relative(home, canonical);
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
+	return canonical;
+}
+
 /**
  * List installed GJC plugin roots from the GJC plugin registry and, when present,
  * the nearest project-scoped registry resolved from `cwd`.
@@ -939,15 +947,22 @@ export async function listClaudePluginRoots(
 						continue;
 					}
 					if (entry.enabled === false) continue;
+					const installPath = isolatedHome
+						? await resolveIsolatedPluginPath(home, entry.installPath)
+						: entry.installPath;
+					if (!installPath) {
+						warnings.push(`Plugin ${pluginId} installPath escapes the isolated home`);
+						continue;
+					}
 					// Deduplicate by installPath within same ID
-					if (roots.some(r => r.id === pluginId && r.path === entry.installPath)) continue;
+					if (roots.some(r => r.id === pluginId && r.path === installPath)) continue;
 
 					roots.push({
 						id: pluginId,
 						marketplace,
 						plugin: pluginName,
 						version: entry.version || "unknown",
-						path: entry.installPath,
+						path: installPath,
 						scope: entry.scope || "user",
 					});
 				}
@@ -980,12 +995,19 @@ export async function listClaudePluginRoots(
 							continue;
 						}
 						if (entry.enabled === false) continue;
+						const installPath = isolatedHome
+							? await resolveIsolatedPluginPath(home, entry.installPath)
+							: entry.installPath;
+						if (!installPath) {
+							warnings.push(`Plugin ${pluginId} installPath escapes the isolated home`);
+							continue;
+						}
 						projectRoots.push({
 							id: pluginId,
 							marketplace,
 							plugin: pluginName,
 							version: entry.version || "unknown",
-							path: entry.installPath,
+							path: installPath,
 							scope: "project",
 						});
 					}
