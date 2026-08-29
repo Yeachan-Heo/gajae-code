@@ -26,11 +26,13 @@ import {
 	planTmuxOwnerIsolationSync,
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
+	isTrustedOwnerIsolationProtocolRequest,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
 	isTmuxOwnerIsolationCliArgv,
+	runTmuxOwnerIsolationCli,
 	tmuxServerProof,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation-cli";
 
@@ -131,6 +133,37 @@ describe("tmux owner isolation", () => {
 		for (const argv of [[], [ownerIsolationFlag, "extra"], ["extra", ownerIsolationFlag], ["--other"]]) {
 			expect(isTmuxOwnerIsolationCliArgv(argv)).toBe(false);
 		}
+	});
+
+	it("rejects a spoofed protocol platform before planning", async () => {
+		const spoofedPlatform = process.platform === "linux" ? "darwin" : "linux";
+		const spoofedRequest = { ...request, platform: spoofedPlatform };
+		expect(isTrustedOwnerIsolationProtocolRequest(spoofedRequest as never)).toBe(false);
+		expect(JSON.parse(await runTmuxOwnerIsolationCli(JSON.stringify(spoofedRequest)))).toMatchObject({
+			ok: false,
+			code: "scope_unavailable",
+			diagnostic: "invalid_json_line",
+		});
+	});
+
+	it("rejects arbitrary control argv and socket selectors before probing", async () => {
+		let runnerCalls = 0;
+		const proof = await tmuxServerProof("socket", ["tmux", "-L", "other"], {
+			platform: process.platform,
+			runListSessions: () => {
+				runnerCalls += 1;
+				return { exitCode: 0, stdout: "42\towned\n", stderr: "" };
+			},
+		});
+		expect(proof).toEqual({ state: "unverifiable" });
+		expect(runnerCalls).toBe(0);
+		const arbitraryArgv = { ...request, tmux_argv: ["sh", "-c", "new-session", "-s", "owned"] };
+		expect(isTrustedOwnerIsolationProtocolRequest(arbitraryArgv as never)).toBe(false);
+		expect(JSON.parse(await runTmuxOwnerIsolationCli(JSON.stringify(arbitraryArgv)))).toMatchObject({
+			ok: false,
+			code: "scope_unavailable",
+			diagnostic: "invalid_json_line",
+		});
 	});
 
 	it("treats successful whitespace-only list-sessions output as absent", async () => {
