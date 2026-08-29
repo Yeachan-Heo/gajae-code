@@ -127,7 +127,6 @@ export async function loadMarketplaceSkills(
 	const items: Skill[] = [];
 	const warnings: string[] = [];
 
-<<<<<<< HEAD
 	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd, ctx.isolatedHome ?? false, allowedLevels);
 	warnings.push(...rootWarnings);
 

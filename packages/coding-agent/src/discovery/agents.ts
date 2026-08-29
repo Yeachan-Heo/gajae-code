@@ -46,7 +46,7 @@ function getUserPathCandidates(ctx: LoadContext, ...segments: string[]): string[
 export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
 	const paths: string[] = [];
 	let current = ctx.cwd;
-	const stopDirectory = ctx.repoRoot ?? ctx.home;
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : path.parse(ctx.cwd).root);
 	const relativeStop = path.relative(stopDirectory, ctx.cwd);
 	const effectiveStopDirectory =
 		relativeStop === "" ||

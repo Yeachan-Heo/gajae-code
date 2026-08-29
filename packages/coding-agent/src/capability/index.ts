@@ -309,7 +309,10 @@ export async function loadCapabilityForHome<T>(
 	const canonicalRepoRoot = repoRootCandidate
 		? await fs.realpath(repoRootCandidate).catch(() => path.resolve(repoRootCandidate))
 		: null;
-	const repoRoot = canonicalRepoRoot && isWithinOrEqual(canonicalHome, canonicalRepoRoot) ? repoRootCandidate : null;
+	const repoRoot =
+		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
+			? repoRootCandidate
+			: null;
 	const isolatedOptions: LoadOptions = { ...options, isolatedHome: true };
 	const ctx: LoadContext = {
 		cwd,

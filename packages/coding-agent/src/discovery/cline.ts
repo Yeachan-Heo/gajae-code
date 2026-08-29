@@ -49,7 +49,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const warnings: string[] = [];
 
 	// Project-level only (Cline uses root-level .clinerules)
-	const found = await findClinerules(ctx.cwd, ctx.repoRoot ?? ctx.home);
+	const found = await findClinerules(ctx.cwd, ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : undefined));
 	if (!found) {
 		return { items, warnings };
 	}

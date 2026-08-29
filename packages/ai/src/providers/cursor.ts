@@ -1021,6 +1021,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			h2Client.on("close", h2ClientCloseHandler);
 
 			options?.onStreamCreated?.();
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			h2Request = h2Client.request({
 				":method": "POST",
 				":path": "/agent.v1.AgentService/Run",
@@ -1141,6 +1142,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					}
 					const flags = pendingBuffer[0];
 					const msgLen = pendingBuffer.readUInt32BE(1);
+					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
+						endStreamError = new Error("Cursor HTTP/2 frame exceeds the maximum message length");
+						responseEnded = true;
+						closeTerminalAdmission();
+						break;
+					}
 					if (pendingBuffer.length < 5 + msgLen) break;
 
 					const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);

@@ -71,7 +71,7 @@ export async function loadAgentsMd(
 	let aggregateBytes = 0;
 	let omittedOversizedFile = false;
 	let omittedAggregateFile = false;
-	const stopDirectory = ctx.repoRoot ?? ctx.home;
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome ? ctx.home : path.parse(ctx.cwd).root);
 	const relativeStop = path.relative(stopDirectory, ctx.cwd);
 	const effectiveStopDirectory =
 		relativeStop === "" ||
