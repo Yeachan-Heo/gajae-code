@@ -464,6 +464,7 @@ describe("tmux owner isolation", () => {
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, session_id: "../escape" }))).toBeNull();
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, owner_generation: "..\\escape" }))).toBeNull();
 		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, state_dir: "relative/state" }))).toBeNull();
+		expect(parseOwnerIsolationRequest(JSON.stringify({ ...request, session_id: "bad\u0000id" }))).toBeNull();
 		expect(parseOwnerIsolationRequest("x".repeat(16 * 1024 + 1))).toBeNull();
 		expect(
 			await planTmuxOwnerIsolation(request, {
