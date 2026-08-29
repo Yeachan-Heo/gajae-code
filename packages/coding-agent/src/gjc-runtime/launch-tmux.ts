@@ -535,7 +535,10 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 	const command = resolveCurrentGjcCommand(context);
 	const childArgs = stripRootTmuxFlag(rawArgs);
 	const supervisorEnv: Record<string, string> = context.managedOwnerSupervisor
-		? { GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]) }
+		? {
+				GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]),
+				GJC_MANAGED_OWNER_SUPERVISED: "1",
+			}
 		: {};
 	const invocationArgs = context.managedOwnerSupervisor
 		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]

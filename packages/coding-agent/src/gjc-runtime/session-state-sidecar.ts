@@ -2692,7 +2692,7 @@ async function observeOwnerTerminalPostmortem(
 	sessionId: string,
 ): Promise<OwnerVerdict | null> {
 	try {
-		if (process.env.GJC_TMUX_LAUNCHED === "1" && !owner.operatorDispatchId) return null;
+		if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" && !owner.operatorDispatchId) return null;
 		const now = new Date().toISOString();
 		const observation: Omit<ObserveTerminalRequest, "operator_dispatch_id" | "operator_intent_id"> = {
 			schema_version: 1,
@@ -2729,7 +2729,7 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 	if (!owner) return;
 	try {
 		if (!verdict) {
-			if (process.env.GJC_TMUX_LAUNCHED === "1") return;
+			if (process.env.GJC_MANAGED_OWNER_SUPERVISED === "1") return;
 			throw new Error("owner terminal verdict unavailable");
 		}
 		const now = new Date().toISOString();
