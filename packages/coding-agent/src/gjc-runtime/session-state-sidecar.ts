@@ -2697,7 +2697,7 @@ async function observeOwnerTerminalPostmortem(
 				(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
 			reason === postmortem.Reason.SIGTERM &&
 			(!owner.operatorDispatchId || !owner.operatorIntentId) &&
-			(await hasPendingOwnerIntent(owner, sessionId))
+			(await pendingOwnerIntentStatus(owner, sessionId)) !== "none"
 		)
 			return null;
 		const now = new Date().toISOString();
@@ -2725,21 +2725,27 @@ async function observeOwnerTerminalPostmortem(
 	}
 }
 
-async function hasPendingOwnerIntent(owner: OwnerTerminalContext, sessionId: string): Promise<boolean> {
+type PendingOwnerIntentStatus = "none" | "matching" | "foreign";
+
+async function pendingOwnerIntentStatus(
+	owner: OwnerTerminalContext,
+	sessionId: string,
+): Promise<PendingOwnerIntentStatus> {
 	try {
 		const intent = JSON.parse(
 			await Bun.file(lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile).text(),
 		) as unknown;
-		return (
-			isValidOwnerIntent(intent) &&
-			intent.session_id === sessionId &&
-			intent.generation === owner.generation &&
-			intent.server_key === owner.socketKey &&
-			Date.parse(intent.created_at) <= Date.now() &&
-			Date.parse(intent.expires_at) > Date.now()
-		);
+		if (
+			!isValidOwnerIntent(intent) ||
+			intent.session_id !== sessionId ||
+			intent.generation !== owner.generation ||
+			Date.parse(intent.created_at) > Date.now() ||
+			Date.parse(intent.expires_at) <= Date.now()
+		)
+			return "none";
+		return intent.server_key === owner.socketKey ? "matching" : "foreign";
 	} catch {
-		return false;
+		return "none";
 	}
 }
 
@@ -2759,7 +2765,7 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 				(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
 					(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
 				reason === postmortem.Reason.SIGTERM &&
-				(await hasPendingOwnerIntent(owner, sessionId))
+				(await pendingOwnerIntentStatus(owner, sessionId)) === "matching"
 			)
 				return;
 			throw new Error("owner terminal verdict unavailable");
