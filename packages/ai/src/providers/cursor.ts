@@ -805,6 +805,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let queueDrained = false;
 		let endStreamError: Error | null = null;
 		let pendingBuffer = Buffer.alloc(0);
+		let bufferedObservationOffset = 0;
+		let bufferedObservationTurnEnded = false;
 		const closeTerminalAdmission = (): void => {
 			terminalAdmissionMode = "closed";
 			transportWatchdogClosed = true;
@@ -1221,7 +1223,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			 * remaining in an unbounded side buffer.
 			 */
 			const observeBufferedTerminal = (atEof = false): boolean => {
-				let offset = 0;
+				let offset = bufferedObservationOffset;
+				let observedTurnEnded = sawTurnEnded || bufferedObservationTurnEnded;
 				while (pendingBuffer.length - offset >= 5) {
 					const flags = pendingBuffer[offset];
 					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
@@ -1242,13 +1245,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							terminalize(error);
 							return true;
 						}
-						if (!sawTurnEnded) {
+						if (!observedTurnEnded) {
 							const missingTurnEnded = new Error("Cursor HTTP/2 stream ended before turnEnded");
 							endStreamError = missingTurnEnded;
 							responseEnded = true;
 							terminalize(missingTurnEnded);
 							return true;
 						}
+						bufferedObservationOffset = offset + 5 + msgLen;
+						bufferedObservationTurnEnded = observedTurnEnded;
 						return true;
 					}
 					try {
@@ -1257,6 +1262,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							message.message.case === "interactionUpdate" &&
 							message.message.value.message?.case === "turnEnded"
 						) {
+							observedTurnEnded = true;
 							sawTurnEnded = true;
 						}
 					} catch (error) {
@@ -1268,6 +1274,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					}
 					offset += 5 + msgLen;
 				}
+				bufferedObservationOffset = offset;
+				bufferedObservationTurnEnded = observedTurnEnded;
 				if (atEof && pendingBuffer.length > offset) {
 					const error = new Error("Cursor HTTP/2 stream ended with a truncated Connect frame");
 					endStreamError = error;
@@ -1301,6 +1309,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 					const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
 					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
+					bufferedObservationOffset = 0;
+					bufferedObservationTurnEnded = false;
 					if (terminalAdmissionMode === "closed" && !(flags & CONNECT_END_STREAM_FLAG)) continue;
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
@@ -1603,6 +1613,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				gracefulCloseCheckTimer = undefined;
 			}
 			pendingBuffer = Buffer.alloc(0);
+			bufferedObservationOffset = 0;
+			bufferedObservationTurnEnded = false;
 			transportWatchdogClosed = true;
 			if (transportWatchdog) {
 				clearTimeout(transportWatchdog);
