@@ -2696,7 +2696,8 @@ async function observeOwnerTerminalPostmortem(
 			(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
 				(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
 			reason === postmortem.Reason.SIGTERM &&
-			(!owner.operatorDispatchId || !owner.operatorIntentId)
+			(!owner.operatorDispatchId || !owner.operatorIntentId) &&
+			(await hasPendingOwnerIntent(owner, sessionId))
 		)
 			return null;
 		const now = new Date().toISOString();
@@ -2721,6 +2722,22 @@ async function observeOwnerTerminalPostmortem(
 		});
 	} catch {
 		return null;
+	}
+}
+
+async function hasPendingOwnerIntent(owner: OwnerTerminalContext, sessionId: string): Promise<boolean> {
+	try {
+		const intent = JSON.parse(
+			await Bun.file(lifecyclePaths(owner.stateDir, sessionId, owner.generation).intentFile).text(),
+		) as unknown;
+		return (
+			isValidOwnerIntent(intent) &&
+			intent.session_id === sessionId &&
+			intent.generation === owner.generation &&
+			intent.server_key === owner.socketKey
+		);
+	} catch {
+		return false;
 	}
 }
 

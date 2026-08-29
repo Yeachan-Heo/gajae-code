@@ -6,7 +6,13 @@ import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
 import { GJC_TMUX_OWNER_SERVER_KEY_ENV } from "./session-state-sidecar";
-import { isValidOwnerIntent, lifecyclePaths, type OwnerIntent, observeOwnerTerminal } from "./tmux-owner-isolation";
+import {
+	isValidOwnerIntent,
+	lifecyclePaths,
+	type OwnerIntent,
+	observeOwnerTerminal,
+	type TerminalSignal,
+} from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 export const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -272,6 +278,21 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			operator_dispatch_id: terminalIntent.dispatch_id,
 			operator_intent_id: terminalIntent.intent_id,
 		});
+	} else if (child.signalCode || exitCode !== 0) {
+		await observeOwnerTerminal({
+			schema_version: 1,
+			op: "observe_terminal",
+			session_id: sessionId,
+			owner_generation: generation,
+			state_dir: stateDir,
+			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+			observer: "raw_monitor",
+			observed_at: new Date().toISOString(),
+			signal: (child.signalCode ?? "SIGTERM") as TerminalSignal,
+			exit_code: exitCode,
+			exit_kind: child.signalCode ?? "supervisor_child_exit",
+			reason: "managed_owner_supervisor_unexpected_exit",
+		}).catch(() => undefined);
 	}
 	if (child.signalCode === "SIGABRT") {
 		if (binding) {
