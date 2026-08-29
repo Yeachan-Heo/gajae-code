@@ -17,17 +17,50 @@ const residentIdentityByService = new WeakMap<LazyService<MemoryBackend>, Reside
 
 /** Canonicalize the settings group so policy comparison is independent of key order. */
 function canonicalMemoryPolicy(settings: Settings): string {
-	const canonicalize = (value: unknown): string => {
-		if (value === undefined) return "undefined";
-		if (value === null || typeof value !== "object") return JSON.stringify(value);
-		if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
-		const record = value as Record<string, unknown>;
-		return `{${Object.keys(record)
-			.sort()
-			.map(key => `${JSON.stringify(key)}:${canonicalize(record[key])}`)
-			.join(",")}}`;
-	};
-	return canonicalize(settings.getGroup("memories"));
+	return canonicalizePolicy(settings.getGroup("memories"));
+}
+
+function canonicalizePolicy(value: unknown): string {
+	if (value === undefined) return "undefined";
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalizePolicy).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalizePolicy(record[key])}`)
+		.join(",")}}`;
+}
+
+/** Resolve the effective Hindsight and legacy memory policy without loading the backend. */
+function canonicalHindsightPolicy(settings: Settings): string {
+	return canonicalizePolicy({
+		memories: settings.getGroup("memories"),
+		hindsight: {
+			apiUrl: settings.get("hindsight.apiUrl"),
+			apiToken: settings.get("hindsight.apiToken"),
+			bankId: settings.get("hindsight.bankId"),
+			bankIdPrefix: settings.get("hindsight.bankIdPrefix"),
+			scoping: settings.get("hindsight.scoping"),
+			bankMission: settings.get("hindsight.bankMission"),
+			retainMission: settings.get("hindsight.retainMission"),
+			autoRecall: settings.get("hindsight.autoRecall"),
+			autoRetain: settings.get("hindsight.autoRetain"),
+			retainMode: settings.get("hindsight.retainMode"),
+			retainEveryNTurns: settings.get("hindsight.retainEveryNTurns"),
+			retainOverlapTurns: settings.get("hindsight.retainOverlapTurns"),
+			retainContext: settings.get("hindsight.retainContext"),
+			recallBudget: settings.get("hindsight.recallBudget"),
+			recallMaxTokens: settings.get("hindsight.recallMaxTokens"),
+			recallContextTurns: settings.get("hindsight.recallContextTurns"),
+			recallMaxQueryChars: settings.get("hindsight.recallMaxQueryChars"),
+			recallTypes: settings.get("hindsight.recallTypes"),
+			debug: settings.get("hindsight.debug"),
+			mentalModelsEnabled: settings.get("hindsight.mentalModelsEnabled"),
+			mentalModelAutoSeed: settings.get("hindsight.mentalModelAutoSeed"),
+			mentalModelRefreshIntervalMs: settings.get("hindsight.mentalModelRefreshIntervalMs"),
+			mentalModelMaxRenderChars: settings.get("hindsight.mentalModelMaxRenderChars"),
+		},
+	});
 }
 
 /**
@@ -45,7 +78,8 @@ export async function getMemoryBackendRescopeError(
 	memoryBackend: LazyService<MemoryBackend>,
 ): Promise<Error | undefined> {
 	const resident = residentIdentityByService.get(memoryBackend);
-	const residentBackendId = resident?.id ?? memoryBackend.peek()?.id;
+	const residentBackend = memoryBackend.peek();
+	const residentBackendId = resident?.id ?? residentBackend?.id;
 	const serviceState = memoryBackend.status().state;
 	if (!residentBackendId && serviceState !== "idle") {
 		return new Error(
@@ -55,6 +89,20 @@ export async function getMemoryBackendRescopeError(
 	const sourceId = residentBackendId ?? resolveMemoryBackendId(settings);
 	const targetId = resolveMemoryBackendId(targetSettings);
 	if (sourceId === "hindsight") {
+		const isGenuinelyIdle = serviceState === "idle" && resident === undefined && residentBackend === undefined;
+		if (isGenuinelyIdle) {
+			if (sourceId !== targetId) {
+				return new Error(
+					`Refusing to rescope before publication: memory backend would change from "${sourceId}" to "${targetId}"; restart the session at the target cwd to apply the target policy.`,
+				);
+			}
+			const sourcePolicy = canonicalHindsightPolicy(settings);
+			const targetPolicy = canonicalHindsightPolicy(targetSettings);
+			if (sourcePolicy === targetPolicy) return undefined;
+			return new Error(
+				`Refusing to rescope before publication: Hindsight memory policy is launch-bound and differs at target cwd; restart the session at the target cwd to apply the target policy.`,
+			);
+		}
 		// Hindsight state owns a client, resolved config, bank scope, and a
 		// retain queue. Rebinding those pieces before publication would require
 		// draining and recreating state with no safe ownership handoff, so fail

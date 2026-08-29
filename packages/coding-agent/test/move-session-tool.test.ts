@@ -621,6 +621,130 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
+	it("allows a deferred idle Hindsight service to move with the same policy", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+
+		const settings = Settings.isolated(
+			{
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "",
+				"hindsight.mentalModelsEnabled": false,
+			},
+			{ agentDir: path.dirname(cwdA) },
+		);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session, startDeferredMemoryBackend } = await makeSession(cwdA, sessionManager, {
+			settings,
+			toolNames: ["move_session"],
+			deferMemoryBackendStartup: true,
+		});
+		try {
+			expect(startDeferredMemoryBackend).toBeFunction();
+			expect(session.memoryBackend.status().state).toBe("idle");
+			const result = await session.getToolByName("move_session")!.execute("move-deferred-hindsight", { path: cwdB });
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwdB));
+			expect(textContent(result)).toContain("repo-b");
+			expect(session.memoryBackend.status().state).toBe("idle");
+		} finally {
+			await session.dispose();
+		}
+	}, 15_000);
+
+	it("refuses a resident Hindsight service even when the target policy is unchanged", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+
+		const settings = Settings.isolated(
+			{
+				"memory.backend": "hindsight",
+				"hindsight.apiUrl": "",
+				"hindsight.mentalModelsEnabled": false,
+			},
+			{ agentDir: path.dirname(cwdA) },
+		);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, {
+			settings,
+			toolNames: ["move_session"],
+		});
+		try {
+			expect(session.memoryBackend.status().state).toBe("ready");
+			expect(session.memoryBackend.peek()?.id).toBe("hindsight");
+			await expect(
+				session.getToolByName("move_session")!.execute("move-resident-hindsight", { path: cwdB }),
+			).rejects.toThrow(/Hindsight bank scope and queued retains are launch-bound/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(session.memoryBackend.status().state).toBe("ready");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("rejects deferred idle Hindsight moves with a different target policy or backend", async () => {
+		const cases = [
+			{
+				name: "policy",
+				target: {
+					"memory.backend": "hindsight",
+					"hindsight.apiUrl": "",
+					"hindsight.scoping": "global",
+					"hindsight.mentalModelsEnabled": false,
+				},
+				error: /Hindsight memory policy is launch-bound and differs/,
+			},
+			{
+				name: "backend",
+				target: { "memory.backend": "local" },
+				error: /memory backend would change from "hindsight" to "local"/,
+			},
+		] as const;
+
+		for (const testCase of cases) {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwdA = path.join(tempDir, "root");
+			const cwdB = path.join(cwdA, "repo-b");
+			fs.mkdirSync(cwdB, { recursive: true });
+
+			const settings = Settings.isolated(
+				{
+					"memory.backend": "hindsight",
+					"hindsight.apiUrl": "",
+					"hindsight.mentalModelsEnabled": false,
+				},
+				{ agentDir: path.dirname(cwdA) },
+			);
+			const targetSettings = Settings.isolated(testCase.target, { agentDir: path.dirname(cwdA) });
+			const cloneForCwd = vi.spyOn(settings, "cloneForCwd").mockResolvedValue(targetSettings);
+			const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+			const { session } = await makeSession(cwdA, sessionManager, {
+				settings,
+				toolNames: ["move_session"],
+				deferMemoryBackendStartup: true,
+			});
+			try {
+				expect(session.memoryBackend.status().state).toBe("idle");
+				await expect(
+					session
+						.getToolByName("move_session")!
+						.execute(`move-deferred-hindsight-${testCase.name}`, { path: cwdB }),
+				).rejects.toThrow(testCase.error);
+				expect(sessionManager.getCwd()).toBe(cwdA);
+				expect(session.memoryBackend.status().state).toBe("idle");
+			} finally {
+				cloneForCwd.mockRestore();
+				await session.dispose();
+			}
+		}
+	});
+
 	it("rejects a missing directory instead of moving", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
