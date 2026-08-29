@@ -2300,6 +2300,15 @@ export interface SearchResult {
  */
 export declare function secureWriteSkillFile(rootPath: string, skillName: string, content: string, fileMode?: number | undefined | null): NativeSecureSkillWriteResult
 
+/**
+ * Async variant of [`secure_write_skill_file`] scheduled on the libuv blocking
+ * pool.
+ *
+ * Directory traversal, ACL updates, payload writes, and flushes can all block
+ * on a slow filesystem; none of that work may run on the JS thread.
+ */
+export declare function secureWriteSkillFileAsync(rootPath: string, skillName: string, content: string, fileMode?: number | undefined | null): Promise<NativeSecureSkillWriteResult>
+
 /** Options for executing a shell command via brush-core. */
 export interface ShellExecuteOptions {
   /** Command string to execute in the shell. */

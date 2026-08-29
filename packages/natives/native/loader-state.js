@@ -810,6 +810,12 @@ export function validateLoadedBindings(ctx, bindings, candidate) {
 			"`secureWriteSkillFile`; trying the next compatible artifact.",
 		);
 	}
+	if (typeof bindings.secureWriteSkillFileAsync !== "function") {
+		throw new Error(
+			`Loaded ${candidate} but it lacks required asynchronous secure skill publication capability ` +
+			"`secureWriteSkillFileAsync`; trying the next compatible artifact.",
+		);
+	}
 	if (typeof bindings.renameNoReplacePath !== "function") {
 		throw new Error(`Loaded ${candidate} but it lacks required atomic publish capability \`renameNoReplacePath\`.`);
 	}

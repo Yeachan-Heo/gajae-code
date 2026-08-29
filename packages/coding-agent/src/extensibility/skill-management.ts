@@ -116,22 +116,22 @@ export class SkillNativeWriteUnavailableError extends Error {
 
 const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
-type SecureWriteSkillFile = (
+type SecureWriteSkillFileAsync = (
 	rootPath: string,
 	skillName: string,
 	content: string,
 	fileMode: number,
-) => { ok: boolean; path?: string; code?: string };
-let secureWriteSkillFileNative: SecureWriteSkillFile | undefined;
+) => Promise<{ ok: boolean; path?: string; code?: string }>;
+let secureWriteSkillFileAsyncNative: SecureWriteSkillFileAsync | undefined;
 
-function getSecureWriteSkillFileNative(): SecureWriteSkillFile {
-	if (secureWriteSkillFileNative !== undefined) return secureWriteSkillFileNative;
-	const candidate = natives.secureWriteSkillFile;
+function getSecureWriteSkillFileNative(): SecureWriteSkillFileAsync {
+	if (secureWriteSkillFileAsyncNative !== undefined) return secureWriteSkillFileAsyncNative;
+	const candidate = natives.secureWriteSkillFileAsync;
 	if (typeof candidate !== "function") {
-		throw new SkillNativeWriteUnavailableError("native bindings do not export secureWriteSkillFile");
+		throw new SkillNativeWriteUnavailableError("native bindings do not export secureWriteSkillFileAsync");
 	}
-	secureWriteSkillFileNative = candidate;
-	return secureWriteSkillFileNative;
+	secureWriteSkillFileAsyncNative = candidate;
+	return secureWriteSkillFileAsyncNative;
 }
 
 function getRuntimeHome(): string {
