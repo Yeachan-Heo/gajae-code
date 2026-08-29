@@ -704,6 +704,8 @@ export async function filterSessionRowsByScope(
 export function boundWarningSources(
 	sources: readonly { entries: readonly string[]; describeOmitted: (omitted: number) => string }[],
 ): string[] {
+	const totalEntries = sources.reduce((total, source) => total + source.entries.length, 0);
+	if (totalEntries <= SESSION_LIST_WARNING_LIMIT) return sources.flatMap(source => source.entries);
 	const omitted = sources
 		.map(source => ({ source, count: source.entries.length }))
 		.filter(item => item.count > 0)
