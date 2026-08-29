@@ -1715,7 +1715,6 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			// Pin authStorage to modelRegistry.authStorage — mirrors the createAgentSession invariant.
 			const registryFromParent = options.modelRegistry !== undefined;
 			const effectiveAgentDir = options.parentAgentDir ?? settings.getAgentDir();
-			const registryFromParent = options.modelRegistry !== undefined;
 			const registryAuthStorage =
 				options.authStorage ??
 				options.modelRegistry?.authStorage ??
