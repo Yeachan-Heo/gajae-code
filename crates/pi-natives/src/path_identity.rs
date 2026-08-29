@@ -4908,17 +4908,10 @@ pub(crate) mod platform {
 		if valid {
 			return Ok(());
 		}
-		// SAFETY: `parent_fd` retains the parent directory and the final name is
-		// NUL-terminated.
-		if unsafe {
-			libc::fstatat(parent_fd, final_name.as_ptr(), &mut published, libc::AT_SYMLINK_NOFOLLOW)
-		} == 0 && opened.st_dev == published.st_dev
-			&& opened.st_ino == published.st_ino
-		{
-			// SAFETY: The final name still identifies the file just validated against
-			// `private_fd`.
-			unsafe { libc::unlinkat(parent_fd, final_name.as_ptr(), 0) };
-		}
+		// The rename is already committed. Never unlink the public name from a
+		// transient validation failure: the retained descriptor still owns the
+		// newly published payload, and a later fstatat may be observing a safe
+		// publication despite the independent fstat failure.
 		Err(SkillPublicationError::Post("identity_mismatch"))
 	}
 
@@ -7542,9 +7535,8 @@ mod platform {
 			absolute_components(path).map_err(NativeOwnerOnlySecurityResult::failure)?;
 		// Every directory retained as ObjectAttributes.RootDirectory needs traversal
 		// authority for the next descriptor-relative NtCreateFile call.
-		let root_handle =
-			open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE | FILE_ADD_SUBDIRECTORY)
-				.map_err(NativeOwnerOnlySecurityResult::failure)?;
+		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)
+			.map_err(NativeOwnerOnlySecurityResult::failure)?;
 		let root_attributes = match handle_attributes(root_handle) {
 			Ok(attributes) => attributes,
 			Err(code) => {
@@ -9657,17 +9649,17 @@ mod platform {
 	) -> Result<HANDLE, &'static str> {
 		let access = FILE_READ_ATTRIBUTES
 			| FILE_TRAVERSE
-			| FILE_ADD_SUBDIRECTORY
 			| READ_CONTROL
 			| if acl_access {
 				WRITE_DAC | WRITE_OWNER
 			} else {
 				0
 			};
+		let create_access = access | FILE_ADD_SUBDIRECTORY;
 		let handle = open_relative_with_disposition_status(
 			parent,
 			name,
-			access,
+			create_access,
 			true,
 			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 			FILE_OPEN_IF,
