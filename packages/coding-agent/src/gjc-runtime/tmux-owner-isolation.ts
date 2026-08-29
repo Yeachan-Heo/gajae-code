@@ -1595,8 +1595,17 @@ async function pendingIntentBlocksRetry(
 		pending.server_key !== input.server_key
 	)
 		throw new Error("owner_intent_replay");
+	const now = Date.now();
+	const createdAt = pending ? Date.parse(pending.created_at) : Number.NaN;
 	const deadline = pending ? Date.parse(pending.expires_at) : Number.NaN;
-	if (Number.isFinite(deadline) && deadline > Date.now()) return true;
+	if (
+		pending &&
+		isCanonicalUtcTimestamp(pending.created_at) &&
+		isCanonicalUtcTimestamp(pending.expires_at) &&
+		createdAt <= now &&
+		deadline > now
+	)
+		return true;
 	await archiveSupersededIntent(paths.intentFile, pending.intent_id);
 	return await intentMarkerExists(paths.intentFile);
 }
