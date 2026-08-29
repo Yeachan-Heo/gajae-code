@@ -1,5 +1,4 @@
 import * as crypto from "node:crypto";
-import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -10,6 +9,7 @@ import {
 	lifecyclePaths,
 	type OwnerIntent,
 	observeOwnerTerminal,
+	readNoFollowJsonSync,
 	type TerminalSignal,
 } from "./tmux-owner-isolation";
 
@@ -227,10 +227,8 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		let intentEvidencePresent = false;
 		let expiredIntent = false;
 		try {
-			intentEvidencePresent = true;
-			const candidate: unknown = JSON.parse(
-				fsSync.readFileSync(lifecyclePaths(stateDir, sessionId, generation).intentFile, "utf8"),
-			);
+			const candidate: unknown = readNoFollowJsonSync(lifecyclePaths(stateDir, sessionId, generation).intentFile);
+			intentEvidencePresent = candidate !== null;
 			if (
 				isValidOwnerIntent(candidate) &&
 				candidate.session_id === sessionId &&
