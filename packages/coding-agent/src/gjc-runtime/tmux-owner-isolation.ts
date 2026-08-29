@@ -2258,6 +2258,7 @@ function isPlanRequest(request: unknown): request is PlanRequest {
 		isSafePathComponent(request.session_id, "owner session id") &&
 		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
+		path.isAbsolute(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
 		isOwnerGenerationBaseline(request.baseline) &&
 		validArgv(request.tmux_argv)
@@ -2284,6 +2285,7 @@ function isBootstrapRequest(request: unknown): request is BootstrapRequest {
 		isSafePathComponent(request.session_id, "owner session id") &&
 		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
+		path.isAbsolute(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
 		nonEmpty(request.expected_scope) &&
 		validArgv(request.tmux_argv) &&
@@ -2304,6 +2306,7 @@ function isPublishGenerationRequest(request: unknown): request is PublishGenerat
 		isSafePathComponent(request.session_id, "owner session id") &&
 		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
+		path.isAbsolute(request.state_dir) &&
 		isOwnerGenerationBaseline(request.baseline)
 	);
 }
@@ -2334,6 +2337,7 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		isSafePathComponent(request.session_id, "owner session id") &&
 		isSafePathComponent(request.owner_generation, "owner generation") &&
 		nonEmpty(request.state_dir) &&
+		path.isAbsolute(request.state_dir) &&
 		nonEmpty(request.socket_key) &&
 		isTerminalObserver(request.observer) &&
 		isCanonicalUtcTimestamp(request.observed_at) &&
