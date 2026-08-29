@@ -6,6 +6,7 @@ import {
 	cursorExecDeadlineMsForTest,
 	disposeCursorConversation,
 	streamCursor,
+	writeCursorFrameForTest,
 } from "../src/providers/cursor";
 import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cursor/gen/agent_pb";
 import {
@@ -178,6 +179,41 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.stopReason).toBe("aborted");
 		expect(result.errorMessage).toBe("Request was aborted");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
+	it("drops a response when request closure wins the bounded fence write race", () => {
+		let closed = false;
+		let closeDuringWrite = false;
+		let writeCount = 0;
+		const request = {
+			get closed() {
+				return closed;
+			},
+			get destroyed() {
+				return closed;
+			},
+			get writableEnded() {
+				return closed;
+			},
+			get writableFinished() {
+				return closed;
+			},
+			write() {
+				writeCount += 1;
+				if (closeDuringWrite) {
+					closed = true;
+					const error = new Error("write after end") as NodeJS.ErrnoException;
+					error.code = "ERR_STREAM_WRITE_AFTER_END";
+					throw error;
+				}
+				return true;
+			},
+		} as unknown as http2.ClientHttp2Stream;
+
+		expect(writeCursorFrameForTest(request, Buffer.from("first"))).toBe(true);
+		closeDuringWrite = true;
+		expect(writeCursorFrameForTest(request, Buffer.from("late"))).toBe(false);
+		expect(writeCount).toBe(2);
 	});
 
 	it("preserves a caller-supplied AbortError diagnostic", async () => {
