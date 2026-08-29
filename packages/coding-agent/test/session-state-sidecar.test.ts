@@ -2284,7 +2284,7 @@ describe("coordinator runtime state sidecar", () => {
 				created_at: "2026-01-01T00:00:00.000Z",
 				expires_at: "2099-01-01T00:00:00.000Z",
 			});
-			const verdict = await observeOwnerTerminal({
+			const observation = observeOwnerTerminal({
 				schema_version: 1,
 				op: "observe_terminal",
 				session_id: sessionId,
@@ -2299,6 +2299,11 @@ describe("coordinator runtime state sidecar", () => {
 				reason: "terminal",
 				operator_dispatch_id: dispatch,
 			});
+			if (dispatch !== "dispatch") {
+				await expect(observation).rejects.toThrow("stale_terminal_observation");
+				continue;
+			}
+			const verdict = await observation;
 			expect(verdict.classification).toBe("unexpected_owner_loss");
 			expect(verdict.intent_id).toBeUndefined();
 		}
