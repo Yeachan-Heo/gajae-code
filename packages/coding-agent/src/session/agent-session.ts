@@ -24187,7 +24187,7 @@ export class AgentSession {
 				ownerShutdownTransitionCommitted = true;
 				if (switchingToDifferentSession) this.#resetAcpPermissionDecisions();
 				this.clearPlanModeStateForSessionTransition();
-				await this.#runToolSessionTransitionCleanups();
+				if (!ownerShutdownFinalizationDeferred) await this.#runToolSessionTransitionCleanups();
 				if (didReloadConversationChange && !switchingToDifferentSession) this.#quarantineQueuedAsyncResults();
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime

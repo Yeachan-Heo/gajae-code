@@ -26,6 +26,7 @@ import {
 	writeMarketplacesRegistry,
 } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
 import { getAgentDir, getAgentProfileAuthority, setAgentDir } from "@gajae-code/utils";
+import { safeRmSync } from "../../../../scripts/safe-cleanup";
 
 // Inline the parseAnthropic modelPluginsRegistry validation logic to avoid pulling
 // in discovery/helpers.ts which transitively imports @gajae-code/natives.
@@ -210,7 +211,7 @@ describe("registry file I/O", () => {
 	});
 
 	afterEach(() => {
-		fs.rmSync(tmpDir, { recursive: true, force: true });
+		safeRmSync(tmpDir, { recursive: true, force: true });
 	});
 
 	// ── Marketplaces registry ────────────────────────────────────────
@@ -370,7 +371,7 @@ describe("profile registry paths", () => {
 			setAgentDir(originalAgentDir);
 			if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
 			else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
-			fs.rmSync(home, { recursive: true, force: true });
+			safeRmSync(home, { recursive: true, force: true });
 		}
 	});
 });
