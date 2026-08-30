@@ -31,10 +31,15 @@ function startSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
-	options: { forceMissingNativeReferenceMarker?: string } = {},
+	options: { forceMissingChildStartMarker?: string; forceMissingNativeReferenceMarker?: string } = {},
 ) {
-	const script = options.forceMissingNativeReferenceMarker
-		? `const { appendFileSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; } return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(); } finally { Bun.spawn = originalSpawn; }`
+	const forcedMissingPidRead = options.forceMissingChildStartMarker
+		? `if (pidReads === 1) { appendFileSync(${JSON.stringify(options.forceMissingChildStartMarker)}, "forced-missing-child-start:" + actualPid + "\\n"); return 2_000_000_000; }`
+		: options.forceMissingNativeReferenceMarker
+			? `if (pidReads === 2) { appendFileSync(${JSON.stringify(options.forceMissingNativeReferenceMarker)}, "forced-missing-native-reference:" + actualPid + "\\n"); return 2_000_000_000; }`
+			: "";
+	const script = forcedMissingPidRead
+		? `const { appendFileSync } = await import("node:fs"); const originalSpawn = Bun.spawn; Bun.spawn = options => { const child = originalSpawn(options); const actualPid = child.pid; let pidReads = 0; Object.defineProperty(child, "pid", { configurable: true, get() { pidReads += 1; ${forcedMissingPidRead} return actualPid; } }); return child; }; try { const { runManagedOwnerSupervisor } = await import(${JSON.stringify(supervisorModule)}); await runManagedOwnerSupervisor(); } finally { Bun.spawn = originalSpawn; }`
 		: `import { runManagedOwnerSupervisor } from ${JSON.stringify(supervisorModule)}; await runManagedOwnerSupervisor();`;
 	return Bun.spawn({
 		cmd: [process.execPath, "-e", script],
@@ -57,7 +62,7 @@ async function runSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
-	options: { forceMissingNativeReferenceMarker?: string } = {},
+	options: { forceMissingChildStartMarker?: string; forceMissingNativeReferenceMarker?: string } = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = startSupervisor(stateDir, command, env, options);
 	const [stdout, stderr, exitCode] = await Promise.all([
@@ -181,6 +186,31 @@ describe("managed owner supervisor", () => {
 				endpoint_incarnation: "incarnation-2681",
 				exit_code: 134,
 			});
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed without child provenance after an early SIGTERM", async () => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const markerFile = path.join(stateDir, "forced-missing-child-start.marker");
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const childScript = "process.kill(process.ppid, 'SIGTERM'); process.exit(0);";
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", childScript],
+				{},
+				{ forceMissingChildStartMarker: markerFile },
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
+			expect(await fs.readFile(markerFile, "utf8")).toMatch(/^forced-missing-child-start:\d+\n$/);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			expect(await Bun.file(paths.verdictFile).exists()).toBe(false);
+			expect(await Bun.file(paths.incidentFile).exists()).toBe(false);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
