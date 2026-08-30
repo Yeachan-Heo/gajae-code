@@ -358,7 +358,8 @@ describe("GJC tmux session management", () => {
 			const cmd = argv(command);
 			calls.push(cmd);
 			if (cmd.includes("list-sessions")) {
-				return spawnResult(0, "gajae_code_work	1	0	1770000000	1	root	1			\n");
+				if (cmd.at(-1) === "#{session_name}") return spawnResult(0, "gajae_code_work\n");
+				return spawnResult(0, "gajae_code_work\t1\t0\t1770000000\t1\troot\t1\t\t\t\n");
 			}
 			if (cmd.includes("show-options")) return spawnResult(0, "1\n");
 			if (cmd.includes("if-shell")) return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
