@@ -181,14 +181,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	});
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) {
-		const exitCode = await child.exited;
-		try {
-			await publishUnexpectedOwnerExit(stateDir, sessionId, generation, exitCode, child.signalCode);
-		} catch {
-			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
-			return;
-		}
-		process.exitCode = exitCode;
+		await child.exited;
+		// Without the child's immutable start identity, its terminal status cannot
+		// be attributed to this owner. Do not mint an unexpected-loss verdict.
+		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 		return;
 	}
 	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
@@ -218,13 +214,9 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			process.exitCode = 134;
 			return;
 		}
-		try {
-			await publishUnexpectedOwnerExit(stateDir, sessionId, generation, exitCode, child.signalCode);
-		} catch {
-			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
-			return;
-		}
-		process.exitCode = exitCode;
+		// The native process handle is required for exact child ownership. The
+		// start-time evidence alone is insufficient for a non-SIGABRT verdict.
+		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 		return;
 	}
 	if (process.platform === "linux" && childProcess.incarnation !== `linux:${childStartTime}`)
@@ -357,29 +349,6 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		return;
 	}
 	process.exitCode = exitCode;
-}
-
-async function publishUnexpectedOwnerExit(
-	stateDir: string,
-	sessionId: string,
-	generation: string,
-	exitCode: number,
-	signal: NodeJS.Signals | null,
-): Promise<void> {
-	await observeOwnerTerminal({
-		schema_version: 1,
-		op: "observe_terminal",
-		session_id: sessionId,
-		owner_generation: generation,
-		state_dir: stateDir,
-		socket_key: process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? "",
-		observer: "raw_monitor",
-		observed_at: new Date().toISOString(),
-		signal: normalizeTerminalSignal(signal),
-		exit_code: exitCode,
-		exit_kind: signal ?? "supervisor_child_exit",
-		reason: "managed_owner_supervisor_unexpected_exit",
-	});
 }
 
 function normalizeTerminalSignal(signal: NodeJS.Signals | null): TerminalSignal {
