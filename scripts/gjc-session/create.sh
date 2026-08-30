@@ -844,7 +844,7 @@ PY
 done
 CREATION_BOUNDARY=generation
 GENERATION_PUBLISH_REQUEST="$(python3 - "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$GENERATION_BASELINE_JSON" <<'PY'
-import json, sys
+import json, os, sys
 session, generation, state_dir, baseline = sys.argv[1:]
 print(json.dumps({"schema_version":1,"op":"publish_generation","auth_token":os.environ["GJC_TMUX_OWNER_PROTOCOL_TOKEN"],"session_id":session,"owner_generation":generation,"state_dir":state_dir,"baseline":json.loads(baseline)}, separators=(",", ":")))
 PY
@@ -938,7 +938,7 @@ while true; do
 done
 observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 request="$(python3 - "$GJC_SESSION_NAME" "$GJC_SESSION_OWNER_GENERATION" "$GJC_SESSION_STATE_DIR" "$GJC_SESSION_SOCKET_KEY" "$observed_at" <<'PY'
-import json, sys
+import json, os, sys
 session, generation, state_dir, socket_key, observed_at = sys.argv[1:]
 print(json.dumps({"schema_version":1,"op":"observe_terminal","auth_token":os.environ["GJC_TMUX_OWNER_PROTOCOL_TOKEN"],"session_id":session,"owner_generation":generation,"state_dir":state_dir,"socket_key":socket_key,"observer":"raw_monitor","observed_at":observed_at,"signal":"UNKNOWN","exit_code":None,"exit_kind":"owner_lost","reason":"tmux_session_missing"}, separators=(",", ":")))
 PY
