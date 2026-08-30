@@ -715,7 +715,7 @@ PY
 )"
 PLAN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation plan protocol failed" >&2; exit 1; }
 PLAN_MODE="$(python3 - "$PLAN_RESPONSE" "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$SOCKET_KEY" "$GENERATION_BASELINE_JSON" "${TMUX_ARGV[@]}" <<'PY'
-import datetime, json, sys
+import datetime, hashlib, json, sys
 try:
     response = json.loads(sys.argv[1]); session, generation, state_dir, socket_key, baseline_json, argv = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7:]; execution = response["execution"]
     classification = response.get("classification", {}).get("classification")
@@ -730,11 +730,12 @@ try:
         expected_baseline = json.loads(baseline_json)
         bootstrap = json.loads(execution.get("stdin_line"))
         scoped_argv = execution.get("argv")
+        attempt_digest = hashlib.sha256(json.dumps(argv, separators=(',', ':')).encode()).hexdigest()
         expiry_valid = isinstance(expires_at, str) and datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00")) > datetime.datetime.now(datetime.timezone.utc)
         valid = (
             common and response.get("code") == "unsafe_scope_required" and response.get("server_state") == "absent" and classification == "unsafe_service"
             and isinstance(scoped_argv, list) and scoped_argv[:6] == ["systemd-run", "--user", "--scope", "--quiet", "--unit", expected_scope] and len(scoped_argv) in {8, 9} and scoped_argv[-1] == "--internal-tmux-owner-isolation" and "bash" not in scoped_argv and "-c" not in scoped_argv
-            and attempt == {"token": token, "session_name": session, "socket_key": socket_key, "server_absent_before": True, "baseline": expected_baseline, "expires_at": expires_at}
+            and attempt == {"token": token, "session_name": session, "socket_key": socket_key, "server_absent_before": True, "baseline": expected_baseline, "expires_at": expires_at, "tmux_argv_sha256": attempt_digest}
             and execution.get("server_key") == socket_key and execution.get("server_absent_before") is True
             and expiry_valid and execution.get("expected_scope") == expected_scope
             and bootstrap == {"schema_version": 1, "op": "bootstrap", "session_id": session, "owner_generation": generation, "state_dir": state_dir, "socket_key": socket_key, "expected_scope": expected_scope, "tmux_argv": argv, "attempt": attempt}
