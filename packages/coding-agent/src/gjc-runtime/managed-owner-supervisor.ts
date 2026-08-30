@@ -223,7 +223,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	let relayedIntent: OwnerIntent | null = null;
 	let relayedAt: string | null = null;
 	const relaySigterm = () => {
-		if (childExited) return;
+		// Latch the first successful delivery and the intent snapshot that authorized it.
+		// A later intent cannot retroactively authorize an already-delivered signal. When
+		// signalRoot returns false, delivery was not proven and a later signal may retry.
+		if (childExited || sigtermRelayed) return;
 		let candidateIntent: OwnerIntent | null = null;
 		let intentEvidencePresent = false;
 		let expiredIntent = false;
@@ -254,12 +257,6 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			candidateIntent = null;
 		}
 		if (intentEvidencePresent && !candidateIntent && !expiredIntent) return;
-		// One relay is enough for one exact intent. A replacement intent (including one
-		// that reuses the dispatch id) must be allowed to re-arm the child relay.
-		if (sigtermRelayed) {
-			if (candidateIntent?.intent_id === relayedIntent?.intent_id) return;
-			if (!candidateIntent && relayedIntent) return;
-		}
 		try {
 			if (!childProcess.signalRoot(15)) return;
 		} catch {

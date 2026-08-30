@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { lifecyclePaths } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
+import {
+	createOwnerIntent,
+	lifecyclePaths,
+	replaceOwnerGeneration,
+} from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
 const supervisorModule = path.join(
@@ -219,6 +223,112 @@ setInterval(() => {}, 1_000);`;
 			process.kill(supervisor.pid, "SIGTERM");
 			expect(await supervisor.exited).toBe(0);
 			expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({ signals: 1 });
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("does not retroactively attribute an unsolicited relay to a later operator intent", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const readyFile = path.join(stateDir, "child-ready");
+		const signalFile = path.join(stateDir, "child-signals");
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const childScript = `import { writeFileSync } from "node:fs";
+let signals = 0;
+process.on("SIGTERM", () => {
+	signals += 1;
+	writeFileSync(process.env.SIGNAL_FILE!, String(signals));
+	if (signals === 1) setTimeout(() => process.exit(0), 1_000);
+});
+writeFileSync(process.env.READY_FILE!, "ready");
+setInterval(() => {}, 1_000);`;
+			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+				READY_FILE: readyFile,
+				SIGNAL_FILE: signalFile,
+				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+			});
+			await waitForFile(readyFile);
+			process.kill(supervisor.pid, "SIGTERM");
+			await waitForFile(signalFile);
+			expect(await fs.readFile(signalFile, "utf8")).toBe("1");
+			await createOwnerIntent(stateDir, {
+				generation,
+				session_id: sessionId,
+				server_key: "server-key",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "late-dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 60_000).toISOString(),
+			});
+			process.kill(supervisor.pid, "SIGTERM");
+			expect(await supervisor.exited).toBe(0);
+			expect(await fs.readFile(signalFile, "utf8")).toBe("1");
+			const verdict = JSON.parse(
+				await fs.readFile(lifecyclePaths(stateDir, sessionId, generation).verdictFile, "utf8"),
+			) as Record<string, unknown>;
+			expect(verdict).toMatchObject({
+				classification: "unexpected_owner_loss",
+				reason: "terminal_observation",
+			});
+			expect(verdict.intent_id).toBeUndefined();
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("preserves expected attribution for an active matching intent on first relay", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const readyFile = path.join(stateDir, "child-ready");
+		const signalFile = path.join(stateDir, "child-signals");
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			await createOwnerIntent(stateDir, {
+				generation,
+				session_id: sessionId,
+				server_key: "server-key",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "matching-dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 60_000).toISOString(),
+			});
+			const childScript = `import { writeFileSync } from "node:fs";
+let signals = 0;
+process.on("SIGTERM", () => {
+	signals += 1;
+	writeFileSync(process.env.SIGNAL_FILE!, String(signals));
+	setTimeout(() => process.exit(0), 100);
+});
+writeFileSync(process.env.READY_FILE!, "ready");
+setInterval(() => {}, 1_000);`;
+			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+				READY_FILE: readyFile,
+				SIGNAL_FILE: signalFile,
+				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+			});
+			await waitForFile(readyFile);
+			process.kill(supervisor.pid, "SIGTERM");
+			expect(await supervisor.exited).toBe(0);
+			expect(await fs.readFile(signalFile, "utf8")).toBe("1");
+			const verdict = JSON.parse(
+				await fs.readFile(lifecyclePaths(stateDir, sessionId, generation).verdictFile, "utf8"),
+			) as Record<string, unknown>;
+			expect(verdict).toMatchObject({
+				classification: "expected_operator_shutdown",
+				result: "owner_term_then_session_cleanup",
+			});
+			expect(verdict.intent_id).toBeString();
+			await expect(
+				fs.access(`${lifecyclePaths(stateDir, sessionId, generation).intentFile}.consumed`),
+			).resolves.toBeNull();
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
