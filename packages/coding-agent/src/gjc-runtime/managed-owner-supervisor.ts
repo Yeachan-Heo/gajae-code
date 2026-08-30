@@ -25,6 +25,7 @@ export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
+const MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE = 75;
 
 let bootstrapSigtermPending = false;
 const captureBootstrapSigterm = () => {
@@ -181,7 +182,12 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) {
 		const exitCode = await child.exited;
-		await publishUnexpectedOwnerExit(stateDir, sessionId, generation, exitCode, child.signalCode);
+		try {
+			await publishUnexpectedOwnerExit(stateDir, sessionId, generation, exitCode, child.signalCode);
+		} catch {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
 		process.exitCode = exitCode;
 		return;
 	}
@@ -212,7 +218,12 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			process.exitCode = 134;
 			return;
 		}
-		await publishUnexpectedOwnerExit(stateDir, sessionId, generation, exitCode, child.signalCode);
+		try {
+			await publishUnexpectedOwnerExit(stateDir, sessionId, generation, exitCode, child.signalCode);
+		} catch {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
 		process.exitCode = exitCode;
 		return;
 	}
@@ -221,7 +232,6 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	let childExited = false;
 	let sigtermRelayed = false;
 	let relayedIntent: OwnerIntent | null = null;
-	let relayedAt: string | null = null;
 	const relaySigterm = () => {
 		// Latch the first successful delivery and the intent snapshot that authorized it.
 		// A later intent cannot retroactively authorize an already-delivered signal. When
@@ -264,7 +274,6 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			return;
 		}
 		sigtermRelayed = true;
-		relayedAt = new Date().toISOString();
 		relayedIntent = candidateIntent;
 	};
 	sigtermPending ||= bootstrapSigtermPending;
@@ -277,6 +286,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = new Date().toISOString();
+	let unexpectedTerminalPublicationFailed = false;
 	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
 		await observeOwnerTerminal({
 			schema_version: 1,
@@ -295,20 +305,24 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			operator_intent_id: terminalIntent.intent_id,
 		});
 	} else if (sigtermRelayed || child.signalCode || (exitCode !== 0 && exitCode !== 75)) {
-		await observeOwnerTerminal({
-			schema_version: 1,
-			op: "observe_terminal",
-			session_id: sessionId,
-			owner_generation: generation,
-			state_dir: stateDir,
-			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
-			observer: "raw_monitor",
-			observed_at: new Date().toISOString(),
-			signal: normalizeTerminalSignal(child.signalCode),
-			exit_code: exitCode,
-			exit_kind: child.signalCode ?? "supervisor_child_exit",
-			reason: "managed_owner_supervisor_unexpected_exit",
-		}).catch(() => undefined);
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: normalizeTerminalSignal(child.signalCode),
+				exit_code: exitCode,
+				exit_kind: child.signalCode ?? "supervisor_child_exit",
+				reason: "managed_owner_supervisor_unexpected_exit",
+			});
+		} catch {
+			unexpectedTerminalPublicationFailed = true;
+		}
 	}
 	if (child.signalCode === "SIGABRT") {
 		if (binding) {
@@ -334,6 +348,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		process.exitCode = 134;
 		return;
 	}
+	if (unexpectedTerminalPublicationFailed) {
+		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+		return;
+	}
 	process.exitCode = exitCode;
 }
 
@@ -357,7 +375,7 @@ async function publishUnexpectedOwnerExit(
 		exit_code: exitCode,
 		exit_kind: signal ?? "supervisor_child_exit",
 		reason: "managed_owner_supervisor_unexpected_exit",
-	}).catch(() => undefined);
+	});
 }
 
 function normalizeTerminalSignal(signal: NodeJS.Signals | null): TerminalSignal {
