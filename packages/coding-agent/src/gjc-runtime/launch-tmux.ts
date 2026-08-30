@@ -199,6 +199,8 @@ export interface TmuxLaunchPlan {
 	/** Immutable run and endpoint identities bound into the supervised command. */
 	ownerRunId?: string;
 	ownerIncarnation?: string;
+	/** Immutable predecessor evidence captured with the owner-generation baseline. */
+	ownerPredecessor?: ManagedOwnerPredecessorEvidence;
 	/** Generation state captured before owner-isolation planning; required for publication CAS. */
 	ownerGenerationBaseline?: OwnerGenerationBaseline;
 	/** One-shot coordinator signing bootstrap endpoint; key material never enters tmux argv or environment. */
@@ -1209,21 +1211,17 @@ function trustedReplacementAuthority(
 	return resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline);
 }
 
-function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
-	if (plan.ownerGeneration) return;
-	const sessionId = plan.sessionId ?? plan.sessionName;
-	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
-	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
-	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
-	const generation = crypto.randomUUID();
-	const runId = crypto.randomUUID();
-	const incarnation = crypto.randomUUID();
-	plan.ownerGenerationBaseline = baseline;
-	// Stage immutable identity in the child command. It becomes current only after
-	// immutable creation proof and ownership tagging complete.
-	plan.ownerGeneration = generation;
-	plan.ownerRunId = runId;
-	plan.ownerIncarnation = incarnation;
+function rebuildManagedOwnerChildCommand(
+	plan: TmuxLaunchPlan,
+	context: TmuxLaunchContext,
+	stateDir: string,
+	sessionId: string,
+): void {
+	const generation = plan.ownerGeneration;
+	const runId = plan.ownerRunId;
+	const incarnation = plan.ownerIncarnation;
+	if (!generation || !runId || !incarnation) throw new Error("gjc_tmux_owner_lifecycle_identity_missing");
+	const replacement = plan.ownerPredecessor;
 	const innerCommand = buildInnerCommand(
 		{
 			cwd: plan.cwd,
@@ -1275,6 +1273,25 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 	);
 	plan.innerCommand = innerCommand;
 	plan.newSessionArgs = [...plan.newSessionArgs.slice(0, -1), innerCommand];
+}
+
+function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchContext): void {
+	if (plan.ownerGeneration) return;
+	const sessionId = plan.sessionId ?? plan.sessionName;
+	const stateDir = path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime"));
+	const baseline = captureOwnerGenerationBaselineSync(stateDir, sessionId);
+	const replacement = trustedReplacementAuthority(stateDir, sessionId, baseline);
+	const generation = crypto.randomUUID();
+	const runId = crypto.randomUUID();
+	const incarnation = crypto.randomUUID();
+	plan.ownerGenerationBaseline = baseline;
+	// Stage immutable identity in the child command. It becomes current only after
+	// immutable creation proof and ownership tagging complete.
+	plan.ownerGeneration = generation;
+	plan.ownerRunId = runId;
+	plan.ownerIncarnation = incarnation;
+	plan.ownerPredecessor = replacement;
+	rebuildManagedOwnerChildCommand(plan, context, stateDir, sessionId);
 }
 
 function defaultSpawnSync(command: string, args: string[], options: TmuxSpawnOptions): TmuxSpawnResult {
@@ -1569,6 +1586,18 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 						});
 			}
 			plan.tmuxCommand = plan.authority.command;
+			if (!plan.attachSessionName) {
+				// The lifecycle identity is generated before authority resolution so it can
+				// bind the persisted provider record. Rebuild the child after pinning the
+				// canonical executable so its server-key provenance matches every later
+				// namespaced probe, tag, and cleanup command.
+				rebuildManagedOwnerChildCommand(
+					plan,
+					context,
+					path.dirname(plan.sessionStateFile ?? path.join(plan.cwd, ".gjc", "runtime")),
+					plan.sessionId ?? plan.sessionName,
+				);
+			}
 			if (!plan.attachSessionName) {
 				(context.providerAuthorityPersist ?? persistGjcTmuxProviderAuthoritySync)(plan.authority);
 				(context.providerAuthorityStagedAssert ?? assertGjcTmuxStagedMutationAuthoritySync)(plan.authority);

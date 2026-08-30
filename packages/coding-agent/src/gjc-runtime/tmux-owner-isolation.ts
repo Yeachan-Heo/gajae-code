@@ -1465,7 +1465,21 @@ function exactManagedOwnerJson(authority: RecoveryFsRoot, name: string): unknown
 	return JSON.parse(content);
 }
 
-/** Resolve one SIGABRT predecessor from the retained exact prior-generation root. */
+function isCleanManagedOwnerCompletion(
+	value: unknown,
+	input: { generation: string; sessionId: string },
+): value is OwnerVerdict {
+	return (
+		isValidOwnerVerdict(value) &&
+		value.generation === input.generation &&
+		value.session_id === input.sessionId &&
+		value.signal === "EXIT" &&
+		(value.exit_code === null || value.exit_code === 0) &&
+		value.intent_id === undefined
+	);
+}
+
+/** Resolve one SIGABRT predecessor or accept a validated clean terminal completion. */
 export function resolveManagedOwnerPredecessorSync(
 	stateDir: string,
 	sessionId: string,
@@ -1488,6 +1502,19 @@ export function resolveManagedOwnerPredecessorSync(
 		if (entry.startsWith("sigabrt-") && !receipt) throw new Error("managed_owner_replacement_evidence_untrusted");
 		if (binding) bindings.add(binding[1]!);
 		if (receipt) receipts.add(receipt[1]!);
+	}
+	const completionFile = path.basename(lifecyclePaths(stateDir, sessionId, baseline.generation).verdictFile);
+	if (entries.includes(completionFile)) {
+		const authority = openRecoveryFsRootNative()(root);
+		try {
+			const completion = exactManagedOwnerJson(authority, completionFile);
+			if (!isCleanManagedOwnerCompletion(completion, { generation: baseline.generation, sessionId }))
+				throw new Error("managed_owner_replacement_evidence_untrusted");
+		} finally {
+			authority.close();
+		}
+		if (receipts.size > 0) throw new Error("managed_owner_replacement_evidence_ambiguous");
+		return undefined;
 	}
 	if (bindings.size === 0 && receipts.size === 0) return undefined;
 	const tokens = [...bindings].filter(token => receipts.has(token));
