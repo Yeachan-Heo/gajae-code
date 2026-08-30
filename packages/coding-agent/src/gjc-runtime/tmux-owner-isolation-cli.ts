@@ -8,7 +8,7 @@ import {
 	isTmuxControlArgvBoundToSocket,
 	isTmuxShellWrapperArgv,
 	isTrustedOwnerIsolationProtocolRequest,
-	isTrustedTmuxOwnerIsolationArgv,
+	isTrustedTmuxControlArgv,
 	type ObserveTerminalRequest,
 	type OwnerIsolationProbe,
 	observeOwnerTerminal,
@@ -109,8 +109,7 @@ export async function tmuxServerProof(
 		})
 	)
 		return { state: "unverifiable" };
-	if (!usingPlatformBoundTestRunner && !isTrustedTmuxOwnerIsolationArgv(tmuxControlArgv))
-		return { state: "unverifiable" };
+	if (!usingPlatformBoundTestRunner && !isTrustedTmuxControlArgv(tmuxControlArgv)) return { state: "unverifiable" };
 	const subprocess = options.runListSessions?.(tmuxControlArgv) ?? runTmuxListSessions(tmuxControlArgv);
 	if (subprocess.exitCode !== 0)
 		return isKnownNoServerDiagnostic(subprocess.stderr) ? { state: "absent" } : { state: "unverifiable" };
