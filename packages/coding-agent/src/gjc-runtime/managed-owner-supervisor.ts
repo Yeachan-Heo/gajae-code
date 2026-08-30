@@ -319,7 +319,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		} catch {
 			terminalPublicationFailed = true;
 		}
-	} else {
+	} else if (child.signalCode !== "SIGABRT") {
 		try {
 			await observeOwnerTerminal({
 				schema_version: 1,
