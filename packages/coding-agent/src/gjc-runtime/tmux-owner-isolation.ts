@@ -29,6 +29,7 @@ import { isCompiledBinary } from "@gajae-code/utils/env";
 import { parseLinuxProcStartTime } from "./linux-proc";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { assertSafePathComponent } from "./session-layout";
+import { assertSafeGjcTmuxSessionName } from "./tmux-common";
 
 export const TMUX_OWNER_ISOLATION_SCHEMA_VERSION = 1;
 export const TMUX_OWNER_ISOLATION_MAX_LINE_BYTES = 16 * 1024;
@@ -395,13 +396,227 @@ export function isTmuxShellWrapperArgv(argv: readonly string[]): boolean {
 	return typeof command === "string" && isShellWrapperCommand(command);
 }
 
+const TMUX_OWNER_ISOLATION_COMMAND_SEPARATORS = new Set([";", "\\;", "&", "&&", "|", "||", "\\|"]);
+const TMUX_OWNER_ISOLATION_RESERVED_COMMANDS = new Set([
+	"attach",
+	"attach-session",
+	"break-pane",
+	"capture-pane",
+	"capturep",
+	"choose-session",
+	"choose-tree",
+	"choose-window",
+	"detach",
+	"detach-client",
+	"display",
+	"display-message",
+	"has",
+	"has-session",
+	"if-shell",
+	"join-pane",
+	"kill",
+	"kill-server",
+	"kill-session",
+	"last-window",
+	"ls",
+	"list-sessions",
+	"new",
+	"new-session",
+	"neww",
+	"new-window",
+	"next-window",
+	"pipe-pane",
+	"previous-window",
+	"refresh-client",
+	"renamew",
+	"rename-window",
+	"resize-window",
+	"respawn-pane",
+	"run",
+	"run-shell",
+	"select-pane",
+	"select-window",
+	"selectw",
+	"send",
+	"send-keys",
+	"set",
+	"set-option",
+	"set-window-option",
+	"show",
+	"show-options",
+	"source",
+	"source-file",
+	"splitw",
+	"split-window",
+	"switchc",
+	"switch-client",
+	"unlink-window",
+	"wait",
+	"wait-for",
+]);
+const TMUX_OWNER_ISOLATION_FIXED_FORMAT = "#{session_id}";
+
+interface StrictOwnerIsolationArgv {
+	controlArgv: string[];
+	session: string;
+	cwd: string;
+}
+
+function isPositiveTmuxDimension(value: string): boolean {
+	if (!/^[1-9]\d{0,5}$/.test(value)) return false;
+	const numeric = Number(value);
+	return Number.isSafeInteger(numeric) && numeric > 0;
+}
+
+function isSafeTmuxCwd(value: string, platform: NodeJS.Platform): boolean {
+	return (
+		nonEmpty(value) &&
+		Buffer.byteLength(value) <= TMUX_OWNER_ISOLATION_MAX_LINE_BYTES &&
+		!/[\0\r\n]/.test(value) &&
+		(platform === "win32" ? path.win32.isAbsolute(value) : path.isAbsolute(value))
+	);
+}
+
+function isSafeTmuxWindowName(value: string): boolean {
+	try {
+		assertSafeGjcTmuxSessionName(value);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function isReservedTmuxPaneCommand(value: string): boolean {
+	const command = value.trimStart().split(/[\s;|&]/, 1)[0] ?? "";
+	return TMUX_OWNER_ISOLATION_RESERVED_COMMANDS.has(command);
+}
+
+/** Parse the complete owner-isolation create command, not merely its session selector. */
+function strictOwnerIsolationArgv(
+	argv: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+): StrictOwnerIsolationArgv | null {
+	if (!validArgv(argv) || isTmuxShellWrapperArgv(argv)) return null;
+	let commandIndex = 1;
+	if (argv[commandIndex] === "-L" || argv[commandIndex] === "-S") {
+		const selector = argv[commandIndex + 1];
+		if (!nonEmpty(selector) || selector.startsWith("-") || TMUX_OWNER_ISOLATION_COMMAND_SEPARATORS.has(selector))
+			return null;
+		commandIndex += 2;
+	}
+	if (argv[commandIndex] !== "new-session") return null;
+	const controlArgv = [...argv.slice(0, commandIndex)];
+	let detached = false;
+	let printReceipt = false;
+	let format: string | undefined;
+	let session: string | undefined;
+	let cwd: string | undefined;
+	let width = false;
+	let height = false;
+	let windowName: string | undefined;
+	let paneCommand: string | undefined;
+
+	for (let index = commandIndex + 1; index < argv.length; ) {
+		const arg = argv[index]!;
+		if (TMUX_OWNER_ISOLATION_COMMAND_SEPARATORS.has(arg)) return null;
+		if (arg === "-d") {
+			if (detached) return null;
+			detached = true;
+			index += 1;
+			continue;
+		}
+		if (arg === "-P") {
+			if (printReceipt) return null;
+			printReceipt = true;
+			index += 1;
+			continue;
+		}
+		if (arg === "-F") {
+			const value = argv[index + 1];
+			if (format !== undefined || value !== TMUX_OWNER_ISOLATION_FIXED_FORMAT) return null;
+			format = TMUX_OWNER_ISOLATION_FIXED_FORMAT;
+			index += 2;
+			continue;
+		}
+		if (arg === "-s") {
+			const value = argv[index + 1];
+			if (session !== undefined || !nonEmpty(value)) return null;
+			try {
+				session = assertSafeGjcTmuxSessionName(value);
+			} catch {
+				return null;
+			}
+			index += 2;
+			continue;
+		}
+		if (arg === "-c") {
+			const value = argv[index + 1];
+			if (cwd !== undefined || !nonEmpty(value) || !isSafeTmuxCwd(value, platform)) return null;
+			cwd = value;
+			index += 2;
+			continue;
+		}
+		if (arg === "-x" || arg === "-y") {
+			const value = argv[index + 1];
+			if (!nonEmpty(value) || !isPositiveTmuxDimension(value) || (arg === "-x" ? width : height)) return null;
+			if (arg === "-x") width = true;
+			else height = true;
+			index += 2;
+			continue;
+		}
+		if (arg === "-n") {
+			const value = argv[index + 1];
+			if (windowName !== undefined || !nonEmpty(value) || !isSafeTmuxWindowName(value)) return null;
+			windowName = value;
+			index += 2;
+			continue;
+		}
+		if (index !== argv.length - 1 || arg.startsWith("-") || !nonEmpty(arg)) return null;
+		if (Buffer.byteLength(arg) > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES || /[\0\r\n]/.test(arg)) return null;
+		if (isReservedTmuxPaneCommand(arg)) return null;
+		paneCommand = arg;
+		index += 1;
+	}
+
+	if (!detached || session === undefined || cwd === undefined || paneCommand === undefined) return null;
+	if (printReceipt !== (format !== undefined)) return null;
+	return { controlArgv, session, cwd };
+}
+
+/** Validate a trusted provider-only prefix used by list-sessions probes. */
+export function isTrustedTmuxControlArgv(controlArgv: readonly string[]): boolean {
+	if (!validArgv(controlArgv) || isTmuxShellWrapperArgv(controlArgv)) return false;
+	try {
+		const provider = resolveGjcTmuxBinary({ env: process.env, platform: process.platform });
+		if (controlArgv[0] !== provider.command) return false;
+		let selector: string | undefined;
+		for (let index = 1; index < controlArgv.length; index += 1) {
+			const arg = controlArgv[index]!;
+			if (arg !== "-L" && arg !== "-S") return false;
+			const value = controlArgv[index + 1];
+			if (
+				selector !== undefined ||
+				!nonEmpty(value) ||
+				value.startsWith("-") ||
+				TMUX_OWNER_ISOLATION_COMMAND_SEPARATORS.has(value)
+			)
+				return false;
+			selector = value;
+			index += 1;
+		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Admission check for protocol-supplied tmux argv. Internal launch callers keep
  * their injectable argv seams; only the JSON-line protocol binds argv[0] to the
- * provider selected by this process.
+ * provider selected by this process and admits the complete create command.
  */
 export function isTrustedTmuxOwnerIsolationArgv(argv: readonly string[]): boolean {
-	if (!validArgv(argv) || isTmuxShellWrapperArgv(argv)) return false;
+	if (!strictOwnerIsolationArgv(argv)) return false;
 	try {
 		const provider = resolveGjcTmuxBinary({ env: process.env, platform: process.platform });
 		return argv[0] === provider.command;
@@ -2624,6 +2839,8 @@ export function isTrustedOwnerIsolationProtocolRequest(
 ): boolean {
 	if (request.op === "plan") {
 		if (request.platform !== process.platform) return false;
+		const admittedArgv = strictOwnerIsolationArgv(request.tmux_argv);
+		if (!admittedArgv || admittedArgv.cwd !== request.cwd) return false;
 		const controlArgv = tmuxControlArgv(request.tmux_argv);
 		if (
 			controlArgv.length > 0 &&
@@ -2636,6 +2853,7 @@ export function isTrustedOwnerIsolationProtocolRequest(
 	}
 	if (request.op === "bootstrap") {
 		if (process.platform !== "linux") return false;
+		if (!strictOwnerIsolationArgv(request.tmux_argv)) return false;
 		const controlArgv = tmuxControlArgv(request.tmux_argv);
 		if (
 			controlArgv.length > 0 &&

@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
-import * as fs from "node:fs/promises";
+
 import * as path from "node:path";
 import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -338,6 +338,9 @@ function parseNumber(value: string | undefined): number {
 }
 
 function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
+	const fields = line.split("\t");
+	if (fields.length > 17) throw new Error("gjc_tmux_session_row_malformed");
+	while (fields.length < 17) fields.push("");
 	const [
 		name = "",
 		windows = "0",
@@ -356,7 +359,7 @@ function parseSessionLine(line: string): GjcTmuxSessionStatus | null {
 		version = "",
 		psmuxIncarnation = "",
 		nativeSessionId = "",
-	] = line.split("\t");
+	] = fields;
 
 	if (!name) return null;
 	assertSafeGjcTmuxSessionName(name);
@@ -505,7 +508,10 @@ function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[]
 		// psmux may ignore `-F` and return its prose shape. runListSessions
 		// synthesizes a tabular row for that case; only unwrap that known shape,
 		// while rejecting literal tabs from a native provider's session name.
-		const name = line.includes("\t") ? (line.split("\t")[0] ?? line) : line;
+		const columns = line.split("\t");
+		if (!listed.synthetic && columns.length > 1 && columns.length < 7)
+			throw new Error("gjc_tmux_session_row_malformed");
+		const name = listed.synthetic || columns.length >= 7 ? (columns[0] ?? line) : line;
 		assertSafeGjcTmuxSessionName(name);
 		return name;
 	});
