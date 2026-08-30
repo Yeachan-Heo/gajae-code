@@ -200,14 +200,24 @@ describe("tmux owner isolation", () => {
 			}),
 		).toBe(true);
 		for (const argv of [
+			[...validLaunchArgv.slice(0, 5), ...validLaunchArgv.slice(8)],
 			[...validLaunchArgv.slice(0, -1), "run-shell", "echo escaped"],
 			[...validLaunchArgv.slice(0, -1), "run-shell -b echo escaped"],
 			[...validLaunchArgv.slice(0, -1), ";", "echo escaped"],
 			[...validLaunchArgv.slice(0, 4), "-A", ...validLaunchArgv.slice(4)],
 			[...validLaunchArgv.slice(0, 4), "-f", "/tmp/tmux.conf", ...validLaunchArgv.slice(4)],
 			[...validLaunchArgv.slice(0, 8), "../unsafe", ...validLaunchArgv.slice(9)],
-		])
+		]) {
 			expect(isTrustedTmuxOwnerIsolationArgv(argv)).toBe(false);
+			expect(
+				isTrustedOwnerIsolationProtocolRequest({
+					...request,
+					platform: process.platform,
+					cwd: launchCwd,
+					tmux_argv: argv,
+				}),
+			).toBe(false);
+		}
 	});
 
 	it("treats successful whitespace-only list-sessions output as absent", async () => {

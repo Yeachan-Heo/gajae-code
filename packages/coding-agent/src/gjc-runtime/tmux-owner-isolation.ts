@@ -580,7 +580,7 @@ function strictOwnerIsolationArgv(
 	}
 
 	if (!detached || session === undefined || cwd === undefined || paneCommand === undefined) return null;
-	if (printReceipt !== (format !== undefined)) return null;
+	if (!printReceipt || format !== TMUX_OWNER_ISOLATION_FIXED_FORMAT) return null;
 	return { controlArgv, session, cwd };
 }
 
