@@ -387,8 +387,7 @@ describe("tmux owner isolation", () => {
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
 				expect(result.exitCode).toBe(1);
 				expect(result.stderr).toBe("");
-				if (entry === "direct main entry") expect(result.stdout).toBe("");
-				else expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
+				expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
 				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({ state: "absent" });
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
@@ -422,8 +421,7 @@ describe("tmux owner isolation", () => {
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
 				expect(result.exitCode).toBe(1);
 				expect(result.stderr).toBe("");
-				if (entry === "direct main entry") expect(result.stdout).toBe("");
-				else expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
+				expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
 				expect(result.stdout).not.toContain(state);
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
