@@ -154,6 +154,7 @@ export interface PlanRequest {
 export interface PublishGenerationRequest {
 	schema_version: 1;
 	op: "publish_generation";
+	auth_token?: string;
 	session_id: string;
 	owner_generation: string;
 	state_dir: string;
@@ -1260,6 +1261,7 @@ export interface OwnerIncident {
 export interface ObserveTerminalRequest {
 	schema_version: 1;
 	op: "observe_terminal";
+	auth_token?: string;
 	session_id: string;
 	owner_generation: string;
 	state_dir: string;
@@ -2772,7 +2774,15 @@ function isBootstrapRequest(request: unknown): request is BootstrapRequest {
 function isPublishGenerationRequest(request: unknown): request is PublishGenerationRequest {
 	return (
 		isRecord(request) &&
-		hasOnlyKeys(request, ["schema_version", "op", "session_id", "owner_generation", "state_dir", "baseline"]) &&
+		hasOnlyKeys(request, [
+			"schema_version",
+			"op",
+			"auth_token",
+			"session_id",
+			"owner_generation",
+			"state_dir",
+			"baseline",
+		]) &&
 		request.schema_version === 1 &&
 		request.op === "publish_generation" &&
 		nonEmpty(request.session_id) &&
@@ -2791,6 +2801,7 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 		hasOnlyKeys(request, [
 			"schema_version",
 			"op",
+			"auth_token",
 			"session_id",
 			"owner_generation",
 			"state_dir",
@@ -2912,11 +2923,11 @@ export function isTrustedOwnerIsolationProtocolRequest(
 			return false;
 		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
 	}
-	// Generation publication and terminal observation are owner-authority mutations.
-	// They are performed through the authenticated in-process lifecycle paths; the
-	// JSON-line facade has no process-bound capability channel, so do not expose
-	// these operations to arbitrary local callers.
-	return false;
+	return (
+		nonEmpty(request.auth_token) &&
+		/^[a-f0-9]{64}$/.test(request.auth_token) &&
+		request.auth_token === process.env.GJC_TMUX_OWNER_PROTOCOL_TOKEN
+	);
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {
 	return (
