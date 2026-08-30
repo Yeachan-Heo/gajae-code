@@ -138,7 +138,7 @@ if (isManagedOwnerSupervisorArgv(process.argv.slice(2))) {
 	process.on("SIGTERM", captureBootstrapSigterm);
 }
 
-/** Runs one exact child and publishes authority only for a directly observed Linux signal 6. */
+/** Runs one exact child and publishes authority for its directly observed terminal state. */
 export async function runManagedOwnerSupervisor(): Promise<void> {
 	const { root, stateDir, generation, sessionId, runId, incarnation } = lifecycleRoot();
 	const command = childCommand();
@@ -315,6 +315,25 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				exit_code: exitCode,
 				exit_kind: child.signalCode ?? "supervisor_child_exit",
 				reason: "managed_owner_supervisor_unexpected_exit",
+			});
+		} catch {
+			terminalPublicationFailed = true;
+		}
+	} else {
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? "",
+				observer: "raw_monitor",
+				observed_at: terminalObservedAt,
+				signal: "EXIT",
+				exit_code: exitCode,
+				exit_kind: "exit",
+				reason: "owner_exit",
 			});
 		} catch {
 			terminalPublicationFailed = true;

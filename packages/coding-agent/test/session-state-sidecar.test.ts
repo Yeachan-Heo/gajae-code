@@ -2200,9 +2200,9 @@ describe("coordinator runtime state sidecar", () => {
 		).toBe(false);
 	});
 
-	it("fails closed for absent, malformed, mismatched, and expired owner intents", async () => {
+	it("fails closed for absent, malformed, mismatched, future, and expired owner intents", async () => {
 		const root = await tempRoot();
-		for (const kind of ["absent", "malformed", "mismatched", "expired"] as const) {
+		for (const kind of ["absent", "malformed", "mismatched", "future", "expired"] as const) {
 			const sessionId = `owner-intent-${kind}`;
 			const generation = await replaceOwnerGeneration(root, sessionId, `generation-${kind}`);
 			const paths = lifecyclePaths(root, sessionId, generation);
@@ -2218,6 +2218,22 @@ describe("coordinator runtime state sidecar", () => {
 					expires_at: "2099-01-01T00:00:00.000Z",
 				});
 			}
+			if (kind === "future")
+				await Bun.write(
+					paths.intentFile,
+					JSON.stringify({
+						schema_version: 1,
+						intent_id: "future-intent",
+						generation,
+						session_id: sessionId,
+						server_key: "opaque-owner",
+						expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+						dispatch_id: "dispatch",
+						created_at: "2099-01-01T00:00:00.000Z",
+						expires_at: "2100-01-01T00:00:00.000Z",
+						state: "pending",
+					}),
+				);
 			if (kind === "expired")
 				await Bun.write(
 					paths.intentFile,
@@ -2243,7 +2259,9 @@ describe("coordinator runtime state sidecar", () => {
 				ownerTerminal: { generation, stateDir: root, socketKey: "opaque-owner" },
 			});
 			const payload = await readPayload(stateFile);
-			const expectedReason = kind === "malformed" ? "owner_verdict_unavailable" : "unexpected_owner_loss";
+			const expectedReason = ["malformed", "future", "expired"].includes(kind)
+				? "owner_verdict_unavailable"
+				: "unexpected_owner_loss";
 			expect(payload).toMatchObject({
 				owner_generation: generation,
 				state: "errored",
@@ -2251,7 +2269,52 @@ describe("coordinator runtime state sidecar", () => {
 				error: { code: expectedReason, recoverable: true },
 				recovery: { action: "recover_or_resume_session" },
 			});
+			expect(await Bun.file(paths.verdictFile).exists()).toBe(kind === "absent" || kind === "mismatched");
 		}
+	});
+
+	it("surfaces typed uncertainty when a durable owner verdict cannot build its runtime payload", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "verdict-payload-failure.json");
+		const sessionId = "verdict-payload-failure";
+		const generation = await replaceOwnerGeneration(root, sessionId, "verdict-payload-generation");
+		const owner = { generation, stateDir: root, socketKey: "opaque-owner" };
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			}),
+		);
+
+		let cwdReads = 0;
+		const context = {
+			sessionId,
+			get cwd(): string {
+				cwdReads += 1;
+				if (cwdReads >= 3) throw new Error("identity construction failed");
+				return root;
+			},
+			sessionFile: null,
+			ownerTerminal: owner,
+		};
+		await expect(
+			persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.SIGTERM, context),
+		).rejects.toMatchObject({
+			name: "OwnerTerminalPublicationError",
+			code: "owner_terminal_publication_failed",
+		});
+		expect(await readPayload(stateFile)).toMatchObject({ state: "running" });
+		expect(await readJson(lifecyclePaths(root, sessionId, generation).verdictFile)).toMatchObject({
+			classification: "unexpected_owner_loss",
+			generation,
+		});
 	});
 
 	it("reuses one immutable owner verdict when raw observation wins the race", async () => {

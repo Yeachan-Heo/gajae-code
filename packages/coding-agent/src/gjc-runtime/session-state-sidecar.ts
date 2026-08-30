@@ -24,6 +24,7 @@ import { SessionStateLockUnavailableError, withSessionStateFileLock } from "./se
 import {
 	captureOwnerGenerationBaseline,
 	isValidOwnerIntent,
+	isValidOwnerVerdict,
 	lifecyclePaths,
 	type ObserveTerminalRequest,
 	type OwnerIntent,
@@ -1076,6 +1077,13 @@ function pathIsInside(candidate: string, root: string, platform: NodeJS.Platform
 	return normalizedCandidate.startsWith(prefix);
 }
 
+class OwnerTerminalPublicationError extends Error {
+	constructor(cause: unknown) {
+		super("Owner terminal verdict is durable, but its public runtime state could not be constructed.");
+		this.name = "OwnerTerminalPublicationError";
+		Object.assign(this, { code: "owner_terminal_publication_failed", cause });
+	}
+}
 class RuntimeToolActivityRefusedError extends Error {
 	constructor(reason: string) {
 		super(`Refusing to overwrite the coordinator tool-activity snapshot: ${reason}.`);
@@ -2882,12 +2890,20 @@ async function observeOwnerTerminalPostmortem(
 	sessionId: string,
 ): Promise<OwnerVerdict | null> {
 	try {
+		const intentStatus =
+			reason === postmortem.Reason.SIGTERM ? await pendingOwnerIntentStatus(owner, sessionId) : "none";
+		// A present but unparseable, future-dated, expired, or otherwise unavailable intent
+		// is evidence that cannot authorize an unbound sidecar observation. Only a proven
+		// ENOENT (`none`) permits the ordinary unbound path below. A durable verdict is
+		// the exception: observeOwnerTerminal must still be allowed to replay it exactly,
+		// even when a stale intent marker remains beside it.
+		if (intentStatus === "unavailable" && !(await hasMatchingDurableOwnerVerdict(owner, sessionId))) return null;
 		if (
 			(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
 				(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
 			reason === postmortem.Reason.SIGTERM &&
 			(!owner.operatorDispatchId || !owner.operatorIntentId) &&
-			(await pendingOwnerIntentStatus(owner, sessionId)) !== "none"
+			intentStatus !== "none"
 		)
 			return null;
 		const now = new Date().toISOString();
@@ -2917,6 +2933,20 @@ async function observeOwnerTerminalPostmortem(
 
 type PendingOwnerIntentStatus = "none" | "matching" | "foreign" | "unavailable";
 
+async function hasMatchingDurableOwnerVerdict(owner: OwnerTerminalContext, sessionId: string): Promise<boolean> {
+	try {
+		const verdict = await readNoFollowJson(lifecyclePaths(owner.stateDir, sessionId, owner.generation).verdictFile);
+		return (
+			isValidOwnerVerdict(verdict) &&
+			verdict.generation === owner.generation &&
+			verdict.session_id === sessionId &&
+			verdict.server_key === owner.socketKey
+		);
+	} catch {
+		return false;
+	}
+}
+
 async function pendingOwnerIntentStatus(
 	owner: OwnerTerminalContext,
 	sessionId: string,
@@ -2938,7 +2968,7 @@ async function pendingOwnerIntentStatus(
 			Date.parse(intent.created_at) > Date.now() ||
 			Date.parse(intent.expires_at) <= Date.now()
 		)
-			return "none";
+			return "unavailable";
 		return intent.server_key === owner.socketKey ? "matching" : "foreign";
 	} catch {
 		return "unavailable";
@@ -2999,8 +3029,8 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 					}),
 			previous_runtime_state: typeof previous.state === "string" ? previous.state : null,
 		};
-	} catch {
-		if (verdict) return;
+	} catch (error) {
+		if (verdict) throw new OwnerTerminalPublicationError(error);
 		const now = new Date().toISOString();
 		await writeStateFileSync(stateFile, {
 			...basePayload({

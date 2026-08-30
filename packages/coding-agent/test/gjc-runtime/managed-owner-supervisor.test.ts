@@ -4,9 +4,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { sessionUltragoalDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
+	captureOwnerGenerationBaseline,
 	createOwnerIntent,
 	lifecyclePaths,
 	replaceOwnerGeneration,
+	resolveManagedOwnerPredecessorSync,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 
 const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
@@ -223,6 +225,34 @@ describe("managed owner supervisor", () => {
 			expect(result.exitCode).toBe(75);
 			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
 			expect((await fs.readdir(root)).some(file => file.startsWith("sigabrt-"))).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("publishes clean EXIT evidence without stranding the next replacement", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "setTimeout(() => process.exit(0), 100)"],
+				{ GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+			const paths = lifecyclePaths(stateDir, sessionId, generation);
+			expect(await Bun.file(paths.verdictFile).json()).toMatchObject({
+				generation,
+				session_id: sessionId,
+				signal: "EXIT",
+				exit_code: 0,
+				result: "exit",
+				observer: "raw_monitor",
+				classification: "unexpected_owner_loss",
+			});
+			expect(resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toBeUndefined();
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
