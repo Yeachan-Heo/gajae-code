@@ -171,6 +171,7 @@ export interface AttemptCapability {
 	token: string;
 	session_name: string;
 	socket_key: string;
+	tmux_argv_sha256: string;
 	server_absent_before: boolean;
 	baseline: OwnerGenerationBaseline;
 	expires_at: string;
@@ -717,6 +718,7 @@ export function planTmuxOwnerIsolationSync(request: PlanRequest, probe: OwnerIso
 			token,
 			session_name: attemptSession,
 			socket_key: request.socket_key,
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(request.tmux_argv),
 			server_absent_before: true,
 			baseline,
 			expires_at: new Date(Date.now() + 7_000).toISOString(),
@@ -1003,6 +1005,7 @@ export async function planTmuxOwnerIsolation(request: PlanRequest, probe: OwnerI
 			token,
 			session_name: attemptSession,
 			socket_key: request.socket_key,
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(request.tmux_argv),
 			server_absent_before: true,
 			baseline,
 			expires_at: new Date(Date.now() + 7_000).toISOString(),
@@ -2726,6 +2729,7 @@ function isBootstrapRequest(request: unknown): request is BootstrapRequest {
 		nonEmpty(request.expected_scope) &&
 		validArgv(request.tmux_argv) &&
 		isAttemptCapability(request.attempt) &&
+		request.attempt.tmux_argv_sha256 === tmuxOwnerIsolationArgvSha256(request.tmux_argv) &&
 		request.attempt.socket_key === request.socket_key &&
 		isSafePathComponent(request.attempt.token, "attempt token") &&
 		request.attempt.server_absent_before
@@ -2791,11 +2795,21 @@ function isObserveTerminalRequest(request: unknown): request is ObserveTerminalR
 function isAttemptCapability(value: unknown): value is AttemptCapability {
 	return (
 		isRecord(value) &&
-		hasOnlyKeys(value, ["token", "session_name", "socket_key", "server_absent_before", "baseline", "expires_at"]) &&
+		hasOnlyKeys(value, [
+			"token",
+			"session_name",
+			"socket_key",
+			"tmux_argv_sha256",
+			"server_absent_before",
+			"baseline",
+			"expires_at",
+		]) &&
 		nonEmpty(value.token) &&
 		isSafePathComponent(value.token, "attempt token") &&
 		nonEmpty(value.session_name) &&
 		nonEmpty(value.socket_key) &&
+		nonEmpty(value.tmux_argv_sha256) &&
+		/^[a-f0-9]{64}$/.test(value.tmux_argv_sha256) &&
 		typeof value.server_absent_before === "boolean" &&
 		isOwnerGenerationBaseline(value.baseline) &&
 		nonEmpty(value.expires_at) &&
@@ -2887,6 +2901,8 @@ function validPersistedAttempt(value: PersistedAttempt | null, request: Bootstra
 			value.token === request.attempt.token &&
 			value.session_name === request.attempt.session_name &&
 			value.socket_key === request.socket_key &&
+			value.tmux_argv_sha256 === request.attempt.tmux_argv_sha256 &&
+			request.attempt.tmux_argv_sha256 === tmuxOwnerIsolationArgvSha256(request.tmux_argv) &&
 			value.server_absent_before === true &&
 			sameOwnerGenerationBaseline(value.baseline, request.attempt.baseline) &&
 			value.expires_at === request.attempt.expires_at &&
@@ -2894,6 +2910,11 @@ function validPersistedAttempt(value: PersistedAttempt | null, request: Bootstra
 			Date.parse(value.created_at) <= Date.now() &&
 			Date.parse(value.expires_at) > Date.now(),
 	);
+}
+
+/** Canonical identity for the exact argv handed to tmux, including its -c cwd argument. */
+export function tmuxOwnerIsolationArgvSha256(argv: readonly string[]): string {
+	return crypto.createHash("sha256").update(JSON.stringify(argv)).digest("hex");
 }
 
 function isTerminalObserver(value: unknown): value is TerminalObserver {
