@@ -352,6 +352,43 @@ setInterval(() => {}, 1_000);`;
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+	it("fails closed when expected owner-shutdown publication cannot persist", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
+		const readyFile = path.join(stateDir, "child-ready");
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			await createOwnerIntent(stateDir, {
+				generation,
+				session_id: sessionId,
+				server_key: "server-key",
+				expected_terminal: {
+					signal: "SIGTERM",
+					result: "owner_term_then_session_cleanup",
+				},
+				dispatch_id: "matching-dispatch",
+				created_at: new Date(Date.now() - 1_000).toISOString(),
+				expires_at: new Date(Date.now() + 60_000).toISOString(),
+			});
+			const childScript = `import { chmod, writeFile } from "node:fs/promises"; import { lifecyclePaths } from ${JSON.stringify(
+				path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"),
+			)}; process.on("SIGTERM", async () => { await chmod(lifecyclePaths(process.env.GJC_TMUX_OWNER_STATE_DIR!, process.env.GJC_COORDINATOR_SESSION_ID!, process.env.GJC_TMUX_OWNER_GENERATION!).root, 0o500); process.exit(0); }); await writeFile(process.env.READY_FILE!, "ready"); setInterval(() => {}, 1_000);`;
+			const supervisor = startSupervisor(stateDir, [process.execPath, "-e", childScript], {
+				READY_FILE: readyFile,
+				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+			});
+			await waitForFile(readyFile);
+			process.kill(supervisor.pid, "SIGTERM");
+			expect(await supervisor.exited).toBe(75);
+			expect(await Bun.file(lifecyclePaths(stateDir, sessionId, generation).verdictFile).exists()).toBe(false);
+			expect(await Bun.file(lifecyclePaths(stateDir, sessionId, generation).incidentFile).exists()).toBe(false);
+		} finally {
+			await fs.chmod(lifecycleRoot, 0o700).catch(() => undefined);
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 	it("routes a replacement supervisor child through predecessor recovery before normal CLI", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-cwd-"));

@@ -286,24 +286,28 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = new Date().toISOString();
-	let unexpectedTerminalPublicationFailed = false;
+	let terminalPublicationFailed = false;
 	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
-		await observeOwnerTerminal({
-			schema_version: 1,
-			op: "observe_terminal",
-			session_id: sessionId,
-			owner_generation: generation,
-			state_dir: stateDir,
-			socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
-			observer: "raw_monitor",
-			observed_at: terminalObservedAt,
-			signal: "SIGTERM",
-			exit_code: exitCode,
-			exit_kind: "supervisor_child_exit",
-			reason: "managed_owner_supervisor_exit",
-			operator_dispatch_id: terminalIntent.dispatch_id,
-			operator_intent_id: terminalIntent.intent_id,
-		});
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
+				observer: "raw_monitor",
+				observed_at: terminalObservedAt,
+				signal: "SIGTERM",
+				exit_code: exitCode,
+				exit_kind: "supervisor_child_exit",
+				reason: "managed_owner_supervisor_exit",
+				operator_dispatch_id: terminalIntent.dispatch_id,
+				operator_intent_id: terminalIntent.intent_id,
+			});
+		} catch {
+			terminalPublicationFailed = true;
+		}
 	} else if (sigtermRelayed || child.signalCode || (exitCode !== 0 && exitCode !== 75)) {
 		try {
 			await observeOwnerTerminal({
@@ -321,7 +325,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				reason: "managed_owner_supervisor_unexpected_exit",
 			});
 		} catch {
-			unexpectedTerminalPublicationFailed = true;
+			terminalPublicationFailed = true;
 		}
 	}
 	if (child.signalCode === "SIGABRT") {
@@ -348,7 +352,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		process.exitCode = 134;
 		return;
 	}
-	if (unexpectedTerminalPublicationFailed) {
+	if (terminalPublicationFailed) {
 		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 		return;
 	}
