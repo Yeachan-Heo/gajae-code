@@ -832,8 +832,101 @@ export function normalizeSchemaForCCA(value: unknown): unknown {
 	});
 }
 
+const MCP_SCHEMA_ARRAY_KEYS = new Set(["anyOf", "oneOf", "allOf", "prefixItems"]);
+const MCP_SCHEMA_MAP_KEYS = new Set([
+	"properties",
+	"patternProperties",
+	"dependencies",
+	"dependentSchemas",
+	"$defs",
+	"definitions",
+]);
+const MCP_SCHEMA_VALUE_KEYS = new Set([
+	"items",
+	"additionalItems",
+	"contains",
+	"contentSchema",
+	"propertyNames",
+	"if",
+	"then",
+	"else",
+	"not",
+	"additionalProperties",
+	"unevaluatedItems",
+	"unevaluatedProperties",
+]);
+
+function makeImplicitMcpObjectMapsExplicit(value: unknown): unknown {
+	return normalizeMcpObjectMapNode(value, new WeakMap());
+}
+
+function normalizeMcpObjectMapNode(value: unknown, cache: WeakMap<JsonObject, JsonObject>): unknown {
+	if (!isJsonObject(value)) return value;
+	const cached = cache.get(value);
+	if (cached) return cached;
+
+	const output: JsonObject = {};
+	cache.set(value, output);
+	let changed = false;
+
+	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
+		const child = value[key];
+		let next: unknown = child;
+		if (MCP_SCHEMA_MAP_KEYS.has(key) && isJsonObject(child)) {
+			next = normalizeMcpObjectMap(child, cache);
+		} else if (MCP_SCHEMA_ARRAY_KEYS.has(key) && Array.isArray(child)) {
+			next = normalizeMcpObjectMapArray(child, cache);
+		} else if (MCP_SCHEMA_VALUE_KEYS.has(key)) {
+			next = Array.isArray(child)
+				? normalizeMcpObjectMapArray(child, cache)
+				: normalizeMcpObjectMapNode(child, cache);
+		}
+		if (next !== child) changed = true;
+		output[key] = next;
+	}
+
+	if (
+		declaresObjectType(value.type) &&
+		!Object.hasOwn(value, "properties") &&
+		!Object.hasOwn(value, "additionalProperties") &&
+		!Object.hasOwn(value, "patternProperties") &&
+		!Object.hasOwn(value, "unevaluatedProperties")
+	) {
+		output.additionalProperties = true;
+		changed = true;
+	}
+
+	const result = changed ? output : value;
+	cache.set(value, result);
+	return result;
+}
+
+function normalizeMcpObjectMapArray(value: unknown[], cache: WeakMap<JsonObject, JsonObject>): unknown[] {
+	let changed = false;
+	const output = value.map(item => {
+		const next = normalizeMcpObjectMapNode(item, cache);
+		if (next !== item) changed = true;
+		return next;
+	});
+	return changed ? output : value;
+}
+
+function normalizeMcpObjectMap(schemaMap: JsonObject, cache: WeakMap<JsonObject, JsonObject>): JsonObject {
+	let changed = false;
+	const output: JsonObject = {};
+	for (const key in schemaMap) {
+		if (!Object.hasOwn(schemaMap, key)) continue;
+		const child = schemaMap[key];
+		const next = normalizeMcpObjectMapNode(child, cache);
+		if (next !== child) changed = true;
+		output[key] = next;
+	}
+	return changed ? output : schemaMap;
+}
+
 export function normalizeSchemaForMCP(value: unknown): unknown {
-	return normalizeSchema(value, {
+	const normalized = normalizeSchema(value, {
 		unsupportedFields: isMcpUnsupportedSchemaField,
 		normalizeFieldNames: false,
 		collapseNullFields: false,
@@ -848,6 +941,7 @@ export function normalizeSchemaForMCP(value: unknown): unknown {
 		stripResidualCombinersFixpoint: false,
 		extractNullableFromUnions: false,
 	});
+	return makeImplicitMcpObjectMapsExplicit(normalized);
 }
 
 // ---------------------------------------------------------------------------

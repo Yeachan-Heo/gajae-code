@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- MCP dispatcher tools now preserve dynamic nested `args` and `params` objects when a server declares them as propertyless JSON Schema objects. `normalizeSchemaForMCP` makes the implicit open-map semantics explicit with `additionalProperties: true` without loosening objects that declare properties or an explicit closure, so provider tool schemas no longer collapse valid nested arguments to `{}`.
+
 ## [0.15.6] - 2026-08-30
 
 ### Added

@@ -349,6 +349,32 @@ describe("normalizeSchemaForMCP", () => {
 		});
 	});
 
+	it("makes implicit propertyless MCP argument maps explicitly open without loosening declared objects", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				action: { type: "string" },
+				args: { type: "object", description: "Dispatcher arguments" },
+				explicitlyClosed: { type: "object", additionalProperties: false },
+				declared: { type: "object", properties: { path: { type: "string" } } },
+				literalCarrier: { type: "string", default: { type: "object" } },
+			},
+		};
+		const before = structuredClone(schema);
+
+		expect(normalizeSchemaForMCP(schema)).toEqual({
+			type: "object",
+			properties: {
+				action: { type: "string" },
+				args: { type: "object", description: "Dispatcher arguments", additionalProperties: true },
+				explicitlyClosed: { type: "object", additionalProperties: false },
+				declared: { type: "object", properties: { path: { type: "string" } } },
+				literalCarrier: { type: "string", default: { type: "object" } },
+			},
+		});
+		expect(schema).toEqual(before);
+	});
+
 	// Regression: issue #1101. Some MCP servers ship `JSON.stringify(zodSchema)`
 	// directly as a tool's `inputSchema`. Zod 4 surfaces `.type`, `.enum`,
 	// `.options`, and `.def` on every schema instance — those keys collide with
