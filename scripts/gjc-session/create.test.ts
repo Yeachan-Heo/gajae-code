@@ -74,7 +74,7 @@ elif request["op"] == "plan":
             with open(generation_path, encoding="utf-8") as handle: baseline = {"state": "current", **json.load(handle)}
         else:
             baseline = {"state": "absent"}
-        attempt = {"token":token,"session_name":request["session_id"],"socket_key":request["socket_key"],"server_absent_before":True,"baseline":baseline,"expires_at":"2099-01-01T00:00:00.000Z","tmux_argv_sha256":hashlib.sha256(json.dumps(request["tmux_argv"],separators=(",", ":")).encode()).hexdigest()}
+        attempt = {"token":token,"session_name":request["session_id"],"socket_key":request["socket_key"],"server_absent_before":True,"baseline":baseline,"expires_at":"2099-01-01T00:00:00.000Z","tmux_argv_sha256":hashlib.sha256(json.dumps(request["tmux_argv"],ensure_ascii=False,separators=(",", ":")).encode("utf-8")).hexdigest()}
         with open(os.path.join(request["state_dir"], ".fixture-attempt.json"), "x", encoding="utf-8") as handle:
             json.dump(attempt, handle, separators=(",", ":"))
         bootstrap = {"schema_version":1,"op":"bootstrap","session_id":request["session_id"],"owner_generation":request["owner_generation"],"state_dir":request["state_dir"],"socket_key":request["socket_key"],"expected_scope":expected_scope,"tmux_argv":request["tmux_argv"],"attempt":attempt}
@@ -296,7 +296,7 @@ describe("gjc-session create public owner lifecycle", () => {
 	test("accepts scoped plans with exactly the owner bootstrap stdin line", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-scoped-")); roots.push(root);
 		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root, "scoped");
-		const name = `scoped-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+		const name = `scoped-日本-${Date.now()}`; sessions.push({ name, socket: `gjc-${name.replace(/[^A-Za-z0-9_.-]/g, "_")}` });
 		expect(Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }) }).exitCode).toBe(0);
 		expect(await Bun.file(path.join(state, "started.json")).exists()).toBe(true);
 	});

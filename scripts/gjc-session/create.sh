@@ -12,6 +12,7 @@ SESSION="$1"
 WORKDIR="$2"
 GJC_BIN="${GJC_BIN-$(command -v gjc || true)}"
 TMUX_BIN="${GJC_SESSION_TMUX_BIN:-tmux}"
+export GJC_TMUX_COMMAND="$TMUX_BIN"
 STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
 RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 SOCKET_KEY="gjc-${SESSION//[^A-Za-z0-9_.-]/_}"
@@ -730,7 +731,7 @@ try:
         expected_baseline = json.loads(baseline_json)
         bootstrap = json.loads(execution.get("stdin_line"))
         scoped_argv = execution.get("argv")
-        attempt_digest = hashlib.sha256(json.dumps(argv, separators=(',', ':')).encode()).hexdigest()
+        attempt_digest = hashlib.sha256(json.dumps(argv, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
         expiry_valid = isinstance(expires_at, str) and datetime.datetime.fromisoformat(expires_at.replace("Z", "+00:00")) > datetime.datetime.now(datetime.timezone.utc)
         valid = (
             common and response.get("code") == "unsafe_scope_required" and response.get("server_state") == "absent" and classification == "unsafe_service"
