@@ -23,13 +23,15 @@ describe("persistCoordinatorLaunchFailure", () => {
 			});
 			const state = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
 			expect(state.owner_generation).toBe(generation);
-			await persistCoordinatorLaunchFailure(new Error("launch_failed"), root, {
-				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
-				[GJC_COORDINATOR_SESSION_ID_ENV]: "coordinator-123",
-			});
+			await expect(
+				persistCoordinatorLaunchFailure(new Error("launch_failed"), root, {
+					[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
+					[GJC_COORDINATOR_SESSION_ID_ENV]: "coordinator-123",
+				}),
+			).rejects.toThrow();
 			const missing = JSON.parse(await fs.readFile(stateFile, "utf8")) as Record<string, unknown>;
 			expect(Object.hasOwn(missing, "owner_generation")).toBe(true);
-			expect(missing.owner_generation).toBeNull();
+			expect(missing.owner_generation).toBe(generation);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
