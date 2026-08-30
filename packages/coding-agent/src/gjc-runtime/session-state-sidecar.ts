@@ -2942,7 +2942,8 @@ async function observeOwnerTerminalPostmortem(
 			...observation,
 			...(operatorIdentity ?? {}),
 		});
-	} catch {
+	} catch (error) {
+		if (await hasMatchingDurableOwnerVerdict(owner, sessionId)) throw new OwnerTerminalPublicationError(error);
 		return null;
 	}
 }
