@@ -40,6 +40,7 @@ if [[ "${"$"}{1:-}" == --internal-tmux-owner-isolation ]]; then
   if [[ -n "${"$"}{GJC_FIXTURE_ISOLATION_LOG:-}" ]]; then printf '%s\n' "$request" >>"${"$"}GJC_FIXTURE_ISOLATION_LOG"; fi
   python3 - "$request" "${mode}" "$0" <<'PY'
 import json
+import hashlib
 import datetime
 import os
 import subprocess
@@ -73,7 +74,7 @@ elif request["op"] == "plan":
             with open(generation_path, encoding="utf-8") as handle: baseline = {"state": "current", **json.load(handle)}
         else:
             baseline = {"state": "absent"}
-        attempt = {"token":token,"session_name":request["session_id"],"socket_key":request["socket_key"],"server_absent_before":True,"baseline":baseline,"expires_at":"2099-01-01T00:00:00.000Z"}
+        attempt = {"token":token,"session_name":request["session_id"],"socket_key":request["socket_key"],"server_absent_before":True,"baseline":baseline,"expires_at":"2099-01-01T00:00:00.000Z","tmux_argv_sha256":hashlib.sha256(json.dumps(request["tmux_argv"],separators=(",", ":")).encode()).hexdigest()}
         with open(os.path.join(request["state_dir"], ".fixture-attempt.json"), "x", encoding="utf-8") as handle:
             json.dump(attempt, handle, separators=(",", ":"))
         bootstrap = {"schema_version":1,"op":"bootstrap","session_id":request["session_id"],"owner_generation":request["owner_generation"],"state_dir":request["state_dir"],"socket_key":request["socket_key"],"expected_scope":expected_scope,"tmux_argv":request["tmux_argv"],"attempt":attempt}
