@@ -5988,9 +5988,11 @@ export class AgentSession {
 		return () => this.#toolSessionTransitionCleanups.delete(cleanup);
 	}
 
-	async #runToolSessionTransitionCleanups(): Promise<void> {
-		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
-		this.#toolSessionTransitionCleanups.clear();
+	async #runToolSessionTransitionCleanups(selectedCleanups?: ReadonlySet<() => Promise<void> | void>): Promise<void> {
+		const cleanups = selectedCleanups
+			? Array.from(selectedCleanups).filter(cleanup => this.#toolSessionTransitionCleanups.has(cleanup))
+			: Array.from(this.#toolSessionTransitionCleanups);
+		for (const cleanup of cleanups) this.#toolSessionTransitionCleanups.delete(cleanup);
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
 		for (const result of results) {
 			if (result.status === "rejected")
@@ -6090,6 +6092,7 @@ export class AgentSession {
 		lease: OwnerSubagentShutdownLease,
 		ownerId: string,
 		predecessorEndpointId: string,
+		predecessorCleanups: ReadonlySet<() => Promise<void> | void>,
 	): void {
 		const finalization = (async () => {
 			while (!this.#isDisposed) {
@@ -6106,7 +6109,7 @@ export class AgentSession {
 					}
 					retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
 					this.sessionManager.retireEphemeralArtifactsAfterTransition();
-					await this.#runToolSessionTransitionCleanups();
+					await this.#runToolSessionTransitionCleanups(predecessorCleanups);
 					manager.finishOwnerSubagentShutdown(lease, "commit");
 					return;
 				} catch (error) {
@@ -23875,6 +23878,7 @@ export class AgentSession {
 		let ownerShutdownLease: OwnerSubagentShutdownLease | undefined;
 		let ownerShutdownTransitionCommitted = false;
 		let ownerShutdownFinalizationDeferred = false;
+		const predecessorTransitionCleanups = new Set(this.#toolSessionTransitionCleanups);
 		let successorEndpointReservation: { endpointId: string; release: () => void; finalize: () => void } | undefined;
 		this.#beginSessionTransition("switch-session");
 		try {
@@ -24151,6 +24155,7 @@ export class AgentSession {
 								ownerShutdownLease,
 								ownerId,
 								predecessorEndpointId,
+								predecessorTransitionCleanups,
 							);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
@@ -24187,7 +24192,16 @@ export class AgentSession {
 				ownerShutdownTransitionCommitted = true;
 				if (switchingToDifferentSession) this.#resetAcpPermissionDecisions();
 				this.clearPlanModeStateForSessionTransition();
-				if (!ownerShutdownFinalizationDeferred) await this.#runToolSessionTransitionCleanups();
+				if (ownerShutdownFinalizationDeferred) {
+					const successorCleanups = new Set(
+						Array.from(this.#toolSessionTransitionCleanups).filter(
+							cleanup => !predecessorTransitionCleanups.has(cleanup),
+						),
+					);
+					await this.#runToolSessionTransitionCleanups(successorCleanups);
+				} else {
+					await this.#runToolSessionTransitionCleanups();
+				}
 				if (didReloadConversationChange && !switchingToDifferentSession) this.#quarantineQueuedAsyncResults();
 				this.#reconnectToAgent();
 				// Fence predecessor continuations before session_switch starts SDK runtime

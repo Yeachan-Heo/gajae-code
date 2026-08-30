@@ -26,7 +26,7 @@ import {
 	writeMarketplacesRegistry,
 } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
 import { getAgentDir, getAgentProfileAuthority, setAgentDir } from "@gajae-code/utils";
-import { safeRmSync } from "../../../../scripts/safe-cleanup";
+import { registerOwnedDeletionRoot, safeRmSync } from "../../../../scripts/safe-cleanup";
 
 // Inline the parseAnthropic modelPluginsRegistry validation logic to avoid pulling
 // in discovery/helpers.ts which transitively imports @gajae-code/natives.
@@ -203,15 +203,22 @@ describe("registry file I/O", () => {
 	let tmpDir: string;
 	let marketplacesPath: string;
 	let installedPath: string;
+	let releaseTmpDir: () => void;
 
 	beforeEach(() => {
-		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-mkt-test-"));
+		const tmpRoot = path.join(os.tmpdir(), `gjc-mkt-test-${crypto.randomUUID()}`);
+		releaseTmpDir = registerOwnedDeletionRoot(tmpRoot);
+		tmpDir = fs.mkdtempSync(tmpRoot);
 		marketplacesPath = path.join(tmpDir, "marketplaces.json");
 		installedPath = path.join(tmpDir, "installed_plugins.json");
 	});
 
 	afterEach(() => {
-		safeRmSync(tmpDir, { recursive: true, force: true });
+		try {
+			safeRmSync(tmpDir, { recursive: true, force: true });
+		} finally {
+			releaseTmpDir();
+		}
 	});
 
 	// ── Marketplaces registry ────────────────────────────────────────
@@ -337,7 +344,9 @@ describe("profile registry paths", () => {
 		const originalGjcAgentDir = process.env.GJC_CODING_AGENT_DIR;
 		const originalConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
-		const home = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-registry-home-"));
+		const homeRoot = path.join(os.tmpdir(), `gjc-registry-home-${crypto.randomUUID()}`);
+		const releaseHome = registerOwnedDeletionRoot(homeRoot);
+		const home = fs.mkdtempSync(homeRoot);
 		const beforeConfigDir = `gjc-registry-before-${Date.now()}`;
 		const refreshedConfigDir = `gjc-registry-refresh-${Date.now()}`;
 		const customAgentDir = path.join(home, refreshedConfigDir, "agent");
@@ -371,7 +380,11 @@ describe("profile registry paths", () => {
 			setAgentDir(originalAgentDir);
 			if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
 			else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
-			safeRmSync(home, { recursive: true, force: true });
+			try {
+				safeRmSync(home, { recursive: true, force: true });
+			} finally {
+				releaseHome();
+			}
 		}
 	});
 });
