@@ -300,7 +300,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		} catch {
 			terminalPublicationFailed = true;
 		}
-	} else if (sigtermRelayed || child.signalCode || (exitCode !== 0 && exitCode !== 75)) {
+	} else if (sigtermRelayed || child.signalCode || exitCode !== 0) {
 		try {
 			await observeOwnerTerminal({
 				schema_version: 1,
