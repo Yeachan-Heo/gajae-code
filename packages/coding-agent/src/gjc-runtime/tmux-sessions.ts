@@ -509,9 +509,8 @@ function listRawTmuxSessionNames(env: NodeJS.ProcessEnv = process.env): string[]
 		// synthesizes a tabular row for that case; only unwrap that known shape,
 		// while rejecting literal tabs from a native provider's session name.
 		const columns = line.split("\t");
-		if (!listed.synthetic && columns.length > 1 && columns.length < 7)
-			throw new Error("gjc_tmux_session_row_malformed");
-		const name = listed.synthetic || columns.length >= 7 ? (columns[0] ?? line) : line;
+		if (!listed.synthetic && columns.length > 1) throw new Error("gjc_tmux_session_row_malformed");
+		const name = listed.synthetic ? (columns[0] ?? line) : line;
 		assertSafeGjcTmuxSessionName(name);
 		return name;
 	});
