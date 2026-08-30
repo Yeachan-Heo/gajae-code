@@ -31,6 +31,7 @@ import {
 	replaceOwnerGeneration,
 	replaceOwnerGenerationSync,
 	TMUX_OWNER_ISOLATION_MAX_LINE_BYTES,
+	tmuxOwnerIsolationArgvSha256,
 	tmuxOwnerIsolationBootstrapArgv,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-owner-isolation";
 import {
@@ -619,6 +620,9 @@ describe("tmux owner isolation", () => {
 		});
 		expect(scoped.ok && scoped.execution.mode).toBe("scoped");
 		expect(scoped.ok && scoped.execution.attempt_session).toBe("owned-session");
+		expect(
+			scoped.ok && scoped.execution.mode === "scoped" ? scoped.execution.attempt.tmux_argv_sha256 : undefined,
+		).toBe(tmuxOwnerIsolationArgvSha256(request.tmux_argv));
 		expect(attempts).toHaveLength(1);
 		const calls: Array<{ argv: string[]; stdin?: string }> = [];
 		const executed = executeTmuxOwnerIsolationPlanSync(scoped, {
@@ -918,6 +922,7 @@ describe("tmux owner isolation", () => {
 			token: "token",
 			session_name: "owned",
 			socket_key: "socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(["tmux", "new-session", "-s", "owned", "a b"]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at: new Date(Date.now() + 5_000).toISOString(),
@@ -978,6 +983,15 @@ describe("tmux owner isolation", () => {
 			token: "explicit-token",
 			session_name: "owned-explicit",
 			socket_key: "opaque socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256([
+				"tmux",
+				"-L",
+				"explicit",
+				"new-session",
+				"-s",
+				"owned-explicit",
+				"a b",
+			]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at: new Date(Date.now() + 5_000).toISOString(),
@@ -1070,6 +1084,131 @@ describe("tmux owner isolation", () => {
 		await fs.rm(state, { recursive: true, force: true });
 	});
 
+	it("rejects bootstrap replay when the pane command, cwd, or argv changes", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-bootstrap-argv-"));
+		const sessionId = "session";
+		const generation = "generation";
+		const token = "argv-token";
+		const originalArgv = [
+			"tmux",
+			"new-session",
+			"-d",
+			"-P",
+			"-F",
+			"#{session_id}",
+			"-s",
+			"owned",
+			"-c",
+			state,
+			"-n",
+			"gjc",
+			"exec env GJC_SESSION_NAME='owned'; exec gjc",
+		];
+		try {
+			await replaceOwnerGeneration(state, sessionId, generation);
+			const root = lifecyclePaths(state, sessionId, generation).root;
+			const attempt: AttemptCapability = {
+				token,
+				session_name: "owned",
+				socket_key: "socket",
+				tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(originalArgv),
+				server_absent_before: true,
+				baseline: captureOwnerGenerationBaselineSync(state, sessionId),
+				expires_at: new Date(Date.now() + 5_000).toISOString(),
+			};
+			const attemptFile = path.join(root, `attempt-${token}.json`);
+			await fs.writeFile(
+				attemptFile,
+				JSON.stringify({
+					schema_version: 1,
+					generation,
+					session_id: sessionId,
+					created_at: "2026-01-01T00:00:00.000Z",
+					...attempt,
+				}),
+			);
+
+			const alteredCwd = [...originalArgv];
+			alteredCwd[9] = path.join(state, "different-cwd");
+			const alteredArgv = [...originalArgv];
+			alteredArgv.splice(8, 0, "-x", "100");
+			const alteredRequests: Array<[string, string[]]> = [
+				["pane command", [...originalArgv.slice(0, -1), "exec env GJC_SESSION_NAME='changed'; exec gjc"]],
+				["cwd", alteredCwd],
+				["argv", alteredArgv],
+			];
+			let spawnCount = 0;
+			for (const [_label, tmux_argv] of alteredRequests) {
+				const result = await bootstrapTmuxOwnerIsolation(
+					{
+						schema_version: 1,
+						op: "bootstrap",
+						session_id: sessionId,
+						owner_generation: generation,
+						state_dir: state,
+						socket_key: "socket",
+						expected_scope: `gjc-owner-${token}.scope`,
+						tmux_argv,
+						attempt,
+					},
+					{
+						readSelfCgroup: async () => `0::/gjc-owner-${token}.scope`,
+						spawn: () => {
+							spawnCount += 1;
+							return { exitCode: 0, stdout: "$0\n" };
+						},
+						probeServer: async () => ({
+							state: "safe",
+							pid: 1,
+							startTime: "1",
+							cgroup: { classification: "safe" },
+						}),
+					},
+				);
+				expect(result).toMatchObject({
+					ok: false,
+					code: "scope_bootstrap_failed",
+				});
+				expect(await Bun.file(attemptFile).exists()).toBe(true);
+			}
+			expect(spawnCount).toBe(0);
+
+			const accepted = await bootstrapTmuxOwnerIsolation(
+				{
+					schema_version: 1,
+					op: "bootstrap",
+					session_id: sessionId,
+					owner_generation: generation,
+					state_dir: state,
+					socket_key: "socket",
+					expected_scope: `gjc-owner-${token}.scope`,
+					tmux_argv: originalArgv,
+					attempt,
+				},
+				{
+					readSelfCgroup: async () => `0::/gjc-owner-${token}.scope`,
+					spawn: argv => {
+						spawnCount += 1;
+						expect(argv).toEqual(originalArgv);
+						return { exitCode: 0, stdout: "$0\n" };
+					},
+					probeServer: async () => ({
+						state: "safe",
+						pid: 1,
+						startTime: "1",
+						cgroup: { classification: "safe" },
+					}),
+				},
+			);
+			expect(accepted).toMatchObject({ ok: true, code: "bootstrapped" });
+			expect(spawnCount).toBe(1);
+			expect(await Bun.file(attemptFile).exists()).toBe(false);
+			expect(await Bun.file(`${attemptFile}.consumed`).exists()).toBe(true);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("never cleans after an unsafe or unrelated post-spawn server proof", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-bootstrap-cleanup-"));
 		const sessionId = "session";
@@ -1080,6 +1219,15 @@ describe("tmux owner isolation", () => {
 			token: "qualifying-token",
 			session_name: "qualifying-session",
 			socket_key: "qualifying-socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256([
+				"tmux",
+				"-L",
+				"qualifying-token",
+				"new-session",
+				"-s",
+				"qualifying-session",
+				"a b",
+			]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at,
@@ -1088,6 +1236,15 @@ describe("tmux owner isolation", () => {
 			token: "non-qualifying-token",
 			session_name: "non-qualifying-session",
 			socket_key: "non-qualifying-socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256([
+				"tmux",
+				"-L",
+				"non-qualifying-token",
+				"new-session",
+				"-s",
+				"non-qualifying-session",
+				"a b",
+			]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at,
@@ -1165,6 +1322,7 @@ describe("tmux owner isolation", () => {
 			token: "stale-token",
 			session_name: "owned",
 			socket_key: "socket",
+			tmux_argv_sha256: tmuxOwnerIsolationArgvSha256(["tmux", "new-session", "-s", "owned"]),
 			server_absent_before: true,
 			baseline: { state: "absent" as const },
 			expires_at: new Date(Date.now() + 5_000).toISOString(),
