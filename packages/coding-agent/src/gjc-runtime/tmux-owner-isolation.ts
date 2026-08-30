@@ -1715,7 +1715,14 @@ export function replaceOwnerGenerationSync(
 				generationPublicationRecord(previous),
 			);
 		fsSync.writeFileSync(temporaryGeneration, `${JSON.stringify(published)}\n`, { mode: 0o600, flag: "wx" });
+		const generationFd = fsSync.openSync(temporaryGeneration, "r");
+		try {
+			fsSync.fsyncSync(generationFd);
+		} finally {
+			fsSync.closeSync(generationFd);
+		}
 		fsSync.renameSync(temporaryGeneration, paths.generationFile);
+		fsyncDirectorySync(paths.root);
 		if (previous.state === "current" && previous.generation !== generation) {
 			const priorIntent = lifecyclePaths(stateDir, sessionId, previous.generation).intentFile;
 			try {
@@ -3012,7 +3019,14 @@ function publishImmutableGenerationMarkerSync(
 	generation: { schema_version: 1; generation: string; session_id: string; published_at: string },
 ): void {
 	try {
-		fsSync.writeFileSync(file, `${JSON.stringify(generation)}\n`, { mode: 0o600, flag: "wx" });
+		const fd = fsSync.openSync(file, "wx", 0o600);
+		try {
+			fsSync.writeFileSync(fd, `${JSON.stringify(generation)}\n`);
+			fsSync.fsyncSync(fd);
+		} finally {
+			fsSync.closeSync(fd);
+		}
+		fsyncDirectorySync(path.dirname(file));
 	} catch (error) {
 		if (isCode(error, "EEXIST")) throw new Error("generation_replay");
 		throw error;
@@ -3069,6 +3083,18 @@ async function fsyncDirectory(directoryPath: string): Promise<void> {
 		if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
 	} finally {
 		await directory.close();
+	}
+}
+function fsyncDirectorySync(directoryPath: string): void {
+	const directory = fsSync.openSync(directoryPath, "r");
+	try {
+		try {
+			fsSync.fsyncSync(directory);
+		} catch (error) {
+			if (process.platform !== "win32" || (error as NodeJS.ErrnoException).code !== "EPERM") throw error;
+		}
+	} finally {
+		fsSync.closeSync(directory);
 	}
 }
 async function writeAttempt(
