@@ -190,10 +190,29 @@ describe("managed owner supervisor", () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		try {
 			const result = await runSupervisor(stateDir, [process.execPath, "-e", "process.exit(23)"]);
-			expect(result.exitCode).toBe(23);
+			expect(result.exitCode).toBe(75);
 			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
 			expect((await fs.readdir(root)).some(file => file.startsWith("sigabrt-"))).toBe(false);
 		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("fails closed when unexpected owner-loss publication cannot persist", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const lifecycleRoot = lifecyclePaths(stateDir, sessionId, generation).root;
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const childScript = `import { chmod } from "node:fs/promises"; import { lifecyclePaths } from ${JSON.stringify(
+				path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"),
+			)}; await chmod(lifecyclePaths(process.env.GJC_TMUX_OWNER_STATE_DIR!, process.env.GJC_COORDINATOR_SESSION_ID!, process.env.GJC_TMUX_OWNER_GENERATION!).root, 0o500); process.exit(23);`;
+			const result = await runSupervisor(stateDir, [process.execPath, "-e", childScript]);
+			expect(result.exitCode).toBe(75);
+			expect(await Bun.file(lifecyclePaths(stateDir, sessionId, generation).verdictFile).exists()).toBe(false);
+			expect(await Bun.file(lifecyclePaths(stateDir, sessionId, generation).incidentFile).exists()).toBe(false);
+		} finally {
+			await fs.chmod(lifecycleRoot, 0o700).catch(() => undefined);
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
@@ -221,7 +240,7 @@ setInterval(() => {}, 1_000);`;
 			await waitForFile(cleanupFile);
 			expect(() => process.kill(supervisor.pid, 0)).not.toThrow();
 			process.kill(supervisor.pid, "SIGTERM");
-			expect(await supervisor.exited).toBe(0);
+			expect(await supervisor.exited).toBe(75);
 			expect(JSON.parse(await fs.readFile(cleanupFile, "utf8"))).toEqual({ signals: 1 });
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
