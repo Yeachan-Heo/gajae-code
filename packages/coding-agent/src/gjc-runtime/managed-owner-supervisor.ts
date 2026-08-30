@@ -279,7 +279,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = new Date().toISOString();
 	let terminalPublicationFailed = false;
-	if (sigtermRelayed && terminalObservedAt && terminalIntent) {
+	if (child.signalCode !== "SIGABRT" && sigtermRelayed && terminalObservedAt && terminalIntent) {
 		try {
 			await observeOwnerTerminal({
 				schema_version: 1,
