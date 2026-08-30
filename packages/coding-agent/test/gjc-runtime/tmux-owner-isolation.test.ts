@@ -370,7 +370,7 @@ describe("tmux owner isolation", () => {
 	);
 
 	it.each(ownerIsolationEntries)(
-		"publishes a generation through the canonical CAS path via %s",
+		"rejects unauthenticated generation publication via %s",
 		async (entry, command) => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-cli-generation-"));
 			const sessionId = `session-${entry.replace(/\W+/g, "-")}`;
@@ -385,27 +385,11 @@ describe("tmux owner isolation", () => {
 					baseline: { state: "absent" },
 				};
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
-				expect(result.exitCode).toBe(0);
+				expect(result.exitCode).toBe(1);
 				expect(result.stderr).toBe("");
-				expect(JSON.parse(result.stdout)).toEqual({
-					schema_version: 1,
-					ok: true,
-					code: "generation_published",
-					generation,
-				});
-				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({
-					state: "current",
-					generation,
-					session_id: sessionId,
-				});
-				const stale = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
-				expect(JSON.parse(stale.stdout)).toEqual({
-					schema_version: 1,
-					ok: false,
-					code: "scope_unavailable",
-					diagnostic: "generation_publication_failed",
-				});
-				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({ generation });
+				if (entry === "direct main entry") expect(result.stdout).toBe("");
+				else expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
+				expect(captureOwnerGenerationBaselineSync(state, sessionId)).toMatchObject({ state: "absent" });
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
 			}
@@ -414,7 +398,7 @@ describe("tmux owner isolation", () => {
 	);
 
 	it.each(ownerIsolationEntries)(
-		"routes a valid bounded terminal observation through %s",
+		"rejects unauthenticated terminal observation through %s",
 		async (entry, command) => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-cli-observe-"));
 			const sessionId = `session-${entry.replace(/\W+/g, "-")}`;
@@ -436,19 +420,10 @@ describe("tmux owner isolation", () => {
 					reason: "test",
 				};
 				const result = await runOwnerIsolationEntry(command, `${JSON.stringify(request)}\n`);
-				const response = JSON.parse(result.stdout) as Record<string, unknown>;
-				expect(result.exitCode).toBe(0);
+				expect(result.exitCode).toBe(1);
 				expect(result.stderr).toBe("");
-				expect(response).toMatchObject({
-					schema_version: 1,
-					generation,
-					session_id: sessionId,
-					server_key: request.socket_key,
-					observer: "sidecar",
-					signal: "EXIT",
-					result: "cleanup",
-					classification: "non_operator_cleanup",
-				});
+				if (entry === "direct main entry") expect(result.stdout).toBe("");
+				else expect(JSON.parse(result.stdout)).toMatchObject({ ok: false, code: "scope_unavailable" });
 				expect(result.stdout).not.toContain(state);
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });

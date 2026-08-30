@@ -2912,7 +2912,11 @@ export function isTrustedOwnerIsolationProtocolRequest(
 			return false;
 		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
 	}
-	return true;
+	// Generation publication and terminal observation are owner-authority mutations.
+	// They are performed through the authenticated in-process lifecycle paths; the
+	// JSON-line facade has no process-bound capability channel, so do not expose
+	// these operations to arbitrary local callers.
+	return false;
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {
 	return (
