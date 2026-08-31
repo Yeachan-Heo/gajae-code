@@ -1880,6 +1880,8 @@ async function withStateFileLocks<T>(stateFiles: readonly string[], operation: (
 	const [stateFile, ...remaining] = stateFiles;
 	if (!stateFile) return await operation();
 	return await withStateFileLock(stateFile, async () => await withStateFileLocks(remaining, operation));
+}
+
 /**
  * Owner-bound state writers take the lifecycle lock before either state lock. Owner
  * replacement uses that same lifecycle lock, so the generation read and the eventual
