@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-- Added exact-identity detached cleanup export for safely removing stale claim files without following replacement paths or retaining the JavaScript lifecycle.
+- Added exact-identity detached cleanup export for safely removing stale claim files without following replacement paths or retaining the JavaScript lifecycle; cleanup dispatch uses a bounded native worker queue and reports queue admission so callers can retry saturation.
 
 ## [0.15.6] - 2026-08-30
 
