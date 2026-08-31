@@ -3,9 +3,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "../src/extensibility/extensions";
 import { Broker } from "../src/sdk/broker/broker";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { createSdkSessionRuntimeExtension } from "../src/sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../src/sdk/host/websocket-transport";
+import { SessionRouter } from "../src/sdk/router/session-router";
 
 const event = (
 	type: "host_registered" | "host_heartbeat" | "host_unregistered",
@@ -309,6 +311,109 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 			error: { code: "resource_gone", message: "session endpoint record is gone" },
 		});
 	} finally {
+		const shutdown = handlers.get("session_shutdown");
+		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+test("resumed direct SDK-only session replaces generation zero and is usable through the Router", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-direct-resume-"));
+	const cwd = path.join(agentDir, "workspace");
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const sessionId = "sdk-direct-resume";
+	await fs.mkdir(cwd, { recursive: true });
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	const index = await new SessionIndex(agentDir).open();
+	const incarnation = processIncarnation(process.pid);
+	await index.append({
+		type: "host_registered",
+		sessionId,
+		locator: { cwd, worktreeRoot: null, stateRoot: agentDir },
+		endpointGeneration: 0,
+		pid: process.pid,
+		...(incarnation ? { processIncarnation: incarnation } : {}),
+	});
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void | Promise<void>>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir,
+		createTransport: input => createSdkWebSocketTransport(input),
+	});
+	const pendingGateIds = new Set(["resume-gate"]);
+	const context = {
+		cwd,
+		sdkBindings: () => [],
+		sessionManager: { getSessionId: () => sessionId, getSessionName: () => "Resumed direct session" },
+		workflowGate: {
+			listWorkflowGateQueryRecords: () =>
+				[...pendingGateIds].map(gateId => ({ id: `pending:${gateId}`, gate_id: gateId, tag: "pending" })),
+			listPendingGates: () => [...pendingGateIds].map(gate_id => ({ gate_id })),
+			resolveGate: async (response: { gate_id: string }) => {
+				pendingGateIds.delete(response.gate_id);
+				return { gate_id: response.gate_id, status: "accepted" };
+			},
+			recoverAcceptedGates: async () => [],
+			lookupCompletedResolution: () => ({ kind: "none" }),
+			prepareTerminalization: () => true,
+			clearPreparedTerminalization: () => {},
+			registerGateTerminalController: () => () => {},
+			quarantineGate: () => {},
+		},
+	} as unknown as ExtensionContext;
+	const router = new SessionRouter({ agentDir, sessionIds: [sessionId] });
+	try {
+		const start = handlers.get("session_start");
+		if (!start) throw new Error("SDK-only session_start handler was not registered.");
+		await start({}, context);
+		await index.refresh();
+		const resumed = index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(resumed).toMatchObject({
+			endpointGeneration: 1,
+			live: true,
+			terminal: false,
+			ambiguous: false,
+			locator: { cwd, stateRoot },
+		});
+		expect(resumed?.endpointMtimeMs).toEqual(expect.any(Number));
+
+		await router.start();
+		const attachment = router.attachment(sessionId);
+		expect(attachment).not.toBeNull();
+		expect(attachment?.generation).toBe(1);
+		expect(
+			await router.request(
+				sessionId,
+				{ type: "query_request", id: "resume-query", query: "Q12", input: {} },
+				1,
+				attachment ?? undefined,
+			),
+		).toMatchObject({
+			type: "query_response",
+			ok: true,
+			page: { items: [{ gate_id: "resume-gate" }] },
+		});
+		expect(
+			await router.request(
+				sessionId,
+				{
+					type: "control_request",
+					id: "resume-control",
+					operation: "workflow.gate_answer",
+					input: { id: "resume-gate", response: "approve", expectedSessionId: sessionId },
+				},
+				1,
+				attachment ?? undefined,
+			),
+		).toMatchObject({ type: "control_response", ok: true, result: { status: "accepted" } });
+	} finally {
+		await router.stop().catch(() => undefined);
 		const shutdown = handlers.get("session_shutdown");
 		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
 		await broker.stop();

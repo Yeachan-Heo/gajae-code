@@ -33,6 +33,7 @@ export interface SessionEndpointIdentity {
 	readonly mtimeNs: bigint;
 	readonly ctimeNs: bigint;
 	readonly size: bigint;
+	readonly dev: bigint;
 	readonly ino: bigint;
 }
 
@@ -63,6 +64,7 @@ export function sessionAttachmentAuthorityId(input: {
 				mtimeNs: input.endpointIdentity.mtimeNs.toString(),
 				ctimeNs: input.endpointIdentity.ctimeNs.toString(),
 				size: input.endpointIdentity.size.toString(),
+				dev: input.endpointIdentity.dev.toString(),
 				ino: input.endpointIdentity.ino.toString(),
 			}
 		: undefined;
@@ -464,6 +466,7 @@ async function lstatEndpoint(file: string): Promise<SessionEndpointIdentity | un
 		mtimeNs: identity.mtimeNs,
 		ctimeNs: identity.ctimeNs,
 		size: identity.size,
+		dev: identity.dev,
 		ino: identity.ino,
 	};
 }
@@ -479,7 +482,17 @@ function sameEndpointIdentity(expected: SessionEndpointIdentity, current: Sessio
 		expected.mtimeNs === current.mtimeNs &&
 		expected.ctimeNs === current.ctimeNs &&
 		expected.size === current.size &&
+		expected.dev === current.dev &&
 		expected.ino === current.ino
+	);
+}
+
+function matchesIndexedEndpointIdentity(identity: SessionEndpointIdentity, indexed: IndexedSession): boolean {
+	return (
+		indexed.endpointMtimeMs !== undefined &&
+		Number.isFinite(indexed.endpointMtimeMs) &&
+		Math.abs(identity.mtimeMs - indexed.endpointMtimeMs) <= 0.001 &&
+		(indexed.endpointFileId === undefined || indexed.endpointFileId === `${identity.dev}:${identity.ino}`)
 	);
 }
 
@@ -1365,7 +1378,7 @@ export class SessionRouter {
 		// cannot keep the old attachment authorized.
 		const identityBefore = await lstatEndpoint(attached.endpoint.path);
 		if (!identityBefore || !sameEndpointIdentity(attached.endpointIdentity, identityBefore)) return false;
-		if (!matchesIndexedEndpointFile(identityBefore, indexed)) return false;
+		if (!matchesIndexedEndpointIdentity(identityBefore, indexed)) return false;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
@@ -1389,7 +1402,7 @@ export class SessionRouter {
 		const identityAfter = await lstatEndpoint(attached.endpoint.path);
 		return (
 			identityAfter !== undefined &&
-			matchesIndexedEndpointFile(identityAfter, indexed) &&
+			matchesIndexedEndpointIdentity(identityAfter, indexed) &&
 			sameEndpointIdentity(attached.endpointIdentity, identityAfter)
 		);
 	}
@@ -1421,7 +1434,7 @@ export class SessionRouter {
 		const endpointIdentity = await lstatEndpoint(endpointPath);
 		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
-		if (!endpointIdentity || !matchesIndexedEndpointFile(endpointIdentity, indexed)) return null;
+		if (!endpointIdentity || !matchesIndexedEndpointIdentity(endpointIdentity, indexed)) return null;
 		// Identity is proven INSIDE this authority read (#4730 review): sampling it
 		// afterwards would let an identical rename between the read and the sample
 		// install the replacement's inode as the trusted baseline.
@@ -1446,7 +1459,7 @@ export class SessionRouter {
 		const endpointIdentityAfterRead = await lstatEndpoint(endpoint.path);
 		if (
 			!endpointIdentityAfterRead ||
-			!matchesIndexedEndpointFile(endpointIdentityAfterRead, indexed) ||
+			!matchesIndexedEndpointIdentity(endpointIdentityAfterRead, indexed) ||
 			!sameEndpointIdentity(endpointIdentity, endpointIdentityAfterRead)
 		)
 			return null;
