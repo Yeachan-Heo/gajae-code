@@ -2298,7 +2298,7 @@ type SessionAdmissionEntry = {
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
 	selectionFenceGeneration: number;
-	allowDuringClosed?: boolean;
+	selectionTransaction?: symbol;
 	continuationCapability?: symbol;
 };
 
@@ -2421,6 +2421,8 @@ export class AgentSession {
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#pendingSelectionFences = 0;
+	#selectionAwaitingMutationTransaction: symbol | undefined;
+	#authorizedClosedSelectionTransaction: symbol | undefined;
 	#selectionFenceDeferredContinuations = new Map<number, number>();
 	#scopedSettlementWaiters = new Set<() => void>();
 	#oldestPendingSelectionFenceGeneration = 0;
@@ -3495,7 +3497,9 @@ export class AgentSession {
 		if (this.#activeSessionAdmission) return;
 		let next: SessionAdmissionEntry | undefined;
 		if (this.#sessionAdmissionClosed) {
-			const index = this.#sessionAdmissionQueue.findIndex(entry => entry.allowDuringClosed === true);
+			const index = this.#sessionAdmissionQueue.findIndex(
+				entry => entry.selectionTransaction === this.#authorizedClosedSelectionTransaction,
+			);
 			if (index < 0) return;
 			[next] = this.#sessionAdmissionQueue.splice(index, 1);
 		} else {
@@ -3582,7 +3586,8 @@ export class AgentSession {
 		continuationAdmission?: ScheduledContinuationAdmission,
 		options?: {
 			allowDuringClosing?: boolean;
-			allowDuringClosed?: boolean;
+			closedSelectionTransaction?: symbol;
+			selectionTransaction?: symbol;
 			bypassSelectionFenceGeneration?: number;
 			allowPromptContinuationReentry?: boolean;
 			idleDelivery?: boolean;
@@ -3627,8 +3632,11 @@ export class AgentSession {
 		) {
 			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
 		}
+		const closedSelectionAuthorized =
+			options?.closedSelectionTransaction !== undefined &&
+			options.closedSelectionTransaction === this.#authorizedClosedSelectionTransaction;
 		if (
-			(this.#sessionAdmissionClosed && options?.allowDuringClosed !== true) ||
+			(this.#sessionAdmissionClosed && !closedSelectionAuthorized) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		)
 			throw this.#sessionAdmissionBusyError();
@@ -3649,7 +3657,7 @@ export class AgentSession {
 			settled: Promise.withResolvers<void>(),
 			released: false,
 			selectionFenceGeneration: this.#selectionFenceGeneration,
-			...(options?.allowDuringClosed === true ? { allowDuringClosed: true } : {}),
+			...(options?.selectionTransaction ? { selectionTransaction: options.selectionTransaction } : {}),
 			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
@@ -3670,7 +3678,8 @@ export class AgentSession {
 			throw error;
 		}
 		if (
-			(this.#sessionAdmissionClosed && options?.allowDuringClosed !== true) ||
+			entry.released ||
+			(this.#sessionAdmissionClosed && !closedSelectionAuthorized) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		) {
 			entry.released = true;
@@ -3710,6 +3719,10 @@ export class AgentSession {
 			this.#promptPreflightAbortController.abort();
 		}
 		if (options?.waitForActive === false) {
+			this.#authorizedClosedSelectionTransaction =
+				active?.kind === "prompt"
+					? undefined
+					: (active?.selectionTransaction ?? this.#selectionAwaitingMutationTransaction);
 			this.#sessionAdmissionClosed = true;
 			const queued = this.#sessionAdmissionQueue.splice(0);
 			for (const entry of queued) {
@@ -9307,6 +9320,13 @@ export class AgentSession {
 		await this.awaitPendingContextTransformations();
 		await this.#waitForSessionSettlement();
 		await this.sessionManager.flush();
+	}
+
+	/** Test seam: hold prompt admission while bypassing a pending selection fence. */
+	runWithPromptAdmissionForTests(body: () => Promise<void>): Promise<void> {
+		return this.#withSessionAdmission("prompt", async () => body(), undefined, undefined, {
+			bypassSelectionFenceGeneration: this.#selectionFenceGeneration - 1,
+		});
 	}
 
 	queueCoordinatorRuntimeStatePersistForTests(event: AgentSessionEvent, gate: Promise<void>): Promise<void> {
@@ -16274,6 +16294,7 @@ export class AgentSession {
 			throw new Error("Default model selection cannot inherit a thinking level");
 		}
 		const expectedSessionId = this.sessionId;
+		const selectionTransaction = Symbol("default-model-selection");
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
 		this.#selectionFenceGeneration += 1;
@@ -16309,8 +16330,9 @@ export class AgentSession {
 				},
 				undefined,
 				undefined,
-				{ allowDuringClosing: true },
+				{ allowDuringClosing: true, selectionTransaction },
 			);
+			this.#selectionAwaitingMutationTransaction = selectionTransaction;
 			await this.waitForIdle(selectionFenceGeneration);
 			await options?.onBeforeMutationAdmissionForTests?.();
 			return await this.#withSessionAdmission(
@@ -16394,9 +16416,15 @@ export class AgentSession {
 				},
 				undefined,
 				undefined,
-				{ allowDuringClosing: true, allowDuringClosed: true },
+				{
+					allowDuringClosing: true,
+					closedSelectionTransaction: selectionTransaction,
+					selectionTransaction,
+				},
 			);
 		} finally {
+			if (this.#selectionAwaitingMutationTransaction === selectionTransaction)
+				this.#selectionAwaitingMutationTransaction = undefined;
 			selectionFence.resolve();
 			this.#pendingSelectionFences -= 1;
 			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration) {

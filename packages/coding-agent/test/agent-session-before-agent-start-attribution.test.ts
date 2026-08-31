@@ -961,4 +961,67 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		]);
 		session = undefined as unknown as AgentSession;
 	});
+
+	it("disposal rejects a second-phase selection queued behind an active prompt", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-behind-prompt" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const admissionGapStarted = Promise.withResolvers<void>();
+		const releaseAdmissionGap = Promise.withResolvers<void>();
+		const promptAdmissionStarted = Promise.withResolvers<void>();
+		const releasePromptAdmission = Promise.withResolvers<void>();
+		const safetyRelease = setTimeout(() => {
+			releaseAdmissionGap.resolve();
+			releasePromptAdmission.resolve();
+		}, 5_000);
+		safetyRelease.unref?.();
+
+		try {
+			const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+				onBeforeMutationAdmissionForTests: async () => {
+					admissionGapStarted.resolve();
+					await releaseAdmissionGap.promise;
+				},
+			});
+			const selectionResult = selection.then(
+				value => ({ status: "fulfilled" as const, value }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await admissionGapStarted.promise;
+			const activePrompt = session.runWithPromptAdmissionForTests(async () => {
+				promptAdmissionStarted.resolve();
+				await releasePromptAdmission.promise;
+			});
+			await promptAdmissionStarted.promise;
+			releaseAdmissionGap.resolve();
+			await Promise.resolve();
+			await Promise.resolve();
+
+			const disposal = session.dispose();
+			const queuedPrompt = session.prompt("reject behind active prompt disposal");
+			const queuedPromptResult = queuedPrompt.then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await Promise.race([
+				disposal,
+				Bun.sleep(2_000).then(() => {
+					throw new Error("Disposal waited for the active prompt admission");
+				}),
+			]);
+			expect(await selectionResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+			expect(await queuedPromptResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+			expect(session.model?.id).toBe(currentModel.id);
+
+			releasePromptAdmission.resolve();
+			await activePrompt;
+		} finally {
+			clearTimeout(safetyRelease);
+			releaseAdmissionGap.resolve();
+			releasePromptAdmission.resolve();
+			session = undefined as unknown as AgentSession;
+		}
+	});
 });
