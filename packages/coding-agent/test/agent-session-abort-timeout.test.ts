@@ -547,6 +547,13 @@ describe("AgentSession abort timeout", () => {
 
 		const prompt = activeSession.prompt("Start a stream that ignores abort.");
 		let disposed = false;
+		// Keep a regression from consuming the suite's hook timeout and hiding the
+		// failed elapsed-time assertion. A correct dispose returns before this fires.
+		const safetyRelease = setTimeout(() => {
+			releaseHeldTool.resolve();
+			heldStream.end(response);
+		}, 5_000);
+		safetyRelease.unref?.();
 		try {
 			const deadline = Date.now() + 1_000;
 			while (!(streamStarted && toolStarted && activeSession.isStreaming)) {
@@ -586,6 +593,7 @@ describe("AgentSession abort timeout", () => {
 			expect(sessionManager.getBranch().map(entry => entry.id)).toEqual(branchIdsAfterDispose);
 			expect(agentEndsAfterTeardownStarted).toBe(0);
 		} finally {
+			clearTimeout(safetyRelease);
 			releaseHeldTool.resolve();
 			heldStream.end(response);
 			try {

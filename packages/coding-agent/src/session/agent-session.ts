@@ -3691,7 +3691,7 @@ export class AgentSession {
 		}
 	}
 
-	async #closeSessionAdmission(): Promise<void> {
+	async #closeSessionAdmission(options?: { waitForActive?: boolean }): Promise<void> {
 		this.#sessionAdmissionClosing = true;
 		const active = this.#activeSessionAdmission;
 		if (active?.kind === "prompt") {
@@ -3699,7 +3699,7 @@ export class AgentSession {
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 		}
-		if (active) await active.settled.promise;
+		if (active && options?.waitForActive !== false) await active.settled.promise;
 		await this.#selectionFenceTail;
 		this.#sessionAdmissionClosed = true;
 		const queued = this.#sessionAdmissionQueue.splice(0);
@@ -8917,7 +8917,9 @@ export class AgentSession {
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
 		this.#disposeAbortController.abort();
-		this.#disposeAdmissionClosed = this.#closeSessionAdmission();
+		// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
+		// admission here would put that unbounded prompt ahead of the abort budget.
+		this.#disposeAdmissionClosed = this.#closeSessionAdmission({ waitForActive: false });
 		this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
 		this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
 		this.#pendingNextTurnMessages = [];
