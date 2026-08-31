@@ -1414,6 +1414,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	let agent: Agent;
+	let sessionAgent: Agent | undefined;
 	let session!: AgentSession;
 	let sessionManager!: SessionManager;
 	let hasSession = false;
@@ -4276,13 +4277,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			preferWebsockets: preferOpenAICodexWebsockets,
 			getToolContext: tc => toolContextStore.getContext(tc),
 			getApiKey: async provider => {
-				// Read agent.sessionId at call time so credential selection stays aligned
-				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
-				if (!key) {
+				// AgentLoop asks by provider, but the active model carries the
+				// model-scoped credential selector. Read it at call time so model
+				// changes are honored after /new, fork, resume, or branch switches.
+				const liveModel = sessionAgent?.state.model ?? model;
+				const key =
+					liveModel?.provider === provider
+						? await modelRegistry.getApiKey(liveModel, credentialSessionId)
+						: undefined;
+				const providerKey = key ?? (await modelRegistry.getApiKeyForProvider(provider, credentialSessionId));
+				if (!providerKey) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
-				return key;
+				return providerKey;
 			},
 			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
 			streamFn: async (streamModel, context, streamOptions) => {
@@ -4369,6 +4376,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			telemetry: options.telemetry,
 			appendOnlyContext,
 		});
+		sessionAgent = agent;
 
 		cursorEventEmitter = event => agent.emitExternalEvent(event);
 

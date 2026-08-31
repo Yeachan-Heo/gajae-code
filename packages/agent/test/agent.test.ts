@@ -114,6 +114,42 @@ describe("Agent", () => {
 		expect(JSON.stringify(agent.state.error ?? "")).not.toContain(secret);
 	});
 
+	it("persists only trusted error classifiers and constructor names", async () => {
+		const secret = "sk-live-should-never-land-in-jsonl";
+		const error = Object.assign(new TypeError(`provider exploded: ${secret}`), { code: "provider_down" });
+		Object.defineProperty(error, "name", { configurable: true, value: `Custom${secret}Error` });
+		const agent = new Agent({
+			streamFn: () => {
+				throw error;
+			},
+		});
+		await agent.prompt("trigger classified failure", { fallbackManaged: true });
+		const last = agent.state.messages.at(-1) as { errorMessage?: string; errorCode?: string; errorName?: string };
+		expect(last).toMatchObject({
+			errorMessage: "Agent run failed.",
+			errorCode: "provider_down",
+			errorName: "TypeError",
+		});
+		expect(JSON.stringify(last)).not.toContain(secret);
+	});
+
+	it("terminalizes when an error name getter throws", async () => {
+		const error = Object.assign(new Error("provider exploded"), { code: "provider_down" });
+		Object.defineProperty(error, "name", {
+			get() {
+				throw new Error("hostile getter");
+			},
+		});
+		const agent = new Agent({
+			streamFn: () => {
+				throw error;
+			},
+		});
+		await agent.prompt("trigger hostile name getter", { fallbackManaged: true });
+		const last = agent.state.messages.at(-1) as { stopReason?: string; errorCode?: string; errorName?: string };
+		expect(last).toMatchObject({ stopReason: "error", errorName: "Error" });
+	});
+
 	it("preserves first-event timeout options and runtime mutations", () => {
 		const absent = new Agent();
 		expect(absent.streamFirstEventTimeoutMs).toBeUndefined();

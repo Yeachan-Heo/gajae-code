@@ -5333,11 +5333,28 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					sessionId,
 				);
 			} catch (closeError) {
-				throw new SdkClientError(
-					UNOBSERVED_COMPENSATION_CODE,
-					`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
-					{ primary: error, compensation: closeError, session_id: sessionId },
-				);
+				let listed: Record<string, unknown>;
+				try {
+					listed = await paginatedBrokerSessionList(cwd, { cwd });
+				} catch (listError) {
+					throw new SdkClientError(
+						UNOBSERVED_COMPENSATION_CODE,
+						`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
+						{ primary: error, compensation: closeError, list: listError, session_id: sessionId },
+					);
+				}
+				const rows = jsonRecords(Array.isArray(listed.sessions) ? listed.sessions : []);
+				const row = rows.find(candidate => brokerSessionId(candidate) === sessionId);
+				const deadUncertain =
+					row !== undefined &&
+					row.live !== true &&
+					(row.terminalUncertain === true || (row as Record<string, unknown>).terminal_uncertain === true);
+				if (!deadUncertain)
+					throw new SdkClientError(
+						UNOBSERVED_COMPENSATION_CODE,
+						`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
+						{ primary: error, compensation: closeError, session_id: sessionId },
+					);
 			}
 			throw error;
 		}

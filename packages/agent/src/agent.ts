@@ -117,6 +117,27 @@ function sanitizeAgentFailure(error: unknown, runtimeClassifiedCode?: string): {
 	return { code, message: "Agent run failed." };
 }
 
+/** Only runtime-authenticated built-in constructors may contribute a name. */
+const TRUSTED_ERROR_CONSTRUCTORS = new Map<Function, string>([
+	[Error, "Error"],
+	[TypeError, "TypeError"],
+	[RangeError, "RangeError"],
+	[SyntaxError, "SyntaxError"],
+	[ReferenceError, "ReferenceError"],
+	[URIError, "URIError"],
+	[EvalError, "EvalError"],
+	[AggregateError, "AggregateError"],
+]);
+
+function safeErrorName(error: unknown): string | undefined {
+	try {
+		if (!(error instanceof Error)) return undefined;
+		return TRUSTED_ERROR_CONSTRUCTORS.get(error.constructor);
+	} catch {
+		return undefined;
+	}
+}
+
 /** Guarded HTTP-status extraction for untrusted provider errors: a throwing
  * getter must never escape the failure handler and suppress terminalization
  * (exact-head review P1). */
@@ -2128,6 +2149,8 @@ export class Agent {
 			const runtimeFailureCode = abortController.signal.aborted
 				? "aborted"
 				: (managedLocalErrorDiagnostic(err)?.errorKind ?? providerCode);
+			const sanitized = sanitizeAgentFailure(err, runtimeFailureCode);
+			const errorName = safeErrorName(err);
 
 			const errorMsg: AgentMessage = {
 				role: "assistant",
@@ -2144,7 +2167,9 @@ export class Agent {
 					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 				},
 				stopReason: abortController.signal.aborted ? "aborted" : "error",
-				errorMessage: sanitizeAgentFailure(err).message,
+				errorMessage: sanitized.message,
+				errorCode: sanitized.code,
+				...(errorName ? { errorName } : {}),
 				errorStatus: safeErrorStatus(err),
 				// Local-diagnostic authority (`errorKind` + structured
 				// `bufferOverflow`) comes from ONE identity check: a foreign error
