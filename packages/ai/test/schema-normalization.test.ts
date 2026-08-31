@@ -666,6 +666,48 @@ describe("normalizeSchemaForMCP", () => {
 		expect(isValidJsonSchema(normalized)).toBe(true);
 	});
 
+	it("dereferences refs in schema arrays, nested definitions, escaped names, and boolean definitions", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				nested: {
+					$defs: { Inner: { type: "string" } },
+					$ref: "#/properties/nested/$defs/Inner",
+				},
+			},
+			$defs: {
+				"Array/Definition": { type: "object" },
+				BooleanDefinition: false,
+			},
+			anyOf: [{ $ref: "#/$defs/Array~1Definition" }, { $ref: "#/$defs/BooleanDefinition" }],
+		};
+
+		const normalized = normalizeSchemaForMCP(schema) as Record<string, unknown>;
+		const properties = normalized.properties as Record<string, unknown>;
+		const alternatives = normalized.anyOf as Array<Record<string, unknown> | boolean>;
+
+		expect(properties.nested).toEqual({ type: "string" });
+		expect(alternatives).toEqual([{ type: "object", additionalProperties: true }, false]);
+		expect(normalized.$defs).toBeUndefined();
+		expect(isValidJsonSchema(normalized)).toBe(true);
+	});
+
+	it("terminates direct object cycles encountered while dereferencing definitions", () => {
+		const schema: Record<string, unknown> = {
+			$defs: { Node: { type: "object" } },
+			type: "object",
+			properties: {},
+		};
+		(schema.properties as Record<string, unknown>).self = schema;
+
+		const normalized = normalizeSchemaForMCP(schema) as Record<string, unknown>;
+		const properties = normalized.properties as Record<string, unknown>;
+
+		expect(properties.self).toEqual({});
+		expect(normalized.$defs).toBeUndefined();
+		expect(isValidJsonSchema(normalized)).toBe(true);
+	});
+
 	it("recurses nested additionalProperties, unions, arrays, and referenced definitions", () => {
 		const schema = {
 			type: "object",

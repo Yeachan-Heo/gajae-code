@@ -6,6 +6,8 @@ export function isJsonObject(value: unknown): value is JsonObject {
 
 /** True when `value` is a plain JSON object with no own enumerable keys. */
 export function isJsonObjectEmpty(value: JsonObject): boolean {
-	for (const _ in value) return false;
+	for (const key in value) {
+		if (Object.hasOwn(value, key)) return false;
+	}
 	return true;
 }

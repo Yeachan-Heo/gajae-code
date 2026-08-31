@@ -161,7 +161,9 @@ function hasNullType(type: unknown): boolean {
 
 /** True if any variant in `anyOf` declares (only) a null type. Used to avoid double-adding `{type:"null"}`. */
 function hasNullVariant(variants: unknown[]): boolean {
-	return variants.some(variant => isJsonObject(variant) && hasNullType(variant.type));
+	return variants.some(
+		variant => isJsonObject(variant) && Object.hasOwn(variant, "type") && hasNullType(variant.type),
+	);
 }
 
 /**
