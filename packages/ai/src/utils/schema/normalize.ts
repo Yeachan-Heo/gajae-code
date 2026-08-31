@@ -70,6 +70,14 @@ const SNAKE_TO_CAMEL_RENAMES = new Map<string, string>([
 
 const JSON_SCHEMA_COMBINERS = ["anyOf", "oneOf"] as const;
 const CCA_FORBIDDEN_COMBINERS = new Set(["anyOf", "oneOf", "allOf"]);
+const JSON_SCHEMA_MAP_KEYS = new Set([
+	"properties",
+	"patternProperties",
+	"dependencies",
+	"dependentSchemas",
+	"$defs",
+	"definitions",
+]);
 
 const CLOUD_CODE_ASSIST_CLAUDE_FALLBACK_SCHEMA = {
 	type: "object",
@@ -269,6 +277,21 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 		return value;
 	}
 	if (!once(value, options.epoch)) return {};
+	if (options.insideProperties) {
+		let changed = false;
+		const result: JsonObject = {};
+		for (const key in value) {
+			if (!Object.hasOwn(value, key)) continue;
+			const child = value[key];
+			const next = normalizeSchemaNode(child, {
+				...options,
+				insideProperties: false,
+			});
+			if (next !== child) changed = true;
+			setOwnKey(result, key, next);
+		}
+		return changed ? result : value;
+	}
 	let obj = options.normalizeFieldNames && !options.insideProperties ? applySnakeCaseRenames(value) : value;
 	if (options.collapseNullFields && !options.insideProperties) {
 		obj = preHandleNullFields(obj);
@@ -331,7 +354,7 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 				key,
 				normalizeSchemaNode(entry, {
 					...options,
-					insideProperties: key === "properties",
+					insideProperties: JSON_SCHEMA_MAP_KEYS.has(key),
 				}),
 			);
 		}
@@ -361,7 +384,7 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 			key,
 			normalizeSchemaNode(entry, {
 				...options,
-				insideProperties: key === "properties",
+				insideProperties: JSON_SCHEMA_MAP_KEYS.has(key),
 			}),
 		);
 	}

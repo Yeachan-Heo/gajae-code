@@ -115,6 +115,14 @@ const KEYS_THAT_ACCEPT_NULL: Record<string, true> = {
 	examples: true,
 };
 
+function setOwnKey(target: JsonObject, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+		return;
+	}
+	target[key] = value;
+}
+
 function isZodLeak(node: JsonObject): boolean {
 	const def = node.def;
 	if (!isJsonObject(def)) return false;
@@ -145,10 +153,11 @@ function unwrapInnerSchema(def: JsonObject): unknown {
 function copyWithoutNoise(node: JsonObject): JsonObject {
 	const out: JsonObject = {};
 	for (const key in node) {
+		if (!Object.hasOwn(node, key)) continue;
 		if (ZOD_NOISE_KEYS[key]) continue;
 		const value = node[key];
 		if (value === null && !KEYS_THAT_ACCEPT_NULL[key]) continue;
-		out[key] = value;
+		setOwnKey(out, key, value);
 	}
 	return out;
 }
@@ -222,8 +231,9 @@ function rewriteZodNode(node: JsonObject, seen: WeakSet<object>): unknown {
 			const properties: JsonObject = {};
 			const required: string[] = [];
 			for (const key in shape) {
+				if (!Object.hasOwn(shape, key)) continue;
 				const inner = walk(shape[key], seen);
-				properties[key] = inner;
+				setOwnKey(properties, key, inner);
 				if (!isOptionalEntry(shape[key])) required.push(key);
 			}
 			const out: JsonObject = { type: "object", properties };
@@ -322,10 +332,11 @@ function walk(value: unknown, seen: WeakSet<object>): unknown {
 	let changed = false;
 	const out: JsonObject = {};
 	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
 		const child = value[key];
 		const rewritten = walk(child, seen);
 		if (rewritten !== child) changed = true;
-		out[key] = rewritten;
+		setOwnKey(out, key, rewritten);
 	}
 	return changed ? out : value;
 }

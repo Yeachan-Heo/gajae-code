@@ -11,6 +11,16 @@
  */
 import { isJsonObject, type JsonObject } from "./types";
 
+const JSON_SCHEMA_LITERAL_PAYLOAD_KEYS = new Set(["default", "const", "enum", "examples"]);
+
+function setOwnKey(target: JsonObject, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+		return;
+	}
+	target[key] = value;
+}
+
 /**
  * Resolve a JSON-pointer-style `$ref` against the root schema's `$defs`
  * or `definitions` block. Returns `undefined` for external or unresolvable refs.
@@ -23,6 +33,7 @@ function resolveLocalRef(ref: string, root: JsonObject): JsonObject | undefined 
 	const [, defsKey, name] = match;
 	const defs = root[defsKey!];
 	if (!isJsonObject(defs)) return undefined;
+	if (!Object.hasOwn(defs, name!)) return undefined;
 
 	const resolved = defs[name!];
 	return isJsonObject(resolved) ? resolved : undefined;
@@ -49,6 +60,7 @@ function dereferenceNode(node: unknown, root: JsonObject, visiting: Set<string>)
 		// referencing node. In draft 2020-12 these are valid alongside $ref.
 		let hasSiblings = false;
 		for (const k in node) {
+			if (!Object.hasOwn(node, k)) continue;
 			if (k !== "$ref") {
 				hasSiblings = true;
 				break;
@@ -62,16 +74,27 @@ function dereferenceNode(node: unknown, root: JsonObject, visiting: Set<string>)
 
 	const result: JsonObject = {};
 	for (const key in node) {
+		if (!Object.hasOwn(node, key)) continue;
 		const value = node[key];
 		// Skip $defs/definitions — they get inlined into consumers
 		if (key === "$defs" || key === "definitions") continue;
+		// Literal instance data is not schema-shaped, even when it contains an
+		// object that happens to use schema-looking keys or a local `$ref`.
+		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
+			setOwnKey(result, key, value);
+			continue;
+		}
 
 		if (Array.isArray(value)) {
-			result[key] = value.map(item => dereferenceNode(item, root, visiting));
+			setOwnKey(
+				result,
+				key,
+				value.map(item => dereferenceNode(item, root, visiting)),
+			);
 		} else if (isJsonObject(value)) {
-			result[key] = dereferenceNode(value, root, visiting);
+			setOwnKey(result, key, dereferenceNode(value, root, visiting));
 		} else {
-			result[key] = value;
+			setOwnKey(result, key, value);
 		}
 	}
 	return result;
@@ -91,7 +114,7 @@ export function dereferenceJsonSchema(schema: unknown): unknown {
 	if (!isJsonObject(schema)) return schema;
 
 	// Fast path: nothing to dereference
-	const hasDefs = schema.$defs !== undefined || schema.definitions !== undefined;
+	const hasDefs = Object.hasOwn(schema, "$defs") || Object.hasOwn(schema, "definitions");
 	if (!hasDefs) return schema;
 
 	return dereferenceNode(schema, schema, new Set());

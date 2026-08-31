@@ -34,6 +34,14 @@ const NON_SCHEMA_VALUE_KEYS: Record<string, true> = {
 	type: true,
 };
 
+function setOwnKey(target: JsonObject, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+		return;
+	}
+	target[key] = value;
+}
+
 /** Rewrite draft-07's `#/definitions/Foo` ref form to draft 2020-12's `#/$defs/Foo`. External refs (`http://…`) pass through. */
 function convertRef(value: string): string {
 	return value.startsWith("#/definitions/") ? `#/$defs/${value.slice("#/definitions/".length)}` : value;
@@ -44,7 +52,7 @@ function getObjectMap(target: JsonObject, key: string): JsonObject {
 	const existing = target[key];
 	if (isJsonObject(existing)) return existing;
 	const next: JsonObject = {};
-	target[key] = next;
+	setOwnKey(target, key, next);
 	return next;
 }
 
@@ -52,13 +60,14 @@ function getObjectMap(target: JsonObject, key: string): JsonObject {
 function mergeSchemaMap(target: JsonObject, key: string, value: JsonObject, cache: WeakMap<object, unknown>): void {
 	const map = getObjectMap(target, key);
 	for (const name in value) {
-		map[name] = upgradeJsonSchemaTo202012Impl(value[name], cache);
+		if (!Object.hasOwn(value, name)) continue;
+		setOwnKey(map, name, upgradeJsonSchemaTo202012Impl(value[name], cache));
 	}
 }
 /** Copy a schema-map field with upgrade; non-object values are passed through verbatim. */
 function copySchemaMap(target: JsonObject, key: string, value: unknown, cache: WeakMap<object, unknown>): void {
 	if (!isJsonObject(value)) {
-		target[key] = value;
+		setOwnKey(target, key, value);
 		return;
 	}
 	mergeSchemaMap(target, key, value, cache);
@@ -109,18 +118,18 @@ function mergeDependentRequired(target: JsonObject, key: string, deps: unknown[]
 	const dependentRequired = getObjectMap(target, "dependentRequired");
 	const existing = dependentRequired[key];
 	if (existing === undefined) {
-		dependentRequired[key] = deps;
+		setOwnKey(dependentRequired, key, deps);
 		return;
 	}
 	if (Array.isArray(existing)) {
-		dependentRequired[key] = mergeArrayValues(existing, deps);
+		setOwnKey(dependentRequired, key, mergeArrayValues(existing, deps));
 	}
 }
 
 /** Record `key → schema` in `dependentSchemas`, intersecting with any existing entry. */
 function mergeDependentSchema(target: JsonObject, key: string, schema: unknown): void {
 	const dependentSchemas = getObjectMap(target, "dependentSchemas");
-	dependentSchemas[key] = combineSchemas(dependentSchemas[key], schema);
+	setOwnKey(dependentSchemas, key, combineSchemas(dependentSchemas[key], schema));
 }
 
 /**
@@ -133,6 +142,7 @@ function convertDependencies(source: JsonObject, target: JsonObject, cache: Weak
 	const dependencies = source.dependencies;
 	if (!isJsonObject(dependencies)) return;
 	for (const key in dependencies) {
+		if (!Object.hasOwn(dependencies, key)) continue;
 		const dependency = dependencies[key];
 		const converted = upgradeJsonSchemaTo202012Impl(dependency, cache);
 		if (Array.isArray(converted)) {
@@ -203,6 +213,7 @@ function schemaNeedsDraft202012UpgradeImpl(value: unknown, epoch: number): boole
 	if (!once(value, epoch)) return false;
 
 	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
 		const entry = value[key];
 		if (key === "$schema") {
 			if (typeof entry === "string" && entry in DRAFT_07_SCHEMA_URIS) return true;
@@ -253,6 +264,7 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 	// Seed cache before recursion so back-edges in cyclic graphs resolve.
 	cache.set(value, result);
 	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
 		const entry = value[key];
 		// `definitions` is the draft-07 name; merge under the canonical `$defs`.
 		// `$defs` may appear pre-upgraded — still walk entries to upgrade their bodies.
@@ -267,7 +279,7 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 		}
 		// JSON-Schema *value* keywords — copy verbatim.
 		if (key in NON_SCHEMA_VALUE_KEYS) {
-			result[key] = entry;
+			setOwnKey(result, key, entry);
 			continue;
 		}
 		// Draft-07-only keywords with no draft 2020-12 spelling — drop entirely.
@@ -290,7 +302,7 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 		if (key === "items" && Array.isArray(entry)) {
 			continue;
 		}
-		result[key] = upgradeJsonSchemaTo202012Impl(entry, cache);
+		setOwnKey(result, key, upgradeJsonSchemaTo202012Impl(entry, cache));
 	}
 
 	// Draft-07 tuple form: `items: [a, b]` (+ optional `additionalItems`) becomes
