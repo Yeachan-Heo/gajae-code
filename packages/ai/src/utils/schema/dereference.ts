@@ -46,7 +46,7 @@ function dereferenceNode(node: unknown, root: JsonObject, visiting: Set<string>)
 	if (!isJsonObject(node)) return node;
 	if (Array.isArray(node)) return node.map(item => dereferenceNode(item, root, visiting));
 
-	const ref = node.$ref;
+	const ref = Object.hasOwn(node, "$ref") ? node.$ref : undefined;
 	if (typeof ref === "string") {
 		// Break circular references
 		if (visiting.has(ref)) return {};

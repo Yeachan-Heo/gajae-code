@@ -969,8 +969,9 @@ function normalizeMcpObjectMapNode(value: unknown, cache: WeakMap<JsonObject, Js
 		setOwnKey(output, key, next);
 	}
 
+	const schemaType = Object.hasOwn(value, "type") ? value.type : undefined;
 	if (
-		declaresObjectType(value.type) &&
+		declaresObjectType(schemaType) &&
 		!Object.hasOwn(value, "properties") &&
 		!Object.hasOwn(value, "additionalProperties") &&
 		!Object.hasOwn(value, "patternProperties") &&

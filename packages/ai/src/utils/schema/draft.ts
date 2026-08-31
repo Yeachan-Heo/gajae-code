@@ -140,7 +140,7 @@ function mergeDependentSchema(target: JsonObject, key: string, schema: unknown):
  *   - schema value → `dependentSchemas`
  */
 function convertDependencies(source: JsonObject, target: JsonObject, cache: WeakMap<object, unknown>): void {
-	const dependencies = source.dependencies;
+	const dependencies = Object.hasOwn(source, "dependencies") ? source.dependencies : undefined;
 	if (!isJsonObject(dependencies)) return;
 	for (const key in dependencies) {
 		if (!Object.hasOwn(dependencies, key)) continue;
@@ -311,10 +311,15 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 
 	// Draft-07 tuple form: `items: [a, b]` (+ optional `additionalItems`) becomes
 	// draft 2020-12 `prefixItems: [a, b]` (+ optional `items` for the rest).
-	if (Array.isArray(value.items)) {
-		const convertedItems = upgradeJsonSchemaTo202012Impl(value.items, cache) as unknown[];
+	const tupleItems = Object.hasOwn(value, "items") && Array.isArray(value.items) ? value.items : undefined;
+	if (tupleItems !== undefined) {
+		const convertedItems = upgradeJsonSchemaTo202012Impl(tupleItems, cache) as unknown[];
 		result.prefixItems = mergePrefixItems(result.prefixItems, convertedItems);
-		if (value.additionalItems !== undefined && value.additionalItems !== true) {
+		if (
+			Object.hasOwn(value, "additionalItems") &&
+			value.additionalItems !== undefined &&
+			value.additionalItems !== true
+		) {
 			result.items = upgradeJsonSchemaTo202012Impl(value.additionalItems, cache);
 		} else {
 			// `additionalItems: true` (or absent) in draft-07 == no `items` in 2020-12.
@@ -327,7 +332,7 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 	// OpenAPI 3.0 `nullable: true` → 2020-12 nullability. `makeNullable` may
 	// return a fresh wrapper object, in which case update the cache so callers
 	// referring to the same input see the wrapper instead of the inner result.
-	if (value.nullable === true) {
+	if (Object.hasOwn(value, "nullable") && value.nullable === true) {
 		const nullable = makeNullable(result);
 		if (nullable !== result) cache.set(value, nullable);
 		return nullable;

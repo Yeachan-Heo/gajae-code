@@ -125,6 +125,7 @@ function setOwnKey(target: JsonObject, key: string, value: unknown): void {
 }
 
 function isZodLeak(node: JsonObject): boolean {
+	if (!Object.hasOwn(node, "def") || !Object.hasOwn(node, "type")) return false;
 	const def = node.def;
 	if (!isJsonObject(def)) return false;
 	const defType = def.type;
