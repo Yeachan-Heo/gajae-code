@@ -3,8 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
-import type { BrokerDiscovery } from "../../src/sdk/broker/discovery";
-import { brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SessionIndex } from "../../src/sdk/broker/session-index";
 import type { SessionRouterClient } from "../../src/sdk/router";
 import { prepareExactSessionAuthority } from "../helpers/sdk-exact-session-authority";
@@ -32,7 +31,7 @@ describe("send_prompt same-session concurrency", () => {
 			const sessionUrl = "ws://127.0.0.1:4313";
 			const agentDir = path.join(root, "agent-global");
 			const brokerSessions: Array<Record<string, unknown>> = [];
-			const brokerDiscovery = {
+			const discovery: BrokerDiscovery = {
 				version: 1,
 				protocolVersion: 3,
 				packageGeneration: "test",
@@ -45,8 +44,8 @@ describe("send_prompt same-session concurrency", () => {
 				token: "broker-token",
 				startedAt: Date.now(),
 				heartbeatAt: Date.now(),
-			} satisfies BrokerDiscovery;
-			await writeBrokerDiscovery(agentDir, brokerDiscovery);
+			};
+			await writeBrokerDiscovery(agentDir, discovery);
 			const authority = await prepareExactSessionAuthority({
 				agentDir,
 				cwd: root,
@@ -65,15 +64,15 @@ describe("send_prompt same-session concurrency", () => {
 				},
 				services: {
 					getAgentDir: () => agentDir,
-					ensureBroker: async () => brokerDiscovery,
-					readSdkBrokerDiscovery: async () => brokerDiscovery,
+					ensureBroker: async () => discovery,
+					readSdkBrokerDiscovery: async () => discovery,
 					connectBroker: async () =>
 						({
 							global: async (operation: string, input: Record<string, unknown>) => {
 								if (operation === "session.create") {
 									brokerSessions.push({
 										sessionId,
-										locator: { repo: root },
+										locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 										live: true,
 										endpointGeneration: 1,
 										pid: authority.pid,
@@ -104,7 +103,7 @@ describe("send_prompt same-session concurrency", () => {
 									indexSeq: 1,
 									sessions: brokerSessions.map(session => ({
 										sessionId: session.sessionId,
-										locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
+										locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 										live: session.live,
 										endpointGeneration: session.endpointGeneration,
 										pid: session.pid,

@@ -19,8 +19,9 @@ export interface YieldQueueOptions {
 	isStreaming: () => boolean;
 	isTransitionFenced?: () => boolean;
 	injectStreaming(msg: AgentMessage): void;
-	injectIdle(messages: AgentMessage[]): Promise<void>;
-	scheduleIdleFlush(run: () => Promise<void>): void;
+	injectIdle(messages: AgentMessage[], signal?: AbortSignal): Promise<void>;
+	scheduleIdleFlush(run: (signal?: AbortSignal) => Promise<void>, onSkip: () => void): void;
+	getIdleFlushSignal?(): AbortSignal | undefined;
 }
 
 type YieldFlushMode = "streaming" | "idle";
@@ -57,6 +58,7 @@ export class YieldQueue {
 	#idleFlushPending = false;
 	#deferredIdleMessages: DeferredIdleMessage[] = [];
 	readonly #messageProvenance = new WeakMap<AgentMessage, DeferredIdleMessage>();
+	#idleFlushPendingOwner: symbol | undefined;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
@@ -105,10 +107,10 @@ export class YieldQueue {
 		return false;
 	}
 
-	async flush(mode: YieldFlushMode): Promise<void> {
+	async flush(mode: YieldFlushMode, signal?: AbortSignal): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
-			if (this.#options.isTransitionFenced?.()) return;
+			this.#idleFlushPendingOwner = undefined;
 		}
 		if (mode === "streaming" && this.#options.isTransitionFenced?.()) return;
 		// Deferred idle deliveries stay idle-only: a streaming flush must not turn a
@@ -126,7 +128,7 @@ export class YieldQueue {
 		}
 		if (messages.length > 0) {
 			try {
-				await this.#options.injectIdle(messages);
+				await this.#options.injectIdle(messages, signal ?? this.#options.getIdleFlushSignal?.());
 			} catch (error) {
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
 			}
@@ -143,7 +145,7 @@ export class YieldQueue {
 	}
 
 	drainMessages(includeStale = false): AgentMessage[] {
-		return this.#drainMessages(includeStale, true);
+		return this.#drainMessages(includeStale, true).map(message => message);
 	}
 
 	drainKindMessages(kind: string, includeStale = false): AgentMessage[] {
@@ -198,17 +200,19 @@ export class YieldQueue {
 				messages.push(deferred.message);
 				continue;
 			}
-			messages.push(
-				...this.#recordBuiltMessages(deferred.kind, deferred.dispatcher, deferred.entries, includeStale),
-			);
+			messages.push(...this.#recordBuiltMessages(deferred.kind, deferred.dispatcher, deferred.entries, includeStale));
 		}
 		return messages;
 	}
 
-	clear(): void {
+	clear(onDrop?: (kind: string, entries: readonly unknown[]) => void): void {
+		if (onDrop) {
+			for (const [kind, entries] of this.#entries) onDrop(kind, entries);
+		}
 		this.#entries.clear();
 		this.#deferredIdleMessages = [];
 		this.#idleFlushPending = false;
+		this.#idleFlushPendingOwner = undefined;
 	}
 
 	/** Drop only the queued entries of a single kind, leaving other kinds intact. */
@@ -241,14 +245,21 @@ export class YieldQueue {
 	#scheduleIdleFlush(): void {
 		if (this.#idleFlushPending) return;
 		this.#idleFlushPending = true;
-		try {
-			this.#options.scheduleIdleFlush(async () => {
-				this.#idleFlushPending = false;
-				if (this.#options.isStreaming()) return;
-				await this.flush("idle");
-			});
-		} catch (error) {
+		const owner = Symbol("idle-flush");
+		this.#idleFlushPendingOwner = owner;
+		const releaseOwner = () => {
+			if (this.#idleFlushPendingOwner !== owner) return;
+			this.#idleFlushPendingOwner = undefined;
 			this.#idleFlushPending = false;
+		};
+		try {
+			this.#options.scheduleIdleFlush(async signal => {
+				releaseOwner();
+				if (this.#options.isStreaming()) return;
+				await this.flush("idle", signal);
+			}, releaseOwner);
+		} catch (error) {
+			releaseOwner();
 			logger.warn("Yield queue idle flush scheduling failed", { error: formatError(error) });
 		}
 	}
