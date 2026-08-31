@@ -1,3 +1,5 @@
+import * as nodeFs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	Agent,
@@ -37,6 +39,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	setProjectDir,
 } from "@gajae-code/utils";
 import {
 	createAppendOnlyContextManager,
@@ -82,7 +85,6 @@ import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings, releaseSettingsScope } from "../discovery";
-import { reset as resetCapabilities } from "../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
