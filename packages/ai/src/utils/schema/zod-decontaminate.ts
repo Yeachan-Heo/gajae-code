@@ -191,7 +191,8 @@ function rewriteZodNode(node: JsonObject, seen: WeakSet<object>): unknown {
 		}
 
 		case "literal": {
-			const values = Array.isArray(def.values) ? (def.values as unknown[]) : [];
+			const valuesValue = ownValue(def, "values");
+			const values = Array.isArray(valuesValue) ? valuesValue : [];
 			if (values.length === 1) {
 				return { const: values[0] };
 			}
