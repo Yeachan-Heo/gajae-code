@@ -494,14 +494,27 @@ describe("normalizeSchemaForMCP", () => {
 	it("copies literal payloads verbatim instead of normalizing them as schemas", () => {
 		const schema = {
 			type: "string",
-			default: { type: "object", nullable: true, format: null },
+			$defs: { RootDefinition: { type: "number" } },
+			default: {
+				type: "object",
+				nullable: true,
+				format: null,
+				$ref: "#/$defs/Literal",
+				$defs: { Literal: { type: "string" } },
+			},
 			examples: [{ anyOf: [{ const: "a" }, { const: "b" }] }],
 		};
 		const before = structuredClone(schema);
 
 		expect(normalizeSchemaForMCP(schema)).toEqual({
 			type: "string",
-			default: { type: "object", nullable: true, format: null },
+			default: {
+				type: "object",
+				nullable: true,
+				format: null,
+				$ref: "#/$defs/Literal",
+				$defs: { Literal: { type: "string" } },
+			},
 			examples: [{ anyOf: [{ const: "a" }, { const: "b" }] }],
 		});
 		expect(schema).toEqual(before);
@@ -536,6 +549,20 @@ describe("normalizeSchemaForMCP", () => {
 		});
 		expect(Object.getPrototypeOf(properties)).toBe(Object.prototype);
 		expect(({} as Record<string, unknown>).additionalProperties).toBeUndefined();
+		expect(isValidJsonSchema(normalized)).toBe(true);
+	});
+
+	it("keeps a root prototype-colliding extension out of draft dispatch and Object.prototype", () => {
+		const parsed = JSON.parse(
+			'{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","__proto__":{"marker":"data"}}',
+		) as Record<string, unknown>;
+
+		const normalized = normalizeSchemaForMCP(parsed) as Record<string, unknown>;
+
+		expect(Object.hasOwn(normalized, "__proto__")).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(normalized, "__proto__")?.value).toEqual({ marker: "data" });
+		expect(Object.getPrototypeOf(normalized)).toBe(Object.prototype);
+		expect(({} as Record<string, unknown>).marker).toBeUndefined();
 		expect(isValidJsonSchema(normalized)).toBe(true);
 	});
 
@@ -613,6 +640,18 @@ describe("normalizeSchemaForMCP", () => {
 		expect(Object.getPrototypeOf(properties)).toBe(Object.prototype);
 		expect(isValidJsonSchema(normalized)).toBe(true);
 		expect(({} as Record<string, unknown>).additionalProperties).toBeUndefined();
+	});
+
+	it("does not resolve an inherited prototype value for an unresolved local ref", () => {
+		const schema = {
+			$defs: { Safe: { type: "string" } },
+			$ref: "#/$defs/__proto__",
+		};
+
+		const normalized = normalizeSchemaForMCP(schema) as Record<string, unknown>;
+
+		expect(normalized).toEqual({ $defs: { Safe: { type: "string" } }, $ref: "#/$defs/__proto__" });
+		expect(isValidJsonSchema(normalized)).toBe(true);
 	});
 
 	it("recurses nested additionalProperties, unions, arrays, and referenced definitions", () => {

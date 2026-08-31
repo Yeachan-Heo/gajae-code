@@ -127,7 +127,7 @@ function isZodLeak(node: JsonObject): boolean {
 	const def = node.def;
 	if (!isJsonObject(def)) return false;
 	const defType = def.type;
-	if (typeof defType !== "string" || !ZOD_KINDS[defType]) return false;
+	if (typeof defType !== "string" || !Object.hasOwn(ZOD_KINDS, defType)) return false;
 	// Both surface and inner `.type` must agree — Zod always mirrors `_def.type`
 	// onto the instance, so this is a near-zero false-positive guard.
 	return node.type === defType;
@@ -154,9 +154,9 @@ function copyWithoutNoise(node: JsonObject): JsonObject {
 	const out: JsonObject = {};
 	for (const key in node) {
 		if (!Object.hasOwn(node, key)) continue;
-		if (ZOD_NOISE_KEYS[key]) continue;
+		if (Object.hasOwn(ZOD_NOISE_KEYS, key)) continue;
 		const value = node[key];
-		if (value === null && !KEYS_THAT_ACCEPT_NULL[key]) continue;
+		if (value === null && !Object.hasOwn(KEYS_THAT_ACCEPT_NULL, key)) continue;
 		setOwnKey(out, key, value);
 	}
 	return out;
@@ -276,7 +276,7 @@ function rewriteZodNode(node: JsonObject, seen: WeakSet<object>): unknown {
 			const mapped = ZOD_SCALAR_TO_JSON_TYPE[kind];
 			if (mapped) {
 				cleaned.type = mapped;
-			} else if (typeof cleaned.type === "string" && !VALID_JSON_SCHEMA_TYPES[cleaned.type]) {
+			} else if (typeof cleaned.type === "string" && !Object.hasOwn(VALID_JSON_SCHEMA_TYPES, cleaned.type)) {
 				delete cleaned.type;
 			}
 			// Object-shaped `enum` survives as a noise field — remove if present.

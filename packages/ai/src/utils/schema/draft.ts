@@ -17,7 +17,7 @@ const DRAFT_07_SCHEMA_URIS: Record<string, true> = {
  * entry rather than the map object itself so legacy `definitions`-style refs
  * inside property schemas get rewritten.
  */
-const SCHEMA_MAP_KEYS: Record<string, true> = { properties: true, patternProperties: true, dependentSchemas: true };
+const SCHEMA_MAP_KEYS = new Set(["properties", "patternProperties", "dependentSchemas"]);
 /**
  * Keys whose values are JSON-Schema *values*, not nested schemas. The upgrade
  * walker must NOT descend into these — `type: ["string","null"]` is not a
@@ -49,7 +49,7 @@ function convertRef(value: string): string {
 
 /** Get-or-create a child object map on `target[key]`. Used to lazily build up `$defs`/`dependentRequired`/`dependentSchemas` during conversion. */
 function getObjectMap(target: JsonObject, key: string): JsonObject {
-	const existing = target[key];
+	const existing = Object.hasOwn(target, key) ? target[key] : undefined;
 	if (isJsonObject(existing)) return existing;
 	const next: JsonObject = {};
 	setOwnKey(target, key, next);
@@ -116,7 +116,7 @@ function mergePrefixItems(existing: unknown, convertedItems: unknown[]): unknown
 /** Record `key → deps` in `dependentRequired`, unioning with any existing array. */
 function mergeDependentRequired(target: JsonObject, key: string, deps: unknown[]): void {
 	const dependentRequired = getObjectMap(target, "dependentRequired");
-	const existing = dependentRequired[key];
+	const existing = Object.hasOwn(dependentRequired, key) ? dependentRequired[key] : undefined;
 	if (existing === undefined) {
 		setOwnKey(dependentRequired, key, deps);
 		return;
@@ -129,7 +129,8 @@ function mergeDependentRequired(target: JsonObject, key: string, deps: unknown[]
 /** Record `key → schema` in `dependentSchemas`, intersecting with any existing entry. */
 function mergeDependentSchema(target: JsonObject, key: string, schema: unknown): void {
 	const dependentSchemas = getObjectMap(target, "dependentSchemas");
-	setOwnKey(dependentSchemas, key, combineSchemas(dependentSchemas[key], schema));
+	const existing = Object.hasOwn(dependentSchemas, key) ? dependentSchemas[key] : undefined;
+	setOwnKey(dependentSchemas, key, combineSchemas(existing, schema));
 }
 
 /**
@@ -216,7 +217,7 @@ function schemaNeedsDraft202012UpgradeImpl(value: unknown, epoch: number): boole
 		if (!Object.hasOwn(value, key)) continue;
 		const entry = value[key];
 		if (key === "$schema") {
-			if (typeof entry === "string" && entry in DRAFT_07_SCHEMA_URIS) return true;
+			if (typeof entry === "string" && Object.hasOwn(DRAFT_07_SCHEMA_URIS, entry)) return true;
 			continue;
 		}
 		if (key === "definitions" || key === "dependencies" || key === "additionalItems" || key === "nullable") {
@@ -227,11 +228,11 @@ function schemaNeedsDraft202012UpgradeImpl(value: unknown, epoch: number): boole
 			continue;
 		}
 		if (key === "items" && Array.isArray(entry)) return true;
-		if (key === "$defs" || key in SCHEMA_MAP_KEYS) {
+		if (key === "$defs" || SCHEMA_MAP_KEYS.has(key)) {
 			if (schemaMapNeedsDraft202012Upgrade(entry, epoch)) return true;
 			continue;
 		}
-		if (key in NON_SCHEMA_VALUE_KEYS) continue;
+		if (Object.hasOwn(NON_SCHEMA_VALUE_KEYS, key)) continue;
 		if (schemaNeedsDraft202012UpgradeImpl(entry, epoch)) return true;
 	}
 
@@ -273,12 +274,12 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 			continue;
 		}
 		// Recurse into each entry; the map shape itself is preserved.
-		if (key in SCHEMA_MAP_KEYS) {
+		if (SCHEMA_MAP_KEYS.has(key)) {
 			copySchemaMap(result, key, entry, cache);
 			continue;
 		}
 		// JSON-Schema *value* keywords — copy verbatim.
-		if (key in NON_SCHEMA_VALUE_KEYS) {
+		if (Object.hasOwn(NON_SCHEMA_VALUE_KEYS, key)) {
 			setOwnKey(result, key, entry);
 			continue;
 		}
@@ -290,7 +291,9 @@ function upgradeJsonSchemaTo202012Impl(value: unknown, cache: WeakMap<object, un
 		// Rewrite `$schema` URI to the 2020-12 form; non-draft-07 URIs pass through.
 		if (key === "$schema") {
 			result.$schema =
-				typeof entry === "string" && entry in DRAFT_07_SCHEMA_URIS ? JSON_SCHEMA_DRAFT_2020_12_URI : entry;
+				typeof entry === "string" && Object.hasOwn(DRAFT_07_SCHEMA_URIS, entry)
+					? JSON_SCHEMA_DRAFT_2020_12_URI
+					: entry;
 			continue;
 		}
 		// `#/definitions/Foo` → `#/$defs/Foo`.
