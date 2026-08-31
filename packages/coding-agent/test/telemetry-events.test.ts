@@ -17,15 +17,17 @@ const CLAIM_WRITE_FLAGS =
 	fs.constants.O_RDWR |
 	(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
 
-function unsupportedNoReplaceResult(): NativeNoReplaceResult {
+function unsupportedNoReplaceResult(
+	reason: "atomic_unavailable" | "invalid_request" = "atomic_unavailable",
+): NativeNoReplaceResult {
 	return {
 		ok: false,
-		code: "atomic_unavailable",
+		code: reason,
 		mutationState: "not_committed",
 		durabilityState: "not_attempted",
-		reason: "atomic_unavailable",
+		reason,
 		primitive: "unsupported",
-		phase: "pre_mutation",
+		phase: reason === "invalid_request" ? "preflight" : "rename",
 		diagnostic: { schemaVersion: 1, collectionState: "not_run" },
 	};
 }
@@ -263,7 +265,9 @@ describe("telemetry install ID", () => {
 			error.code = "EPERM";
 			throw error;
 		});
-		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
+		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(
+			unsupportedNoReplaceResult("invalid_request"),
+		);
 		const linkSpy = spyOn(natives, "linkNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
 		const finalOpened = Promise.withResolvers<void>();
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {

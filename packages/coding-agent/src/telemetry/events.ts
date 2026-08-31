@@ -199,7 +199,11 @@ function isHardLinkUnsupported(error: unknown): boolean {
 }
 
 function isAtomicPublicationUnsupported(result: NativeNoReplaceResult): boolean {
-	return result.code === "atomic_unavailable" || result.reason === "atomic_unavailable";
+	return (
+		result.mutationState === "not_committed" &&
+		result.durabilityState === "not_attempted" &&
+		(result.reason === "atomic_unavailable" || (result.reason === "invalid_request" && result.phase === "preflight"))
+	);
 }
 
 async function publishNoReplace(
