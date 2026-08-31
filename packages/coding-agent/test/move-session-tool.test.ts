@@ -1397,6 +1397,30 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
 	});
 
+	it("rejects a cwd move fenced after teardown without waiting for active readers", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		fs.mkdirSync(cwd, { recursive: true });
+		const sessionManager = SessionManager.inMemory(cwd);
+		const readerStarted = Promise.withResolvers<void>();
+		const releaseReader = Promise.withResolvers<void>();
+		const reader = sessionManager.runWithCwdReadLease(async () => {
+			readerStarted.resolve();
+			await releaseReader.promise;
+		});
+		await readerStarted.promise;
+
+		await sessionManager.closeCwdMoveAdmission();
+		const started = Date.now();
+		await expect(sessionManager.moveTo(cwd)).rejects.toThrow("Session cwd move admission is closed.");
+		expect(Date.now() - started).toBeLessThan(1_000);
+
+		releaseReader.resolve();
+		await reader;
+		await sessionManager.close();
+	});
+
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

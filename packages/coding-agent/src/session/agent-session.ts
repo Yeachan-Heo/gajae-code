@@ -3699,7 +3699,17 @@ export class AgentSession {
 			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 		}
-		if (active && options?.waitForActive !== false) await active.settled.promise;
+		if (options?.waitForActive === false) {
+			this.#sessionAdmissionClosed = true;
+			const queued = this.#sessionAdmissionQueue.splice(0);
+			for (const entry of queued) {
+				entry.released = true;
+				entry.ready.resolve();
+				entry.settled.resolve();
+			}
+			return;
+		}
+		if (active) await active.settled.promise;
 		await this.#selectionFenceTail;
 		this.#sessionAdmissionClosed = true;
 		const queued = this.#sessionAdmissionQueue.splice(0);

@@ -7400,6 +7400,7 @@ export class SessionManager {
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
 	#cwdMoveAdmissionClosed = false;
+	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/**
@@ -11091,9 +11092,21 @@ export class SessionManager {
 		},
 	): Promise<void> {
 		if (!this.#ownsCwdTransition()) {
-			return this.runExclusiveCwdTransition(() => this.moveTo(newCwd, options));
+			if (this.#cwdMoveAdmissionClosed) throw new Error("Session cwd move admission is closed.");
+			return this.runExclusiveCwdTransition(async () => {
+				const owner = this.#cwdTransitionOwner;
+				if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
+				this.#cwdMoveAdmittedOwners.add(owner);
+				try {
+					return await this.moveTo(newCwd, options);
+				} finally {
+					this.#cwdMoveAdmittedOwners.delete(owner);
+				}
+			});
 		}
-		if (this.#cwdMoveAdmissionClosed) throw new Error("Session cwd move admission is closed.");
+		const owner = this.#cwdTransitionOwner;
+		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))
+			throw new Error("Session cwd move admission is closed.");
 		if (!options?.sourceHandle) {
 			const sourceHandle = await SessionManager.openNoFollowDirectory(this.cwd);
 			try {

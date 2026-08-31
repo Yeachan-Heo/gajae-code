@@ -560,6 +560,15 @@ describe("AgentSession abort timeout", () => {
 				if (Date.now() >= deadline) throw new Error("Timed out waiting for the abort-ignoring run to stream");
 				await Bun.sleep(1);
 			}
+			const queuedSelection = activeSession.setDefaultModelSelection(
+				{ ...mock.model, id: "queued-selection" },
+				undefined,
+			);
+			const queuedSelectionResult = queuedSelection.then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			await Promise.resolve();
 
 			const originalForceAbort = agent.forceAbort.bind(agent);
 			const forceAbortResults: boolean[] = [];
@@ -575,6 +584,10 @@ describe("AgentSession abort timeout", () => {
 			disposed = true;
 			const elapsed = Date.now() - started;
 
+			expect(await queuedSelectionResult).toMatchObject({
+				status: "rejected",
+				error: { name: "AgentBusyError", code: "busy" },
+			});
 			// Since #3894 the agent loop emits a synthetic aborted result for tool
 			// calls that outlive their signal, so the turn terminates on its own and
 			// `waitForIdle` settles well inside the 2s force-abort budget. Burning
