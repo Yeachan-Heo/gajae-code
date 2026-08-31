@@ -10891,6 +10891,15 @@ export class SessionManager {
 	}
 
 	async closeCwdMoveAdmission(): Promise<void> {
+		// With no admitted writer, fence synchronously without taking the writer
+		// lock. An abort-ignoring tool can retain a cwd read lease after the Agent has
+		// cooperatively ended its turn, and disposal must not wait on that unbounded
+		// work. A writer already announced before the fence keeps its place and is
+		// allowed to commit; this close queues behind it and rejects later writers.
+		if (this.#cwdWriterPending === 0) {
+			this.#cwdMoveAdmissionClosed = true;
+			return;
+		}
 		await this.runExclusiveCwdTransition(async () => {
 			this.#cwdMoveAdmissionClosed = true;
 		});
