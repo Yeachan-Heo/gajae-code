@@ -279,6 +279,30 @@ describe("telemetry install ID", () => {
 		}
 	});
 
+	it("fails closed when no safe no-replace primitive is available", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
+		tempDirs.push(directory);
+		const filePath = path.join(directory, "telemetry-install-id");
+		const hardLinkSpy = spyOn(fs, "link").mockImplementation(async () => {
+			const error = new Error("hard links are unavailable") as NodeJS.ErrnoException;
+			error.code = "EOPNOTSUPP";
+			throw error;
+		});
+		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(
+			unsupportedNoReplaceResult("invalid_request"),
+		);
+		const linkSpy = spyOn(natives, "linkNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
+
+		try {
+			await expect(getTelemetryInstallId(filePath)).rejects.toThrow("atomic no-replace publication is unavailable");
+			expect(await fs.stat(filePath).catch(() => undefined)).toBeUndefined();
+		} finally {
+			linkSpy.mockRestore();
+			renameSpy.mockRestore();
+			hardLinkSpy.mockRestore();
+		}
+	});
+
 	it("adopts a winner after an owned-claim destination collision", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
 		tempDirs.push(directory);
