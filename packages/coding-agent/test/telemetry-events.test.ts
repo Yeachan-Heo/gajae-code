@@ -3,7 +3,6 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as natives from "@gajae-code/natives";
 import { getTelemetryInstallId, serializeTelemetryEvent } from "../src/telemetry/events";
 
@@ -16,21 +15,6 @@ const realBunSleep = Bun.sleep;
 const CLAIM_WRITE_FLAGS =
 	fs.constants.O_RDWR |
 	(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
-
-function unsupportedNoReplaceResult(
-	reason: "atomic_unavailable" | "invalid_request" = "atomic_unavailable",
-): NativeNoReplaceResult {
-	return {
-		ok: false,
-		code: reason,
-		mutationState: "not_committed",
-		durabilityState: "not_attempted",
-		reason,
-		primitive: "unsupported",
-		phase: reason === "invalid_request" ? "preflight" : "rename",
-		diagnostic: { schemaVersion: 1, collectionState: "not_run" },
-	};
-}
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
@@ -253,53 +237,6 @@ describe("telemetry install ID", () => {
 			expect((await fs.readdir(directory)).filter(name => !name.endsWith(".tmp"))).toEqual(["telemetry-install-id"]);
 		} finally {
 			linkSpy.mockRestore();
-		}
-	});
-
-	it("uses the native link stand-in when rename no-replace is unavailable", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
-		tempDirs.push(directory);
-		const filePath = path.join(directory, "telemetry-install-id");
-		const hardLinkSpy = spyOn(fs, "link").mockImplementation(async () => {
-			const error = new Error("hard links are unavailable") as NodeJS.ErrnoException;
-			error.code = "EPERM";
-			throw error;
-		});
-		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(
-			unsupportedNoReplaceResult("invalid_request"),
-		);
-
-		try {
-			const ids = await Promise.all([getTelemetryInstallId(filePath), getTelemetryInstallId(filePath)]);
-			expect(ids[0]).toBe(ids[1]);
-			expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
-		} finally {
-			renameSpy.mockRestore();
-			hardLinkSpy.mockRestore();
-		}
-	});
-
-	it("fails closed when no safe no-replace primitive is available", async () => {
-		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
-		tempDirs.push(directory);
-		const filePath = path.join(directory, "telemetry-install-id");
-		const hardLinkSpy = spyOn(fs, "link").mockImplementation(async () => {
-			const error = new Error("hard links are unavailable") as NodeJS.ErrnoException;
-			error.code = "EOPNOTSUPP";
-			throw error;
-		});
-		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(
-			unsupportedNoReplaceResult("invalid_request"),
-		);
-		const linkSpy = spyOn(natives, "linkNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
-
-		try {
-			await expect(getTelemetryInstallId(filePath)).rejects.toThrow("atomic no-replace publication is unavailable");
-			expect(await fs.stat(filePath).catch(() => undefined)).toBeUndefined();
-		} finally {
-			linkSpy.mockRestore();
-			renameSpy.mockRestore();
-			hardLinkSpy.mockRestore();
 		}
 	});
 

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NativeExactFileIdentity, NativeNoReplaceResult } from "@gajae-code/natives";
+import type { NativeExactFileIdentity } from "@gajae-code/natives";
 import * as natives from "@gajae-code/natives";
 import { getTrustedAgentFile } from "@gajae-code/utils";
 
@@ -202,27 +202,6 @@ function scheduleExactDetachedCleanup(pathname: string, identity: NativeExactFil
 function isHardLinkUnsupported(error: unknown): boolean {
 	const code = (error as NodeJS.ErrnoException).code;
 	return code === "EOPNOTSUPP" || code === "ENOTSUP" || code === "EPERM" || code === "ENOSYS";
-}
-
-function isAtomicPublicationUnsupported(result: NativeNoReplaceResult): boolean {
-	return (
-		result.mutationState === "not_committed" &&
-		result.durabilityState === "not_attempted" &&
-		(result.reason === "atomic_unavailable" || (result.reason === "invalid_request" && result.phase === "preflight"))
-	);
-}
-
-async function publishNoReplace(
-	sourcePath: string,
-	destinationPath: string,
-): Promise<{ result: NativeNoReplaceResult; sourceRetained: boolean }> {
-	const renamed = await natives.renameNoReplacePathAsync(sourcePath, destinationPath);
-	if (!isAtomicPublicationUnsupported(renamed)) return { result: renamed, sourceRetained: false };
-	const linked = await natives.linkNoReplacePathAsync(sourcePath, destinationPath);
-	if (!isAtomicPublicationUnsupported(linked)) return { result: linked, sourceRetained: linked.ok };
-	const unsupported = new Error("atomic no-replace publication is unavailable") as NodeJS.ErrnoException;
-	unsupported.code = "EUNSUPPORTED";
-	throw unsupported;
 }
 
 async function syncDirectory(directory: string): Promise<void> {
@@ -1113,19 +1092,16 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 		} finally {
 			await claim.close();
 		}
-		const claimPublication = await publishNoReplace(claimTemporaryPath, claimPath);
-		if (!claimPublication.result.ok) {
-			if (
-				claimPublication.result.code === "destination_exists" ||
-				claimPublication.result.reason === "destination_exists"
-			) {
+		const claimPublication = await natives.renameNoReplacePathAsync(claimTemporaryPath, claimPath);
+		if (!claimPublication.ok) {
+			if (claimPublication.code === "destination_exists" || claimPublication.reason === "destination_exists") {
 				const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
 				busy.code = "ECLAIM";
 				throw busy;
 			}
-			throw new Error(`telemetry install ID claim publication failed: ${claimPublication.result.reason}`);
+			throw new Error(`telemetry install ID claim publication failed: ${claimPublication.reason}`);
 		}
-		if (!claimPublication.sourceRetained) claimTemporaryIdentity = undefined;
+		claimTemporaryIdentity = undefined;
 		ownsClaim = (await readClaimIdentity(claimPath))?.token === token;
 		if (!ownsClaim) throw new Error("telemetry install ID claim changed");
 		const scheduleHeartbeat = (): void => {
@@ -1168,10 +1144,10 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 		heartbeatStopped = false;
 		scheduleHeartbeat();
 		await assertClaimOwned(claimPath, token, "publishing");
-		const publication = await publishNoReplace(temporaryPath, filePath);
-		if (!publication.result.ok) {
-			if (publication.result.code !== "destination_exists" && publication.result.reason !== "destination_exists")
-				throw new Error(`telemetry install ID publication failed: ${publication.result.reason}`);
+		const publication = await natives.renameNoReplacePathAsync(temporaryPath, filePath);
+		if (!publication.ok) {
+			if (publication.code !== "destination_exists" && publication.reason !== "destination_exists")
+				throw new Error(`telemetry install ID publication failed: ${publication.reason}`);
 			return await readWinnerAfterCollision(filePath, claimPath, token);
 		}
 		publishedFinal = true;

@@ -4587,13 +4587,7 @@ pub(crate) mod platform {
 		Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::EXDEV) => "cross_device",
-			Some(libc::EACCES) => "permission_denied",
-			// A valid regular-file link request that the filesystem rejects with
-			// EPERM/EOPNOTSUPP/ENOTSUP is the common no-hard-link profile; let the
-			// managed caller select its exclusive-claim fallback instead of treating
-			// the capability refusal as a final authorization failure.
-			Some(libc::EPERM) => "atomic_unavailable",
-			Some(errno) if errno == libc::EOPNOTSUPP || errno == libc::ENOTSUP => "atomic_unavailable",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",
