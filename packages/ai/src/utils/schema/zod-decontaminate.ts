@@ -114,6 +114,7 @@ const KEYS_THAT_ACCEPT_NULL: Record<string, true> = {
 	const: true,
 	examples: true,
 };
+const JSON_SCHEMA_LITERAL_PAYLOAD_KEYS = new Set(["default", "const", "enum", "examples"]);
 
 function setOwnKey(target: JsonObject, key: string, value: unknown): void {
 	if (key === "__proto__") {
@@ -334,6 +335,10 @@ function walk(value: unknown, seen: WeakSet<object>): unknown {
 	for (const key in value) {
 		if (!Object.hasOwn(value, key)) continue;
 		const child = value[key];
+		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
+			setOwnKey(out, key, child);
+			continue;
+		}
 		const rewritten = walk(child, seen);
 		if (rewritten !== child) changed = true;
 		setOwnKey(out, key, rewritten);

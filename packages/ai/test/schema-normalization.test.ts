@@ -501,6 +501,12 @@ describe("normalizeSchemaForMCP", () => {
 				format: null,
 				$ref: "#/$defs/Literal",
 				$defs: { Literal: { type: "string" } },
+				nestedZodLookingData: {
+					def: { type: "enum", entries: { literal: "literal" } },
+					type: "enum",
+					enum: { literal: "literal" },
+					options: ["literal"],
+				},
 			},
 			examples: [{ anyOf: [{ const: "a" }, { const: "b" }] }],
 		};
@@ -514,6 +520,12 @@ describe("normalizeSchemaForMCP", () => {
 				format: null,
 				$ref: "#/$defs/Literal",
 				$defs: { Literal: { type: "string" } },
+				nestedZodLookingData: {
+					def: { type: "enum", entries: { literal: "literal" } },
+					type: "enum",
+					enum: { literal: "literal" },
+					options: ["literal"],
+				},
 			},
 			examples: [{ anyOf: [{ const: "a" }, { const: "b" }] }],
 		});
