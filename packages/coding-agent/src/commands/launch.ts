@@ -194,8 +194,6 @@ export default class Index extends Command {
 			}
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
-			await persistCoordinatorLaunchFailure(error, process.cwd());
-			throw error;
 		}
 		try {
 			if (launch.worktree.enabled) {
