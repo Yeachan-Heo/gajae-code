@@ -1161,7 +1161,7 @@ export class CommandController {
 		}
 
 		try {
-			await this.ctx.sessionManager.runExclusiveCwdTransition(async () => {
+			await this.ctx.sessionManager.runExclusiveCwdMoveTransition(async () => {
 				await this.ctx.sessionManager.flush();
 				await this.ctx.sessionManager.moveTo(resolvedPath);
 				setProjectDir(resolvedPath);

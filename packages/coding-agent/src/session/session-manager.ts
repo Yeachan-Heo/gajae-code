@@ -7401,7 +7401,7 @@ export class SessionManager {
 	#cwdTransitionOwner: symbol | undefined;
 	#cwdMoveAdmissionClosing = false;
 	#cwdMoveAdmissionClosed = false;
-	#pendingCwdMoveAdmissions = new Set<{ controller: AbortController; retainsOwnReadLease: boolean }>();
+	#pendingCwdMoveAdmissions = new Set<AbortController>();
 	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
@@ -10854,10 +10854,17 @@ export class SessionManager {
 		if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
 			throw new Error("Session cwd move admission is closed.");
 		const readLease = cwdReadLeaseAls.getStore();
-		const admission = {
-			controller: new AbortController(),
-			retainsOwnReadLease: readLease?.active === true && readLease.owner === this.#cwdReadLeaseOwner,
-		};
+		const suspendedOwnReadLease = readLease?.active === true && readLease.owner === this.#cwdReadLeaseOwner;
+		if (suspendedOwnReadLease) {
+			readLease.active = false;
+			this.#cwdReaderCount -= 1;
+			if (this.#cwdReaderCount === 0) {
+				const drained = this.#cwdReadersDrained;
+				this.#cwdReadersDrained = undefined;
+				drained?.();
+			}
+		}
+		const admission = new AbortController();
 		this.#pendingCwdMoveAdmissions.add(admission);
 		try {
 			return await this.runExclusiveCwdTransition(
@@ -10871,10 +10878,19 @@ export class SessionManager {
 						this.#cwdMoveAdmittedOwners.delete(owner);
 					}
 				},
-				{ signal: admission.controller.signal },
+				{ signal: admission.signal },
 			);
 		} finally {
 			this.#pendingCwdMoveAdmissions.delete(admission);
+			if (suspendedOwnReadLease) {
+				if (this.#cwdReaderCount === 0) {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					this.#cwdReadersIdle = promise;
+					this.#cwdReadersDrained = resolve;
+				}
+				this.#cwdReaderCount += 1;
+				readLease.active = true;
+			}
 		}
 	}
 
@@ -10937,8 +10953,7 @@ export class SessionManager {
 		// work ahead of disposal's bounded Agent abort.
 		if (this.#cwdReaderCount > 0) {
 			for (const admission of this.#pendingCwdMoveAdmissions) {
-				if (!admission.retainsOwnReadLease)
-					admission.controller.abort(new Error("Session cwd move admission is closed."));
+				admission.abort(new Error("Session cwd move admission is closed."));
 			}
 		}
 	}
