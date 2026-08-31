@@ -678,16 +678,29 @@ describe("normalizeSchemaForMCP", () => {
 			$defs: {
 				"Array/Definition": { type: "object" },
 				BooleanDefinition: false,
+				Base: { type: "string" },
+				Sibling: { type: "number" },
 			},
 			anyOf: [{ $ref: "#/$defs/Array~1Definition" }, { $ref: "#/$defs/BooleanDefinition" }],
+			additionalProperties: {
+				$ref: "#/$defs/Base",
+				anyOf: [{ $ref: "#/$defs/Sibling" }],
+				default: { $ref: "#/$defs/BooleanDefinition" },
+			},
 		};
 
 		const normalized = normalizeSchemaForMCP(schema) as Record<string, unknown>;
 		const properties = normalized.properties as Record<string, unknown>;
 		const alternatives = normalized.anyOf as Array<Record<string, unknown> | boolean>;
+		const additionalProperties = normalized.additionalProperties as Record<string, unknown>;
 
 		expect(properties.nested).toEqual({ type: "string" });
 		expect(alternatives).toEqual([{ type: "object", additionalProperties: true }, false]);
+		expect(additionalProperties).toEqual({
+			type: "string",
+			anyOf: [{ type: "number" }],
+			default: { $ref: "#/$defs/BooleanDefinition" },
+		});
 		expect(normalized.$defs).toBeUndefined();
 		expect(isValidJsonSchema(normalized)).toBe(true);
 	});

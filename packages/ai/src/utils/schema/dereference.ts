@@ -123,7 +123,11 @@ function dereferenceNode(
 				if (Object.hasOwn(inlined, key)) setOwnKey(merged, key, inlined[key]);
 			}
 			for (const key in schemaNode) {
-				if (Object.hasOwn(schemaNode, key) && key !== "$ref") setOwnKey(merged, key, schemaNode[key]);
+				if (!Object.hasOwn(schemaNode, key) || key === "$ref") continue;
+				const sibling = JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)
+					? schemaNode[key]
+					: dereferenceNode(schemaNode[key], root, visitingRefs, visitingNodes, state);
+				setOwnKey(merged, key, sibling);
 			}
 			if (!state.unresolvedRef) {
 				delete merged.$defs;
