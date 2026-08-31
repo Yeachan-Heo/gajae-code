@@ -755,3 +755,60 @@ describe("pi-native managed gateway credential failure marking", () => {
 		}
 	});
 });
+
+describe("pi-native client wire context", () => {
+	it("serializes only wire-safe tool fields — harness state (incl. BigInts) never crosses the wire", async () => {
+		let received: { context?: { tools?: unknown[] } } | undefined;
+		const finalMessage = baseAssistant({ content: [{ type: "text", text: "ok" }] });
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				received = (await req.json()) as typeof received;
+				const sse = `data: ${JSON.stringify({ type: "done", reason: "stop", message: finalMessage })}\n\n`;
+				return new Response(sse, { headers: { "Content-Type": "text/event-stream" } });
+			},
+		});
+		try {
+			const model = {
+				id: "upstream/custom-model",
+				provider: "gateway",
+				api: "openai-completions",
+				baseUrl: `http://127.0.0.1:${server.port}`,
+				transport: "pi-native",
+			} as unknown as Model<Api>;
+			// Runtime tool objects carry harness-only state: runners, session
+			// managers, and fs-stat BigInts. Unsanitized, JSON.stringify throws
+			// on the BigInts ("cannot serialize BigInt") and the rest leaks
+			// local paths to the gateway.
+			const harnessTool = {
+				name: "probe",
+				description: "a tool",
+				parameters: { type: "object", properties: {} },
+				strict: true,
+				rawArgumentValidation: () => ({ outcome: "passthrough" as const }),
+				runner: {
+					sessionManager: {
+						destination: { securityContext: { rootAuthority: { dev: 39n, ino: 2501705n } } },
+					},
+				},
+			};
+			const context: Context = {
+				messages: [{ role: "user", content: "hi", timestamp: 0 }],
+				tools: [harnessTool as unknown as Context["tools"] extends (infer T)[] | undefined ? T : never],
+			};
+			const { streamPiNative } = await import("../src/providers/pi-native-client");
+			const result = await streamPiNative(model, context).result();
+			expect(result.stopReason).toBe("stop");
+			expect(received?.context?.tools).toEqual([
+				{
+					name: "probe",
+					description: "a tool",
+					parameters: { type: "object", properties: {} },
+					strict: true,
+				},
+			]);
+		} finally {
+			server.stop(true);
+		}
+	});
+});

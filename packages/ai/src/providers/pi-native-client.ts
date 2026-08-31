@@ -49,6 +49,29 @@ const NON_WIRE_KEYS = new Set<keyof SimpleStreamOptions>([
 	"fallbackAttempt",
 ]);
 
+/**
+ * Project the caller's {@link Context} onto the wire schema. Runtime tool
+ * objects routinely carry harness-only state (runners, session managers,
+ * fs-stat BigInts) that must never be serialized: BigInt fields make
+ * `JSON.stringify` throw outright, and the rest is dead weight the gateway
+ * re-derives from its own tool registry. Only the protocol-meaningful,
+ * JSON-safe `Tool` fields cross the wire.
+ */
+function buildWireContext(context: Context): Context {
+	if (!context.tools || context.tools.length === 0) return context;
+	return {
+		...context,
+		tools: context.tools.map(tool => ({
+			name: tool.name,
+			description: tool.description,
+			parameters: tool.parameters,
+			...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+			...(tool.customFormat !== undefined ? { customFormat: tool.customFormat } : {}),
+			...(tool.customWireName !== undefined ? { customWireName: tool.customWireName } : {}),
+		})),
+	};
+}
+
 function buildWireOptions(options: SimpleStreamOptions | undefined): Record<string, unknown> {
 	if (!options) return {};
 	const wire: Record<string, unknown> = {};
@@ -166,7 +189,7 @@ export function streamPiNative<TApi extends Api>(
 			const headers = buildHeaders(model as Model<Api>, options?.apiKey);
 			const body = JSON.stringify({
 				modelId: model.id,
-				context,
+				context: buildWireContext(context),
 				options: buildWireOptions(options),
 				stream: true,
 			});

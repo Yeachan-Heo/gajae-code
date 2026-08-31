@@ -885,6 +885,22 @@ describe("ModelRegistry", () => {
 			expect(variants.some(variant => variant.selector === "proxy-anthropic/corp-sonnet")).toBe(true);
 		});
 
+		test("provider-level pi-native transport reaches custom models", () => {
+			writeRawModelsConfig({
+				providers: {
+					gateway: {
+						...providerConfig("http://127.0.0.1:4000", [{ id: "upstream/custom-model" }], "openai-completions"),
+						transport: "pi-native",
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("gateway", "upstream/custom-model");
+
+			expect(model?.transport).toBe("pi-native");
+		});
+
 		test("exclusions keep variants out of canonical grouping", () => {
 			writeRawModelsConfig({
 				providers: {
