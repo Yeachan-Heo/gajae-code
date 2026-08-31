@@ -1446,7 +1446,7 @@ export async function runUpdateCommand(
 		}
 	};
 	const flushTelemetryBeforeExit = async (): Promise<never> => {
-		await Promise.race([Promise.allSettled([...pendingTelemetry]), Bun.sleep(2000)]);
+		await Promise.race([Promise.allSettled([...pendingTelemetry]), Bun.sleep(5000)]);
 		return exit(1);
 	};
 	record("update_check_started", { channel });

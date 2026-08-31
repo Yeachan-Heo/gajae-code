@@ -48,6 +48,7 @@ export const exactReplacePath = nativeBindings.exactReplacePath;
 export const exactRestore = nativeBindings.exactRestore;
 export const exactUnlink = nativeBindings.exactUnlink;
 export const exactUnlinkDirect = nativeBindings.exactUnlinkDirect;
+export const exactUnlinkDirectDetached = nativeBindings.exactUnlinkDirectDetached;
 export const executeShell = nativeBindings.executeShell;
 export const extractSegments = nativeBindings.extractSegments;
 export const fuzzyFind = nativeBindings.fuzzyFind;

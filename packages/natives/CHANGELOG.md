@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added exact-identity detached cleanup export for safely removing stale claim files without following replacement paths or retaining the JavaScript lifecycle.
+
 ## [0.15.6] - 2026-08-30
 
 ## [0.15.5] - 2026-08-29

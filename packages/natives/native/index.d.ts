@@ -909,7 +909,7 @@ export declare function exactRemoveDirectoryTree(path: string, snapshot: NativeD
 export declare function exactReplacePath(sourcePath: string, destinationPath: string, expectedSource: NativeExactFileIdentity, expectedDestination: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
- * Restore only the detached object that still has the supplied platform
+ * Restore only the detached object that still has the supplied exact
  * identity. The detached and original paths must retain the same validated
  * parent, and restoration never replaces an existing original path.
  */
@@ -934,6 +934,15 @@ export declare function exactUnlink(path: string, identity: NativeExactFileIdent
  * and this path cannot manufacture another exchange placeholder.
  */
 export declare function exactUnlinkDirect(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Start direct exact unlink without retaining an N-API task or promise.
+ *
+ * Cleanup is best effort: the detached operation is intentionally abandoned
+ * when the process exits, while the exact identity checks still protect any
+ * pathname that remains alive long enough to be examined.
+ */
+export declare function exactUnlinkDirectDetached(path: string, identity: NativeExactFileIdentity): void
 
 /**
  * Execute a brush shell command.

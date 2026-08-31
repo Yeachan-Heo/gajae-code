@@ -63,8 +63,8 @@ describe("update telemetry lifecycle", () => {
 		).rejects.toThrow("exit");
 
 		expect(exitCode).toBe(1);
-		expect(performance.now() - startedAt).toBeLessThan(2500);
-	});
+		expect(performance.now() - startedAt).toBeLessThan(5500);
+	}, 6000);
 
 	it("records a bounded allowlisted check lifecycle without changing update behavior", async () => {
 		const events: string[] = [];

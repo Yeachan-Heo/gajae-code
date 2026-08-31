@@ -1243,6 +1243,7 @@ pub fn exact_unlink_direct(
 	};
 	platform::exact_unlink_direct(Path::new(&path), &identity)
 }
+
 /// Atomically replace a staged regular file only after validating the exact
 /// staged source and expected destination.
 ///
@@ -1274,6 +1275,7 @@ pub fn exact_replace_path(
 			&expected_destination,
 		)
 	}
+
 	#[cfg(not(any(unix, windows)))]
 	{
 		let _ = (source_path, destination_path, expected_source, expected_destination);
@@ -1281,7 +1283,19 @@ pub fn exact_replace_path(
 	}
 }
 
-/// Restore only the detached object that still has the supplied platform
+/// Start direct exact unlink without retaining an N-API task or promise.
+///
+/// Cleanup is best effort: the detached operation is intentionally abandoned
+/// when the process exits, while the exact identity checks still protect any
+/// pathname that remains alive long enough to be examined.
+#[napi]
+pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) {
+	std::thread::spawn(move || {
+		let _ = exact_unlink_direct(path, identity);
+	});
+}
+
+/// Restore only the detached object that still has the supplied exact
 #[cfg_attr(clippy, doc = "")]
 /// identity. The detached and original paths must retain the same validated
 /// parent, and restoration never replaces an existing original path.
@@ -4609,9 +4623,10 @@ pub(crate) mod platform {
 				&& stat_mtime_ns(&opened) == i128::from(identity.mtime_ns)
 				&& (identity.allow_hard_link
 					|| (opened.st_nlink == 1 && identity.nlink.is_none_or(|nlink| nlink == 1)))
-				&& identity
-					.nlink
-					.is_none_or(|nlink| nlink == opened.st_nlink as u64)
+				&& (identity.allow_hard_link
+					|| identity
+						.nlink
+						.is_none_or(|nlink| nlink == opened.st_nlink as u64))
 				&& identity.sha256.as_ref() == Some(&digest)
 				&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 				&& named.st_dev == opened.st_dev
