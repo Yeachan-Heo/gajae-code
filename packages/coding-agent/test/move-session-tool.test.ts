@@ -1421,7 +1421,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await sessionManager.close();
 	});
 
-	it("preserves a pre-fence cwd writer and rejects a later writer before the reader drains", async () => {
+	it("cancels a reader-blocked cwd writer and rejects later writers without delaying close", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
 		const cwd = path.join(tempDir, "root");
@@ -1438,17 +1438,24 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		});
 		await readerStarted.promise;
 
-		const admittedMove = sessionManager.moveTo(repoA);
-		const admissionClose = sessionManager.closeCwdMoveAdmission();
+		const pendingMove = sessionManager.moveTo(repoA);
+		const pendingMoveResult = pendingMove.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
 		const started = Date.now();
+		const admissionClose = sessionManager.closeCwdMoveAdmission();
 		await expect(sessionManager.moveTo(repoB)).rejects.toThrow("Session cwd move admission is closed.");
+		await admissionClose;
 		expect(Date.now() - started).toBeLessThan(1_000);
+		expect(await pendingMoveResult).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
 
 		releaseReader.resolve();
 		await reader;
-		await admittedMove;
-		await admissionClose;
-		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoA));
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
 		await sessionManager.close();
 	});
 

@@ -7401,6 +7401,7 @@ export class SessionManager {
 	#cwdTransitionOwner: symbol | undefined;
 	#cwdMoveAdmissionClosing = false;
 	#cwdMoveAdmissionClosed = false;
+	#pendingCwdMoveAdmissions = new Set<{ controller: AbortController; retainsOwnReadLease: boolean }>();
 	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
@@ -10798,11 +10799,32 @@ export class SessionManager {
 	 * only for the async context that already owns the lock — unrelated callers
 	 * queue on the tail instead of skipping it.
 	 */
-	async runExclusiveCwdTransition<T>(fn: () => Promise<T>): Promise<T> {
+	async runExclusiveCwdTransition<T>(fn: () => Promise<T>, options?: { signal?: AbortSignal }): Promise<T> {
 		const owner = this.#cwdTransitionOwner;
 		if (owner !== undefined && cwdTransitionAls.getStore() === owner) {
 			return fn();
 		}
+		const signal = options?.signal;
+		const throwIfAborted = (): void => {
+			if (!signal?.aborted) return;
+			throw signal.reason instanceof Error ? signal.reason : new Error("Session cwd move admission is closed.");
+		};
+		const waitAbortably = async (promise: Promise<void>): Promise<void> => {
+			throwIfAborted();
+			if (!signal) {
+				await promise;
+				return;
+			}
+			const aborted = Promise.withResolvers<void>();
+			const onAbort = () => aborted.resolve();
+			signal.addEventListener("abort", onAbort, { once: true });
+			try {
+				await Promise.race([promise, aborted.promise]);
+			} finally {
+				signal.removeEventListener("abort", onAbort);
+			}
+			throwIfAborted();
+		};
 		const previous = this.#cwdTransitionTail;
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#cwdTransitionTail = previous.then(
@@ -10814,17 +10836,45 @@ export class SessionManager {
 		this.#cwdWriterPending += 1;
 		const token = Symbol("cwd-transition");
 		try {
-			await previous.catch(() => {});
+			await waitAbortably(previous.catch(() => {}));
 			// A reader that entered before this writer was announced still holds the
 			// old cwd; the transition may not commit until every such lease is
 			// released, otherwise an in-flight tool resolves paths across the move.
-			while (this.#cwdReaderCount > 0) await this.#cwdReadersIdle;
+			while (this.#cwdReaderCount > 0) await waitAbortably(this.#cwdReadersIdle);
 			this.#cwdTransitionOwner = token;
 			return await cwdTransitionAls.run(token, fn);
 		} finally {
 			if (this.#cwdTransitionOwner === token) this.#cwdTransitionOwner = undefined;
 			this.#cwdWriterPending -= 1;
 			resolve();
+		}
+	}
+
+	async runExclusiveCwdMoveTransition<T>(fn: () => Promise<T>): Promise<T> {
+		if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
+			throw new Error("Session cwd move admission is closed.");
+		const readLease = cwdReadLeaseAls.getStore();
+		const admission = {
+			controller: new AbortController(),
+			retainsOwnReadLease: readLease?.active === true && readLease.owner === this.#cwdReadLeaseOwner,
+		};
+		this.#pendingCwdMoveAdmissions.add(admission);
+		try {
+			return await this.runExclusiveCwdTransition(
+				async () => {
+					const owner = this.#cwdTransitionOwner;
+					if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
+					this.#cwdMoveAdmittedOwners.add(owner);
+					try {
+						return await fn();
+					} finally {
+						this.#cwdMoveAdmittedOwners.delete(owner);
+					}
+				},
+				{ signal: admission.controller.signal },
+			);
+		} finally {
+			this.#pendingCwdMoveAdmissions.delete(admission);
 		}
 	}
 
@@ -10879,23 +10929,18 @@ export class SessionManager {
 
 	async closeCwdMoveAdmission(): Promise<void> {
 		if (this.#cwdMoveAdmissionClosed) return;
-		if (this.#cwdMoveAdmissionClosing) {
-			await this.#cwdTransitionTail;
-			return;
-		}
+		if (this.#cwdMoveAdmissionClosing) return;
 		this.#cwdMoveAdmissionClosing = true;
-		// With no admitted writer, fence synchronously without taking the writer
-		// lock. An abort-ignoring tool can retain a cwd read lease after the Agent has
-		// cooperatively ended its turn, and disposal must not wait on that unbounded
-		// work. A writer already announced before the fence keeps its place and is
-		// allowed to commit; this close queues behind it and rejects later writers.
-		if (this.#cwdWriterPending === 0) {
-			this.#cwdMoveAdmissionClosed = true;
-			return;
+		this.#cwdMoveAdmissionClosed = true;
+		// A writer that can acquire immediately keeps its pre-fence authority. Only
+		// cancel queued moves when an active reader would otherwise put that external
+		// work ahead of disposal's bounded Agent abort.
+		if (this.#cwdReaderCount > 0) {
+			for (const admission of this.#pendingCwdMoveAdmissions) {
+				if (!admission.retainsOwnReadLease)
+					admission.controller.abort(new Error("Session cwd move admission is closed."));
+			}
 		}
-		await this.runExclusiveCwdTransition(async () => {
-			this.#cwdMoveAdmissionClosed = true;
-		});
 	}
 	getCwdGeneration(): number {
 		return this.#cwdGeneration;
@@ -11099,18 +11144,7 @@ export class SessionManager {
 		},
 	): Promise<void> {
 		if (!this.#ownsCwdTransition()) {
-			if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
-				throw new Error("Session cwd move admission is closed.");
-			return this.runExclusiveCwdTransition(async () => {
-				const owner = this.#cwdTransitionOwner;
-				if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
-				this.#cwdMoveAdmittedOwners.add(owner);
-				try {
-					return await this.moveTo(newCwd, options);
-				} finally {
-					this.#cwdMoveAdmittedOwners.delete(owner);
-				}
-			});
+			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
 		}
 		const owner = this.#cwdTransitionOwner;
 		if (this.#cwdMoveAdmissionClosed && (owner === undefined || !this.#cwdMoveAdmittedOwners.has(owner)))

@@ -2443,7 +2443,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
 									);
 								}
-								return sessionManager.runExclusiveCwdTransition(async () => {
+								return sessionManager.runExclusiveCwdMoveTransition(async () => {
 									if (moveConsumed) {
 										throw new Error(
 											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
