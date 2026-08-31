@@ -235,6 +235,9 @@ export async function pollForToken(
 		});
 
 		if ("accessToken" in data && typeof data.accessToken === "string") {
+			if (!Number.isFinite(data.expiresIn) || data.expiresIn <= 0 || "error" in data) {
+				throw new Error("SSO OIDC CreateToken: invalid success response");
+			}
 			return data;
 		}
 
@@ -242,7 +245,7 @@ export async function pollForToken(
 			const errorCode = data.error;
 			if (errorCode === "authorization_pending") continue;
 			if (errorCode === "slow_down") {
-				currentInterval = Math.ceil(currentInterval * 1.5);
+				currentInterval += 5_000;
 				continue;
 			}
 			if (SSO_OIDC_FATAL_ERRORS.has(errorCode)) {
@@ -434,17 +437,13 @@ function ssoOidcEndpoint(region: string, pathSuffix: string): string {
 async function fetchOidc(url: string, init: RequestInit & { signal?: AbortSignal }): Promise<Response> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
-		let errorBody = "";
-		try {
-			errorBody = await response.text();
-		} catch {}
-		throw new Error(oidcRequestFailure(url, response, errorBody));
+		throw new Error(oidcRequestFailure(url, response));
 	}
 	return response;
 }
 
-function oidcRequestFailure(url: string, response: Response, body: string): string {
-	return `SSO OIDC request to ${url} failed: ${response.status} ${response.statusText}: ${body.slice(0, 500)}`;
+function oidcRequestFailure(url: string, response: Response): string {
+	return `SSO OIDC request to ${url} failed: ${response.status} ${response.statusText}`;
 }
 
 /**
@@ -463,10 +462,13 @@ async function createTokenOnce(
 	try {
 		data = JSON.parse(rawBody) as CreateTokenSuccess | CreateTokenError;
 	} catch {
-		throw new Error(oidcRequestFailure(url, response, rawBody));
+		throw new Error(oidcRequestFailure(url, response));
+	}
+	if (data === null || typeof data !== "object") {
+		throw new Error(oidcRequestFailure(url, response));
 	}
 	if (!response.ok && !("error" in data)) {
-		throw new Error(oidcRequestFailure(url, response, rawBody));
+		throw new Error(oidcRequestFailure(url, response));
 	}
 	return data;
 }
