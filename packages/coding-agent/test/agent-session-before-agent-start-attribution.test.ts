@@ -906,4 +906,59 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		await disposal;
 		session = undefined as unknown as AgentSession;
 	});
+
+	it("disposal drains a selection between validation and mutation admissions", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-between-admissions" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const admissionGapStarted = Promise.withResolvers<void>();
+		const releaseAdmissionGap = Promise.withResolvers<void>();
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onBeforeMutationAdmissionForTests: async () => {
+				admissionGapStarted.resolve();
+				await releaseAdmissionGap.promise;
+			},
+		});
+		await Promise.race([
+			admissionGapStarted.promise,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("Selection did not reach the inter-admission idle wait");
+			}),
+		]);
+		const disposal = session.dispose();
+		let disposalSettled = false;
+		void disposal.then(() => {
+			disposalSettled = true;
+		});
+		const queuedPrompt = session.prompt("reject while selection drains");
+		const queuedResult = queuedPrompt.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		await Bun.sleep(20);
+		expect(disposalSettled).toBe(false);
+
+		releaseAdmissionGap.resolve();
+		const selectionResult = await Promise.race([
+			selection,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("Selection did not settle after its idle wait was released");
+			}),
+		]);
+		expect(selectionResult).toMatchObject({
+			provider: selectionModel.provider,
+			modelId: selectionModel.id,
+		});
+		expect(await queuedResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+		await Promise.race([
+			disposal,
+			Bun.sleep(2_000).then(() => {
+				throw new Error("Disposal did not settle after the selection completed");
+			}),
+		]);
+		session = undefined as unknown as AgentSession;
+	});
 });

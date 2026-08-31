@@ -3720,10 +3720,12 @@ export class AgentSession {
 			// Only an active prompt may outlive bounded disposal. A selection mutates
 			// session/model state and must finish (or observe the closed fence) before
 			// teardown closes those resources; its own finally resolves the fence tail.
-			if (active?.kind === "selection") {
-				await active.settled.promise;
-				await this.#selectionFenceTail;
-			}
+			if (active?.kind === "selection") await active.settled.promise;
+			// An abort-ignoring prompt may have queued selection fences behind it, so
+			// that one case must bypass the fence. Otherwise the fence covers a
+			// selection between its validation and mutation admissions as well as one
+			// currently admitted.
+			if (active?.kind !== "prompt") await this.#selectionFenceTail;
 			return;
 		}
 		if (active) await active.settled.promise;
@@ -16255,6 +16257,8 @@ export class AgentSession {
 			onBeforeMutation?: () => void;
 			/** Run inside the selection admission after the durable mutation. */
 			onAfterMutation?: () => void;
+			/** Test seam: pause after idle drain but before mutation admission. */
+			onBeforeMutationAdmissionForTests?: () => Promise<void>;
 		},
 	): Promise<DefaultModelSelectionResult> {
 		// Reserve the causal selection fence synchronously, before credential
@@ -16308,6 +16312,7 @@ export class AgentSession {
 				{ allowDuringClosing: true },
 			);
 			await this.waitForIdle(selectionFenceGeneration);
+			await options?.onBeforeMutationAdmissionForTests?.();
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
