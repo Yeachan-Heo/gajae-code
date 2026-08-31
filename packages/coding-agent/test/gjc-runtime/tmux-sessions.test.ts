@@ -13,8 +13,8 @@ import { tmuxRuntimeSessionPath } from "@gajae-code/coding-agent/gjc-runtime/ses
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
-	buildGjcTmuxSessionSlug,
 	buildGjcTmuxSessionName,
+	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionHint,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
