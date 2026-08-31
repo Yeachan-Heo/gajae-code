@@ -1197,24 +1197,17 @@ function createQuerySurface(
 		kind: ctx.sessionMetadata?.kind ?? "main",
 	});
 	const lastAssistant = () => {
-		for (const entry of ctx.sessionManager.getBranch().toReversed()) {
-			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-			const content = entry.message.content;
+		const transcript =
+			typeof (ctx as Partial<ExtensionContext>).getTranscript === "function" ? ctx.getTranscript() : [];
+		for (const entry of transcript.toReversed()) {
+			if (entry.role !== "assistant") continue;
 			const text =
-				typeof content === "string"
-					? content
-					: Array.isArray(content)
-						? content
-								.filter(
-									(block): block is { type: "text"; text: string } =>
-										block.type === "text" && typeof block.text === "string",
-								)
-								.map(block => block.text)
-								.join("")
-						: "";
-			if (text.length > 0) return text;
+				typeof entry.body === "string"
+					? entry.body
+					: entry.content?.flatMap(block => (block.type === "text" ? [block.text] : [])).join("\n");
+			if (text !== undefined && text.trim().length > 0) return text;
 		}
-		return undefined;
+		return "";
 	};
 	const getProfileCredentialSessionId = () => ctx.credentialSessionId ?? id;
 	const profileSettings = (options.settings ?? ctx.settings) as Pick<Settings, "get"> | undefined;

@@ -80,6 +80,7 @@ async function routerFixture(
 		onClientCreated?: () => void | Promise<void>;
 		createBrokerClient?: () => Promise<SessionRouterClient>;
 		indexedRepo?: string;
+		onRequest?: (operation: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
 	} = {},
 ): Promise<RouterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
@@ -168,7 +169,7 @@ async function routerFixture(
 							requestOption?.beforeDispatch?.(context);
 							requestOption?.onDispatch?.(context);
 						}
-						return { events: [] };
+						return options.onRequest ? await options.onRequest(operation) : { events: [] };
 					},
 					close: async () => {},
 					send: frame => sent.push(frame),
@@ -718,6 +719,28 @@ describe("SessionRouter dispatch authority", () => {
 			expect(attachment).not.toBeNull();
 			expect(attachment?.isCurrent()).toBe(true);
 			expect(await fixture.router.request(fixture.sessionId, { type: "query_request" })).toEqual({ events: [] });
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("preserves session.last_assistant projection results through the broker Router", async () => {
+		const directResponse = {
+			type: "query_response",
+			id: "last-assistant",
+			ok: true,
+			page: { items: ["latest readable assistant text"], complete: true, revision: "1" },
+		};
+		const fixture = await routerFixture({ onRequest: () => directResponse });
+		try {
+			const request = {
+				type: "query_request",
+				id: "last-assistant",
+				query: "session.last_assistant",
+				input: {},
+			};
+			expect(await fixture.router.request(fixture.sessionId, request)).toEqual(directResponse);
+			expect(fixture.clients[0]?.requests).toContainEqual(request);
 		} finally {
 			await fixture.router.stop();
 		}
