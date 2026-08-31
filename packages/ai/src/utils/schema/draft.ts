@@ -193,6 +193,7 @@ function makeNullable(schema: JsonObject): JsonObject {
 function schemaMapNeedsDraft202012Upgrade(value: unknown, epoch: number): boolean {
 	if (!isJsonObject(value)) return false;
 	for (const k in value) {
+		if (!Object.hasOwn(value, k)) continue;
 		if (schemaNeedsDraft202012UpgradeImpl(value[k], epoch)) return true;
 	}
 	return false;

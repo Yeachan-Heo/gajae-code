@@ -301,7 +301,7 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 	for (const combiner of JSON_SCHEMA_COMBINERS) {
 		if (!Array.isArray(obj[combiner])) continue;
 		const variants = obj[combiner] as JsonObject[];
-		const allHaveConst = variants.every(v => isJsonObject(v) && "const" in v);
+		const allHaveConst = variants.every(v => isJsonObject(v) && Object.hasOwn(v, "const"));
 		if (!allHaveConst || variants.length === 0) continue;
 
 		const dedupedEnum: unknown[] = [];
