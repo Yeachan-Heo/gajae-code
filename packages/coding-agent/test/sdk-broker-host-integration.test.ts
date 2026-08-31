@@ -324,7 +324,7 @@ test("resumed direct SDK-only session replaces generation zero and is usable thr
 	const stateRoot = path.join(cwd, ".gjc", "state");
 	const sessionId = "sdk-direct-resume";
 	await fs.mkdir(cwd, { recursive: true });
-	const broker = new Broker({ agentDir });
+	let broker = new Broker({ agentDir });
 	await broker.start();
 	const index = await new SessionIndex(agentDir).open();
 	const incarnation = processIncarnation(process.pid);
@@ -373,7 +373,7 @@ test("resumed direct SDK-only session replaces generation zero and is usable thr
 		if (!start) throw new Error("SDK-only session_start handler was not registered.");
 		await start({}, context);
 		await index.refresh();
-		const resumed = index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		let resumed = index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		expect(resumed).toMatchObject({
 			endpointGeneration: 1,
 			live: true,
@@ -382,6 +382,32 @@ test("resumed direct SDK-only session replaces generation zero and is usable thr
 			locator: { cwd, stateRoot },
 		});
 		expect(resumed?.endpointMtimeMs).toEqual(expect.any(Number));
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const endpointIdentity = await fs.lstat(endpointPath, { bigint: true });
+		const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
+		await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs: endpointMtimeMs + 0.0005,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
+			...(incarnation ? { processIncarnation: incarnation } : {}),
+		});
+		await index.refresh();
+		resumed = index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		expect(Math.abs(endpointMtimeMs - resumed!.endpointMtimeMs!)).toBeGreaterThan(0);
+		expect(Math.abs(endpointMtimeMs - resumed!.endpointMtimeMs!)).toBeLessThanOrEqual(0.001);
+		expect(resumed?.endpointFileId).toBe(`${endpointIdentity.dev}:${endpointIdentity.ino}`);
+
+		await broker.stop();
+		broker = new Broker({ agentDir });
+		await broker.start();
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+			ok: true,
+			result: { sessionId, pid: process.pid, url: expect.stringMatching(/^ws:\/\/127\.0\.0\.1:/) },
+		});
 
 		await router.start();
 		const attachment = router.attachment(sessionId);

@@ -64,7 +64,6 @@ export function sessionAttachmentAuthorityId(input: {
 				mtimeNs: input.endpointIdentity.mtimeNs.toString(),
 				ctimeNs: input.endpointIdentity.ctimeNs.toString(),
 				size: input.endpointIdentity.size.toString(),
-				dev: input.endpointIdentity.dev.toString(),
 				ino: input.endpointIdentity.ino.toString(),
 			}
 		: undefined;
@@ -488,11 +487,11 @@ function sameEndpointIdentity(expected: SessionEndpointIdentity, current: Sessio
 }
 
 function matchesIndexedEndpointIdentity(identity: SessionEndpointIdentity, indexed: IndexedSession): boolean {
+	if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
+	if (indexed.endpointFileId === undefined) return identity.mtimeMs === indexed.endpointMtimeMs;
 	return (
-		indexed.endpointMtimeMs !== undefined &&
-		Number.isFinite(indexed.endpointMtimeMs) &&
-		Math.abs(identity.mtimeMs - indexed.endpointMtimeMs) <= 0.001 &&
-		(indexed.endpointFileId === undefined || indexed.endpointFileId === `${identity.dev}:${identity.ino}`)
+		indexed.endpointFileId === `${identity.dev}:${identity.ino}` &&
+		Math.abs(identity.mtimeMs - indexed.endpointMtimeMs) <= 0.001
 	);
 }
 
@@ -590,7 +589,13 @@ function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession)
 		!current.terminalUncertain &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs
+		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.endpointFileId === expected.endpointFileId &&
+		current.locator.cwd === expected.locator.cwd &&
+		resolveEquivalentPath(current.locator.stateRoot) === resolveEquivalentPath(expected.locator.stateRoot) &&
+		current.processIncarnation === expected.processIncarnation &&
+		current.hostIncarnation === expected.hostIncarnation &&
+		current.lifecycleRequestId === expected.lifecycleRequestId
 	);
 }
 
