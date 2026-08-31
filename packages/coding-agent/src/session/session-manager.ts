@@ -7402,6 +7402,7 @@ export class SessionManager {
 	#cwdMoveAdmissionClosing = false;
 	#cwdMoveAdmissionClosed = false;
 	#pendingCwdMoveAdmissions = new Set<AbortController>();
+	#cwdMoveAdmittedAdmissions = new Set<AbortController>();
 	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
@@ -10864,17 +10865,21 @@ export class SessionManager {
 				drained?.();
 			}
 		}
+		const admittedBeforeClose = this.#cwdWriterPending === 0 && this.#cwdReaderCount === 0;
 		const admission = new AbortController();
 		this.#pendingCwdMoveAdmissions.add(admission);
+		if (admittedBeforeClose) this.#cwdMoveAdmittedAdmissions.add(admission);
 		try {
 			return await this.runExclusiveCwdTransition(
 				async () => {
 					const owner = this.#cwdTransitionOwner;
 					if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
+					this.#cwdMoveAdmittedAdmissions.add(admission);
 					this.#cwdMoveAdmittedOwners.add(owner);
 					try {
 						return await fn();
 					} finally {
+						this.#cwdMoveAdmittedAdmissions.delete(admission);
 						this.#cwdMoveAdmittedOwners.delete(owner);
 					}
 				},
@@ -10882,6 +10887,7 @@ export class SessionManager {
 			);
 		} finally {
 			this.#pendingCwdMoveAdmissions.delete(admission);
+			this.#cwdMoveAdmittedAdmissions.delete(admission);
 			if (suspendedOwnReadLease) {
 				if (this.#cwdReaderCount === 0) {
 					const { promise, resolve } = Promise.withResolvers<void>();
@@ -10948,11 +10954,11 @@ export class SessionManager {
 		if (this.#cwdMoveAdmissionClosing) return;
 		this.#cwdMoveAdmissionClosing = true;
 		this.#cwdMoveAdmissionClosed = true;
-		// A writer that can acquire immediately keeps its pre-fence authority. Only
-		// cancel queued moves when an active reader would otherwise put that external
-		// work ahead of disposal's bounded Agent abort.
-		if (this.#cwdReaderCount > 0) {
-			for (const admission of this.#pendingCwdMoveAdmissions) {
+		// Preserve moves that already acquired exclusive ownership, but cancel every
+		// queued admission. A queued writer can otherwise pass the initial admission
+		// check after an earlier writer finishes and mutate the closed session.
+		for (const admission of this.#pendingCwdMoveAdmissions) {
+			if (!this.#cwdMoveAdmittedAdmissions.has(admission)) {
 				admission.abort(new Error("Session cwd move admission is closed."));
 			}
 		}

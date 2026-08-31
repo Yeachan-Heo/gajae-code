@@ -3059,6 +3059,7 @@ export class AgentSession {
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
+	#disposeDeadline = 0;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
 	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
@@ -8958,6 +8959,7 @@ export class AgentSession {
 		if (this.#disposePromise) return this.#disposePromise;
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.#disposePromise = promise;
+		this.#disposeDeadline = Date.now() + SIGNAL_TEARDOWN_TIMEOUT_MS;
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
 		this.#disposeAbortController.abort();
@@ -8975,7 +8977,21 @@ export class AgentSession {
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		this.#disconnectFromAgent();
-		void this.#dispose().then(resolve, reject);
+		const teardown = this.#dispose();
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		const deadline = Promise.withResolvers<void>();
+		timeout = setTimeout(() => deadline.resolve(), SIGNAL_TEARDOWN_TIMEOUT_MS);
+		timeout.unref?.();
+		void Promise.race([teardown, deadline.promise]).then(
+			() => {
+				if (timeout) clearTimeout(timeout);
+				resolve();
+			},
+			error => {
+				if (timeout) clearTimeout(timeout);
+				reject(error);
+			},
+		);
 		return promise;
 	}
 
@@ -8986,9 +9002,29 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
+		const awaitDisposeStep = async <T>(label: string, operation: Promise<T>): Promise<T | undefined> => {
+			const remainingMs = this.#disposeDeadline - Date.now();
+			if (remainingMs <= 0) {
+				logger.warn("Session dispose deadline reached", { label });
+				void operation.catch(() => {});
+				return undefined;
+			}
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const deadline = Promise.withResolvers<undefined>();
+			timeout = setTimeout(() => deadline.resolve(undefined), remainingMs);
+			timeout.unref?.();
+			try {
+				return await Promise.race([operation, deadline.promise]);
+			} catch (error) {
+				logger.warn("Session dispose step failed", { label, error: String(error) });
+				return undefined;
+			} finally {
+				if (timeout) clearTimeout(timeout);
+			}
+		};
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
-		await admissionClosed;
-		await this.sessionManager.closeCwdMoveAdmission();
+		await awaitDisposeStep("session admission close", admissionClosed);
+		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
