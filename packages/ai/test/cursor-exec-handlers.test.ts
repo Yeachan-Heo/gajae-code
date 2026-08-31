@@ -821,6 +821,7 @@ describe("Cursor request lifecycle", () => {
 
 	it("serializes multiple admitted exec responses before turn completion", async () => {
 		const { promise: releaseFirst, resolve: resolveFirst } = Promise.withResolvers<void>();
+		const { promise: firstStarted, resolve: resolveFirstStarted } = Promise.withResolvers<void>();
 		const server = http2.createServer();
 		server.on("stream", (stream: http2.ServerHttp2Stream) => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
@@ -859,7 +860,10 @@ describe("Cursor request lifecycle", () => {
 							async read(args) {
 								const id = Number(args.path.slice(-1));
 								calls.push(id);
-								if (id === 1) await releaseFirst;
+						if (id === 1) {
+							resolveFirstStarted();
+							await releaseFirst;
+						}
 								return { result: createReadSuccessResult(String(id)), toolResult: undefined };
 							},
 						},
@@ -867,7 +871,7 @@ describe("Cursor request lifecycle", () => {
 				)) {
 				}
 			})();
-			await Bun.sleep(10);
+			await firstStarted;
 			expect(calls).toEqual([1]);
 			resolveFirst();
 			await consume;
