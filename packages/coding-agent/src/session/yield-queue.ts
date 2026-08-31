@@ -200,7 +200,9 @@ export class YieldQueue {
 				messages.push(deferred.message);
 				continue;
 			}
-			messages.push(...this.#recordBuiltMessages(deferred.kind, deferred.dispatcher, deferred.entries, includeStale));
+			messages.push(
+				...this.#recordBuiltMessages(deferred.kind, deferred.dispatcher, deferred.entries, includeStale),
+			);
 		}
 		return messages;
 	}
