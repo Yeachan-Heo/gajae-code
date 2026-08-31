@@ -1293,8 +1293,8 @@ pub fn exact_replace_path(
 /// keeps cleanup bursts from spawning an unbounded number of OS threads; work
 /// that cannot be queued is left for the owning reconciliation pass.
 #[napi]
-pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) {
-	detached_cleanup_sender().try_send((path, identity)).ok();
+pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) -> bool {
+	detached_cleanup_sender().try_send((path, identity)).is_ok()
 }
 
 type DetachedCleanupJob = (String, NativeExactFileIdentity);

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NativeNoReplaceResult } from "@gajae-code/natives";
+import type { NativeExactFileIdentity, NativeNoReplaceResult } from "@gajae-code/natives";
 import * as natives from "@gajae-code/natives";
 import { getTrustedAgentFile } from "@gajae-code/utils";
 
@@ -181,7 +181,7 @@ async function publishNewInstallId(filePath: string, installId: string): Promise
 }
 
 function scheduleExactStagedCleanup(filePath: string, identity: BigIntStats, content: string): void {
-	natives.exactUnlinkDirectDetached(filePath, {
+	scheduleExactDetachedCleanup(filePath, {
 		dev: identity.dev,
 		ino: identity.ino,
 		nlink: identity.nlink,
@@ -191,6 +191,12 @@ function scheduleExactStagedCleanup(filePath: string, identity: BigIntStats, con
 		allowHardLink: true,
 		quarantineName: `.${path.basename(filePath)}.${randomUUID()}.quarantine`,
 	});
+}
+
+function scheduleExactDetachedCleanup(pathname: string, identity: NativeExactFileIdentity, attempt = 0): void {
+	if (natives.exactUnlinkDirectDetached(pathname, identity) || attempt >= 3) return;
+	const retry = setTimeout(() => scheduleExactDetachedCleanup(pathname, identity, attempt + 1), 25 * (attempt + 1));
+	retry.unref();
 }
 
 function isHardLinkUnsupported(error: unknown): boolean {
@@ -1030,7 +1036,7 @@ async function reclaimStaleClaim(claimPath: string, stat: BigIntStats, claim: Cl
 	scheduledClaimCleanups.add(cleanupKey);
 	const releaseTimer = setTimeout(() => scheduledClaimCleanups.delete(cleanupKey), INSTALL_ID_CLAIM_TIMEOUT_MS);
 	releaseTimer.unref();
-	natives.exactUnlinkDirectDetached(claimPath, {
+	scheduleExactDetachedCleanup(claimPath, {
 		dev: current.dev,
 		ino: current.ino,
 		nlink: current.nlink,
@@ -1046,7 +1052,7 @@ async function removeOwnedClaim(claimPath: string, token: string): Promise<void>
 	try {
 		const snapshot = await readClaimSnapshot(claimPath);
 		if (parseClaim(snapshot.content).token !== token) return;
-		natives.exactUnlinkDirectDetached(claimPath, {
+		scheduleExactDetachedCleanup(claimPath, {
 			dev: snapshot.stat.dev,
 			ino: snapshot.stat.ino,
 			nlink: snapshot.stat.nlink,

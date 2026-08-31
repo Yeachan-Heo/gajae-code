@@ -940,9 +940,11 @@ export declare function exactUnlinkDirect(path: string, identity: NativeExactFil
  *
  * Cleanup is best effort: the detached operation is intentionally abandoned
  * when the process exits, while the exact identity checks still protect any
- * pathname that remains alive long enough to be examined.
+ * pathname that remains alive long enough to be examined. A bounded queue
+ * keeps cleanup bursts from spawning an unbounded number of OS threads; work
+ * that cannot be queued is left for the owning reconciliation pass.
  */
-export declare function exactUnlinkDirectDetached(path: string, identity: NativeExactFileIdentity): void
+export declare function exactUnlinkDirectDetached(path: string, identity: NativeExactFileIdentity): boolean
 
 /**
  * Execute a brush shell command.
