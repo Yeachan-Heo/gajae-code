@@ -467,6 +467,54 @@ describe("normalizeSchemaForMCP", () => {
 		};
 		expect(normalizeSchemaForMCP(schema)).toEqual(schema);
 	});
+
+	// A tool schema arriving over the MCP wire is `JSON.parse`d, so `__proto__` is
+	// an ordinary own data property. Copying it with `out[key] = value` would hit
+	// `Object.prototype`'s `__proto__` setter and silently drop the property name.
+	it("preserves parsed `__proto__`, `constructor`, and `prototype` property names as own data", () => {
+		const parsed = JSON.parse(
+			'{"type":"object","properties":{"__proto__":{"type":"object","description":"open map"},"constructor":{"type":"string"},"prototype":{"type":"string"}},"required":["__proto__"]}',
+		);
+		const normalized = normalizeSchemaForMCP(parsed) as Record<string, Record<string, unknown>>;
+
+		expect(Object.keys(normalized.properties)).toEqual(["__proto__", "constructor", "prototype"]);
+		expect(Object.getOwnPropertyDescriptor(normalized.properties, "__proto__")?.value).toEqual({
+			type: "object",
+			description: "open map",
+			additionalProperties: true,
+		});
+		expect(Object.getPrototypeOf(normalized.properties)).toBe(Object.prototype);
+		expect(({} as Record<string, unknown>).description).toBeUndefined();
+	});
+
+	// `default`, `const`, `enum`, and `examples` carry instance data, not
+	// subschemas. The generic pre-walk used to recurse into them and rewrite user
+	// payloads as schemas; every value below changes visibly if that regresses.
+	it("copies literal payloads verbatim instead of normalizing them as schemas", () => {
+		const schema = {
+			type: "string",
+			default: { type: "object", nullable: true, format: null },
+			examples: [{ anyOf: [{ const: "a" }, { const: "b" }] }],
+		};
+		const before = structuredClone(schema);
+
+		expect(normalizeSchemaForMCP(schema)).toEqual({
+			type: "string",
+			default: { type: "object", nullable: true, format: null },
+			examples: [{ anyOf: [{ const: "a" }, { const: "b" }] }],
+		});
+		expect(schema).toEqual(before);
+	});
+
+	it("does not alias literal payloads back to the caller's input", () => {
+		const defaultValue = { nested: { keep: true } };
+		const schema = { type: "object", properties: {}, default: defaultValue };
+		const normalized = normalizeSchemaForMCP(schema) as { default: typeof defaultValue };
+
+		expect(normalized.default).toEqual(defaultValue);
+		expect(normalized.default).not.toBe(defaultValue);
+		expect(normalized.default.nested).not.toBe(defaultValue.nested);
+	});
 });
 
 // ---------------------------------------------------------------------------

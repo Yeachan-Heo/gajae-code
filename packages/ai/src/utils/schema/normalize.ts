@@ -109,9 +109,9 @@ function applySnakeCaseRenames(obj: JsonObject): JsonObject {
 		if (!Object.hasOwn(obj, k)) continue;
 		const renamed = SNAKE_TO_CAMEL_RENAMES.get(k);
 		if (renamed !== undefined) {
-			out[renamed] = obj[k];
+			setOwnKey(out, renamed, obj[k]);
 		} else if (!outHasOwn(out, k)) {
-			out[k] = obj[k];
+			setOwnKey(out, k, obj[k]);
 		}
 	}
 	return out;
@@ -128,7 +128,7 @@ function preHandleNullFields(obj: JsonObject): JsonObject {
 		const out: JsonObject = {};
 		for (const k in obj) {
 			if (!Object.hasOwn(obj, k) || k === "type") continue;
-			out[k] = obj[k];
+			setOwnKey(out, k, obj[k]);
 		}
 		out.nullable = true;
 		return out;
@@ -147,7 +147,7 @@ function preHandleNullFields(obj: JsonObject): JsonObject {
 	if (!sawNull) return obj;
 	const out: JsonObject = {};
 	for (const k in obj) {
-		if (Object.hasOwn(obj, k)) out[k] = obj[k];
+		if (Object.hasOwn(obj, k)) setOwnKey(out, k, obj[k]);
 	}
 	out.nullable = true;
 	if (kept.length === 0) {
@@ -156,7 +156,7 @@ function preHandleNullFields(obj: JsonObject): JsonObject {
 		delete out.anyOf;
 		const only = kept[0];
 		for (const k in only) {
-			if (Object.hasOwn(only, k) && !outHasOwn(out, k)) out[k] = only[k];
+			if (Object.hasOwn(only, k) && !outHasOwn(out, k)) setOwnKey(out, k, only[k]);
 		}
 	} else {
 		out.anyOf = kept;
@@ -166,6 +166,50 @@ function preHandleNullFields(obj: JsonObject): JsonObject {
 
 function outHasOwn(obj: JsonObject, key: string): boolean {
 	return Object.hasOwn(obj, key);
+}
+
+/**
+ * Setter-independent own-data write. `JSON.parse` produces `__proto__` as an own
+ * data property, but plain-object assignment routes it to `Object.prototype`'s
+ * `__proto__` setter, so the key would be silently dropped from the copy (and a
+ * schema-shaped value would mutate the copy's prototype). Every schema copy site
+ * writes through this helper so arbitrary property names round-trip as data.
+ */
+function setOwnKey(target: JsonObject, key: string, value: unknown): void {
+	if (key === "__proto__") {
+		Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+		return;
+	}
+	target[key] = value;
+}
+
+/**
+ * JSON Schema keywords whose values are literal instance data, not subschemas.
+ * The schema walkers must copy them verbatim: recursing into them rewrites user
+ * payloads (a `default` of `{type:"object",nullable:true}` is a default value,
+ * not a nullable object schema).
+ */
+const JSON_SCHEMA_LITERAL_PAYLOAD_KEYS = new Set(["default", "const", "enum", "examples"]);
+
+/** Deep copy of literal payload data; preserves arbitrary keys and breaks aliasing to the caller's input. */
+function cloneJsonLiteral(value: unknown, seen?: WeakMap<object, unknown>): unknown {
+	if (!value || typeof value !== "object") return value;
+	const cache = seen ?? new WeakMap<object, unknown>();
+	const cached = cache.get(value);
+	if (cached !== undefined) return cached;
+	if (Array.isArray(value)) {
+		const out: unknown[] = [];
+		cache.set(value, out);
+		for (const entry of value) out.push(cloneJsonLiteral(entry, cache));
+		return out;
+	}
+	const out: JsonObject = {};
+	cache.set(value, out);
+	for (const key in value as JsonObject) {
+		if (!Object.hasOwn(value, key)) continue;
+		setOwnKey(out, key, cloneJsonLiteral((value as JsonObject)[key], cache));
+	}
+	return out;
 }
 
 function inferJsonSchemaTypeFromValue(value: unknown): string | undefined {
@@ -239,7 +283,7 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 
 		const dedupedEnum: unknown[] = [];
 		for (const variant of variants) {
-			pushEnumValue(dedupedEnum, variant.const);
+			pushEnumValue(dedupedEnum, cloneJsonLiteral(variant.const));
 		}
 		result.enum = dedupedEnum;
 
@@ -278,10 +322,18 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 				continue;
 			}
 			if (options.stripNullableKeyword && key === "nullable") continue;
-			result[key] = normalizeSchemaNode(entry, {
-				...options,
-				insideProperties: key === "properties",
-			});
+			if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
+				setOwnKey(result, key, cloneJsonLiteral(entry));
+				continue;
+			}
+			setOwnKey(
+				result,
+				key,
+				normalizeSchemaNode(entry, {
+					...options,
+					insideProperties: key === "properties",
+				}),
+			);
 		}
 		applyDescriptionSpill(result, spill, options);
 		return applyNodePostProcessing(result, options);
@@ -297,13 +349,21 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 		}
 		if (options.stripNullableKeyword && key === "nullable") continue;
 		if (key === "const") {
-			constValue = entry;
+			constValue = cloneJsonLiteral(entry);
 			continue;
 		}
-		result[key] = normalizeSchemaNode(entry, {
-			...options,
-			insideProperties: key === "properties",
-		});
+		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
+			setOwnKey(result, key, cloneJsonLiteral(entry));
+			continue;
+		}
+		setOwnKey(
+			result,
+			key,
+			normalizeSchemaNode(entry, {
+				...options,
+				insideProperties: key === "properties",
+			}),
+		);
 	}
 
 	if (options.normalizeTypeArrayToNullable && Array.isArray(result.type)) {
@@ -883,7 +943,7 @@ function normalizeMcpObjectMapNode(value: unknown, cache: WeakMap<JsonObject, Js
 				: normalizeMcpObjectMapNode(child, cache);
 		}
 		if (next !== child) changed = true;
-		output[key] = next;
+		setOwnKey(output, key, next);
 	}
 
 	if (
@@ -920,7 +980,7 @@ function normalizeMcpObjectMap(schemaMap: JsonObject, cache: WeakMap<JsonObject,
 		const child = schemaMap[key];
 		const next = normalizeMcpObjectMapNode(child, cache);
 		if (next !== child) changed = true;
-		output[key] = next;
+		setOwnKey(output, key, next);
 	}
 	return changed ? output : schemaMap;
 }

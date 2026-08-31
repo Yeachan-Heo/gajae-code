@@ -5,6 +5,8 @@
 ### Fixed
 
 - MCP dispatcher tools now preserve dynamic nested `args` and `params` objects when a server declares them as propertyless JSON Schema objects. `normalizeSchemaForMCP` makes the implicit open-map semantics explicit with `additionalProperties: true` without loosening objects that declare properties or an explicit closure, so provider tool schemas no longer collapse valid nested arguments to `{}`.
+- Schema normalization now copies `default`, `const`, `enum`, and `examples` payloads verbatim. These keywords carry instance data, not subschemas, so the previous recursive walk rewrote user payloads as if they were schemas (a `default` of `{"type":"object","nullable":true}` lost `nullable`, and literal `anyOf`/`const` branches collapsed into `enum`).
+- Schema copies now write property names as own data properties. A `JSON.parse`d tool schema carries `__proto__` as an ordinary key, and plain assignment routed it to `Object.prototype`'s `__proto__` setter, dropping that valid property from the normalized schema.
 
 ## [0.15.6] - 2026-08-30
 
