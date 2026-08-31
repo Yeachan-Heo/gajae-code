@@ -1070,29 +1070,6 @@ function scheduleOwnedClaimCleanup(claimPath: string, token: string): void {
 	releaseTimer.unref();
 }
 
-async function createDirectClaim(claimPath: string, token: string): Promise<string> {
-	const content = serializeClaim(token, "publishing", Date.now() + INSTALL_ID_CLAIM_LEASE_MS);
-	const handle = await fs.open(claimPath, "wx", 0o600);
-	try {
-		await handle.writeFile(content, "utf8");
-		await handle.sync();
-		return content;
-	} finally {
-		await handle.close();
-	}
-}
-
-async function publishInstallIdDirectly(filePath: string, installId: string): Promise<void> {
-	const handle = await fs.open(filePath, "wx", 0o600);
-	try {
-		await handle.writeFile(`${installId}\n`, "utf8");
-		await handle.sync();
-	} finally {
-		await handle.close();
-	}
-	await syncDirectory(path.dirname(filePath));
-}
-
 async function publishWithClaim(filePath: string, installId: string): Promise<string> {
 	const claimPath = `${filePath}.lock`;
 	const token = randomUUID();
@@ -1130,35 +1107,19 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 		} finally {
 			await claim.close();
 		}
-		let claimSourceRetained = true;
-		try {
-			const claimPublication = await publishNoReplace(claimTemporaryPath, claimPath);
-			if (!claimPublication.result.ok) {
-				if (
-					claimPublication.result.code === "destination_exists" ||
-					claimPublication.result.reason === "destination_exists"
-				) {
-					const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
-					busy.code = "ECLAIM";
-					throw busy;
-				}
-				throw new Error(`telemetry install ID claim publication failed: ${claimPublication.result.reason}`);
+		const claimPublication = await publishNoReplace(claimTemporaryPath, claimPath);
+		if (!claimPublication.result.ok) {
+			if (
+				claimPublication.result.code === "destination_exists" ||
+				claimPublication.result.reason === "destination_exists"
+			) {
+				const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
+				busy.code = "ECLAIM";
+				throw busy;
 			}
-			claimSourceRetained = claimPublication.sourceRetained;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EUNSUPPORTED") throw error;
-			try {
-				await createDirectClaim(claimPath, token);
-			} catch (directError) {
-				if ((directError as NodeJS.ErrnoException).code === "EEXIST") {
-					const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
-					busy.code = "ECLAIM";
-					throw busy;
-				}
-				throw directError;
-			}
+			throw new Error(`telemetry install ID claim publication failed: ${claimPublication.result.reason}`);
 		}
-		if (!claimSourceRetained) claimTemporaryIdentity = undefined;
+		if (!claimPublication.sourceRetained) claimTemporaryIdentity = undefined;
 		ownsClaim = (await readClaimIdentity(claimPath))?.token === token;
 		if (!ownsClaim) throw new Error("telemetry install ID claim changed");
 		const scheduleHeartbeat = (): void => {
@@ -1201,22 +1162,11 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 		heartbeatStopped = false;
 		scheduleHeartbeat();
 		await assertClaimOwned(claimPath, token, "publishing");
-		try {
-			const publication = await publishNoReplace(temporaryPath, filePath);
-			if (!publication.result.ok) {
-				if (publication.result.code !== "destination_exists" && publication.result.reason !== "destination_exists")
-					throw new Error(`telemetry install ID publication failed: ${publication.result.reason}`);
-				return await readWinnerAfterCollision(filePath, claimPath, token);
-			}
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EUNSUPPORTED") throw error;
-			try {
-				await publishInstallIdDirectly(filePath, installId);
-			} catch (directError) {
-				if ((directError as NodeJS.ErrnoException).code === "EEXIST")
-					return await readWinnerAfterCollision(filePath, claimPath, token);
-				throw directError;
-			}
+		const publication = await publishNoReplace(temporaryPath, filePath);
+		if (!publication.result.ok) {
+			if (publication.result.code !== "destination_exists" && publication.result.reason !== "destination_exists")
+				throw new Error(`telemetry install ID publication failed: ${publication.result.reason}`);
+			return await readWinnerAfterCollision(filePath, claimPath, token);
 		}
 		publishedFinal = true;
 		await assertClaimOwned(claimPath, token, "publishing");
@@ -1261,8 +1211,14 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 			claimTemporaryIdentity !== undefined &&
 			claimTemporaryContent !== undefined &&
 			!claimTemporaryCleanupScheduled
-		)
-			scheduleExactStagedCleanup(claimTemporaryPath, claimTemporaryIdentity, claimTemporaryContent);
+		) {
+			const currentIdentity = await fs.lstat(claimTemporaryPath, { bigint: true }).catch(() => undefined);
+			if (currentIdentity !== undefined) {
+				const currentContent = (await readStagedContentBounded(claimTemporaryPath)) ?? claimTemporaryContent;
+				scheduleExactStagedCleanup(claimTemporaryPath, currentIdentity, currentContent);
+				claimTemporaryCleanupScheduled = true;
+			}
+		}
 		if (temporaryIdentity !== undefined && !temporaryCleanupScheduled)
 			scheduleExactStagedCleanup(temporaryPath, temporaryIdentity, `${installId}\n`);
 		if (ownsClaim && (!publishedFinal || committed)) scheduleOwnedClaimCleanup(claimPath, token);

@@ -256,7 +256,7 @@ describe("telemetry install ID", () => {
 		}
 	});
 
-	it("keeps readers behind a direct claim when rename and hard links are unavailable", async () => {
+	it("uses the native link stand-in when rename no-replace is unavailable", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
 		tempDirs.push(directory);
 		const filePath = path.join(directory, "telemetry-install-id");
@@ -268,27 +268,12 @@ describe("telemetry install ID", () => {
 		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(
 			unsupportedNoReplaceResult("invalid_request"),
 		);
-		const linkSpy = spyOn(natives, "linkNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
-		const finalOpened = Promise.withResolvers<void>();
-		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
-			const handle = await realOpen(...args);
-			if (String(args[0]) === filePath && args[1] === "wx") {
-				finalOpened.resolve();
-				await Bun.sleep(150);
-			}
-			return handle;
-		});
 
 		try {
-			const first = getTelemetryInstallId(filePath);
-			await finalOpened.promise;
-			const second = getTelemetryInstallId(filePath);
-			const ids = await Promise.all([first, second]);
+			const ids = await Promise.all([getTelemetryInstallId(filePath), getTelemetryInstallId(filePath)]);
 			expect(ids[0]).toBe(ids[1]);
 			expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
 		} finally {
-			openSpy.mockRestore();
-			linkSpy.mockRestore();
 			renameSpy.mockRestore();
 			hardLinkSpy.mockRestore();
 		}
