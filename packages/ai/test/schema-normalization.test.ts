@@ -705,6 +705,46 @@ describe("normalizeSchemaForMCP", () => {
 		expect(isValidJsonSchema(normalized)).toBe(true);
 	});
 
+	it("keeps reserved words as schema-map names through dereference and Zod cleanup", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				default: { $ref: "#/$defs/Value" },
+				const: {
+					type: "enum",
+					def: { type: "enum", entries: { enabled: "enabled" } },
+					enum: { enabled: "enabled" },
+				},
+			},
+			$defs: { Value: { type: "string" } },
+		};
+
+		const normalized = normalizeSchemaForMCP(schema) as Record<string, unknown>;
+		const properties = normalized.properties as Record<string, unknown>;
+
+		expect(properties.default).toEqual({ type: "string" });
+		expect(properties.const).toEqual({ type: "string", enum: ["enabled"] });
+		expect(normalized.$defs).toBeUndefined();
+		expect(isValidJsonSchema(normalized)).toBe(true);
+	});
+
+	it("applies sibling constraints when a local ref resolves to the boolean true schema", () => {
+		const schema = {
+			type: "object",
+			properties: {
+				value: { $ref: "#/$defs/Any", type: "string" },
+			},
+			$defs: { Any: true },
+		};
+
+		const normalized = normalizeSchemaForMCP(schema) as Record<string, unknown>;
+		const properties = normalized.properties as Record<string, unknown>;
+
+		expect(properties.value).toEqual({ type: "string" });
+		expect(normalized.$defs).toBeUndefined();
+		expect(isValidJsonSchema(normalized)).toBe(true);
+	});
+
 	it("terminates direct object cycles encountered while dereferencing definitions", () => {
 		const schema: Record<string, unknown> = {
 			$defs: { Node: { type: "object" } },
@@ -1079,6 +1119,20 @@ describe("stripResidualCombiners", () => {
 // ---------------------------------------------------------------------------
 
 describe("normalizeSchemaForCCA", () => {
+	it("normalizes colliding property names as schema-map entries", () => {
+		const normalized = normalizeSchemaForCCA({
+			type: "object",
+			properties: {
+				default: { anyOf: [{ type: "string" }, { type: "null" }] },
+			},
+			required: ["default"],
+		}) as Record<string, unknown>;
+		const properties = normalized.properties as Record<string, unknown>;
+
+		expect(properties.default).toEqual({ type: "string" });
+		expect(normalized.required).toEqual(["default"]);
+	});
+
 	it("collapses same-type anyOf variants when mixed-type collapse bails out", () => {
 		const prepared = normalizeSchemaForCCA({
 			type: "object",

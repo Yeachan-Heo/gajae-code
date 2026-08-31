@@ -12,6 +12,14 @@
 import { isJsonObject, type JsonObject } from "./types";
 
 const JSON_SCHEMA_LITERAL_PAYLOAD_KEYS = new Set(["default", "const", "enum", "examples"]);
+const JSON_SCHEMA_MAP_KEYS = new Set([
+	"properties",
+	"patternProperties",
+	"dependencies",
+	"dependentSchemas",
+	"$defs",
+	"definitions",
+]);
 
 function setOwnKey(target: JsonObject, key: string, value: unknown): void {
 	if (key === "__proto__") {
@@ -54,21 +62,37 @@ function resolveLocalRef(ref: string, root: JsonObject): unknown | undefined {
 }
 
 /** Find definition maps anywhere in a schema graph, excluding literal instance data. */
-function hasDefinitionMapDeep(value: unknown, seen: Set<object>): boolean {
+function hasDefinitionMapDeep(value: unknown, seen: Set<object>, inSchemaMap = false): boolean {
 	if (Array.isArray(value)) {
 		if (seen.has(value)) return false;
 		seen.add(value);
-		return value.some(entry => hasDefinitionMapDeep(entry, seen));
+		return value.some(entry => hasDefinitionMapDeep(entry, seen, false));
 	}
 	if (!isJsonObject(value) || seen.has(value)) return false;
 	seen.add(value);
 	for (const key in value) {
 		if (!Object.hasOwn(value, key)) continue;
-		if (key === "$defs" || key === "definitions") return true;
-		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) continue;
-		if (hasDefinitionMapDeep(value[key], seen)) return true;
+		if (!inSchemaMap && (key === "$defs" || key === "definitions")) return true;
+		if (!inSchemaMap && JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) continue;
+		const childInSchemaMap = !inSchemaMap && JSON_SCHEMA_MAP_KEYS.has(key);
+		if (hasDefinitionMapDeep(value[key], seen, childInSchemaMap)) return true;
 	}
 	return false;
+}
+
+function dereferenceSchemaMap(
+	schemaMap: JsonObject,
+	root: JsonObject,
+	visitingRefs: Set<string>,
+	visitingNodes: Set<object>,
+	state: DereferenceState,
+): JsonObject {
+	const result: JsonObject = {};
+	for (const key in schemaMap) {
+		if (!Object.hasOwn(schemaMap, key)) continue;
+		setOwnKey(result, key, dereferenceNode(schemaMap[key], root, visitingRefs, visitingNodes, state));
+	}
+	return result;
 }
 
 /**
@@ -81,6 +105,7 @@ function dereferenceNode(
 	visitingRefs: Set<string>,
 	visitingNodes: Set<object>,
 	state: DereferenceState,
+	inSchemaMap = false,
 ): unknown {
 	if (!node || typeof node !== "object") return node;
 	if (visitingNodes.has(node)) return {};
@@ -114,19 +139,29 @@ function dereferenceNode(
 					break;
 				}
 			}
-			if (!hasSiblings || !isJsonObject(inlined)) {
+			if (inlined === false) {
+				visitingNodes.delete(node);
+				return false;
+			}
+			if (!hasSiblings || (!isJsonObject(inlined) && inlined !== true)) {
 				visitingNodes.delete(node);
 				return inlined;
 			}
 			const merged: JsonObject = {};
-			for (const key in inlined) {
-				if (Object.hasOwn(inlined, key)) setOwnKey(merged, key, inlined[key]);
+			if (isJsonObject(inlined)) {
+				for (const key in inlined) {
+					if (Object.hasOwn(inlined, key)) setOwnKey(merged, key, inlined[key]);
+				}
 			}
 			for (const key in schemaNode) {
 				if (!Object.hasOwn(schemaNode, key) || key === "$ref") continue;
-				const sibling = JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)
-					? schemaNode[key]
-					: dereferenceNode(schemaNode[key], root, visitingRefs, visitingNodes, state);
+				const siblingValue = schemaNode[key];
+				const sibling =
+					!inSchemaMap && JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)
+						? schemaNode[key]
+						: !inSchemaMap && JSON_SCHEMA_MAP_KEYS.has(key) && isJsonObject(siblingValue)
+							? dereferenceSchemaMap(siblingValue, root, visitingRefs, visitingNodes, state)
+							: dereferenceNode(siblingValue, root, visitingRefs, visitingNodes, state);
 				setOwnKey(merged, key, sibling);
 			}
 			if (!state.unresolvedRef) {
@@ -145,8 +180,12 @@ function dereferenceNode(
 		const value = schemaNode[key];
 		// Literal instance data is not schema-shaped, even when it contains an
 		// object that happens to use schema-looking keys or a local `$ref`.
-		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
+		if (!inSchemaMap && JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
 			setOwnKey(result, key, value);
+			continue;
+		}
+		if (!inSchemaMap && JSON_SCHEMA_MAP_KEYS.has(key) && isJsonObject(value)) {
+			setOwnKey(result, key, dereferenceSchemaMap(value, root, visitingRefs, visitingNodes, state));
 			continue;
 		}
 		setOwnKey(result, key, dereferenceNode(value, root, visitingRefs, visitingNodes, state));

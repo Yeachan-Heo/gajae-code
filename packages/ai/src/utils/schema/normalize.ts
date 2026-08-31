@@ -494,7 +494,7 @@ function mergeObjectCombinerVariants(schema: JsonObject, combiner: "anyOf" | "on
 		for (const name in properties) {
 			if (!Object.hasOwn(properties, name)) continue;
 			const propertySchema = properties[name];
-			const existingSchema = mergedProperties[name];
+			const existingSchema = Object.hasOwn(mergedProperties, name) ? mergedProperties[name] : undefined;
 			setOwnKey(
 				mergedProperties,
 				name,
@@ -578,7 +578,7 @@ function collapseMixedTypeCombinerVariants(schema: JsonObject, combiner: "anyOf"
 				return schema;
 			}
 
-			const existingValue = mergedVariantFields[key];
+			const existingValue = Object.hasOwn(mergedVariantFields, key) ? mergedVariantFields[key] : undefined;
 			if (existingValue !== undefined && !areJsonValuesEqual(existingValue, variantValue)) {
 				return schema;
 			}
@@ -599,7 +599,7 @@ function collapseMixedTypeCombinerVariants(schema: JsonObject, combiner: "anyOf"
 	for (const key in mergedVariantFields) {
 		if (!Object.hasOwn(mergedVariantFields, key)) continue;
 		const value = mergedVariantFields[key];
-		const existingValue = nextSchema[key];
+		const existingValue = Object.hasOwn(nextSchema, key) ? nextSchema[key] : undefined;
 		if (existingValue !== undefined && !areJsonValuesEqual(existingValue, value)) {
 			return schema;
 		}
@@ -635,6 +635,16 @@ function collapseSameTypeCombinerVariants(schema: JsonObject, combiner: "anyOf" 
  * collapse can handle. This is needed because object-combiner merging can
  * create new anyOf in merged subtrees after child normalization already ran.
  */
+function stripResidualCombinersMap(schemaMap: JsonObject, epoch: number): JsonObject {
+	if (!once(schemaMap, epoch)) return {};
+	const result: JsonObject = {};
+	for (const key in schemaMap) {
+		if (!Object.hasOwn(schemaMap, key)) continue;
+		setOwnKey(result, key, stripResidualCombiners(schemaMap[key], epoch));
+	}
+	return result;
+}
+
 export function stripResidualCombiners(value: unknown, epoch: number = epochNext()): unknown {
 	if (Array.isArray(value)) {
 		if (!once(value, epoch)) return [];
@@ -649,7 +659,14 @@ export function stripResidualCombiners(value: unknown, epoch: number = epochNext
 			setOwnKey(result, key, value[key]);
 			continue;
 		}
-		setOwnKey(result, key, stripResidualCombiners(value[key], epoch));
+		const child = value[key];
+		setOwnKey(
+			result,
+			key,
+			JSON_SCHEMA_MAP_KEYS.has(key) && isJsonObject(child)
+				? stripResidualCombinersMap(child, epoch)
+				: stripResidualCombiners(child, epoch),
+		);
 	}
 	let current: JsonObject = result;
 	let changed = true;
@@ -726,7 +743,7 @@ function extractNullableUnionSchema(schema: unknown): NullableExtractionResult {
 		for (const key in nonNullVariant) {
 			if (!Object.hasOwn(nonNullVariant, key)) continue;
 			const value = nonNullVariant[key];
-			const existingValue = nextSchema[key];
+			const existingValue = Object.hasOwn(nextSchema, key) ? nextSchema[key] : undefined;
 			if (existingValue !== undefined && !areJsonValuesEqual(existingValue, value)) {
 				return { schema, nullable: false };
 			}
@@ -743,6 +760,23 @@ function extractNullableUnionSchema(schema: unknown): NullableExtractionResult {
 interface NullableNormalizationResult {
 	schema: unknown;
 	nullable: boolean;
+}
+
+function normalizeNullableSchemaMapForCloudCodeAssist(
+	value: JsonObject,
+	propertyMap: boolean,
+	epoch: number,
+): { schema: JsonObject; nullableKeys: Set<string> } {
+	if (!once(value, epoch)) return { schema: {}, nullableKeys: new Set() };
+	const normalized: JsonObject = {};
+	const nullableKeys = new Set<string>();
+	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
+		const child = normalizeNullablePropertiesForCloudCodeAssist(value[key], propertyMap, epoch);
+		setOwnKey(normalized, key, child.schema);
+		if (child.nullable) nullableKeys.add(key);
+	}
+	return { schema: normalized, nullableKeys };
 }
 
 function normalizeNullablePropertiesForCloudCodeAssist(
@@ -767,33 +801,30 @@ function normalizeNullablePropertiesForCloudCodeAssist(
 	}
 
 	const normalized: JsonObject = {};
+	let nullablePropertyKeys: Set<string> | undefined;
 	for (const key in value) {
 		if (!Object.hasOwn(value, key)) continue;
 		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
 			setOwnKey(normalized, key, value[key]);
 			continue;
 		}
+		if (JSON_SCHEMA_MAP_KEYS.has(key) && isJsonObject(value[key])) {
+			const mapped = normalizeNullableSchemaMapForCloudCodeAssist(value[key], key === "properties", epoch);
+			setOwnKey(normalized, key, mapped.schema);
+			if (key === "properties") nullablePropertyKeys = mapped.nullableKeys;
+			continue;
+		}
 		setOwnKey(normalized, key, normalizeNullablePropertiesForCloudCodeAssist(value[key], false, epoch).schema);
 	}
 
-	if (isJsonObject(normalized.properties)) {
-		const properties = normalized.properties;
+	if (nullablePropertyKeys && isJsonObject(normalized.properties)) {
 		const required = new Set(
 			Array.isArray(normalized.required)
 				? normalized.required.filter((entry): entry is string => typeof entry === "string")
 				: [],
 		);
-		const nextProperties: JsonObject = {};
-		for (const name in properties) {
-			if (!Object.hasOwn(properties, name)) continue;
-			const normalizedProperty = normalizeNullablePropertiesForCloudCodeAssist(properties[name], true, epoch);
-			setOwnKey(nextProperties, name, normalizedProperty.schema);
-			if (normalizedProperty.nullable) {
-				required.delete(name);
-			}
-		}
-		normalized.properties = nextProperties;
-		if (Array.isArray(normalized.required)) {
+		for (const key of nullablePropertyKeys) required.delete(key);
+		if (Object.hasOwn(normalized, "required") && Array.isArray(normalized.required)) {
 			normalized.required = Array.from(required);
 		}
 	}
@@ -861,9 +892,23 @@ function hasResidualSchemaIncompatibilities(
 	for (const k in value) {
 		if (!Object.hasOwn(value, k)) continue;
 		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(k)) continue;
-		if (hasResidualSchemaIncompatibilities(value[k], checks, epoch)) {
+		const child = value[k];
+		const hasResidual =
+			JSON_SCHEMA_MAP_KEYS.has(k) && isJsonObject(child)
+				? hasResidualSchemaMap(child, checks, epoch)
+				: hasResidualSchemaIncompatibilities(child, checks, epoch);
+		if (hasResidual) {
 			return true;
 		}
+	}
+	return false;
+}
+
+function hasResidualSchemaMap(value: JsonObject, checks: ResidualIncompatibilityChecks, epoch: number): boolean {
+	if (!once(value, epoch)) return false;
+	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
+		if (hasResidualSchemaIncompatibilities(value[key], checks, epoch)) return true;
 	}
 	return false;
 }

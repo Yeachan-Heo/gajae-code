@@ -115,6 +115,14 @@ const KEYS_THAT_ACCEPT_NULL: Record<string, true> = {
 	examples: true,
 };
 const JSON_SCHEMA_LITERAL_PAYLOAD_KEYS = new Set(["default", "const", "enum", "examples"]);
+const JSON_SCHEMA_MAP_KEYS = new Set([
+	"properties",
+	"patternProperties",
+	"dependencies",
+	"dependentSchemas",
+	"$defs",
+	"definitions",
+]);
 
 function setOwnKey(target: JsonObject, key: string, value: unknown): void {
 	if (key === "__proto__") {
@@ -319,7 +327,20 @@ export function decontaminateZodInstance(value: unknown): unknown {
 	return walk(value, new WeakSet());
 }
 
-function walk(value: unknown, seen: WeakSet<object>): unknown {
+function walkSchemaMap(value: JsonObject, seen: WeakSet<object>): JsonObject {
+	let changed = false;
+	const out: JsonObject = {};
+	for (const key in value) {
+		if (!Object.hasOwn(value, key)) continue;
+		const child = value[key];
+		const rewritten = walk(child, seen);
+		if (rewritten !== child) changed = true;
+		setOwnKey(out, key, rewritten);
+	}
+	return changed ? out : value;
+}
+
+function walk(value: unknown, seen: WeakSet<object>, inSchemaMap = false): unknown {
 	if (Array.isArray(value)) {
 		if (seen.has(value)) return value;
 		seen.add(value);
@@ -349,11 +370,14 @@ function walk(value: unknown, seen: WeakSet<object>): unknown {
 	for (const key in value) {
 		if (!Object.hasOwn(value, key)) continue;
 		const child = value[key];
-		if (JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
+		if (!inSchemaMap && JSON_SCHEMA_LITERAL_PAYLOAD_KEYS.has(key)) {
 			setOwnKey(out, key, child);
 			continue;
 		}
-		const rewritten = walk(child, seen);
+		const rewritten =
+			!inSchemaMap && JSON_SCHEMA_MAP_KEYS.has(key) && isJsonObject(child)
+				? walkSchemaMap(child, seen)
+				: walk(child, seen);
 		if (rewritten !== child) changed = true;
 		setOwnKey(out, key, rewritten);
 	}
