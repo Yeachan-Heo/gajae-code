@@ -2307,6 +2307,15 @@ function recordCodexWebSocketFailure(state: CodexWebSocketSessionState, activate
 	}
 }
 
+/**
+ * Bun 1.4.0's Windows WebSocket client can segfault during TLS handshakes.
+ * Keep the model's websocket preference available on other platforms, while
+ * requiring an explicit opt-in on Windows until the bundled runtime is fixed.
+ */
+export function isCodexWebSocketSafeByDefault(platform: NodeJS.Platform = process.platform): boolean {
+	return platform !== "win32";
+}
+
 function shouldUseCodexWebSocket(
 	model: Model<"openai-codex-responses">,
 	state: CodexWebSocketSessionState | undefined,
@@ -2314,7 +2323,11 @@ function shouldUseCodexWebSocket(
 ): boolean {
 	if (!state || state.disableWebsocket) return false;
 	if (preferWebsockets === false) return false;
-	return isCodexWebSocketEnvEnabled() || preferWebsockets === true || model.preferWebsockets === true;
+	return (
+		isCodexWebSocketEnvEnabled() ||
+		preferWebsockets === true ||
+		(isCodexWebSocketSafeByDefault() && model.preferWebsockets === true)
+	);
 }
 
 export interface OpenAICodexTransportDetails {
@@ -2372,7 +2385,9 @@ export function getOpenAICodexTransportDetails(
 	const websocketPreferred =
 		options?.preferWebsockets === false
 			? false
-			: isCodexWebSocketEnvEnabled() || options?.preferWebsockets === true || model.preferWebsockets === true;
+			: isCodexWebSocketEnvEnabled() ||
+				options?.preferWebsockets === true ||
+				(isCodexWebSocketSafeByDefault() && model.preferWebsockets === true);
 	const state = getCodexWebSocketStateForPublicSession(model, options);
 
 	return {

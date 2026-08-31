@@ -6,6 +6,7 @@ import {
 	codexToolWireName,
 	convertOpenAICodexResponsesTools,
 	formatCodexUserAgent,
+	isCodexWebSocketSafeByDefault,
 	normalizeCodexToolChoice,
 } from "@gajae-code/ai/providers/openai-codex-responses";
 import type { Tool } from "@gajae-code/ai/types";
@@ -26,6 +27,17 @@ describe("openai-codex user agent", () => {
 		const userAgent = formatCodexUserAgent("linux\n", "6.8.0\t-generic", "arm64\r");
 
 		expect(userAgent).toMatch(/^pi\/[^ ]+ \(linux 6\.8\.0-generic; arm64\)$/);
+	});
+});
+
+describe("openai-codex websocket platform policy", () => {
+	it("requires explicit opt-in on Windows", () => {
+		expect(isCodexWebSocketSafeByDefault("win32")).toBe(false);
+	});
+
+	it("keeps model websocket defaults enabled off Windows", () => {
+		expect(isCodexWebSocketSafeByDefault("linux")).toBe(true);
+		expect(isCodexWebSocketSafeByDefault("darwin")).toBe(true);
 	});
 });
 
