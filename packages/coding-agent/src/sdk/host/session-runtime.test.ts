@@ -17,7 +17,7 @@ import { createKindAwareReconciliation } from "../bus/kind-aware-reconciliation"
 import { createPromptReconciliation } from "../bus/prompt-reconciliation";
 import { createReconciliationStore } from "../bus/reconciliation-store";
 import { BROKER_RUNTIME_ABORT_CAPABILITY_FIELD, setBrokerRuntimeAbortCapabilityForTest } from "./control/runtime-gate";
-import { CursorRegistry, QueryHandlers, RevisionStore } from "./query";
+import { CursorRegistry, QueryHandlers, RevisionStore, type QueryResponse } from "./query";
 import {
 	createInvocationReconciliation,
 	createSdkSessionRuntimeExtension,
@@ -151,7 +151,7 @@ async function queryGoalState(
 	return response.page?.items[0];
 }
 
-async function queryLastAssistant(ctx: ExtensionContext, sessionId: string): Promise<unknown> {
+async function queryLastAssistant(ctx: ExtensionContext, sessionId: string): Promise<QueryResponse> {
 	const surface = createSdkSurfaceFactory({
 		ctx,
 		id: sessionId,
@@ -167,8 +167,7 @@ async function queryLastAssistant(ctx: ExtensionContext, sessionId: string): Pro
 		query: "session.last_assistant",
 		connectionId: "last-assistant-test-connection",
 	});
-	if (!response.ok) throw new Error(`last assistant query failed: ${JSON.stringify(response)}`);
-	return response.page?.items[0];
+	return response;
 }
 
 test("session.last_assistant returns the latest projected readable text past non-text assistant tails", async () => {
@@ -213,10 +212,10 @@ test("session.last_assistant returns the latest projected readable text past non
 		],
 	});
 
-	expect(await queryLastAssistant(ctx, sessionId)).toBe("first line\nsecond line");
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: true, page: { items: ["first line\nsecond line"] } });
 });
 
-test("session.last_assistant returns empty when the projected transcript has no readable assistant text", async () => {
+test("session.last_assistant returns resource_gone when the projected transcript has no readable assistant text", async () => {
 	const sessionId = "last-assistant-empty";
 	const ctx = extensionContext(sessionId, "/tmp", {
 		transcript: [
@@ -237,7 +236,7 @@ test("session.last_assistant returns empty when the projected transcript has no 
 		],
 	});
 
-	expect(await queryLastAssistant(ctx, sessionId)).toBe("");
+	expect(await queryLastAssistant(ctx, sessionId)).toMatchObject({ ok: false, error: { code: "resource_gone" } });
 });
 
 test("native prompt reconciliation fails closed for an explicitly empty assistant result", () => {
