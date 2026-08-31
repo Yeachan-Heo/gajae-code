@@ -146,7 +146,7 @@ function preHandleNullFields(obj: JsonObject): JsonObject {
 	let sawNull = false;
 	const kept: unknown[] = [];
 	for (const v of variants) {
-		if (isJsonObject(v) && v.type === "null") {
+		if (isJsonObject(v) && Object.hasOwn(v, "type") && v.type === "null") {
 			sawNull = true;
 			continue;
 		}
@@ -299,8 +299,9 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 	const result: JsonObject = {};
 	let spill: Array<[string, unknown]> | undefined;
 	for (const combiner of JSON_SCHEMA_COMBINERS) {
-		if (!Array.isArray(obj[combiner])) continue;
-		const variants = obj[combiner] as JsonObject[];
+		const variantsRaw = Object.hasOwn(obj, combiner) ? obj[combiner] : undefined;
+		if (!Array.isArray(variantsRaw)) continue;
+		const variants = variantsRaw as JsonObject[];
 		const allHaveConst = variants.every(v => isJsonObject(v) && Object.hasOwn(v, "const"));
 		if (!allHaveConst || variants.length === 0) continue;
 
@@ -311,7 +312,7 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 		result.enum = dedupedEnum;
 
 		const explicitTypes = variants
-			.map(variant => variant.type)
+			.map(variant => (Object.hasOwn(variant, "type") ? variant.type : undefined))
 			.filter((variantType): variantType is string => typeof variantType === "string");
 		const allHaveSameExplicitType =
 			explicitTypes.length === variants.length &&
