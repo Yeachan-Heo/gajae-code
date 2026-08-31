@@ -7399,6 +7399,7 @@ export class SessionManager {
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
+	#cwdMoveAdmissionClosing = false;
 	#cwdMoveAdmissionClosed = false;
 	#cwdMoveAdmittedOwners = new Set<symbol>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
@@ -10877,6 +10878,12 @@ export class SessionManager {
 	}
 
 	async closeCwdMoveAdmission(): Promise<void> {
+		if (this.#cwdMoveAdmissionClosed) return;
+		if (this.#cwdMoveAdmissionClosing) {
+			await this.#cwdTransitionTail;
+			return;
+		}
+		this.#cwdMoveAdmissionClosing = true;
 		// With no admitted writer, fence synchronously without taking the writer
 		// lock. An abort-ignoring tool can retain a cwd read lease after the Agent has
 		// cooperatively ended its turn, and disposal must not wait on that unbounded
@@ -11092,7 +11099,8 @@ export class SessionManager {
 		},
 	): Promise<void> {
 		if (!this.#ownsCwdTransition()) {
-			if (this.#cwdMoveAdmissionClosed) throw new Error("Session cwd move admission is closed.");
+			if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
+				throw new Error("Session cwd move admission is closed.");
 			return this.runExclusiveCwdTransition(async () => {
 				const owner = this.#cwdTransitionOwner;
 				if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
