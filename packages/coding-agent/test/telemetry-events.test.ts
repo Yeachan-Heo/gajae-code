@@ -3,6 +3,7 @@ import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as natives from "@gajae-code/natives";
 import { getTelemetryInstallId, serializeTelemetryEvent } from "../src/telemetry/events";
 
@@ -12,6 +13,22 @@ const realLstat = fs.lstat;
 const realStat = fs.stat.bind(fs);
 
 const realBunSleep = Bun.sleep;
+const CLAIM_WRITE_FLAGS =
+	fs.constants.O_RDWR |
+	(process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
+
+function unsupportedNoReplaceResult(): NativeNoReplaceResult {
+	return {
+		ok: false,
+		code: "atomic_unavailable",
+		mutationState: "not_committed",
+		durabilityState: "not_attempted",
+		reason: "atomic_unavailable",
+		primitive: "unsupported",
+		phase: "pre_mutation",
+		diagnostic: { schemaVersion: 1, collectionState: "not_run" },
+	};
+}
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
@@ -234,6 +251,42 @@ describe("telemetry install ID", () => {
 			expect((await fs.readdir(directory)).filter(name => !name.endsWith(".tmp"))).toEqual(["telemetry-install-id"]);
 		} finally {
 			linkSpy.mockRestore();
+		}
+	});
+
+	it("keeps readers behind a direct claim when rename and hard links are unavailable", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-telemetry-test-"));
+		tempDirs.push(directory);
+		const filePath = path.join(directory, "telemetry-install-id");
+		const hardLinkSpy = spyOn(fs, "link").mockImplementation(async () => {
+			const error = new Error("hard links are unavailable") as NodeJS.ErrnoException;
+			error.code = "EPERM";
+			throw error;
+		});
+		const renameSpy = spyOn(natives, "renameNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
+		const linkSpy = spyOn(natives, "linkNoReplacePathAsync").mockResolvedValue(unsupportedNoReplaceResult());
+		const finalOpened = Promise.withResolvers<void>();
+		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
+			const handle = await realOpen(...args);
+			if (String(args[0]) === filePath && args[1] === "wx") {
+				finalOpened.resolve();
+				await Bun.sleep(150);
+			}
+			return handle;
+		});
+
+		try {
+			const first = getTelemetryInstallId(filePath);
+			await finalOpened.promise;
+			const second = getTelemetryInstallId(filePath);
+			const ids = await Promise.all([first, second]);
+			expect(ids[0]).toBe(ids[1]);
+			expect((await fs.stat(filePath)).mode & 0o777).toBe(0o600);
+		} finally {
+			openSpy.mockRestore();
+			linkSpy.mockRestore();
+			renameSpy.mockRestore();
+			hardLinkSpy.mockRestore();
 		}
 	});
 
@@ -784,7 +837,7 @@ describe("telemetry install ID", () => {
 					await originalSync();
 				};
 			}
-			if (String(args[0]) === claimPath && args[1] === "r+" && ++claimOpens % 2 === 0) {
+			if (String(args[0]) === claimPath && args[1] === CLAIM_WRITE_FLAGS && ++claimOpens % 2 === 0) {
 				const originalSync = handle.sync.bind(handle);
 				handle.sync = async () => {
 					refreshes++;
@@ -834,7 +887,7 @@ describe("telemetry install ID", () => {
 		let claimOpens = 0;
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const handle = await realOpen(...args);
-			if (String(args[0]) === claimPath && args[1] === "r+" && ++claimOpens % 2 === 0) {
+			if (String(args[0]) === claimPath && args[1] === CLAIM_WRITE_FLAGS && ++claimOpens % 2 === 0) {
 				const originalSync = handle.sync.bind(handle);
 				handle.sync = async () => {
 					refreshes++;
@@ -890,7 +943,7 @@ describe("telemetry install ID", () => {
 		let partialWrites = 0;
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const handle = await realOpen(...args);
-			if (String(args[0]) === claimPath && args[1] === "r+" && ++claimOpens % 2 === 0) {
+			if (String(args[0]) === claimPath && args[1] === CLAIM_WRITE_FLAGS && ++claimOpens % 2 === 0) {
 				const originalWrite = handle.write.bind(handle);
 				handle.write = (async (buffer, offset, length, position) => {
 					partialWrites++;
@@ -922,7 +975,7 @@ describe("telemetry install ID", () => {
 		let claimOpens = 0;
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const handle = await realOpen(...args);
-			if (String(args[0]) === claimPath && args[1] === "r+" && ++claimOpens % 2 === 0) {
+			if (String(args[0]) === claimPath && args[1] === CLAIM_WRITE_FLAGS && ++claimOpens % 2 === 0) {
 				handle.sync = async () => {
 					const error = new Error("claim sync failed") as NodeJS.ErrnoException;
 					error.code = "EIO";
@@ -952,7 +1005,7 @@ describe("telemetry install ID", () => {
 		});
 		const openSpy = spyOn(fs, "open").mockImplementation(async (...args) => {
 			const handle = await realOpen(...args);
-			if (String(args[0]) === claimPath && args[1] === "r+") {
+			if (String(args[0]) === claimPath && args[1] === CLAIM_WRITE_FLAGS) {
 				const originalUtimes = handle.utimes.bind(handle);
 				let substituted = false;
 				handle.utimes = async (atime, mtime) => {

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NativeNoReplaceResult } from "@gajae-code/natives";
 import * as natives from "@gajae-code/natives";
 import { getTrustedAgentFile } from "@gajae-code/utils";
 
@@ -52,6 +53,10 @@ const INSTALL_ID_CLAIM_POLL_INITIAL_MS = 25;
 const INSTALL_ID_MAX_SERIALIZED_BYTES = 128;
 const CLAIM_MAX_SERIALIZED_BYTES = 16_384;
 const INSTALL_ID_PARTIAL_GRACE_MS = 250;
+const INSTALL_ID_NOFOLLOW_NONBLOCK_FLAGS =
+	process.platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0);
+const INSTALL_ID_READ_FLAGS = fs.constants.O_RDONLY | INSTALL_ID_NOFOLLOW_NONBLOCK_FLAGS;
+const INSTALL_ID_WRITE_FLAGS = fs.constants.O_RDWR | INSTALL_ID_NOFOLLOW_NONBLOCK_FLAGS;
 const durableInstallIdPaths = new Map<string, { identity: string; promise: Promise<void> }>();
 const scheduledClaimCleanups = new Set<string>();
 
@@ -193,6 +198,23 @@ function isHardLinkUnsupported(error: unknown): boolean {
 	return code === "EOPNOTSUPP" || code === "ENOTSUP" || code === "EPERM" || code === "ENOSYS";
 }
 
+function isAtomicPublicationUnsupported(result: NativeNoReplaceResult): boolean {
+	return result.code === "atomic_unavailable" || result.reason === "atomic_unavailable";
+}
+
+async function publishNoReplace(
+	sourcePath: string,
+	destinationPath: string,
+): Promise<{ result: NativeNoReplaceResult; sourceRetained: boolean }> {
+	const renamed = await natives.renameNoReplacePathAsync(sourcePath, destinationPath);
+	if (!isAtomicPublicationUnsupported(renamed)) return { result: renamed, sourceRetained: false };
+	const linked = await natives.linkNoReplacePathAsync(sourcePath, destinationPath);
+	if (!isAtomicPublicationUnsupported(linked)) return { result: linked, sourceRetained: linked.ok };
+	const unsupported = new Error("atomic no-replace publication is unavailable") as NodeJS.ErrnoException;
+	unsupported.code = "EUNSUPPORTED";
+	throw unsupported;
+}
+
 async function syncDirectory(directory: string): Promise<void> {
 	let handle: fs.FileHandle;
 	try {
@@ -212,8 +234,43 @@ async function syncDirectory(directory: string): Promise<void> {
 	}
 }
 
+async function openRegularFileNoFollow(
+	filePath: string,
+	flags: number,
+	failureMessage: string,
+	failureCode?: string,
+): Promise<fs.FileHandle> {
+	let named: BigIntStats | undefined;
+	if (process.platform === "win32") {
+		named = await fs.lstat(filePath, { bigint: true });
+		if (!named.isFile()) {
+			const error = new Error(failureMessage) as NodeJS.ErrnoException;
+			if (failureCode !== undefined) error.code = failureCode;
+			throw error;
+		}
+	}
+	const handle = await fs.open(filePath, flags);
+	if (named === undefined) return handle;
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile() || opened.dev !== named.dev || opened.ino !== named.ino) throw claimRaceError();
+		return handle;
+	} catch (error) {
+		await handle.close().catch(() => undefined);
+		throw error;
+	}
+}
+
+async function openInstallIdFile(filePath: string, flags: number): Promise<fs.FileHandle> {
+	return openRegularFileNoFollow(filePath, flags, "telemetry install ID is malformed");
+}
+
+async function openClaimFile(claimPath: string, flags: number): Promise<fs.FileHandle> {
+	return openRegularFileNoFollow(claimPath, flags, "telemetry install ID claim is nonregular", "ECLAIMNONREGULAR");
+}
+
 async function syncFile(filePath: string, expected?: BigIntStats): Promise<void> {
-	const handle = await fs.open(filePath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+	const handle = await openInstallIdFile(filePath, INSTALL_ID_WRITE_FLAGS);
 	try {
 		const stat = await handle.stat({ bigint: true });
 		if (
@@ -234,10 +291,10 @@ async function chmodWinner(filePath: string, expected: BigIntStats): Promise<boo
 	let handle: fs.FileHandle;
 	let readOnly = false;
 	try {
-		handle = await fs.open(filePath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		handle = await openInstallIdFile(filePath, INSTALL_ID_WRITE_FLAGS);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
-		handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		handle = await openInstallIdFile(filePath, INSTALL_ID_READ_FLAGS);
 		readOnly = true;
 	}
 	try {
@@ -252,7 +309,7 @@ async function chmodWinner(filePath: string, expected: BigIntStats): Promise<boo
 		await handle.chmod(0o600);
 		if (readOnly) {
 			await handle.close();
-			handle = await fs.open(filePath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+			handle = await openInstallIdFile(filePath, INSTALL_ID_WRITE_FLAGS);
 			const reopened = await handle.stat({ bigint: true });
 			if (reopened.dev !== expected.dev || reopened.ino !== expected.ino) return false;
 		}
@@ -299,7 +356,7 @@ type PersistedInstallIdSnapshot = { value: string; stat: BigIntStats };
 async function readPublishedInstallIdSnapshot(filePath: string): Promise<PersistedInstallIdSnapshot> {
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		handle = await openInstallIdFile(filePath, INSTALL_ID_READ_FLAGS);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile() || stat.size > BigInt(INSTALL_ID_MAX_SERIALIZED_BYTES))
 			throw new Error("telemetry install ID is malformed");
@@ -354,7 +411,7 @@ async function readPublishedInstallId(filePath: string): Promise<string> {
 async function readStagedContentBounded(filePath: string): Promise<string | undefined> {
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		handle = await openRegularFileNoFollow(filePath, INSTALL_ID_READ_FLAGS, "telemetry staged file is nonregular");
 		const identity = await handle.stat({ bigint: true });
 		if (!identity.isFile() || identity.size > BigInt(CLAIM_MAX_SERIALIZED_BYTES)) return undefined;
 		const bytes = await readClaimHandleBounded(handle, identity.size);
@@ -403,6 +460,7 @@ async function readExistingInstallIdSnapshot(filePath: string): Promise<string> 
 	const claimPath = `${filePath}.lock`;
 	const claimBefore = await readClaimIdentity(claimPath);
 	let fileMissing = false;
+	let malformed: Error | undefined;
 	try {
 		await readPublishedInstallId(filePath);
 		const claimAfter = await readClaimIdentity(claimPath);
@@ -413,11 +471,13 @@ async function readExistingInstallIdSnapshot(filePath: string): Promise<string> 
 		if (claimBefore !== undefined && claimAfter === undefined)
 			return readPublishedInstallIdWhenUnclaimed(filePath, claimPath);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-		fileMissing = true;
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") fileMissing = true;
+		else if (error instanceof Error && error.message === "telemetry install ID is malformed") malformed = error;
+		else throw error;
 	}
 	const activeClaim = await readClaimIdentity(claimPath);
 	if (activeClaim === undefined) {
+		if (malformed !== undefined) throw malformed;
 		if (fileMissing) {
 			const missing = new Error("telemetry install ID is missing") as NodeJS.ErrnoException;
 			missing.code = "ENOENT";
@@ -445,7 +505,7 @@ type ClaimIdentity = {
 async function readClaimIdentity(claimPath: string): Promise<ClaimIdentity | undefined> {
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(claimPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+		handle = await openClaimFile(claimPath, INSTALL_ID_READ_FLAGS);
 		const stat = await handle.stat({ bigint: true });
 		if (!stat.isFile()) {
 			const error = new Error("telemetry install ID claim is nonregular") as NodeJS.ErrnoException;
@@ -508,7 +568,7 @@ function hashClaimBytes(content: string): string {
 type ClaimSnapshot = { stat: BigIntStats; content: string; digest: string };
 
 async function readClaimSnapshot(claimPath: string): Promise<ClaimSnapshot> {
-	const handle = await fs.open(claimPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+	const handle = await openClaimFile(claimPath, INSTALL_ID_READ_FLAGS);
 	try {
 		const opened = await handle.stat({ bigint: true });
 		if (!opened.isFile()) throw new Error("telemetry install ID claim is nonregular");
@@ -698,7 +758,7 @@ async function refreshClaimLease(claimPath: string, token: string): Promise<void
 	let handle: fs.FileHandle | undefined;
 	try {
 		const named = await fs.lstat(claimPath, { bigint: true });
-		handle = await fs.open(claimPath, "r+");
+		handle = await openClaimFile(claimPath, INSTALL_ID_WRITE_FLAGS);
 		const opened = await handle.stat({ bigint: true });
 		if (named.dev !== opened.dev || named.ino !== opened.ino) return;
 		const content = await readClaimHandleBounded(handle, opened.size);
@@ -706,7 +766,7 @@ async function refreshClaimLease(claimPath: string, token: string): Promise<void
 		if (claim.token !== token || claim.state === undefined) return;
 		const contentDigest = hashClaimBytes(content);
 		await handle.close();
-		handle = await fs.open(claimPath, "r+");
+		handle = await openClaimFile(claimPath, INSTALL_ID_WRITE_FLAGS);
 		const reopened = await handle.stat({ bigint: true });
 		if (
 			reopened.dev !== opened.dev ||
@@ -744,7 +804,7 @@ async function transitionClaimCommitted(claimPath: string, token: string): Promi
 	let handle: fs.FileHandle | undefined;
 	try {
 		const before = await fs.lstat(claimPath, { bigint: true });
-		handle = await fs.open(claimPath, "r+");
+		handle = await openClaimFile(claimPath, INSTALL_ID_WRITE_FLAGS);
 		const opened = await handle.stat({ bigint: true });
 		if (opened.dev !== before.dev || opened.ino !== before.ino) throw new Error("telemetry install ID claim changed");
 		const content = await readClaimHandleBounded(handle, opened.size);
@@ -753,7 +813,7 @@ async function transitionClaimCommitted(claimPath: string, token: string): Promi
 			throw new Error("telemetry install ID claim changed");
 		const contentDigest = hashClaimBytes(content);
 		await handle.close();
-		handle = await fs.open(claimPath, "r+");
+		handle = await openClaimFile(claimPath, INSTALL_ID_WRITE_FLAGS);
 		const reopened = await handle.stat({ bigint: true });
 		if (
 			reopened.dev !== opened.dev ||
@@ -776,7 +836,7 @@ async function transitionClaimCommitted(claimPath: string, token: string): Promi
 }
 
 async function syncClaimDurably(claimPath: string, token: string): Promise<void> {
-	const handle = await fs.open(claimPath, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+	const handle = await openClaimFile(claimPath, INSTALL_ID_WRITE_FLAGS);
 	try {
 		const before = await handle.stat({ bigint: true });
 		if (!before.isFile() || parseClaim(await readClaimHandleBounded(handle, before.size)).token !== token)
@@ -1006,6 +1066,29 @@ function scheduleOwnedClaimCleanup(claimPath: string, token: string): void {
 	releaseTimer.unref();
 }
 
+async function createDirectClaim(claimPath: string, token: string): Promise<string> {
+	const content = serializeClaim(token, "publishing", Date.now() + INSTALL_ID_CLAIM_LEASE_MS);
+	const handle = await fs.open(claimPath, "wx", 0o600);
+	try {
+		await handle.writeFile(content, "utf8");
+		await handle.sync();
+		return content;
+	} finally {
+		await handle.close();
+	}
+}
+
+async function publishInstallIdDirectly(filePath: string, installId: string): Promise<void> {
+	const handle = await fs.open(filePath, "wx", 0o600);
+	try {
+		await handle.writeFile(`${installId}\n`, "utf8");
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await syncDirectory(path.dirname(filePath));
+}
+
 async function publishWithClaim(filePath: string, installId: string): Promise<string> {
 	const claimPath = `${filePath}.lock`;
 	const token = randomUUID();
@@ -1043,16 +1126,35 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 		} finally {
 			await claim.close();
 		}
-		const claimPublication = await natives.renameNoReplacePathAsync(claimTemporaryPath, claimPath);
-		if (!claimPublication.ok) {
-			if (claimPublication.code === "destination_exists" || claimPublication.reason === "destination_exists") {
-				const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
-				busy.code = "ECLAIM";
-				throw busy;
+		let claimSourceRetained = true;
+		try {
+			const claimPublication = await publishNoReplace(claimTemporaryPath, claimPath);
+			if (!claimPublication.result.ok) {
+				if (
+					claimPublication.result.code === "destination_exists" ||
+					claimPublication.result.reason === "destination_exists"
+				) {
+					const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
+					busy.code = "ECLAIM";
+					throw busy;
+				}
+				throw new Error(`telemetry install ID claim publication failed: ${claimPublication.result.reason}`);
 			}
-			throw new Error(`telemetry install ID claim publication failed: ${claimPublication.reason}`);
+			claimSourceRetained = claimPublication.sourceRetained;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EUNSUPPORTED") throw error;
+			try {
+				await createDirectClaim(claimPath, token);
+			} catch (directError) {
+				if ((directError as NodeJS.ErrnoException).code === "EEXIST") {
+					const busy = new Error("telemetry install ID claim is busy") as NodeJS.ErrnoException;
+					busy.code = "ECLAIM";
+					throw busy;
+				}
+				throw directError;
+			}
 		}
-		claimTemporaryIdentity = undefined;
+		if (!claimSourceRetained) claimTemporaryIdentity = undefined;
 		ownsClaim = (await readClaimIdentity(claimPath))?.token === token;
 		if (!ownsClaim) throw new Error("telemetry install ID claim changed");
 		const scheduleHeartbeat = (): void => {
@@ -1095,11 +1197,22 @@ async function publishWithClaim(filePath: string, installId: string): Promise<st
 		heartbeatStopped = false;
 		scheduleHeartbeat();
 		await assertClaimOwned(claimPath, token, "publishing");
-		const publication = await natives.renameNoReplacePathAsync(temporaryPath, filePath);
-		if (!publication.ok) {
-			if (publication.code !== "destination_exists" && publication.reason !== "destination_exists")
-				throw new Error(`telemetry install ID publication failed: ${publication.reason}`);
-			return await readWinnerAfterCollision(filePath, claimPath, token);
+		try {
+			const publication = await publishNoReplace(temporaryPath, filePath);
+			if (!publication.result.ok) {
+				if (publication.result.code !== "destination_exists" && publication.result.reason !== "destination_exists")
+					throw new Error(`telemetry install ID publication failed: ${publication.result.reason}`);
+				return await readWinnerAfterCollision(filePath, claimPath, token);
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EUNSUPPORTED") throw error;
+			try {
+				await publishInstallIdDirectly(filePath, installId);
+			} catch (directError) {
+				if ((directError as NodeJS.ErrnoException).code === "EEXIST")
+					return await readWinnerAfterCollision(filePath, claimPath, token);
+				throw directError;
+			}
 		}
 		publishedFinal = true;
 		await assertClaimOwned(claimPath, token, "publishing");
@@ -1194,7 +1307,9 @@ async function getTelemetryInstallIdOnce(filePath: string): Promise<string> {
 	await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
 	const generated = randomUUID();
 	try {
-		return await publishPortably(filePath, generated);
+		const published = await publishPortably(filePath, generated);
+		await tightenInstallIdPermissions(filePath, published);
+		return published;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
 			const existing = await readExistingInstallId(filePath);
