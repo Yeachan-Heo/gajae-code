@@ -350,6 +350,23 @@ describe("kiro OAuth — SSO OIDC flow", () => {
 			fetchSpy.mockRestore();
 		}
 	}, 15_000);
+
+	test("pollForToken rejects primitive CreateToken bodies without a raw TypeError", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse(null, 500));
+		try {
+			await expect(
+				pollForToken(
+					"us-east-1",
+					{ clientId: "test-client-id", clientSecret: "test-client-secret", expiresAt: Date.now() + 86_400_000 },
+					"device-code",
+					1,
+					10,
+				),
+			).rejects.toThrow(/failed: 500/);
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
 });
 
 // =============================================================================
