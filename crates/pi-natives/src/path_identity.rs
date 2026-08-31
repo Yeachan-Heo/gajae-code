@@ -3,10 +3,12 @@
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
 use std::{
+	panic::{AssertUnwindSafe, catch_unwind},
 	path::{Component, Path, PathBuf},
 	sync::{
-		Arc,
+		Arc, OnceLock,
 		atomic::{AtomicBool, Ordering},
+		mpsc::{SyncSender, sync_channel},
 	},
 };
 
@@ -1287,12 +1289,31 @@ pub fn exact_replace_path(
 ///
 /// Cleanup is best effort: the detached operation is intentionally abandoned
 /// when the process exits, while the exact identity checks still protect any
-/// pathname that remains alive long enough to be examined.
+/// pathname that remains alive long enough to be examined. A bounded queue
+/// keeps cleanup bursts from spawning an unbounded number of OS threads; work
+/// that cannot be queued is left for the owning reconciliation pass.
 #[napi]
 pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) {
-	std::thread::spawn(move || {
-		let _ = exact_unlink_direct(path, identity);
-	});
+	detached_cleanup_sender().try_send((path, identity)).ok();
+}
+
+type DetachedCleanupJob = (String, NativeExactFileIdentity);
+
+fn detached_cleanup_sender() -> &'static SyncSender<DetachedCleanupJob> {
+	static SENDER: OnceLock<SyncSender<DetachedCleanupJob>> = OnceLock::new();
+	SENDER.get_or_init(|| {
+		let (sender, receiver) = sync_channel::<DetachedCleanupJob>(64);
+		let _ = std::thread::Builder::new()
+			.name("pi-natives-exact-unlink-cleanup".to_owned())
+			.spawn(move || {
+				while let Ok((path, identity)) = receiver.recv() {
+					let _ = catch_unwind(AssertUnwindSafe(|| {
+						let _ = exact_unlink_direct(path, identity);
+					}));
+				}
+			});
+		sender
+	})
 }
 
 /// Restore only the detached object that still has the supplied exact
