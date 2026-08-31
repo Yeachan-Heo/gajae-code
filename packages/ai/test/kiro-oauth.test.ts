@@ -325,6 +325,29 @@ describe("kiro OAuth — SSO OIDC flow", () => {
 			fetchSpy.mockRestore();
 		}
 	});
+
+	test("pollForToken applies persistent five-second slow_down backoff", async () => {
+		const fetchMock = mock()
+			.mockResolvedValueOnce(mockResponse({ error: "slow_down" }, 400))
+			.mockResolvedValueOnce(
+				mockResponse({ accessToken: "device-access-token", tokenType: "Bearer", expiresIn: 3600 }),
+			);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock as unknown as typeof globalThis.fetch);
+
+		try {
+			const token = await pollForToken(
+				"us-east-1",
+				{ clientId: "test-client-id", clientSecret: "test-client-secret", expiresAt: Date.now() + 86_400_000 },
+				"device-code",
+				1,
+				8,
+			);
+			expect(token.accessToken).toBe("device-access-token");
+			expect(fetchMock).toHaveBeenCalledTimes(2);
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	}, 15_000);
 });
 
 // =============================================================================

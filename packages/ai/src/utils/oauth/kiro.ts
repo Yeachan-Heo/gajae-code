@@ -72,23 +72,38 @@ interface CreateTokenError {
 	error_uri?: string;
 }
 
+interface CreateTokenResult {
+	response: Response;
+	status: number;
+	data: CreateTokenSuccess | CreateTokenError;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Typed SSO OIDC error names from the published service model
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SSO_OIDC_FATAL_ERRORS = new Set([
 	"access_denied_exception",
+	"access_denied",
 	"expired_token_exception",
+	"expired_token",
 	"internal_server_exception",
+	"server_error",
 	"invalid_client_exception",
+	"invalid_client",
 	"invalid_client_metadata_exception",
 	"invalid_grant_exception",
+	"invalid_grant",
 	"invalid_redirect_uri_exception",
 	"invalid_request_exception",
+	"invalid_request",
 	"invalid_request_region_exception",
 	"invalid_scope_exception",
+	"invalid_scope",
 	"unauthorized_client_exception",
+	"unauthorized_client",
 	"unsupported_grant_type_exception",
+	"unsupported_grant_type",
 ]);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -227,21 +242,36 @@ export async function pollForToken(
 			deviceCode,
 		};
 
-		const data = await createTokenOnce(url, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(body),
-			signal,
-		});
+		const requestSignal = AbortSignal.any([
+			...(signal ? [signal] : []),
+			AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+		]);
+		let result: CreateTokenResult;
+		try {
+			result = await createTokenOnce(url, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+				signal: requestSignal,
+			});
+		} catch (error) {
+			if (signal?.aborted) throw new Error("Login cancelled");
+			if (Date.now() >= deadline) break;
+			throw error;
+		}
 
-		if ("accessToken" in data && typeof data.accessToken === "string") {
-			if (!Number.isFinite(data.expiresIn) || data.expiresIn <= 0 || "error" in data) {
+		if (Date.now() >= deadline) break;
+		const { status, data } = result;
+
+		if ("accessToken" in data) {
+			if (status < 200 || status >= 300 || "error" in data || data.accessToken.length === 0 || !Number.isFinite(data.expiresIn) || data.expiresIn <= 0) {
 				throw new Error("SSO OIDC CreateToken: invalid success response");
 			}
 			return data;
 		}
 
 		if ("error" in data) {
+			if (status !== 400) throw new Error(oidcRequestFailure(url, result.response));
 			const errorCode = data.error;
 			if (errorCode === "authorization_pending") continue;
 			if (errorCode === "slow_down") {
@@ -249,12 +279,10 @@ export async function pollForToken(
 				continue;
 			}
 			if (SSO_OIDC_FATAL_ERRORS.has(errorCode)) {
-				const desc = data.error_description ? `: ${data.error_description}` : "";
-				throw new Error(`SSO OIDC token error: ${errorCode}${desc}`);
+				throw new Error(`SSO OIDC token error: ${errorCode}`);
 			}
 			// Unknown error — fail closed
-			const desc = data.error_description ? `: ${data.error_description}` : "";
-			throw new Error(`SSO OIDC unrecognized token error: ${errorCode}${desc}`);
+			throw new Error(`SSO OIDC unrecognized token error: ${errorCode}`);
 		}
 
 		throw new Error("SSO OIDC CreateToken: unrecognized response shape");
@@ -455,7 +483,7 @@ function oidcRequestFailure(url: string, response: Response): string {
 async function createTokenOnce(
 	url: string,
 	init: RequestInit & { signal?: AbortSignal },
-): Promise<CreateTokenSuccess | CreateTokenError> {
+): Promise<CreateTokenResult> {
 	const response = await fetch(url, init);
 	const rawBody = await response.text();
 	let data: CreateTokenSuccess | CreateTokenError;
@@ -470,5 +498,11 @@ async function createTokenOnce(
 	if (!response.ok && !("error" in data)) {
 		throw new Error(oidcRequestFailure(url, response));
 	}
-	return data;
+	if ("error" in data && typeof data.error !== "string") {
+		throw new Error(oidcRequestFailure(url, response));
+	}
+	if ("accessToken" in data && typeof data.accessToken !== "string") {
+		throw new Error(oidcRequestFailure(url, response));
+	}
+	return { response, status: response.status, data };
 }
