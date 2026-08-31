@@ -2298,6 +2298,7 @@ type SessionAdmissionEntry = {
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
 	selectionFenceGeneration: number;
+	allowDuringClosed?: boolean;
 	continuationCapability?: symbol;
 };
 
@@ -3491,8 +3492,15 @@ export class AgentSession {
 	}
 
 	#activateNextSessionAdmission(): void {
-		if (this.#activeSessionAdmission || this.#sessionAdmissionClosed) return;
-		const next = this.#sessionAdmissionQueue.shift();
+		if (this.#activeSessionAdmission) return;
+		let next: SessionAdmissionEntry | undefined;
+		if (this.#sessionAdmissionClosed) {
+			const index = this.#sessionAdmissionQueue.findIndex(entry => entry.allowDuringClosed === true);
+			if (index < 0) return;
+			[next] = this.#sessionAdmissionQueue.splice(index, 1);
+		} else {
+			next = this.#sessionAdmissionQueue.shift();
+		}
 		if (!next) return;
 		this.#activeSessionAdmission = next;
 		next.ready.resolve();
@@ -3574,6 +3582,7 @@ export class AgentSession {
 		continuationAdmission?: ScheduledContinuationAdmission,
 		options?: {
 			allowDuringClosing?: boolean;
+			allowDuringClosed?: boolean;
 			bypassSelectionFenceGeneration?: number;
 			allowPromptContinuationReentry?: boolean;
 			idleDelivery?: boolean;
@@ -3619,7 +3628,7 @@ export class AgentSession {
 			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
 		}
 		if (
-			this.#sessionAdmissionClosed ||
+			(this.#sessionAdmissionClosed && options?.allowDuringClosed !== true) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		)
 			throw this.#sessionAdmissionBusyError();
@@ -3640,6 +3649,7 @@ export class AgentSession {
 			settled: Promise.withResolvers<void>(),
 			released: false,
 			selectionFenceGeneration: this.#selectionFenceGeneration,
+			...(options?.allowDuringClosed === true ? { allowDuringClosed: true } : {}),
 			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
@@ -3660,7 +3670,7 @@ export class AgentSession {
 			throw error;
 		}
 		if (
-			this.#sessionAdmissionClosed ||
+			(this.#sessionAdmissionClosed && options?.allowDuringClosed !== true) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		) {
 			entry.released = true;
@@ -3706,6 +3716,13 @@ export class AgentSession {
 				entry.released = true;
 				entry.ready.resolve();
 				entry.settled.resolve();
+			}
+			// Only an active prompt may outlive bounded disposal. A selection mutates
+			// session/model state and must finish (or observe the closed fence) before
+			// teardown closes those resources; its own finally resolves the fence tail.
+			if (active?.kind === "selection") {
+				await active.settled.promise;
+				await this.#selectionFenceTail;
 			}
 			return;
 		}
@@ -16372,7 +16389,7 @@ export class AgentSession {
 				},
 				undefined,
 				undefined,
-				{ allowDuringClosing: true },
+				{ allowDuringClosing: true, allowDuringClosed: true },
 			);
 		} finally {
 			selectionFence.resolve();
