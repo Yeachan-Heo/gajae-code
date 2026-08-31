@@ -4568,10 +4568,11 @@ pub(crate) mod platform {
 			Some(libc::EXDEV) => "cross_device",
 			Some(libc::EACCES) => "permission_denied",
 			// A valid regular-file link request that the filesystem rejects with
-			// EPERM is the common no-hard-link profile; let the managed caller
-			// select its exclusive-claim fallback instead of treating the
-			// capability refusal as a final authorization failure.
+			// EPERM/EOPNOTSUPP/ENOTSUP is the common no-hard-link profile; let the
+			// managed caller select its exclusive-claim fallback instead of treating
+			// the capability refusal as a final authorization failure.
 			Some(libc::EPERM) => "atomic_unavailable",
+			Some(errno) if errno == libc::EOPNOTSUPP || errno == libc::ENOTSUP => "atomic_unavailable",
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",
