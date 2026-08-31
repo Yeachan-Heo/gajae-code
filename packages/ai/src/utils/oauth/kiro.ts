@@ -264,7 +264,14 @@ export async function pollForToken(
 		const { status, data } = result;
 
 		if ("accessToken" in data) {
-			if (status < 200 || status >= 300 || "error" in data || data.accessToken.length === 0 || !Number.isFinite(data.expiresIn) || data.expiresIn <= 0) {
+			if (
+				status < 200 ||
+				status >= 300 ||
+				"error" in data ||
+				data.accessToken.length === 0 ||
+				!Number.isFinite(data.expiresIn) ||
+				data.expiresIn <= 0
+			) {
 				throw new Error("SSO OIDC CreateToken: invalid success response");
 			}
 			return data;
@@ -480,10 +487,7 @@ function oidcRequestFailure(url: string, response: Response): string {
  * loop must read the payload instead of treating a non-2xx status as fatal.
  * Non-2xx responses without an `error` field still fail closed.
  */
-async function createTokenOnce(
-	url: string,
-	init: RequestInit & { signal?: AbortSignal },
-): Promise<CreateTokenResult> {
+async function createTokenOnce(url: string, init: RequestInit & { signal?: AbortSignal }): Promise<CreateTokenResult> {
 	const response = await fetch(url, init);
 	const rawBody = await response.text();
 	let data: CreateTokenSuccess | CreateTokenError;

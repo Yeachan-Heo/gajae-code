@@ -332,7 +332,9 @@ describe("kiro OAuth — SSO OIDC flow", () => {
 			.mockResolvedValueOnce(
 				mockResponse({ accessToken: "device-access-token", tokenType: "Bearer", expiresIn: 3600 }),
 			);
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(fetchMock as unknown as typeof globalThis.fetch);
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(fetchMock as unknown as typeof globalThis.fetch);
 
 		try {
 			const token = await pollForToken(
