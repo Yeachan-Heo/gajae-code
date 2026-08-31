@@ -33,9 +33,10 @@ export interface SessionEndpointIdentity {
 	readonly mtimeNs: bigint;
 	readonly ctimeNs: bigint;
 	readonly size: bigint;
-	readonly dev: bigint;
 	readonly ino: bigint;
 }
+
+type SessionEndpointFileIdentity = SessionEndpointIdentity & { readonly dev: bigint };
 
 /**
  * Exact identity of one attached SDK session endpoint. Providers persist it next to
@@ -325,7 +326,7 @@ type AttachedSession = {
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
 	/** No-follow endpoint identity proven before this attachment became current. */
-	readonly endpointIdentity: SessionEndpointIdentity;
+	readonly endpointIdentity: SessionEndpointFileIdentity;
 	readonly runEpoch: number;
 	readonly client: SessionRouterClient;
 	readonly indexed: IndexedSession;
@@ -447,7 +448,7 @@ function readNonnegativeSequence(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
-async function lstatEndpoint(file: string): Promise<SessionEndpointIdentity | undefined> {
+async function lstatEndpoint(file: string): Promise<SessionEndpointFileIdentity | undefined> {
 	const stat = await fs.lstat(file).catch(() => undefined);
 	if (!stat?.isFile()) return undefined;
 	const identity = await fs.lstat(file, { bigint: true }).catch(() => undefined);
@@ -474,7 +475,7 @@ function warningAffectsSession(warning: string, sessionId: string): boolean {
 	return !warning.startsWith("Session ") || warning.includes(`Session ${sessionId} `);
 }
 
-function sameEndpointIdentity(expected: SessionEndpointIdentity, current: SessionEndpointIdentity): boolean {
+function sameEndpointIdentity(expected: SessionEndpointFileIdentity, current: SessionEndpointFileIdentity): boolean {
 	return (
 		expected.dev === current.dev &&
 		expected.mtimeMs === current.mtimeMs &&
@@ -486,7 +487,7 @@ function sameEndpointIdentity(expected: SessionEndpointIdentity, current: Sessio
 	);
 }
 
-function matchesIndexedEndpointIdentity(identity: SessionEndpointIdentity, indexed: IndexedSession): boolean {
+function matchesIndexedEndpointIdentity(identity: SessionEndpointFileIdentity, indexed: IndexedSession): boolean {
 	if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
 	if (indexed.endpointFileId === undefined) return identity.mtimeMs === indexed.endpointMtimeMs;
 	return (
@@ -590,12 +591,12 @@ function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession)
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		current.endpointFileId === expected.endpointFileId &&
+		(expected.endpointFileId === undefined || current.endpointFileId === expected.endpointFileId) &&
 		current.locator.cwd === expected.locator.cwd &&
 		resolveEquivalentPath(current.locator.stateRoot) === resolveEquivalentPath(expected.locator.stateRoot) &&
-		current.processIncarnation === expected.processIncarnation &&
-		current.hostIncarnation === expected.hostIncarnation &&
-		current.lifecycleRequestId === expected.lifecycleRequestId
+		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
+		(expected.hostIncarnation === undefined || current.hostIncarnation === expected.hostIncarnation) &&
+		(expected.lifecycleRequestId === undefined || current.lifecycleRequestId === expected.lifecycleRequestId)
 	);
 }
 
@@ -1420,7 +1421,7 @@ export class SessionRouter {
 	 */
 	async #readProvenEndpoint(
 		indexed: IndexedSession,
-	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointIdentity } | null> {
+	): Promise<{ endpoint: SdkSessionEndpoint; identity: SessionEndpointFileIdentity } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const cwd = indexed.locator.cwd;
 		const defaultStateRoot = path.join(cwd, ".gjc", "state");
