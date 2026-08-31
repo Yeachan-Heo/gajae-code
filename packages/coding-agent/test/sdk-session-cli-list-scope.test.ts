@@ -355,8 +355,8 @@ describe("scope exclusion warnings are bounded", () => {
 		const selection = await resolveSessionListSelection("cwd", unknownPath);
 		const row = {
 			sessionId: "unknown-row",
-			locator: { repo: "unknown", stateRoot: path.join(repo, ".gjc") },
-		} as SdkSessionRowV1;
+			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: path.join(repo, ".gjc") },
+		} as unknown as SdkSessionRowV1;
 		const filtered = await filterSessionRowsByScope([row], "cwd", {
 			scope: "cwd",
 			selection: selection.selection,
