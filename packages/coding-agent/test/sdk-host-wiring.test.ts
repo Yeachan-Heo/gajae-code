@@ -5307,6 +5307,18 @@ test("Q17 returns resource_gone without an assistant and reads a completed persi
 			}),
 		]),
 	);
+	const completedAssistant = sessionManager
+		.getBranch()
+		.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+	if (!completedAssistant || completedAssistant.type !== "message" || completedAssistant.message.role !== "assistant")
+		throw new Error("Expected persisted assistant response");
+	sessionManager.appendMessage({
+		...completedAssistant.message,
+		content: [{ type: "toolCall", id: "trailing-tool", name: "read", arguments: {} }],
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	});
+	await sessionManager.flush();
 	query("after");
 	await waitFor(
 		() =>

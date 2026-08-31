@@ -13,6 +13,8 @@
 
 ### Fixed
 
+- `session.last_assistant` now skips trailing assistant rows that contain only tool calls, returning the most recent assistant text instead of an empty result. (#5078)
+
 - SDK lifecycle readiness now uses the same descriptor-bound endpoint identity tolerance as broker endpoint reads and selects owners by scoped state root, process incarnation, and lifecycle marker instead of bare session ID. This restores default source-host startup, shipped SDK lifecycle topology, shared-agent saved-source isolation, cold resume/fork cleanup, local SDK-only broker recovery, and generated operation-matrix closure after the master-mode merge. (#5114)
 
 - Coordinator event watchers now advertise the exact supported event-kind enum, while outbox entity validation and durable WAL/active-turn cleanup reuse their existing authority helpers instead of leaving those checks disconnected. (#5115)
