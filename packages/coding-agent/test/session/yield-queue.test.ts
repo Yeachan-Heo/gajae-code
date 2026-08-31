@@ -23,15 +23,23 @@ function messageText(message: AgentMessage): string {
 
 function createHarness(initialStreaming: boolean) {
 	let streaming = initialStreaming;
+	let transitionFenced = false;
+	let holdIdle = false;
 	const streamingMessages: AgentMessage[] = [];
 	const idleBatches: AgentMessage[][] = [];
 	const scheduledFlushes: Array<{ run: () => Promise<void>; onSkip: () => void }> = [];
 	const queue = new YieldQueue({
 		isStreaming: () => streaming,
+		isTransitionFenced: () => transitionFenced,
 		injectStreaming: message => {
 			streamingMessages.push(message);
 		},
 		injectIdle: async messages => {
+			if (holdIdle) {
+				transitionFenced = true;
+				queue.deferIdle(messages);
+				return;
+			}
 			idleBatches.push(messages);
 		},
 		scheduleIdleFlush: (run, onSkip) => {
@@ -45,6 +53,12 @@ function createHarness(initialStreaming: boolean) {
 		scheduledFlushes,
 		setStreaming: (value: boolean) => {
 			streaming = value;
+		},
+		setTransitionFenced: (value: boolean) => {
+			transitionFenced = value;
+		},
+		setHoldIdle: (value: boolean) => {
+			holdIdle = value;
 		},
 	};
 }
@@ -184,5 +198,64 @@ describe("YieldQueue", () => {
 		await harness.queue.flush("streaming");
 
 		expect(harness.streamingMessages.map(messageText)).toEqual(["second", "first"]);
+	});
+
+	test("deferred mixed deliveries retain kind provenance across destructive clear", async () => {
+		const harness = createHarness(false);
+		harness.queue.register<Entry>("async-result", {
+			build: entries => userMessage(`async:${entries.map(entry => entry.id).join(",")}`),
+		});
+		harness.queue.register<Entry>("mcp-notification", {
+			build: entries => userMessage(`mcp:${entries.map(entry => entry.id).join(",")}`),
+		});
+
+		harness.queue.enqueue("async-result", { id: "job" });
+		harness.queue.enqueue("mcp-notification", { id: "resource" });
+		harness.setHoldIdle(true);
+		await harness.scheduledFlushes[0]!.run();
+
+		expect(harness.idleBatches).toHaveLength(0);
+		expect(harness.queue.has("async-result")).toBe(true);
+		expect(harness.queue.has("mcp-notification")).toBe(true);
+
+		harness.queue.clearKind("async-result");
+		expect(harness.queue.has("async-result")).toBe(false);
+		expect(harness.queue.has("mcp-notification")).toBe(true);
+
+		harness.setHoldIdle(false);
+		harness.setTransitionFenced(false);
+		harness.queue.rearmIdle();
+		await harness.scheduledFlushes.at(-1)!.run();
+
+		expect(harness.queue.has()).toBe(false);
+		expect(harness.idleBatches.map(batch => batch.map(messageText))).toEqual([["mcp:resource"]]);
+	});
+
+	test("deferred raw entries are stale-filtered again when rearmed", async () => {
+		const harness = createHarness(false);
+		let stale = false;
+		let staleChecks = 0;
+		harness.queue.register<Entry>("items", {
+			isStale: () => {
+				staleChecks++;
+				return stale;
+			},
+			build: entries => userMessage(entries.map(entry => entry.id).join(",")),
+		});
+		harness.queue.enqueue("items", { id: "held" });
+		harness.setHoldIdle(true);
+		await harness.scheduledFlushes[0]!.run();
+		expect(staleChecks).toBe(1);
+		expect(harness.queue.has("items")).toBe(true);
+
+		stale = true;
+		harness.setHoldIdle(false);
+		harness.setTransitionFenced(false);
+		harness.queue.rearmIdle();
+		await harness.scheduledFlushes.at(-1)!.run();
+
+		expect(staleChecks).toBe(2);
+		expect(harness.queue.has()).toBe(false);
+		expect(harness.idleBatches).toHaveLength(0);
 	});
 });
