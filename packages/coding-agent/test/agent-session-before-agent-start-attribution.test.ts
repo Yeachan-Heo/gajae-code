@@ -962,6 +962,45 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		session = undefined as unknown as AgentSession;
 	});
 
+	it("disposal drains a mutation admission activated before its closed-fence recheck", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-activated" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const admissionReady = Promise.withResolvers<void>();
+		const releaseAdmissionReady = Promise.withResolvers<void>();
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutationAdmissionReadyForTests: async () => {
+				admissionReady.resolve();
+				await releaseAdmissionReady.promise;
+			},
+		});
+		await admissionReady.promise;
+		const disposal = session.dispose();
+		let disposalSettled = false;
+		void disposal.then(() => {
+			disposalSettled = true;
+		});
+		const queuedPrompt = session.prompt("reject while activated selection drains");
+		const queuedPromptResult = queuedPrompt.then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		await Bun.sleep(20);
+		expect(disposalSettled).toBe(false);
+
+		releaseAdmissionReady.resolve();
+		await expect(selection).resolves.toMatchObject({
+			provider: selectionModel.provider,
+			modelId: selectionModel.id,
+		});
+		expect(await queuedPromptResult).toMatchObject({ status: "rejected", error: { code: "busy" } });
+		await disposal;
+		session = undefined as unknown as AgentSession;
+	});
+
 	it("disposal rejects a second-phase selection queued behind an active prompt", async () => {
 		createSession();
 		const currentModel = session.model;

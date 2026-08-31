@@ -3588,6 +3588,7 @@ export class AgentSession {
 			allowDuringClosing?: boolean;
 			closedSelectionTransaction?: symbol;
 			selectionTransaction?: symbol;
+			onAfterReadyForTests?: () => Promise<void>;
 			bypassSelectionFenceGeneration?: number;
 			allowPromptContinuationReentry?: boolean;
 			idleDelivery?: boolean;
@@ -3632,11 +3633,11 @@ export class AgentSession {
 		) {
 			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
 		}
-		const closedSelectionAuthorized =
+		const closedSelectionAuthorized = (): boolean =>
 			options?.closedSelectionTransaction !== undefined &&
 			options.closedSelectionTransaction === this.#authorizedClosedSelectionTransaction;
 		if (
-			(this.#sessionAdmissionClosed && !closedSelectionAuthorized) ||
+			(this.#sessionAdmissionClosed && !closedSelectionAuthorized()) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		)
 			throw this.#sessionAdmissionBusyError();
@@ -3677,9 +3678,10 @@ export class AgentSession {
 			releaseEntry();
 			throw error;
 		}
+		await options?.onAfterReadyForTests?.();
 		if (
 			entry.released ||
-			(this.#sessionAdmissionClosed && !closedSelectionAuthorized) ||
+			(this.#sessionAdmissionClosed && !closedSelectionAuthorized()) ||
 			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
 		) {
 			entry.released = true;
@@ -16279,6 +16281,8 @@ export class AgentSession {
 			onAfterMutation?: () => void;
 			/** Test seam: pause after idle drain but before mutation admission. */
 			onBeforeMutationAdmissionForTests?: () => Promise<void>;
+			/** Test seam: pause after mutation admission activates, before its closed-fence recheck. */
+			onAfterMutationAdmissionReadyForTests?: () => Promise<void>;
 		},
 	): Promise<DefaultModelSelectionResult> {
 		// Reserve the causal selection fence synchronously, before credential
@@ -16420,6 +16424,7 @@ export class AgentSession {
 					allowDuringClosing: true,
 					closedSelectionTransaction: selectionTransaction,
 					selectionTransaction,
+					onAfterReadyForTests: options?.onAfterMutationAdmissionReadyForTests,
 				},
 			);
 		} finally {
