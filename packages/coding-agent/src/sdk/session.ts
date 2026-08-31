@@ -36,6 +36,7 @@ import {
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
+	normalizePathForComparison,
 	postmortem,
 	prompt,
 	Snowflake,
@@ -1416,7 +1417,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
 	const profileAuthority: "default" | "custom" =
-		getAgentProfileAuthority() === "custom" || path.resolve(agentDir) !== path.resolve(getDefaultAgentDir())
+		getAgentProfileAuthority() === "custom" ||
+		normalizePathForComparison(agentDir) !== normalizePathForComparison(getDefaultAgentDir())
 			? "custom"
 			: "default";
 	if (options.agentDir !== undefined && options.settings?.isAgentDirExplicit()) {
