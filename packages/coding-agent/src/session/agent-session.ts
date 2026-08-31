@@ -8978,7 +8978,7 @@ export class AgentSession {
 		this.agent.setMainAttemptScopeObserver(undefined);
 		this.#disconnectFromAgent();
 		const teardown = this.#dispose();
-		let timeout: ReturnType<typeof setTimeout> | undefined;
+		let timeout: NodeJS.Timeout | undefined;
 		const deadline = Promise.withResolvers<void>();
 		timeout = setTimeout(() => deadline.resolve(), SIGNAL_TEARDOWN_TIMEOUT_MS);
 		timeout.unref?.();
@@ -9009,7 +9009,7 @@ export class AgentSession {
 				void operation.catch(() => {});
 				return undefined;
 			}
-			let timeout: ReturnType<typeof setTimeout> | undefined;
+			let timeout: NodeJS.Timeout | undefined;
 			const deadline = Promise.withResolvers<undefined>();
 			timeout = setTimeout(() => deadline.resolve(undefined), remainingMs);
 			timeout.unref?.();
