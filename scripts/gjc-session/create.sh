@@ -17,7 +17,6 @@ STATE_DIR="${GJC_SESSION_STATE_DIR:-$WORKDIR/.gjc-session-state/$SESSION}"
 RUNTIME_STATE_JSON="$STATE_DIR/runtime-state.json"
 SOCKET_KEY="gjc-${SESSION//[^A-Za-z0-9_.-]/_}"
 PROTOCOL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-export GJC_TMUX_OWNER_PROTOCOL_TOKEN="$PROTOCOL_TOKEN"
 MONITOR_SESSION="${SESSION}-owner-monitor"
 
 
@@ -682,8 +681,10 @@ for handled_signal in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
 
 started_at = now()
 command = [os.environ["GJC_SESSION_GJC_BIN"]]
+child_environment = os.environ.copy()
+child_environment.pop("GJC_TMUX_OWNER_PROTOCOL_TOKEN", None)
 try:
-    child = subprocess.Popen(command, cwd=os.environ["GJC_SESSION_WORKDIR"])
+    child = subprocess.Popen(command, cwd=os.environ["GJC_SESSION_WORKDIR"], env=child_environment)
     status = child.wait()
 except OSError:
     status = 127
@@ -708,7 +709,7 @@ raise SystemExit(exit_code)
 SUPERVISOR
 chmod 700 "$STATE_DIR/supervisor.py"
 
-LAUNCH=(env "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_BRANCH=$BRANCH" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_SESSION_RUNTIME_FRESH_AFTER=$CREATED_AT" "GJC_SESSION_STARTED_JSON=$STATE_DIR/started.json" "GJC_SESSION_TERMINAL_JSON=$STATE_DIR/terminal.json" "GJC_SESSION_TERMINAL_CANONICAL_JSON=$LIFECYCLE_DIR/terminal-$OWNER_GENERATION.json" "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json" "GJC_SESSION_FINAL_CANONICAL_JSON=$LIFECYCLE_DIR/final-$OWNER_GENERATION.json" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_COORDINATOR_SESSION_ID=$SESSION" "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH" "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON" "GJC_TMUX_OWNER_GENERATION=$OWNER_GENERATION" "GJC_TMUX_OWNER_STATE_DIR=$STATE_DIR" "GJC_TMUX_OWNER_SERVER_KEY=$SOCKET_KEY" "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json" "GJC_SESSION_WORKTREE_BASELINE_DIRTY=$WORKTREE_BASELINE_DIRTY" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_RUNNER_SH=$STATE_DIR/runner.sh" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" python3 "$STATE_DIR/supervisor.py")
+LAUNCH=(env "GJC_SESSION_NAME=$SESSION" "GJC_SESSION_WORKDIR=$WORKDIR" "GJC_SESSION_BRANCH=$BRANCH" "GJC_SESSION_STATE_DIR=$STATE_DIR" "GJC_SESSION_OWNER_GENERATION=$OWNER_GENERATION" "GJC_SESSION_RUNTIME_FRESH_AFTER=$CREATED_AT" "GJC_SESSION_STARTED_JSON=$STATE_DIR/started.json" "GJC_SESSION_TERMINAL_JSON=$STATE_DIR/terminal.json" "GJC_SESSION_TERMINAL_CANONICAL_JSON=$LIFECYCLE_DIR/terminal-$OWNER_GENERATION.json" "GJC_SESSION_FINAL_JSON=$STATE_DIR/final.json" "GJC_SESSION_FINAL_CANONICAL_JSON=$LIFECYCLE_DIR/final-$OWNER_GENERATION.json" "GJC_SESSION_GENERATION_JSON=$GENERATION_JSON" "GJC_COORDINATOR_SESSION_ID=$SESSION" "GJC_COORDINATOR_SESSION_BRANCH=$BRANCH" "GJC_COORDINATOR_SESSION_STATE_FILE=$RUNTIME_STATE_JSON" "GJC_TMUX_OWNER_GENERATION=$OWNER_GENERATION" "GJC_TMUX_OWNER_STATE_DIR=$STATE_DIR" "GJC_TMUX_OWNER_SERVER_KEY=$SOCKET_KEY" "GJC_SESSION_PROMPT_ACCEPTED_JSON=$STATE_DIR/prompt-accepted.json" "GJC_SESSION_WORKTREE_BASELINE_DIRTY=$WORKTREE_BASELINE_DIRTY" "GJC_SESSION_GJC_BIN=$GJC_BIN" "GJC_SESSION_RUNNER_SH=$STATE_DIR/runner.sh" "GJC_SESSION_POSTMORTEM_SH=$SCRIPT_DIR/postmortem.sh" python3 "$STATE_DIR/supervisor.py")
 LAUNCH_SHELL="$(shell_join "${LAUNCH[@]}")"
 TMUX_ARGV=("$TMUX_BIN" -L "$SOCKET_KEY" new-session -d -P -F '#{session_id}' -s "$SESSION" -c "$WORKDIR" -n gjc "$LAUNCH_SHELL")
 PLAN_LINE="$(python3 - "$SESSION" "$OWNER_GENERATION" "$WORKDIR" "$STATE_DIR" "$SOCKET_KEY" "$GENERATION_BASELINE_JSON" "${TMUX_ARGV[@]}" <<'PY'
@@ -717,7 +718,7 @@ session, generation, cwd, state_dir, socket_key, baseline, *argv = sys.argv[1:]
 print(json.dumps({"schema_version": 1, "op": "plan", "platform": "linux", "session_id": session, "owner_generation": generation, "cwd": cwd, "state_dir": state_dir, "socket_key": socket_key, "tmux_argv": argv, "baseline": json.loads(baseline)}, separators=(",", ":")))
 PY
 )"
-PLAN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation plan protocol failed" >&2; exit 1; }
+PLAN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | env "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation plan protocol failed" >&2; exit 1; }
 PLAN_MODE="$(python3 - "$PLAN_RESPONSE" "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$SOCKET_KEY" "$GENERATION_BASELINE_JSON" "${TMUX_ARGV[@]}" <<'PY'
 import datetime, hashlib, json, sys
 try:
@@ -780,7 +781,7 @@ record_rollback_identity owner_session "$SESSION" ROLLBACK_OWNER_NATIVE_ID ROLLB
 
 CREATION_BOUNDARY=postspawn
 
-POST_SPAWN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation post-spawn proof failed" >&2; show_recovery_hint; exit 1; }
+POST_SPAWN_RESPONSE="$(printf '%s\n' "$PLAN_LINE" | env "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "owner-isolation post-spawn proof failed" >&2; show_recovery_hint; exit 1; }
 python3 - "$POST_SPAWN_RESPONSE" "$SESSION" "$SOCKET_KEY" "$ROLLBACK_OWNER_SERVER_PID" "$ROLLBACK_OWNER_SERVER_START_TIME" <<'PY' || { echo "owner-isolation post-spawn server proof rejected" >&2; show_recovery_hint; exit 1; }
 import json
 import sys
@@ -843,13 +844,13 @@ PY
   fi
 done
 CREATION_BOUNDARY=generation
-GENERATION_PUBLISH_REQUEST="$(python3 - "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$GENERATION_BASELINE_JSON" <<'PY'
+GENERATION_PUBLISH_REQUEST="$(GJC_TMUX_OWNER_PROTOCOL_TOKEN="$PROTOCOL_TOKEN" python3 - "$SESSION" "$OWNER_GENERATION" "$STATE_DIR" "$GENERATION_BASELINE_JSON" <<'PY'
 import json, os, sys
 session, generation, state_dir, baseline = sys.argv[1:]
 print(json.dumps({"schema_version":1,"op":"publish_generation","auth_token":os.environ["GJC_TMUX_OWNER_PROTOCOL_TOKEN"],"session_id":session,"owner_generation":generation,"state_dir":state_dir,"baseline":json.loads(baseline)}, separators=(",", ":")))
 PY
 )"
-GENERATION_PUBLISH_RESPONSE="$(printf '%s\n' "$GENERATION_PUBLISH_REQUEST" | "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "generation publication protocol failed" >&2; exit 1; }
+GENERATION_PUBLISH_RESPONSE="$(printf '%s\n' "$GENERATION_PUBLISH_REQUEST" | env "GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN" "$GJC_BIN" --internal-tmux-owner-isolation)" || { echo "generation publication protocol failed" >&2; exit 1; }
 python3 - "$GENERATION_PUBLISH_RESPONSE" "$OWNER_GENERATION" <<'PY' || { echo "generation publication rejected" >&2; exit 1; }
 import json, sys
 try:
