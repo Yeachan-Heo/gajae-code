@@ -7374,6 +7374,7 @@ export class SessionManager {
 	#flushed: boolean = false;
 	#needsFullRewriteOnNextPersist: boolean = false;
 	#readOnlyResume = false;
+	#strictResumeMutationPending = false;
 	#resumedDraftConsumed = false;
 	#ensuredOnDisk: boolean = false;
 	#recoveryHydrationContext: RecoveryHydrationContext | undefined;
@@ -16206,10 +16207,15 @@ export class SessionManager {
 			});
 		}
 		let priorPersistError = this.#persistError;
-		if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) {
+		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
 			await this.#persistChain.catch(() => {});
 			try {
 				await this.#rewriteFileContents();
+				if (this.#strictResumeMutationPending && this.#readOnlyResume && this.#sessionFile) {
+					writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+					this.#readOnlyResume = false;
+				}
+				this.#strictResumeMutationPending = false;
 			} catch (error) {
 				priorPersistError ??= toError(error);
 				return { kind: "close_failed_retryable", error: priorPersistError };
@@ -17919,7 +17925,7 @@ export class SessionManager {
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
-		this.#readOnlyResume = false;
+		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
@@ -17941,7 +17947,7 @@ export class SessionManager {
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
 		this.#assertRecoveryHydrationWritable();
-		this.#readOnlyResume = false;
+		if (this.#readOnlyResume) this.#strictResumeMutationPending = true;
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
