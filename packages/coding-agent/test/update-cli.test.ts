@@ -877,6 +877,7 @@ describe("update-cli managed notification recovery", () => {
 			await runUpdateCommand(
 				{ force: false, check: false },
 				{
+					platform: "darwin",
 					getLatestRelease: async () => release,
 					resolveUpdateTarget: async () => ({ method: "binary", path: "/standalone/gjc" }),
 					performUpdate: async () => ({ ok: true, path: "/standalone/gjc" }),

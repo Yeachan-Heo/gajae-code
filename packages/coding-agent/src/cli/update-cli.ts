@@ -1247,6 +1247,7 @@ async function updateViaBinaryAt(
  * Run the update command.
  */
 export interface UpdateCommandDependencies {
+	platform?: NodeJS.Platform;
 	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
 	resolveUpdateTarget?: () => Promise<UpdateTarget>;
 	verifyMigrationTarget?: (release: ReleaseInfo, runtimePath: string) => Promise<InstalledVersionVerification>;
@@ -1624,7 +1625,7 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
-	if (installedVersion && installedRuntimePath && process.platform === "darwin") {
+	if (installedVersion && installedRuntimePath && (deps.platform ?? process.platform) === "darwin") {
 		try {
 			await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(installedRuntimePath);
 		} catch (error) {
