@@ -10900,7 +10900,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
+			"contextWindow": 1048576,
 			"maxTokens": 64000
 		},
 		"kimi-k3-low": {
@@ -10919,7 +10919,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
+			"contextWindow": 1048576,
 			"maxTokens": 64000
 		},
 		"kimi-k3-max": {
@@ -10938,7 +10938,7 @@
 				"cacheRead": 0,
 				"cacheWrite": 0
 			},
-			"contextWindow": 200000,
+			"contextWindow": 1048576,
 			"maxTokens": 64000
 		}
 	},

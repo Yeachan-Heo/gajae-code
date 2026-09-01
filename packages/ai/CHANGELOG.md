@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Cursor's `kimi-k3-low`, `kimi-k3-high`, and `kimi-k3-max` now declare their real 1,048,576-token context window instead of 200,000. The bundled value was understated by 5.2x, so context management compacted these models at roughly a fifth of their usable window. The same underlying model already declares 1,048,576 elsewhere in this catalog (`openrouter/moonshotai/kimi-k3`, `kilo/moonshotai/kimi-k3`, and `opencode-go/kimi-k3` in `provider-models/openai-compat.ts`), so the cursor entries were the inconsistent ones. Measured against the live `cursor-agent` transport, which reports `usage.inputTokens` per request: 1,026,459 input tokens were accepted and answered correctly, while 1,161,948 tokens were silently summarized down to 20,552 and lost the answer. Output `maxTokens` is unchanged at 64,000, which this change did not measure.
+
 - OpenCode Go's bundled catalog now contains all 33 models advertised by its live provider list, including the seven newly published models. Canonical endpoint metadata supplies their transport, multimodal input, limits, pricing, and reasoning capabilities, while generated output remains deterministic and preserves fail-closed selection when a live catalog is unavailable (#5144).
 
 - SQLite corruption detection is now shared by credential and capability-cache surfaces, so callers can recognize `SQLITE_CORRUPT` and `SQLITE_NOTADB` without inspecting provider-specific error details.
