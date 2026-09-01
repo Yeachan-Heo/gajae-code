@@ -2823,6 +2823,7 @@ export class AgentSession {
 
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
+	#compactionCompletion: Promise<void> | undefined;
 	#autoCompactionAbortController: AbortController | undefined = undefined;
 
 	/** Invocation-scoped EventStream drain barriers owned by active maintenance calls. */
@@ -9027,6 +9028,7 @@ export class AgentSession {
 		this.#evalExecutionDisposing = true;
 		this.#abortActiveMidRunBarriers();
 		this.abortCompaction();
+		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
@@ -17566,14 +17568,21 @@ export class AgentSession {
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
 		this.#beginSessionTransition("compact");
+		const completion = Promise.withResolvers<void>();
+		this.#compactionCompletion = completion.promise;
 		try {
 			if (this.#compactionAbortController) {
 				throw new Error("Compaction already in progress");
 			}
-			this.#disconnectFromAgent();
-			await this.abort();
 			const compactionAbortController = new AbortController();
 			this.#compactionAbortController = compactionAbortController;
+			this.#disconnectFromAgent();
+			try {
+				await this.abort();
+			} catch (error) {
+				this.#compactionAbortController = undefined;
+				throw error;
+			}
 			// Take this invocation's state snapshot for the summarizer context.
 			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
 
@@ -17714,9 +17723,11 @@ export class AgentSession {
 				if (this.#compactionAbortController === compactionAbortController) {
 					this.#compactionAbortController = undefined;
 				}
-				this.#reconnectToAgent();
+				if (!this.#isDisposed && !this.#sessionAdmissionClosing) this.#reconnectToAgent();
 			}
 		} finally {
+			completion.resolve();
+			if (this.#compactionCompletion === completion.promise) this.#compactionCompletion = undefined;
 			this.#endSessionTransition();
 		}
 	}
