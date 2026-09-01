@@ -88,7 +88,10 @@ export function crystalSnapshotDigest(
 				revision: snapshot.revision,
 				start: snapshot.start,
 				end: snapshot.end,
-				messages: snapshot.messages,
+				messages: snapshot.messages.map(message => ({
+					...message,
+					content: message.content.normalize("NFC").trim(),
+				})),
 			}),
 		)
 		.digest("hex");
@@ -181,6 +184,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const items = validateItems(value.items, snapshot);
 	if (snapshot.messages.length === 0 || items.length === 0)
 		throw new Error("crystallize requires material conversation evidence");
+	if (!items.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
+		throw new Error("crystallize requires a confirmed user requirement");
 	const removedIds = value.removed_ids === undefined ? [] : validateRemovedIds(value.removed_ids);
 	const gaps = normalizedGaps(value.open_gaps);
 	if (gaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
@@ -220,8 +225,16 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			mergedItems.push(item);
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
+	const sameIntent = (left: CrystalItem, right: CrystalItem): boolean =>
+		left.id === right.id &&
+		left.kind === right.kind &&
+		left.classification === right.classification &&
+		left.statement === right.statement;
 	const changed = currentItems
-		.filter(item => priorItems.has(item.id) && JSON.stringify(item) !== JSON.stringify(priorItems.get(item.id)))
+		.filter(item => {
+			const previous = priorItems.get(item.id);
+			return previous !== undefined && !sameIntent(item, previous);
+		})
 		.map(item => item.id)
 		.sort();
 	const added = currentItems
@@ -267,7 +280,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			? "stale"
 			: goalChanged || removedGoal
 				? "superseded"
-				: gaps.length > 0
+				: intentChanged || removedIntent || gaps.length > 0
 					? "needs-questions"
 					: "ready";
 	return {
