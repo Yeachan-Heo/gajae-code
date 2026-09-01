@@ -470,7 +470,11 @@ export async function loadCapabilityForHome<T>(
 				)
 			: path.join(canonicalHome, getConfigDirName(), "agent");
 	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir), effectiveProviderIds);
-	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome);
+	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome, {
+		isolatedHome: true,
+		home: canonicalHome,
+		bypassCache: true,
+	});
 	const canonicalRepoRoot = repoRootCandidate ? await canonicalizeThroughExistingAncestor(repoRootCandidate) : null;
 	const repoRoot =
 		canonicalRepoRoot && canonicalRepoRoot !== canonicalHome && isWithinOrEqual(canonicalHome, canonicalRepoRoot)
