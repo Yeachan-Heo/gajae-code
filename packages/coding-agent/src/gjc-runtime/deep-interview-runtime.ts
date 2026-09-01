@@ -364,6 +364,7 @@ async function handleCrystallizeUnlocked(
 		throw new DeepInterviewCommandError(2, "conversation snapshot does not match the live session transcript");
 	const existingSpecPath = typeof existing.spec_path === "string" ? existing.spec_path : undefined;
 	const existingSpecHash = typeof existing.spec_sha256 === "string" ? existing.spec_sha256 : undefined;
+	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
 	const priorRecord = isRecord(storedPrior) ? storedPrior : undefined;
 	const priorSource = priorRecord && isRecord(priorRecord.source) ? priorRecord.source : undefined;
 	if (priorSource && Array.isArray(priorSource.messages)) {
@@ -391,10 +392,19 @@ async function handleCrystallizeUnlocked(
 		existingSpecPath &&
 		existingSpecHash
 	) {
-		const recoverySlug = flagValue(args, "--slug")?.trim() || `crystal-v${priorRecord.spec_version}`;
+		const specName = path.basename(existingSpecPath);
+		const specMatch = /^deep-interview-(.+)-v[0-9]+\.md$/.exec(specName);
+		const recoverySlug = specMatch?.[1];
+		if (!recoverySlug) throw new DeepInterviewCommandError(2, "canonical Crystal publication identity is invalid");
 		const recoveryMutationId = `crystal:${sessionId}:${priorRecord.spec_version}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}\0${existingSpecHash}`).digest("hex")}`;
 		const pending = await readWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
-		if (pending) {
+		if (
+			pending &&
+			pending.status === "pending" &&
+			JSON.stringify(pending.paths) === JSON.stringify([existingSpecPath, indexPath, statePath]) &&
+			pending.steps.includes("artifact") &&
+			pending.steps.includes("index")
+		) {
 			await syncDeepInterviewHud({
 				cwd,
 				sessionId,
@@ -402,6 +412,7 @@ async function handleCrystallizeUnlocked(
 				phase: existing.current_phase,
 				specStatus: "persisted",
 			});
+			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
 			await completeWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
 			return {
 				status: 0,
@@ -421,7 +432,6 @@ async function handleCrystallizeUnlocked(
 	const specContent = specPath ? crystalMarkdown(crystal) : undefined;
 	if (specContent && [...specContent].length > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
 		throw new DeepInterviewCommandError(2, "crystallized specification exceeds the structured response limit");
-	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
 	const specHash = specContent ? createHash("sha256").update(specContent).digest("hex") : undefined;
 	const mutationId =
 		specPath && specHash
@@ -515,7 +525,6 @@ async function handleCrystallizeUnlocked(
 	});
 	if (specPath && specContent)
 		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact", "index", "state"] });
-	if (specPath && specContent) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId!);
 	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({
 		cwd,
@@ -524,6 +533,7 @@ async function handleCrystallizeUnlocked(
 		phase: envelope.current_phase,
 		specStatus: specPath ? "persisted" : "not_persisted",
 	});
+	if (specPath && specContent) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId!);
 	const summary = {
 		skill: "deep-interview",
 		mode: "crystallize",
