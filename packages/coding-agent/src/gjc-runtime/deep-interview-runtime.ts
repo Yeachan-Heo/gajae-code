@@ -391,6 +391,13 @@ async function handleCrystallizeUnlocked(
 		state,
 		updated_at: now,
 	};
+	if (!specPath) {
+		delete envelope.spec_slug;
+		delete envelope.spec_path;
+		delete envelope.spec_stage;
+		delete envelope.spec_sha256;
+		delete envelope.spec_persisted_at;
+	}
 	await writeWorkflowEnvelopeAtomic(statePath, envelope, {
 		lockHeld: true,
 		cwd,
