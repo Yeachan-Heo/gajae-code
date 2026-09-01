@@ -654,8 +654,10 @@ install_binary() {
         OFFER_RUNTIME="${DEST_PATH}.community-app-offer.$$"
         if [ ! -e "$OFFER_RUNTIME" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && ln "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
             remember_tmp "$OFFER_RUNTIME"
-            "$OFFER_RUNTIME" macos-community-app-offer || true
-            rm -f "$OFFER_RUNTIME"
+            if [ -f "$OFFER_RUNTIME" ] && [ "$OFFER_RUNTIME" -ef "$DEST_PATH" ]; then
+                "$OFFER_RUNTIME" macos-community-app-offer || true
+            fi
+            rm -f "$OFFER_RUNTIME" || true
         fi
     fi
 
