@@ -1587,7 +1587,9 @@ function isExactTmuxSelfInjectionGuardVerb(
 }
 
 function tmuxMachineBusViolations(file: string, contents: string): string[] {
-	if (isGeneratedDocumentationIndex(file) || file === tmuxSelfInjectionGuardPath) return [];
+	if (isGeneratedDocumentationIndex(file)) return [];
+	if (file === tmuxSelfInjectionGuardPath && contents.includes("export async function checkTmuxSelfInjection"))
+		return [];
 	const allowedTeamFallbackRanges =
 		file === teamRuntimeTmuxPath
 			? [...exactTeamRuntimeSendKeysRanges(contents), ...exactMemoryGuardSendKeysRanges(contents)]
