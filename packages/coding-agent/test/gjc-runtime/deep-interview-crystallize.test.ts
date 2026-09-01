@@ -132,6 +132,22 @@ describe("deep-interview crystallize contract", () => {
 			).toThrow("verbatim user anchor");
 		}
 	});
+	it("does not preserve a confirmed-to-inferred downgrade", () => {
+		const prior = crystallizeDeepInterview(input());
+		const downgraded = later(
+			input({
+				prior,
+				items: [
+					{ id: "goal:report", kind: "goal", classification: "inferred", statement: "Build a fast report" },
+					input().items[1]!,
+				],
+			}),
+			2,
+		);
+		const crystal = crystallizeDeepInterview(downgraded);
+		expect(crystal.delta.kind).toBe("goal-replaced");
+		expect(crystal.lifecycle).toBe("superseded");
+	});
 
 	it("represents bounded gaps as needs-questions", () => {
 		const crystal = crystallizeDeepInterview(input({ open_gaps: ["What is the memory budget?"] }));
