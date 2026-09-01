@@ -1330,6 +1330,7 @@ async function runCommunityAppOfferFromRuntime(
 		if (createHash("sha256").update(snapshot).digest("hex") !== expectedIdentity.sha256)
 			throw new Error("verified runtime content changed before optional offer");
 		await fs.promises.writeFile(pinnedRuntimePath, snapshot, { flag: "wx", mode: 0o500 });
+		await fs.promises.chmod(pinDirectory, 0o500);
 		const pinnedStat = await fs.promises.lstat(pinnedRuntimePath);
 		if (
 			!pinnedStat.isFile() ||
