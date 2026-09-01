@@ -2152,6 +2152,22 @@ export interface RecoveryFsRetainedCleanupResult {
   treeSnapshot?: NativeDirectoryTreeSnapshot
 }
 
+/**
+ * Publish a staged directory under a destination name that must not already
+ * exist, using descriptor-relative `mkdirat` ownership followed by `renameat`.
+ * This is the directory stand-in for `renameat2(RENAME_NOREPLACE)` on mounts
+ * that reject rename flags with `EINVAL`/`ENOSYS`. The native implementation
+ * validates every path component without following symlinks and never
+ * overwrites a non-empty destination directory.
+ */
+export declare function renameDirectoryNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
+
+/**
+ * Async variant of [`rename_directory_no_replace_path`] scheduled on the
+ * libuv blocking pool.
+ */
+export declare function renameDirectoryNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
+
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
 
 /**

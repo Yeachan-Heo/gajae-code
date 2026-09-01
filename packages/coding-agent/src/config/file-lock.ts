@@ -1,9 +1,9 @@
 import * as crypto from "node:crypto";
-import type { BigIntStats, Stats } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { NativeDirectoryTreeResult, NativeExactUnlinkResult } from "@gajae-code/natives";
-import { renameNoReplacePathAsync } from "@gajae-code/natives";
+import type { NativeDirectoryTreeResult, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
+import { renameDirectoryNoReplacePathAsync, renameNoReplacePathAsync } from "@gajae-code/natives";
 import { isEnoent } from "@gajae-code/utils/fs-error";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 
@@ -49,6 +49,10 @@ type LockInfo = FileLockOwnerToken;
 
 export const FileLockTestHooks: {
 	afterParentMkdir?: (lockPath: string) => void | Promise<void>;
+	nativePublicationBindings?: () => {
+		renameNoReplacePathAsync: typeof renameNoReplacePathAsync;
+		renameDirectoryNoReplacePathAsync: typeof renameDirectoryNoReplacePathAsync;
+	};
 	nativeQuarantineBindings?: () => NativeFileLockBindings;
 } = {};
 
@@ -423,6 +427,118 @@ async function ensureLockParent(directory: string): Promise<void> {
 	}
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		!Array.isArray(value) &&
+		Object.getPrototypeOf(value) === Object.prototype
+	);
+}
+
+function isValidNativeNoReplaceResult(value: unknown): value is NativeNoReplaceResult {
+	if (!isPlainRecord(value)) return false;
+	const expectedKeys = [
+		"ok",
+		"code",
+		"mutationState",
+		"durabilityState",
+		"reason",
+		"primitive",
+		"phase",
+		"diagnostic",
+	];
+	if (Object.keys(value).some(key => !expectedKeys.includes(key))) return false;
+	if (
+		typeof value.ok !== "boolean" ||
+		(value.code !== undefined && (typeof value.code !== "string" || !/^[a-z0-9_]{1,64}$/.test(value.code))) ||
+		!(["not_committed", "committed", "unknown"] as const).includes(value.mutationState as never) ||
+		!(["not_attempted", "proven", "not_provable"] as const).includes(value.durabilityState as never) ||
+		!(
+			[
+				"none",
+				"destination_exists",
+				"atomic_unavailable",
+				"cross_device",
+				"permission_denied",
+				"io_failure",
+				"invalid_request",
+				"interrupted",
+				"identity_violation",
+				"durability_not_provable",
+				"unknown",
+			] as const
+		).includes(value.reason as never) ||
+		!(
+			[
+				"renameat2_noreplace",
+				"linkat_noreplace",
+				"mkdirat_renameat_noreplace",
+				"renameatx_np_excl",
+				"windows_rename_noreplace",
+				"unsupported",
+				"unknown",
+			] as const
+		).includes(value.primitive as never) ||
+		!(
+			[
+				"preflight",
+				"file_sync",
+				"rename",
+				"source_unlink",
+				"source_parent_sync",
+				"destination_parent_sync",
+				"terminal_identity",
+				"complete",
+				"unknown",
+			] as const
+		).includes(value.phase as never)
+	)
+		return false;
+	if (!isPlainRecord(value.diagnostic)) return false;
+	if (
+		Object.keys(value.diagnostic).some(
+			key => !["schemaVersion", "collectionState", "osCode", "syncFailures"].includes(key),
+		) ||
+		value.diagnostic.schemaVersion !== 1 ||
+		!(["complete", "partial", "unavailable"] as const).includes(value.diagnostic.collectionState as never) ||
+		(value.diagnostic.osCode !== undefined &&
+			(typeof value.diagnostic.osCode !== "number" || !Number.isInteger(value.diagnostic.osCode))) ||
+		(value.diagnostic.syncFailures !== undefined && !Array.isArray(value.diagnostic.syncFailures))
+	)
+		return false;
+	if (value.ok)
+		return (
+			value.mutationState === "committed" &&
+			value.reason === "none" &&
+			value.phase === "complete" &&
+			(value.durabilityState === "not_attempted" || value.durabilityState === "proven")
+		);
+	if (value.mutationState === "not_committed") return value.durabilityState === "not_attempted";
+	return value.mutationState === "unknown" && value.durabilityState === "not_provable";
+}
+
+/**
+ * Only a complete native envelope proving that no namespace mutation happened
+ * may authorize the directory fallback. A legacy or malformed result is
+ * treated as an unknown publication outcome and never followed by another
+ * mutating primitive.
+ */
+function isPreMutationUnsupportedRenameResult(value: unknown): value is NativeNoReplaceResult {
+	if (!isValidNativeNoReplaceResult(value)) return false;
+	if (
+		value.ok !== false ||
+		(value.code !== "invalid_request" && value.code !== "atomic_unavailable") ||
+		value.mutationState !== "not_committed" ||
+		value.durabilityState !== "not_attempted" ||
+		value.reason !== value.code ||
+		(value.primitive !== "renameat2_noreplace" && value.primitive !== "renameatx_np_excl") ||
+		(value.phase !== "preflight" && value.phase !== "rename")
+	)
+		return false;
+	return true;
+}
+
 async function localLockKey(lockPath: string): Promise<string> {
 	try {
 		return normalizeLockKey(await fs.realpath(lockPath));
@@ -452,17 +568,9 @@ function ownerIncarnationChanged(owner: FileLockOwnerToken, startTimeCache?: Map
 /** Outcome of a guarded lock-dir removal attempt (`removeFileLockDirForGc`). */
 export type FileLockGcRemoval = "removed" | "owner_changed" | "missing" | "cleanup_failed";
 
-interface LockDirStatToken {
-	dev: number;
-	ino: number;
-	mtimeMs: number;
-	ctimeMs: number;
-}
-
 type LockStaleSnapshot =
 	| { stale: false }
-	| { stale: true; owner: FileLockOwnerToken; identity: GenericFileLockDirIdentity }
-	| { stale: true; owner: null; stat: LockDirStatToken };
+	| { stale: true; owner: FileLockOwnerToken; identity: GenericFileLockDirIdentity };
 
 /** Identity evidence carried by the generic stale verdict into a later removal. */
 export interface GenericFileLockDirIdentity {
@@ -634,22 +742,9 @@ function ownerLiveness(pid: number): OwnerLiveness {
 	}
 }
 
-function statToken(stats: Stats): LockDirStatToken {
-	return {
-		dev: stats.dev,
-		ino: stats.ino,
-		mtimeMs: stats.mtimeMs,
-		ctimeMs: stats.ctimeMs,
-	};
-}
-
-function sameStatToken(a: LockDirStatToken, b: LockDirStatToken): boolean {
-	return a.dev === b.dev && a.ino === b.ino && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
-}
-
 async function staleLockSnapshot(
 	lockPath: string,
-	staleMs: number,
+	_staleMs: number,
 	ownerHostId?: string,
 	previousOwnerHostIds: readonly string[] = [],
 	startTimeCache?: Map<string, string | null>,
@@ -673,26 +768,12 @@ async function staleLockSnapshot(
 		if (isTransientReleaseError(error)) return { stale: false };
 		throw error;
 	}
-	if (!info && ownerHostId !== undefined) return { stale: false };
 	if (!info) {
-		// A present but malformed owner record is not equivalent to a lock directory
-		// caught between mkdir and metadata publication. Refuse stale fallback when the
-		// metadata path exists: an unreadable live holder must never be reclaimed by
-		// elapsed mtime alone.
-		try {
-			await fs.lstat(path.join(lockPath, "info"));
-			return { stale: false };
-		} catch (error) {
-			if (!isEnoent(error)) throw error;
-		}
-		try {
-			const stats = await fs.stat(lockPath);
-			if (Date.now() - stats.mtimeMs <= staleMs) return { stale: false };
-			return { stale: true, owner: null, stat: statToken(stats) };
-		} catch (err) {
-			if (isEnoent(err)) return { stale: false };
-			throw err;
-		}
+		// A directory without a valid owner record is either a contender between
+		// native mkdirat ownership and metadata publication, or malformed/foreign
+		// state. Neither case carries enough identity evidence for stale removal;
+		// elapsed mtime must never make this empty namespace reclaimable.
+		return { stale: false };
 	}
 
 	// A host-qualified lock may only be reclaimed after proving that its owner is
@@ -741,38 +822,7 @@ async function staleLockSnapshot(
 
 async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
 	if (!snapshot.stale) return false;
-	if (snapshot.owner) {
-		return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
-	}
-
-	let currentInfo: LockInfo | null;
-	try {
-		currentInfo = await readLockInfo(lockPath);
-	} catch (error) {
-		if (isTransientReleaseError(error)) return false;
-		throw error;
-	}
-	if (currentInfo) return false;
-	try {
-		const currentStats = await fs.lstat(lockPath);
-		if (currentStats.isSymbolicLink() || !currentStats.isDirectory()) return false;
-		if (!sameStatToken(statToken(currentStats), snapshot.stat)) return false;
-		const nativeCapturePath = await canonicalLockPathPreservingFinal(lockPath);
-		const captured = nativeFileLockBindings().snapshotDirectoryTree(nativeCapturePath);
-		if (captured.code === "sharing_violation") throwTransientNativeResult(captured.code);
-		if (!captured.ok || !captured.snapshot) return false;
-		if (
-			captured.snapshot.rootDev !== String(currentStats.dev) ||
-			captured.snapshot.rootIno !== String(currentStats.ino)
-		)
-			return false;
-		const removed = nativeFileLockBindings().exactRemoveDirectoryTree(nativeCapturePath, captured.snapshot);
-		return removed.ok || removed.code === "not_found";
-	} catch (err) {
-		if (isEnoent(err)) return false;
-		if (isTransientReleaseError(err)) return false;
-		throw err;
-	}
+	return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
 }
 
 /**
@@ -812,7 +862,7 @@ export async function genericFileLockDirStaleVerdict(
 	ownerHostId?: string,
 ): Promise<GenericFileLockDirStaleVerdict> {
 	const verdict = await staleLockSnapshot(lockDir, staleMs, ownerHostId);
-	if (!verdict.stale || verdict.owner === null) return { stale: false };
+	if (!verdict.stale) return { stale: false };
 	return {
 		stale: true,
 		identity: verdict.identity,
@@ -841,11 +891,32 @@ async function tryAcquireLock(
 		// already-created staging entry and its parent before publication so aliases
 		// retain the same lock identity as the ordinary path.
 		const canonicalParent = await fs.realpath(path.dirname(lockPath));
-		const published = await renameNoReplacePathAsync(
-			await fs.realpath(pendingPath),
-			path.join(canonicalParent, path.basename(lockPath)),
-		);
-		if (!published.ok) {
+		const destinationPath = path.join(canonicalParent, path.basename(lockPath));
+		// Resolve only the stable parent: resolving the mutable staging final
+		// component would follow an attacker-replaced symlink before native no-follow
+		// validation gets a chance to reject it.
+		const canonicalPendingPath = path.join(canonicalParent, path.basename(pendingPath));
+		const publication = FileLockTestHooks.nativePublicationBindings?.() ?? {
+			renameNoReplacePathAsync,
+			renameDirectoryNoReplacePathAsync,
+		};
+		const published = await publication.renameNoReplacePathAsync(canonicalPendingPath, destinationPath);
+		let publishedSuccessfully = published.ok;
+		if (!published.ok && isPreMutationUnsupportedRenameResult(published)) {
+			const fallback = await publication.renameDirectoryNoReplacePathAsync(canonicalPendingPath, destinationPath);
+			if (fallback.ok) {
+				publishedSuccessfully = true;
+			} else if (fallback.reason === "destination_exists") {
+				return null;
+			} else {
+				const failure = new Error(
+					`Failed to publish file lock: ${fallback.code ?? fallback.reason ?? "unknown"}.`,
+				) as NodeJS.ErrnoException;
+				if (fallback.code) failure.code = fallback.code;
+				throw failure;
+			}
+		}
+		if (!publishedSuccessfully) {
 			if (published.reason === "destination_exists") return null;
 			const failure = new Error(
 				`Failed to publish file lock: ${published.code ?? published.reason ?? "unknown"}.`,

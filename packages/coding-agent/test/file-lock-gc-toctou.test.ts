@@ -12,7 +12,6 @@ import {
 } from "@gajae-code/coding-agent/config/file-lock";
 import { fileLocksGcAdapter } from "@gajae-code/coding-agent/config/file-lock-gc";
 import type { GcContext, GcPidProbe, GcRecord } from "@gajae-code/coding-agent/gjc-runtime/gc-runtime";
-import * as native from "@gajae-code/natives";
 import { snapshotDirectoryTree } from "@gajae-code/natives";
 
 const DEAD_PID = 525_252;
@@ -23,6 +22,7 @@ const tempDirs: string[] = [];
 afterEach(async () => {
 	vi.restoreAllMocks();
 	FileLockTestHooks.afterParentMkdir = undefined;
+	FileLockTestHooks.nativePublicationBindings = undefined;
 	FileLockTestHooks.nativeQuarantineBindings = undefined;
 	for (const dir of tempDirs.splice(0)) {
 		await fs.rm(dir, { recursive: true, force: true });
@@ -98,45 +98,124 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect((await fs.readdir(`${file}.lock`)).join(",")).toBe("info");
 	});
 
-	test("fails closed when native no-replace publication is unsupported", async () => {
+	test("publishes through the directory fallback when native no-replace is unsupported", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "unsupported", "publication.json");
-		const realRename = native.renameNoReplacePathAsync;
-		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async () => ({
-			ok: false,
-			code: "atomic_unavailable",
-			mutationState: "not_committed",
-			durabilityState: "not_attempted",
-			reason: "atomic_unavailable",
-			primitive: "renameat2_noreplace",
-			phase: "preflight",
-			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
-		}));
-		await expect(withFileLock(file, async () => undefined)).rejects.toThrow(
-			"Failed to publish file lock: atomic_unavailable",
-		);
-		expect(await fs.exists(`${file}.lock`)).toBe(false);
-		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(realRename);
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async () => ({
+				ok: false,
+				code: "atomic_unavailable",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "atomic_unavailable",
+				primitive: "renameat2_noreplace",
+				phase: "preflight",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			}),
+			renameDirectoryNoReplacePathAsync: async (source, destination) => {
+				await fs.rename(source, destination);
+				return {
+					ok: true,
+					mutationState: "committed",
+					durabilityState: "not_attempted",
+					reason: "none",
+					primitive: "mkdirat_renameat_noreplace",
+					phase: "complete",
+					diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+				};
+			},
+		});
+		let publishedInfo = "";
+		await expect(
+			withFileLock(file, async () => {
+				publishedInfo = await fs.readFile(`${file}.lock/info`, "utf8");
+			}),
+		).resolves.toBeUndefined();
+		expect(publishedInfo).toContain('"pid"');
+	});
+
+	test("keeps non-ASCII lock paths on the native fallback boundary", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "사내블로그", "월간트렌드_2608", "publication.json");
+		let fallbackCalls = 0;
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async () => ({
+				ok: false,
+				code: "atomic_unavailable",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "atomic_unavailable",
+				primitive: "renameat2_noreplace",
+				phase: "preflight",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			}),
+			renameDirectoryNoReplacePathAsync: async (source, destination) => {
+				fallbackCalls += 1;
+				await fs.rename(source, destination);
+				return {
+					ok: true,
+					mutationState: "committed",
+					durabilityState: "not_attempted",
+					reason: "none",
+					primitive: "mkdirat_renameat_noreplace",
+					phase: "complete",
+					diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+				};
+			},
+		});
+
+		await withFileLock(file, async () => {
+			expect(await fs.readFile(`${file}.lock/info`, "utf8")).toContain('"owner_token"');
+		});
+		expect(fallbackCalls).toBe(1);
 	});
 
 	test("does not replace a legacy empty lock directory when publication is unsupported", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "legacy-empty", "publication.json");
 		await fs.mkdir(`${file}.lock`, { recursive: true });
-		const realRename = native.renameNoReplacePathAsync;
-		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async () => ({
-			ok: false,
-			code: "invalid_request",
-			mutationState: "not_committed",
-			durabilityState: "not_attempted",
-			reason: "invalid_request",
-			primitive: "renameat2_noreplace",
-			phase: "preflight",
-			diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
-		}));
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async () => ({
+				ok: false,
+				code: "invalid_request",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "invalid_request",
+				primitive: "renameat2_noreplace",
+				phase: "preflight",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			}),
+			renameDirectoryNoReplacePathAsync: async () => ({
+				ok: false,
+				code: "quarantine_collision",
+				mutationState: "not_committed",
+				durabilityState: "not_attempted",
+				reason: "destination_exists",
+				primitive: "mkdirat_renameat_noreplace",
+				phase: "rename",
+				diagnostic: { schemaVersion: 1, collectionState: "unavailable" },
+			}),
+		});
 		await expect(withFileLock(file, async () => undefined, { retries: 2, retryDelayMs: 1 })).rejects.toThrow();
 		expect((await fs.stat(`${file}.lock`)).isDirectory()).toBe(true);
-		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(realRename);
+	});
+
+	test("does not invoke the directory fallback for a malformed native result", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "malformed", "publication.json");
+		let fallbackCalled = false;
+		FileLockTestHooks.nativePublicationBindings = () => ({
+			renameNoReplacePathAsync: async () => ({ ok: false, code: "atomic_unavailable" }) as never,
+			renameDirectoryNoReplacePathAsync: async () => {
+				fallbackCalled = true;
+				throw new Error("fallback must not run");
+			},
+		});
+
+		await expect(withFileLock(file, async () => undefined, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
+			"Failed to publish file lock: atomic_unavailable.",
+		);
+		expect(fallbackCalled).toBe(false);
 	});
 
 	test("publishes nested lock directories with private modes under restrictive umask", async () => {
@@ -185,6 +264,21 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		} finally {
 			process.umask(previousUmask);
 		}
+	});
+
+	test("publishes a lock for a non-ASCII path", async () => {
+		const root = await makeTemp();
+		const file = path.join(root, "사내블로그", "월간트렌드_2608", "post.md");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+
+		let entered = false;
+		await withFileLock(file, async () => {
+			entered = true;
+			expect(await fs.readFile(`${file}.lock/info`, "utf8")).toContain('"owner_token"');
+		});
+
+		expect(entered).toBe(true);
+		expect(await fs.exists(`${file}.lock`)).toBe(false);
 	});
 
 	test("honors an already-aborted signal before creating lock parents", async () => {
@@ -376,6 +470,8 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		const lockedFile = path.join(base, "state.json");
 		const lockDir = `${lockedFile}.lock`;
 		await fs.mkdir(lockDir);
+		const old = new Date(Date.now() - 60_000);
+		await fs.utimes(lockDir, old, old);
 
 		await expect(withFileLock(lockedFile, async () => undefined, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
 			"Failed to acquire lock",

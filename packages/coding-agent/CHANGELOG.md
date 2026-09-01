@@ -20,6 +20,13 @@
 
 ### Fixed
 
+- File locks now use a descriptor-relative exclusive directory-publication fallback
+	when a filesystem returns `EINVAL` for `renameat2(RENAME_NOREPLACE)` (for example
+	WSL2 DrvFs), so `edit` and terminal persistence no longer surface `Failed to publish
+	file lock: invalid_request` on valid paths. The native fallback preserves no-follow
+	path containment, owner identity, no-replace contention, and fail-closed stale-owner
+	checks. (#5164)
+
 - The first Esc on a streaming turn with a queued steering message again consumes that steer and auto-continues instead of aborting the turn and dumping the queue back into the composer. The busy-indicator recovery branch counted the same drainable queue as cancellable work and, because a streaming turn always has that indicator mounted, it short-circuited before the steer-on-interrupt branch could run. Stale busy-indicator recovery, pending-submission cancellation, and the loud second-Esc abort are unchanged.
 
 - Print and JSON turns now fail closed when the provider/agent produces no readable assistant text: JSON emits a bounded `agent_failed` disposition and failures exit nonzero, while tool-only terminal output can no longer masquerade as success. (#5153)
