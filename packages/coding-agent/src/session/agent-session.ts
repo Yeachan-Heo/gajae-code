@@ -14500,6 +14500,7 @@ export class AgentSession {
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
 			this.#drainTerminalOwnedYieldEntries();
+			if (options?.preserveCompaction !== true) this.abortCompaction();
 			const overlappingPostPromptDrain = this.#cancelPostPromptTasks();
 			// Abort visibility is per-request: a later real abort must not inherit an
 			// earlier silent abort's suppression and swallow the user-visible notice.
