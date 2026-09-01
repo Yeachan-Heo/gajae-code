@@ -58,6 +58,7 @@ import {
 	scopeRequestV1,
 } from "./session-scope";
 import {
+	isSubstrateDiagnostic,
 	type MasterCapabilityVerifier,
 	type SeedDeliveryV2,
 	SpawnAuthorityStore,
@@ -1496,7 +1497,12 @@ export class Broker {
 	#spawnTerminalResponse(claim: SpawnClaimV2): BrokerResponse {
 		if (claim.state === "accepted") return { ok: true, result: this.#spawnResult("spawn_replayed", claim) };
 		if (claim.state === "pre_send_rejected")
-			return error("spawn_failed", "session.spawn was rejected before seed handoff");
+			return error(
+				"spawn_failed",
+				claim.substrateDiagnostic === undefined
+					? "session.spawn was rejected before seed handoff"
+					: `session.spawn was rejected before seed handoff: ${claim.substrateDiagnostic}`,
+			);
 		return error("resource_gone", "session.spawn claim is closed");
 	}
 
@@ -1553,14 +1559,24 @@ export class Broker {
 				});
 				if (launched.ok) launchedProof = launched.proof;
 				if (!launched.ok) {
+					// The provider's concrete reason is the only actionable evidence the
+					// operator gets, so it travels into BOTH the durable claim and the
+					// response instead of being replaced by a constant (#5128).
+					const diagnostic = isSubstrateDiagnostic(launched.diagnostic) ? launched.diagnostic : undefined;
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
 							from: "substrate_starting",
 							to: "pre_send_rejected",
+							...(diagnostic === undefined ? {} : { substrateDiagnostic: diagnostic }),
 						})
 					).claim;
-					return error("spawn_failed", "session.spawn substrate could not be safely established");
+					return error(
+						"spawn_failed",
+						diagnostic === undefined
+							? "session.spawn substrate could not be safely established"
+							: `session.spawn substrate could not be safely established: ${diagnostic}`,
+					);
 				}
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,

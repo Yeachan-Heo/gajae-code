@@ -24,6 +24,8 @@ export type SpawnClaimV2 = {
 	childId?: string;
 	seed?: SeedDeliveryV2;
 	authorityRef?: string;
+	/** Bounded, secret-free reason a rejected spawn could not establish a substrate. */
+	substrateDiagnostic?: string;
 	createdAt: number;
 	updatedAt: number;
 };
@@ -71,11 +73,15 @@ export type SpawnSubstrateProof = {
 };
 
 export interface SpawnSubstrateProvider {
-	launch(
-		spec: SpawnSubstrateLaunchSpec,
-	): Promise<
+	launch(spec: SpawnSubstrateLaunchSpec): Promise<
 		| { ok: true; proof: SpawnSubstrateProof }
-		| { ok: false; code: "substrate_unavailable" | "substrate_proof_failed"; message: string }
+		| {
+				ok: false;
+				code: "substrate_unavailable" | "substrate_proof_failed";
+				message: string;
+				/** Bounded, secret-free reason every rejected candidate substrate gave. */
+				diagnostic?: string;
+		  }
 	>;
 	verify(proof: SpawnSubstrateProof): Promise<"verified" | "mismatch" | "gone">;
 	close(proof: SpawnSubstrateProof): Promise<{ ok: boolean; code?: string }>;
@@ -138,6 +144,8 @@ export type SpawnClaimTransition = {
 	authority?: SpawnAuthorityV1;
 	/** Required to downgrade dispatching only when no frame was handed off. */
 	provenNoHandoff?: true;
+	/** Bounded, secret-free substrate rejection note; only a pre_send_rejected edge carries it. */
+	substrateDiagnostic?: string;
 };
 
 export type SpawnAuthorityTransitionResult = {
@@ -218,6 +226,7 @@ const CLAIM_KEYS = new Set([
 	"childId",
 	"seed",
 	"authorityRef",
+	"substrateDiagnostic",
 	"createdAt",
 	"updatedAt",
 ]);
@@ -258,6 +267,8 @@ const AUTHORITY_KEYS = new Set([
 	"createdAt",
 	"updatedAt",
 ]);
+/** Bound for the operator-facing substrate diagnostic carried by a rejected claim. */
+export const SUBSTRATE_DIAGNOSTIC_MAX_LENGTH = 400;
 const SUBSTRATE_KINDS = new Set<SpawnSubstrateProof["substrateKind"]>(["tmux", "psmux", "headless"]);
 const FORBIDDEN_FIELD =
 	/(?:task|prompt|capability|idempotency|fingerprint|requesthash|digest|credential|token|secret|password|stderr)/i;
@@ -290,6 +301,20 @@ function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean
 
 function isOpaque(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= 512;
+}
+
+/**
+ * A bounded, single-line, control-character-free operator note. It is the only
+ * free-form text the claim journal accepts, so its shape is validated here
+ * rather than trusted from the caller.
+ */
+export function isSubstrateDiagnostic(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= SUBSTRATE_DIAGNOSTIC_MAX_LENGTH &&
+		!/[\u0000-\u001f\u007f]/u.test(value)
+	);
 }
 
 function isTimestamp(value: unknown): value is number {
@@ -457,6 +482,11 @@ export function isSpawnClaimV2(value: unknown): value is SpawnClaimV2 {
 		(claim.childId === undefined || isOpaque(claim.childId)) &&
 		(claim.seed === undefined || isSeed(claim.seed)) &&
 		(claim.authorityRef === undefined || isOpaque(claim.authorityRef)) &&
+		(claim.substrateDiagnostic === undefined || isSubstrateDiagnostic(claim.substrateDiagnostic)) &&
+		(claim.substrateDiagnostic === undefined ||
+			claim.state === "pre_send_rejected" ||
+			claim.state === "uncertain" ||
+			claim.state === "closed") &&
 		isTimestamp(claim.createdAt) &&
 		isTimestamp(claim.updatedAt) &&
 		claim.updatedAt >= claim.createdAt;
@@ -754,6 +784,15 @@ export class SpawnAuthorityStore {
 						throw new SpawnAuthorityTransitionError("invalid_transition");
 					if (transition.childId !== undefined || transition.authority !== undefined)
 						throw new SpawnAuthorityTransitionError("invalid_transition");
+					if (
+						transition.substrateDiagnostic !== undefined &&
+						!isSubstrateDiagnostic(transition.substrateDiagnostic)
+					)
+						throw new SpawnAuthorityTransitionError("invalid_transition");
+					const rejection =
+						transition.substrateDiagnostic === undefined
+							? {}
+							: { substrateDiagnostic: transition.substrateDiagnostic };
 					if (current.seed) {
 						if (
 							!isSeed(transition.seed) ||
@@ -761,10 +800,10 @@ export class SpawnAuthorityStore {
 							!sameSeedIdentity(current.seed, transition.seed)
 						)
 							throw new SpawnAuthorityTransitionError("invalid_transition");
-						next = { ...current, state: "pre_send_rejected", seed: transition.seed };
+						next = { ...current, ...rejection, state: "pre_send_rejected", seed: transition.seed };
 					} else {
 						if (transition.seed !== undefined) throw new SpawnAuthorityTransitionError("invalid_transition");
-						next = { ...current, state: "pre_send_rejected" };
+						next = { ...current, ...rejection, state: "pre_send_rejected" };
 					}
 					break;
 				}

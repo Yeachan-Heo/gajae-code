@@ -14,7 +14,12 @@ import {
 	verifyManagedGjcTmuxSession,
 } from "../../gjc-runtime/tmux-sessions";
 import { processIncarnation } from "./process-incarnation";
-import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof, SpawnSubstrateProvider } from "./spawn-authority";
+import {
+	type SpawnSubstrateLaunchSpec,
+	type SpawnSubstrateProof,
+	type SpawnSubstrateProvider,
+	SUBSTRATE_DIAGNOSTIC_MAX_LENGTH,
+} from "./spawn-authority";
 
 export type SpawnMultiplexerSelection = "none" | "tmux" | "psmux" | "proof_failed";
 
@@ -77,6 +82,26 @@ function messageFor(code: "substrate_unavailable" | "substrate_proof_failed"): s
 	return code === "substrate_unavailable"
 		? "No safe spawn substrate is available."
 		: "The selected spawn substrate could not be proven exactly.";
+}
+
+/**
+ * Collapses one operator-facing failure note to a bounded, control-character-free
+ * single line. Substrate diagnostics never carry task text or credentials, so the
+ * only hardening needed here is shape: no control bytes, no unbounded growth.
+ */
+export function boundedDiagnostic(value: string): string | undefined {
+	const cleaned = value
+		.replaceAll(/[\u0000-\u001f\u007f]+/gu, " ")
+		.replaceAll(/\s+/gu, " ")
+		.trim();
+	if (!cleaned) return undefined;
+	return cleaned.length <= SUBSTRATE_DIAGNOSTIC_MAX_LENGTH
+		? cleaned
+		: `${cleaned.slice(0, SUBSTRATE_DIAGNOSTIC_MAX_LENGTH - 1)}…`;
+}
+
+function diagnosticFrom(error: unknown): string {
+	return boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "unknown_error";
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
@@ -372,44 +397,65 @@ export function createSpawnSubstrateProvider(
 			const selected = selectMultiplexer();
 			if (selected === "proof_failed")
 				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+			// A multiplexer that cannot be launched is not evidence that the host has
+			// no usable substrate (#5128). Record why it failed and continue to the
+			// next candidate, which proves itself with its own exact proof.
+			const rejected: string[] = [];
 			if (selected === "tmux" || selected === "psmux") {
-				let managed: ManagedTmuxLaunchProof;
+				let managed: ManagedTmuxLaunchProof | undefined;
 				try {
 					managed = launchManaged(spec, launchEnv, platform);
-				} catch {
-					return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+				} catch (error) {
+					rejected.push(`${selected}_launch_failed:${diagnosticFrom(error)}`);
 				}
-				const incarnation = readIncarnation(managed.pid);
-				if (!incarnation || verifyManaged(managed, launchEnv) !== "verified") {
-					try {
-						await closeManaged(managed, launchEnv);
-					} catch {
-						// The managed close primitive is already exact-proof fenced. Retain its result only in authority state.
-					}
-					return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+				if (managed) {
+					const incarnation = readIncarnation(managed.pid);
+					const verdict = incarnation ? verifyManaged(managed, launchEnv) : "mismatch";
+					if (!incarnation || verdict !== "verified") {
+						try {
+							await closeManaged(managed, launchEnv);
+						} catch {
+							// The managed close primitive is already exact-proof fenced. Retain its result only in authority state.
+						}
+						rejected.push(
+							`${selected}_proof_failed:${incarnation ? verdict : "process_incarnation_unavailable"}`,
+						);
+					} else
+						return {
+							ok: true,
+							proof: {
+								substrateKind: selected,
+								providerIdentity: managed.providerIdentity,
+								nativeSessionId: managed.nativeSessionId,
+								pid: managed.pid,
+								processIncarnation: incarnation,
+								stateFileProof: managedStateProof(managed),
+							},
+						};
 				}
-				return {
-					ok: true,
-					proof: {
-						substrateKind: selected,
-						providerIdentity: managed.providerIdentity,
-						nativeSessionId: managed.nativeSessionId,
-						pid: managed.pid,
-						processIncarnation: incarnation,
-						stateFileProof: managedStateProof(managed),
-					},
-				};
 			}
+			const failure = (
+				code: "substrate_unavailable" | "substrate_proof_failed",
+				reason: string,
+			): {
+				ok: false;
+				code: "substrate_unavailable" | "substrate_proof_failed";
+				message: string;
+				diagnostic: string;
+			} => {
+				const diagnostic = boundedDiagnostic([...rejected, `headless_${reason}`].join(" | "))!;
+				return { ok: false, code, message: `${messageFor(code)} (${diagnostic})`, diagnostic };
+			};
 			let child: SpawnHeadlessProcess;
 			try {
 				child = launchHeadless(spec, launchEnv);
-			} catch {
-				return { ok: false, code: "substrate_unavailable", message: messageFor("substrate_unavailable") };
+			} catch (error) {
+				return failure("substrate_unavailable", `launch_failed:${diagnosticFrom(error)}`);
 			}
 			const incarnation = readIncarnation(child.pid);
 			if (!incarnation) {
 				child.terminate();
-				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+				return failure("substrate_proof_failed", "process_incarnation_unavailable");
 			}
 			const providerIdentity = crypto.randomUUID();
 			const state: HeadlessState = {
@@ -423,10 +469,14 @@ export function createSpawnSubstrateProvider(
 			const stateFile = stateFileFor(spec, providerIdentity);
 			try {
 				await writeHeadlessState(stateFile, state);
-			} catch {
+			} catch (error) {
 				child.terminate();
-				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+				return failure("substrate_proof_failed", `state_write_failed:${diagnosticFrom(error)}`);
 			}
+			if (rejected.length > 0)
+				logger.warn("sdk broker fell back to the headless spawn substrate", {
+					rejected: boundedDiagnostic(rejected.join(" | ")),
+				});
 			return {
 				ok: true,
 				proof: {
