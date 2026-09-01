@@ -8,7 +8,7 @@ import {
 	turnTimeoutFingerprint,
 } from "../../goals/continuation-timeout-guard";
 import { type Goal, type GoalModeState, normalizeGoal } from "../../goals/state";
-import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent, SessionIdentityAdmission } from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
 import { formatDuration } from "../../slash-commands/helpers/format";
 import type { SubmittedUserInput } from "../types";
@@ -22,7 +22,7 @@ type GoalAsyncMutationFence = {
 	kind: GoalAsyncMutationKind;
 	lifecycleGeneration: number;
 	continuationGeneration: number;
-	identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
+	identity: SessionIdentityAdmission | undefined;
 };
 
 const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop"]);
@@ -96,18 +96,16 @@ export class GoalModeController {
 		this.#paused = paused;
 	}
 
-	#captureSessionIdentity(): ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined {
+	#captureSessionIdentity(): SessionIdentityAdmission | undefined {
 		const session = this.ctx.session as AgentSession & {
-			captureSessionIdentityForMode?: () => ReturnType<AgentSession["captureSessionIdentityForMode"]>;
+			captureSessionIdentityForMode?: () => SessionIdentityAdmission;
 		};
 		return session.captureSessionIdentityForMode?.();
 	}
 
-	#isSessionIdentityCurrent(identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined): boolean {
+	#isSessionIdentityCurrent(identity: SessionIdentityAdmission | undefined): boolean {
 		const session = this.ctx.session as AgentSession & {
-			isSessionIdentityCurrentForMode?: (
-				admission: ReturnType<AgentSession["captureSessionIdentityForMode"]>,
-			) => boolean;
+			isSessionIdentityCurrentForMode?: (admission: SessionIdentityAdmission) => boolean;
 		};
 		return identity === undefined
 			? !this.ctx.session.isSessionTransitioning

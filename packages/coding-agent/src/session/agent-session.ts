@@ -2275,6 +2275,17 @@ export class StreamingEditFileCache {
 	}
 }
 type SessionAdmissionKind = "prompt" | "selection";
+/** Identity captured before an async mutator may yield. */
+export type SessionIdentityAdmission = {
+	readonly manager: SessionManager;
+	readonly sessionId: string;
+	readonly sessionFile: string | undefined;
+	readonly transitionGeneration: number;
+};
+/** Per-hook exception token; its generation invalidates when a transition starts. */
+type InternalTransitionEmissionToken = {
+	readonly transitionGeneration: number;
+};
 class SessionRunCancellationDomainBridge implements RunCancellationDomainBridge {
 	#domains = new Map<string, { domain: RunCancellationDomain; controller: AbortController }>();
 	#released = new Set<string>();

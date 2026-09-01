@@ -11,7 +11,11 @@ import planModeApprovedPrompt from "../../prompts/system/plan-mode-approved.md" 
 import planModeCompactInstructionsPrompt from "../../prompts/system/plan-mode-compact-instructions.md" with {
 	type: "text",
 };
-import type { AgentSession, TemporaryProviderSessionScope } from "../../session/agent-session";
+import type {
+	AgentSession,
+	SessionIdentityAdmission,
+	TemporaryProviderSessionScope,
+} from "../../session/agent-session";
 import type { SessionContext, SessionManager } from "../../session/session-manager";
 import { normalizeLocalScheme } from "../../tools/path-utils";
 import { type ResolveToolDetails, runResolveInvocation } from "../../tools/resolve";
@@ -108,18 +112,16 @@ export class PlanModeController {
 		});
 	}
 
-	#captureSessionIdentity(): ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined {
+	#captureSessionIdentity(): SessionIdentityAdmission | undefined {
 		const session = this.ctx.session as AgentSession & {
-			captureSessionIdentityForMode?: () => ReturnType<AgentSession["captureSessionIdentityForMode"]>;
+			captureSessionIdentityForMode?: () => SessionIdentityAdmission;
 		};
 		return session.captureSessionIdentityForMode?.();
 	}
 
-	#isSessionIdentityCurrent(identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined): boolean {
+	#isSessionIdentityCurrent(identity: SessionIdentityAdmission | undefined): boolean {
 		const session = this.ctx.session as AgentSession & {
-			isSessionIdentityCurrentForMode?: (
-				admission: ReturnType<AgentSession["captureSessionIdentityForMode"]>,
-			) => boolean;
+			isSessionIdentityCurrentForMode?: (admission: SessionIdentityAdmission) => boolean;
 		};
 		return identity === undefined
 			? !this.ctx.session.isSessionTransitioning
@@ -128,15 +130,12 @@ export class PlanModeController {
 
 	#captureLifecycle(): {
 		epoch: number;
-		identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
+		identity: SessionIdentityAdmission | undefined;
 	} {
 		return { epoch: this.#lifecycleEpoch, identity: this.#captureSessionIdentity() };
 	}
 
-	#isLifecycleCurrent(lifecycle: {
-		epoch: number;
-		identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
-	}): boolean {
+	#isLifecycleCurrent(lifecycle: { epoch: number; identity: SessionIdentityAdmission | undefined }): boolean {
 		return (
 			lifecycle.epoch === this.#lifecycleEpoch &&
 			this.#isSessionIdentityCurrent(lifecycle.identity) &&
@@ -393,10 +392,7 @@ export class PlanModeController {
 		}
 	}
 
-	async #applyModel(lifecycle: {
-		epoch: number;
-		identity: ReturnType<AgentSession["captureSessionIdentityForMode"]> | undefined;
-	}): Promise<void> {
+	async #applyModel(lifecycle: { epoch: number; identity: SessionIdentityAdmission | undefined }): Promise<void> {
 		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		const resolved = this.ctx.session.resolveRoleModelWithThinking("plan");
 		if (!resolved.model) return;
