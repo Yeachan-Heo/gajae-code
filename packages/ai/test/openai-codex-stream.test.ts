@@ -3988,7 +3988,7 @@ describe("openai-codex streaming", () => {
 			streamMaxRetries: 0,
 		}).result();
 		expect(stalled.stopReason).toBe("error");
-		expect(Date.now() - startedAt).toBeLessThan(5_000);
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
 	});
 
 	it("replays x-codex-turn-state on subsequent SSE requests", async () => {

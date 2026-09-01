@@ -146,13 +146,19 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				);
 			}
 
+			const sessionAgentDir = this.#session.getSessionAgentDir?.();
+			const sessionHome =
+				this.#session.getSessionHome?.() ??
+				(this.#session.getSessionAgentDir === undefined ? this.#session.home : undefined);
+			const resolvedAgentDir =
+				sessionAgentDir ?? (sessionHome === undefined ? this.#session.settings.getAgentDir() : undefined);
 			const runtimeSkill = isProviderEnabled("native", this.#session.settings)
 				? await findRuntimeSkillByName(
 						this.#session.cwd,
 						requestedName,
 						this.#getRuntimeSkillPolicy(),
-						this.#session.getSessionHome?.(),
-						this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
+						sessionHome,
+						resolvedAgentDir,
 						this.#session.getSessionProfileAuthority?.(),
 					)
 				: undefined;
@@ -193,7 +199,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			const args = (input.args ?? "").trim();
 			const activationResult = await resolveSubskillActivationForSkillInvocation({
 				cwd: this.#session.cwd,
-				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
+				agentDir: resolvedAgentDir,
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 				skillName: skill.name,
 				args,
@@ -202,7 +208,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				subskillActivation: activationResult.activation,
 				subskillActivationSet: activationResult.activeSubskillsToPersist,
 				cwd: this.#session.cwd,
-				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
+				agentDir: resolvedAgentDir,
 				sessionId: this.#session.getSessionId?.() ?? activeState?.session_id?.trim() ?? undefined,
 			});
 

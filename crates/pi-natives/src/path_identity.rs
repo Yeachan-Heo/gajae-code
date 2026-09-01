@@ -5019,6 +5019,29 @@ pub(crate) mod platform {
 		Ok(())
 	}
 
+	/// Scrub a publication that has already crossed the rename boundary before
+	/// returning a failure.  The retained descriptor is the authority for the
+	/// payload, while the pathname is removed only after an exact descriptor/name
+	/// comparison; a concurrent successor is therefore never consumed by
+	/// cleanup.
+	fn fail_published_skill_file(
+		file: File,
+		skill_fd: libc::c_int,
+		skills_fd: libc::c_int,
+		final_name: &CString,
+		code: &'static str,
+	) -> NativeSecureSkillWriteResult {
+		let cleanup = scrub_published_skill_file(&file, skill_fd, final_name);
+		drop(file);
+		// SAFETY: this operation owns both duplicated directory descriptors exactly
+		// once; the retained root authority owns and closes its separate descriptor.
+		unsafe {
+			libc::close(skill_fd);
+			libc::close(skills_fd);
+		}
+		NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code))
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained published descriptor and parent descriptor remain live through final validation"
@@ -5027,6 +5050,7 @@ pub(crate) mod platform {
 		file: &File,
 		parent_fd: libc::c_int,
 		name: &CString,
+		expected_mode: Option<u32>,
 	) -> Result<bool, &'static str> {
 		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
 		if unsafe { libc::fstat(file.as_raw_fd(), &mut opened) } != 0 {
@@ -5040,6 +5064,9 @@ pub(crate) mod platform {
 		}
 		Ok(opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& named.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& expected_mode.map_or(true, |mode| {
+				opened.st_mode & 0o7777 == mode && named.st_mode & 0o7777 == mode
+			})
 			&& opened.st_nlink == 1
 			&& named.st_nlink == 1
 			&& opened.st_dev == named.st_dev
@@ -5133,13 +5160,12 @@ pub(crate) mod platform {
 				},
 			};
 		if skill_created && unsafe { libc::fchmod(skill_fd, directory_mode) } != 0 {
+			let code = skill_write_error(&std::io::Error::last_os_error());
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
-			return NativeSecureSkillWriteResult::failure(skill_write_error(
-				&std::io::Error::last_os_error(),
-			));
+			return NativeSecureSkillWriteResult::failure(code);
 		}
 		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
 			unsafe {
@@ -5303,29 +5329,34 @@ pub(crate) mod platform {
 		}
 		if file_mode != 0o600 {
 			if unsafe { libc::fchmod(private_fd, requested_file_mode as libc::mode_t) } != 0 {
-				drop(file);
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(skill_write_error(
-					&std::io::Error::last_os_error(),
-				));
+				let code = skill_write_error(&std::io::Error::last_os_error());
+				return fail_published_skill_file(file, skill_fd, skills_fd, &final_name, code);
 			}
 			if file.sync_all().is_err() {
-				drop(file);
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure("durability_failed");
+				return fail_published_skill_file(
+					file,
+					skill_fd,
+					skills_fd,
+					&final_name,
+					"durability_failed",
+				);
 			}
 		}
 		// A hard link can be added after the post-rename check but before the
 		// metadata sync above completes.  Re-check the retained inode after every
 		// delayed write; if the single-link invariant no longer holds, scrub the
 		// inode and remove only our exact public name before returning failure.
-		match published_skill_file_is_valid(&file, skill_fd, &final_name) {
+		let expected_published_mode = if file_mode == 0o600 {
+			0o600
+		} else {
+			requested_file_mode
+		};
+		match published_skill_file_is_valid(
+			&file,
+			skill_fd,
+			&final_name,
+			Some(expected_published_mode),
+		) {
 			Ok(true) => {},
 			Ok(false) => {
 				let cleanup = scrub_published_skill_file(&file, skill_fd, &final_name);
@@ -5348,46 +5379,43 @@ pub(crate) mod platform {
 			},
 		}
 		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
-			drop(file);
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure("identity_mismatch");
+			return fail_published_skill_file(
+				file,
+				skill_fd,
+				skills_fd,
+				&final_name,
+				"identity_mismatch",
+			);
 		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
-			drop(file);
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure(code);
+			return fail_published_skill_file(file, skill_fd, skills_fd, &final_name, code);
 		}
 		if skill_created && let Err(code) = fsync_root_parent(skills_fd) {
-			drop(file);
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure(code);
+			return fail_published_skill_file(file, skill_fd, skills_fd, &final_name, code);
 		}
 		// The directory fsyncs above can block long enough for the public skill
 		// directory to be detached and replaced. Revalidate the retained binding
 		// immediately before returning success so the receipt names the object
 		// that discovery can still reach through the requested root.
 		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
-			drop(file);
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure("identity_mismatch");
+			return fail_published_skill_file(
+				file,
+				skill_fd,
+				skills_fd,
+				&final_name,
+				"identity_mismatch",
+			);
 		}
 		// Keep the file binding as the final publication check as well.  The root
 		// revalidation above can itself race with a writer that replaces SKILL.md;
 		// never return a success receipt for an inode that is no longer the one
 		// retained by this transaction.
-		match published_skill_file_is_valid(&file, skill_fd, &final_name) {
+		match published_skill_file_is_valid(
+			&file,
+			skill_fd,
+			&final_name,
+			Some(expected_published_mode),
+		) {
 			Ok(true) => {},
 			Ok(false) => {
 				let cleanup = scrub_published_skill_file(&file, skill_fd, &final_name);

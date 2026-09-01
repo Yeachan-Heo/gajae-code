@@ -241,4 +241,26 @@ describe("session Python tool unit contracts", () => {
 			}),
 		]);
 	});
+
+	it("resolves the session settings accessor at execution time", async () => {
+		const cwd = await tempDir();
+		const launchSettings = Settings.isolated();
+		const liveSettings = Settings.isolated();
+		const settingsSeen: unknown[] = [];
+		vi.spyOn(pyExecutor, "executePython").mockImplementation(async (_code, options) => {
+			settingsSeen.push(options?.settings);
+			return mockPythonResult({ output: "live settings" });
+		});
+		const tool = createSessionPythonTool({
+			cwd,
+			settings: launchSettings,
+			getSettings: () => liveSettings,
+			getSessionId: () => "live-settings",
+			registerSessionCleanup: () => {},
+		});
+
+		await executeTool(tool, { code: "print('settings')" });
+
+		expect(settingsSeen).toEqual([liveSettings]);
+	});
 });

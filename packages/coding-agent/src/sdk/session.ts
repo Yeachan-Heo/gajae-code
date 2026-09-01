@@ -1,5 +1,3 @@
-import * as nodeFs from "node:fs";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	Agent,
@@ -41,7 +39,6 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
-	setProjectDir,
 } from "@gajae-code/utils";
 import {
 	createAppendOnlyContextManager,
@@ -87,7 +84,6 @@ import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings, releaseSettingsScope } from "../discovery";
-import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
@@ -129,7 +125,6 @@ import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import { getMemoryRootForSession } from "../internal-urls/memory-protocol";
 import { discoverStartupLspServers, type LspStartupServerInfo } from "../lsp";
-import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
 import { getMemoryBackendRescopeError } from "../memory-backend/service";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
@@ -139,6 +134,7 @@ import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-r
 import { createLazyService } from "../runtime/lazy-service";
 import {
 	createOptionalRuntimeServices,
+	type OptionalRuntimeServices,
 	type OptionalRuntimeServicesOverrides,
 } from "../runtime/optional-runtime-services";
 import { loadAllMCPConfigs, MCPManager } from "../runtime-mcp";
@@ -1568,7 +1564,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// only truth available, and it is also the manager's initial cwd.
 		let liveSessionManager: SessionManager | undefined;
 		const getLiveCwd = (): string => liveSessionManager?.getCwd() ?? cwd;
-		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd: getLiveCwd });
+		let runtimeServices: OptionalRuntimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, {
+			cwd: getLiveCwd,
+		});
 		modelRegistry.setScopedSettings(settings, { reload: options.modelRegistry === undefined });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
@@ -2372,10 +2370,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const previousCwdCapturing = [...cwdCapturingToolNames];
 			const nextCwdCapturing: string[] = [];
 			const nextCustomTools: CustomTool[] = [];
-			const declarations = await getGjcPluginToolDeclarations(to, agentDir);
+			const declarations = await getGjcPluginToolDeclarations(to, agentDir, profileAuthority);
 			const pluginToolResult = await loadAlwaysOnPluginTools({
 				cwd: to,
 				agentDir,
+				profileAuthority,
 				reservedToolNames: session.getAllToolNames().filter(name => !previousCwdCapturing.includes(name)),
 				declarations,
 			});
@@ -2391,6 +2390,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					const loaded = await loadAllMCPConfigs(to, {
 						agentDir,
+						profileAuthority,
 						enableProjectConfig: settings.has("mcp.enableProjectConfig")
 							? settings.get("mcp.enableProjectConfig")
 							: true,
@@ -2401,6 +2401,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					const { configs: pluginConfigs, sources: pluginSources } = await buildPluginMcpConfigs({
 						cwd: to,
 						agentDir,
+						profileAuthority,
 					});
 					const pluginNames = new Set(Object.keys(pluginConfigs));
 					replacementPluginNames = pluginNames;
@@ -2608,6 +2609,49 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolSession.settings = settings;
 			} catch (error) {
 				warnRefreshFailure("Failed to reload settings after session rescope", error);
+			}
+			// Workspace-tree and network-prewarm services capture their Settings
+			// instance at construction. Replace those defaults after the durable move
+			// so target policy is applied to the next turn; retain caller-owned
+			// overrides and the resident memory service, whose identity is validated
+			// before publication and must not be reset here.
+			try {
+				const previousRuntimeServices = runtimeServices;
+				runtimeServices = createOptionalRuntimeServices(
+					settings,
+					{
+						...options.runtimeServices,
+						memoryBackend: previousRuntimeServices.memoryBackend,
+					},
+					{ cwd: getLiveCwd },
+				);
+				session?.setRuntimeServices({
+					workspaceTreeService: options.workspaceTree === undefined ? runtimeServices.workspaceTree : undefined,
+					networkPrewarmService: runtimeServices.networkPrewarm,
+				});
+				const retiredServices: Promise<void>[] = [];
+				if (
+					options.runtimeServices?.workspaceTree === undefined &&
+					previousRuntimeServices.workspaceTree !== runtimeServices.workspaceTree
+				) {
+					retiredServices.push(previousRuntimeServices.workspaceTree.dispose());
+				}
+				if (
+					options.runtimeServices?.networkPrewarm === undefined &&
+					previousRuntimeServices.networkPrewarm !== runtimeServices.networkPrewarm
+				) {
+					retiredServices.push(previousRuntimeServices.networkPrewarm.dispose());
+				}
+				const retiredResults = await Promise.allSettled(retiredServices);
+				for (const result of retiredResults) {
+					if (result.status === "rejected")
+						warnRefreshFailure(
+							"Failed to release superseded runtime service after session rescope",
+							result.reason,
+						);
+				}
+			} catch (error) {
+				warnRefreshFailure("Failed to refresh runtime services after session rescope", error);
 			}
 			try {
 				// Capability providers that do not receive an explicit Settings object
@@ -2864,277 +2908,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			currentAgentType: options.currentAgentType,
 			...(canExposeMoveSession
 				? {
-						rescopeSessionCwd: (() => {
-							let moveConsumed = false;
-							return async (target: string): Promise<{ from: string; to: string }> => {
-								const delegatedSession = session;
-								if (delegatedSession)
-									return delegatedSession.rescopeSessionCwd(target, { scope: "descendant" });
-								if (moveConsumed) {
-									throw new Error(
-										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
-									);
-								}
-								if (session?.getEffectiveActiveWorkflowSkillState()) {
-									throw new Error(
-										"A workflow skill is active in this session; finish or exit it before rescoping.",
-									);
-								}
-								if (options.mcpManager && !ownsMcpManager) {
-									throw new Error(
-										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
-									);
-								}
-								return sessionManager.runExclusiveCwdTransition(async () => {
-									if (moveConsumed) {
-										throw new Error(
-											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
-										);
-									}
-									if (session?.getEffectiveActiveWorkflowSkillState()) {
-										throw new Error(
-											"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
-										);
-									}
-									const from = sessionManager.getCwd();
-									const sourceHandle = await SessionManager.openNoFollowDirectory(from);
-									const sourceOpened = await sourceHandle.stat({ bigint: true });
-									if (!sourceOpened.isDirectory()) {
-										await sourceHandle.close().catch(() => {});
-										throw new Error(`Current session directory is no longer a directory: ${from}`);
-									}
-									try {
-										const resolvedPath = path.resolve(from, target);
-										let canonicalFrom: string;
-										let canonicalTarget: string;
-										try {
-											canonicalFrom = await fs.realpath(from);
-											canonicalTarget = await fs.realpath(resolvedPath);
-										} catch (error) {
-											// macOS `realpath(3)` reports EACCES on an unreadable
-											// directory where Linux succeeds and fails later at the
-											// `access` probe; keep both platforms on the access message.
-											const code = (error as NodeJS.ErrnoException)?.code;
-											if (code === "EACCES" || code === "EPERM") {
-												throw new Error(
-													`Directory identity or access unavailable: ${resolvedPath}${
-														error instanceof Error ? ` (${error.message})` : ""
-													}`,
-												);
-											}
-											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
-										}
-										if (!(await fs.stat(canonicalTarget)).isDirectory()) {
-											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
-										}
-										const relative = path.relative(canonicalFrom, canonicalTarget);
-										if (relative === "") {
-											throw new Error(
-												`Target ${canonicalTarget} is the current session directory; nothing to move.`,
-											);
-										}
-										if (
-											relative === ".." ||
-											relative.startsWith(`..${path.sep}`) ||
-											path.isAbsolute(relative)
-										) {
-											throw new Error(
-												`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
-											);
-										}
-										let targetHandle: nodeFs.promises.FileHandle | undefined;
-										let expectedIdentity: { dev: bigint; ino: bigint };
-										try {
-											targetHandle = await SessionManager.openNoFollowDirectory(canonicalTarget);
-											const opened = await targetHandle.stat({ bigint: true });
-											if (!opened.isDirectory()) {
-												throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
-											}
-											const revalidatedFrom = await fs.realpath(from);
-											const revalidatedTarget = await fs.realpath(resolvedPath);
-											const revalidatedRelative = path.relative(revalidatedFrom, revalidatedTarget);
-											if (
-												revalidatedFrom !== canonicalFrom ||
-												revalidatedTarget !== canonicalTarget ||
-												revalidatedRelative === "" ||
-												revalidatedRelative === ".." ||
-												revalidatedRelative.startsWith(`..${path.sep}`) ||
-												path.isAbsolute(revalidatedRelative)
-											) {
-												throw new Error(
-													`Directory identity changed during confinement validation: ${resolvedPath}`,
-												);
-											}
-											const named = await fs.lstat(revalidatedTarget, { bigint: true });
-											const namedSource = await fs.lstat(revalidatedFrom, { bigint: true });
-											if (
-												!namedSource.isDirectory() ||
-												namedSource.isSymbolicLink() ||
-												namedSource.dev !== sourceOpened.dev ||
-												namedSource.ino !== sourceOpened.ino ||
-												!named.isDirectory() ||
-												named.isSymbolicLink() ||
-												named.dev !== opened.dev ||
-												named.ino !== opened.ino
-											) {
-												throw new Error(
-													`Directory identity changed during confinement validation: ${resolvedPath}`,
-												);
-											}
-											expectedIdentity = { dev: opened.dev, ino: opened.ino };
-											await fs.access(canonicalTarget, nodeFs.constants.R_OK | nodeFs.constants.X_OK);
-										} catch (error) {
-											await targetHandle?.close().catch(() => {});
-											if (error instanceof Error && error.message.startsWith("Directory does not exist")) {
-												throw error;
-											}
-											throw new Error(
-												`Directory identity or access unavailable: ${canonicalTarget}${
-													error instanceof Error ? ` (${error.message})` : ""
-												}`,
-											);
-										}
-										// Process-cwd authority is an explicit claim, never inferred from
-										// `process.cwd() === from`: sibling sessions launched at the same
-										// root both satisfy that, so acting on it would chdir the process
-										// and clear process-global caches underneath the sibling.
-										const ownsProcessCwd = SessionManager.isProcessCwdOwner(sessionManager);
-										const restoreLaunchRoot = async (failure: unknown): Promise<never> => {
-											const restoreErrors: Error[] = [];
-											if (ownsProcessCwd) {
-												try {
-													setProjectDir(canonicalFrom);
-													if (path.resolve(process.cwd()) !== path.resolve(canonicalFrom)) {
-														throw new Error("Process cwd did not restore to the launch root.");
-													}
-													await SessionManager.assertProcessCwdIdentity({
-														dev: sourceOpened.dev,
-														ino: sourceOpened.ino,
-													});
-												} catch (error) {
-													restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
-												}
-												try {
-													resetCapabilities();
-													const restoreRegistry = await resolveActiveProjectRegistryPath(
-														canonicalFrom,
-													).catch(() => undefined);
-													clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
-												} catch (error) {
-													restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
-												}
-											}
-											try {
-												await rebindCwdCapturingAuthority(canonicalFrom);
-											} catch (error) {
-												restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
-											}
-											if (restoreErrors.length > 0) {
-												throw new AggregateError(
-													restoreErrors,
-													"Failed to restore launch-root rescope authority.",
-													{
-														cause: failure,
-													},
-												);
-											}
-											throw failure;
-										};
-										try {
-											// Every fallible step that the moved session depends on runs
-											// BEFORE the session-file commit, so a failure here leaves the
-											// session exactly where it was and the tool call is a clean
-											// rejection rather than a half-moved session.
-											if (ownsProcessCwd) {
-												setProjectDir(canonicalTarget);
-												try {
-													// `setProjectDir` chdirs a NAME. Confirm the process actually
-													// landed on the pinned directory, so a path replaced after
-													// the name checks cannot escape the validated descendant.
-													await SessionManager.assertProcessCwdIdentity(expectedIdentity);
-												} catch (error) {
-													setProjectDir(canonicalFrom);
-													await SessionManager.assertProcessCwdIdentity({
-														dev: sourceOpened.dev,
-														ino: sourceOpened.ino,
-													});
-													throw error;
-												}
-											}
-											let rescopeFailure: unknown;
-											try {
-												if (ownsProcessCwd) {
-													resetCapabilities();
-													const projectRegistry = await resolveActiveProjectRegistryPath(canonicalTarget);
-													clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
-												}
-												// Plugin/MCP/Python authority must be rebound successfully
-												// before committing; swallowing a failure here is what leaves
-												// a moved session holding launch-root tool authority.
-												await rebindCwdCapturingAuthority(canonicalTarget);
-											} catch (error) {
-												rescopeFailure = error;
-											}
-											if (rescopeFailure !== undefined) {
-												await restoreLaunchRoot(rescopeFailure);
-											}
-											try {
-												await sessionManager.flush();
-												// Commit last: `moveTo` re-validates the pinned identity through
-												// the still-open handle at the state-changing boundary.
-												await sessionManager.moveTo(canonicalTarget, {
-													expectedIdentity,
-													targetHandle,
-													expectedSourceIdentity: { dev: sourceOpened.dev, ino: sourceOpened.ino },
-													sourceHandle,
-												});
-											} catch (error) {
-												const committedCwd = sessionManager.getCwd();
-												const stayedAtLaunchRoot = path.resolve(committedCwd) === path.resolve(from);
-												if (stayedAtLaunchRoot) await restoreLaunchRoot(error);
-												// SessionManager can publish the durable move before a later metadata
-												// write fails. Treat that state as committed rather than reporting a
-												// rejection after the session has moved.
-												moveConsumed = true;
-												logger.warn("Session rescope committed before finalization failed", {
-													error: safeErrorForLog(error),
-													cwd: committedCwd,
-												});
-											}
-											moveConsumed = true;
-											if (ownsProcessCwd) {
-												try {
-													await shutdownAllLspClients();
-												} catch (error) {
-													logger.warn("Failed to reset launch-root LSP clients after session rescope", {
-														error: safeErrorForLog(error),
-													});
-												}
-											}
-											// Cwd-derived read-only state the prompt and subagents consume.
-											// Best-effort by design: the move is committed, and a failed
-											// re-discovery must not present a committed move as a failure.
-											await applyRescopedReadState(sessionManager.getCwd());
-											try {
-												await session?.refreshSshTool({ activateIfAvailable: true });
-											} catch (error) {
-												// Non-fatal: the session has moved; the SSH tool refreshes
-												// on its next activation attempt.
-												logger.warn("Committed session rescope could not refresh the SSH tool", {
-													error: safeErrorForLog(error),
-													cwd: sessionManager.getCwd(),
-												});
-											}
-											return { from, to: sessionManager.getCwd() };
-										} finally {
-											await targetHandle.close().catch(() => {});
-										}
-									} finally {
-										await sourceHandle.close().catch(() => {});
-									}
-								});
-							};
-						})(),
+						rescopeSessionCwd: async (target: string): Promise<{ from: string; to: string }> => {
+							if (!session) {
+								throw new Error("Session cwd rescope is unavailable before session initialization.");
+							}
+							return session.rescopeSessionCwd(target, { scope: "descendant" });
+						},
 					}
 				: {}),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
@@ -3357,7 +3136,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Registry load performs v1-to-v2 metadata migration without importing
 		// plugin implementations. Keep this declaration phase before any subskill
 		// tool activation so an entry cannot be live on both paths.
-		const gjcToolDeclarations = await getGjcPluginToolDeclarations(cwd, agentDir);
+		const gjcToolDeclarations = await getGjcPluginToolDeclarations(cwd, agentDir, profileAuthority);
 
 		const gjcSubskillToolContext = options.gjcSubskillToolContext;
 		if (gjcSubskillToolContext?.parent.trim() && gjcSubskillToolContext.phase.trim()) {
@@ -3368,6 +3147,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				phase: gjcSubskillToolContext.phase,
 				reservedToolNames: getReservedSubskillToolNames(),
 				agentDir,
+				profileAuthority,
 			});
 			if (pluginTools.length > 0) {
 				customTools.push(...pluginTools);
@@ -3386,6 +3166,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					phase,
 					reservedToolNames: getReservedSubskillToolNames(),
 					agentDir,
+					profileAuthority,
 				});
 				if (pluginTools.length > 0) {
 					customTools.push(...pluginTools);
@@ -3400,7 +3181,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let gjcProducersComplete = true;
 		let gjcActivationGeneration = 0;
 		try {
-			gjcActivationGeneration = gjcActivationGenerationFor(await currentActivationFingerprint({ cwd, agentDir }));
+			gjcActivationGeneration = gjcActivationGenerationFor(
+				await currentActivationFingerprint({ cwd, agentDir, profileAuthority }),
+			);
 		} catch (error) {
 			// Without a readable activation generation no snapshot can be proven
 			// current, so publish nothing rather than a snapshot consumers cannot
@@ -3416,6 +3199,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		try {
 			const pluginToolResult = await loadAlwaysOnPluginTools({
 				cwd,
+				profileAuthority,
 				reservedToolNames: [...getReservedSubskillToolNames(), ...customTools.map(tool => tool.name)],
 				declarations: gjcToolDeclarations,
 				agentDir,
@@ -3482,6 +3266,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// `gjc mcp add` (user scope) writes; an SDK embedder that runs on
 						// its own agent directory autoloads its own registrations.
 						agentDir,
+						profileAuthority,
 						// Project-scope native config loads by default; only an
 						// explicitly configured `mcp.enableProjectConfig: false`
 						// disables it (the legacy schema default stays false for
@@ -3516,7 +3301,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// tools are surfaced as always-on tools rather than gated behind MCP
 			// selection.
 			try {
-				const { configs, sources: pluginSources, quarantine } = await buildPluginMcpConfigs({ cwd, agentDir });
+				const {
+					configs,
+					sources: pluginSources,
+					quarantine,
+				} = await buildPluginMcpConfigs({
+					cwd,
+					agentDir,
+					profileAuthority,
+				});
 				for (const q of quarantine) {
 					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined GJC plugin MCP", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
@@ -3670,7 +3463,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive
 		// and a no-op without installed plugins; the loader denies all dangerous APIs.
 		try {
-			const pluginHookResult = await loadConstrainedPluginHooks({ cwd, agentDir });
+			const pluginHookResult = await loadConstrainedPluginHooks({ cwd, agentDir, profileAuthority });
 			if (pluginHookResult.hooks.length > 0) {
 				constrainedPluginHookFactory = createPluginHooksExtension(pluginHookResult.hooks);
 				inlineExtensions.push(constrainedPluginHookFactory);
@@ -4130,7 +3923,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 
-				const pluginHookResult = await loadConstrainedPluginHooks({ cwd: to, agentDir });
+				const pluginHookResult = await loadConstrainedPluginHooks({ cwd: to, agentDir, profileAuthority });
 				for (const q of pluginHookResult.quarantine) {
 					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 					logger.warn("Quarantined relocated GJC plugin hook", {
@@ -4474,7 +4267,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				[memoryInstructions, browserBackend.developerInstructions].filter(Boolean).join("\n\n") || undefined;
 			let pluginSystemAppendices = "";
 			try {
-				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd(), agentDir });
+				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({
+					cwd: getLiveCwd(),
+					agentDir,
+					profileAuthority,
+				});
 			} catch (error) {
 				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error: safeErrorForLog(error) });
@@ -5013,6 +4810,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			sessionManager,
 			settings,
+			releaseSettingsScope: ownsScopedSettings ? releaseSettingsScope : undefined,
 			// The resolved session profile is authoritative even when the caller
 			// supplied a relative option or injected settings instance.
 			agentDir,

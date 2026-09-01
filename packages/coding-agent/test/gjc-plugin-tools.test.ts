@@ -25,7 +25,7 @@ async function writeTool(cwd: string, fileName: string, toolName: string): Promi
 	const toolsDir = path.join(cwd, "tools");
 	await fs.mkdir(toolsDir, { recursive: true });
 	const toolPath = path.join(toolsDir, fileName);
-	await fs.writeFile(
+	await Bun.write(
 		toolPath,
 		`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 
@@ -49,18 +49,15 @@ async function writeInstalledPlugin(agentDir: string, pluginName: string, toolNa
 	const pluginsDir = path.join(agentDir, "plugins");
 	const pluginDir = path.join(pluginsDir, "node_modules", pluginName);
 	await fs.mkdir(path.join(pluginDir, "tools"), { recursive: true });
-	await fs.writeFile(
-		path.join(pluginsDir, "package.json"),
-		JSON.stringify({ dependencies: { [pluginName]: "1.0.0" } }),
-	);
-	await fs.writeFile(
+	await Bun.write(path.join(pluginsDir, "package.json"), JSON.stringify({ dependencies: { [pluginName]: "1.0.0" } }));
+	await Bun.write(
 		path.join(pluginDir, "package.json"),
 		JSON.stringify({
 			version: "1.0.0",
 			gjc: { kind: "gajae-code-plugin", name: pluginName, version: "1.0.0", tools: ["tools/index.ts"] },
 		}),
 	);
-	await fs.writeFile(
+	await Bun.write(
 		path.join(pluginDir, "tools", "index.ts"),
 		`import type { CustomToolFactory } from "@gajae-code/coding-agent/extensibility/custom-tools/types";
 
@@ -161,7 +158,8 @@ describe("GJC plugin sub-skill tools", () => {
 			beforeImport: async () => {
 				if (mutated) return;
 				mutated = true;
-				await fs.appendFile(toolPath, "\n// changed after initial validation\n");
+				const current = await Bun.file(toolPath).text();
+				await Bun.write(toolPath, `${current}\n// changed after initial validation\n`);
 			},
 		});
 		expect(loaded).toEqual([]);

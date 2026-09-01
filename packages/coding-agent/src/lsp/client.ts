@@ -1163,6 +1163,13 @@ export async function sendNotification(client: LspClient, method: string, params
 export async function shutdownAll(): Promise<void> {
 	stopIdleChecker();
 	shutdownGeneration += 1;
+	// A global shutdown invalidates every retained scope and its policy. Clear
+	// these registries with the clients so repeated process/test teardown cannot
+	// retain one entry per workspace/profile forever.
+	scopeReferences.clear();
+	scopeShutdownGenerations.clear();
+	scopedIdleTimeouts.clear();
+	idleTimeoutMs = null;
 	const inFlightPromises = Array.from(clientLocks.values());
 	const initializingToShutdown = Array.from(initializingClients);
 	clientLocks.clear();

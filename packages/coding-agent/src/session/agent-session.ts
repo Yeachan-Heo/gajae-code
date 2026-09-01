@@ -5323,6 +5323,32 @@ export class AgentSession {
 					} catch (error) {
 						restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
 					}
+					this.#releaseSupersededSettingsScopes();
+					if (restoreErrors.length > 0) {
+						throw new AggregateError(restoreErrors, "Failed to restore launch-root rescope authority.", {
+							cause: failure,
+						});
+					}
+					throw failure;
+				};
+				try {
+					// Every fallible step that the moved session depends on runs
+					// BEFORE the session-file commit, so a failure here leaves the
+					// session exactly where it was and the tool call is a clean
+					// rejection rather than a half-moved session.
+					if (ownsProcessCwd) {
+						setProjectDir(canonicalTarget);
+						try {
+							// `setProjectDir` chdirs a NAME. Confirm the process actually
+							// landed on the pinned directory, so a path replaced after
+							// the name checks cannot escape the validated descendant.
+							await SessionManager.assertProcessCwdIdentity(expectedIdentity);
+						} catch (error) {
+							setProjectDir(canonicalFrom);
+							throw error;
+						}
+					}
+					let rescopeFailure: unknown;
 					try {
 						resetCapabilities();
 						const restoreRegistry = await resolveActiveProjectRegistryPath(canonicalFrom).catch(() => undefined);
@@ -9749,8 +9775,20 @@ export class AgentSession {
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
 		await this.memoryBackend.dispose();
-		if (this.#workspaceTreeService) await this.#workspaceTreeService.dispose();
-		if (this.#networkPrewarmService) await this.#networkPrewarmService.dispose();
+		if (this.#workspaceTreeService) {
+			await this.#workspaceTreeService.dispose().catch(error =>
+				logger.warn("Failed to dispose workspace-tree runtime", {
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		}
+		if (this.#networkPrewarmService) {
+			await this.#networkPrewarmService.dispose().catch(error =>
+				logger.warn("Failed to dispose network-prewarm runtime", {
+					error: error instanceof Error ? error.message : String(error),
+				}),
+			);
+		}
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
@@ -10870,6 +10908,17 @@ export class AgentSession {
 		);
 	}
 
+	/** Replace settings-bound lazy runtime services after a committed cwd rescope. */
+	setRuntimeServices(services: {
+		memoryBackend?: LazyService<MemoryBackend>;
+		workspaceTreeService?: LazyService<WorkspaceTreeRuntime>;
+		networkPrewarmService?: LazyService<NetworkPrewarmRuntime>;
+	}): void {
+		if (services.memoryBackend) this.memoryBackend = services.memoryBackend;
+		this.#workspaceTreeService = services.workspaceTreeService;
+		this.#networkPrewarmService = services.networkPrewarmService;
+	}
+
 	/**
 	 * Set active tools by name.
 	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
@@ -11195,6 +11244,7 @@ export class AgentSession {
 			phase,
 			reservedToolNames,
 			agentDir: this.getSessionAgentDir(),
+			profileAuthority: this.getSessionProfileAuthority(),
 		});
 		this.#assertSessionIdentityAdmission(identityAdmission);
 		const nextToolNames = customTools.map(tool => tool.name);

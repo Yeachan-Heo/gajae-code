@@ -269,6 +269,47 @@ describe("SkillTool", () => {
 		}
 	});
 
+	it("uses legacy ToolSession.home for runtime fallback without borrowing the settings profile", async () => {
+		const cwd = await makeTempCwd();
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-legacy-home-"));
+		const decoyAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-decoy-agent-"));
+		const originalHome = process.env.HOME;
+		const originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		let loaded: Skill | undefined;
+		try {
+			process.env.HOME = home;
+			process.env.GJC_CODING_AGENT_DIR = decoyAgentDir;
+			const runtimePath = await makeRuntimeSkill(
+				path.join(home, ".gjc", "agent", "skills"),
+				"legacy-home-helper",
+				"Legacy home helper",
+				"Runtime skill resolved from the legacy session home.",
+			);
+			const captured: CapturedSend[] = [];
+			loaded = await makeSkill("unrelated", "Unrelated body.");
+			const session = createSession(cwd, [loaded], captured, {
+				home,
+				settings: runtimeSkillSettings(),
+			});
+			const tool = SkillTool.createIf(session);
+			expect(tool).not.toBeNull();
+
+			const result = await tool!.execute("legacy-home", { name: "legacy-home-helper" });
+
+			expect(result.details?.path).toBe(runtimePath);
+			expect(captured[0]?.message.content).toContain("Runtime skill resolved from the legacy session home.");
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+			if (originalAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalAgentDir;
+			if (loaded) await safeRm(loaded.baseDir, { recursive: true, force: true });
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+			await safeRm(decoyAgentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("uses exact runtime fallback precedence across project, canonical, configured, and historical roots", async () => {
 		const cwd = await makeTempCwd();
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
