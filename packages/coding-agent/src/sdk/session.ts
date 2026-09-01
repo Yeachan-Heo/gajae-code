@@ -4578,30 +4578,37 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null);
 		{
 			const originalDispose = session.dispose.bind(session);
-			session.dispose = async () => {
-				await originalDispose();
-				try {
-					agentRegistry.unregister(resolvedAgentId);
-					releaseCredentialDisabledSubscription();
-					releaseLocalProtocolOverride();
-				} finally {
-					// The endpoint is gone: its owned registrations can never
-					// reach a delivery settlement boundary, and foreign-endpoint
-					// tuples are deliberately never classified terminal by other
-					// managers — retire them before unregistering the manager so
-					// repeated session churn cannot saturate the registry
-					// (review thread P2). The endpoint is the manager's live
-					// registration key, which survives newSession/switchSession
-					// rekeying and may differ from the persisted logical session id.
-					if (!options.parentTaskPrefix) {
-						retireOwnedRegistrationsForEndpoint(
-							AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
-						);
-						AsyncJobManager.unregisterManager(asyncJobManager);
+			let cleanupPromise: Promise<void> | undefined;
+			const finishCleanup = async (): Promise<void> => {
+				if (cleanupPromise) return cleanupPromise;
+				cleanupPromise = (async () => {
+					try {
+						agentRegistry.unregister(resolvedAgentId);
+						releaseCredentialDisabledSubscription();
+						releaseLocalProtocolOverride();
+					} finally {
+						if (!options.parentTaskPrefix) {
+							retireOwnedRegistrationsForEndpoint(
+								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+							);
+							AsyncJobManager.unregisterManager(asyncJobManager);
+						}
+						await closeOwnedAuthStorage();
+						await closeOwnedSettings();
 					}
-					await closeOwnedAuthStorage();
-					await closeOwnedSettings();
-				}
+				})();
+				return cleanupPromise;
+			};
+			session.dispose = async () => {
+				const boundedDispose = originalDispose();
+				void boundedDispose.catch(async error => {
+					if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) {
+						await session.dispose();
+						await finishCleanup();
+					}
+				});
+				await boundedDispose;
+				await finishCleanup();
 			};
 		}
 
@@ -4830,7 +4837,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let cleanupDiagnostic: unknown;
 		try {
 			if (hasSession) {
-				await session.dispose();
+				try {
+					await session.dispose();
+				} catch (disposeError) {
+					if (
+						!(disposeError instanceof Error) ||
+						!disposeError.message.startsWith("Session disposal incomplete:")
+					) {
+						throw disposeError;
+					}
+					// The first call is intentionally bounded for startup callers. Join the
+					// retained teardown before releasing the resources it still owns.
+					await session.dispose();
+				}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
 				// Admission happens before session construction. Any later startup
