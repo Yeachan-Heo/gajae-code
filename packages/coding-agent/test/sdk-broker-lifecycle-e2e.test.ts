@@ -3358,11 +3358,13 @@ test("broker promotes the lower-generation root after the higher-generation root
 	const endpointPath = path.join(alternateStateRoot, "sdk", `${sessionId}.json`);
 	try {
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(
+		await Bun.write(
 			endpointPath,
 			JSON.stringify({ sessionId, pid: process.pid, url: "ws://127.0.0.1:1", token: "alternate-token" }),
 		);
-		const alternateEndpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const alternateEndpointIdentity = await fs.stat(endpointPath, { bigint: true });
+		const alternateEndpointMtimeMs = Number(alternateEndpointIdentity.mtimeNs) / 1_000_000;
+		const alternateEndpointFileId = `${alternateEndpointIdentity.dev}:${alternateEndpointIdentity.ino}`;
 		await broker.start();
 		const alternate = await broker.index.append({
 			type: "host_registered",
@@ -3371,6 +3373,7 @@ test("broker promotes the lower-generation root after the higher-generation root
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: alternateEndpointMtimeMs,
+			endpointFileId: alternateEndpointFileId,
 		});
 		const current = await broker.index.append({
 			type: "host_registered",
