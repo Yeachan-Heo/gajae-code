@@ -194,11 +194,24 @@ async function authoritativeConversationSnapshot(): Promise<{
 					entry.type === "message" && entry.message && typeof entry.message === "object" ? entry.message : entry;
 				if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
 				const message = candidate as Record<string, unknown>;
-				if (typeof message.role !== "string" || typeof message.content !== "string") continue;
+				if (typeof message.role !== "string") continue;
+				const content =
+					typeof message.content === "string"
+						? message.content
+						: Array.isArray(message.content)
+							? message.content
+									.filter(item => item && typeof item === "object" && !Array.isArray(item))
+									.map(item => {
+										const block = item as Record<string, unknown>;
+										return typeof block.text === "string" ? block.text : "";
+									})
+									.join("")
+							: "";
+				if (!content) continue;
 				messages.push({
 					index: messages.length,
 					role: message.role,
-					content: message.content.normalize("NFC").trim(),
+					content: content.normalize("NFC").trim(),
 				});
 			} catch {
 				throw new DeepInterviewCommandError(2, "live session transcript is malformed");
