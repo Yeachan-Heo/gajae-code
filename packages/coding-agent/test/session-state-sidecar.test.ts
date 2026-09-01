@@ -1327,7 +1327,7 @@ describe("coordinator runtime state sidecar", () => {
 				cwd: "D:\\Users\\Operator\\Repo",
 				sessionFile: "D:\\Users\\Operator\\Repo\\.gjc\\session.jsonl",
 			}),
-		).rejects.toThrow("invalid or unreadable");
+		).rejects.toThrow("belongs to a different workspace");
 		expect(await Bun.file(stateFile).text()).toBe(beforeRejectedWrite);
 	});
 	it("rejects case-different POSIX runtime-state identities", async () => {
@@ -1353,8 +1353,142 @@ describe("coordinator runtime state sidecar", () => {
 					sessionFile: path.join(root, "WORKSPACE", "session.jsonl"),
 				},
 			),
-		).rejects.toThrow("invalid or unreadable");
+		).rejects.toThrow("belongs to a different workspace");
 		expect(await Bun.file(stateFile).text()).toBe(beforeRejectedWrite);
+	});
+
+	it("adopts a terminal foreign-workspace marker that travelled inside the current workspace", async () => {
+		// A session directory committed to version control reaches a second machine with a
+		// marker whose recorded cwd is the other platform's path. The marker is readable and
+		// terminal, and it now lives inside this workspace, so resuming here must not be
+		// refused as if the file were corrupt.
+		const root = await tempRoot();
+		const sessionId = "travelled-session";
+		const runtimeDir = path.join(root, ".gjc", `_session-${sessionId}`, "runtime");
+		await fs.mkdir(runtimeDir, { recursive: true });
+		const stateFile = path.join(runtimeDir, "runtime-state.json");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "completed",
+				live: false,
+				cwd: "D:\\Users\\Operator\\Repo",
+				workdir: "D:\\Users\\Operator\\Repo",
+				session_file: null,
+			}),
+		);
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId, cwd: root, sessionFile: null },
+		);
+
+		expect(JSON.parse(await Bun.file(stateFile).text())).toMatchObject({
+			session_id: sessionId,
+			cwd: root,
+			workdir: root,
+		});
+	});
+
+	it("refuses a foreign-workspace marker that is live, non-terminal, or outside this workspace", async () => {
+		const sessionId = "foreign-session";
+		const foreign = "D:\\Users\\Operator\\Repo";
+
+		// Live or non-terminal markers may still have a running owner behind them. A live
+		// marker is refused as a foreign workspace; a non-terminal one is refused earlier, by
+		// the pre-existing non-terminal guard, so both messages are accepted here.
+		for (const marker of [
+			{ state: "running", live: true },
+			{ state: "completed" }, // `live` absent says nothing about the owner
+			{ state: "running", live: false },
+		]) {
+			const root = await tempRoot();
+			const runtimeDir = path.join(root, ".gjc", `_session-${sessionId}`, "runtime");
+			await fs.mkdir(runtimeDir, { recursive: true });
+			const stateFile = path.join(runtimeDir, "runtime-state.json");
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
+					cwd: foreign,
+					workdir: foreign,
+					session_file: null,
+					...marker,
+				}),
+			);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			const before = await Bun.file(stateFile).text();
+
+			await expect(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "turn_start" },
+					{ sessionId, cwd: root, sessionFile: null },
+				),
+			).rejects.toThrow(/belongs to a different workspace|invalid or unreadable/);
+			expect(await Bun.file(stateFile).text()).toBe(before);
+		}
+
+		// A terminal marker stored outside this workspace belongs to a different checkout on
+		// the same machine, so being terminal is not enough to adopt it.
+		const root = await tempRoot();
+		const elsewhere = await tempRoot();
+		const stateFile = path.join(elsewhere, "runtime-state.json");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "completed",
+				live: false,
+				cwd: elsewhere,
+				workdir: elsewhere,
+				session_file: null,
+			}),
+		);
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		const before = await Bun.file(stateFile).text();
+
+		await expect(
+			persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: root, sessionFile: null }),
+		).rejects.toThrow("belongs to a different workspace");
+		expect(await Bun.file(stateFile).text()).toBe(before);
+	});
+
+	it("names both workspaces so the mismatch is not mistaken for file corruption", async () => {
+		const root = await tempRoot();
+		const sessionId = "diagnostic-session";
+		const stateFile = path.join(root, "runtime-state.json");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				live: true,
+				cwd: "D:\\Users\\Operator\\Repo",
+				workdir: "D:\\Users\\Operator\\Repo",
+				session_file: null,
+			}),
+		);
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+
+		const failure = await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "turn_start" },
+			{ sessionId, cwd: root, sessionFile: null },
+		).then(
+			() => new Error("Expected runtime-state persistence to reject"),
+			(error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+		);
+
+		expect(failure).toBeInstanceOf(Error);
+		expect(failure.name).toBe("ForeignRuntimeStateError");
+		expect(failure.message).toContain("D:\\Users\\Operator\\Repo");
+		expect(failure.message).toContain(root);
+		expect(failure.message).not.toContain("invalid or unreadable");
 	});
 
 	it("rejects non-terminal and mismatched runtime markers", async () => {
@@ -1749,7 +1883,7 @@ describe("coordinator runtime state sidecar", () => {
 					cwd: root,
 					sessionFile: path.join(root, "session.jsonl"),
 				}),
-			).rejects.toThrow("invalid or unreadable");
+			).rejects.toThrow("belongs to a different workspace");
 			expect(await Bun.file(stateFile).text()).toBe(before);
 		}
 	});
