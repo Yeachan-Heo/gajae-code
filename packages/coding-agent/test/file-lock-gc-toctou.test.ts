@@ -170,6 +170,18 @@ describe("withFileLock stale owner liveness (#652)", () => {
 		expect(fallbackCalls).toBe(1);
 	});
 
+	test("rejects malformed runtime lock operands before publication", async () => {
+		let entered = false;
+		for (const operand of ["", null, 42, "../escape"] as unknown[]) {
+			await expect(
+				withFileLock(operand as string, async () => {
+					entered = true;
+				}),
+			).rejects.toThrow("filePath must be a non-empty absolute path");
+		}
+		expect(entered).toBe(false);
+	});
+
 	test("does not replace a legacy empty lock directory when publication is unsupported", async () => {
 		const root = await makeTemp();
 		const file = path.join(root, "legacy-empty", "publication.json");

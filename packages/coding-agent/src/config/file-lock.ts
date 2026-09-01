@@ -1174,6 +1174,10 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 }
 
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
+	const requestedFilePath: unknown = filePath;
+	if (typeof requestedFilePath !== "string" || requestedFilePath.length === 0 || !path.isAbsolute(requestedFilePath))
+		throw new TypeError("filePath must be a non-empty absolute path");
+	if (requestedFilePath.includes("\0")) throw new TypeError("filePath must not contain NUL bytes");
 	if (options.ownerHostId !== undefined && !options.ownerHostId) throw new Error("ownerHostId must be non-empty");
 	if (options.previousOwnerHostIds?.some(hostId => !hostId))
 		throw new Error("previousOwnerHostIds must contain only non-empty identities");
