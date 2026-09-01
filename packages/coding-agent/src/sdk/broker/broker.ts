@@ -735,7 +735,9 @@ function matchesLifecycleReplayEndpointFile(
 ): boolean {
 	if (record.endpointMtimeMs === undefined || !Number.isFinite(record.endpointMtimeMs)) return false;
 	if (record.endpointFileId === undefined) return file.mtimeMs === record.endpointMtimeMs;
-	return record.endpointFileId === `${file.dev}:${file.ino}` && Math.abs(file.mtimeMs - record.endpointMtimeMs) <= 0.001;
+	return (
+		record.endpointFileId === `${file.dev}:${file.ino}` && Math.abs(file.mtimeMs - record.endpointMtimeMs) <= 0.001
+	);
 }
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
@@ -3377,9 +3379,7 @@ export class Broker {
 								endpointGeneration: refreshed.endpointGeneration,
 								pid: refreshed.pid,
 								endpointMtimeMs: refreshed.endpointMtimeMs,
-								...(refreshed.endpointFileId === undefined
-									? {}
-									: { endpointFileId: refreshed.endpointFileId }),
+								...(refreshed.endpointFileId === undefined ? {} : { endpointFileId: refreshed.endpointFileId }),
 								endpoint: refreshed.endpoint,
 							},
 						};
