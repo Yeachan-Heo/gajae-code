@@ -1577,6 +1577,17 @@ interface EphemeralTurnResult {
  */
 const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
 
+export class SessionDisposalIncompleteError extends Error {
+	constructor() {
+		super("Session disposal exceeded its bounded caller deadline.");
+		this.name = "SessionDisposalIncompleteError";
+	}
+}
+
+export function isSessionDisposalIncompleteError(error: unknown): error is SessionDisposalIncompleteError {
+	return error instanceof Error && error.name === "SessionDisposalIncompleteError";
+}
+
 const AGENT_BASH_ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 
 function boundAgentBashArtifactSaveDiagnostic(error: unknown): string {
@@ -8978,10 +8989,7 @@ export class AgentSession {
 		const teardown = this.#dispose();
 		this.#disposeRunPromise = teardown;
 		const timeout = Promise.withResolvers<never>();
-		const timer = setTimeout(
-			() => timeout.reject(new Error("Session disposal incomplete: teardown exceeded the deadline.")),
-			SIGNAL_TEARDOWN_TIMEOUT_MS,
-		);
+		const timer = setTimeout(() => timeout.reject(new SessionDisposalIncompleteError()), SIGNAL_TEARDOWN_TIMEOUT_MS);
 		timer.unref?.();
 		const boundedTeardown = Promise.race([teardown, timeout.promise]);
 		void boundedTeardown.finally(() => clearTimeout(timer)).catch(() => {});
@@ -9077,7 +9085,7 @@ export class AgentSession {
 				);
 			}
 		} catch (error) {
-			if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) throw error;
+			if (isSessionDisposalIncompleteError(error)) throw error;
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
 		this.#workflowGateEmitter?.fence?.();
@@ -9172,7 +9180,7 @@ export class AgentSession {
 		if (this.#workspaceTreeService) await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose());
 		if (this.#networkPrewarmService) await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose());
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
-		await awaitDisposeStep("session manager close", this.sessionManager.close(), true);
+		await this.#closeSessionManagerForDispose();
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
 		await awaitDisposeStep("hindsight state", hindsightState?.dispose() ?? Promise.resolve());
@@ -9183,6 +9191,18 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+	}
+
+	async #closeSessionManagerForDispose(): Promise<void> {
+		for (;;) {
+			try {
+				await this.sessionManager.close();
+				return;
+			} catch (error) {
+				logger.warn("Session manager close is retryable during dispose", { error: String(error) });
+				await Bun.sleep(50);
+			}
+		}
 	}
 
 	/**

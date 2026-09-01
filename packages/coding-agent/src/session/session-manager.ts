@@ -11000,7 +11000,6 @@ export class SessionManager {
 		const readLease = cwdReadLeaseAls.getStore();
 		if (readLease?.committedMoveGeneration === undefined) return false;
 		const committed = readLease.committedMoveGeneration;
-		readLease.committedMoveGeneration = undefined;
 		return committed !== admittedGeneration;
 	}
 

@@ -151,7 +151,7 @@ import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state"
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
-import { AgentSession, type ForkContextSeed } from "../session/agent-session";
+import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
@@ -4603,7 +4603,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const boundedDispose = originalDispose();
 				void boundedDispose
 					.catch(async error => {
-						if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) {
+						if (isSessionDisposalIncompleteError(error)) {
 							await session.dispose();
 						}
 						await finishCleanup();
@@ -4844,10 +4844,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					await session.dispose();
 				} catch (disposeError) {
-					if (
-						!(disposeError instanceof Error) ||
-						!disposeError.message.startsWith("Session disposal incomplete:")
-					) {
+					if (!isSessionDisposalIncompleteError(disposeError)) {
 						throw disposeError;
 					}
 					// The first call is intentionally bounded for startup callers. Join the
