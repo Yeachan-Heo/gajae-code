@@ -134,12 +134,44 @@ async function readBundleValue(bundlePath: string, key: string, command: Command
 }
 
 async function isExpectedBundle(bundlePath: string, command: CommandRunner): Promise<boolean> {
+	if (!(await validateBundleLayout(bundlePath))) return false;
 	return (await readBundleValue(bundlePath, "CFBundleIdentifier", command)) === COMMUNITY_APP_BUNDLE_ID;
+}
+
+async function validateBundleLayout(bundlePath: string): Promise<boolean> {
+	const bundleReal = await fs.realpath(bundlePath).catch(() => undefined);
+	if (!bundleReal || bundleReal !== path.resolve(bundlePath)) return false;
+	const contents = path.join(bundlePath, "Contents");
+	const contentsReal = await fs.realpath(contents).catch(() => undefined);
+	if (!contentsReal || contentsReal !== path.join(bundleReal, "Contents")) return false;
+	const infoPlist = path.join(contents, "Info.plist");
+	const infoReal = await fs.realpath(infoPlist).catch(() => undefined);
+	if (!infoReal || infoReal !== path.join(contentsReal, "Info.plist")) return false;
+	const macOSRoot = path.join(contents, "MacOS");
+	const macOSRootReal = await fs.realpath(macOSRoot).catch(() => undefined);
+	if (!macOSRootReal || macOSRootReal !== path.join(contentsReal, "MacOS")) return false;
+	const [bundleStat, contentsStat, infoStat, macOSRootStat] = await Promise.all([
+		fs.lstat(bundlePath).catch(() => undefined),
+		fs.lstat(contents).catch(() => undefined),
+		fs.lstat(infoPlist).catch(() => undefined),
+		fs.lstat(macOSRoot).catch(() => undefined),
+	]);
+	return Boolean(
+		bundleStat?.isDirectory() &&
+			contentsStat?.isDirectory() &&
+			infoStat?.isFile() &&
+			macOSRootStat?.isDirectory() &&
+			!bundleStat.isSymbolicLink() &&
+			!contentsStat.isSymbolicLink() &&
+			!infoStat.isSymbolicLink() &&
+			!macOSRootStat.isSymbolicLink(),
+	);
 }
 
 async function resolveVerifiedExecutable(bundlePath: string, executable: string): Promise<string | undefined> {
 	if (executable.length === 0 || path.basename(executable) !== executable || executable.includes("\\"))
 		return undefined;
+	if (!(await validateBundleLayout(bundlePath))) return undefined;
 	const macOSRoot = path.join(bundlePath, "Contents", "MacOS");
 	const executablePath = path.resolve(macOSRoot, executable);
 	if (path.dirname(executablePath) !== path.resolve(macOSRoot)) return undefined;
