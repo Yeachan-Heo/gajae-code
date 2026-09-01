@@ -127,7 +127,16 @@ describe("deep-interview crystallize contract", () => {
 		const value = input();
 		try {
 			const result = await runNativeDeepInterviewCommand(
-				["--crystallize", "--input", JSON.stringify(value), "--slug", "runtime", "--json"],
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(value),
+					"--session-id",
+					"crystallize-test",
+					"--slug",
+					"runtime",
+					"--json",
+				],
 				root,
 			);
 			expect(result.status).toBe(0);
