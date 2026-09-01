@@ -467,6 +467,8 @@ export async function offerMacosCommunityApp(
 		if (!tempRootIdentity) return failure("the temporary root was not a real directory", log);
 		const dmgPath = path.join(tempRoot, dmg.name);
 		mountPoint = path.join(tempRoot, "mount");
+		if (!(await sameDirectoryIdentity(tempRoot, tempRootIdentity)))
+			return failure("the temporary root identity changed", log);
 		await fs.mkdir(mountPoint);
 		const dmgHandle = await fs.open(dmgPath, "wx");
 		try {
@@ -479,6 +481,8 @@ export async function offerMacosCommunityApp(
 			return failure("the staged DMG path was unsafe", log);
 		const stagedDmgIdentity: FileIdentity = { dev: BigInt(stagedDmgStat.dev), ino: BigInt(stagedDmgStat.ino) };
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity))) return failure("the staged DMG identity changed", log);
+		if (!(await sameDirectoryIdentity(tempRoot, tempRootIdentity)))
+			return failure("the temporary root identity changed before attach", log);
 		mountAttempted = true;
 		mountAttached = true;
 		const attach = await command([
@@ -536,6 +540,7 @@ export async function offerMacosCommunityApp(
 		const destination = path.join(currentDestinationRoot, appEntry.name);
 		if (!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)))
 			return failure("the Applications destination identity changed", log);
+		throwIfInterrupted();
 		try {
 			await fs.mkdir(destination);
 		} catch {
@@ -628,6 +633,18 @@ export async function offerMacosCommunityApp(
 				if (mountAttached && mountIdentity && !(await sameDirectoryIdentity(mountPoint, mountIdentity))) {
 					removeTempRoot = false;
 					log("Optional community app cleanup warning: mountpoint identity changed; refusing detach");
+				} else if (mountAttached && !mountIdentity) {
+					const mountStat = await fs.lstat(mountPoint).catch(() => undefined);
+					if (!mountStat?.isDirectory() || mountStat.isSymbolicLink()) {
+						removeTempRoot = false;
+						log("Optional community app cleanup warning: uncertain mountpoint is unsafe; refusing detach");
+					} else {
+						const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+						if (detach.exitCode !== 0) {
+							removeTempRoot = false;
+							log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
+						} else mountAttached = false;
+					}
 				} else {
 					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
 					if (detach.exitCode !== 0) {
