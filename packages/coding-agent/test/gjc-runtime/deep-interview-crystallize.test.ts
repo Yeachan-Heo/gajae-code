@@ -169,7 +169,13 @@ describe("deep-interview crystallize contract", () => {
 			const sessionFile = path.join(root, "conversation.jsonl");
 			await fs.writeFile(
 				sessionFile,
-				`${JSON.stringify({ type: "message", message: value.snapshot.messages[0] })}\n`,
+				`${JSON.stringify({
+					type: "message",
+					message: {
+						...value.snapshot.messages[0],
+						content: [{ type: "text", text: value.snapshot.messages[0]!.content }],
+					},
+				})}\n`,
 			);
 			process.env.GJC_SESSION_FILE = sessionFile;
 			const result = await runNativeDeepInterviewCommand(
