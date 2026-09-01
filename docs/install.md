@@ -115,6 +115,7 @@ Install Gajae Code App (experimental, community-built)? [y/N]
 
 The default is **No**. This is not an official first-party support claim; the
 app is separately licensed and maintained at
+<https://github.com/devswha/gajae-code-app>.
 The offer is interactive-only and
 is skipped when the app is already installed, when running in CI/automation, or
 when no canonical published release is available. A yes answer uses only the
