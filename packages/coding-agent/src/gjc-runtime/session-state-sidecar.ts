@@ -1941,7 +1941,9 @@ function stampRuntimeStateOwnerGeneration(
 	previous: Record<string, unknown>,
 	context: RuntimeStateContext,
 ): Record<string, unknown> {
-	return context.ownerTerminal && context.ownerGenerationPublished !== false && context.ownerTerminal.generationPublished !== false
+	return context.ownerTerminal &&
+		context.ownerGenerationPublished !== false &&
+		context.ownerTerminal.generationPublished !== false
 		? { ...previous, owner_generation: context.ownerTerminal.generation }
 		: previous;
 }
@@ -3091,7 +3093,9 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 		throw error;
 	}
 	if (ownerTerminalVerdict && context.ownerTerminal && context.ownerTerminal.generationPublished !== undefined) {
-		const generation = await captureOwnerGenerationBaseline(context.ownerTerminal.stateDir, identity.sessionId).catch(() => ({ state: "absent" as const }));
+		const generation = await captureOwnerGenerationBaseline(context.ownerTerminal.stateDir, identity.sessionId).catch(
+			() => ({ state: "absent" as const }),
+		);
 		context = { ...context, ownerGenerationPublished: generation.state === "current" };
 	}
 	let ownerSessionRoot: string;
