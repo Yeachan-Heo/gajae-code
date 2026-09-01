@@ -607,6 +607,21 @@ describe("MCPConnectionPool", () => {
 		await pool.shutdown();
 	});
 
+	test("failed final close restores lease roots before release retry", async () => {
+		const transport = new FakeTransport();
+		const pool = new MCPConnectionPool({ connect: async (name, cfg) => connection(name, cfg, transport) });
+		const lease = await pool.acquire("server", config(), { sessionId: "close-roots-retry" });
+		const roots = [{ uri: "file:///workspace", name: "workspace" }];
+		lease.updateRoots(roots);
+		transport.failClose = true;
+		await expect(lease.release()).rejects.toThrow("close failed");
+		expect(await transport.onRequest?.("roots/list", {})).toEqual({ roots });
+		transport.failClose = false;
+		await lease.release();
+		expect(pool.size).toBe(0);
+		await pool.shutdown();
+	});
+
 	test("failed shared idle close re-arms the idle timer", async () => {
 		const transport = new FakeTransport();
 		const pool = new MCPConnectionPool({
