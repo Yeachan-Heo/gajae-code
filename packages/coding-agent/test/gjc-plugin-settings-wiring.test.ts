@@ -44,7 +44,7 @@ describe("GJC bundle Settings runtime wiring", () => {
 
 	test("publication happens only after the last producer", async () => {
 		const source = await read("sdk/session.ts");
-		const appendix = source.indexOf("renderAlwaysOnSystemAppendices({ cwd:");
+		const appendix = source.indexOf("renderAlwaysOnSystemAppendices({");
 		const publish = source.indexOf("gjcRuntimeStore.publish(");
 		expect(appendix).toBeGreaterThan(-1);
 		expect(publish).toBeGreaterThan(appendix);

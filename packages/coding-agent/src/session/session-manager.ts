@@ -11192,6 +11192,14 @@ export class SessionManager {
 			? path.join(newSessionDir, path.basename(this.#sessionFile))
 			: undefined;
 		const pinnedSourceIdentity = await options.sourceHandle.stat({ bigint: true });
+		// Capture the managed source transcript before revalidating the target. A
+		// target identity hook can race this boundary and replace the source path;
+		// reading afterward would copy replacement bytes into the destination before
+		// rollback can reject them.
+		const preflightManagedTranscript =
+			this.destination.kind === "managed" && nextDestination.kind === "managed" && this.#sessionFile
+				? this.#managedTranscriptStore(this.#sessionFile).readExpected(path.basename(this.#sessionFile))
+				: undefined;
 		const pinnedTargetIdentity = await options.targetHandle.stat({ bigint: true });
 		const moveDetails = {
 			previousCwd,
@@ -11344,7 +11352,8 @@ export class SessionManager {
 								);
 						}
 					};
-					managedTranscript = managedSourceStore.readExpected(path.basename(oldSessionFile));
+					managedTranscript =
+						preflightManagedTranscript ?? managedSourceStore.readExpected(path.basename(oldSessionFile));
 					hadSessionFile = managedTranscript !== null;
 					if (managedTranscript) {
 						await managedDestinationStore.publishNoReplace(

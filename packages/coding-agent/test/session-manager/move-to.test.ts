@@ -212,7 +212,7 @@ describe("SessionManager.moveTo", () => {
 				targetHandle,
 			}),
 		).rejects.toThrow(/replaced path|identity changed/);
-		expect(statCalls).toBe(2);
+		expect(statCalls).toBe(3);
 		expect(session.getCwd()).toBe(cwdA);
 		expect(session.getSessionFile()).toBe(sourceFile);
 		expect(fs.existsSync(sourceFile)).toBe(true);
@@ -248,7 +248,7 @@ describe("SessionManager.moveTo", () => {
 				targetHandle,
 			}),
 		).rejects.toThrow(/replaced path|identity changed/);
-		expect(statCalls).toBe(2);
+		expect(statCalls).toBe(3);
 		expect(session.getCwd()).toBe(cwdA);
 		expect(fs.lstatSync(cwdB).isSymbolicLink()).toBe(true);
 		await session.close();
@@ -282,7 +282,9 @@ describe("SessionManager.moveTo", () => {
 				expectedIdentity: { dev: opened.dev, ino: opened.ino },
 				targetHandle,
 			}),
-		).rejects.toThrow(/managed_move_source_replaced|Failed to rollback managed move/);
+		).rejects.toThrow(
+			/managed_move_source_replaced|Refusing to move through a replaced path|Failed to rollback managed move/,
+		);
 		expect(session.getCwd()).toBe(cwdA);
 		expect(session.getSessionFile()).toBe(sourceFile);
 		expect(await Bun.file(sourceFile).text()).toBe("successor transcript\n");

@@ -249,6 +249,7 @@ describe("stopped interactive lifecycle", () => {
 		const ctx = {
 			isStopped: () => stopped,
 			isInitialized: true,
+			session: { isSessionTransitioning: false },
 			statusLine: { invalidate: vi.fn() },
 			updateEditorTopBorder: vi.fn(),
 			setWorkingMessage: vi.fn(),

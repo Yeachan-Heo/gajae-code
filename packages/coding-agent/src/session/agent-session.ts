@@ -3524,6 +3524,14 @@ export class AgentSession {
 		);
 	}
 
+	#sessionControlAdmissionMatches(admission: SessionIdentityAdmission): boolean {
+		return (
+			this.sessionManager === admission.manager &&
+			this.sessionManager.getSessionId() === admission.sessionId &&
+			this.sessionManager.getSessionFile() === admission.sessionFile
+		);
+	}
+
 	#assertSessionIdentityAdmission(admission: SessionIdentityAdmission): void {
 		this.#assertNoSessionTransitionAdmission({
 			allowInternalTransitionEmission: this.#isInternalTransitionEmission(),
@@ -17814,6 +17822,10 @@ export class AgentSession {
 				}
 			}
 			throw new Error("Unable to persist reasoning settings.");
+		}
+		this.#assertNoSessionTransitionAdmission();
+		if (!this.#sessionControlAdmissionMatches(identityAdmission)) {
+			throw new Error("Session changed while selecting model");
 		}
 
 		if (
