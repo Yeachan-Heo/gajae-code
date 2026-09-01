@@ -179,6 +179,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		stderr: "inherit",
 		env: childEnvironment,
 	});
+	if (redactCommand) {
+		process.exitCode = await child.exited;
+		return;
+	}
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) {
 		await child.exited;
