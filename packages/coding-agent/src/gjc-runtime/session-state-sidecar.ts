@@ -637,6 +637,7 @@ export interface OwnerTerminalContext {
 	generation: string;
 	stateDir: string;
 	socketKey: string;
+	generationPublished?: boolean;
 	scope?: string | null;
 	ownerPid?: number | null;
 	ownerName?: string | null;
@@ -653,6 +654,8 @@ export interface RuntimeStateContext {
 	branch?: string | null;
 	/** Public-safe owner metadata used to persist the canonical terminal verdict. */
 	ownerTerminal?: OwnerTerminalContext | null;
+	/** Internal marker: staged owners may terminalize without stamping an unpublished generation. */
+	ownerGenerationPublished?: boolean;
 	/** Internal fail-closed marker set only when managed owner metadata is malformed or missing. */
 	ownerTerminalMetadataInvalid?: boolean;
 	/**
@@ -1938,7 +1941,9 @@ function stampRuntimeStateOwnerGeneration(
 	previous: Record<string, unknown>,
 	context: RuntimeStateContext,
 ): Record<string, unknown> {
-	return context.ownerTerminal ? { ...previous, owner_generation: context.ownerTerminal.generation } : previous;
+	return context.ownerTerminal && context.ownerGenerationPublished !== false && context.ownerTerminal.generationPublished !== false
+		? { ...previous, owner_generation: context.ownerTerminal.generation }
+		: previous;
 }
 
 async function writeStateFile(stateFile: string, payload: Record<string, unknown>): Promise<void> {
@@ -2818,7 +2823,12 @@ export function ownerTerminalContextFromEnvironment(): OwnerTerminalContext | "i
 	) {
 		return "invalid";
 	}
-	return { generation: normalizedGeneration, stateDir: normalizedStateDir, socketKey: normalizedSocketKey };
+	return {
+		generation: normalizedGeneration,
+		stateDir: normalizedStateDir,
+		socketKey: normalizedSocketKey,
+		...(process.env.GJC_TMUX_OWNER_GENERATION_STAGED === "1" ? { generationPublished: false } : {}),
+	};
 }
 
 async function persistInvalidOwnerTerminalMetadata(
@@ -3070,15 +3080,26 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	if (!stateFile) return;
 	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
 		context = contextWithManagedOwnerGeneration(context);
-	const identity = normalizedIdentity(context);
 	const ownerTerminalVerdict = context.ownerTerminal
-		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, identity.sessionId)
+		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, context.sessionId)
 		: null;
+	let identity: RuntimeStateIdentity;
+	try {
+		identity = normalizedIdentity(context);
+	} catch (error) {
+		if (context.ownerTerminal) throw new OwnerTerminalPublicationError(error);
+		throw error;
+	}
+	if (ownerTerminalVerdict && context.ownerTerminal && context.ownerTerminal.generationPublished !== undefined) {
+		const generation = await captureOwnerGenerationBaseline(context.ownerTerminal.stateDir, identity.sessionId).catch(() => ({ state: "absent" as const }));
+		context = { ...context, ownerGenerationPublished: generation.state === "current" };
+	}
 	let ownerSessionRoot: string;
 	try {
-		ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
+		const ownerCwd = context.cwd;
+		ownerSessionRoot = sessionRoot(ownerCwd, identity.sessionId);
 	} catch (error) {
-		if (ownerTerminalVerdict) throw new OwnerTerminalPublicationError(error);
+		if (context.ownerTerminal) throw new OwnerTerminalPublicationError(error);
 		throw error;
 	}
 	await serializeStateFileWrite(

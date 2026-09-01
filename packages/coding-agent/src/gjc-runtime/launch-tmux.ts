@@ -540,6 +540,7 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 		? {
 				GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]),
 				GJC_MANAGED_OWNER_SUPERVISED: "1",
+				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
 			}
 		: {};
 	const invocationArgs = context.managedOwnerSupervisor
