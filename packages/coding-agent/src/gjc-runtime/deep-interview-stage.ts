@@ -430,6 +430,8 @@ function computeMergedEnvelope(
 	draft: DeepInterviewStageDraft,
 	nowIso: string,
 ): Record<string, unknown> {
+	if (current.active === false && current.current_phase === "handoff")
+		throw new DeepInterviewStageError("DI_STAGE_MERGE_REJECTED", "cannot stage after deep-interview handoff");
 	// A poisoned (unverifiable) intent contract in the persisted base would make
 	// every merge throw forever; heal it instead of bricking the interview.
 	const { base: healedCurrent, healed } = healPoisonedIntentContract(current);
@@ -476,6 +478,14 @@ function computeMergedEnvelope(
 					"DI_STAGE_MERGE_REJECTED",
 					`crystallized ${field} is immutable through staged apply`,
 				);
+		if (isPlainObject(priorState.crystal) && priorState.crystal.lifecycle === "ready") {
+			for (const field of ["rounds", "established_facts", "intent_review", "current_ambiguity"] as const)
+				if (JSON.stringify(mergedState[field]) !== JSON.stringify(priorState[field]))
+					throw new DeepInterviewStageError(
+						"DI_STAGE_MERGE_REJECTED",
+						"ready Crystal evidence is immutable through staged apply",
+					);
+		}
 	}
 	if (mergedState?.crystal && isPlainObject(mergedState.crystal) && mergedState.crystal.lifecycle !== "ready")
 		merged.current_phase = "interviewing";
