@@ -51,6 +51,29 @@ describe("deep-interview crystallize contract", () => {
 		expect(crystal.items[0]?.anchor?.quote).toBe("Build a fast report.");
 	});
 
+	it("accepts developer and toolResult transcript roles", () => {
+		const snapshot: CrystalSnapshot = {
+			revision: 3,
+			start: 0,
+			end: 2,
+			messages: [
+				{ index: 0, role: "developer", content: "System guidance" },
+				{ index: 1, role: "toolResult", content: "Tool output" },
+				{ index: 2, role: "user", content: "Build a fast report." },
+			],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		const crystal = crystallizeDeepInterview(
+			input({
+				snapshot,
+				current_revision: 3,
+				items: input().items.map(item => ({ ...item, anchor: { message_index: 2, quote: "fast" } })),
+			}),
+		);
+		expect(crystal.lifecycle).toBe("ready");
+	});
+
 	it("represents bounded gaps as needs-questions", () => {
 		const crystal = crystallizeDeepInterview(input({ open_gaps: ["What is the memory budget?"] }));
 		expect(crystal.lifecycle).toBe("needs-questions");
