@@ -1312,6 +1312,16 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			if (mode === "deep-interview") {
 				const existingInner = isPlainObject(existingPayload.state) ? existingPayload.state : {};
 				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
+				if (existingInner.intent_contract === undefined && mergedInner.intent_contract !== undefined)
+					throw new StateCommandError(2, "generic state write cannot introduce a Round 0 intent contract");
+				if (
+					existingInner.intent_contract !== undefined &&
+					JSON.stringify(existingInner.intent_contract) !== JSON.stringify(mergedInner.intent_contract)
+				)
+					throw new StateCommandError(
+						2,
+						"canonical Round 0 intent contract is immutable through generic state write",
+					);
 				if (
 					existingInner.crystal !== undefined &&
 					JSON.stringify(existingInner.crystal) !== JSON.stringify(mergedInner.crystal)

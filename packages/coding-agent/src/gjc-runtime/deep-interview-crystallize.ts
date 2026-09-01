@@ -47,7 +47,7 @@ export interface DeepInterviewCrystal {
 	schema_version: 1;
 	spec_version: number;
 	lifecycle: "ready" | "needs-questions" | "stale" | "superseded";
-	source: { revision: number; start: number; end: number; digest: string };
+	source: { revision: number; start: number; end: number; digest: string; messages: CrystalMessage[] };
 	items: CrystalItem[];
 	removed_ids?: string[];
 	open_gaps: string[];
@@ -218,6 +218,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			throw new Error("prior crystal is invalid");
 		if (!isRecord(priorCrystal.source) || snapshot.revision <= priorCrystal.source.revision)
 			throw new Error("conversation snapshot is stale");
+		if (!Array.isArray(priorCrystal.source.messages)) throw new Error("prior crystal source evidence is missing");
+		validateSnapshot({ ...priorCrystal.source, messages: priorCrystal.source.messages });
 		if (!Array.isArray(priorCrystal.items)) throw new Error("prior crystal is invalid");
 		if (
 			!Number.isSafeInteger(priorCrystal.source.revision) ||
@@ -303,7 +305,13 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		schema_version: 1,
 		spec_version: (priorCrystal?.spec_version ?? 0) + 1,
 		lifecycle,
-		source: { revision: snapshot.revision, start: snapshot.start, end: snapshot.end, digest: snapshot.digest },
+		source: {
+			revision: snapshot.revision,
+			start: snapshot.start,
+			end: snapshot.end,
+			digest: snapshot.digest,
+			messages: snapshot.messages,
+		},
 		items: currentItems,
 		...(removedIds.length > 0 ? { removed_ids: removedIds } : {}),
 		open_gaps: gaps,
