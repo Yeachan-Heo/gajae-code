@@ -162,6 +162,7 @@ describe("macOS community app verified installation", () => {
 		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
 		const checksumUrl = `${dmgUrl}.sha256`;
 		const calls: string[][] = [];
+		let failCopy = false;
 		const command = async (argv: string[]) => {
 			calls.push(argv);
 			if (argv[0] === "/usr/bin/plutil") {
@@ -181,6 +182,7 @@ describe("macOS community app verified installation", () => {
 				return { exitCode: 0, stdout: "", stderr: "" };
 			}
 			if (argv[0] === "/usr/bin/ditto") {
+				if (failCopy) return { exitCode: 1, stdout: "", stderr: "copy failed" };
 				await fs.cp(argv[1], argv[2], { recursive: true });
 			}
 			return { exitCode: 0, stdout: argv[0] === "/usr/bin/lipo" ? "arm64" : "", stderr: "" };
@@ -215,5 +217,33 @@ describe("macOS community app verified installation", () => {
 		expect(calls.some(call => call[0] === "/usr/bin/hdiutil" && call[1] === "detach")).toBe(true);
 		expect(calls.some(call => call[0] === "/usr/bin/open")).toBe(true);
 		expect(await fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app"))).toBeTruthy();
+		await fs.rm(path.join(homeDir, "Applications", "Gajae Code App.app"), { recursive: true, force: true });
+		failCopy = true;
+		const failedCopy = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir,
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			command,
+			fetchImpl: async url => {
+				if (url.includes("/releases/latest")) {
+					return new Response(
+						JSON.stringify({
+							assets: [
+								{ name: dmgName, browser_download_url: dmgUrl },
+								{ name: `${dmgName}.sha256`, browser_download_url: checksumUrl },
+							],
+						}),
+					);
+				}
+				if (url === dmgUrl) return new Response(dmg);
+				return new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${dmgName}\n`);
+			},
+		});
+		expect(failedCopy.status).toBe("failed");
+		await expect(fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app"))).rejects.toThrow();
 	});
 });

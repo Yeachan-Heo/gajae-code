@@ -29,7 +29,6 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
-import { offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -1262,9 +1261,19 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
-	offerCommunityApp?: () => Promise<unknown>;
+	offerCommunityApp?: (runtimePath: string) => Promise<void>;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
+}
+
+async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<void> {
+	const child = Bun.spawn([runtimePath, "macos-community-app-offer"], {
+		stdin: "inherit",
+		stdout: "inherit",
+		stderr: "inherit",
+	});
+	const exitCode = await child.exited;
+	if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
 }
 
 export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
@@ -1593,12 +1602,14 @@ export async function runUpdateCommand(
 	}
 
 	let installedVersion: string | undefined;
+	let installedRuntimePath: string | undefined;
 	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
 		if (verification?.path) {
 			installedVersion = release.version;
+			installedRuntimePath = verification.path;
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
@@ -1613,9 +1624,9 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
-	if (installedVersion) {
+	if (installedVersion && installedRuntimePath && process.platform === "darwin") {
 		try {
-			await (deps.offerCommunityApp ?? offerMacosCommunityApp)();
+			await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(installedRuntimePath);
 		} catch (error) {
 			console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
 		}

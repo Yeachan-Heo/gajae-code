@@ -199,7 +199,7 @@ export async function offerMacosCommunityApp(
 ): Promise<CommunityAppOfferResult> {
 	const platform = deps.platform ?? process.platform;
 	const env = deps.env ?? process.env;
-	const log = deps.log ?? (message => console.error(message));
+	const log = deps.log ?? (message => process.stderr.write(`${message}\n`));
 	if (platform !== "darwin") return { status: "skipped", reason: "unsupported platform" };
 	if (env[COMMUNITY_APP_SUPPRESS_ENV] === "1" || env[COMMUNITY_APP_SUPPRESS_ENV]?.toLowerCase() === "true") {
 		return { status: "skipped", reason: "suppressed by environment" };
@@ -307,7 +307,8 @@ export async function offerMacosCommunityApp(
 		const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", sourceApp]);
 		if (signature.exitCode !== 0) return failure("the app bundle signature could not be verified", log);
 		const archCheck = await command(["/usr/bin/lipo", "-archs", executablePath]);
-		if (archCheck.exitCode !== 0 || !archCheck.stdout.split(/\s+/).includes(arch))
+		const executableArch = arch === "x64" ? "x86_64" : arch;
+		if (archCheck.exitCode !== 0 || !archCheck.stdout.split(/\s+/).includes(executableArch))
 			return failure(`the app bundle does not contain ${arch} code`, log);
 
 		const destinationRoot = path.join(homeDir, "Applications");
@@ -319,12 +320,8 @@ export async function offerMacosCommunityApp(
 			return failure("the destination already contains an app bundle", log);
 		}
 		installedDestination = destination;
-		try {
-			const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
-			if (copy.exitCode !== 0) return failure("copying the verified app bundle failed", log);
-		} catch (error) {
-			return failure(error instanceof Error ? error.message : String(error), log);
-		}
+		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
+		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
 		const launch = await command(["/usr/bin/open", destination]);
 		if (launch.exitCode !== 0) {
 			await fs.rm(destination, { recursive: true, force: true });
