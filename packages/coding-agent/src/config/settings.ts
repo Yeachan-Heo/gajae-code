@@ -1117,6 +1117,9 @@ export class Settings implements NotificationSettingsReader {
 			agentDir: this.#agentDir,
 			inMemory: !this.#persist,
 		});
+		// Passing the resolved directory above must not turn a resolver-owned
+		// default profile into an explicit custom profile during a cwd clone.
+		cloned.#agentDirExplicit = this.#agentDirExplicit;
 		cloned.#storage = this.#storage;
 		cloned.#schemaReport = structuredClone(this.#schemaReport);
 
