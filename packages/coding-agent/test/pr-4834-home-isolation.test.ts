@@ -211,6 +211,16 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.warnings).toEqual([]);
 	});
 
+	test.skipIf(process.platform === "win32")("isolated reads reject hardlinked files", async () => {
+		const outsideFile = path.join(tempDir, "outside", "SYSTEM.md");
+		const linkedFile = path.join(home, ".gjc", "agent", "SYSTEM.md");
+		await writeFile(outsideFile, "# outside");
+		await fs.mkdir(path.dirname(linkedFile), { recursive: true });
+		await fs.link(outsideFile, linkedFile);
+
+		expect(await readFile(linkedFile, { isolatedHome: true, home })).toBeNull();
+	});
+
 	test("isolated Cline reads bypass a poisoned same-lexical cache entry", async () => {
 		const decoyFile = path.join(tempDir, "process-decoy", "clinerules");
 		const safeFile = path.join(project, "safe-clinerules");
