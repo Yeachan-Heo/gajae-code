@@ -454,6 +454,11 @@ function computeMergedEnvelope(
 	// one-fact patch cannot erase confirmed/disputed history (#3387 finding 2).
 	const mergedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
 	const priorState = isPlainObject(current.state) ? (current.state as Record<string, unknown>) : undefined;
+	if (priorState?.crystal === undefined && mergedState?.crystal !== undefined)
+		throw new DeepInterviewStageError(
+			"DI_STAGE_MERGE_REJECTED",
+			"staged apply cannot introduce canonical Crystal state",
+		);
 	if (priorState?.crystal !== undefined) {
 		if (!mergedState || JSON.stringify(mergedState.crystal) !== JSON.stringify(priorState.crystal))
 			throw new DeepInterviewStageError(
