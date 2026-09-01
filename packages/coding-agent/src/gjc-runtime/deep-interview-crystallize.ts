@@ -164,6 +164,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				if (
 					anchorMessage.role !== "user" ||
 					/\[(?:image|audio|video|file|content)\]/i.test(item.anchor.quote) ||
+					/^(?:\[?(?:image|audio|video|file|content)\]?)+$/i.test(item.anchor.quote.trim()) ||
 					/^(?:\[[^\]]+\])+$/.test(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote)
 				)
