@@ -23,7 +23,13 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
-type CwdReadLeaseContext = { active: boolean; released: boolean; owner: symbol; suspendedMoveCount: number };
+type CwdReadLeaseContext = {
+	active: boolean;
+	released: boolean;
+	owner: symbol;
+	suspendedMoveCount: number;
+	committedMoveGeneration?: number;
+};
 const cwdReadLeaseAls = new AsyncLocalStorage<CwdReadLeaseContext>();
 const CWD_NOFOLLOW_OPEN_FLAGS =
 	fs.constants.O_RDONLY |
@@ -10981,6 +10987,15 @@ export class SessionManager {
 		return this.#cwdGeneration;
 	}
 
+	/** Consume a move committed by a nested move_session call in this read lease. */
+	consumeNestedCwdMove(admittedGeneration: number): boolean {
+		const readLease = cwdReadLeaseAls.getStore();
+		if (readLease?.committedMoveGeneration === undefined) return false;
+		const committed = readLease.committedMoveGeneration;
+		readLease.committedMoveGeneration = undefined;
+		return committed !== admittedGeneration;
+	}
+
 	/**
 	 * Register a listener invoked after every committed `moveTo`. Returns an idempotent
 	 * unregister handle. Every move surface funnels through `moveTo`, so a single
@@ -11570,6 +11585,8 @@ export class SessionManager {
 			}
 		}
 		this.#cwdGeneration += 1;
+		const readLease = cwdReadLeaseAls.getStore();
+		if (readLease?.owner === this.#cwdReadLeaseOwner) readLease.committedMoveGeneration = this.#cwdGeneration;
 		this.cwd = resolvedCwd;
 		this.sessionDir = newSessionDir;
 		this.destination = nextDestination;
