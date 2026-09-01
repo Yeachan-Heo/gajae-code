@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fresh interactive onboarding now asks for an interface language before showing guidance, supports English, Korean, Simplified Chinese, and Japanese, persists the choice through `ui.language`, and uses a documented English fallback for noninteractive, invalid, cancelled, or unwritable startup.
+- Coordinator projection consumers now retry a bounded number of fresh authoritative scans when concurrent session churn races a candidate. Cap exhaustion, owner disappearance, unsupported authority, and parse failures remain fail-closed, while settled concurrent SDK sessions no longer permanently starve the session reaper or coordinator mutations. (#5168)
 
 - Coordinator session-state locks now reclaim an empty, identity-qualified released transition tombstone on POSIX after a short release grace period. Live, foreign, malformed, non-empty, or identity-changed claims remain fail-closed, while persistent macOS/File Provider debris no longer burns the full transition timeout on every state write. (#5159)
 

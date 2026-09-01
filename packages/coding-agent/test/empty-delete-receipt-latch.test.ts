@@ -9,6 +9,7 @@ import { writeCoordinatorAtomic } from "../src/coordinator-mcp/durability";
 import {
 	COORDINATOR_JSON_SCAN_CAP,
 	listCoordinatorJsonFiles,
+	listCoordinatorJsonFilesWithRetry,
 	type ProjectionScanDirectory,
 	ProjectionScanTestHooks,
 } from "../src/coordinator-mcp/projection-scan";
@@ -95,6 +96,78 @@ describe("empty .gjc-delete-* latch", () => {
 		expect(scan.raced).toBe(1);
 		expect(scan.incomplete).toBe(true);
 		expect(scan.capped).toBe(true);
+	});
+
+	it("Test 1 recovery: six concurrent projection writers settle within bounded retries", async () => {
+		const dir = await tempRoot("gjc-scan-retry-");
+		for (let index = 0; index < 6; index++)
+			await fs.writeFile(
+				path.join(dir, `session-${index}.json`),
+				JSON.stringify({ session_id: `session-${index}` }),
+			);
+		let attempts = 0;
+		const scan = await listCoordinatorJsonFilesWithRetry(
+			dir,
+			{
+				readdir: async target => fs.readdir(target),
+				lstat: async file => {
+					if (path.basename(file) === "session-0.json" && attempts < 2) {
+						attempts += 1;
+						const error = new Error("concurrent writer replaced candidate") as NodeJS.ErrnoException;
+						error.code = "ELOOP";
+						throw error;
+					}
+					return fs.lstat(file);
+				},
+				readFile: (file, encoding) => fs.readFile(file, encoding),
+			},
+			10,
+			3,
+		);
+		expect(attempts).toBe(2);
+		expect(scan.values).toHaveLength(6);
+		expect(scan.incomplete).toBe(false);
+		expect(scan.raced).toBe(0);
+	});
+
+	it("Test 1 recovery: owner disappearance never becomes an authoritative empty result", async () => {
+		const stat = {
+			size: 0,
+			dev: 1n,
+			ino: 2n,
+			isDirectory: () => true,
+			isFile: () => false,
+			isSymbolicLink: () => false,
+		};
+		const error = new Error("owner disappeared") as NodeJS.ErrnoException;
+		error.code = "ENOENT";
+		let opens = 0;
+		const scan = await listCoordinatorJsonFilesWithRetry(
+			"/owner-disappeared",
+			{
+				readdir: async () => [],
+				lstat: async () => stat,
+				readFile: async () => "{}",
+				openDirectory: async () => {
+					opens += 1;
+					return {
+						stat,
+						readdir: async () => {
+							throw error;
+						},
+						lstat: async () => stat,
+						readFile: async () => "{}",
+						close: async () => {},
+					};
+				},
+			},
+			COORDINATOR_JSON_SCAN_CAP,
+			3,
+		);
+		expect(opens).toBe(3);
+		expect(scan.values).toEqual([]);
+		expect(scan.incomplete).toBe(true);
+		expect(scan.raced).toBe(1);
 	});
 
 	it.skipIf(process.platform !== "linux")(

@@ -36,6 +36,8 @@ function projectionPlatform(): NodeJS.Platform {
 
 /** Post-filter parse-candidate cap. Exhaustion returns an explicit incomplete result. */
 export const COORDINATOR_JSON_SCAN_CAP = 10_000;
+/** Number of fresh authoritative attempts allowed for a scan that observed churn. */
+export const COORDINATOR_JSON_SCAN_RETRY_ATTEMPTS = 3;
 
 export interface ProjectionScanStat {
 	size: number | bigint;
@@ -568,4 +570,23 @@ export async function listCoordinatorJsonFiles(
 	} finally {
 		await authority?.close().catch(() => undefined);
 	}
+}
+
+/**
+ * Retry only scans invalidated by observed directory/file churn. A candidate cap,
+ * unsupported authority, parse error, or any other failure remains fail-closed.
+ * Each attempt acquires a new authority, so no partial result crosses attempts.
+ */
+export async function listCoordinatorJsonFilesWithRetry(
+	dir: string,
+	io: ProjectionScanFs = defaultFs,
+	cap: number = COORDINATOR_JSON_SCAN_CAP,
+	maxAttempts: number = COORDINATOR_JSON_SCAN_RETRY_ATTEMPTS,
+): Promise<ProjectionScanResult> {
+	const attempts = Math.max(1, Math.floor(maxAttempts));
+	let scan = await listCoordinatorJsonFiles(dir, io, cap);
+	for (let attempt = 1; attempt < attempts && scan.incomplete && scan.raced > 0; attempt++) {
+		scan = await listCoordinatorJsonFiles(dir, io, cap);
+	}
+	return scan;
 }

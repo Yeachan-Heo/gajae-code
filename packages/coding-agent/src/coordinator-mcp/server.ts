@@ -83,7 +83,7 @@ import {
 	requireCoordinatorMutation,
 	safeOpenCoordinatorArtifact,
 } from "./policy";
-import { listCoordinatorJsonFiles } from "./projection-scan";
+import { listCoordinatorJsonFilesWithRetry } from "./projection-scan";
 import {
 	answerBindingMatches,
 	buildCoordinatorAskAnswerSchema,
@@ -1498,7 +1498,7 @@ function publicSdkAcknowledgement(result: RuntimePromptAcknowledgement): Record<
 }
 
 async function listJsonFiles(dir: string): Promise<unknown[]> {
-	const scan = await listCoordinatorJsonFiles(dir);
+	const scan = await listCoordinatorJsonFilesWithRetry(dir);
 	if (scan.capped) throw new Error("coordinator_projection_scan_incomplete");
 	if (scan.skippedEmpty > 0 || scan.skippedDebris > 0) {
 		logger.warn("Coordinator projection scan skipped debris", {
