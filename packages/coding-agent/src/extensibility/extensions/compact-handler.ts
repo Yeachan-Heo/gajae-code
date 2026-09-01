@@ -6,7 +6,7 @@
  * union so the same adapter can be reused by print, SDK, ACP, and executor callers.
  */
 import type { Model } from "@gajae-code/ai/core";
-import type { CompactOptions } from "./types";
+import type { CompactOptions, SdkControlMutationOptions } from "./types";
 
 interface CompactableSession {
 	compact(instructions?: string, options?: CompactOptions): Promise<unknown>;
@@ -27,7 +27,7 @@ interface SetModelCapableSession {
 	modelRegistry: { getApiKey(model: Model, sessionId?: string): Promise<string | undefined> };
 	setModel(model: Model, role?: string, options?: { cause?: string }): Promise<unknown>;
 	/** Serialize the complete extension model mutation with session controls. */
-	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
+	withSdkControlMutation?<T>(body: () => Promise<T>, options?: SdkControlMutationOptions): Promise<T>;
 	/** Capture the session identity before an asynchronous extension mutation. */
 	captureSessionIdentityForMode?(): unknown;
 	/** Reject materialization when the extension mutation crossed a session transition. */
@@ -82,5 +82,7 @@ export async function runExtensionSetModel(session: SetModelCapableSession, mode
 		}
 		return true;
 	};
-	return session.withSdkControlMutation ? session.withSdkControlMutation(runMutation) : runMutation();
+	return session.withSdkControlMutation
+		? session.withSdkControlMutation(runMutation, { allowSdkControlMutationReentry: true })
+		: runMutation();
 }

@@ -16990,8 +16990,16 @@ export class AgentSession {
 	 * SDK `config.patch` and other host mutations serialize against synthetic
 	 * profile activation and default-model selection.
 	 */
-	async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+	async withSdkControlMutation<T>(
+		body: () => Promise<T>,
+		options?: { allowSdkControlMutationReentry?: boolean },
+	): Promise<T> {
 		const identityAdmission = this.#captureSessionIdentityAdmission();
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner?.kind === "selection" && !owner.released && options?.allowSdkControlMutationReentry === true) {
+			this.#assertSessionIdentityAdmission(identityAdmission);
+			return await body();
+		}
 		// Waiting while selection owns admission deadlocks with a scheduled
 		// continuation queued behind it. Wait before acquiring the mutation lease.
 		await this.waitForIdle();

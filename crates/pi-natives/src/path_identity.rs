@@ -4556,7 +4556,7 @@ pub(crate) mod platform {
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::ENOTDIR) => "not_directory",
 			Some(libc::EISDIR) => "not_regular_file",
-			Some(libc::EACCES) | Some(libc::EPERM) => "permission_denied",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::EROFS) => "permission_denied",
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::EINVAL) => "invalid_request",
@@ -4699,6 +4699,8 @@ pub(crate) mod platform {
 		if current.st_mode & libc::S_IFMT != libc::S_IFDIR || !stat_same_object(expected, &current) {
 			return Err("identity_mismatch");
 		}
+		// SAFETY: `parent_fd` is an open directory descriptor and `name` is
+		// NUL-terminated.
 		if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
 			return Err(skill_write_error(&std::io::Error::last_os_error()));
 		}
@@ -4758,13 +4760,11 @@ pub(crate) mod platform {
 				drop(next);
 				return Err(cleanup.err().unwrap_or(code));
 			}
-			if created {
-				if let Err(code) = fsync_root_parent(current.as_raw_fd()) {
-					let cleanup =
-						remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
-					drop(next);
-					return Err(cleanup.err().unwrap_or(code));
-				}
+			if created && let Err(code) = fsync_root_parent(current.as_raw_fd()) {
+				let cleanup =
+					remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
+				drop(next);
+				return Err(cleanup.err().unwrap_or(code));
 			}
 			let parent_initial = fstat(current.as_raw_fd()).map_err(|_| "io_error")?;
 			let child_initial = fstat(next.as_raw_fd()).map_err(|_| "io_error")?;
@@ -4960,6 +4960,7 @@ pub(crate) mod platform {
 			}
 			// The mode change is part of the payload publication transaction; make
 			// it durable before exposing the inode under its final name.
+			// SAFETY: `private_fd` is the open staging file descriptor retained above.
 			if unsafe { libc::fsync(private_fd) } != 0 {
 				return Err(SkillPublicationError::Pre("durability_failed"));
 			}
@@ -5084,8 +5085,8 @@ pub(crate) mod platform {
 		}
 		Ok(opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& named.st_mode & libc::S_IFMT == libc::S_IFREG
-			&& expected_mode.map_or(true, |mode| {
-				u32::from(opened.st_mode & 0o7777) == mode && u32::from(named.st_mode & 0o7777) == mode
+			&& expected_mode.is_none_or(|mode| {
+				(opened.st_mode & 0o7777) == mode && (named.st_mode & 0o7777) == mode
 			}) && opened.st_nlink == 1
 			&& named.st_nlink == 1
 			&& opened.st_dev == named.st_dev
@@ -5891,7 +5892,7 @@ pub(crate) mod platform {
 			// A filesystem without hard links reports EPERM for a valid request, which
 			// is indistinguishable here from a denied one; both leave the destination
 			// unpublished.
-			Some(libc::EACCES) | Some(libc::EPERM) => "permission_denied",
+			Some(libc::EACCES | libc::EPERM) => "permission_denied",
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",

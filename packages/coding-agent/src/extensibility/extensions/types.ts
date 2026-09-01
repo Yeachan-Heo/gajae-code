@@ -16,6 +16,7 @@ import type {
 	RunSettlementProof,
 	ThinkingLevel,
 } from "@gajae-code/agent-core";
+
 import type { AttemptScope } from "@gajae-code/agent-core/attempt-scope";
 import type { CompactionResult } from "@gajae-code/agent-core/compaction";
 import type {
@@ -107,6 +108,10 @@ import type { SlashCommandInfo } from "../slash-commands";
 export type { AppKeybinding, KeybindingsManager } from "../../config/keybindings";
 export type { ExecOptions, ExecResult } from "../../exec/exec";
 export type { AgentToolResult, AgentToolUpdateCallback };
+
+export interface SdkControlMutationOptions {
+	allowSdkControlMutationReentry?: boolean;
+}
 
 // ============================================================================
 // UI Context
@@ -510,7 +515,7 @@ export interface ExtensionContext {
 	/** The in-session active-profile marker; sole source of logical current state. */
 	getActiveModelProfile?(): string | undefined;
 	/** Run a control-surface mutation inside the session admission boundary. */
-	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
+	withSdkControlMutation?<T>(body: () => Promise<T>, options?: SdkControlMutationOptions): Promise<T>;
 	cycleThinkingLevel(): ThinkingLevel | undefined;
 	setQueueMode(kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown): boolean;
 	getSkillState(): unknown;
@@ -1673,7 +1678,7 @@ export interface ExtensionContextActions {
 		},
 	) => Promise<DefaultModelProfileActivationResult>;
 	getActiveModelProfile?: () => string | undefined;
-	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
+	withSdkControlMutation?: <T>(body: () => Promise<T>, options?: SdkControlMutationOptions) => Promise<T>;
 	cycleThinkingLevel?: () => ThinkingLevel | undefined;
 	setQueueMode?: (kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown) => boolean;
 	getSkillState?: () => unknown;

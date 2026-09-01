@@ -632,7 +632,7 @@ export class ExtensionUiController {
 			setModelProfile: name => this.ctx.session.activateModelProfileForControl(name),
 			setDefaultModelProfile: (name, options) => this.ctx.session.setDefaultModelProfileForControl(name, options),
 			getActiveModelProfile: () => this.ctx.session.getActiveModelProfile(),
-			withSdkControlMutation: body => this.ctx.session.withSdkControlMutation(body),
+			withSdkControlMutation: (body, options) => this.ctx.session.withSdkControlMutation(body, options),
 			cycleThinkingLevel: () => this.ctx.session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {
@@ -862,7 +862,7 @@ export class ExtensionUiController {
 			setModelProfile: name => this.ctx.session.activateModelProfileForControl(name),
 			setDefaultModelProfile: (name, options) => this.ctx.session.setDefaultModelProfileForControl(name, options),
 			getActiveModelProfile: () => this.ctx.session.getActiveModelProfile(),
-			withSdkControlMutation: body => this.ctx.session.withSdkControlMutation(body),
+			withSdkControlMutation: (body, options) => this.ctx.session.withSdkControlMutation(body, options),
 			cycleThinkingLevel: () => this.ctx.session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				if (kind === "steering" && (mode === "all" || mode === "one-at-a-time")) {

@@ -73,9 +73,8 @@ function adapterTestPrefix(adapter: Adapter): string {
 }
 function acpDispositionFileFor(operation: (typeof OPERATIONS)[number]): string {
 	const index = OPERATIONS.indexOf(operation);
-	const cohort = Math.min(
-		acpDispositionFiles.length - 1,
-		Math.floor(((index + 1) * acpDispositionFiles.length) / OPERATIONS.length),
+	const cohort = acpDispositionFiles.findIndex(
+		(_, cohortIndex) => index < Math.floor(((cohortIndex + 1) * OPERATIONS.length) / acpDispositionFiles.length),
 	);
 	return acpDispositionFiles[cohort]!;
 }

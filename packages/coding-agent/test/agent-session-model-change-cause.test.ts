@@ -100,6 +100,24 @@ describe("AgentSession model-change causes", () => {
 		expect(calls[0]).toEqual({ role: "default", cause: "user-selection" });
 		expect(materialized).toEqual([model]);
 	});
+	test("runExtensionSetModel permits reentry under a selection admission", async () => {
+		const model = { provider: "p", id: "m" } as unknown as Model;
+		let reentryAllowed = false;
+		const session = {
+			modelRegistry: { getApiKey: async () => "key" },
+			setModel: async () => undefined,
+			withSdkControlMutation: async <T>(
+				body: () => Promise<T>,
+				options?: { allowSdkControlMutationReentry?: boolean },
+			): Promise<T> => {
+				reentryAllowed = options?.allowSdkControlMutationReentry === true;
+				return await body();
+			},
+		};
+
+		expect(await runExtensionSetModel(session, model)).toBe(true);
+		expect(reentryAllowed).toBe(true);
+	});
 
 	test("runExtensionSetModel returns false without an API key and does not set the model", async () => {
 		const model = { provider: "p", id: "m" } as unknown as Model;

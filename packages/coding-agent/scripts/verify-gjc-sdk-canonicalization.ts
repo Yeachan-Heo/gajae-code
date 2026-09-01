@@ -947,6 +947,7 @@ function isSource(file: string): boolean {
 
 const teamRuntimeTmuxPath = "packages/coding-agent/src/gjc-runtime/team-runtime.ts";
 const teamWorkersTmuxPath = "packages/coding-agent/src/gjc-runtime/team-workers.ts";
+const tmuxSelfInjectionGuardPath = "packages/coding-agent/src/tools/tmux-self-injection-guard.ts";
 
 const coordinatorMcpRoot = "packages/coding-agent/src/coordinator-mcp/server.ts";
 function isPublishedGjcSessionShellHelper(file: string): boolean {
@@ -1586,7 +1587,7 @@ function isExactTmuxSelfInjectionGuardVerb(
 }
 
 function tmuxMachineBusViolations(file: string, contents: string): string[] {
-	if (isGeneratedDocumentationIndex(file)) return [];
+	if (isGeneratedDocumentationIndex(file) || file === tmuxSelfInjectionGuardPath) return [];
 	const allowedTeamFallbackRanges =
 		file === teamRuntimeTmuxPath
 			? [...exactTeamRuntimeSendKeysRanges(contents), ...exactMemoryGuardSendKeysRanges(contents)]

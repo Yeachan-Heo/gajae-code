@@ -158,7 +158,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			setModelProfile: name => session.activateModelProfileForControl(name),
 			setDefaultModelProfile: (name, options) => session.setDefaultModelProfileForControl(name, options),
 			getActiveModelProfile: () => session.getActiveModelProfile(),
-			withSdkControlMutation: body => session.withSdkControlMutation(body),
+			withSdkControlMutation: (body, options) => session.withSdkControlMutation(body, options),
 			cycleThinkingLevel: () => session.cycleThinkingLevel(),
 			setQueueMode: (kind, mode) => {
 				const admission = session.captureSessionIdentityForMode();
