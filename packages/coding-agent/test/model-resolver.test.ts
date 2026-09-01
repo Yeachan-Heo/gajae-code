@@ -1120,6 +1120,20 @@ describe("OpenAI Codex default resolution", () => {
 		expect(result.model).toBeUndefined();
 		expect(result.fallbackMessage).toBe("Model opencode-go/glm-5.3-flash not found");
 	});
+
+	test("keeps an available OpenCode Go catalog model as the configured default", async () => {
+		const model = { ...codexDefaultModels[0]!, provider: "opencode-go" as const, id: "deepseek-v4-flash" };
+		const result = await findInitialModel({
+			defaultProvider: model.provider,
+			defaultModelId: model.id,
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: { getAvailable: () => [model], getApiKey: async () => "test-key" },
+		});
+
+		expect(result.model).toBe(model);
+		expect(result.fallbackMessage).toBeUndefined();
+	});
 });
 
 test("restores only an exact available provider/model candidate", async () => {
