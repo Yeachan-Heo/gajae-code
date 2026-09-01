@@ -5,6 +5,7 @@ import * as path from "node:path";
 import * as activeStateModule from "@gajae-code/coding-agent/skill-state/active-state";
 import { logger } from "@gajae-code/utils";
 import { DEFAULT_DISABLED_EXTENSIONS, DEFAULT_SKILL_DISCOVERY_SETTINGS } from "../src/config/skill-settings-defaults";
+import { runNativeRalplanCommand } from "../src/gjc-runtime/ralplan-runtime";
 import {
 	activeEntryPath,
 	activeSnapshotPath,
@@ -94,6 +95,21 @@ describe("GJC native skill-state hooks", () => {
 	async function cwd(): Promise<string> {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-hooks-"));
 		return tempDir;
+	}
+
+	async function initGitRepo(root: string): Promise<void> {
+		const run = async (args: string[]) => {
+			const process = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "pipe" });
+			const status = await process.exited;
+			if (status !== 0)
+				throw new Error(`git ${args.join(" ")} failed: ${await new Response(process.stderr).text()}`);
+		};
+		await run(["init"]);
+		await run(["config", "user.email", "test@example.com"]);
+		await run(["config", "user.name", "Test"]);
+		await fs.writeFile(path.join(root, "README.md"), "test\n");
+		await run(["add", "README.md"]);
+		await run(["commit", "-m", "init"]);
 	}
 
 	async function writePersistedSessionFile(
@@ -1997,6 +2013,82 @@ disabledExtensions:
 		expect(persistedMode.current_phase).toBe("requirements");
 		expect(persistedEntry.phase).toBe("requirements");
 		expect(rebuiltSnapshot.phase).toBe("requirements");
+	});
+
+	it("seeds ralplan repository binding for the first explicit-target role write", async () => {
+		const root = await cwd();
+		await initGitRepo(root);
+		const sessionId = "session-ralplan-first-use-binding";
+		const activation = await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "ralplan", sessionId });
+		expect(activation.seeded).toBe(true);
+
+		const state = JSON.parse(await fs.readFile(modeStatePath(root, sessionId, "ralplan"), "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(state.repository_binding).toMatchObject({ schema: "gjc.repository_binding.v1", worktreeRoot: root });
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--worktree-root",
+				root,
+				"--session-id",
+				sessionId,
+				"--run-id",
+				"first-use-run",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# planner\n",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(0);
+	});
+
+	it("rejects malformed ralplan hook bindings before an explicit-target role write", async () => {
+		const root = await cwd();
+		await initGitRepo(root);
+		const sessionId = "session-ralplan-malformed-binding";
+		await ensureWorkflowSkillActivationSeed({ cwd: root, skill: "ralplan", sessionId });
+		const statePath = modeStatePath(root, sessionId, "ralplan");
+		const state = JSON.parse(await fs.readFile(statePath, "utf8")) as Record<string, unknown>;
+		const revision = state.state_revision;
+		if (typeof revision !== "number") throw new Error("Expected seeded state revision");
+		await writeGuardedWorkflowEnvelopeAtomic(
+			statePath,
+			{ ...state, repository_binding: { schema: "gjc.repository_binding.v1", worktreeRoot: "" } },
+			{
+				cwd: root,
+				policy: "source",
+				expectedRevision: revision,
+				receipt: { cwd: root, skill: "ralplan", owner: "gjc-runtime", command: "test", sessionId },
+			},
+		);
+
+		const result = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--worktree-root",
+				root,
+				"--session-id",
+				sessionId,
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--artifact",
+				"# planner\n",
+				"--json",
+			],
+			root,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toMatch(/repository binding rejected|requires worktreeRoot/i);
 	});
 	it("rollback restores upstream pipeline entries superseded by a later seed", async () => {
 		const root = await cwd();

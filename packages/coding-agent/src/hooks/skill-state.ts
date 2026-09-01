@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { resolveSkillScopeTrust, type SkillDiscoverySettings } from "../config/skill-settings-defaults";
 import { detectDeepInterviewPlaintextAskLeak } from "../deep-interview/plaintext-gate-guard";
+import { captureRepositoryBinding, publicRepositoryBinding } from "../gjc-runtime/repository-binding";
 import { activeSnapshotPath, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
 import { ModeStateSchema, SkillActiveStateSchema } from "../gjc-runtime/state-schema";
@@ -421,6 +422,10 @@ async function seedSkillActivationState(
 		active_skills: [entry],
 		...(input.activeSubskills ? { active_subskills: input.activeSubskills } : {}),
 	};
+	const repositoryBinding =
+		skill === "ralplan"
+			? publicRepositoryBinding(await captureRepositoryBinding(input.cwd, { displayPath: input.cwd }))
+			: undefined;
 	const modeState: ModeState = {
 		active: true,
 		version: WORKFLOW_STATE_VERSION,
@@ -431,6 +436,7 @@ async function seedSkillActivationState(
 		session_id: resolvedSessionId,
 		...(input.threadId ? { thread_id: input.threadId } : {}),
 		...(input.turnId ? { turn_id: input.turnId } : {}),
+		...(repositoryBinding ? { repository_binding: repositoryBinding } : {}),
 	};
 	if (skill === "deep-interview") {
 		modeState.threshold = DEFAULT_DEEP_INTERVIEW_AMBIGUITY_THRESHOLD;
