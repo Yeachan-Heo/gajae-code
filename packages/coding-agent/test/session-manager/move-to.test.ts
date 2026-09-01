@@ -159,7 +159,7 @@ describe("SessionManager.moveTo", () => {
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
-		expect(JSON.parse(fs.readFileSync(newFile, "utf8").split("\n", 1)[0]!).cwd).toBe(path.resolve(cwdB));
+		expect(JSON.parse((await Bun.file(newFile).text()).split("\n", 1)[0]!).cwd).toBe(path.resolve(cwdB));
 		expect(hasAssistantEntry(entries)).toBe(true);
 		const reopened = await SessionManager.open(newFile);
 		expect(reopened.getCwd()).toBe(path.resolve(cwdB));
@@ -174,10 +174,10 @@ describe("SessionManager.moveTo", () => {
 		const sourceFile = session.getSessionFile()!;
 		const destinationDir = SessionManager.getDefaultSessionDir(cwdB);
 		const destinationFile = path.join(destinationDir, path.basename(sourceFile));
-		fs.writeFileSync(destinationFile, "unrelated destination\n");
+		await Bun.write(destinationFile, "unrelated destination\n");
 
 		await expect(session.moveTo(cwdB)).rejects.toThrow();
-		expect(fs.readFileSync(destinationFile, "utf8")).toBe("unrelated destination\n");
+		expect(await Bun.file(destinationFile).text()).toBe("unrelated destination\n");
 		expect(fs.existsSync(sourceFile)).toBe(true);
 	});
 
@@ -217,9 +217,9 @@ describe("SessionManager.moveTo", () => {
 		expect(session.getSessionFile()).toBe(sourceFile);
 		expect(fs.existsSync(sourceFile)).toBe(true);
 		expect(fs.existsSync(destinationFile)).toBe(true);
-		expect(fs.readFileSync(sourceFile, "utf8")).toBe(fs.readFileSync(destinationFile, "utf8"));
-		expect(fs.readFileSync(sourceArtifact, "utf8")).toBe("authoritative artifact");
-		expect(fs.readFileSync(path.join(destinationFile.slice(0, -6), path.basename(sourceArtifact)), "utf8")).toBe(
+		expect(await Bun.file(sourceFile).text()).toBe(await Bun.file(destinationFile).text());
+		expect(await Bun.file(sourceArtifact).text()).toBe("authoritative artifact");
+		expect(await Bun.file(path.join(destinationFile.slice(0, -6), path.basename(sourceArtifact))).text()).toBe(
 			"authoritative artifact",
 		);
 		await session.close();
@@ -269,7 +269,7 @@ describe("SessionManager.moveTo", () => {
 			stat: async () => {
 				statCalls++;
 				if (statCalls === 2) {
-					fs.writeFileSync(sourceFile, "successor transcript\n");
+					await Bun.write(sourceFile, "successor transcript\n");
 					fs.rmdirSync(cwdB);
 					fs.symlinkSync(replacement, cwdB);
 				}
@@ -285,8 +285,8 @@ describe("SessionManager.moveTo", () => {
 		).rejects.toThrow(/managed_move_source_replaced|Failed to rollback managed move/);
 		expect(session.getCwd()).toBe(cwdA);
 		expect(session.getSessionFile()).toBe(sourceFile);
-		expect(fs.readFileSync(sourceFile, "utf8")).toBe("successor transcript\n");
-		expect(fs.readFileSync(destinationFile, "utf8")).not.toBe("successor transcript\n");
+		expect(await Bun.file(sourceFile).text()).toBe("successor transcript\n");
+		expect(await Bun.file(destinationFile).text()).not.toBe("successor transcript\n");
 		await session.close();
 	});
 

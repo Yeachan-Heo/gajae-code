@@ -15,7 +15,7 @@ describe("plugin extension discovery", () => {
 	let originalXdgDataHome: string | undefined;
 	const originalAgentDir = getAgentDir();
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		projectDir = TempDir.createSync("@pi-plugin-ext-");
 		originalXdgDataHome = process.env.XDG_DATA_HOME;
 		tempXdgDataHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-plugin-data-"));
@@ -27,7 +27,7 @@ describe("plugin extension discovery", () => {
 		const pluginsDir = getPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
 		fs.mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginsDir, "package.json"),
 			JSON.stringify({
 				name: "gjc-plugins",
@@ -37,7 +37,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginDir, "package.json"),
 			JSON.stringify({
 				name: "@demo/plugin",
@@ -47,7 +47,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginDir, "dist", "extension.ts"),
 			`
 				export default function(pi) {
@@ -92,11 +92,11 @@ describe("plugin extension discovery", () => {
 		`;
 		fs.mkdirSync(path.dirname(ambientNativeExtensionPath), { recursive: true });
 		fs.mkdirSync(path.dirname(selectedNativeExtensionPath), { recursive: true });
-		fs.writeFileSync(ambientNativeExtensionPath, nativeExtension("ambient-profile-ext"));
-		fs.writeFileSync(selectedNativeExtensionPath, nativeExtension("selected-native-ext"));
+		await Bun.write(ambientNativeExtensionPath, nativeExtension("ambient-profile-ext"));
+		await Bun.write(selectedNativeExtensionPath, nativeExtension("selected-native-ext"));
 		setAgentDir(ambientAgentDir);
 		fs.mkdirSync(path.dirname(selectedExtensionPath), { recursive: true });
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(selectedPluginsDir, "package.json"),
 			JSON.stringify({
 				name: "gjc-plugins",
@@ -106,7 +106,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(selectedPluginDir, "package.json"),
 			JSON.stringify({
 				name: "@selected/plugin",
@@ -116,7 +116,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			selectedExtensionPath,
 			`
 				export default function(pi) {
@@ -152,7 +152,7 @@ describe("plugin extension discovery", () => {
 		const extensionPath = path.join(pluginDir, "dist", "extension.ts");
 		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
 		fs.mkdirSync(path.dirname(extensionPath), { recursive: true });
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginsDir, "package.json"),
 			JSON.stringify({
 				name: "gjc-plugins",
@@ -162,7 +162,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginDir, "package.json"),
 			JSON.stringify({
 				name: "legacy-pi-plugin",
@@ -172,7 +172,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			extensionPath,
 			[
 				'import * as nodePath from "path";',
@@ -216,7 +216,7 @@ describe("plugin extension discovery", () => {
 		const extensionPath = path.join(extensionDir, "index.ts");
 		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
 		fs.mkdirSync(extensionDir, { recursive: true });
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginsDir, "package.json"),
 			JSON.stringify({
 				name: "gjc-plugins",
@@ -226,7 +226,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			path.join(pluginDir, "package.json"),
 			JSON.stringify({
 				name: "dir-entry-plugin",
@@ -237,7 +237,7 @@ describe("plugin extension discovery", () => {
 				},
 			}),
 		);
-		fs.writeFileSync(
+		await Bun.write(
 			extensionPath,
 			[
 				"export default function(pi) {",
