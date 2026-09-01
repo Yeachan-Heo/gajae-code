@@ -549,6 +549,7 @@ export async function offerMacosCommunityApp(
 			!(await sameDirectoryIdentity(destination, destinationIdentity))
 		)
 			throw new Error("the destination identity changed before copy");
+		throwIfInterrupted();
 		if (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))
 			throw new Error("the mounted volume identity changed before copy");
 		if (!(await isExpectedBundle(sourceApp, command))) throw new Error("the mounted app bundle changed before copy");
@@ -577,6 +578,7 @@ export async function offerMacosCommunityApp(
 			!(await sameDirectoryIdentity(destination, destinationIdentity))
 		)
 			throw new Error("the destination identity changed before launch");
+		throwIfInterrupted();
 		const launch = await command(["/usr/bin/open", destination]);
 		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
