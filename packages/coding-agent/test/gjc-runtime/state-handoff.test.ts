@@ -122,6 +122,34 @@ describe("gjc state handoff", () => {
 			expect(di?.handoff_at).toBe(handoffAt);
 		});
 	});
+	it("records explicit ready-Crystal execution approval in canonical state", async () => {
+		await withTempCwd(async cwd => {
+			const specPath = path.join(cwd, "crystal.md");
+			await fs.writeFile(specPath, "# Crystal\n");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: 2,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				spec_sha256: createHash("sha256").update("# Crystal\n").digest("hex"),
+				state: {
+					crystal: { lifecycle: "ready" },
+					execution_approval: "not-approved",
+					rounds: [],
+					established_facts: [],
+				},
+			});
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(0);
+			const after = (await readJson(callerPath)) as Record<string, unknown>;
+			expect((after.state as Record<string, unknown>).execution_approval).toBe("approved");
+		});
+	});
 
 	it("bounds referenced legacy specs before a deep-interview handoff mutates workflow state", async () => {
 		const writeLegacyCaller = async (cwd: string, spec: string) => {
