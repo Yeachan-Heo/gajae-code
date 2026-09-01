@@ -8,6 +8,7 @@ import "@gajae-code/utils/postmortem";
 import { Args, type CliConfig, Command, type CommandEntry, run } from "@gajae-code/utils/cli";
 import { APP_NAME, formatBunRuntimeError, MIN_BUN_VERSION, VERSION } from "@gajae-code/utils/dirs";
 import { runFixtureReport } from "./cli/fixture-report";
+import { offerMacosCommunityApp } from "./cli/macos-community-app";
 import { ROOT_LAUNCH_FLAGS } from "./cli/root-flags";
 import QuickLane from "./commands/quick-lane";
 import { runBashShellGuardian } from "./exec/bash-shell-guardian";
@@ -74,10 +75,6 @@ export const commands: CommandEntry[] = [
 	{ name: "deep-interview", load: () => import("./commands/deep-interview").then(m => m.default) },
 	{ name: "migrate", load: () => import("./commands/migrate").then(m => m.default) },
 	{ name: "update", load: () => import("./commands/update").then(m => m.default) },
-	{
-		name: "macos-community-app-offer",
-		load: () => import("./commands/macos-community-app-offer").then(m => m.default),
-	},
 	{ name: "read", load: () => import("./commands/read").then(m => m.default) },
 	{ name: "customize", load: () => import("./commands/customize").then(m => m.default) },
 	{ name: "plugin", load: () => import("./commands/plugin").then(m => m.default) },
@@ -474,6 +471,10 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
+		return;
+	}
+	if (argv.length === 1 && argv[0] === "macos-community-app-offer") {
+		await offerMacosCommunityApp();
 		return;
 	}
 	const fixtureArg = rootFixtureArg(argv);

@@ -1613,7 +1613,13 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
-	if (installedVersion) await (deps.offerCommunityApp ?? offerMacosCommunityApp)();
+	if (installedVersion) {
+		try {
+			await (deps.offerCommunityApp ?? offerMacosCommunityApp)();
+		} catch (error) {
+			console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
+		}
+	}
 	record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 }
 

@@ -9,6 +9,8 @@ export const COMMUNITY_APP_BUNDLE_ID = "app.gajae.desktop";
 export const COMMUNITY_APP_SUPPRESS_ENV = "GJC_NO_COMMUNITY_APP";
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_RELEASE_ORIGIN = "https://github.com";
+const MAX_DMG_BYTES = 512 * 1024 * 1024;
+const FETCH_TIMEOUT_MS = 30_000;
 type CommandRunner = (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
 interface ReleaseAsset {
@@ -47,19 +49,17 @@ function isMacArchitecture(arch: string): arch is "arm64" | "x64" {
 }
 
 function assetMatchesArchitecture(name: string, arch: "arm64" | "x64"): boolean {
-	const normalized = name.toLowerCase();
-	return (
-		normalized.includes("macos") && (normalized.includes(arch) || (arch === "x64" && normalized.includes("x86_64")))
-	);
+	return new RegExp(`^gajae-app-desktop-[0-9]+\\.[0-9]+\\.[0-9]+-macos-${arch}\\.dmg$`, "i").test(name);
 }
 
-function trustedReleaseAssetUrl(value: string): boolean {
+function trustedReleaseAssetUrl(value: string, expectedName: string): boolean {
 	try {
 		const url = new URL(value);
 		return (
 			url.protocol === "https:" &&
 			url.origin === GITHUB_RELEASE_ORIGIN &&
-			url.pathname.startsWith(`/${COMMUNITY_APP_REPOSITORY}/releases/download/`)
+			url.pathname.startsWith(`/${COMMUNITY_APP_REPOSITORY}/releases/download/`) &&
+			decodeURIComponent(path.posix.basename(url.pathname)) === expectedName
 		);
 	} catch {
 		return false;
@@ -73,6 +73,41 @@ function parseChecksum(text: string, assetName: string): string | undefined {
 		if (match[2] === assetName || path.basename(match[2]) === assetName) return match[1].toLowerCase();
 	}
 	return undefined;
+}
+
+async function readResponseBytes(response: Response, maxBytes: number): Promise<Uint8Array> {
+	const declaredLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+		throw new Error(`DMG exceeds the ${maxBytes} byte safety limit`);
+	}
+	if (!response.body) {
+		const bytes = new Uint8Array(await response.arrayBuffer());
+		if (bytes.byteLength > maxBytes) throw new Error(`DMG exceeds the ${maxBytes} byte safety limit`);
+		return bytes;
+	}
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (value) {
+				total += value.byteLength;
+				if (total > maxBytes) throw new Error(`DMG exceeds the ${maxBytes} byte safety limit`);
+				chunks.push(value);
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
 }
 
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -100,6 +135,27 @@ async function readBundleValue(bundlePath: string, key: string, command: Command
 
 async function isExpectedBundle(bundlePath: string, command: CommandRunner): Promise<boolean> {
 	return (await readBundleValue(bundlePath, "CFBundleIdentifier", command)) === COMMUNITY_APP_BUNDLE_ID;
+}
+
+async function resolveVerifiedExecutable(bundlePath: string, executable: string): Promise<string | undefined> {
+	if (executable.length === 0 || path.basename(executable) !== executable || executable.includes("\\"))
+		return undefined;
+	const macOSRoot = path.join(bundlePath, "Contents", "MacOS");
+	const executablePath = path.resolve(macOSRoot, executable);
+	if (path.dirname(executablePath) !== path.resolve(macOSRoot)) return undefined;
+	const [rootStat, executableStat] = await Promise.all([
+		fs.lstat(macOSRoot).catch(() => undefined),
+		fs.lstat(executablePath).catch(() => undefined),
+	]);
+	if (
+		!rootStat?.isDirectory() ||
+		rootStat.isSymbolicLink() ||
+		!executableStat?.isFile() ||
+		executableStat.isSymbolicLink()
+	) {
+		return undefined;
+	}
+	return executablePath;
 }
 
 async function findInstalledApp(homeDir: string, command: CommandRunner): Promise<string | undefined> {
@@ -149,6 +205,14 @@ export async function offerMacosCommunityApp(
 		return { status: "skipped", reason: "suppressed by environment" };
 	}
 	if (
+		env.CI ||
+		env.GITHUB_ACTIONS ||
+		env.GJC_NONINTERACTIVE === "1" ||
+		env.GJC_NONINTERACTIVE?.toLowerCase() === "true"
+	) {
+		return { status: "skipped", reason: "automation environment" };
+	}
+	if (
 		deps.stdinIsTTY === false ||
 		deps.stdoutIsTTY === false ||
 		(!deps.stdinIsTTY && !process.stdin.isTTY) ||
@@ -169,6 +233,7 @@ export async function offerMacosCommunityApp(
 	const arch = deps.arch ?? process.arch;
 	if (!isMacArchitecture(arch)) return failure(`unsupported macOS architecture ${arch}`, log);
 	const fetchImpl = deps.fetchImpl ?? fetch;
+	const fetchOptions = (): RequestInit => ({ signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
 	let tempRoot: string | undefined;
 	let mountPoint: string | undefined;
 	let attached = false;
@@ -182,6 +247,7 @@ export async function offerMacosCommunityApp(
 					"User-Agent": "gjc-community-app-offer",
 					"X-GitHub-Api-Version": "2022-11-28",
 				},
+				signal: fetchOptions().signal,
 			},
 		);
 		if (!releaseResponse.ok)
@@ -192,21 +258,21 @@ export async function offerMacosCommunityApp(
 		const dmg = release.assets.find(
 			asset => asset.name.toLowerCase().endsWith(".dmg") && assetMatchesArchitecture(asset.name, arch),
 		);
-		if (!dmg || !trustedReleaseAssetUrl(dmg.browser_download_url))
+		if (!dmg || !trustedReleaseAssetUrl(dmg.browser_download_url, dmg.name))
 			return failure(`no verified macOS ${arch} DMG is published`, log);
 		const checksumAsset = release.assets.find(
 			asset =>
 				asset.name === `${dmg.name}.sha256` || (asset.name.endsWith(".sha256") && asset.name.includes(dmg.name)),
 		);
-		if (!checksumAsset || !trustedReleaseAssetUrl(checksumAsset.browser_download_url))
+		if (!checksumAsset || !trustedReleaseAssetUrl(checksumAsset.browser_download_url, checksumAsset.name))
 			return failure("the release has no trusted DMG checksum", log);
 		const [dmgResponse, checksumResponse] = await Promise.all([
-			fetchImpl(dmg.browser_download_url),
-			fetchImpl(checksumAsset.browser_download_url),
+			fetchImpl(dmg.browser_download_url, fetchOptions()),
+			fetchImpl(checksumAsset.browser_download_url, fetchOptions()),
 		]);
 		if (!dmgResponse.ok || !checksumResponse.ok)
 			return failure("the canonical release assets could not be downloaded", log);
-		const dmgBytes = new Uint8Array(await dmgResponse.arrayBuffer());
+		const dmgBytes = await readResponseBytes(dmgResponse, MAX_DMG_BYTES);
 		const expected = parseChecksum(await checksumResponse.text(), dmg.name);
 		if (!expected) return failure("the published checksum does not name the DMG", log);
 		const actual = createHash("sha256").update(dmgBytes).digest("hex");
@@ -236,13 +302,11 @@ export async function offerMacosCommunityApp(
 			return failure(`the app bundle identifier was not ${COMMUNITY_APP_BUNDLE_ID}`, log);
 		const executable = await readBundleValue(sourceApp, "CFBundleExecutable", command);
 		if (!executable) return failure("the app bundle has no executable identity", log);
+		const executablePath = await resolveVerifiedExecutable(sourceApp, executable);
+		if (!executablePath) return failure("the app bundle executable path was unsafe", log);
 		const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", sourceApp]);
 		if (signature.exitCode !== 0) return failure("the app bundle signature could not be verified", log);
-		const archCheck = await command([
-			"/usr/bin/lipo",
-			"-archs",
-			path.join(sourceApp, "Contents", "MacOS", executable),
-		]);
+		const archCheck = await command(["/usr/bin/lipo", "-archs", executablePath]);
 		if (archCheck.exitCode !== 0 || !archCheck.stdout.split(/\s+/).includes(arch))
 			return failure(`the app bundle does not contain ${arch} code`, log);
 
@@ -250,20 +314,16 @@ export async function offerMacosCommunityApp(
 		await fs.mkdir(destinationRoot, { recursive: true });
 		const destination = path.join(destinationRoot, appEntry.name);
 		try {
-			await fs.access(destination, fs.constants.F_OK);
-			return failure("the destination already contains an app bundle", log);
+			await fs.mkdir(destination);
 		} catch {
-			// Expected: install only into a new destination.
+			return failure("the destination already contains an app bundle", log);
 		}
-		const staging = path.join(destinationRoot, `.${appEntry.name}.gjc-${process.pid}`);
-		await fs.rm(staging, { recursive: true, force: true });
+		installedDestination = destination;
 		try {
-			const copy = await command(["/usr/bin/ditto", sourceApp, staging]);
+			const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
 			if (copy.exitCode !== 0) return failure("copying the verified app bundle failed", log);
-			await fs.rename(staging, destination);
-			installedDestination = destination;
-		} finally {
-			await fs.rm(staging, { recursive: true, force: true });
+		} catch (error) {
+			return failure(error instanceof Error ? error.message : String(error), log);
 		}
 		const launch = await command(["/usr/bin/open", destination]);
 		if (launch.exitCode !== 0) {
@@ -284,7 +344,9 @@ export async function offerMacosCommunityApp(
 	} finally {
 		if (attached && mountPoint) {
 			try {
-				await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+				const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+				if (detach.exitCode !== 0)
+					log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
 			} catch (error) {
 				log(`Optional community app cleanup warning: failed to detach the temporary DMG: ${String(error)}`);
 			}
@@ -305,4 +367,11 @@ export function parseCommunityAppChecksumForTest(text: string, assetName: string
 
 export function communityAppAssetMatchesArchitectureForTest(name: string, arch: "arm64" | "x64"): boolean {
 	return assetMatchesArchitecture(name, arch);
+}
+
+export async function resolveCommunityAppExecutableForTest(
+	bundlePath: string,
+	executable: string,
+): Promise<string | undefined> {
+	return resolveVerifiedExecutable(bundlePath, executable);
 }
