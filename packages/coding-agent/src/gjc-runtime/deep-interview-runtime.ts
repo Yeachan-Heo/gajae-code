@@ -158,6 +158,7 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 			);
 		}
 	}
+	if ([...raw].length > 1_000_000) throw new DeepInterviewCommandError(2, "crystallize input exceeds 1 MiB");
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(raw);

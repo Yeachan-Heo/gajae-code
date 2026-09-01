@@ -114,6 +114,8 @@ function validateSnapshot(value: unknown): CrystalSnapshot {
 	if (messages.some((message, index) => index > 0 && message.index <= messages[index - 1]!.index))
 		throw new Error("snapshot messages must be ordered and unique");
 	if (end - start + 1 > MAX_MESSAGES) throw new Error("snapshot range is too large");
+	if (messages.length !== end - start + 1 || messages.some((message, index) => message.index !== start + index))
+		throw new Error("snapshot messages must cover the declared range");
 	const digest = text(value.digest, "snapshot.digest", 64);
 	if (!/^[a-f0-9]{64}$/.test(digest) || digest !== crystalSnapshotDigest({ revision, start, end, messages }))
 		throw new Error("snapshot digest mismatch");
@@ -186,6 +188,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const prior = value.prior;
 	if (prior !== undefined && !isRecord(prior)) throw new Error("prior crystal is invalid");
 	const priorCrystal = prior as DeepInterviewCrystal | undefined;
+	let canonicalPriorItems: CrystalItem[] = [];
 	if (priorCrystal) {
 		if (
 			priorCrystal.schema_version !== 1 ||
@@ -196,13 +199,23 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		if (!isRecord(priorCrystal.source) || snapshot.revision <= priorCrystal.source.revision)
 			throw new Error("conversation snapshot is stale");
 		if (!Array.isArray(priorCrystal.items)) throw new Error("prior crystal is invalid");
-		validateItems(priorCrystal.items);
+		if (
+			!Number.isSafeInteger(priorCrystal.source.revision) ||
+			!Number.isSafeInteger(priorCrystal.source.start) ||
+			!Number.isSafeInteger(priorCrystal.source.end) ||
+			typeof priorCrystal.source.digest !== "string" ||
+			!/^[a-f0-9]{64}$/.test(priorCrystal.source.digest) ||
+			!isRecord(priorCrystal.delta) ||
+			priorCrystal.execution_approval !== "not-approved"
+		)
+			throw new Error("prior crystal is invalid");
+		canonicalPriorItems = validateItems(priorCrystal.items);
 	}
-	const priorItems = new Map((priorCrystal?.items ?? []).map(item => [item.id, item]));
+	const priorItems = new Map(canonicalPriorItems.map(item => [item.id, item]));
 	if (removedIds.some(id => !priorItems.has(id)))
 		throw new Error("removed crystallize item is not present in prior crystal");
 	const mergedItems = [...items];
-	for (const item of priorCrystal?.items ?? [])
+	for (const item of canonicalPriorItems)
 		if (!removedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
 			mergedItems.push(item);
 	const currentItems = mergedItems;
