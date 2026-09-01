@@ -99,6 +99,12 @@ describe("macOS community app offer guards", () => {
 		await fs.writeFile(path.join(macOSRoot, "GajaeCode"), "fixture");
 		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBe(path.join(macOSRoot, "GajaeCode"));
 		expect(await resolveCommunityAppExecutableForTest(root, "../../outside")).toBeUndefined();
+		const nestedOutside = path.join(container, "nested-outside");
+		await fs.mkdir(nestedOutside);
+		await fs.mkdir(path.join(root, "Contents", "Resources"));
+		await fs.symlink(nestedOutside, path.join(root, "Contents", "Resources", "Escape"));
+		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBeUndefined();
+		await fs.rm(path.join(root, "Contents", "Resources"), { recursive: true, force: true });
 		await fs.symlink(path.join(macOSRoot, "GajaeCode"), path.join(macOSRoot, "Link"));
 		expect(await resolveCommunityAppExecutableForTest(root, "Link")).toBeUndefined();
 		await fs.rm(path.join(root, "Contents"), { recursive: true, force: true });

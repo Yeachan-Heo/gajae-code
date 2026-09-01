@@ -225,16 +225,37 @@ async function validateBundleLayout(bundlePath: string): Promise<boolean> {
 		fs.lstat(infoPlist).catch(() => undefined),
 		fs.lstat(macOSRoot).catch(() => undefined),
 	]);
-	return Boolean(
-		bundleStat?.isDirectory() &&
+	if (
+		!(
+			bundleStat?.isDirectory() &&
 			contentsStat?.isDirectory() &&
 			infoStat?.isFile() &&
 			macOSRootStat?.isDirectory() &&
 			!bundleStat.isSymbolicLink() &&
 			!contentsStat.isSymbolicLink() &&
 			!infoStat.isSymbolicLink() &&
-			!macOSRootStat.isSymbolicLink(),
-	);
+			!macOSRootStat.isSymbolicLink()
+		)
+	)
+		return false;
+	const walk = async (directory: string): Promise<boolean> => {
+		const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => undefined);
+		if (!entries) return false;
+		for (const entry of entries) {
+			const entryPath = path.join(directory, entry.name);
+			const stat = await fs.lstat(entryPath).catch(() => undefined);
+			if (!stat) return false;
+			if (stat.isSymbolicLink()) {
+				const resolved = await fs.realpath(entryPath).catch(() => undefined);
+				if (!resolved || (resolved !== bundleReal && !resolved.startsWith(`${bundleReal}${path.sep}`)))
+					return false;
+				continue;
+			}
+			if (stat.isDirectory() && !(await walk(entryPath))) return false;
+		}
+		return true;
+	};
+	return walk(bundlePath);
 }
 
 async function resolveVerifiedExecutable(bundlePath: string, executable: string): Promise<string | undefined> {
@@ -428,6 +449,7 @@ export async function offerMacosCommunityApp(
 		const stagedDmgIdentity: FileIdentity = { dev: BigInt(stagedDmgStat.dev), ino: BigInt(stagedDmgStat.ino) };
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity))) return failure("the staged DMG identity changed", log);
 		mountAttempted = true;
+		mountAttached = true;
 		const attach = await command([
 			"/usr/bin/hdiutil",
 			"attach",
@@ -439,7 +461,6 @@ export async function offerMacosCommunityApp(
 		]);
 		throwIfInterrupted();
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
-		mountAttached = true;
 		mountIdentity = await fileIdentity(mountPoint);
 		if (!mountIdentity) return failure("the mounted volume was not a real directory", log);
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
@@ -490,13 +511,13 @@ export async function offerMacosCommunityApp(
 			return failure("the destination already contains an app bundle", log);
 		}
 		const destinationIdentity = await fileIdentity(destination);
-		if (!destinationIdentity) return failure("the destination claim was not a regular directory", log);
+		if (!destinationIdentity) throw new Error("the destination claim was not a regular directory");
 		installedDestination = { path: destination, identity: destinationIdentity };
 		if (
 			!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
 			!(await sameDirectoryIdentity(destination, destinationIdentity))
 		)
-			return failure("the destination identity changed before copy", log);
+			throw new Error("the destination identity changed before copy");
 		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
 		throwIfInterrupted();
 		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
