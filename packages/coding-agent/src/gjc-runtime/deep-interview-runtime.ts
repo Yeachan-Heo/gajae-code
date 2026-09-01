@@ -178,6 +178,7 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);
 	const session = resolveGjcSessionForWrite(cwd, {
 		flagValue: flagValue(args, "--session-id"),
+		payloadSessionId: input.session_id,
 		envSessionId: process.env.GJC_SESSION_ID,
 	});
 	const sessionId = session.gjcSessionId;

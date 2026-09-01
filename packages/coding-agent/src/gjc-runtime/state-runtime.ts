@@ -1328,6 +1328,11 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 						2,
 						"crystallized execution approval is immutable through generic state write",
 					);
+				if (existingInner.crystal !== undefined) {
+					for (const field of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const)
+						if (merged[field] !== existingPayload[field])
+							throw new StateCommandError(2, `crystallized ${field} is immutable through generic state write`);
+				}
 			}
 			merged.skill = mode;
 			if (incomingPhase) {
