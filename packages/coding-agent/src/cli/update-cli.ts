@@ -1271,9 +1271,10 @@ async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<voi
 	const runtimeStat = await fs.promises.lstat(runtimePath);
 	if (!runtimeStat.isFile() || runtimeStat.isSymbolicLink())
 		throw new Error("verified runtime path is not a regular file");
-	const pinnedRuntimePath = `${runtimePath}.community-app-offer.${process.pid}.${Date.now().toString(16)}`;
-	await fs.promises.link(runtimePath, pinnedRuntimePath);
+	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
+	const pinnedRuntimePath = path.join(pinDirectory, "gjc");
 	try {
+		await fs.promises.link(runtimePath, pinnedRuntimePath);
 		const pinnedStat = await fs.promises.lstat(pinnedRuntimePath);
 		if (
 			!pinnedStat.isFile() ||
@@ -1299,7 +1300,7 @@ async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<voi
 		}
 		if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
 	} finally {
-		await fs.promises.unlink(pinnedRuntimePath).catch(() => undefined);
+		await fs.promises.rm(pinDirectory, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 
@@ -1590,7 +1591,17 @@ export async function runUpdateCommand(
 		migrate: target?.method === "migrate",
 	});
 
-	if (target.method === "migrate" && decision.install && !opts.force) {
+	if (target.method === "migrate" && decision.install && !opts.force && opts.check) {
+		const verification = await verifyTarget(release, target.path);
+		if (verification.ok) {
+			record("update_check_completed", { channel, result: "available" });
+			printVerifiedMigrationTarget(target, release.version);
+			record("update_install_completed", { channel, result: "skipped" });
+			return;
+		}
+	}
+
+	if (target.method === "migrate" && decision.install && !opts.force && !opts.check) {
 		let migrationVerified = false;
 		const releaseLock = await acquireBinaryUpdateLock(target.path);
 		try {
@@ -1605,7 +1616,7 @@ export async function runUpdateCommand(
 			await releaseLock();
 		}
 		if (migrationVerified) {
-			if (!opts.check && (deps.platform ?? process.platform) === "darwin") {
+			if ((deps.platform ?? process.platform) === "darwin") {
 				try {
 					await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path);
 				} catch (error) {
