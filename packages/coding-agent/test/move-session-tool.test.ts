@@ -1553,6 +1553,24 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await sessionManager.close();
 	});
 
+	it("retains outer move admission after a reentrant inner transition", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		await sessionManager.runExclusiveCwdMoveTransition(async () => {
+			await sessionManager.runExclusiveCwdMoveTransition(async () => {});
+			await sessionManager.closeCwdMoveAdmission();
+			await sessionManager.moveTo(repoA);
+		});
+
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoA));
+		await sessionManager.close();
+	});
+
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

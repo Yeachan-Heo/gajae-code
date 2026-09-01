@@ -7410,6 +7410,7 @@ export class SessionManager {
 	#pendingCwdMoveAdmissions = new Set<AbortController>();
 	#cwdMoveAdmittedAdmissions = new Set<AbortController>();
 	#cwdMoveAdmittedOwners = new Set<symbol>();
+	#cwdMoveAdmittedOwnerCounts = new Map<symbol, number>();
 	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/**
@@ -10885,11 +10886,18 @@ export class SessionManager {
 					if (owner === undefined) throw new Error("Session cwd move transition owner is unavailable.");
 					this.#cwdMoveAdmittedAdmissions.add(admission);
 					this.#cwdMoveAdmittedOwners.add(owner);
+					this.#cwdMoveAdmittedOwnerCounts.set(owner, (this.#cwdMoveAdmittedOwnerCounts.get(owner) ?? 0) + 1);
 					try {
 						return await fn();
 					} finally {
 						this.#cwdMoveAdmittedAdmissions.delete(admission);
-						this.#cwdMoveAdmittedOwners.delete(owner);
+						const count = this.#cwdMoveAdmittedOwnerCounts.get(owner) ?? 0;
+						if (count <= 1) {
+							this.#cwdMoveAdmittedOwnerCounts.delete(owner);
+							this.#cwdMoveAdmittedOwners.delete(owner);
+						} else {
+							this.#cwdMoveAdmittedOwnerCounts.set(owner, count - 1);
+						}
 					}
 				},
 				{ signal: admission.signal },
