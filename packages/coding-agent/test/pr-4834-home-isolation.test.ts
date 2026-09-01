@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import type * as buffer from "node:buffer";
-import type * as nfs from "node:fs";
+import * as nfs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -8,7 +8,7 @@ import { initializeWithSettings, loadCapability, loadCapabilityForHome } from "@
 import { type ContextFile, contextFileCapability } from "@gajae-code/coding-agent/capability/context-file";
 import { type Extension, extensionCapability } from "@gajae-code/coding-agent/capability/extension";
 import { type ExtensionModule, extensionModuleCapability } from "@gajae-code/coding-agent/capability/extension-module";
-import { clearCache, readFile } from "@gajae-code/coding-agent/capability/fs";
+import { clearCache, readDirEntries, readFile } from "@gajae-code/coding-agent/capability/fs";
 import { hookCapability } from "@gajae-code/coding-agent/capability/hook";
 import { type Rule, ruleCapability } from "@gajae-code/coding-agent/capability/rule";
 import { settingsCapability } from "@gajae-code/coding-agent/capability/settings";
@@ -220,6 +220,43 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 
 		expect(await readFile(linkedFile, { isolatedHome: true, home })).toBeNull();
 	});
+
+	test.skipIf(process.platform === "win32")(
+		"isolated reads reject a parent directory swap after canonicalization",
+		async () => {
+			const safeParent = path.join(home, "swappable");
+			const safeFile = path.join(safeParent, "SYSTEM.md");
+			const outsideParent = path.join(tempDir, "outside-parent");
+			const outsideFile = path.join(outsideParent, "SYSTEM.md");
+			const movedSafeParent = path.join(home, "swappable-original");
+			await writeFile(safeFile, "# safe");
+			await writeFile(outsideFile, "# outside");
+
+			let swapped = false;
+			const realOpen = nfs.promises.open.bind(nfs.promises);
+			vi.spyOn(nfs.promises, "open").mockImplementation(async (...args) => {
+				if (!swapped && String(args[0]) === safeFile) {
+					swapped = true;
+					await fs.rename(safeParent, movedSafeParent);
+					await fs.symlink(outsideParent, safeParent, "dir");
+				}
+				return realOpen(...args);
+			});
+
+			expect(await readFile(safeFile, { isolatedHome: true, home })).toBeNull();
+			expect(swapped).toBe(true);
+		},
+	);
+
+	test.skipIf(process.platform === "linux")(
+		"isolated directory reads do not fall back to a path when descriptor enumeration is unavailable",
+		async () => {
+			const directory = path.join(home, "enumeration");
+			await writeFile(path.join(directory, "entry.txt"), "entry");
+
+			expect(await readDirEntries(directory, { isolatedHome: true, home })).toEqual([]);
+		},
+	);
 
 	test("isolated Cline reads bypass a poisoned same-lexical cache entry", async () => {
 		const decoyFile = path.join(tempDir, "process-decoy", "clinerules");

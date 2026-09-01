@@ -90,17 +90,64 @@ function isSingleLinkRegularFile(stat: fs.Stats): boolean {
 	return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
 }
 
-async function openIsolatedFile(abs: string, options?: ReadFileOptions): Promise<fsPromises.FileHandle | null> {
+function sameFileIdentity(left: fs.Stats, right: fs.Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+/**
+ * Capture the identity of the currently-authorized path before opening it.
+ * Stat first and canonicalize second so a parent replacement in either seam
+ * is detected by the descriptor identity check below.
+ */
+async function statAuthorizedPath(abs: string, options?: ReadFileOptions): Promise<fs.Stats | null> {
+	if (!options?.isolatedHome) return null;
+	let authorized: fs.Stats;
+	try {
+		authorized = await fs.promises.stat(abs);
+	} catch {
+		return null;
+	}
+	return (await isCurrentIsolatedPath(abs, options)) ? authorized : null;
+}
+
+async function validateOpenedPath(
+	handle: fsPromises.FileHandle,
+	abs: string,
+	options: ReadFileOptions | undefined,
+	authorized: fs.Stats | null,
+	kind: "file" | "directory",
+): Promise<boolean> {
+	if (!options?.isolatedHome) return true;
+	try {
+		const opened = await handle.stat();
+		const validKind =
+			kind === "file" ? isSingleLinkRegularFile(opened) : opened.isDirectory() && !opened.isSymbolicLink();
+		if (!validKind || authorized === null || !sameFileIdentity(opened, authorized)) return false;
+		const current = await fs.promises.stat(abs);
+		if (!sameFileIdentity(opened, current)) return false;
+		return await isCurrentIsolatedPath(abs, options);
+	} catch {
+		return false;
+	}
+}
+
+interface OpenedPath {
+	handle: fsPromises.FileHandle;
+	authorized: fs.Stats | null;
+}
+
+async function openIsolatedFile(abs: string, options?: ReadFileOptions): Promise<OpenedPath | null> {
 	let handle: fsPromises.FileHandle | undefined;
+	const authorized = await statAuthorizedPath(abs, options);
+	if (options?.isolatedHome && authorized === null) return null;
 	try {
 		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
 		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow);
-		const opened = await handle.stat();
-		if (options?.isolatedHome && !isSingleLinkRegularFile(opened)) {
+		if (!(await validateOpenedPath(handle, abs, options, authorized, "file"))) {
 			await handle.close();
 			return null;
 		}
-		return handle;
+		return { handle, authorized };
 	} catch {
 		await handle?.close().catch(() => {});
 		return null;
@@ -121,20 +168,22 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		return contentCache.get(abs) ?? null;
 	}
 
-	const handle = await openIsolatedFile(abs, options);
-	if (!handle) {
+	const opened = await openIsolatedFile(abs, options);
+	if (!opened) {
 		if (useCache) contentCache.set(abs, null);
 		return null;
 	}
 	try {
-		const content = await handle.readFile({ encoding: "utf8" });
+		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
+		const content = await opened.handle.readFile({ encoding: "utf8" });
+		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		if (useCache) contentCache.set(abs, content);
 		return content;
 	} catch {
 		if (useCache) contentCache.set(abs, null);
 		return null;
 	} finally {
-		await handle.close();
+		await opened.handle.close();
 	}
 }
 
@@ -152,17 +201,19 @@ export async function readFileSlice(
 		return null;
 	}
 	if (abs === null || !(await isCurrentIsolatedPath(abs, options))) return null;
-	const handle = await openIsolatedFile(abs, options);
-	if (!handle) return null;
+	const opened = await openIsolatedFile(abs, options);
+	if (!opened) return null;
 	try {
+		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		const length = Math.max(0, end - start);
 		const buffer = Buffer.alloc(length);
-		const { bytesRead } = await handle.read(buffer, 0, length, start);
+		const { bytesRead } = await opened.handle.read(buffer, 0, length, start);
+		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
 		return new Uint8Array(buffer.subarray(0, bytesRead));
 	} catch {
 		return null;
 	} finally {
-		await handle.close();
+		await opened.handle.close();
 	}
 }
 
@@ -175,14 +226,17 @@ export async function readFileSize(filePath: string, options?: ReadFileOptions):
 		return null;
 	}
 	if (abs === null || !(await isCurrentIsolatedPath(abs, options))) return null;
-	const handle = await openIsolatedFile(abs, options);
-	if (!handle) return null;
+	const opened = await openIsolatedFile(abs, options);
+	if (!opened) return null;
 	try {
-		return (await handle.stat()).size;
+		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
+		const size = (await opened.handle.stat()).size;
+		if (!(await validateOpenedPath(opened.handle, abs, options, opened.authorized, "file"))) return null;
+		return size;
 	} catch {
 		return null;
 	} finally {
-		await handle.close();
+		await opened.handle.close();
 	}
 }
 
@@ -201,14 +255,19 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	}
 
 	let handle: fsPromises.FileHandle | undefined;
+	const authorized = await statAuthorizedPath(abs, options);
+	if (options?.isolatedHome && authorized === null) return [];
 	try {
 		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
 		const directoryOnly = fs.constants.O_DIRECTORY ?? 0;
 		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow | directoryOnly);
-		const opened = await handle.stat();
-		if (options?.isolatedHome && (!opened.isDirectory() || opened.isSymbolicLink())) return [];
-		const directoryPath = process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : abs;
+		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
+		const directoryPath =
+			process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : options?.isolatedHome ? null : abs;
+		if (directoryPath === null) return [];
+		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
 		const entries = await fs.promises.readdir(directoryPath, { withFileTypes: true });
+		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
 		if (useCache) dirCache.set(abs, entries);
 		return entries;
 	} catch {

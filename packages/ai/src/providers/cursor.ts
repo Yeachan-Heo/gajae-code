@@ -640,22 +640,91 @@ function isClosedCursorRequest(request: http2.ClientHttp2Stream): boolean {
 	return request.closed || request.destroyed || request.writableEnded || request.writableFinished;
 }
 
+const CURSOR_WRITE_DRAIN_TIMEOUT_MS = 5_000;
 const pendingCursorWrites = new WeakMap<object, Set<Promise<void>>>();
+const cursorWriteErrors = new WeakMap<object, unknown>();
+
+function closeStalledCursorRequest(request: http2.ClientHttp2Stream): void {
+	// A request whose peer stopped reading may never invoke a write callback. Close
+	// and destroy both sides of the stream so the bounded drain cannot leave a
+	// live HTTP/2 transport behind. Test writers may only implement one of these
+	// methods, hence the defensive checks.
+	try {
+		request.close?.();
+	} catch {
+		// Teardown is best effort; the timeout remains the authoritative result.
+	}
+	try {
+		request.destroy?.();
+	} catch {
+		// Teardown is best effort; the timeout remains the authoritative result.
+	}
+}
 
 /** Wait until every frame accepted by a request has reached the HTTP/2 writer. */
-async function waitForCursorWrites(request: http2.ClientHttp2Stream | null): Promise<void> {
+async function waitForCursorWrites(
+	request: http2.ClientHttp2Stream | null,
+	timeoutMs = CURSOR_WRITE_DRAIN_TIMEOUT_MS,
+	onTimeout?: (error: Error) => void,
+): Promise<void> {
 	if (!request) return;
 	const pending = pendingCursorWrites.get(request);
 	if (!pending) return;
-	while (pending.size > 0) {
-		await Promise.all([...pending]);
+	const boundedTimeoutMs = Math.max(1, timeoutMs);
+	const deadline = Date.now() + boundedTimeoutMs;
+	let timeout: NodeJS.Timeout | undefined;
+	try {
+		while (pending.size > 0) {
+			const writesDone = Promise.all([...pending]);
+			// The timeout race may win while one or more writes later reject. Keep a
+			// rejection handler attached so late callback errors never become unhandled.
+			writesDone.catch(() => {});
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) {
+				const error = new Error(`Cursor request write drain timed out after ${boundedTimeoutMs}ms`);
+				try {
+					onTimeout?.(error);
+				} catch {
+					// The transport teardown callback is best effort.
+				}
+				if (!onTimeout) closeStalledCursorRequest(request);
+				throw error;
+			}
+			const timeoutPromise = new Promise<never>((_resolve, reject) => {
+				timeout = setTimeout(() => {
+					const error = new Error(`Cursor request write drain timed out after ${boundedTimeoutMs}ms`);
+					// Reject first so teardown callbacks that synchronously complete or
+					// fail a write cannot replace the deterministic timeout outcome.
+					reject(error);
+					try {
+						onTimeout?.(error);
+					} catch {
+						// The transport teardown callback is best effort.
+					}
+					if (!onTimeout) closeStalledCursorRequest(request);
+				}, remainingMs);
+			});
+			timeoutPromise.catch(() => {});
+			await Promise.race([writesDone, timeoutPromise]);
+			if (timeout) {
+				clearTimeout(timeout);
+				timeout = undefined;
+			}
+			const writeError = cursorWriteErrors.get(request);
+			if (writeError !== undefined) throw writeError;
+		}
+		const writeError = cursorWriteErrors.get(request);
+		if (writeError !== undefined) throw writeError;
+	} finally {
+		if (timeout) clearTimeout(timeout);
+		pendingCursorWrites.delete(request);
+		cursorWriteErrors.delete(request);
 	}
-	pendingCursorWrites.delete(request);
 }
 
 /** Exported for deterministic coverage of successful writer teardown ordering. */
-export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | null): Promise<void> {
-	return waitForCursorWrites(request);
+export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | null, timeoutMs?: number): Promise<void> {
+	return waitForCursorWrites(request, timeoutMs);
 }
 
 /**
@@ -666,23 +735,31 @@ export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | nu
 function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
 	if (isClosedCursorRequest(request)) return false;
 	let resolveWrite!: () => void;
+	let rejectWrite!: (error: unknown) => void;
 	let completed = false;
 	let completion!: Promise<void>;
 	const pending = pendingCursorWrites.get(request) ?? new Set<Promise<void>>();
 	pendingCursorWrites.set(request, pending);
-	completion = new Promise<void>(resolve => {
+	completion = new Promise<void>((resolve, reject) => {
 		resolveWrite = resolve;
+		rejectWrite = reject;
 	});
+	// The final request drain observes this rejection, but an asynchronous writer
+	// callback can run before that drain starts. Mark it handled immediately so a
+	// late transport error cannot surface as an unhandled rejection in the gap.
+	completion.catch(() => {});
 	pending.add(completion);
-	const finish = () => {
+	const finish = (error?: unknown) => {
 		if (completed) return;
 		completed = true;
 		pending.delete(completion);
+		if (error != null && !cursorWriteErrors.has(request)) cursorWriteErrors.set(request, error);
 		if (typeof request.removeListener === "function") {
 			request.removeListener("close", finish);
 			request.removeListener("error", finish);
 		}
-		resolveWrite();
+		if (error == null) resolveWrite();
+		else rejectWrite(error);
 	};
 	try {
 		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
@@ -694,15 +771,20 @@ function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): 
 		request.write(frame, finish);
 		return true;
 	} catch (error) {
-		finish();
-		if (isClosedCursorRequest(request)) return false;
+		if (isClosedCursorRequest(request)) {
+			finish();
+			return false;
+		}
 		const code = (error as NodeJS.ErrnoException).code;
 		if (
 			code === "ERR_STREAM_WRITE_AFTER_END" ||
 			code === "ERR_HTTP2_INVALID_STREAM" ||
 			code === "ERR_HTTP2_STREAM_CLOSED"
-		)
+		) {
+			finish();
 			return false;
+		}
+		finish(error);
 		throw error;
 	}
 }
@@ -1054,6 +1136,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			localTransportCloseRequested = true;
 			h2Request?.close();
 			h2Client?.close();
+			proxiedSocket?.destroy();
+		};
+		const forceCloseTransport = (): void => {
+			closeTransportLocally();
+			try {
+				h2Request?.destroy();
+			} catch {
+				// Teardown is best effort; the write-drain timeout remains authoritative.
+			}
+			try {
+				h2Client?.destroy();
+			} catch {
+				// Teardown is best effort; the write-drain timeout remains authoritative.
+			}
 			proxiedSocket?.destroy();
 		};
 		// Terminal publication (caller abort, transport error, or stream end)
@@ -1901,6 +1997,11 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
 			// The watchdog was armed before setup; never restart it after request creation.
 			await h2Completion.promise;
+			// A successful terminal frame can settle before the HTTP/2 writer callback.
+			// Bound this final drain so a peer that stopped reading cannot hold the
+			// request open forever, and surface asynchronous callback failures as a
+			// failed request instead of publishing a false successful result.
+			await waitForCursorWrites(h2Request, CURSOR_WRITE_DRAIN_TIMEOUT_MS, forceCloseTransport);
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -1996,7 +2097,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// `write()` only queues the frame. Await each accepted frame's completion
 			// callback before tearing down a successful HTTP/2 request, otherwise the
 			// final exec response can be lost when close wins the writer race.
-			await waitForCursorWrites(h2Request);
+			await waitForCursorWrites(h2Request, CURSOR_WRITE_DRAIN_TIMEOUT_MS, forceCloseTransport).catch(() => {});
 			h2Request?.close();
 			h2Client?.close();
 			proxiedSocket?.destroy();

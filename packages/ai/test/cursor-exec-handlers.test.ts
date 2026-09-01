@@ -9,6 +9,8 @@ import {
 	disposeCursorConversation,
 	resolveExecHandler,
 	streamCursor,
+	waitForCursorWritesForTest,
+	writeCursorFrameForTest,
 } from "../src/providers/cursor";
 import type { AgentRunRequest, AgentServerMessage } from "../src/providers/cursor/gen/agent_pb";
 import {
@@ -439,6 +441,67 @@ describe("Cursor payload transport boundary", () => {
 			server.close(error => (error ? serverClosed.reject(error) : serverClosed.resolve()));
 			await serverClosed.promise;
 		}
+describe("Cursor request writer teardown", () => {
+	it("makes an asynchronous write callback failure observable", async () => {
+		let writeCallback: ((error?: Error | null) => void) | undefined;
+		const request = {
+			closed: false,
+			destroyed: false,
+			writableEnded: false,
+			writableFinished: false,
+			once() {
+				return this;
+			},
+			removeListener() {
+				return this;
+			},
+			write(_frame: Uint8Array, callback: (error?: Error | null) => void) {
+				writeCallback = callback;
+				return true;
+			},
+		} as unknown as http2.ClientHttp2Stream;
+
+		expect(writeCursorFrameForTest(request, Buffer.from("response"))).toBe(true);
+		const drained = waitForCursorWritesForTest(request, 100);
+		writeCallback?.(new Error("async write failed"));
+		await expect(drained).rejects.toThrow("async write failed");
+	});
+
+	it("bounds teardown when a peer stops reading after terminal", async () => {
+		let closed = false;
+		let destroyed = false;
+		const request = {
+			get closed() {
+				return closed;
+			},
+			get destroyed() {
+				return destroyed;
+			},
+			writableEnded: false,
+			writableFinished: false,
+			once() {
+				return this;
+			},
+			removeListener() {
+				return this;
+			},
+			write() {
+				return true;
+			},
+			close() {
+				closed = true;
+			},
+			destroy() {
+				destroyed = true;
+			},
+		} as unknown as http2.ClientHttp2Stream;
+
+		expect(writeCursorFrameForTest(request, Buffer.from("response"))).toBe(true);
+		await expect(waitForCursorWritesForTest(request, 10)).rejects.toThrow(
+			"Cursor request write drain timed out after 10ms",
+		);
+		expect(closed).toBe(true);
+		expect(destroyed).toBe(true);
 	});
 });
 
