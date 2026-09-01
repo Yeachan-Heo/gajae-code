@@ -4036,7 +4036,11 @@ async function currentReadyAuthority(
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: endpointFile.mtimeMs,
+			// Lifecycle responses are Router adoption inputs. Publish the index's
+			// canonical millisecond representation so the provisional attachment
+			// mints the same persisted authority ID as ordinary reattachment. The
+			// descriptor itself was already matched to this row above.
+			endpointMtimeMs: record.endpointMtimeMs!,
 			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};
