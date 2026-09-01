@@ -3056,6 +3056,7 @@ export class AgentSession {
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
 	#disposePromise: Promise<void> | undefined;
+	readonly #disposeDetachedOperations = new Set<Promise<unknown>>();
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
@@ -8997,7 +8998,7 @@ export class AgentSession {
 			const remainingMs = this.#disposeDeadline - Date.now();
 			if (remainingMs <= 0) {
 				logger.warn("Session dispose deadline reached", { label });
-				void operation.catch(() => {});
+				this.#trackDetachedDisposeOperation(operation);
 				throw new Error(`Session disposal incomplete: ${label} exceeded the teardown deadline.`);
 			}
 			let timeout: NodeJS.Timeout | undefined;
@@ -9010,7 +9011,7 @@ export class AgentSession {
 			try {
 				const result = await Promise.race([operation, deadline.promise]);
 				if (result === timedOut) {
-					void operation.catch(() => {});
+					this.#trackDetachedDisposeOperation(operation);
 					throw new Error(`Session disposal incomplete: ${label} exceeded the teardown deadline.`);
 				}
 				return result;
@@ -9022,6 +9023,9 @@ export class AgentSession {
 				if (timeout) clearTimeout(timeout);
 			}
 		};
+		if (this.#disposeDetachedOperations.size > 0) {
+			await awaitDisposeStep("previous disposal operations", Promise.allSettled(this.#disposeDetachedOperations));
+		}
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		await awaitDisposeStep("session admission close", admissionClosed);
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
@@ -9195,6 +9199,12 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+	}
+
+	#trackDetachedDisposeOperation(operation: Promise<unknown>): void {
+		const settled = operation.catch(() => {});
+		this.#disposeDetachedOperations.add(settled);
+		void settled.then(() => this.#disposeDetachedOperations.delete(settled));
 	}
 	/**
 	 * Strict writer close for ACP session delete. On the first attempt it flushes

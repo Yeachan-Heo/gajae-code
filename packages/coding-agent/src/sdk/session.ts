@@ -4579,31 +4579,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		{
 			const originalDispose = session.dispose.bind(session);
 			session.dispose = async () => {
+				await originalDispose();
 				try {
-					await originalDispose();
+					agentRegistry.unregister(resolvedAgentId);
+					releaseCredentialDisabledSubscription();
+					releaseLocalProtocolOverride();
 				} finally {
-					try {
-						agentRegistry.unregister(resolvedAgentId);
-						releaseCredentialDisabledSubscription();
-						releaseLocalProtocolOverride();
-					} finally {
-						// The endpoint is gone: its owned registrations can never
-						// reach a delivery settlement boundary, and foreign-endpoint
-						// tuples are deliberately never classified terminal by other
-						// managers — retire them before unregistering the manager so
-						// repeated session churn cannot saturate the registry
-						// (review thread P2). The endpoint is the manager's live
-						// registration key, which survives newSession/switchSession
-						// rekeying and may differ from the persisted logical session id.
-						if (!options.parentTaskPrefix) {
-							retireOwnedRegistrationsForEndpoint(
-								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
-							);
-							AsyncJobManager.unregisterManager(asyncJobManager);
-						}
-						await closeOwnedAuthStorage();
-						await closeOwnedSettings();
+					// The endpoint is gone: its owned registrations can never
+					// reach a delivery settlement boundary, and foreign-endpoint
+					// tuples are deliberately never classified terminal by other
+					// managers — retire them before unregistering the manager so
+					// repeated session churn cannot saturate the registry
+					// (review thread P2). The endpoint is the manager's live
+					// registration key, which survives newSession/switchSession
+					// rekeying and may differ from the persisted logical session id.
+					if (!options.parentTaskPrefix) {
+						retireOwnedRegistrationsForEndpoint(
+							AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+						);
+						AsyncJobManager.unregisterManager(asyncJobManager);
 					}
+					await closeOwnedAuthStorage();
+					await closeOwnedSettings();
 				}
 			};
 		}
