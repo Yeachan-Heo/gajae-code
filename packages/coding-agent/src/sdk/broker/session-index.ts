@@ -184,6 +184,24 @@ export interface SessionList {
 	indexSeq: number;
 	sessions: IndexedSession[];
 	warnings: string[];
+	/**
+	 * Warnings attributable to one exact row. Absent means every warning in
+	 * `warnings` is index-wide and therefore applies to every session.
+	 */
+	rowWarnings?: Readonly<Record<string, readonly string[]>>;
+}
+
+/**
+ * The warnings that bear on one session's authority: index-wide faults plus the
+ * warnings raised for that exact row. A rejected UNRELATED row must not disable
+ * routing for every other session (#5128), so per-row warnings are excluded
+ * from every other session's decision.
+ */
+export function warningsForSession(listing: SessionList, sessionId: string): readonly string[] {
+	const rows = listing.rowWarnings;
+	if (!rows) return listing.warnings;
+	const otherRows = new Set(Object.entries(rows).flatMap(([id, messages]) => (id === sessionId ? [] : [...messages])));
+	return listing.warnings.filter(message => !otherRows.has(message));
 }
 
 export type SessionGenerationIndexStatus =
@@ -1098,6 +1116,12 @@ function followsApplicableTombstone(
 	return reRegistration === undefined || reRegistration.indexSeq < tombstone.indexSeq;
 }
 
+/** An index diagnostic, scoped to one row when the fault belongs to that row. */
+interface IndexWarning {
+	message: string;
+	sessionId?: string;
+}
+
 export class SessionIndex {
 	static #operations = new Map<string, Promise<void>>();
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
@@ -1105,7 +1129,7 @@ export class SessionIndex {
 	#policy: ResolvedRetentionPolicy;
 	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
-	#warnings: string[] = [];
+	#warnings: IndexWarning[] = [];
 	#logOffset = 0;
 	#corruptSuffix = false;
 	/**
@@ -1239,12 +1263,12 @@ export class SessionIndex {
 		this.#events = [...scan.snapshotEvents, ...scan.validLogEvents];
 		this.#warnings = [];
 		for (const event of this.#events) {
-			if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
+			if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event), event.sessionId);
 		}
 		this.#logOffset = scan.logContents?.length ?? 0;
 		this.#corruptSuffix = scan.diagnosis.status === "corrupt";
-		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
-		if (this.#corruptSuffix) this.#warnings.push("Corrupt session index entry; replay truncated");
+		if (scan.diagnosis.reason === "invalid snapshot") this.#warn("Invalid session index snapshot");
+		if (this.#corruptSuffix) this.#warn("Corrupt session index entry; replay truncated");
 		await this.#writeAuditUnderLock();
 		this.#changeStamp = await readIndexChangeStamp(this.#agentDir);
 	}
@@ -1520,8 +1544,21 @@ export class SessionIndex {
 			if (allowResync) await this.#replayUnderLock();
 		}
 	}
-	#warn(message: string): void {
-		if (!this.#warnings.includes(message)) this.#warnings.push(message);
+	/** `sessionId` scopes a warning to one row; omit it for an index-wide fault. */
+	#warn(message: string, sessionId?: string): void {
+		if (!this.#warnings.some(warning => warning.message === message)) this.#warnings.push({ message, sessionId });
+	}
+
+	/** Groups the row-scoped warnings so one rejected row cannot fence the others. */
+	#rowWarnings(): Readonly<Record<string, readonly string[]>> {
+		const rows: Record<string, string[]> = {};
+		for (const warning of this.#warnings) {
+			if (warning.sessionId === undefined) continue;
+			const existing = rows[warning.sessionId];
+			if (existing) existing.push(warning.message);
+			else rows[warning.sessionId] = [warning.message];
+		}
+		return rows;
 	}
 
 	async refresh(): Promise<void> {
@@ -1762,7 +1799,8 @@ export class SessionIndex {
 		return {
 			indexSeq: this.indexSeq,
 			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
-			warnings: this.#warnings,
+			warnings: this.#warnings.map(warning => warning.message),
+			rowWarnings: this.#rowWarnings(),
 		};
 	}
 

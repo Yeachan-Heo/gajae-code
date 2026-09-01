@@ -9,6 +9,7 @@ import {
 	isSessionAuthorityEligible,
 	resolveSessionLocator,
 	type SessionIndex,
+	warningsForSession,
 } from "../broker/session-index";
 import { cancellableSleep, lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClient, SdkClientError, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
@@ -431,9 +432,9 @@ function readSequence(value: unknown): number | undefined {
 
 async function lstatEndpoint(file: string): Promise<SessionEndpointIdentity | undefined> {
 	const stat = await fs.lstat(file).catch(() => undefined);
-	if (!stat || !stat.isFile()) return undefined;
+	if (!stat?.isFile()) return undefined;
 	const identity = await fs.lstat(file, { bigint: true }).catch(() => undefined);
-	if (!identity || !identity.isFile()) return undefined;
+	if (!identity?.isFile()) return undefined;
 	if (
 		stat.size !== Number(identity.size) ||
 		stat.ino !== Number(identity.ino) ||
@@ -787,7 +788,9 @@ export class SessionRouter {
 			throw new SessionRouterError("pre_send", "Broker session endpoint could not be attached.");
 		const listing = this.#index.listSessions();
 		const indexedCurrent =
-			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
+			warningsForSession(listing, sessionId).length === 0
+				? listing.sessions.find(item => item.sessionId === sessionId)
+				: undefined;
 		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent))
 			await this.#serialReconcile(this.#runEpoch, true, true);
 		return capability;
@@ -959,7 +962,7 @@ export class SessionRouter {
 		try {
 			await this.#index.refresh();
 			const listing = this.#index.listSessions();
-			if (listing.warnings.length > 0) return undefined;
+			if (warningsForSession(listing, sessionId).length > 0) return undefined;
 			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
 		} catch {
 			return undefined;
@@ -1031,7 +1034,7 @@ export class SessionRouter {
 			await this.#index.open();
 			await this.#index.refresh();
 			const listing = this.#index.listSessions();
-			if (listing.warnings.length > 0)
+			if (warningsForSession(listing, sessionId).length > 0)
 				throw new SessionActivationError(
 					"session_not_live",
 					"Session activation requires an intact session index.",
@@ -1209,54 +1212,53 @@ export class SessionRouter {
 			return;
 		}
 		const indexed = this.#index.listSessions();
-		const live =
-			indexed.warnings.length === 0
-				? indexed.sessions.filter(
-						session =>
-							session.live &&
-							isSessionAuthorityEligible(session) &&
-							!session.terminalUncertain &&
-							(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
-					)
-				: [];
+		// Per-row scoping (#5128): an index-wide fault still warns for every
+		// session, but one rejected unrelated row must not empty the live set.
+		const live = indexed.sessions.filter(
+			session =>
+				session.live &&
+				isSessionAuthorityEligible(session) &&
+				!session.terminalUncertain &&
+				warningsForSession(indexed, session.sessionId).length === 0 &&
+				(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
+		);
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
-		if (indexed.warnings.length === 0) {
-			for (const [sessionId, adopted] of [...this.#adopted]) {
-				const attached = this.#sessions.get(sessionId);
-				const indexedSession = indexed.sessions.find(session => session.sessionId === sessionId);
-				if (!attached || attached.capability !== adopted.attachment) {
+		for (const [sessionId, adopted] of [...this.#adopted]) {
+			const attached = this.#sessions.get(sessionId);
+			const indexedSession = indexed.sessions.find(session => session.sessionId === sessionId);
+			if (!attached || attached.capability !== adopted.attachment) {
+				this.#adopted.delete(sessionId);
+				continue;
+			}
+			const exactIndex =
+				warningsForSession(indexed, sessionId).length === 0 &&
+				indexedSession?.live === true &&
+				isSessionAuthorityEligible(indexedSession) &&
+				!indexedSession.terminalUncertain &&
+				indexedSession.endpointGeneration === adopted.generation &&
+				indexedSession.pid === adopted.pid &&
+				indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
+			const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
+			if (
+				!exactIndex ||
+				!endpoint ||
+				endpoint.pid !== adopted.pid ||
+				endpoint.url !== attached.endpoint.url ||
+				endpoint.token !== attached.endpoint.token
+			) {
+				this.#adopted.delete(sessionId);
+				await this.#retireAttachment(attached);
+				continue;
+			}
+			try {
+				if (await this.#publishAttachment(attached, true)) {
 					this.#adopted.delete(sessionId);
-					continue;
+					attachedIds.add(sessionId);
 				}
-				const exactIndex =
-					indexedSession?.live === true &&
-					isSessionAuthorityEligible(indexedSession) &&
-					!indexedSession.terminalUncertain &&
-					indexedSession.endpointGeneration === adopted.generation &&
-					indexedSession.pid === adopted.pid &&
-					indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
-				const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
-				if (
-					!exactIndex ||
-					!endpoint ||
-					endpoint.pid !== adopted.pid ||
-					endpoint.url !== attached.endpoint.url ||
-					endpoint.token !== attached.endpoint.token
-				) {
-					this.#adopted.delete(sessionId);
-					await this.#retireAttachment(attached);
-					continue;
-				}
-				try {
-					if (await this.#publishAttachment(attached, true)) {
-						this.#adopted.delete(sessionId);
-						attachedIds.add(sessionId);
-					}
-				} catch {
-					this.#adopted.delete(sessionId);
-					await this.#retireAttachment(attached);
-				}
+			} catch {
+				this.#adopted.delete(sessionId);
+				await this.#retireAttachment(attached);
 			}
 		}
 		let nextAttachment = 0;
@@ -1419,7 +1421,9 @@ export class SessionRouter {
 			return null;
 		await this.#index.refresh();
 		const listing = this.#index.listSessions();
-		if (listing.warnings.length > 0) return null;
+		// Scoped to THIS row plus index-wide faults (#5128): a warning about an
+		// unrelated legacy row must not disable routing for a proven endpoint.
+		if (warningsForSession(listing, indexed.sessionId).length > 0) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
 		return { endpoint, identity: provenIdentity };
