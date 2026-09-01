@@ -454,6 +454,26 @@ function computeMergedEnvelope(
 	// one-fact patch cannot erase confirmed/disputed history (#3387 finding 2).
 	const mergedState = isPlainObject(merged.state) ? (merged.state as Record<string, unknown>) : undefined;
 	const priorState = isPlainObject(current.state) ? (current.state as Record<string, unknown>) : undefined;
+	if (priorState?.crystal !== undefined) {
+		if (!mergedState || JSON.stringify(mergedState.crystal) !== JSON.stringify(priorState.crystal))
+			throw new DeepInterviewStageError(
+				"DI_STAGE_MERGE_REJECTED",
+				"canonical crystallized state cannot be replaced or deleted through staged apply",
+			);
+		if (mergedState.execution_approval !== priorState.execution_approval)
+			throw new DeepInterviewStageError(
+				"DI_STAGE_MERGE_REJECTED",
+				"crystallized execution approval is immutable through staged apply",
+			);
+		for (const field of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const)
+			if (merged[field] !== current[field])
+				throw new DeepInterviewStageError(
+					"DI_STAGE_MERGE_REJECTED",
+					`crystallized ${field} is immutable through staged apply`,
+				);
+	}
+	if (mergedState?.crystal && isPlainObject(mergedState.crystal) && mergedState.crystal.lifecycle !== "ready")
+		merged.current_phase = "interviewing";
 	if (mergedState && priorState && Array.isArray(priorState.established_facts)) {
 		mergedState.established_facts = mergeEstablishedFacts(
 			priorState.established_facts,
