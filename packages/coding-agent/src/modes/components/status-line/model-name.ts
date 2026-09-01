@@ -33,10 +33,17 @@ const DATE_OR_BUILD_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{6}|v\d+(?:\.\d+)*)$
  */
 const SPLIT_VERSION = /(\d)-(\d+)(?![\dA-Za-z])/g;
 
+/**
+ * Control and formatting characters (newlines, tabs, escape sequences) break
+ * both row-width accounting and TUI rendering, and a model id is external
+ * data. Stripped before anything else looks at the string.
+ */
+const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/gu;
+
 export const NO_MODEL_LABEL = "no-model";
 
 export function shortenModelId(rawId: string | undefined | null): string {
-	const raw = (rawId ?? "").trim();
+	const raw = (rawId ?? "").replace(CONTROL_CHARACTERS, "").trim();
 	if (!raw) return NO_MODEL_LABEL;
 
 	// Provider prefix: `anthropic/claude-…`, `openrouter/anthropic/claude-…`.
