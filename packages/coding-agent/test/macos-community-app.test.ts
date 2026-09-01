@@ -10,6 +10,7 @@ import {
 	offerMacosCommunityApp,
 	parseCommunityAppChecksumForTest,
 	resolveCommunityAppExecutableForTest,
+	runCommunityAppCommandForTest,
 } from "../src/cli/macos-community-app";
 
 const tempDirs: string[] = [];
@@ -118,6 +119,17 @@ describe("macOS community app offer guards", () => {
 			path.join(aliasRoot, "Contents", "MacOS", "GajaeCode"),
 		);
 		await fs.rm(aliasParent, { recursive: true, force: true });
+	});
+
+	test("terminates a native helper when output exceeds the cap", async () => {
+		const started = performance.now();
+		const result = await runCommunityAppCommandForTest([
+			process.execPath,
+			"-e",
+			'process.stdout.write("x".repeat(1024 * 1024 + 1)); setTimeout(() => {}, 60_000);',
+		]);
+		expect(result.exitCode).toBe(125);
+		expect(performance.now() - started).toBeLessThan(10_000);
 	});
 
 	test("fails closed when the canonical release or checksum is unavailable", async () => {

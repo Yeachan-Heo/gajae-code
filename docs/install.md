@@ -106,7 +106,7 @@ Run `gjc config set startup.checkUpdate false` to disable the launch-time check.
 
 ## Optional macOS community app
 
-After a successful macOS install or `gjc update`, GJC may offer to install the
+After a successful macOS binary install or `gjc update`, GJC may offer to install the
 experimental, community-built, third-party Gajae Code App:
 
 ```text

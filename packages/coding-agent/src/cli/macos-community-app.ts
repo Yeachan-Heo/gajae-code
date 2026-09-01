@@ -131,6 +131,14 @@ async function readResponseText(response: Response, maxBytes: number): Promise<s
 
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+	const terminateAndReap = async (): Promise<void> => {
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			// The command may have exited between the failure and the kill.
+		}
+		await Promise.race([child.exited, Bun.sleep(5000)]);
+	};
 	const outputPromise = Promise.all([
 		readResponseText(new Response(child.stdout), MAX_COMMAND_OUTPUT_BYTES),
 		readResponseText(new Response(child.stderr), MAX_COMMAND_OUTPUT_BYTES),
@@ -138,12 +146,7 @@ async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: s
 	]);
 	const timeout = Promise.withResolvers<undefined>();
 	const timer: NodeJS.Timeout = setTimeout(() => {
-		try {
-			child.kill("SIGKILL");
-		} catch {
-			// The command may have exited between the timeout and the kill.
-		}
-		timeout.resolve(undefined);
+		void terminateAndReap().finally(() => timeout.resolve(undefined));
 	}, COMMAND_TIMEOUT_MS);
 	const output = await Promise.race([
 		outputPromise
@@ -156,7 +159,10 @@ async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: s
 		await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(5000)]);
 		return { exitCode: 124, stdout: "", stderr: `command timed out: ${argv[0]}` };
 	}
-	if (output.kind === "error") return { exitCode: 125, stdout: "", stderr: String(output.error) };
+	if (output.kind === "error") {
+		await terminateAndReap();
+		return { exitCode: 125, stdout: "", stderr: String(output.error) };
+	}
 	const [stdout, stderr, exitCode] = output.value;
 	return { exitCode, stdout, stderr };
 }
@@ -448,4 +454,10 @@ export async function resolveCommunityAppExecutableForTest(
 	executable: string,
 ): Promise<string | undefined> {
 	return resolveVerifiedExecutable(bundlePath, executable);
+}
+
+export async function runCommunityAppCommandForTest(
+	argv: string[],
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	return runCommand(argv);
 }
