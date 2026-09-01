@@ -896,6 +896,14 @@ export async function persistDeepInterviewSpec(
 		);
 	}
 	const existing = existingRead.kind === "valid" ? existingRead.value : {};
+	const existingInner =
+		existing.state && typeof existing.state === "object" && !Array.isArray(existing.state)
+			? (existing.state as Record<string, unknown>)
+			: undefined;
+	if (existingInner?.crystal !== undefined) {
+		if (existing.spec_path !== undefined || existing.spec_sha256 !== undefined)
+			throw new DeepInterviewCommandError(2, "crystallized spec metadata is immutable through direct spec write");
+	}
 
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
 	const intentReview = resolveLockedIntentReview(existing, content);
