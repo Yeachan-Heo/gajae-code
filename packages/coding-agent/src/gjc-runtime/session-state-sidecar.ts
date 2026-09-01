@@ -3071,10 +3071,16 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
 		context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
-	const ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
 	const ownerTerminalVerdict = context.ownerTerminal
 		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, identity.sessionId)
 		: null;
+	let ownerSessionRoot: string;
+	try {
+		ownerSessionRoot = sessionRoot(context.cwd, identity.sessionId);
+	} catch (error) {
+		if (ownerTerminalVerdict) throw new OwnerTerminalPublicationError(error);
+		throw error;
+	}
 	await serializeStateFileWrite(
 		stateFile,
 		async () =>
@@ -3147,6 +3153,7 @@ assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 					}),
 			),
 	).catch(error => {
+		if (ownerTerminalVerdict) throw new OwnerTerminalPublicationError(error);
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
 			try {
 				fsSync.lstatSync(ownerSessionRoot);
