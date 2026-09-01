@@ -19,7 +19,7 @@ export interface ReadFileOptions {
 	readonly home?: string;
 	readonly homeIdentity?: FileIdentity;
 	readonly userAgentDir?: string;
-	readonly userAgentIdentity?: FileIdentity;
+	readonly userAgentIdentity?: FileIdentity | null;
 	/**
 	 * Scope of the read. Foreign user/project providers are home-bound; only
 	 * native/SSH user reads may use an explicitly external agent directory.
@@ -49,8 +49,21 @@ async function isHomeIdentityStable(options?: ReadFileOptions): Promise<boolean>
 }
 
 async function isUserAgentIdentityStable(options?: ReadFileOptions): Promise<boolean> {
-	if (!options?.isolatedHome || options.scope !== "native" || !options.userAgentDir || !options.userAgentIdentity)
+	if (
+		!options?.isolatedHome ||
+		options.scope !== "native" ||
+		!options.userAgentDir ||
+		options.userAgentIdentity === undefined
+	)
 		return true;
+	if (options.userAgentIdentity === null) {
+		try {
+			await fs.promises.lstat(options.userAgentDir);
+			return false;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "ENOENT";
+		}
+	}
 	try {
 		const current = await fs.promises.stat(options.userAgentDir);
 		return current.dev === options.userAgentIdentity.dev && current.ino === options.userAgentIdentity.ino;

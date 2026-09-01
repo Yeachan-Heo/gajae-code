@@ -777,6 +777,38 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(result.items.map(item => item.content)).toEqual(["# explicit system"]);
 	});
 
+	test("rejects an agent root that appears after an absent-root capture", async () => {
+		const homeAgentDir = path.join(home, ".gjc", "agent");
+		const outsideAgentDir = path.join(tempDir, "appeared-agent");
+		await seedProfile(outsideAgentDir, "outside");
+		await fs.mkdir(path.dirname(homeAgentDir), { recursive: true });
+
+		const homeStats = await fs.stat(home);
+		const result = await readFile(path.join(homeAgentDir, "SYSTEM.md"), {
+			isolatedHome: true,
+			home,
+			homeIdentity: { dev: homeStats.dev, ino: homeStats.ino },
+			userAgentDir: homeAgentDir,
+			userAgentIdentity: null,
+			scope: "native",
+			bypassCache: true,
+		});
+
+		await fs.symlink(outsideAgentDir, homeAgentDir, "dir");
+		const afterAppearance = await readFile(path.join(homeAgentDir, "SYSTEM.md"), {
+			isolatedHome: true,
+			home,
+			homeIdentity: { dev: homeStats.dev, ino: homeStats.ino },
+			userAgentDir: homeAgentDir,
+			userAgentIdentity: null,
+			scope: "native",
+			bypassCache: true,
+		});
+
+		expect(result).toBeNull();
+		expect(afterAppearance).toBeNull();
+	});
+
 	test("explicit home scopes ssh-json user discovery away from the ambient profile", async () => {
 		const homeAgentDir = path.join(home, ".gjc", "agent");
 		const decoyAgentDir = path.join(tempDir, "process-decoy", ".gjc", "agent");
