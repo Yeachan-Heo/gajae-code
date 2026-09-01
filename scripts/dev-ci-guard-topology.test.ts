@@ -134,9 +134,8 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(dispatchInputs).not.toContain("head_repository");
 
 		const guard = requiredJob(d, "telegram-daemon-generation");
-		// The guard head SHA never reads inputs.head_sha; for push/dispatch it is
-		// github.sha — exactly the source the planner checks out.
-		expect(requiredEnvValue(guard, "GITHUB_HEAD_SHA")).not.toContain("inputs.head_sha");
+		// Dispatch validation binds the guard head to inputs.head_sha; PR/push runs use
+		// their event source.
 		expect(requiredEnvValue(guard, "GITHUB_HEAD_SHA")).toContain("github.sha");
 		expect(requiredEnvValue(guard, "HEAD_REF")).not.toContain("inputs.head_ref");
 		expect(requiredEnvValue(guard, "HEAD_REPOSITORY")).not.toContain("inputs.head_repository");
@@ -144,10 +143,10 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		const guardRef = checkoutRef(guard.steps);
 		const plan = requiredJob(d, "affected-plan");
 		const planRef = checkoutRef(plan.steps);
-		// The guard checks out the exact same source expression as the planner, so a
-		// push/workflow_dispatch validates github.sha in both, and a PR validates the PR
-		// head in both — never divergent revisions.
-		expect(guardRef).toBe("${{ github.event.pull_request.head.sha || github.sha }}");
+		// The guard checks out the exact same event-specific source expression as the planner.
+		expect(guardRef).toBe(
+			"${{ github.event_name == 'workflow_dispatch' && inputs.head_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}",
+		);
 		expect(guardRef).toBe(planRef);
 		// The guard's authority head SHA tracks that same source.
 		expect(requiredEnvValue(guard, "GITHUB_HEAD_SHA")).toContain("github.event.pull_request.head.sha");
