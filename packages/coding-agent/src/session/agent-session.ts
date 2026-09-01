@@ -9180,7 +9180,15 @@ export class AgentSession {
 		if (this.#workspaceTreeService) await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose());
 		if (this.#networkPrewarmService) await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose());
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
-		await this.#closeSessionManagerForDispose();
+		let criticalDisposeError: unknown;
+		try {
+			await this.#closeSessionManagerForDispose();
+		} catch (error) {
+			criticalDisposeError = error;
+			logger.warn("Session manager close failed during dispose; continuing independent cleanup", {
+				error: String(error),
+			});
+		}
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
 		await awaitDisposeStep("hindsight state", hindsightState?.dispose() ?? Promise.resolve());
@@ -9191,6 +9199,7 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+		if (criticalDisposeError !== undefined) throw criticalDisposeError;
 	}
 
 	async #closeSessionManagerForDispose(): Promise<void> {
