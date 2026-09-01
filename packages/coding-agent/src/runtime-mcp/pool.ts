@@ -846,7 +846,7 @@ export class MCPConnectionPool {
 		entry.refCount = Math.max(0, entry.refCount - 1);
 		if (entry.refCount > 0) return;
 		if (entry.identity.sharingMode === "shared" && this.#sharedPoolIdleMs > 0) {
-			this.scheduleIdleClose(entry);
+			this.#scheduleIdleClose(entry);
 			return;
 		}
 		try {
@@ -866,7 +866,7 @@ export class MCPConnectionPool {
 		}
 	}
 
-	private scheduleIdleClose(entry: PoolEntry): void {
+	#scheduleIdleClose(entry: PoolEntry): void {
 		if (
 			this.#shuttingDown ||
 			this.#sharedPoolIdleMs <= 0 ||
@@ -883,7 +883,7 @@ export class MCPConnectionPool {
 				// A transient close failure leaves a connected, unleased shared entry
 				// in the pool. Keep retrying its idle close rather than leaking the
 				// transport until a later acquire happens to touch this key.
-				this.scheduleIdleClose(entry);
+				this.#scheduleIdleClose(entry);
 			});
 		}, this.#sharedPoolIdleMs);
 	}
@@ -939,7 +939,7 @@ export class MCPConnectionPool {
 						this.#sharedPoolIdleMs > 0 &&
 						!this.#shuttingDown
 					)
-						this.scheduleIdleClose(entry);
+						this.#scheduleIdleClose(entry);
 				}
 			}
 		});
