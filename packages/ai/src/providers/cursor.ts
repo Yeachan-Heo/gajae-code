@@ -1120,6 +1120,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let terminalDrainMode = false;
 		let terminalDrain: (() => void) | undefined;
 		let terminalDrainStarted = false;
+		let execQueuePrefix: Promise<void> | undefined;
 		let terminalPendingError: unknown;
 		let terminalBoundarySeen = false;
 		// Lookahead can validate turnEnded while an exec handler holds the normal
@@ -1519,7 +1520,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				// A transport terminal can preempt an abortable exec whose handler ignores
 				// its signal. Do not wait on that queue chain; the bounded settlement fence
 				// below still protects any mutation that explicitly became non-abortable.
-				const queueCompletion = processingPausedForExec || execInFlight ? Promise.resolve() : messageQueue.drain();
+				const queueCompletion =
+					processingPausedForExec || execInFlight ? (execQueuePrefix ?? Promise.resolve()) : messageQueue.drain();
 				void queueCompletion.then(
 					() => {
 						queueDrained = true;
@@ -1662,7 +1664,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 			const finishResponseAfterParsing = (): void => {
 				if (!responseEnded || processingPausedForExec || processingPausedForQueue) return;
-				if (pendingBuffer.length > 0) {
+				if (terminalBoundarySeen) {
+					// A validated turnEnded makes every remaining byte transport tail,
+					// including an incomplete 1–4 byte frame header. Never turn tail
+					// noise into a truncated-stream failure after the authoritative boundary.
+					pendingBuffer.clear();
+				} else if (pendingBuffer.length > 0) {
 					endStreamError = new Error("Cursor HTTP/2 stream ended with a truncated Connect frame");
 				}
 				drainMessageQueue();
@@ -1753,6 +1760,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						if (isExecutable) {
 							processingPausedForExec = true;
 							clearTransportWatchdog();
+							execQueuePrefix = messageQueue.drain();
 						}
 						let mutationSlotReserved = false;
 						const queued = messageQueue.enqueue(async () => {

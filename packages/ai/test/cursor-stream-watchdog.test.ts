@@ -808,15 +808,7 @@ describe("Cursor raw transport watchdog", () => {
 						message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/late" }) },
 					}),
 				});
-				stream.end(
-					Buffer.concat([
-						prefix,
-						heldExec,
-						turnEnded,
-						lateExec,
-						frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG),
-					]),
-				);
+				stream.end(Buffer.concat([prefix, heldExec, turnEnded, lateExec, Buffer.from([0, 1, 2])]));
 			}, 10);
 		});
 

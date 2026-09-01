@@ -127,6 +127,14 @@
 - Coordinator projection consumers now retry a bounded number of fresh authoritative scans when concurrent session churn races a candidate. Cap exhaustion, owner disappearance, unsupported authority, and parse failures remain fail-closed, while settled concurrent SDK sessions no longer permanently starve the session reaper or coordinator mutations. (#5168)
 
 - Coordinator session-state locks now reclaim an empty, identity-qualified released transition tombstone on POSIX after a short release grace period. Live, foreign, malformed, non-empty, or identity-changed claims remain fail-closed, while persistent macOS/File Provider debris no longer burns the full transition timeout on every state write. (#5159)
+- Explicit-home capability discovery now validates only the selected provider roots, isolates plugin-root caching from ordinary loads, and rejects configured extension paths that escape the canonical home.
+- `loadCapabilityForHome` no longer falls back to the process-global agent directory when an explicit home is supplied. The user agent directory is derived from the supplied home (`<home>/<configDir>/agent`) unless the caller passes an explicit `agentDir`, and a non-absolute home fails closed instead of silently resolving against the process profile. Explicit-home loads can no longer read another profile's SYSTEM.md/RULES.md/AGENTS.md, skills, commands, hooks, settings, or custom-tool descriptors; a decoy-process-profile test instruments every filesystem read across all eight surfaces to prove zero reads escape the supplied home (#4834).
+- An explicit `agentDir` redirect now applies uniformly to native user-scope surfaces instead of only to MCP: `loadCapability`/`loadCapabilityForHome` set the context user scope only for an explicit agent directory, and the native SYSTEM.md, RULES.md, skills, config-dir, and AGENTS.md loaders resolve user paths from it. The process-default (no explicit `agentDir`) layout is unchanged (#4834 review).
+- `loadCapability` keeps `getAgentDir()` as the DEFAULT context user scope for native surfaces, so a process-selected non-default profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / setAgentDir()) is never split across two directories: an explicit `options.agentDir` still wins, and `loadCapabilityForHome` still derives its scope from the supplied home (#4834 review).
+- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
+
+- `gjc auth-gateway serve` now requires `--provider=<id>`; existing unscoped invocations must choose the provider whose source-backed model catalog and broker credential the gateway should expose.
+- `gjc auth-gateway serve` verifies an enabled broker credential before binding and reports only redacted provider-scoped status/check information.
 
 - A runtime-state marker recorded against a different workspace path now reports that mismatch instead of claiming the file is unreadable, and a terminal, not-live marker that travelled into the current workspace with its session directory is adopted rather than refused. Live, non-terminal, and out-of-workspace markers are still refused untouched.
 - An unavailable provider-qualified `modelRoles.default` selection now reports the requested model instead of silently starting on another provider's baseline. This keeps signed-registry omissions and failed catalog admission actionable rather than routing requests to an unrelated retired model. (#5144)
@@ -176,14 +184,6 @@
 - Blob references and filesystem-backed blob reads now accept only exact lowercase SHA-256 names before resolving a disk path; canonical references and valid missing-blob behavior are unchanged.
 
 ## [0.15.6] - 2026-08-30
-
-- Explicit-home capability discovery now validates only the selected provider roots, isolates plugin-root caching from ordinary loads, and rejects configured extension paths that escape the canonical home.
-
-- `loadCapabilityForHome` no longer falls back to the process-global agent directory when an explicit home is supplied. The user agent directory is derived from the supplied home (`<home>/<configDir>/agent`) unless the caller passes an explicit `agentDir`, and a non-absolute home fails closed instead of silently resolving against the process profile. Explicit-home loads can no longer read another profile's SYSTEM.md/RULES.md/AGENTS.md, skills, commands, hooks, settings, or custom-tool descriptors; a decoy-process-profile test instruments every filesystem read across all eight surfaces to prove zero reads escape the supplied home (#4834).
-- An explicit `agentDir` redirect now applies uniformly to native user-scope surfaces instead of only to MCP: `loadCapability`/`loadCapabilityForHome` set the context user scope only for an explicit agent directory, and the native SYSTEM.md, RULES.md, skills, config-dir, and AGENTS.md loaders resolve user paths from it. The process-default (no explicit `agentDir`) layout is unchanged (#4834 review).
-- `loadCapability` keeps `getAgentDir()` as the DEFAULT context user scope for native surfaces, so a process-selected non-default profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / setAgentDir()) is never split across two directories: an explicit `options.agentDir` still wins, and `loadCapabilityForHome` still derives its scope from the supplied home (#4834 review).
-
-- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
 
 - Auth metadata remains session-only when a compatibility registry has auth storage but no owner accessor, preventing an unscoped OAuth account lookup from attributing a registry-scoped API-key request to the wrong account.
 
@@ -268,14 +268,6 @@
 - Lean notifications no longer replay a retained completion receipt at idle when identical text was already delivered immediately before an autonomous `ask`; distinct receipts and other settlement windows remain preserved.
 - SDK prompts now publish a bounded structured terminal failure when a provider immediately returns HTTP 402 or 429. The accepted receipt remains non-terminal until the correlated `agent_end`, while `turn.result`/`turn.prompt_status` no longer strand the prompt as `in_flight`; replacement turns remain independently abortable and recoverable. (#4941)
 
-### Breaking Changes
-
-- `gjc auth-gateway serve` now requires `--provider=<id>`; existing unscoped invocations must choose the provider whose source-backed model catalog and broker credential the gateway should expose.
-
-### Added
-
-- `gjc auth-gateway serve` verifies an enabled broker credential before binding and reports only redacted provider-scoped status/check information.
-
 ## [0.15.2] - 2026-08-25
 
 ### Changed
@@ -301,6 +293,8 @@
 ### Fixed
 
 - Onboarding language detection (`/tutorial`, first-run onboarding) no longer misreads English or Korean transcripts as French, Spanish, or German. Word evidence for space-delimited languages is matched on token boundaries instead of substrings — `le`/`la`/`el` used to match inside `file`, `please`, `class`, and `help`, so plain English handed French a majority — Korean, Japanese, and Chinese are identified by script instead of particle substrings, script counts and word hits share one ranking so two Hangul or Han characters cannot override a clearly English transcript, a Hangul claimant needs two characters before it may claim mixed han text so one stray Hangul glyph cannot erase dominant han evidence, a language must lead the runner-up outright to beat the OS locale, and an explicit `ui.language` selection outranks both. `/language` also accepts locale tags such as `en-US` / `ko-KR` and now rejects hostile inputs that used to resolve to inherited object properties (`__proto__`, `constructor`) instead of canonical `en`/`ko`.
+- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, avoiding a startup provider request; caller-supplied registries, foreign credentials, and unknown models remain fail-closed.
+- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
 - `ask` question wording and option labels no longer use the post-resample U+2014 display-text exemption because accepted calls enter durable session history and deep-interview rounds; genuinely display-only tool fields retain the existing exemption (#4926).
 - Gajae Pet now treats forwarded `LC_TERMINAL=iTerm2` and `TERM_PROGRAM=iTerm.app` values as probe hints over SSH, enabling iTerm2 only after an active OSC 1337 File-capability reply. Generic SSH, spoofed/noninteractive/CI environments, and unmanaged tmux/screen/zellij nesting remain on the text fallback; verified Kitty and Sixel keep precedence. (#4911)
 - Interactive terminal completion now publishes the local `agent_end` boundary before waiting for the ordered coordinator sidecar write, so slow or lock-hostile WSL drvfs mounts cannot leave the foreground activity indicator and composer busy after a turn has completed. Coordinator persistence ordering and extension delivery remain unchanged. (#4741)
