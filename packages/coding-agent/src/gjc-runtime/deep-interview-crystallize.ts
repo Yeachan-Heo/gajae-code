@@ -241,7 +241,11 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	const sameIntent = (left: CrystalItem, right: CrystalItem): boolean =>
-		left.id === right.id && left.kind === right.kind && left.statement === right.statement;
+		left.id === right.id &&
+		left.kind === right.kind &&
+		left.statement === right.statement &&
+		(left.classification === right.classification ||
+			(right.classification === "inferred" && left.classification === "confirmed"));
 	const changed = currentItems
 		.filter(item => {
 			const previous = priorItems.get(item.id);
