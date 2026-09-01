@@ -2314,13 +2314,15 @@ describe("coordinator runtime state sidecar", () => {
 		await Bun.write(
 			`${stateFile}.lock/info`,
 			JSON.stringify({
-				pid: 2 ** 22 - 1,
+				pid: 999_999_999,
 				start_time: "whenever",
 				timestamp: Date.now() - 60_000,
-				owner_host_id: await loadInstallationHostId(),
 			}),
 		);
 		await Bun.write(`${stateFile}.lock/protected-payload`, "not-json-secret\n");
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(`${stateFile}.lock`, stale, stale);
+		await fs.utimes(`${stateFile}.lock/info`, stale, stale);
 		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("completed"), {
 			sessionId: "orphaned-runtime-lock",
 			cwd: root,
