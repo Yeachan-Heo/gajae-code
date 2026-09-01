@@ -438,6 +438,12 @@ export async function appendOrMergeDeepInterviewRound(
 		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	const envelope = await readEnvelope(statePath);
 	if (envelope.active === false) throw new Error("cannot record a deep-interview turn after handoff or completion");
+	const envelopeState = envelope.state as Record<string, unknown>;
+	const crystal = envelopeState.crystal;
+	if (crystal && typeof crystal === "object" && !Array.isArray(crystal)) {
+		if ((crystal as Record<string, unknown>).lifecycle === "ready")
+			throw new Error("cannot record a deep-interview turn after Crystal promotion");
+	}
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({
 		...input,
@@ -447,7 +453,7 @@ export async function appendOrMergeDeepInterviewRound(
 	const rounds = readRounds(envelope);
 	const priorRecord = rounds.find(r => r.round_key === shell.round_key);
 	const result = appendOrMergeRound(rounds, shell);
-	const inner = envelope.state as Record<string, unknown>;
+	const inner = envelopeState;
 	let intentStateChanged = false;
 	if (input.intent_contract) {
 		if (input.round !== 0 || input.component !== "review-topology" || input.dimension !== "topology")
