@@ -1415,9 +1415,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Resolve the selected profile once at session admission. A relative agent
 	// directory must not be reinterpreted against a process cwd changed by a
 	// later session rescope.
+	// Capture the trusted home alongside that profile identity: skill and
+	// skill-discovery tools may run after a global home refresh, but must retain
+	// the discovery root that was authoritative when this session was created.
+	const trustedHome = getTrustedHomeDir();
 	const selectedAgentDir = options.agentDir ?? options.settings?.getAgentDir();
 	const agentDir = path.resolve(selectedAgentDir ?? getDefaultAgentDir());
-	const canonicalDefaultAgentDir = path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
+	const canonicalDefaultAgentDir = path.join(trustedHome, getConfigDirName(), "agent");
 	const profileAuthority: "default" | "custom" =
 		selectedAgentDir !== undefined
 			? normalizePathForComparison(agentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
@@ -2955,7 +2959,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				Promise.resolve(session?.requestForegroundBashBackground(reason, adapter) ?? false),
 			getToolInterruptPolicy: () => agent?.getToolInterruptPolicy() ?? "abort_tools",
 
-			getSessionHome: () => getTrustedHomeDir(),
+			getSessionHome: () => trustedHome,
 			getSessionProfileAuthority: () => profileAuthority,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,

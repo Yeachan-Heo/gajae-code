@@ -10,14 +10,8 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import {
-	getAgentDir,
-	getAgentProfileAuthority,
-	getTrustedHomeDir,
-	logger,
-	normalizePathForComparison,
-} from "@gajae-code/utils";
-import { isProviderEnabled } from "../capability";
+import { getAgentDir, getAgentProfileAuthority, getTrustedHomeDir, logger } from "@gajae-code/utils";
+import { isProviderEnabled, resolveProfileAuthority } from "../capability";
 import { findAllNearestProjectConfigDirs, getConfigDirs } from "../config";
 import type { Settings } from "../config/settings";
 import { listClaudePluginRoots } from "../discovery/helpers";
@@ -77,19 +71,14 @@ export async function discoverAgents(
 		agentDir ??
 		activeSettings?.getAgentDir() ??
 		(getAgentProfileAuthority() === "custom" ? getAgentDir() : undefined);
-	const resolverAuthority = getAgentProfileAuthority();
-	const selectedAgentDir = agentDir ?? activeSettings?.getAgentDir();
-	// Resolver authority is sticky across HOME refreshes. An explicit directory
-	// is custom only when it differs from the resolver's current default; a
-	// resolver-owned custom profile remains custom even when its path later
-	// coincides with a newly derived default.
-	const resolvedProfileAuthority =
-		profileAuthority ??
-		(resolverAuthority === "custom" ||
-		(selectedAgentDir !== undefined &&
-			normalizePathForComparison(selectedAgentDir) !== normalizePathForComparison(getAgentDir()))
-			? "custom"
-			: resolverAuthority);
+	// Let the shared resolver classify the selected settings provenance before
+	// consulting ambient profile state. This keeps a Settings instance bound to
+	// the canonical default profile on default roots even when the process
+	// resolver currently points at a custom profile.
+	const resolvedProfileAuthority = resolveProfileAuthority(
+		{ agentDir, settings: activeSettings, profileAuthority },
+		home,
+	);
 	// A selected custom profile replaces only the user scope. The default
 	// profile must retain its compatibility roots (including ~/.gemini), and
 	// project discovery must always consider both supported project sources.

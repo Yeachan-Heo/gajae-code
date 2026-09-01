@@ -317,6 +317,48 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 		}
 	});
 
+	test("session skill discovery keeps the trusted home captured at session creation", async () => {
+		const refreshedHome = path.join(tempDir, "refreshed-home");
+		await fs.mkdir(refreshedHome, { recursive: true });
+		await makeSkill(path.join(home, ".custom-skills"), "session-trusted-home-skill");
+		await makeSkill(path.join(refreshedHome, ".custom-skills"), "session-refreshed-home-decoy");
+
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+		const settings = Settings.isolated(
+			{
+				"skill.enabled": true,
+				"skills.enabled": true,
+				"skills.trustProjectSkills": true,
+				"skills.trustUserSkills": true,
+				"skills.customDirectories": ["~/.custom-skills"],
+			},
+			{ agentDir: profile },
+		);
+		const { session } = await createAgentSession({
+			cwd: project,
+			agentDir: profile,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			enableMCP: false,
+			enableLsp: false,
+			disableExtensionDiscovery: true,
+		});
+		try {
+			homeSpy.mockReturnValue(refreshedHome);
+			const skillDiscovery = session.getToolByName("skill_discovery");
+			expect(skillDiscovery).toBeDefined();
+			const result = await skillDiscovery!.execute("call", { source: "user" });
+			const candidateNames = (
+				result.details as { candidates?: Array<{ name: string }> } | undefined
+			)?.candidates?.map(candidate => candidate.name);
+			expect(candidateNames).toContain("session-trusted-home-skill");
+			expect(candidateNames).not.toContain("session-refreshed-home-decoy");
+		} finally {
+			await session.dispose();
+			await settings.close();
+		}
+	});
+
 	test("writeNativeSkill(user) targets the agent dir and is listed, discovered, and loaded", async () => {
 		const receipt = await writeNativeSkill({
 			cwd: project,

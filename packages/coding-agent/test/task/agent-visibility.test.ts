@@ -212,4 +212,41 @@ describe("task agent visibility", () => {
 			setAgentDir(previousAgentDir);
 		}
 	});
+
+	it("uses canonical default settings provenance despite an ambient custom resolver", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-task-default-authority-"));
+		temporaryRoots.push(root);
+		const home = path.join(root, "home");
+		const project = path.join(root, "project");
+		const defaultPlugin = path.join(root, "default-plugin");
+		const ambientCustomProfile = path.join(root, "ambient-custom-profile");
+		const writeRegistry = async (agentDir: string, pluginPath: string, pluginName: string) => {
+			await fs.mkdir(path.join(agentDir, "plugins"), { recursive: true });
+			await Bun.write(
+				path.join(agentDir, "plugins", "installed_plugins.json"),
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						[`${pluginName}@test-market`]: [{ scope: "user", installPath: pluginPath, version: "1.0.0" }],
+					},
+				}),
+			);
+		};
+
+		await fs.mkdir(project, { recursive: true });
+		await writeAgent(defaultPlugin, "settings-default-agent");
+		await writeRegistry(path.join(home, ".gjc"), defaultPlugin, "settings-default");
+
+		const previousAgentDir = getAgentDir();
+		setAgentDir(ambientCustomProfile);
+		try {
+			const canonicalDefault = path.join(home, getConfigDirName(), "agent");
+			const settings = Settings.isolated({}, { agentDir: canonicalDefault });
+			const result = await discoverAgents(project, home, settings);
+
+			expect(result.agents.map(agent => agent.name)).toContain("settings-default-agent");
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
+	});
 });
