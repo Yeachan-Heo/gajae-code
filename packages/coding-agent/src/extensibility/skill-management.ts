@@ -15,6 +15,7 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { NativeSecureSkillWriteResult } from "@gajae-code/natives";
 import * as natives from "@gajae-code/natives";
 import {
 	getAgentDir,
@@ -343,7 +344,7 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const secureWriteSkillFile = getSecureWriteSkillFileNative();
-	let result: Awaited<ReturnType<SecureWriteSkillFileAsync>>;
+	let result: NativeSecureSkillWriteResult;
 	try {
 		result = await secureWriteSkillFile(
 			directory,
