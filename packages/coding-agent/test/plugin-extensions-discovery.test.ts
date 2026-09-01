@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { discoverAndLoadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
-import { getAgentDir, getPluginsDir, setAgentDir, TempDir } from "@gajae-code/utils";
+import { getAgentDir, getDefaultPluginsDir, setAgentDir, TempDir } from "@gajae-code/utils";
 
 const currentPiCodingAgentPath = Bun.resolveSync("@gajae-code/coding-agent", import.meta.dir);
 const currentPiExtensionsPath = Bun.resolveSync("@gajae-code/coding-agent/extensibility/extensions", import.meta.dir);
@@ -24,7 +24,7 @@ describe("plugin extension discovery", () => {
 		// Rebuild path caches after changing XDG env so plugin discovery resolves into the temp root.
 		setAgentDir(originalAgentDir);
 
-		const pluginsDir = getPluginsDir();
+		const pluginsDir = getDefaultPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "@demo", "plugin");
 		fs.mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
 		await Bun.write(
@@ -126,7 +126,7 @@ describe("plugin extension discovery", () => {
 		);
 
 		const ambientExtensionPath = path.join(
-			getPluginsDir(),
+			getDefaultPluginsDir(),
 			"node_modules",
 			"@demo",
 			"plugin",
@@ -147,7 +147,7 @@ describe("plugin extension discovery", () => {
 	});
 
 	it("loads installed legacy Pi plugin extensions from Windows drive-letter paths", async () => {
-		const pluginsDir = getPluginsDir();
+		const pluginsDir = getDefaultPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "legacy-pi-plugin");
 		const extensionPath = path.join(pluginDir, "dist", "extension.ts");
 		fs.rmSync(path.join(pluginsDir, "node_modules"), { recursive: true, force: true });
@@ -210,7 +210,7 @@ describe("plugin extension discovery", () => {
 	});
 
 	it("loads installed plugin extensions whose manifest entry points at a directory with index.ts", async () => {
-		const pluginsDir = getPluginsDir();
+		const pluginsDir = getDefaultPluginsDir();
 		const pluginDir = path.join(pluginsDir, "node_modules", "dir-entry-plugin");
 		const extensionDir = path.join(pluginDir, ".pi", "extensions", "dir-entry");
 		const extensionPath = path.join(extensionDir, "index.ts");

@@ -86,7 +86,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const guardEnd = workflow.indexOf("\n      - ", guardStart + 1);
 		const guard = workflow.slice(guardStart, guardEnd);
 		expect(guardStart).toBeGreaterThan(0);
-		expect(guard).toContain("if: ${{ github.event_name == 'pull_request' }}");
+		expect(guard).toContain("if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}");
 		expect(guard).toContain('if ! git fetch --no-tags origin "${GITHUB_BASE_SHA}"; then');
 		expect(guard).toContain("Could not fetch immutable event base ${GITHUB_BASE_SHA}");
 		expect(guard).toContain('if git merge-base --is-ancestor "${GITHUB_BASE_SHA}" HEAD; then');
@@ -152,8 +152,8 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
-		expect(workflow).toContain(
-			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
+		expect(
+			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
 		);
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
@@ -188,7 +188,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).not.toContain("continue-on-error");
 		const protectedJob = workflow.slice(workflow.indexOf("  affected:\n"), workflow.indexOf("\n  gjc-state-gates-matrix:"));
 		expect(protectedJob).toContain(
-			"if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
+			"if: ${{ always() && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
 		);
 		expect(protectedJob).toContain("name: Validate finalized affected evidence");
 		expect(protectedJob).not.toContain("continue-on-error");
