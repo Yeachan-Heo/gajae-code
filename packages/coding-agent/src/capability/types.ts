@@ -32,6 +32,8 @@ export interface LoadContext {
 	userAgentDir?: string;
 	/** Device/inode identity captured for the explicit home root. */
 	homeIdentity?: FileIdentity;
+	/** Device/inode identity captured for the isolated native agent root. */
+	userAgentIdentity?: FileIdentity;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 	/** Whether discovery must remain isolated to the supplied home boundary. */

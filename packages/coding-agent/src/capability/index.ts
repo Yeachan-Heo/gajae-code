@@ -471,6 +471,8 @@ export async function loadCapabilityForHome<T>(
 					"user agent directory",
 				)
 			: path.join(canonicalHome, getConfigDirName(), "agent");
+	const userAgentStats = await fs.stat(userAgentDir).catch(() => null);
+	const userAgentIdentity = userAgentStats ? { dev: userAgentStats.dev, ino: userAgentStats.ino } : undefined;
 	await assertExplicitHomeRoots(canonicalHome, cwd, Boolean(options.agentDir), effectiveProviderIds);
 	const repoRootCandidate = await findRepoRoot(cwd, canonicalHome, {
 		isolatedHome: true,
@@ -487,6 +489,7 @@ export async function loadCapabilityForHome<T>(
 		cwd,
 		home: canonicalHome,
 		userAgentDir,
+		userAgentIdentity,
 		repoRoot,
 		isolatedHome: true,
 		homeIdentity,

@@ -44,7 +44,7 @@ interface ResolvedPluginDir {
 
 async function readPluginManifest(
 	root: ClaudePluginRoot,
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity">,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
 ): Promise<ClaudePluginManifest | null> {
 	const manifestPath = await canonicalizePathWithinHome(
 		ctx,
@@ -71,7 +71,7 @@ function isWithinPluginRoot(rootPath: string, targetPath: string): boolean {
 }
 
 async function resolvePluginDir(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity">,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
 	root: ClaudePluginRoot,
 	manifestKeys: ReadonlyArray<keyof ClaudePluginManifest>,
 	fallback: string,

@@ -19,6 +19,7 @@ export interface ReadFileOptions {
 	readonly home?: string;
 	readonly homeIdentity?: FileIdentity;
 	readonly userAgentDir?: string;
+	readonly userAgentIdentity?: FileIdentity;
 	/**
 	 * Scope of the read. Foreign user/project providers are home-bound; only
 	 * native/SSH user reads may use an explicitly external agent directory.
@@ -42,6 +43,17 @@ async function isHomeIdentityStable(options?: ReadFileOptions): Promise<boolean>
 	try {
 		const current = await fs.promises.stat(options.home);
 		return current.dev === options.homeIdentity.dev && current.ino === options.homeIdentity.ino;
+	} catch {
+		return false;
+	}
+}
+
+async function isUserAgentIdentityStable(options?: ReadFileOptions): Promise<boolean> {
+	if (!options?.isolatedHome || options.scope !== "native" || !options.userAgentDir || !options.userAgentIdentity)
+		return true;
+	try {
+		const current = await fs.promises.stat(options.userAgentDir);
+		return current.dev === options.userAgentIdentity.dev && current.ino === options.userAgentIdentity.ino;
 	} catch {
 		return false;
 	}
@@ -78,6 +90,7 @@ async function resolveReadPath(filePath: string, options?: ReadFileOptions): Pro
 	const lexical = resolvePath(filePath);
 	if (!options?.isolatedHome) return lexical;
 	if (!(await isHomeIdentityStable(options))) return null;
+	if (!(await isUserAgentIdentityStable(options))) return null;
 	const roots = rootsForRead(options);
 	if (roots.length === 0) return null;
 	const [canonicalTarget, canonicalRoots] = await Promise.all([
@@ -96,6 +109,7 @@ async function resolveReadPath(filePath: string, options?: ReadFileOptions): Pro
 async function isCurrentIsolatedPath(abs: string, options?: ReadFileOptions): Promise<boolean> {
 	if (!options?.isolatedHome) return true;
 	if (!(await isHomeIdentityStable(options))) return false;
+	if (!(await isUserAgentIdentityStable(options))) return false;
 	try {
 		const current = await resolveReadPath(abs, options);
 		return current === abs;
@@ -120,6 +134,7 @@ function sameFileIdentity(left: fs.Stats, right: fs.Stats): boolean {
 async function statAuthorizedPath(abs: string, options?: ReadFileOptions): Promise<fs.Stats | null> {
 	if (!options?.isolatedHome) return null;
 	if (!(await isHomeIdentityStable(options))) return null;
+	if (!(await isUserAgentIdentityStable(options))) return null;
 	let authorized: fs.Stats;
 	try {
 		authorized = await fs.promises.stat(abs);
@@ -138,6 +153,7 @@ async function validateOpenedPath(
 ): Promise<boolean> {
 	if (!options?.isolatedHome) return true;
 	if (!(await isHomeIdentityStable(options))) return false;
+	if (!(await isUserAgentIdentityStable(options))) return false;
 	try {
 		const opened = await handle.stat();
 		const validKind =
@@ -288,6 +304,7 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
 		const entries = await fs.promises.readdir(directoryPath, { withFileTypes: true });
 		if (!(await isHomeIdentityStable(options))) return [];
+		if (!(await isUserAgentIdentityStable(options))) return [];
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
 		if (useCache) dirCache.set(abs, entries);
 		return entries;

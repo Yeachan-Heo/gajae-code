@@ -132,7 +132,7 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 
 /** Build the filesystem authority for a provider read. */
 export function getReadOptions(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity">,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
 	scope: ReadScope,
 ): ReadFileOptions | undefined {
 	if (!ctx.isolatedHome) return undefined;
@@ -141,6 +141,7 @@ export function getReadOptions(
 		home: ctx.home,
 		homeIdentity: ctx.homeIdentity,
 		userAgentDir: scope === "native" ? ctx.userAgentDir : undefined,
+		userAgentIdentity: scope === "native" ? ctx.userAgentIdentity : undefined,
 		scope,
 		bypassCache: true,
 	};
