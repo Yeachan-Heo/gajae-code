@@ -1558,7 +1558,7 @@ async function assertDeepInterviewHandoffReady(
 			throw new StateCommandError(2, "deep-interview crystallized handoff spec hash mismatch");
 		if (inner.execution_approval !== "approved" && !options.allowPlanningHandoff)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
-		if (options.allowPlanningHandoff && inner.intent_contract === undefined) return;
+		if (options.allowPlanningHandoff) return;
 	}
 	if (inner.intent_contract === undefined) {
 		if (inner.intent_contract_required === true)
@@ -1677,7 +1677,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 	}
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
-			allowPlanningHandoff: callee === "ralplan" || callee === "autoresearch" || callee === "ultragoal",
+			allowPlanningHandoff: callee === "ralplan" || callee === "autoresearch",
 		});
 
 	// Runtime callees have no native mode-state to clear later, so do not
