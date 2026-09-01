@@ -566,6 +566,16 @@ export async function enrichDeepInterviewRoundScoring(
 ): Promise<{ record: DeepInterviewRoundRecord }> {
 	assertDeepInterviewStructuredResponseWithinLimit(input);
 	const envelope = await readEnvelope(statePath);
+	if (envelope.active === false) throw new Error("cannot score a deep-interview turn after handoff or completion");
+	const scoringState = envelope.state as Record<string, unknown>;
+	const scoringCrystal = scoringState.crystal;
+	if (
+		scoringCrystal &&
+		typeof scoringCrystal === "object" &&
+		!Array.isArray(scoringCrystal) &&
+		(scoringCrystal as Record<string, unknown>).lifecycle === "ready"
+	)
+		throw new Error("cannot score a deep-interview turn after Crystal promotion");
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const rounds = readRounds(envelope);
 	const { rounds: enrichedRounds, record: reportedRecord } = enrichRoundWithScoring(rounds, {
