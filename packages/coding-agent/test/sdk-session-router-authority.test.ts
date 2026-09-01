@@ -1511,7 +1511,7 @@ describe("SessionRouter dispatch authority", () => {
 				removed.push(reason);
 			},
 		});
-		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
+		const endpoint = (await Bun.file(fixture.endpointFile).json()) as Record<string, unknown>;
 		const identity = fs.statSync(fixture.endpointFile, { bigint: true });
 		const descriptorMtimeMs = Number(identity.mtimeNs) / 1_000_000;
 		fixture.authority.endpointMtimeMs = descriptorMtimeMs + 0.0005;
