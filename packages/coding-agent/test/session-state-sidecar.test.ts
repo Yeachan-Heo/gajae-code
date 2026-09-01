@@ -1505,10 +1505,15 @@ describe("coordinator runtime state sidecar", () => {
 		);
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 
-		const failure = await persistCoordinatorRuntimeStateFromEvent(
-			{ type: "turn_start" },
-			{ sessionId, cwd: root, sessionFile: null },
-		).catch((error: unknown) => error as Error);
+		let failure: Error | undefined;
+		try {
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId, cwd: root, sessionFile: null },
+			);
+		} catch (error: unknown) {
+			failure = error as Error;
+		}
 
 		expect(failure).toBeInstanceOf(Error);
 		if (!(failure instanceof Error)) throw new Error("Expected persistence failure");
