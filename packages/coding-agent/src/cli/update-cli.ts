@@ -77,6 +77,21 @@ async function runtimeSha256(runtimePath: string): Promise<string> {
 		.digest("hex");
 }
 
+async function captureRuntimeIdentity(runtimePath: string): Promise<RuntimeFileIdentity | undefined> {
+	const stat = await fs.promises.lstat(runtimePath, { bigint: true }).catch(() => undefined);
+	if (!stat?.isFile() || stat.isSymbolicLink()) return undefined;
+	return {
+		dev: stat.dev.toString(),
+		ino: stat.ino.toString(),
+		size: stat.size.toString(),
+		sha256: await runtimeSha256(runtimePath),
+	};
+}
+
+function sameRuntimeIdentity(left: RuntimeFileIdentity, right: RuntimeFileIdentity): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.sha256 === right.sha256;
+}
+
 export interface PackageManagerUpdateResult {
 	exitCode: number | null;
 	text: () => string;
@@ -565,23 +580,23 @@ async function verifyInstalledRuntime(
 	expectedVersion: string,
 	runtimePath?: string,
 ): Promise<InstalledVersionVerification> {
-	const versionResult = await verifyInstalledVersion(expectedVersion, runtimePath ?? resolveGjcPath());
+	const resolvedRuntimePath = runtimePath ?? resolveGjcPath();
+	if (!resolvedRuntimePath) return { ok: false };
+	const initialIdentity = await captureRuntimeIdentity(resolvedRuntimePath);
+	if (!initialIdentity) return { ok: false, path: resolvedRuntimePath };
+	const versionResult = await verifyInstalledVersion(expectedVersion, resolvedRuntimePath);
 	if (!versionResult.ok || !versionResult.path) {
 		return versionResult;
 	}
 	try {
 		const smokeResult = await $`${versionResult.path} --smoke-test`.quiet().nothrow();
 		if (smokeResult.exitCode === 0) {
-			const stat = await fs.promises.lstat(versionResult.path, { bigint: true });
-			if (!stat.isFile() || stat.isSymbolicLink()) return { ...versionResult, ok: false };
+			const finalIdentity = await captureRuntimeIdentity(versionResult.path);
+			if (!finalIdentity || !sameRuntimeIdentity(initialIdentity, finalIdentity))
+				return { ...versionResult, ok: false };
 			return {
 				...versionResult,
-				identity: {
-					dev: stat.dev.toString(),
-					ino: stat.ino.toString(),
-					size: stat.size.toString(),
-					sha256: await runtimeSha256(versionResult.path),
-				},
+				identity: finalIdentity,
 			};
 		}
 		return {
