@@ -32,7 +32,7 @@ function textContent(result: { content?: Array<{ type: string; text?: string }> 
 	);
 }
 
-describe("move_session tool (agent-invokable session rescope)", () => {
+describe.serial("move_session tool (agent-invokable session rescope)", () => {
 	const tempDirs: string[] = [];
 	// The accessor's setProjectDir() chdirs the process into the moved
 	// directory; tests must restore the original cwd before their temp roots
