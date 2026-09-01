@@ -167,7 +167,6 @@ async function removeClaimedDirectory(
 		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) return;
 		const tombstone = path.join(quarantineRoot, path.basename(filePath));
 		await fs.rename(filePath, tombstone);
-		await fs.chmod(quarantineRoot, 0o500);
 		if (
 			!(await sameDirectoryIdentity(parentPath, parentIdentity)) ||
 			!(await sameDirectoryIdentity(quarantineRoot, quarantineIdentity)) ||
