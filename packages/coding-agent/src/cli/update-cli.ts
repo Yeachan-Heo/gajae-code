@@ -1565,6 +1565,7 @@ export async function runUpdateCommand(
 	});
 
 	if (target.method === "migrate" && decision.install && !opts.force) {
+		let migrationVerified = false;
 		const releaseLock = await acquireBinaryUpdateLock(target.path);
 		try {
 			const verification = await verifyTarget(release, target.path);
@@ -1572,18 +1573,21 @@ export async function runUpdateCommand(
 				record("update_check_completed", { channel, result: "available" });
 				record("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
-				if (process.platform === "darwin") {
-					try {
-						await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path);
-					} catch (error) {
-						console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
-					}
-				}
-				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
-				return;
+				migrationVerified = true;
 			}
 		} finally {
 			await releaseLock();
+		}
+		if (migrationVerified) {
+			if ((deps.platform ?? process.platform) === "darwin") {
+				try {
+					await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path);
+				} catch (error) {
+					console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
+				}
+			}
+			record("update_install_completed", { channel, result: "installed", installMethod: target.method });
+			return;
 		}
 	}
 

@@ -12,6 +12,7 @@ const GITHUB_RELEASE_ORIGIN = "https://github.com";
 const MAX_DMG_BYTES = 512 * 1024 * 1024;
 const MAX_RELEASE_BYTES = 1024 * 1024;
 const MAX_CHECKSUM_BYTES = 128 * 1024;
+const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 type CommandRunner = (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
@@ -63,13 +64,13 @@ function releaseVersion(tag: string | undefined): string | undefined {
 	return tag.slice(1);
 }
 
-function trustedReleaseAssetUrl(value: string, expectedName: string): boolean {
+function trustedReleaseAssetUrl(value: string, expectedName: string, expectedTag: string): boolean {
 	try {
 		const url = new URL(value);
 		return (
 			url.protocol === "https:" &&
 			url.origin === GITHUB_RELEASE_ORIGIN &&
-			url.pathname.startsWith(`/${COMMUNITY_APP_REPOSITORY}/releases/download/`) &&
+			url.pathname.startsWith(`/${COMMUNITY_APP_REPOSITORY}/releases/download/${expectedTag}/`) &&
 			decodeURIComponent(path.posix.basename(url.pathname)) === expectedName
 		);
 	} catch {
@@ -131,8 +132,8 @@ async function readResponseText(response: Response, maxBytes: number): Promise<s
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
 	const outputPromise = Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
+		readResponseText(new Response(child.stdout), MAX_COMMAND_OUTPUT_BYTES),
+		readResponseText(new Response(child.stderr), MAX_COMMAND_OUTPUT_BYTES),
 		child.exited,
 	]);
 	const timeout = Promise.withResolvers<undefined>();
@@ -144,13 +145,19 @@ async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: s
 		}
 		timeout.resolve(undefined);
 	}, COMMAND_TIMEOUT_MS);
-	const output = await Promise.race([outputPromise, timeout.promise]);
+	const output = await Promise.race([
+		outputPromise
+			.then(value => ({ kind: "output" as const, value }))
+			.catch(error => ({ kind: "error" as const, error })),
+		timeout.promise.then(() => ({ kind: "timeout" as const })),
+	]);
 	clearTimeout(timer);
-	if (!output) {
-		await outputPromise.catch(() => undefined);
+	if (output.kind === "timeout") {
+		await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(5000)]);
 		return { exitCode: 124, stdout: "", stderr: `command timed out: ${argv[0]}` };
 	}
-	const [stdout, stderr, exitCode] = output;
+	if (output.kind === "error") return { exitCode: 125, stdout: "", stderr: String(output.error) };
+	const [stdout, stderr, exitCode] = output.value;
 	return { exitCode, stdout, stderr };
 }
 
@@ -302,7 +309,7 @@ export async function offerMacosCommunityApp(
 	const fetchOptions = (): RequestInit => ({ signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
 	let tempRoot: string | undefined;
 	let mountPoint: string | undefined;
-	let attached = false;
+	let mountAttempted = false;
 	let installedDestination: string | undefined;
 	try {
 		const releaseResponse = await fetchImpl(
@@ -325,13 +332,16 @@ export async function offerMacosCommunityApp(
 		const dmg = release.assets.find(
 			asset => asset.name.toLowerCase().endsWith(".dmg") && assetMatchesArchitecture(asset.name, arch, tagVersion),
 		);
-		if (!dmg || !trustedReleaseAssetUrl(dmg.browser_download_url, dmg.name))
+		if (!dmg || !trustedReleaseAssetUrl(dmg.browser_download_url, dmg.name, release.tag_name!))
 			return failure(`no verified macOS ${arch} DMG is published`, log);
 		const checksumAsset = release.assets.find(
 			asset =>
 				asset.name === `${dmg.name}.sha256` || (asset.name.endsWith(".sha256") && asset.name.includes(dmg.name)),
 		);
-		if (!checksumAsset || !trustedReleaseAssetUrl(checksumAsset.browser_download_url, checksumAsset.name))
+		if (
+			!checksumAsset ||
+			!trustedReleaseAssetUrl(checksumAsset.browser_download_url, checksumAsset.name, release.tag_name!)
+		)
 			return failure("the release has no trusted DMG checksum", log);
 		const [dmgResponse, checksumResponse] = await Promise.all([
 			fetchImpl(dmg.browser_download_url, fetchOptions()),
@@ -350,6 +360,7 @@ export async function offerMacosCommunityApp(
 		mountPoint = path.join(tempRoot, "mount");
 		await fs.mkdir(mountPoint);
 		await Bun.write(dmgPath, dmgBytes);
+		mountAttempted = true;
 		const attach = await command([
 			"/usr/bin/hdiutil",
 			"attach",
@@ -359,15 +370,7 @@ export async function offerMacosCommunityApp(
 			mountPoint,
 			dmgPath,
 		]);
-		if (attach.exitCode !== 0) {
-			try {
-				await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
-			} catch {
-				// The image may not have mounted; cleanup remains best effort.
-			}
-			return failure("the DMG could not be mounted safely", log);
-		}
-		attached = true;
+		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		const entries = await fs.readdir(mountPoint, { withFileTypes: true });
 		const appEntry = entries.find(entry => entry.isDirectory() && entry.name.endsWith(".app"));
 		if (!appEntry) return failure("the mounted DMG contained no app bundle", log);
@@ -413,7 +416,7 @@ export async function offerMacosCommunityApp(
 		}
 		return failure(error instanceof Error ? error.message : String(error), log);
 	} finally {
-		if (attached && mountPoint) {
+		if (mountAttempted && mountPoint) {
 			try {
 				const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
 				if (detach.exitCode !== 0)
