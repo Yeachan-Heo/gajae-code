@@ -109,6 +109,9 @@ async function readResponseBytes(response: Response, maxBytes: number): Promise<
 				chunks.push(value);
 			}
 		}
+	} catch (error) {
+		await reader.cancel().catch(() => undefined);
+		throw error;
 	} finally {
 		reader.releaseLock();
 	}
@@ -356,7 +359,14 @@ export async function offerMacosCommunityApp(
 			mountPoint,
 			dmgPath,
 		]);
-		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
+		if (attach.exitCode !== 0) {
+			try {
+				await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+			} catch {
+				// The image may not have mounted; cleanup remains best effort.
+			}
+			return failure("the DMG could not be mounted safely", log);
+		}
 		attached = true;
 		const entries = await fs.readdir(mountPoint, { withFileTypes: true });
 		const appEntry = entries.find(entry => entry.isDirectory() && entry.name.endsWith(".app"));
