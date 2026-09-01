@@ -154,6 +154,13 @@ describe("deep-interview crystallize contract", () => {
 		expect(second.delta.approval_invalidated).toBe(true);
 	});
 
+	it("rejects removal IDs that remain submitted", () => {
+		const first = crystallizeDeepInterview(input());
+		expect(() =>
+			crystallizeDeepInterview(later(input({ prior: first, removed_ids: ["constraint:latency"] }), 2)),
+		).toThrow("disjoint");
+	});
+
 	it("promotes through the existing state/spec shape without approval", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-runtime-"));
 		const value = input();
