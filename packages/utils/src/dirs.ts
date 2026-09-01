@@ -575,7 +575,7 @@ class DirResolver {
 	agentSubdir(userAgentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
 		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
-		if (!userAgentDir || userAgentDir === this.agentDir) {
+		if (!userAgentDir || normalizePathForComparison(userAgentDir) === normalizePathForComparison(this.agentDir)) {
 			const cached = this.#agentCache.get(subdir);
 			if (cached) return cached;
 			const base = xdg ? this.#agentDirs[xdg] : this.agentDir;
