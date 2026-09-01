@@ -5,7 +5,7 @@ export type CrystalItemKind = "goal" | "constraint" | "decision" | "acceptance_c
 
 export interface CrystalMessage {
 	index: number;
-	role: "user" | "assistant" | "system" | "tool";
+	role: "user" | "assistant" | "system" | "tool" | "toolResult" | "developer";
 	content: string;
 }
 
@@ -110,7 +110,14 @@ function validateSnapshot(value: unknown): CrystalSnapshot {
 		const messageIndex = integer(entry.index, `snapshot.messages[${index}].index`);
 		if (messageIndex < start || messageIndex > end) throw new Error("snapshot message is outside its declared range");
 		const role = entry.role as CrystalMessage["role"];
-		if (role !== "user" && role !== "assistant" && role !== "system" && role !== "tool")
+		if (
+			role !== "user" &&
+			role !== "assistant" &&
+			role !== "system" &&
+			role !== "tool" &&
+			role !== "toolResult" &&
+			role !== "developer"
+		)
 			throw new Error("snapshot message role is invalid");
 		return { index: messageIndex, role, content: text(entry.content, `snapshot.messages[${index}].content`) };
 	});
