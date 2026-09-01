@@ -5,10 +5,12 @@ import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import { crystallizeDeepInterview, crystalMarkdown } from "./deep-interview-crystallize";
 import { isDeepInterviewStageVerb, runDeepInterviewStageCommand } from "./deep-interview-stage";
 import {
 	assertDeepInterviewInputWithinLimit,
 	assertDeepInterviewIntentReview,
+	assertDeepInterviewStructuredResponseWithinLimit,
 	type DeepInterviewIntentCategory,
 	type DeepInterviewIntentItem,
 	type DeepInterviewIntentManifest,
@@ -132,6 +134,110 @@ const VALUE_FLAGS = new Set([
 	"--spec",
 	"--handoff",
 ]);
+
+async function readCrystallizeInput(rawInput: string | undefined, cwd: string): Promise<Record<string, unknown>> {
+	if (!rawInput?.trim())
+		throw new DeepInterviewCommandError(2, "--input is required for deep-interview --crystallize");
+	let raw = rawInput.trim();
+	if (raw.startsWith("@")) {
+		const filePath = path.resolve(cwd, raw.slice(1));
+		try {
+			raw = await fs.readFile(filePath, "utf-8");
+		} catch (error) {
+			throw new DeepInterviewCommandError(
+				2,
+				`failed to read --input file ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch (error) {
+		throw new DeepInterviewCommandError(
+			2,
+			`--input is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	assertDeepInterviewStructuredResponseWithinLimit(parsed);
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+		throw new DeepInterviewCommandError(2, "crystallize input must be a JSON object");
+	return parsed as Record<string, unknown>;
+}
+
+async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
+	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);
+	const session = resolveGjcSessionForWrite(cwd, {
+		flagValue: flagValue(args, "--session-id"),
+		envSessionId: process.env.GJC_SESSION_ID,
+	});
+	const sessionId = session.gjcSessionId;
+	assertSafePathComponent(sessionId, "session-id");
+	const statePath = deepInterviewStatePath(cwd, sessionId);
+	const existingRead = await readExistingStateForMutation(statePath);
+	if (existingRead.kind === "corrupt")
+		throw new DeepInterviewCommandError(
+			2,
+			`existing deep-interview state is corrupt or tampered (${existingRead.error})`,
+		);
+	const existing =
+		existingRead.kind === "valid"
+			? normalizeDeepInterviewEnvelope(existingRead.value)
+			: normalizeDeepInterviewEnvelope({});
+	const payload = { ...input, prior: input.prior ?? (existing.state as Record<string, unknown> | undefined)?.crystal };
+	const crystal = crystallizeDeepInterview(payload);
+	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
+	assertSafePathComponent(slug, "slug");
+	const specPath = path.join(sessionSpecsDir(cwd, sessionId), `deep-interview-${slug}.md`);
+	const now = new Date().toISOString();
+	await writeArtifact(specPath, crystalMarkdown(crystal), {
+		cwd,
+		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+	});
+	const state = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
+	const envelope = {
+		...existing,
+		active: true,
+		current_phase: "handoff",
+		skill: "deep-interview",
+		version: WORKFLOW_STATE_VERSION,
+		session_id: sessionId,
+		spec_slug: slug,
+		spec_path: specPath,
+		spec_stage: "final",
+		spec_sha256: createHash("sha256").update(crystalMarkdown(crystal)).digest("hex"),
+		spec_persisted_at: now,
+		state,
+		updated_at: now,
+	};
+	await writeWorkflowEnvelopeAtomic(statePath, envelope, {
+		cwd,
+		receipt: {
+			cwd,
+			skill: "deep-interview",
+			owner: "gjc-runtime",
+			command: "gjc deep-interview crystallize",
+			sessionId,
+			nowIso: now,
+		},
+		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+	});
+	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
+	await syncDeepInterviewHud({ cwd, sessionId, payload: envelope, phase: "handoff", specStatus: "persisted" });
+	const summary = {
+		skill: "deep-interview",
+		mode: "crystallize",
+		crystal,
+		spec_path: specPath,
+		state_path: statePath,
+	};
+	return {
+		status: 0,
+		stdout: hasFlag(args, "--json")
+			? `${JSON.stringify(summary)}\n`
+			: `Crystal v${crystal.spec_version} created\nReadiness: ${crystal.lifecycle}\nExecution approval: none\nspec_path=${specPath}\n`,
+	};
+}
 
 function defaultSpecSlug(now: Date = new Date()): string {
 	const yyyy = now.getUTCFullYear().toString().padStart(4, "0");
@@ -878,6 +984,7 @@ export async function runNativeDeepInterviewCommand(
 	try {
 		const [firstArg, ...restArgs] = args;
 		if (isDeepInterviewStageVerb(firstArg)) return await runDeepInterviewStageCommand(firstArg, restArgs, cwd);
+		if (hasFlag(args, "--crystallize")) return await handleCrystallize(args, cwd);
 		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd, options.agentDir);
 		const resolved = await resolveDeepInterviewArgs(args, cwd, options.agentDir);
 		if (!resolved.idea) {
