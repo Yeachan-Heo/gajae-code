@@ -158,7 +158,8 @@ function getDoneOptionLabel(): string {
 	return success ? `${success} Done selecting` : "Done selecting";
 }
 
-function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
+export function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
+	if (optionCount <= 1) return undefined;
 	return typeof recommended === "number" &&
 		Number.isFinite(recommended) &&
 		Number.isInteger(recommended) &&
@@ -350,7 +351,7 @@ async function askSingleQuestion(
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
 	const {
-		recommended,
+		recommended: requestedRecommended,
 		timeout,
 		signal,
 		initialSelection,
@@ -358,6 +359,7 @@ async function askSingleQuestion(
 		scrollTitleRows,
 		autoSelectOnTimeout = true,
 	} = options;
+	const recommended = validRecommendedIndex(requestedRecommended, optionLabels.length);
 	const doneLabel = getDoneOptionLabel();
 	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 	const clarificationOptionLabel = options.clarificationOptionLabel;

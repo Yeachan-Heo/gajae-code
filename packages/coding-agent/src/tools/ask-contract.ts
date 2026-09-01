@@ -26,8 +26,31 @@ function deepInterviewBoundedString(maximum: number) {
 	});
 }
 
+const RESERVED_CUSTOM_INPUT_OPTION_PATTERNS: readonly RegExp[] = [
+	/^other$/i,
+	/\bother\s*\(\s*type\s+your\s+own\s*\)/i,
+	/\btype\s+your\s+own\b/i,
+	/\bcustom\s+input\b/i,
+	/직접\s*입력/,
+];
+
+function isReservedCustomInputOptionLabel(label: string): boolean {
+	const normalized = label.trim().replace(/\s+/g, " ");
+	return RESERVED_CUSTOM_INPUT_OPTION_PATTERNS.some(pattern => pattern.test(normalized));
+}
+
 const OptionItem = z.object({
-	label: z.string().describe("display label"),
+	label: z
+		.string()
+		.describe("display label")
+		.superRefine((value, context) => {
+			if (isReservedCustomInputOptionLabel(value))
+				context.addIssue({
+					code: "custom",
+					message:
+						"ask option labels must not imitate the reserved custom-input control; omit the pseudo-option and let the Ask UI add Other (type your own)",
+				});
+		}),
 });
 
 const DEEP_INTERVIEW_INTENT_ID_PATTERN = /^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/;
