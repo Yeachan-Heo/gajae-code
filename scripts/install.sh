@@ -459,30 +459,40 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
 verify_checksum() {
     asset_name="$1"
     downloaded="$2"
+    VERIFY_CHECKSUM_OPTIONAL="${3:-}"
     exclusive_tmp "gjc.sha256"
     sums_tmp="$LAST_EXCLUSIVE_TMP"
     exclusive_tmp "gjc.manifest"
     manifest_tmp="$LAST_EXCLUSIVE_TMP"
     sums_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_SHA256_ASSET}"
-    http_code=$(curl_github_optional "$sums_url" "$sums_tmp") || die "Failed to fetch integrity asset $sums_url. Existing install was not changed."
+    http_code=$(curl_github_optional "$sums_url" "$sums_tmp") || {
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
+        die "Failed to fetch integrity asset $sums_url. Existing install was not changed."
+    }
     if [ "$http_code" = "200" ]; then
         expected=$(lookup_checksum "$sums_tmp" "$asset_name")
         if [ ${#expected} -ne 64 ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Release checksum file ${BINARY_SHA256_ASSET} did not list ${asset_name}"
         fi
         actual=$(file_sha256 "$downloaded")
         if [ "$actual" != "$expected" ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
         fi
         echo "Verified SHA-256 for ${asset_name}"
         return 0
     fi
     if [ "$http_code" != "404" ]; then
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
         die "Integrity asset ${BINARY_SHA256_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
     manifest_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_MANIFEST_ASSET}"
-    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp") || die "Failed to fetch integrity asset $manifest_url. Existing install was not changed."
+    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp") || {
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
+        die "Failed to fetch integrity asset $manifest_url. Existing install was not changed."
+    }
     if [ "$http_code" = "200" ]; then
         expected=$(awk -v name="$asset_name" '
             $0 ~ "\"name\"" && $0 ~ name { saw=1 }
@@ -497,19 +507,23 @@ verify_checksum() {
             }
         ' "$manifest_tmp")
         if [ ${#expected} -ne 64 ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Release manifest ${BINARY_MANIFEST_ASSET} did not list a SHA-256 for ${asset_name}"
         fi
         actual=$(file_sha256 "$downloaded")
         if [ "$actual" != "$expected" ]; then
+            if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
             die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
         fi
         echo "Verified SHA-256 for ${asset_name} from ${BINARY_MANIFEST_ASSET}"
         return 0
     fi
     if [ "$http_code" != "404" ]; then
+        if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
         die "Integrity asset ${BINARY_MANIFEST_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
+    if [ "$VERIFY_CHECKSUM_OPTIONAL" = "optional" ]; then return 1; fi
     die "Release ${LATEST} has no checksum assets. Existing install was not changed."
 }
 
@@ -658,7 +672,7 @@ install_binary() {
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && ln "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
-            if [ -f "$OFFER_RUNTIME" ] && [ "$OFFER_RUNTIME" -ef "$DEST_PATH" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME"; then
+            if [ -f "$OFFER_RUNTIME" ] && [ "$OFFER_RUNTIME" -ef "$DEST_PATH" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
                 "$OFFER_RUNTIME" macos-community-app-offer || true
             fi
             rm -rf "$OFFER_RUNTIME_DIR" || true
