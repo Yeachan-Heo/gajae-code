@@ -287,3 +287,48 @@ describe("macOS community app verified installation", () => {
 		await expect(fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app"))).rejects.toThrow();
 	});
 });
+
+describe("macOS community app attach cleanup", () => {
+	test("removes temporary state when attach returns failure or throws before mounting", async () => {
+		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
+		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
+		const dmg = new Uint8Array([5, 6, 7]);
+		const before = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
+		for (const mode of ["return", "throw"] as const) {
+			const command = async (argv: string[]) => {
+				if (argv[0] === "/usr/bin/mdfind") return { exitCode: 1, stdout: "", stderr: "" };
+				if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "attach") {
+					if (mode === "throw") throw new Error("attach failed");
+					return { exitCode: 1, stdout: "", stderr: "attach failed" };
+				}
+				return { exitCode: 1, stdout: "", stderr: "" };
+			};
+			const result = await offerMacosCommunityApp({
+				platform: "darwin",
+				arch: "arm64",
+				env: {},
+				stdinIsTTY: true,
+				stdoutIsTTY: true,
+				prompt: async () => true,
+				command,
+				fetchImpl: async url => {
+					if (url.includes("/releases/latest"))
+						return new Response(
+							JSON.stringify({
+								tag_name: "v1.0.0",
+								assets: [
+									{ name: dmgName, browser_download_url: dmgUrl },
+									{ name: `${dmgName}.sha256`, browser_download_url: `${dmgUrl}.sha256` },
+								],
+							}),
+						);
+					if (url === dmgUrl) return new Response(dmg);
+					return new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${dmgName}\n`);
+				},
+			});
+			expect(result.status).toBe("failed");
+		}
+		const after = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
+		expect(after).toEqual(before);
+	});
+});

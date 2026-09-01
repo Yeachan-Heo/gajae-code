@@ -484,19 +484,40 @@ export async function offerMacosCommunityApp(
 		if (!(await sameDirectoryIdentity(tempRoot, tempRootIdentity)))
 			return failure("the temporary root identity changed before attach", log);
 		throwIfInterrupted();
+		const mountPointBeforeAttachIdentity = await fileIdentity(mountPoint);
 		mountAttempted = true;
 		mountAttached = true;
-		const attach = await command([
-			"/usr/bin/hdiutil",
-			"attach",
-			"-nobrowse",
-			"-readonly",
-			"-mountpoint",
-			mountPoint,
-			dmgPath,
-		]);
+		let attach: { exitCode: number; stdout: string; stderr: string };
+		try {
+			attach = await command([
+				"/usr/bin/hdiutil",
+				"attach",
+				"-nobrowse",
+				"-readonly",
+				"-mountpoint",
+				mountPoint,
+				dmgPath,
+			]);
+		} catch (error) {
+			const observedMountIdentity = await fileIdentity(mountPoint);
+			const mountChanged =
+				observedMountIdentity &&
+				mountPointBeforeAttachIdentity &&
+				(observedMountIdentity.dev !== mountPointBeforeAttachIdentity.dev ||
+					observedMountIdentity.ino !== mountPointBeforeAttachIdentity.ino);
+			mountIdentity = mountChanged ? observedMountIdentity : undefined;
+			mountAttached = Boolean(mountIdentity);
+			throw error;
+		}
 		throwIfInterrupted();
-		mountIdentity = await fileIdentity(mountPoint);
+		const observedMountIdentity = await fileIdentity(mountPoint);
+		const mountChanged =
+			observedMountIdentity &&
+			mountPointBeforeAttachIdentity &&
+			(observedMountIdentity.dev !== mountPointBeforeAttachIdentity.dev ||
+				observedMountIdentity.ino !== mountPointBeforeAttachIdentity.ino);
+		mountIdentity = attach.exitCode === 0 || mountChanged ? observedMountIdentity : undefined;
+		mountAttached = Boolean(mountIdentity);
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		if (!mountIdentity) return failure("the mounted volume was not a real directory", log);
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
@@ -637,6 +658,8 @@ export async function offerMacosCommunityApp(
 				} else if (mountAttached && !mountIdentity) {
 					removeTempRoot = false;
 					log("Optional community app cleanup warning: mount identity was unavailable; refusing pathname detach");
+				} else if (!mountAttached && !mountIdentity) {
+					// The attach attempt completed without establishing a mount.
 				} else {
 					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
 					if (detach.exitCode !== 0) {
