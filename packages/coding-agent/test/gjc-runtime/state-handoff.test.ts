@@ -150,6 +150,27 @@ describe("gjc state handoff", () => {
 			expect((after.state as Record<string, unknown>).execution_approval).toBe("approved");
 		});
 	});
+	it("permits validated legacy final-spec execution handoff", async () => {
+		await withTempCwd(async cwd => {
+			const specPath = path.join(cwd, "legacy.md");
+			await fs.writeFile(specPath, "# Legacy\n");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: 2,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				spec_sha256: createHash("sha256").update("# Legacy\n").digest("hex"),
+				state: { rounds: [], established_facts: [] },
+			});
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(0);
+		});
+	});
 
 	it("bounds referenced legacy specs before a deep-interview handoff mutates workflow state", async () => {
 		const writeLegacyCaller = async (cwd: string, spec: string) => {
