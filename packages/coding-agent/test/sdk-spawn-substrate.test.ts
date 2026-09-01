@@ -150,7 +150,9 @@ describe("Broker spawn substrate provider", () => {
 		});
 	});
 
-	it("returns a typed proof failure after managed tagging or identity failure without falling back to headless", async () => {
+	it("degrades to the headless substrate when the managed launch fails, retaining its diagnostic", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-substrate-"));
+		temporaryDirectories.push(cwd);
 		let headlessStarted = false;
 		const provider = createSpawnSubstrateProvider(
 			managedDependencies({
@@ -161,14 +163,12 @@ describe("Broker spawn substrate provider", () => {
 					headlessStarted = true;
 					return { pid: 999, terminate() {} };
 				},
+				processIncarnation: () => "darwin:999",
 			}),
 		);
-		await expect(provider.launch(launchSpec())).resolves.toEqual({
-			ok: false,
-			code: "substrate_proof_failed",
-			message: "The selected spawn substrate could not be proven exactly.",
-		});
-		expect(headlessStarted).toBeFalse();
+		const result = await provider.launch(launchSpec(cwd));
+		expect(result).toMatchObject({ ok: true, proof: { substrateKind: "headless", pid: 999 } });
+		expect(headlessStarted).toBeTrue();
 	});
 
 	it("reports a reused pane PID with a different OS incarnation as a mismatch", async () => {
