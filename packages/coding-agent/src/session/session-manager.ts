@@ -10944,14 +10944,16 @@ export class SessionManager {
 			try {
 				return await fn();
 			} finally {
-				readLease.active = false;
-				readLease.released = true;
-				this.#cwdReaderCount -= 1;
-				if (this.#cwdReaderCount === 0) {
-					const drained = this.#cwdReadersDrained;
-					this.#cwdReadersDrained = undefined;
-					drained?.();
+				if (readLease.active) {
+					readLease.active = false;
+					this.#cwdReaderCount -= 1;
+					if (this.#cwdReaderCount === 0) {
+						const drained = this.#cwdReadersDrained;
+						this.#cwdReadersDrained = undefined;
+						drained?.();
+					}
 				}
+				readLease.released = true;
 			}
 		});
 	}

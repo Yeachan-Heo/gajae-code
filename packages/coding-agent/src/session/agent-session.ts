@@ -8977,21 +8977,7 @@ export class AgentSession {
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		this.#disconnectFromAgent();
-		const teardown = this.#dispose();
-		let timeout: NodeJS.Timeout | undefined;
-		const deadline = Promise.withResolvers<void>();
-		timeout = setTimeout(() => deadline.resolve(), SIGNAL_TEARDOWN_TIMEOUT_MS);
-		timeout.unref?.();
-		void Promise.race([teardown, deadline.promise]).then(
-			() => {
-				if (timeout) clearTimeout(timeout);
-				resolve();
-			},
-			error => {
-				if (timeout) clearTimeout(timeout);
-				reject(error);
-			},
-		);
+		void this.#dispose().then(resolve, reject);
 		return promise;
 	}
 
@@ -9042,7 +9028,7 @@ export class AgentSession {
 		// R2-5: join any in-flight mid-run maintenance invocation before teardown so the
 		// abort-aware maintenance promise (already aborted above) settles and cannot touch
 		// torn-down state afterward.
-		await this.#waitForActiveMidRunMaintenance();
+		await awaitDisposeStep("mid-run maintenance", this.#waitForActiveMidRunMaintenance());
 		// R2-5: give the aborted Agent run a bounded chance to settle, then force-
 		// invalidate its run id so an abort-ignoring provider/tool cannot emit a late
 		// message_end after teardown. Mirrors AgentSession.abort({ timeoutMs }).
@@ -9062,27 +9048,30 @@ export class AgentSession {
 				this.agent.forceAbort("Session disposed");
 			}
 		}
-		await this.#agentEndPublicationPromise;
-		await this.#queuedExtensionEvents;
-		await this.#agentEndHandlingPromise;
+		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
+		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
+		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
 		// a still-queued write would run after the session that owns it is gone — releasing
 		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
 		// the addon after the runtime tore down the context it was scheduled in. The chain
 		// is already failure-absorbing, so this only waits.
-		await this.#coordinatorPersistQueue;
+		await awaitDisposeStep("coordinator persistence", this.#coordinatorPersistQueue);
 		// Terminal publication records its reconciliation from a promise reaction, which
 		// can append after the queue snapshot above was awaited. Drain the tracked writes
 		// again so disposal cannot return while that late reconciliation still owns a lock.
-		await this.#drainUnbarrieredCoordinatorPersists();
+		await awaitDisposeStep("unbarriered coordinator persistence", this.#drainUnbarrieredCoordinatorPersists());
 		this.#pendingBackgroundExchanges = [];
 		this.#drainTerminalOwnedYieldEntries();
 
 		this.agent.setOnBeforeYield(undefined);
 		try {
 			if (this.#extensionRunner?.hasHandlers("session_shutdown")) {
-				await this.#extensionRunner.emit({ type: "session_shutdown" });
+				await awaitDisposeStep(
+					"session shutdown handlers",
+					this.#extensionRunner.emit({ type: "session_shutdown" }),
+				);
 			}
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
@@ -9090,12 +9079,12 @@ export class AgentSession {
 		this.#workflowGateEmitter?.fence?.();
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
-		await this.#flushWorkerIntegrationAttempt();
+		await awaitDisposeStep("worker integration", this.#flushWorkerIntegrationAttempt());
 		// Worker integration completion can enqueue terminal reconciliation while the
 		// flush above is pending; drain that late producer before disposal resolves.
-		await this.#coordinatorPersistQueue;
-		await this.#drainUnbarrieredCoordinatorPersists();
-		await (this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
+		await awaitDisposeStep("post-worker coordinator persistence", this.#coordinatorPersistQueue);
+		await awaitDisposeStep("post-worker unbarriered persistence", this.#drainUnbarrieredCoordinatorPersists());
+		await awaitDisposeStep("post-prompt tasks", this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
 		// the session that owns the manager goes on to dispose it (which itself
@@ -9110,10 +9099,10 @@ export class AgentSession {
 		// — a shared manager would otherwise keep the claim past this session's
 		// disposal.
 		this.#drainTerminalOwnedYieldEntries();
-		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
+		await awaitDisposeStep("deferred owner shutdown", Promise.allSettled(this.#deferredOwnerShutdownFinalizations));
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
 		if (ownedAsyncManager && this.#disposeAsyncJobManager) {
-			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
+			const drained = await awaitDisposeStep("async job manager", ownedAsyncManager.dispose({ timeoutMs: 3_000 }));
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
 				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
@@ -9122,20 +9111,20 @@ export class AgentSession {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
-		await this.#runToolSessionTransitionCleanups();
-		await this.#runToolSessionCleanups();
+		await awaitDisposeStep("tool session transition cleanups", this.#runToolSessionTransitionCleanups());
+		await awaitDisposeStep("tool session cleanups", this.#runToolSessionCleanups());
 		// Only disconnect the MCP manager THIS session owns (top-level sessions that
 		// connected plugin-bundle MCP servers). Subagents and callers that merely
 		// observe the process-global manager must never tear down a manager they do
 		// not own. Mirrors the ownedAsyncJobManager rule above.
 		const ownedMcpManager = this.#ownedMcpManager;
 		if (ownedMcpManager) {
-			await ownedMcpManager.releaseLeases();
+			await awaitDisposeStep("MCP lease release", ownedMcpManager.releaseLeases());
 			if (MCPManager.instance() === ownedMcpManager) {
 				MCPManager.setInstance(undefined);
 			}
 		}
-		await shutdownAllLspClients();
+		await awaitDisposeStep("LSP shutdown", shutdownAllLspClients());
 		// F13: release only THIS session's browser tabs on dispose (kill:false → remote
 		// browsers disconnect, headless close gracefully). Scoped by the session id the
 		// browser tool tagged tabs with, so other live sessions' tabs are untouched.
@@ -9154,29 +9143,35 @@ export class AgentSession {
 		this.#unregisterMovePublicationListener = undefined;
 		this.#unregisterAfterMoveListener?.();
 		this.#unregisterAfterMoveListener = undefined;
-		await releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
-			logger.warn("session dispose: releaseTabsForOwner failed", { error }),
+		await awaitDisposeStep(
+			"browser tab release",
+			releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
+				logger.warn("session dispose: releaseTabsForOwner failed", { error }),
+			),
 		);
-		const pythonExecutionsSettled = await this.#prepareEvalExecutionsForDispose();
+		const pythonExecutionsSettled = await awaitDisposeStep(
+			"Python execution preparation",
+			this.#prepareEvalExecutionsForDispose(),
+		);
 		if (!pythonExecutionsSettled) {
 			logger.warn(
 				"Detaching retained Python kernel ownership during dispose while Python execution is still active",
 			);
 		}
-		await disposeKernelSessionsByOwner(this.#evalKernelOwnerId);
-		await disposeVmContextsByOwner(this.#evalKernelOwnerId);
+		await awaitDisposeStep("Python kernel sessions", disposeKernelSessionsByOwner(this.#evalKernelOwnerId));
+		await awaitDisposeStep("VM contexts", disposeVmContextsByOwner(this.#evalKernelOwnerId));
 		this.#releasePowerAssertion();
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
-		await this.memoryBackend.dispose();
-		if (this.#workspaceTreeService) await this.#workspaceTreeService.dispose();
-		if (this.#networkPrewarmService) await this.#networkPrewarmService.dispose();
+		await awaitDisposeStep("memory backend", this.memoryBackend.dispose());
+		if (this.#workspaceTreeService) await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose());
+		if (this.#networkPrewarmService) await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose());
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
-		await this.sessionManager.close();
+		await awaitDisposeStep("session manager close", this.sessionManager.close());
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
-		await hindsightState?.dispose();
+		await awaitDisposeStep("hindsight state", hindsightState?.dispose() ?? Promise.resolve());
 		this.setHindsightSessionState(undefined);
 		if (this.#unsubscribeAppendOnly) {
 			this.#unsubscribeAppendOnly();
