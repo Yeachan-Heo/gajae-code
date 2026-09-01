@@ -17,6 +17,8 @@
 
 ### Fixed
 
+- The first Esc on a streaming turn with a queued steering message again consumes that steer and auto-continues instead of aborting the turn and dumping the queue back into the composer. The busy-indicator recovery branch counted the same drainable queue as cancellable work and, because a streaming turn always has that indicator mounted, it short-circuited before the steer-on-interrupt branch could run. Stale busy-indicator recovery, pending-submission cancellation, and the loud second-Esc abort are unchanged.
+
 - Interactive `/login`, `/logout`, and account inventory commands now keep the TUI alive when the credential database reports `SQLITE_CORRUPT` or `SQLITE_NOTADB`. They show a bounded, payload-free recovery message and never auto-repair or delete the database. (#5070)
 - `session.last_assistant` now reads the public transcript projection, skips trailing tool-only, thinking-only, empty, and whitespace-only assistant rows, and returns the most recent readable assistant text or an empty string when none exists. (#5078)
 - Chat-daemon same-generation successor attachments now wait for predecessor provider retirement before admitting frames. Retired attachment frames remain fenced, successor frames resume after retirement, queue waiters settle during takeover and shutdown, and cross-generation replacement remains isolated. (#5120)

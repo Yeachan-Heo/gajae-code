@@ -420,6 +420,24 @@ export class InputController {
 			if (this.ctx.cancelPendingSubmission()) {
 				return true;
 			}
+			// A queued steer on a live stream is owned by the steering branch below,
+			// which silently consumes it and auto-continues. This branch counts the same
+			// queue as cancellable work, and a streaming turn always has the indicator
+			// mounted, so without this hand-off it short-circuited first and turned the
+			// documented steer-on-interrupt into a loud abort that dumped the steer back
+			// into the composer. `cancelPendingSubmission()` above still wins: a
+			// submission that has not started yet is cancelled before the stream owns
+			// the key, and one that has started returns false there by design.
+			if (
+				options.streaming === true &&
+				this.ctx.session.isStreaming &&
+				this.ctx.session.hasQueuedSteering &&
+				!this.#steerConsumePending
+			) {
+				this.#steerConsumePending = true;
+				void this.#abortInteractive({ silent: true });
+				return true;
+			}
 			// Only count queues this handler can actually drain. The aggregate
 			// `queuedMessageCount` also counts hidden next-turn context, which
 			// `restoreQueuedMessagesToEditor()` never returns and which survives turn

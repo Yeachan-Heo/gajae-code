@@ -951,6 +951,102 @@ describe("InputController escape behavior", () => {
 		expect(spies.clearQueue).not.toHaveBeenCalled();
 	});
 
+	it("consumes a queued steer on the first Esc while the streaming busy indicator is mounted", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		// Every streaming turn mounts the activity indicator, so the busy branch is
+		// live for the exact case steer-on-interrupt is meant to handle.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		(ctx.session as { drainableQueuedMessageCount: number }).drainableQueuedMessageCount = 1;
+		spies.clearQueue.mockReturnValue({ steering: ["do this instead"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt", silent: true }));
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+	});
+
+	it("consumes a queued steer while the started submission for that turn is still pending", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		(ctx.session as { drainableQueuedMessageCount: number }).drainableQueuedMessageCount = 1;
+		// The submission that started this turn is only finished in the turn-level
+		// `finally`, so it stays pending for the whole stream. It has already started,
+		// so `cancelPendingSubmission()` declines it.
+		spies.hasPendingSubmission.mockReturnValue(true);
+		spies.cancelPendingSubmission.mockReturnValue(false);
+		spies.clearQueue.mockReturnValue({ steering: ["do this instead"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt", silent: true }));
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		expect(editor.getText()).toBe("");
+	});
+
+	it("still cancels an unstarted submission before a queued steer claims the key", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		spies.hasPendingSubmission.mockReturnValue(true);
+		spies.cancelPendingSubmission.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.cancelPendingSubmission).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+	});
+
+	it("still aborts loudly on the second Esc when the busy indicator is mounted", () => {
+		const { ctx, editor, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		(ctx.session as { drainableQueuedMessageCount: number }).drainableQueuedMessageCount = 1;
+		spies.clearQueue.mockReturnValue({ steering: ["do this instead"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+		editor.onEscape?.();
+
+		expect(spies.abort).toHaveBeenCalledTimes(2);
+		expect(spies.abort.mock.calls[0]?.[0]).toMatchObject({ silent: true });
+		expect(spies.abort.mock.calls[1]?.[0]?.silent).toBeUndefined();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("do this instead");
+	});
+
+	it("consumes a queued steer on the first Ctrl+C while the streaming busy indicator is mounted", () => {
+		const { ctx, inputListeners, spies } = createContext();
+		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
+		(ctx.session as { hasQueuedSteering: boolean }).hasQueuedSteering = true;
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		(ctx.session as { drainableQueuedMessageCount: number }).drainableQueuedMessageCount = 1;
+		spies.clearQueue.mockReturnValue({ steering: ["do this instead"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		expect(inputListeners[0]?.("\x03")).toEqual({ consume: true });
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt", silent: true }));
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+	});
+
 	it("does a real abort on the second Esc while a steer consume is still pending", () => {
 		const { ctx, editor, spies } = createContext();
 		(ctx.session as { isStreaming: boolean; hasQueuedSteering: boolean }).isStreaming = true;
