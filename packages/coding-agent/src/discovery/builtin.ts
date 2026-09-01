@@ -115,7 +115,7 @@ async function findNearestProjectConfigDir(
 	repoRoot?: string | null,
 	home?: string,
 ): Promise<{ dir: string; depth: number } | null> {
-	for (const ancestor of getAncestorDirs(cwd, repoRoot ?? home, home)) {
+	for (const ancestor of getAncestorDirs(cwd, repoRoot ?? home, repoRoot ? undefined : home)) {
 		for (const projectConfigDir of getProjectConfigDirs()) {
 			const configDir = await ifNonEmptyDir(ancestor.dir, projectConfigDir);
 			if (configDir) return { dir: configDir, depth: ancestor.depth };
@@ -326,7 +326,7 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	// Walk up from cwd finding .gjc/skills/ in ancestors (closest first)
-	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home, ctx.home);
+	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home, ctx.repoRoot ? undefined : ctx.home);
 	const projectScans = ancestors.flatMap(({ dir }) =>
 		getProjectConfigDirs().map(projectConfigDir =>
 			scanSkillsFromDir(ctx, {
