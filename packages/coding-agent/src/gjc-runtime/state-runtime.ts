@@ -1671,6 +1671,12 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 		);
 	}
 	const existingCaller = callerRead.kind === "valid" ? callerRead.value : {};
+	if (
+		!forced &&
+		existingCaller.active !== true &&
+		!(existingCaller.current_phase === "handoff" && existingCaller.handoff_to === callee)
+	)
+		throw new StateCommandError(2, `gjc state ${caller} handoff: caller is not active`);
 
 	const handoffAt = nowIso();
 	const mutationId = `${caller}:handoff:${callee}:${handoffAt}`;
