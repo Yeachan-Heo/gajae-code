@@ -16246,7 +16246,7 @@ export class SessionManager {
 		);
 		// Only tear down the resident blob store on a terminal outcome; a retryable
 		// close leaves the session live for a genuine retry.
-		if (!this.#persistWriter) {
+		if (!this.#persistWriter && !this.#needsFullRewriteOnNextPersist) {
 			this.#releaseResidentTextStore();
 			this.#retireEphemeralArtifacts();
 			try {
@@ -16257,8 +16257,9 @@ export class SessionManager {
 			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 			this.#releaseClosedSessionState();
 		}
-		if (priorPersistError && outcome.kind === "closed") {
-			return { kind: "close_unknown", error: priorPersistError };
+		const observedPersistError = priorPersistError ?? this.#persistError;
+		if (observedPersistError && outcome.kind === "closed") {
+			return { kind: "close_unknown", error: observedPersistError };
 		}
 		return outcome;
 	}
