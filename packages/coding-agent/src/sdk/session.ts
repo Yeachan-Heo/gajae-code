@@ -67,6 +67,7 @@ import {
 	resolveModelRoleValue,
 	type ScopedModelSelection,
 } from "../config/model-resolver";
+import { normalizeModelSelectorValue } from "../config/model-selector-value";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
 import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
@@ -1832,8 +1833,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				credentialSessionId,
 			}),
 		);
+		const configuredDefaultPatterns = normalizeModelSelectorValue(settings.getModelRole("default"));
 		let model = options.model;
 		let modelFallbackMessage: string | undefined;
+		if (!hasExplicitModel && configuredDefaultPatterns.length > 0 && !defaultRoleSpec.model) {
+			modelFallbackMessage = `Model ${configuredDefaultPatterns.join(" -> ")} not found`;
+		}
 		const resumeModelBehavior = settings.get("session.resumeModelBehavior");
 		const persistedDefaultChain = existingSession.configuredModelChains.default;
 		const defaultModelEntries =
@@ -3542,7 +3547,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
-		if (!model && !options.modelPattern && !startupCredentialModelRejected) {
+		if (
+			!model &&
+			!options.modelPattern &&
+			!startupCredentialModelRejected &&
+			configuredDefaultPatterns.length === 0
+		) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
 			const allowedFallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);

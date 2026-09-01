@@ -1107,6 +1107,19 @@ describe("OpenAI Codex default resolution", () => {
 			"Could not restore model openai-codex/missing-gpt (model no longer exists). Using openai-codex/gpt-5.5.",
 		);
 	});
+
+	test("does not replace an unavailable configured default with another provider's baseline", async () => {
+		const result = await findInitialModel({
+			defaultProvider: "opencode-go",
+			defaultModelId: "glm-5.3-flash",
+			scopedModels: [],
+			isContinuing: false,
+			modelRegistry: codexDefaultRegistry,
+		});
+
+		expect(result.model).toBeUndefined();
+		expect(result.fallbackMessage).toBe("Model opencode-go/glm-5.3-flash not found");
+	});
 });
 
 test("restores only an exact available provider/model candidate", async () => {

@@ -1580,6 +1580,11 @@ export async function findInitialModel(options: {
 			thinkingLevel = resolveThinkingLevelForModel(found, defaultThinkingSelector);
 			return { model, thinkingLevel, fallbackMessage: undefined };
 		}
+		return {
+			model: undefined,
+			thinkingLevel: undefined,
+			fallbackMessage: `Model ${defaultProvider}/${defaultModelId} not found`,
+		};
 	}
 
 	// 4. Try first available model with valid API key

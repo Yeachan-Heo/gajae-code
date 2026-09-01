@@ -145,6 +145,20 @@ describe("model onboarding guidance", () => {
 		}
 	}, 30000);
 
+	it("does not replace an unavailable signed-registry default with another provider baseline", async () => {
+		const agentDir = await createTempDir();
+		const settings = Settings.isolated({
+			modelRoles: { default: "opencode-go/glm-5.3-flash" },
+		});
+		const { session, modelFallbackMessage } = await createAgentSession(createSessionOptions(agentDir, { settings }));
+		try {
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toBe("Model opencode-go/glm-5.3-flash not found");
+		} finally {
+			await session.dispose();
+		}
+	}, 30000);
+
 	it("uses shared provider onboarding text for AgentSession no-model and no-credential errors", async () => {
 		const noModelDir = await createTempDir();
 		const noModelSettings = Settings.isolated({ enabledModels: ["provider-without-models"] });
