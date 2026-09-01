@@ -193,6 +193,7 @@ import {
 	isEnoent,
 	isUnexpectedSocketCloseMessage,
 	logger,
+	normalizePathForComparison,
 	prompt,
 	Snowflake,
 	setProjectDir,
@@ -4533,7 +4534,10 @@ export class AgentSession {
 		const resolverDefaultAgentDir = path.resolve(getAgentDir());
 		const effectiveAgentDir = this.#requestedAgentDir ?? path.resolve(this.settings.getAgentDir());
 		this.#profileAuthority =
-			config.profileAuthority ?? (effectiveAgentDir !== resolverDefaultAgentDir ? "custom" : "default");
+			config.profileAuthority ??
+			(normalizePathForComparison(effectiveAgentDir) !== normalizePathForComparison(resolverDefaultAgentDir)
+				? "custom"
+				: "default");
 		retainLspScope(this.sessionManager.getCwd(), this.getSessionAgentDir());
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
