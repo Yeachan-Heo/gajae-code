@@ -142,6 +142,8 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 	if (raw.startsWith("@")) {
 		const filePath = path.resolve(cwd, raw.slice(1));
 		try {
+			const stat = await fs.stat(filePath);
+			if (!stat.isFile() || stat.size > 1_000_000) throw new Error("input file exceeds 1 MiB");
 			raw = await fs.readFile(filePath, "utf-8");
 		} catch (error) {
 			throw new DeepInterviewCommandError(
@@ -184,28 +186,47 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 		existingRead.kind === "valid"
 			? normalizeDeepInterviewEnvelope(existingRead.value)
 			: normalizeDeepInterviewEnvelope({});
-	const payload = { ...input, prior: input.prior ?? (existing.state as Record<string, unknown> | undefined)?.crystal };
+	const storedPrior = (existing.state as Record<string, unknown> | undefined)?.crystal;
+	if (
+		input.prior !== undefined &&
+		storedPrior !== undefined &&
+		JSON.stringify(input.prior) !== JSON.stringify(storedPrior)
+	)
+		throw new DeepInterviewCommandError(2, "supplied prior crystal does not match canonical stored crystal");
+	const payload = { ...input, prior: storedPrior };
 	const crystal = crystallizeDeepInterview(payload);
 	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
 	assertSafePathComponent(slug, "slug");
 	const specPath = path.join(sessionSpecsDir(cwd, sessionId), `deep-interview-${slug}.md`);
 	const now = new Date().toISOString();
-	await writeArtifact(specPath, crystalMarkdown(crystal), {
+	const specContent = crystalMarkdown(crystal);
+	await writeArtifact(specPath, specContent, {
 		cwd,
 		audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 	});
+	await appendJsonl(
+		path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl"),
+		{
+			slug,
+			stage: "final",
+			path: specPath,
+			created_at: now,
+			sha256: createHash("sha256").update(specContent).digest("hex"),
+		},
+		{ cwd, audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId } },
+	);
 	const state = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
 	const envelope = {
 		...existing,
 		active: true,
-		current_phase: "handoff",
+		current_phase: crystal.lifecycle === "ready" ? "handoff" : "crystallizing",
 		skill: "deep-interview",
 		version: WORKFLOW_STATE_VERSION,
 		session_id: sessionId,
 		spec_slug: slug,
 		spec_path: specPath,
 		spec_stage: "final",
-		spec_sha256: createHash("sha256").update(crystalMarkdown(crystal)).digest("hex"),
+		spec_sha256: createHash("sha256").update(specContent).digest("hex"),
 		spec_persisted_at: now,
 		state,
 		updated_at: now,
@@ -223,7 +244,13 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 	});
 	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
-	await syncDeepInterviewHud({ cwd, sessionId, payload: envelope, phase: "handoff", specStatus: "persisted" });
+	await syncDeepInterviewHud({
+		cwd,
+		sessionId,
+		payload: envelope,
+		phase: envelope.current_phase,
+		specStatus: "persisted",
+	});
 	const summary = {
 		skill: "deep-interview",
 		mode: "crystallize",

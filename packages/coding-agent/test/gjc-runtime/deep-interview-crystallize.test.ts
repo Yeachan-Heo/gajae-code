@@ -15,6 +15,7 @@ function input(overrides: Partial<CrystalInput> = {}): CrystalInput {
 	snapshot.digest = crystalSnapshotDigest(snapshot);
 	return {
 		snapshot,
+		current_revision: 1,
 		items: [
 			{
 				id: "goal:report",
@@ -38,7 +39,7 @@ function input(overrides: Partial<CrystalInput> = {}): CrystalInput {
 function later(value: CrystalInput, revision: number): CrystalInput {
 	const snapshot = { ...value.snapshot, revision };
 	snapshot.digest = crystalSnapshotDigest(snapshot);
-	return { ...value, snapshot };
+	return { ...value, snapshot, current_revision: revision };
 }
 
 describe("deep-interview crystallize contract", () => {
@@ -117,9 +118,24 @@ describe("deep-interview crystallize contract", () => {
 		const value = input();
 		value.current_revision = 2;
 		expect(() => crystallizeDeepInterview(value)).toThrow("snapshot is stale");
-		value.current_revision = undefined;
+		value.current_revision = 1;
 		value.snapshot.digest = "0".repeat(64);
 		expect(() => crystallizeDeepInterview(value)).toThrow("digest mismatch");
+	});
+
+	it("rejects fabricated confirmed anchors and missing current revisions", () => {
+		const value = input({ items: [{ ...input().items[0]!, anchor: { message_index: 0, quote: "not present" } }] });
+		expect(() => crystallizeDeepInterview(value)).toThrow("verbatim user anchor");
+		const missingRevision = input();
+		delete missingRevision.current_revision;
+		expect(() => crystallizeDeepInterview(missingRevision)).toThrow("authoritative current revision");
+	});
+
+	it("carries omitted prior material forward", () => {
+		const first = crystallizeDeepInterview(input());
+		const second = crystallizeDeepInterview(later(input({ prior: first, items: [first.items[0]!] }), 2));
+		expect(second.items.map(item => item.id)).toContain("constraint:latency");
+		expect(second.delta.approval_invalidated).toBe(false);
 	});
 
 	it("promotes through the existing state/spec shape without approval", async () => {
