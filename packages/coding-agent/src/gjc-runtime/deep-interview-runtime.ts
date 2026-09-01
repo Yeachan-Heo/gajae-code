@@ -7,7 +7,12 @@ import { listProjectSessionTranscriptFiles, parseSessionEntries } from "../sessi
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
-import { type CrystalSnapshot, crystallizeDeepInterview, crystalMarkdown } from "./deep-interview-crystallize";
+import {
+	type CrystalSnapshot,
+	crystallizeDeepInterview,
+	crystalMarkdown,
+	crystalSnapshotDigest,
+} from "./deep-interview-crystallize";
 import { isDeepInterviewStageVerb, runDeepInterviewStageCommand } from "./deep-interview-stage";
 import {
 	assertDeepInterviewInputWithinLimit,
@@ -277,6 +282,7 @@ async function authoritativeConversationSnapshot(
 }
 
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
+	assertCrystallizeArgs(args);
 	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);
 	const session = resolveGjcSessionForWrite(cwd, {
 		flagValue: flagValue(args, "--session-id"),
@@ -291,6 +297,23 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 		async () => handleCrystallizeUnlocked(args, cwd, sessionId, statePath, input),
 		{ cwd },
 	);
+}
+
+function assertCrystallizeArgs(args: readonly string[]): void {
+	let valueExpected = false;
+	for (const arg of args) {
+		if (valueExpected) {
+			valueExpected = false;
+			continue;
+		}
+		if (arg === "--input" || arg === "--session-id" || arg === "--slug") {
+			valueExpected = true;
+			continue;
+		}
+		if (arg === "--crystallize" || arg === "--json") continue;
+		throw new DeepInterviewCommandError(2, `unsupported crystallize argument: ${arg}`);
+	}
+	if (valueExpected) throw new DeepInterviewCommandError(2, "crystallize option requires a value");
 }
 
 async function handleCrystallizeUnlocked(
@@ -343,6 +366,24 @@ async function handleCrystallizeUnlocked(
 	const existingSpecHash = typeof existing.spec_sha256 === "string" ? existing.spec_sha256 : undefined;
 	const priorRecord = isRecord(storedPrior) ? storedPrior : undefined;
 	const priorSource = priorRecord && isRecord(priorRecord.source) ? priorRecord.source : undefined;
+	if (priorSource && Array.isArray(priorSource.messages)) {
+		const priorMessages = priorSource.messages as CrystalSnapshot["messages"];
+		const livePriorMessages = liveSnapshot.messages.slice(priorSource.start, priorSource.end + 1);
+		if (
+			priorSource.start < 0 ||
+			priorSource.end < priorSource.start ||
+			priorSource.end >= liveSnapshot.messages.length ||
+			JSON.stringify(priorMessages) !== JSON.stringify(livePriorMessages) ||
+			crystalSnapshotDigest({
+				revision: priorSource.revision,
+				start: priorSource.start,
+				end: priorSource.end,
+				messages: priorMessages,
+				digest: priorSource.digest,
+			}) !== priorSource.digest
+		)
+			throw new DeepInterviewCommandError(2, "prior Crystal source evidence does not match the live transcript");
+	}
 	if (
 		priorSource &&
 		priorSource.revision === snapshot.revision &&
@@ -378,6 +419,8 @@ async function handleCrystallizeUnlocked(
 			: undefined;
 	const now = new Date().toISOString();
 	const specContent = specPath ? crystalMarkdown(crystal) : undefined;
+	if (specContent && [...specContent].length > MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH)
+		throw new DeepInterviewCommandError(2, "crystallized specification exceeds the structured response limit");
 	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
 	const specHash = specContent ? createHash("sha256").update(specContent).digest("hex") : undefined;
 	const mutationId =
