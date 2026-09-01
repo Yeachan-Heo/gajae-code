@@ -95,6 +95,14 @@ describe("session-state lock debris subprocess contract", () => {
 		expect(result.wallMs).toBeLessThan(4_000);
 	});
 
+	it("reclaims an empty released transition tombstone on POSIX", async () => {
+		const result = await runProbe("released-transition-tombstone");
+		expect(result.entered).toBe(true);
+		expect(result.error).toBeNull();
+		expect(result.attempts).toBeLessThanOrEqual(2);
+		expect(result.wallMs).toBeLessThan(3_000);
+	});
+
 	it.skipIf(process.platform !== "win32")("reclaims a dead Windows transition claim", async () => {
 		const result = await runProbe("stale-dead-transition", true);
 		expect(result.entered).toBe(true);

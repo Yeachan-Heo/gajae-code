@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Coordinator session-state locks now reclaim an empty, identity-qualified released transition tombstone on POSIX after a short release grace period. Live, foreign, malformed, non-empty, or identity-changed claims remain fail-closed, while persistent macOS/File Provider debris no longer burns the full transition timeout on every state write. (#5159)
+
 - A runtime-state marker recorded against a different workspace path now reports that mismatch instead of claiming the file is unreadable, and a terminal, not-live marker that travelled into the current workspace with its session directory is adopted rather than refused. Live, non-terminal, and out-of-workspace markers are still refused untouched.
 - An unavailable provider-qualified `modelRoles.default` selection now reports the requested model instead of silently starting on another provider's baseline. This keeps signed-registry omissions and failed catalog admission actionable rather than routing requests to an unrelated retired model. (#5144)
 

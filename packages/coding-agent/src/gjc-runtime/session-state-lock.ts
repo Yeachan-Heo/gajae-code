@@ -39,6 +39,7 @@ const LOCK_ACQUIRE_RETRY_MS = 5;
 const LOCK_ACQUIRE_MAX_RETRY_MS = 100;
 const LOCK_ACQUIRE_TIMEOUT_MS = 2_000;
 const LOCK_STALE_MS = 30_000;
+const RELEASED_TRANSITION_GRACE_MS = 1_000;
 
 interface LockRetryBudget {
 	startedAt: number;
@@ -1336,7 +1337,10 @@ async function acquireOwnerLock(
  *
  * Stale-owner reclaim still uses the native identity-bound detach protocol because no live
  * owner or transition claim can vouch for that pathname. A mismatch here likewise leaves a
- * successor strictly alone.
+ * successor strictly alone. A released tombstone is reclaimable on every platform when its
+ * owner host is this installation and the transition directory is proven empty and unchanged:
+ * the tombstone is the release marker, while the directory generation binds that marker to
+ * the exact claim that release failed to remove.
  */
 async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
 	let owner: unknown;
@@ -1572,7 +1576,6 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
-	if (process.platform !== "win32") return;
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
 	if (!ownerSnapshot) return;
 	let owner: unknown;
@@ -1582,9 +1585,19 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		return;
 	}
 	if (!validLockOwner(owner)) return;
-	// Released tombstones intentionally remain fail-closed: they carry no live
-	// process proof and are not generation-bound to the sibling directory.
-	if (owner.released === true || (await lockOwnerIsAlive(owner))) return;
+	if (owner.released === true) {
+		// A released record is safe only when it is qualified by this installation.
+		// Never let a shared-volume tombstone, an absent identity, or a legacy foreign
+		// identity authorize removal of a claim this process cannot own.
+		if (owner.owner_host_id === undefined) return;
+		const currentHost = await currentOwnerHostId();
+		const legacyHost = await currentLegacyOwnerHostId();
+		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return;
+		if (Date.now() - Number(stat.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return;
+	} else {
+		if (process.platform !== "win32") return;
+		if (await lockOwnerIsAlive(owner)) return;
+	}
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
 	if (!nativePath) return;
@@ -1601,6 +1614,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		root.ctimeNs !== String(generation.ctimeNs)
 	)
 		return;
+	if (captured.snapshot.entries.length !== 1) return;
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
 		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
