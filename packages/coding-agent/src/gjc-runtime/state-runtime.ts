@@ -1680,7 +1680,8 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 	// in memory the same way direct `/skill:<runtime>` invocation does.
 	if (!calleeIsWorkflow) {
 		const mergedCallerState: Record<string, unknown> = {
-			...normalizedCaller,
+			...(caller === "deep-interview" ? existingCaller : normalizedCaller),
+			...(caller === "deep-interview" ? { state: normalizedCaller } : {}),
 			skill: caller,
 			version: WORKFLOW_STATE_VERSION,
 			active: false,
@@ -1798,7 +1799,8 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 		mergedCalleeState.session_id = sessionId;
 	}
 	const mergedCallerState: Record<string, unknown> = {
-		...normalizedCaller,
+		...(caller === "deep-interview" ? existingCaller : normalizedCaller),
+		...(caller === "deep-interview" ? { state: normalizedCaller } : {}),
 		skill: caller,
 		version: WORKFLOW_STATE_VERSION,
 		active: false,
