@@ -43,6 +43,7 @@ DEV_REPO_ROOT=""
 DEV_REQUESTED=0
 SOURCE_REQUESTED=0
 BINARY_REQUESTED=0
+OFFER_RUNTIME_DIR=""
 
 usage() {
     cat <<'EOF'
@@ -91,6 +92,9 @@ cleanup() {
     fi
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
         rm -rf "$SOURCE_CLONE_DIR"
+    fi
+    if [ -n "$OFFER_RUNTIME_DIR" ] && [ -d "$OFFER_RUNTIME_DIR" ]; then
+        rm -rf "$OFFER_RUNTIME_DIR"
     fi
     return 0
 }
@@ -651,13 +655,17 @@ install_binary() {
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
     if [ "$PLATFORM" = "darwin" ]; then
-        OFFER_RUNTIME="${DEST_PATH}.community-app-offer.$$"
-        if [ ! -e "$OFFER_RUNTIME" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && ln "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
-            remember_tmp "$OFFER_RUNTIME"
+        OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
+        OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
+        if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && ln "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
             if [ -f "$OFFER_RUNTIME" ] && [ "$OFFER_RUNTIME" -ef "$DEST_PATH" ]; then
                 "$OFFER_RUNTIME" macos-community-app-offer || true
             fi
-            rm -f "$OFFER_RUNTIME" || true
+            rm -rf "$OFFER_RUNTIME_DIR" || true
+            OFFER_RUNTIME_DIR=""
+        elif [ -n "$OFFER_RUNTIME_DIR" ]; then
+            rm -rf "$OFFER_RUNTIME_DIR" || true
+            OFFER_RUNTIME_DIR=""
         fi
     fi
 

@@ -338,10 +338,11 @@ export async function offerMacosCommunityApp(
 	let tempRoot: string | undefined;
 	let tempRootIdentity: FileIdentity | undefined;
 	let mountPoint: string | undefined;
+	let mountIdentity: FileIdentity | undefined;
 	let mountAttempted = false;
 	let installedDestination: { path: string; identity: FileIdentity } | undefined;
 	let receivedSignal: NodeJS.Signals | undefined;
-	const signalNames = ["SIGINT", "SIGTERM"] as const;
+	const signalNames = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
 	const onSignal = (signal: NodeJS.Signals) => {
 		receivedSignal = signal;
@@ -349,7 +350,7 @@ export async function offerMacosCommunityApp(
 	for (const signal of signalNames) {
 		const handler = () => onSignal(signal);
 		signalHandlers.set(signal, handler);
-		process.once(signal, handler);
+		process.on(signal, handler);
 	}
 	const removeSignalHandlers = () => {
 		for (const signal of signalNames) {
@@ -412,8 +413,6 @@ export async function offerMacosCommunityApp(
 		const dmgPath = path.join(tempRoot, dmg.name);
 		mountPoint = path.join(tempRoot, "mount");
 		await fs.mkdir(mountPoint);
-		const mountIdentity = await fileIdentity(mountPoint);
-		if (!mountIdentity) return failure("the temporary mountpoint was not a regular directory", log);
 		await Bun.write(dmgPath, dmgBytes);
 		const stagedDmgStat = await fs.lstat(dmgPath).catch(() => undefined);
 		if (!stagedDmgStat?.isFile() || stagedDmgStat.isSymbolicLink())
@@ -432,6 +431,8 @@ export async function offerMacosCommunityApp(
 		]);
 		throwIfInterrupted();
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
+		mountIdentity = await fileIdentity(mountPoint);
+		if (!mountIdentity) return failure("the mounted volume was not a real directory", log);
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
 			return failure("the staged DMG identity changed before verification", log);
 		if (!(await sameDirectoryIdentity(mountPoint, mountIdentity)))
@@ -452,6 +453,10 @@ export async function offerMacosCommunityApp(
 		const executableArch = arch === "x64" ? "x86_64" : arch;
 		if (archCheck.exitCode !== 0 || !archCheck.stdout.split(/\s+/).includes(executableArch))
 			return failure(`the app bundle does not contain ${arch} code`, log);
+		if (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))
+			return failure("the mounted volume identity changed before copy", log);
+		if (!(await isExpectedBundle(sourceApp, command)))
+			return failure("the mounted app bundle identity changed before copy", log);
 
 		const destinationRoot = path.join(homeDir, "Applications");
 		const existingDestinationRoot = await fs.lstat(destinationRoot).catch(() => undefined);
