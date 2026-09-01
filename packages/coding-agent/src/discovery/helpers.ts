@@ -13,6 +13,7 @@ import {
 } from "@gajae-code/utils";
 import type { ExtensionModule } from "../capability/extension-module";
 import {
+	type FileIdentity,
 	invalidate as invalidateFsCache,
 	type ReadFileOptions,
 	type ReadScope,
@@ -1069,6 +1070,7 @@ export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
 	isolatedHome = false,
+	homeIdentity?: FileIdentity,
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd, home, isolatedHome) : null;
 	const canonicalHome = await canonicalizeThroughExistingAncestor(home);
@@ -1087,7 +1089,7 @@ export async function listClaudePluginRoots(
 	const warnings: string[] = [];
 	const projectRoots: ClaudePluginRoot[] = [];
 	const registryReadOptions: ReadFileOptions | undefined = isolatedHome
-		? { isolatedHome: true, home: canonicalHome, scope: "project", bypassCache: true }
+		? { isolatedHome: true, home: canonicalHome, homeIdentity, scope: "project", bypassCache: true }
 		: undefined;
 
 	// ── GJC installed plugins registry ───────────────────────────────────────
