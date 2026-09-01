@@ -273,11 +273,29 @@ export async function offerMacosCommunityApp(
 		}
 		return { status: "installed", reason: destination };
 	} catch (error) {
-		if (installedDestination) await fs.rm(installedDestination, { recursive: true, force: true });
+		if (installedDestination) {
+			try {
+				await fs.rm(installedDestination, { recursive: true, force: true });
+			} catch (cleanupError) {
+				log(`Optional community app cleanup warning: failed to remove partial app state: ${String(cleanupError)}`);
+			}
+		}
 		return failure(error instanceof Error ? error.message : String(error), log);
 	} finally {
-		if (attached && mountPoint) await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
-		if (tempRoot) await fs.rm(tempRoot, { recursive: true, force: true });
+		if (attached && mountPoint) {
+			try {
+				await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+			} catch (error) {
+				log(`Optional community app cleanup warning: failed to detach the temporary DMG: ${String(error)}`);
+			}
+		}
+		if (tempRoot) {
+			try {
+				await fs.rm(tempRoot, { recursive: true, force: true });
+			} catch (error) {
+				log(`Optional community app cleanup warning: failed to remove temporary files: ${String(error)}`);
+			}
+		}
 	}
 }
 
