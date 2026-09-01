@@ -7,6 +7,7 @@
  */
 
 import type { Settings } from "../config/settings";
+import type { FileIdentity } from "./fs";
 /**
  * Context passed to every provider loader.
  */
@@ -29,6 +30,8 @@ export interface LoadContext {
 	 * produced. This includes MCP registrations and user-installed skills.
 	 */
 	userAgentDir?: string;
+	/** Device/inode identity captured for the explicit home root. */
+	homeIdentity?: FileIdentity;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
 	/** Whether discovery must remain isolated to the supplied home boundary. */

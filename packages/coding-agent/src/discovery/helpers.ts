@@ -131,13 +131,14 @@ export function getProjectPath(ctx: LoadContext, source: SourceId, subpath: stri
 
 /** Build the filesystem authority for a provider read. */
 export function getReadOptions(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir">,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity">,
 	scope: ReadScope,
 ): ReadFileOptions | undefined {
 	if (!ctx.isolatedHome) return undefined;
 	return {
 		isolatedHome: true,
 		home: ctx.home,
+		homeIdentity: ctx.homeIdentity,
 		userAgentDir: scope === "native" ? ctx.userAgentDir : undefined,
 		scope,
 		bypassCache: true,
@@ -1027,7 +1028,7 @@ async function canonicalizePluginRegistryPath(
  * an additional physical boundary, such as a plugin root.
  */
 export async function canonicalizePathWithinHome(
-	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir">,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity">,
 	target: string,
 	containmentRoot?: string,
 	scope: ReadScope = "project",

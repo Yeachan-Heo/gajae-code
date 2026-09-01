@@ -10,6 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
+import type { FileIdentity } from "../capability/fs";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { calculateDepth, canonicalizePathWithinHome, createSourceMeta } from "./helpers";
 
@@ -26,7 +27,7 @@ const AGGREGATE_LIMIT_WARNING = "Skipped one or more AGENTS.md files that exceed
 export type AgentsMdReader = (
 	filePath: string,
 	maxBytes: number,
-	options?: { noFollow?: boolean },
+	options?: { noFollow?: boolean; home?: string; homeIdentity?: FileIdentity },
 ) => Promise<{ content: string | null; byteLength: number; tooLarge: boolean }>;
 
 function sameFileIdentity(left: Stats, right: Stats): boolean {
@@ -36,12 +37,22 @@ function sameFileIdentity(left: Stats, right: Stats): boolean {
 async function readBoundedAgentsMdFile(
 	filePath: string,
 	maxBytes: number,
-	options?: { noFollow?: boolean },
+	options?: { noFollow?: boolean; home?: string; homeIdentity?: FileIdentity },
 ): Promise<{ content: string | null; byteLength: number; tooLarge: boolean }> {
 	const noFollow = options?.noFollow === true;
+	const homeIsStable = async (): Promise<boolean> => {
+		if (!options?.home || !options.homeIdentity) return true;
+		try {
+			const current = await fs.stat(options.home);
+			return current.dev === options.homeIdentity.dev && current.ino === options.homeIdentity.ino;
+		} catch {
+			return false;
+		}
+	};
 	let before: Stats | undefined;
 	let canonicalPath: string | undefined;
 	try {
+		if (!(await homeIsStable())) return { content: null, byteLength: 0, tooLarge: false };
 		if (noFollow) {
 			// `loadAgentsMd` canonicalizes the candidate before calling the reader,
 			// but that pathname can be swapped before open. Recheck the canonical
@@ -80,6 +91,7 @@ async function readBoundedAgentsMdFile(
 			if (bytesRead > maxBytes) return { content: null, byteLength: bytesRead, tooLarge: true };
 			if (before && canonicalPath !== (await fs.realpath(filePath)))
 				return { content: null, byteLength: 0, tooLarge: false };
+			if (!(await homeIsStable())) return { content: null, byteLength: 0, tooLarge: false };
 			return {
 				content: new TextDecoder().decode(bytes.subarray(0, bytesRead)),
 				byteLength: bytesRead,
@@ -132,6 +144,8 @@ export async function loadAgentsMd(
 			const result = authorizedCandidate
 				? await readCandidate(authorizedCandidate, allowedBytes, {
 						noFollow: ctx.isolatedHome === true,
+						home: ctx.home,
+						homeIdentity: ctx.homeIdentity,
 					})
 				: { content: null, byteLength: 0, tooLarge: false };
 			if (result.tooLarge) {
