@@ -5112,7 +5112,7 @@ test("idempotent lifecycle replay rejects preserved-mtime endpoint identity tran
 		let refreshSpy: Mock<() => Promise<void>> | undefined;
 		try {
 			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-			await fs.writeFile(
+			await Bun.write(
 				endpointPath,
 				JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "predecessor-token" }),
 			);
@@ -5155,7 +5155,7 @@ test("idempotent lifecycle replay rejects preserved-mtime endpoint identity tran
 				refreshes += 1;
 				if (refreshes === 2) {
 					await fs.rename(endpointPath, displacedPath);
-					await fs.writeFile(
+					await Bun.write(
 						endpointPath,
 						JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:2", token: "successor-token" }),
 					);
