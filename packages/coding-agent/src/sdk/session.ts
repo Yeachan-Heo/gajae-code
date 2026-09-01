@@ -4601,12 +4601,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 			session.dispose = async () => {
 				const boundedDispose = originalDispose();
-				void boundedDispose.catch(async error => {
-					if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) {
-						await session.dispose();
-						await finishCleanup();
-					}
-				});
+				void boundedDispose
+					.catch(async error => {
+						if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) {
+							await session.dispose();
+							await finishCleanup();
+						}
+					})
+					.catch(error => {
+						logger.warn("Deferred SDK disposal cleanup failed", { error: safeErrorForLog(error) });
+					});
 				await boundedDispose;
 				await finishCleanup();
 			};

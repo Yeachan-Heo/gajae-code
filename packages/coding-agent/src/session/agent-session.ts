@@ -8977,10 +8977,14 @@ export class AgentSession {
 		this.#disconnectFromAgent();
 		const teardown = this.#dispose();
 		this.#disposeRunPromise = teardown;
-		const timeout = Bun.sleep(SIGNAL_TEARDOWN_TIMEOUT_MS).then(() => {
-			throw new Error("Session disposal incomplete: teardown exceeded the deadline.");
-		});
-		const boundedTeardown = Promise.race([teardown, timeout]);
+		const timeout = Promise.withResolvers<never>();
+		const timer = setTimeout(
+			() => timeout.reject(new Error("Session disposal incomplete: teardown exceeded the deadline.")),
+			SIGNAL_TEARDOWN_TIMEOUT_MS,
+		);
+		timer.unref?.();
+		const boundedTeardown = Promise.race([teardown, timeout.promise]);
+		void boundedTeardown.finally(() => clearTimeout(timer)).catch(() => {});
 		void teardown.catch(() => {});
 		return boundedTeardown;
 	}
@@ -8992,10 +8996,15 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
-		const awaitDisposeStep = async <T>(label: string, operation: Promise<T>): Promise<T | undefined> => {
+		const awaitDisposeStep = async <T>(
+			label: string,
+			operation: Promise<T>,
+			critical = false,
+		): Promise<T | undefined> => {
 			try {
 				return await operation;
 			} catch (error) {
+				if (critical) throw error;
 				logger.warn("Session dispose step failed", { label, error: String(error) });
 				return undefined;
 			}
@@ -9003,6 +9012,7 @@ export class AgentSession {
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		await awaitDisposeStep("session admission close", admissionClosed);
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
+		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
@@ -9162,7 +9172,7 @@ export class AgentSession {
 		if (this.#workspaceTreeService) await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose());
 		if (this.#networkPrewarmService) await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose());
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
-		await awaitDisposeStep("session manager close", this.sessionManager.close());
+		await awaitDisposeStep("session manager close", this.sessionManager.close(), true);
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
 		await awaitDisposeStep("hindsight state", hindsightState?.dispose() ?? Promise.resolve());
