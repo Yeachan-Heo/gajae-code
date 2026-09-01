@@ -1506,6 +1506,33 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await sessionManager.close();
 	});
 
+	it("settles concurrent nested moves without restoring a shared lease early", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		const repoB = path.join(cwd, "repo-b");
+		fs.mkdirSync(repoA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		const outcomes = await sessionManager.runWithCwdReadLease(async () =>
+			Promise.all(
+				[repoA, repoB].map(target =>
+					sessionManager.moveTo(target).then(
+						() => "fulfilled" as const,
+						() => "rejected" as const,
+					),
+				),
+			),
+		);
+
+		expect(outcomes).toEqual(["fulfilled", "fulfilled"]);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		await sessionManager.runWithCwdReadLease(async () => {});
+		await sessionManager.close();
+	});
+
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

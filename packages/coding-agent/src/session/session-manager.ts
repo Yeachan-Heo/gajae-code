@@ -23,7 +23,7 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
-type CwdReadLeaseContext = { active: boolean; owner: symbol };
+type CwdReadLeaseContext = { active: boolean; owner: symbol; suspendedMoveCount: number };
 const cwdReadLeaseAls = new AsyncLocalStorage<CwdReadLeaseContext>();
 const CWD_NOFOLLOW_OPEN_FLAGS =
 	fs.constants.O_RDONLY |
@@ -10855,14 +10855,17 @@ export class SessionManager {
 		if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
 			throw new Error("Session cwd move admission is closed.");
 		const readLease = cwdReadLeaseAls.getStore();
-		const suspendedOwnReadLease = readLease?.active === true && readLease.owner === this.#cwdReadLeaseOwner;
+		const suspendedOwnReadLease = readLease?.owner === this.#cwdReadLeaseOwner;
 		if (suspendedOwnReadLease) {
-			readLease.active = false;
-			this.#cwdReaderCount -= 1;
-			if (this.#cwdReaderCount === 0) {
-				const drained = this.#cwdReadersDrained;
-				this.#cwdReadersDrained = undefined;
-				drained?.();
+			readLease.suspendedMoveCount += 1;
+			if (readLease.active) {
+				readLease.active = false;
+				this.#cwdReaderCount -= 1;
+				if (this.#cwdReaderCount === 0) {
+					const drained = this.#cwdReadersDrained;
+					this.#cwdReadersDrained = undefined;
+					drained?.();
+				}
 			}
 		}
 		const admittedBeforeClose = this.#cwdWriterPending === 0 && this.#cwdReaderCount === 0;
@@ -10889,13 +10892,16 @@ export class SessionManager {
 			this.#pendingCwdMoveAdmissions.delete(admission);
 			this.#cwdMoveAdmittedAdmissions.delete(admission);
 			if (suspendedOwnReadLease) {
-				if (this.#cwdReaderCount === 0) {
-					const { promise, resolve } = Promise.withResolvers<void>();
-					this.#cwdReadersIdle = promise;
-					this.#cwdReadersDrained = resolve;
+				readLease.suspendedMoveCount -= 1;
+				if (readLease.suspendedMoveCount === 0) {
+					if (this.#cwdReaderCount === 0) {
+						const { promise, resolve } = Promise.withResolvers<void>();
+						this.#cwdReadersIdle = promise;
+						this.#cwdReadersDrained = resolve;
+					}
+					this.#cwdReaderCount += 1;
+					readLease.active = true;
 				}
-				this.#cwdReaderCount += 1;
-				readLease.active = true;
 			}
 		}
 	}
@@ -10928,7 +10934,7 @@ export class SessionManager {
 			this.#cwdReadersDrained = resolve;
 		}
 		this.#cwdReaderCount += 1;
-		const readLease: CwdReadLeaseContext = { active: true, owner: this.#cwdReadLeaseOwner };
+		const readLease: CwdReadLeaseContext = { active: true, owner: this.#cwdReadLeaseOwner, suspendedMoveCount: 0 };
 		return cwdReadLeaseAls.run(readLease, async () => {
 			try {
 				return await fn();
