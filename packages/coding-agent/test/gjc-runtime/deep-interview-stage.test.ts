@@ -741,9 +741,10 @@ describe("deep-interview staged transitions", () => {
 		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
 		const reset = parse(
 			(await run(root, ["write", "--reset", "--input", JSON.stringify({ state: { fresh: true } }), "--json"]))
-				.stdout,
+				.stderr,
 		);
-		expect(reset.mode).toBe("reset");
+		expect(reset.ok).toBe(false);
+		expect(reset.code).toBe("DI_STAGE_MERGE_REJECTED");
 		const after = await readState(root);
 		expect((after.state as Record<string, unknown>).crystal).toEqual({ lifecycle: "ready", schema_version: 1 });
 		expect(after.spec_path).toBe("/tmp/crystal.md");
