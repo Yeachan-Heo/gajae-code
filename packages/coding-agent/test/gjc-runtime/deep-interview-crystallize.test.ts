@@ -164,7 +164,14 @@ describe("deep-interview crystallize contract", () => {
 	it("promotes through the existing state/spec shape without approval", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-runtime-"));
 		const value = input();
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
+			const sessionFile = path.join(root, "conversation.jsonl");
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "message", message: value.snapshot.messages[0] })}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
 			const result = await runNativeDeepInterviewCommand(
 				[
 					"--crystallize",
@@ -184,6 +191,8 @@ describe("deep-interview crystallize contract", () => {
 			expect(summary.crystal.execution_approval).toBe("not-approved");
 			expect(await fs.readFile(summary.spec_path, "utf8")).toContain("Execution approval: not-approved");
 		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
