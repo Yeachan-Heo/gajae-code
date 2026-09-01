@@ -1303,7 +1303,7 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
-	offerCommunityApp?: (runtimePath: string) => Promise<void>;
+	offerCommunityApp?: (runtimePath: string, identity?: RuntimeFileIdentity) => Promise<void>;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
