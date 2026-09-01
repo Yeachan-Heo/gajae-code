@@ -77,10 +77,10 @@ export function matchesIndexedEndpointFile(
 	file: Pick<EndpointFileRead, "dev" | "ino" | "mtimeMs">,
 	authority: IndexedEndpointAuthority,
 ): boolean {
+	if (authority.endpointMtimeMs === undefined || !Number.isFinite(authority.endpointMtimeMs)) return false;
+	if (authority.endpointFileId === undefined) return file.mtimeMs === authority.endpointMtimeMs;
 	return (
-		authority.endpointMtimeMs !== undefined &&
-		Number.isFinite(authority.endpointMtimeMs) &&
-		Math.abs(file.mtimeMs - authority.endpointMtimeMs) <= 0.001 &&
-		(authority.endpointFileId === undefined || authority.endpointFileId === `${file.dev}:${file.ino}`)
+		authority.endpointFileId === `${file.dev}:${file.ino}` &&
+		Math.abs(file.mtimeMs - authority.endpointMtimeMs) <= 0.001
 	);
 }

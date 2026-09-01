@@ -14,6 +14,7 @@ const event = (
 	sessionId: string,
 	stateRoot: string,
 	endpointMtimeMs?: number,
+	endpointFileId?: string,
 ) => ({
 	type,
 	sessionId,
@@ -21,6 +22,7 @@ const event = (
 	endpointGeneration: 1,
 	pid: process.pid,
 	...(endpointMtimeMs === undefined ? {} : { endpointMtimeMs }),
+	...(endpointFileId === undefined ? {} : { endpointFileId }),
 });
 
 test("broker preserves host registration endpoint metadata across heartbeats", async () => {
@@ -29,12 +31,14 @@ test("broker preserves host registration endpoint metadata across heartbeats", a
 	const endpointPath = path.join(stateRoot, "sdk", "live.json");
 	await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 	await fs.writeFile(endpointPath, JSON.stringify({ sessionId: "live", pid: process.pid, token: "session-secret" }));
-	const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+	const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
+	const endpointMtimeMs = Number(endpointIdentity.mtimeNs) / 1_000_000;
+	const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 	const broker = new Broker({ agentDir });
 	await broker.start();
 	try {
 		const busIndex = await new SessionIndex(agentDir).open();
-		await busIndex.append(event("host_registered", "live", stateRoot, endpointMtimeMs));
+		await busIndex.append(event("host_registered", "live", stateRoot, endpointMtimeMs, endpointFileId));
 		await busIndex.append(event("host_heartbeat", "live", stateRoot));
 		await busIndex.append(event("host_heartbeat", "live", stateRoot));
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "live", endpointGeneration: 1 })).toEqual({
