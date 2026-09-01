@@ -580,10 +580,10 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
-	it("rejects an empty Connect end-stream before turnEnded", async () => {
+	it("rejects a valid Connect end-stream before turnEnded", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
-			setTimeout(() => stream.end(frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG)), 10);
+			setTimeout(() => stream.end(frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG)), 10);
 		});
 
 		const { events, result } = await collectTerminal(baseUrl, {
@@ -592,7 +592,7 @@ describe("Cursor raw transport watchdog", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Failed to parse Connect end stream");
+		expect(result.errorMessage).toBe("Cursor HTTP/2 stream ended before turnEnded");
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 

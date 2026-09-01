@@ -1718,12 +1718,16 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					if (flags & CONNECT_END_STREAM_FLAG) {
 						closeTerminalAdmission();
 						responseEnded = true;
-						terminalBoundarySeen = true;
 						terminalBoundaryObserved = false;
-						const endError = parseConnectEndStream(messageBytes);
+						const parsedEndError = parseConnectEndStream(messageBytes);
+						const endError =
+							parsedEndError ??
+							(!sawTurnEnded ? new Error("Cursor HTTP/2 stream ended before turnEnded") : undefined);
 						if (endError) {
 							endStreamError = endError;
 							terminalize(endError, "drainable");
+						} else {
+							terminalBoundarySeen = true;
 						}
 						pendingBuffer.clear();
 						break;

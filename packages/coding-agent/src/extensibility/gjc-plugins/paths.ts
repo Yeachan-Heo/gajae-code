@@ -1,6 +1,8 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
 import { getAgentDir, pathIsWithin } from "@gajae-code/utils";
+import type { ReadFileOptions } from "../../capability/fs";
+import { readFile } from "../../capability/fs";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
 export function gjcPluginUserRoot(): string {
@@ -28,7 +30,8 @@ function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
-export async function rootContainsGjcManifest(dir: string): Promise<boolean> {
+export async function rootContainsGjcManifest(dir: string, options?: ReadFileOptions): Promise<boolean> {
+	if (options?.isolatedHome) return (await readFile(path.join(dir, GJC_PLUGIN_MANIFEST_FILENAME), options)) !== null;
 	try {
 		await fs.access(path.join(dir, GJC_PLUGIN_MANIFEST_FILENAME));
 		return true;
