@@ -156,19 +156,27 @@ async function removeClaimedDirectory(
 	identity: FileIdentity,
 	parentPath: string,
 	parentIdentity: FileIdentity,
-	quarantineRoot: string,
 	log: (message: string) => void,
 ): Promise<void> {
 	if (!(await sameDirectoryIdentity(parentPath, parentIdentity)) || !(await sameDirectoryIdentity(filePath, identity)))
 		return;
-	const tombstone = path.join(quarantineRoot, `claimed-app-${process.pid}-${Date.now().toString(16)}`);
+	const quarantineRoot = path.join(parentPath, `.gjc-community-app-cleanup-${process.pid}-${Date.now().toString(16)}`);
 	try {
+		await fs.mkdir(quarantineRoot, { mode: 0o700 });
+		const quarantineIdentity = await fileIdentity(quarantineRoot);
+		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) return;
+		const tombstone = path.join(quarantineRoot, path.basename(filePath));
 		await fs.rename(filePath, tombstone);
-		if (!(await sameDirectoryIdentity(tombstone, identity))) {
+		if (
+			!(await sameDirectoryIdentity(parentPath, parentIdentity)) ||
+			!(await sameDirectoryIdentity(quarantineRoot, quarantineIdentity)) ||
+			!(await sameDirectoryIdentity(tombstone, identity))
+		) {
 			log("Optional community app cleanup warning: claimed destination identity changed during removal");
 			return;
 		}
 		await fs.rm(tombstone, { recursive: true, force: true });
+		if (await sameDirectoryIdentity(quarantineRoot, quarantineIdentity)) await fs.rm(quarantineRoot, { force: true });
 	} catch (error) {
 		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
 	}
@@ -583,7 +591,6 @@ export async function offerMacosCommunityApp(
 					destinationIdentity,
 					destinationRoot,
 					destinationRootIdentity,
-					tempRoot,
 					log,
 				);
 			installedDestination = undefined;
@@ -605,7 +612,6 @@ export async function offerMacosCommunityApp(
 						installedDestination.identity,
 						destinationRoot,
 						destinationRootIdentity,
-						tempRoot,
 						log,
 					);
 			} catch (cleanupError) {
