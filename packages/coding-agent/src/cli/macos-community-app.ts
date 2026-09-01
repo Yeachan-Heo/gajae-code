@@ -615,7 +615,7 @@ export async function offerMacosCommunityApp(
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {
-				if (mountAttached && (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))) {
+				if (mountAttached && mountIdentity && !(await sameDirectoryIdentity(mountPoint, mountIdentity))) {
 					removeTempRoot = false;
 					log("Optional community app cleanup warning: mountpoint identity changed; refusing detach");
 				} else {

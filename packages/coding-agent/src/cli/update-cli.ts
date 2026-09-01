@@ -1326,17 +1326,17 @@ async function runCommunityAppOfferFromRuntime(
 	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
 	const pinnedRuntimePath = path.join(pinDirectory, "gjc");
 	try {
-		await fs.promises.link(runtimePath, pinnedRuntimePath);
+		const snapshot = Buffer.from(await Bun.file(runtimePath).arrayBuffer());
+		if (createHash("sha256").update(snapshot).digest("hex") !== expectedIdentity.sha256)
+			throw new Error("verified runtime content changed before optional offer");
+		await fs.promises.writeFile(pinnedRuntimePath, snapshot, { flag: "wx", mode: 0o500 });
 		const pinnedStat = await fs.promises.lstat(pinnedRuntimePath);
 		if (
 			!pinnedStat.isFile() ||
 			pinnedStat.isSymbolicLink() ||
-			pinnedStat.dev !== runtimeStat.dev ||
-			pinnedStat.ino !== runtimeStat.ino ||
-			pinnedStat.size !== runtimeStat.size ||
 			(await runtimeSha256(pinnedRuntimePath)) !== expectedIdentity.sha256
 		)
-			throw new Error("verified runtime identity changed before optional offer");
+			throw new Error("verified runtime snapshot changed before optional offer");
 		const child = Bun.spawn([pinnedRuntimePath, "macos-community-app-offer"], {
 			stdin: "inherit",
 			stdout: "inherit",
