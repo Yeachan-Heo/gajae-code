@@ -1671,7 +1671,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 				>)
 			: migrateWorkflowState(existingCaller, caller).state;
 	if (caller === "deep-interview" && callee === "ultragoal") {
-		const inner = normalizedCaller;
+		const inner = isPlainObject(normalizedCaller.state) ? normalizedCaller.state : {};
 		if (inner?.crystal && isPlainObject(inner.crystal) && inner.crystal.lifecycle === "ready")
 			inner.execution_approval = "approved";
 	}
@@ -1685,8 +1685,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 	// in memory the same way direct `/skill:<runtime>` invocation does.
 	if (!calleeIsWorkflow) {
 		const mergedCallerState: Record<string, unknown> = {
-			...(caller === "deep-interview" ? existingCaller : normalizedCaller),
-			...(caller === "deep-interview" ? { state: normalizedCaller } : {}),
+			...normalizedCaller,
 			skill: caller,
 			version: WORKFLOW_STATE_VERSION,
 			active: false,
@@ -1804,8 +1803,7 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 		mergedCalleeState.session_id = sessionId;
 	}
 	const mergedCallerState: Record<string, unknown> = {
-		...(caller === "deep-interview" ? existingCaller : normalizedCaller),
-		...(caller === "deep-interview" ? { state: normalizedCaller } : {}),
+		...normalizedCaller,
 		skill: caller,
 		version: WORKFLOW_STATE_VERSION,
 		active: false,
