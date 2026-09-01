@@ -9052,13 +9052,7 @@ export class AgentSession {
 			Bun.sleep(idleBudgetMs).then(() => false),
 		]);
 		if (!disposeIdleSettled) {
-			try {
-				this.agent.forceAbort("Session disposed", this.#activeLogicalRunId);
-			} catch {
-				// AttemptScope handle may not be registered for sessions
-				// that don't participate in the facility (e.g. test mocks).
-				this.agent.forceAbort("Session disposed");
-			}
+			this.#forceSessionRecovery();
 		}
 		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
