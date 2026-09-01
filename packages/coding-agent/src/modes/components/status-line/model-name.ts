@@ -28,15 +28,23 @@ const DATE_OR_BUILD_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{6}|v\d+(?:\.\d+)*)$
 /**
  * Split version parts read as one number: `sonnet-4-5` -> `sonnet-4.5`.
  *
- * The trailing group must be a complete numeric token, so dashed size and
- * variant tokens survive intact: `llama-3-8b-instruct` keeps its `3-8b`.
+ * Deliberately narrow, because several id shapes look like a version pair and
+ * are not:
+ * - the trailing group must be a complete numeric token, so dashed size and
+ *   variant tokens survive (`llama-3-8b-instruct` keeps its `3-8b`);
+ * - it may not be zero-padded, so snapshot tails stay literal
+ *   (`gpt-4-0314`, `gemini-2.5-pro-preview-05-06`);
+ * - it is at most two digits, so month-year tails stay literal
+ *   (`command-r-08-2024`).
  */
-const SPLIT_VERSION = /(\d)-(\d+)(?![\dA-Za-z])/g;
+const SPLIT_VERSION = /(\d)-([1-9]\d?)(?![\dA-Za-z])/g;
 
 /**
- * Control and formatting characters (newlines, tabs, escape sequences) break
- * both row-width accounting and TUI rendering, and a model id is external
- * data. Stripped before anything else looks at the string.
+ * Control and formatting characters (newlines, tabs, escape sequences, and
+ * bidi overrides) break row-width accounting, TUI rendering, or both, and a
+ * model id is external data. Stripping rather than substituting keeps the
+ * label compact; it also removes ZWJ, which only matters for emoji ids that no
+ * provider registry produces.
  */
 const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/gu;
 

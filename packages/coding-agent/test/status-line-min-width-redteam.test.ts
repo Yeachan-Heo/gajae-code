@@ -3,7 +3,7 @@ import { visibleWidth } from "@gajae-code/tui";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { shortenModelId } from "../src/modes/components/status-line/model-name";
 import { StatusLineComponent } from "../src/modes/components/tool-status-header";
-import { initTheme } from "../src/modes/theme/theme";
+import { initTheme, theme } from "../src/modes/theme/theme";
 
 /**
  * Adversarial coverage for the narrow-width priority row: hostile model ids,
@@ -96,12 +96,18 @@ describe("status rail narrow-width red team", () => {
 		["over 100", 4_242.9],
 		["null", null],
 		["string", "42"],
-	])("survives a %s context percentage", (_label, percent) => {
+	])("never paints a %s context percentage as a number", (_label, percent) => {
 		for (const width of [4, 10, 24, 40]) {
 			const rows = buildRail({ percent }).render(width);
+			const text = strip(rows.join(""));
 			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
-			// Something always renders: the rail never goes blank at these widths.
-			expect(strip(rows.join("")).length).toBeGreaterThan(0);
+			// Something always renders, and it is never a garbage numeral: an
+			// unusable percentage must read as `?`, not `NaN%` or `Infinity%`.
+			expect(text.length).toBeGreaterThan(0);
+			expect(text).not.toContain("NaN");
+			expect(text).not.toContain("Infinity");
+			expect(text).not.toContain("undefined");
+			expect(text).not.toContain("null");
 		}
 	});
 
@@ -116,11 +122,15 @@ describe("status rail narrow-width red team", () => {
 		}
 	});
 
-	it("survives an unknown goal status", () => {
-		for (const width of [4, 12, 30]) {
+	it("keeps the goal indicator visible for an unknown goal status", () => {
+		const goalGlyph = theme.icon.goal || "G";
+		for (const width of [12, 30]) {
 			const rows = buildRail({ goalStatus: "totally-unknown" }).render(width);
+			const text = strip(rows.join(""));
 			for (const row of rows) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
-			expect(strip(rows.join("")).length).toBeGreaterThan(0);
+			// An unrecognized status falls back to the active presentation rather
+			// than silently dropping the indicator.
+			expect(text).toContain(goalGlyph);
 		}
 	});
 

@@ -88,6 +88,12 @@ describe("shortenModelId", () => {
 		["llama-3-70b", "llama-3-70b"],
 		["qwen-2-5-7b-instruct", "qwen-2.5-7b-instruct"],
 		["claude-3-5-haiku-20241022", "3.5-haiku"],
+		// Snapshot tails are dates, not versions, and must stay literal.
+		["openai/gpt-4-0314", "gpt-4-0314"],
+		["cohere/command-r-08-2024", "command-r-08-2024"],
+		["google/gemini-2.5-pro-preview-05-06", "gemini-2.5-pro-preview-05-06"],
+		["x-ai/grok-4-1-fast", "grok-4.1-fast"],
+		["mistralai/mistral-medium-3-5", "mistral-medium-3.5"],
 	])("shortens %s to %s", (input, expected) => {
 		expect(shortenModelId(input)).toBe(expected);
 	});
@@ -205,9 +211,15 @@ describe("status rail survives very small widths", () => {
 
 		const rows = component.render(10);
 
+		const goalGlyph = theme.icon.goal || "G";
+		const modelGlyph = theme.icon.model || "s";
+
 		expect(rows).toHaveLength(1);
+		// The exact compact row, not merely "one row that mentions a percentage":
+		// spaced separators would mean a leftover wrapped row slipped through.
+		expect(strip(rows[0])).toBe(`18%·${goalGlyph}·${modelGlyph}`);
 		expect(strip(rows[0])).not.toContain("…+");
-		expect(strip(rows[0])).toMatch(CONTEXT_TOKEN);
+		expect(strip(rows[0])).not.toContain(" / ");
 	});
 
 	it("still shows an unknown context percentage rather than nothing", () => {
