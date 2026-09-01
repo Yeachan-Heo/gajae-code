@@ -450,6 +450,10 @@ async function lstatEndpoint(file: string): Promise<SessionEndpointIdentity | un
 	};
 }
 
+function warningAffectsSession(warning: string, sessionId: string): boolean {
+	return !warning.startsWith("Session ") || warning.includes(`Session ${sessionId} `);
+}
+
 function sameEndpointIdentity(expected: SessionEndpointIdentity, current: SessionEndpointIdentity): boolean {
 	return (
 		expected.mtimeMs === current.mtimeMs &&
@@ -786,8 +790,9 @@ export class SessionRouter {
 		if (!attached || !current || !capability)
 			throw new SessionRouterError("pre_send", "Broker session endpoint could not be attached.");
 		const listing = this.#index.listSessions();
-		const indexedCurrent =
-			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
+		const indexedCurrent = listing.warnings.some(warning => warningAffectsSession(warning, sessionId))
+			? undefined
+			: listing.sessions.find(item => item.sessionId === sessionId);
 		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent))
 			await this.#serialReconcile(this.#runEpoch, true, true);
 		return capability;
@@ -959,7 +964,7 @@ export class SessionRouter {
 		try {
 			await this.#index.refresh();
 			const listing = this.#index.listSessions();
-			if (listing.warnings.length > 0) return undefined;
+			if (listing.warnings.some(warning => warningAffectsSession(warning, sessionId))) return undefined;
 			indexed = listing.sessions.find(candidate => candidate.sessionId === sessionId);
 		} catch {
 			return undefined;
@@ -1031,7 +1036,7 @@ export class SessionRouter {
 			await this.#index.open();
 			await this.#index.refresh();
 			const listing = this.#index.listSessions();
-			if (listing.warnings.length > 0)
+			if (listing.warnings.some(warning => warningAffectsSession(warning, sessionId)))
 				throw new SessionActivationError(
 					"session_not_live",
 					"Session activation requires an intact session index.",
@@ -1209,54 +1214,51 @@ export class SessionRouter {
 			return;
 		}
 		const indexed = this.#index.listSessions();
-		const live =
-			indexed.warnings.length === 0
-				? indexed.sessions.filter(
-						session =>
-							session.live &&
-							isSessionAuthorityEligible(session) &&
-							!session.terminalUncertain &&
-							(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
-					)
-				: [];
+		const live = indexed.sessions.filter(
+			session =>
+				!indexed.warnings.some(warning => warningAffectsSession(warning, session.sessionId)) &&
+				session.live &&
+				isSessionAuthorityEligible(session) &&
+				!session.terminalUncertain &&
+				(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
+		);
 		const liveIds = new Set(live.map(session => session.sessionId));
 		const attachedIds = new Set<string>();
-		if (indexed.warnings.length === 0) {
-			for (const [sessionId, adopted] of [...this.#adopted]) {
-				const attached = this.#sessions.get(sessionId);
-				const indexedSession = indexed.sessions.find(session => session.sessionId === sessionId);
-				if (!attached || attached.capability !== adopted.attachment) {
+		for (const [sessionId, adopted] of [...this.#adopted]) {
+			if (indexed.warnings.some(warning => warningAffectsSession(warning, sessionId))) continue;
+			const attached = this.#sessions.get(sessionId);
+			const indexedSession = indexed.sessions.find(session => session.sessionId === sessionId);
+			if (!attached || attached.capability !== adopted.attachment) {
+				this.#adopted.delete(sessionId);
+				continue;
+			}
+			const exactIndex =
+				indexedSession?.live === true &&
+				isSessionAuthorityEligible(indexedSession) &&
+				!indexedSession.terminalUncertain &&
+				indexedSession.endpointGeneration === adopted.generation &&
+				indexedSession.pid === adopted.pid &&
+				indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
+			const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
+			if (
+				!exactIndex ||
+				!endpoint ||
+				endpoint.pid !== adopted.pid ||
+				endpoint.url !== attached.endpoint.url ||
+				endpoint.token !== attached.endpoint.token
+			) {
+				this.#adopted.delete(sessionId);
+				await this.#retireAttachment(attached);
+				continue;
+			}
+			try {
+				if (await this.#publishAttachment(attached, true)) {
 					this.#adopted.delete(sessionId);
-					continue;
+					attachedIds.add(sessionId);
 				}
-				const exactIndex =
-					indexedSession?.live === true &&
-					isSessionAuthorityEligible(indexedSession) &&
-					!indexedSession.terminalUncertain &&
-					indexedSession.endpointGeneration === adopted.generation &&
-					indexedSession.pid === adopted.pid &&
-					indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
-				const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
-				if (
-					!exactIndex ||
-					!endpoint ||
-					endpoint.pid !== adopted.pid ||
-					endpoint.url !== attached.endpoint.url ||
-					endpoint.token !== attached.endpoint.token
-				) {
-					this.#adopted.delete(sessionId);
-					await this.#retireAttachment(attached);
-					continue;
-				}
-				try {
-					if (await this.#publishAttachment(attached, true)) {
-						this.#adopted.delete(sessionId);
-						attachedIds.add(sessionId);
-					}
-				} catch {
-					this.#adopted.delete(sessionId);
-					await this.#retireAttachment(attached);
-				}
+			} catch {
+				this.#adopted.delete(sessionId);
+				await this.#retireAttachment(attached);
 			}
 		}
 		let nextAttachment = 0;
@@ -1419,7 +1421,7 @@ export class SessionRouter {
 			return null;
 		await this.#index.refresh();
 		const listing = this.#index.listSessions();
-		if (listing.warnings.length > 0) return null;
+		if (listing.warnings.some(warning => warningAffectsSession(warning, indexed.sessionId))) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
 		return { endpoint, identity: provenIdentity };

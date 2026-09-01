@@ -249,7 +249,7 @@ export type TmuxOwnerIsolationExecutionResult = TmuxOwnerIsolationExecutionSucce
 /** Synchronous spawn boundary; callers pass argv and scoped stdin unchanged. */
 export interface TmuxOwnerIsolationExecutionDependencies {
 	socketKey: string;
-	spawn(argv: string[], stdinLine?: string): { exitCode: number | null; stdout?: string };
+	spawn(argv: string[], stdinLine?: string): { exitCode: number | null; stdout?: string; stderr?: string };
 	probeServer(socketKey: string): TmuxServerProof;
 	/** Reads the published owner generation immediately around direct execution. */
 	isCurrentGeneration?(): boolean;
@@ -493,7 +493,7 @@ export function executeTmuxOwnerIsolationPlanSync(
 			return {
 				ok: false,
 				code: "scope_bootstrap_failed",
-				diagnostic: "planned_spawn_failed",
+				diagnostic: safeDiagnostic(`planned_spawn_failed${result.stderr?.trim() ? `: ${result.stderr}` : ""}`),
 			};
 		if (execution.mode === "scoped" && !isExactScopedBootstrapSuccessReceipt(result.stdout ?? ""))
 			return {

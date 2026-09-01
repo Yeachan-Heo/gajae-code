@@ -851,7 +851,7 @@ export function createGjcTmuxSession(
 							env: executionEnv,
 						})
 					: Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe", env: executionEnv });
-				return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+				return { exitCode: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
 			} finally {
 				assertGjcTmuxStagedMutationAuthoritySync(authority);
 			}

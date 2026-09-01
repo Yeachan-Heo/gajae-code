@@ -150,7 +150,9 @@ describe("Broker spawn substrate provider", () => {
 		});
 	});
 
-	it("returns a typed proof failure after managed tagging or identity failure without falling back to headless", async () => {
+	it("falls back to an exact headless proof after managed substrate launch failure", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-substrate-"));
+		temporaryDirectories.push(cwd);
 		let headlessStarted = false;
 		const provider = createSpawnSubstrateProvider(
 			managedDependencies({
@@ -163,12 +165,30 @@ describe("Broker spawn substrate provider", () => {
 				},
 			}),
 		);
+		await expect(provider.launch(launchSpec(cwd))).resolves.toMatchObject({
+			ok: true,
+			proof: { substrateKind: "headless", pid: 999 },
+		});
+		expect(headlessStarted).toBeTrue();
+	});
+
+	it("preserves both substrate diagnostics when every substrate fails", async () => {
+		const provider = createSpawnSubstrateProvider(
+			managedDependencies({
+				launchManaged: () => {
+					throw new Error("planned_spawn_failed: fork failed");
+				},
+				startHeadless: () => {
+					throw new Error("headless unavailable");
+				},
+			}),
+		);
 		await expect(provider.launch(launchSpec())).resolves.toEqual({
 			ok: false,
-			code: "substrate_proof_failed",
-			message: "The selected spawn substrate could not be proven exactly.",
+			code: "substrate_unavailable",
+			message:
+				"tmux substrate launch failed: planned_spawn_failed: fork failed; headless substrate failed: No safe spawn substrate is available.",
 		});
-		expect(headlessStarted).toBeFalse();
 	});
 
 	it("reports a reused pane PID with a different OS incarnation as a mismatch", async () => {

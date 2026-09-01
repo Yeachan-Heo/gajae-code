@@ -64,6 +64,7 @@ import {
 	type SpawnAuthorityV1,
 	type SpawnClaimDecision,
 	type SpawnClaimV2,
+	type SpawnSubstrateFailure,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
 } from "./spawn-authority";
@@ -224,7 +225,7 @@ export type BrokerResponse =
 			error: {
 				code: BrokerErrorCode;
 				message: string;
-				details?: ModelProfileErrorDetails;
+				details?: ModelProfileErrorDetails | SpawnSubstrateFailure;
 				endpoint?: "unavailable";
 				cleanup?: BrokerCleanupEvidence;
 			};
@@ -233,6 +234,14 @@ export type BrokerResponse =
 			startupFailure?: LifecycleStartupFailureReceipt;
 	  };
 const error = (code: BrokerErrorCode, message: string): BrokerResponse => ({ ok: false, error: { code, message } });
+const spawnFailureError = (failure: SpawnSubstrateFailure): BrokerResponse => ({
+	ok: false,
+	error: {
+		code: "spawn_failed",
+		message: `session.spawn substrate could not be safely established: ${failure.message}`,
+		details: failure,
+	},
+});
 
 function isCleanupPending(response: BrokerResponse): boolean {
 	if (response.ok) return false;
@@ -1496,7 +1505,9 @@ export class Broker {
 	#spawnTerminalResponse(claim: SpawnClaimV2): BrokerResponse {
 		if (claim.state === "accepted") return { ok: true, result: this.#spawnResult("spawn_replayed", claim) };
 		if (claim.state === "pre_send_rejected")
-			return error("spawn_failed", "session.spawn was rejected before seed handoff");
+			return claim.failure
+				? spawnFailureError(claim.failure)
+				: error("spawn_failed", "session.spawn was rejected before seed handoff");
 		return error("resource_gone", "session.spawn claim is closed");
 	}
 
@@ -1553,14 +1564,20 @@ export class Broker {
 				});
 				if (launched.ok) launchedProof = launched.proof;
 				if (!launched.ok) {
+					const failure: SpawnSubstrateFailure = {
+						substrateKind: launched.code === "substrate_unavailable" ? "headless" : "tmux",
+						code: launched.code,
+						message: launched.message,
+					};
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
 							from: "substrate_starting",
 							to: "pre_send_rejected",
+							failure,
 						})
 					).claim;
-					return error("spawn_failed", "session.spawn substrate could not be safely established");
+					return spawnFailureError(failure);
 				}
 				const registration = await this.#spawnPromptLayer.awaitRegistration({
 					childId: prep.childId,

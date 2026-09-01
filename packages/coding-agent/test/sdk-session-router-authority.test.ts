@@ -1527,6 +1527,24 @@ describe("SessionRouter dispatch authority", () => {
 		expect(fixture.clients[0]?.requests).toEqual([{ type: "event_replay", sinceSeq: 0, sinceGeneration: 1 }]);
 		await fixture.router.stop();
 	});
+	test("retains a proven attachment when warnings name another session", async () => {
+		const fixture = await routerFixture();
+		fixture.authority.warnings = ["Session another-session has a legacy locator row and must re-register."];
+
+		const response = await fixture.router.request(
+			fixture.sessionId,
+			{
+				type: "control_request",
+				id: "state",
+				operation: "session.state",
+				input: {},
+			},
+			1,
+		);
+		expect(response).toEqual({ events: [] });
+		expect(fixture.router.attachment(fixture.sessionId)).not.toBeNull();
+		await fixture.router.stop();
+	});
 	test("rejects activation when the exact endpoint rotates after connecting", async () => {
 		let fixture!: RouterFixture;
 		fixture = await routerFixture({

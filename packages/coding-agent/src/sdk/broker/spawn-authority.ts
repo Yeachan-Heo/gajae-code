@@ -20,12 +20,19 @@ export type SpawnClaimV2 = {
 		| "pre_send_rejected"
 		| "uncertain"
 		| "closed";
+	failure?: SpawnSubstrateFailure;
 	preSendLease?: { epoch: string; status: "owned" | "consumed" };
 	childId?: string;
 	seed?: SeedDeliveryV2;
 	authorityRef?: string;
 	createdAt: number;
 	updatedAt: number;
+};
+
+export type SpawnSubstrateFailure = {
+	substrateKind: "tmux" | "psmux" | "headless";
+	code: string;
+	message: string;
 };
 
 export type SeedDeliveryV2 = {
@@ -134,6 +141,7 @@ export type SpawnClaimTransition = {
 	childId?: string;
 	/** Required for seed and terminal state transitions that carry Q26 facts. */
 	seed?: SeedDeliveryV2;
+	failure?: SpawnSubstrateFailure;
 	/** Required when exact substrate authority becomes active or closes. */
 	authority?: SpawnAuthorityV1;
 	/** Required to downgrade dispatching only when no frame was handed off. */
@@ -214,6 +222,7 @@ const CLAIM_KEYS = new Set([
 	"requestBindingMac",
 	"bindingMac",
 	"state",
+	"failure",
 	"preSendLease",
 	"childId",
 	"seed",
@@ -432,6 +441,18 @@ function hasClaimStateShape(claim: SpawnClaimV2): boolean {
 	}
 }
 
+function isSpawnSubstrateFailure(value: unknown): value is SpawnSubstrateFailure {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const failure = value as Record<string, unknown>;
+	return (
+		Object.keys(failure).every(key => key === "substrateKind" || key === "code" || key === "message") &&
+		SUBSTRATE_KINDS.has(failure.substrateKind as SpawnSubstrateProof["substrateKind"]) &&
+		isOpaque(failure.code) &&
+		isOpaque(failure.message) &&
+		failure.message.length <= 2048
+	);
+}
+
 export function isSpawnClaimV2(value: unknown): value is SpawnClaimV2 {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 	const claim = value as Record<string, unknown>;
@@ -457,6 +478,7 @@ export function isSpawnClaimV2(value: unknown): value is SpawnClaimV2 {
 		(claim.childId === undefined || isOpaque(claim.childId)) &&
 		(claim.seed === undefined || isSeed(claim.seed)) &&
 		(claim.authorityRef === undefined || isOpaque(claim.authorityRef)) &&
+		(claim.failure === undefined || isSpawnSubstrateFailure(claim.failure)) &&
 		isTimestamp(claim.createdAt) &&
 		isTimestamp(claim.updatedAt) &&
 		claim.updatedAt >= claim.createdAt;
@@ -672,7 +694,12 @@ export class SpawnAuthorityStore {
 			let next: SpawnClaimV2;
 			switch (transition.to) {
 				case "substrate_starting": {
-					if (!isOpaque(transition.childId) || transition.seed !== undefined || transition.authority !== undefined)
+					if (
+						!isOpaque(transition.childId) ||
+						transition.seed !== undefined ||
+						transition.authority !== undefined ||
+						transition.failure !== undefined
+					)
 						throw new SpawnAuthorityTransitionError("invalid_transition");
 					next = { ...current, state: "substrate_starting", childId: transition.childId };
 					break;
@@ -752,7 +779,11 @@ export class SpawnAuthorityStore {
 				case "pre_send_rejected": {
 					if (current.state === "dispatching" && transition.provenNoHandoff !== true)
 						throw new SpawnAuthorityTransitionError("invalid_transition");
-					if (transition.childId !== undefined || transition.authority !== undefined)
+					if (
+						transition.childId !== undefined ||
+						transition.authority !== undefined ||
+						(transition.failure !== undefined && !isSpawnSubstrateFailure(transition.failure))
+					)
 						throw new SpawnAuthorityTransitionError("invalid_transition");
 					if (current.seed) {
 						if (
@@ -761,10 +792,14 @@ export class SpawnAuthorityStore {
 							!sameSeedIdentity(current.seed, transition.seed)
 						)
 							throw new SpawnAuthorityTransitionError("invalid_transition");
-						next = { ...current, state: "pre_send_rejected", seed: transition.seed };
+						next = { ...current, state: "pre_send_rejected", seed: transition.seed, failure: transition.failure };
 					} else {
 						if (transition.seed !== undefined) throw new SpawnAuthorityTransitionError("invalid_transition");
-						next = { ...current, state: "pre_send_rejected" };
+						next = {
+							...current,
+							state: "pre_send_rejected",
+							...(transition.failure === undefined ? {} : { failure: transition.failure }),
+						};
 					}
 					break;
 				}
