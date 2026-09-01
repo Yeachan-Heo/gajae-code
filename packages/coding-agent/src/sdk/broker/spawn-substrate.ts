@@ -518,20 +518,26 @@ export function createSpawnSubstrateProvider(
 			}
 			if (!isPositiveInteger(proof.pid) || !isNonEmptyString(proof.processIncarnation))
 				return { ok: false, code: "substrate_mismatch" };
+			const pid = proof.pid;
 			const closeFailure = (verdict: "verified" | "mismatch" | "gone") => ({
 				ok: false,
 				code: verdict === "verified" ? "substrate_close_pending" : `substrate_${verdict}`,
 			});
+			const verifyAfterSignal = async (): Promise<"verified" | "mismatch" | "gone"> => {
+				const verdict = await provider.verify(proof);
+				if (verdict === "mismatch" && readIncarnation(pid) === undefined && isGone(pid)) return "gone";
+				return verdict;
+			};
 			// Delivery starts shutdown; only a later exact proof of absence completes it.
 			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGTERM")) {
-				const afterSignalFailure = await provider.verify(proof);
+				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
 			const afterTerm = await waitForHeadlessExit(proof, provider.verify, sleep);
 			if (afterTerm === "gone") return { ok: true };
 			if (afterTerm !== "verified") return closeFailure(afterTerm);
 			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGKILL")) {
-				const afterSignalFailure = await provider.verify(proof);
+				const afterSignalFailure = await verifyAfterSignal();
 				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
 			}
 			const afterKill = await waitForHeadlessExit(proof, provider.verify, sleep);

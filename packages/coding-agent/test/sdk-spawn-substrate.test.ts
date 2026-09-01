@@ -293,6 +293,34 @@ describe("Broker spawn substrate provider", () => {
 		expect(await provider.verify(launched.proof)).toBe("gone");
 	});
 
+	it("accepts a gone headless process when teardown unlinks its proof first", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-substrate-"));
+		temporaryDirectories.push(cwd);
+		let live = true;
+		let stateFile: string | undefined;
+		const provider = createSpawnSubstrateProvider({
+			platform: "darwin",
+			selectMultiplexer: () => "none",
+			startHeadless: () => ({ pid: 994, terminate() {} }),
+			processIncarnation: () => (live ? "darwin:994" : undefined),
+			isProcessGone: () => !live,
+			signalHeadless: () => {
+				live = false;
+				if (stateFile) void fs.rm(stateFile, { force: true });
+				return true;
+			},
+			sleep: async () => {
+				await Bun.sleep(0);
+			},
+		});
+		const launched = await provider.launch(launchSpec(cwd));
+		expect(launched.ok).toBeTrue();
+		if (!launched.ok) throw new Error("headless substrate did not launch");
+		const candidateStateFile = launched.proof.stateFileProof?.stateFile;
+		stateFile = typeof candidateStateFile === "string" ? candidateStateFile : undefined;
+		expect(await provider.close(launched.proof)).toEqual({ ok: true });
+	});
+
 	it("closes only the requested exact sibling proof", async () => {
 		const first = managedProof();
 		const sibling = managedProof({

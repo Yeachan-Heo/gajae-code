@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Headless SDK substrate close now reports success when exact teardown observes the recorded process gone even if cleanup unlinks the durable proof first; live or identity-ambiguous substrates still report `substrate_mismatch`. (#5130)
+
 - Windows session-state locks now drain late terminal reconciliation writes before disposal returns and safely reclaim valid dead transition claims during resume. (#5102)
 
 - Deferred MCP startup now releases queued idle yields as soon as readiness settles without bypassing prompt admission. Barrier extensions remain gated, rejected startup drops the wake without prompting, settled sessions retain the normal idle merge window, and readiness stays session-local. (#5085)
