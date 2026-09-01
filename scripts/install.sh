@@ -651,7 +651,12 @@ install_binary() {
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
     if [ "$PLATFORM" = "darwin" ]; then
-        "$DEST_PATH" macos-community-app-offer || true
+        OFFER_RUNTIME="${DEST_PATH}.community-app-offer.$$"
+        if [ ! -e "$OFFER_RUNTIME" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && ln "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
+            remember_tmp "$OFFER_RUNTIME"
+            "$OFFER_RUNTIME" macos-community-app-offer || true
+            rm -f "$OFFER_RUNTIME"
+        fi
     fi
 
     case ":$PATH:" in
