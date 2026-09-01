@@ -873,6 +873,30 @@ describe("SessionManager read-only resume", () => {
 		expect(rewritten.every(line => line.type === "session" || typeof line.id === "string")).toBe(true);
 	});
 
+	it("publishes canonical mutations made after a read-only legacy open", async () => {
+		const storage = new WriteTrackingStorage();
+		const filePath = "/sessions/legacy-mutation.jsonl";
+		storage.writeTextSync(
+			filePath,
+			`${JSON.stringify({ type: "session", id: "legacy-mutation", timestamp: new Date(0).toISOString(), cwd: "/cwd", version: 2 })}\n${JSON.stringify({ type: "message", id: "legacy-message", parentId: null, timestamp: new Date(0).toISOString(), message: { role: "user", content: "legacy", timestamp: 0 } })}\n`,
+		);
+		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+		if (inspection.kind === "error") throw new Error("Expected legacy inspection");
+		const opened = await SessionManager.openExistingStrict(inspection.identity, "/sessions", storage);
+		if (opened.kind === "error") throw new Error("Expected strict open");
+		const entry = opened.manager.getBranch().find(candidate => candidate.type === "message");
+		if (entry?.type !== "message" || entry.message.role !== "user") throw new Error("Expected legacy user message");
+		opened.manager.applyEntryMessageUpdates([{ ...entry, message: { ...entry.message, content: "updated" } }]);
+		expect((await opened.manager.closeStrict()).kind).toBe("closed");
+		const rewritten = storage
+			.readTextSync(filePath)
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 5 });
+		expect(rewritten[1].message.content).toBe("updated");
+	});
+
 	it("inspects and strictly opens a checked-in legacy transcript", async () => {
 		const root = makeTempDir();
 		const filePath = path.join(root, "legacy-session.jsonl");

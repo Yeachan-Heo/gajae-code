@@ -17919,6 +17919,7 @@ export class SessionManager {
 	 */
 	applyEntryMessageUpdates(entries: readonly SessionMessageEntry[]): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#readOnlyResume = false;
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
@@ -17940,6 +17941,7 @@ export class SessionManager {
 		options: { preserveEvictedContent?: boolean } = {},
 	): void {
 		this.#assertRecoveryHydrationWritable();
+		this.#readOnlyResume = false;
 		this.#deactivateColdForBranchMutation();
 		for (const updated of entries) {
 			const canonical = this.#byId.get(updated.id);
