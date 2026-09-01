@@ -2850,6 +2850,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						rescopeSessionCwd: (() => {
 							let moveConsumed = false;
 							return async (target: string): Promise<{ from: string; to: string }> => {
+								const delegatedSession = session;
+								if (delegatedSession)
+									return delegatedSession.rescopeSessionCwd(target, { scope: "descendant" });
 								if (moveConsumed) {
 									throw new Error(
 										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
