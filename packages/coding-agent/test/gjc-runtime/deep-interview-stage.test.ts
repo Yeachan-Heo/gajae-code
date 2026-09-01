@@ -728,6 +728,28 @@ describe("deep-interview staged transitions", () => {
 		expect(afterState.note_b).toBeUndefined();
 	});
 
+	it("reset preserves canonical Crystal and spec ownership metadata", async () => {
+		const root = await tempDir();
+		await seed(root);
+		const statePath = modeStatePath(root, TEST_SESSION_ID, "deep-interview");
+		const state = await readState(root);
+		state.spec_path = "/tmp/crystal.md";
+		state.spec_sha256 = "a".repeat(64);
+		state.spec_slug = "crystal";
+		state.spec_stage = "final";
+		state.state = { crystal: { lifecycle: "ready", schema_version: 1 }, execution_approval: "not-approved" };
+		await fs.writeFile(statePath, `${JSON.stringify(state)}\n`, "utf8");
+		const reset = parse(
+			(await run(root, ["write", "--reset", "--input", JSON.stringify({ state: { fresh: true } }), "--json"]))
+				.stdout,
+		);
+		expect(reset.mode).toBe("reset");
+		const after = await readState(root);
+		expect((after.state as Record<string, unknown>).crystal).toEqual({ lifecycle: "ready", schema_version: 1 });
+		expect(after.spec_path).toBe("/tmp/crystal.md");
+		expect((after.state as Record<string, unknown>).execution_approval).toBe("not-approved");
+	});
+
 	it("write refuses while a staged draft is pending and strips runtime-owned keys", async () => {
 		const root = await tempDir();
 		await seed(root);
