@@ -92,6 +92,25 @@ describe("deep-interview crystallize contract", () => {
 			),
 		).toThrow("verbatim user anchor");
 	});
+	it("rejects marker substrings in mixed text anchors", () => {
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content: "Need [image] support" }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					snapshot,
+					current_revision: 1,
+					items: [{ ...input().items[0], anchor: { message_index: 0, quote: "[image]" } }],
+				}),
+			),
+		).toThrow("verbatim user anchor");
+	});
 
 	it("represents bounded gaps as needs-questions", () => {
 		const crystal = crystallizeDeepInterview(input({ open_gaps: ["What is the memory budget?"] }));

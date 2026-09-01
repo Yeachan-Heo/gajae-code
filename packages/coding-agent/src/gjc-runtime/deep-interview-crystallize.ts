@@ -163,7 +163,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					throw new Error(`confirmed item ${id} anchor message ${item.anchor!.message_index} is missing`);
 				if (
 					anchorMessage.role !== "user" ||
-					/^(?:\[[^\]]+\])+$/.test(item.anchor.quote) ||
+					/\[(?:image|audio|video|file|content)\]/i.test(item.anchor.quote) ||
 					/^(?:\[[^\]]+\])+$/.test(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote)
 				)
