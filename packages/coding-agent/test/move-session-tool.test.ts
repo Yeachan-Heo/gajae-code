@@ -1205,10 +1205,12 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		fs.mkdirSync(cwd);
 		fs.symlinkSync(cwd, alias);
 		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
-
-		await sessionManager.moveTo(alias);
-
-		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+		try {
+			await sessionManager.moveTo(alias);
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+		} finally {
+			await sessionManager.close();
+		}
 	});
 
 	it("rejects direct manager moves when the source root is replaced after pinning", async () => {
@@ -1235,6 +1237,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 			expect(sessionManager.getCwd()).toBe(cwdA);
 		} finally {
 			openSpy.mockRestore();
+			await sessionManager.close();
 		}
 	});
 
@@ -1265,6 +1268,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 			expect(sessionManager.getCwd()).toBe(cwdA);
 		} finally {
 			openSpy.mockRestore();
+			await sessionManager.close();
 		}
 	});
 

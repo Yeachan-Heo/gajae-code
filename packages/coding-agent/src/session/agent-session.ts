@@ -4669,10 +4669,8 @@ export class AgentSession {
 				completed = true;
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				if (completed) {
-					this.#coordinatorRescopeMoveId = undefined;
-					this.#endCoordinatorRescopeBarrier();
-				}
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
