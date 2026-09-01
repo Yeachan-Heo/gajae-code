@@ -1325,11 +1325,14 @@ async function runCommunityAppOfferFromRuntime(
 		throw new Error("verified runtime identity changed before optional offer");
 	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
 	const pinnedRuntimePath = path.join(pinDirectory, "gjc");
+	let pinDirectoryLocked = false;
 	try {
 		const snapshot = Buffer.from(await Bun.file(runtimePath).arrayBuffer());
 		if (createHash("sha256").update(snapshot).digest("hex") !== expectedIdentity.sha256)
 			throw new Error("verified runtime content changed before optional offer");
 		await fs.promises.writeFile(pinnedRuntimePath, snapshot, { flag: "wx", mode: 0o500 });
+		await fs.promises.chmod(pinDirectory, 0o500);
+		pinDirectoryLocked = true;
 		const pinnedStat = await fs.promises.lstat(pinnedRuntimePath);
 		if (
 			!pinnedStat.isFile() ||
@@ -1354,6 +1357,7 @@ async function runCommunityAppOfferFromRuntime(
 		}
 		if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
 	} finally {
+		if (pinDirectoryLocked) await fs.promises.chmod(pinDirectory, 0o700).catch(() => undefined);
 		await fs.promises.rm(pinDirectory, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
