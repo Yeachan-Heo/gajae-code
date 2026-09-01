@@ -1744,6 +1744,15 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
+						if (isTurnEnded) {
+							// Record the boundary at parse time, before the queued handler runs,
+							// so a following coalesced END_STREAM cannot race ahead of the
+							// already-admitted prefix and report a false missing-turn failure.
+							sawTurnEnded = true;
+							terminalBoundarySeen = true;
+							terminalBoundaryObserved = false;
+							closeTerminalAdmission();
+						}
 						if (atBufferedTerminalBoundary && !isTurnEnded) continue;
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.

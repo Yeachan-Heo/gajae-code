@@ -513,6 +513,51 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("drains a coalesced pre-boundary exec before valid Connect end-stream", async () => {
+		let executions = 0;
+		const releaseExec = Promise.withResolvers<void>();
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			const exec = buildServerMessageFrame({
+				case: "execServerMessage",
+				value: create(ExecServerMessageSchema, {
+					id: 1,
+					message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "before.txt" }) },
+				}),
+			});
+			const turnEnded = buildServerMessageFrame({
+				case: "interactionUpdate",
+				value: create(InteractionUpdateSchema, {
+					message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+				}),
+			});
+			stream.end(Buffer.concat([exec, turnEnded, frameConnectMessage(Buffer.from("{}"), CONNECT_END_STREAM_FLAG)]));
+		});
+		setTimeout(() => releaseExec.resolve(), 20);
+
+		const { result } = await collectTerminal(baseUrl, {
+			streamFirstEventTimeoutMs: 100,
+			streamIdleTimeoutMs: 100,
+			execHandlers: {
+				piRead: async call => {
+					executions += 1;
+					await releaseExec.promise;
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "read",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+		});
+		expect(result.errorMessage).toBeUndefined();
+		expect(result.stopReason).toBe("stop");
+		expect(executions).toBe(1);
+	});
+
 	it("drops a malformed frame coalesced after turnEnded", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
