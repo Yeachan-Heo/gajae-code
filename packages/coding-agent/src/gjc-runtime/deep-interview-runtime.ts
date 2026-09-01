@@ -1,8 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { getSessionsDir } from "@gajae-code/utils";
 import { isSettingsInitialized, Settings } from "../config/settings";
-import { listProjectSessionTranscriptFiles } from "../session/session-manager";
+import { listProjectSessionTranscriptFiles, parseSessionEntries } from "../session/session-manager";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -184,7 +185,24 @@ async function authoritativeConversationSnapshot(
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
 	if (!sessionFile) {
-		for (const candidate of listProjectSessionTranscriptFiles(cwd)) {
+		const candidates = [...listProjectSessionTranscriptFiles(cwd)];
+		const pending = [getSessionsDir()];
+		while (pending.length > 0 && candidates.length < 1000) {
+			const directory = pending.pop()!;
+			let entries: Array<{ isDirectory(): boolean; isFile(): boolean; name: string }> = [];
+			try {
+				entries = await fs.readdir(directory, { withFileTypes: true });
+			} catch {
+				continue;
+			}
+			for (const entry of entries) {
+				const candidate = path.join(directory, entry.name);
+				if (entry.isDirectory()) pending.push(candidate);
+				else if (entry.isFile() && entry.name.endsWith(".jsonl")) candidates.push(candidate);
+				if (candidates.length >= 1000) break;
+			}
+		}
+		for (const candidate of candidates) {
 			try {
 				const header = JSON.parse((await fs.readFile(candidate, "utf-8")).split(/\r?\n/, 1)[0]) as Record<
 					string,
@@ -205,40 +223,41 @@ async function authoritativeConversationSnapshot(
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
 		const text = await fs.readFile(sessionFile, "utf-8");
-		const messages: Array<{ index: number; role: string; content: string }> = [];
 		for (const line of text.split(/\r?\n/)) {
 			if (!line.trim()) continue;
-			try {
-				const parsed = JSON.parse(line);
-				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
-					throw new Error("invalid transcript entry");
-				const entry = parsed as Record<string, unknown>;
-				const candidate =
-					entry.type === "message" && entry.message && typeof entry.message === "object" ? entry.message : entry;
-				if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
-				const message = candidate as Record<string, unknown>;
-				if (typeof message.role !== "string") continue;
-				const content =
-					typeof message.content === "string"
-						? message.content
-						: Array.isArray(message.content)
-							? message.content
-									.filter(item => item && typeof item === "object" && !Array.isArray(item))
-									.map(item => {
-										const block = item as Record<string, unknown>;
-										return typeof block.text === "string" ? block.text : "";
-									})
-									.join("")
-							: "";
-				if (!content) continue;
-				messages.push({
-					index: messages.length,
-					role: message.role,
-					content: content.normalize("NFC").trim(),
-				});
-			} catch {
+			const parsed = JSON.parse(line);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
 				throw new DeepInterviewCommandError(2, "live session transcript is malformed");
-			}
+		}
+		const entries = parseSessionEntries(text);
+		const header = entries[0];
+		if (
+			header?.type !== "session" ||
+			header?.id !== sessionId ||
+			typeof header?.cwd !== "string" ||
+			path.resolve(header.cwd) !== path.resolve(cwd)
+		)
+			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
+		const messages: Array<{ index: number; role: string; content: string }> = [];
+		for (const entry of entries.slice(1)) {
+			if (entry.type !== "message") continue;
+			const message = entry.message as unknown as Record<string, unknown>;
+			if (typeof message.role !== "string") continue;
+			const content =
+				typeof message.content === "string"
+					? message.content
+					: Array.isArray(message.content)
+						? message.content
+								.filter(item => item && typeof item === "object" && !Array.isArray(item))
+								.map(item =>
+									typeof (item as Record<string, unknown>).text === "string"
+										? (item as Record<string, unknown>).text
+										: "",
+								)
+								.join("")
+						: "";
+			if (content)
+				messages.push({ index: messages.length, role: message.role, content: content.normalize("NFC").trim() });
 		}
 		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
 		return { revision: messages.length, messages };
