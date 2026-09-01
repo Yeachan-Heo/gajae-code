@@ -151,6 +151,28 @@ async function samePathIdentity(filePath: string, expected: FileIdentity): Promi
 	return actual?.dev === expected.dev && actual.ino === expected.ino;
 }
 
+async function removeClaimedDirectory(
+	filePath: string,
+	identity: FileIdentity,
+	parentPath: string,
+	parentIdentity: FileIdentity,
+	log: (message: string) => void,
+): Promise<void> {
+	if (!(await sameDirectoryIdentity(parentPath, parentIdentity)) || !(await sameDirectoryIdentity(filePath, identity)))
+		return;
+	const tombstone = `${filePath}.cleanup-${process.pid}-${Date.now().toString(16)}`;
+	try {
+		await fs.rename(filePath, tombstone);
+		if (!(await sameDirectoryIdentity(tombstone, identity))) {
+			log("Optional community app cleanup warning: claimed destination identity changed during removal");
+			return;
+		}
+		await fs.rm(tombstone, { recursive: true, force: true });
+	} catch (error) {
+		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
+	}
+}
+
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
 	const terminateAndReap = async (): Promise<void> => {
@@ -518,6 +540,9 @@ export async function offerMacosCommunityApp(
 			!(await sameDirectoryIdentity(destination, destinationIdentity))
 		)
 			throw new Error("the destination identity changed before copy");
+		if (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))
+			throw new Error("the mounted volume identity changed before copy");
+		if (!(await isExpectedBundle(sourceApp, command))) throw new Error("the mounted app bundle changed before copy");
 		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
 		throwIfInterrupted();
 		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
@@ -538,6 +563,11 @@ export async function offerMacosCommunityApp(
 		const copiedArchCheck = await command(["/usr/bin/lipo", "-archs", copiedExecutablePath]);
 		if (copiedArchCheck.exitCode !== 0 || !copiedArchCheck.stdout.split(/\s+/).includes(executableArch))
 			throw new Error("the copied app architecture changed");
+		if (
+			!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
+			!(await sameDirectoryIdentity(destination, destinationIdentity))
+		)
+			throw new Error("the destination identity changed before launch");
 		const launch = await command(["/usr/bin/open", destination]);
 		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
@@ -546,7 +576,13 @@ export async function offerMacosCommunityApp(
 				(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
 				(await sameDirectoryIdentity(destination, destinationIdentity))
 			)
-				await fs.rm(destination, { recursive: true, force: true });
+				await removeClaimedDirectory(
+					destination,
+					destinationIdentity,
+					destinationRoot,
+					destinationRootIdentity,
+					log,
+				);
 			installedDestination = undefined;
 			return failure("the verified app could not be launched; the partial app state was removed", log);
 		}
@@ -560,7 +596,13 @@ export async function offerMacosCommunityApp(
 					(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
 					(await sameDirectoryIdentity(installedDestination.path, installedDestination.identity))
 				)
-					await fs.rm(installedDestination.path, { recursive: true, force: true });
+					await removeClaimedDirectory(
+						installedDestination.path,
+						installedDestination.identity,
+						destinationRoot,
+						destinationRootIdentity,
+						log,
+					);
 			} catch (cleanupError) {
 				log(`Optional community app cleanup warning: failed to remove partial app state: ${String(cleanupError)}`);
 			}
