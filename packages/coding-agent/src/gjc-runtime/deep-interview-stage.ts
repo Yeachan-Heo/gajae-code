@@ -478,14 +478,6 @@ function computeMergedEnvelope(
 					"DI_STAGE_MERGE_REJECTED",
 					`crystallized ${field} is immutable through staged apply`,
 				);
-		if (isPlainObject(priorState.crystal) && priorState.crystal.lifecycle === "ready") {
-			for (const field of ["rounds", "established_facts", "intent_review", "current_ambiguity"] as const)
-				if (JSON.stringify(mergedState[field]) !== JSON.stringify(priorState[field]))
-					throw new DeepInterviewStageError(
-						"DI_STAGE_MERGE_REJECTED",
-						"ready Crystal evidence is immutable through staged apply",
-					);
-		}
 	}
 	if (mergedState?.crystal && isPlainObject(mergedState.crystal) && mergedState.crystal.lifecycle !== "ready")
 		merged.current_phase = "interviewing";
@@ -496,6 +488,24 @@ function computeMergedEnvelope(
 		);
 	}
 	merged = deriveRuntimeAmbiguity(merged, current);
+	if (isPlainObject(priorState?.crystal) && priorState.crystal.lifecycle === "ready") {
+		for (const field of [
+			"rounds",
+			"established_facts",
+			"intent_review",
+			"current_ambiguity",
+			"topology",
+			"auto_answered_rounds",
+		] as const)
+			if (
+				JSON.stringify((merged.state as Record<string, unknown> | undefined)?.[field]) !==
+				JSON.stringify(priorState[field])
+			)
+				throw new DeepInterviewStageError(
+					"DI_STAGE_MERGE_REJECTED",
+					"ready Crystal evidence is immutable through staged apply",
+				);
+	}
 	try {
 		assertDeepInterviewEnvelopeInputLimits(merged);
 	} catch (error) {
