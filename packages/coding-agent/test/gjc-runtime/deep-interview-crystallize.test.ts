@@ -106,7 +106,7 @@ describe("deep-interview crystallize contract", () => {
 				input({
 					snapshot,
 					current_revision: 1,
-					items: [{ ...input().items[0], anchor: { message_index: 0, quote: "[image]" } }],
+					items: [{ ...input().items[0], anchor: { message_index: 0, quote: "Need [image] support" } }],
 				}),
 			),
 		).toThrow("verbatim user anchor");
