@@ -1000,7 +1000,7 @@ async function syncStageHud(cwd: string, sessionId: string, envelope: Record<str
 		await syncSkillActiveState({
 			cwd,
 			skill: "deep-interview",
-			active: phase !== "complete",
+			active: envelope.active !== false && phase !== "complete",
 			phase,
 			sessionId,
 			source: "gjc-deep-interview-native",
