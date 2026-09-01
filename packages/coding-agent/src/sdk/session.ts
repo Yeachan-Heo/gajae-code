@@ -33,6 +33,7 @@ import {
 	getAgentDbPath,
 	getAgentDir,
 	getAgentProfileAuthority,
+	getConfigDirName,
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
@@ -1418,12 +1419,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	// Resolve the selected profile once at session admission. A relative agent
 	// directory must not be reinterpreted against a process cwd changed by a
 	// later session rescope.
-	const agentDir = path.resolve(options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir());
+	const selectedAgentDir = options.agentDir ?? options.settings?.getAgentDir();
+	const agentDir = path.resolve(selectedAgentDir ?? getDefaultAgentDir());
+	const canonicalDefaultAgentDir = path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
 	const profileAuthority: "default" | "custom" =
-		getAgentProfileAuthority() === "custom" ||
-		normalizePathForComparison(agentDir) !== normalizePathForComparison(getDefaultAgentDir())
-			? "custom"
-			: "default";
+		selectedAgentDir !== undefined
+			? normalizePathForComparison(agentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
+				? "default"
+				: "custom"
+			: getAgentProfileAuthority();
 	if (options.agentDir !== undefined && options.settings?.isAgentDirExplicit()) {
 		const settingsAgentDir = path.resolve(options.settings.getAgentDir());
 		if (normalizePathForComparison(path.resolve(options.agentDir)) !== normalizePathForComparison(settingsAgentDir)) {
