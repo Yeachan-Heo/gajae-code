@@ -1268,13 +1268,31 @@ export interface UpdateCommandDependencies {
 }
 
 async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<void> {
-	const child = Bun.spawn([runtimePath, "macos-community-app-offer"], {
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-	});
-	const exitCode = await child.exited;
-	if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
+	const runtimeStat = await fs.promises.lstat(runtimePath);
+	if (!runtimeStat.isFile() || runtimeStat.isSymbolicLink())
+		throw new Error("verified runtime path is not a regular file");
+	const pinnedRuntimePath = `${runtimePath}.community-app-offer.${process.pid}.${Date.now().toString(16)}`;
+	await fs.promises.link(runtimePath, pinnedRuntimePath);
+	try {
+		const child = Bun.spawn([pinnedRuntimePath, "macos-community-app-offer"], {
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+		});
+		const exitCode = await Promise.race([child.exited, Bun.sleep(120_000).then(() => 124)]);
+		if (exitCode === 124) {
+			try {
+				child.kill("SIGKILL");
+			} catch {
+				// The optional child may have exited at the timeout boundary.
+			}
+			await Promise.race([child.exited, Bun.sleep(5000)]);
+			throw new Error("optional macOS community app offer timed out");
+		}
+		if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
+	} finally {
+		await fs.promises.unlink(pinnedRuntimePath).catch(() => undefined);
+	}
 }
 
 export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
@@ -1579,7 +1597,7 @@ export async function runUpdateCommand(
 			await releaseLock();
 		}
 		if (migrationVerified) {
-			if ((deps.platform ?? process.platform) === "darwin") {
+			if (!opts.check && (deps.platform ?? process.platform) === "darwin") {
 				try {
 					await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path);
 				} catch (error) {

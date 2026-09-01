@@ -317,6 +317,26 @@ export async function offerMacosCommunityApp(
 	let mountPoint: string | undefined;
 	let mountAttempted = false;
 	let installedDestination: string | undefined;
+	let receivedSignal: NodeJS.Signals | undefined;
+	const signalNames = ["SIGINT", "SIGTERM"] as const;
+	const signalHandlers = new Map<NodeJS.Signals, () => void>();
+	const onSignal = (signal: NodeJS.Signals) => {
+		receivedSignal = signal;
+	};
+	for (const signal of signalNames) {
+		const handler = () => onSignal(signal);
+		signalHandlers.set(signal, handler);
+		process.once(signal, handler);
+	}
+	const removeSignalHandlers = () => {
+		for (const signal of signalNames) {
+			const handler = signalHandlers.get(signal);
+			if (handler) process.removeListener(signal, handler);
+		}
+	};
+	const throwIfInterrupted = () => {
+		if (receivedSignal) throw new Error(`community app offer interrupted by ${receivedSignal}`);
+	};
 	try {
 		const releaseResponse = await fetchImpl(
 			`${GITHUB_API_ORIGIN}/repos/${COMMUNITY_APP_REPOSITORY}/releases/latest`,
@@ -332,6 +352,7 @@ export async function offerMacosCommunityApp(
 		if (!releaseResponse.ok)
 			return failure(`no canonical published release is available (HTTP ${releaseResponse.status})`, log);
 		const release = JSON.parse(await readResponseText(releaseResponse, MAX_RELEASE_BYTES)) as ReleasePayload;
+		throwIfInterrupted();
 		const tagVersion = releaseVersion(release.tag_name);
 		if (!tagVersion || release.draft || release.prerelease || !release.assets?.length)
 			return failure("no canonical published release is available", log);
@@ -357,6 +378,7 @@ export async function offerMacosCommunityApp(
 			return failure("the canonical release assets could not be downloaded", log);
 		const dmgBytes = await readResponseBytes(dmgResponse, MAX_DMG_BYTES);
 		const expected = parseChecksum(await readResponseText(checksumResponse, MAX_CHECKSUM_BYTES), dmg.name);
+		throwIfInterrupted();
 		if (!expected) return failure("the published checksum does not name the DMG", log);
 		const actual = createHash("sha256").update(dmgBytes).digest("hex");
 		if (actual !== expected) return failure("the DMG checksum did not match", log);
@@ -376,6 +398,7 @@ export async function offerMacosCommunityApp(
 			mountPoint,
 			dmgPath,
 		]);
+		throwIfInterrupted();
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		const entries = await fs.readdir(mountPoint, { withFileTypes: true });
 		const appEntry = entries.find(entry => entry.isDirectory() && entry.name.endsWith(".app"));
@@ -404,8 +427,10 @@ export async function offerMacosCommunityApp(
 		}
 		installedDestination = destination;
 		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
+		throwIfInterrupted();
 		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
 		const launch = await command(["/usr/bin/open", destination]);
+		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
 			await fs.rm(destination, { recursive: true, force: true });
 			installedDestination = undefined;
@@ -422,6 +447,7 @@ export async function offerMacosCommunityApp(
 		}
 		return failure(error instanceof Error ? error.message : String(error), log);
 	} finally {
+		removeSignalHandlers();
 		if (mountAttempted && mountPoint) {
 			try {
 				const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
