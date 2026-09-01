@@ -40,7 +40,7 @@ const SPLIT_VERSION = /(\d)-(\d+)(?![\dA-Za-z])/g;
  */
 const CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/gu;
 
-export const NO_MODEL_LABEL = "no-model";
+const NO_MODEL_LABEL = "no-model";
 
 export function shortenModelId(rawId: string | undefined | null): string {
 	const raw = (rawId ?? "").replace(CONTROL_CHARACTERS, "").trim();
