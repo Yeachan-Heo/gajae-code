@@ -1717,7 +1717,12 @@ export async function persistCoordinatorLaunchFailureState(input: {
 					// Any owner generation already represented by the state file requires an
 					// authenticated, still-current caller. Do not turn an unavailable
 					// lifecycle record into an unowned overwrite.
-					if (input.managedLaunch && previousManagedEvidence && (activeGeneration === null || baseline === undefined)) return;
+					if (
+						input.managedLaunch &&
+						previousManagedEvidence &&
+						(activeGeneration === null || baseline === undefined)
+					)
+						return;
 					if (activeGeneration !== null) {
 						if (
 							!sessionId ||
