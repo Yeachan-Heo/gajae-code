@@ -277,34 +277,42 @@ async function loadCapabilityWithContext<T>(
 }
 
 export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
+	const trustedHome = getTrustedHomeDir();
 	const settingsAgentDir =
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
+	const settingsAgentDirExplicit =
+		typeof options.settings?.isAgentDirExplicit === "function" ? options.settings.isAgentDirExplicit() : undefined;
 	const customProcessProfile = getAgentProfileAuthority() === "custom";
 	const processAgentDir = getAgentDir();
 	const selectedAgentDir = options.agentDir || settingsAgentDir || (customProcessProfile ? getAgentDir() : undefined);
-	const canonicalDefaultAgentDir = path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
+	const canonicalDefaultAgentDir = path.join(trustedHome, getConfigDirName(), "agent");
+	const settingsOwnsDefaultProfile =
+		options.agentDir === undefined && settingsAgentDir !== undefined && settingsAgentDirExplicit === false;
 	const selectedProfileAuthority =
 		options.profileAuthority ??
 		(customProcessProfile &&
 		selectedAgentDir !== undefined &&
 		normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(processAgentDir)
 			? "custom"
-			: selectedAgentDir !== undefined
-				? normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
-					? "default"
-					: "custom"
-				: customProcessProfile
-					? "custom"
-					: "default");
+			: settingsOwnsDefaultProfile && !customProcessProfile
+				? "default"
+				: selectedAgentDir !== undefined
+					? normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
+						? "default"
+						: "custom"
+					: customProcessProfile
+						? "custom"
+						: "default");
 	return await loadCapabilityWithContext(
 		capabilityId,
 		{
 			...options,
-			agentDir: options.agentDir || settingsAgentDir || (customProcessProfile ? getAgentDir() : undefined),
+			agentDir:
+				options.agentDir || settingsAgentDir || (customProcessProfile ? processAgentDir : canonicalDefaultAgentDir),
 			userAgentDirExplicit: options.agentDir !== undefined || settingsAgentDir !== undefined || customProcessProfile,
 			profileAuthority: selectedProfileAuthority,
 		},
-		getTrustedHomeDir(),
+		trustedHome,
 	);
 }
 

@@ -24,6 +24,7 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { isProviderEnabled } from "../capability";
 import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gjc-plugins";
 import { findRuntimeSkillByName } from "../extensibility/runtime-skill-discovery";
 import { buildSkillPromptMessage } from "../extensibility/skills";
@@ -145,16 +146,17 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				);
 			}
 
-			const skill =
-				skills.find(s => s.name === requestedName) ??
-				(await findRuntimeSkillByName(
-					this.#session.cwd,
-					requestedName,
-					this.#getRuntimeSkillPolicy(),
-					this.#session.getSessionHome?.(),
-					this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
-					this.#session.getSessionProfileAuthority?.(),
-				));
+			const runtimeSkill = isProviderEnabled("native", this.#session.settings)
+				? await findRuntimeSkillByName(
+						this.#session.cwd,
+						requestedName,
+						this.#getRuntimeSkillPolicy(),
+						this.#session.getSessionHome?.(),
+						this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
+						this.#session.getSessionProfileAuthority?.(),
+					)
+				: undefined;
+			const skill = skills.find(s => s.name === requestedName) ?? runtimeSkill;
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();
 				const hint =

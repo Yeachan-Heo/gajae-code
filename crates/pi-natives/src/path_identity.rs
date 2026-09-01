@@ -5107,7 +5107,7 @@ pub(crate) mod platform {
 		// mode. Project skills are eventually 0644, but exposing their plaintext
 		// while the private name is live would permit an observer to retain a
 		// second hard link and defeat the single-link publication invariant.
-		let (mut file, private_name, created_mode) =
+		let (mut file, private_name, _created_mode) =
 			match create_private_skill_file(skill_fd, requested_file_mode) {
 				Ok(value) => value,
 				Err(code) => {
@@ -5159,32 +5159,6 @@ pub(crate) mod platform {
 			return NativeSecureSkillWriteResult::failure(
 				cleanup.err().unwrap_or("durability_failed"),
 			);
-		}
-		if file_mode != 0o600 {
-			// Establish the final mode while the file is still private. A permission
-			// failure must never report failure after the payload becomes visible.
-			let published_mode = existing_mode.unwrap_or(created_mode);
-			if unsafe { libc::fchmod(file.as_raw_fd(), published_mode as libc::mode_t) } != 0 {
-				let code = skill_write_error(&std::io::Error::last_os_error());
-				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
-				drop(file);
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
-			}
-			if file.sync_all().is_err() {
-				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
-				drop(file);
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(
-					cleanup.err().unwrap_or("durability_failed"),
-				);
-			}
 		}
 		let private_fd = file.as_raw_fd();
 		match replace_skill_file_name(
@@ -9922,17 +9896,21 @@ mod platform {
 		for _ in 0..16 {
 			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
 			let name = OsString::from(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence));
+			// The retained staging handle is written through directly below. Keep
+			// FILE_WRITE_DATA explicit here: FILE_WRITE_ATTRIBUTES only permits
+			// metadata changes and makes the first payload write fail closed.
+			let staging_access = FILE_READ_ATTRIBUTES
+				| FILE_WRITE_ATTRIBUTES
+				| FILE_READ_DATA
+				| FILE_WRITE_DATA
+				| READ_CONTROL
+				| WRITE_DAC
+				| WRITE_OWNER
+				| 0x0001_0000;
 			let file = match open_relative_with_disposition_status(
 				parent,
 				&name,
-				FILE_READ_ATTRIBUTES
-					| FILE_WRITE_ATTRIBUTES
-					| FILE_READ_DATA
-					| FILE_WRITE_DATA
-					| READ_CONTROL
-					| WRITE_DAC
-					| WRITE_OWNER
-					| 0x0001_0000,
+				staging_access,
 				false,
 				FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
 				FILE_CREATE,
@@ -10116,15 +10094,19 @@ mod platform {
 			}
 		}
 		skills.retain_child(skill_handle);
+		// `retain_child` promotes the per-skill handle to `skills.target`; all
+		// staging and publication operations must remain relative to that retained
+		// handle rather than reopening the skills root by pathname.
+		let skill_parent = skills.target;
 		path_names.push(skill_name.clone());
 		if revalidate_skill_root(&skills, &path_names).is_err() {
 			return NativeSecureSkillWriteResult::failure("identity_mismatch");
 		}
 		let file_name = std::ffi::OsStr::new("SKILL.md");
-		if let Err(code) = inspect_existing_skill_file(skills.target, file_name) {
+		if let Err(code) = inspect_existing_skill_file(skill_parent, file_name) {
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		let (file, _private_name) = match create_private_skill_file(skills.target) {
+		let (file, _private_name) = match create_private_skill_file(skill_parent) {
 			Ok(file) => file,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
@@ -10170,12 +10152,12 @@ mod platform {
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
 		if let Err(error) =
-			replace_skill_file_name(file, skills.target, &final_name, &skills, &path_names)
+			replace_skill_file_name(file, skill_parent, &final_name, &skills, &path_names)
 		{
 			if let SkillPublicationError::Published { code, target_verified } = error {
 				// `file` names the post-rename public object now. Never route it
 				// through private cleanup: that helper truncates before deleting.
-				let removed = remove_published_skill_file_if_exact(file, skills.target);
+				let removed = remove_published_skill_file_if_exact(file, skill_parent);
 				if !removed && target_verified {
 					unsafe { CloseHandle(file) };
 					return NativeSecureSkillWriteResult::success(
