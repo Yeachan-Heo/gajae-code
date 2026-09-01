@@ -9028,7 +9028,6 @@ export class AgentSession {
 		this.#evalExecutionDisposing = true;
 		this.#abortActiveMidRunBarriers();
 		this.abortCompaction();
-		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		// Disconnect the Agent event bridge NOW — before the maintenance join and the
@@ -9061,6 +9060,7 @@ export class AgentSession {
 				this.agent.forceAbort("Session disposed");
 			}
 		}
+		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
 		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
 		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
 		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
