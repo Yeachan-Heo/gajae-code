@@ -5086,7 +5086,7 @@ pub(crate) mod platform {
 		Ok(opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& expected_mode.is_none_or(|mode| {
-				(opened.st_mode & 0o7777) == mode && (named.st_mode & 0o7777) == mode
+				(opened.st_mode as u32 & 0o7777) == mode && (named.st_mode as u32 & 0o7777) == mode
 			}) && opened.st_nlink == 1
 			&& named.st_nlink == 1
 			&& opened.st_dev == named.st_dev
