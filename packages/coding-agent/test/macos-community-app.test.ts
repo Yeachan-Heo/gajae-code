@@ -294,13 +294,23 @@ describe("macOS community app attach cleanup", () => {
 		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
 		const dmg = new Uint8Array([5, 6, 7]);
 		const before = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
-		for (const mode of ["return", "throw"] as const) {
+		for (const mode of ["return", "throw", "partial-return", "partial-throw"] as const) {
+			const calls: string[][] = [];
 			const command = async (argv: string[]) => {
+				calls.push(argv);
 				if (argv[0] === "/usr/bin/mdfind") return { exitCode: 1, stdout: "", stderr: "" };
 				if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "attach") {
-					if (mode === "throw") throw new Error("attach failed");
+					if (mode.startsWith("partial")) {
+						const mount = argv[argv.indexOf("-mountpoint") + 1];
+						const replacement = `${mount}-replacement`;
+						await fs.mkdir(replacement);
+						await fs.rm(mount, { recursive: true, force: true });
+						await fs.rename(replacement, mount);
+					}
+					if (mode === "throw" || mode === "partial-throw") throw new Error("attach failed");
 					return { exitCode: 1, stdout: "", stderr: "attach failed" };
 				}
+				if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "detach") return { exitCode: 0, stdout: "", stderr: "" };
 				return { exitCode: 1, stdout: "", stderr: "" };
 			};
 			const result = await offerMacosCommunityApp({
@@ -327,6 +337,8 @@ describe("macOS community app attach cleanup", () => {
 				},
 			});
 			expect(result.status).toBe("failed");
+			if (mode.startsWith("partial"))
+				expect(calls.some(call => call[0] === "/usr/bin/hdiutil" && call[1] === "detach")).toBe(true);
 		}
 		const after = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
 		expect(after).toEqual(before);
