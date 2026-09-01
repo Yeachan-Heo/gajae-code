@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
+import { listProjectSessionTranscriptFiles } from "../session/session-manager";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -174,12 +175,34 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 	return parsed as Record<string, unknown>;
 }
 
-async function authoritativeConversationSnapshot(): Promise<{
+async function authoritativeConversationSnapshot(
+	cwd: string,
+	sessionId: string,
+): Promise<{
 	revision: number;
 	messages: Array<{ index: number; role: string; content: string }>;
 }> {
-	const sessionFile = process.env.GJC_SESSION_FILE?.trim();
-	if (!sessionFile) throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is required for crystallization");
+	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
+	if (!sessionFile) {
+		for (const candidate of listProjectSessionTranscriptFiles(cwd)) {
+			try {
+				const header = JSON.parse((await fs.readFile(candidate, "utf-8")).split(/\r?\n/, 1)[0]) as Record<
+					string,
+					unknown
+				>;
+				if (
+					header.id === sessionId &&
+					typeof header.cwd === "string" &&
+					path.resolve(header.cwd) === path.resolve(cwd)
+				) {
+					sessionFile = candidate;
+					break;
+				}
+			} catch {}
+		}
+	}
+	if (!sessionFile)
+		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
 		const text = await fs.readFile(sessionFile, "utf-8");
 		const messages: Array<{ index: number; role: string; content: string }> = [];
@@ -266,7 +289,7 @@ async function handleCrystallizeUnlocked(
 		JSON.stringify(input.prior) !== JSON.stringify(storedPrior)
 	)
 		throw new DeepInterviewCommandError(2, "supplied prior crystal does not match canonical stored crystal");
-	const liveSnapshot = await authoritativeConversationSnapshot();
+	const liveSnapshot = await authoritativeConversationSnapshot(cwd, sessionId);
 	if (liveSnapshot.revision !== input.current_revision)
 		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the live session transcript");
 	const rawSnapshot = input.snapshot;
