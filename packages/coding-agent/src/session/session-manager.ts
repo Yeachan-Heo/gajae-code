@@ -16249,7 +16249,11 @@ export class SessionManager {
 		// Only tear down the resident blob store on a terminal outcome; a retryable
 		// close leaves the session live for a genuine retry.
 		const observedPersistError = priorPersistError ?? this.#persistError;
-		if (!observedPersistError && !this.#persistWriter && (!this.persist || !this.#needsFullRewriteOnNextPersist)) {
+		if (
+			!observedPersistError &&
+			!this.#persistWriter &&
+			(!this.persist || this.#readOnlyResume || !this.#needsFullRewriteOnNextPersist)
+		) {
 			this.#releaseResidentTextStore();
 			this.#retireEphemeralArtifacts();
 			try {
