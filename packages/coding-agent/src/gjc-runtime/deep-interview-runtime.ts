@@ -28,7 +28,10 @@ import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session
 import { runNativeStateCommand } from "./state-runtime";
 import {
 	appendJsonl,
+	beginWorkflowTransactionJournal,
+	completeWorkflowTransactionJournal,
 	readExistingStateForMutation,
+	updateWorkflowTransactionJournal,
 	withWorkflowStateLock,
 	writeArtifact,
 	writeWorkflowEnvelopeAtomic,
@@ -340,14 +343,20 @@ async function handleCrystallizeUnlocked(
 			: undefined;
 	const now = new Date().toISOString();
 	const specContent = specPath ? crystalMarkdown(crystal) : undefined;
+	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
+	const mutationId = `crystal:${sessionId}:${crystal.spec_version}:${crystal.source.digest}`;
+	if (specPath && specContent)
+		await beginWorkflowTransactionJournal({ cwd, sessionId, mutationId, paths: [specPath, indexPath, statePath] });
 	if (specPath && specContent)
 		await writeArtifact(specPath, specContent, {
 			cwd,
 			audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 		});
 	if (specPath && specContent)
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["artifact"] });
+	if (specPath && specContent)
 		await appendJsonl(
-			path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl"),
+			indexPath,
 			{
 				slug,
 				stage: "final",
@@ -360,6 +369,8 @@ async function handleCrystallizeUnlocked(
 				audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 			},
 		);
+	if (specPath && specContent)
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["artifact", "index"] });
 	const state = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
 	const envelope = {
 		...existing,
@@ -393,6 +404,7 @@ async function handleCrystallizeUnlocked(
 		},
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 	});
+	if (specPath && specContent) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
 	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({
 		cwd,
