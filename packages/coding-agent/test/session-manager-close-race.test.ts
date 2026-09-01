@@ -448,6 +448,17 @@ class RetryableFirstCloseWriter implements SessionStorageWriter {
 }
 
 describe("SessionManager closeStrict retryable-close ownership", () => {
+	it("releases in-memory resident state after a rewrite-required mutation", async () => {
+		const sm = SessionManager.inMemory();
+		const id = sm.appendCustomMessageEntry("test", "before", true);
+		const entry = sm.getBranch().find(candidate => candidate.id === id);
+		if (entry?.type !== "custom_message") throw new Error("Expected custom message entry");
+
+		sm.applyCustomMessageEntryUpdates([{ ...entry, content: "after" }]);
+		const outcome = await sm.closeStrict();
+		expect(outcome.kind).toBe("closed");
+	});
+
 	it("retains ownership across a certified pre-dispatch failure and closes on retry", async () => {
 		const storage = new RetryableFirstCloseStorage();
 		const sm = SessionManager.create("/cwd", "/sessions", storage);
