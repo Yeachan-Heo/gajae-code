@@ -53,6 +53,7 @@ export const STATE_BOOLEAN_FLAGS: ReadonlySet<string> = new Set([
 	"--compact",
 	"--history",
 	"--force",
+	"--approve-execution",
 ]);
 
 export interface StateFlagOccurrence {

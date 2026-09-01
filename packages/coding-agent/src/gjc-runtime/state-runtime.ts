@@ -1700,7 +1700,11 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 		const inner = isPlainObject(normalizedCaller.state) ? normalizedCaller.state : {};
 		if (typeof normalizedCaller.spec_path !== "string" || typeof normalizedCaller.spec_sha256 !== "string")
 			throw new StateCommandError(2, "ultragoal handoff requires a persisted Crystal specification");
-		if (isPlainObject(inner.crystal) && inner.crystal.lifecycle === "ready") inner.execution_approval = "approved";
+		if (isPlainObject(inner.crystal) && inner.crystal.lifecycle === "ready") {
+			if (!hasFlag(args, "--approve-execution"))
+				throw new StateCommandError(2, "ultragoal handoff requires explicit execution approval");
+			inner.execution_approval = "approved";
+		}
 	}
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
