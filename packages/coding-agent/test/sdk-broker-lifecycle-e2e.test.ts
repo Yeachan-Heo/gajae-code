@@ -3736,10 +3736,11 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 	try {
 		await broker.start();
 		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
-		await fs.writeFile(
+		await Bun.write(
 			endpointPath,
 			JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "live-owner-token" }),
 		);
+		const endpointIdentity = await fs.stat(endpointPath, { bigint: true });
 		const hostIncarnation = await incarnation(host.pid);
 		await broker.index.append({
 			type: "host_registered",
@@ -3747,7 +3748,8 @@ test("broker atomically reuses the indexed live owner for distinct resume keys",
 			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 17,
 			pid: host.pid,
-			endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			endpointMtimeMs: Number(endpointIdentity.mtimeNs) / 1_000_000,
+			endpointFileId: `${endpointIdentity.dev}:${endpointIdentity.ino}`,
 			processIncarnation: hostIncarnation,
 			hostIncarnation,
 		});
