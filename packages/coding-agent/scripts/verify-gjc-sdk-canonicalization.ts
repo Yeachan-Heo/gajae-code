@@ -3169,16 +3169,16 @@ fi
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
-				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nif (!INPUT_VERBS.has(invocation.verb)) continue;\n',
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nfunction guarded(invocation: { verb: string }): void { if (!INPUT_VERBS.has(invocation.verb)) return; }\n',
 		},
 		0,
 	);
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
-				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nif (!INPUT_VERBS.has(invocation.verb)) continue;\nfor (const verb of INPUT_VERBS) Bun.spawnSync(["tmux", verb, "-t", pane, prompt]);\n',
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nfunction guarded(invocation: { verb: string }): void { if (!INPUT_VERBS.has(invocation.verb)) return; }\nfor (const verb of INPUT_VERBS) Bun.spawnSync(["tmux", verb, "-t", pane, prompt]);\n',
 		},
-		2,
+		1,
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
 	await runSelfTestFixture(
