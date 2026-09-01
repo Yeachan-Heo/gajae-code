@@ -882,16 +882,38 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 				payload,
 				created_at: nowIso,
 			};
-			// --reset replaces: merge against an empty base but re-lock the intent
-			// contract from prior state through the merge's own immutability guard.
+			// --reset replaces free-form interview state but retains every runtime-owned
+			// Crystal/approval/spec field so computeMergedEnvelope can enforce its
+			// immutability guard against the real canonical base.
 			const base = reset
 				? (() => {
+						const baseEnvelope: Record<string, unknown> = {};
+						for (const field of [
+							"skill",
+							"version",
+							"active",
+							"current_phase",
+							"session_id",
+							"spec_slug",
+							"spec_path",
+							"spec_stage",
+							"spec_sha256",
+							"spec_persisted_at",
+						] as const)
+							if (current.value[field] !== undefined) baseEnvelope[field] = current.value[field];
 						const priorState = isPlainObject(current.value.state)
 							? (current.value.state as Record<string, unknown>)
 							: {};
-						return priorState.intent_contract !== undefined
-							? { state: { intent_contract: priorState.intent_contract, intent_contract_required: true } }
-							: {};
+						const retainedState: Record<string, unknown> = {};
+						for (const field of [
+							"crystal",
+							"execution_approval",
+							"intent_contract",
+							"intent_contract_required",
+						] as const)
+							if (priorState[field] !== undefined) retainedState[field] = priorState[field];
+						if (Object.keys(retainedState).length > 0) baseEnvelope.state = retainedState;
+						return baseEnvelope;
 					})()
 				: current.value;
 			const merged = computeMergedEnvelope(base as Record<string, unknown>, syntheticDraft, nowIso);
