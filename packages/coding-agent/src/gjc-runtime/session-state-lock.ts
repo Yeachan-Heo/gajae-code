@@ -1724,7 +1724,15 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
 	if (!nativePath) return false;
-	const captured = nativeSessionStateLock().snapshotDirectoryTree(nativePath);
+	const captured = await Promise.resolve()
+		.then(() => nativeSessionStateLock().snapshotDirectoryTree(nativePath))
+		.catch(() => undefined);
+	if (!captured) {
+		// A native snapshot failure is an inspection failure, not permission to
+		// reclaim the claim. Keep the transition untouched and let the retry budget
+		// surface the typed lock-unavailable result.
+		return false;
+	}
 	if (!captured.ok || !captured.snapshot) return false;
 	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
 	if (
