@@ -4070,11 +4070,12 @@ async function currentReadyAuthority(
 		// that record's endpoint. Re-deriving the mtime from a fresh `stat` made
 		// the tuple internally inconsistent: the float differed from the indexed
 		// value in its last digits (…272.1147 vs …272.1145), and replay hashing
-		// then read the same endpoint as replaced. Prefer the validated value.
+		// then read the same endpoint as replaced. Publishing the validated indexed
+		// value also keeps Router adoption and ordinary reattachment authority equal.
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: record.endpointMtimeMs ?? endpointFile.mtimeMs,
+			endpointMtimeMs: record.endpointMtimeMs!,
 			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};
