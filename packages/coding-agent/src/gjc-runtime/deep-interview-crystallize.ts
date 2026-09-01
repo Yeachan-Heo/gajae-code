@@ -109,13 +109,16 @@ function validateSnapshot(value: unknown): CrystalSnapshot {
 			throw new Error("snapshot message role is invalid");
 		return { index: messageIndex, role, content: text(entry.content, `snapshot.messages[${index}].content`) };
 	});
+	if (messages.some((message, index) => index > 0 && message.index <= messages[index - 1]!.index))
+		throw new Error("snapshot messages must be ordered and unique");
+	if (end - start + 1 > MAX_MESSAGES) throw new Error("snapshot range is too large");
 	const digest = text(value.digest, "snapshot.digest", 64);
 	if (!/^[a-f0-9]{64}$/.test(digest) || digest !== crystalSnapshotDigest({ revision, start, end, messages }))
 		throw new Error("snapshot digest mismatch");
 	return { revision, start, end, digest, messages };
 }
 
-function validateItems(value: unknown): CrystalItem[] {
+function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[] {
 	if (!Array.isArray(value) || value.length > MAX_ITEMS) throw new Error("crystallize items must be a bounded array");
 	const ids = new Set<string>();
 	return value.map((entry, index) => {
@@ -138,6 +141,15 @@ function validateItems(value: unknown): CrystalItem[] {
 				message_index: integer(entry.anchor.message_index, `items[${index}].anchor.message_index`),
 				quote: text(entry.anchor.quote, `items[${index}].anchor.quote`),
 			};
+			if (snapshot) {
+				const anchorMessage = snapshot.messages.find(
+					message => String(message.index) === String(item.anchor!.message_index),
+				);
+				if (!anchorMessage)
+					throw new Error(`confirmed item ${id} anchor message ${item.anchor!.message_index} is missing`);
+				if (anchorMessage.role !== "user" || !anchorMessage.content.includes(item.anchor.quote))
+					throw new Error(`confirmed item ${id} has no verbatim user anchor`);
+			}
 		}
 		return item;
 	});
@@ -152,12 +164,10 @@ function normalizedGaps(value: unknown): string[] {
 export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (!isRecord(value)) throw new Error("crystallize input must be an object");
 	const snapshot = validateSnapshot(value.snapshot);
-	if (
-		value.current_revision !== undefined &&
-		integer(value.current_revision, "current_revision") !== snapshot.revision
-	)
+	if (value.current_revision === undefined) throw new Error("authoritative current revision is required");
+	if (integer(value.current_revision, "current_revision") !== snapshot.revision)
 		throw new Error("conversation snapshot is stale");
-	const items = validateItems(value.items);
+	const items = validateItems(value.items, snapshot);
 	const gaps = normalizedGaps(value.open_gaps);
 	const conflicts = normalizedGaps(value.conflicts);
 	const prior = value.prior;
@@ -172,21 +182,31 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			throw new Error("prior crystal is invalid");
 		if (!isRecord(priorCrystal.source) || snapshot.revision <= priorCrystal.source.revision)
 			throw new Error("conversation snapshot is stale");
+		if (!Array.isArray(priorCrystal.items)) throw new Error("prior crystal is invalid");
+		validateItems(priorCrystal.items);
 	}
 	const priorItems = new Map((priorCrystal?.items ?? []).map(item => [item.id, item]));
-	const changed = items
+	const mergedItems = [...items];
+	for (const item of priorCrystal?.items ?? [])
+		if (!mergedItems.some(candidate => candidate.id === item.id)) mergedItems.push(item);
+	const currentItems = mergedItems;
+	const changed = currentItems
 		.filter(item => priorItems.has(item.id) && JSON.stringify(item) !== JSON.stringify(priorItems.get(item.id)))
 		.map(item => item.id)
 		.sort();
-	const added = items
+	const added = currentItems
 		.filter(item => !priorItems.has(item.id))
 		.map(item => item.id)
 		.sort();
-	const preserved = items
+	const preserved = currentItems
 		.filter(item => priorItems.has(item.id) && !changed.includes(item.id))
 		.map(item => item.id)
 		.sort();
-	const goalChanged = changed.some(id => items.find(item => item.id === id)?.kind === "goal");
+	const goalChanged = changed.some(id => {
+		const current = currentItems.find(item => item.id === id);
+		const previous = priorItems.get(id);
+		return current?.kind === "goal" || previous?.kind === "goal";
+	});
 	const intentChanged =
 		goalChanged ||
 		changed.some(id =>
@@ -217,7 +237,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		spec_version: (priorCrystal?.spec_version ?? 0) + 1,
 		lifecycle,
 		source: { revision: snapshot.revision, start: snapshot.start, end: snapshot.end, digest: snapshot.digest },
-		items,
+		items: currentItems,
 		open_gaps: gaps,
 		conflicts,
 		delta,

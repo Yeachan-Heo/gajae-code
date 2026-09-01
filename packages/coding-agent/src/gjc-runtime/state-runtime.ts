@@ -1516,6 +1516,12 @@ async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): 
 	const envelope = normalizeDeepInterviewEnvelope(state);
 	const inner = envelope.state;
 	if (!inner) return;
+	if (inner.crystal !== undefined) {
+		if (!isPlainObject(inner.crystal) || inner.crystal.lifecycle !== "ready")
+			throw new StateCommandError(2, "deep-interview handoff requires a ready crystallized specification");
+		if (inner.execution_approval !== "approved")
+			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
+	}
 	if (inner.intent_contract === undefined) {
 		if (inner.intent_contract_required === true)
 			throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
