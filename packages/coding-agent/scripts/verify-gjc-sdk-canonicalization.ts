@@ -1576,6 +1576,12 @@ function isExactTmuxSelfInjectionGuardVerb(
 	const declaration = 'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);';
 	const declarationStart = contents.indexOf(declaration);
 	if (declarationStart === -1 || contents.indexOf(declaration, declarationStart + 1) !== -1) return false;
+	const references = [...contents.matchAll(/\bINPUT_VERBS\b/g)];
+	if (references.length !== 2) return false;
+	const guardUse = "INPUT_VERBS.has(invocation.verb)";
+	const guardUseStart = contents.indexOf(guardUse);
+	if (guardUseStart === -1 || contents.indexOf(guardUse, guardUseStart + 1) !== -1) return false;
+	if (!references.some(reference => reference.index === guardUseStart)) return false;
 	return occurrence.start >= declarationStart && occurrence.end <= declarationStart + declaration.length;
 }
 
@@ -3163,9 +3169,17 @@ fi
 	await runSelfTestFixture(
 		{
 			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
-				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\n',
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nif (!INPUT_VERBS.has(invocation.verb)) continue;\n',
 		},
 		0,
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\nif (!INPUT_VERBS.has(invocation.verb)) continue;\nfor (const verb of INPUT_VERBS) Bun.spawnSync(["tmux", verb, "-t", pane, prompt]);\n',
+		},
+		2,
+		"tmux send-keys content injection is outside sanctioned process lifecycle",
 	);
 	await runSelfTestFixture(
 		{
