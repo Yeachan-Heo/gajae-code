@@ -77,7 +77,7 @@ export async function discoverAgents(
 	// resolver currently points at a custom profile.
 	const resolvedProfileAuthority = resolveProfileAuthority(
 		{ agentDir, settings: activeSettings, profileAuthority },
-		home,
+		agentDir === undefined ? home : undefined,
 	);
 	// A selected custom profile replaces only the user scope. The default
 	// profile must retain its compatibility roots (including ~/.gemini), and
