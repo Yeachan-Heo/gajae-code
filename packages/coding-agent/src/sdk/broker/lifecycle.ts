@@ -5514,6 +5514,7 @@ async function executeLifecycleResponse(
 				endpointIncarnation: replayIncarnation,
 				pid: verified.endpoint.pid,
 				endpointMtimeMs: verified.endpointMtimeMs,
+				...(verified.endpointFileId === undefined ? {} : { endpointFileId: verified.endpointFileId }),
 				endpoint: verified.endpoint,
 				// Public, ledger-replayable evidence of the bootstrap authority that
 				// reached this runtime. The private key never enters the response.
