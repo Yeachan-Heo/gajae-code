@@ -5,7 +5,7 @@ import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
-import { crystallizeDeepInterview, crystalMarkdown } from "./deep-interview-crystallize";
+import { type CrystalSnapshot, crystallizeDeepInterview, crystalMarkdown } from "./deep-interview-crystallize";
 import { isDeepInterviewStageVerb, runDeepInterviewStageCommand } from "./deep-interview-stage";
 import {
 	assertDeepInterviewInputWithinLimit,
@@ -174,26 +174,41 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 	return parsed as Record<string, unknown>;
 }
 
-async function authoritativeConversationRevision(): Promise<number | undefined> {
+async function authoritativeConversationSnapshot(): Promise<{
+	revision: number;
+	messages: Array<{ index: number; role: string; content: string }>;
+}> {
 	const sessionFile = process.env.GJC_SESSION_FILE?.trim();
-	if (!sessionFile) return undefined;
+	if (!sessionFile) throw new DeepInterviewCommandError(2, "GJC_SESSION_FILE is required for crystallization");
 	try {
 		const text = await fs.readFile(sessionFile, "utf-8");
-		let revision = 0;
+		const messages: Array<{ index: number; role: string; content: string }> = [];
 		for (const line of text.split(/\r?\n/)) {
 			if (!line.trim()) continue;
 			try {
 				const parsed = JSON.parse(line);
-				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+					throw new Error("invalid transcript entry");
 				const entry = parsed as Record<string, unknown>;
-				if (entry.type === "message" || entry.role === "user" || entry.role === "assistant") revision++;
+				const candidate =
+					entry.type === "message" && entry.message && typeof entry.message === "object" ? entry.message : entry;
+				if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+				const message = candidate as Record<string, unknown>;
+				if (typeof message.role !== "string" || typeof message.content !== "string") continue;
+				messages.push({
+					index: messages.length,
+					role: message.role,
+					content: message.content.normalize("NFC").trim(),
+				});
 			} catch {
-				return undefined;
+				throw new DeepInterviewCommandError(2, "live session transcript is malformed");
 			}
 		}
-		return revision;
-	} catch {
-		return undefined;
+		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
+		return { revision: messages.length, messages };
+	} catch (error) {
+		if (error instanceof DeepInterviewCommandError) throw error;
+		throw new DeepInterviewCommandError(2, "live session transcript is unavailable");
 	}
 }
 
@@ -238,9 +253,26 @@ async function handleCrystallizeUnlocked(
 		JSON.stringify(input.prior) !== JSON.stringify(storedPrior)
 	)
 		throw new DeepInterviewCommandError(2, "supplied prior crystal does not match canonical stored crystal");
-	const liveRevision = await authoritativeConversationRevision();
-	if (liveRevision !== undefined && liveRevision !== input.current_revision)
+	const liveSnapshot = await authoritativeConversationSnapshot();
+	if (liveSnapshot.revision !== input.current_revision)
 		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the live session transcript");
+	const rawSnapshot = input.snapshot;
+	if (
+		!rawSnapshot ||
+		typeof rawSnapshot !== "object" ||
+		Array.isArray(rawSnapshot) ||
+		!Array.isArray((rawSnapshot as Record<string, unknown>).messages)
+	)
+		throw new DeepInterviewCommandError(2, "crystallize snapshot is required");
+	const snapshot = rawSnapshot as CrystalSnapshot;
+	const expectedMessages = liveSnapshot.messages.slice(snapshot.start, snapshot.end + 1);
+	const suppliedMessages = snapshot.messages.map((message, index) => ({
+		index: snapshot.start + index,
+		role: message.role,
+		content: message.content.normalize("NFC").trim(),
+	}));
+	if (JSON.stringify(expectedMessages) !== JSON.stringify(suppliedMessages))
+		throw new DeepInterviewCommandError(2, "conversation snapshot does not match the live session transcript");
 	const payload = { ...input, prior: storedPrior };
 	const crystal = crystallizeDeepInterview(payload);
 	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
