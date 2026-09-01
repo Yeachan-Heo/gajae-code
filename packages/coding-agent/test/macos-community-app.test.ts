@@ -9,6 +9,7 @@ import {
 	communityAppAssetMatchesArchitectureForTest,
 	offerMacosCommunityApp,
 	parseCommunityAppChecksumForTest,
+	resolveCommunityAppExecutableForTest,
 } from "../src/cli/macos-community-app";
 
 const tempDirs: string[] = [];
@@ -37,6 +38,19 @@ describe("macOS community app offer guards", () => {
 					platform: "darwin",
 					stdinIsTTY: true,
 					stdoutIsTTY: true,
+					env: { CI: "true" },
+					prompt: async () => {
+						throw new Error("prompt must not run in CI");
+					},
+				})
+			).status,
+		).toBe("skipped");
+		expect(
+			(
+				await offerMacosCommunityApp({
+					platform: "darwin",
+					stdinIsTTY: true,
+					stdoutIsTTY: true,
 					env: { [COMMUNITY_APP_SUPPRESS_ENV]: "1" },
 				})
 			).status,
@@ -46,6 +60,7 @@ describe("macOS community app offer guards", () => {
 	test("keeps the default answer negative and parses only exact release checksums", async () => {
 		const result = await offerMacosCommunityApp({
 			platform: "darwin",
+			env: {},
 			stdinIsTTY: true,
 			stdoutIsTTY: true,
 			prompt: async () => false,
@@ -61,9 +76,27 @@ describe("macOS community app offer guards", () => {
 	});
 
 	test("accepts only matching macOS architecture assets", () => {
-		expect(communityAppAssetMatchesArchitectureForTest("Gajae-Code-App-macos-arm64.dmg", "arm64")).toBe(true);
-		expect(communityAppAssetMatchesArchitectureForTest("Gajae-Code-App-macos-x64.dmg", "arm64")).toBe(false);
-		expect(communityAppAssetMatchesArchitectureForTest("Gajae-Code-App-linux-arm64.dmg", "arm64")).toBe(false);
+		expect(communityAppAssetMatchesArchitectureForTest("gajae-app-desktop-1.0.0-macos-arm64.dmg", "arm64")).toBe(
+			true,
+		);
+		expect(communityAppAssetMatchesArchitectureForTest("gajae-app-desktop-1.0.0-macos-x64.dmg", "arm64")).toBe(false);
+		expect(communityAppAssetMatchesArchitectureForTest("gajae-app-desktop-1.0.0-linux-arm64.dmg", "arm64")).toBe(
+			false,
+		);
+		expect(communityAppAssetMatchesArchitectureForTest("../gajae-app-desktop-1.0.0-macos-arm64.dmg", "arm64")).toBe(
+			false,
+		);
+	});
+
+	test("rejects executable traversal and symlink escapes", async () => {
+		const root = await tempDir();
+		const macOSRoot = path.join(root, "Contents", "MacOS");
+		await fs.mkdir(macOSRoot, { recursive: true });
+		await fs.writeFile(path.join(macOSRoot, "GajaeCode"), "fixture");
+		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBe(path.join(macOSRoot, "GajaeCode"));
+		expect(await resolveCommunityAppExecutableForTest(root, "../../outside")).toBeUndefined();
+		await fs.symlink(path.join(macOSRoot, "GajaeCode"), path.join(macOSRoot, "Link"));
+		expect(await resolveCommunityAppExecutableForTest(root, "Link")).toBeUndefined();
 	});
 
 	test("fails closed when the canonical release or checksum is unavailable", async () => {
@@ -72,6 +105,7 @@ describe("macOS community app offer guards", () => {
 		const missing = await offerMacosCommunityApp({
 			platform: "darwin",
 			arch: "arm64",
+			env: {},
 			stdinIsTTY: true,
 			stdoutIsTTY: true,
 			prompt: async () => true,
@@ -85,6 +119,7 @@ describe("macOS community app offer guards", () => {
 		const badChecksum = await offerMacosCommunityApp({
 			platform: "darwin",
 			arch: "arm64",
+			env: {},
 			stdinIsTTY: true,
 			stdoutIsTTY: true,
 			prompt: async () => true,
@@ -95,21 +130,23 @@ describe("macOS community app offer guards", () => {
 						JSON.stringify({
 							assets: [
 								{
-									name: "Gajae-Code-App-macos-arm64.dmg",
+									name: "gajae-app-desktop-1.0.0-macos-arm64.dmg",
 									browser_download_url:
-										"https://github.com/devswha/gajae-code-app/releases/download/v1/Gajae-Code-App-macos-arm64.dmg",
+										"https://github.com/devswha/gajae-code-app/releases/download/v1/gajae-app-desktop-1.0.0-macos-arm64.dmg",
 								},
 								{
-									name: "Gajae-Code-App-macos-arm64.dmg.sha256",
+									name: "gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
 									browser_download_url:
-										"https://github.com/devswha/gajae-code-app/releases/download/v1/Gajae-Code-App-macos-arm64.dmg.sha256",
+										"https://github.com/devswha/gajae-code-app/releases/download/v1/gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
 								},
 							],
 						}),
 					);
 				}
 				return new Response(
-					url.endsWith(".dmg") ? new Uint8Array([1]) : `${"0".repeat(64)}  Gajae-Code-App-macos-arm64.dmg\n`,
+					url.endsWith(".dmg")
+						? new Uint8Array([1])
+						: `${"0".repeat(64)}  gajae-app-desktop-1.0.0-macos-arm64.dmg\n`,
 				);
 			},
 		});
@@ -121,7 +158,7 @@ describe("macOS community app verified installation", () => {
 	test("verifies checksum, bundle identity, signature, architecture, cleanup, and launch", async () => {
 		const homeDir = await tempDir();
 		const dmg = new Uint8Array([1, 2, 3, 4]);
-		const dmgName = "Gajae-Code-App-macos-arm64.dmg";
+		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
 		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
 		const checksumUrl = `${dmgUrl}.sha256`;
 		const calls: string[][] = [];
@@ -140,6 +177,7 @@ describe("macOS community app verified installation", () => {
 				const mount = argv[argv.indexOf("-mountpoint") + 1];
 				await fs.mkdir(path.join(mount, "Gajae Code App.app", "Contents", "MacOS"), { recursive: true });
 				await fs.writeFile(path.join(mount, "Gajae Code App.app", "Contents", "Info.plist"), "fixture");
+				await fs.writeFile(path.join(mount, "Gajae Code App.app", "Contents", "MacOS", "GajaeCode"), "fixture");
 				return { exitCode: 0, stdout: "", stderr: "" };
 			}
 			if (argv[0] === "/usr/bin/ditto") {
@@ -150,6 +188,7 @@ describe("macOS community app verified installation", () => {
 		const result = await offerMacosCommunityApp({
 			platform: "darwin",
 			arch: "arm64",
+			env: {},
 			homeDir,
 			stdinIsTTY: true,
 			stdoutIsTTY: true,

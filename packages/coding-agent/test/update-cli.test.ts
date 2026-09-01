@@ -872,6 +872,28 @@ describe("update-cli managed notification recovery", () => {
 			expect(calls).toEqual(["update", "recovery", "refresh"]);
 		});
 
+		it("keeps a successful update successful when the optional app offer rejects", async () => {
+			const calls: string[] = [];
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async () => release,
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/standalone/gjc" }),
+					performUpdate: async () => ({ ok: true, path: "/standalone/gjc" }),
+					runPostUpdateRecovery: async () => {
+						calls.push("recovery");
+					},
+					refreshInstalledDefaultSkills: async () => {
+						calls.push("refresh");
+					},
+					offerCommunityApp: async () => {
+						throw new Error("detach failed");
+					},
+				},
+			);
+			expect(calls).toEqual(["recovery", "refresh"]);
+		});
+
 		it("does not preflight a migration target when the release decision is already up to date", async () => {
 			const calls: string[] = [];
 			await runUpdateCommand(
