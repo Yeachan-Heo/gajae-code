@@ -83,6 +83,11 @@ describe("shortenModelId", () => {
 		["openrouter/anthropic/claude-haiku-4-5", "haiku-4.5"],
 		["qwen2.5:7b", "qwen2.5:7b"],
 		["llama3", "llama3"],
+		// Dashed size/variant tokens are not version parts and must survive intact.
+		["meta/llama-3-8b-instruct", "llama-3-8b-instruct"],
+		["llama-3-70b", "llama-3-70b"],
+		["qwen-2-5-7b-instruct", "qwen-2.5-7b-instruct"],
+		["claude-3-5-haiku-20241022", "3.5-haiku"],
 	])("shortens %s to %s", (input, expected) => {
 		expect(shortenModelId(input)).toBe(expected);
 	});
@@ -158,7 +163,9 @@ describe("status rail survives very small widths", () => {
 		const wide = strip(buildRail().render(80)[0]);
 		expect(wide).toContain("sonnet-4.5");
 		expect(wide).toContain("Goal");
-		expect(wide).toContain("MinWidth");
+		// Segment chrome (spaced separators) proves this is the normal rail rather
+		// than the compact priority row, whose separators carry no spaces.
+		expect(wide).toContain(" / ");
 	});
 
 	it("keeps the goal glyph in its status color", () => {
@@ -167,6 +174,40 @@ describe("status rail survives very small widths", () => {
 
 		expect(pausedRow).toContain(theme.getFgAnsi("warning"));
 		expect(pausedRow).not.toEqual(activeRow);
+	});
+
+	it.each(["complete", "dropped"] as const)("keeps a %s goal distinguishable in glyph form", goalStatus => {
+		const row = buildRail({ goalStatus }).render(12)[0];
+		const active = buildRail({ goalStatus: "active" }).render(12)[0];
+
+		expect(strip(row).length).toBeGreaterThan(0);
+		expect(row).not.toEqual(active);
+	});
+
+	it("keeps a wrapped rail wrapped when only ordinary telemetry is lost", () => {
+		const component = buildRail();
+		component.updateSettings({ maxRows: 3 });
+
+		// Wide enough that wrapping still carries context %, goal and model across
+		// its rows: the priority row must not replace a rail that kept them.
+		const rows = component.render(44);
+		const text = strip(rows.join(" "));
+
+		expect(rows.length).toBeGreaterThan(1);
+		expect(text).toContain("sonnet-4.5");
+		expect(text).toContain("Goal");
+		expect(text).toMatch(CONTEXT_TOKEN);
+	});
+
+	it("falls back to the priority row when wrapping itself loses a priority item", () => {
+		const component = buildRail();
+		component.updateSettings({ maxRows: 3 });
+
+		const rows = component.render(10);
+
+		expect(rows).toHaveLength(1);
+		expect(strip(rows[0])).not.toContain("…+");
+		expect(strip(rows[0])).toMatch(CONTEXT_TOKEN);
 	});
 
 	it("still shows an unknown context percentage rather than nothing", () => {

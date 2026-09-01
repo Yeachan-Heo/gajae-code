@@ -25,8 +25,13 @@ const VENDOR_FAMILY_WORDS: ReadonlySet<string> = new Set(["claude"]);
 /** Trailing snapshot dates and build stamps: `-20250929`, `-2024-05-13`, `-v2`. */
 const DATE_OR_BUILD_SUFFIX = /-(?:\d{4}-\d{2}-\d{2}|\d{8}|\d{6}|v\d+(?:\.\d+)*)$/;
 
-/** Split version parts read as one number: `sonnet-4-5` -> `sonnet-4.5`. */
-const SPLIT_VERSION = /(\d)-(\d)/g;
+/**
+ * Split version parts read as one number: `sonnet-4-5` -> `sonnet-4.5`.
+ *
+ * The trailing group must be a complete numeric token, so dashed size and
+ * variant tokens survive intact: `llama-3-8b-instruct` keeps its `3-8b`.
+ */
+const SPLIT_VERSION = /(\d)-(\d+)(?![\dA-Za-z])/g;
 
 export const NO_MODEL_LABEL = "no-model";
 

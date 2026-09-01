@@ -1097,6 +1097,7 @@ export class StatusLineComponent implements Component {
 			left: seg.left,
 			leftSegIds: seg.leftSegIds,
 			right: seg.right,
+			rightSegIds: seg.rightSegIds,
 			separator: effectiveSettings.separator,
 			previewHighlightSegment: seg.previewHighlightSegment,
 			sessionAccent: seg.sessionAccent,
@@ -1146,9 +1147,13 @@ export class StatusLineComponent implements Component {
 			const single = this.#buildStatusLine(width, seg);
 			rows = single ? [single] : [];
 		} else {
-			const items: { content: string; isPath: boolean }[] = [
-				...seg.left.map((content, i) => ({ content, isPath: seg.leftSegIds[i] === "path" })),
-				...seg.right.map(content => ({ content, isPath: false })),
+			const items: { content: string; isPath: boolean; id: StatusLineSegmentId | null }[] = [
+				...seg.left.map((content, i) => ({
+					content,
+					isPath: seg.leftSegIds[i] === "path",
+					id: seg.leftSegIds[i] ?? null,
+				})),
+				...seg.right.map((content, i) => ({ content, isPath: false, id: seg.rightSegIds[i] ?? null })),
 			];
 
 			for (const item of items) {
@@ -1160,21 +1165,29 @@ export class StatusLineComponent implements Component {
 				}
 			}
 
-			const packedRows: string[][] = [];
-			let current: string[] = [];
+			type PackedItem = { content: string; isPath: boolean; id: StatusLineSegmentId | null };
+			const rowWidth = (row: readonly PackedItem[]): number =>
+				this.#groupWidth(
+					row.map(item => item.content),
+					seg.leftCapWidth,
+					seg.leftSepWidth,
+				);
+
+			const packedRows: PackedItem[][] = [];
+			let current: PackedItem[] = [];
 			let dropped = 0;
 			for (let index = 0; index < items.length; index += 1) {
 				const item = items[index];
 				if (current.length === 0) {
-					current.push(item.content);
+					current.push(item);
 					continue;
 				}
-				const tentative = [...current, item.content];
-				if (this.#groupWidth(tentative, seg.leftCapWidth, seg.leftSepWidth) <= topFillWidth) {
+				const tentative = [...current, item];
+				if (rowWidth(tentative) <= topFillWidth) {
 					current = tentative;
 				} else {
 					packedRows.push(current);
-					current = [item.content];
+					current = [item];
 					if (packedRows.length >= maxRows) {
 						// `current` holds the item that opened the row we cannot admit,
 						// and everything after it is never visited: all of it is lost.
@@ -1196,22 +1209,11 @@ export class StatusLineComponent implements Component {
 			// emitted blank, so at tiny widths the marker ends up alone on one row.
 			for (let index = packedRows.length - 1; index >= 0; index -= 1) {
 				const row = packedRows[index];
-				while (row.length > 0 && this.#groupWidth(row, seg.leftCapWidth, seg.leftSepWidth) > topFillWidth) {
+				while (row.length > 0 && rowWidth(row) > topFillWidth) {
 					row.pop();
 					dropped += 1;
 				}
 				if (row.length === 0) packedRows.splice(index, 1);
-			}
-
-			// Wrapping is supposed to be the lossless path. When even `maxRows` rows
-			// cannot hold everything, the priority row beats a partial rail plus a
-			// count of what is missing.
-			if (dropped > 0) {
-				const priorityRow = this.#priorityRowFor(seg, [], [], topFillWidth);
-				if (priorityRow !== null) {
-					this.#renderedRowsCache = { key: cacheKey, rows: [priorityRow] };
-					return [priorityRow];
-				}
 			}
 
 			// Reserve marker cells on whichever row ends up last, evicting from its
@@ -1225,7 +1227,7 @@ export class StatusLineComponent implements Component {
 				let reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
 				while (packedRows.length > 0) {
 					const lastRow = packedRows[packedRows.length - 1];
-					if (this.#groupWidth(lastRow, seg.leftCapWidth, seg.leftSepWidth) + reserved <= topFillWidth) break;
+					if (rowWidth(lastRow) + reserved <= topFillWidth) break;
 					if (lastRow.length === 0) break;
 					lastRow.pop();
 					dropped += 1;
@@ -1233,10 +1235,21 @@ export class StatusLineComponent implements Component {
 				}
 				marker = this.#renderOverflowMarker(dropped, reserved);
 			}
+			// Wrapping is the lossless path, so it only yields to the priority row
+			// when the rows that actually survived lost a priority item. A rail that
+			// merely shed trailing telemetry keeps its wrapped layout.
+			if (dropped > 0) {
+				const survivingIds = packedRows.flatMap(row => row.map(item => item.id));
+				const priorityRow = this.#priorityRowFor(seg, survivingIds, [], topFillWidth);
+				if (priorityRow !== null) {
+					this.#renderedRowsCache = { key: cacheKey, rows: [priorityRow] };
+					return [priorityRow];
+				}
+			}
 
 			rows = packedRows.map((row, index) => {
 				const rendered = this.#renderStatusGroup(
-					row,
+					row.map(item => item.content),
 					"left",
 					seg.separatorDef,
 					seg.bgAnsi,
