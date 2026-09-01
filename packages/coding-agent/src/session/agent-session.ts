@@ -14409,6 +14409,7 @@ export class AgentSession {
 			| "internal";
 		silent?: boolean;
 		sdkRunToken?: string;
+		preserveCompaction?: boolean;
 	}): void {
 		const abortGoalState = this.getGoalModeState();
 		this.#suppressNextGoalReminderAfterAbortGoalId =
@@ -14481,6 +14482,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		preserveCompaction?: boolean;
 	}): Promise<AbortOutcome> {
 		// Advance the admission epoch SYNCHRONOUSLY, before any await and before the
 		// shared-unwind branch. A second abort that piggybacks on the first unwind
@@ -14620,6 +14622,7 @@ export class AgentSession {
 			| "tool_abort"
 			| "internal";
 		silent?: boolean;
+		preserveCompaction?: boolean;
 	}): Promise<void> {
 		const outcome = await this.#abortWithOutcome(options);
 		if (outcome.kind === "error") throw outcome.cause;
@@ -17579,7 +17582,7 @@ export class AgentSession {
 			this.#compactionAbortController = compactionAbortController;
 			this.#disconnectFromAgent();
 			try {
-				await this.abort();
+				await this.abort({ cause: "compaction", preserveCompaction: true });
 			} catch (error) {
 				this.#compactionAbortController = undefined;
 				throw error;
