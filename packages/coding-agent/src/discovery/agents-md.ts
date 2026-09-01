@@ -40,13 +40,14 @@ async function readBoundedAgentsMdFile(
 ): Promise<{ content: string | null; byteLength: number; tooLarge: boolean }> {
 	const noFollow = options?.noFollow === true;
 	let before: Stats | undefined;
+	let canonicalPath: string | undefined;
 	try {
 		if (noFollow) {
 			// `loadAgentsMd` canonicalizes the candidate before calling the reader,
 			// but that pathname can be swapped before open. Recheck the canonical
 			// target immediately before opening and bracket the descriptor with
 			// identity checks so explicit-home reads cannot follow a raced link.
-			const canonicalPath = await fs.realpath(filePath);
+			canonicalPath = await fs.realpath(filePath);
 			if (canonicalPath !== path.resolve(filePath)) return { content: null, byteLength: 0, tooLarge: false };
 			before = await fs.lstat(filePath);
 			if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1)
@@ -63,8 +64,10 @@ async function readBoundedAgentsMdFile(
 			if (before && (!sameFileIdentity(before, stats) || stats.nlink !== 1))
 				return { content: null, byteLength: 0, tooLarge: false };
 			if (before) {
+				if (canonicalPath !== (await fs.realpath(filePath)))
+					return { content: null, byteLength: 0, tooLarge: false };
 				const after = await fs.lstat(filePath);
-				if (after.isSymbolicLink() || !sameFileIdentity(before, after))
+				if (after.isSymbolicLink() || after.nlink !== 1 || !sameFileIdentity(before, after))
 					return { content: null, byteLength: 0, tooLarge: false };
 			}
 			const bytes = Buffer.alloc(maxBytes + 1);
@@ -75,6 +78,8 @@ async function readBoundedAgentsMdFile(
 				bytesRead += result.bytesRead;
 			}
 			if (bytesRead > maxBytes) return { content: null, byteLength: bytesRead, tooLarge: true };
+			if (before && canonicalPath !== (await fs.realpath(filePath)))
+				return { content: null, byteLength: 0, tooLarge: false };
 			return {
 				content: new TextDecoder().decode(bytes.subarray(0, bytesRead)),
 				byteLength: bytesRead,
@@ -125,7 +130,9 @@ export async function loadAgentsMd(
 			const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
 			const authorizedCandidate = await canonicalizePathWithinHome(ctx, candidate, undefined, "project");
 			const result = authorizedCandidate
-				? await readCandidate(authorizedCandidate, allowedBytes, { noFollow: ctx.isolatedHome === true })
+				? await readCandidate(authorizedCandidate, allowedBytes, {
+						noFollow: ctx.isolatedHome === true,
+					})
 				: { content: null, byteLength: 0, tooLarge: false };
 			if (result.tooLarge) {
 				if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;

@@ -214,4 +214,36 @@ describe("AGENTS.md discovery bounds", () => {
 			}
 		},
 	);
+	test.skipIf(process.platform === "win32")("rejects an ancestor symlink swap during an isolated read", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-ancestor-race-"));
+		const home = path.join(tempDir, "home");
+		const project = path.join(home, "project");
+		const movedProject = path.join(home, "project-original");
+		const outside = path.join(tempDir, "outside");
+		const candidate = path.join(project, "AGENTS.md");
+		const outsideCandidate = path.join(outside, "AGENTS.md");
+		await fsPromises.mkdir(project, { recursive: true });
+		await fsPromises.mkdir(outside, { recursive: true });
+		await fsPromises.writeFile(candidate, "safe instructions");
+		await fsPromises.writeFile(outsideCandidate, "outside instructions");
+		let swapped = false;
+		const realOpen = fsPromises.open.bind(fsPromises);
+		const openSpy = spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+			const [filePath] = args;
+			if (!swapped && String(filePath) === candidate) {
+				swapped = true;
+				await fsPromises.rename(project, movedProject);
+				await fsPromises.symlink(outside, project, "dir");
+			}
+			return await realOpen(...args);
+		});
+		try {
+			const result = await loadAgentsMd({ cwd: project, home, repoRoot: project, isolatedHome: true });
+			expect(swapped).toBe(true);
+			expect(result.items).toEqual([]);
+		} finally {
+			openSpy.mockRestore();
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 });
