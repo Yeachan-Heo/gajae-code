@@ -8988,25 +8988,29 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
-		let disposalIncomplete = false;
 		const awaitDisposeStep = async <T>(label: string, operation: Promise<T>): Promise<T | undefined> => {
 			const remainingMs = this.#disposeDeadline - Date.now();
 			if (remainingMs <= 0) {
 				logger.warn("Session dispose deadline reached", { label });
-				disposalIncomplete = true;
 				void operation.catch(() => {});
-				return undefined;
+				throw new Error(`Session disposal incomplete: ${label} exceeded the teardown deadline.`);
 			}
 			let timeout: NodeJS.Timeout | undefined;
-			const deadline = Promise.withResolvers<undefined>();
+			const timedOut = Symbol("dispose-timeout");
+			const deadline = Promise.withResolvers<typeof timedOut>();
 			timeout = setTimeout(() => {
-				disposalIncomplete = true;
-				deadline.resolve(undefined);
+				deadline.resolve(timedOut);
 			}, remainingMs);
 			timeout.unref?.();
 			try {
-				return await Promise.race([operation, deadline.promise]);
+				const result = await Promise.race([operation, deadline.promise]);
+				if (result === timedOut) {
+					void operation.catch(() => {});
+					throw new Error(`Session disposal incomplete: ${label} exceeded the teardown deadline.`);
+				}
+				return result;
 			} catch (error) {
+				if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) throw error;
 				logger.warn("Session dispose step failed", { label, error: String(error) });
 				return undefined;
 			} finally {
@@ -9185,7 +9189,6 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
-		if (disposalIncomplete) throw new Error("Session disposal completed with incomplete timed-out cleanup steps.");
 	}
 	/**
 	 * Strict writer close for ACP session delete. On the first attempt it flushes
