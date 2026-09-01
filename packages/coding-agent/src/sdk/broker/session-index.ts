@@ -185,23 +185,28 @@ export interface SessionList {
 	sessions: IndexedSession[];
 	warnings: string[];
 	/**
-	 * Warnings attributable to one exact row. Absent means every warning in
-	 * `warnings` is index-wide and therefore applies to every session.
+	 * Row-attributed view of `warnings`. `indexWide` fences every session;
+	 * `rows` maps a session id to the warnings raised for that exact row.
+	 * Attribution is keyed by row, never by message text, so two rows raising an
+	 * identical warning stay independently fenced. Absent means no attribution
+	 * was published and every warning is treated as index-wide.
 	 */
-	rowWarnings?: Readonly<Record<string, readonly string[]>>;
+	warningScope?: {
+		indexWide: readonly string[];
+		rows: Readonly<Record<string, readonly string[]>>;
+	};
 }
 
 /**
  * The warnings that bear on one session's authority: index-wide faults plus the
  * warnings raised for that exact row. A rejected UNRELATED row must not disable
- * routing for every other session (#5128), so per-row warnings are excluded
- * from every other session's decision.
+ * routing for every other session (#5128), so per-row warnings never enter
+ * another session's decision.
  */
 export function warningsForSession(listing: SessionList, sessionId: string): readonly string[] {
-	const rows = listing.rowWarnings;
-	if (!rows) return listing.warnings;
-	const otherRows = new Set(Object.entries(rows).flatMap(([id, messages]) => (id === sessionId ? [] : [...messages])));
-	return listing.warnings.filter(message => !otherRows.has(message));
+	const scope = listing.warningScope;
+	if (!scope) return listing.warnings;
+	return [...scope.indexWide, ...(scope.rows[sessionId] ?? [])];
 }
 
 export type SessionGenerationIndexStatus =
@@ -1544,21 +1549,30 @@ export class SessionIndex {
 			if (allowResync) await this.#replayUnderLock();
 		}
 	}
-	/** `sessionId` scopes a warning to one row; omit it for an index-wide fault. */
+	/**
+	 * `sessionId` scopes a warning to one row; omit it for an index-wide fault.
+	 * Deduplication is keyed by row AND message, so two rows raising an identical
+	 * warning each keep their own attribution.
+	 */
 	#warn(message: string, sessionId?: string): void {
-		if (!this.#warnings.some(warning => warning.message === message)) this.#warnings.push({ message, sessionId });
+		if (!this.#warnings.some(warning => warning.message === message && warning.sessionId === sessionId))
+			this.#warnings.push({ message, sessionId });
 	}
 
-	/** Groups the row-scoped warnings so one rejected row cannot fence the others. */
-	#rowWarnings(): Readonly<Record<string, readonly string[]>> {
+	/** Row-keyed attribution so one rejected row cannot fence the others. */
+	#warningScope(): { indexWide: readonly string[]; rows: Readonly<Record<string, readonly string[]>> } {
+		const indexWide: string[] = [];
 		const rows: Record<string, string[]> = {};
 		for (const warning of this.#warnings) {
-			if (warning.sessionId === undefined) continue;
+			if (warning.sessionId === undefined) {
+				indexWide.push(warning.message);
+				continue;
+			}
 			const existing = rows[warning.sessionId];
 			if (existing) existing.push(warning.message);
 			else rows[warning.sessionId] = [warning.message];
 		}
-		return rows;
+		return { indexWide, rows };
 	}
 
 	async refresh(): Promise<void> {
@@ -1800,7 +1814,7 @@ export class SessionIndex {
 			indexSeq: this.indexSeq,
 			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
 			warnings: this.#warnings.map(warning => warning.message),
-			rowWarnings: this.#rowWarnings(),
+			warningScope: this.#warningScope(),
 		};
 	}
 
@@ -1880,7 +1894,13 @@ export class SessionIndex {
 		probedIncarnations: ReadonlyMap<string, string | undefined>,
 	): SessionGenerationIndexStatus {
 		const observedIndexSeq = this.indexSeq;
-		if (this.#corruptSuffix || this.#warnings.length > 0)
+		// Scoped exactly like routing (#5128): an index-wide fault still makes every
+		// generation unreportable, but a warning about an unrelated row says nothing
+		// about THIS session's generation history.
+		if (
+			this.#corruptSuffix ||
+			this.#warnings.some(warning => warning.sessionId === undefined || warning.sessionId === sessionId)
+		)
 			return { status: "unknown", observedIndexSeq, reason: "index_incomplete" };
 
 		const rawSessionEvents = this.#events.filter(event => event.sessionId === sessionId);
