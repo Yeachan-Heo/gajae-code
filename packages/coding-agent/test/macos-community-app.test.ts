@@ -154,12 +154,12 @@ describe("macOS community app offer guards", () => {
 								{
 									name: "gajae-app-desktop-1.0.0-macos-arm64.dmg",
 									browser_download_url:
-										"https://github.com/devswha/gajae-code-app/releases/download/v1/gajae-app-desktop-1.0.0-macos-arm64.dmg",
+										"https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/gajae-app-desktop-1.0.0-macos-arm64.dmg",
 								},
 								{
 									name: "gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
 									browser_download_url:
-										"https://github.com/devswha/gajae-code-app/releases/download/v1/gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
+										"https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/gajae-app-desktop-1.0.0-macos-arm64.dmg.sha256",
 								},
 							],
 						}),
