@@ -382,7 +382,7 @@ async function syncRecorderHud(
 	await syncSkillActiveState({
 		cwd,
 		skill: "deep-interview",
-		active: phase !== "complete",
+		active: envelope.active !== false && phase !== "complete",
 		phase,
 		sessionId,
 		source: "gjc-runtime-deep-interview-recorder",
@@ -437,6 +437,7 @@ export async function appendOrMergeDeepInterviewRound(
 	if (input.customInput !== undefined)
 		assertDeepInterviewInputWithinLimit(input.customInput, MAX_USER_RESPONSE_LENGTH, "user_response");
 	const envelope = await readEnvelope(statePath);
+	if (envelope.active === false) throw new Error("cannot record a deep-interview turn after handoff or completion");
 	const interviewId = input.interviewId ?? interviewIdOf(envelope);
 	const shell = buildAnswerShell({
 		...input,
