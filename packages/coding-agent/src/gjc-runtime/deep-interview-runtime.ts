@@ -24,7 +24,13 @@ import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { modeStatePath, sessionSpecsDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
-import { appendJsonl, readExistingStateForMutation, writeArtifact, writeWorkflowEnvelopeAtomic } from "./state-writer";
+import {
+	appendJsonl,
+	readExistingStateForMutation,
+	withWorkflowStateLock,
+	writeArtifact,
+	writeWorkflowEnvelopeAtomic,
+} from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
 import { resolveWorkflowSetting } from "./workflow-settings";
 
@@ -176,6 +182,20 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 	const sessionId = session.gjcSessionId;
 	assertSafePathComponent(sessionId, "session-id");
 	const statePath = deepInterviewStatePath(cwd, sessionId);
+	return withWorkflowStateLock(
+		statePath,
+		async () => handleCrystallizeUnlocked(args, cwd, sessionId, statePath, input),
+		{ cwd },
+	);
+}
+
+async function handleCrystallizeUnlocked(
+	args: readonly string[],
+	cwd: string,
+	sessionId: string,
+	statePath: string,
+	input: Record<string, unknown>,
+): Promise<DeepInterviewCommandResult> {
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt")
 		throw new DeepInterviewCommandError(
@@ -197,7 +217,7 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 	const crystal = crystallizeDeepInterview(payload);
 	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
 	assertSafePathComponent(slug, "slug");
-	const specPath = path.join(sessionSpecsDir(cwd, sessionId), `deep-interview-${slug}.md`);
+	const specPath = path.join(sessionSpecsDir(cwd, sessionId), `deep-interview-${slug}-v${crystal.spec_version}.md`);
 	const now = new Date().toISOString();
 	const specContent = crystalMarkdown(crystal);
 	await writeArtifact(specPath, specContent, {
@@ -232,6 +252,7 @@ async function handleCrystallize(args: readonly string[], cwd: string): Promise<
 		updated_at: now,
 	};
 	await writeWorkflowEnvelopeAtomic(statePath, envelope, {
+		lockHeld: true,
 		cwd,
 		receipt: {
 			cwd,

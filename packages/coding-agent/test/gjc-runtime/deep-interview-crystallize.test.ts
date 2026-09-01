@@ -131,6 +131,13 @@ describe("deep-interview crystallize contract", () => {
 		expect(() => crystallizeDeepInterview(missingRevision)).toThrow("authoritative current revision");
 	});
 
+	it("rejects empty evidence and broad ambiguity", () => {
+		const empty = input({ items: [] });
+		expect(() => crystallizeDeepInterview(empty)).toThrow("material conversation evidence");
+		const broad = input({ open_gaps: ["one", "two", "three"] });
+		expect(() => crystallizeDeepInterview(broad)).toThrow("full deep-interview flow");
+	});
+
 	it("carries omitted prior material forward", () => {
 		const first = crystallizeDeepInterview(input());
 		const second = crystallizeDeepInterview(later(input({ prior: first, items: [first.items[0]!] }), 2));
