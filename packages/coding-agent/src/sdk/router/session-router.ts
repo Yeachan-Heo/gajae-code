@@ -789,6 +789,7 @@ export class SessionRouter {
 		const endpointGeneration = readPositiveInteger(result.endpointGeneration);
 		const pid = readPositiveInteger(result.pid);
 		const endpointMtimeMs = readEndpointMtime(result.endpointMtimeMs);
+		const endpointFileId = typeof result.endpointFileId === "string" ? result.endpointFileId : undefined;
 		if (
 			sessionId !== fallback.sessionId ||
 			(this.#sessionIds !== undefined && !this.#sessionIds.has(sessionId ?? "")) ||
@@ -812,6 +813,7 @@ export class SessionRouter {
 			endpointGeneration,
 			pid,
 			endpointMtimeMs,
+			...(endpointFileId === undefined ? {} : { endpointFileId }),
 			live: true,
 			indexSeq: 0,
 			identityProvenance: "legacy",

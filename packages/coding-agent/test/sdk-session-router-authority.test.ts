@@ -41,6 +41,7 @@ interface RouterFixtureAuthority {
 	generation: number;
 	pid: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	indexed: boolean;
 	terminalUncertain: boolean;
 	warnings: string[];
@@ -103,7 +104,7 @@ async function routerFixture(
 	fs.writeFileSync(endpointFile, JSON.stringify({ sessionId, url: "ws://router.test", token: "secret", pid: 42 }));
 	const endpointMtimeMs = fs.statSync(endpointFile).mtimeMs;
 
-	const authority = {
+	const authority: RouterFixtureAuthority = {
 		generation: 1,
 		pid: 42,
 		endpointMtimeMs,
@@ -130,6 +131,7 @@ async function routerFixture(
 							endpointGeneration: authority.generation,
 							pid: authority.pid,
 							endpointMtimeMs: authority.endpointMtimeMs,
+							...(authority.endpointFileId === undefined ? {} : { endpointFileId: authority.endpointFileId }),
 							live: true,
 							indexSeq: authority.generation,
 							terminalUncertain: authority.terminalUncertain || undefined,
@@ -1492,6 +1494,37 @@ describe("SessionRouter dispatch authority", () => {
 		try {
 			expect(adopted.isCurrent()).toBe(false);
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			fixture.authority.indexed = true;
+			await fixture.router.reconcile();
+			expect(adopted.isCurrent()).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).toBe(adopted);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("adopts rounded lifecycle authority only with the exact endpoint file identity", async () => {
+		const fixture = await routerFixture({ initiallyIndexed: false });
+		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
+		const identity = fs.statSync(fixture.endpointFile, { bigint: true });
+		fixture.authority.endpointMtimeMs = Number(identity.mtimeNs) / 1_000_000 + 0.0005;
+		fixture.authority.endpointFileId = `${identity.dev}:${identity.ino}`;
+		const adopted = await fixture.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: fixture.sessionId,
+					endpointGeneration: fixture.authority.generation,
+					pid: fixture.authority.pid,
+					endpointMtimeMs: fixture.authority.endpointMtimeMs,
+					endpointFileId: fixture.authority.endpointFileId,
+					endpoint,
+				},
+			},
+			{ sessionId: fixture.sessionId, cwd: fixture.repo },
+		);
+		try {
+			expect(adopted.isCurrent()).toBe(false);
 			fixture.authority.indexed = true;
 			await fixture.router.reconcile();
 			expect(adopted.isCurrent()).toBe(true);
