@@ -16176,10 +16176,16 @@ export class SessionManager {
 	}
 	/** Flush while open, then strictly close; retryable close skips the invalid second flush. */
 	async flushAndCloseStrict(): Promise<SessionManagerCloseOutcome> {
+		let priorFlushError: Error | undefined;
 		if (this.#persistWriter?.getCloseState() !== "close_failed_retryable") {
-			await this.flush();
+			try {
+				await this.flush();
+			} catch (error) {
+				priorFlushError = toError(error);
+			}
 		}
-		return this.closeStrict();
+		const outcome = await this.closeStrict();
+		return priorFlushError && outcome.kind === "closed" ? { kind: "close_unknown", error: priorFlushError } : outcome;
 	}
 
 	/**
