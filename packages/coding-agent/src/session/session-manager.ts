@@ -16207,6 +16207,7 @@ export class SessionManager {
 		}
 		let priorPersistError = this.#persistError;
 		if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) {
+			await this.#persistChain.catch(() => {});
 			try {
 				await this.#rewriteFileContents();
 			} catch (error) {
@@ -16247,7 +16248,8 @@ export class SessionManager {
 		);
 		// Only tear down the resident blob store on a terminal outcome; a retryable
 		// close leaves the session live for a genuine retry.
-		if (!this.#persistWriter && (!this.persist || !this.#needsFullRewriteOnNextPersist)) {
+		const observedPersistError = priorPersistError ?? this.#persistError;
+		if (!observedPersistError && !this.#persistWriter && (!this.persist || !this.#needsFullRewriteOnNextPersist)) {
 			this.#releaseResidentTextStore();
 			this.#retireEphemeralArtifacts();
 			try {
@@ -16258,7 +16260,6 @@ export class SessionManager {
 			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 			this.#releaseClosedSessionState();
 		}
-		const observedPersistError = priorPersistError ?? this.#persistError;
 		if (observedPersistError && outcome.kind === "closed") {
 			return { kind: "close_unknown", error: observedPersistError };
 		}
