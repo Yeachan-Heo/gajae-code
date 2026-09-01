@@ -4605,8 +4605,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					.catch(async error => {
 						if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) {
 							await session.dispose();
-							await finishCleanup();
 						}
+						await finishCleanup();
 					})
 					.catch(error => {
 						logger.warn("Deferred SDK disposal cleanup failed", { error: safeErrorForLog(error) });
