@@ -884,7 +884,10 @@ describe("SessionManager read-only resume", () => {
 		if (inspection.kind === "error") throw new Error(`Expected legacy fixture inspection, got ${inspection.reason}`);
 		const opened = await SessionManager.openExistingStrict(inspection.identity, root);
 		expect(opened.kind).toBe("opened");
-		if (opened.kind === "opened") await opened.manager.close();
+		if (opened.kind === "opened") {
+			const outcome = await opened.manager.closeStrict();
+			expect(outcome.kind).toBe("closed");
+		}
 		expect(fs.readFileSync(filePath)).toEqual(before);
 		expect(fs.statSync(filePath).mtimeMs).toBe(beforeMtime);
 	});
