@@ -15,7 +15,7 @@ const temporaryRoots: string[] = [];
 async function writeAgent(root: string, name: string): Promise<void> {
 	const dir = path.join(root, "agents");
 	await fs.mkdir(dir, { recursive: true });
-	await fs.writeFile(path.join(dir, `${name}.md`), `---\nname: ${name}\ndescription: ${name}\n---\n\n# ${name}\n`);
+	await Bun.write(path.join(dir, `${name}.md`), `---\nname: ${name}\ndescription: ${name}\n---\n\n# ${name}\n`);
 }
 
 function createSession(): ToolSession {
@@ -179,7 +179,7 @@ describe("task agent visibility", () => {
 		const settingsPlugin = path.join(root, "settings-plugin");
 		const writeRegistry = async (agentDir: string, pluginPath: string, pluginName: string) => {
 			await fs.mkdir(path.join(agentDir, "plugins"), { recursive: true });
-			await fs.writeFile(
+			await Bun.write(
 				path.join(agentDir, "plugins", "installed_plugins.json"),
 				JSON.stringify({
 					version: 2,
