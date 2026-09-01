@@ -14426,7 +14426,7 @@ export class AgentSession {
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.abortCompaction();
+		if (!options?.preserveCompaction) this.abortCompaction();
 		this.abortHandoff();
 		this.abortBash();
 		this.abortEval();
