@@ -16197,34 +16197,38 @@ export class SessionManager {
 				error: toError(error).message,
 			});
 		}
+		const priorPersistError = this.#persistError;
 		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
-		await this.#queuePersistTask(async () => {
-			const writer = this.#persistWriter;
-			if (!writer) {
-				this.#flushed = true;
-				return;
-			}
-			try {
-				await writer.close();
-			} catch {
-				// Outcome is captured from the underlying writer's close state below.
-			}
-			outcome = this.#closeOutcomeFromWriter(writer);
-			if (outcome.kind === "closed") {
-				this.#flushed = true;
-				// Confirmed closed: release writer ownership.
-				this.#persistWriter = undefined;
-				this.#persistWriterPath = undefined;
-			} else if (outcome.kind === "close_unknown") {
-				// Quarantined (terminal): release ownership so no retry/finalizer
-				// touches the uncertain fd again.
-				this.#persistWriter = undefined;
-				this.#persistWriterPath = undefined;
-			}
-			// close_failed_retryable: RETAIN the writer so a later closeStrict() call
-			// can actually re-dispatch the OS close (ownership stays proven). The
-			// wrapper must not manufacture success or surrender a retryable fd.
-		});
+		await this.#queuePersistTask(
+			async () => {
+				const writer = this.#persistWriter;
+				if (!writer) {
+					this.#flushed = true;
+					return;
+				}
+				try {
+					await writer.close();
+				} catch {
+					// Outcome is captured from the underlying writer's close state below.
+				}
+				outcome = this.#closeOutcomeFromWriter(writer);
+				if (outcome.kind === "closed") {
+					this.#flushed = true;
+					// Confirmed closed: release writer ownership.
+					this.#persistWriter = undefined;
+					this.#persistWriterPath = undefined;
+				} else if (outcome.kind === "close_unknown") {
+					// Quarantined (terminal): release ownership so no retry/finalizer
+					// touches the uncertain fd again.
+					this.#persistWriter = undefined;
+					this.#persistWriterPath = undefined;
+				}
+				// close_failed_retryable: RETAIN the writer so a later closeStrict() call
+				// can actually re-dispatch the OS close (ownership stays proven). The
+				// wrapper must not manufacture success or surrender a retryable fd.
+			},
+			{ ignoreError: true },
+		);
 		// Only tear down the resident blob store on a terminal outcome; a retryable
 		// close leaves the session live for a genuine retry.
 		if (!this.#persistWriter) {
@@ -16237,6 +16241,9 @@ export class SessionManager {
 			}
 			if (this.#preparedNewSessions.size === 0) this.#releaseOwnedManagedAuthority();
 			this.#releaseClosedSessionState();
+		}
+		if (priorPersistError && outcome.kind === "closed") {
+			return { kind: "close_unknown", error: priorPersistError };
 		}
 		return outcome;
 	}
