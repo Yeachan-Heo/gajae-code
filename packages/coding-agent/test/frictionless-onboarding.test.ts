@@ -250,6 +250,14 @@ describe("frictionless onboarding", () => {
 		expect(
 			shouldOfferAutomaticOnboarding({
 				normalInteractive: true,
+				automation: true,
+				initialMessages: [],
+				resumeAction: undefined,
+			}),
+		).toBe(false);
+		expect(
+			shouldOfferAutomaticOnboarding({
+				normalInteractive: true,
 				initialMessage: undefined,
 				initialMessages: [],
 				initialImages: [{}],
@@ -329,6 +337,13 @@ describe("frictionless onboarding", () => {
 		expect(copy.title).toBe("Frictionless onboarding");
 		expect(copy.manual.endsWith("?")).toBe(true);
 		expect(copy.disclosure).toContain("only the derived profile and completion state are retained");
+	});
+
+	test("renders onboarding guidance for every supported interface language", () => {
+		expect(getFrictionlessOnboardingCopy("en").title).toBe("Frictionless onboarding");
+		expect(getFrictionlessOnboardingCopy("ko").title).toBe("간편 온보딩");
+		expect(getFrictionlessOnboardingCopy("zh").title).toBe("轻松入门");
+		expect(getFrictionlessOnboardingCopy("ja").title).toBe("簡単オンボーディング");
 	});
 
 	test("builds each manual answer as previewable command guidance", () => {

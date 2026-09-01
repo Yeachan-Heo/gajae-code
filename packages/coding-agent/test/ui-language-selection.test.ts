@@ -1,4 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import {
 	reconcileSettingsSchema,
 	resetSettingsForTest,
@@ -6,9 +7,15 @@ import {
 	settings,
 	validateSettingPatch,
 } from "@gajae-code/coding-agent/config/settings";
+import { InterfaceLanguageSelectorComponent } from "@gajae-code/coding-agent/modes/components/frictionless-onboarding-selector";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
-import { parseUiLanguage, resolveUiLanguage, uiString } from "@gajae-code/coding-agent/modes/ui-language";
+import {
+	parseUiLanguage,
+	resolveExplicitUiLanguage,
+	resolveUiLanguage,
+	uiString,
+} from "@gajae-code/coding-agent/modes/ui-language";
 import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
 
 beforeAll(async () => {
@@ -38,6 +45,28 @@ function createSelector(): SettingsSelectorComponent {
 }
 
 describe("interactive UI language selection", () => {
+	it("offers the four supported languages before onboarding guidance", () => {
+		let selected: string | undefined;
+		const selector = new InterfaceLanguageSelectorComponent(
+			language => {
+				selected = language;
+			},
+			() => {},
+		);
+		const rendered = selector.render(160).map(Bun.stripANSI).join("\n");
+
+		expect(rendered).toContain("Choose your interface language");
+		expect(rendered).toContain("English");
+		expect(rendered).toContain("한국어");
+		expect(rendered).toContain("简体中文");
+		expect(rendered).toContain("日本語");
+
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+		expect(selected).toBe("zh");
+	});
+
 	it("defaults invalid and unavailable selections to English", () => {
 		expect(resolveUiLanguage(undefined)).toBe("en");
 		expect(resolveUiLanguage("fr")).toBe("en");
@@ -50,6 +79,13 @@ describe("interactive UI language selection", () => {
 		expect(validateSettingPatch({ "ui.language": "fr" })).toEqual([
 			{ path: "ui.language", detail: "Expected enum." },
 		]);
+	});
+
+	it("uses deterministic English fallback for invalid explicit startup language", () => {
+		expect(resolveExplicitUiLanguage(undefined, undefined)).toEqual({ language: "en", hasPreference: false });
+		expect(resolveExplicitUiLanguage(undefined, "zh-CN")).toEqual({ language: "zh", hasPreference: true });
+		expect(resolveExplicitUiLanguage(undefined, "fr-FR")).toEqual({ language: "en", hasPreference: true });
+		expect(resolveExplicitUiLanguage("ko", "en-US")).toEqual({ language: "ko", hasPreference: true });
 	});
 
 	it("renders persisted Korean settings chrome without changing canonical values", () => {
@@ -90,8 +126,20 @@ describe("interactive UI language selection", () => {
 		expect(submenu).toContain("日本語");
 	});
 
+	it("renders persisted Simplified Chinese settings chrome", () => {
+		settings.set("ui.language", "zh");
+		const selector = createSelector();
+		const rendered = selector.render(160).map(Bun.stripANSI).join("\n");
+
+		expect(rendered).toContain("设置:");
+		expect(rendered).toContain("外观");
+		expect(rendered).toContain("语言");
+		expect(settings.get("ui.language")).toBe("zh");
+	});
+
 	it("validates Japanese in the settings enum patch surface", () => {
 		expect(validateSettingPatch({ "ui.language": "ja" })).toEqual([]);
+		expect(validateSettingPatch({ "ui.language": "zh" })).toEqual([]);
 	});
 
 	it("keeps the operator language authoritative over runtime overrides", () => {
@@ -99,6 +147,25 @@ describe("interactive UI language selection", () => {
 			Settings.isolated({ "ui.language": "ko" }, { overrides: { "ui.language": "en" } }).get("ui.language"),
 		).toBe("ko");
 		expect(Settings.isolated({}, { overrides: { "ui.language": "ko" } }).get("ui.language")).toBe("en");
+	});
+
+	it("reloads a selected language from durable config", async () => {
+		const agentDir = await fs.mkdtemp(`${process.env.TMPDIR ?? "/tmp"}/gjc-language-`);
+		resetSettingsForTest();
+		const durable = await Settings.init({ agentDir, cwd: agentDir });
+		durable.set("ui.language", "zh");
+		await durable.flushOrThrow();
+		await durable.close();
+
+		resetSettingsForTest();
+		const reloaded = await Settings.init({ agentDir, cwd: agentDir });
+		try {
+			expect(reloaded.has("ui.language")).toBe(true);
+			expect(reloaded.get("ui.language")).toBe("zh");
+		} finally {
+			await reloaded.close();
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
 	});
 
 	it("persists a user selection and refreshes the open settings surface", () => {
@@ -125,7 +192,7 @@ describe("/language slash command", () => {
 			settings: {
 				get: (path: "ui.language") => settings.get(path),
 				has: (path: "ui.language") => settings.has(path),
-				set: (path: "ui.language", value: "en" | "ko" | "ja") => settings.set(path, value),
+				set: (path: "ui.language", value: "en" | "ko" | "zh" | "ja") => settings.set(path, value),
 				canWriteDurableConfig: () => options.canWriteDurableConfig ?? settings.canWriteDurableConfig(),
 			},
 			editor: { setText: () => {} },
@@ -180,6 +247,8 @@ describe("/language slash command", () => {
 		expect(parseUiLanguage("en-US")).toBe("en");
 		expect(parseUiLanguage("fr")).toBeUndefined();
 		expect(parseUiLanguage("fr-FR")).toBeUndefined();
+		expect(parseUiLanguage("中文")).toBe("zh");
+		expect(parseUiLanguage("zh-CN")).toBe("zh");
 	});
 
 	it("never returns inherited object properties for hostile inputs", () => {

@@ -548,6 +548,7 @@
 					"enum": [
 						"en",
 						"ko",
+						"zh",
 						"ja"
 					],
 					"description": "Language for human-facing interactive UI text",

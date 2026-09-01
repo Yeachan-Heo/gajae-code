@@ -1,4 +1,4 @@
-export const UI_LANGUAGES = ["en", "ko", "ja"] as const;
+export const UI_LANGUAGES = ["en", "ko", "zh", "ja"] as const;
 
 export type UiLanguage = (typeof UI_LANGUAGES)[number];
 
@@ -23,6 +23,7 @@ const ENGLISH_STRINGS = {
 	"settings.language.description": "Language for human-facing interactive UI text",
 	"settings.language.english": "English",
 	"settings.language.korean": "Korean (한국어)",
+	"settings.language.chinese": "Chinese (简体中文)",
 	"settings.language.japanese": "Japanese (日本語)",
 	"language.current": "Current UI language:",
 	"language.changed": "UI language changed to",
@@ -52,6 +53,7 @@ const KOREAN_STRINGS: Record<UiStringKey, string> = {
 	"settings.language.description": "사람이 읽는 대화형 UI 텍스트의 언어",
 	"settings.language.english": "English",
 	"settings.language.korean": "한국어",
+	"settings.language.chinese": "简体中文",
 	"settings.language.japanese": "日本語",
 	"language.current": "현재 UI 언어:",
 	"language.changed": "UI 언어를 다음으로 변경했습니다:",
@@ -79,21 +81,61 @@ const JAPANESE_STRINGS: Record<UiStringKey, string> = {
 	"settings.language.description": "対話型 UI テキストに使う言語",
 	"settings.language.english": "English",
 	"settings.language.korean": "한국어",
+	"settings.language.chinese": "简体中文",
 	"settings.language.japanese": "日本語",
 	"language.current": "現在の UI 言語:",
 	"language.changed": "UI 言語を次に変更しました:",
 	"language.unknown": "不明な言語",
 };
 
+const CHINESE_STRINGS: Record<UiStringKey, string> = {
+	"settings.title": "设置",
+	"settings.navigationHint": "（按 Tab 切换）",
+	"settings.selectHint": "  Enter：选择 · Esc：返回",
+	"settings.preview": "预览：",
+	"settings.tab.appearance": "外观",
+	"settings.tab.model": "模型",
+	"settings.tab.interaction": "交互",
+	"settings.tab.context": "上下文",
+	"settings.tab.memory": "记忆",
+	"settings.tab.editing": "编辑",
+	"settings.tab.tools": "工具",
+	"settings.tab.tasks": "任务",
+	"settings.tab.providers": "提供商",
+	"settings.tab.notifications": "通知",
+	"settings.tab.plugins": "插件",
+	"settings.tab.gjcBundles": "GJC 捆绑包",
+	"settings.language.label": "语言",
+	"settings.language.description": "面向用户的交互式界面文字所使用的语言",
+	"settings.language.english": "English",
+	"settings.language.korean": "한국어",
+	"settings.language.chinese": "简体中文",
+	"settings.language.japanese": "日本語",
+	"language.current": "当前界面语言：",
+	"language.changed": "界面语言已更改为",
+	"language.unknown": "未知语言",
+};
+
 const STRINGS: Record<UiLanguage, Record<UiStringKey, string>> = {
 	en: ENGLISH_STRINGS,
 	ko: KOREAN_STRINGS,
+	zh: CHINESE_STRINGS,
 	ja: JAPANESE_STRINGS,
 };
 
 /** User selection is authoritative; invalid or unavailable values deterministically fall back to English. */
 export function resolveUiLanguage(value: unknown): UiLanguage {
-	return value === "ko" || value === "ja" ? value : "en";
+	return value === "ko" || value === "zh" || value === "ja" ? value : "en";
+}
+
+/** Resolve explicit startup preference without allowing an invalid value to block startup. */
+export function resolveExplicitUiLanguage(
+	configuredValue: unknown,
+	environmentValue: string | undefined,
+): { language: UiLanguage; hasPreference: boolean } {
+	if (configuredValue !== undefined) return { language: resolveUiLanguage(configuredValue), hasPreference: true };
+	if (environmentValue === undefined) return { language: "en", hasPreference: false };
+	return { language: parseUiLanguage(environmentValue) ?? "en", hasPreference: true };
 }
 
 export function uiString(language: unknown, key: UiStringKey): string {
@@ -104,6 +146,7 @@ export function uiString(language: unknown, key: UiStringKey): string {
 export const UI_LANGUAGE_LABELS: Record<UiLanguage, string> = {
 	en: "English",
 	ko: "한국어",
+	zh: "简体中文",
 	ja: "日本語",
 };
 
@@ -117,6 +160,10 @@ const UI_LANGUAGE_ALIASES: Readonly<Record<string, UiLanguage>> = {
 	kor: "ko",
 	korean: "ko",
 	한국어: "ko",
+	zh: "zh",
+	中文: "zh",
+	简体中文: "zh",
+	chinese: "zh",
 	ja: "ja",
 	jp: "ja",
 	jpn: "ja",

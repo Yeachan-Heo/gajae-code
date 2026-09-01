@@ -751,7 +751,7 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	"ui.language": {
 		type: "enum",
-		values: ["en", "ko", "ja"] as const,
+		values: ["en", "ko", "zh", "ja"] as const,
 		default: "en",
 		ui: {
 			tab: "appearance",
@@ -760,6 +760,7 @@ export const SETTINGS_SCHEMA = {
 			options: [
 				{ value: "en", label: "English" },
 				{ value: "ko", label: "Korean (한국어)" },
+				{ value: "zh", label: "Chinese (简体中文)" },
 				{ value: "ja", label: "Japanese (日本語)" },
 			],
 		},

@@ -8,6 +8,12 @@ This reference is derived from current code paths in:
 
 It documents only active behavior.
 
+## Interface language
+
+| Variable | Used for | Behavior |
+| --- | --- | --- |
+| `GJC_UI_LANGUAGE` | Explicit first-use onboarding language | Accepts `en`, `ko`, `zh`, and `ja` (also locale tags such as `ko-KR`). An invalid value safely falls back to English and never opens the first-use picker. A valid value bypasses the picker for onboarding only and is not persisted; use `gjc config set ui.language <code>` or Settings for a durable preference. |
+
 ## Crash relay
 
 | Variable | Used for | Trusted-source behavior |

@@ -754,6 +754,9 @@ export async function runInteractiveMode(
 	if (
 		shouldOfferAutomaticOnboarding({
 			normalInteractive: true,
+			automation:
+				/^(?:1|true|yes|on)$/i.test(process.env.CI ?? "") ||
+				/^(?:1|true|yes|on)$/i.test(process.env.GJC_AUTOMATION ?? ""),
 			initialMessage,
 			initialMessages,
 			initialImages,

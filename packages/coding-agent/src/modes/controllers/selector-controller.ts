@@ -181,6 +181,7 @@ import {
 	FrictionlessOnboardingSelectorComponent,
 	type FrictionlessOnboardingStage,
 	getFrictionlessOnboardingCopy,
+	InterfaceLanguageSelectorComponent,
 } from "../components/frictionless-onboarding-selector";
 import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
@@ -225,6 +226,7 @@ import type { SessionObserverRegistry } from "../session-observer-registry";
 import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
 import type { TasksAggregator } from "../tasks-aggregator";
 import type { TranscriptItemRegistry } from "../transcript-item-registry";
+import { resolveExplicitUiLanguage, type UiLanguage } from "../ui-language";
 import { acquireResumeProgressLease, type ResumeProgressLease } from "../utils/ui-helpers";
 
 const CALLBACK_SERVER_PROVIDERS = new Set<string>([
@@ -1483,11 +1485,57 @@ export class SelectorController {
 
 	async showFrictionlessOnboarding(): Promise<void> {
 		const agentDir = this.ctx.session.getSessionAgentDir();
+		const languagePreference = resolveExplicitUiLanguage(
+			this.ctx.settings.has("ui.language") ? this.ctx.settings.get("ui.language") : undefined,
+			process.env.GJC_UI_LANGUAGE,
+		);
+		let selectedLanguage: UiLanguage = languagePreference.language;
+		if (!languagePreference.hasPreference && this.ctx.settings.canPersistDurableConfig()) {
+			const decision = Promise.withResolvers<UiLanguage | undefined>();
+			let settled = false;
+			let unregisterStop: (() => void) | undefined;
+			const finish = (language: UiLanguage | undefined): void => {
+				if (settled) return;
+				settled = true;
+				unregisterStop?.();
+				decision.resolve(language);
+			};
+			this.showSelector(done => {
+				unregisterStop = this.ctx.onStop(() => {
+					done();
+					finish(undefined);
+				});
+				const selector = new InterfaceLanguageSelectorComponent(
+					language => {
+						done();
+						finish(language);
+					},
+					() => {
+						done();
+						finish(undefined);
+					},
+				);
+				return { component: selector, focus: selector };
+			});
+			selectedLanguage = (await decision.promise) ?? "en";
+			try {
+				await this.ctx.settings.commitAtomicBatch([{ path: "ui.language", op: "set", value: selectedLanguage }]);
+			} catch (error) {
+				this.ctx.showError(
+					error instanceof Error
+						? `${error.message}; continuing in English.`
+						: "Cannot save the interface language; continuing in English.",
+				);
+				selectedLanguage = "en";
+			}
+		} else if (!languagePreference.hasPreference) {
+			this.ctx.showError("Cannot save the interface language; continuing in English.");
+		}
 		const presence = await discoverOnboardingRootPresence();
 		// An explicit `/language` (or settings) selection outranks locale and transcript evidence.
 		const profileOptions = {
 			osLocale: Intl.DateTimeFormat().resolvedOptions().locale,
-			...(this.ctx.settings.has("ui.language") ? { preferredLanguage: this.ctx.settings.get("ui.language") } : {}),
+			preferredLanguage: selectedLanguage,
 		};
 		const initialProfile = deriveOnboardingProfile([], profileOptions);
 

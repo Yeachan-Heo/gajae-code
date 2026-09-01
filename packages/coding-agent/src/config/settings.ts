@@ -748,6 +748,11 @@ export class Settings implements NotificationSettingsReader {
 		return !this.#persist || !this.#hasRecoveredConfigSyntax;
 	}
 
+	/** Whether this instance can publish a mutation to a durable config file. */
+	canPersistDurableConfig(): boolean {
+		return this.#persist && !this.#hasRecoveredConfigSyntax;
+	}
+
 	/**
 	 * Set a setting value (sync).
 	 * Updates global settings and reserves its background persistence slot before

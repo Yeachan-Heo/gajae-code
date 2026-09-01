@@ -748,6 +748,7 @@ export function shouldOfferOnboarding(state: FrictionlessOnboardingState): boole
 
 export interface AutomaticOnboardingInput {
 	normalInteractive: boolean;
+	automation?: boolean;
 	initialMessage?: string;
 	initialMessages: readonly string[];
 	initialImages?: readonly unknown[];
@@ -757,6 +758,7 @@ export interface AutomaticOnboardingInput {
 export function shouldOfferAutomaticOnboarding(input: AutomaticOnboardingInput): boolean {
 	return (
 		input.normalInteractive &&
+		!input.automation &&
 		!input.initialMessage &&
 		input.initialMessages.length === 0 &&
 		(input.initialImages?.length ?? 0) === 0 &&

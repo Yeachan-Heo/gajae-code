@@ -79,6 +79,7 @@ Environment Variables:
 
   # Configuration
   GJC_CODING_AGENT_DIR       - Session storage directory (default: ~/${CONFIG_DIR_NAME}/agent)
+  GJC_UI_LANGUAGE            - Explicit first-use onboarding language (en, ko, zh, or ja); invalid values use English without prompting
   GJC_PACKAGE_DIR            - Override package directory (for Nix/Guix store paths)
   GJC_SMOL_MODEL              - Override smol/fast model (see --smol)
   GJC_SLOW_MODEL              - Override slow/reasoning model (see --slow)

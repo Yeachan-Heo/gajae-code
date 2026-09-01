@@ -1,6 +1,6 @@
 # UI language
 
-Human-facing interactive chrome can render in English, Korean, or Japanese. Canonical persisted values are only `en`, `ko`, and `ja`. Commands, flags, environment variables, JSON, and other protocol output stay in English.
+Human-facing interactive chrome can render in English, Korean, Simplified Chinese, or Japanese. Canonical persisted values are `en`, `ko`, `zh`, and `ja`. Commands, flags, environment variables, JSON, and other protocol output stay in English.
 
 Primary implementation: `packages/coding-agent/src/modes/ui-language.ts`. Setting: `ui.language` in `packages/coding-agent/src/config/settings-schema.ts` (global-only; workspace config and runtime overrides cannot change it).
 
@@ -8,20 +8,22 @@ Primary implementation: `packages/coding-agent/src/modes/ui-language.ts`. Settin
 
 - `/language` with no arguments reports the current language and the available codes.
 - `/language <value>` persists `ui.language` and confirms in the selected language. Accepted spellings:
-  - canonical codes: `en`, `ko`, `ja`
-  - locale tags whose language subtag is one of those codes: `en-US`, `ko-KR`, `ja-JP`
-  - English names: `english`, `korean`, `japanese`
-  - endonyms: `한국어`, `日本語`
-  - common aliases: `eng`, `kr`, `kor`, `jp`, `jpn`
-- An unsupported value (`fr`, `zh`, …) is rejected with the available list and changes nothing.
+  - canonical codes: `en`, `ko`, `zh`, `ja`
+  - locale tags whose language subtag is one of those codes: `en-US`, `ko-KR`, `zh-CN`, `ja-JP`
+  - English names: `english`, `korean`, `chinese`, `japanese`
+  - endonyms: `한국어`, `中文`, `简体中文`, `日本語`
+  - common aliases: `eng`, `kr`, `kor`, `zh`, `jp`, `jpn`
+- An unsupported value (`fr`, …) is rejected with the available list and changes nothing.
 - Durable-config failures use the same `config.yml` repair guidance as `/theme`.
 - `/language` is TUI-only (visual/local). It is not an SDK control seam.
 
-The settings Appearance tab exposes the same `en` / `ko` / `ja` selector.
+The settings Appearance tab exposes the same `en` / `ko` / `zh` / `ja` selector.
+
+`GJC_UI_LANGUAGE` is an optional session-only first-use onboarding preference. It accepts the same codes and locale tags, bypasses the first-use picker, and falls back to English without prompting when invalid. It does not change later interactive chrome; use `gjc config set ui.language <code>` or Settings for a durable preference.
 
 ## Onboarding detection
 
-`/tutorial` and first-run onboarding may still choose copy from a larger catalog (`en`, `ko`, `ja`, `zh`, `es`, `fr`, `de`) based on transcript evidence and the OS locale. An explicit `ui.language: ja` selection also pins onboarding copy to Japanese, like `en` and `ko`. The remaining catalog entries are display-only for onboarding and are not added to the persisted `ui.language` enum.
+An explicit `ui.language` selection pins onboarding copy to the selected supported language. The remaining catalog entries are display-only for onboarding and are not added to the persisted `ui.language` enum.
 
 Detection rules:
 

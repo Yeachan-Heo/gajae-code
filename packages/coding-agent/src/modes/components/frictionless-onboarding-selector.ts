@@ -1,8 +1,54 @@
-import { Container, matchesKey, Spacer, TruncatedText } from "@gajae-code/tui";
+import { Container, matchesKey, type SelectItem, SelectList, Spacer, TruncatedText } from "@gajae-code/tui";
 import type { OnboardingProfile } from "../../setup/frictionless-onboarding";
-import { theme } from "../theme/theme";
+import { getSelectListTheme, theme } from "../theme/theme";
+import { UI_LANGUAGES, type UiLanguage } from "../ui-language";
 import { matchesSelectCancel } from "../utils/keybinding-matchers";
 import { DynamicBorder } from "./dynamic-border";
+
+export const UI_LANGUAGE_CHOICES: readonly { value: UiLanguage; label: string }[] = [
+	{ value: "en", label: "English" },
+	{ value: "ko", label: "한국어" },
+	{ value: "zh", label: "简体中文" },
+	{ value: "ja", label: "日本語" },
+];
+
+export class InterfaceLanguageSelectorComponent extends Container {
+	readonly #selectList: SelectList;
+
+	constructor(onSelect: (language: UiLanguage) => void, onCancel: () => void) {
+		super();
+		this.addChild(new DynamicBorder());
+		this.addChild(new Spacer(1));
+		this.addChild(
+			new TruncatedText(
+				theme.bold(
+					"Choose your interface language / 언어를 선택하세요 / 选择界面语言 / インターフェース言語を選択",
+				),
+			),
+		);
+		this.addChild(new Spacer(1));
+		const items: SelectItem[] = UI_LANGUAGE_CHOICES.map(choice => ({ value: choice.value, label: choice.label }));
+		this.#selectList = new SelectList(items, items.length, getSelectListTheme());
+		this.#selectList.onSelect = item => {
+			if (UI_LANGUAGES.includes(item.value as UiLanguage)) onSelect(item.value as UiLanguage);
+		};
+		this.#selectList.onCancel = onCancel;
+		this.addChild(this.#selectList);
+		this.addChild(new Spacer(1));
+		this.addChild(new TruncatedText(theme.fg("dim", "↑/↓ select · Enter choose · Esc use English")));
+		this.addChild(new DynamicBorder());
+	}
+
+	handleInput(keyData: string): void {
+		// The app.exit action is owned by the parent editor and is not a TUI
+		// selector key id. Ctrl-D is its default byte when the editor is empty.
+		if (keyData === "\x04") {
+			this.#selectList.onCancel?.();
+			return;
+		}
+		this.#selectList.handleInput(keyData);
+	}
+}
 
 export type FrictionlessOnboardingAction =
 	| "analyze"

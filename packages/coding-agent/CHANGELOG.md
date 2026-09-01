@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fresh interactive onboarding now asks for an interface language before showing guidance, supports English, Korean, Simplified Chinese, and Japanese, persists the choice through `ui.language`, and uses a documented English fallback for noninteractive, invalid, cancelled, or unwritable startup.
+
 - Coordinator session-state locks now reclaim an empty, identity-qualified released transition tombstone on POSIX after a short release grace period. Live, foreign, malformed, non-empty, or identity-changed claims remain fail-closed, while persistent macOS/File Provider debris no longer burns the full transition timeout on every state write. (#5159)
 
 - A runtime-state marker recorded against a different workspace path now reports that mismatch instead of claiming the file is unreadable, and a terminal, not-live marker that travelled into the current workspace with its session directory is adopted rather than refused. Live, non-terminal, and out-of-workspace markers are still refused untouched.
