@@ -362,9 +362,12 @@ describe("LSP lifecycle behavior", () => {
 			const uri = `file://${filePath}`;
 			const { promise: refreshGate, resolve: releaseRefresh } = Promise.withResolvers<void>();
 			const { promise: refreshWriteStarted, resolve: refreshStarted } = Promise.withResolvers<void>();
+			const writes: Array<{ method?: string; params?: unknown }> = [];
 			const stdin = {
 				write: async (message: string) => {
-					if (parseWrittenMessage(message).method === "textDocument/didChange") {
+					const parsed = parseWrittenMessage(message);
+					writes.push(parsed);
+					if (parsed.method === "textDocument/didChange") {
 						refreshStarted();
 						await refreshGate;
 					}
@@ -391,6 +394,7 @@ describe("LSP lifecycle behavior", () => {
 
 			releaseRefresh();
 			await refreshPromise;
+			expect(writes.filter(message => message.method === "textDocument/didSave")).toHaveLength(1);
 		} finally {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}

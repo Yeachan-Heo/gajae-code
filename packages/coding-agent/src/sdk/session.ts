@@ -1563,6 +1563,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// capturing the launch root. Before the manager exists the launch cwd is the
 		// only truth available, and it is also the manager's initial cwd.
 		let liveSessionManager: SessionManager | undefined;
+		// AgentSession prepares cwd-bound authority before committing a move. Most
+		// built-ins resolve cwd at execution time, but Recipe discovers runners while
+		// it is constructed; let that pre-commit rebuild observe the pinned target
+		// without changing the durable session manager early.
+		let pendingBuiltinToolCwd: string | undefined;
 		const getLiveCwd = (): string => liveSessionManager?.getCwd() ?? cwd;
 		let runtimeServices: OptionalRuntimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, {
 			cwd: getLiveCwd,
@@ -2570,6 +2575,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				nextCustomTools,
 			);
 			await rebindProjectExtensions?.(to, settings);
+			// Keep the target override alive only after all cwd-capturing authority
+			// has prepared successfully; the AgentSession participant invokes the
+			// built-in rebuild immediately after this callback returns.
+			pendingBuiltinToolCwd = to;
 		};
 
 		/**
@@ -2617,14 +2626,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// before publication and must not be reset here.
 			try {
 				const previousRuntimeServices = runtimeServices;
-				runtimeServices = createOptionalRuntimeServices(
-					settings,
-					{
-						...options.runtimeServices,
-						memoryBackend: previousRuntimeServices.memoryBackend,
-					},
-					{ cwd: getLiveCwd },
-				);
+				const runtimeServiceOverrides: OptionalRuntimeServicesOverrides = {
+					...options.runtimeServices,
+					memoryBackend: previousRuntimeServices.memoryBackend,
+				};
+				// An injected workspace-tree snapshot deliberately has no runtime
+				// workspace service. Preserve the existing unused default instead of
+				// allocating a replacement that cannot be published or retired.
+				if (options.workspaceTree !== undefined && options.runtimeServices?.workspaceTree === undefined) {
+					runtimeServiceOverrides.workspaceTree = previousRuntimeServices.workspaceTree;
+				}
+				runtimeServices = createOptionalRuntimeServices(settings, runtimeServiceOverrides, { cwd: getLiveCwd });
 				session?.setRuntimeServices({
 					workspaceTreeService: options.workspaceTree === undefined ? runtimeServices.workspaceTree : undefined,
 					networkPrewarmService: runtimeServices.networkPrewarm,
@@ -2860,7 +2872,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		const toolSession: ToolSession = {
 			get cwd() {
-				return sessionManager.getCwd();
+				return pendingBuiltinToolCwd ?? sessionManager.getCwd();
 			},
 			hasUI: options.hasUI ?? false,
 			workflowGateEligible: true,
@@ -3997,20 +4009,24 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			};
 		}
 		rebindBuiltinTools = async (): Promise<void> => {
-			let nextBuiltinTools = await createTools(toolSession, options.toolNames, automationTools);
-			if ((session.model ?? model)?.provider === "cursor") {
-				nextBuiltinTools = nextBuiltinTools.filter(tool => tool.name !== "edit");
+			try {
+				let nextBuiltinTools = await createTools(toolSession, options.toolNames, automationTools);
+				if ((session.model ?? model)?.provider === "cursor") {
+					nextBuiltinTools = nextBuiltinTools.filter(tool => tool.name !== "edit");
+				}
+				await session.replaceBuiltinTools(nextBuiltinTools);
+				const nextCursorReplaceEditTool = captureCursorEditTool(
+					toolRegistry,
+					() => new EditTool(toolSession, "replace"),
+				);
+				cursorReplaceEditTool = nextCursorReplaceEditTool
+					? extensionRunner
+						? (new ExtensionToolWrapper(nextCursorReplaceEditTool, extensionRunner) as AgentTool)
+						: (nextCursorReplaceEditTool as AgentTool)
+					: undefined;
+			} finally {
+				pendingBuiltinToolCwd = undefined;
 			}
-			await session.replaceBuiltinTools(nextBuiltinTools);
-			const nextCursorReplaceEditTool = captureCursorEditTool(
-				toolRegistry,
-				() => new EditTool(toolSession, "replace"),
-			);
-			cursorReplaceEditTool = nextCursorReplaceEditTool
-				? extensionRunner
-					? (new ExtensionToolWrapper(nextCursorReplaceEditTool, extensionRunner) as AgentTool)
-					: (nextCursorReplaceEditTool as AgentTool)
-				: undefined;
 		};
 
 		if (extensionRunner) {

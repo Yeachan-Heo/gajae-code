@@ -4857,9 +4857,8 @@ pub(crate) mod platform {
 						| libc::O_CLOEXEC
 						| libc::O_NOFOLLOW
 						| libc::O_NONBLOCK,
-					// Never expose project-scope payload bytes under the staging
-					// name: the requested 0644 mode is applied only after the
-					// atomic replacement has removed this private name.
+					// Start every staging inode owner-only. Project mode is restored only
+					// after the final identity checks, immediately before publication.
 					0o600,
 				)
 			};
@@ -4915,6 +4914,7 @@ pub(crate) mod platform {
 		private_name: &CString,
 		final_name: &CString,
 		private_fd: libc::c_int,
+		requested_mode: Option<u32>,
 		root: &SkillRootAuthority,
 		skill_name: &CString,
 	) -> Result<(), SkillPublicationError> {
@@ -4944,6 +4944,24 @@ pub(crate) mod platform {
 			|| opened.st_ino != named.st_ino
 		{
 			return Err(SkillPublicationError::Pre("identity_mismatch"));
+		}
+		if let Some(mode) = requested_mode {
+			// Keep the private inode owner-only until all identity checks pass, then
+			// restore the published mode on the retained descriptor immediately
+			// before the atomic rename. This avoids exposing a project payload under
+			// its staging name while ensuring publication never has a 0600 mode gap.
+			// SAFETY: `private_fd` is the retained regular-file descriptor validated
+			// above, and `mode` contains only the permitted file mode bits.
+			if unsafe { libc::fchmod(private_fd, mode as libc::mode_t) } != 0 {
+				return Err(SkillPublicationError::Pre(skill_write_error(
+					&std::io::Error::last_os_error(),
+				)));
+			}
+			// The mode change is part of the payload publication transaction; make
+			// it durable before exposing the inode under its final name.
+			if unsafe { libc::fsync(private_fd) } != 0 {
+				return Err(SkillPublicationError::Pre("durability_failed"));
+			}
 		}
 		// SAFETY: `parent_fd` retains the destination directory and both names are
 		// NUL-terminated.
@@ -5297,6 +5315,7 @@ pub(crate) mod platform {
 			&private_name,
 			&final_name,
 			private_fd,
+			(file_mode != 0o600).then_some(requested_file_mode),
 			&root,
 			&skill_component,
 		) {
@@ -5328,25 +5347,10 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		}
-		if file_mode != 0o600 {
-			if unsafe { libc::fchmod(private_fd, requested_file_mode as libc::mode_t) } != 0 {
-				let code = skill_write_error(&std::io::Error::last_os_error());
-				return fail_published_skill_file(file, skill_fd, skills_fd, &final_name, code);
-			}
-			if file.sync_all().is_err() {
-				return fail_published_skill_file(
-					file,
-					skill_fd,
-					skills_fd,
-					&final_name,
-					"durability_failed",
-				);
-			}
-		}
-		// A hard link can be added after the post-rename check but before the
-		// metadata sync above completes.  Re-check the retained inode after every
-		// delayed write; if the single-link invariant no longer holds, scrub the
-		// inode and remove only our exact public name before returning failure.
+		// A hard link can be added after the post-rename check. Re-check the
+		// retained inode before returning success; if the single-link invariant no
+		// longer holds, scrub the inode and remove only our exact public name before
+		// returning failure.
 		let expected_published_mode = if file_mode == 0o600 {
 			0o600
 		} else {

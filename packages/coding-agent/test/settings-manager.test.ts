@@ -1036,6 +1036,20 @@ describe("Settings", () => {
 			source.getStorage()?.close();
 		}
 	});
+	it("preserves agent directory explicitness in cwd clones", async () => {
+		const clonedCwd = path.join(testDir, "cloned-project");
+		fs.mkdirSync(clonedCwd, { recursive: true });
+		const implicit = Settings.isolated();
+		const explicit = Settings.isolated({}, { agentDir });
+
+		const [implicitClone, explicitClone] = await Promise.all([
+			implicit.cloneForCwd(clonedCwd),
+			explicit.cloneForCwd(clonedCwd),
+		]);
+
+		expect(implicitClone.isAgentDirExplicit()).toBe(false);
+		expect(explicitClone.isAgentDirExplicit()).toBe(true);
+	});
 	it("keeps the source as the sole owner of retained patches in recovered cwd clones", async () => {
 		const clonedCwd = path.join(testDir, "cloned-project");
 		fs.mkdirSync(clonedCwd, { recursive: true });

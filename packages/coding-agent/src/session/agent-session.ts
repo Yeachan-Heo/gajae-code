@@ -4533,7 +4533,7 @@ export class AgentSession {
 		const resolverDefaultAgentDir = path.resolve(getAgentDir());
 		const effectiveAgentDir = this.#requestedAgentDir ?? path.resolve(this.settings.getAgentDir());
 		this.#profileAuthority =
-			config.profileAuthority === "custom" || effectiveAgentDir !== resolverDefaultAgentDir ? "custom" : "default";
+			config.profileAuthority ?? (effectiveAgentDir !== resolverDefaultAgentDir ? "custom" : "default");
 		retainLspScope(this.sessionManager.getCwd(), this.getSessionAgentDir());
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {

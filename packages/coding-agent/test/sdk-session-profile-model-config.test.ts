@@ -30,7 +30,7 @@ afterEach(async () => {
 
 describe("createAgentSession model profile authority", () => {
 	test("uses the session models/config files instead of ambient registry and provider settings", async () => {
-		await fs.writeFile(
+		await Bun.write(
 			path.join(profileDir, "models.yml"),
 			[
 				"providers:",
@@ -45,12 +45,12 @@ describe("createAgentSession model profile authority", () => {
 				"        maxTokens: 4096",
 			].join("\n"),
 		);
-		await fs.writeFile(
+		await Bun.write(
 			path.join(profileDir, "config.yml"),
 			["disabledProviders: []", "modelRoles:", "  default: profile-provider/profile-model"].join("\n"),
 		);
 
-		await fs.writeFile(
+		await Bun.write(
 			path.join(ambientDir, "models.yml"),
 			[
 				"providers:",
@@ -65,7 +65,7 @@ describe("createAgentSession model profile authority", () => {
 				"        maxTokens: 4096",
 			].join("\n"),
 		);
-		await fs.writeFile(
+		await Bun.write(
 			path.join(ambientDir, "config.yml"),
 			[
 				"disabledProviders:",
@@ -152,7 +152,7 @@ describe("createAgentSession model profile authority", () => {
 	});
 
 	test("allows explicit agentDir with injected settings using the default agentDir", async () => {
-		await fs.writeFile(
+		await Bun.write(
 			path.join(profileDir, "models.yml"),
 			[
 				"providers:",

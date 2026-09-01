@@ -6,6 +6,7 @@
  * behavior they have in the TUI.
  */
 import { afterEach, beforeEach, expect, it, spyOn } from "bun:test";
+import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel, type MockModelOptions } from "@gajae-code/ai/providers/mock";
@@ -84,11 +85,12 @@ async function createSession(
 	tools: AgentTool[],
 	bridge?: ClientBridge,
 	permissionMode: "allow" | "prompt" = "prompt",
+	profile?: { agentDir?: string; profileAuthority?: "default" | "custom" },
 ): Promise<AgentSession> {
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
-	const settings = Settings.isolated({ "compaction.enabled": false });
+	const settings = Settings.isolated({ "compaction.enabled": false }, { agentDir: profile?.agentDir });
 	const sessionManager = SessionManager.inMemory(tempDir.path());
 
 	const agent = new Agent({
@@ -109,6 +111,8 @@ async function createSession(
 		settings,
 		modelRegistry: { getAuthStorageOwner: () => ({}) } as never,
 		toolRegistry: new Map(tools.map(t => [t.name, t])),
+		agentDir: profile?.agentDir,
+		profileAuthority: profile?.profileAuthority,
 	});
 
 	// Session default is `allow`; ACP registers a prompt bridge alongside prompt mode (see acp-agent).
@@ -178,6 +182,13 @@ it("allow_once: calls bridge once and executes the underlying tool", async () =>
 
 	expect(permissionSpy).toHaveBeenCalledTimes(1);
 	expect(bashTool.executeCalls).toBe(1);
+});
+
+it("preserves an explicitly admitted default profile authority", async () => {
+	const profileDir = path.join(tempDir.path(), "custom-profile");
+	session = await createSession([], undefined, "allow", { agentDir: profileDir, profileAuthority: "default" });
+
+	expect(session.getSessionProfileAuthority()).toBe("default");
 });
 
 it("delete and move tools request ACP permission before executing", async () => {
