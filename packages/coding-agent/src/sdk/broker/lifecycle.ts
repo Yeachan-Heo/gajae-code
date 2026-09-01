@@ -777,6 +777,7 @@ type LiveResumeRecord = {
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
+	endpointFileId?: string;
 	processIncarnation?: string;
 	hostIncarnation?: string;
 	live: boolean;
@@ -833,6 +834,7 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		current.endpointFileId === expected.endpointFileId &&
 		(current.hostIncarnation ?? current.processIncarnation) ===
 			(expected.hostIncarnation ?? expected.processIncarnation) &&
 		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
@@ -5023,6 +5025,7 @@ async function executeLifecycleResponse(
 						endpointIncarnation: finalIncarnation,
 						pid: current.pid,
 						endpointMtimeMs: current.endpointMtimeMs,
+						...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
 						endpoint: endpoint.result,
 						reused: true,
 					},

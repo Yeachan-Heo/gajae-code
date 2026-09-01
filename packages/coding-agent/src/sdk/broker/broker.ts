@@ -729,6 +729,7 @@ type LifecycleReplayEndpoint = {
 	endpointIncarnation: string;
 	pid: number;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 };
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
@@ -2891,6 +2892,7 @@ export class Broker {
 			endpointIncarnation: currentIncarnation,
 			pid: record.pid,
 			endpointMtimeMs,
+			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 		};
 	}
 	async #readEndpoint(record: IndexedSession, authority: EndpointAuthority): Promise<BrokerResponse> {
@@ -3379,6 +3381,9 @@ export class Broker {
 								endpointIncarnation: refreshed.endpointIncarnation,
 								pid: refreshed.pid,
 								endpointMtimeMs: refreshed.endpointMtimeMs,
+								...(refreshed.endpointFileId === undefined
+									? {}
+									: { endpointFileId: refreshed.endpointFileId }),
 								endpoint: refreshed.endpoint,
 							},
 						};
