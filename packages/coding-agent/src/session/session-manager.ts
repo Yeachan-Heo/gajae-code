@@ -23,7 +23,7 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
-type CwdReadLeaseContext = { active: boolean; owner: symbol; suspendedMoveCount: number };
+type CwdReadLeaseContext = { active: boolean; released: boolean; owner: symbol; suspendedMoveCount: number };
 const cwdReadLeaseAls = new AsyncLocalStorage<CwdReadLeaseContext>();
 const CWD_NOFOLLOW_OPEN_FLAGS =
 	fs.constants.O_RDONLY |
@@ -10855,7 +10855,7 @@ export class SessionManager {
 		if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
 			throw new Error("Session cwd move admission is closed.");
 		const readLease = cwdReadLeaseAls.getStore();
-		const suspendedOwnReadLease = readLease?.owner === this.#cwdReadLeaseOwner;
+		const suspendedOwnReadLease = readLease?.owner === this.#cwdReadLeaseOwner && !readLease.released;
 		if (suspendedOwnReadLease) {
 			readLease.suspendedMoveCount += 1;
 			if (readLease.active) {
@@ -10893,7 +10893,7 @@ export class SessionManager {
 			this.#cwdMoveAdmittedAdmissions.delete(admission);
 			if (suspendedOwnReadLease) {
 				readLease.suspendedMoveCount -= 1;
-				if (readLease.suspendedMoveCount === 0) {
+				if (readLease.suspendedMoveCount === 0 && !readLease.released) {
 					if (this.#cwdReaderCount === 0) {
 						const { promise, resolve } = Promise.withResolvers<void>();
 						this.#cwdReadersIdle = promise;
@@ -10934,12 +10934,18 @@ export class SessionManager {
 			this.#cwdReadersDrained = resolve;
 		}
 		this.#cwdReaderCount += 1;
-		const readLease: CwdReadLeaseContext = { active: true, owner: this.#cwdReadLeaseOwner, suspendedMoveCount: 0 };
+		const readLease: CwdReadLeaseContext = {
+			active: true,
+			released: false,
+			owner: this.#cwdReadLeaseOwner,
+			suspendedMoveCount: 0,
+		};
 		return cwdReadLeaseAls.run(readLease, async () => {
 			try {
 				return await fn();
 			} finally {
 				readLease.active = false;
+				readLease.released = true;
 				this.#cwdReaderCount -= 1;
 				if (this.#cwdReaderCount === 0) {
 					const drained = this.#cwdReadersDrained;

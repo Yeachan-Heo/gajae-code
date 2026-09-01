@@ -1533,6 +1533,26 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await sessionManager.close();
 	});
 
+	it("does not resurrect a read lease in a detached nested move", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		const repoB = path.join(cwd, "repo-b");
+		fs.mkdirSync(repoA, { recursive: true });
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+
+		let detachedMove!: Promise<void>;
+		await sessionManager.runWithCwdReadLease(async () => {
+			detachedMove = Promise.resolve().then(() => sessionManager.moveTo(repoA));
+		});
+		await detachedMove;
+		await sessionManager.moveTo(repoB);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		await sessionManager.close();
+	});
+
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
