@@ -26,6 +26,11 @@ import { runNativeRalplanCommand } from "./ralplan-runtime";
 import { modeStatePath, sessionSpecsDir } from "./session-layout";
 import { resolveGjcSessionForWrite, writeSessionActivityMarker } from "./session-resolution";
 import { runNativeStateCommand } from "./state-runtime";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 import {
 	appendJsonl,
 	beginWorkflowTransactionJournal,
@@ -334,6 +339,35 @@ async function handleCrystallizeUnlocked(
 	}));
 	if (JSON.stringify(expectedMessages) !== JSON.stringify(suppliedMessages))
 		throw new DeepInterviewCommandError(2, "conversation snapshot does not match the live session transcript");
+	const existingSpecPath = typeof existing.spec_path === "string" ? existing.spec_path : undefined;
+	const existingSpecHash = typeof existing.spec_sha256 === "string" ? existing.spec_sha256 : undefined;
+	const priorRecord = isRecord(storedPrior) ? storedPrior : undefined;
+	const priorSource = priorRecord && isRecord(priorRecord.source) ? priorRecord.source : undefined;
+	if (
+		priorSource &&
+		priorSource.revision === snapshot.revision &&
+		priorSource.digest === snapshot.digest &&
+		existingSpecPath &&
+		existingSpecHash
+	) {
+		const recoverySlug = flagValue(args, "--slug")?.trim() || `crystal-v${priorRecord.spec_version}`;
+		const recoveryMutationId = `crystal:${sessionId}:${priorRecord.spec_version}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}\0${existingSpecHash}`).digest("hex")}`;
+		const pending = await readWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
+		if (pending) {
+			await syncDeepInterviewHud({
+				cwd,
+				sessionId,
+				payload: existing,
+				phase: existing.current_phase,
+				specStatus: "persisted",
+			});
+			await completeWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
+			return {
+				status: 0,
+				stdout: `${JSON.stringify({ skill: "deep-interview", mode: "crystallize", crystal: priorRecord, spec_path: existingSpecPath, state_path: statePath })}\n`,
+			};
+		}
+	}
 	const payload = { ...input, prior: storedPrior };
 	const crystal = crystallizeDeepInterview(payload);
 	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
@@ -942,6 +976,17 @@ export async function persistDeepInterviewSpec(
 	cwd: string,
 	resolved: ResolvedDeepInterviewSpecWriteArgs,
 ): Promise<PersistedDeepInterviewSpec> {
+	return withWorkflowStateLock(
+		deepInterviewStatePath(cwd, resolved.sessionId),
+		() => persistDeepInterviewSpecUnlocked(cwd, resolved),
+		{ cwd },
+	);
+}
+
+async function persistDeepInterviewSpecUnlocked(
+	cwd: string,
+	resolved: ResolvedDeepInterviewSpecWriteArgs,
+): Promise<PersistedDeepInterviewSpec> {
 	assertDeepInterviewInputWithinLimit(
 		resolved.spec,
 		MAX_DEEP_INTERVIEW_STRUCTURED_RESPONSE_LENGTH,
@@ -1015,6 +1060,7 @@ export async function persistDeepInterviewSpec(
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
 	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
+		lockHeld: true,
 		receipt: {
 			cwd,
 			skill: "deep-interview",
