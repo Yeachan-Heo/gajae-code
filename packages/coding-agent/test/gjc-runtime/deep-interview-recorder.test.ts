@@ -527,6 +527,28 @@ describe("deep-interview recorder: persistence (state-writer backed)", () => {
 		expect(persisted.state.current_ambiguity).toBe(0.5);
 	});
 
+	it("rejects scoring after ready Crystal promotion", async () => {
+		const cwd = await tempDir();
+		const statePath = statePathFor(cwd);
+		await appendOrMergeDeepInterviewRound(
+			cwd,
+			statePath,
+			{ round: 1, questionId: "q1", questionText: "Q1?" },
+			{ sessionId: TEST_SESSION_ID },
+		);
+		const before = JSON.parse(await fs.readFile(statePath, "utf-8"));
+		before.state.crystal = { lifecycle: "ready" };
+		await fs.writeFile(statePath, `${JSON.stringify(before)}\n`, "utf8");
+		await expect(
+			enrichDeepInterviewRoundScoring(
+				cwd,
+				statePath,
+				{ round: 1, questionId: "q1", scores: { goal: 0.5 }, ambiguity: 0.5 },
+				{ sessionId: TEST_SESSION_ID },
+			),
+		).rejects.toThrow("after Crystal promotion");
+	});
+
 	it("accepts a 100,000-code-point emoji scoring payload and rejects 100,001 without mutation", async () => {
 		const cwd = await tempDir();
 		const statePath = statePathFor(cwd);
