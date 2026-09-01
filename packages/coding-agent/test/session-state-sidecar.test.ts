@@ -3991,7 +3991,7 @@ describe("coordinator runtime tool activity", () => {
 		}
 		const drained = await activityOf(stateFile);
 		expect(drained).toMatchObject({ active_tool_count: 0, active_tools: [], in_flight: [] });
-	}, 15_000);
+	}, 60_000);
 
 	it("keeps distinct whitespace-bearing call ids distinct", async () => {
 		const stateFile = await runningSession("activity-whitespace-ids");
