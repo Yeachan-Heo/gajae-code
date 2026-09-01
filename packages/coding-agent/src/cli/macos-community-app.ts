@@ -10,7 +10,10 @@ export const COMMUNITY_APP_SUPPRESS_ENV = "GJC_NO_COMMUNITY_APP";
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_RELEASE_ORIGIN = "https://github.com";
 const MAX_DMG_BYTES = 512 * 1024 * 1024;
+const MAX_RELEASE_BYTES = 1024 * 1024;
+const MAX_CHECKSUM_BYTES = 128 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
+const COMMAND_TIMEOUT_MS = 120_000;
 type CommandRunner = (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
 interface ReleaseAsset {
@@ -48,8 +51,16 @@ function isMacArchitecture(arch: string): arch is "arm64" | "x64" {
 	return arch === "arm64" || arch === "x64";
 }
 
-function assetMatchesArchitecture(name: string, arch: "arm64" | "x64"): boolean {
-	return new RegExp(`^gajae-app-desktop-[0-9]+\\.[0-9]+\\.[0-9]+-macos-${arch}\\.dmg$`, "i").test(name);
+function assetMatchesArchitecture(name: string, arch: "arm64" | "x64", version?: string): boolean {
+	const versionPattern = version
+		? version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+		: "[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?";
+	return new RegExp(`^gajae-app-desktop-${versionPattern}-macos-${arch}\\.dmg$`, "i").test(name);
+}
+
+function releaseVersion(tag: string | undefined): string | undefined {
+	if (!tag || !/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/u.test(tag)) return undefined;
+	return tag.slice(1);
 }
 
 function trustedReleaseAssetUrl(value: string, expectedName: string): boolean {
@@ -110,13 +121,33 @@ async function readResponseBytes(response: Response, maxBytes: number): Promise<
 	return bytes;
 }
 
+async function readResponseText(response: Response, maxBytes: number): Promise<string> {
+	return new TextDecoder().decode(await readResponseBytes(response, maxBytes));
+}
+
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
-	const [stdout, stderr, exitCode] = await Promise.all([
+	const outputPromise = Promise.all([
 		new Response(child.stdout).text(),
 		new Response(child.stderr).text(),
 		child.exited,
 	]);
+	const timeout = Promise.withResolvers<undefined>();
+	const timer: NodeJS.Timeout = setTimeout(() => {
+		try {
+			child.kill("SIGKILL");
+		} catch {
+			// The command may have exited between the timeout and the kill.
+		}
+		timeout.resolve(undefined);
+	}, COMMAND_TIMEOUT_MS);
+	const output = await Promise.race([outputPromise, timeout.promise]);
+	clearTimeout(timer);
+	if (!output) {
+		await outputPromise.catch(() => undefined);
+		return { exitCode: 124, stdout: "", stderr: `command timed out: ${argv[0]}` };
+	}
+	const [stdout, stderr, exitCode] = output;
 	return { exitCode, stdout, stderr };
 }
 
@@ -140,7 +171,7 @@ async function isExpectedBundle(bundlePath: string, command: CommandRunner): Pro
 
 async function validateBundleLayout(bundlePath: string): Promise<boolean> {
 	const bundleReal = await fs.realpath(bundlePath).catch(() => undefined);
-	if (!bundleReal || bundleReal !== path.resolve(bundlePath)) return false;
+	if (!bundleReal) return false;
 	const contents = path.join(bundlePath, "Contents");
 	const contentsReal = await fs.realpath(contents).catch(() => undefined);
 	if (!contentsReal || contentsReal !== path.join(bundleReal, "Contents")) return false;
@@ -284,11 +315,12 @@ export async function offerMacosCommunityApp(
 		);
 		if (!releaseResponse.ok)
 			return failure(`no canonical published release is available (HTTP ${releaseResponse.status})`, log);
-		const release = (await releaseResponse.json()) as ReleasePayload;
-		if (release.draft || release.prerelease || !release.assets?.length)
+		const release = JSON.parse(await readResponseText(releaseResponse, MAX_RELEASE_BYTES)) as ReleasePayload;
+		const tagVersion = releaseVersion(release.tag_name);
+		if (!tagVersion || release.draft || release.prerelease || !release.assets?.length)
 			return failure("no canonical published release is available", log);
 		const dmg = release.assets.find(
-			asset => asset.name.toLowerCase().endsWith(".dmg") && assetMatchesArchitecture(asset.name, arch),
+			asset => asset.name.toLowerCase().endsWith(".dmg") && assetMatchesArchitecture(asset.name, arch, tagVersion),
 		);
 		if (!dmg || !trustedReleaseAssetUrl(dmg.browser_download_url, dmg.name))
 			return failure(`no verified macOS ${arch} DMG is published`, log);
@@ -305,7 +337,7 @@ export async function offerMacosCommunityApp(
 		if (!dmgResponse.ok || !checksumResponse.ok)
 			return failure("the canonical release assets could not be downloaded", log);
 		const dmgBytes = await readResponseBytes(dmgResponse, MAX_DMG_BYTES);
-		const expected = parseChecksum(await checksumResponse.text(), dmg.name);
+		const expected = parseChecksum(await readResponseText(checksumResponse, MAX_CHECKSUM_BYTES), dmg.name);
 		if (!expected) return failure("the published checksum does not name the DMG", log);
 		const actual = createHash("sha256").update(dmgBytes).digest("hex");
 		if (actual !== expected) return failure("the DMG checksum did not match", log);
