@@ -13,6 +13,7 @@ async function resolveBoundarySessionId(cwd: string, sessionId?: string): Promis
 
 import { readVisibleSkillActiveState } from "../../skill-state/active-state";
 import { initialPhaseForSkill } from "../../skill-state/initial-phase";
+import type { ProfileAuthority } from "./paths";
 import { sanitizePromptBody } from "./prompt-appendix";
 import { readActiveSubskillsForParent } from "./state";
 import { resolveValidatedActiveSubskill } from "./subskill-authority";
@@ -61,6 +62,7 @@ export async function resolveCurrentPhaseForParent(input: {
 export async function buildSubskillInjection(input: {
 	cwd: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	sessionId?: string;
 	skillName: string;
 	activation?: LoadedSubskillActivation;
@@ -80,6 +82,7 @@ export async function buildSubskillInjection(input: {
 		const validated = await resolveValidatedActiveSubskill({
 			cwd: input.cwd,
 			agentDir: input.agentDir,
+			profileAuthority: input.profileAuthority,
 			reference: input.activation,
 		});
 		if (validated) {
@@ -98,6 +101,7 @@ export async function buildSubskillInjection(input: {
 	const validated = await resolveValidatedActiveSubskill({
 		cwd: input.cwd,
 		agentDir: input.agentDir,
+		profileAuthority: input.profileAuthority,
 		reference: entry,
 		persisted: true,
 	});
@@ -109,6 +113,7 @@ export async function buildSubskillInjection(input: {
 export async function buildAgentSubskillInjection(input: {
 	cwd: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	sessionId?: string;
 	agentName: string;
 	/** Test seam runs after validation; injection uses exact verified bytes. */
@@ -129,6 +134,7 @@ export async function buildAgentSubskillInjection(input: {
 				resolveValidatedActiveSubskill({
 					cwd: input.cwd,
 					agentDir: input.agentDir,
+					profileAuthority: input.profileAuthority,
 					reference: entry,
 					persisted: true,
 				}),

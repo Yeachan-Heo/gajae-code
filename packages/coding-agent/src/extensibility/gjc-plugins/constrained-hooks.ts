@@ -4,6 +4,7 @@ import { logger } from "@gajae-code/utils";
 import { normalizePluginHook } from "../../hooks/normalize";
 import { bundleIdentity } from "./lifecycle-reconciliation";
 import { verifyImplementationHash } from "./metadata";
+import type { ProfileAuthority } from "./paths";
 import { resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
@@ -181,8 +182,12 @@ async function loadOneHook(
 export async function loadConstrainedPluginHooks(input: {
 	cwd: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 }): Promise<ConstrainedHookLoadResult> {
-	const effective = await loadEffectiveGjcPluginRegistry(input.cwd, { agentDir: input.agentDir });
+	const effective = await loadEffectiveGjcPluginRegistry(input.cwd, {
+		agentDir: input.agentDir,
+		profileAuthority: input.profileAuthority,
+	});
 	const preQuarantine: SessionQuarantine[] = [];
 	const invalidHookIds = new Set<string>();
 	for (const entry of effective) {

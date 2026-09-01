@@ -14,6 +14,7 @@ import { isEnoent, logger, pathIsWithin } from "@gajae-code/utils";
 
 import { cachePlugin, getCachedPluginPath } from "./cache";
 import { classifySource, fetchMarketplace, parseMarketplaceCatalog, promoteCloneToCache } from "./fetcher";
+import type { ProfileAuthority } from "./registry";
 import {
 	addInstalledPlugin,
 	addMarketplaceEntry,
@@ -50,10 +51,17 @@ export interface MarketplaceManagerOptions {
 	projectInstalledRegistryPath?: string;
 	marketplacesCacheDir: string;
 	pluginsCacheDir: string;
+	/** Owning session profile, used when invalidating the user registry cache. */
+	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	/** Injected for testing; production callers pass clearAnthropic modelPluginRootsCache.
 	 *  Receives any additional file paths that should also be invalidated from the fs cache.
 	 */
-	clearPluginRootsCache?: (extraPaths?: readonly string[]) => void;
+	clearPluginRootsCache?: (
+		extraPaths?: readonly string[],
+		agentDir?: string,
+		profileAuthority?: ProfileAuthority,
+	) => void;
 }
 
 // ── Manager ──────────────────────────────────────────────────────────────────
@@ -71,7 +79,7 @@ export class MarketplaceManager {
 			this.#opts.installedRegistryPath,
 			...(this.#opts.projectInstalledRegistryPath ? [this.#opts.projectInstalledRegistryPath] : []),
 		] as readonly string[];
-		this.#opts.clearPluginRootsCache?.(extra);
+		this.#opts.clearPluginRootsCache?.(extra, this.#opts.agentDir, this.#opts.profileAuthority);
 	}
 
 	// ── Marketplace lifecycle ─────────────────────────────────────────────────

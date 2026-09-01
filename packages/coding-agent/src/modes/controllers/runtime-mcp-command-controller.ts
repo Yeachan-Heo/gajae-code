@@ -6,7 +6,7 @@
 import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
 import { matchesKey, type OverlayHandle, Spacer, Text } from "@gajae-code/tui";
-import { getAgentDir, getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
+import { getAgentDir, getMCPConfigPath } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
 import { listTools } from "../../runtime-mcp/client";
@@ -530,11 +530,12 @@ export class MCPCommandController {
 		};
 
 		// Create wizard with OAuth handler and connection test
+		const wizardCwd = this.ctx.sessionManager.getCwd();
 		let wizard: MCPAddWizard;
 		wizard = new MCPAddWizard(
 			async (name: string, config: MCPServerConfig, scope: "user" | "project") => {
 				done();
-				await this.#handleWizardComplete(name, config, scope);
+				await this.#handleWizardComplete(name, config, scope, wizardCwd);
 			},
 			() => {
 				done();
@@ -581,7 +582,7 @@ export class MCPCommandController {
 						error instanceof Error ? error.message : String(error)
 					}`,
 				),
-			this.ctx.sessionManager?.getCwd?.() ?? getProjectDir(),
+			wizardCwd,
 		);
 
 		// Replace editor with wizard
@@ -979,10 +980,14 @@ export class MCPCommandController {
 		}
 	}
 
-	async #handleWizardComplete(name: string, config: MCPServerConfig, scope: "user" | "project"): Promise<void> {
+	async #handleWizardComplete(
+		name: string,
+		config: MCPServerConfig,
+		scope: "user" | "project",
+		cwd = this.ctx.sessionManager.getCwd(),
+	): Promise<void> {
 		try {
 			// Determine file path
-			const cwd = this.ctx.sessionManager.getCwd();
 			const filePath = getMCPConfigPath(scope, cwd, this.ctx.session.getSessionAgentDir());
 
 			// Add server to config

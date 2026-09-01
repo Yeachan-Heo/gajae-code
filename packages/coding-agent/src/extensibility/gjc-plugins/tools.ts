@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { loadCustomTools } from "../custom-tools/loader";
 import type { CustomTool } from "../custom-tools/types";
+import type { ProfileAuthority } from "./paths";
 import { readActiveSubskillsForParent } from "./state";
 import {
 	resolveValidatedActiveSubskill,
@@ -16,6 +17,7 @@ export async function loadActiveSubskillTools(input: {
 	phase: string;
 	reservedToolNames?: string[];
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	/** Test seam runs before the security guard; the guard remains adjacent to import. */
 	beforeImport?: (resolvedPath: string) => Promise<void>;
 }): Promise<CustomTool[]> {
@@ -28,6 +30,7 @@ export async function loadActiveSubskillTools(input: {
 					reference: entry,
 					persisted: true,
 					agentDir: input.agentDir,
+					profileAuthority: input.profileAuthority,
 				}),
 			),
 		)

@@ -20,6 +20,7 @@ import {
 	surfaceIdsOf,
 	targetFingerprint,
 } from "./lifecycle-reconciliation";
+import type { ProfileAuthority } from "./paths";
 import {
 	readEffectiveRegistryUnpersisted,
 	readRegistry,
@@ -61,6 +62,8 @@ export interface GjcLifecycleContext {
 	cwd: string;
 	/** User-scope registry root for this session; never fall back to process-global state. */
 	agentDir?: string;
+	/** Resolver-owned profile classification for the selected agent directory. */
+	profileAuthority?: ProfileAuthority;
 }
 
 function fail(code: GjcLifecycleError["code"], message: string, recovery?: string): GjcLifecycleError {
@@ -223,17 +226,21 @@ export const storedSourceLocatorForTest = storedSourceLocator;
 /** Exposed so a test can pin parity with the installer's source predicates. */
 export const isLocalDirectorySourceForTest = isLocalDirectorySource;
 
-async function readEffective(cwd: string, agentDir?: string): Promise<GjcPluginRegistryEntry[]> {
+async function readEffective(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): Promise<GjcPluginRegistryEntry[]> {
 	const [user, project] = await Promise.all([
-		readRegistry("user", cwd, { agentDir }),
-		readRegistry("project", cwd, { agentDir }),
+		readRegistry("user", cwd, { agentDir, profileAuthority }),
+		readRegistry("project", cwd, { agentDir, profileAuthority }),
 	]);
 	return sortRegistryEntries([...user.plugins, ...project.plugins]);
 }
 
 /** All installed bundles across both scopes, deterministically ordered. */
 export async function listGjcBundles(ctx: GjcLifecycleContext): Promise<GjcBundleSummary[]> {
-	return (await readEffective(ctx.cwd, ctx.agentDir)).map(toBundleSummary);
+	return (await readEffective(ctx.cwd, ctx.agentDir, ctx.profileAuthority)).map(toBundleSummary);
 }
 
 /** One bundle by exact (scope, name) identity. Opposite scope never matches. */
@@ -241,15 +248,24 @@ export async function getGjcBundle(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<GjcBundleSummary>> {
-	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
+	const registry = await readRegistry(identity.scope, ctx.cwd, {
+		agentDir: ctx.agentDir,
+		profileAuthority: ctx.profileAuthority,
+	});
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	return { ok: true, value: toBundleSummary(entry) };
 }
 
-function safeInstalledRoot(scope: GjcPluginScope, cwd: string, pluginRoot: string, agentDir?: string): string | null {
+function safeInstalledRoot(
+	scope: GjcPluginScope,
+	cwd: string,
+	pluginRoot: string,
+	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): string | null {
 	const root = path.resolve(pluginRoot);
-	const scopeRoot = path.resolve(registryRootForScope(scope, cwd, agentDir));
+	const scopeRoot = path.resolve(registryRootForScope(scope, cwd, agentDir, profileAuthority));
 	const relative = path.relative(scopeRoot, root);
 	if (!relative || relative.startsWith(`..${path.sep}`) || relative === ".." || path.isAbsolute(relative)) return null;
 	return root;
@@ -260,9 +276,10 @@ function expectedInstalledRoot(
 	cwd: string,
 	entry: GjcPluginRegistryEntry,
 	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
 ): string {
 	const safeName = entry.name.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, "");
-	return path.resolve(path.join(registryRootForScope(scope, cwd, agentDir), safeName));
+	return path.resolve(path.join(registryRootForScope(scope, cwd, agentDir, profileAuthority), safeName));
 }
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null;
@@ -374,11 +391,13 @@ function resolveUninstallTarget(
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	if (!isUninstallableEntry(entry, identity)) return { ok: false, error: uninstallFailure(identity, "metadata") };
 
-	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot, ctx.agentDir);
+	const root = safeInstalledRoot(identity.scope, ctx.cwd, entry.pluginRoot, ctx.agentDir, ctx.profileAuthority);
 	if (!root) return { ok: false, error: uninstallFailure(identity, "metadata") };
 	if (
 		normalizePathForComparison(root) !==
-		normalizePathForComparison(expectedInstalledRoot(identity.scope, ctx.cwd, entry, ctx.agentDir))
+		normalizePathForComparison(
+			expectedInstalledRoot(identity.scope, ctx.cwd, entry, ctx.agentDir, ctx.profileAuthority),
+		)
 	)
 		return { ok: false, error: uninstallFailure(identity, "metadata") };
 	return { ok: true, value: { entry, root } };
@@ -387,11 +406,16 @@ function resolveUninstallTarget(
 async function readUninstallRegistry(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
-	read: (scope: GjcPluginScope, cwd: string, agentDir?: string) => Promise<GjcPluginRegistry>,
+	read: (
+		scope: GjcPluginScope,
+		cwd: string,
+		agentDir?: string,
+		profileAuthority?: ProfileAuthority,
+	) => Promise<GjcPluginRegistry>,
 	onMalformed: (identity: GjcBundleIdentity) => GjcLifecycleError,
 ): Promise<GjcLifecycleResult<GjcPluginRegistry>> {
 	try {
-		return { ok: true, value: await read(identity.scope, ctx.cwd, ctx.agentDir) };
+		return { ok: true, value: await read(identity.scope, ctx.cwd, ctx.agentDir, ctx.profileAuthority) };
 	} catch (error) {
 		if (isMalformedRegistryError(error)) return { ok: false, error: onMalformed(identity) };
 		throw error;
@@ -438,7 +462,8 @@ export async function uninstallGjcBundle(
 			const read = await readUninstallRegistry(
 				ctx,
 				identity,
-				(scope, cwd, agentDir) => readRegistry(scope, cwd, { migrate: false, agentDir }),
+				(scope, cwd, agentDir, profileAuthority) =>
+					readRegistry(scope, cwd, { migrate: false, agentDir, profileAuthority }),
 				failing => uninstallFailure(failing, "metadata"),
 			);
 			if (!read.ok) return read;
@@ -461,7 +486,7 @@ export async function uninstallGjcBundle(
 			}
 
 			try {
-				await writeRegistryUnlocked(nextRegistry, ctx.cwd, identity.scope, ctx.agentDir);
+				await writeRegistryUnlocked(nextRegistry, ctx.cwd, identity.scope, ctx.agentDir, ctx.profileAuthority);
 			} catch {
 				if (moved) {
 					try {
@@ -478,7 +503,7 @@ export async function uninstallGjcBundle(
 					await fs.rm(backupRoot, { recursive: true, force: true });
 				} catch {
 					try {
-						await writeRegistryUnlocked(registry, ctx.cwd, identity.scope, ctx.agentDir);
+						await writeRegistryUnlocked(registry, ctx.cwd, identity.scope, ctx.agentDir, ctx.profileAuthority);
 						await fs.rename(backupRoot, root);
 					} catch {
 						return { ok: false, error: uninstallFailure(identity, "restore") };
@@ -489,6 +514,7 @@ export async function uninstallGjcBundle(
 			return { ok: true, value: { identity, summary } };
 		},
 		ctx.agentDir,
+		ctx.profileAuthority,
 	);
 }
 
@@ -649,7 +675,11 @@ export async function installGjcBundle(
 	// pre-lock preflight refuses after resolving.
 	const declared = await declaredBundleName(source);
 	if (declared) {
-		const registry = await readRegistry(scope, ctx.cwd, { migrate: false, agentDir: ctx.agentDir });
+		const registry = await readRegistry(scope, ctx.cwd, {
+			migrate: false,
+			agentDir: ctx.agentDir,
+			profileAuthority: ctx.profileAuthority,
+		});
 		const existing = registry.plugins.find(p => p.name === declared);
 		if (existing) return { ok: false, error: alreadyInstalled(existing.name, scope) };
 	}
@@ -660,6 +690,7 @@ export async function installGjcBundle(
 			scope,
 			cwd: ctx.cwd,
 			agentDir: ctx.agentDir,
+			profileAuthority: ctx.profileAuthority,
 			decide: async ({ existing, candidate }): Promise<GjcBundleTransactionDecision> => {
 				if (existing) {
 					return {
@@ -693,7 +724,10 @@ export async function previewGjcBundleUpdate(
 	ctx: GjcLifecycleContext,
 	identity: GjcBundleIdentity,
 ): Promise<GjcLifecycleResult<GjcUpdatePreview>> {
-	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
+	const registry = await readRegistry(identity.scope, ctx.cwd, {
+		agentDir: ctx.agentDir,
+		profileAuthority: ctx.profileAuthority,
+	});
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	const safeSource = toSafeSource(entry.source);
@@ -707,7 +741,7 @@ export async function previewGjcBundleUpdate(
 		};
 	}
 
-	const effective = await readEffective(ctx.cwd, ctx.agentDir);
+	const effective = await readEffective(ctx.cwd, ctx.agentDir, ctx.profileAuthority);
 	// Re-resolution reaches the network and the filesystem, so it can throw with
 	// a cause carrying the raw locator. Convert that into the typed
 	// `source_unavailable` result the contract promises, rather than letting an
@@ -732,6 +766,7 @@ export async function previewGjcBundleUpdate(
 			const token: GjcReviewedUpdateToken = {
 				identity,
 				agentDir: path.resolve(ctx.agentDir ?? getAgentDir()),
+				profileAuthority: ctx.profileAuthority,
 				candidateFingerprint: candidateHash,
 				baselineFingerprint: baselineHash,
 				decisionContextFingerprint: contextHash,
@@ -774,7 +809,16 @@ export async function applyGjcBundleUpdate(
 			error: fail("stale_decision_context", "The reviewed update belongs to a different agent directory."),
 		};
 	}
-	const registry = await readRegistry(identity.scope, ctx.cwd, { agentDir: ctx.agentDir });
+	if (token.profileAuthority !== undefined && token.profileAuthority !== ctx.profileAuthority) {
+		return {
+			ok: false,
+			error: fail("stale_decision_context", "The reviewed update belongs to a different profile authority."),
+		};
+	}
+	const registry = await readRegistry(identity.scope, ctx.cwd, {
+		agentDir: ctx.agentDir,
+		profileAuthority: ctx.profileAuthority,
+	});
 	const entry = registry.plugins.find(p => p.name === identity.name);
 	if (!entry) return { ok: false, error: notInstalled(identity) };
 	if (!toSafeSource(entry.source).updatable) {
@@ -792,6 +836,7 @@ export async function applyGjcBundleUpdate(
 			scope: identity.scope,
 			cwd: ctx.cwd,
 			agentDir: ctx.agentDir,
+			profileAuthority: ctx.profileAuthority,
 			decide: async ({ existing, effective, bundle, candidate }): Promise<GjcBundleTransactionDecision> => {
 				if (!existing) return { kind: "abort", error: notInstalled(identity) };
 				if (
@@ -871,7 +916,11 @@ async function mutateEntry(
 		identity.scope,
 		ctx.cwd,
 		async () => {
-			const registry = await readRegistry(identity.scope, ctx.cwd, { migrate: false, agentDir: ctx.agentDir });
+			const registry = await readRegistry(identity.scope, ctx.cwd, {
+				migrate: false,
+				agentDir: ctx.agentDir,
+				profileAuthority: ctx.profileAuthority,
+			});
 			const entry = registry.plugins.find(p => p.name === identity.name);
 			if (!entry) return { ok: false, error: notInstalled(identity) };
 			const outcome = mutate(entry);
@@ -883,10 +932,12 @@ async function mutateEntry(
 				ctx.cwd,
 				identity.scope,
 				ctx.agentDir,
+				ctx.profileAuthority,
 			);
 			return { ok: true, value: { summary: toBundleSummary(outcome.value), mutated: true } };
 		},
 		ctx.agentDir,
+		ctx.profileAuthority,
 	);
 }
 
@@ -944,5 +995,5 @@ export async function setGjcBundleSurfaceEnabled(
 
 /** Deterministic activation generation for the current persisted state. */
 export async function currentActivationFingerprint(ctx: GjcLifecycleContext): Promise<string> {
-	return activationFingerprint(await readEffective(ctx.cwd, ctx.agentDir));
+	return activationFingerprint(await readEffective(ctx.cwd, ctx.agentDir, ctx.profileAuthority));
 }

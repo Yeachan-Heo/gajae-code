@@ -864,6 +864,8 @@ export interface AgentSessionRescopeParticipant {
 	prepareRescope?: (cwd: string, memoryBackend: LazyService<MemoryBackend>) => Promise<void>;
 	/** Rebind cwd-capturing plugin, MCP, and other host tool authority. */
 	rebindCwdCapturingAuthority: (cwd: string) => Promise<void>;
+	/** Rebuild built-ins whose implementation or schema is settings-derived. */
+	rebindBuiltinTools?: () => Promise<void>;
 	/** Release any predecessor runtime services after the durable move commits. */
 	finalizeRescope?: () => Promise<void>;
 	/** Re-discover the cwd-derived context, skills, and workspace state after commit. */
@@ -4525,6 +4527,8 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#releaseSettingsScope = config.releaseSettingsScope;
+		this.#rescopeSessionCwdParticipant = config.rescopeSessionCwdParticipant;
+		this.#onSessionManagerReplaced = config.onSessionManagerReplaced;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		const resolverDefaultAgentDir = path.resolve(getAgentDir());
 		const effectiveAgentDir = this.#requestedAgentDir ?? path.resolve(this.settings.getAgentDir());
@@ -5315,6 +5319,7 @@ export class AgentSession {
 						if (path.resolve(process.cwd()) !== path.resolve(canonicalFrom)) {
 							throw new Error("Process cwd did not restore to the launch root.");
 						}
+
 					} catch (error) {
 						restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
 					}
@@ -10833,6 +10838,36 @@ export class AgentSession {
 			nextActive.push(refreshedTool.name);
 		}
 		await this.#applyActiveToolsByName(nextActive, { identityAdmission });
+	}
+
+	/**
+	 * Replace built-in implementations after a settings scope changes. Several
+	 * built-ins (notably Bash and Edit) capture settings-derived schema/policy at
+	 * construction, so merely swapping ToolSession.settings leaves stale
+	 * behavior in the registry. Keep extension/custom/MCP collisions intact by
+	 * replacing only entries whose object provenance is known to be built-in.
+	 */
+	async replaceBuiltinTools(nextTools: readonly AgentTool[]): Promise<void> {
+		const identityAdmission = this.#captureSessionIdentityAdmission();
+		this.#assertSessionIdentityAdmission(identityAdmission);
+		const previousActiveToolNames = this.getActiveToolNames();
+		for (const [name, tool] of this.#toolRegistry) {
+			if (this.#builtinToolIdentities.has(tool)) this.#toolRegistry.delete(name);
+		}
+		for (const tool of nextTools) {
+			if (this.#toolRegistry.has(tool.name)) continue;
+			this.#builtinToolIdentities.add(tool);
+			const exposed = this.#extensionRunner ? new ExtensionToolWrapper(tool, this.#extensionRunner) : tool;
+			if (exposed !== tool) this.#builtinToolIdentities.add(exposed);
+			this.#toolRegistry.set(exposed.name, exposed);
+		}
+		if (!Array.from(this.#toolRegistry.values()).some(tool => tool.deferrable === true)) {
+			this.#toolRegistry.delete("resolve");
+		}
+		await this.#applyActiveToolsByName(
+			previousActiveToolNames.filter(name => this.#toolRegistry.has(name)),
+			{ identityAdmission },
+		);
 	}
 
 	/**

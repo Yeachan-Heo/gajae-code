@@ -2299,6 +2299,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let replacementMcpGeneration = 0;
 		let ownedPluginServersConnected = false;
 		let rebindProjectExtensions: ((cwd: string, settings: Settings) => Promise<void>) | undefined;
+		let rebindBuiltinTools: (() => Promise<void>) | undefined;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const stagedMcpCleanup = new Map<MCPManager, () => void>();
 		const wireMcpManagerCallbacks = (
@@ -2737,17 +2738,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					warnRefreshFailure("Failed to clear slash commands after session rescope", error);
 				}
 			}
-			// The launch-bound tree is retired immediately: a stale root-scoped tree is
-			// worse than none, and the next turn re-scans at the new cwd.
+			// Retire the launch-bound tree before rebuilding at the target. A stale
+			// root-scoped tree is worse than none, and the rebuilt snapshot must be
+			// available to the post-move prompt as well as the next turn.
 			if (options.workspaceTree === undefined) {
 				liveWorkspaceTree = undefined;
-				workspaceTreePromise = Promise.resolve({
+				const emptyTree: WorkspaceTree = {
 					rootPath: to,
 					rendered: "",
 					truncated: false,
 					totalLines: 0,
 					agentsMdFiles: [],
-				});
+				};
+				workspaceTreePromise = Promise.resolve(emptyTree);
+				void logger
+					.time("buildWorkspaceTree:rescope", async () => {
+						const runtime = await runtimeServices.workspaceTree.get("rescope");
+						return await runtime.refresh();
+					})
+					.then(tree => {
+						liveWorkspaceTree = tree;
+						workspaceTreePromise = Promise.resolve(tree);
+						return session?.refreshBaseSystemPrompt();
+					})
+					.catch(error => {
+						liveWorkspaceTree = undefined;
+						warnRefreshFailure("Failed to rebuild workspace tree after session rescope", error);
+					});
 			}
 			workspaceTreePromise.catch(() => {});
 			try {
@@ -2789,6 +2806,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						preparedRescopeSettings = { cwd: to, settings: targetSettings };
 					},
 					rebindCwdCapturingAuthority,
+					rebindBuiltinTools: async (): Promise<void> => {
+						await rebindBuiltinTools?.();
+					},
 					applyRescopedReadState,
 				}
 			: undefined;
@@ -4183,6 +4203,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 			};
 		}
+		rebindBuiltinTools = async (): Promise<void> => {
+			let nextBuiltinTools = await createTools(toolSession, options.toolNames, automationTools);
+			if ((session.model ?? model)?.provider === "cursor") {
+				nextBuiltinTools = nextBuiltinTools.filter(tool => tool.name !== "edit");
+			}
+			await session.replaceBuiltinTools(nextBuiltinTools);
+			const nextCursorReplaceEditTool = captureCursorEditTool(
+				toolRegistry,
+				() => new EditTool(toolSession, "replace"),
+			);
+			cursorReplaceEditTool = nextCursorReplaceEditTool
+				? extensionRunner
+					? (new ExtensionToolWrapper(nextCursorReplaceEditTool, extensionRunner) as AgentTool)
+					: (nextCursorReplaceEditTool as AgentTool)
+				: undefined;
+		};
 
 		if (extensionRunner) {
 			credentialDisabledTarget = extensionRunner;
@@ -4300,7 +4336,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			}
 		}
 		const rawCursorReplaceEditTool = captureCursorEditTool(toolRegistry, () => new EditTool(toolSession, "replace"));
-		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
+		let cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
 			? extensionRunner
 				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
 				: (rawCursorReplaceEditTool as AgentTool)

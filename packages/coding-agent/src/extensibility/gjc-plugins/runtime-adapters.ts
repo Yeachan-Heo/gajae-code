@@ -7,7 +7,7 @@ import type { CustomTool } from "../custom-tools/types";
 import { bundleIdentity } from "./lifecycle-reconciliation";
 import { verifyImplementationHash } from "./metadata";
 import { isV2Tool } from "./migration";
-import { resolveWithinRoot } from "./paths";
+import { type ProfileAuthority, resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry, registryPathForScope } from "./registry";
 import { type SessionQuarantine, type SessionValidationResult, validateSessionBundles } from "./session-validation";
 import type { GjcPluginRegistryEntry, GjcPluginScope, JsonSchema202012, NormalizedToolSurfaceV2 } from "./types";
@@ -41,8 +41,9 @@ async function resolveRuntimeFile(root: string, relativePath: string): Promise<s
 export async function getGjcPluginToolDeclarations(
 	cwd: string,
 	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
 ): Promise<GjcPluginToolDeclaration[]> {
-	const entries = await loadEffectiveGjcPluginRegistry(cwd, { agentDir });
+	const entries = await loadEffectiveGjcPluginRegistry(cwd, { agentDir, profileAuthority });
 	const declarations: GjcPluginToolDeclaration[] = [];
 	for (const entry of entries) {
 		if (!entry.enabled || entry.migration?.status === "failed") continue;
@@ -55,8 +56,12 @@ export async function getGjcPluginToolDeclarations(
 }
 
 /** Serve the canonical schemas keyed by their stable tool surface id. */
-export async function serveGjcPluginSchemas(cwd: string, agentDir?: string): Promise<Record<string, JsonSchema202012>> {
-	const declarations = await getGjcPluginToolDeclarations(cwd, agentDir);
+export async function serveGjcPluginSchemas(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): Promise<Record<string, JsonSchema202012>> {
+	const declarations = await getGjcPluginToolDeclarations(cwd, agentDir, profileAuthority);
 	return Object.fromEntries(declarations.map(declaration => [declaration.extensionId, declaration.schema]));
 }
 
@@ -103,9 +108,13 @@ function snapshotsKey(snapshots: readonly FileSnapshot[]): string {
 	return snapshots.map(s => `${s.path}:${s.mtimeMs}:${s.ctimeMs}:${s.size}:${s.ino}`).join("|");
 }
 
-async function snapshotRegistryFiles(cwd: string, agentDir?: string): Promise<FileSnapshot[]> {
+async function snapshotRegistryFiles(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): Promise<FileSnapshot[]> {
 	const snapshots = await Promise.all(
-		registryScopes.map(scope => snapshotExistingFile(registryPathForScope(scope, cwd, agentDir))),
+		registryScopes.map(scope => snapshotExistingFile(registryPathForScope(scope, cwd, agentDir, profileAuthority))),
 	);
 	return snapshots.filter((s): s is FileSnapshot => s !== null);
 }
@@ -183,9 +192,13 @@ async function verifyEntryHashesCached(entry: GjcPluginRegistryEntry): Promise<S
 	return null;
 }
 
-async function loadValidatedPluginRegistry(cwd: string, agentDir?: string): Promise<ValidatedPluginRegistry> {
-	const cacheKey = JSON.stringify([cwd, agentDir ?? null]);
-	const registryFiles = await snapshotRegistryFiles(cwd, agentDir);
+async function loadValidatedPluginRegistry(
+	cwd: string,
+	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): Promise<ValidatedPluginRegistry> {
+	const cacheKey = JSON.stringify([cwd, agentDir ?? null, profileAuthority ?? null]);
+	const registryFiles = await snapshotRegistryFiles(cwd, agentDir, profileAuthority);
 	const registryKey = snapshotsKey(registryFiles);
 	const cached = validatedRegistryCache.get(cacheKey);
 	if (cached && cached.registryKey === registryKey) {
@@ -194,8 +207,8 @@ async function loadValidatedPluginRegistry(cwd: string, agentDir?: string): Prom
 		if (cached.pluginKey === pluginKey) return cached;
 	}
 
-	const effective = await loadEffectiveGjcPluginRegistry(cwd, { agentDir });
-	const currentRegistryFiles = await snapshotRegistryFiles(cwd, agentDir);
+	const effective = await loadEffectiveGjcPluginRegistry(cwd, { agentDir, profileAuthority });
+	const currentRegistryFiles = await snapshotRegistryFiles(cwd, agentDir, profileAuthority);
 	const preQuarantine: SessionQuarantine[] = [];
 	for (const entry of effective) {
 		if (!entry.enabled) continue;
@@ -236,10 +249,11 @@ export async function loadAlwaysOnPluginTools(input: {
 	reservedToolNames: string[];
 	declarations?: readonly GjcPluginToolDeclaration[];
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	/** Test seam runs before the final per-import integrity guard. */
 	beforeImport?: (resolvedPath: string) => Promise<void>;
 }): Promise<AlwaysOnPluginTools> {
-	const validated = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
+	const validated = await loadValidatedPluginRegistry(input.cwd, input.agentDir, input.profileAuthority);
 	const { effective } = validated;
 	if (effective.length === 0) return { tools: [], quarantine: [] };
 
@@ -385,8 +399,12 @@ export async function loadAlwaysOnPluginTools(input: {
  * `cwd`, applying hash-drift + collision quarantine first. Returns "" when no
  * plugins are installed/enabled. Safe to call unconditionally at session start.
  */
-export async function renderAlwaysOnSystemAppendices(input: { cwd: string; agentDir?: string }): Promise<string> {
-	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
+export async function renderAlwaysOnSystemAppendices(input: {
+	cwd: string;
+	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
+}): Promise<string> {
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir, input.profileAuthority);
 	if (effective.length === 0) return "";
 	const { renderPluginAppendices } = await import("./prompt-appendix");
 	return (await renderPluginAppendices(active)).system;
@@ -401,8 +419,9 @@ export async function renderAgentPromptAdditions(input: {
 	cwd: string;
 	agentName: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 }): Promise<{ appendix: string; advertisement: string }> {
-	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir, input.profileAuthority);
 	if (effective.length === 0) return { appendix: "", advertisement: "" };
 	const { renderPluginAppendices } = await import("./prompt-appendix");
 	const { buildAgentSubskillAdvertisement } = await import("./injection");
@@ -422,8 +441,9 @@ export async function renderSkillAdvertisement(input: {
 	skillName: string;
 	phase?: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 }): Promise<string> {
-	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
+	const { effective, active } = await loadValidatedPluginRegistry(input.cwd, input.agentDir, input.profileAuthority);
 	if (effective.length === 0) return "";
 	const { buildSubskillAdvertisement } = await import("./injection");
 	return buildSubskillAdvertisement(active, input.skillName, input.phase);
@@ -435,12 +455,20 @@ export async function renderSkillAdvertisement(input: {
  * re-resolution for http/sse, stdio root-confinement) before connection. Servers
  * failing policy are quarantined and excluded. Returns {} when none.
  */
-export async function buildPluginMcpConfigs(input: { cwd: string; agentDir?: string }): Promise<{
+export async function buildPluginMcpConfigs(input: {
+	cwd: string;
+	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
+}): Promise<{
 	configs: Record<string, any>;
 	sources: Record<string, { provider: string; providerName: string; level: "user" | "project"; path: string }>;
 	quarantine: SessionQuarantine[];
 }> {
-	const { effective, active, quarantine } = await loadValidatedPluginRegistry(input.cwd, input.agentDir);
+	const { effective, active, quarantine } = await loadValidatedPluginRegistry(
+		input.cwd,
+		input.agentDir,
+		input.profileAuthority,
+	);
 	if (effective.length === 0) return { configs: {}, sources: {}, quarantine: [] };
 	const { assertMcpInstallPolicy, assertDnsResolvesPublic, assertUrlAllowed } = await import("./mcp-policy");
 	const nodePath = await import("node:path");

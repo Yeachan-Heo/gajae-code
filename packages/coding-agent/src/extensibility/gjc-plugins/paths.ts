@@ -1,10 +1,18 @@
 import { promises as fs } from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, pathIsWithin } from "@gajae-code/utils";
+import { getAgentDir, getConfigDirName, getTrustedHomeDir, pathIsWithin } from "@gajae-code/utils";
 import { GJC_PLUGIN_MANIFEST_FILENAME, GjcPluginLoadError } from "./types";
 
-export function gjcPluginUserRoot(agentDir?: string): string {
-	return path.join(agentDir ?? getAgentDir(), "gjc-plugins");
+export type ProfileAuthority = "default" | "custom";
+
+function resolveUserAgentDir(agentDir: string | undefined, profileAuthority: ProfileAuthority | undefined): string {
+	if (agentDir) return agentDir;
+	if (profileAuthority === "default") return path.join(getTrustedHomeDir(), getConfigDirName(), "agent");
+	return getAgentDir();
+}
+
+export function gjcPluginUserRoot(agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	return path.join(resolveUserAgentDir(agentDir, profileAuthority), "gjc-plugins");
 }
 
 export function gjcPluginProjectRoot(cwd: string): string {
@@ -51,13 +59,15 @@ async function discoverGjcPluginRootsIn(baseDir: string): Promise<string[]> {
 export async function discoverGjcPluginRoots({
 	cwd,
 	agentDir,
+	profileAuthority,
 }: {
 	cwd: string;
 	home?: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 }): Promise<string[]> {
 	const roots = await Promise.all([
-		discoverGjcPluginRootsIn(gjcPluginUserRoot(agentDir)),
+		discoverGjcPluginRootsIn(gjcPluginUserRoot(agentDir, profileAuthority)),
 		discoverGjcPluginRootsIn(gjcPluginProjectRoot(cwd)),
 	]);
 	return roots.flat();

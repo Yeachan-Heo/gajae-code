@@ -1,3 +1,4 @@
+import type { ProfileAuthority } from "./paths";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { resolveValidatedActiveSubskill } from "./subskill-authority";
 import type { LoadedSubskillActivation } from "./types";
@@ -12,13 +13,17 @@ export interface SubskillActivationResult {
 export async function resolveSubskillActivationForSkillInvocation(input: {
 	cwd: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	sessionId?: string;
 	threadId?: string;
 	turnId?: string;
 	skillName: string;
 	args: string;
 }): Promise<SubskillActivationResult> {
-	const registry = await loadEffectiveGjcPluginRegistry(input.cwd, { agentDir: input.agentDir });
+	const registry = await loadEffectiveGjcPluginRegistry(input.cwd, {
+		agentDir: input.agentDir,
+		profileAuthority: input.profileAuthority,
+	});
 	const candidates: LoadedSubskillActivation[] = [];
 	for (const entry of registry) {
 		if (!entry.enabled || entry.migration?.status === "failed") continue;
@@ -26,6 +31,7 @@ export async function resolveSubskillActivationForSkillInvocation(input: {
 			const validated = await resolveValidatedActiveSubskill({
 				cwd: input.cwd,
 				agentDir: input.agentDir,
+				profileAuthority: input.profileAuthority,
 				reference: {
 					plugin: entry.name,
 					scope: entry.scope,

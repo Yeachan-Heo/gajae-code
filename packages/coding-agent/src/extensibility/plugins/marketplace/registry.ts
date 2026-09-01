@@ -83,6 +83,7 @@ async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
 	const content = `${JSON.stringify(data, null, 2)}\n`;
 	const tmpPath = `${filePath}.tmp`;
 
+	await fs.mkdir(path.dirname(filePath), { recursive: true });
 	await Bun.write(tmpPath, content);
 
 	try {

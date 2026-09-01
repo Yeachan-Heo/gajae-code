@@ -376,6 +376,7 @@ export interface BuildSkillPromptMessageContext {
 	currentPhase?: string;
 	cwd?: string;
 	agentDir?: string;
+	profileAuthority?: "default" | "custom";
 	sessionId?: string;
 }
 
@@ -533,6 +534,7 @@ export async function buildSkillPromptMessage(
 			? await buildSubskillInjection({
 					cwd: context.cwd,
 					agentDir: context.agentDir,
+					profileAuthority: context.profileAuthority,
 					sessionId: context.sessionId,
 					skillName: skill.name,
 					activation: context.subskillActivation,

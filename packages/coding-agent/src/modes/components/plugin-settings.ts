@@ -18,6 +18,7 @@ import {
 	Text,
 } from "@gajae-code/tui";
 import { PluginManager } from "../../extensibility/plugins/manager";
+import type { ProfileAuthority } from "../../extensibility/plugins/marketplace/registry";
 import type { InstalledPlugin, PluginSettingSchema } from "../../extensibility/plugins/types";
 import { getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { DynamicBorder } from "./dynamic-border";
@@ -435,9 +436,10 @@ export class PluginSettingsComponent extends Container {
 		cwd: string,
 		private readonly callbacks: PluginSettingsCallbacks,
 		agentDir?: string,
+		profileAuthority?: ProfileAuthority,
 	) {
 		super();
-		this.#manager = new PluginManager(cwd, agentDir);
+		this.#manager = new PluginManager(cwd, agentDir, profileAuthority);
 		this.#showPluginList();
 	}
 

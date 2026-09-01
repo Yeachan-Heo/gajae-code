@@ -3087,6 +3087,8 @@ export class SelectorController {
 				(await resolveActiveProjectRegistryPath(this.ctx.sessionManager.getCwd())) ?? undefined,
 			marketplacesCacheDir: getMarketplacesCacheDir(agentDir, profileAuthority),
 			pluginsCacheDir: getPluginsCacheDir(agentDir, profileAuthority),
+			agentDir,
+			profileAuthority,
 			clearPluginRootsCache: clearPluginRootsAndCaches,
 		});
 

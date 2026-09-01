@@ -508,6 +508,10 @@ export async function connectToServer(
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = config.timeout ?? CONNECTION_TIMEOUT_MS;
+	// Snapshot the connection's working directory when the transport is
+	// admitted. Server-initiated roots/list requests may arrive much later,
+	// after the process-level project directory has changed.
+	const clientCwd = options?.cwd ?? getProjectDir();
 	let transport: MCPTransport | undefined;
 	const connectAbort = new AbortController();
 	const connectSignal = options?.signal ? AbortSignal.any([options.signal, connectAbort.signal]) : connectAbort.signal;
@@ -525,7 +529,7 @@ export async function connectToServer(
 		// (Modern-era transports never receive server-initiated requests; MRTR
 		// input requests arrive as input_required results instead.)
 		transport.onRequest =
-			options?.onRequest ?? ((method, params) => defaultRequestHandler(method, params, options?.cwd));
+			options?.onRequest ?? ((method, params) => defaultRequestHandler(method, params, clientCwd));
 
 		const connectLegacy = async (
 			negotiationState: "legacy-fallback" | "legacy-forced",
@@ -545,7 +549,7 @@ export async function connectToServer(
 			return {
 				name,
 				config,
-				clientCwd: options?.cwd,
+				clientCwd,
 				rootsEnabled: options?.advertiseRoots !== false,
 				transport: transport!,
 				serverInfo: initResult.serverInfo,
@@ -592,7 +596,7 @@ export async function connectToServer(
 			return {
 				name,
 				config,
-				clientCwd: options?.cwd,
+				clientCwd,
 				rootsEnabled: options?.advertiseRoots !== false,
 				transport,
 				serverInfo,

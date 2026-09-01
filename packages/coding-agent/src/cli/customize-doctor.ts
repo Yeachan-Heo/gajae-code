@@ -1165,8 +1165,8 @@ async function collectPluginBundles(cwd: string, activeSettings: SettingsInstanc
 	// observability; never raw locators or config values.
 	// Read-only: migrate:false keeps the doctor from persisting registry
 	// migrations/legacy discovery (startup activation owns those writes).
-	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false, agentDir });
-	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false, agentDir });
+	const bundleEntries = await loadEffectiveGjcPluginRegistry(cwd, { migrate: false, agentDir, profileAuthority });
+	const observability = await summarizeGjcPluginObservability(cwd, { migrate: false, agentDir, profileAuthority });
 	const items: CustomizeDoctorItem[] = [...npmItems];
 	for (const entry of bundleEntries) {
 		const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {

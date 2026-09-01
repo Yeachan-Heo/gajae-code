@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
 import { compileGjcPluginBundle } from "./compiler";
-import { gjcPluginProjectRoot, gjcPluginUserRoot } from "./paths";
+import { gjcPluginProjectRoot, gjcPluginUserRoot, type ProfileAuthority } from "./paths";
 import { readRegistry, sortRegistryEntries, withRegistryLock, writeRegistryUnlocked } from "./registry";
 import {
 	GJC_PLUGIN_MANIFEST_FILENAME,
@@ -23,6 +23,7 @@ export interface GjcBundleTransactionOptions {
 	scope: GjcPluginScope;
 	cwd: string;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 	/**
 	 * Policy hook evaluated while both scope locks are held. It decides whether
 	 * to commit the candidate, report an already-satisfied no-op, or abort with
@@ -61,8 +62,8 @@ const TAR_MAX_ARCHIVE_BYTES = TAR_MAX_TOTAL_BYTES + TAR_MAX_FILES * 1024 + 1024;
 // A gzip stream can be slightly larger than its incompressible TAR payload.
 const TAR_MAX_COMPRESSED_BYTES = TAR_MAX_ARCHIVE_BYTES + 1024 * 1024;
 
-function scopeRoot(scope: GjcPluginScope, cwd: string, agentDir?: string): string {
-	return scope === "user" ? gjcPluginUserRoot(agentDir) : gjcPluginProjectRoot(cwd);
+function scopeRoot(scope: GjcPluginScope, cwd: string, agentDir?: string, profileAuthority?: ProfileAuthority): string {
+	return scope === "user" ? gjcPluginUserRoot(agentDir, profileAuthority) : gjcPluginProjectRoot(cwd);
 }
 
 function safeDirSegment(name: string): string {
@@ -440,7 +441,7 @@ export async function runGjcBundleTransaction(
 		const bundle = await compileGjcPluginBundle(resolved.dir);
 		validateInstallPlan(bundle, []);
 		const dirName = safeDirSegment(bundle.name);
-		const root = scopeRoot(options.scope, options.cwd, options.agentDir);
+		const root = scopeRoot(options.scope, options.cwd, options.agentDir, options.profileAuthority);
 		const finalDir = path.join(root, dirName);
 
 		// Lock-free refusal preflight. Acquiring a scope lock creates the scope
@@ -450,6 +451,7 @@ export async function runGjcBundleTransaction(
 		const preflightTarget = await readRegistry(options.scope, options.cwd, {
 			migrate: false,
 			agentDir: options.agentDir,
+			profileAuthority: options.profileAuthority,
 		});
 		const preexisting = preflightTarget.plugins.find(p => p.name === bundle.name);
 		if (preexisting) {
@@ -458,6 +460,7 @@ export async function runGjcBundleTransaction(
 			const preflightOther = await readRegistry(options.scope === "user" ? "project" : "user", options.cwd, {
 				migrate: false,
 				agentDir: options.agentDir,
+				profileAuthority: options.profileAuthority,
 			});
 			const early = await options.decide({
 				targetRegistry: preflightTarget,
@@ -485,11 +488,13 @@ export async function runGjcBundleTransaction(
 			const targetRegistry = await readRegistry(options.scope, options.cwd, {
 				migrate: false,
 				agentDir: options.agentDir,
+				profileAuthority: options.profileAuthority,
 			});
 			const otherScope: GjcPluginScope = options.scope === "user" ? "project" : "user";
 			const otherRegistry = await readRegistry(otherScope, options.cwd, {
 				migrate: false,
 				agentDir: options.agentDir,
+				profileAuthority: options.profileAuthority,
 			});
 			const effective = sortRegistryEntries([...targetRegistry.plugins, ...otherRegistry.plugins]);
 			const existing = targetRegistry.plugins.find(p => p.name === bundle.name);
@@ -541,6 +546,7 @@ export async function runGjcBundleTransaction(
 						options.cwd,
 						options.scope,
 						options.agentDir,
+						options.profileAuthority,
 					);
 				} catch (error) {
 					await fs.rm(finalDir, { recursive: true, force: true });
@@ -569,8 +575,9 @@ export async function runGjcBundleTransaction(
 		return await withRegistryLock(
 			"user",
 			options.cwd,
-			() => withRegistryLock("project", options.cwd, critical, options.agentDir),
+			() => withRegistryLock("project", options.cwd, critical, options.agentDir, options.profileAuthority),
 			options.agentDir,
+			options.profileAuthority,
 		);
 	} finally {
 		await resolved.cleanup();
@@ -599,8 +606,9 @@ export function candidateRegistryEntry(
 	source: GjcPluginRegistrySource,
 	now: string,
 	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
 ): GjcPluginRegistryEntry {
-	const finalDir = path.join(scopeRoot(scope, cwd, agentDir), safeDirSegment(bundle.name));
+	const finalDir = path.join(scopeRoot(scope, cwd, agentDir, profileAuthority), safeDirSegment(bundle.name));
 	return bundleToRegistryEntry(bundle, finalDir, scope, source, now);
 }
 

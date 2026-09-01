@@ -4,6 +4,8 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
+	getAgentDir,
+	getAgentProfileAuthority,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
@@ -908,7 +910,7 @@ export async function listClaudePluginRoots(
 	home: string,
 	cwd?: string,
 	userAgentDir?: string,
-	profileAuthority: "default" | "custom" = "default",
+	profileAuthority: ProfileAuthority = "default",
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
 	const resolvedProjectPath = cwd ? await resolveActiveProjectRegistryPath(cwd) : null;
 	const cacheKey = `${home}:${userAgentDir ?? ""}:${profileAuthority}:${resolvedProjectPath ?? ""}`;
@@ -924,7 +926,7 @@ export async function listClaudePluginRoots(
 	// same XDG-aware path the marketplace writer uses (reads and writes always agree).
 	// Tests pass a temp dir, which short-circuits the resolver for deterministic isolation.
 	const userPluginsDir =
-		profileAuthority === "custom" && userAgentDir ? path.join(userAgentDir, "plugins") : getPluginsDir(home);
+		profileAuthority === "custom" ? path.join(userAgentDir ?? getAgentDir(), "plugins") : getPluginsDir(home);
 	const gjcRegistryPath = path.join(userPluginsDir, "installed_plugins.json");
 	const gjcContent = await readFile(gjcRegistryPath);
 	if (gjcContent) {
@@ -1040,9 +1042,34 @@ export function clearClaudePluginRootsCache(): void {
  * in-memory plugin roots cache. Used by MarketplaceManager clients after
  * installing/uninstalling/enabling/disabling plugins.
  */
-export function clearPluginRootsAndCaches(extraPaths?: readonly string[]): void {
-	invalidateFsCache(path.join(getPluginsDir(), "installed_plugins.json"));
-	for (const p of extraPaths ?? []) invalidateFsCache(p);
+export interface PluginRootsCacheInvalidationOptions {
+	extraPaths?: readonly string[];
+	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
+}
+
+export function clearPluginRootsAndCaches(
+	extraPathsOrOptions?: readonly string[] | PluginRootsCacheInvalidationOptions,
+	agentDir?: string,
+	profileAuthority?: ProfileAuthority,
+): void {
+	const options: PluginRootsCacheInvalidationOptions = Array.isArray(extraPathsOrOptions)
+		? { extraPaths: extraPathsOrOptions, agentDir, profileAuthority }
+		: {
+				...(extraPathsOrOptions ?? {}),
+				agentDir: (extraPathsOrOptions as PluginRootsCacheInvalidationOptions | undefined)?.agentDir ?? agentDir,
+				profileAuthority:
+					(extraPathsOrOptions as PluginRootsCacheInvalidationOptions | undefined)?.profileAuthority ??
+					profileAuthority,
+			};
+	const authority = options.profileAuthority ?? getAgentProfileAuthority();
+	const userPluginsDir =
+		authority === "custom" ? path.join(options.agentDir ?? getAgentDir(), "plugins") : getPluginsDir();
+	invalidateFsCache(path.join(userPluginsDir, "installed_plugins.json"));
+	if (authority === "custom") {
+		invalidateFsCache(path.join(options.agentDir ?? getAgentDir(), "gjc-plugins", "registry.json"));
+	}
+	for (const p of options.extraPaths ?? []) invalidateFsCache(p);
 	clearClaudePluginRootsCache();
 }
 
@@ -1070,7 +1097,7 @@ export async function preloadPluginRoots(
 	home: string,
 	cwd?: string,
 	userAgentDir?: string,
-	profileAuthority: "default" | "custom" = "default",
+	profileAuthority: ProfileAuthority = "default",
 ): Promise<void> {
 	lastPreloadHome = home;
 	lastPreloadCwd = cwd;
@@ -1088,7 +1115,7 @@ export async function preloadPluginRoots(
 export function getPreloadedPluginRoots(
 	cwd?: string,
 	userAgentDir?: string,
-	profileAuthority: "default" | "custom" = "default",
+	profileAuthority: ProfileAuthority = "default",
 ): readonly ClaudePluginRoot[] {
 	if (cwd !== undefined || userAgentDir !== undefined || profileAuthority !== "default") {
 		return (

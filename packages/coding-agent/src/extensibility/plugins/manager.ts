@@ -1,7 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getProjectDir, getProjectPluginOverridesPath, isEnoent, logger } from "@gajae-code/utils";
-import { getProfilePluginsDir } from "./marketplace/registry";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getProjectDir,
+	getProjectPluginOverridesPath,
+	isEnoent,
+	logger,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
+import { getProfilePluginsDir, type ProfileAuthority } from "./marketplace/registry";
 import { extractPackageName, parsePluginSpec } from "./parser";
 import type {
 	DoctorCheck,
@@ -44,14 +52,22 @@ export class PluginManager {
 	#runtimeConfig: PluginRuntimeConfig | null = null;
 	#cwd: string;
 	#agentDir: string | undefined;
+	#profileAuthority: ProfileAuthority | undefined;
 
-	constructor(cwd: string = getProjectDir(), agentDir?: string) {
+	constructor(cwd: string = getProjectDir(), agentDir?: string, profileAuthority?: ProfileAuthority) {
 		this.#cwd = cwd;
 		this.#agentDir = agentDir;
+		this.#profileAuthority =
+			profileAuthority ??
+			(agentDir && normalizePathForComparison(agentDir) === normalizePathForComparison(getAgentDir())
+				? getAgentProfileAuthority()
+				: agentDir
+					? "custom"
+					: getAgentProfileAuthority());
 	}
 
 	#getPluginsDir(): string {
-		return getProfilePluginsDir(this.#agentDir);
+		return getProfilePluginsDir(this.#agentDir, this.#profileAuthority);
 	}
 
 	#getPluginsNodeModules(): string {
@@ -119,6 +135,7 @@ export class PluginManager {
 			await Bun.file(pkgJsonPath).json();
 		} catch (err) {
 			if (isEnoent(err)) {
+				await this.#ensurePluginsDir();
 				await Bun.write(
 					pkgJsonPath,
 					JSON.stringify(

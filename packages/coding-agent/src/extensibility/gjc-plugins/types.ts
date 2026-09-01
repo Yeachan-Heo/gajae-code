@@ -444,6 +444,8 @@ export interface GjcBundleSummary {
 export interface GjcReviewedUpdateToken {
 	identity: GjcBundleIdentity;
 	agentDir: string;
+	/** Resolver-owned profile authority captured with the review. */
+	profileAuthority?: "default" | "custom";
 	candidateFingerprint: string;
 	baselineFingerprint: string;
 	decisionContextFingerprint: string;

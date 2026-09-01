@@ -264,6 +264,7 @@ export class SSHCommandController {
 					cwd,
 					settings: this.ctx.settings,
 					agentDir,
+					profileAuthority: this.ctx.session.getSessionProfileAuthority?.(),
 				});
 				discoveredHosts = result.items.filter(h => !configHostNames.has(h.name));
 			} catch {

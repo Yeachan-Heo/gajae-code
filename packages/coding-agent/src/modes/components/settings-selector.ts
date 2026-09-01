@@ -684,6 +684,8 @@ export interface SettingsRuntimeContext {
 	cwd: string;
 	/** User-scope settings/profile directory for this session. */
 	agentDir?: string;
+	/** Resolver-owned profile authority for this session. */
+	profileAuthority?: "default" | "custom";
 	/** Whether this terminal can render the pet overlay. */
 	petAvailable?: boolean;
 	/** Terminal environment used to select unavailable-pet guidance. Omitted in production to use Bun.env. */
@@ -1424,6 +1426,7 @@ export class SettingsSelectorComponent extends Container {
 				onRenderRequested: () => this.callbacks.onRenderRequested?.(),
 			},
 			this.context.agentDir,
+			this.context.profileAuthority,
 		);
 		this.addChild(this.#pluginComponent);
 	}

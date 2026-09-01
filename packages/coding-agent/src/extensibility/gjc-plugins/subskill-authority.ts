@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { ActiveSubskillEntry } from "../../skill-state/active-state";
-import { resolveWithinRoot } from "./paths";
+import { type ProfileAuthority, resolveWithinRoot } from "./paths";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import type {
 	GjcPluginRegistryEntry,
@@ -156,10 +156,14 @@ export async function resolveValidatedActiveSubskill(input: {
 	reference: SubskillReference | ActiveSubskillEntry;
 	persisted?: boolean;
 	agentDir?: string;
+	profileAuthority?: ProfileAuthority;
 }): Promise<ValidatedActiveSubskill | null> {
 	const reference = input.reference as SubskillReference;
 	if (!reference.scope || !reference.extensionId || !reference.expectedDigest) return null;
-	const entries = await loadEffectiveGjcPluginRegistry(input.cwd, { agentDir: input.agentDir });
+	const entries = await loadEffectiveGjcPluginRegistry(input.cwd, {
+		agentDir: input.agentDir,
+		profileAuthority: input.profileAuthority,
+	});
 	const entry = entryForReference(entries, reference);
 	if (!entry?.enabled || entry.migration?.status === "failed") return null;
 	const surface = surfaceForReference(entry, reference);

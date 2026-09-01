@@ -1,3 +1,4 @@
+import type { ProfileAuthority } from "./paths";
 import { loadEffectiveGjcPluginRegistry } from "./registry";
 import { type SessionQuarantine, validateSessionBundles, verifyEntryHashes } from "./session-validation";
 import type { GjcPluginRegistryEntry, GjcPluginScope } from "./types";
@@ -71,7 +72,7 @@ function rowsForEntry(entry: GjcPluginRegistryEntry, quarantinedIds: Map<string,
  */
 export async function summarizeGjcPluginObservability(
 	cwd: string,
-	options: { migrate?: boolean; agentDir?: string } = {},
+	options: { migrate?: boolean; agentDir?: string; profileAuthority?: ProfileAuthority } = {},
 ): Promise<PluginObservabilitySummary> {
 	const effective = await loadEffectiveGjcPluginRegistry(cwd, options);
 	const preQuarantine: SessionQuarantine[] = [];

@@ -1953,7 +1953,7 @@ pub(crate) mod platform {
 		ffi::CString,
 		fmt::Write as _,
 		fs::{self, File},
-		io::Write as IoWrite,
+		io::{Read as IoRead, Write as IoWrite},
 		os::{
 			fd::{AsRawFd, FromRawFd, IntoRawFd},
 			unix::ffi::OsStrExt,
@@ -4827,12 +4827,26 @@ pub(crate) mod platform {
 	)]
 	fn create_private_skill_file(
 		parent_fd: libc::c_int,
-		file_mode: u32,
 	) -> Result<(File, CString, u32), &'static str> {
 		for _ in 0..16 {
 			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-			let name = CString::new(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence))
-				.expect("private skill name contains no NUL");
+			// The staging name is visible to other processes in the retained directory,
+			// so do not make it enumerable from the process id and a counter alone.  The
+			// link-count proof below still rejects an observed race; this token only
+			// removes the predictable window in which an attacker could pre-position a
+			// hard-link operation before the writer has even created the inode.
+			let mut entropy = [0_u8; 16];
+			let mut entropy_source = File::open("/dev/urandom").map_err(|_| "io_error")?;
+			entropy_source
+				.read_exact(&mut entropy)
+				.map_err(|_| "io_error")?;
+			let token = u128::from_ne_bytes(entropy);
+			let name = CString::new(format!(
+				".gjc-skill-write-{}-{}-{token:032x}",
+				std::process::id(),
+				sequence,
+			))
+			.expect("private skill name contains no NUL");
 			let fd = unsafe {
 				libc::openat(
 					parent_fd,
@@ -4843,7 +4857,10 @@ pub(crate) mod platform {
 						| libc::O_CLOEXEC
 						| libc::O_NOFOLLOW
 						| libc::O_NONBLOCK,
-					file_mode as libc::c_uint,
+					// Never expose project-scope payload bytes under the staging
+					// name: the requested 0644 mode is applied only after the
+					// atomic replacement has removed this private name.
+					0o600,
 				)
 			};
 			if fd < 0 {
@@ -4856,21 +4873,29 @@ pub(crate) mod platform {
 			let mut information: libc::stat = unsafe { std::mem::zeroed() };
 			if unsafe { libc::fstat(fd, &mut information) } != 0 {
 				let error = std::io::Error::last_os_error();
-				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+				let cleaned = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } == 0;
 				unsafe { libc::close(fd) };
-				return Err(skill_write_error(&error));
+				return Err(if cleaned {
+					skill_write_error(&error)
+				} else {
+					"cleanup_failed"
+				});
 			}
 			let effective_mode = information.st_mode & 0o7777;
 			if unsafe { libc::fchmod(fd, 0o600) } != 0 {
 				let error = std::io::Error::last_os_error();
-				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+				let cleaned = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } == 0;
 				unsafe { libc::close(fd) };
-				return Err(skill_write_error(&error));
+				return Err(if cleaned {
+					skill_write_error(&error)
+				} else {
+					"cleanup_failed"
+				});
 			}
 			if information.st_mode & libc::S_IFMT != libc::S_IFREG || information.st_nlink != 1 {
-				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+				let cleaned = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } == 0;
 				unsafe { libc::close(fd) };
-				return Err("identity_mismatch");
+				return Err(if cleaned { "identity_mismatch" } else { "cleanup_failed" });
 			}
 			return Ok((unsafe { File::from_raw_fd(fd) }, name, effective_mode as u32));
 		}
@@ -4879,7 +4904,10 @@ pub(crate) mod platform {
 
 	enum SkillPublicationError {
 		Pre(&'static str),
-		Post(&'static str),
+		Post {
+			code:            &'static str,
+			staging_aliases: bool,
+		},
 	}
 
 	fn replace_skill_file_name(
@@ -4947,11 +4975,75 @@ pub(crate) mod platform {
 		if valid {
 			return Ok(());
 		}
+		// A hard link created after the pre-rename check moved the staged inode
+		// into the public name while retaining the attacker's alias.  Unlike an
+		// independent stat failure, this is a proven unsafe publication: the
+		// payload must be scrubbed through the retained descriptor before the
+		// caller reports failure.  The public name is removed only after an exact
+		// descriptor/name comparison, so a concurrent successor is never touched.
+		let staging_aliases = (opened_after_ok && opened.st_nlink != 1)
+			|| (published_ok && published.st_nlink != 1);
 		// The rename is already committed. Never unlink the public name from a
 		// transient validation failure: the retained descriptor still owns the
 		// newly published payload, and a later fstatat may be observing a safe
 		// publication despite the independent fstat failure.
-		Err(SkillPublicationError::Post("identity_mismatch"))
+		Err(SkillPublicationError::Post { code: "identity_mismatch", staging_aliases })
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained published descriptor and parent descriptor remain live through exact scrub"
+	)]
+	fn scrub_published_skill_file(
+		file: &File,
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<(), &'static str> {
+		if file.set_len(0).is_err() || file.sync_all().is_err() {
+			return Err("cleanup_failed");
+		}
+		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		let same = unsafe { libc::fstat(file.as_raw_fd(), &mut opened) } == 0
+			&& unsafe {
+				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+			} == 0
+			&& opened.st_dev == named.st_dev
+			&& opened.st_ino == named.st_ino;
+		if !same {
+			return Ok(());
+		}
+		if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } != 0 {
+			return Err("cleanup_failed");
+		}
+		Ok(())
+	}
+
+	#[expect(
+		clippy::undocumented_unsafe_blocks,
+		reason = "the retained published descriptor and parent descriptor remain live through final validation"
+	)]
+	fn published_skill_file_is_valid(
+		file: &File,
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<bool, &'static str> {
+		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe { libc::fstat(file.as_raw_fd(), &mut opened) } != 0 {
+			return Err("identity_mismatch");
+		}
+		let mut named: libc::stat = unsafe { std::mem::zeroed() };
+		if unsafe {
+			libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
+		} != 0 {
+			return Err("identity_mismatch");
+		}
+		Ok(opened.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& named.st_mode & libc::S_IFMT == libc::S_IFREG
+			&& opened.st_nlink == 1
+			&& named.st_nlink == 1
+			&& opened.st_dev == named.st_dev
+			&& opened.st_ino == named.st_ino)
 	}
 
 	fn unlink_private_skill_file(
@@ -4990,8 +5082,10 @@ pub(crate) mod platform {
 		name: &CString,
 	) -> Result<(), &'static str> {
 		let private_fd = file.as_raw_fd();
-		let scrubbed = file.set_len(0).is_ok();
-		let unlinked = unlink_private_skill_file(parent_fd, name, private_fd).is_ok();
+		// Scrubbing must reach stable storage before the staging name is removed;
+		// otherwise a crash can resurrect a failed payload through a retained alias.
+		let scrubbed = file.set_len(0).is_ok() && file.sync_all().is_ok();
+		let unlinked = scrubbed && unlink_private_skill_file(parent_fd, name, private_fd).is_ok();
 		if scrubbed && unlinked {
 			Ok(())
 		} else {
@@ -5114,7 +5208,7 @@ pub(crate) mod platform {
 		// while the private name is live would permit an observer to retain a
 		// second hard link and defeat the single-link publication invariant.
 		let (mut file, private_name, _created_mode) =
-			match create_private_skill_file(skill_fd, requested_file_mode) {
+			match create_private_skill_file(skill_fd) {
 				Ok(value) => value,
 				Err(code) => {
 					unsafe {
@@ -5124,27 +5218,28 @@ pub(crate) mod platform {
 					return NativeSecureSkillWriteResult::failure(code);
 				},
 			};
-		if file_mode == 0o600 {
-			#[cfg(target_os = "linux")]
-			if let Err(code) = secure_created_owner_only_file(&file) {
-				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
-				drop(file);
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+		// Harden every private staging inode, including project-scope writes.  A
+		// parent default ACL can grant read access despite mode 0600; clear and
+		// verify it before any payload bytes are written or the name is replaced.
+		#[cfg(target_os = "linux")]
+		if let Err(code) = secure_created_owner_only_file(&file) {
+			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
 			}
-			#[cfg(target_os = "macos")]
-			if let Err(code) = clear_and_verify_macos_acl(file.as_raw_fd()) {
-				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
-				drop(file);
-				unsafe {
-					libc::close(skill_fd);
-					libc::close(skills_fd);
-				}
-				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+		}
+		#[cfg(target_os = "macos")]
+		if let Err(code) = clear_and_verify_macos_acl(file.as_raw_fd()) {
+			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
 			}
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
 		if file.write_all(content.as_bytes()).is_err() {
 			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
@@ -5155,7 +5250,10 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("write_failed"));
 		}
-		if file.sync_all().is_err() {
+		// `File` is currently unbuffered, but flush explicitly keeps this boundary
+		// correct if the writer ever gains a buffering layer: all payload bytes must
+		// reach the kernel before the durability fence and namespace replacement.
+		if file.flush().is_err() || file.sync_all().is_err() {
 			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 			drop(file);
 			unsafe {
@@ -5185,7 +5283,16 @@ pub(crate) mod platform {
 				}
 				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 			},
-			Err(SkillPublicationError::Post(code)) => {
+			Err(SkillPublicationError::Post { code, staging_aliases }) => {
+				if staging_aliases {
+					let cleanup = scrub_published_skill_file(&file, skill_fd, &final_name);
+					drop(file);
+					unsafe {
+						libc::close(skill_fd);
+						libc::close(skills_fd);
+					}
+					return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
+				}
 				drop(file);
 				unsafe {
 					libc::close(skill_fd);
@@ -5214,6 +5321,32 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure("durability_failed");
 			}
 		}
+		// A hard link can be added after the post-rename check but before the
+		// metadata sync above completes.  Re-check the retained inode after every
+		// delayed write; if the single-link invariant no longer holds, scrub the
+		// inode and remove only our exact public name before returning failure.
+		match published_skill_file_is_valid(&file, skill_fd, &final_name) {
+			Ok(true) => {},
+			Ok(false) => {
+				let cleanup = scrub_published_skill_file(&file, skill_fd, &final_name);
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(
+					cleanup.err().unwrap_or("identity_mismatch"),
+				);
+			},
+			Err(code) => {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
+			},
+		}
 		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
 			drop(file);
 			unsafe {
@@ -5223,6 +5356,7 @@ pub(crate) mod platform {
 			return NativeSecureSkillWriteResult::failure("identity_mismatch");
 		}
 		if let Err(code) = fsync_root_parent(skill_fd) {
+			drop(file);
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
@@ -5230,6 +5364,7 @@ pub(crate) mod platform {
 			return NativeSecureSkillWriteResult::failure(code);
 		}
 		if skill_created && let Err(code) = fsync_root_parent(skills_fd) {
+			drop(file);
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
@@ -5247,6 +5382,32 @@ pub(crate) mod platform {
 				libc::close(skills_fd);
 			}
 			return NativeSecureSkillWriteResult::failure("identity_mismatch");
+		}
+		// Keep the file binding as the final publication check as well.  The root
+		// revalidation above can itself race with a writer that replaces SKILL.md;
+		// never return a success receipt for an inode that is no longer the one
+		// retained by this transaction.
+		match published_skill_file_is_valid(&file, skill_fd, &final_name) {
+			Ok(true) => {},
+			Ok(false) => {
+				let cleanup = scrub_published_skill_file(&file, skill_fd, &final_name);
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(
+					cleanup.err().unwrap_or("identity_mismatch"),
+				);
+			},
+			Err(code) => {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
+			},
 		}
 		drop(file);
 		unsafe {

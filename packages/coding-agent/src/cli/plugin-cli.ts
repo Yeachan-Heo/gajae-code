@@ -175,7 +175,7 @@ export { classifyInstallTarget } from "./classify-install-target";
  * Run a plugin command.
  */
 export async function runPluginCommand(cmd: PluginCommandArgs): Promise<void> {
-	const manager = new PluginManager();
+	const manager = new PluginManager(getProjectDir(), getAgentDir(), getAgentProfileAuthority());
 
 	switch (cmd.action) {
 		case "install":
@@ -230,6 +230,8 @@ async function makeMarketplaceManager(): Promise<MarketplaceManager> {
 		projectInstalledRegistryPath: await resolveOrDefaultProjectRegistryPath(getProjectDir()),
 		marketplacesCacheDir: getMarketplacesCacheDir(agentDir, profileAuthority),
 		pluginsCacheDir: getPluginsCacheDir(agentDir, profileAuthority),
+		agentDir,
+		profileAuthority,
 	});
 }
 
