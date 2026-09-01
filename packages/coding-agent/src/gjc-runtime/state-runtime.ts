@@ -1342,6 +1342,14 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 					for (const field of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const)
 						if (merged[field] !== existingPayload[field])
 							throw new StateCommandError(2, `crystallized ${field} is immutable through generic state write`);
+					if (isPlainObject(existingInner.crystal) && existingInner.crystal.lifecycle === "ready") {
+						for (const field of ["rounds", "established_facts", "intent_review", "current_ambiguity"] as const)
+							if (JSON.stringify(mergedInner[field]) !== JSON.stringify(existingInner[field]))
+								throw new StateCommandError(
+									2,
+									`ready Crystal evidence is immutable through generic state write`,
+								);
+					}
 				}
 			}
 			merged.skill = mode;
@@ -1682,8 +1690,11 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 			: migrateWorkflowState(existingCaller, caller).state;
 	if (caller === "deep-interview" && callee === "ultragoal") {
 		const inner = isPlainObject(normalizedCaller.state) ? normalizedCaller.state : {};
-		if (inner?.crystal && isPlainObject(inner.crystal) && inner.crystal.lifecycle === "ready")
-			inner.execution_approval = "approved";
+		if (!isPlainObject(inner.crystal) || inner.crystal.lifecycle !== "ready")
+			throw new StateCommandError(2, "ultragoal handoff requires a ready crystallized specification");
+		if (typeof normalizedCaller.spec_path !== "string" || typeof normalizedCaller.spec_sha256 !== "string")
+			throw new StateCommandError(2, "ultragoal handoff requires a persisted Crystal specification");
+		inner.execution_approval = "approved";
 	}
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
