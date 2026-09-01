@@ -190,9 +190,30 @@ describe("deep-interview crystallize contract", () => {
 		const previousSessionFile = process.env.GJC_SESSION_FILE;
 		try {
 			const sessionFile = path.join(root, "conversation.jsonl");
+			const runtimeValue = {
+				...value,
+				current_revision: 2,
+				items: value.items.map(item => ({ ...item, anchor: { message_index: 1, quote: item.anchor?.quote } })),
+				snapshot: {
+					...value.snapshot,
+					revision: 2,
+					end: 1,
+					messages: [
+						{ index: 0, role: "assistant" as const, content: "[image]" },
+						{ ...value.snapshot.messages[0]!, index: 1 },
+					],
+				},
+			};
+			runtimeValue.snapshot.digest = crystalSnapshotDigest(runtimeValue.snapshot);
 			await fs.writeFile(
 				sessionFile,
 				`${JSON.stringify({ type: "session", id: "crystallize-test", cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "image", source: { type: "url", url: "data:image/png;base64,x" } }],
+					},
+				})}\n${JSON.stringify({
 					type: "message",
 					message: {
 						...value.snapshot.messages[0],
@@ -205,7 +226,7 @@ describe("deep-interview crystallize contract", () => {
 				[
 					"--crystallize",
 					"--input",
-					JSON.stringify(value),
+					JSON.stringify(runtimeValue),
 					"--session-id",
 					"crystallize-test",
 					"--slug",
