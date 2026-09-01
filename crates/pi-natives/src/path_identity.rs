@@ -5038,14 +5038,21 @@ pub(crate) mod platform {
 					return NativeSecureSkillWriteResult::failure(code);
 				},
 			};
+		let skill_created_identity = if skill_created {
+			statat_fd(skills_fd, &skill_component).ok()
+		} else {
+			None
+		};
 		if skill_created && unsafe { libc::fchmod(skill_fd, directory_mode) } != 0 {
+			let code = skill_write_error(&std::io::Error::last_os_error());
+			let cleanup = skill_created_identity.as_ref().and_then(|identity| {
+				remove_created_directory_if_exact(skills_fd, &skill_component, identity).err()
+			});
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
-			return NativeSecureSkillWriteResult::failure(skill_write_error(
-				&std::io::Error::last_os_error(),
-			));
+			return NativeSecureSkillWriteResult::failure(cleanup.unwrap_or(code));
 		}
 		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
 			unsafe {
