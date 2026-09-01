@@ -784,6 +784,9 @@ describe("deep-interview staged transitions", () => {
 		if (read.exists) {
 			expect((read.envelope as Record<string, unknown>).active).toBe(false);
 		}
+		const staged = await run(root, ["write", "--input", JSON.stringify({ state: { revived: true } }), "--json"]);
+		expect(staged.status).not.toBe(0);
+		expect(staged.stderr).toContain("cannot stage after deep-interview handoff or completion");
 	});
 
 	it("strips recorder-owned intent keys from staged payloads", async () => {
