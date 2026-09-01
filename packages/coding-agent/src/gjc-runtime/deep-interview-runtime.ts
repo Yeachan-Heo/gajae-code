@@ -245,9 +245,10 @@ async function authoritativeConversationSnapshot(
 		const messages: Array<{ index: number; role: string; content: string }> = [];
 		for (const entry of entries.slice(1)) {
 			if (entry.type !== "message") continue;
+			const index = messages.length;
 			const message = entry.message as unknown as Record<string, unknown>;
 			if (typeof message.role !== "string") continue;
-			const content =
+			const projectedContent =
 				typeof message.content === "string"
 					? message.content
 					: Array.isArray(message.content)
@@ -256,12 +257,11 @@ async function authoritativeConversationSnapshot(
 								.map(item =>
 									typeof (item as Record<string, unknown>).text === "string"
 										? (item as Record<string, unknown>).text
-										: "",
+										: `[${typeof (item as Record<string, unknown>).type === "string" ? (item as Record<string, unknown>).type : "content"}]`,
 								)
 								.join("")
 						: "";
-			if (content)
-				messages.push({ index: messages.length, role: message.role, content: content.normalize("NFC").trim() });
+			messages.push({ index, role: message.role, content: projectedContent.normalize("NFC").trim() });
 		}
 		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
 		return { revision: messages.length, messages };
