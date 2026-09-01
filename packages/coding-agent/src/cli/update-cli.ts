@@ -5,6 +5,8 @@
  * binaries. Package-manager installs are migrated to a user binary path
  * rather than overwritten. Source checkouts and dev-links are never replaced.
  */
+
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -66,6 +68,13 @@ export interface RuntimeFileIdentity {
 	dev: string;
 	ino: string;
 	size: string;
+	sha256: string;
+}
+
+async function runtimeSha256(runtimePath: string): Promise<string> {
+	return createHash("sha256")
+		.update(Buffer.from(await Bun.file(runtimePath).arrayBuffer()))
+		.digest("hex");
 }
 
 export interface PackageManagerUpdateResult {
@@ -567,7 +576,12 @@ async function verifyInstalledRuntime(
 			if (!stat.isFile() || stat.isSymbolicLink()) return { ...versionResult, ok: false };
 			return {
 				...versionResult,
-				identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: stat.size.toString() },
+				identity: {
+					dev: stat.dev.toString(),
+					ino: stat.ino.toString(),
+					size: stat.size.toString(),
+					sha256: await runtimeSha256(versionResult.path),
+				},
 			};
 		}
 		return {
@@ -1290,7 +1304,8 @@ async function runCommunityAppOfferFromRuntime(
 	if (
 		runtimeStat.dev.toString() !== expectedIdentity.dev ||
 		runtimeStat.ino.toString() !== expectedIdentity.ino ||
-		runtimeStat.size.toString() !== expectedIdentity.size
+		runtimeStat.size.toString() !== expectedIdentity.size ||
+		(await runtimeSha256(runtimePath)) !== expectedIdentity.sha256
 	)
 		throw new Error("verified runtime identity changed before optional offer");
 	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
@@ -1303,7 +1318,8 @@ async function runCommunityAppOfferFromRuntime(
 			pinnedStat.isSymbolicLink() ||
 			pinnedStat.dev !== runtimeStat.dev ||
 			pinnedStat.ino !== runtimeStat.ino ||
-			pinnedStat.size !== runtimeStat.size
+			pinnedStat.size !== runtimeStat.size ||
+			(await runtimeSha256(pinnedRuntimePath)) !== expectedIdentity.sha256
 		)
 			throw new Error("verified runtime identity changed before optional offer");
 		const child = Bun.spawn([pinnedRuntimePath, "macos-community-app-offer"], {
