@@ -1294,16 +1294,22 @@ pub fn exact_replace_path(
 /// that cannot be queued is left for the owning reconciliation pass.
 #[napi]
 pub fn exact_unlink_direct_detached(path: String, identity: NativeExactFileIdentity) -> bool {
-	detached_cleanup_sender().try_send((path, identity)).is_ok()
+	let queue = detached_cleanup_sender();
+	queue.worker_started && queue.sender.try_send((path, identity)).is_ok()
 }
 
 type DetachedCleanupJob = (String, NativeExactFileIdentity);
 
-fn detached_cleanup_sender() -> &'static SyncSender<DetachedCleanupJob> {
-	static SENDER: OnceLock<SyncSender<DetachedCleanupJob>> = OnceLock::new();
-	SENDER.get_or_init(|| {
+struct DetachedCleanupQueue {
+	sender:         SyncSender<DetachedCleanupJob>,
+	worker_started: bool,
+}
+
+fn detached_cleanup_sender() -> &'static DetachedCleanupQueue {
+	static QUEUE: OnceLock<DetachedCleanupQueue> = OnceLock::new();
+	QUEUE.get_or_init(|| {
 		let (sender, receiver) = sync_channel::<DetachedCleanupJob>(64);
-		let _ = std::thread::Builder::new()
+		let worker_started = std::thread::Builder::new()
 			.name("pi-natives-exact-unlink-cleanup".to_owned())
 			.spawn(move || {
 				while let Ok((path, identity)) = receiver.recv() {
@@ -1311,8 +1317,9 @@ fn detached_cleanup_sender() -> &'static SyncSender<DetachedCleanupJob> {
 						let _ = exact_unlink_direct(path, identity);
 					}));
 				}
-			});
-		sender
+			})
+			.is_ok();
+		DetachedCleanupQueue { sender, worker_started }
 	})
 }
 
