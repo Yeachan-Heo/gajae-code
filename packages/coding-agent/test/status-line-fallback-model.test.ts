@@ -49,7 +49,7 @@ describe("status-line fallback model", () => {
 	it("renders the active fallback model from the session snapshot", () => {
 		const rendered = Bun.stripANSI(renderSegment("model", contextForModel("Fallback Model")).content);
 
-		expect(rendered).toContain("Fallback Model");
-		expect(rendered).not.toContain("Primary Model");
+		expect(rendered).toContain("fallback model");
+		expect(rendered).not.toContain("primary model");
 	});
 });

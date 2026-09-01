@@ -54,7 +54,7 @@ describe("model segment inline context percentage", () => {
 
 		// Percentage appears, and after the model name + reasoning effort.
 		expect(rendered).toContain("42.5%");
-		expect(rendered).toMatch(/Sonnet.*42\.5%/);
+		expect(rendered).toMatch(/sonnet.*42\.5%/);
 	});
 
 	it("omits the percentage when contextWindow is unknown", () => {
@@ -62,7 +62,7 @@ describe("model segment inline context percentage", () => {
 		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
 
 		expect(rendered).not.toContain("%");
-		expect(rendered).toContain("Sonnet");
+		expect(rendered).toContain("sonnet");
 	});
 
 	it("renders an unknown provider context snapshot as a question mark", () => {
@@ -83,7 +83,7 @@ describe("model segment inline context percentage", () => {
 		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
 
 		expect(rendered).not.toContain("42.5%");
-		expect(rendered).toContain("Sonnet");
+		expect(rendered).toContain("sonnet");
 	});
 	it("suppresses the inline percentage when a standalone context_pct segment is active", () => {
 		const ctx = makeCtx({
@@ -96,7 +96,7 @@ describe("model segment inline context percentage", () => {
 		// Avoids showing the same percentage twice in custom layouts that keep
 		// both the model segment and a standalone context_pct segment.
 		expect(rendered).not.toContain("42.5%");
-		expect(rendered).toContain("Sonnet");
+		expect(rendered).toContain("sonnet");
 	});
 
 	it("still shows the percentage when the reasoning effort is off", () => {
@@ -114,6 +114,6 @@ describe("model segment inline context percentage", () => {
 		const rendered = Bun.stripANSI(renderSegment("model", ctx).content);
 
 		expect(rendered).toContain("7.3%");
-		expect(rendered).toMatch(/Sonnet.*7\.3%/);
+		expect(rendered).toMatch(/sonnet.*7\.3%/);
 	});
 });

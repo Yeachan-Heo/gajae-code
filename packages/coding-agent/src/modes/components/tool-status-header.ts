@@ -28,6 +28,7 @@ import {
 	resolveCurrentBranch,
 } from "./status-line/git-utils";
 import { getPreset } from "./status-line/presets";
+import { buildPriorityRow, type PriorityItemSet } from "./status-line/priority-row";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
 import { getSeparator } from "./status-line/separators";
 import { calculateTokensPerSecond } from "./status-line/token-rate";
@@ -132,6 +133,8 @@ interface CollectedStatusSegments {
 	left: string[];
 	leftSegIds: StatusLineSegmentId[];
 	right: string[];
+	/** Parallel to `right`; null for action hints, job counts and the version tag. */
+	rightSegIds: (StatusLineSegmentId | null)[];
 	previewHighlightSegment: StatusLineSegmentId | undefined;
 	sessionAccent: boolean | undefined;
 	leftSepWidth: number;
@@ -819,6 +822,7 @@ export class StatusLineComponent implements Component {
 		}
 
 		const right: string[] = [];
+		const rightSegIds: (StatusLineSegmentId | null)[] = [];
 		const actionHints =
 			effectiveSettings.showActionHints === false
 				? []
@@ -833,9 +837,13 @@ export class StatusLineComponent implements Component {
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				right.push(highlightSegment(segId, rendered.content));
+				rightSegIds.push(segId);
 			}
 		}
-		right.push(...actionHints.map(hint => hint.content));
+		for (const hint of actionHints) {
+			right.push(hint.content);
+			rightSegIds.push(null);
+		}
 
 		const runningBackgroundJobs =
 			this.session.getAsyncJobSnapshot()?.running.filter(job => job.metadata?.monitor !== true).length ?? 0;
@@ -843,9 +851,11 @@ export class StatusLineComponent implements Component {
 			const icon = theme.icon.agents ? `${theme.icon.agents} ` : "";
 			const label = `${formatCount("job", runningBackgroundJobs)} running`;
 			right.push(theme.fg("statusLineSubagents", `${icon}${label}`));
+			rightSegIds.push(null);
 		}
 		if (this.#version) {
 			right.push(theme.fg("dim", `v${this.#version}`));
+			rightSegIds.push(null);
 		}
 
 		return {
@@ -857,6 +867,7 @@ export class StatusLineComponent implements Component {
 			left,
 			leftSegIds,
 			right,
+			rightSegIds,
 			previewHighlightSegment,
 			sessionAccent: effectiveSettings.sessionAccent,
 			leftSepWidth: visibleWidth(separatorDef.left),
@@ -872,22 +883,108 @@ export class StatusLineComponent implements Component {
 		return Math.max(1, Math.min(3, Math.trunc(raw)));
 	}
 
+	/**
+	 * Which priority items this layout is carrying, and where.
+	 *
+	 * Context % has no segment of its own in most presets — it rides inside the
+	 * `model` segment — so `model` inherits the context rank whenever it does.
+	 * Items whose data is absent (no context window, no active goal) carry no
+	 * priority at all, which keeps a rail with nothing to protect evicting
+	 * exactly as it always did.
+	 */
+	#priorityItems(seg: CollectedStatusSegments): {
+		include: PriorityItemSet;
+		inlineContextPct: boolean;
+	} {
+		const collected = (id: StatusLineSegmentId): boolean =>
+			seg.leftSegIds.includes(id) || seg.rightSegIds.includes(id);
+		const inlineContextPct =
+			seg.ctx.options.model?.showContextPercent !== false && seg.ctx.contextPctSegmentActive !== true;
+		const goalMode = seg.ctx.goalMode;
+
+		return {
+			inlineContextPct,
+			include: {
+				context:
+					seg.ctx.contextWindow > 0 && (collected("context_pct") || (collected("model") && inlineContextPct)),
+				goal: collected("mode") && goalMode !== null && (goalMode.enabled || goalMode.paused),
+				model: collected("model"),
+			},
+		};
+	}
+
+	/**
+	 * Eviction rank: 0 is ordinary telemetry and goes first, 3 is context % and
+	 * goes last. The model name outranks telemetry but loses to the goal
+	 * indicator, matching context % > goal > model.
+	 */
+	#priorityRanker(seg: CollectedStatusSegments): (id: StatusLineSegmentId | null) => number {
+		const { include, inlineContextPct } = this.#priorityItems(seg);
+		const anyPriority = include.context || include.goal;
+
+		return (id: StatusLineSegmentId | null): number => {
+			if (id === null || !anyPriority) return 0;
+			if (id === "context_pct") return include.context ? 3 : 0;
+			if (id === "model") {
+				if (include.context && inlineContextPct) return 3;
+				return include.model ? 1 : 0;
+			}
+			if (id === "mode") return include.goal ? 2 : 0;
+			return 0;
+		};
+	}
+
+	/**
+	 * Priority row for a layout that could not keep everything the user needs on
+	 * screen, or null when the normal rail already carries context %, the goal
+	 * indicator and the model name.
+	 *
+	 * Context % has no segment of its own in most presets — it rides inside the
+	 * `model` segment — so losing `model` silently loses the highest-priority
+	 * item too. Survival is therefore resolved per item, not per segment.
+	 */
+	#priorityRowFor(
+		seg: CollectedStatusSegments,
+		survivingLeftIds: readonly (StatusLineSegmentId | null)[],
+		survivingRightIds: readonly (StatusLineSegmentId | null)[],
+		width: number,
+	): string | null {
+		const survived = (id: StatusLineSegmentId): boolean =>
+			survivingLeftIds.includes(id) || survivingRightIds.includes(id);
+
+		const { include, inlineContextPct } = this.#priorityItems(seg);
+		if (!include.context && !include.goal) return null;
+
+		const contextLost = include.context && !survived("context_pct") && !(inlineContextPct && survived("model"));
+		const goalLost = include.goal && !survived("mode");
+		const modelLost = include.model && !survived("model");
+		if (!contextLost && !goalLost && !modelLost) return null;
+
+		return buildPriorityRow(seg.ctx, width, include);
+	}
+
 	#buildStatusLine(width: number, precollected?: CollectedStatusSegments): string {
 		const seg = precollected ?? this.#collectStatusSegments(width, this.#resolveSettings());
 		const { ctx, separatorDef, bgAnsi, fgAnsi, sepAnsi, previewHighlightSegment } = seg;
 		const { leftSepWidth, rightSepWidth, leftCapWidth, rightCapWidth } = seg;
 		const topFillWidth = Math.max(0, width);
 
+		const rank = this.#priorityRanker(seg);
+
 		/**
-		 * Evict against `budget` using the existing configured-order semantics
-		 * (shrink path, then pop right, then pop left) and report how many
-		 * segments were dropped. Runs from the original segment lists each time so
-		 * the marker reservation can be recomputed without compounding evictions.
+		 * Evict against `budget`: shrink the path first, then drop the
+		 * lowest-priority segment still standing — right side before left, tail
+		 * first within a side, which is the historical order for everything that
+		 * carries no priority. Context %, the goal indicator and the model name
+		 * outrank ordinary telemetry and are therefore the last to go. Runs from
+		 * the original segment lists each time so the marker reservation can be
+		 * recomputed without compounding evictions.
 		 */
 		const layout = (budget: number) => {
 			const left = [...seg.left];
 			const leftIds = [...seg.leftSegIds];
 			const right = [...seg.right];
+			const rightIds = [...seg.rightSegIds];
 			let leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 			let rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
 			const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
@@ -905,19 +1002,42 @@ export class StatusLineComponent implements Component {
 						leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 					}
 				}
-				while (totalWidth() > budget && right.length > 0) {
-					right.pop();
+				// Lowest rank loses first; equal ranks fall back to the historical
+				// right-then-left, tail-first order.
+				while (totalWidth() > budget && (left.length > 0 || right.length > 0)) {
+					let victimSide: "left" | "right" | null = null;
+					let victimIndex = -1;
+					let victimRank = Number.POSITIVE_INFINITY;
+					for (let index = right.length - 1; index >= 0; index -= 1) {
+						const candidate = rank(rightIds[index]);
+						if (candidate < victimRank) {
+							victimRank = candidate;
+							victimSide = "right";
+							victimIndex = index;
+						}
+					}
+					for (let index = left.length - 1; index >= 0; index -= 1) {
+						const candidate = rank(leftIds[index]);
+						if (candidate < victimRank) {
+							victimRank = candidate;
+							victimSide = "left";
+							victimIndex = index;
+						}
+					}
+					if (victimSide === null) break;
+					if (victimSide === "right") {
+						right.splice(victimIndex, 1);
+						rightIds.splice(victimIndex, 1);
+						rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
+					} else {
+						left.splice(victimIndex, 1);
+						leftIds.splice(victimIndex, 1);
+						leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+					}
 					dropped += 1;
-					rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
-				}
-				while (totalWidth() > budget && left.length > 0) {
-					left.pop();
-					leftIds.pop();
-					dropped += 1;
-					leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 				}
 			}
-			return { left, right, leftWidth, rightWidth, dropped };
+			return { left, right, leftIds, rightIds, leftWidth, rightWidth, dropped };
 		};
 
 		// First pass with the full budget establishes whether anything is lost at
@@ -939,6 +1059,11 @@ export class StatusLineComponent implements Component {
 			}
 		}
 		const marker = this.#renderOverflowMarker(placed.dropped, reserved);
+		// Nothing survived that the user actually needs? Spend the rail on the
+		// priority row instead of an overflow marker. Suppressing the marker here
+		// is deliberate: at these widths its cells are worth more as context %.
+		const priorityRow = this.#priorityRowFor(seg, placed.leftIds, placed.rightIds, topFillWidth);
+		if (priorityRow !== null) return priorityRow;
 
 		const leftGroup = this.#renderStatusGroup(placed.left, "left", separatorDef, bgAnsi, fgAnsi, sepAnsi);
 		const rightGroup = this.#renderStatusGroup(placed.right, "right", separatorDef, bgAnsi, fgAnsi, sepAnsi);
@@ -1076,6 +1201,17 @@ export class StatusLineComponent implements Component {
 					dropped += 1;
 				}
 				if (row.length === 0) packedRows.splice(index, 1);
+			}
+
+			// Wrapping is supposed to be the lossless path. When even `maxRows` rows
+			// cannot hold everything, the priority row beats a partial rail plus a
+			// count of what is missing.
+			if (dropped > 0) {
+				const priorityRow = this.#priorityRowFor(seg, [], [], topFillWidth);
+				if (priorityRow !== null) {
+					this.#renderedRowsCache = { key: cacheKey, rows: [priorityRow] };
+					return [priorityRow];
+				}
 			}
 
 			// Reserve marker cells on whichever row ends up last, evicting from its

@@ -8,6 +8,7 @@ import { shortenPath } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
+import { shortenModelId } from "./model-name";
 import type { RenderedSegment, SegmentContext, StatusLineSegment, StatusLineSegmentId } from "./types";
 
 export type { SegmentContext } from "./types";
@@ -99,10 +100,10 @@ const modelSegment: StatusLineSegment = {
 		const state = ctx.session.state;
 		const opts = ctx.options.model ?? {};
 
-		let modelName = state.model?.name || state.model?.id || "no-model";
-		if (modelName.startsWith("Claude ")) {
-			modelName = modelName.slice(7);
-		}
+		// Shortest recognizable id-derived form (`sonnet-4.5`), the same label the
+		// footer renders, so a narrow rail never spends cells on a provider prefix
+		// or a snapshot date.
+		const modelName = shortenModelId(state.model?.id ?? state.model?.name);
 
 		let content = withIcon(theme.icon.model, modelName);
 
@@ -148,9 +149,16 @@ function formatGoalUsage(current: number): string {
 	return used;
 }
 
-function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: boolean }): RenderedSegment {
-	const goal = ctx.session.getGoalModeState()?.goal;
-	const status = goal?.status ?? (mode.paused ? "paused" : "active");
+/**
+ * Icon and color for the active goal indicator, or null when goal mode is not
+ * showing. Shared with the narrow-width priority row so the compact glyph keeps
+ * the same status color as the full label.
+ */
+export function goalStatusDisplay(ctx: SegmentContext): { icon: string; color: ThemeColor } | null {
+	const mode = ctx.goalMode;
+	if (!mode || (!mode.enabled && !mode.paused)) return null;
+
+	const status = ctx.session.getGoalModeState?.()?.goal?.status ?? (mode.paused ? "paused" : "active");
 
 	let icon: string = theme.icon.goal;
 	let color: ThemeColor = "accent";
@@ -170,13 +178,19 @@ function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: b
 		default:
 			break;
 	}
+	return { icon, color };
+}
 
-	const parts: string[] = [withIcon(icon, "Goal")];
+function renderGoalMode(ctx: SegmentContext, mode: { enabled: boolean; paused: boolean }): RenderedSegment {
+	const display = goalStatusDisplay(ctx) ?? { icon: theme.icon.goal, color: "accent" as ThemeColor };
+	const goal = ctx.session.getGoalModeState?.()?.goal;
+
+	const parts: string[] = [withIcon(display.icon, "Goal")];
 	const showUsage = ctx.session.settings.get("goal.statusInFooter") === true;
 	if (showUsage && goal) {
 		parts.push(formatGoalUsage(goal.tokensUsed));
 	}
-	return { content: theme.fg(color, parts.join(" ")), visible: true };
+	return { content: theme.fg(display.color, parts.join(" ")), visible: mode.enabled || mode.paused };
 }
 
 const modeSegment: StatusLineSegment = {

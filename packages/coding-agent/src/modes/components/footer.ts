@@ -9,6 +9,7 @@ import * as git from "../../utils/git";
 import { sanitizeStatusText } from "../shared";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./status-line/context-thresholds";
 import { resolveCurrentBranch } from "./status-line/git-utils";
+import { shortenModelId } from "./status-line/model-name";
 
 /**
  * Footer component that shows pwd, token stats, and context usage
@@ -191,8 +192,9 @@ export class FooterComponent implements Component {
 
 		let statsLeft = statsParts.join(" ");
 
-		// Add model name on the right side, plus thinking level if model supports it
-		const modelName = state.model?.id || "no-model";
+		// Add model name on the right side, plus thinking level if model supports it.
+		// Same shortest-recognizable form the status rail renders.
+		const modelName = shortenModelId(state.model?.id ?? state.model?.name);
 
 		// Add thinking level hint when the current model advertises supported efforts
 		let rightSide = modelName;
