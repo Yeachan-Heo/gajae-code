@@ -585,6 +585,9 @@ install_via_bun() {
     fi
     echo ""
     echo "Installed gjc via bun (development/source mode)"
+    if [ "$(uname -s)" = "Darwin" ] && command -v gjc >/dev/null 2>&1; then
+        gjc macos-community-app-offer || true
+    fi
     echo "Run 'gjc' to get started!"
 }
 

@@ -89,7 +89,9 @@ describe("macOS community app offer guards", () => {
 	});
 
 	test("rejects executable traversal and symlink escapes", async () => {
-		const root = await tempDir();
+		const container = await tempDir();
+		const root = path.join(container, "bundle");
+		await fs.mkdir(root);
 		const macOSRoot = path.join(root, "Contents", "MacOS");
 		await fs.mkdir(macOSRoot, { recursive: true });
 		await fs.writeFile(path.join(root, "Contents", "Info.plist"), "fixture");
@@ -105,6 +107,17 @@ describe("macOS community app offer guards", () => {
 		await fs.symlink(outside, path.join(root, "Contents"));
 		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBeUndefined();
 		await fs.rm(outside, { recursive: true, force: true });
+		await fs.rm(path.join(root, "Contents"), { recursive: true, force: true });
+		await fs.mkdir(path.join(root, "Contents", "MacOS"), { recursive: true });
+		await fs.writeFile(path.join(root, "Contents", "Info.plist"), "fixture");
+		await fs.writeFile(path.join(root, "Contents", "MacOS", "GajaeCode"), "fixture");
+		const aliasParent = path.join(container, "community-app-alias-parent");
+		const aliasRoot = path.join(aliasParent, path.basename(root));
+		await fs.symlink(path.dirname(root), aliasParent);
+		expect(await resolveCommunityAppExecutableForTest(aliasRoot, "GajaeCode")).toBe(
+			path.join(aliasRoot, "Contents", "MacOS", "GajaeCode"),
+		);
+		await fs.rm(aliasParent, { recursive: true, force: true });
 	});
 
 	test("fails closed when the canonical release or checksum is unavailable", async () => {
@@ -136,6 +149,7 @@ describe("macOS community app offer guards", () => {
 				if (url.includes("/releases/latest")) {
 					return new Response(
 						JSON.stringify({
+							tag_name: "v1.0.0",
 							assets: [
 								{
 									name: "gajae-app-desktop-1.0.0-macos-arm64.dmg",

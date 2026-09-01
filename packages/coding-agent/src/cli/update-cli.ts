@@ -1572,6 +1572,13 @@ export async function runUpdateCommand(
 				record("update_check_completed", { channel, result: "available" });
 				record("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
+				if (process.platform === "darwin") {
+					try {
+						await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path);
+					} catch (error) {
+						console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
+					}
+				}
 				record("update_install_completed", { channel, result: "installed", installMethod: target.method });
 				return;
 			}
