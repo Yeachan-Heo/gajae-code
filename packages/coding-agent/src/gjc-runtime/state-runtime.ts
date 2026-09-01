@@ -1665,9 +1665,14 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 					unknown
 				>)
 			: migrateWorkflowState(existingCaller, caller).state;
+	if (caller === "deep-interview" && callee === "ultragoal") {
+		const inner = normalizedCaller;
+		if (inner?.crystal && isPlainObject(inner.crystal) && inner.crystal.lifecycle === "ready")
+			inner.execution_approval = "approved";
+	}
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
-			allowPlanningHandoff: callee === "ralplan" || callee === "autoresearch",
+			allowPlanningHandoff: callee === "ralplan" || callee === "autoresearch" || callee === "ultragoal",
 		});
 
 	// Runtime callees have no native mode-state to clear later, so do not
