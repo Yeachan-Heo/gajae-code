@@ -243,17 +243,33 @@ export interface TmuxOwnerIsolationExecutionFailure {
 	ok: false;
 	code: PlanErrorCode;
 	diagnostic: string;
+	/** Bounded, secret-free stderr of the planned spawn, when it produced any. */
+	detail?: string;
 }
 export type TmuxOwnerIsolationExecutionResult = TmuxOwnerIsolationExecutionSuccess | TmuxOwnerIsolationExecutionFailure;
 
 /** Synchronous spawn boundary; callers pass argv and scoped stdin unchanged. */
 export interface TmuxOwnerIsolationExecutionDependencies {
 	socketKey: string;
-	spawn(argv: string[], stdinLine?: string): { exitCode: number | null; stdout?: string };
+	spawn(argv: string[], stdinLine?: string): { exitCode: number | null; stdout?: string; stderr?: string };
 	probeServer(socketKey: string): TmuxServerProof;
 	/** Reads the published owner generation immediately around direct execution. */
 	isCurrentGeneration?(): boolean;
 	cleanupSpawned?(input: { execution: DirectExecution; nativeSessionId: string; server: TmuxServerProof }): void;
+}
+
+/** Bound for the spawn-stderr detail carried out of a failed planned execution. */
+const SPAWN_DETAIL_MAX_LENGTH = 200;
+
+/** Collapses spawn stderr to one bounded, control-character-free line. */
+function boundedSpawnDetail(value: string | undefined): string | undefined {
+	if (!value) return undefined;
+	const cleaned = value
+		.replaceAll(/[\u0000-\u001f\u007f]+/gu, " ")
+		.replaceAll(/\s+/gu, " ")
+		.trim();
+	if (!cleaned) return undefined;
+	return cleaned.length <= SPAWN_DETAIL_MAX_LENGTH ? cleaned : `${cleaned.slice(0, SPAWN_DETAIL_MAX_LENGTH - 1)}…`;
 }
 
 function nativeTmuxSessionId(value: unknown): value is string {
@@ -489,12 +505,18 @@ export function executeTmuxOwnerIsolationPlanSync(
 			execution.mode === "direct"
 				? deps.spawn([...execution.argv])
 				: deps.spawn([...execution.argv], execution.stdin_line);
-		if (result.exitCode !== 0)
+		if (result.exitCode !== 0) {
+			// The spawn's own stderr is the only text that names WHY the multiplexer
+			// refused (for example "fork failed: Device not configured"). Dropping it
+			// left operators with an unactionable constant (#5128).
+			const detail = boundedSpawnDetail(result.stderr);
 			return {
 				ok: false,
 				code: "scope_bootstrap_failed",
 				diagnostic: "planned_spawn_failed",
+				...(detail === undefined ? {} : { detail }),
 			};
+		}
 		if (execution.mode === "scoped" && !isExactScopedBootstrapSuccessReceipt(result.stdout ?? ""))
 			return {
 				ok: false,

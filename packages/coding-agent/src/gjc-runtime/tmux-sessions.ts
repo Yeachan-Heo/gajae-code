@@ -851,7 +851,11 @@ export function createGjcTmuxSession(
 							env: executionEnv,
 						})
 					: Bun.spawnSync(argv, { stdout: "pipe", stderr: "pipe", env: executionEnv });
-				return { exitCode: result.exitCode, stdout: result.stdout.toString() };
+				return {
+					exitCode: result.exitCode,
+					stdout: result.stdout.toString(),
+					stderr: result.stderr.toString(),
+				};
 			} finally {
 				assertGjcTmuxStagedMutationAuthoritySync(authority);
 			}
@@ -872,7 +876,10 @@ export function createGjcTmuxSession(
 			);
 		},
 	});
-	if (!outcome.ok) throw new Error(`gjc_tmux_owner_isolation_${outcome.code}:${outcome.diagnostic}`);
+	if (!outcome.ok)
+		throw new Error(
+			`gjc_tmux_owner_isolation_${outcome.code}:${outcome.diagnostic}${outcome.detail ? `:${outcome.detail}` : ""}`,
+		);
 
 	const nativeSessionId = outcome.native_session_id ?? (provider.binary.isPsmux ? sessionName : undefined);
 	if (!nativeSessionId) throw new Error("gjc_tmux_owner_isolation_native_session_identity_unavailable");
