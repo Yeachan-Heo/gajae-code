@@ -430,8 +430,11 @@ function computeMergedEnvelope(
 	draft: DeepInterviewStageDraft,
 	nowIso: string,
 ): Record<string, unknown> {
-	if (current.active === false && current.current_phase === "handoff")
-		throw new DeepInterviewStageError("DI_STAGE_MERGE_REJECTED", "cannot stage after deep-interview handoff");
+	if (current.active === false)
+		throw new DeepInterviewStageError(
+			"DI_STAGE_MERGE_REJECTED",
+			"cannot stage after deep-interview handoff or completion",
+		);
 	// A poisoned (unverifiable) intent contract in the persisted base would make
 	// every merge throw forever; heal it instead of bricking the interview.
 	const { base: healedCurrent, healed } = healPoisonedIntentContract(current);
