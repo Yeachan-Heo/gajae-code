@@ -4581,43 +4581,75 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			let cleanupPromise: Promise<void> | undefined;
 			const finishCleanup = async (): Promise<void> => {
 				if (cleanupPromise) return cleanupPromise;
-				cleanupPromise = (async () => {
+				const cleanup = (async () => {
+					const failures: unknown[] = [];
 					try {
 						agentRegistry.unregister(resolvedAgentId);
 						releaseCredentialDisabledSubscription();
 						releaseLocalProtocolOverride();
+					} catch (error) {
+						failures.push(error);
 					} finally {
-						if (!options.parentTaskPrefix) {
-							retireOwnedRegistrationsForEndpoint(
-								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
-							);
-							AsyncJobManager.unregisterManager(asyncJobManager);
+						try {
+							if (!options.parentTaskPrefix) {
+								retireOwnedRegistrationsForEndpoint(
+									AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
+								);
+								AsyncJobManager.unregisterManager(asyncJobManager);
+							}
+						} catch (error) {
+							failures.push(error);
 						}
-						await closeOwnedAuthStorage();
-						await closeOwnedSettings();
+						try {
+							await closeOwnedAuthStorage();
+						} catch (error) {
+							failures.push(error);
+						}
+						try {
+							await closeOwnedSettings();
+						} catch (error) {
+							failures.push(error);
+						}
 					}
+					if (failures.length > 0) throw new AggregateError(failures, "SDK disposal cleanup failed.");
 				})();
-				return cleanupPromise;
+				cleanupPromise = cleanup;
+				void cleanup.catch(() => {
+					if (cleanupPromise === cleanup) cleanupPromise = undefined;
+				});
+				return cleanup;
 			};
 			session.dispose = async () => {
 				const boundedDispose = originalDispose();
-				void boundedDispose
-					.catch(async error => {
-						if (isSessionDisposalIncompleteError(error)) {
+				try {
+					await boundedDispose;
+					await finishCleanup();
+				} catch (error) {
+					if (isSessionDisposalIncompleteError(error)) {
+						void (async () => {
 							try {
 								await session.dispose();
 							} finally {
-								await finishCleanup();
+								try {
+									await finishCleanup();
+								} catch (cleanupError) {
+									logger.warn("Deferred SDK disposal cleanup failed", {
+										error: safeErrorForLog(cleanupError),
+									});
+								}
 							}
-							return;
-						}
+						})();
+						throw error;
+					}
+					try {
 						await finishCleanup();
-					})
-					.catch(error => {
-						logger.warn("Deferred SDK disposal cleanup failed", { error: safeErrorForLog(error) });
-					});
-				await boundedDispose;
-				await finishCleanup();
+					} catch (cleanupError) {
+						logger.warn("SDK disposal cleanup failed after terminal teardown error", {
+							error: safeErrorForLog(cleanupError),
+						});
+					}
+					throw error;
+				}
 			};
 		}
 
