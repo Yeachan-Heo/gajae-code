@@ -16211,6 +16211,7 @@ export class SessionManager {
 				await this.#rewriteFileContents();
 			} catch (error) {
 				priorPersistError ??= toError(error);
+				return { kind: "close_failed_retryable", error: priorPersistError };
 			}
 		}
 		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
@@ -16246,7 +16247,7 @@ export class SessionManager {
 		);
 		// Only tear down the resident blob store on a terminal outcome; a retryable
 		// close leaves the session live for a genuine retry.
-		if (!this.#persistWriter && !this.#needsFullRewriteOnNextPersist) {
+		if (!this.#persistWriter && (!this.persist || !this.#needsFullRewriteOnNextPersist)) {
 			this.#releaseResidentTextStore();
 			this.#retireEphemeralArtifacts();
 			try {
