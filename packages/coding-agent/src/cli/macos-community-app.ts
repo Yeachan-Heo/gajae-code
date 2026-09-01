@@ -156,29 +156,19 @@ async function removeClaimedDirectory(
 	identity: FileIdentity,
 	parentPath: string,
 	parentIdentity: FileIdentity,
+	quarantineRoot: string,
 	log: (message: string) => void,
 ): Promise<void> {
 	if (!(await sameDirectoryIdentity(parentPath, parentIdentity)) || !(await sameDirectoryIdentity(filePath, identity)))
 		return;
-	const tombstone = `${filePath}.cleanup-${process.pid}-${Date.now().toString(16)}`;
+	const tombstone = path.join(quarantineRoot, `claimed-app-${process.pid}-${Date.now().toString(16)}`);
 	try {
 		await fs.rename(filePath, tombstone);
-		const parentHandle = await fs.open(parentPath, "r");
-		try {
-			const parentStat = await parentHandle.stat({ bigint: true });
-			if (
-				parentStat.dev !== parentIdentity.dev ||
-				parentStat.ino !== parentIdentity.ino ||
-				!(await sameDirectoryIdentity(tombstone, identity)) ||
-				!(await sameDirectoryIdentity(parentPath, parentIdentity))
-			) {
-				log("Optional community app cleanup warning: claimed destination identity changed during removal");
-				return;
-			}
-			await fs.rm(tombstone, { recursive: true, force: true });
-		} finally {
-			await parentHandle.close();
+		if (!(await sameDirectoryIdentity(tombstone, identity))) {
+			log("Optional community app cleanup warning: claimed destination identity changed during removal");
+			return;
 		}
+		await fs.rm(tombstone, { recursive: true, force: true });
 	} catch (error) {
 		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
 	}
@@ -583,6 +573,7 @@ export async function offerMacosCommunityApp(
 		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
 			if (
+				tempRoot &&
 				destinationRootIdentity &&
 				(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
 				(await sameDirectoryIdentity(destination, destinationIdentity))
@@ -592,6 +583,7 @@ export async function offerMacosCommunityApp(
 					destinationIdentity,
 					destinationRoot,
 					destinationRootIdentity,
+					tempRoot,
 					log,
 				);
 			installedDestination = undefined;
@@ -603,6 +595,7 @@ export async function offerMacosCommunityApp(
 			try {
 				if (
 					destinationRoot &&
+					tempRoot &&
 					destinationRootIdentity &&
 					(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
 					(await sameDirectoryIdentity(installedDestination.path, installedDestination.identity))
@@ -612,6 +605,7 @@ export async function offerMacosCommunityApp(
 						installedDestination.identity,
 						destinationRoot,
 						destinationRootIdentity,
+						tempRoot,
 						log,
 					);
 			} catch (cleanupError) {
