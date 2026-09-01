@@ -325,6 +325,19 @@ describe("scope exclusion warnings are bounded", () => {
 		expect(warnings.at(-1)).toBe("20 scope warnings omitted");
 	});
 
+	test("fills the global cap when one source needs a summary", () => {
+		const warnings = boundWarningSources([
+			{ entries: ["broker"], describeOmitted: count => `${count} broker omitted` },
+			{
+				entries: Array.from({ length: SESSION_LIST_WARNING_LIMIT }, (_, index) => `scope-${index}`),
+				describeOmitted: count => `${count} scope omitted`,
+			},
+		]);
+
+		expect(warnings).toHaveLength(SESSION_LIST_WARNING_LIMIT);
+		expect(warnings.at(-1)).toBe("2 scope omitted");
+	});
+
 	test("does not emit a summary when a source fits within its allocation", () => {
 		const warnings = boundWarningSources([{ entries: ["one"], describeOmitted: count => `${count} omitted` }]);
 
