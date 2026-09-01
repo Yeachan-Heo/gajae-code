@@ -3055,8 +3055,7 @@ export class AgentSession {
 	#providerCacheSessionId: string | undefined;
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
-	#disposePromise: Promise<void> | undefined;
-	readonly #disposeDetachedOperations = new Set<Promise<unknown>>();
+	#disposeRunPromise: Promise<void> | undefined;
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
@@ -8957,9 +8956,7 @@ export class AgentSession {
 	 */
 	dispose(): Promise<void> {
 		this.#evalExecutionDisposing = true;
-		if (this.#disposePromise) return this.#disposePromise;
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		this.#disposePromise = promise;
+		if (this.#disposeRunPromise) return this.#disposeRunPromise;
 		this.#disposeDeadline = Date.now() + SIGNAL_TEARDOWN_TIMEOUT_MS;
 		this.#abortAdmissionEpoch++;
 		this.#isDisposed = true;
@@ -8978,13 +8975,14 @@ export class AgentSession {
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		this.#disconnectFromAgent();
-		void this.#dispose().then(resolve, error => {
-			// A deadline failure leaves owned resources in place for a retry; do not
-			// memoize the rejected attempt as the terminal disposal result.
-			this.#disposePromise = undefined;
-			reject(error);
+		const teardown = this.#dispose();
+		this.#disposeRunPromise = teardown;
+		const timeout = Bun.sleep(SIGNAL_TEARDOWN_TIMEOUT_MS).then(() => {
+			throw new Error("Session disposal incomplete: teardown exceeded the deadline.");
 		});
-		return promise;
+		const boundedTeardown = Promise.race([teardown, timeout]);
+		void teardown.catch(() => {});
+		return boundedTeardown;
 	}
 
 	/** Cancel the active logical run domain, including managed continuations detached from Agent's active attempt. */
@@ -8995,37 +8993,13 @@ export class AgentSession {
 
 	async #dispose(): Promise<void> {
 		const awaitDisposeStep = async <T>(label: string, operation: Promise<T>): Promise<T | undefined> => {
-			const remainingMs = this.#disposeDeadline - Date.now();
-			if (remainingMs <= 0) {
-				logger.warn("Session dispose deadline reached", { label });
-				this.#trackDetachedDisposeOperation(operation);
-				throw new Error(`Session disposal incomplete: ${label} exceeded the teardown deadline.`);
-			}
-			let timeout: NodeJS.Timeout | undefined;
-			const timedOut = Symbol("dispose-timeout");
-			const deadline = Promise.withResolvers<typeof timedOut>();
-			timeout = setTimeout(() => {
-				deadline.resolve(timedOut);
-			}, remainingMs);
-			timeout.unref?.();
 			try {
-				const result = await Promise.race([operation, deadline.promise]);
-				if (result === timedOut) {
-					this.#trackDetachedDisposeOperation(operation);
-					throw new Error(`Session disposal incomplete: ${label} exceeded the teardown deadline.`);
-				}
-				return result;
+				return await operation;
 			} catch (error) {
-				if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) throw error;
 				logger.warn("Session dispose step failed", { label, error: String(error) });
 				return undefined;
-			} finally {
-				if (timeout) clearTimeout(timeout);
 			}
 		};
-		if (this.#disposeDetachedOperations.size > 0) {
-			await awaitDisposeStep("previous disposal operations", Promise.allSettled(this.#disposeDetachedOperations));
-		}
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		await awaitDisposeStep("session admission close", admissionClosed);
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
@@ -9201,11 +9175,6 @@ export class AgentSession {
 		this.#rebuildEventListenerSnapshot();
 	}
 
-	#trackDetachedDisposeOperation(operation: Promise<unknown>): void {
-		const settled = operation.catch(() => {});
-		this.#disposeDetachedOperations.add(settled);
-		void settled.then(() => this.#disposeDetachedOperations.delete(settled));
-	}
 	/**
 	 * Strict writer close for ACP session delete. On the first attempt it flushes
 	 * pending writes, then returns the certainty-aware close outcome so the caller
