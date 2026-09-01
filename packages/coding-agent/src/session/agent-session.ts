@@ -2824,6 +2824,7 @@ export class AgentSession {
 	// Compaction state
 	#compactionAbortController: AbortController | undefined = undefined;
 	#compactionCompletion: Promise<void> | undefined;
+	#autoCompactionCompletions = new Set<Promise<AutoCompactionTerminalStatus>>();
 	#autoCompactionAbortController: AbortController | undefined = undefined;
 
 	/** Invocation-scoped EventStream drain barriers owned by active maintenance calls. */
@@ -9055,6 +9056,11 @@ export class AgentSession {
 			this.#forceSessionRecovery();
 		}
 		await awaitDisposeStep("active compaction", this.#compactionCompletion ?? Promise.resolve(), true);
+		await awaitDisposeStep(
+			"active auto-compaction",
+			Promise.allSettled([...this.#autoCompactionCompletions]).then(() => {}),
+			true,
+		);
 		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
 		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
 		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
@@ -17791,7 +17797,7 @@ export class AgentSession {
 
 	/** Trigger idle compaction through the auto-compaction flow (with UI events). */
 	async runIdleCompaction(): Promise<void> {
-		if (this.isStreaming || this.isCompacting) return;
+		if (this.#isDisposed || this.#sessionAdmissionClosing || this.isStreaming || this.isCompacting) return;
 		// Do not start idle compaction while a handoff transition owns the session.
 		if (this.isGeneratingHandoff || this.#handoffTransitionActive) return;
 		await this.#runAutoCompaction("idle", false, true);
@@ -19639,7 +19645,27 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	async #runAutoCompaction(
+	#runAutoCompaction(
+		reason: "overflow" | "threshold" | "idle",
+		willRetry: boolean,
+		deferred = false,
+		options?: {
+			continueAfterMaintenance?: boolean;
+			deferHandoffMaintenance?: boolean;
+			force?: boolean;
+			signal?: AbortSignal;
+			beforeTerminalOverflowNoop?: () => void;
+			resourceRunId?: string;
+		},
+	): Promise<AutoCompactionTerminalStatus> {
+		if (this.#isDisposed || this.#sessionAdmissionClosing) return Promise.resolve({ kind: "skipped" });
+		const completion = this.#runAutoCompactionImpl(reason, willRetry, deferred, options);
+		this.#autoCompactionCompletions.add(completion);
+		void completion.finally(() => this.#autoCompactionCompletions.delete(completion)).catch(() => {});
+		return completion;
+	}
+
+	async #runAutoCompactionImpl(
 		reason: "overflow" | "threshold" | "idle",
 		willRetry: boolean,
 		deferred = false,
