@@ -169,7 +169,7 @@ describe("deep-interview crystallize contract", () => {
 			const sessionFile = path.join(root, "conversation.jsonl");
 			await fs.writeFile(
 				sessionFile,
-				`${JSON.stringify({
+				`${JSON.stringify({ type: "session", id: "crystallize-test", cwd: root })}\n${JSON.stringify({
 					type: "message",
 					message: {
 						...value.snapshot.messages[0],
