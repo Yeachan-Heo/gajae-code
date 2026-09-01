@@ -168,6 +168,19 @@ async function connectModern(
 }
 
 describe("MCP 2026-07-28 strict stateless transport", () => {
+	it("binds the default roots handler to the connection cwd", async () => {
+		const fixture = startModernFixture();
+		const cwd = "/tmp/scoped mcp project";
+		const connection = await connectToServer("modern", httpConfig(fixture.url, "2026-07-28"), { cwd });
+		try {
+			await expect(connection.transport.onRequest?.("roots/list", {})).resolves.toEqual({
+				roots: [{ uri: "file:///tmp/scoped%20mcp%20project", name: "scoped mcp project" }],
+			});
+		} finally {
+			await disconnectServer(connection);
+		}
+	});
+
 	it("completes discover, tools/list, and tools/call without initialize, session id, or streams", async () => {
 		const fixture = startModernFixture();
 		const connection = await connectModern(fixture.url);

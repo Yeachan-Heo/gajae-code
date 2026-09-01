@@ -6,7 +6,14 @@
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getAgentDir, getProjectDir, isEnoent, logger } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getProjectDir,
+	isEnoent,
+	logger,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
 import * as zod from "zod/v4";
 import { getConfigDirs } from "../../config";
 import { execCommand } from "../../exec/exec";
@@ -65,6 +72,8 @@ export interface DiscoverCustomCommandsOptions {
 	cwd?: string;
 	/** Agent config directory. Default: from getAgentDir() */
 	agentDir?: string;
+	/** Resolver-owned profile classification. */
+	profileAuthority?: "default" | "custom";
 }
 
 export interface DiscoverCustomCommandsResult {
@@ -81,6 +90,17 @@ export async function discoverCustomCommands(
 ): Promise<DiscoverCustomCommandsResult> {
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
+	const resolverAuthority = getAgentProfileAuthority();
+	const profileAuthority =
+		options.profileAuthority ??
+		(resolverAuthority === "custom" ||
+		(options.agentDir !== undefined &&
+			normalizePathForComparison(options.agentDir) !== normalizePathForComparison(getAgentDir()))
+			? "custom"
+			: resolverAuthority);
+	// Custom profiles replace only the user scope. The default profile retains
+	// supported legacy roots such as ~/.gemini/commands.
+	const scopedUserAgentDir = profileAuthority === "custom" ? agentDir : undefined;
 	const paths: Array<{ path: string; source: CustomCommandSource }> = [];
 	const seen = new Set<string>();
 
@@ -92,14 +112,14 @@ export async function discoverCustomCommands(
 	};
 
 	const commandDirs: Array<{ path: string; source: CustomCommandSource }> = [];
-	if (agentDir) {
-		const userCommandsDir = path.join(agentDir, "commands");
+	if (scopedUserAgentDir) {
+		const userCommandsDir = path.join(scopedUserAgentDir, "commands");
 		if (fs.existsSync(userCommandsDir)) {
 			commandDirs.push({ path: userCommandsDir, source: "user" });
 		}
 	}
 
-	for (const entry of getConfigDirs("commands", { cwd, existingOnly: true, userAgentDir: agentDir })) {
+	for (const entry of getConfigDirs("commands", { cwd, existingOnly: true, userAgentDir: scopedUserAgentDir })) {
 		const source = entry.level === "user" ? "user" : "project";
 		if (!commandDirs.some(d => d.path === entry.path)) {
 			commandDirs.push({ path: entry.path, source });
@@ -139,6 +159,8 @@ export interface LoadCustomCommandsOptions {
 	cwd?: string;
 	/** Agent config directory. Default: from getAgentDir() */
 	agentDir?: string;
+	/** Resolver-owned profile classification. */
+	profileAuthority?: "default" | "custom";
 }
 
 /**
@@ -165,7 +187,7 @@ export async function loadCustomCommands(options: LoadCustomCommandsOptions = {}
 	const cwd = options.cwd ?? getProjectDir();
 	const agentDir = options.agentDir ?? getAgentDir();
 
-	const { paths } = await discoverCustomCommands({ cwd, agentDir });
+	const { paths } = await discoverCustomCommands({ cwd, agentDir, profileAuthority: options.profileAuthority });
 
 	const commands: LoadedCustomCommand[] = [];
 	const errors: Array<{ path: string; error: string }> = [];

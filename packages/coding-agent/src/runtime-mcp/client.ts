@@ -524,7 +524,8 @@ export async function connectToServer(
 		// Callers that do not advertise roots can reject roots/list via onRequest.
 		// (Modern-era transports never receive server-initiated requests; MRTR
 		// input requests arrive as input_required results instead.)
-		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
+		transport.onRequest =
+			options?.onRequest ?? ((method, params) => defaultRequestHandler(method, params, options?.cwd));
 
 		const connectLegacy = async (
 			negotiationState: "legacy-fallback" | "legacy-forced",

@@ -451,10 +451,11 @@ function getConfigSources(cwd: string, agentDir?: string, capturedAuthority?: "d
 	const resolverAuthority = capturedAuthority ?? getAgentProfileAuthority();
 	const selectedAgentDir = agentDir ?? (resolverAuthority === "custom" ? getAgentDir() : undefined);
 	const profileAuthority =
-		resolverAuthority === "custom" ||
+		capturedAuthority ??
+		(resolverAuthority === "custom" ||
 		(agentDir !== undefined && path.resolve(agentDir) !== path.resolve(getAgentDir()))
 			? "custom"
-			: "default";
+			: "default");
 	const isScopedProfile = profileAuthority === "custom";
 
 	// Project root files (highest priority)
