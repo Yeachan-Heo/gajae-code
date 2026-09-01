@@ -8977,7 +8977,12 @@ export class AgentSession {
 		this.agent.abort();
 		this.agent.setMainAttemptScopeObserver(undefined);
 		this.#disconnectFromAgent();
-		void this.#dispose().then(resolve, reject);
+		void this.#dispose().then(resolve, error => {
+			// A deadline failure leaves owned resources in place for a retry; do not
+			// memoize the rejected attempt as the terminal disposal result.
+			this.#disposePromise = undefined;
+			reject(error);
+		});
 		return promise;
 	}
 
@@ -9084,6 +9089,7 @@ export class AgentSession {
 				);
 			}
 		} catch (error) {
+			if (error instanceof Error && error.message.startsWith("Session disposal incomplete:")) throw error;
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
 		this.#workflowGateEmitter?.fence?.();
