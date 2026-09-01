@@ -2867,12 +2867,16 @@ export class Broker {
 		if (!endpoint.ok) return endpoint;
 		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
 			return error("endpoint_stale", "session endpoint is malformed");
+		await this.index.refresh();
+		const current = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (!current || !sameEndpointRecord(record, current))
+			return error("endpoint_stale", "session endpoint authority changed during replay refresh");
 		return {
 			endpoint: endpoint.result as Record<string, unknown>,
-			endpointGeneration: record.endpointGeneration,
-			pid: record.pid,
-			endpointMtimeMs,
-			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
+			endpointGeneration: current.endpointGeneration,
+			pid: current.pid,
+			endpointMtimeMs: current.endpointMtimeMs!,
+			...(current.endpointFileId === undefined ? {} : { endpointFileId: current.endpointFileId }),
 		};
 	}
 	async #readEndpoint(record: IndexedSession, authority: EndpointAuthority): Promise<BrokerResponse> {
@@ -3332,10 +3336,14 @@ export class Broker {
 							(replay.result as { sessionId: string }).sessionId,
 						);
 						if (isBrokerResponse(refreshed)) return refreshed;
+						const { endpointFileId: _staleEndpointFileId, ...replayResult } = replay.result as Record<
+							string,
+							unknown
+						>;
 						return {
 							ok: true,
 							result: {
-								...(replay.result as Record<string, unknown>),
+								...replayResult,
 								endpointGeneration: refreshed.endpointGeneration,
 								pid: refreshed.pid,
 								endpointMtimeMs: refreshed.endpointMtimeMs,

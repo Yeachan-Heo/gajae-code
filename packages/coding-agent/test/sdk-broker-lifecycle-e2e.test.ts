@@ -5019,6 +5019,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 					endpointGeneration: 1,
 					pid: host.pid + 1,
 					endpointMtimeMs: 1,
+					endpointFileId: "stale:identity",
 					reused: true,
 				},
 			},
@@ -5036,6 +5037,52 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 				pid: host.pid,
 				endpointMtimeMs,
 				endpointFileId,
+				reused: true,
+				endpoint: {
+					sessionId,
+					pid: host.pid,
+					url: "ws://127.0.0.1:1",
+					token: "successor-token",
+				},
+			},
+		});
+
+		const exactMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		await restarted.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 2,
+			pid: host.pid,
+			endpointMtimeMs: exactMtimeMs,
+			processIncarnation: hostIncarnation,
+			hostIncarnation,
+		});
+		const identityLessKey = "replay-authority-identity-less";
+		const identityLess = await deriveIdempotencyIdentity(agentDir, "session.resume", identityLessKey, targetHash);
+		expect(await restarted.ledger.begin(identityLess, requestHash)).toMatchObject({ kind: "new" });
+		await restarted.ledger.transition(identityLess, "terminal_ok", {
+			response: {
+				ok: true,
+				result: {
+					sessionId,
+					cwd: root,
+					endpointGeneration: 1,
+					pid: host.pid + 1,
+					endpointMtimeMs: 1,
+					endpointFileId: "stale:identity",
+					reused: true,
+				},
+			},
+		});
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, identityLessKey)).toEqual({
+			ok: true,
+			result: {
+				sessionId,
+				cwd: root,
+				endpointGeneration: 2,
+				pid: host.pid,
+				endpointMtimeMs: exactMtimeMs,
 				reused: true,
 				endpoint: {
 					sessionId,
