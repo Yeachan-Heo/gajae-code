@@ -4507,7 +4507,6 @@ export class AgentSession {
 		// fence refuses every later persist) and rebinds the postmortem finalizer, which
 		// otherwise keeps writing terminal state to the launch root's cwd/session file.
 		this.#unregisterAfterMoveListener = this.sessionManager.registerAfterMoveListener(async move => {
-			let completed = false;
 			try {
 				const relocated = await relocateCoordinatorRuntimeStateForRescope(
 					{
@@ -4528,13 +4527,10 @@ export class AgentSession {
 					this.#coordinatorRescopeMoveId,
 					move.previousCwd,
 				);
-				completed = true;
 			} finally {
 				this.#registerRuntimeStateFinalizer();
-				if (completed) {
-					this.#coordinatorRescopeMoveId = undefined;
-					this.#endCoordinatorRescopeBarrier();
-				}
+				this.#coordinatorRescopeMoveId = undefined;
+				this.#endCoordinatorRescopeBarrier();
 			}
 		});
 		// Power assertions are taken per turn (see #beginInFlight); nothing acquired here.
