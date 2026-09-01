@@ -6149,12 +6149,12 @@
 			"sdkId": "session.spawn",
 			"adapter": "acp",
 			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 			"testNamePattern": "AD-A-G09",
 			"argv": [
 				"bun",
 				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+				"packages/coding-agent/test/sdk-adapter-dispositions-acp-3.test.ts",
 				"--test-name-pattern",
 				"^AD-A-G09:"
 			],

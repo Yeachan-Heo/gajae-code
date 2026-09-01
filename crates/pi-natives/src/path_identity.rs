@@ -4894,7 +4894,11 @@ pub(crate) mod platform {
 			if information.st_mode & libc::S_IFMT != libc::S_IFREG || information.st_nlink != 1 {
 				let cleaned = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } == 0;
 				unsafe { libc::close(fd) };
-				return Err(if cleaned { "identity_mismatch" } else { "cleanup_failed" });
+				return Err(if cleaned {
+					"identity_mismatch"
+				} else {
+					"cleanup_failed"
+				});
 			}
 			return Ok((unsafe { File::from_raw_fd(fd) }, name, effective_mode as u32));
 		}
@@ -4903,10 +4907,7 @@ pub(crate) mod platform {
 
 	enum SkillPublicationError {
 		Pre(&'static str),
-		Post {
-			code:            &'static str,
-			staging_aliases: bool,
-		},
+		Post { code: &'static str, staging_aliases: bool },
 	}
 
 	fn replace_skill_file_name(
@@ -4999,8 +5000,8 @@ pub(crate) mod platform {
 		// payload must be scrubbed through the retained descriptor before the
 		// caller reports failure.  The public name is removed only after an exact
 		// descriptor/name comparison, so a concurrent successor is never touched.
-		let staging_aliases = (opened_after_ok && opened.st_nlink != 1)
-			|| (published_ok && published.st_nlink != 1);
+		let staging_aliases =
+			(opened_after_ok && opened.st_nlink != 1) || (published_ok && published.st_nlink != 1);
 		// The rename is already committed. Never unlink the public name from a
 		// transient validation failure: the retained descriptor still owns the
 		// newly published payload, and a later fstatat may be observing a safe
@@ -5010,7 +5011,8 @@ pub(crate) mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained published descriptor and parent descriptor remain live through exact scrub"
+		reason = "the retained published descriptor and parent descriptor remain live through exact \
+		          scrub"
 	)]
 	fn scrub_published_skill_file(
 		file: &File,
@@ -5025,8 +5027,7 @@ pub(crate) mod platform {
 		let same = unsafe { libc::fstat(file.as_raw_fd(), &mut opened) } == 0
 			&& unsafe {
 				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-			} == 0
-			&& opened.st_dev == named.st_dev
+			} == 0 && opened.st_dev == named.st_dev
 			&& opened.st_ino == named.st_ino;
 		if !same {
 			return Ok(());
@@ -5039,9 +5040,9 @@ pub(crate) mod platform {
 
 	/// Scrub a publication that has already crossed the rename boundary before
 	/// returning a failure.  The retained descriptor is the authority for the
-	/// payload, while the pathname is removed only after an exact descriptor/name
-	/// comparison; a concurrent successor is therefore never consumed by
-	/// cleanup.
+	/// payload, while the pathname is removed only after an exact
+	/// descriptor/name comparison; a concurrent successor is therefore never
+	/// consumed by cleanup.
 	fn fail_published_skill_file(
 		file: File,
 		skill_fd: libc::c_int,
@@ -5062,7 +5063,8 @@ pub(crate) mod platform {
 
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
-		reason = "the retained published descriptor and parent descriptor remain live through final validation"
+		reason = "the retained published descriptor and parent descriptor remain live through final \
+		          validation"
 	)]
 	fn published_skill_file_is_valid(
 		file: &File,
@@ -5075,17 +5077,16 @@ pub(crate) mod platform {
 			return Err("identity_mismatch");
 		}
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
-		if unsafe {
-			libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
-		} != 0 {
+		if unsafe { libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW) }
+			!= 0
+		{
 			return Err("identity_mismatch");
 		}
 		Ok(opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& expected_mode.map_or(true, |mode| {
 				u32::from(opened.st_mode & 0o7777) == mode && u32::from(named.st_mode & 0o7777) == mode
-			})
-			&& opened.st_nlink == 1
+			}) && opened.st_nlink == 1
 			&& named.st_nlink == 1
 			&& opened.st_dev == named.st_dev
 			&& opened.st_ino == named.st_ino)
@@ -5252,17 +5253,16 @@ pub(crate) mod platform {
 		// mode. Project skills are eventually 0644, but exposing their plaintext
 		// while the private name is live would permit an observer to retain a
 		// second hard link and defeat the single-link publication invariant.
-		let (mut file, private_name, _created_mode) =
-			match create_private_skill_file(skill_fd) {
-				Ok(value) => value,
-				Err(code) => {
-					unsafe {
-						libc::close(skill_fd);
-						libc::close(skills_fd);
-					}
-					return NativeSecureSkillWriteResult::failure(code);
-				},
-			};
+		let (mut file, private_name, _created_mode) = match create_private_skill_file(skill_fd) {
+			Ok(value) => value,
+			Err(code) => {
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(code);
+			},
+		};
 		// Harden every private staging inode, including project-scope writes.  A
 		// parent default ACL can grant read access despite mode 0600; clear and
 		// verify it before any payload bytes are written or the name is replaced.
@@ -10145,8 +10145,7 @@ mod platform {
 					READ_CONTROL | WRITE_DAC | WRITE_OWNER
 				} else {
 					0
-				}
-				| 0x0001_0000;
+				} | 0x0001_0000;
 			let file = match open_relative_with_disposition_status(
 				parent,
 				&name,
@@ -10303,14 +10302,11 @@ mod platform {
 				Err(code) => return NativeSecureSkillWriteResult::failure(code),
 			};
 		let skill_name = std::ffi::OsString::from(skill_name);
-		let skill_handle = match open_or_create_skill_directory(
-			skills.target,
-			&skill_name,
-			file_mode == 0o600,
-		) {
-			Ok(handle) => handle,
-			Err(code) => return NativeSecureSkillWriteResult::failure(code),
-		};
+		let skill_handle =
+			match open_or_create_skill_directory(skills.target, &skill_name, file_mode == 0o600) {
+				Ok(handle) => handle,
+				Err(code) => return NativeSecureSkillWriteResult::failure(code),
+			};
 		if let Err(code) = skill_directory_matches_volume(skill_handle, &canonical_volume) {
 			unsafe { CloseHandle(skill_handle) };
 			return NativeSecureSkillWriteResult::failure(code);
@@ -10351,11 +10347,11 @@ mod platform {
 		if let Err(code) = inspect_existing_skill_file(skill_parent, file_name) {
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		let (file, _private_name) =
-			match create_private_skill_file(skill_parent, file_mode == 0o600) {
-				Ok(file) => file,
-				Err(code) => return NativeSecureSkillWriteResult::failure(code),
-			};
+		let (file, _private_name) = match create_private_skill_file(skill_parent, file_mode == 0o600)
+		{
+			Ok(file) => file,
+			Err(code) => return NativeSecureSkillWriteResult::failure(code),
+		};
 		if let Err(code) = truncate_and_write_skill_file(file, content.as_bytes()) {
 			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };

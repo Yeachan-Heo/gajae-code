@@ -59,6 +59,20 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:getSessionAgentDir":
 		"internal session-scoped agent-directory accessor, not a user-facing SDK control seam",
+	"agent_session:getSessionProfileAuthority":
+		"internal session-scoped profile-authority accessor, not a user-facing SDK control seam",
+	"agent_session:replaceBuiltinTools":
+		"internal settings-rescope tool-registry rebuild, not a user-facing SDK control seam",
+	"agent_session:setRuntimeServices":
+		"internal settings-rescope runtime-service rebind, not a user-facing SDK control seam",
+	"agent_session:clearPlanModeStateForSessionTransition":
+		"internal session-transition cleanup, not a user-facing SDK control seam",
+	"agent_session:captureSessionIdentityForMode":
+		"internal workflow-mode identity capture, not a user-facing SDK control seam",
+	"agent_session:isSessionIdentityCurrentForMode":
+		"internal workflow-mode identity validation, not a user-facing SDK control seam",
+	"agent_session:isSessionEventCurrent":
+		"internal session-event freshness predicate, not a user-facing SDK control seam",
 	"agent_session:captureTerminalAbortSteeringSnapshot":
 		"internal terminal-abort steering snapshot, not a user-facing SDK control seam",
 	"agent_session:rebindTerminalAbortSteeringSnapshot":
