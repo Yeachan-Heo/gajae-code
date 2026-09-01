@@ -201,14 +201,25 @@ async function authoritativeConversationSnapshot(
 	if (!sessionFile) {
 		const candidates = [...listProjectSessionTranscriptFiles(cwd)];
 		const pending = [getSessionsDir()];
+		const visitedDirectories = new Set<string>();
+		const maxDirectories = 4096;
+		let visitedEntries = 0;
+		const maxEntries = 100_000;
 		while (pending.length > 0 && candidates.length < 1000) {
 			const directory = pending.pop()!;
+			if (visitedDirectories.has(directory)) continue;
+			visitedDirectories.add(directory);
+			if (visitedDirectories.size > maxDirectories)
+				throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded directory limit");
 			let entries: Array<{ isDirectory(): boolean; isFile(): boolean; name: string }> = [];
 			try {
 				entries = await fs.readdir(directory, { withFileTypes: true });
 			} catch {
 				continue;
 			}
+			visitedEntries += entries.length;
+			if (visitedEntries > maxEntries)
+				throw new DeepInterviewCommandError(2, "session transcript discovery exceeded the bounded entry limit");
 			for (const entry of entries) {
 				const candidate = path.join(directory, entry.name);
 				if (entry.isDirectory()) pending.push(candidate);
