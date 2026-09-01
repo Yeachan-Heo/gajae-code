@@ -475,6 +475,14 @@ function computeMergedEnvelope(
 				"DI_STAGE_MERGE_REJECTED",
 				"crystallized execution approval is immutable through staged apply",
 			);
+		if (
+			JSON.stringify(mergedState.execution_approval_receipt) !==
+			JSON.stringify(priorState.execution_approval_receipt)
+		)
+			throw new DeepInterviewStageError(
+				"DI_STAGE_MERGE_REJECTED",
+				"crystallized execution approval provenance is immutable through staged apply",
+			);
 		for (const field of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const)
 			if (merged[field] !== current[field])
 				throw new DeepInterviewStageError(
