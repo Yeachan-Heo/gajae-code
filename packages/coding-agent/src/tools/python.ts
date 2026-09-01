@@ -26,6 +26,8 @@ export interface SessionPythonToolInput {
 	getCwd?: () => string;
 	/** Session settings used for Python runtime policy. */
 	settings?: SettingsType;
+	/** Resolve the current session settings after a cwd rescope. */
+	getSettings?: () => SettingsType;
 	/** Resolve the GJC session id used for the kernel owner and transcript paths. */
 	getSessionId: () => string | null;
 	/** Register cleanup with the current logical session lifecycle. */
@@ -163,7 +165,7 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 
 			seenOwnerIds.add(ownerId);
 			try {
-				const activeSettings = input.settings ?? Settings.instance;
+				const activeSettings = input.getSettings?.() ?? input.settings ?? Settings.instance;
 				const result = await executePython(code, {
 					cwd,
 					settings: activeSettings,

@@ -26,7 +26,7 @@ export function memoryRootsFromRegistry(): string[] {
 		const session = ref.session;
 		const sm = session?.sessionManager;
 		if (!sm) continue;
-		const agentDir = session.settings?.getAgentDir() ?? getAgentDir();
+		const agentDir = session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.() ?? getAgentDir();
 		const root = getMemoryRootForSession(agentDir, sm.getCwd());
 		if (root && !roots.includes(root)) roots.push(root);
 	}

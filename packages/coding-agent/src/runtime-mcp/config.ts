@@ -133,6 +133,10 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const filterExa = exactConfig ? false : (options?.filterExa ?? true);
 	const filterBrowser = exactConfig ? false : (options?.filterBrowser ?? false);
 	const autoloadOnly = exactConfig || (options?.autoloadOnly ?? false);
+	// Keep the denylist read on the same profile as capability discovery. An
+	// injected Settings instance is authoritative when no explicit directory
+	// was supplied; only the ordinary no-options path falls back to getAgentDir.
+	const agentDir = options?.agentDir ?? options?.settings?.getAgentDir?.();
 
 	let servers: MCPServer[];
 	let disabledServers: Set<string>;
@@ -164,9 +168,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		// must not abort discovery of valid servers in the other scope (the
 		// capability loader itself is already per-file tolerant).
 		const [userDisabled, projectDisabled] = await Promise.all([
-			readDisabledServers(
-				getMCPConfigPath("user", cwd, options?.agentDir ?? options?.settings?.getAgentDir?.()),
-			).catch(() => []),
+			readDisabledServers(getMCPConfigPath("user", cwd, agentDir)).catch(() => []),
 			readDisabledServers(getMCPConfigPath("project", cwd)).catch(() => []),
 		]);
 		disabledServers = new Set([...userDisabled, ...projectDisabled]);

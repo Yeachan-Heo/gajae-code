@@ -173,7 +173,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// itself: project scope beats user scope.
 	const loadOptions = {
 		cwd,
-		agentDir: agentDir ?? (home === undefined ? undefined : resolveUserAgentDir(resolvedHome)),
+		// Settings owns the selected profile when no explicit agent directory was
+		// supplied. Only fall back to the injected home after both authorities are
+		// absent; otherwise policy and files can come from different profiles.
+		agentDir:
+			agentDir ?? settings?.getAgentDir() ?? (home === undefined ? undefined : resolveUserAgentDir(resolvedHome)),
 		providers: ["native"],
 		disabledExtensions,
 		settings,

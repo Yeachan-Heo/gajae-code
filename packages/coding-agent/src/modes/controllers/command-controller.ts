@@ -721,7 +721,7 @@ export class CommandController {
 	async handleMemoryCommand(text: string): Promise<void> {
 		const argumentText = text.slice(7).trim();
 		const action = argumentText.split(/\s+/, 1)[0]?.toLowerCase() || "view";
-		const agentDir = this.ctx.settings.getAgentDir();
+		const agentDir = this.ctx.session.getSessionAgentDir?.() ?? this.ctx.settings.getAgentDir();
 		const backend = await this.ctx.session.memoryBackend.get("memory-command");
 
 		if (action === "view") {

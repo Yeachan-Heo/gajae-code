@@ -16,7 +16,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as natives from "@gajae-code/natives";
-import { getAgentDir, getAgentProfileAuthority, getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getTrustedHomeDir,
+	normalizePathForComparison,
+	parseFrontmatter,
+} from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
@@ -221,7 +227,15 @@ export async function listNativeSkillsForManagement(options: {
 	const homeWasInjected = options.home !== undefined;
 	const home = options.home ?? getRuntimeHome();
 	const agentDir = options.agentDir ?? (homeWasInjected ? resolveUserAgentDir(home) : getAgentDir());
-	const profileAuthority = options.profileAuthority ?? (!homeWasInjected ? getAgentProfileAuthority() : undefined);
+	const profileAuthority =
+		options.profileAuthority ??
+		(options.agentDir !== undefined
+			? normalizePathForComparison(options.agentDir) === normalizePathForComparison(getAgentDir())
+				? getAgentProfileAuthority()
+				: "custom"
+			: !homeWasInjected
+				? getAgentProfileAuthority()
+				: undefined);
 	const policy = options.policy;
 	const projectTrusted = resolveSkillScopeTrust(policy ?? {}, "project");
 	const userTrusted = resolveSkillScopeTrust(policy ?? {}, "user");
@@ -310,7 +324,13 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 	const name = input.name.trim();
 	if (!name) throw new SkillFrontmatterError("skill name is required");
 
-	const { frontmatter } = parseFrontmatter(input.content, { source: "<skill-content>", level: "fatal" });
+	let frontmatter: Record<string, unknown> | undefined;
+	try {
+		frontmatter = parseFrontmatter(input.content, { source: "<skill-content>", level: "fatal" }).frontmatter;
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new SkillFrontmatterError(message);
+	}
 	if (!frontmatter) throw new SkillFrontmatterError("skill content must start with a YAML frontmatter block (---)");
 	const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
 	if (!description) throw new SkillFrontmatterError("skill frontmatter must include a non-empty description");
@@ -323,17 +343,21 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const secureWriteSkillFile = getSecureWriteSkillFileNative();
-	const result = await secureWriteSkillFile(
-		directory,
-		effectiveName,
-		`${input.content.trimEnd()}\n`,
-		input.scope === "project" ? 0o644 : 0o600,
-	);
+	let result: Awaited<ReturnType<SecureWriteSkillFileAsync>>;
+	try {
+		result = await secureWriteSkillFile(
+			directory,
+			effectiveName,
+			`${input.content.trimEnd()}\n`,
+			input.scope === "project" ? 0o644 : 0o600,
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new SkillNativeWriteError(`secure native skill write failed: ${message}`);
+	}
 	if (!result.ok) {
 		if (result.code === "unsupported_platform" || result.code === "native_unavailable")
 			throw new SkillNativeWriteUnavailableError();
-		if (result.code === "reparse_point")
-			throw new SkillFrontmatterError("secure native skill write rejected a symbolic link");
 		throw new SkillNativeWriteError(`secure native skill write failed: ${result.code ?? "unknown"}`);
 	}
 	const filePath = result.path;

@@ -4556,7 +4556,7 @@ pub(crate) mod platform {
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::ENOTDIR) => "not_directory",
 			Some(libc::EISDIR) => "not_regular_file",
-			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			Some(libc::EACCES) | Some(libc::EPERM) => "permission_denied",
 			Some(libc::EROFS) => "permission_denied",
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::EINVAL) => "invalid_request",
@@ -4598,9 +4598,14 @@ pub(crate) mod platform {
 		} else {
 			true
 		};
+		let created_identity = if created { statat_fd(parent_fd, name).ok() } else { None };
 		let reopened = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
 		if reopened < 0 {
-			return Err(skill_write_error(&std::io::Error::last_os_error()));
+			let error = std::io::Error::last_os_error();
+			if let Some(expected) = created_identity {
+				let _ = remove_created_directory_if_exact(parent_fd, name, &expected);
+			}
+			return Err(skill_write_error(&error));
 		}
 		Ok((reopened, created))
 	}
@@ -4681,6 +4686,21 @@ pub(crate) mod platform {
 		Ok(named)
 	}
 
+	fn remove_created_directory_if_exact(
+		parent_fd: libc::c_int,
+		name: &CString,
+		expected: &libc::stat,
+	) -> Result<(), &'static str> {
+		let current = statat_fd(parent_fd, name)?;
+		if current.st_mode & libc::S_IFMT != libc::S_IFDIR || !stat_same_object(expected, &current) {
+			return Err("identity_mismatch");
+		}
+		if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+			return Err(skill_write_error(&std::io::Error::last_os_error()));
+		}
+		Ok(())
+	}
+
 	/// Descriptor-walk an absolute path, creating missing directories along the
 	/// way. The returned path is the no-alias spelling used by the walk (not a
 	/// second, race-prone `realpath` lookup).
@@ -4726,11 +4746,19 @@ pub(crate) mod platform {
 				},
 			};
 			let next = unsafe { File::from_raw_fd(next) };
+			let child_identity = fstat(next.as_raw_fd()).map_err(|_| "io_error")?;
 			if created && unsafe { libc::fchmod(next.as_raw_fd(), directory_mode) } != 0 {
-				return Err(skill_write_error(&std::io::Error::last_os_error()));
+				let code = skill_write_error(&std::io::Error::last_os_error());
+				let cleanup = remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
+				drop(next);
+				return Err(cleanup.err().unwrap_or(code));
 			}
 			if created {
-				fsync_root_parent(current.as_raw_fd())?;
+				if let Err(code) = fsync_root_parent(current.as_raw_fd()) {
+					let cleanup = remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
+					drop(next);
+					return Err(cleanup.err().unwrap_or(code));
+				}
 			}
 			let parent_initial = fstat(current.as_raw_fd()).map_err(|_| "io_error")?;
 			let child_initial = fstat(next.as_raw_fd()).map_err(|_| "io_error")?;
@@ -4754,7 +4782,7 @@ pub(crate) mod platform {
 	fn inspect_existing_skill_file(
 		parent_fd: libc::c_int,
 		name: &CString,
-	) -> Result<bool, &'static str> {
+	) -> Result<Option<u32>, &'static str> {
 		let fd = unsafe {
 			libc::openat(
 				parent_fd,
@@ -4765,7 +4793,7 @@ pub(crate) mod platform {
 		if fd < 0 {
 			let error = std::io::Error::last_os_error();
 			return if error.raw_os_error() == Some(libc::ENOENT) {
-				Ok(false)
+				Ok(None)
 			} else {
 				Err(skill_write_error(&error))
 			};
@@ -4781,7 +4809,7 @@ pub(crate) mod platform {
 			if information.st_nlink > 1 {
 				return Err("hard_link");
 			}
-			Ok(information.st_nlink == 1)
+			Ok(Some((information.st_mode & 0o7777) as u32))
 		})();
 		unsafe { libc::close(fd) };
 		result
@@ -4794,7 +4822,7 @@ pub(crate) mod platform {
 	fn create_private_skill_file(
 		parent_fd: libc::c_int,
 		file_mode: u32,
-	) -> Result<(File, CString), &'static str> {
+	) -> Result<(File, CString, u32), &'static str> {
 		for _ in 0..16 {
 			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
 			let name = CString::new(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence))
@@ -4819,21 +4847,26 @@ pub(crate) mod platform {
 				}
 				return Err(skill_write_error(&error));
 			}
-			if unsafe { libc::fchmod(fd, file_mode as libc::mode_t) } != 0 {
+			let mut information: libc::stat = unsafe { std::mem::zeroed() };
+			if unsafe { libc::fstat(fd, &mut information) } != 0 {
 				let error = std::io::Error::last_os_error();
 				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 				unsafe { libc::close(fd) };
 				return Err(skill_write_error(&error));
 			}
-			let mut information: libc::stat = unsafe { std::mem::zeroed() };
-			let valid = unsafe { libc::fstat(fd, &mut information) } == 0
-				&& information.st_mode & libc::S_IFMT == libc::S_IFREG
-				&& information.st_nlink == 1;
-			if !valid {
+			let effective_mode = information.st_mode & 0o7777;
+			if unsafe { libc::fchmod(fd, 0o600) } != 0 {
+				let error = std::io::Error::last_os_error();
+				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
+				unsafe { libc::close(fd) };
+				return Err(skill_write_error(&error));
+			}
+			if information.st_mode & libc::S_IFMT != libc::S_IFREG || information.st_nlink != 1 {
+				let _ = unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) };
 				unsafe { libc::close(fd) };
 				return Err("identity_mismatch");
 			}
-			return Ok((unsafe { File::from_raw_fd(fd) }, name));
+			return Ok((unsafe { File::from_raw_fd(fd) }, name, effective_mode as u32));
 		}
 		Err("race_limit")
 	}
@@ -5059,19 +5092,8 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure("invalid_request");
 		};
-		if let Err(code) = inspect_existing_skill_file(skill_fd, &final_name) {
-			unsafe {
-				libc::close(skill_fd);
-				libc::close(skills_fd);
-			}
-			return NativeSecureSkillWriteResult::failure(code);
-		}
-		// Keep the staging name owner-only regardless of the requested published
-		// mode. Project skills are eventually 0644, but exposing their plaintext
-		// while the private name is live would permit an observer to retain a
-		// second hard link and defeat the single-link publication invariant.
-		let (mut file, private_name) = match create_private_skill_file(skill_fd, 0o600) {
-			Ok(value) => value,
+		let existing_mode = match inspect_existing_skill_file(skill_fd, &final_name) {
+			Ok(mode) => mode,
 			Err(code) => {
 				unsafe {
 					libc::close(skill_fd);
@@ -5080,6 +5102,22 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(code);
 			},
 		};
+		let requested_file_mode = existing_mode.unwrap_or(file_mode);
+		// Keep the staging name owner-only regardless of the requested published
+		// mode. Project skills are eventually 0644, but exposing their plaintext
+		// while the private name is live would permit an observer to retain a
+		// second hard link and defeat the single-link publication invariant.
+		let (mut file, private_name, created_mode) =
+			match create_private_skill_file(skill_fd, requested_file_mode) {
+				Ok(value) => value,
+				Err(code) => {
+					unsafe {
+						libc::close(skill_fd);
+						libc::close(skills_fd);
+					}
+					return NativeSecureSkillWriteResult::failure(code);
+				},
+			};
 		if file_mode == 0o600 {
 			#[cfg(target_os = "linux")]
 			if let Err(code) = secure_created_owner_only_file(&file) {
@@ -5092,13 +5130,14 @@ pub(crate) mod platform {
 				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 			}
 			#[cfg(target_os = "macos")]
-			if clear_and_verify_macos_acl(file.as_raw_fd()).is_err() {
+			if let Err(code) = clear_and_verify_macos_acl(file.as_raw_fd()) {
+				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 				drop(file);
 				unsafe {
 					libc::close(skill_fd);
 					libc::close(skills_fd);
 				}
-				return NativeSecureSkillWriteResult::failure("acl_verify_failed");
+				return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 			}
 		}
 		if file.write_all(content.as_bytes()).is_err() {
@@ -5124,7 +5163,8 @@ pub(crate) mod platform {
 		if file_mode != 0o600 {
 			// Establish the final mode while the file is still private. A permission
 			// failure must never report failure after the payload becomes visible.
-			if unsafe { libc::fchmod(file.as_raw_fd(), file_mode as libc::mode_t) } != 0 {
+			let published_mode = existing_mode.unwrap_or(created_mode);
+			if unsafe { libc::fchmod(file.as_raw_fd(), published_mode as libc::mode_t) } != 0 {
 				let code = skill_write_error(&std::io::Error::last_os_error());
 				let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 				drop(file);
@@ -5642,7 +5682,10 @@ pub(crate) mod platform {
 		Err(match std::io::Error::last_os_error().raw_os_error() {
 			Some(libc::EEXIST) => "already_exists",
 			Some(libc::EXDEV) => "cross_device",
-			Some(libc::EACCES | libc::EPERM) => "permission_denied",
+			// A filesystem without hard links reports EPERM for a valid request, which
+			// is indistinguishable here from a denied one; both leave the destination
+			// unpublished.
+			Some(libc::EACCES) | Some(libc::EPERM) => "permission_denied",
 			Some(libc::ENOENT) => "not_found",
 			Some(libc::EINTR) => "interrupted",
 			_ => "io_error",

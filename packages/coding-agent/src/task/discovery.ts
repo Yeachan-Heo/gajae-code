@@ -90,25 +90,23 @@ export async function discoverAgents(
 			normalizePathForComparison(selectedAgentDir) !== normalizePathForComparison(getAgentDir()))
 			? "custom"
 			: resolverAuthority);
-	const agentSources = Array.from(
-		new Set(getConfigDirs("", { project: false, userAgentDir: resolvedAgentDir }).map(entry => entry.source)),
-	);
+	// A selected custom profile replaces only the user scope. The default
+	// profile must retain its compatibility roots (including ~/.gemini), and
+	// project discovery must always consider both supported project sources.
+	const scopedUserAgentDir = resolvedProfileAuthority === "custom" ? resolvedAgentDir : undefined;
 
 	// Get user directories (priority order: .gjc, ...)
-	const userDirs = getConfigDirs("agents", { project: false, userAgentDir: resolvedAgentDir })
-		.filter(entry => agentSources.includes(entry.source))
-		.map(entry => ({
-			...entry,
-			path: path.resolve(entry.path),
-		}));
+	const userDirs = getConfigDirs("agents", { project: false, userAgentDir: scopedUserAgentDir }).map(entry => ({
+		...entry,
+		path: path.resolve(entry.path),
+	}));
 
 	// Get project directories by walking up from cwd (priority order)
-	const projectDirs = findAllNearestProjectConfigDirs("agents", resolvedCwd)
-		.filter(entry => agentSources.includes(entry.source))
-		.map(entry => ({
-			...entry,
-			path: path.resolve(entry.path),
-		}));
+	const projectDirs = findAllNearestProjectConfigDirs("agents", resolvedCwd).map(entry => ({
+		...entry,
+		path: path.resolve(entry.path),
+	}));
+	const agentSources = Array.from(new Set([...userDirs, ...projectDirs].map(entry => entry.source)));
 
 	const orderedSources = agentSources.filter(
 		source => userDirs.some(entry => entry.source === source) || projectDirs.some(entry => entry.source === source),

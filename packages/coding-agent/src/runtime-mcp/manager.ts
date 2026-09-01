@@ -977,6 +977,8 @@ export class MCPManager {
 			throw new Error("Tools-only MCP manager already loaded an explicit config");
 		}
 		if (this.#toolsOnly) this.#toolsOnlyConfigLoaded = true;
+		const settings = options?.settings ?? this.#settings;
+		const agentDir = options?.agentDir ?? this.#agentDir ?? settings?.getAgentDir?.();
 		const { configs, exaApiKeys, sources, configurationWarning } = await loadAllMCPConfigs(this.cwd, {
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
@@ -984,8 +986,8 @@ export class MCPManager {
 			autoloadOnly: options?.autoloadOnly,
 			nativeOnly: options?.nativeOnly,
 			configPath: options?.configPath,
-			agentDir: options?.agentDir ?? this.#agentDir,
-			settings: options?.settings ?? this.#settings,
+			agentDir,
+			settings,
 			profileAuthority: options?.profileAuthority ?? this.#profileAuthority,
 		});
 		const result = await this.#connectServers(configs, sources, options?.onConnecting);

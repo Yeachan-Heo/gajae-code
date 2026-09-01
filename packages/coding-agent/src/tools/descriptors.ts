@@ -337,6 +337,7 @@ const loaders: Record<string, Loader> = {
 			module.createSessionPythonTool({
 				cwd: session.cwd,
 				settings: session.settings,
+				getSettings: () => session.settings,
 				getCwd: () => session.cwd,
 				getSessionId: () => session.getSessionId?.() ?? null,
 				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {

@@ -1415,7 +1415,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 	const cwd = options.cwd ?? getProjectDir();
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
-	const agentDir = options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir();
+	// Resolve the selected profile once at session admission. A relative agent
+	// directory must not be reinterpreted against a process cwd changed by a
+	// later session rescope.
+	const agentDir = path.resolve(options.agentDir ?? options.settings?.getAgentDir() ?? getDefaultAgentDir());
 	const profileAuthority: "default" | "custom" =
 		getAgentProfileAuthority() === "custom" ||
 		normalizePathForComparison(agentDir) !== normalizePathForComparison(getDefaultAgentDir())
@@ -1423,7 +1426,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			: "default";
 	if (options.agentDir !== undefined && options.settings?.isAgentDirExplicit()) {
 		const settingsAgentDir = path.resolve(options.settings.getAgentDir());
-		if (path.resolve(options.agentDir) !== settingsAgentDir) {
+		if (normalizePathForComparison(path.resolve(options.agentDir)) !== normalizePathForComparison(settingsAgentDir)) {
 			throw new Error("options.agentDir and options.settings must resolve to the same profile");
 		}
 	}
@@ -2675,13 +2678,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
 					await replaceSkillsBestEffort(skills);
 				} catch (error) {
-					skills = [];
-					await replaceSkillsBestEffort([]);
+					skills = getEmbeddedDefaultGjcSkills();
+					await replaceSkillsBestEffort(skills);
 					warnRefreshFailure("Failed to reload skills after session rescope", error);
 				}
 			} else if (options.skills === undefined) {
-				skills = [];
-				await replaceSkillsBestEffort([]);
+				skills = getEmbeddedDefaultGjcSkills();
+				await replaceSkillsBestEffort(skills);
 			}
 			if (options.rules === undefined) {
 				try {
@@ -4865,12 +4868,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			sessionManager,
 			settings,
-			// The session's REQUESTED agent directory when the caller explicitly
-			// supplied it, independent of the reused global Settings singleton
-			// (which may belong to an earlier session). When the option is
-			// absent, the injected settings instance's own profile wins via the
-			// AgentSession fallback - never the process default.
-			agentDir: options.agentDir,
+			// The resolved session profile is authoritative even when the caller
+			// supplied a relative option or injected settings instance.
+			agentDir,
 			profileAuthority,
 			memoryBackend: runtimeServices.memoryBackend,
 			notificationSessionController,

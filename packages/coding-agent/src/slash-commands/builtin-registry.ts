@@ -2137,14 +2137,11 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		allowArgs: true,
 		handle: async (command, runtime) => {
 			const verb = (command.args.trim().split(/\s+/)[0] ?? "").toLowerCase() || "view";
+			const agentDir = runtime.session.getSessionAgentDir?.() ?? runtime.settings.getAgentDir();
 			switch (verb) {
 				case "view": {
 					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
-					const payload = await backend.buildDeveloperInstructions(
-						runtime.settings.getAgentDir(),
-						runtime.settings,
-						runtime.session,
-					);
+					const payload = await backend.buildDeveloperInstructions(agentDir, runtime.settings, runtime.session);
 					await runtime.output(
 						payload || "Memory payload is empty; durable memory is unavailable or unconfirmed.",
 					);
@@ -2153,7 +2150,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				case "clear":
 				case "reset": {
 					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
-					await backend.clear(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+					await backend.clear(agentDir, runtime.cwd, runtime.session);
 					await runtime.session.refreshBaseSystemPrompt();
 					await runtime.output("Memory cleared.");
 					return commandConsumed();
@@ -2161,7 +2158,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 				case "enqueue":
 				case "rebuild": {
 					const backend = await runtime.session.memoryBackend.get("memory-slash-command");
-					await backend.enqueue(runtime.settings.getAgentDir(), runtime.cwd, runtime.session);
+					await backend.enqueue(agentDir, runtime.cwd, runtime.session);
 					await runtime.output("Memory consolidation enqueued.");
 					return commandConsumed();
 				}

@@ -528,9 +528,12 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 		pathOf: server => server._source.path,
 		extensionIdOf: server => mcpCapability.toExtensionId?.(server),
 	});
-	const disabledServers = new Set(
-		await readDisabledServers(getMCPConfigPath("user", cwd, activeSettings.getAgentDir())),
-	);
+	const agentDir = activeSettings.getAgentDir();
+	const [userDisabled, projectDisabled] = await Promise.all([
+		readDisabledServers(getMCPConfigPath("user", cwd, agentDir)).catch(() => []),
+		readDisabledServers(getMCPConfigPath("project", cwd)).catch(() => []),
+	]);
+	const disabledServers = new Set([...userDisabled, ...projectDisabled]);
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// The startup projection: `loadAllMCPConfigs` is what a session uses when
@@ -542,10 +545,7 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 	const surfaceWarnings: string[] = [];
 	try {
 		connectableNames = new Set(
-			Object.keys(
-				(await loadAllMCPConfigs(cwd, { settings: activeSettings, agentDir: activeSettings.getAgentDir() }))
-					.configs,
-			),
+			Object.keys((await loadAllMCPConfigs(cwd, { settings: activeSettings, agentDir })).configs),
 		);
 	} catch (error) {
 		surfaceWarnings.push(
@@ -649,6 +649,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 		pathOf: skill => skill.path,
 		extensionIdOf: skill => skillCapability.toExtensionId?.(skill),
 	});
+	const agentDir = activeSettings.getAgentDir();
 	const skillsEnabled = activeSettings.get("skills.enabled") === true;
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
@@ -662,7 +663,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 		const result = await loadSkills({
 			...activeSettings.getGroup("skills"),
 			cwd,
-			agentDir: activeSettings.getAgentDir(),
+			agentDir,
 			settings: activeSettings,
 			disabledExtensions: activeSettings.get("disabledExtensions"),
 		});
@@ -1021,13 +1022,12 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 		pathOf: cmd => cmd.path,
 		extensionIdOf: cmd => slashCommandCapability.toExtensionId?.(cmd),
 	});
+	const agentDir = activeSettings.getAgentDir();
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// Exact session-startup consumer (interactive/print modes).
 	const loadedNames = new Set(
-		(await loadSlashCommands({ cwd, agentDir: activeSettings.getAgentDir(), settings: activeSettings })).map(
-			cmd => cmd.name,
-		),
+		(await loadSlashCommands({ cwd, agentDir, settings: activeSettings })).map(cmd => cmd.name),
 	);
 
 	const items: CustomizeDoctorItem[] = entries.map(entry => {

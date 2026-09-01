@@ -8,6 +8,9 @@
 
 ## [0.16.0] - 2026-09-02
 
+### Added
+
+- Exposed `secureWriteSkillFile` to publish user-scope skill files through descriptor/handle-relative, atomic native writes. Unsafe traversal, reparse/symlink, hard-link, identity-replacement, cleanup, and unsupported-platform cases fail closed instead of falling back to path-based writes (#4769).
 - Added exact-identity detached cleanup export for safely removing stale claim files without following replacement paths or retaining the JavaScript lifecycle; cleanup dispatch uses a bounded native worker queue and reports queue admission so callers can retry saturation.
 
 ## [0.15.6] - 2026-08-30
@@ -42,10 +45,6 @@
 ### Fixed
 
 - Windows bash-tool children no longer open visible console windows when GJC runs as a console-less ACP/GUI host (#4883). The native brush shell spawned every external command with default creation flags, so from a console-less parent each child (python/cmd/powershell) made Windows allocate its own visible top-level console — a flashing, focus-stealing window per bash call. External spawns now add `CREATE_NO_WINDOW` when the host process has no console (`GetConsoleWindow() == null`), composed with `CREATE_NEW_PROCESS_GROUP` so cancellation still works; a hidden console is inherited by grandchildren instead of letting them allocate fresh visible ones (`DETACHED_PROCESS` is deliberately not used). Console-attached interactive sessions are unchanged: they keep inheriting the parent console. The shell-session `where git` probe gets the same treatment, and the contract is covered by Windows-gated Rust tests plus a live windows-latest regression (`windows-hidden-shell.windows.test.ts`) that detaches the host console and asserts child console-window state via P/Invoke.
-
-### Added
-
-- Exposed `secureWriteSkillFile` to publish user-scope skill files through descriptor/handle-relative, atomic native writes. Unsafe traversal, reparse/symlink, hard-link, identity-replacement, cleanup, and unsupported-platform cases fail closed instead of falling back to path-based writes (#4769).
 
 ## [0.15.0] - 2026-08-22
 ### Fixed
