@@ -5220,9 +5220,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (!memoryBackend) throw new Error("Memory backend became ready without a resident value.");
 				await memoryBackend.start({
 					session,
-					settings,
+					settings: session.settings,
 					modelRegistry,
-					agentDir,
+					agentDir: session.getSessionAgentDir?.() ?? agentDir,
 					taskDepth,
 					parentHindsightSessionState: options.parentHindsightSessionState,
 				});

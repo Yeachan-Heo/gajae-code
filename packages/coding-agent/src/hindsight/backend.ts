@@ -49,13 +49,11 @@ function isSessionDisposed(session: AgentSession): boolean {
 
 function makeStartGuard(session: AgentSession, epoch: number, sessionId: string): StartGuard {
 	const managerSessionId = session.sessionManager.getSessionId();
-	const managerSessionFile = session.sessionManager.getSessionFile();
 	return () =>
 		startEpochBySession.get(session) === epoch &&
 		!isSessionDisposed(session) &&
 		session.sessionId === sessionId &&
-		session.sessionManager.getSessionId() === managerSessionId &&
-		session.sessionManager.getSessionFile() === managerSessionFile;
+		session.sessionManager.getSessionId() === managerSessionId;
 }
 
 /** Reload the active session's mental-model cache and prompt. */
