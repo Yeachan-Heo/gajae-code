@@ -1,7 +1,7 @@
 ---
 name: deep-interview
 description: Socratic deep interview with mathematical ambiguity gating before explicit execution approval
-argument-hint: "[--trace] [--quick|--standard|--deep] <idea or vague description>"
+argument-hint: "[--crystallize] [--trace] [--quick|--standard|--deep] <idea or vague description>"
 pipeline: [deep-interview, ralplan]
 handoff-policy: approval-required
 handoff: .gjc/_session-{sessionid}/specs/deep-interview-{slug}.md
@@ -74,6 +74,14 @@ source: "forked from upstream deep-interview skill and rebranded for GJC"
 - After 3 consecutive agent-resolved answers (accepted auto-answers), route the next question to the user (dialectic rhythm guard)
 - Run an independent closure audit and a one-sentence goal restatement, each requiring explicit user confirmation, before crystallizing the spec
 - When `--trace` is active, use the bounded trace evidence summary as pre-question context; never dump raw logs, raw files, or unbounded search output into questions, scoring, specs, or handoffs
+
+### Crystallize sub-mode
+
+`--crystallize` is a bounded shortcut on this skill, not a new workflow or an execution path. Use it only when the current conversation already contains material requirements and decisions. Before any state write, capture a deterministic conversation snapshot with an explicit message range, source revision, and digest. Extract each item into exactly one of `confirmed`, `inferred`, or `disputed`; every confirmed goal, constraint, decision, and acceptance criterion MUST retain a verbatim source anchor. Do not treat inferred or disputed text as confirmed.
+
+Submit the bounded snapshot and extraction through the native crystallize writer. The writer is the sole promoter into the existing deep-interview state/spec shape; exploration remains non-canonical. A sufficient snapshot creates a versioned Crystal/spec without replaying interview rounds. One or two blocking gaps may be asked through `ask`; unresolved consequential choices use the existing lateral/adversarial review hook. Broad ambiguity MUST fall back to the ordinary full interview flow. Never create a Crystal when the snapshot revision or digest is stale or mismatched.
+
+When a prior Crystal exists, compare only evidence after its bound revision. Preserve unchanged confirmed material and record a versioned delta: additive requirements create the next version, changed constraints or decisions reopen affected fields and invalidate execution approval, changed goals supersede the prior Crystal, and conflicting later evidence marks it stale rather than overwriting it. Every promoted Crystal records `spec_version`, source range/revision/digest, classifications, anchors, open gaps, and `execution_approval: not-approved` unless a separate existing approval gate later records approval. Crystallization MUST NOT invoke implementation, `run`, `ralplan`, or any automatic handoff.
 </Execution_Policy>
 
 <Internal_Auto_Mode_Protocol>

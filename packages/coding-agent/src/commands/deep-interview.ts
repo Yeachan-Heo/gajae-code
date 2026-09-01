@@ -15,6 +15,7 @@ All deep-interview state operations go through this command — no gjc state nee
   discard             Remove the pending draft
   clear               Clear deep-interview state for the session (lifecycle passthrough)
   handoff             Hand off to the next workflow skill (lifecycle passthrough)
+  --crystallize       Promote a bounded conversation snapshot into a versioned Crystal
 
 Ambiguity is runtime-owned: apply/write derive current_ambiguity from the latest valid scored
 round and clamp it to the deterministic floor. Sessions resolve from --session-id, payload
@@ -24,6 +25,7 @@ session_id, or GJC_SESSION_ID.`;
 		quick: Flags.boolean({ description: "Seed a quick deep-interview run" }),
 		standard: Flags.boolean({ description: "Seed a standard deep-interview run" }),
 		deep: Flags.boolean({ description: "Seed a deep deep-interview run" }),
+		crystallize: Flags.boolean({ description: "Crystallize a bounded conversation snapshot into a versioned spec" }),
 		trace: Flags.boolean({ description: "Run a bounded trace evidence pre-step before interview questions" }),
 		threshold: Flags.string({ description: "Override ambiguity threshold for kickoff" }),
 		"threshold-source": Flags.string({ description: "Describe the threshold override source" }),
@@ -55,6 +57,7 @@ session_id, or GJC_SESSION_ID.`;
 		"$ gjc deep-interview apply --json",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md --deliberate",
+		"$ gjc deep-interview --crystallize --input @conversation.json --slug my-feature --json",
 	];
 
 	async run(): Promise<void> {
