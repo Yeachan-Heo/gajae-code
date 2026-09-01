@@ -367,28 +367,42 @@ async function handleCrystallizeUnlocked(
 	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
 	const priorRecord = isRecord(storedPrior) ? storedPrior : undefined;
 	const priorSource = priorRecord && isRecord(priorRecord.source) ? priorRecord.source : undefined;
-	if (priorSource && Array.isArray(priorSource.messages)) {
+	const priorStart = priorSource && typeof priorSource.start === "number" ? priorSource.start : undefined;
+	const priorEnd = priorSource && typeof priorSource.end === "number" ? priorSource.end : undefined;
+	const priorRevision = priorSource && typeof priorSource.revision === "number" ? priorSource.revision : undefined;
+	const priorDigest = priorSource && typeof priorSource.digest === "string" ? priorSource.digest : undefined;
+	const priorSpecVersion =
+		priorRecord && typeof priorRecord.spec_version === "number" ? priorRecord.spec_version : undefined;
+	if (
+		priorSource &&
+		priorStart !== undefined &&
+		priorEnd !== undefined &&
+		priorRevision !== undefined &&
+		priorDigest &&
+		Array.isArray(priorSource.messages)
+	) {
 		const priorMessages = priorSource.messages as CrystalSnapshot["messages"];
-		const livePriorMessages = liveSnapshot.messages.slice(priorSource.start, priorSource.end + 1);
+		const livePriorMessages = liveSnapshot.messages.slice(priorStart, priorEnd + 1);
 		if (
-			priorSource.start < 0 ||
-			priorSource.end < priorSource.start ||
-			priorSource.end >= liveSnapshot.messages.length ||
+			priorStart < 0 ||
+			priorEnd < priorStart ||
+			priorEnd >= liveSnapshot.messages.length ||
 			JSON.stringify(priorMessages) !== JSON.stringify(livePriorMessages) ||
 			crystalSnapshotDigest({
-				revision: priorSource.revision,
-				start: priorSource.start,
-				end: priorSource.end,
+				revision: priorRevision,
+				start: priorStart,
+				end: priorEnd,
 				messages: priorMessages,
-				digest: priorSource.digest,
-			}) !== priorSource.digest
+			}) !== priorDigest
 		)
 			throw new DeepInterviewCommandError(2, "prior Crystal source evidence does not match the live transcript");
 	}
 	if (
 		priorSource &&
-		priorSource.revision === snapshot.revision &&
-		priorSource.digest === snapshot.digest &&
+		priorRevision === snapshot.revision &&
+		priorDigest === snapshot.digest &&
+		priorRecord &&
+		priorSpecVersion !== undefined &&
 		existingSpecPath &&
 		existingSpecHash
 	) {
@@ -396,7 +410,7 @@ async function handleCrystallizeUnlocked(
 		const specMatch = /^deep-interview-(.+)-v[0-9]+\.md$/.exec(specName);
 		const recoverySlug = specMatch?.[1];
 		if (!recoverySlug) throw new DeepInterviewCommandError(2, "canonical Crystal publication identity is invalid");
-		const recoveryMutationId = `crystal:${sessionId}:${priorRecord.spec_version}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}\0${existingSpecHash}`).digest("hex")}`;
+		const recoveryMutationId = `crystal:${sessionId}:${priorSpecVersion}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}\0${existingSpecHash}`).digest("hex")}`;
 		const pending = await readWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
 		if (
 			pending &&
@@ -432,7 +446,7 @@ async function handleCrystallizeUnlocked(
 				cwd,
 				sessionId,
 				payload: existing,
-				phase: existing.current_phase,
+				phase: typeof existing.current_phase === "string" ? existing.current_phase : "handoff",
 				specStatus: "persisted",
 			});
 			await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
