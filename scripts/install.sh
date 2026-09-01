@@ -658,7 +658,7 @@ install_binary() {
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && ln "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
-            if [ -f "$OFFER_RUNTIME" ] && [ "$OFFER_RUNTIME" -ef "$DEST_PATH" ]; then
+            if [ -f "$OFFER_RUNTIME" ] && [ "$OFFER_RUNTIME" -ef "$DEST_PATH" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME"; then
                 "$OFFER_RUNTIME" macos-community-app-offer || true
             fi
             rm -rf "$OFFER_RUNTIME_DIR" || true
