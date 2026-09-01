@@ -583,6 +583,13 @@ function readReplayGap(
 }
 
 function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession): boolean {
+	const sameEndpointAuthority =
+		expected.endpointMtimeMs !== undefined &&
+		current.endpointMtimeMs !== undefined &&
+		(expected.endpointFileId === undefined
+			? current.endpointMtimeMs === expected.endpointMtimeMs
+			: current.endpointFileId === expected.endpointFileId &&
+				Math.abs(current.endpointMtimeMs - expected.endpointMtimeMs) <= 0.001);
 	return (
 		current.sessionId === expected.sessionId &&
 		current.live &&
@@ -590,8 +597,7 @@ function sameIndexedAuthority(expected: IndexedSession, current: IndexedSession)
 		!current.terminalUncertain &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
-		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		(expected.endpointFileId === undefined || current.endpointFileId === expected.endpointFileId) &&
+		sameEndpointAuthority &&
 		current.locator.cwd === expected.locator.cwd &&
 		resolveEquivalentPath(current.locator.stateRoot) === resolveEquivalentPath(expected.locator.stateRoot) &&
 		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
@@ -604,8 +610,23 @@ type AdoptedSession = {
 	readonly generation: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
+	readonly endpointFileId?: string;
 	readonly attachment: SessionAttachment;
 };
+
+function matchesAdoptedSessionAuthority(adopted: AdoptedSession, indexed: IndexedSession): boolean {
+	if (
+		indexed.endpointGeneration !== adopted.generation ||
+		indexed.pid !== adopted.pid ||
+		indexed.endpointMtimeMs === undefined
+	)
+		return false;
+	if (adopted.endpointFileId === undefined) return indexed.endpointMtimeMs === adopted.endpointMtimeMs;
+	return (
+		indexed.endpointFileId === adopted.endpointFileId &&
+		Math.abs(indexed.endpointMtimeMs - adopted.endpointMtimeMs) <= 0.001
+	);
+}
 
 /**
  * Broker-index-backed SDK attachment authority. Providers receive only opaque
@@ -1288,9 +1309,7 @@ export class SessionRouter {
 				indexedSession?.live === true &&
 				isSessionAuthorityEligible(indexedSession) &&
 				!indexedSession.terminalUncertain &&
-				indexedSession.endpointGeneration === adopted.generation &&
-				indexedSession.pid === adopted.pid &&
-				indexedSession.endpointMtimeMs === adopted.endpointMtimeMs;
+				matchesAdoptedSessionAuthority(adopted, indexedSession);
 			const endpoint = exactIndex ? await this.#readEndpoint(indexedSession).catch(() => null) : null;
 			if (
 				!exactIndex ||
@@ -1584,9 +1603,7 @@ export class SessionRouter {
 			existing !== undefined &&
 			existing.endpoint.url === endpoint.url &&
 			existing.endpoint.token === endpoint.token &&
-			existing.generation === indexed.endpointGeneration &&
-			existing.pid === indexed.pid &&
-			existing.endpointMtimeMs === indexed.endpointMtimeMs &&
+			sameIndexedAuthority(existing.indexed, indexed) &&
 			endpointIdentity !== undefined &&
 			sameEndpointIdentity(existing.endpointIdentity, endpointIdentity);
 		if (
@@ -1621,8 +1638,7 @@ export class SessionRouter {
 					existing.generation === indexed.endpointGeneration &&
 						(existing.endpoint.url !== endpoint.url ||
 							existing.endpoint.token !== endpoint.token ||
-							existing.pid !== indexed.pid ||
-							existing.endpointMtimeMs !== indexed.endpointMtimeMs ||
+							!sameIndexedAuthority(existing.indexed, indexed) ||
 							endpointIdentity === undefined ||
 							!sameEndpointIdentity(existing.endpointIdentity, endpointIdentity))
 						? "replaced_same_generation"
@@ -1807,6 +1823,7 @@ export class SessionRouter {
 				generation: indexed.endpointGeneration,
 				pid: indexed.pid,
 				endpointMtimeMs: indexed.endpointMtimeMs,
+				...(indexed.endpointFileId === undefined ? {} : { endpointFileId: indexed.endpointFileId }),
 				attachment: capability,
 			});
 		try {

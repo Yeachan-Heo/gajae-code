@@ -1,4 +1,4 @@
-import { afterEach, expect, test, vi } from "bun:test";
+import { afterEach, expect, type Mock, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as syncFs from "node:fs";
 import { renameSync, writeFileSync } from "node:fs";
@@ -5109,7 +5109,7 @@ test("idempotent lifecycle replay rejects preserved-mtime endpoint identity tran
 		const displacedPath = `${endpointPath}.displaced`;
 		const host = spawnDisposableHost();
 		const broker = new Broker({ agentDir });
-		let refreshSpy: ReturnType<typeof vi.spyOn> | undefined;
+		let refreshSpy: Mock<() => Promise<void>> | undefined;
 		try {
 			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
 			await fs.writeFile(
