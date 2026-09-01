@@ -7402,6 +7402,7 @@ export class SessionManager {
 	/** Defense-in-depth (#4443): one-shot warn for adjacent private thinking blocks in persisted assistant transcripts. */
 	#warnedAdjacentThinkingPersist = false;
 	#closeRetryPending = false;
+	#strictClosePending = false;
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
@@ -16195,6 +16196,7 @@ export class SessionManager {
 	 * writer closure before any destructive operation.
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
+		this.#strictClosePending = true;
 		// Drain staged successors on the strict ACP dispose path as well as best-effort close (#3138).
 		try {
 			await this.#retryPreparedNewSessionCleanups();
@@ -17321,6 +17323,7 @@ export class SessionManager {
 	}
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.#sessionFile) return;
+		if (this.#strictClosePending) throw new Error("Session manager is closing.");
 		const publishResumeBreadcrumb = this.#readOnlyResume;
 		if (this.#persistError) throw this.#persistError;
 

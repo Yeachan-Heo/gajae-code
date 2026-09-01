@@ -4638,7 +4638,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									});
 								}
 							}
-						})();
+						})().catch(error => {
+							logger.warn("Deferred SDK teardown failed", { error: safeErrorForLog(error) });
+						});
 						throw error;
 					}
 					try {
