@@ -8988,16 +8988,21 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
+		let disposalIncomplete = false;
 		const awaitDisposeStep = async <T>(label: string, operation: Promise<T>): Promise<T | undefined> => {
 			const remainingMs = this.#disposeDeadline - Date.now();
 			if (remainingMs <= 0) {
 				logger.warn("Session dispose deadline reached", { label });
+				disposalIncomplete = true;
 				void operation.catch(() => {});
 				return undefined;
 			}
 			let timeout: NodeJS.Timeout | undefined;
 			const deadline = Promise.withResolvers<undefined>();
-			timeout = setTimeout(() => deadline.resolve(undefined), remainingMs);
+			timeout = setTimeout(() => {
+				disposalIncomplete = true;
+				deadline.resolve(undefined);
+			}, remainingMs);
 			timeout.unref?.();
 			try {
 				return await Promise.race([operation, deadline.promise]);
@@ -9032,12 +9037,13 @@ export class AgentSession {
 		// R2-5: give the aborted Agent run a bounded chance to settle, then force-
 		// invalidate its run id so an abort-ignoring provider/tool cannot emit a late
 		// message_end after teardown. Mirrors AgentSession.abort({ timeoutMs }).
+		const idleBudgetMs = Math.max(0, Math.min(2_000, this.#disposeDeadline - Date.now()));
 		const disposeIdleSettled = await Promise.race([
 			this.agent.waitForIdle().then(
 				() => true,
 				() => true,
 			),
-			Bun.sleep(2_000).then(() => false),
+			Bun.sleep(idleBudgetMs).then(() => false),
 		]);
 		if (!disposeIdleSettled) {
 			try {
@@ -9179,6 +9185,7 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
+		if (disposalIncomplete) throw new Error("Session disposal completed with incomplete timed-out cleanup steps.");
 	}
 	/**
 	 * Strict writer close for ACP session delete. On the first attempt it flushes
@@ -10027,7 +10034,10 @@ export class AgentSession {
 						// The lease keeps writers out for the whole execution, so this can
 						// only trip if a caller bypassed the lease; surface it rather than
 						// returning a result computed against a retired cwd.
-						if (this.sessionManager.getCwdGeneration() !== admittedGeneration) {
+						if (
+							this.sessionManager.getCwdGeneration() !== admittedGeneration &&
+							!this.sessionManager.consumeNestedCwdMove(admittedGeneration)
+						) {
 							throw new Error(
 								"Session working directory changed while this tool executed; retry against the new cwd.",
 							);
