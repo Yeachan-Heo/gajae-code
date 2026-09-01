@@ -690,6 +690,16 @@ install_binary() {
             OFFER_RUNTIME_DIR=""
         fi
         OFFER_RUNTIME_ACTIVE=""
+        OFFER_SIGNAL_EXIT=0
+        case "$OFFER_RUNTIME_SIGNAL" in
+            INT) OFFER_SIGNAL_EXIT=130 ;;
+            TERM) OFFER_SIGNAL_EXIT=143 ;;
+            HUP) OFFER_SIGNAL_EXIT=129 ;;
+        esac
+        OFFER_RUNTIME_SIGNAL=""
+        if [ "$OFFER_SIGNAL_EXIT" -ne 0 ]; then
+            exit "$OFFER_SIGNAL_EXIT"
+        fi
     fi
 
     case ":$PATH:" in
