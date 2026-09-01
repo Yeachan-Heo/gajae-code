@@ -163,7 +163,10 @@ async function removeClaimedDirectory(
 	const tombstone = `${filePath}.cleanup-${process.pid}-${Date.now().toString(16)}`;
 	try {
 		await fs.rename(filePath, tombstone);
-		if (!(await sameDirectoryIdentity(tombstone, identity))) {
+		if (
+			!(await sameDirectoryIdentity(parentPath, parentIdentity)) ||
+			!(await sameDirectoryIdentity(tombstone, identity))
+		) {
 			log("Optional community app cleanup warning: claimed destination identity changed during removal");
 			return;
 		}
