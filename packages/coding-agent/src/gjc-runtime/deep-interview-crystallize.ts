@@ -168,7 +168,10 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (integer(value.current_revision, "current_revision") !== snapshot.revision)
 		throw new Error("conversation snapshot is stale");
 	const items = validateItems(value.items, snapshot);
+	if (snapshot.messages.length === 0 || items.length === 0)
+		throw new Error("crystallize requires material conversation evidence");
 	const gaps = normalizedGaps(value.open_gaps);
+	if (gaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
 	const conflicts = normalizedGaps(value.conflicts);
 	const prior = value.prior;
 	if (prior !== undefined && !isRecord(prior)) throw new Error("prior crystal is invalid");
