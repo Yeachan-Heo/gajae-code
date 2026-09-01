@@ -275,7 +275,6 @@
 - Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
 
 ## [0.15.1] - 2026-08-25
-
 ### Added
 
 - Added `/language [en|ko]`, the interactive slash command for the persisted `ui.language` selection. Without arguments it reports the current language; with a canonical code, locale tag (`en-US`, `ko-KR`), endonym (`한국어`), English name, or common aliases (`eng`, `kr`, `kor`) it persists the canonical `en`/`ko` value through settings and confirms in the selected language. An unsupported value is rejected with the available list and changes nothing. See `docs/ui-language.md`.

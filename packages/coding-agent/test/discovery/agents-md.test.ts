@@ -124,6 +124,24 @@ describe("AGENTS.md discovery bounds", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	test.skipIf(process.platform === "win32")("rejects a hardlinked candidate in isolated-home mode", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-hardlink-"));
+		const home = path.join(tempDir, "home");
+		const project = path.join(home, "project");
+		const outside = path.join(tempDir, "outside.md");
+		const candidate = path.join(project, "AGENTS.md");
+		try {
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(outside, "outside instructions");
+			fs.linkSync(outside, candidate);
+			await expect(loadAgentsMd({ cwd: project, home, repoRoot: project, isolatedHome: true })).resolves.toEqual({
+				items: [],
+				warnings: [],
+			});
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	test("ignores non-regular AGENTS.md candidates", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-"));
 		const agentPath = path.join(tempDir, "AGENTS.md");

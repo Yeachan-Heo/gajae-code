@@ -49,7 +49,8 @@ async function readBoundedAgentsMdFile(
 			const canonicalPath = await fs.realpath(filePath);
 			if (canonicalPath !== path.resolve(filePath)) return { content: null, byteLength: 0, tooLarge: false };
 			before = await fs.lstat(filePath);
-			if (before.isSymbolicLink() || !before.isFile()) return { content: null, byteLength: 0, tooLarge: false };
+			if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1)
+				return { content: null, byteLength: 0, tooLarge: false };
 		}
 		const flags =
 			fs.constants.O_RDONLY |
@@ -59,7 +60,8 @@ async function readBoundedAgentsMdFile(
 		try {
 			const stats = await file.stat();
 			if (!stats.isFile()) return { content: null, byteLength: 0, tooLarge: false };
-			if (before && !sameFileIdentity(before, stats)) return { content: null, byteLength: 0, tooLarge: false };
+			if (before && (!sameFileIdentity(before, stats) || stats.nlink !== 1))
+				return { content: null, byteLength: 0, tooLarge: false };
 			if (before) {
 				const after = await fs.lstat(filePath);
 				if (after.isSymbolicLink() || !sameFileIdentity(before, after))
