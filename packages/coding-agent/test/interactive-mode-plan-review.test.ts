@@ -573,6 +573,39 @@ describe("InteractiveMode plan review rendering", () => {
 		});
 	});
 
+	it("refreshes the lifecycle identity after approve-and-execute creates the successor session", async () => {
+		const planFilePath = "local://PLAN.md";
+		const finalPlanFilePath = "local://APPROVED.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nTransition and execute.");
+
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
+		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
+			action: "Approve and execute",
+			comments: [],
+			notes: "",
+			snapshotHash: planSnapshotHash("# Plan\n\nTransition and execute."),
+		});
+		const clear = vi.spyOn(mode, "handleClearCommand").mockImplementation(() => session.newSession());
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
+
+		expect(clear).toHaveBeenCalledTimes(1);
+		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
+			synthetic: true,
+		});
+	});
+
 	it("does not dispatch an approved plan when fresh-session creation is refused", async () => {
 		const planFilePath = "local://PLAN.md";
 		const finalPlanFilePath = "local://APPROVED.md";
@@ -650,6 +683,42 @@ describe("InteractiveMode plan review rendering", () => {
 		// turn doesn't double-inject the plan reference (it was just dispatched
 		// inside the synthetic prompt).
 		expect(markSentSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("refreshes the lifecycle identity after approve-and-compact transitions the session", async () => {
+		const planFilePath = "local://PLAN.md";
+		const finalPlanFilePath = "local://APPROVED.md";
+		const resolvedPlanPath = resolveLocalUrlToPath(planFilePath, {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		});
+		await Bun.write(resolvedPlanPath, "# Plan\n\nTransition, compact, and execute.");
+
+		mode.planModeController.setEnabledForCompatibility(true);
+		mode.planModeController.setPlanFilePathForCompatibility(planFilePath);
+		vi.spyOn(SelectorController.prototype, "showPlanPreview").mockResolvedValue({
+			action: "Approve and compact context",
+			comments: [],
+			notes: "",
+			snapshotHash: planSnapshotHash("# Plan\n\nTransition, compact, and execute."),
+		});
+		const compact = vi.spyOn(mode, "handleCompactCommand").mockImplementation(async () => {
+			await session.newSession();
+			return "ok";
+		});
+		const prompt = vi.spyOn(session, "prompt").mockResolvedValue(undefined as never);
+
+		await mode.planModeController.handleApproval({
+			planFilePath,
+			planExists: true,
+			title: "PLAN",
+			finalPlanFilePath,
+		});
+
+		expect(compact).toHaveBeenCalledTimes(1);
+		expect(prompt).toHaveBeenCalledWith(expect.any(String), {
+			synthetic: true,
+		});
 	});
 	it("finalizes the reviewed bytes when the draft changes during destination publication", async () => {
 		const planFilePath = "local://PLAN.md";

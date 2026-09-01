@@ -572,12 +572,12 @@ export class PlanModeController {
 			reviewerComments?: string;
 		},
 	): Promise<void> {
-		const lifecycle = this.#captureLifecycle();
+		let lifecycle = this.#captureLifecycle();
 		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		await this.#finalizeApprovedPlan(planContent, options.planFilePath, options.finalPlanFilePath);
 		if (!this.#isLifecycleCurrent(lifecycle)) return;
 		const previousTools = this.#previousTools ?? this.ctx.session.getActiveToolNames();
-		const compactAbortMarkerOwner = options.compactBeforeExecute ? this.#captureLifecycle() : undefined;
+		let compactAbortMarkerOwner = options.compactBeforeExecute ? this.#captureLifecycle() : undefined;
 		if (compactAbortMarkerOwner) this.ctx.session.markPlanCompactAbortPending();
 		let sessionSwitchCompleted = true;
 		let compactOutcome: CompactionOutcome | undefined;
@@ -586,8 +586,10 @@ export class PlanModeController {
 			if (!this.#isLifecycleCurrent(lifecycle)) return;
 			if (!options.preserveContext) {
 				sessionSwitchCompleted = await this.ctx.handleClearCommand();
-				if (!this.#isLifecycleCurrent(lifecycle)) return;
 				if (sessionSwitchCompleted) {
+					// Creating the successor session is the approved execution transition;
+					// adopt its identity rather than fencing out the rest of this approval.
+					lifecycle = this.#captureLifecycle();
 					await Bun.write(
 						resolveLocalUrlToPath(options.finalPlanFilePath, {
 							getArtifactsDir: () => this.ctx.sessionManager.getArtifactsDir(),
@@ -597,7 +599,7 @@ export class PlanModeController {
 						planContent,
 					);
 					if (!this.#isLifecycleCurrent(lifecycle)) return;
-				}
+				} else if (!this.#isLifecycleCurrent(lifecycle)) return;
 			} else if (options.compactBeforeExecute) {
 				this.ctx.session.setPlanReferencePath(options.finalPlanFilePath);
 				this.#planApprovalDispatchPending = true;
@@ -605,7 +607,10 @@ export class PlanModeController {
 					compactOutcome = await this.ctx.handleCompactCommand(
 						prompt.render(planModeCompactInstructionsPrompt, { planFilePath: options.finalPlanFilePath }),
 					);
-					if (!this.#isLifecycleCurrent(lifecycle)) return;
+					// Compaction may commit a new session/context identity as part of the
+					// approved transition. Continue fenced to that intentional successor.
+					lifecycle = this.#captureLifecycle();
+					compactAbortMarkerOwner = lifecycle;
 				} catch (error) {
 					this.#planApprovalDispatchPending = false;
 					if (this.#isLifecycleCurrent(lifecycle)) await this.ctx.flushCompactionQueue({ willRetry: false });
