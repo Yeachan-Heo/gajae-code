@@ -2008,7 +2008,7 @@ async function persistCoordinatorRuntimeToolActivity(
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
-assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						// A tool event that lands after the session settled must never
 						// resurrect it into a live-looking state.
@@ -2093,7 +2093,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
-assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
@@ -2172,7 +2172,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
-assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						const now = new Date().toISOString();
 						const terminalPersistenceFailed =
@@ -3138,7 +3138,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 					await withStateFileLock(stateFile, async () => {
 						assertNoRuntimeStateRescopeJournal(context, identity);
 						const previous = readPreviousPayload(stateFile);
-assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
+						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
 						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
 						// The immutable owner verdict remains in its lifecycle artifact; never replace a
