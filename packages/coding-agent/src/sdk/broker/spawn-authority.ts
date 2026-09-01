@@ -307,6 +307,23 @@ function isOpaque(value: unknown): value is string {
  * A bounded, single-line, control-character-free operator note. It is the only
  * free-form text the claim journal accepts, so its shape is validated here
  * rather than trusted from the caller.
+ *
+ * `FORBIDDEN_FIELD` bans a field NAMED `stderr` because a raw child stream is
+ * not journalable evidence; the one substrate diagnostic that may quote a
+ * multiplexer's stderr is secret-free by construction, not by filtering:
+ *
+ * - the planned tmux argv inlines only the `GJC_*` child environment
+ *   (`prepareSpawnChildHostLaunch` in `lifecycle.ts`), and
+ *   `GJC_MASTER_CAPABILITY` is stripped there before the spec is built, so no
+ *   capability material is ever a command-line token tmux could echo;
+ * - the inherited environment travels out-of-band through
+ *   `Bun.spawnSync({ env })`, never as argv, so it cannot appear in an error
+ *   line either;
+ * - task text never reaches the substrate layer at all: the prompt is delivered
+ *   over the child's authenticated endpoint after registration.
+ *
+ * Anything that later adds non-`GJC_*` material to the launch argv must revisit
+ * this, because shape validation below does not inspect content.
  */
 export function isSubstrateDiagnostic(value: unknown): value is string {
 	return (

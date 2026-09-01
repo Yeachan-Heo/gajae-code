@@ -89,7 +89,7 @@ function messageFor(code: "substrate_unavailable" | "substrate_proof_failed"): s
  * single line. Substrate diagnostics never carry task text or credentials, so the
  * only hardening needed here is shape: no control bytes, no unbounded growth.
  */
-export function boundedDiagnostic(value: string): string | undefined {
+function boundedDiagnostic(value: string): string | undefined {
 	const cleaned = value
 		.replaceAll(/[\u0000-\u001f\u007f]+/gu, " ")
 		.replaceAll(/\s+/gu, " ")
@@ -102,6 +102,24 @@ export function boundedDiagnostic(value: string): string | undefined {
 
 function diagnosticFrom(error: unknown): string {
 	return boundedDiagnostic(error instanceof Error ? error.message : String(error)) ?? "unknown_error";
+}
+
+/**
+ * Whether a rejected managed launch may have left a live child behind.
+ *
+ * `createGjcTmuxSession` and `createManagedGjcTmuxSession` both raise an
+ * `AggregateError` (`gjc_tmux_precommit_failed_cleanup_failed`,
+ * `gjc_tmux_managed_launch_proof_failed_cleanup_failed`) exactly when the tmux
+ * session was created and its exact-proof cleanup then failed, and the owner
+ * isolation layer reports the same uncertainty as a `*_cleanup_uncertain`
+ * diagnostic. Those errors are evidence of surviving residue, not of a launch
+ * that never happened, so the caller must not start a second child on the same
+ * session identity after them.
+ */
+function mayHaveLiveResidue(error: unknown): boolean {
+	if (error instanceof AggregateError) return true;
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("cleanup_failed") || message.includes("cleanup_uncertain");
 }
 
 function hasOnlyKeys(value: Record<string, unknown>, keys: Set<string>): boolean {
@@ -401,25 +419,46 @@ export function createSpawnSubstrateProvider(
 			// no usable substrate (#5128). Record why it failed and continue to the
 			// next candidate, which proves itself with its own exact proof.
 			const rejected: string[] = [];
+			const rejection = (
+				code: "substrate_unavailable" | "substrate_proof_failed",
+				reason: string,
+			): {
+				ok: false;
+				code: "substrate_unavailable" | "substrate_proof_failed";
+				message: string;
+				diagnostic: string;
+			} => {
+				const diagnostic = boundedDiagnostic([...rejected, reason].join(" | "))!;
+				return { ok: false, code, message: `${messageFor(code)} (${diagnostic})`, diagnostic };
+			};
 			if (selected === "tmux" || selected === "psmux") {
 				let managed: ManagedTmuxLaunchProof | undefined;
 				try {
 					managed = launchManaged(spec, launchEnv, platform);
 				} catch (error) {
-					rejected.push(`${selected}_launch_failed:${diagnosticFrom(error)}`);
+					const reason = `${selected}_launch_failed:${diagnosticFrom(error)}`;
+					// Degrading here would start a SECOND child on the same
+					// spec.childSessionId while a multiplexer-resident child holding that
+					// identity may still be alive and, because only the winning proof is
+					// recorded, unowned forever. Continue only when the rejection proves
+					// no residue survived.
+					if (mayHaveLiveResidue(error)) return rejection("substrate_proof_failed", reason);
+					rejected.push(reason);
 				}
 				if (managed) {
 					const incarnation = readIncarnation(managed.pid);
 					const verdict = incarnation ? verifyManaged(managed, launchEnv) : "mismatch";
 					if (!incarnation || verdict !== "verified") {
+						const reason = `${selected}_proof_failed:${incarnation ? verdict : "process_incarnation_unavailable"}`;
 						try {
 							await closeManaged(managed, launchEnv);
-						} catch {
-							// The managed close primitive is already exact-proof fenced. Retain its result only in authority state.
+						} catch (closeError) {
+							// The exact-proof close was refused, so the managed child may still
+							// be running this exact session identity. Retain that uncertainty
+							// instead of adding a second child to it.
+							return rejection("substrate_proof_failed", `${reason}:close_failed:${diagnosticFrom(closeError)}`);
 						}
-						rejected.push(
-							`${selected}_proof_failed:${incarnation ? verdict : "process_incarnation_unavailable"}`,
-						);
+						rejected.push(reason);
 					} else
 						return {
 							ok: true,
@@ -442,10 +481,7 @@ export function createSpawnSubstrateProvider(
 				code: "substrate_unavailable" | "substrate_proof_failed";
 				message: string;
 				diagnostic: string;
-			} => {
-				const diagnostic = boundedDiagnostic([...rejected, `headless_${reason}`].join(" | "))!;
-				return { ok: false, code, message: `${messageFor(code)} (${diagnostic})`, diagnostic };
-			};
+			} => rejection(code, `headless_${reason}`);
 			let child: SpawnHeadlessProcess;
 			try {
 				child = launchHeadless(spec, launchEnv);
