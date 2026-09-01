@@ -104,6 +104,29 @@ Run `gjc config set startup.checkUpdate false` to disable the launch-time check.
 
 `gjc update` resolves `stable` from GitHub `/releases/latest` and `nightly` from the newest published GitHub prerelease. Optional `GITHUB_TOKEN` / `GH_TOKEN` raises API rate limits. `--check`, `--force`, and channel switch-back semantics are unchanged.
 
+## Optional macOS community app
+
+After a successful macOS install or `gjc update`, GJC may offer to install the
+experimental, community-built, third-party Gajae Code App:
+
+```text
+Install Gajae Code App (experimental, community-built)? [y/N]
+```
+
+The default is **No**. This is not an official first-party support claim; the
+app is separately licensed and maintained at
+<https://github.com/devswha/gajae-code-app>. The offer is interactive-only and
+is skipped when the app is already installed, when running in automation, or
+when no canonical published release is available. A yes answer uses only the
+repository's published macOS DMG and SHA-256, verifies its bundle identity,
+signature, and architecture, installs to a user-writable Applications folder,
+and launches with macOS `open`. GJC never uses `sudo`, disables Gatekeeper, or
+removes quarantine metadata. Any app-specific failure leaves the GJC install
+or update successful and unchanged.
+
+Set `GJC_NO_COMMUNITY_APP=1` for unattended environments, package automation,
+or repeated installs. The flag suppresses only this optional offer.
+
 ## Retry configuration
 
 Provider retry budgets live in `~/.gjc/config.yml`:

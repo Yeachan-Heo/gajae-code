@@ -647,6 +647,13 @@ install_binary() {
     echo ""
     echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"
 
+    # The verified runtime owns the optional macOS community-app flow so fresh
+    # installs and `gjc update` share the same supply-chain checks. The offer is
+    # strictly best-effort and must never change a successful GJC install.
+    if [ "$PLATFORM" = "darwin" ]; then
+        "$DEST_PATH" macos-community-app-offer || true
+    fi
+
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) echo "Run 'gjc' to get started!" ;;
         *) echo "Add ${INSTALL_DIR} to your PATH, then run 'gjc'" ;;
