@@ -483,6 +483,7 @@ export async function offerMacosCommunityApp(
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity))) return failure("the staged DMG identity changed", log);
 		if (!(await sameDirectoryIdentity(tempRoot, tempRootIdentity)))
 			return failure("the temporary root identity changed before attach", log);
+		throwIfInterrupted();
 		mountAttempted = true;
 		mountAttached = true;
 		const attach = await command([
@@ -634,17 +635,8 @@ export async function offerMacosCommunityApp(
 					removeTempRoot = false;
 					log("Optional community app cleanup warning: mountpoint identity changed; refusing detach");
 				} else if (mountAttached && !mountIdentity) {
-					const mountStat = await fs.lstat(mountPoint).catch(() => undefined);
-					if (!mountStat?.isDirectory() || mountStat.isSymbolicLink()) {
-						removeTempRoot = false;
-						log("Optional community app cleanup warning: uncertain mountpoint is unsafe; refusing detach");
-					} else {
-						const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
-						if (detach.exitCode !== 0) {
-							removeTempRoot = false;
-							log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
-						} else mountAttached = false;
-					}
+					removeTempRoot = false;
+					log("Optional community app cleanup warning: mount identity was unavailable; refusing pathname detach");
 				} else {
 					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
 					if (detach.exitCode !== 0) {
