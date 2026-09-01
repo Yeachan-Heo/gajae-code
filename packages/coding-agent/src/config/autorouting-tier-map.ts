@@ -361,10 +361,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"nvidia/upstage/solar-10.7b-instruct": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"openai-codex/gpt-6-astra": { rationale: "GPT-6 Astra catalog addition (2026-09-03 release); not yet curated" },
 	"openai-codex/gpt-daybreak-blue-latest": { rationale: "post-rebase catalog addition from dev; not yet curated" },
-	"opencode-go/deepseek-v4-flash-vision-exp": {
-		rationale: "post-rebase catalog addition from dev; not yet curated",
-	},
-	"opencode-go/glm-5.3-flash": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/gpt-5.6-luna": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/grok-4.6": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"opencode-go/hy3": { rationale: "post-rebase catalog addition from dev; not yet curated" },
