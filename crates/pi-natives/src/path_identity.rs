@@ -5065,7 +5065,7 @@ pub(crate) mod platform {
 		Ok(opened.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& named.st_mode & libc::S_IFMT == libc::S_IFREG
 			&& expected_mode.map_or(true, |mode| {
-				opened.st_mode & 0o7777 == mode && named.st_mode & 0o7777 == mode
+				u32::from(opened.st_mode & 0o7777) == mode && u32::from(named.st_mode & 0o7777) == mode
 			})
 			&& opened.st_nlink == 1
 			&& named.st_nlink == 1
@@ -5144,6 +5144,7 @@ pub(crate) mod platform {
 		if skills_fd < 0 {
 			return NativeSecureSkillWriteResult::failure("io_error");
 		}
+		#[cfg(target_os = "linux")]
 		let canonical_root = root.canonical.clone();
 		let Ok(skill_component) = CString::new(skill_name.as_bytes()) else {
 			unsafe { libc::close(skills_fd) };
