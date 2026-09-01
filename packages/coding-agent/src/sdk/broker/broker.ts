@@ -729,6 +729,15 @@ type LifecycleReplayEndpoint = {
 	endpointFileId?: string;
 };
 
+function matchesLifecycleReplayEndpointFile(
+	file: { dev: bigint; ino: bigint; mtimeMs: number },
+	record: Pick<IndexedSession, "endpointMtimeMs" | "endpointFileId">,
+): boolean {
+	if (record.endpointMtimeMs === undefined || !Number.isFinite(record.endpointMtimeMs)) return false;
+	if (record.endpointFileId === undefined) return file.mtimeMs === record.endpointMtimeMs;
+	return record.endpointFileId === `${file.dev}:${file.ino}` && Math.abs(file.mtimeMs - record.endpointMtimeMs) <= 0.001;
+}
+
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
 function endpointIncarnation(
 	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
@@ -2863,16 +2872,37 @@ export class Broker {
 			endpointMtimeMs <= 0
 		)
 			return error("endpoint_stale", "session endpoint authority is incomplete");
-		const endpoint = await this.#readEndpoint(record, {});
-		if (!endpoint.ok) return endpoint;
-		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
-			return error("endpoint_stale", "session endpoint is malformed");
+		const endpointPath = path.join(record.locator.stateRoot, "sdk", `${sessionId}.json`);
+		const firstFile = await readEndpointFile(endpointPath);
+		if (!firstFile || !matchesLifecycleReplayEndpointFile(firstFile, record))
+			return error("endpoint_stale", "session endpoint is stale");
 		await this.index.refresh();
 		const current = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
 		if (!current || !sameEndpointRecord(record, current))
 			return error("endpoint_stale", "session endpoint authority changed during replay refresh");
+		const currentFile = await readEndpointFile(endpointPath);
+		if (
+			!currentFile ||
+			currentFile.dev !== firstFile.dev ||
+			currentFile.ino !== firstFile.ino ||
+			currentFile.mtimeNs !== firstFile.mtimeNs ||
+			currentFile.source !== firstFile.source ||
+			!matchesLifecycleReplayEndpointFile(currentFile, current)
+		)
+			return error("endpoint_stale", "session endpoint changed during replay refresh");
+		let endpoint: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(currentFile.source);
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+				return error("endpoint_stale", "session endpoint is malformed");
+			endpoint = parsed as Record<string, unknown>;
+		} catch {
+			return error("endpoint_stale", "session endpoint is malformed");
+		}
+		if (endpoint.sessionId !== sessionId || endpoint.pid !== current.pid || endpoint.stale === true)
+			return error("endpoint_stale", "session endpoint is stale");
 		return {
-			endpoint: endpoint.result as Record<string, unknown>,
+			endpoint,
 			endpointGeneration: current.endpointGeneration,
 			pid: current.pid,
 			endpointMtimeMs: current.endpointMtimeMs!,

@@ -5047,7 +5047,7 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 			},
 		});
 
-		const exactMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
+		const exactMtimeMs = Number((await fs.stat(endpointPath, { bigint: true })).mtimeNs) / 1_000_000;
 		await restarted.index.append({
 			type: "host_registered",
 			sessionId,
@@ -5096,6 +5096,97 @@ test("idempotent lifecycle replay refreshes authority after a broker restart", a
 		await initial?.stop();
 		await restarted?.stop();
 		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("idempotent lifecycle replay rejects preserved-mtime endpoint identity transitions", async () => {
+	for (const transition of ["identity-less-to-identityful", "identityful-to-identity-less"] as const) {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", `gjc-replay-race-${transition}-`));
+		const agentDir = path.join(root, "agent");
+		const stateRoot = path.join(root, ".gjc", "state");
+		const sessionId = `replay-race-${transition}`;
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		const displacedPath = `${endpointPath}.displaced`;
+		const host = spawnDisposableHost();
+		const broker = new Broker({ agentDir });
+		let refreshSpy: ReturnType<typeof vi.spyOn> | undefined;
+		try {
+			await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+			await fs.writeFile(
+				endpointPath,
+				JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:1", token: "predecessor-token" }),
+			);
+			const fixedMtimeSeconds = 1_700_000_000;
+			await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+			const initialFile = await fs.stat(endpointPath, { bigint: true });
+			const initialMtimeMs = Number(initialFile.mtimeNs) / 1_000_000;
+			const initialFileId = `${initialFile.dev}:${initialFile.ino}`;
+			const hostIncarnation = await incarnation(host.pid);
+			await broker.start();
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd: root, worktreeRoot: null, stateRoot },
+				endpointGeneration: 2,
+				pid: host.pid,
+				endpointMtimeMs: initialMtimeMs,
+				...(transition === "identityful-to-identity-less" ? { endpointFileId: initialFileId } : {}),
+				processIncarnation: hostIncarnation,
+				hostIncarnation,
+			});
+			const key = `replay-race-${transition}`;
+			const targetHash = createHash("sha256").update(canonicalJson({ sessionId })).digest("hex");
+			const identity = await deriveIdempotencyIdentity(agentDir, "session.resume", key, targetHash);
+			const input = { cwd: root, stateRoot, sessionId };
+			const requestHash = createHash("sha256")
+				.update(canonicalJson({ operation: "session.resume", input }))
+				.digest("hex");
+			expect(await broker.ledger.begin(identity, requestHash)).toMatchObject({ kind: "new" });
+			await broker.ledger.transition(identity, "terminal_ok", {
+				response: {
+					ok: true,
+					result: { sessionId, cwd: root, endpointGeneration: 1, pid: host.pid + 1, endpointMtimeMs: 1 },
+				},
+			});
+			const replacementIndex = await new SessionIndex(agentDir).open();
+			const realRefresh = broker.index.refresh.bind(broker.index);
+			let refreshes = 0;
+			refreshSpy = vi.spyOn(broker.index, "refresh").mockImplementation(async () => {
+				refreshes += 1;
+				if (refreshes === 2) {
+					await fs.rename(endpointPath, displacedPath);
+					await fs.writeFile(
+						endpointPath,
+						JSON.stringify({ sessionId, pid: host.pid, url: "ws://127.0.0.1:2", token: "successor-token" }),
+					);
+					await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+					const replacementFile = await fs.stat(endpointPath, { bigint: true });
+					await replacementIndex.append({
+						type: "host_registered",
+						sessionId,
+						locator: { cwd: root, worktreeRoot: null, stateRoot },
+						endpointGeneration: 2,
+						pid: host.pid,
+						endpointMtimeMs: Number(replacementFile.mtimeNs) / 1_000_000,
+						...(transition === "identity-less-to-identityful"
+							? { endpointFileId: `${replacementFile.dev}:${replacementFile.ino}` }
+							: {}),
+						processIncarnation: hostIncarnation,
+						hostIncarnation,
+					});
+				}
+				await realRefresh();
+			});
+			expect(await broker.handleRequest("session.resume", { cwd: root, sessionId }, key)).toMatchObject({
+				ok: false,
+				error: { code: "endpoint_stale" },
+			});
+		} finally {
+			refreshSpy?.mockRestore();
+			await broker.stop();
+			host.kill();
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	}
 });
 
