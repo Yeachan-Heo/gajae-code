@@ -31,6 +31,7 @@ import {
 	beginWorkflowTransactionJournal,
 	completeWorkflowTransactionJournal,
 	readExistingStateForMutation,
+	readWorkflowTransactionJournal,
 	updateWorkflowTransactionJournal,
 	withWorkflowStateLock,
 	writeArtifact,
@@ -344,33 +345,57 @@ async function handleCrystallizeUnlocked(
 	const now = new Date().toISOString();
 	const specContent = specPath ? crystalMarkdown(crystal) : undefined;
 	const indexPath = path.join(sessionSpecsDir(cwd, sessionId), "deep-interview-index.jsonl");
-	const mutationId = `crystal:${sessionId}:${crystal.spec_version}:${crystal.source.digest}`;
+	const specHash = specContent ? createHash("sha256").update(specContent).digest("hex") : undefined;
+	const mutationId =
+		specPath && specHash
+			? `crystal:${sessionId}:${crystal.spec_version}:${createHash("sha256").update(`${slug}\0${specPath}\0${specHash}`).digest("hex")}`
+			: undefined;
+	if (mutationId) {
+		const existingJournal = await readWorkflowTransactionJournal(cwd, sessionId, mutationId);
+		if (existingJournal && JSON.stringify(existingJournal.paths) !== JSON.stringify([specPath, indexPath, statePath]))
+			throw new DeepInterviewCommandError(2, "Crystal promotion journal identity mismatch");
+	}
 	if (specPath && specContent)
-		await beginWorkflowTransactionJournal({ cwd, sessionId, mutationId, paths: [specPath, indexPath, statePath] });
+		await beginWorkflowTransactionJournal({
+			cwd,
+			sessionId,
+			mutationId: mutationId!,
+			paths: [specPath, indexPath, statePath],
+		});
 	if (specPath && specContent)
 		await writeArtifact(specPath, specContent, {
 			cwd,
 			audit: { category: "artifact", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 		});
 	if (specPath && specContent)
-		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["artifact"] });
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact"] });
+	let indexAlreadyContains = false;
+	if (specPath && specContent) {
+		try {
+			const index = await fs.readFile(indexPath, "utf8");
+			indexAlreadyContains = index.split(/\r?\n/).some(line => {
+				try {
+					const entry = JSON.parse(line) as Record<string, unknown>;
+					return entry.path === specPath && entry.sha256 === specHash;
+				} catch {
+					return false;
+				}
+			});
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+		if (!indexAlreadyContains)
+			await appendJsonl(
+				indexPath,
+				{ slug, stage: "final", path: specPath, created_at: now, sha256: specHash },
+				{
+					cwd,
+					audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId },
+				},
+			);
+	}
 	if (specPath && specContent)
-		await appendJsonl(
-			indexPath,
-			{
-				slug,
-				stage: "final",
-				path: specPath,
-				created_at: now,
-				sha256: createHash("sha256").update(specContent).digest("hex"),
-			},
-			{
-				cwd,
-				audit: { category: "ledger", verb: "append", owner: "gjc-runtime", skill: "deep-interview", sessionId },
-			},
-		);
-	if (specPath && specContent)
-		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["artifact", "index"] });
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact", "index"] });
 	const state = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
 	const envelope = {
 		...existing,
@@ -411,7 +436,9 @@ async function handleCrystallizeUnlocked(
 		},
 		audit: { category: "state", verb: "write", owner: "gjc-runtime", skill: "deep-interview", sessionId },
 	});
-	if (specPath && specContent) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId);
+	if (specPath && specContent)
+		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact", "index", "state"] });
+	if (specPath && specContent) await completeWorkflowTransactionJournal(cwd, sessionId, mutationId!);
 	await writeSessionActivityMarker(cwd, sessionId, { writer: "deep-interview-runtime", path: statePath });
 	await syncDeepInterviewHud({
 		cwd,
@@ -934,8 +961,7 @@ export async function persistDeepInterviewSpec(
 			? (existing.state as Record<string, unknown>)
 			: undefined;
 	if (existingInner?.crystal !== undefined) {
-		if (existing.spec_path !== undefined || existing.spec_sha256 !== undefined)
-			throw new DeepInterviewCommandError(2, "crystallized spec metadata is immutable through direct spec write");
+		throw new DeepInterviewCommandError(2, "direct spec write is unavailable while canonical Crystal state exists");
 	}
 
 	const content = resolved.spec.endsWith("\n") ? resolved.spec : `${resolved.spec}\n`;
