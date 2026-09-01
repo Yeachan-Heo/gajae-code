@@ -24,6 +24,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	Usage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
@@ -733,7 +734,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const usageState: UsageState = { sawTokenDelta: false };
+			const usageState: UsageState = { sawTokenDelta: false, conversationUsedTokens: 0 };
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -899,6 +900,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				});
 			}
 
+			finalizeCursorUsage(output, usageState);
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
@@ -959,6 +961,11 @@ interface BlockState {
 
 interface UsageState {
 	sawTokenDelta: boolean;
+	/**
+	 * Latest `ConversationTokenDetails.used_tokens`: the whole conversation's
+	 * token consumption as counted by Cursor, not this turn's output.
+	 */
+	conversationUsedTokens: number;
 }
 
 async function handleServerMessage(
@@ -2855,17 +2862,43 @@ function handleConversationCheckpointUpdate(
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): void {
 	onConversationCheckpoint?.(checkpoint);
-	if (usageState.sawTokenDelta) {
-		return;
-	}
 	const usedTokens = checkpoint.tokenDetails?.usedTokens ?? 0;
 	if (usedTokens <= 0) {
 		return;
 	}
-	if (output.usage.output !== usedTokens) {
-		output.usage.output = usedTokens;
-		output.usage.totalTokens = output.usage.input + output.usage.output;
+	// `used_tokens` counts the whole conversation, so it is prompt-side usage and
+	// must not be attributed to this turn's output. Checkpoints can arrive while
+	// output is still streaming; the split is applied once the stream finalizes.
+	usageState.conversationUsedTokens = usedTokens;
+}
+
+/**
+ * Cursor streams output tokens as deltas and reports whole-conversation
+ * consumption separately as `ConversationTokenDetails.used_tokens`. Derive
+ * prompt tokens from the difference so context accounting and compaction see a
+ * real prompt size instead of zero.
+ */
+export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageState): void {
+	const used = usageState.conversationUsedTokens;
+	if (used <= 0) {
+		return;
 	}
+	output.usage.input = Math.max(0, used - output.usage.output);
+	output.usage.totalTokens = output.usage.input + output.usage.output;
+}
+
+/** Exposes {@link finalizeCursorUsage} for tests without a live HTTP/2 stream. */
+export function finalizeCursorUsageForTest(usedTokens: number, outputTokens: number): Usage {
+	const usage: Usage = {
+		input: 0,
+		output: outputTokens,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: outputTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	finalizeCursorUsage({ usage } as AssistantMessage, { sawTokenDelta: true, conversationUsedTokens: usedTokens });
+	return usage;
 }
 
 function createBlobId(data: Uint8Array): Uint8Array {

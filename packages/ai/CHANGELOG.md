@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Cursor sessions now report prompt tokens instead of zero. `ConversationTokenDetails.used_tokens` counts the whole conversation, but the checkpoint handler assigned it to `usage.output` and returned early whenever token deltas had been seen — which is the normal streaming path — so `usage.input`, `usage.cacheRead`, and `usage.cacheWrite` were left at their zero initializers for every cursor request. `calculatePromptTokens` therefore fell through to its output-only fallback, so the context indicator tracked the last response's output size rather than the conversation, and automatic compaction never observed a full context. Conversation usage is now recorded through the stream and split into prompt and output tokens when the stream finalizes.
+
 - OpenCode Go's bundled catalog now contains all 33 models advertised by its live provider list, including the seven newly published models. Canonical endpoint metadata supplies their transport, multimodal input, limits, pricing, and reasoning capabilities, while generated output remains deterministic and preserves fail-closed selection when a live catalog is unavailable (#5144).
 
 - SQLite corruption detection is now shared by credential and capability-cache surfaces, so callers can recognize `SQLITE_CORRUPT` and `SQLITE_NOTADB` without inspecting provider-specific error details.
