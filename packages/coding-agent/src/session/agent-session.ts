@@ -874,6 +874,8 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** Release a superseded settings scope when this session owns that scope. */
+	releaseSettingsScope?: (settings: Settings) => void;
 	/** The session's REQUESTED effective agent directory, independent of the
 	 * global Settings singleton (which may be reused across sessions). */
 	agentDir?: string;
@@ -2416,6 +2418,8 @@ export class AgentSession {
 	readonly agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	readonly #releaseSettingsScope: ((settings: Settings) => void) | undefined;
+	#supersededSettingsScopes: Settings[] = [];
 	readonly #requestedAgentDir: string | undefined;
 	readonly #profileAuthority: "default" | "custom";
 
@@ -4520,6 +4524,7 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#releaseSettingsScope = config.releaseSettingsScope;
 		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		const resolverDefaultAgentDir = path.resolve(getAgentDir());
 		const effectiveAgentDir = this.#requestedAgentDir ?? path.resolve(this.settings.getAgentDir());
@@ -5320,6 +5325,113 @@ export class AgentSession {
 					} catch (error) {
 						restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
 					}
+					if (rescopeFailure !== undefined) {
+						await restoreLaunchRoot(rescopeFailure);
+					}
+					try {
+						await this.sessionManager.flush();
+						// Commit last: `moveTo` re-validates the pinned identity through
+						// the still-open handle at the state-changing boundary.
+						await this.sessionManager.moveTo(canonicalTarget, {
+							expectedIdentity,
+							targetHandle,
+						});
+					} catch (error) {
+						const committedCwd = this.sessionManager.getCwd();
+						const stayedAtLaunchRoot = path.resolve(committedCwd) === path.resolve(from);
+						if (stayedAtLaunchRoot) await restoreLaunchRoot(error);
+						// SessionManager can publish the durable move before a later metadata
+						// write fails. Treat that state as committed rather than reporting a
+						// rejection after the session has moved.
+						if (enforceOneShot) this.#rescopeSessionCwdConsumed = true;
+						logger.warn("Session rescope committed before finalization failed", {
+							error: error instanceof Error ? error.message : String(error),
+							cwd: committedCwd,
+						});
+					}
+					if (endpointChanged) {
+						const committedSessionFile = this.sessionManager.getSessionFile();
+						if (
+							committedSessionFile !== undefined &&
+							successorSessionFile !== undefined &&
+							path.resolve(committedSessionFile) === path.resolve(successorSessionFile)
+						) {
+							this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity, previousSessionFile);
+							endpointReservation?.finalize();
+						} else {
+							endpointReservation?.release();
+						}
+					}
+					if (enforceOneShot) this.#rescopeSessionCwdConsumed = true;
+					try {
+						await participant.finalizeRescope?.();
+					} catch (error) {
+						// The move is already durable. Runtime-service cleanup is best effort
+						// and must not turn a committed move into a false rejection.
+						logger.warn("Committed session rescope could not finalize runtime services", {
+							error: error instanceof Error ? error.message : String(error),
+							cwd: this.sessionManager.getCwd(),
+						});
+					}
+					// Drop only this session's previous workspace/profile clients. A global
+					// shutdown here would terminate sibling sessions' pending LSP requests.
+					retainLspScope(this.sessionManager.getCwd(), lspAgentDir);
+					try {
+						await releaseLspScope(from, lspAgentDir);
+					} catch (error) {
+						logger.warn("Failed to release previous session LSP scope after rescope", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+					// Cwd-derived read-only state the prompt and subagents consume.
+					// Best-effort by design: the move is committed, and a failed
+					// re-discovery must not present a committed move as a failure.
+					try {
+						await participant.applyRescopedReadState(this.sessionManager.getCwd());
+					} catch (error) {
+						// Hosts should make this callback non-throwing, but keep the
+						// transaction boundary defensive so a replacement implementation
+						// cannot turn a committed move into a false failure.
+						logger.warn("Committed session rescope could not refresh post-move read state", {
+							error: error instanceof Error ? error.message : String(error),
+							cwd: this.sessionManager.getCwd(),
+						});
+					}
+					this.#releaseSupersededSettingsScopes();
+					try {
+						await this.refreshSshTool({ activateIfAvailable: true });
+					} catch (error) {
+						try {
+							this.agent.setTools(this.agent.state.tools.filter(tool => tool.name !== "ssh"));
+						} catch (cleanupError) {
+							logger.warn("Failed to remove stale SSH tool after session rescope", {
+								error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+								cwd: this.sessionManager.getCwd(),
+							});
+						}
+						this.#toolRegistry.delete("ssh");
+						this.#selectedDiscoveredToolNames.delete("ssh");
+						try {
+							await this.#applyActiveToolsByName(this.getActiveToolNames().filter(name => name !== "ssh"));
+						} catch (cleanupError) {
+							logger.warn("Failed to rebuild tools after SSH refresh failure", {
+								error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+								cwd: this.sessionManager.getCwd(),
+							});
+						}
+						// Non-fatal: the session has moved; the SSH tool refreshes
+						// on its next activation attempt.
+						logger.warn("Committed session rescope could not refresh the SSH tool", {
+							error: error instanceof Error ? error.message : String(error),
+							cwd: this.sessionManager.getCwd(),
+						});
+					}
+					return { from, to: this.sessionManager.getCwd() };
+				} finally {
+					await targetHandle.close().catch(() => {});
+					// A pre-commit failure must relinquish the reserved destination
+					// endpoint; after finalize() this is a no-op.
+					endpointReservation?.release();
 				}
 				try {
 					await participant.rebindCwdCapturingAuthority(canonicalFrom);
@@ -12004,8 +12116,25 @@ export class AgentSession {
 		return this.#promptTemplates;
 	}
 
+	/** Release superseded settings scopes after the replacement is ambiently registered. */
+	#releaseSupersededSettingsScopes(): void {
+		const superseded = this.#supersededSettingsScopes;
+		this.#supersededSettingsScopes = [];
+		for (const settings of superseded) {
+			try {
+				this.#releaseSettingsScope?.(settings);
+			} catch (error) {
+				logger.warn("Failed to release superseded settings scope", {
+					error: error instanceof Error ? error.message : String(error),
+					cwd: settings.getCwd(),
+				});
+			}
+		}
+	}
+
 	/** Replace project-scoped settings after a committed cwd rescope. */
 	setSettings(settings: Settings): void {
+		if (this.settings !== settings && this.#releaseSettingsScope) this.#supersededSettingsScopes.push(this.settings);
 		this.#unregisterSessionMemorySettings?.();
 		this.#unregisterSessionMemorySettings = undefined;
 		this.#unregisterResourceGc?.();

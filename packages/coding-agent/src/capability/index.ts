@@ -276,40 +276,71 @@ async function loadCapabilityWithContext<T>(
 	return await loadImpl(capability, providers, ctx, options);
 }
 
-export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
-	const trustedHome = getTrustedHomeDir();
+/**
+ * Resolve the profile authority for a capability load.
+ *
+ * The selected agent directory and the resolver-owned authority are separate
+ * inputs: a caller can pin the default profile while the process resolver is
+ * currently pointed at a custom profile, and a custom profile must remain
+ * custom after HOME/config-root refreshes make its path look canonical. Keep
+ * this decision in one place so higher-level startup projections use the same
+ * authority as capability discovery.
+ */
+export function resolveProfileAuthority(
+	options: Pick<LoadOptions, "agentDir" | "settings" | "profileAuthority"> = {},
+	home?: string,
+	resolverAuthority?: "default" | "custom",
+): "default" | "custom" {
+	if (options.profileAuthority !== undefined) return options.profileAuthority;
+
 	const settingsAgentDir =
 		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
 	const settingsAgentDirExplicit =
 		typeof options.settings?.isAgentDirExplicit === "function" ? options.settings.isAgentDirExplicit() : undefined;
-	const customProcessProfile = getAgentProfileAuthority() === "custom";
-	const processAgentDir = getAgentDir();
-	const selectedAgentDir = options.agentDir || settingsAgentDir || (customProcessProfile ? getAgentDir() : undefined);
-	const canonicalDefaultAgentDir = path.join(trustedHome, getConfigDirName(), "agent");
+	const ambientAuthority = resolverAuthority ?? getAgentProfileAuthority();
+	const processAgentDir = resolverAuthority === undefined ? getAgentDir() : undefined;
+	const selectedAgentDir =
+		options.agentDir || settingsAgentDir || (ambientAuthority === "custom" ? processAgentDir : undefined);
+	const canonicalDefaultAgentDir = path.join(home ?? getTrustedHomeDir(), getConfigDirName(), "agent");
 	const settingsOwnsDefaultProfile =
 		options.agentDir === undefined && settingsAgentDir !== undefined && settingsAgentDirExplicit === false;
-	const selectedProfileAuthority =
-		options.profileAuthority ??
-		(customProcessProfile &&
+
+	if (
+		ambientAuthority === "custom" &&
+		processAgentDir !== undefined &&
 		selectedAgentDir !== undefined &&
 		normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(processAgentDir)
-			? "custom"
-			: settingsOwnsDefaultProfile && !customProcessProfile
-				? "default"
-				: selectedAgentDir !== undefined
-					? normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
-						? "default"
-						: "custom"
-					: customProcessProfile
-						? "custom"
-						: "default");
+	) {
+		return "custom";
+	}
+	if (settingsOwnsDefaultProfile && ambientAuthority !== "custom" && resolverAuthority === undefined) {
+		return "default";
+	}
+	if (selectedAgentDir !== undefined) {
+		return normalizePathForComparison(selectedAgentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
+			? "default"
+			: "custom";
+	}
+	return ambientAuthority;
+}
+
+export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
+	const trustedHome = getTrustedHomeDir();
+	const settingsAgentDir =
+		typeof options.settings?.getAgentDir === "function" ? options.settings.getAgentDir() : undefined;
+	const selectedProfileAuthority = resolveProfileAuthority(options, trustedHome);
 	return await loadCapabilityWithContext(
 		capabilityId,
 		{
 			...options,
 			agentDir:
-				options.agentDir || settingsAgentDir || (customProcessProfile ? processAgentDir : canonicalDefaultAgentDir),
-			userAgentDirExplicit: options.agentDir !== undefined || settingsAgentDir !== undefined || customProcessProfile,
+				options.agentDir ??
+				settingsAgentDir ??
+				(selectedProfileAuthority === "custom"
+					? getAgentDir()
+					: path.join(trustedHome, getConfigDirName(), "agent")),
+			userAgentDirExplicit:
+				options.agentDir !== undefined || settingsAgentDir !== undefined || getAgentProfileAuthority() === "custom",
 			profileAuthority: selectedProfileAuthority,
 		},
 		trustedHome,
@@ -338,13 +369,15 @@ export async function loadCapabilityForHome<T>(
 			...options,
 			agentDir: options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
 			isolateAmbientPolicy: true,
-			profileAuthority:
-				options.profileAuthority ??
-				(normalizePathForComparison(
-					options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
-				) === normalizePathForComparison(path.join(resolvedHome, getConfigDirName(), "agent"))
-					? "default"
-					: "custom"),
+			profileAuthority: resolveProfileAuthority(
+				{
+					agentDir: options.agentDir ?? settingsAgentDir ?? path.join(resolvedHome, getConfigDirName(), "agent"),
+					settings: options.settings,
+					profileAuthority: options.profileAuthority,
+				},
+				resolvedHome,
+				"default",
+			),
 		},
 		resolvedHome,
 	);

@@ -2727,17 +2727,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				warnRefreshFailure("Failed to reload prompt templates after session rescope", error);
 			}
 			if (options.slashCommands === undefined) {
+				// SDK sessions intentionally do not discover ambient file-backed slash
+				// commands. Keep that isolation after a cwd rescope as well; interactive
+				// hosts that want them refresh and install their own command set.
+				slashCommands = [];
 				try {
-					slashCommands = await loadSlashCommands({ cwd: to, agentDir, settings, profileAuthority });
-					session?.setSlashCommands(slashCommands);
+					session?.setSlashCommands([]);
 				} catch (error) {
-					slashCommands = [];
-					try {
-						session?.setSlashCommands([]);
-					} catch (clearError) {
-						warnRefreshFailure("Failed to clear slash commands after session rescope", clearError);
-					}
-					warnRefreshFailure("Failed to reload slash commands after session rescope", error);
+					warnRefreshFailure("Failed to clear slash commands after session rescope", error);
 				}
 			}
 			// The launch-bound tree is retired immediately: a stale root-scoped tree is

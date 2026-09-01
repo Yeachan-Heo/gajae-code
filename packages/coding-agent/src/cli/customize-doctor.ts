@@ -16,13 +16,8 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-	getAgentDir,
-	getAgentProfileAuthority,
-	getMCPConfigPath,
-	getProjectDir,
-	normalizePathForComparison,
-} from "@gajae-code/utils";
+import { getMCPConfigPath, getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
+import { resolveProfileAuthority } from "../capability";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { findRepoRoot } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
@@ -375,6 +370,10 @@ async function discoverCapability<T extends { _source: SourceMeta }>(
 		cwd,
 		agentDir: activeSettings.getAgentDir(),
 		settings: activeSettings,
+		profileAuthority: resolveProfileAuthority({
+			agentDir: activeSettings.getAgentDir(),
+			settings: activeSettings,
+		}),
 		includeDisabled: true,
 		includeInvalid: true,
 		includeDisabledProviders: true,
@@ -529,6 +528,7 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 		extensionIdOf: server => mcpCapability.toExtensionId?.(server),
 	});
 	const agentDir = activeSettings.getAgentDir();
+	const profileAuthority = resolveProfileAuthority({ agentDir, settings: activeSettings });
 	const [userDisabled, projectDisabled] = await Promise.all([
 		readDisabledServers(getMCPConfigPath("user", cwd, agentDir)).catch(() => []),
 		readDisabledServers(getMCPConfigPath("project", cwd)).catch(() => []),
@@ -545,7 +545,7 @@ async function collectMcps(cwd: string, activeSettings: SettingsInstance): Promi
 	const surfaceWarnings: string[] = [];
 	try {
 		connectableNames = new Set(
-			Object.keys((await loadAllMCPConfigs(cwd, { settings: activeSettings, agentDir })).configs),
+			Object.keys((await loadAllMCPConfigs(cwd, { settings: activeSettings, agentDir, profileAuthority })).configs),
 		);
 	} catch (error) {
 		surfaceWarnings.push(
@@ -650,11 +650,13 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 		extensionIdOf: skill => skillCapability.toExtensionId?.(skill),
 	});
 	const agentDir = activeSettings.getAgentDir();
+	const profileAuthority = resolveProfileAuthority({ agentDir, settings: activeSettings });
 	const skillsEnabled = activeSettings.get("skills.enabled") === true;
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	const ignoredPatterns = activeSettings.get("skills.ignoredSkills") ?? [];
 	const includePatterns = activeSettings.get("skills.includeSkills") ?? [];
+	const trustedHome = getTrustedHomeDir();
 
 	// Exact session-startup consumer (sdk/session.ts): loadSkills only runs when
 	// skills.enabled is true, and only GJC (native) skills survive its filters.
@@ -664,6 +666,7 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 			...activeSettings.getGroup("skills"),
 			cwd,
 			agentDir,
+			profileAuthority,
 			settings: activeSettings,
 			disabledExtensions: activeSettings.get("disabledExtensions"),
 		});
@@ -780,8 +783,8 @@ async function collectSkills(cwd: string, activeSettings: SettingsInstance): Pro
 	const customDirs = activeSettings.get("skills.customDirectories") ?? [];
 	for (const dir of [...customDirs].sort()) {
 		const scan = await scanSkillsFromDir(
-			{ cwd, home: os.homedir(), repoRoot: null },
-			{ dir: expandTilde(dir), providerId: "custom", level: "user", requireDescription: true },
+			{ cwd, home: trustedHome, repoRoot: null },
+			{ dir: expandTilde(dir, trustedHome), providerId: "custom", level: "user", requireDescription: true },
 		);
 		for (const skill of scan.items) {
 			const base: Omit<CustomizeDoctorItem, "status" | "reason" | "detail" | "remediation"> = {
@@ -1023,11 +1026,12 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 		extensionIdOf: cmd => slashCommandCapability.toExtensionId?.(cmd),
 	});
 	const agentDir = activeSettings.getAgentDir();
+	const profileAuthority = resolveProfileAuthority({ agentDir, settings: activeSettings });
 	const disabledExts = disabledExtensionIds(activeSettings);
 	const disabledProviders = new Set(activeSettings.get("disabledProviders"));
 	// Exact session-startup consumer (interactive/print modes).
 	const loadedNames = new Set(
-		(await loadSlashCommands({ cwd, agentDir, settings: activeSettings })).map(cmd => cmd.name),
+		(await loadSlashCommands({ cwd, agentDir, settings: activeSettings, profileAuthority })).map(cmd => cmd.name),
 	);
 
 	const items: CustomizeDoctorItem[] = entries.map(entry => {
@@ -1088,17 +1092,15 @@ async function collectCommands(cwd: string, activeSettings: SettingsInstance): P
 	};
 }
 
-async function collectPluginBundles(cwd: string, agentDir: string): Promise<CustomizeDoctorSurface> {
-	const resolverAuthority = getAgentProfileAuthority();
-	const profileAuthority =
-		resolverAuthority === "custom" ||
-		normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir())
-			? "custom"
-			: "default";
+async function collectPluginBundles(cwd: string, activeSettings: SettingsInstance): Promise<CustomizeDoctorSurface> {
+	const agentDir = activeSettings.getAgentDir();
+	const profileAuthority = resolveProfileAuthority({ agentDir, settings: activeSettings });
 	// npm plugin packages (convention "plugin") — the startup consumer is
 	// getEnabledPlugins(cwd); the lockfile provides the disabled set.
 	const enabledNames = new Set(
-		(await getEnabledPlugins(cwd, profileAuthority === "custom" ? agentDir : undefined)).map(p => p.name),
+		(await getEnabledPlugins(cwd, profileAuthority === "custom" ? agentDir : undefined, profileAuthority)).map(
+			p => p.name,
+		),
 	);
 	const lockNames = new Map<string, { enabled?: boolean }>();
 	const pluginsDir = getProfilePluginsDir(agentDir, profileAuthority);
@@ -1448,7 +1450,7 @@ export async function runCustomizeDoctor(
 	await collect("tool", () => collectTools(projectDir, settings));
 	await collect("extension", () => collectExtensions(projectDir, settings));
 	await collect("command", () => collectCommands(projectDir, settings));
-	await collect("plugin-bundle", () => collectPluginBundles(projectDir, settings.getAgentDir()));
+	await collect("plugin-bundle", () => collectPluginBundles(projectDir, settings));
 
 	// Foreign conventions (Claude Code / Codex project dirs) are never part of
 	// the load path; report them as import candidates for provenance.

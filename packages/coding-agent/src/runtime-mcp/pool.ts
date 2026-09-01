@@ -867,9 +867,24 @@ export class MCPConnectionPool {
 	}
 
 	private scheduleIdleClose(entry: PoolEntry): void {
+		if (
+			this.#shuttingDown ||
+			this.#sharedPoolIdleMs <= 0 ||
+			entry.refCount !== 0 ||
+			entry.state !== "connected" ||
+			entry.transportCloseStarted
+		)
+			return;
+		if (entry.idleTimer) clearTimeout(entry.idleTimer);
 		entry.idleTimer = setTimeout(() => {
 			entry.idleTimer = undefined;
-			void this.closeEntry(entry).catch(error => logger.debug("MCP pool idle close failed", { error }));
+			void this.closeEntry(entry).catch(error => {
+				logger.debug("MCP pool idle close failed", { error });
+				// A transient close failure leaves a connected, unleased shared entry
+				// in the pool. Keep retrying its idle close rather than leaking the
+				// transport until a later acquire happens to touch this key.
+				this.scheduleIdleClose(entry);
+			});
 		}, this.#sharedPoolIdleMs);
 	}
 

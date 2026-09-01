@@ -1,5 +1,6 @@
 import type { AutocompleteItem } from "@gajae-code/tui";
 import { parseFrontmatter, prompt } from "@gajae-code/utils";
+import { resolveProfileAuthority } from "../capability";
 import { slashCommandCapability } from "../capability/slash-command";
 import { appendInlineArgsFallback, templateUsesInlineArgPlaceholders } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
@@ -166,11 +167,12 @@ export interface LoadSlashCommandsOptions {
  * Loads from all registered providers (builtin, user, project).
  */
 export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}): Promise<FileSlashCommand[]> {
+	const profileAuthority = resolveProfileAuthority(options);
 	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, {
 		cwd: options.cwd,
 		agentDir: options.agentDir,
 		settings: options.settings,
-		profileAuthority: options.profileAuthority,
+		profileAuthority,
 	});
 
 	const fileCommands: FileSlashCommand[] = result.items.map(cmd => {

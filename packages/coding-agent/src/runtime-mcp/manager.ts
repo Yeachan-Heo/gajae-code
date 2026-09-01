@@ -1831,6 +1831,10 @@ export class MCPManager {
 			this.#reconnectBackoffs.clear();
 			this.#pendingReconnections.clear();
 			const retiredReleaseFailures = await this.#drainRetiredLeaseReleases();
+			// A failed active/scoped release is retained for one retry. Once that
+			// retry has been attempted, report only its final outcome rather than
+			// preserving the superseded first error as a duplicate diagnostic.
+			const retryableLeasesBeforeDrain = new Set(this.#retryableLeaseReleases.keys());
 			const retryableLeaseFailures = await this.#drainRetryableLeaseReleases();
 			this.#deferredSharedRebinds.clear();
 			this.#pendingResourceRefresh.clear();
@@ -1841,14 +1845,14 @@ export class MCPManager {
 			this.#subscribedResources.clear();
 			const releaseFailures = [
 				...scopedReleaseFailures
-					.filter(failure => failure.lease === undefined || this.#retryableLeaseReleases.has(failure.lease))
+					.filter(failure => failure.lease === undefined || !retryableLeasesBeforeDrain.has(failure.lease))
 					.map(failure => failure.error),
 				...retryableLeaseFailures,
 				...releaseResults
 					.filter((result, index): result is PromiseRejectedResult => {
 						if (result.status !== "rejected") return false;
 						const lease = releaseEntries[index]?.[1];
-						return lease === undefined || this.#retryableLeaseReleases.has(lease);
+						return lease === undefined || !retryableLeasesBeforeDrain.has(lease);
 					})
 					.map(result => result.reason),
 				...retiredReleaseFailures,

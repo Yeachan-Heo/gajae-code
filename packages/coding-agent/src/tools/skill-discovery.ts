@@ -76,10 +76,18 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 	): Promise<AgentToolResult<SkillDiscoveryToolDetails>> {
 		return untilAborted(signal, async () => {
 			const source = input.source ?? "all";
+			const sessionAgentDir = this.#session.getSessionAgentDir?.();
+			const sessionHome =
+				this.#session.getSessionHome?.() ??
+				(this.#session.getSessionAgentDir === undefined ? this.#session.home : undefined);
 			const result = await discoverRuntimeSkills({
 				cwd: this.#session.cwd,
-				home: this.#session.getSessionHome?.(),
-				agentDir: this.#session.getSessionAgentDir?.() ?? this.#session.settings.getAgentDir(),
+				home: sessionHome,
+				// A legacy ToolSession.home is an explicit discovery root only for
+				// sessions that predate the scoped-home/profile accessors. Let the
+				// runtime scanner derive <home>/.gjc/agent rather than overriding it
+				// with the settings profile in that compatibility case.
+				agentDir: sessionAgentDir ?? (sessionHome === undefined ? this.#session.settings.getAgentDir() : undefined),
 				profileAuthority: this.#session.getSessionProfileAuthority?.(),
 				query: input.query,
 				source,

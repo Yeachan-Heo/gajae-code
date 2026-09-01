@@ -5236,6 +5236,18 @@ pub(crate) mod platform {
 			}
 			return NativeSecureSkillWriteResult::failure(code);
 		}
+		// The directory fsyncs above can block long enough for the public skill
+		// directory to be detached and replaced. Revalidate the retained binding
+		// immediately before returning success so the receipt names the object
+		// that discovery can still reach through the requested root.
+		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
+			drop(file);
+			unsafe {
+				libc::close(skill_fd);
+				libc::close(skills_fd);
+			}
+			return NativeSecureSkillWriteResult::failure("identity_mismatch");
+		}
 		drop(file);
 		unsafe {
 			libc::close(skill_fd);
@@ -9721,11 +9733,13 @@ mod platform {
 		name: &std::ffi::OsStr,
 		acl_access: bool,
 	) -> Result<HANDLE, &'static str> {
+		// DACL ownership rights are needed only when hardening a private user
+		// directory. Project-scope writes must remain usable by collaborators who
+		// can create files but are not allowed to replace the owner or DACL.
 		let access = FILE_READ_ATTRIBUTES
 			| FILE_TRAVERSE
-			| READ_CONTROL
 			| if acl_access {
-				WRITE_DAC | WRITE_OWNER
+				READ_CONTROL | WRITE_DAC | WRITE_OWNER
 			} else {
 				0
 			};
@@ -9778,6 +9792,7 @@ mod platform {
 	)]
 	fn open_or_create_skill_root(
 		path: &Path,
+		acl_access: bool,
 	) -> Result<(HeldExact, String, Vec<OsString>), &'static str> {
 		let (root, names) = absolute_components(path)?;
 		let root_handle = open_path(&root, true, FILE_READ_ATTRIBUTES | FILE_TRAVERSE)?;
@@ -9804,7 +9819,7 @@ mod platform {
 			let child = match open_or_create_skill_directory(
 				authority.target,
 				name,
-				index + 1 == names.len(),
+				acl_access && index + 1 == names.len(),
 			) {
 				Ok(child) => child,
 				Err(code) => return Err(code),
@@ -9918,7 +9933,10 @@ mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained skill-directory handle owns each unique private file name"
 	)]
-	fn create_private_skill_file(parent: HANDLE) -> Result<(HANDLE, Vec<u16>), &'static str> {
+	fn create_private_skill_file(
+		parent: HANDLE,
+		acl_access: bool,
+	) -> Result<(HANDLE, Vec<u16>), &'static str> {
 		for _ in 0..16 {
 			let sequence = NEXT_SECURE_SKILL_TEMP_ID.fetch_add(1, Ordering::Relaxed);
 			let name = OsString::from(format!(".gjc-skill-write-{}-{}", std::process::id(), sequence));
@@ -9929,9 +9947,11 @@ mod platform {
 				| FILE_WRITE_ATTRIBUTES
 				| FILE_READ_DATA
 				| FILE_WRITE_DATA
-				| READ_CONTROL
-				| WRITE_DAC
-				| WRITE_OWNER
+				| if acl_access {
+					READ_CONTROL | WRITE_DAC | WRITE_OWNER
+				} else {
+					0
+				}
 				| 0x0001_0000;
 			let file = match open_relative_with_disposition_status(
 				parent,
@@ -9946,8 +9966,9 @@ mod platform {
 				Err(status) => return Err(ntstatus_code(status)),
 			};
 			if let Err(code) = validate_skill_file_handle(file) {
+				let cleanup = cleanup_private_skill_file(file);
 				unsafe { CloseHandle(file) };
-				return Err(code);
+				return Err(cleanup.err().unwrap_or(code));
 			}
 			return Ok((file, name.encode_wide().collect()));
 		}
@@ -10083,12 +10104,16 @@ mod platform {
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
 		let (mut skills, canonical_volume, mut path_names) =
-			match open_or_create_skill_root(root_path) {
+			match open_or_create_skill_root(root_path, file_mode == 0o600) {
 				Ok(value) => value,
 				Err(code) => return NativeSecureSkillWriteResult::failure(code),
 			};
 		let skill_name = std::ffi::OsString::from(skill_name);
-		let skill_handle = match open_or_create_skill_directory(skills.target, &skill_name, true) {
+		let skill_handle = match open_or_create_skill_directory(
+			skills.target,
+			&skill_name,
+			file_mode == 0o600,
+		) {
 			Ok(handle) => handle,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
@@ -10132,10 +10157,11 @@ mod platform {
 		if let Err(code) = inspect_existing_skill_file(skill_parent, file_name) {
 			return NativeSecureSkillWriteResult::failure(code);
 		}
-		let (file, _private_name) = match create_private_skill_file(skill_parent) {
-			Ok(file) => file,
-			Err(code) => return NativeSecureSkillWriteResult::failure(code),
-		};
+		let (file, _private_name) =
+			match create_private_skill_file(skill_parent, file_mode == 0o600) {
+				Ok(file) => file,
+				Err(code) => return NativeSecureSkillWriteResult::failure(code),
+			};
 		if let Err(code) = truncate_and_write_skill_file(file, content.as_bytes()) {
 			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
@@ -10208,6 +10234,13 @@ mod platform {
 			};
 			unsafe { CloseHandle(file) };
 			return NativeSecureSkillWriteResult::failure(code);
+		}
+		// Recheck the retained root and per-skill binding after publication. The
+		// post-rename verification runs before this caller resumes, but a concurrent
+		// rename can still replace the skill directory during that final check.
+		if revalidate_skill_root(&skills, &path_names).is_err() {
+			unsafe { CloseHandle(file) };
+			return NativeSecureSkillWriteResult::failure("identity_mismatch");
 		}
 		unsafe { CloseHandle(file) };
 		NativeSecureSkillWriteResult::success(

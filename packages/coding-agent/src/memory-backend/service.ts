@@ -87,21 +87,22 @@ export async function getMemoryBackendRescopeError(
 	}
 	const sourceId = residentBackendId ?? resolveMemoryBackendId(settings);
 	const targetId = resolveMemoryBackendId(targetSettings);
-	if (sourceId === "hindsight") {
-		const isGenuinelyIdle = serviceState === "idle" && resident === undefined && residentBackend === undefined;
-		if (isGenuinelyIdle) {
-			if (sourceId !== targetId) {
-				return new Error(
-					`Refusing to rescope before publication: memory backend would change from "${sourceId}" to "${targetId}"; restart the session at the target cwd to apply the target policy.`,
-				);
-			}
-			const sourcePolicy = canonicalHindsightPolicy(settings);
-			const targetPolicy = canonicalHindsightPolicy(targetSettings);
-			if (sourcePolicy === targetPolicy) return undefined;
+	const isGenuinelyIdle = serviceState === "idle" && resident === undefined && residentBackend === undefined;
+	if (isGenuinelyIdle && (sourceId === "local" || sourceId === "hindsight")) {
+		if (sourceId !== targetId) {
 			return new Error(
-				`Refusing to rescope before publication: Hindsight memory policy is launch-bound and differs at target cwd; restart the session at the target cwd to apply the target policy.`,
+				`Refusing to rescope before publication: memory backend would change from "${sourceId}" to "${targetId}"; restart the session at the target cwd to apply the target policy.`,
 			);
 		}
+		const sourcePolicy = sourceId === "local" ? canonicalMemoryPolicy(settings) : canonicalHindsightPolicy(settings);
+		const targetPolicy =
+			sourceId === "local" ? canonicalMemoryPolicy(targetSettings) : canonicalHindsightPolicy(targetSettings);
+		if (sourcePolicy === targetPolicy) return undefined;
+		return new Error(
+			`Refusing to rescope before publication: ${sourceId === "local" ? "local memory" : "Hindsight memory"} policy is launch-bound and differs at target cwd; restart the session at the target cwd to apply the target policy.`,
+		);
+	}
+	if (sourceId === "hindsight") {
 		// Hindsight state owns a client, resolved config, bank scope, and a
 		// retain queue. Rebinding those pieces before publication would require
 		// draining and recreating state with no safe ownership handoff, so fail

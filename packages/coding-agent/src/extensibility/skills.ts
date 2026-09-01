@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import { getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
-import { loadCapabilityForHome } from "../capability";
+import { loadCapabilityForHome, resolveProfileAuthority } from "../capability";
 import { skillCapability } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
 import type { Settings, SkillsSettings } from "../config/settings";
@@ -171,17 +171,26 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
+	const selectedAgentDir =
+		agentDir ?? settings?.getAgentDir() ?? (home === undefined ? undefined : resolveUserAgentDir(resolvedHome));
 	const loadOptions = {
 		cwd,
 		// Settings owns the selected profile when no explicit agent directory was
 		// supplied. Only fall back to the injected home after both authorities are
 		// absent; otherwise policy and files can come from different profiles.
-		agentDir:
-			agentDir ?? settings?.getAgentDir() ?? (home === undefined ? undefined : resolveUserAgentDir(resolvedHome)),
+		agentDir: selectedAgentDir,
 		providers: ["native"],
 		disabledExtensions,
 		settings,
-		profileAuthority,
+		profileAuthority: resolveProfileAuthority(
+			{
+				agentDir: selectedAgentDir,
+				settings,
+				profileAuthority,
+			},
+			resolvedHome,
+			home === undefined ? undefined : "default",
+		),
 	};
 	const result = await (home === undefined
 		? loadCapability<CapabilitySkill>(skillCapability.id, loadOptions)
