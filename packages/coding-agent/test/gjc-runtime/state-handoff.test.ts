@@ -142,12 +142,33 @@ describe("gjc state handoff", () => {
 				},
 			});
 			const result = await runNativeStateCommand(
-				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--approve-execution", "--json"],
 				cwd,
 			);
 			expect(result.status).toBe(0);
 			const after = (await readJson(callerPath)) as Record<string, unknown>;
 			expect((after.state as Record<string, unknown>).execution_approval).toBe("approved");
+		});
+	});
+	it("rejects ready-Crystal execution handoff without explicit approval", async () => {
+		await withTempCwd(async cwd => {
+			const specPath = path.join(cwd, "crystal.md");
+			await fs.writeFile(specPath, "# Crystal\n");
+			await writeJson(modeStatePath(cwd, TEST_SESSION_ID, "deep-interview"), {
+				skill: "deep-interview",
+				version: 2,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				spec_sha256: createHash("sha256").update("# Crystal\n").digest("hex"),
+				state: { crystal: { lifecycle: "ready" }, execution_approval: "not-approved" },
+			});
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("requires explicit execution approval");
 		});
 	});
 	it("permits validated legacy final-spec execution handoff", async () => {
