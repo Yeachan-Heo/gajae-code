@@ -78,6 +78,7 @@ function makeComposerHarness() {
 		showError: () => {},
 		showStatus: () => {},
 		isStopped: () => false,
+		sessionManager: { getCwd: () => process.cwd() },
 		ui: {
 			setFocus: () => {},
 			requestRender: () => {},
