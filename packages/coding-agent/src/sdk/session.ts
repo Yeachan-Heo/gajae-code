@@ -4604,7 +4604,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				void boundedDispose
 					.catch(async error => {
 						if (isSessionDisposalIncompleteError(error)) {
-							await session.dispose();
+							try {
+								await session.dispose();
+							} finally {
+								await finishCleanup();
+							}
+							return;
 						}
 						await finishCleanup();
 					})

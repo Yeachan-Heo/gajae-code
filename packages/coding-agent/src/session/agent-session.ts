@@ -9195,13 +9195,17 @@ export class AgentSession {
 
 	async #closeSessionManagerForDispose(): Promise<void> {
 		for (;;) {
-			try {
-				await this.sessionManager.close();
+			const outcome = await this.sessionManager.closeStrict();
+			if (outcome.kind === "closed") {
+				SessionManager.releaseProcessCwdOwnership(this.sessionManager);
 				return;
-			} catch (error) {
-				logger.warn("Session manager close is retryable during dispose", { error: String(error) });
-				await Bun.sleep(50);
 			}
+			if (outcome.kind === "close_unknown") {
+				SessionManager.releaseProcessCwdOwnership(this.sessionManager);
+				throw outcome.error;
+			}
+			logger.warn("Session manager close remains retryable during dispose", { error: outcome.error.message });
+			await Bun.sleep(50);
 		}
 	}
 
