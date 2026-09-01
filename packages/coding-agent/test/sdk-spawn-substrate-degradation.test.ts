@@ -107,6 +107,80 @@ describe("spawn substrate degradation (#5128)", () => {
 		expect(launched).toMatchObject({ ok: true, proof: { substrateKind: "headless" } });
 	});
 
+	it("refuses to degrade when the managed cleanup failed and residue may be alive", async () => {
+		const cwd = await temp("gjc-substrate-degrade-");
+		let headlessStarted = false;
+		const provider = createSpawnSubstrateProvider(
+			tmuxFirstDependencies({
+				launchManaged: () => {
+					throw new AggregateError(
+						[
+							new Error("gjc_tmux_managed_launch_proof_unavailable"),
+							new Error("gjc_tmux_cleanup_target_changed"),
+						],
+						"gjc_tmux_managed_launch_proof_failed_cleanup_failed",
+					);
+				},
+				startHeadless: () => {
+					headlessStarted = true;
+					return { pid: 4242, terminate() {} };
+				},
+			}),
+		);
+		const launched = await provider.launch(launchSpec(cwd));
+		expect(launched.ok).toBeFalse();
+		if (launched.ok) throw new Error("a live tmux residue must not gain a second child");
+		expect(launched.code).toBe("substrate_proof_failed");
+		expect(launched.diagnostic).toContain("gjc_tmux_managed_launch_proof_failed_cleanup_failed");
+		expect(launched.diagnostic).not.toContain("headless_");
+		expect(headlessStarted).toBeFalse();
+	});
+
+	it("refuses to degrade when the owner isolation layer reports cleanup uncertainty", async () => {
+		const cwd = await temp("gjc-substrate-degrade-");
+		let headlessStarted = false;
+		const provider = createSpawnSubstrateProvider(
+			tmuxFirstDependencies({
+				launchManaged: () => {
+					throw new Error("gjc_tmux_owner_isolation_scope_bootstrap_failed:bootstrap_cleanup_uncertain");
+				},
+				startHeadless: () => {
+					headlessStarted = true;
+					return { pid: 4242, terminate() {} };
+				},
+			}),
+		);
+		expect(await provider.launch(launchSpec(cwd))).toMatchObject({
+			ok: false,
+			code: "substrate_proof_failed",
+		});
+		expect(headlessStarted).toBeFalse();
+	});
+
+	it("refuses to degrade when the exact-proof close of an unprovable managed substrate is rejected", async () => {
+		const cwd = await temp("gjc-substrate-degrade-");
+		let headlessStarted = false;
+		const provider = createSpawnSubstrateProvider(
+			tmuxFirstDependencies({
+				launchManaged: () => managedProof(),
+				verifyManaged: () => "mismatch",
+				closeManaged: async () => {
+					throw new Error("gjc_tmux_owner_changed:managed-child");
+				},
+				startHeadless: () => {
+					headlessStarted = true;
+					return { pid: 4242, terminate() {} };
+				},
+			}),
+		);
+		const launched = await provider.launch(launchSpec(cwd));
+		expect(launched.ok).toBeFalse();
+		if (launched.ok) throw new Error("an unclosed managed substrate must not gain a second child");
+		expect(launched.code).toBe("substrate_proof_failed");
+		expect(launched.diagnostic).toContain("close_failed");
+		expect(headlessStarted).toBeFalse();
+	});
+
 	it("fails closed with the concrete diagnostic when every candidate substrate fails", async () => {
 		const cwd = await temp("gjc-substrate-degrade-");
 		const provider = createSpawnSubstrateProvider(
@@ -222,6 +296,73 @@ describe("Broker spawn diagnostic propagation (#5128)", () => {
 		ownerSessionId: "master-diagnostic",
 		attestationEpoch: "epoch-diagnostic",
 		cwd: process.cwd(),
+	});
+
+	/** The issue's acceptance observable: the SPAWN RESPONSE must name the substrate that won. */
+	it("answers spawn_accepted with substrateKind headless after a real tmux-first degradation", async () => {
+		const agentDir = await temp("gjc-spawn-degraded-");
+		let managedLaunches = 0;
+		let headlessLaunches = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: createSpawnSubstrateProvider({
+				platform: "darwin",
+				selectMultiplexer: () => "tmux",
+				launchManaged: () => {
+					managedLaunches += 1;
+					throw new Error(
+						"gjc_tmux_owner_isolation_scope_bootstrap_failed:planned_spawn_failed:create window failed: fork failed: Device not configured",
+					);
+				},
+				verifyManaged: () => "verified",
+				closeManaged: async () => {},
+				startHeadless: () => {
+					headlessLaunches += 1;
+					return { pid: 4343, terminate() {} };
+				},
+				processIncarnation: () => "darwin:4343",
+			}),
+			spawnPromptLayer: {
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+					ok: true as const,
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 4343,
+						processIncarnation: "darwin:4343",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
+				}),
+				dispatch: async () => ({
+					kind: "accepted" as const,
+					commandId: "cmd-degraded",
+					turnId: "turn-degraded",
+					acceptedAt: Date.now(),
+				}),
+				reconcile: async () => ({
+					status: "terminal_ok" as const,
+					commandId: "cmd-degraded",
+					turnId: "turn-degraded",
+				}),
+			},
+		});
+		await broker.start();
+		try {
+			const response = (await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), cwd: agentDir },
+				"degraded-key",
+			)) as { ok: boolean; result?: { code?: string; substrateKind?: string } };
+			expect(response.ok).toBeTrue();
+			expect(response.result?.code).toBe("spawn_accepted");
+			expect(response.result?.substrateKind).toBe("headless");
+			expect(managedLaunches).toBe(1);
+			expect(headlessLaunches).toBe(1);
+		} finally {
+			await broker.stop();
+		}
 	});
 
 	it("reports and durably records the substrate diagnostic of a failed spawn", async () => {
@@ -355,9 +496,57 @@ describe("session index warning scoping (#5128)", () => {
 			indexSeq: 1,
 			sessions: [],
 			warnings: ["Corrupt session index entry; replay truncated"],
-			rowWarnings: {},
+			warningScope: { indexWide: ["Corrupt session index entry; replay truncated"], rows: {} },
 		};
 		expect(warningsForSession(listing, "any-session")).toEqual(["Corrupt session index entry; replay truncated"]);
+	});
+
+	it("fences two rows that raised an identical warning independently", () => {
+		const duplicated = "Session index row was rejected.";
+		const listing = {
+			indexSeq: 1,
+			sessions: [],
+			warnings: [duplicated, duplicated],
+			warningScope: { indexWide: [], rows: { first: [duplicated], second: [duplicated] } },
+		};
+		expect(warningsForSession(listing, "first")).toEqual([duplicated]);
+		expect(warningsForSession(listing, "second")).toEqual([duplicated]);
+		expect(warningsForSession(listing, "third")).toEqual([]);
+	});
+
+	it("scopes generationStatus to the requested row", async () => {
+		const directory = await temp("gjc-index-scoped-generation-");
+		const stateRoot = path.join(directory, ".gjc", "state");
+		await writeRows(directory, [
+			{
+				version: SDK_STATE_VERSION,
+				indexSeq: 1,
+				type: "host_registered",
+				sessionId: "legacy-session",
+				locator: { repo: directory, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+				ts: Date.now(),
+			},
+			{
+				version: SDK_STATE_VERSION,
+				indexSeq: 2,
+				type: "host_registered",
+				sessionId: "healthy-session",
+				locator: { cwd: directory, worktreeRoot: null, stateRoot },
+				endpointGeneration: 4,
+				pid: process.pid,
+				ts: Date.now(),
+			},
+		]);
+		const index = await new SessionIndex(directory).open();
+		// The unrelated legacy row no longer makes THIS row's generation unreportable.
+		// The row still carries no process incarnation, so it reconciles no further
+		// than `reconciliation_incomplete`; the point is that it is not index_incomplete.
+		const healthy = await index.generationStatus("healthy-session", 4);
+		expect(healthy).not.toMatchObject({ reason: "index_incomplete" });
+		const warned = await index.generationStatus("legacy-session", 1);
+		expect(warned).toMatchObject({ status: "unknown", reason: "index_incomplete" });
 	});
 
 	it("treats every warning as index-wide when no row attribution is published", () => {

@@ -36,6 +36,8 @@ interface RouterFixtureAuthority {
 	indexed: boolean;
 	terminalUncertain: boolean;
 	warnings: string[];
+	/** Row-attributed warnings, as a real SessionIndex publishes them (#5128). */
+	warningScope?: { indexWide: readonly string[]; rows: Readonly<Record<string, readonly string[]>> };
 }
 
 interface RouterFixtureClient {
@@ -101,6 +103,9 @@ async function routerFixture(
 		indexed: options.initiallyIndexed !== false,
 		terminalUncertain: false,
 		warnings: [] as string[],
+		warningScope: undefined as
+			| { indexWide: readonly string[]; rows: Readonly<Record<string, readonly string[]>> }
+			| undefined,
 	};
 	const index = {
 		open: async () => {},
@@ -130,6 +135,7 @@ async function routerFixture(
 					]
 				: [],
 			warnings: authority.warnings,
+			...(authority.warningScope === undefined ? {} : { warningScope: authority.warningScope }),
 		}),
 	} as unknown as SessionIndex;
 	const clients: RouterFixtureClient[] = [];
@@ -1359,6 +1365,68 @@ describe("SessionRouter dispatch authority", () => {
 			expect(fixture.router.attachment(fixture.sessionId)).toBe(adopted);
 		} finally {
 			await fixture.router.stop();
+		}
+	});
+
+	/**
+	 * Reconcile fences per row (#5128). The adopted-attachment loop used to be
+	 * skipped wholesale whenever the listing carried any warning; it now runs for
+	 * every tick, so both directions are pinned: an index-wide fault revokes the
+	 * adoption, and a warning about a different row leaves it alone.
+	 */
+	test("retires an adopted attachment on an index-wide fault and keeps it on an unrelated row warning", async () => {
+		const unrelated = await routerFixture({ initiallyIndexed: false });
+		const unrelatedEndpoint = JSON.parse(fs.readFileSync(unrelated.endpointFile, "utf8")) as Record<string, unknown>;
+		const unrelatedAdopted = await unrelated.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: unrelated.sessionId,
+					endpointGeneration: unrelated.authority.generation,
+					pid: unrelated.authority.pid,
+					endpointMtimeMs: unrelated.authority.endpointMtimeMs,
+					endpoint: unrelatedEndpoint,
+				},
+			},
+			{ sessionId: unrelated.sessionId, cwd: unrelated.repo },
+		);
+		try {
+			unrelated.authority.indexed = true;
+			const legacy = "Session other-session has a legacy locator row and must re-register.";
+			unrelated.authority.warnings = [legacy];
+			unrelated.authority.warningScope = { indexWide: [], rows: { "other-session": [legacy] } };
+			await unrelated.router.reconcile();
+			expect(unrelatedAdopted.isCurrent()).toBe(true);
+			expect(unrelated.router.attachment(unrelated.sessionId)).toBe(unrelatedAdopted);
+		} finally {
+			await unrelated.router.stop();
+		}
+
+		const faulted = await routerFixture({ initiallyIndexed: false });
+		const faultedEndpoint = JSON.parse(fs.readFileSync(faulted.endpointFile, "utf8")) as Record<string, unknown>;
+		const faultedAdopted = await faulted.router.adoptLifecycleResult(
+			{
+				ok: true,
+				result: {
+					sessionId: faulted.sessionId,
+					endpointGeneration: faulted.authority.generation,
+					pid: faulted.authority.pid,
+					endpointMtimeMs: faulted.authority.endpointMtimeMs,
+					endpoint: faultedEndpoint,
+				},
+			},
+			{ sessionId: faulted.sessionId, cwd: faulted.repo },
+		);
+		try {
+			faulted.authority.indexed = true;
+			const corrupt = "Corrupt session index entry; replay truncated";
+			faulted.authority.warnings = [corrupt];
+			faulted.authority.warningScope = { indexWide: [corrupt], rows: {} };
+			await faulted.router.reconcile();
+			expect(faultedAdopted.isCurrent()).toBe(false);
+			expect(faulted.router.attachment(faulted.sessionId)).toBeNull();
+		} finally {
+			await faulted.router.stop();
 		}
 	});
 
