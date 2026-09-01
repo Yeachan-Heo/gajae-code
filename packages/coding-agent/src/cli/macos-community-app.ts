@@ -496,8 +496,8 @@ export async function offerMacosCommunityApp(
 			dmgPath,
 		]);
 		throwIfInterrupted();
-		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		mountIdentity = await fileIdentity(mountPoint);
+		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		if (!mountIdentity) return failure("the mounted volume was not a real directory", log);
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
 			return failure("the staged DMG identity changed before verification", log);
