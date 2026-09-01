@@ -174,6 +174,29 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 	return parsed as Record<string, unknown>;
 }
 
+async function authoritativeConversationRevision(): Promise<number | undefined> {
+	const sessionFile = process.env.GJC_SESSION_FILE?.trim();
+	if (!sessionFile) return undefined;
+	try {
+		const text = await fs.readFile(sessionFile, "utf-8");
+		let revision = 0;
+		for (const line of text.split(/\r?\n/)) {
+			if (!line.trim()) continue;
+			try {
+				const parsed = JSON.parse(line);
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+				const entry = parsed as Record<string, unknown>;
+				if (entry.type === "message" || entry.role === "user" || entry.role === "assistant") revision++;
+			} catch {
+				return undefined;
+			}
+		}
+		return revision;
+	} catch {
+		return undefined;
+	}
+}
+
 async function handleCrystallize(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
 	const input = await readCrystallizeInput(flagValue(args, "--input"), cwd);
 	const session = resolveGjcSessionForWrite(cwd, {
@@ -215,6 +238,9 @@ async function handleCrystallizeUnlocked(
 		JSON.stringify(input.prior) !== JSON.stringify(storedPrior)
 	)
 		throw new DeepInterviewCommandError(2, "supplied prior crystal does not match canonical stored crystal");
+	const liveRevision = await authoritativeConversationRevision();
+	if (liveRevision !== undefined && liveRevision !== input.current_revision)
+		throw new DeepInterviewCommandError(2, "conversation snapshot is stale against the live session transcript");
 	const payload = { ...input, prior: storedPrior };
 	const crystal = crystallizeDeepInterview(payload);
 	const slug = flagValue(args, "--slug")?.trim() || `crystal-v${crystal.spec_version}`;
