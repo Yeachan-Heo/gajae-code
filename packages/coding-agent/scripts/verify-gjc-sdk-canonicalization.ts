@@ -1567,6 +1567,18 @@ function isTypeOnlyTmuxPrimitiveOccurrence(contents: string, occurrence: TmuxPri
 	return /^\s*(?:export\s+)?type\b/.test(contents.slice(lineStart, lineEnd === -1 ? contents.length : lineEnd));
 }
 
+function isExactTmuxSelfInjectionGuardVerb(
+	file: string,
+	contents: string,
+	occurrence: TmuxPrimitiveOccurrence,
+): boolean {
+	if (file !== "packages/coding-agent/src/tools/tmux-self-injection-guard.ts") return false;
+	const declaration = 'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);';
+	const declarationStart = contents.indexOf(declaration);
+	if (declarationStart === -1 || contents.indexOf(declaration, declarationStart + 1) !== -1) return false;
+	return occurrence.start >= declarationStart && occurrence.end <= declarationStart + declaration.length;
+}
+
 function tmuxMachineBusViolations(file: string, contents: string): string[] {
 	if (isGeneratedDocumentationIndex(file)) return [];
 	const allowedTeamFallbackRanges =
@@ -1581,7 +1593,8 @@ function tmuxMachineBusViolations(file: string, contents: string): string[] {
 		if (
 			isExactTeamFallback ||
 			isExactTmuxScrollCopyModeSendKeys(file, contents, occurrence) ||
-			isTypeOnlyTmuxPrimitiveOccurrence(contents, occurrence)
+			isTypeOnlyTmuxPrimitiveOccurrence(contents, occurrence) ||
+			isExactTmuxSelfInjectionGuardVerb(file, contents, occurrence)
 		)
 			continue;
 		const detail =
@@ -3146,6 +3159,13 @@ fi
 		},
 		1,
 		"tmux send-keys content injection is outside sanctioned process lifecycle",
+	);
+	await runSelfTestFixture(
+		{
+			"packages/coding-agent/src/tools/tmux-self-injection-guard.ts":
+				'const INPUT_VERBS = new Set(["send-keys", "paste-buffer", "send-prefix"]);\n',
+		},
+		0,
 	);
 	await runSelfTestFixture(
 		{
