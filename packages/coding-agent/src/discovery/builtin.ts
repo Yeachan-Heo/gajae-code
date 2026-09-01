@@ -4,7 +4,7 @@
  * Primary provider for GJC native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { logger, normalizePathForComparison, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
@@ -97,14 +97,18 @@ function getAncestorDirs(
 	const ancestors: Array<{ dir: string; depth: number }> = [];
 	let current = path.resolve(cwd);
 	let depth = 0;
+	let normalizedCurrent = normalizePathForComparison(current);
 	const resolvedStop = stopAt ? path.resolve(stopAt) : undefined;
+	const normalizedStop = resolvedStop ? normalizePathForComparison(resolvedStop) : undefined;
 	const resolvedExclude = excludeDir ? path.resolve(excludeDir) : undefined;
+	const normalizedExclude = resolvedExclude ? normalizePathForComparison(resolvedExclude) : undefined;
 	while (true) {
-		if (current !== resolvedExclude) ancestors.push({ dir: current, depth });
-		if (resolvedStop && current === resolvedStop) break;
+		if (normalizedCurrent !== normalizedExclude) ancestors.push({ dir: current, depth });
+		if (normalizedStop && normalizedCurrent === normalizedStop) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
+		normalizedCurrent = normalizePathForComparison(current);
 		depth++;
 	}
 	return ancestors;

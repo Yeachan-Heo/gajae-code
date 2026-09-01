@@ -839,6 +839,7 @@ export class MCPConnectionPool {
 		}
 		const subscriptionUpdate = this.updateLeaseSubscriptions(entry, subscriptions, new Set());
 		await subscriptionUpdate;
+		const previousRoots = entry.rootsByLease.get(lease)?.map(root => ({ ...root })) ?? [];
 		entry.leases.delete(lease);
 		entry.rootsByLease.delete(lease);
 		this.#scheduleRootsNotification(entry);
@@ -859,7 +860,7 @@ export class MCPConnectionPool {
 				releaseError = new AggregateError([error, restoreError], "MCP lease release rollback failed");
 			}
 			entry.leases.add(lease);
-			entry.rootsByLease.set(lease, []);
+			entry.rootsByLease.set(lease, previousRoots);
 			this.#allLeases.add(lease);
 			entry.refCount += 1;
 			throw releaseError;
