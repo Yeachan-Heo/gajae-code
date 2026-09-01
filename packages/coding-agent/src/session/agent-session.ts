@@ -9203,6 +9203,7 @@ export class AgentSession {
 	}
 
 	async #closeSessionManagerForDispose(): Promise<void> {
+		let retryDelayMs = 50;
 		for (;;) {
 			const outcome = await this.sessionManager.closeStrict();
 			if (outcome.kind === "closed") {
@@ -9214,7 +9215,8 @@ export class AgentSession {
 				throw outcome.error;
 			}
 			logger.warn("Session manager close remains retryable during dispose", { error: outcome.error.message });
-			await Bun.sleep(50);
+			await Bun.sleep(retryDelayMs);
+			retryDelayMs = Math.min(retryDelayMs * 2, 1_000);
 		}
 	}
 
