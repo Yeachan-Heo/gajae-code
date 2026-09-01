@@ -4598,7 +4598,11 @@ pub(crate) mod platform {
 		} else {
 			true
 		};
-		let created_identity = if created { statat_fd(parent_fd, name).ok() } else { None };
+		let created_identity = if created {
+			statat_fd(parent_fd, name).ok()
+		} else {
+			None
+		};
 		let reopened = unsafe { libc::openat(parent_fd, name.as_ptr(), flags) };
 		if reopened < 0 {
 			let error = std::io::Error::last_os_error();
@@ -4749,13 +4753,15 @@ pub(crate) mod platform {
 			let child_identity = fstat(next.as_raw_fd()).map_err(|_| "io_error")?;
 			if created && unsafe { libc::fchmod(next.as_raw_fd(), directory_mode) } != 0 {
 				let code = skill_write_error(&std::io::Error::last_os_error());
-				let cleanup = remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
+				let cleanup =
+					remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
 				drop(next);
 				return Err(cleanup.err().unwrap_or(code));
 			}
 			if created {
 				if let Err(code) = fsync_root_parent(current.as_raw_fd()) {
-					let cleanup = remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
+					let cleanup =
+						remove_created_directory_if_exact(current.as_raw_fd(), &name, &child_identity);
 					drop(next);
 					return Err(cleanup.err().unwrap_or(code));
 				}
@@ -5187,6 +5193,26 @@ pub(crate) mod platform {
 				}
 				return NativeSecureSkillWriteResult::failure(code);
 			},
+		}
+		if file_mode != 0o600 {
+			if unsafe { libc::fchmod(private_fd, requested_file_mode as libc::mode_t) } != 0 {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure(skill_write_error(
+					&std::io::Error::last_os_error(),
+				));
+			}
+			if file.sync_all().is_err() {
+				drop(file);
+				unsafe {
+					libc::close(skill_fd);
+					libc::close(skills_fd);
+				}
+				return NativeSecureSkillWriteResult::failure("durability_failed");
+			}
 		}
 		if revalidate_skill_directory(&root, &skill_component, skill_fd).is_err() {
 			drop(file);
