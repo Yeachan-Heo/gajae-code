@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
 const contentCache = new Map<string, string | null>();
@@ -85,6 +86,27 @@ async function isCurrentIsolatedPath(abs: string, options?: ReadFileOptions): Pr
 	}
 }
 
+function isSingleLinkRegularFile(stat: fs.Stats): boolean {
+	return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
+}
+
+async function openIsolatedFile(abs: string, options?: ReadFileOptions): Promise<fsPromises.FileHandle | null> {
+	let handle: fsPromises.FileHandle | undefined;
+	try {
+		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
+		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow);
+		const opened = await handle.stat();
+		if (options?.isolatedHome && !isSingleLinkRegularFile(opened)) {
+			await handle.close();
+			return null;
+		}
+		return handle;
+	} catch {
+		await handle?.close().catch(() => {});
+		return null;
+	}
+}
+
 export async function readFile(filePath: string, options?: ReadFileOptions): Promise<string | null> {
 	let abs: string | null;
 	try {
@@ -99,13 +121,20 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		return contentCache.get(abs) ?? null;
 	}
 
+	const handle = await openIsolatedFile(abs, options);
+	if (!handle) {
+		if (useCache) contentCache.set(abs, null);
+		return null;
+	}
 	try {
-		const content = await Bun.file(abs).text();
+		const content = await handle.readFile({ encoding: "utf8" });
 		if (useCache) contentCache.set(abs, content);
 		return content;
 	} catch {
 		if (useCache) contentCache.set(abs, null);
 		return null;
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -123,10 +152,17 @@ export async function readFileSlice(
 		return null;
 	}
 	if (abs === null || !(await isCurrentIsolatedPath(abs, options))) return null;
+	const handle = await openIsolatedFile(abs, options);
+	if (!handle) return null;
 	try {
-		return new Uint8Array(await Bun.file(abs).slice(start, end).arrayBuffer());
+		const length = Math.max(0, end - start);
+		const buffer = Buffer.alloc(length);
+		const { bytesRead } = await handle.read(buffer, 0, length, start);
+		return new Uint8Array(buffer.subarray(0, bytesRead));
 	} catch {
 		return null;
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -139,10 +175,14 @@ export async function readFileSize(filePath: string, options?: ReadFileOptions):
 		return null;
 	}
 	if (abs === null || !(await isCurrentIsolatedPath(abs, options))) return null;
+	const handle = await openIsolatedFile(abs, options);
+	if (!handle) return null;
 	try {
-		return (await fs.promises.stat(abs)).size;
+		return (await handle.stat()).size;
 	} catch {
 		return null;
+	} finally {
+		await handle.close();
 	}
 }
 
@@ -160,13 +200,22 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 		return dirCache.get(abs) ?? [];
 	}
 
+	let handle: fsPromises.FileHandle | undefined;
 	try {
-		const entries = await fs.promises.readdir(abs, { withFileTypes: true });
+		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
+		const directoryOnly = fs.constants.O_DIRECTORY ?? 0;
+		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow | directoryOnly);
+		const opened = await handle.stat();
+		if (options?.isolatedHome && (!opened.isDirectory() || opened.isSymbolicLink())) return [];
+		const directoryPath = process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : abs;
+		const entries = await fs.promises.readdir(directoryPath, { withFileTypes: true });
 		if (useCache) dirCache.set(abs, entries);
 		return entries;
 	} catch {
 		if (useCache) dirCache.set(abs, []);
 		return [];
+	} finally {
+		await handle?.close().catch(() => {});
 	}
 }
 

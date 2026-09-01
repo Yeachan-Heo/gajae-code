@@ -468,7 +468,7 @@ export async function loadMCPJsonFile(
 	}
 
 	const content = options?.quiet
-		? await readExactMCPConfigFile(filePath)
+		? await readExactMCPConfigFile(sourcePath)
 		: options?.useCache === false
 			? await readFile(filePath, { ...options.readOptions, bypassCache: true })
 			: await readFile(filePath, options?.readOptions);

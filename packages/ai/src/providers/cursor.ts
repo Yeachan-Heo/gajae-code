@@ -1984,6 +1984,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				h2Request.removeListener("error", h2RequestErrorHandler);
 			}
 			if (h2Client && h2ClientErrorHandler) {
+				// Keep a listener installed while the session closes. Node treats a late
+				// ClientHttp2Session error without listeners as an uncaught exception.
+				h2Client.on("error", () => {});
 				h2Client.removeListener("error", h2ClientErrorHandler);
 			}
 			// A queued exec handler can still be draining when the caller aborts; its

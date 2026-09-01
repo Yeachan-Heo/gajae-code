@@ -860,10 +860,10 @@ describe("Cursor request lifecycle", () => {
 							async read(args) {
 								const id = Number(args.path.slice(-1));
 								calls.push(id);
-						if (id === 1) {
-							resolveFirstStarted();
-							await releaseFirst;
-						}
+								if (id === 1) {
+									resolveFirstStarted();
+									await releaseFirst;
+								}
 								return { result: createReadSuccessResult(String(id)), toolResult: undefined };
 							},
 						},
