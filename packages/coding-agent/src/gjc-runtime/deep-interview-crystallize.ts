@@ -270,6 +270,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	});
 	const removedGoal = removedIds.some(id => priorItems.get(id)?.kind === "goal");
 	const removedIntent = removedIds.length > 0;
+	const allGaps = [...new Set([...(priorCrystal?.open_gaps ?? []), ...gaps])];
+	const allConflicts = [...new Set([...(priorCrystal?.conflicts ?? []), ...conflicts])];
+	const hasDisputed = currentItems.some(item => item.classification === "disputed");
 	const intentChanged =
 		goalChanged ||
 		changed.some(id =>
@@ -279,7 +282,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		);
 	const delta: CrystalDelta = {
 		kind:
-			conflicts.length > 0
+			allConflicts.length > 0 || hasDisputed
 				? "stale"
 				: goalChanged || removedGoal
 					? "goal-replaced"
@@ -291,14 +294,14 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		changed_ids: changed,
 		added_ids: added,
 		preserved_ids: preserved,
-		approval_invalidated: intentChanged || removedIntent || conflicts.length > 0,
+		approval_invalidated: intentChanged || removedIntent || allConflicts.length > 0 || hasDisputed,
 	};
 	const lifecycle =
-		conflicts.length > 0
+		allConflicts.length > 0 || hasDisputed
 			? "stale"
 			: goalChanged || removedGoal
 				? "superseded"
-				: intentChanged || removedIntent || gaps.length > 0
+				: intentChanged || removedIntent || allGaps.length > 0
 					? "needs-questions"
 					: "ready";
 	return {
@@ -314,8 +317,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		},
 		items: currentItems,
 		...(removedIds.length > 0 ? { removed_ids: removedIds } : {}),
-		open_gaps: gaps,
-		conflicts,
+		open_gaps: allGaps,
+		conflicts: allConflicts,
 		delta,
 		execution_approval: "not-approved",
 	};
