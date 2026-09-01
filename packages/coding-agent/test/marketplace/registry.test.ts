@@ -25,7 +25,7 @@ import {
 	writeInstalledPluginsRegistry,
 	writeMarketplacesRegistry,
 } from "@gajae-code/coding-agent/extensibility/plugins/marketplace";
-import { getAgentDir, getAgentProfileAuthority, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, getConfigDirName, getPluginsDir, setAgentDir } from "@gajae-code/utils";
 import { registerOwnedDeletionRoot, safeRmSync } from "../../../../scripts/safe-cleanup";
 
 // Inline the parseAnthropic modelPluginsRegistry validation logic to avoid pulling
@@ -339,6 +339,46 @@ describe("registry file I/O", () => {
 });
 
 describe("profile registry paths", () => {
+	it("uses XDG storage for an explicit default authority despite a custom ambient profile", () => {
+		if (process.platform === "win32") return;
+
+		const originalAgentDir = getAgentDir();
+		const originalGjcAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const originalXdgDataHome = process.env.XDG_DATA_HOME;
+		const homeRoot = path.join(os.tmpdir(), `gjc-registry-default-${crypto.randomUUID()}`);
+		const releaseHome = registerOwnedDeletionRoot(homeRoot);
+		const home = fs.mkdtempSync(homeRoot);
+		const customAgentDir = path.join(home, "custom-agent");
+		const xdgDataHome = path.join(home, "xdg-data");
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(home);
+
+		try {
+			fs.mkdirSync(path.join(xdgDataHome, "gjc"), { recursive: true });
+			process.env.XDG_DATA_HOME = xdgDataHome;
+			setAgentDir(customAgentDir);
+			expect(getAgentProfileAuthority()).toBe("custom");
+			expect(getPluginsDir()).toBe(path.join(home, getConfigDirName(), "plugins"));
+
+			const defaultAgentDir = path.join(home, getConfigDirName(), "agent");
+			const expectedDefaultPluginsDir = path.join(xdgDataHome, "gjc", "plugins");
+			expect(getProfilePluginsDir(defaultAgentDir, "default")).toBe(expectedDefaultPluginsDir);
+			expect(getProfilePluginsDir(undefined, "default")).toBe(expectedDefaultPluginsDir);
+			expect(getProfilePluginsDir(customAgentDir, "custom")).toBe(path.join(customAgentDir, "plugins"));
+		} finally {
+			homeSpy.mockRestore();
+			if (originalXdgDataHome === undefined) delete process.env.XDG_DATA_HOME;
+			else process.env.XDG_DATA_HOME = originalXdgDataHome;
+			setAgentDir(originalAgentDir);
+			if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
+			try {
+				safeRmSync(home, { recursive: true, force: true });
+			} finally {
+				releaseHome();
+			}
+		}
+	});
+
 	it("keeps resolver-owned custom paths after a config-root refresh", async () => {
 		const originalAgentDir = getAgentDir();
 		const originalGjcAgentDir = process.env.GJC_CODING_AGENT_DIR;

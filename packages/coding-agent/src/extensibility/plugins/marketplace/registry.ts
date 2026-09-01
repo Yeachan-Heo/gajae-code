@@ -22,7 +22,7 @@ import {
 	getAgentDir,
 	getAgentProfileAuthority,
 	getConfigRootDir,
-	getPluginsDir,
+	getDefaultPluginsDir,
 	isEnoent,
 	logger,
 	tryParseJson,
@@ -56,7 +56,7 @@ function resolveProfileAgentDir(agentDir: string | undefined): string {
 export function getProfilePluginsDir(agentDir?: string, profileAuthority?: ProfileAuthority): string {
 	const authority = resolveProfileAuthority(agentDir, profileAuthority);
 	if (authority === "custom") return path.join(resolveProfileAgentDir(agentDir), "plugins");
-	return getPluginsDir();
+	return getDefaultPluginsDir();
 }
 
 export function getMarketplacesRegistryPath(agentDir?: string, profileAuthority?: ProfileAuthority): string {

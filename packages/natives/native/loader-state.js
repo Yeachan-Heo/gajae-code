@@ -550,6 +550,7 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 	const extracted = [];
 	for (const embeddedFile of embeddedAddonCandidates(ctx.selectedVariant)) {
 		const targetPath = path.join(ctx.versionedDir, embeddedFile.filename);
+		let verifiedStaleTarget;
 		if (fs.existsSync(targetPath)) {
 			try {
 				const cachedIdentity = fs.lstatSync(targetPath);
@@ -569,6 +570,8 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 			// different native surface (e.g. a symbol added mid-cycle). The embedded addon
 			// is the source of truth, so reuse the cached file only when it matches the
 			// embedded payload size and re-extract otherwise.
+			let cachedTargetSnapshot;
+			let embeddedHash;
 			const sizeOf = candidate => {
 				try {
 					const identity = fs.lstatSync(candidate);
@@ -595,7 +598,13 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 					},
 					hashOf: candidate => {
 						try {
-							return safeFileSnapshot(candidate).hash;
+							const snapshot = safeFileSnapshot(candidate);
+							if (candidate === targetPath) {
+								cachedTargetSnapshot = { hash: snapshot.hash, identity: snapshot.identity };
+							} else if (candidate === embeddedFile.filePath) {
+								embeddedHash = snapshot.hash;
+							}
+							return snapshot.hash;
 						} catch {
 							return null;
 						}
@@ -604,6 +613,12 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 			) {
 				extracted.push(targetPath);
 				continue;
+			}
+			if (cachedTargetSnapshot && embeddedHash !== undefined && cachedTargetSnapshot.hash !== embeddedHash) {
+				// The target was verified as stale by the same-size content check. Keep
+				// its identity so a Windows overwrite fallback cannot unlink a path that
+				// changed after validation.
+				verifiedStaleTarget = cachedTargetSnapshot;
 			}
 		}
 
@@ -624,7 +639,27 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 			} finally {
 				fs.closeSync(tempFd);
 			}
-			fs.renameSync(tempPath, targetPath);
+			try {
+				fs.renameSync(tempPath, targetPath);
+			} catch (err) {
+				const code = err && typeof err === "object" ? err.code : undefined;
+				if (process.platform !== "win32" || code !== "EPERM" || !verifiedStaleTarget) throw err;
+				try {
+					const currentIdentity = fs.lstatSync(targetPath);
+					const currentStat = fs.statSync(targetPath);
+					if (currentIdentity.isSymbolicLink() || !currentIdentity.isFile() || currentStat.nlink !== 1) throw err;
+					const currentSnapshot = safeFileSnapshot(targetPath);
+					if (
+						currentSnapshot.identity !== verifiedStaleTarget.identity ||
+						currentSnapshot.hash !== verifiedStaleTarget.hash
+					)
+						throw err;
+					fs.unlinkSync(targetPath);
+				} catch (fallbackError) {
+					if (!isMissingPathError(fallbackError)) throw fallbackError;
+				}
+				fs.renameSync(tempPath, targetPath);
+			}
 			extracted.push(targetPath);
 		} catch (err) {
 			if (tempPath) {
