@@ -187,6 +187,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (!items.some(item => item.classification === "confirmed" && item.kind !== "non_goal"))
 		throw new Error("crystallize requires a confirmed user requirement");
 	const removedIds = value.removed_ids === undefined ? [] : validateRemovedIds(value.removed_ids);
+	if (removedIds.some(id => items.some(item => item.id === id)))
+		throw new Error("removed_ids must be disjoint from submitted items");
 	const gaps = normalizedGaps(value.open_gaps);
 	if (gaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
 	const conflicts = normalizedGaps(value.conflicts);
