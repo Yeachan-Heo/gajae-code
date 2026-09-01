@@ -163,14 +163,22 @@ async function removeClaimedDirectory(
 	const tombstone = `${filePath}.cleanup-${process.pid}-${Date.now().toString(16)}`;
 	try {
 		await fs.rename(filePath, tombstone);
-		if (
-			!(await sameDirectoryIdentity(parentPath, parentIdentity)) ||
-			!(await sameDirectoryIdentity(tombstone, identity))
-		) {
-			log("Optional community app cleanup warning: claimed destination identity changed during removal");
-			return;
+		const parentHandle = await fs.open(parentPath, "r");
+		try {
+			const parentStat = await parentHandle.stat({ bigint: true });
+			if (
+				parentStat.dev !== parentIdentity.dev ||
+				parentStat.ino !== parentIdentity.ino ||
+				!(await sameDirectoryIdentity(tombstone, identity)) ||
+				!(await sameDirectoryIdentity(parentPath, parentIdentity))
+			) {
+				log("Optional community app cleanup warning: claimed destination identity changed during removal");
+				return;
+			}
+			await fs.rm(tombstone, { recursive: true, force: true });
+		} finally {
+			await parentHandle.close();
 		}
-		await fs.rm(tombstone, { recursive: true, force: true });
 	} catch (error) {
 		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
 	}
