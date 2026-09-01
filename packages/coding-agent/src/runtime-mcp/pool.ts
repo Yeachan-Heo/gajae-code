@@ -846,21 +846,31 @@ export class MCPConnectionPool {
 		entry.refCount = Math.max(0, entry.refCount - 1);
 		if (entry.refCount > 0) return;
 		if (entry.identity.sharingMode === "shared" && this.#sharedPoolIdleMs > 0) {
-			entry.idleTimer = setTimeout(() => {
-				entry.idleTimer = undefined;
-				void this.closeEntry(entry).catch(error => logger.debug("MCP pool idle close failed", { error }));
-			}, this.#sharedPoolIdleMs);
+			this.scheduleIdleClose(entry);
 			return;
 		}
 		try {
 			await this.closeEntry(entry);
 		} catch (error) {
+			let releaseError: unknown = error;
+			try {
+				await this.updateLeaseSubscriptions(entry, new Set(), subscriptions);
+			} catch (restoreError) {
+				releaseError = new AggregateError([error, restoreError], "MCP lease release rollback failed");
+			}
 			entry.leases.add(lease);
 			entry.rootsByLease.set(lease, []);
 			this.#allLeases.add(lease);
-			entry.refCount = 1;
-			throw error;
+			entry.refCount += 1;
+			throw releaseError;
 		}
+	}
+
+	private scheduleIdleClose(entry: PoolEntry): void {
+		entry.idleTimer = setTimeout(() => {
+			entry.idleTimer = undefined;
+			void this.closeEntry(entry).catch(error => logger.debug("MCP pool idle close failed", { error }));
+		}, this.#sharedPoolIdleMs);
 	}
 
 	private closeEntry(entry: PoolEntry): Promise<void> {
@@ -907,6 +917,14 @@ export class MCPConnectionPool {
 						!this.#entries.has(entry.key)
 					)
 						this.#entries.set(entry.key, entry);
+					if (
+						entry.state === "connected" &&
+						entry.refCount === 0 &&
+						entry.identity.sharingMode === "shared" &&
+						this.#sharedPoolIdleMs > 0 &&
+						!this.#shuttingDown
+					)
+						this.scheduleIdleClose(entry);
 				}
 			}
 		});

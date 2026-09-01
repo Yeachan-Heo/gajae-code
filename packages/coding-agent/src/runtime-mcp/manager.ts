@@ -100,6 +100,10 @@ type RetiredLeaseRelease = {
 	poolKey: string;
 	promise: Promise<void>;
 };
+type LeaseReleaseFailure = {
+	lease?: MCPPoolLease;
+	error: unknown;
+};
 
 const STARTUP_TIMEOUT_MS = 250;
 const STARTUP_TIMEOUT_GRACE_MS = 500;
@@ -690,22 +694,23 @@ export class MCPManager {
 		return failures;
 	}
 
-	async #shutdownScopedOperations(reason: Error): Promise<unknown[]> {
+	async #shutdownScopedOperations(reason: Error): Promise<LeaseReleaseFailure[]> {
 		const operations = [...this.#scopedOperations.values()];
 		for (const operation of operations) operation.controller.abort(reason);
 		const releases = await Promise.allSettled(operations.map(operation => this.#releaseScopedLease(operation)));
-		const failures: unknown[] = [];
+		const failures: LeaseReleaseFailure[] = [];
 		for (const [index, result] of releases.entries()) {
 			if (result.status === "rejected") {
 				const operation = operations[index];
-				failures.push(
-					this.#logLeaseReleaseFailure(
+				failures.push({
+					lease: operation?.lease,
+					error: this.#logLeaseReleaseFailure(
 						operation?.name ?? "unknown",
 						operation?.lease?.connection,
 						result.reason,
 						operation?.lease?.key,
 					),
-				);
+				});
 			}
 		}
 		await Promise.allSettled(operations.map(operation => operation.completion));
@@ -1803,9 +1808,9 @@ export class MCPManager {
 			// They captured the old epoch; after increment they'll detect staleness.
 			this.#epoch++;
 			const scopedReleaseFailures = await this.#shutdownScopedOperations(new Error("MCP manager disconnected"));
+			const releaseEntries = [...this.#leases.entries()];
 			const releaseResults = await Promise.allSettled(
-				[...this.#leases.keys()].map(async name => {
-					const lease = this.#leases.get(name);
+				releaseEntries.map(async ([name, lease]) => {
 					try {
 						await this.#releaseLease(name);
 					} catch (error) {
@@ -1835,10 +1840,16 @@ export class MCPManager {
 			this.#tools = [];
 			this.#subscribedResources.clear();
 			const releaseFailures = [
-				...scopedReleaseFailures,
+				...scopedReleaseFailures
+					.filter(failure => failure.lease === undefined || this.#retryableLeaseReleases.has(failure.lease))
+					.map(failure => failure.error),
 				...retryableLeaseFailures,
 				...releaseResults
-					.filter((result): result is PromiseRejectedResult => result.status === "rejected")
+					.filter((result, index): result is PromiseRejectedResult => {
+						if (result.status !== "rejected") return false;
+						const lease = releaseEntries[index]?.[1];
+						return lease === undefined || this.#retryableLeaseReleases.has(lease);
+					})
 					.map(result => result.reason),
 				...retiredReleaseFailures,
 			];

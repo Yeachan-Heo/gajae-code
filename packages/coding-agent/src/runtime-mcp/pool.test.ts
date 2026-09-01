@@ -11,6 +11,7 @@ class FakeTransport implements MCPTransport {
 	requests: string[] = [];
 	notifications: string[] = [];
 	onClose?: () => void;
+	failClose = false;
 	failSubscribe = false;
 	failUnsubscribe = false;
 	failSubscribeUri?: string;
@@ -44,6 +45,7 @@ class FakeTransport implements MCPTransport {
 
 	async close(): Promise<void> {
 		this.closeCount += 1;
+		if (this.failClose) throw new Error("close failed");
 		this.connected = false;
 	}
 }
@@ -581,6 +583,45 @@ describe("MCPConnectionPool", () => {
 		transport.failUnsubscribe = false;
 		await lease.release();
 		expect(transport.requests.filter(method => method === "resources/unsubscribe")).toHaveLength(2);
+		expect(pool.size).toBe(0);
+		await pool.shutdown();
+	});
+
+	test("failed final close restores subscriptions before release retry", async () => {
+		const transport = new FakeTransport();
+		const pool = new MCPConnectionPool({ connect: async (name, cfg) => connection(name, cfg, transport) });
+		const lease = await pool.acquire("server", config(), { sessionId: "close-retry" });
+		await lease.setResourceSubscriptions(["file:///resource"]);
+		transport.failClose = true;
+		await expect(lease.release()).rejects.toThrow("close failed");
+		expect(transport.requests).toEqual(["resources/subscribe", "resources/unsubscribe", "resources/subscribe"]);
+		transport.failClose = false;
+		await lease.release();
+		expect(transport.requests).toEqual([
+			"resources/subscribe",
+			"resources/unsubscribe",
+			"resources/subscribe",
+			"resources/unsubscribe",
+		]);
+		expect(pool.size).toBe(0);
+		await pool.shutdown();
+	});
+
+	test("failed shared idle close re-arms the idle timer", async () => {
+		const transport = new FakeTransport();
+		const pool = new MCPConnectionPool({
+			sharedPoolIdleMs: 1,
+			connect: async (name, cfg) => connection(name, cfg, transport),
+		});
+		const lease = await pool.acquire("server", config("shared"), { sharingMode: "shared" });
+		transport.failClose = true;
+		await lease.release();
+		await Bun.sleep(10);
+		const failedCloseCount = transport.closeCount;
+		expect(failedCloseCount).toBeGreaterThan(0);
+		transport.failClose = false;
+		await Bun.sleep(10);
+		expect(transport.closeCount).toBeGreaterThan(failedCloseCount);
 		expect(pool.size).toBe(0);
 		await pool.shutdown();
 	});
