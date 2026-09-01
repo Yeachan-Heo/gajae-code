@@ -765,7 +765,10 @@ export async function applyGjcBundleUpdate(
 	token: GjcReviewedUpdateToken,
 ): Promise<GjcLifecycleResult<GjcUpdateApplyResult>> {
 	const identity = token.identity;
-	if (token.agentDir !== path.resolve(ctx.agentDir ?? getAgentDir())) {
+	if (
+		normalizePathForComparison(token.agentDir) !==
+		normalizePathForComparison(path.resolve(ctx.agentDir ?? getAgentDir()))
+	) {
 		return {
 			ok: false,
 			error: fail("stale_decision_context", "The reviewed update belongs to a different agent directory."),

@@ -1,6 +1,12 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, getAgentProfileAuthority, getPluginsDir, getTrustedHomeDir } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getPluginsDir,
+	getTrustedHomeDir,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
 import { findRepoRoot, invalidate as invalidateFsCache } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
@@ -407,7 +413,14 @@ export async function discoverRuntimeSkills(
 	const policy = options.policy;
 	const diagnostics: string[] = [];
 	const agentDir = resolveRuntimeAgentDir(home, options.agentDir, hasExplicitHome);
-	const profileAuthority = options.profileAuthority ?? (!hasExplicitHome ? getAgentProfileAuthority() : undefined);
+	const profileAuthority =
+		options.profileAuthority ??
+		(!hasExplicitHome
+			? options.agentDir !== undefined &&
+				normalizePathForComparison(options.agentDir) !== normalizePathForComparison(getAgentDir())
+				? "custom"
+				: getAgentProfileAuthority()
+			: undefined);
 	const scanJobs: Array<Promise<ScanJobResult>> = [];
 	const projectDirs = await getProjectSkillDirs(options.cwd, home);
 	const projectContext = { cwd: options.cwd, home, repoRoot: projectDirs.repoRoot };
@@ -533,7 +546,13 @@ export async function findRuntimeSkillByName(
 	const hasExplicitHome = home !== undefined;
 	const resolvedHome = home ?? getRuntimeHome();
 	const resolvedAgentDir = resolveRuntimeAgentDir(resolvedHome, agentDir, hasExplicitHome);
-	const resolvedProfileAuthority = profileAuthority ?? (!hasExplicitHome ? getAgentProfileAuthority() : undefined);
+	const resolvedProfileAuthority =
+		profileAuthority ??
+		(!hasExplicitHome
+			? agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir())
+				? "custom"
+				: getAgentProfileAuthority()
+			: undefined);
 	const scanJobs: Array<Promise<{ skill: CapabilitySkill; source: RuntimeSkillDiscoverySource }[]>> = [];
 	const projectDirs = await getProjectSkillDirs(cwd, resolvedHome);
 	const projectContext = { cwd, home: resolvedHome, repoRoot: projectDirs.repoRoot };

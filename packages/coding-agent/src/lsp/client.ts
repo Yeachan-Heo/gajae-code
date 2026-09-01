@@ -862,6 +862,7 @@ export async function syncContent(
 	throwIfAborted(signal);
 
 	const syncPromise = withFileOperationLock(lockKey, signal, async () => {
+		throwIfAborted(signal);
 		// Clear stale diagnostics before syncing new content
 		client.diagnostics.delete(uri);
 

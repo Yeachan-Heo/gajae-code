@@ -7,7 +7,7 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { ImageContent, Model, TextContent, Tool, UsageReport } from "@gajae-code/ai/core";
 import type { KeyId } from "@gajae-code/tui";
-import { hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
+import { getAgentProfileAuthority, hasFsCode, isEacces, isEnoent, logger } from "@gajae-code/utils";
 import * as Zod from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import type { Settings } from "../../config/settings";
@@ -702,7 +702,15 @@ export async function discoverAndLoadExtensions(
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds);
 	const selectedAgentDir = agentDir ?? settings?.getAgentDir();
-	const selectedProfileAuthority = profileAuthority ?? (selectedAgentDir ? "custom" : "default");
+	const selectedProfileAuthority =
+		profileAuthority ??
+		(agentDir !== undefined
+			? "custom"
+			: settings?.isAgentDirExplicit()
+				? "custom"
+				: settings
+					? getAgentProfileAuthority()
+					: "default");
 
 	const isDisabledName = (name: string): boolean => disabled.has(`extension-module:${name}`);
 
