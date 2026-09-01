@@ -148,6 +148,9 @@ describe("gjc state handoff", () => {
 			expect(result.status).toBe(0);
 			const after = (await readJson(callerPath)) as Record<string, unknown>;
 			expect((after.state as Record<string, unknown>).execution_approval).toBe("approved");
+			expect((after.state as Record<string, unknown>).execution_approval_receipt).toMatchObject({
+				method: "explicit-cli-flag",
+			});
 		});
 	});
 	it("rejects ready-Crystal execution handoff without explicit approval", async () => {

@@ -1340,6 +1340,15 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 						2,
 						"crystallized execution approval is immutable through generic state write",
 					);
+				if (
+					existingInner.crystal !== undefined &&
+					JSON.stringify(mergedInner.execution_approval_receipt) !==
+						JSON.stringify(existingInner.execution_approval_receipt)
+				)
+					throw new StateCommandError(
+						2,
+						"crystallized execution approval provenance is immutable through generic state write",
+					);
 				if (existingInner.crystal !== undefined) {
 					for (const field of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const)
 						if (merged[field] !== existingPayload[field])
@@ -1578,6 +1587,13 @@ async function assertDeepInterviewHandoffReady(
 			throw new StateCommandError(2, "deep-interview crystallized handoff spec hash mismatch");
 		if (inner.execution_approval !== "approved" && !options.allowPlanningHandoff)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
+		if (!options.allowPlanningHandoff) {
+			const approval = isPlainObject(inner.execution_approval_receipt)
+				? inner.execution_approval_receipt
+				: undefined;
+			if (approval?.method !== "explicit-cli-flag" || typeof approval.approved_at !== "string")
+				throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+		}
 		if (options.allowPlanningHandoff) return;
 	}
 	if (inner.intent_contract === undefined) {
@@ -1704,6 +1720,11 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 			if (!hasFlag(args, "--approve-execution"))
 				throw new StateCommandError(2, "ultragoal handoff requires explicit execution approval");
 			inner.execution_approval = "approved";
+			inner.execution_approval_receipt = {
+				method: "explicit-cli-flag",
+				approved_at: handoffAt,
+				mutation_id: mutationId,
+			};
 		}
 	}
 	if (caller === "deep-interview")
