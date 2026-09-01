@@ -92,11 +92,19 @@ describe("macOS community app offer guards", () => {
 		const root = await tempDir();
 		const macOSRoot = path.join(root, "Contents", "MacOS");
 		await fs.mkdir(macOSRoot, { recursive: true });
+		await fs.writeFile(path.join(root, "Contents", "Info.plist"), "fixture");
 		await fs.writeFile(path.join(macOSRoot, "GajaeCode"), "fixture");
 		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBe(path.join(macOSRoot, "GajaeCode"));
 		expect(await resolveCommunityAppExecutableForTest(root, "../../outside")).toBeUndefined();
 		await fs.symlink(path.join(macOSRoot, "GajaeCode"), path.join(macOSRoot, "Link"));
 		expect(await resolveCommunityAppExecutableForTest(root, "Link")).toBeUndefined();
+		await fs.rm(path.join(root, "Contents"), { recursive: true, force: true });
+		const outside = path.join(path.dirname(root), "community-app-outside");
+		await fs.mkdir(path.join(outside, "MacOS"), { recursive: true });
+		await fs.writeFile(path.join(outside, "Info.plist"), "fixture");
+		await fs.symlink(outside, path.join(root, "Contents"));
+		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBeUndefined();
+		await fs.rm(outside, { recursive: true, force: true });
 	});
 
 	test("fails closed when the canonical release or checksum is unavailable", async () => {
