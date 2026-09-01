@@ -59,6 +59,12 @@ afterAll(() => {
 });
 
 describe("native gjc deep-interview runtime", () => {
+	it("rejects unsupported crystallize arguments before reading input", async () => {
+		const root = await tempDir();
+		const result = await runNativeDeepInterviewCommand(["--crystallize", "--write", "--json"], root);
+		expect(result.status).toBe(2);
+		expect(result.stderr).toContain("unsupported crystallize argument: --write");
+	});
 	it("advertises the deep-interview spec persistence and handoff surface in command help", async () => {
 		const source = await fs.readFile(path.join(codingAgentRoot, "src/commands/deep-interview.ts"), "utf-8");
 		// The lightweight CLI help renderer advertises exactly the static flags/examples declared by the command.
