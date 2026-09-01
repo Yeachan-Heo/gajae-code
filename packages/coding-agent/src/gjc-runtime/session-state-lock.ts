@@ -1593,7 +1593,7 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		const currentHost = await currentOwnerHostId();
 		const legacyHost = await currentLegacyOwnerHostId();
 		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return;
-		if (Date.now() - Number(stat.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return;
+		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return;
 	} else {
 		if (process.platform !== "win32") return;
 		if (await lockOwnerIsAlive(owner)) return;
@@ -1629,6 +1629,12 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		removed.retainedUnknownPath === undefined &&
 		removed.retainedPlaceholderPath === undefined
 	) {
+		// The captured claim is proven empty, so the native detach receipt leaves an
+		// empty directory at detachedPath. Remove that exact directory directly: calling
+		// the detach primitive again would deterministically create a second `.removing`
+		// collision on POSIX. rmdir never follows a directory's contents and refuses if a
+		// successor populated the detached path.
+		await removeTransitionDir(removed.detachedPath);
 		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
 		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
 		return;
