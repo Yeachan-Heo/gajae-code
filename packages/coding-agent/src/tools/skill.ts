@@ -152,17 +152,19 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				(this.#session.getSessionAgentDir === undefined ? this.#session.home : undefined);
 			const resolvedAgentDir =
 				sessionAgentDir ?? (sessionHome === undefined ? this.#session.settings.getAgentDir() : undefined);
-			const runtimeSkill = isProviderEnabled("native", this.#session.settings)
-				? await findRuntimeSkillByName(
-						this.#session.cwd,
-						requestedName,
-						this.#getRuntimeSkillPolicy(),
-						sessionHome,
-						resolvedAgentDir,
-						this.#session.getSessionProfileAuthority?.(),
-					)
-				: undefined;
-			const skill = skills.find(s => s.name === requestedName) ?? runtimeSkill;
+			const preloadedSkill = skills.find(s => s.name === requestedName);
+			const runtimeSkill =
+				!preloadedSkill && isProviderEnabled("native", this.#session.settings)
+					? await findRuntimeSkillByName(
+							this.#session.cwd,
+							requestedName,
+							this.#getRuntimeSkillPolicy(),
+							sessionHome,
+							resolvedAgentDir,
+							this.#session.getSessionProfileAuthority?.(),
+						)
+					: undefined;
+			const skill = preloadedSkill ?? runtimeSkill;
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();
 				const hint =
