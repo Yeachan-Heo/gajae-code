@@ -1493,7 +1493,10 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 
 const DEEP_INTERVIEW_INTENT_ID_RE = /(?:artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}/g;
 
-async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): Promise<void> {
+async function assertDeepInterviewHandoffReady(
+	state: Record<string, unknown>,
+	options: { allowPlanningHandoff?: boolean } = {},
+): Promise<void> {
 	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
 	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
 	let content: string | undefined;
@@ -1519,7 +1522,7 @@ async function assertDeepInterviewHandoffReady(state: Record<string, unknown>): 
 	if (inner.crystal !== undefined) {
 		if (!isPlainObject(inner.crystal) || inner.crystal.lifecycle !== "ready")
 			throw new StateCommandError(2, "deep-interview handoff requires a ready crystallized specification");
-		if (inner.execution_approval !== "approved")
+		if (inner.execution_approval !== "approved" && !options.allowPlanningHandoff)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
 	}
 	if (inner.intent_contract === undefined) {
@@ -1632,7 +1635,8 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 					unknown
 				>)
 			: migrateWorkflowState(existingCaller, caller).state;
-	if (caller === "deep-interview") await assertDeepInterviewHandoffReady(normalizedCaller);
+	if (caller === "deep-interview")
+		await assertDeepInterviewHandoffReady(normalizedCaller, { allowPlanningHandoff: callee === "ralplan" });
 
 	// Runtime callees have no native mode-state to clear later, so do not
 	// persist them as active-state entries; the prompt observer tracks them
