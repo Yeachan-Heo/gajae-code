@@ -1153,6 +1153,12 @@ async function persistDeepInterviewSpecUnlocked(
 async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
 	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
 	assertDeepInterviewInputWithinLimit(resolved.idea, MAX_INITIAL_CONTEXT_LENGTH, "initial_idea");
+	const existingRead = await readExistingStateForMutation(statePath);
+	if (existingRead.kind === "valid") {
+		const existingInner = isRecord(existingRead.value.state) ? existingRead.value.state : undefined;
+		if (existingInner?.crystal !== undefined)
+			throw new DeepInterviewCommandError(2, "deep-interview seed cannot replace canonical Crystal state");
+	}
 	const now = new Date().toISOString();
 	const payload: Record<string, unknown> = {
 		active: true,
