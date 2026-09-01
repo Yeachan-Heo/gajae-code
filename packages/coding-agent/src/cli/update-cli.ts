@@ -1274,6 +1274,14 @@ async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<voi
 	const pinnedRuntimePath = `${runtimePath}.community-app-offer.${process.pid}.${Date.now().toString(16)}`;
 	await fs.promises.link(runtimePath, pinnedRuntimePath);
 	try {
+		const pinnedStat = await fs.promises.lstat(pinnedRuntimePath);
+		if (
+			!pinnedStat.isFile() ||
+			pinnedStat.isSymbolicLink() ||
+			pinnedStat.dev !== runtimeStat.dev ||
+			pinnedStat.ino !== runtimeStat.ino
+		)
+			throw new Error("verified runtime identity changed before optional offer");
 		const child = Bun.spawn([pinnedRuntimePath, "macos-community-app-offer"], {
 			stdin: "inherit",
 			stdout: "inherit",

@@ -129,6 +129,28 @@ async function readResponseText(response: Response, maxBytes: number): Promise<s
 	return new TextDecoder().decode(await readResponseBytes(response, maxBytes));
 }
 
+type FileIdentity = { dev: bigint; ino: bigint };
+
+async function fileIdentity(filePath: string): Promise<FileIdentity | undefined> {
+	const stat = await fs.lstat(filePath, { bigint: true }).catch(() => undefined);
+	return stat?.isDirectory() ? { dev: stat.dev, ino: stat.ino } : undefined;
+}
+
+async function pathIdentity(filePath: string): Promise<FileIdentity | undefined> {
+	const stat = await fs.lstat(filePath, { bigint: true }).catch(() => undefined);
+	return stat ? { dev: stat.dev, ino: stat.ino } : undefined;
+}
+
+async function sameDirectoryIdentity(filePath: string, expected: FileIdentity): Promise<boolean> {
+	const actual = await fileIdentity(filePath);
+	return actual?.dev === expected.dev && actual.ino === expected.ino;
+}
+
+async function samePathIdentity(filePath: string, expected: FileIdentity): Promise<boolean> {
+	const actual = await pathIdentity(filePath);
+	return actual?.dev === expected.dev && actual.ino === expected.ino;
+}
+
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
 	const terminateAndReap = async (): Promise<void> => {
@@ -314,9 +336,10 @@ export async function offerMacosCommunityApp(
 	const fetchImpl = deps.fetchImpl ?? fetch;
 	const fetchOptions = (): RequestInit => ({ signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
 	let tempRoot: string | undefined;
+	let tempRootIdentity: FileIdentity | undefined;
 	let mountPoint: string | undefined;
 	let mountAttempted = false;
-	let installedDestination: string | undefined;
+	let installedDestination: { path: string; identity: FileIdentity } | undefined;
 	let receivedSignal: NodeJS.Signals | undefined;
 	const signalNames = ["SIGINT", "SIGTERM"] as const;
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
@@ -384,10 +407,19 @@ export async function offerMacosCommunityApp(
 		if (actual !== expected) return failure("the DMG checksum did not match", log);
 
 		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-"));
+		tempRootIdentity = await fileIdentity(tempRoot);
+		if (!tempRootIdentity) return failure("the temporary root was not a real directory", log);
 		const dmgPath = path.join(tempRoot, dmg.name);
 		mountPoint = path.join(tempRoot, "mount");
 		await fs.mkdir(mountPoint);
+		const mountIdentity = await fileIdentity(mountPoint);
+		if (!mountIdentity) return failure("the temporary mountpoint was not a regular directory", log);
 		await Bun.write(dmgPath, dmgBytes);
+		const stagedDmgStat = await fs.lstat(dmgPath).catch(() => undefined);
+		if (!stagedDmgStat?.isFile() || stagedDmgStat.isSymbolicLink())
+			return failure("the staged DMG path was unsafe", log);
+		const stagedDmgIdentity: FileIdentity = { dev: BigInt(stagedDmgStat.dev), ino: BigInt(stagedDmgStat.ino) };
+		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity))) return failure("the staged DMG identity changed", log);
 		mountAttempted = true;
 		const attach = await command([
 			"/usr/bin/hdiutil",
@@ -400,6 +432,10 @@ export async function offerMacosCommunityApp(
 		]);
 		throwIfInterrupted();
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
+		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
+			return failure("the staged DMG identity changed before verification", log);
+		if (!(await sameDirectoryIdentity(mountPoint, mountIdentity)))
+			return failure("the temporary mountpoint identity changed", log);
 		const entries = await fs.readdir(mountPoint, { withFileTypes: true });
 		const appEntry = entries.find(entry => entry.isDirectory() && entry.name.endsWith(".app"));
 		if (!appEntry) return failure("the mounted DMG contained no app bundle", log);
@@ -418,21 +454,37 @@ export async function offerMacosCommunityApp(
 			return failure(`the app bundle does not contain ${arch} code`, log);
 
 		const destinationRoot = path.join(homeDir, "Applications");
+		const existingDestinationRoot = await fs.lstat(destinationRoot).catch(() => undefined);
+		if (
+			existingDestinationRoot &&
+			(!existingDestinationRoot.isDirectory() || existingDestinationRoot.isSymbolicLink())
+		)
+			return failure("the Applications destination is not a real directory", log);
 		await fs.mkdir(destinationRoot, { recursive: true });
+		const destinationRootStat = await fs.lstat(destinationRoot);
+		if (!destinationRootStat.isDirectory() || destinationRootStat.isSymbolicLink())
+			return failure("the Applications destination is not a real directory", log);
 		const destination = path.join(destinationRoot, appEntry.name);
 		try {
 			await fs.mkdir(destination);
 		} catch {
 			return failure("the destination already contains an app bundle", log);
 		}
-		installedDestination = destination;
+		const destinationIdentity = await fileIdentity(destination);
+		if (!destinationIdentity) return failure("the destination claim was not a regular directory", log);
+		installedDestination = { path: destination, identity: destinationIdentity };
+		if (!(await sameDirectoryIdentity(destination, destinationIdentity)))
+			return failure("the destination identity changed before copy", log);
 		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
 		throwIfInterrupted();
 		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
+		if (!(await sameDirectoryIdentity(destination, destinationIdentity)))
+			throw new Error("the destination identity changed after copy");
 		const launch = await command(["/usr/bin/open", destination]);
 		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
-			await fs.rm(destination, { recursive: true, force: true });
+			if (await sameDirectoryIdentity(destination, destinationIdentity))
+				await fs.rm(destination, { recursive: true, force: true });
 			installedDestination = undefined;
 			return failure("the verified app could not be launched; the partial app state was removed", log);
 		}
@@ -440,14 +492,14 @@ export async function offerMacosCommunityApp(
 	} catch (error) {
 		if (installedDestination) {
 			try {
-				await fs.rm(installedDestination, { recursive: true, force: true });
+				if (await sameDirectoryIdentity(installedDestination.path, installedDestination.identity))
+					await fs.rm(installedDestination.path, { recursive: true, force: true });
 			} catch (cleanupError) {
 				log(`Optional community app cleanup warning: failed to remove partial app state: ${String(cleanupError)}`);
 			}
 		}
 		return failure(error instanceof Error ? error.message : String(error), log);
 	} finally {
-		removeSignalHandlers();
 		if (mountAttempted && mountPoint) {
 			try {
 				const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
@@ -457,13 +509,16 @@ export async function offerMacosCommunityApp(
 				log(`Optional community app cleanup warning: failed to detach the temporary DMG: ${String(error)}`);
 			}
 		}
-		if (tempRoot) {
+		if (tempRoot && tempRootIdentity && (await sameDirectoryIdentity(tempRoot, tempRootIdentity))) {
 			try {
 				await fs.rm(tempRoot, { recursive: true, force: true });
 			} catch (error) {
 				log(`Optional community app cleanup warning: failed to remove temporary files: ${String(error)}`);
 			}
+		} else if (tempRoot) {
+			log("Optional community app cleanup warning: temporary root identity changed; refusing recursive removal");
 		}
+		removeSignalHandlers();
 	}
 }
 
