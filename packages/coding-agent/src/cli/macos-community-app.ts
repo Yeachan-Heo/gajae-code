@@ -526,6 +526,18 @@ export async function offerMacosCommunityApp(
 			!(await sameDirectoryIdentity(destination, destinationIdentity))
 		)
 			throw new Error("the destination identity changed after copy");
+		if (!(await isExpectedBundle(destination, command))) throw new Error("the copied app bundle identity changed");
+		const copiedExecutable = await readBundleValue(destination, "CFBundleExecutable", command);
+		const copiedExecutablePath = copiedExecutable
+			? await resolveVerifiedExecutable(destination, copiedExecutable)
+			: undefined;
+		if (!copiedExecutable || copiedExecutable !== executable || !copiedExecutablePath)
+			throw new Error("the copied app executable identity changed");
+		const copiedSignature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", destination]);
+		if (copiedSignature.exitCode !== 0) throw new Error("the copied app signature could not be verified");
+		const copiedArchCheck = await command(["/usr/bin/lipo", "-archs", copiedExecutablePath]);
+		if (copiedArchCheck.exitCode !== 0 || !copiedArchCheck.stdout.split(/\s+/).includes(executableArch))
+			throw new Error("the copied app architecture changed");
 		const launch = await command(["/usr/bin/open", destination]);
 		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
@@ -558,12 +570,17 @@ export async function offerMacosCommunityApp(
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {
-				const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
-				if (detach.exitCode !== 0) {
-					if (mountAttached) removeTempRoot = false;
-					log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
+				if (mountAttached && (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))) {
+					removeTempRoot = false;
+					log("Optional community app cleanup warning: mountpoint identity changed; refusing detach");
 				} else {
-					mountAttached = false;
+					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+					if (detach.exitCode !== 0) {
+						if (mountAttached) removeTempRoot = false;
+						log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
+					} else {
+						mountAttached = false;
+					}
 				}
 			} catch (error) {
 				if (mountAttached) removeTempRoot = false;

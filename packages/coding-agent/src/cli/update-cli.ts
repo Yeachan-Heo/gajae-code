@@ -55,10 +55,17 @@ export interface InstalledVersionVerification {
 	ok: boolean;
 	actual?: string;
 	path?: string;
+	identity?: RuntimeFileIdentity;
 	versionOutput?: string;
 	smokeTestFailed?: boolean;
 	smokeTestOutput?: string;
 	cleanupWarning?: string;
+}
+
+export interface RuntimeFileIdentity {
+	dev: string;
+	ino: string;
+	size: string;
 }
 
 export interface PackageManagerUpdateResult {
@@ -556,7 +563,12 @@ async function verifyInstalledRuntime(
 	try {
 		const smokeResult = await $`${versionResult.path} --smoke-test`.quiet().nothrow();
 		if (smokeResult.exitCode === 0) {
-			return versionResult;
+			const stat = await fs.promises.lstat(versionResult.path, { bigint: true });
+			if (!stat.isFile() || stat.isSymbolicLink()) return { ...versionResult, ok: false };
+			return {
+				...versionResult,
+				identity: { dev: stat.dev.toString(), ino: stat.ino.toString(), size: stat.size.toString() },
+			};
 		}
 		return {
 			...versionResult,
@@ -1267,10 +1279,20 @@ export interface UpdateCommandDependencies {
 	exit?: (code: number) => never;
 }
 
-async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<void> {
+async function runCommunityAppOfferFromRuntime(
+	runtimePath: string,
+	expectedIdentity?: RuntimeFileIdentity,
+): Promise<void> {
 	const runtimeStat = await fs.promises.lstat(runtimePath);
 	if (!runtimeStat.isFile() || runtimeStat.isSymbolicLink())
 		throw new Error("verified runtime path is not a regular file");
+	if (!expectedIdentity) throw new Error("verified runtime identity is unavailable");
+	if (
+		runtimeStat.dev.toString() !== expectedIdentity.dev ||
+		runtimeStat.ino.toString() !== expectedIdentity.ino ||
+		runtimeStat.size.toString() !== expectedIdentity.size
+	)
+		throw new Error("verified runtime identity changed before optional offer");
 	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
 	const pinnedRuntimePath = path.join(pinDirectory, "gjc");
 	try {
@@ -1280,7 +1302,8 @@ async function runCommunityAppOfferFromRuntime(runtimePath: string): Promise<voi
 			!pinnedStat.isFile() ||
 			pinnedStat.isSymbolicLink() ||
 			pinnedStat.dev !== runtimeStat.dev ||
-			pinnedStat.ino !== runtimeStat.ino
+			pinnedStat.ino !== runtimeStat.ino ||
+			pinnedStat.size !== runtimeStat.size
 		)
 			throw new Error("verified runtime identity changed before optional offer");
 		const child = Bun.spawn([pinnedRuntimePath, "macos-community-app-offer"], {
@@ -1603,6 +1626,7 @@ export async function runUpdateCommand(
 
 	if (target.method === "migrate" && decision.install && !opts.force && !opts.check) {
 		let migrationVerified = false;
+		let migrationIdentity: RuntimeFileIdentity | undefined;
 		const releaseLock = await acquireBinaryUpdateLock(target.path);
 		try {
 			const verification = await verifyTarget(release, target.path);
@@ -1611,6 +1635,7 @@ export async function runUpdateCommand(
 				record("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
 				migrationVerified = true;
+				migrationIdentity = verification.identity;
 			}
 		} finally {
 			await releaseLock();
@@ -1618,7 +1643,7 @@ export async function runUpdateCommand(
 		if (migrationVerified) {
 			if ((deps.platform ?? process.platform) === "darwin") {
 				try {
-					await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path);
+					await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path, migrationIdentity);
 				} catch (error) {
 					console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
 				}
@@ -1652,6 +1677,7 @@ export async function runUpdateCommand(
 
 	let installedVersion: string | undefined;
 	let installedRuntimePath: string | undefined;
+	let installedRuntimeIdentity: RuntimeFileIdentity | undefined;
 	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
@@ -1659,6 +1685,7 @@ export async function runUpdateCommand(
 		if (verification?.path) {
 			installedVersion = release.version;
 			installedRuntimePath = verification.path;
+			installedRuntimeIdentity = verification.identity;
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
@@ -1675,7 +1702,10 @@ export async function runUpdateCommand(
 	await refreshDefaults();
 	if (installedVersion && installedRuntimePath && (deps.platform ?? process.platform) === "darwin") {
 		try {
-			await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(installedRuntimePath);
+			await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(
+				installedRuntimePath,
+				installedRuntimeIdentity,
+			);
 		} catch (error) {
 			console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
 		}
