@@ -228,10 +228,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	const sameIntent = (left: CrystalItem, right: CrystalItem): boolean =>
-		left.id === right.id &&
-		left.kind === right.kind &&
-		left.classification === right.classification &&
-		left.statement === right.statement;
+		left.id === right.id && left.kind === right.kind && left.statement === right.statement;
 	const changed = currentItems
 		.filter(item => {
 			const previous = priorItems.get(item.id);
@@ -306,6 +303,14 @@ export function crystalMarkdown(crystal: DeepInterviewCrystal): string {
 		`- Readiness: ${crystal.lifecycle}`,
 		`- Source: revision ${crystal.source.revision}, messages ${crystal.source.start}–${crystal.source.end}, digest ${crystal.source.digest}`,
 		`- Execution approval: ${crystal.execution_approval}`,
+		"",
+		"## Delta",
+		`- Kind: ${crystal.delta.kind}`,
+		`- Changed IDs: ${crystal.delta.changed_ids.join(", ") || "none"}`,
+		`- Added IDs: ${crystal.delta.added_ids.join(", ") || "none"}`,
+		`- Preserved IDs: ${crystal.delta.preserved_ids.join(", ") || "none"}`,
+		`- Removed IDs: ${crystal.removed_ids?.join(", ") || "none"}`,
+		`- Approval invalidated: ${crystal.delta.approval_invalidated}`,
 		"",
 		"## Classified material",
 	];
