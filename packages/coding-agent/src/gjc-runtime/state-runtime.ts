@@ -1309,6 +1309,26 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			if (!preDefaultValidation.valid) {
 				throw new StateCommandError(2, preDefaultValidation.error ?? `invalid ${mode} state envelope`);
 			}
+			if (mode === "deep-interview") {
+				const existingInner = isPlainObject(existingPayload.state) ? existingPayload.state : {};
+				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
+				if (
+					existingInner.crystal !== undefined &&
+					JSON.stringify(existingInner.crystal) !== JSON.stringify(mergedInner.crystal)
+				)
+					throw new StateCommandError(
+						2,
+						"canonical crystallized state cannot be replaced or deleted through generic state write",
+					);
+				if (
+					existingInner.crystal !== undefined &&
+					mergedInner.execution_approval !== existingInner.execution_approval
+				)
+					throw new StateCommandError(
+						2,
+						"crystallized execution approval is immutable through generic state write",
+					);
+			}
 			merged.skill = mode;
 			if (incomingPhase) {
 				merged.current_phase = incomingPhase;
@@ -1522,6 +1542,10 @@ async function assertDeepInterviewHandoffReady(
 	if (inner.crystal !== undefined) {
 		if (!isPlainObject(inner.crystal) || inner.crystal.lifecycle !== "ready")
 			throw new StateCommandError(2, "deep-interview handoff requires a ready crystallized specification");
+		if (!specPath || !expectedSha || content === undefined)
+			throw new StateCommandError(2, "deep-interview crystallized handoff requires a persisted spec");
+		if (createHash("sha256").update(content).digest("hex") !== expectedSha)
+			throw new StateCommandError(2, "deep-interview crystallized handoff spec hash mismatch");
 		if (inner.execution_approval !== "approved" && !options.allowPlanningHandoff)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
 	}

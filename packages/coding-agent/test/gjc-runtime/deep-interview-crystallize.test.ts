@@ -127,7 +127,7 @@ describe("deep-interview crystallize contract", () => {
 		const value = input({ items: [{ ...input().items[0]!, anchor: { message_index: 0, quote: "not present" } }] });
 		expect(() => crystallizeDeepInterview(value)).toThrow("verbatim user anchor");
 		const missingRevision = input();
-		delete missingRevision.current_revision;
+		delete (missingRevision as unknown as Record<string, unknown>).current_revision;
 		expect(() => crystallizeDeepInterview(missingRevision)).toThrow("authoritative current revision");
 	});
 
@@ -143,6 +143,15 @@ describe("deep-interview crystallize contract", () => {
 		const second = crystallizeDeepInterview(later(input({ prior: first, items: [first.items[0]!] }), 2));
 		expect(second.items.map(item => item.id)).toContain("constraint:latency");
 		expect(second.delta.approval_invalidated).toBe(false);
+	});
+
+	it("requires explicit removals and invalidates their prior approval", () => {
+		const first = crystallizeDeepInterview(input());
+		const second = crystallizeDeepInterview(
+			later(input({ prior: first, items: [first.items[0]!], removed_ids: ["constraint:latency"] }), 2),
+		);
+		expect(second.items.map(item => item.id)).not.toContain("constraint:latency");
+		expect(second.delta.approval_invalidated).toBe(true);
 	});
 
 	it("promotes through the existing state/spec shape without approval", async () => {

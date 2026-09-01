@@ -27,8 +27,9 @@ export interface CrystalItem {
 
 export interface CrystalInput {
 	snapshot: CrystalSnapshot;
-	current_revision?: number;
+	current_revision: number;
 	items: CrystalItem[];
+	removed_ids?: string[];
 	open_gaps?: string[];
 	conflicts?: string[];
 	prior?: DeepInterviewCrystal;
@@ -48,6 +49,7 @@ export interface DeepInterviewCrystal {
 	lifecycle: "ready" | "needs-questions" | "stale" | "superseded";
 	source: { revision: number; start: number; end: number; digest: string };
 	items: CrystalItem[];
+	removed_ids?: string[];
 	open_gaps: string[];
 	conflicts: string[];
 	delta: CrystalDelta;
@@ -161,6 +163,13 @@ function normalizedGaps(value: unknown): string[] {
 	return value.map((gap, index) => text(gap, `open_gaps[${index}]`, 500));
 }
 
+function validateRemovedIds(value: unknown): string[] {
+	if (!Array.isArray(value) || value.length > MAX_ITEMS) throw new Error("removed_ids must be a bounded array");
+	const ids = value.map((id, index) => text(id, `removed_ids[${index}]`, 128));
+	if (new Set(ids).size !== ids.length) throw new Error("removed_ids must be unique");
+	return ids.sort();
+}
+
 export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	if (!isRecord(value)) throw new Error("crystallize input must be an object");
 	const snapshot = validateSnapshot(value.snapshot);
@@ -170,6 +179,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const items = validateItems(value.items, snapshot);
 	if (snapshot.messages.length === 0 || items.length === 0)
 		throw new Error("crystallize requires material conversation evidence");
+	const removedIds = value.removed_ids === undefined ? [] : validateRemovedIds(value.removed_ids);
 	const gaps = normalizedGaps(value.open_gaps);
 	if (gaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
 	const conflicts = normalizedGaps(value.conflicts);
@@ -189,10 +199,14 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		validateItems(priorCrystal.items);
 	}
 	const priorItems = new Map((priorCrystal?.items ?? []).map(item => [item.id, item]));
+	if (removedIds.some(id => !priorItems.has(id)))
+		throw new Error("removed crystallize item is not present in prior crystal");
 	const mergedItems = [...items];
 	for (const item of priorCrystal?.items ?? [])
-		if (!mergedItems.some(candidate => candidate.id === item.id)) mergedItems.push(item);
+		if (!removedIds.includes(item.id) && !mergedItems.some(candidate => candidate.id === item.id))
+			mergedItems.push(item);
 	const currentItems = mergedItems;
+	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
 	const changed = currentItems
 		.filter(item => priorItems.has(item.id) && JSON.stringify(item) !== JSON.stringify(priorItems.get(item.id)))
 		.map(item => item.id)
@@ -210,6 +224,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		const previous = priorItems.get(id);
 		return current?.kind === "goal" || previous?.kind === "goal";
 	});
+	const removedGoal = removedIds.some(id => priorItems.get(id)?.kind === "goal");
+	const removedIntent = removedIds.length > 0;
 	const intentChanged =
 		goalChanged ||
 		changed.some(id =>
@@ -221,9 +237,9 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		kind:
 			conflicts.length > 0
 				? "stale"
-				: goalChanged
+				: goalChanged || removedGoal
 					? "goal-replaced"
-					: intentChanged
+					: intentChanged || removedIntent
 						? "intent-changed"
 						: added.length > 0
 							? "additive"
@@ -231,16 +247,23 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		changed_ids: changed,
 		added_ids: added,
 		preserved_ids: preserved,
-		approval_invalidated: intentChanged || conflicts.length > 0,
+		approval_invalidated: intentChanged || removedIntent || conflicts.length > 0,
 	};
 	const lifecycle =
-		conflicts.length > 0 ? "stale" : goalChanged ? "superseded" : gaps.length > 0 ? "needs-questions" : "ready";
+		conflicts.length > 0
+			? "stale"
+			: goalChanged || removedGoal
+				? "superseded"
+				: gaps.length > 0
+					? "needs-questions"
+					: "ready";
 	return {
 		schema_version: 1,
 		spec_version: (priorCrystal?.spec_version ?? 0) + 1,
 		lifecycle,
 		source: { revision: snapshot.revision, start: snapshot.start, end: snapshot.end, digest: snapshot.digest },
 		items: currentItems,
+		...(removedIds.length > 0 ? { removed_ids: removedIds } : {}),
 		open_gaps: gaps,
 		conflicts,
 		delta,

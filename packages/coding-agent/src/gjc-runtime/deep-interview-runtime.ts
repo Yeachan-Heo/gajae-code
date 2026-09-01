@@ -239,7 +239,7 @@ async function handleCrystallizeUnlocked(
 	const envelope = {
 		...existing,
 		active: true,
-		current_phase: crystal.lifecycle === "ready" ? "handoff" : "crystallizing",
+		current_phase: crystal.lifecycle === "ready" ? "handoff" : "interviewing",
 		skill: "deep-interview",
 		version: WORKFLOW_STATE_VERSION,
 		session_id: sessionId,
