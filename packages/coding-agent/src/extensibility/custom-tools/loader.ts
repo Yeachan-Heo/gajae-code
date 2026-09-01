@@ -253,7 +253,7 @@ export async function discoverAndLoadCustomTools(
 	}
 
 	// 2. Plugin tools: ~/.gjc/plugins/node_modules/*/
-	for (const pluginPath of await getAllPluginToolPaths(cwd, agentDir)) {
+	for (const pluginPath of await getAllPluginToolPaths(cwd, agentDir, profileAuthority)) {
 		addPath(pluginPath, { provider: "plugin", providerName: "Plugin", level: "user" });
 	}
 
