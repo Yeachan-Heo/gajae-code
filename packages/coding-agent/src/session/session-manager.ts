@@ -16203,7 +16203,14 @@ export class SessionManager {
 				error: toError(error).message,
 			});
 		}
-		const priorPersistError = this.#persistError;
+		let priorPersistError = this.#persistError;
+		if (this.#needsFullRewriteOnNextPersist && !this.#readOnlyResume) {
+			try {
+				await this.#rewriteFileContents();
+			} catch (error) {
+				priorPersistError ??= toError(error);
+			}
+		}
 		let outcome: SessionManagerCloseOutcome = { kind: "closed" };
 		await this.#queuePersistTask(
 			async () => {
