@@ -405,6 +405,29 @@ async function handleCrystallizeUnlocked(
 			pending.steps.includes("artifact") &&
 			pending.steps.includes("index")
 		) {
+			let artifactValid = false;
+			try {
+				const artifact = await fs.readFile(existingSpecPath, "utf8");
+				artifactValid = createHash("sha256").update(artifact).digest("hex") === existingSpecHash;
+			} catch {
+				artifactValid = false;
+			}
+			if (!artifactValid) throw new DeepInterviewCommandError(2, "pending Crystal artifact verification failed");
+			let indexValid = false;
+			try {
+				const index = await fs.readFile(indexPath, "utf8");
+				indexValid = index.split(/\r?\n/).some(line => {
+					try {
+						const entry = JSON.parse(line) as Record<string, unknown>;
+						return entry.path === existingSpecPath && entry.sha256 === existingSpecHash;
+					} catch {
+						return false;
+					}
+				});
+			} catch {
+				indexValid = false;
+			}
+			if (!indexValid) throw new DeepInterviewCommandError(2, "pending Crystal index verification failed");
 			await syncDeepInterviewHud({
 				cwd,
 				sessionId,
@@ -1152,6 +1175,11 @@ async function persistDeepInterviewSpecUnlocked(
 
 async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
 	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
+	return withWorkflowStateLock(statePath, () => seedDeepInterviewStateUnlocked(cwd, resolved), { cwd });
+}
+
+async function seedDeepInterviewStateUnlocked(cwd: string, resolved: ResolvedDeepInterviewArgs): Promise<string> {
+	const statePath = deepInterviewStatePath(cwd, resolved.sessionId);
 	assertDeepInterviewInputWithinLimit(resolved.idea, MAX_INITIAL_CONTEXT_LENGTH, "initial_idea");
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "valid") {
@@ -1197,6 +1225,7 @@ async function seedDeepInterviewState(cwd: string, resolved: ResolvedDeepIntervi
 	if (resolved.sessionId) payload.session_id = resolved.sessionId;
 	await writeWorkflowEnvelopeAtomic(statePath, payload, {
 		cwd,
+		lockHeld: true,
 		receipt: {
 			cwd,
 			skill: "deep-interview",
