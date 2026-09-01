@@ -17564,6 +17564,7 @@ export class AgentSession {
 	 * @param options Optional callbacks for completion/error handling
 	 */
 	async compact(customInstructions?: string, options?: CompactOptions): Promise<CompactionResult> {
+		this.#assertSessionAdmissionOpen();
 		// Serialize with every other session-identity transition via the shared lease
 		// (bidirectional mutual exclusion with handoff/new/switch/branch/clear/fork/
 		// navigateTree). Released in the outer finally below.
