@@ -1344,6 +1344,11 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 			} else {
 				merged.current_phase = merged.current_phase.trim();
 			}
+			if (mode === "deep-interview") {
+				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
+				if (isPlainObject(mergedInner.crystal) && mergedInner.crystal.lifecycle !== "ready")
+					merged.current_phase = "interviewing";
+			}
 			merged.version = WORKFLOW_STATE_VERSION;
 			if (typeof merged.active !== "boolean") merged.active = true;
 			merged.updated_at = nowIsoStr;
