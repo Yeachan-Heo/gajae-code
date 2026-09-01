@@ -3450,6 +3450,59 @@ pub(crate) mod platform {
 	}
 
 	#[cfg(target_os = "linux")]
+	fn rename_directory_no_replace_at(
+		source_parent_fd: libc::c_int,
+		destination_parent_fd: libc::c_int,
+		source: &CString,
+		destination: &CString,
+	) -> Result<(), &'static str> {
+		// `renameat2(RENAME_NOREPLACE)` is unavailable on some shared mounts. Claim
+		// the destination with mkdirat, then replace only that still-empty directory.
+		// The caller has already validated the source descriptor and parent identity.
+		// SAFETY: the parent descriptor is live and destination is NUL-terminated.
+		if unsafe { libc::mkdirat(destination_parent_fd, destination.as_ptr(), 0o700) } != 0 {
+			return Err(match std::io::Error::last_os_error().raw_os_error() {
+				Some(libc::EEXIST | libc::ENOTEMPTY) => "quarantine_collision",
+				Some(libc::ENOENT) => "not_found",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				_ => "io_error",
+			});
+		}
+		// SAFETY: both parent descriptors and names remain valid for the syscall.
+		let renamed = unsafe {
+			libc::renameat(
+				source_parent_fd,
+				source.as_ptr(),
+				destination_parent_fd,
+				destination.as_ptr(),
+			)
+		};
+		if renamed == 0 {
+			Ok(())
+		} else {
+			let error = std::io::Error::last_os_error();
+			// SAFETY: remove only the empty directory claimed by this call.
+			unsafe { libc::unlinkat(destination_parent_fd, destination.as_ptr(), libc::AT_REMOVEDIR) };
+			Err(match error.raw_os_error() {
+				Some(libc::EEXIST | libc::ENOTEMPTY) => "quarantine_collision",
+				Some(libc::ENOENT) => "not_found",
+				Some(libc::EACCES | libc::EPERM) => "permission_denied",
+				_ => "io_error",
+			})
+		}
+	}
+
+	#[cfg(not(target_os = "linux"))]
+	fn rename_directory_no_replace_at(
+		_: libc::c_int,
+		_: libc::c_int,
+		_: &CString,
+		_: &CString,
+	) -> Result<(), &'static str> {
+		Err("atomic_unavailable")
+	}
+
+	#[cfg(target_os = "linux")]
 	fn rename_exchange(
 		source_parent_fd: libc::c_int,
 		destination_parent_fd: libc::c_int,
@@ -5929,7 +5982,13 @@ pub(crate) mod platform {
 		} else {
 			#[cfg(test)]
 			pause_before_tree_root_rename_for_test();
-			match rename_no_replace(parent, parent, root_name, &final_name) {
+			match rename_no_replace(parent, parent, root_name, &final_name).or_else(|code| {
+				if matches!(code, "invalid_request" | "atomic_unavailable") {
+					rename_directory_no_replace_at(parent, parent, root_name, &final_name)
+				} else {
+					Err(code)
+				}
+			}) {
 				Ok(()) => final_path,
 				Err(code) => {
 					// SAFETY: this branch owns the live descriptors and closes each exactly once.
