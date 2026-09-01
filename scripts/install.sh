@@ -44,6 +44,8 @@ DEV_REQUESTED=0
 SOURCE_REQUESTED=0
 BINARY_REQUESTED=0
 OFFER_RUNTIME_DIR=""
+OFFER_RUNTIME_ACTIVE=""
+OFFER_RUNTIME_SIGNAL=""
 
 usage() {
     cat <<'EOF'
@@ -93,16 +95,20 @@ cleanup() {
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
         rm -rf "$SOURCE_CLONE_DIR"
     fi
-    if [ -n "$OFFER_RUNTIME_DIR" ] && [ -d "$OFFER_RUNTIME_DIR" ]; then
-        rm -rf "$OFFER_RUNTIME_DIR"
+    if [ -z "$OFFER_RUNTIME_ACTIVE" ] && [ -n "$OFFER_RUNTIME_DIR" ] && [ -d "$OFFER_RUNTIME_DIR" ]; then
+        chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
+        rm -rf "$OFFER_RUNTIME_DIR" || true
     fi
     return 0
 }
 
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
-trap 'cleanup; exit 129' HUP
+handle_int() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then OFFER_RUNTIME_SIGNAL=INT; else cleanup; exit 130; fi; }
+handle_term() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then OFFER_RUNTIME_SIGNAL=TERM; else cleanup; exit 143; fi; }
+handle_hup() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then OFFER_RUNTIME_SIGNAL=HUP; else cleanup; exit 129; fi; }
+trap handle_int INT
+trap handle_term TERM
+trap handle_hup HUP
 
 remember_tmp() {
     TMP_FILES="${TMP_FILES}$1
@@ -669,18 +675,21 @@ install_binary() {
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
     if [ "$PLATFORM" = "darwin" ]; then
+        OFFER_RUNTIME_ACTIVE=1
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && cp -p "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
-            if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
+            if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
                 "$OFFER_RUNTIME" macos-community-app-offer || true
             fi
+            chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
             rm -rf "$OFFER_RUNTIME_DIR" || true
             OFFER_RUNTIME_DIR=""
         elif [ -n "$OFFER_RUNTIME_DIR" ]; then
             rm -rf "$OFFER_RUNTIME_DIR" || true
             OFFER_RUNTIME_DIR=""
         fi
+        OFFER_RUNTIME_ACTIVE=""
     fi
 
     case ":$PATH:" in
