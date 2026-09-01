@@ -2298,6 +2298,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let replacementMcpToolsSync: Promise<void> = Promise.resolve();
 		let replacementMcpGeneration = 0;
 		let ownedPluginServersConnected = false;
+		let rebindProjectExtensions: ((cwd: string, settings: Settings) => Promise<void>) | undefined;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const stagedMcpCleanup = new Map<MCPManager, () => void>();
 		const wireMcpManagerCallbacks = (
@@ -2566,6 +2567,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
 				nextCustomTools,
 			);
+			await rebindProjectExtensions?.(to, settings);
 		};
 
 		/**
@@ -3623,6 +3625,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// normalize before import and then adapt into the authoritative ExtensionRunner.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
+		let constrainedPluginHookFactory: ExtensionFactory | undefined;
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
@@ -3649,7 +3652,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		try {
 			const pluginHookResult = await loadConstrainedPluginHooks({ cwd, agentDir });
 			if (pluginHookResult.hooks.length > 0) {
-				inlineExtensions.push(createPluginHooksExtension(pluginHookResult.hooks));
+				constrainedPluginHookFactory = createPluginHooksExtension(pluginHookResult.hooks);
+				inlineExtensions.push(constrainedPluginHookFactory);
 			}
 			for (const q of pluginHookResult.quarantine) {
 				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
@@ -3869,6 +3873,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			errors: [],
 			runtime: new ExtensionRuntime(),
 		};
+		const projectExtensionPaths = new Set<string>();
+		const discoveredProjectExtensionPaths = new Set<string>();
+		let constrainedPluginHookPath: string | undefined;
 
 		if (!extensionsResult.extensions.some(extension => extension.path === BUNDLED_GROK_BUILD_EXTENSION_ID)) {
 			const bundledGrokExtension = await loadExtensionFromFactory(
@@ -3893,6 +3900,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					`<inline-${i}>`,
 				);
 				extensionsResult.extensions.push(loaded);
+				if (factory === constrainedPluginHookFactory) {
+					projectExtensionPaths.add(loaded.path);
+					constrainedPluginHookPath = loaded.path;
+				}
 			}
 		}
 		for (const entry of discoveredHookExtensions) {
@@ -3904,6 +3915,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				entry.name,
 			);
 			extensionsResult.extensions.push(loaded);
+			projectExtensionPaths.add(loaded.path);
+			discoveredProjectExtensionPaths.add(loaded.path);
 		}
 
 		// Process provider registrations queued during extension loading.
@@ -4077,6 +4090,98 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				settings,
 				() => session?.credentialSessionId ?? credentialSessionId,
 			);
+		}
+
+		if (extensionRunner) {
+			const runner = extensionRunner;
+			rebindProjectExtensions = async (to: string, targetSettings: Settings): Promise<void> => {
+				const nextHookFactories: Array<{ factory: ExtensionFactory; name: string }> = [];
+				if (!options.disableExtensionDiscovery) {
+					const hookExtensions = await discoverAndLoadHookExtensions(
+						options.hookPaths ?? [],
+						to,
+						agentDir,
+						targetSettings,
+						profileAuthority,
+					);
+					nextHookFactories.push(...hookExtensions.factories);
+					for (const error of hookExtensions.errors) {
+						logger.warn("Rejected relocated hook", { path: error.path, error: error.error });
+					}
+				}
+
+				const pluginHookResult = await loadConstrainedPluginHooks({ cwd: to, agentDir });
+				for (const q of pluginHookResult.quarantine) {
+					gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
+					logger.warn("Quarantined relocated GJC plugin hook", {
+						plugin: q.plugin,
+						surface: q.surfaceId,
+						code: q.code,
+					});
+				}
+
+				let nextPluginExtension: (typeof extensionsResult.extensions)[number] | undefined;
+				if (pluginHookResult.hooks.length > 0) {
+					nextPluginExtension = await loadExtensionFromFactory(
+						createPluginHooksExtension(pluginHookResult.hooks),
+						to,
+						eventBus,
+						extensionsResult.runtime,
+						"<gjc-plugin-hooks>",
+					);
+				}
+				const nextHookExtensions: typeof extensionsResult.extensions = [];
+				for (const entry of nextHookFactories) {
+					nextHookExtensions.push(
+						await loadExtensionFromFactory(entry.factory, to, eventBus, extensionsResult.runtime, entry.name),
+					);
+				}
+
+				const previousPluginPath = constrainedPluginHookPath;
+				const previousHookPaths = new Set(discoveredProjectExtensionPaths);
+				const nextExtensions: typeof extensionsResult.extensions = [];
+				let pluginPlaced = false;
+				let hooksPlaced = false;
+				for (const extension of extensionsResult.extensions) {
+					if (previousPluginPath !== undefined && extension.path === previousPluginPath) {
+						if (nextPluginExtension) nextExtensions.push(nextPluginExtension);
+						pluginPlaced = true;
+						continue;
+					}
+					if (previousHookPaths.has(extension.path)) {
+						if (!hooksPlaced) nextExtensions.push(...nextHookExtensions);
+						hooksPlaced = true;
+						continue;
+					}
+					nextExtensions.push(extension);
+				}
+				if (nextPluginExtension && !pluginPlaced) nextExtensions.push(nextPluginExtension);
+				if (!hooksPlaced) nextExtensions.push(...nextHookExtensions);
+
+				const sourceIds = new Set([
+					...projectExtensionPaths,
+					...(nextPluginExtension ? [nextPluginExtension.path] : []),
+					...nextHookExtensions.map(extension => extension.path),
+				]);
+				for (const sourceId of sourceIds) modelRegistry.clearSourceRegistrations(sourceId);
+				modelRegistry.syncExtensionSources(nextExtensions.map(extension => extension.path));
+				for (const { name, config, sourceId } of extensionsResult.runtime.pendingProviderRegistrations) {
+					modelRegistry.registerProvider(name, config, sourceId);
+				}
+				extensionsResult.runtime.pendingProviderRegistrations = [];
+
+				runner.rebindScope(to, targetSettings);
+				runner.rebindExtensions(nextExtensions);
+				extensionsResult.extensions.splice(0, extensionsResult.extensions.length, ...nextExtensions);
+				projectExtensionPaths.clear();
+				discoveredProjectExtensionPaths.clear();
+				constrainedPluginHookPath = nextPluginExtension?.path;
+				if (nextPluginExtension) projectExtensionPaths.add(nextPluginExtension.path);
+				for (const extension of nextHookExtensions) {
+					projectExtensionPaths.add(extension.path);
+					discoveredProjectExtensionPaths.add(extension.path);
+				}
+			};
 		}
 
 		if (extensionRunner) {
