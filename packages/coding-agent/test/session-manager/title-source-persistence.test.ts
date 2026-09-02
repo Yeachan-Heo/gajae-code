@@ -251,6 +251,29 @@ describe("session title source persistence", () => {
 		expect(reopened.isSessionStarred()).toBe(true);
 	});
 
+	it("marks prepared new and fork successors as star-capable without inheriting a star", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "keep this", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		expect(await session.setSessionStarred(true)).toBe(true);
+
+		const preparedNew = await session.prepareNewSession();
+		await session.ensurePreparedNewSessionOnDisk(preparedNew);
+		expect(preparedNew.sessionFile).toBeDefined();
+		const newHeader = JSON.parse(fs.readFileSync(preparedNew.sessionFile!, "utf8").split("\n")[0]!);
+		expect(newHeader).toMatchObject({ type: "session", starredPatchVersion: 1 });
+		expect(newHeader).not.toHaveProperty("starred");
+		await session.discardPreparedNewSession(preparedNew);
+
+		const preparedFork = await session.prepareFork();
+		expect(preparedFork?.sessionFile).toBeDefined();
+		const forkHeader = JSON.parse(fs.readFileSync(preparedFork!.sessionFile!, "utf8").split("\n")[0]!);
+		expect(forkHeader).toMatchObject({ type: "session", starredPatchVersion: 1 });
+		expect(forkHeader).not.toHaveProperty("starred");
+		await session.discardPreparedNewSession(preparedFork!);
+	});
+
 	it("appends a bounded header patch and replays v3 and v4 transcripts deterministically", async () => {
 		const session = SessionManager.create(cwd);
 		session.appendMessage({ role: "user", content: "x".repeat(1_000_000), timestamp: 1 });

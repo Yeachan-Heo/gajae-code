@@ -171,4 +171,40 @@ describe("resume listing trailing-patch scan cost", () => {
 		// A patch in the final chunk must not drag the scan across the transcript.
 		expect(counter.bytes()).toBeLessThan(size / 2);
 	});
+
+	it("recognizes star capability in an oversized header prefix fallback", async () => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-oversized-header-"));
+		const cwd = path.join(testDir, "cwd");
+		const sessionDir = path.join(testDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(sessionDir, { recursive: true });
+		const sessionFile = path.join(sessionDir, "oversized-header.jsonl");
+		const records = [
+			{
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				starredPatchVersion: 1,
+				id: "oversized-header",
+				timestamp: "2026-08-16T00:00:00.000Z",
+				cwd,
+				title: "oversized",
+				parentSession: "x".repeat(8 * 1024),
+			},
+			{
+				type: "message",
+				id: "message",
+				parentId: null,
+				timestamp: "2026-08-16T00:00:01.000Z",
+				message: { role: "user", content: "hello", timestamp: 1 },
+			},
+			{ type: "header_patch", patch: { starred: true } },
+		];
+		fs.writeFileSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+
+		const candidates = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		expect(candidates.find(item => item.id === "oversized-header")).toMatchObject({
+			title: "oversized",
+			starred: true,
+		});
+	});
 });

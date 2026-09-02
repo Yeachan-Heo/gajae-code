@@ -6730,6 +6730,17 @@ function extractBooleanProperty(source: string, name: string): boolean | undefin
 	return undefined;
 }
 
+function extractIntegerProperty(source: string, name: string): number | undefined {
+	const propertyIndex = source.indexOf(`"${name}"`);
+	if (propertyIndex === -1) return undefined;
+	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
+	if (colonIndex === -1) return undefined;
+	const match = /^\s*(-?\d+)/.exec(source.slice(colonIndex + 1));
+	if (!match) return undefined;
+	const value = Number(match[1]);
+	return Number.isSafeInteger(value) ? value : undefined;
+}
+
 function countMessageMarkers(content: string): number {
 	let count = 0;
 	let index = 0;
@@ -6778,6 +6789,10 @@ function parseSessionListHeader(
 	content: string,
 	entries: Array<Record<string, unknown>>,
 ): SessionListHeader | undefined {
+	const firstLineEnd = content.indexOf("\n");
+	const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
+	const inlineStarred = extractBooleanProperty(firstLine, "starred");
+	const starredPatchVersion = extractIntegerProperty(firstLine, "starredPatchVersion") === 1 ? 1 : undefined;
 	const parsedHeader = entries[0];
 	if (parsedHeader?.type === "session" && typeof parsedHeader.id === "string") {
 		return {
@@ -6786,15 +6801,13 @@ function parseSessionListHeader(
 			version: typeof parsedHeader.version === "number" ? parsedHeader.version : undefined,
 			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
 			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
-			starredPatchVersion: parsedHeader.starredPatchVersion === 1 ? 1 : undefined,
-			starred: typeof parsedHeader.starred === "boolean" ? parsedHeader.starred : undefined,
+			starredPatchVersion: parsedHeader.starredPatchVersion === 1 ? 1 : starredPatchVersion,
+			starred: typeof parsedHeader.starred === "boolean" ? parsedHeader.starred : inlineStarred,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
 			timestamp: typeof parsedHeader.timestamp === "string" ? parsedHeader.timestamp : undefined,
 		};
 	}
 
-	const firstLineEnd = content.indexOf("\n");
-	const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
 	if (extractStringProperty(firstLine, "type") !== "session") return undefined;
 
 	const id = extractStringProperty(firstLine, "id");
@@ -6803,10 +6816,11 @@ function parseSessionListHeader(
 	return {
 		type: "session",
 		id,
-		version: Number(extractStringProperty(firstLine, "version")) || undefined,
+		version: extractIntegerProperty(firstLine, "version"),
 		cwd: extractStringProperty(firstLine, "cwd"),
 		title: extractStringProperty(firstLine, "title"),
-		starred: extractBooleanProperty(firstLine, "starred"),
+		starred: inlineStarred,
+		starredPatchVersion,
 		parentSession: extractStringProperty(firstLine, "parentSession"),
 		timestamp: extractStringProperty(firstLine, "timestamp"),
 	};
@@ -9757,6 +9771,7 @@ export class SessionManager {
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			starredPatchVersion: 1,
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
@@ -9965,6 +9980,7 @@ export class SessionManager {
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			starredPatchVersion: 1,
 			id: sessionId,
 			title: this.#sessionName,
 			titleSource: this.#titleSource,
@@ -10033,6 +10049,7 @@ export class SessionManager {
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			starredPatchVersion: 1,
 			id: sessionId,
 			timestamp,
 			cwd: this.cwd,
@@ -10355,6 +10372,7 @@ export class SessionManager {
 		const newHeader: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			starredPatchVersion: 1,
 			id: newSessionId,
 			title: oldHeader?.title ?? this.#sessionName,
 			titleSource: oldHeader?.titleSource ?? this.#titleSource,
@@ -18896,6 +18914,7 @@ export class SessionManager {
 		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
+			starredPatchVersion: 1,
 			id: newSessionId,
 			timestamp,
 			cwd: this.cwd,

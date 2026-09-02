@@ -37,9 +37,9 @@ There are two different listing pipelines:
    - Sorts by file `mtime` descending.
 
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
-   - Reads a bounded 4KB prefix, then reverse-scans for the latest strict `header_patch` values (cwd/title/starred) in 64KB chunks, stopping once all mutable list fields resolve.
-   - Recent patches near EOF stay cheap; when a field is still missing the scan continues past the historical 16KB window so a buried but still-canonical title remains listable without a full sequential JSONL parse of multi-MB message bodies.
-   - A transcript that never emitted a `header_patch`, or whose legacy metadata patches do not carry a star field, cannot rule out an earlier standalone star patch without reaching BOF, so its whole file is walked. The scan therefore uses its own 64KB buffer rather than the 4KB prefix buffer: chunk size sets how many `read` syscalls a listing costs per transcript byte, and listings run on every resume, continue, and picker open.
+   - Reads a bounded 4KB prefix, then reverse-scans strict `header_patch` records in 64KB chunks. Legacy transcripts request cwd/title only; `starredPatchVersion: 1` transcripts also request the latest star state.
+   - Recent patches near EOF stay cheap. When a requested field is still missing, the scan continues past the historical 16KB window so buried canonical metadata remains listable without a full sequential JSONL parse of multi-MB message bodies.
+   - A transcript that never emitted a requested `header_patch` cannot be recognized as such without reaching BOF, so its whole file is walked. Legacy rename/move patches stop once cwd/title resolve. Star-capable writers checkpoint current star state beside later cwd/title patches, keeping those metadata groups bounded without making read-only discovery mutate transcripts.
    - Builds `SessionInfo` objects from that projection plus prefix preview extraction.
    - Drops sessions with zero `message` entries and sorts by `modified` descending; resume selectors and the sessions dashboard then stable-partition starred sessions ahead of unstarred sessions without changing ID-prefix resolution order.
 
