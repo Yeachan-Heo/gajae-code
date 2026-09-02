@@ -1347,6 +1347,15 @@ async function runCommunityAppOfferFromRuntime(
 			stderr: "inherit",
 			detached: true,
 		});
+		let runtimeLeaderExited = false;
+		child.exited.then(
+			() => {
+				runtimeLeaderExited = true;
+			},
+			() => {
+				runtimeLeaderExited = true;
+			},
+		);
 		const waitForRuntimeGroupGone = async (): Promise<boolean> => {
 			for (let attempt = 0; attempt < 100; attempt++) {
 				try {
@@ -1359,6 +1368,7 @@ async function runCommunityAppOfferFromRuntime(
 			return false;
 		};
 		const signalRuntimeGroup = (signal: NodeJS.Signals): boolean => {
+			if (runtimeLeaderExited) return false;
 			try {
 				process.kill(child.pid, 0);
 			} catch {
