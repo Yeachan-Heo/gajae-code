@@ -344,6 +344,8 @@ async function handleCrystallizeUnlocked(
 		existingRead.kind === "valid"
 			? normalizeDeepInterviewEnvelope(existingRead.value)
 			: normalizeDeepInterviewEnvelope({});
+	if (existingRead.kind === "valid" && existing.active === false)
+		throw new DeepInterviewCommandError(2, "cannot crystallize an inactive deep-interview state");
 	const storedPrior = (existing.state as Record<string, unknown> | undefined)?.crystal;
 	if (
 		input.prior !== undefined &&

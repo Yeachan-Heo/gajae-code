@@ -192,6 +192,36 @@ function normalizedGaps(value: unknown): string[] {
 	return value.map((gap, index) => text(gap, `open_gaps[${index}]`, 500));
 }
 
+function evidenceTerms(value: string): Set<string> {
+	const ignored = new Set([
+		"and",
+		"are",
+		"can",
+		"does",
+		"for",
+		"how",
+		"must",
+		"should",
+		"that",
+		"the",
+		"this",
+		"was",
+		"were",
+		"what",
+		"when",
+		"where",
+		"which",
+		"why",
+		"will",
+		"with",
+	]);
+	return new Set(
+		(value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
+			term => [...term].length >= 3 && !ignored.has(term),
+		),
+	);
+}
+
 function validateResolutionAnchors(
 	resolutions: readonly string[],
 	value: unknown,
@@ -216,6 +246,9 @@ function validateResolutionAnchors(
 		const introducesNewTerm = resolutionWords.some(
 			word => word.length >= 3 && !itemWords.has(word) && !genericResolutionWords.has(word),
 		);
+		const itemTerms = evidenceTerms(item);
+		const resolutionTerms = evidenceTerms(resolution);
+		const addressesItem = [...resolutionTerms].some(term => itemTerms.has(term));
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
@@ -229,6 +262,7 @@ function validateResolutionAnchors(
 			!introducesNewTerm
 		)
 			throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
+		if (!addressesItem) throw new Error(`${field}[${index}] has no relevant verbatim user anchor`);
 		seen.add(item);
 	}
 }
@@ -291,6 +325,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		priorCrystal && isRecord(priorCrystal.source) && typeof priorCrystal.source.end === "number"
 			? priorCrystal.source.end
 			: -1;
+	if (priorCrystal && snapshot.start > priorEnd + 1)
+		throw new Error("conversation snapshot must include every message after the prior Crystal boundary");
 	if (gaps.some(gap => resolvedGaps.includes(gap)))
 		throw new Error("open_gaps and resolved_open_gaps must be disjoint");
 	if (conflicts.some(conflict => resolvedConflicts.includes(conflict)))
@@ -310,6 +346,21 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		priorEnd,
 	);
 	const priorItems = new Map(canonicalPriorItems.map(item => [item.id, item]));
+	const sameIntent = (left: CrystalItem, right: CrystalItem): boolean =>
+		left.id === right.id &&
+		left.kind === right.kind &&
+		left.statement === right.statement &&
+		(left.classification === right.classification ||
+			(right.classification === "inferred" && left.classification === "confirmed"));
+	for (const item of items) {
+		const previous = priorItems.get(item.id);
+		if (
+			item.classification === "confirmed" &&
+			(previous === undefined || !sameIntent(item, previous)) &&
+			(item.anchor === undefined || item.anchor.message_index <= priorEnd)
+		)
+			throw new Error(`changed confirmed item ${item.id} requires fresh user evidence`);
+	}
 	if (removedIds.some(id => !priorItems.has(id)))
 		throw new Error("removed crystallize item is not present in prior crystal");
 	const mergedItems = [...items];
@@ -318,12 +369,6 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			mergedItems.push(item);
 	const currentItems = mergedItems;
 	if (currentItems.length > MAX_ITEMS) throw new Error("merged crystallize items exceed the bounded limit");
-	const sameIntent = (left: CrystalItem, right: CrystalItem): boolean =>
-		left.id === right.id &&
-		left.kind === right.kind &&
-		left.statement === right.statement &&
-		(left.classification === right.classification ||
-			(right.classification === "inferred" && left.classification === "confirmed"));
 	const changed = currentItems
 		.filter(item => {
 			const previous = priorItems.get(item.id);
