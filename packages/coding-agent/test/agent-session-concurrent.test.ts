@@ -1024,6 +1024,68 @@ describe("AgentSession concurrent prompt guard", () => {
 		await expect(transition).resolves.toBe(true);
 	});
 
+	it("rejects direct goal controls before side effects during a cancelled pre-switch transition", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-goal-transition-cancel.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-goal-transition-cancel.yml"));
+		const hookStarted = Promise.withResolvers<void>();
+		const hookGate = Promise.withResolvers<void>();
+		const publishedGoalEvents: unknown[] = [];
+		const extensionGoalUpdates: unknown[] = [];
+		const extensionRunner = {
+			hasHandlers: vi.fn((event: string) => event === "session_before_switch" || event === "goal_updated"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_before_switch") {
+					hookStarted.resolve();
+					await hookGate.promise;
+					return { cancel: true };
+				}
+				if (event.type === "goal_updated") extensionGoalUpdates.push(event);
+				return undefined;
+			}),
+		} as unknown as ExtensionRunner;
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		session.subscribe(event => {
+			if (event.type === "goal_updated") publishedGoalEvents.push(event);
+		});
+		await session.goalRuntime.createGoal({ objective: "existing goal" });
+
+		const stateBeforeTransition = session.getGoalModeState();
+		const originalState = stateBeforeTransition
+			? { ...stateBeforeTransition, goal: { ...stateBeforeTransition.goal } }
+			: undefined;
+		const originalAccounting = session.goalRuntime.snapshot;
+		const publishedCount = publishedGoalEvents.length;
+		const extensionCount = extensionGoalUpdates.length;
+		const persistedEntryCount = sessionManager.getBranch().length;
+		const transition = session.newSession();
+		await hookStarted.promise;
+		expect(session.isSessionTransitioning).toBe(true);
+
+		await expect(session.goalRuntime.pauseGoal()).rejects.toThrow(/session transition is in progress/i);
+		await expect(session.goalRuntime.dropGoal()).rejects.toThrow(/session transition is in progress/i);
+		expect(publishedGoalEvents).toHaveLength(publishedCount);
+		expect(extensionGoalUpdates).toHaveLength(extensionCount);
+		expect(sessionManager.getBranch()).toHaveLength(persistedEntryCount);
+
+		hookGate.resolve();
+		await expect(transition).resolves.toBe(false);
+		expect(session.getGoalModeState()).toEqual(originalState);
+		expect(session.goalRuntime.snapshot).toEqual(originalAccounting);
+		expect(publishedGoalEvents).toHaveLength(publishedCount);
+		expect(extensionGoalUpdates).toHaveLength(extensionCount);
+		expect(sessionManager.getBranch()).toHaveLength(persistedEntryCount);
+	});
+
 	it("keeps session_switch hook-queued steering deliverable after clearing pre-switch queues", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const agent = new Agent({

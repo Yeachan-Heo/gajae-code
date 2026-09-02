@@ -151,6 +151,11 @@ export class GoalRuntime {
 		);
 		await previous.catch(() => {});
 		try {
+			// Admission must be checked only after this operation owns the accounting
+			// queue, but before it can mutate accounting or publish any state. The
+			// commit-time check below remains necessary because an awaited operation may
+			// cross an identity transition after this admission succeeds.
+			this.#host.assertMutationAllowed?.();
 			return await fn();
 		} finally {
 			resolve();
@@ -249,18 +254,20 @@ export class GoalRuntime {
 	}
 
 	async onThreadResumed(): Promise<GoalModeState | undefined> {
-		const state = this.#getStateClone();
-		if (!state) return undefined;
-		if (state.goal.status === "active") {
-			state.enabled = true;
-		}
-		if (state.enabled && isAccountingStatus(state.goal)) {
-			this.#markActiveAccounting(state.goal);
-		} else {
-			this.#clearActiveAccounting();
-		}
-		await this.#commitState(state, { emit: true });
-		return state;
+		return await this.#withAccounting(async () => {
+			const state = this.#getStateClone();
+			if (!state) return undefined;
+			if (state.goal.status === "active") {
+				state.enabled = true;
+			}
+			if (state.enabled && isAccountingStatus(state.goal)) {
+				this.#markActiveAccounting(state.goal);
+			} else {
+				this.#clearActiveAccounting();
+			}
+			await this.#commitState(state, { emit: true });
+			return state;
+		});
 	}
 
 	async #flushUsageLocked(currentUsage: GoalTokenUsage = this.#host.getCurrentUsage()): Promise<void> {

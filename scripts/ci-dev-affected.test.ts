@@ -152,7 +152,7 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
-		expect(
+		expect(workflow).toContain(
 			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}",
 		);
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
