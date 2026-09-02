@@ -1376,7 +1376,9 @@ async function offlineTailReplay(
 			version: SESSION_ROWS_VERSION,
 			source: "offline",
 			session: row,
-			items: entries.map((entry, index) => toTailItemV1(entry, { kind: "transcript", seq: index })),
+			items: entries.map((entry, index) =>
+				toTailItemV1(entry, { kind: "transcript", revision: index + 1, seq: index }),
+			),
 			terminal: true,
 		},
 	};
@@ -1484,6 +1486,8 @@ async function runLiveTail(
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
+										if (item.revision === undefined && checkpoint?.revision !== undefined) item.revision = checkpoint.revision;
+		// If checkpoint was undefined, queue for later stamping? For now leave without rev
 		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, [item], include));
 	};
 
@@ -1525,10 +1529,18 @@ async function runLiveTail(
 				);
 				throwResponseFailure(response);
 				const page = extractTranscriptPage(response);
+				const rev = checkpoint?.revision;
+				let nextSeq = transcriptItems.length;
 				mergeTailItems(
 					transcriptItems,
 					seenTranscript,
-					page.items.map(item => toTailItemV1(item, { kind: "transcript" })),
+					page.items.map(item => {
+						const it = toTailItemV1(item, { kind: "transcript" });
+						if (it.revision === undefined && rev !== undefined) it.revision = rev;
+						if (it.generation === undefined) it.generation = checkpoint?.generation ?? 0;
+						if (it.seq === undefined) it.seq = nextSeq++;
+						return it;
+					}),
 					include,
 				);
 				if (page.complete || page.cursor === undefined) break;
@@ -1574,7 +1586,11 @@ async function runLiveTail(
 					raw.seq,
 				);
 			}
-			const replayItems = rawEvents.map(event => toTailItemV1(event, { kind: "event" }));
+			const replayItems = rawEvents.map(event => {
+				const it = toTailItemV1(event, { kind: "event" });
+				if (it.revision === undefined && checkpoint?.revision !== undefined) it.revision = checkpoint.revision;
+				return it;
+			});
 			applyLifecycle(mergeEventTailItems(eventItems, seenEvents, replayItems, include));
 			if (malformed !== undefined) throw malformed;
 			if (checkpoint !== undefined) {

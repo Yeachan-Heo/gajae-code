@@ -2,6 +2,7 @@ import type { SdkFrame } from "./types";
 
 export interface EventFrame extends SdkFrame {
 	type: "event";
+	revision?: number;
 	generation: number;
 	seq: number;
 }

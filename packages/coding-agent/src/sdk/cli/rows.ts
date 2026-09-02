@@ -62,6 +62,8 @@ export interface SdkTailItemV1 {
 	/** "transcript" for retained transcript entries, otherwise the event-ring kind. */
 	kind: string;
 	id?: string;
+	/** Durable revision at emission; (revision,generation,seq) is unique per session. generation:seq alone is revision-local. */
+	revision?: number;
 	generation?: number;
 	seq?: number;
 	payload: unknown;
@@ -216,7 +218,7 @@ export function toRetentionGapV1(value: unknown): SdkRetentionGapV1 | undefined 
 /** Projects a transcript entry or ring event into a tail item with dedupe keys. */
 export function toTailItemV1(
 	value: unknown,
-	fallback: { kind: string; generation?: number; seq?: number },
+	fallback: { kind: string; revision?: number; generation?: number; seq?: number },
 ): SdkTailItemV1 {
 	if (!isRecord(value)) return { kind: fallback.kind, payload: stripSecretFields(value) };
 	const kind = optionalString(value.kind) ?? fallback.kind;
@@ -226,10 +228,12 @@ export function toTailItemV1(
 	const item: SdkTailItemV1 = {
 		kind,
 		...(payloadId !== undefined ? { id: payloadId } : id !== undefined ? { id } : {}),
+		...(typeof value.revision === "number" ? { revision: value.revision } : {}),
 		...(typeof value.generation === "number" ? { generation: value.generation } : {}),
 		...(typeof value.seq === "number" ? { seq: value.seq } : {}),
 		payload: stripSecretFields(payload),
 	};
+	if (fallback.revision !== undefined && item.revision === undefined) item.revision = fallback.revision;
 	if (fallback.generation !== undefined && item.generation === undefined) item.generation = fallback.generation;
 	if (fallback.seq !== undefined && item.seq === undefined) item.seq = fallback.seq;
 	return item;

@@ -193,10 +193,12 @@ export interface SessionRouterClient {
 }
 
 /** One frame after the caller's envelope/payload identity correlation. */
+/** One frame after the caller's envelope/payload identity correlation. */
 export interface SessionRouterFrame {
 	readonly body: Record<string, unknown>;
 	readonly name: string | undefined;
 	readonly sessionId: string | undefined;
+	readonly revision?: number;
 	readonly generation: number | undefined;
 	readonly commandId?: string;
 	readonly turnId?: string;
@@ -520,6 +522,7 @@ function fallbackCorrelation(frame: Record<string, unknown>): SessionRouterFrame
 		body,
 		name: readName(frame.name) ?? readName(frame.kind) ?? readName(body.type),
 		sessionId,
+		revision: typeof frame.revision === "number" ? frame.revision : undefined,
 		generation,
 		commandId,
 		turnId,
@@ -532,6 +535,7 @@ function coordinateFreeRouterFrame(correlated: SessionRouterFrame): SessionRoute
 		body: correlated.body,
 		name: correlated.name,
 		sessionId: correlated.sessionId,
+		...(correlated.revision === undefined ? {} : { revision: correlated.revision }),
 		generation: undefined,
 		seq: undefined,
 		...(correlated.commandId === undefined ? {} : { commandId: correlated.commandId }),
