@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { canDecryptProfileCookies } from "../../src/tools/browser/launch";
 import { chromeUserDataRoots, discoverDefaultChromeProfile } from "../../src/tools/browser/profile-discovery";
 import { resolveProfileReuse } from "../../src/tools/browser/profile-reuse";
 import type { WarmupManifest } from "../../src/tools/browser/profile-warmup";
@@ -178,5 +179,52 @@ describe("resolveProfileReuse", () => {
 			},
 		});
 		expect(res.mode).toBe("synthetic");
+	});
+});
+
+describe("canDecryptProfileCookies", () => {
+	it("darwin: Chrome profile vs bundled Chromium (no executable) is incompatible", () => {
+		expect(canDecryptProfileCookies(undefined, "/Users/x/Library/Application Support/Google/Chrome", "darwin")).toBe(
+			false,
+		);
+	});
+
+	it("darwin: Chrome profile vs Chromium executable is incompatible", () => {
+		expect(
+			canDecryptProfileCookies(
+				"/Applications/Chromium.app/Contents/MacOS/Chromium",
+				"/Users/x/Library/Application Support/Google/Chrome",
+				"darwin",
+			),
+		).toBe(false);
+	});
+
+	it("darwin: Chrome profile vs Chrome executable is compatible", () => {
+		expect(
+			canDecryptProfileCookies(
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				"/Users/x/Library/Application Support/Google/Chrome",
+				"darwin",
+			),
+		).toBe(true);
+	});
+
+	it("darwin: Chromium profile vs Chrome executable is incompatible", () => {
+		expect(
+			canDecryptProfileCookies(
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				"/Users/x/Library/Application Support/Chromium",
+				"darwin",
+			),
+		).toBe(false);
+	});
+
+	it("darwin: no discovered profile is compatible (no copy needed)", () => {
+		expect(canDecryptProfileCookies(undefined, undefined, "darwin")).toBe(true);
+	});
+
+	it("linux: any combination is compatible (Keychain brand not applicable)", () => {
+		expect(canDecryptProfileCookies(undefined, "/home/x/.config/google-chrome", "linux")).toBe(true);
+		expect(canDecryptProfileCookies("/usr/bin/chromium", "/home/x/.config/google-chrome", "linux")).toBe(true);
 	});
 });

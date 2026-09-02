@@ -293,6 +293,43 @@ function resolveSystemChromium(): string | undefined {
 	return found;
 }
 
+export function resolveSystemChromiumForTest(): string | undefined {
+	return resolveSystemChromium();
+}
+
+export function resetSystemChromiumForTest(): void {
+	resolvedChromium = undefined;
+}
+
+export function headlessExecutableForProfileReuse(): string | undefined {
+	return resolveSystemChromium() ?? trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH");
+}
+
+/**
+ * On macOS the Cookies DB is encrypted with a Keychain key whose service name is
+ * brand-specific ("Chrome Safe Storage" vs "Chromium Safe Storage"). A Chrome profile
+ * copied into a bundled Chromium therefore decrypts to garbage with no warning.
+ * Return true only when the headless executable can actually decrypt the discovered profile.
+ */
+export function canDecryptProfileCookies(
+	executablePath: string | undefined,
+	discoveredUserDataDir: string | undefined,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	if (platform !== "darwin") return true;
+	if (!discoveredUserDataDir) return true;
+	if (!executablePath) return false;
+	const lowerExe = executablePath.toLowerCase();
+	const lowerDir = discoveredUserDataDir.toLowerCase();
+	const isChromiumExe = lowerExe.includes("chromium");
+	const isChromeExe = lowerExe.includes("google chrome") || lowerExe.includes("/google/chrome");
+	const isChromiumProfile = lowerDir.includes("chromium");
+	const isChromeProfile = lowerDir.includes("google") && lowerDir.includes("chrome");
+	if (isChromeProfile && isChromiumExe && !isChromeExe) return false;
+	if (isChromiumProfile && isChromeExe) return false;
+	return true;
+}
+
 /** Edge is Chromium-based but keeps its own profile format under its own user data root. */
 const EDGE_EXECUTABLE_PATTERN =
 	/(?:^|[/\\])(?:msedge(?:\.exe)?|microsoft-edge(?:-(?:stable|beta|dev|canary))?|com\.microsoft\.Edge|Microsoft Edge(?: Beta| Dev| Canary)?)$/i;

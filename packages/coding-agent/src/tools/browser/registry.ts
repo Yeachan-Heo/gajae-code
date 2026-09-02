@@ -12,7 +12,14 @@ import {
 	killExistingByPath,
 	waitForCdp,
 } from "./attach";
-import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
+import {
+	BROWSER_PROTOCOL_TIMEOUT_MS,
+	canDecryptProfileCookies,
+	headlessExecutableForProfileReuse,
+	launchHeadlessBrowser,
+	loadPuppeteer,
+	type UserAgentOverride,
+} from "./launch";
 import { defaultDiscoveryEnv } from "./profile-discovery";
 import type { ProfileReusePosture } from "./profile-posture";
 import { resolveProfileReuse } from "./profile-reuse";
@@ -148,7 +155,20 @@ async function openBrowserHandle(
 				discoveryEnv: defaultDiscoveryEnv(fs.existsSync),
 			});
 			if (reuse.warning) logger.warn(reuse.warning);
-			if (reuse.mode === "real" && reuse.warmupDir) {
+			if (reuse.mode === "real" && reuse.warmupDir && reuse.discovered) {
+				const executablePath = headlessExecutableForProfileReuse();
+				if (!canDecryptProfileCookies(executablePath, reuse.discovered.userDataDir)) {
+					try {
+						fs.rmSync(reuse.warmupDir, { recursive: true, force: true });
+					} catch {}
+					const hint = executablePath
+						? `Real Chrome profile at ${reuse.discovered.userDataDir} cannot be decrypted by ${executablePath} on macOS (Chrome Safe Storage vs Chromium Safe Storage Keychain mismatch). Using synthetic browser state instead. Set PUPPETEER_EXECUTABLE_PATH to the matching Chrome/Chromium binary.`
+						: `Real Chrome profile at ${reuse.discovered.userDataDir} found but no compatible browser executable is available on macOS (bundled Chromium cannot decrypt Chrome's cookies — Chrome Safe Storage vs Chromium Safe Storage). Using synthetic browser state instead. Set PUPPETEER_EXECUTABLE_PATH to /Applications/Google Chrome.app/Contents/MacOS/Google Chrome or install Chrome.`;
+					logger.warn(hint);
+				} else {
+					profileWarmupDir = reuse.warmupDir;
+				}
+			} else if (reuse.mode === "real" && reuse.warmupDir) {
 				profileWarmupDir = reuse.warmupDir;
 			}
 		}

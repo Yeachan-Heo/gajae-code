@@ -3072,7 +3072,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "tools",
 			label: "Profile reuse posture",
 			description:
-				"'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested.",
+				"'auto' (default): when a usable real Chrome profile is available, the browser tool uses an isolated copy of it (cookies/session/cache) for stronger stealth, warns, and falls back to synthetic. 'opt-in': stay synthetic unless a real profile is explicitly requested. On macOS, cookie decryption is brand-specific (Chrome Safe Storage vs Chromium Safe Storage Keychain); a Chrome profile copied into bundled Chromium decrypts to garbage, so auto reuses the profile only when the headless executable can decrypt it — detected system Chrome/Chromium or PUPPETEER_EXECUTABLE_PATH — otherwise it falls back to synthetic with a warning.",
 		},
 	},
 
