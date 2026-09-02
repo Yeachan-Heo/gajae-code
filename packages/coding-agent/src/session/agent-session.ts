@@ -17589,10 +17589,13 @@ export class AgentSession {
 				this.#compactionAbortController = undefined;
 				throw error;
 			}
-			// Take this invocation's state snapshot for the summarizer context.
-			const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
-
+			await this.#waitForAutoCompactionCompletions();
 			try {
+				if (compactionAbortController.signal.aborted) {
+					throw new CompactionCancelledError();
+				}
+				// Take this invocation's state snapshot for the summarizer context.
+				const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
 				if (!this.model) {
 					throw new Error("No model selected");
 				}
@@ -17792,6 +17795,18 @@ export class AgentSession {
 	async #waitForActiveMidRunMaintenance(): Promise<void> {
 		while (this.#activeMidRunMaintenancePromises.size > 0) {
 			await Promise.allSettled([...this.#activeMidRunMaintenancePromises]);
+		}
+	}
+
+	/**
+	 * Wait for every automatic compaction producer currently unwinding. An auto
+	 * compaction owns the session history through its post-append rewrite and
+	 * `session_compact` delivery, so cancelling its signal is not sufficient to
+	 * make that work safe to overlap with a manual compaction.
+	 */
+	async #waitForAutoCompactionCompletions(): Promise<void> {
+		while (this.#autoCompactionCompletions.size > 0) {
+			await Promise.allSettled([...this.#autoCompactionCompletions]);
 		}
 	}
 

@@ -16,8 +16,12 @@ import { SessionManager } from "@gajae-code/coding-agent/session/session-manager
 import { getProjectAgentDir, TempDir, withTimeout } from "@gajae-code/utils";
 
 const runtimeSignalStoreKey = "__gjcRuntimeSignals";
+const autoPostAppendGateStoreKey = "__gjcAutoPostAppendGate";
 
-type RuntimeSignalGlobal = typeof globalThis & { [runtimeSignalStoreKey]?: string[] };
+type RuntimeSignalGlobal = typeof globalThis & {
+	[runtimeSignalStoreKey]?: string[];
+	[autoPostAppendGateStoreKey]?: { wait: Promise<void> | undefined; started: boolean };
+};
 
 function getRuntimeSignals(): string[] {
 	const globalWithSignals = globalThis as RuntimeSignalGlobal;
@@ -55,6 +59,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				'\tpi.on("session_before_compact", async (event) => {',
 				`\t\tconst signals = globalThis.${runtimeSignalStoreKey} ?? (globalThis.${runtimeSignalStoreKey} = []);`,
 				'\t\tsignals.push("ratio:" + (event.preparation.tokenCorrection?.ratio ?? "none"));',
+				`\t\tsignals.push("before");`,
 				"\t\treturn {",
 				"\t\t\tcompaction: {",
 				'\t\t\t\tsummary: "compacted",',
@@ -72,6 +77,15 @@ describe("AgentSession auto-compaction queue resume", () => {
 				'\tpi.on("auto_compaction_end", async (event) => {',
 				`\t\tconst signals = globalThis.${runtimeSignalStoreKey} ?? (globalThis.${runtimeSignalStoreKey} = []);`,
 				'\t\tsignals.push("compaction:end:" + (event.aborted ? "aborted" : "ok"));',
+				"\t});",
+				"\tpi.on(\"session_compact\", async () => {",
+				`\t\tconst gate = globalThis.${autoPostAppendGateStoreKey};`,
+				"\t\tif (gate?.wait) {",
+				"\t\t\tgate.started = true;",
+				"\t\t\tconst wait = gate.wait;",
+				"\t\t\tgate.wait = undefined;",
+				"\t\t\tawait wait;",
+				"\t\t}",
 				"\t});",
 				'\tpi.on("todo_reminder", async (event) => {',
 				`\t\tconst signals = globalThis.${runtimeSignalStoreKey} ?? (globalThis.${runtimeSignalStoreKey} = []);`,
@@ -170,6 +184,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		tempDir.removeSync();
 		vi.useRealTimers();
 		getRuntimeSignals().length = 0;
+		(globalThis as RuntimeSignalGlobal)[autoPostAppendGateStoreKey] = undefined;
 		vi.restoreAllMocks();
 	});
 
@@ -238,6 +253,60 @@ describe("AgentSession auto-compaction queue resume", () => {
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
 	});
+
+	it("waits for cancelled automatic post-append work before manual preparation", async () => {
+		vi.useRealTimers();
+		session.settings.set("compaction.keepRecentTokens", 1);
+		const gate = Promise.withResolvers<void>();
+		const gateState = { wait: gate.promise, started: false };
+		(globalThis as RuntimeSignalGlobal)[autoPostAppendGateStoreKey] = gateState;
+
+		const automaticEnd = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") automaticEnd.resolve();
+		});
+		let automaticSettled = false;
+		const automatic = session.runIdleCompaction().then(() => {
+			automaticSettled = true;
+		});
+		await withTimeout(
+			(async () => {
+				while (!gateState.started) await Bun.sleep(1);
+			})(),
+			1000,
+			"Automatic post-append gate was not reached",
+		);
+
+		// Add a fresh entry while the automatic producer is still delivering its
+		// session_compact hook so the manual compaction remains eligible.
+		const nextMessages = [
+			{ role: "user" as const, content: "after automatic ".repeat(4_000), timestamp: Date.now() },
+			{ role: "user" as const, content: "before manual ".repeat(4_000), timestamp: Date.now() },
+		];
+		for (const nextMessage of nextMessages) {
+			sessionManager.appendMessage(nextMessage);
+			session.agent.appendMessage(nextMessage);
+		}
+		const manual = session.compact();
+		// Let the manual invocation advance through its abort/snapshot awaits while
+		// the automatic post-append gate remains held.
+		await Bun.sleep(1);
+
+		try {
+			expect(automaticSettled).toBe(false);
+			expect(getRuntimeSignals().filter(signal => signal === "before")).toHaveLength(1);
+			expect(sessionManager.getBranch().filter(entry => entry.type === "compaction")).toHaveLength(1);
+		} finally {
+			gate.resolve();
+		}
+		await automatic;
+		await withTimeout(automaticEnd.promise, 1000, "Automatic compaction did not settle");
+		await manual;
+
+		expect(getRuntimeSignals().filter(signal => signal === "before")).toHaveLength(2);
+		expect(sessionManager.getBranch().filter(entry => entry.type === "compaction")).toHaveLength(2);
+	});
+
 	it("does not reserve model output capability for threshold maintenance", async () => {
 		const assistantMsg: AssistantMessage = {
 			role: "assistant",

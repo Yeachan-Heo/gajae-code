@@ -1571,6 +1571,42 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await sessionManager.close();
 	});
 
+	it("rejects a nested move while a sibling tool still holds the lease", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const siblingEntered = Promise.withResolvers<void>();
+		const releaseSibling = Promise.withResolvers<void>();
+
+		await sessionManager.runWithCwdReadLease(async () => {
+			const sibling = sessionManager.runWithCwdReadLease(async () => {
+				siblingEntered.resolve();
+				await releaseSibling.promise;
+				return sessionManager.getCwd();
+			});
+			await siblingEntered.promise;
+
+			const nestedMove = sessionManager.runWithCwdReadLease(() => sessionManager.moveTo(repoA)).then(
+				() => ({ status: "fulfilled" as const }),
+				error => ({ status: "rejected" as const, error }),
+			);
+			expect(await nestedMove).toMatchObject({
+				status: "rejected",
+				error: { message: "Session working directory changed while this tool executed; retry against the new cwd." },
+			});
+			expect(sessionManager.getCwd()).toBe(cwd);
+			releaseSibling.resolve();
+			expect(await sibling).toBe(cwd);
+		});
+
+		await sessionManager.moveTo(repoA);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoA));
+		await sessionManager.close();
+	});
+
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

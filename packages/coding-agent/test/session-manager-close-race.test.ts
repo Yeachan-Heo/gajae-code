@@ -29,6 +29,7 @@ import { SessionManager, type SessionManagerCloseOutcome } from "@gajae-code/cod
 import {
 	MemorySessionStorage,
 	type SessionStorage,
+	type SessionStorageSnapshot,
 	type SessionStorageWriter,
 	type SessionStorageWriterCloseState,
 	type SessionStorageWriterOpenOptions,
@@ -38,10 +39,12 @@ import {
 class CloseHoldingStorage implements SessionStorage {
 	readonly #inner = new MemorySessionStorage();
 	readonly #closeGates: Array<PromiseWithResolvers<void>> = [];
+	onSyncClose: (() => void) | undefined;
 
 	openWriter(path: string, options?: { flags?: "a" | "w"; onError?: (err: Error) => void }): SessionStorageWriter {
 		const inner = this.#inner.openWriter(path, options);
 		const gates = this.#closeGates;
+		const storage = this;
 		return {
 			writeLine(line) {
 				return inner.writeLine(line);
@@ -67,6 +70,7 @@ class CloseHoldingStorage implements SessionStorage {
 			closeSync() {
 				// Sync close (cold-rewrite path) delegates directly; only the async
 				// close parks on a gate to open the race window.
+				storage.onSyncClose?.();
 				inner.closeSync();
 			},
 			getError() {
@@ -104,6 +108,12 @@ class CloseHoldingStorage implements SessionStorage {
 	}
 	readTextSync(p: string): string {
 		return this.#inner.readTextSync(p);
+	}
+	readBytesSync(p: string): Uint8Array {
+		return this.#inner.readBytesSync!(p);
+	}
+	readSnapshotSync(p: string): SessionStorageSnapshot {
+		return this.#inner.readSnapshotSync!(p);
 	}
 	statSync(p: string) {
 		return this.#inner.statSync(p);
@@ -293,6 +303,82 @@ describe("SessionManager close/appendMessage race", () => {
 		expect(sessionFile).toBeDefined();
 		const onDisk = persistedMessageTexts(storage.readTextSync(sessionFile!));
 		expect(onDisk).toEqual(["hello", "prime", "during-close", "after-close"]);
+	});
+
+	it("closeStrict rejects a late canonical append before releasing normal-session state", async () => {
+		const storage = new CloseHoldingStorage();
+		const sm = SessionManager.create("/cwd", "/sessions", storage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		sm.appendMessage({
+			role: "assistant",
+			content: [{ type: "text", text: "seed" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		sm.appendMessage({ role: "user", content: "prime", timestamp: Date.now() });
+		await settle(sm.flush(), storage);
+
+		const closing = sm.closeStrict();
+		for (let i = 0; i < 200; i++) {
+			if (storage.hasPendingClose()) break;
+			await Promise.resolve();
+		}
+		expect(storage.hasPendingClose()).toBe(true);
+		expect(() => sm.appendMessage({ role: "user", content: "late", timestamp: Date.now() })).toThrow(
+			"Session manager is closing.",
+		);
+		storage.releaseNextClose();
+		expect(await settle(closing, storage)).toEqual({ kind: "closed" });
+		expect(sm.getBranch()).toEqual([]);
+	});
+
+	it("closeStrict publishes a migrated mutation before rejecting a late append", async () => {
+		const storage = new CloseHoldingStorage();
+		const filePath = "/sessions/legacy-close-gate.jsonl";
+		storage.writeTextSync(
+			filePath,
+			`${JSON.stringify({ type: "session", id: "legacy-close-gate", timestamp: new Date(0).toISOString(), cwd: "/cwd", version: 2 })}\n${JSON.stringify({ type: "message", id: "legacy-message", parentId: null, timestamp: new Date(0).toISOString(), message: { role: "user", content: "legacy", timestamp: 0 } })}\n`,
+		);
+		const inspection = await SessionManager.inspectSessionTailReadOnly(filePath, storage);
+		if (inspection.kind === "error") throw new Error("Expected legacy inspection");
+		const opened = await SessionManager.openExistingStrict(inspection.identity, "/sessions", storage);
+		if (opened.kind === "error") throw new Error("Expected strict open");
+		const entry = opened.manager.getBranch().find(candidate => candidate.type === "message");
+		if (entry?.type !== "message") throw new Error("Expected legacy message");
+		opened.manager.applyEntryMessageUpdates([{ ...entry, message: { ...entry.message, content: "updated" } }]);
+
+		let lateMutationError: unknown;
+		storage.onSyncClose = () => {
+			try {
+				opened.manager.appendMessage({ role: "user", content: "late", timestamp: Date.now() });
+			} catch (error) {
+				lateMutationError = error;
+			}
+		};
+		const outcome = await opened.manager.closeStrict();
+		storage.onSyncClose = undefined;
+		expect(outcome).toEqual({ kind: "closed" });
+		expect(lateMutationError).toMatchObject({ message: "Session manager is closing." });
+		expect(opened.manager.getBranch()).toEqual([]);
+		const rewritten = storage
+			.readTextSync(filePath)
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(rewritten[0]).toMatchObject({ type: "session", version: 5 });
+		expect(rewritten[1]).toMatchObject({ type: "message", message: { content: "updated" } });
 	});
 });
 
