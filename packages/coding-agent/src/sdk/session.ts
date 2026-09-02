@@ -30,8 +30,6 @@ import {
 	$flag,
 	getAgentDbPath,
 	getAgentDir,
-	getAgentProfileAuthority,
-	getConfigDirName,
 	getProjectDir,
 	getTrustedHomeDir,
 	logger,
@@ -53,7 +51,7 @@ import {
 	jobElapsedMs,
 } from "../async";
 import { resolveBrowserBackend } from "../browser-backend";
-import { loadCapability, reset as resetCapabilities } from "../capability";
+import { loadCapability, reset as resetCapabilities, resolveProfileAuthority } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
@@ -1421,13 +1419,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const trustedHome = getTrustedHomeDir();
 	const selectedAgentDir = options.agentDir ?? options.settings?.getAgentDir();
 	const agentDir = path.resolve(selectedAgentDir ?? getDefaultAgentDir());
-	const canonicalDefaultAgentDir = path.join(trustedHome, getConfigDirName(), "agent");
-	const profileAuthority: "default" | "custom" =
-		selectedAgentDir !== undefined
-			? normalizePathForComparison(agentDir) === normalizePathForComparison(canonicalDefaultAgentDir)
-				? "default"
-				: "custom"
-			: getAgentProfileAuthority();
+	const profileAuthority = resolveProfileAuthority(
+		{ agentDir: options.agentDir, settings: options.settings },
+		trustedHome,
+	);
 	if (options.agentDir !== undefined && options.settings?.isAgentDirExplicit()) {
 		const settingsAgentDir = path.resolve(options.settings.getAgentDir());
 		if (normalizePathForComparison(path.resolve(options.agentDir)) !== normalizePathForComparison(settingsAgentDir)) {

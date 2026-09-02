@@ -30,7 +30,7 @@ import {
 	discoverSlashCommands as discoverSdkSlashCommands,
 } from "@gajae-code/coding-agent/sdk";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getAgentDir, getAgentProfileAuthority, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getAgentProfileAuthority, getConfigDirName, setAgentDir } from "@gajae-code/utils";
 import { safeRm } from "../../../scripts/safe-cleanup";
 // Register all discovery providers as a side effect.
 import "@gajae-code/coding-agent/discovery";
@@ -314,6 +314,43 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 		} finally {
 			await session.dispose();
 			await scopedSettings.close();
+		}
+	});
+
+	test("session startup preserves resolver-owned custom authority after a HOME refresh", async () => {
+		const initialHome = path.join(tempDir, "initial-home");
+		const refreshedHome = path.join(tempDir, "refreshed-home");
+		const customProfile = path.join(refreshedHome, getConfigDirName(), "agent");
+		await fs.mkdir(initialHome, { recursive: true });
+		await fs.mkdir(refreshedHome, { recursive: true });
+		await makeSkill(path.join(customProfile, "skills"), "sticky-session-profile-skill");
+		await makeSkill(path.join(refreshedHome, getConfigDirName(), "skills"), "refreshed-default-decoy");
+
+		const homeSpy = vi.spyOn(os, "homedir").mockReturnValue(initialHome);
+		setAgentDir(customProfile);
+		try {
+			homeSpy.mockReturnValue(refreshedHome);
+			expect(getAgentProfileAuthority()).toBe("custom");
+			const settings = Settings.isolated({}, { agentDir: customProfile });
+			const { session } = await createAgentSession({
+				cwd: project,
+				agentDir: customProfile,
+				settings,
+				sessionManager: SessionManager.inMemory(),
+				enableMCP: false,
+				enableLsp: false,
+				disableExtensionDiscovery: true,
+			});
+			try {
+				expect(session.getSessionProfileAuthority()).toBe("custom");
+				expect(session.skills.map(skill => skill.name)).toContain("sticky-session-profile-skill");
+				expect(session.skills.map(skill => skill.name)).not.toContain("refreshed-default-decoy");
+			} finally {
+				await session.dispose();
+				await settings.close();
+			}
+		} finally {
+			homeSpy.mockRestore();
 		}
 	});
 

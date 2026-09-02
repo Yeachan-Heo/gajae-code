@@ -971,6 +971,58 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(mock.calls).toHaveLength(0);
 		expect(session.queuedMessageCount).toBe(1);
 	});
+	it("rejects direct GoalRuntime mutation during a pre-switch hook", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: createMockModel({ handler: () => ({ content: ["Done"] }) }).stream,
+		});
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-goal-transition.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models-goal-transition.yml"));
+		const hookStarted = Promise.withResolvers<void>();
+		const hookGate = Promise.withResolvers<void>();
+		let directMutation: Promise<unknown> | undefined;
+		let directMutationObservedDuringTransition = false;
+		let transitionStarted = false;
+		const extensionRunner = {
+			hasHandlers: vi.fn((event: string) => event === "session_before_switch" || event === "goal_updated"),
+			emit: vi.fn(async (event: { type: string }) => {
+				if (event.type === "session_before_switch") {
+					transitionStarted = true;
+					hookStarted.resolve();
+					await hookGate.promise;
+				} else if (event.type === "goal_updated" && transitionStarted && !directMutation) {
+					// This callback runs from transition-owned goal accounting. It must
+					// not inherit that internal admission when it starts a new mutation.
+					directMutationObservedDuringTransition = session.isSessionTransitioning;
+					directMutation = session.goalRuntime.pauseGoal().then(
+						() => undefined,
+						error => error,
+					);
+				}
+				return undefined;
+			}),
+		} as unknown as ExtensionRunner;
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry, extensionRunner });
+		await session.goalRuntime.createGoal({ objective: "existing goal" });
+
+		const transition = session.newSession();
+		await hookStarted.promise;
+		expect(session.isSessionTransitioning).toBe(true);
+
+		hookGate.resolve();
+		await waitFor(() => directMutation !== undefined);
+		expect(directMutationObservedDuringTransition).toBe(true);
+		await expect(directMutation).resolves.toMatchObject({
+			message: expect.stringMatching(/session transition is in progress/i),
+		});
+		await expect(transition).resolves.toBe(true);
+	});
 
 	it("keeps session_switch hook-queued steering deliverable after clearing pre-switch queues", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;

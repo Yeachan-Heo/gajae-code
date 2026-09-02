@@ -2286,10 +2286,13 @@ export type SessionIdentityAdmission = {
 	readonly sessionId: string;
 	readonly sessionFile: string | undefined;
 	readonly transitionGeneration: number;
+	/** The transition fence observed at admission time, when one is active. */
+	readonly transitionToken: symbol | undefined;
 };
-/** Per-hook exception token; its generation invalidates when a transition starts. */
+/** Per-hook exception token; its identity invalidates when a transition ends. */
 type InternalTransitionEmissionToken = {
 	readonly transitionGeneration: number;
+	readonly transitionToken: symbol;
 };
 class SessionRunCancellationDomainBridge implements RunCancellationDomainBridge {
 	#domains = new Map<string, { domain: RunCancellationDomain; controller: AbortController }>();
@@ -2470,7 +2473,7 @@ export class AgentSession {
 	// Transition-owned abort accounting must settle the predecessor goal after the
 	// transition fence is claimed. Keep this exception async-local so unrelated goal
 	// mutations cannot bypass the identity fence while that await is in flight.
-	#goalAccountingTransitionContext = new AsyncLocalStorage<number>();
+	#goalAccountingTransitionContext = new AsyncLocalStorage<InternalTransitionEmissionToken>();
 	// Lifecycle hooks are allowed to append successor context while the transition
 	// lease is held. Keep that exception in async-local state: a mutable boolean
 	// would also exempt unrelated work that runs concurrently while the hook awaits.
@@ -3512,6 +3515,7 @@ export class AgentSession {
 			sessionId: this.sessionManager.getSessionId(),
 			sessionFile: this.sessionManager.getSessionFile(),
 			transitionGeneration: this.#coordinatorPersistGeneration,
+			transitionToken: this.#sessionTransitionToken,
 		};
 	}
 
@@ -3520,7 +3524,8 @@ export class AgentSession {
 			this.sessionManager === admission.manager &&
 			this.sessionManager.getSessionId() === admission.sessionId &&
 			this.sessionManager.getSessionFile() === admission.sessionFile &&
-			this.#coordinatorPersistGeneration === admission.transitionGeneration
+			this.#coordinatorPersistGeneration === admission.transitionGeneration &&
+			this.#sessionTransitionToken === admission.transitionToken
 		);
 	}
 
@@ -3543,12 +3548,17 @@ export class AgentSession {
 
 	#isInternalTransitionEmission(): boolean {
 		const token = this.#internalTransitionEmissionContext.getStore();
-		return token?.transitionGeneration === this.#coordinatorPersistGeneration;
+		return (
+			token?.transitionGeneration === this.#coordinatorPersistGeneration &&
+			token.transitionToken === this.#sessionTransitionToken
+		);
 	}
 
 	async #emitInternalTransitionEvent<T>(body: () => Promise<T>): Promise<T> {
+		const transitionToken = this.#sessionTransitionToken;
+		if (transitionToken === undefined) return await body();
 		return this.#internalTransitionEmissionContext.run(
-			{ transitionGeneration: this.#coordinatorPersistGeneration },
+			{ transitionGeneration: this.#coordinatorPersistGeneration, transitionToken },
 			body,
 		);
 	}
@@ -3563,6 +3573,10 @@ export class AgentSession {
 	 * orchestrator does not hold it), so there is no self-deadlock.
 	 */
 	#sessionTransitionKind: string | undefined;
+	// A transition token is separate from the persistence generation: an admission
+	// captured while the transition owns the session must not become valid merely
+	// because the transition later rolls back or is cancelled.
+	#sessionTransitionToken: symbol | undefined;
 	#sessionTransitionDropsAsync = false;
 	#sessionTransitionAdmissionBarrier: Promise<void> | undefined;
 	#coordinatorPersistGeneration = 0;
@@ -3634,6 +3648,7 @@ export class AgentSession {
 			);
 		}
 		this.#sessionTransitionKind = kind;
+		this.#sessionTransitionToken = Symbol(kind);
 		this.#sessionTransitionDropsAsync = false;
 		this.#sessionTransitionAdmissionBarrier =
 			this.#activeSessionAdmission?.kind === "selection" ? this.#activeSessionAdmission.settled.promise : undefined;
@@ -3647,6 +3662,7 @@ export class AgentSession {
 
 	#endSessionTransition(): void {
 		this.#sessionTransitionKind = undefined;
+		this.#sessionTransitionToken = undefined;
 		this.#sessionTransitionDropsAsync = false;
 		this.#sessionTransitionAdmissionBarrier = undefined;
 		this.yieldQueue.rearmIdle();
@@ -4479,11 +4495,12 @@ export class AgentSession {
 			getState: () => this.#goalModeState,
 			setState: state => this.#applyGoalModeState(state),
 			assertMutationAllowed: () => {
-				const accountingGeneration = this.#goalAccountingTransitionContext.getStore();
+				const accountingAdmission = this.#goalAccountingTransitionContext.getStore();
 				if (
-					accountingGeneration !== undefined &&
+					accountingAdmission !== undefined &&
 					this.#sessionTransitionKind !== undefined &&
-					accountingGeneration === this.#coordinatorPersistGeneration
+					accountingAdmission.transitionGeneration === this.#coordinatorPersistGeneration &&
+					accountingAdmission.transitionToken === this.#sessionTransitionToken
 				)
 					return;
 				this.#assertSessionIdentityAdmission(this.#captureSessionIdentityAdmission());
@@ -4499,7 +4516,13 @@ export class AgentSession {
 			},
 			emit: event => {
 				if (event.type === "goal_updated") {
-					return this.#emitSessionEvent({ type: "goal_updated", goal: event.goal, state: event.state });
+					// Do not leak transition-owned accounting authority into external
+					// lifecycle listeners. Internal accounting resumes in the caller's
+					// context after this await, while callbacks spawned by the event must
+					// take a fresh external admission and fail closed during a transition.
+					return this.#goalAccountingTransitionContext.exit(() =>
+						this.#emitSessionEvent({ type: "goal_updated", goal: event.goal, state: event.state }),
+					);
 				}
 			},
 			persist: (mode, state) => {
@@ -15377,14 +15400,14 @@ export class AgentSession {
 				return { kind: forced === "settled" ? "settled" : "timeout" };
 			}
 			await sharedUnwind;
-			const accountingGeneration = this.#goalAccountingTransitionContext.getStore();
-			if (sharedGoalAccounting?.skippedByTransitionFence && accountingGeneration !== undefined) {
+			const accountingAdmission = this.#goalAccountingTransitionContext.getStore();
+			if (sharedGoalAccounting?.skippedByTransitionFence && accountingAdmission !== undefined) {
 				// The original abort entered before the transition fence but reached
 				// GoalRuntime after the fence was claimed. Its predecessor accounting
 				// callback was rejected and deliberately swallowed below; the
 				// transition owner must perform that write before it can publish the
 				// successor, otherwise elapsed usage is lost.
-				const goalAbort = this.#goalAccountingTransitionContext.run(accountingGeneration, () =>
+				const goalAbort = this.#goalAccountingTransitionContext.run(accountingAdmission, () =>
 					this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" }),
 				);
 				await goalAbort;
@@ -15431,8 +15454,12 @@ export class AgentSession {
 				outcome = await cleanup;
 			}
 			try {
-				const goalAbort = this.#goalAccountingTransitionContext.run(this.#coordinatorPersistGeneration, () =>
-					this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" }),
+				const goalAbort = this.#goalAccountingTransitionContext.run(
+					{
+						transitionGeneration: this.#coordinatorPersistGeneration,
+						transitionToken: this.#sessionTransitionToken!,
+					},
+					() => this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" }),
 				);
 				try {
 					await goalAbort;
@@ -15502,7 +15529,12 @@ export class AgentSession {
 
 	/** Abort owned by an identity transition, allowing only its predecessor accounting write. */
 	#abortForSessionTransition(): Promise<void> {
-		return this.#goalAccountingTransitionContext.run(this.#coordinatorPersistGeneration, () => this.abort());
+		const transitionToken = this.#sessionTransitionToken;
+		if (transitionToken === undefined) return this.abort();
+		return this.#goalAccountingTransitionContext.run(
+			{ transitionGeneration: this.#coordinatorPersistGeneration, transitionToken },
+			() => this.abort(),
+		);
 	}
 	/**
 	 * Private terminal-abort seam: read the CURRENT turn's attempt epoch WITHOUT
