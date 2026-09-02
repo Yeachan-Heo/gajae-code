@@ -421,6 +421,7 @@ export async function offerMacosCommunityApp(
 	let mountAttempted = false;
 	let mountState: "none" | "unknown" | "attached" = "none";
 	let installedDestination: { path: string; identity: FileIdentity } | undefined;
+	let cleanupUnsafe = false;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
 	let receivedSignal: NodeJS.Signals | undefined;
@@ -628,6 +629,10 @@ export async function offerMacosCommunityApp(
 		if (!(await isExpectedBundle(sourceApp, command))) throw new Error("the mounted app bundle changed before copy");
 		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
 		throwIfInterrupted();
+		if (copy.reaped === false) {
+			cleanupUnsafe = true;
+			throw new Error("copy helper did not terminate safely");
+		}
 		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
 		if (
 			!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
@@ -642,8 +647,16 @@ export async function offerMacosCommunityApp(
 		if (!copiedExecutable || copiedExecutable !== executable || !copiedExecutablePath)
 			throw new Error("the copied app executable identity changed");
 		const copiedSignature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", destination]);
+		if (copiedSignature.reaped === false) {
+			cleanupUnsafe = true;
+			throw new Error("copied app signature helper did not terminate safely");
+		}
 		if (copiedSignature.exitCode !== 0) throw new Error("the copied app signature could not be verified");
 		const copiedArchCheck = await command(["/usr/bin/lipo", "-archs", copiedExecutablePath]);
+		if (copiedArchCheck.reaped === false) {
+			cleanupUnsafe = true;
+			throw new Error("copied app architecture helper did not terminate safely");
+		}
 		if (copiedArchCheck.exitCode !== 0 || !copiedArchCheck.stdout.split(/\s+/).includes(executableArch))
 			throw new Error("the copied app architecture changed");
 		if (
@@ -654,6 +667,13 @@ export async function offerMacosCommunityApp(
 		throwIfInterrupted();
 		const launch = await command(["/usr/bin/open", destination]);
 		throwIfInterrupted();
+		if (launch.reaped === false) {
+			cleanupUnsafe = true;
+			return failure(
+				"the app launch helper did not terminate safely; partial app state was retained for safety",
+				log,
+			);
+		}
 		if (launch.exitCode !== 0) {
 			let removed = false;
 			if (
@@ -679,7 +699,7 @@ export async function offerMacosCommunityApp(
 		}
 		return { status: "installed", reason: destination };
 	} catch (error) {
-		let partialState = "retained for safety";
+		let partialState = installedDestination ? "retained for safety" : "not created";
 		if (installedDestination) {
 			try {
 				if (
@@ -687,7 +707,8 @@ export async function offerMacosCommunityApp(
 					tempRoot &&
 					destinationRootIdentity &&
 					(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
-					(await sameDirectoryIdentity(installedDestination.path, installedDestination.identity))
+					(await sameDirectoryIdentity(installedDestination.path, installedDestination.identity)) &&
+					!cleanupUnsafe
 				) {
 					const removed = await removeClaimedDirectory(
 						installedDestination.path,
@@ -724,7 +745,10 @@ export async function offerMacosCommunityApp(
 					// The attach attempt completed without establishing a mount.
 				} else {
 					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
-					if (detach.exitCode !== 0) {
+					if (detach.reaped === false) {
+						removeTempRoot = false;
+						log("Optional community app cleanup warning: detach helper did not terminate safely");
+					} else if (detach.exitCode !== 0) {
 						removeTempRoot = false;
 						log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
 					} else {
