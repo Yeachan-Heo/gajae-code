@@ -202,7 +202,17 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		killSignal: "SIGTERM",
 		detached: true,
 	});
+	let leaderExited = false;
+	child.exited.then(
+		() => {
+			leaderExited = true;
+		},
+		() => {
+			leaderExited = true;
+		},
+	);
 	const signalProcessGroup = (signal: NodeJS.Signals): boolean => {
+		if (leaderExited) return false;
 		try {
 			process.kill(child.pid, 0);
 		} catch {
