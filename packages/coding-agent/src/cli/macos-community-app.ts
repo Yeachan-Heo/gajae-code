@@ -158,14 +158,14 @@ async function removeClaimedDirectory(
 	parentPath: string,
 	parentIdentity: FileIdentity,
 	log: (message: string) => void,
-): Promise<void> {
+): Promise<boolean> {
 	if (!(await sameDirectoryIdentity(parentPath, parentIdentity)) || !(await sameDirectoryIdentity(filePath, identity)))
-		return;
+		return false;
 	const quarantineRoot = path.join(parentPath, `.gjc-community-app-cleanup-${process.pid}-${Date.now().toString(16)}`);
 	try {
 		await fs.mkdir(quarantineRoot, { mode: 0o700 });
 		const quarantineIdentity = await fileIdentity(quarantineRoot);
-		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) return;
+		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) return false;
 		const tombstone = path.join(quarantineRoot, path.basename(filePath));
 		await fs.rename(filePath, tombstone);
 		if (
@@ -174,12 +174,14 @@ async function removeClaimedDirectory(
 			!(await sameDirectoryIdentity(tombstone, identity))
 		) {
 			log("Optional community app cleanup warning: claimed destination identity changed during removal");
-			return;
+			return false;
 		}
 		await fs.rm(tombstone, { recursive: true, force: true });
 		if (await sameDirectoryIdentity(quarantineRoot, quarantineIdentity)) await fs.rm(quarantineRoot, { force: true });
+		return true;
 	} catch (error) {
 		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
+		return false;
 	}
 }
 
@@ -635,13 +637,14 @@ export async function offerMacosCommunityApp(
 		const launch = await command(["/usr/bin/open", destination]);
 		throwIfInterrupted();
 		if (launch.exitCode !== 0) {
+			let removed = false;
 			if (
 				tempRoot &&
 				destinationRootIdentity &&
 				(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
 				(await sameDirectoryIdentity(destination, destinationIdentity))
 			)
-				await removeClaimedDirectory(
+				removed = await removeClaimedDirectory(
 					destination,
 					destinationIdentity,
 					destinationRoot,
@@ -649,7 +652,12 @@ export async function offerMacosCommunityApp(
 					log,
 				);
 			installedDestination = undefined;
-			return failure("the verified app could not be launched; the partial app state was removed", log);
+			return failure(
+				removed
+					? "the verified app could not be launched; the partial app state was removed"
+					: "the verified app could not be launched; partial app state was retained for safety",
+				log,
+			);
 		}
 		return { status: "installed", reason: destination };
 	} catch (error) {
