@@ -214,9 +214,21 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		}
 	};
 	controller.signal.addEventListener("abort", () => signalProcessGroup("SIGTERM"), { once: true });
+	const waitForProcessGroupGone = async (): Promise<boolean> => {
+		for (let attempt = 0; attempt < 100; attempt++) {
+			try {
+				process.kill(-child.pid, 0);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+			}
+			await Bun.sleep(50);
+		}
+		return false;
+	};
 	const terminateAndReap = async (): Promise<boolean> => {
 		signalProcessGroup("SIGKILL");
-		return await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)]);
+		const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)]);
+		return exited && (await waitForProcessGroupGone());
 	};
 	try {
 		const outputPromise = Promise.all([
@@ -250,7 +262,7 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 			return { exitCode: 125, stdout: "", stderr: String(output.error), reaped };
 		}
 		const [stdout, stderr, exitCode] = output.value;
-		return { exitCode, stdout, stderr, reaped: true };
+		return { exitCode, stdout, stderr, reaped: await waitForProcessGroupGone() };
 	} finally {
 		activeCommandControllers.delete(controller);
 	}

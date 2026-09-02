@@ -1344,21 +1344,25 @@ async function runCommunityAppOfferFromRuntime(
 			stdin: "inherit",
 			stdout: "inherit",
 			stderr: "inherit",
+			detached: true,
 		});
+		const signalRuntimeGroup = (signal: NodeJS.Signals): void => {
+			try {
+				process.kill(-child.pid, signal);
+			} catch {
+				try {
+					child.kill(signal);
+				} catch {
+					// The optional runtime may have exited between timeout stages.
+				}
+			}
+		};
 		const exitCode = await Promise.race([child.exited, Bun.sleep(180_000).then(() => 124)]);
 		if (exitCode === 124) {
-			try {
-				child.kill("SIGTERM");
-			} catch {
-				// The optional child may have exited at the timeout boundary.
-			}
+			signalRuntimeGroup("SIGTERM");
 			const cleanupExitCode = await Promise.race([child.exited, Bun.sleep(300_000).then(() => 125)]);
 			if (cleanupExitCode === 125) {
-				try {
-					child.kill("SIGKILL");
-				} catch {
-					// The optional child may have exited at the cleanup boundary.
-				}
+				signalRuntimeGroup("SIGKILL");
 				await Promise.race([child.exited, Bun.sleep(5000)]);
 			}
 			throw new Error("optional macOS community app offer timed out");
