@@ -62,12 +62,19 @@ describe("SessionManager append-only header patches", () => {
 
 		const after = storage.readTextSync(sessionFile);
 		expect(after.startsWith(before)).toBe(true);
-		const patch = JSON.parse(after.slice(before.length));
-		expect(patch).toEqual({
-			type: "header_patch",
-			patch: { title: "renamed session", titleSource: "user" },
-		});
-		expect(after.length - before.length).toBeLessThan(128);
+		const patches = after
+			.slice(before.length)
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(patches).toEqual([
+			{ type: "header_patch", patch: { starred: false } },
+			{
+				type: "header_patch",
+				patch: { title: "renamed session", titleSource: "user" },
+			},
+		]);
+		expect(after.length - before.length).toBeLessThan(200);
 		expect(storage.renames).toBe(0);
 
 		session.appendMessage({ role: "user", content: "after patch", timestamp: Date.now() });
