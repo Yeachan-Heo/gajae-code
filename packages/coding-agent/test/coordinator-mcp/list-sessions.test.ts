@@ -168,14 +168,46 @@ describe("gjc_coordinator_list_sessions registration marker", () => {
 		const hostile = await createServerWithSessions(
 			root,
 			[
-				{ sessionId: "", locator: { repo: root }, live: true },
-				{ sessionId: 12345, locator: { repo: root }, live: true },
-				{ sessionId: null, locator: { repo: root }, live: true },
-				{ sessionId: "../escape", locator: { repo: root }, live: true },
-				{ sessionId: "a/b/c", locator: { repo: root }, live: true },
-				{ sessionId: `${"x".repeat(200)}`, locator: { repo: root }, live: true },
-				{ sessionId: REGISTERED_ID, locator: { repo: root }, live: true },
-				{ sessionId: REGISTERED_ID, locator: { repo: root }, live: true },
+				{
+					sessionId: "",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: 12345,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: null,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: "../escape",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: "a/b/c",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: `${"x".repeat(200)}`,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: REGISTERED_ID,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
+				{
+					sessionId: REGISTERED_ID,
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+				},
 			],
 			{ registerFirst: false },
 		);
@@ -264,10 +296,14 @@ describe("gjc_coordinator_list_sessions registration marker", () => {
 		const root = await coordinatorFixtureRoot(tempDirs);
 		const rows = Array.from({ length: 400 }, (_, index) => ({
 			sessionId: `bulk-${`${index}`.padStart(4, "0")}`,
-			locator: { repo: root },
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 			live: true,
 		}));
-		rows.push({ sessionId: REGISTERED_ID, locator: { repo: root }, live: true });
+		rows.push({
+			sessionId: REGISTERED_ID,
+			locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+			live: true,
+		});
 		const server = await createServerWithSessions(root, rows);
 		await writeDurableCoordinatorSession({ sessionId: REGISTERED_ID, cwd: root, env: serverEnv(root) });
 
