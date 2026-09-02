@@ -508,6 +508,11 @@ const persistFailureLastWarnedAt = new Map<string, number>();
 export function shouldWarnPersistFailure(key: string, now = Date.now()): boolean {
 	const last = persistFailureLastWarnedAt.get(key);
 	if (last !== undefined && now - last < PERSIST_FAILURE_WARN_WINDOW_MS) return false;
+	// Every entry older than one window is inert; drop them so a long-lived host that
+	// churns through sessions does not accumulate one key per session forever.
+	for (const [otherKey, warnedAt] of persistFailureLastWarnedAt) {
+		if (now - warnedAt >= PERSIST_FAILURE_WARN_WINDOW_MS) persistFailureLastWarnedAt.delete(otherKey);
+	}
 	persistFailureLastWarnedAt.set(key, now);
 	return true;
 }
@@ -519,25 +524,66 @@ export function resetPersistFailureWarnWindows(): void {
 
 /**
  * Every owner record this process currently holds, keyed by owner-record path, with
- * the empty claim directory that record guards (transition claims only). Maintained by
- * the acquire/release paths so a forced exit can tombstone them synchronously.
+ * the empty claim directory that record guards (transition claims only) and that
+ * directory's captured generation. Maintained by the acquire/release paths so a forced
+ * exit can tombstone them synchronously.
  */
 interface HeldSessionStateLock {
 	held: LockOwnerSnapshot;
-	claimDir?: string;
+	claim?: { dir: string; generation: TransitionDirectoryGeneration };
 }
 
 const heldSessionStateLocks = new Map<string, HeldSessionStateLock>();
 
 /**
+ * Rewrite one held owner record to a released tombstone, synchronously, and only while
+ * the object behind the descriptor is still EXACTLY the record this process wrote.
+ *
+ * The bytes are compared through the opened descriptor, never through the pathname, so
+ * an in-place mutation between any earlier look and the write cannot be overwritten.
+ * The tombstone is written in full and length-checked BEFORE the old tail is truncated:
+ * a short or failed write leaves the original record (or a superset of it) rather than
+ * a malformed one that the fail-closed reclaimers would refuse forever.
+ */
+function tombstoneHeldOwnerRecordSync(file: string, held: LockOwnerSnapshot, hostId: string): boolean {
+	const flags = POSIX_OWNER_REWRITE_FLAGS ?? fsSync.constants.O_RDWR;
+	let descriptor: number;
+	try {
+		descriptor = fsSync.openSync(file, flags);
+	} catch {
+		return false;
+	}
+	try {
+		const opened = fsSync.fstatSync(descriptor, { bigint: true });
+		if (!opened.isFile() || opened.dev !== held.dev || opened.ino !== held.ino) return false;
+		const expected = Buffer.from(held.bytes, "utf8");
+		if (opened.size !== BigInt(expected.length)) return false;
+		const current = Buffer.alloc(expected.length);
+		if (fsSync.readSync(descriptor, current, 0, expected.length, 0) !== expected.length) return false;
+		if (!current.equals(expected)) return false;
+		const tombstone = Buffer.from(JSON.stringify(releasedOwnerForHost(hostId)), "utf8");
+		if (fsSync.writeSync(descriptor, tombstone, 0, tombstone.length, 0) !== tombstone.length) return false;
+		if (tombstone.length < expected.length) fsSync.ftruncateSync(descriptor, tombstone.length);
+		fsSync.fsyncSync(descriptor);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		fsSync.closeSync(descriptor);
+	}
+}
+
+/**
  * Best-effort synchronous release of every owner record this process still holds.
  *
  * Meant for the forced-exit path (`postmortem.quit` after a repeated shutdown request),
- * where the async release protocol will never get to run. Each record is re-read and
- * only rewritten to a released tombstone while it is still byte-identical to what this
- * process wrote; an empty claim directory it guards is then `rmdir`ed. Anything that
- * changed underneath, or any I/O fault, is left for the dead-owner reclaim path on the
- * next writer. Never throws; returns the number of records tombstoned.
+ * where the async release protocol will never get to run. Each record is rewritten to a
+ * released tombstone only while it is still byte-identical to what this process wrote
+ * (see {@link tombstoneHeldOwnerRecordSync}); an empty claim directory it guards is
+ * then `rmdir`ed only while it still carries the generation captured at acquisition.
+ * Anything that changed underneath, or any I/O fault, is left for the dead-owner
+ * reclaim path on the next writer. Never throws; returns the number of records
+ * tombstoned.
  */
 export function releaseHeldSessionStateLocksSync(): number {
 	let released = 0;
@@ -554,33 +600,18 @@ export function releaseHeldSessionStateLocksSync(): number {
 		}
 		if (hostId === undefined) continue;
 		try {
-			const stat = fsSync.lstatSync(file, { bigint: true });
-			if (!stat.isFile() || stat.isSymbolicLink()) continue;
-			const current = fsSync.readFileSync(file);
-			if (
-				stat.dev !== entry.held.dev ||
-				stat.ino !== entry.held.ino ||
-				!current.equals(Buffer.from(entry.held.bytes, "utf8"))
-			)
-				continue;
-			const flags = POSIX_OWNER_REWRITE_FLAGS ?? fsSync.constants.O_RDWR;
-			const descriptor = fsSync.openSync(file, flags);
-			try {
-				const reopened = fsSync.fstatSync(descriptor, { bigint: true });
-				if (reopened.dev !== stat.dev || reopened.ino !== stat.ino) continue;
-				const tombstone = Buffer.from(JSON.stringify(releasedOwnerForHost(hostId)), "utf8");
-				fsSync.ftruncateSync(descriptor, 0);
-				fsSync.writeSync(descriptor, tombstone, 0, tombstone.length, 0);
-				fsSync.fsyncSync(descriptor);
-			} finally {
-				fsSync.closeSync(descriptor);
-			}
-			if (entry.claimDir !== undefined) {
+			if (!tombstoneHeldOwnerRecordSync(file, entry.held, hostId)) continue;
+			if (entry.claim !== undefined) {
 				try {
-					fsSync.rmdirSync(entry.claimDir);
+					const current = fsSync.lstatSync(entry.claim.dir, { bigint: true });
+					if (
+						current.isDirectory() &&
+						sameTransitionGeneration(transitionGenerationFromStat(current), entry.claim.generation)
+					)
+						fsSync.rmdirSync(entry.claim.dir);
 				} catch {
-					// A populated or already-removed claim is the successor's problem; the
-					// released tombstone alone is enough for the tombstone reclaim path.
+					// A replaced, populated, or already-removed claim is the successor's
+					// problem; the released tombstone alone satisfies the tombstone reclaimer.
 				}
 			}
 			released++;
@@ -2143,7 +2174,10 @@ async function withLockPathTransition<T>(
 			}
 			throw error;
 		}
-		heldSessionStateLocks.set(ownerFile, { held, claimDir: transitionDir });
+		heldSessionStateLocks.set(ownerFile, {
+			held,
+			claim: { dir: transitionDir, generation: transitionGeneration },
+		});
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),
@@ -2174,6 +2208,7 @@ async function withLockPathTransition<T>(
 			if (pendingTransitionReleases.has(recoveryKey)) {
 				for (;;) {
 					if (await recoverPendingTransitionRelease(transitionDir, recoveryKey, quarantineName)) {
+						heldSessionStateLocks.delete(ownerFile);
 						if (outcome.ok) return outcome.value;
 						throw outcome.error;
 					}
@@ -2497,11 +2532,16 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// first, so the reclaim that follows can take it.
 			held = await withLockPathTransition(
 				lockFile,
-				() => acquireOwnerLock(lockFile, owner, cycleQuarantine),
+				async () => {
+					const acquired = await acquireOwnerLock(lockFile, owner, cycleQuarantine);
+					// Register the instant the record exists, before the acquisition claim
+					// is released: a forced exit during that release must still see it.
+					heldSessionStateLocks.set(lockFile, { held: acquired });
+					return acquired;
+				},
 				cycleQuarantine,
 				budget,
 			);
-			heldSessionStateLocks.set(lockFile, { held });
 			let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 			try {
 				outcome = { ok: true, value: await operation() };

@@ -9036,13 +9036,21 @@ describe("isQuietLocalDiscoveryFailure", () => {
 
 	test("demotes an unreachable loopback endpoint", () => {
 		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/", refused)).toBe(true);
-		expect(isQuietLocalDiscoveryFailure("http://localhost:1234/v1", "fetch failed")).toBe(true);
+		expect(isQuietLocalDiscoveryFailure("http://localhost:1234/v1", "connect ECONNREFUSED 127.0.0.1:1234")).toBe(
+			true,
+		);
+		expect(isQuietLocalDiscoveryFailure("http://LOCALHOST:1234/v1", refused)).toBe(true);
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.2:11434/", refused)).toBe(true);
 		expect(isQuietLocalDiscoveryFailure("http://[::1]:8080", "connect ECONNREFUSED ::1:8080")).toBe(true);
 	});
 
-	test("keeps remote endpoints and non-connectivity failures at warn", () => {
+	test("keeps remote endpoints, lookalikes, wildcard hosts, and non-connectivity failures at warn", () => {
 		expect(isQuietLocalDiscoveryFailure("https://api.example.com/v1", refused)).toBe(false);
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1.evil.com/", refused)).toBe(false);
+		expect(isQuietLocalDiscoveryFailure("http://0.0.0.0:11434/", refused)).toBe(false);
 		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/", "HTTP 500 from /api/tags")).toBe(false);
+		// Bun wraps TLS/protocol faults as `fetch failed`; that alone proves nothing.
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/", "fetch failed")).toBe(false);
 		expect(isQuietLocalDiscoveryFailure("not a url", refused)).toBe(false);
 	});
 });

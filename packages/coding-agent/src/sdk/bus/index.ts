@@ -4382,15 +4382,18 @@ export function createNotificationsExtension(
 			rt.workflowGate?.setRuntimeTurnProvider?.(null);
 		} catch {}
 		try {
+			const attachedClients = rt.server.clientCount();
 			const delivered = await pushTerminalSessionFrame(rt, { type: "session_closed", sessionId: id });
-			// `pushFrameAndWait` returns false when no SDK client is connected, a writer
-			// rejected the frame, or the 1s settle wait expired. A session closing with no
-			// attached client is the ordinary case, not a fault, so this is diagnostic-only.
-			if (!delivered)
-				logger.debug("notifications: session_closed socket delivery was not acknowledged", {
-					sessionId: id,
-					endpointScope: rt.endpointScope,
-				});
+			// `pushFrameAndWait` returns false for three different outcomes: no SDK client
+			// was connected, a writer rejected the frame, or the 1s settle wait expired. A
+			// session closing with nobody attached is the ordinary case and only diagnostic;
+			// a connected client that never acknowledged its terminal frame is a real loss.
+			if (!delivered) {
+				const fields = { sessionId: id, endpointScope: rt.endpointScope, attachedClients };
+				if (attachedClients > 0)
+					logger.warn("notifications: session_closed socket delivery was not acknowledged", fields);
+				else logger.debug("notifications: session_closed had no attached client to acknowledge", fields);
+			}
 		} catch (e) {
 			logger.warn(`notifications: session_closed failed: ${String(e)}`);
 		}

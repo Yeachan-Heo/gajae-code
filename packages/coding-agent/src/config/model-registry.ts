@@ -138,14 +138,22 @@ function redactDiscoveryUrl(value: string | URL): string {
 		return "(invalid URL)";
 	}
 }
-const LOCAL_DISCOVERY_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"]);
 const UNREACHABLE_DISCOVERY_PATTERN =
-	/unable to connect|econnrefused|connection refused|fetch failed|enotfound|ehostunreach/iu;
+	/unable to connect|econnrefused|connection refused|enotfound|ehostunreach|econnreset/iu;
+
+/** Whether `hostname` (as `URL.hostname` reports it) names this machine's loopback. */
+function isLoopbackDiscoveryHost(hostname: string): boolean {
+	if (hostname === "localhost" || hostname === "[::1]" || hostname === "::1") return true;
+	return /^127(?:\.\d{1,3}){3}$/u.test(hostname);
+}
 
 /**
- * A loopback discovery endpoint that simply is not running is the normal state of a
+ * A loopback discovery endpoint that simply is not listening is the normal state of a
  * machine without ollama/lm-studio/llama.cpp/omlx installed, and it is probed on every
- * process start. Report that at debug; every other discovery failure stays a warning.
+ * process start. Report that at debug; every other discovery failure — remote hosts,
+ * TLS/proxy/protocol faults, HTTP errors, the wildcard `0.0.0.0` — stays a warning. A
+ * bare `fetch failed` is deliberately not treated as connectivity evidence: Bun wraps
+ * certificate and protocol errors in the same text.
  */
 export function isQuietLocalDiscoveryFailure(baseUrl: string, warning: string): boolean {
 	let host: string;
@@ -154,7 +162,7 @@ export function isQuietLocalDiscoveryFailure(baseUrl: string, warning: string): 
 	} catch {
 		return false;
 	}
-	return LOCAL_DISCOVERY_HOSTS.has(host) && UNREACHABLE_DISCOVERY_PATTERN.test(warning);
+	return isLoopbackDiscoveryHost(host) && UNREACHABLE_DISCOVERY_PATTERN.test(warning);
 }
 function stripUrlQuery(value: string): string {
 	const queryStart = value.indexOf("?");

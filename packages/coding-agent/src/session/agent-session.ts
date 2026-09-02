@@ -4124,9 +4124,9 @@ export class AgentSession {
 					),
 				);
 				await extensionDelivery;
-				void terminalPersistence.catch(error =>
-					logger.warn("Terminal persistence continued after SDK publication", { error }),
-				);
+				// `terminalPersistence` rejections are already reported (with lock diagnostics
+				// and the per-session warn window) by the rejection handler above; a second
+				// listener here would only duplicate that warning unsuppressed.
 			} else {
 				// Non-SDK/public publication has already awaited worker integration above.
 			}

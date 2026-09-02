@@ -2473,6 +2473,115 @@ describe("session state lock forced-exit release", () => {
 		await holder.catch(() => undefined);
 	});
 
+	it("leaves a record mutated in place (same inode) untouched", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-inplace");
+		const lockFile = `${stateFile}.lock`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		const holder = withSessionStateFileLock(stateFile, async () => {
+			markEntered();
+			await release;
+		});
+		await entered;
+		const before = fsSync.statSync(lockFile, { bigint: true });
+		// Overwrite the bytes through the SAME inode (no rename, no unlink).
+		const mutated = `${await fs.readFile(lockFile, "utf8")} `;
+		const descriptor = fsSync.openSync(lockFile, fsSync.constants.O_WRONLY);
+		try {
+			fsSync.writeSync(descriptor, Buffer.from(mutated), 0, Buffer.byteLength(mutated), 0);
+		} finally {
+			fsSync.closeSync(descriptor);
+		}
+		expect(fsSync.statSync(lockFile, { bigint: true }).ino).toBe(before.ino);
+
+		expect(releaseHeldSessionStateLocksSync()).toBe(0);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(mutated);
+		allowRelease();
+		await holder.catch(() => undefined);
+	});
+
+	it("refuses to truncate when the tombstone write is short", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-short-write");
+		const lockFile = `${stateFile}.lock`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		const holder = withSessionStateFileLock(stateFile, async () => {
+			markEntered();
+			await release;
+		});
+		await entered;
+		const original = await fs.readFile(lockFile, "utf8");
+		const realWriteSync = fsSync.writeSync;
+		const writeSpy = vi.spyOn(fsSync, "writeSync").mockImplementation(((
+			fd: number,
+			buffer: NodeJS.ArrayBufferView,
+			_offset?: number | null,
+			_length?: number | null,
+			position?: number | null,
+		): number =>
+			// Emulate a short write: only the first byte lands.
+			realWriteSync(fd, buffer as Uint8Array, 0, 1, position ?? null)) as typeof fsSync.writeSync);
+		try {
+			expect(releaseHeldSessionStateLocksSync()).toBe(0);
+		} finally {
+			writeSpy.mockRestore();
+		}
+		// The record is not a malformed tombstone: its length is unchanged (first byte
+		// of the tombstone is `{`, identical to the original), so no truncation happened.
+		const after = await fs.readFile(lockFile, "utf8");
+		expect(after.length).toBe(original.length);
+		expect(after).toBe(original);
+		allowRelease();
+		// The pwrite bumped mtime, so the holder's identity-bound async release refuses
+		// rather than unlinking by name; that refusal is the protocol working.
+		await holder.catch(() => undefined);
+	});
+
+	it("leaves a transition claim directory that was replaced under it alone", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-claim-replaced");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const transitionOwner = `${transitionDir}.owner`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		// Pause inside the acquisition transition so the transition owner is held.
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async file => {
+			if (file !== transitionOwner) return;
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+			markEntered();
+			await release;
+		};
+		const holder = withSessionStateFileLock(stateFile, async () => undefined);
+		await entered;
+		expect(heldSessionStateLockPathsForTest()).toEqual(expect.arrayContaining([transitionOwner, lockFile]));
+		// A successor replaces the (empty) claim directory with a fresh one.
+		await fs.rmdir(transitionDir);
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(path.join(transitionDir, "successor-marker"), "");
+
+		releaseHeldSessionStateLocksSync();
+
+		expect(fsSync.existsSync(path.join(transitionDir, "successor-marker"))).toBe(true);
+		expect(JSON.parse(await fs.readFile(transitionOwner, "utf8"))).toMatchObject({ released: true });
+		allowRelease();
+		await holder.catch(() => undefined);
+		await fs.rm(transitionDir, { recursive: true, force: true });
+	});
+
+	it("registers the base record before the acquisition claim is released", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-register-timing");
+		const lockFile = `${stateFile}.lock`;
+		const transitionOwner = `${lockFile}.transition.owner`;
+		let seenDuringClaimRelease: string[] | undefined;
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async file => {
+			if (file !== transitionOwner || seenDuringClaimRelease) return;
+			seenDuringClaimRelease = heldSessionStateLockPathsForTest();
+		};
+		await withSessionStateFileLock(stateFile, async () => undefined);
+		expect(seenDuringClaimRelease).toEqual(expect.arrayContaining([lockFile, transitionOwner]));
+		expect(heldSessionStateLockPathsForTest()).toEqual([]);
+	});
+
 	it("tracks nothing after a normal release", async () => {
 		const { stateFile } = await seededRunningSession("lock-forced-exit-clean");
 		await withSessionStateFileLock(stateFile, async () => undefined);

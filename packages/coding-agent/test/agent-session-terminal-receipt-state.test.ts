@@ -14,6 +14,7 @@ import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import { createSdkRunCapability } from "@gajae-code/coding-agent/sdk/host/sdk-run-capability";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -132,6 +133,60 @@ describe("AgentSession terminal receipt state", () => {
 		for (const entry of debugged) {
 			expect(entry).toMatchObject({ reason: "transition_claim_timeout", suppressed: true });
 		}
+	});
+
+	it("reports an SDK-published terminal persistence failure exactly once, with lock fields", async () => {
+		tempDir = TempDir.createSync("@gjc-terminal-persistence-sdk-");
+		const stateFile = path.join(tempDir.path(), "runtime-state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "terminal-receipt-sdk-session";
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		resetPersistFailureWarnWindows();
+		const lockFailure = new Error("marker unreadable", {
+			cause: new SessionStateLockUnavailableError({
+				lockPath: "/tmp/runtime-state.json.lock.transition",
+				reason: "transition_claim_timeout",
+			}),
+		});
+		vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockRejectedValue(lockFailure);
+		const warned: Array<{ message: string; context: Record<string, unknown> | undefined }> = [];
+		vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (/persist/iu.test(message)) warned.push({ message, context });
+		});
+		vi.spyOn(logger, "debug").mockImplementation(() => undefined);
+		const terminal = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+
+		await session.sendUserMessage("respond", {
+			sdkRunCapability: createSdkRunCapability("terminal-receipt-sdk-token"),
+		});
+		await terminal.promise;
+		await Bun.sleep(25);
+
+		// One warn for the whole session in the window, carrying the lock diagnostics;
+		// no second, unsuppressed warn from the SDK publication path.
+		expect(warned).toHaveLength(1);
+		expect(warned[0]?.context).toMatchObject({
+			reason: "transition_claim_timeout",
+			lockPath: "/tmp/runtime-state.json.lock.transition",
+		});
 	});
 
 	it("publishes agent_end while terminal sidecar persistence remains pending", async () => {
