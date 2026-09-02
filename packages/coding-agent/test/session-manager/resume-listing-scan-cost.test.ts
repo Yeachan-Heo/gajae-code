@@ -106,7 +106,35 @@ describe("resume listing trailing-patch scan cost", () => {
 		expect(counter.reads()).toBeLessThan(readsAtFourKiB / 4);
 	});
 
-	it("still stops early when a header patch sits near EOF", async () => {
+	it("scans to BOF when a legacy metadata patch has no star state", async () => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-legacy-patch-"));
+		const cwd = path.join(testDir, "cwd");
+		const sessionDir = path.join(testDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(sessionDir, { recursive: true });
+
+		const sessionFile = writeTranscript(sessionDir, cwd, "scan-legacy-patch", 4 * 1024 * 1024);
+		fs.appendFileSync(
+			sessionFile,
+			`${JSON.stringify({
+				type: "header_patch",
+				patch: { cwd, title: "renamed-without-star-state" },
+			})}\n`,
+		);
+		const size = fs.statSync(sessionFile).size;
+		const counter = countReadsFor(sessionFile);
+
+		const candidates = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		expect(candidates.find(item => item.id === "scan-legacy-patch")).toMatchObject({
+			title: "renamed-without-star-state",
+			starred: false,
+		});
+
+		// The reader cannot prove that an earlier star patch does not exist until BOF.
+		expect(counter.bytes()).toBeGreaterThanOrEqual(size / 2);
+	});
+
+	it("still stops early when every mutable header field is patched near EOF", async () => {
 		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-early-"));
 		const cwd = path.join(testDir, "cwd");
 		const sessionDir = path.join(testDir, "sessions");
@@ -116,10 +144,15 @@ describe("resume listing trailing-patch scan cost", () => {
 		const sessionFile = writeTranscript(sessionDir, cwd, "scan-early", 4 * 1024 * 1024);
 		fs.appendFileSync(
 			sessionFile,
-			`${JSON.stringify({
-				type: "header_patch",
-				patch: { cwd, title: "renamed-near-eof" },
-			})}\n`,
+			`${[
+				{
+					type: "header_patch",
+					patch: { cwd, title: "renamed-near-eof" },
+				},
+				{ type: "header_patch", patch: { starred: false } },
+			]
+				.map(record => JSON.stringify(record))
+				.join("\n")}\n`,
 		);
 		const size = fs.statSync(sessionFile).size;
 		const counter = countReadsFor(sessionFile);

@@ -12,6 +12,7 @@ function session(id: string): SessionInfo {
 		id,
 		cwd: "/tmp",
 		title: id,
+		starred: false,
 		created: new Date(),
 		modified: new Date(),
 		messageCount: 1,
@@ -75,6 +76,14 @@ describe("SessionSelectorComponent resume consent", () => {
 		dialog.handleInput("n");
 		dialog.handleInput("N");
 		expect(selected).toEqual(["Yes", "Yes", "No", "No"]);
+	});
+
+	it("marks and prioritizes starred sessions in the picker", () => {
+		const starred = { ...session("important"), starred: true };
+		const component = selector(async () => inspection("important", "terminal"), [], [session("ordinary"), starred]);
+		const rendered = text(component);
+		expect(rendered).toContain("★ important");
+		expect(rendered.indexOf("★ important")).toBeLessThan(rendered.indexOf("ordinary"));
 	});
 
 	it("keeps the legacy five-argument selector immediate and modal-free", () => {

@@ -160,6 +160,45 @@ describe("builtin /pet slash command", () => {
 		expect(petCommand?.getInlineHint?.("ReD")).toBe("Gajae");
 	});
 });
+describe("builtin session star commands", () => {
+	it("exposes star and unstar commands and persists through the session manager", async () => {
+		let starred = false;
+		const setSessionStarred = vi.fn(async (next: boolean) => {
+			if (starred === next) return false;
+			starred = next;
+			return true;
+		});
+		const showStatus = vi.fn();
+		const setText = vi.fn();
+		const ctx = {
+			session: {},
+			sessionManager: { getCwd: () => "/tmp/project", isPersisted: () => true, setSessionStarred },
+			settings: {},
+			editor: { setText },
+			showStatus,
+		} as unknown as InteractiveModeContext;
+		const runtime = { ctx, handleBackgroundCommand: () => undefined };
+
+		expect(BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "star")?.description).toContain(
+			"easier discovery",
+		);
+		expect(BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "unstar")).toBeDefined();
+
+		expect(await executeBuiltinSlashCommand("/star", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/star", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/unstar", runtime)).toBe(true);
+		expect(await executeBuiltinSlashCommand("/star later", runtime)).toBe(true);
+
+		expect(setSessionStarred.mock.calls.map(call => call[0])).toEqual([true, true, false]);
+		expect(showStatus.mock.calls.map(call => call[0])).toEqual([
+			"Session starred.",
+			"Session is already starred.",
+			"Session unstarred.",
+			"Usage: /star",
+		]);
+		expect(setText).toHaveBeenCalledTimes(4);
+	});
+});
 describe("builtin /copy slash command", () => {
 	it("is discoverable as a TUI builtin without public subcommands", () => {
 		const copyCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "copy");

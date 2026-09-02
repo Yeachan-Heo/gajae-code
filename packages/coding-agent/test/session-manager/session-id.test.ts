@@ -83,6 +83,8 @@ describe("SessionManager session ids", () => {
 		session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
 		await session.flush();
 		const firstId = expectUuidV7SessionId(session);
+		expect(await session.setSessionStarred(true)).toBe(true);
+		expect(session.isSessionStarred()).toBe(true);
 
 		const forkResult = await session.fork();
 		if (!forkResult) throw new Error("Expected fork result");
@@ -90,6 +92,8 @@ describe("SessionManager session ids", () => {
 		const forkedId = expectUuidV7SessionId(session);
 		expect(forkedId).not.toBe(firstId);
 		expect(session.getHeader()?.parentSession).toBe(firstId);
+		expect(session.isSessionStarred()).toBe(false);
+		expect(session.getHeader()).not.toHaveProperty("starred");
 	});
 
 	it("rolls back fork identity before publishing a transcript when artifact import fails", async () => {

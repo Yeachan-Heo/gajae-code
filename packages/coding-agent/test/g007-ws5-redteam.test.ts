@@ -43,6 +43,7 @@ function sessionInfo(id: string, sessionPath: string): SessionInfo {
 		id,
 		cwd: "/very/deep/工程/日本語/프로젝트/with/a/path/that/does/not/fit",
 		title: "漢字 café — a title that must truncate at forty columns",
+		starred: false,
 		created: new Date("2026-01-01T00:00:00.000Z"),
 		modified: new Date("2026-01-01T00:00:00.000Z"),
 		messageCount: 1,

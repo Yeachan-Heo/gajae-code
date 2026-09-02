@@ -14,7 +14,12 @@ import {
 import { formatBytes } from "@gajae-code/utils";
 import { theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
-import type { ResumeSessionIdentity, ResumeTailInspection, SessionInfo } from "../../session/session-manager";
+import {
+	prioritizeStarredSessions,
+	type ResumeSessionIdentity,
+	type ResumeTailInspection,
+	type SessionInfo,
+} from "../../session/session-manager";
 import { DynamicBorder } from "./dynamic-border";
 import { HookSelectorComponent } from "./hook-selector";
 
@@ -71,17 +76,19 @@ class SessionList implements Component {
 	}
 
 	#filterSessions(query: string): void {
-		this.#filteredSessions = fuzzyFilter(this.allSessions, query, session =>
-			[
-				session.id,
-				session.title ?? "",
-				session.cwd ?? "",
-				session.firstMessage ?? "",
-				session.allMessagesText,
-				session.path,
-			]
-				.filter(Boolean)
-				.join(" "),
+		this.#filteredSessions = prioritizeStarredSessions(
+			fuzzyFilter(this.allSessions, query, session =>
+				[
+					session.id,
+					session.title ?? "",
+					session.cwd ?? "",
+					session.firstMessage ?? "",
+					session.allMessagesText,
+					session.path,
+				]
+					.filter(Boolean)
+					.join(" "),
+			),
 		);
 		this.#clampSelectedIndex();
 	}
@@ -131,8 +138,9 @@ class SessionList implements Component {
 			const cursorWidth = visibleWidth(cursor);
 			const prefix = selected ? theme.fg("accent", cursor) : padding(cursorWidth);
 			const message = session.firstMessage.replace(/\n/g, " ").trim();
-			const title = truncateToWidth(session.title ?? message, width - cursorWidth);
-			lines.push(prefix + (selected ? theme.bold(title) : title));
+			const star = session.starred ? theme.fg("warning", `${theme.icon.star} `) : "";
+			const title = truncateToWidth(session.title ?? message, width - cursorWidth - visibleWidth(star));
+			lines.push(prefix + star + (selected ? theme.bold(title) : title));
 			if (session.title) lines.push(`  ${theme.fg("dim", truncateToWidth(message, width - cursorWidth))}`);
 			lines.push(
 				theme.fg(
@@ -211,7 +219,7 @@ export class SessionSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 		this.addChild(this.#messageContainer);
-		this.#sessionList = new SessionList(sessions);
+		this.#sessionList = new SessionList(prioritizeStarredSessions(sessions));
 		this.#sessionList.onSelect = session => {
 			if (this.inspector) void this.#inspect(session);
 			else this.#dispatchSelect(session.path);

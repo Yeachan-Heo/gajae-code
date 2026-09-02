@@ -2316,6 +2316,28 @@
 		}
 	},
 	{
+		"sourceId": "slash_command:star",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "local transcript-discovery metadata command; no SDK operation counterpart or runtime/retention authority",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "slash_command:unstar",
+		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
+		"sourceKind": "slash_command",
+		"decision": "exclude",
+		"rationale": "local transcript-discovery metadata command; no SDK operation counterpart or runtime/retention authority",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "slash_command:resume",
 		"sourceFile": "packages/coding-agent/src/slash-commands/builtin-registry.ts",
 		"sourceKind": "slash_command",

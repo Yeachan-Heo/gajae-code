@@ -136,6 +136,7 @@ export type SymbolKey =
 	| "icon.output"
 	| "icon.host"
 	| "icon.session"
+	| "icon.star"
 	| "icon.package"
 	| "icon.warning"
 	| "icon.rewind"
@@ -300,6 +301,7 @@ const UNICODE_SYMBOLS: SymbolMap = {
 	"icon.output": "⤴",
 	"icon.host": "🖥",
 	"icon.session": "🆔",
+	"icon.star": "★",
 	"icon.package": "📦",
 	"icon.warning": "⚠",
 	"icon.rewind": "↶",
@@ -534,6 +536,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.host": "\uf109",
 	// pick:  | alt:  
 	"icon.session": "\uf550",
+	"icon.star": "\uf005",
 	// pick:  | alt: 
 	"icon.package": "\uf487",
 	// pick:  | alt:  
@@ -722,6 +725,7 @@ const ASCII_SYMBOLS: SymbolMap = {
 	"icon.output": "out:",
 	"icon.host": "host",
 	"icon.session": "id",
+	"icon.star": "*",
 	"icon.package": "[P]",
 	"icon.warning": "[!]",
 	"icon.rewind": "<-",
@@ -1496,6 +1500,7 @@ export class Theme {
 			output: this.#symbols["icon.output"],
 			host: this.#symbols["icon.host"],
 			session: this.#symbols["icon.session"],
+			star: this.#symbols["icon.star"],
 			package: this.#symbols["icon.package"],
 			warning: this.#symbols["icon.warning"],
 			rewind: this.#symbols["icon.rewind"],

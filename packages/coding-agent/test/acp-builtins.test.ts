@@ -208,6 +208,10 @@ function createRuntime() {
 		_movedTo: undefined as string | undefined,
 		_flushed: false,
 		_sessionName: undefined as string | undefined,
+		_starred: false,
+		isPersisted(): boolean {
+			return true;
+		},
 		getSessionId(): string {
 			return "fake-session-id";
 		},
@@ -250,6 +254,11 @@ function createRuntime() {
 		},
 		async setSessionName(name: string, _source: string): Promise<boolean> {
 			this._sessionName = name;
+			return true;
+		},
+		async setSessionStarred(starred: boolean): Promise<boolean> {
+			if (this._starred === starred) return false;
+			this._starred = starred;
 			return true;
 		},
 	};
@@ -1304,6 +1313,29 @@ describe("session lifecycle commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(output[0]).toContain("takes precedence");
 		expect(notified).toBe(false);
+	});
+
+	it("/star and /unstar toggle active-session discovery metadata", async () => {
+		const { output, fakeSessionManager, runtime } = createRuntime();
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "star")).toBe(true);
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "unstar")).toBe(true);
+
+		expect(await executeAcpBuiltinSlashCommand("/star", runtime)).toEqual({ consumed: true });
+		expect(fakeSessionManager._starred).toBe(true);
+		expect(output.at(-1)).toBe("Session starred.");
+
+		expect(await executeAcpBuiltinSlashCommand("/unstar", runtime)).toEqual({ consumed: true });
+		expect(fakeSessionManager._starred).toBe(false);
+		expect(output.at(-1)).toBe("Session unstarred.");
+	});
+
+	it("/star rejects ephemeral sessions without changing state", async () => {
+		const { output, fakeSessionManager, runtime } = createRuntime();
+		fakeSessionManager.isPersisted = () => false;
+
+		expect(await executeAcpBuiltinSlashCommand("/star", runtime)).toEqual({ consumed: true });
+		expect(fakeSessionManager._starred).toBe(false);
+		expect(output.at(-1)).toBe("Session stars require a persisted session.");
 	});
 
 	it("/move: reports moved path via sessionManager.getCwd() and calls notifyTitleChanged", async () => {

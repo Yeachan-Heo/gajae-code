@@ -8,6 +8,7 @@ import {
 	parseSessionEntries,
 	type SessionHeader,
 	SessionManager,
+	SessionManagerTestHooks,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage, type SessionStorageWriter } from "@gajae-code/coding-agent/session/session-storage";
 import { getConfigRootDir, parseJsonlLenient, setAgentDir } from "@gajae-code/utils";
@@ -79,6 +80,7 @@ describe("session title source persistence", () => {
 			setAgentDir(fallbackAgentDir);
 			delete process.env.PI_CODING_AGENT_DIR;
 		}
+		SessionManagerTestHooks.beforePersistPatchFence = undefined;
 		fs.rmSync(testAgentDir, { recursive: true, force: true });
 	});
 
@@ -116,6 +118,87 @@ describe("session title source persistence", () => {
 		const reopened = await SessionManager.open(sessionFile!);
 		expect(reopened.getSessionName()).toBe("Manual title");
 		expect(reopened.titleSource).toBe("user");
+	});
+	it("persists star state through append-only header patches", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "keep this", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+		const sessionFile = session.getSessionFile()!;
+
+		expect(session.isSessionStarred()).toBe(false);
+		expect(await session.setSessionStarred(false)).toBe(false);
+		expect(await session.setSessionStarred(true)).toBe(true);
+		expect(await session.setSessionStarred(true)).toBe(false);
+		expect(session.isSessionStarred()).toBe(true);
+		expect(await session.setSessionName("Starred session", "user")).toBe(true);
+
+		const rawRecords = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line) as { type?: string; patch?: { starred?: boolean; title?: string } });
+		expect(rawRecords.at(-2)).toEqual({ type: "header_patch", patch: { starred: true } });
+		expect(rawRecords.at(-1)).toMatchObject({
+			type: "header_patch",
+			patch: { title: "Starred session" },
+		});
+		expect(rawRecords.at(-1)?.patch?.starred).toBeUndefined();
+
+		const listedStarred = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listedStarred.find(candidate => candidate.path === sessionFile)?.starred).toBe(true);
+
+		const reopened = await SessionManager.open(sessionFile);
+		expect(reopened.isSessionStarred()).toBe(true);
+		expect(await reopened.setSessionStarred(false)).toBe(true);
+		expect(reopened.isSessionStarred()).toBe(false);
+
+		const listedUnstarred = await SessionManager.listForResumePickerReadOnly(cwd, path.dirname(sessionFile));
+		expect(listedUnstarred.find(candidate => candidate.path === sessionFile)?.starred).toBe(false);
+	});
+
+	it("restores in-memory star state when persistence fails", async () => {
+		const session = SessionManager.create(cwd);
+		session.appendMessage({ role: "user", content: "keep this", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		SessionManagerTestHooks.beforePersistPatchFence = () => {
+			throw new Error("star patch failed");
+		};
+		await expect(session.setSessionStarred(true)).rejects.toThrow("star patch failed");
+		expect(session.isSessionStarred()).toBe(false);
+		expect(session.getHeader()).not.toHaveProperty("starred");
+	});
+
+	it("ignores malformed star header patches", () => {
+		const content = [
+			{
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "invalid-star",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: "/tmp",
+			},
+			{ type: "header_patch", patch: { starred: "yes" } },
+		]
+			.map(record => JSON.stringify(record))
+			.join("\n");
+
+		expect(parseSessionEntries(content)[0]).not.toHaveProperty("starred");
+	});
+
+	it("keeps a star set before the first message", async () => {
+		const session = SessionManager.create(cwd);
+		expect(await session.setSessionStarred(true)).toBe(true);
+		session.appendMessage({ role: "user", content: "first", timestamp: 1 });
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		const sessionFile = session.getSessionFile();
+		expect(sessionFile).toBeDefined();
+		const reopened = await SessionManager.open(sessionFile!);
+		expect(reopened.isSessionStarred()).toBe(true);
 	});
 
 	it("appends a bounded header patch and replays v3 and v4 transcripts deterministically", async () => {

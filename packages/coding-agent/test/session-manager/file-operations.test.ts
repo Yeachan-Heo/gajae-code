@@ -8,6 +8,7 @@ import {
 	findMostRecentSession,
 	getRecentSessions,
 	loadEntriesFromFile,
+	prioritizeStarredSessions,
 	resolveResumableSession,
 	type SessionHeader,
 	SessionManagedStorageError,
@@ -458,6 +459,42 @@ describe("getRecentSessions", () => {
 
 		expect(session?.name).toBe("Buried title");
 		expect(listed).toMatchObject({ id: "buried-patch", title: "Buried title", cwd: "/tmp" });
+	});
+
+	it("sorts starred sessions before newer unstarred sessions", async () => {
+		const writeSession = (file: string, id: string, starred: boolean) => {
+			const records = [
+				{
+					type: "session",
+					version: CURRENT_SESSION_VERSION,
+					id,
+					timestamp: "2025-01-01T00:00:00Z",
+					cwd: "/tmp",
+				},
+				{
+					type: "message",
+					id: `${id}-message`,
+					parentId: null,
+					timestamp: "2025-01-01T00:00:01Z",
+					message: { role: "user", content: id, timestamp: 1 },
+				},
+				{ type: "header_patch", patch: { starred } },
+			];
+			fs.writeFileSync(file, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+		};
+
+		const starredFile = path.join(tempDir, "starred.jsonl");
+		const unstarredFile = path.join(tempDir, "unstarred.jsonl");
+		writeSession(starredFile, "starred", true);
+		writeSession(unstarredFile, "unstarred", false);
+		fs.utimesSync(starredFile, new Date(1_000), new Date(1_000));
+		fs.utimesSync(unstarredFile, new Date(2_000), new Date(2_000));
+
+		const listed = await SessionManager.list("/tmp", tempDir);
+		expect(listed.map(session => session.id)).toEqual(["unstarred", "starred"]);
+		const prioritized = prioritizeStarredSessions(listed);
+		expect(prioritized.map(session => session.id)).toEqual(["starred", "unstarred"]);
+		expect(prioritized.map(session => session.starred)).toEqual([true, false]);
 	});
 });
 

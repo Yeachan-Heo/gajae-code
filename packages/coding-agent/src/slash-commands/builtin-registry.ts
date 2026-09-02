@@ -139,6 +139,29 @@ function toSlashCommandRuntime(runtime: TuiSlashCommandRuntime): SlashCommandRun
 	};
 }
 
+async function updateSessionStar(
+	starred: boolean,
+	command: ParsedSlashCommand,
+	runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	if (command.args) return usage(`Usage: /${starred ? "star" : "unstar"}`, runtime);
+	if (!runtime.sessionManager.isPersisted()) {
+		await runtime.output("Session stars require a persisted session.");
+		return commandConsumed();
+	}
+	const changed = await runtime.sessionManager.setSessionStarred(starred);
+	await runtime.output(
+		changed
+			? starred
+				? "Session starred."
+				: "Session unstarred."
+			: starred
+				? "Session is already starred."
+				: "Session is not starred.",
+	);
+	return commandConsumed();
+}
+
 function parseProviderSetupSlashArgs(args: string): {
 	preset?: string;
 	compat?: string;
@@ -1960,6 +1983,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: async (command, runtime) => {
 			await runtime.ctx.handleContributionPrepCommand(command.args || undefined);
 		},
+	},
+	{
+		name: "star",
+		priority: 91,
+		description: "Star the current session for easier discovery",
+		// Accept args at dispatch so the handler can consume them as a usage error
+		// instead of silently forwarding `/star ...` to the model.
+		allowArgs: true,
+		handle: (command, runtime) => updateSessionStar(true, command, runtime),
+	},
+	{
+		name: "unstar",
+		priority: 91,
+		description: "Remove the star from the current session",
+		// Accept args at dispatch so the handler can consume them as a usage error
+		// instead of silently forwarding `/unstar ...` to the model.
+		allowArgs: true,
+		handle: (command, runtime) => updateSessionStar(false, command, runtime),
 	},
 	{
 		name: "resume",

@@ -86,6 +86,7 @@ Session files are JSONL: one JSON object per line.
   "cwd": "/work/pi",
   "title": "optional session title",
   "titleSource": "auto",
+  "starred": true,
   "parentSession": "optional lineage marker"
 }
 ```
@@ -93,6 +94,7 @@ Session files are JSONL: one JSON object per line.
 Notes:
 
 - `version` is optional in v1 files; absence means v1.
+- `starred` is optional and defaults to `false`. `/star` and `/unstar` persist changes through append-only `header_patch` records; starring affects discovery order only and does not protect a session from explicit deletion or retention pruning.
 - `parentSession` is an opaque lineage string. Current code writes either a session id or a session path depending on flow (`fork`, `forkFrom`, `createBranchedSession`, or explicit `newSession({ parentSession })`). Treat as metadata, not a typed foreign key.
 
 ### Entry Base (`SessionEntryBase`)

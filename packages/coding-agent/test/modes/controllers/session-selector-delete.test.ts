@@ -17,6 +17,7 @@ function createSession(id: string, title: string): SessionInfo {
 		id,
 		cwd: "/tmp",
 		title,
+		starred: false,
 		created: new Date("2024-01-01T00:00:00Z"),
 		modified: new Date("2024-01-02T00:00:00Z"),
 		messageCount: 1,

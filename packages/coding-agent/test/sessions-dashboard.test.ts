@@ -156,6 +156,7 @@ describe("sessions dashboard", () => {
 			id: liveness,
 			cwd: "/工程/日本語/프로젝트/with\ttabs",
 			title: `漢字 café ${liveness} title`,
+			starred: liveness === "active",
 			modified: new Date("2026-01-01T00:00:00.000Z"),
 			messageCount: 12,
 			liveness,
@@ -165,6 +166,8 @@ describe("sessions dashboard", () => {
 				expect(Bun.stringWidth(line.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, ""))).toBeLessThanOrEqual(width);
 			}
 		}
+		const starred = new SessionsDashboardComponent(rows, () => {}).render(80).join("\n");
+		expect(Bun.stripANSI(starred)).toContain("★");
 	});
 
 	it("keeps a 24-row dashboard bounded while paging to the last session", () => {
@@ -173,6 +176,7 @@ describe("sessions dashboard", () => {
 			cwd: `/projects/${index}`,
 			title: `Session ${index}`,
 			modified: new Date("2026-01-01T00:00:00.000Z"),
+			starred: false,
 			messageCount: index,
 			liveness: "unknown" as const,
 		}));

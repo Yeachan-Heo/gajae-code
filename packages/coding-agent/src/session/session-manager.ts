@@ -246,6 +246,7 @@ export interface SessionHeader {
 	id: string;
 	title?: string; // Auto-generated title from first message
 	titleSource?: "auto" | "user";
+	starred?: boolean;
 	timestamp: string;
 	cwd: string;
 	parentSession?: string;
@@ -931,7 +932,7 @@ export type SessionEntry =
 /** Append-only replacement for mutable fields on the session header. */
 export interface HeaderPatchRecord {
 	type: "header_patch";
-	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd">>;
+	patch: Partial<Pick<SessionHeader, "title" | "titleSource" | "cwd" | "starred">>;
 }
 
 /** Append-only replacement for replay metadata on one existing session entry. */
@@ -2390,6 +2391,7 @@ export interface SessionInfo {
 	/** Working directory where the session was started. Empty string for old sessions. */
 	cwd: string;
 	title?: string;
+	starred: boolean;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
 	created: Date;
@@ -2699,12 +2701,13 @@ function isHeaderPatchRecord(record: SessionPatchRecord): record is HeaderPatchR
 	)
 		return false;
 	const keys = Object.keys(record.patch);
-	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource")) return false;
-	const { cwd, title, titleSource } = record.patch;
+	if (!keys.every(key => key === "cwd" || key === "title" || key === "titleSource" || key === "starred")) return false;
+	const { cwd, title, titleSource, starred } = record.patch;
 	return (
 		(cwd === undefined || typeof cwd === "string") &&
 		(title === undefined || typeof title === "string") &&
-		(titleSource === undefined || titleSource === "auto" || titleSource === "user")
+		(titleSource === undefined || titleSource === "auto" || titleSource === "user") &&
+		(starred === undefined || typeof starred === "boolean")
 	);
 }
 
@@ -2712,6 +2715,7 @@ function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch
 	if (patch.cwd !== undefined) header.cwd = patch.cwd;
 	if (patch.title !== undefined) header.title = patch.title;
 	if (patch.titleSource !== undefined) header.titleSource = patch.titleSource;
+	if (patch.starred !== undefined) header.starred = patch.starred;
 }
 
 function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRecord {
@@ -6413,6 +6417,10 @@ async function collectProjectSessions(cwd: string, storage: FileSessionStorage):
 	return await collectSessionsFromFiles(listProjectSessionTranscriptFiles(cwd), storage);
 }
 
+export function prioritizeStarredSessions(sessions: readonly SessionInfo[]): SessionInfo[] {
+	return [...sessions.filter(session => session.starred), ...sessions.filter(session => !session.starred)];
+}
+
 function mergeSessionInventories(...inventories: SessionInfo[][]): SessionInfo[] {
 	const sessions = new Map<string, SessionInfo>();
 	for (const inventory of inventories) {
@@ -6579,31 +6587,32 @@ async function readSessionListTrailingPatches(
 		const content = await storage.readText(file);
 		const entries = parseSessionEntries(content);
 		const header = entries[0] as SessionHeader | undefined;
-		return header?.type === "session" ? [{ cwd: header.cwd, title: header.title }] : [];
+		return header?.type === "session" ? [{ cwd: header.cwd, title: header.title, starred: header.starred }] : [];
 	}
 
 	const size = storage.statSync(file).size;
 	if (size <= SESSION_LIST_PREFIX_BYTES) return [];
 	const latest: HeaderPatchRecord["patch"] = {};
 	let position = size;
-	// Reverse-scan from EOF in fixed chunks. Stop once both cwd and title
-	// resolve so recent patches stay cheap. Continue past the historical 16 KiB
+	// Reverse-scan from EOF in fixed chunks. Stop once every mutable list field
+	// resolves so recent patches stay cheap. Continue past the historical 16 KiB
 	// window when a field is still missing so a buried but canonically valid
 	// header_patch remains listable without a full sequential JSONL parse (#3633).
 	// Chunks that cannot contain a header_patch marker skip JSON parsing.
 	//
-	// The scan owns its buffer instead of borrowing the caller's 4 KiB prefix
-	// buffer. A transcript with no header_patch at all — the common case, since
-	// only /rename and workspace moves emit one — cannot be recognized without
-	// reaching BOF, so the chunk size sets how many read syscalls a resume costs
-	// per transcript byte.
+	// The scan owns its buffer instead of borrowing the caller's 4 KiB prefix.
+	// A transcript with no header_patch at all — the common case — cannot be
+	// recognized as such without reaching BOF, so the chunk size sets how many
+	// read syscalls a resume costs per transcript byte.
+	// Legacy metadata patches without a star field likewise scan to BOF because
+	// an earlier standalone star patch cannot otherwise be ruled out.
 	let trailingFragment = Buffer.alloc(0);
 	const chunkSize = Math.min(size, SESSION_LIST_TRAILING_PATCH_BYTES);
 	const buffer = Buffer.allocUnsafe(chunkSize);
 	const headerPatchMarker = Buffer.from("header_patch");
 	const handle = await fs.promises.open(file, "r");
 	try {
-		while (position > 0 && (latest.cwd === undefined || latest.title === undefined)) {
+		while (position > 0 && (latest.cwd === undefined || latest.title === undefined || latest.starred === undefined)) {
 			const start = Math.max(0, position - chunkSize);
 			const length = position - start;
 			const { bytesRead } = await handle.read(buffer, 0, length, start);
@@ -6636,6 +6645,8 @@ async function readSessionListTrailingPatches(
 						if (latest.cwd === undefined && typeof record.patch.cwd === "string") latest.cwd = record.patch.cwd;
 						if (latest.title === undefined && typeof record.patch.title === "string")
 							latest.title = record.patch.title;
+						if (latest.starred === undefined && typeof record.patch.starred === "boolean")
+							latest.starred = record.patch.starred;
 					} catch {
 						// Ignore malformed or partial records exactly as the canonical loader does.
 					}
@@ -6643,7 +6654,7 @@ async function readSessionListTrailingPatches(
 			}
 			position = start;
 		}
-		return latest.cwd === undefined && latest.title === undefined ? [] : [latest];
+		return latest.cwd === undefined && latest.title === undefined && latest.starred === undefined ? [] : [latest];
 	} finally {
 		await handle.close();
 	}
@@ -6652,6 +6663,7 @@ async function readSessionListTrailingPatches(
 function applySessionListHeaderPatch(header: SessionListHeader, patch: HeaderPatchRecord["patch"]): void {
 	if (typeof patch.cwd === "string") header.cwd = patch.cwd;
 	if (typeof patch.title === "string") header.title = patch.title;
+	if (typeof patch.starred === "boolean") header.starred = patch.starred;
 }
 function decodeJsonStringFragment(value: string): string {
 	const safeValue = value.endsWith("\\") ? value.slice(0, -1) : value;
@@ -6702,6 +6714,17 @@ function extractStringProperty(source: string, name: string, startIndex = 0): st
 	return decodeJsonStringFragment(source.slice(valueStart));
 }
 
+function extractBooleanProperty(source: string, name: string): boolean | undefined {
+	const propertyIndex = source.indexOf(`"${name}"`);
+	if (propertyIndex === -1) return undefined;
+	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
+	if (colonIndex === -1) return undefined;
+	const value = source.slice(colonIndex + 1).trimStart();
+	if (value.startsWith("true")) return true;
+	if (value.startsWith("false")) return false;
+	return undefined;
+}
+
 function countMessageMarkers(content: string): number {
 	let count = 0;
 	let index = 0;
@@ -6740,6 +6763,7 @@ interface SessionListHeader {
 
 	cwd?: string;
 	title?: string;
+	starred?: boolean;
 	parentSession?: string;
 	timestamp?: string;
 }
@@ -6756,6 +6780,7 @@ function parseSessionListHeader(
 			version: typeof parsedHeader.version === "number" ? parsedHeader.version : undefined,
 			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
 			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
+			starred: typeof parsedHeader.starred === "boolean" ? parsedHeader.starred : undefined,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
 			timestamp: typeof parsedHeader.timestamp === "string" ? parsedHeader.timestamp : undefined,
 		};
@@ -6774,6 +6799,7 @@ function parseSessionListHeader(
 		version: Number(extractStringProperty(firstLine, "version")) || undefined,
 		cwd: extractStringProperty(firstLine, "cwd"),
 		title: extractStringProperty(firstLine, "title"),
+		starred: extractBooleanProperty(firstLine, "starred"),
 		parentSession: extractStringProperty(firstLine, "parentSession"),
 		timestamp: extractStringProperty(firstLine, "timestamp"),
 	};
@@ -6841,6 +6867,7 @@ async function collectSessionFromFile(
 			id: header.id,
 			cwd: header.cwd ?? "",
 			title: header.title ?? shortSummary,
+			starred: header.starred === true,
 			parentSessionPath: header.parentSession,
 			created: new Date(header.timestamp ?? ""),
 			modified: stats.mtime,
@@ -16886,6 +16913,27 @@ export class SessionManager {
 
 	getSessionName(): string | undefined {
 		return this.#sessionName;
+	}
+
+	isSessionStarred(): boolean {
+		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		return header?.starred === true;
+	}
+
+	async setSessionStarred(starred: boolean): Promise<boolean> {
+		this.#assertRecoveryHydrationWritable();
+		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		if (!header || (header.starred === true) === starred) return false;
+		const previous = header.starred;
+		try {
+			await this.#appendHeaderPatch({ starred });
+			return true;
+		} catch (error) {
+			if (previous === undefined) delete header.starred;
+			else header.starred = previous;
+			this.#headerExportRevision++;
+			throw error;
+		}
 	}
 
 	/** Strip C0/C1 control characters (includes ESC, so removes ANSI sequences) and collapse whitespace. */

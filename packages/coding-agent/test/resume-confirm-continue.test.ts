@@ -49,6 +49,7 @@ const sessionInfo: SessionInfo = {
 	path: identity.canonicalPath,
 	id: identity.sessionId,
 	cwd: "/worktree",
+	starred: false,
 	created: new Date(0),
 	modified: new Date(0),
 	messageCount: 1,

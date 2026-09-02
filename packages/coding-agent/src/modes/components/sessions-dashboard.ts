@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
-import { type Component, Container, matchesKey, truncateToWidth } from "@gajae-code/tui";
-import type { SessionInfo } from "../../session/session-manager";
+import { type Component, Container, matchesKey, truncateToWidth, visibleWidth } from "@gajae-code/tui";
+import { prioritizeStarredSessions, type SessionInfo } from "../../session/session-manager";
 import { theme } from "../theme/theme";
 
 const PRESENCE_MAX_BYTES = 4096;
@@ -41,6 +41,7 @@ export interface DashboardSession {
 	id: string;
 	cwd: string;
 	title: string;
+	starred: boolean;
 	modified: Date;
 	messageCount: number;
 	messageCountIsEstimate?: boolean;
@@ -78,10 +79,11 @@ export function dashboardSessions(
 	sessions: readonly SessionInfo[],
 	options: { readFile?: (filePath: string) => string; now?: number } = {},
 ): DashboardSession[] {
-	return sessions.map(session => ({
+	return prioritizeStarredSessions(sessions).map(session => ({
 		id: session.id,
 		cwd: session.cwd,
 		title: session.title ?? session.firstMessage,
+		starred: session.starred,
 		modified: session.modified,
 		messageCountIsEstimate: session.messageCountIsEstimate,
 		messageCount: session.messageCount,
@@ -169,10 +171,11 @@ class SessionDashboardRow implements Component {
 		const fullMetadata = `· ${count} · ${modified}`;
 		const compactMetadata = `· ${this.session.messageCountIsEstimate ? `~${this.session.messageCount}` : this.session.messageCount} msgs`;
 		const metadata = width >= 48 ? fullMetadata : width >= 24 ? compactMetadata : "";
-		const titleWidth = Math.max(0, width - 2 - metadata.length - (metadata ? 1 : 0));
+		const star = this.session.starred ? theme.fg("warning", `${theme.icon.star} `) : "";
+		const titleWidth = Math.max(0, width - 2 - visibleWidth(star) - metadata.length - (metadata ? 1 : 0));
 		return [
 			fit(
-				` ${status} ${truncateToWidth(title, titleWidth)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}`,
+				` ${status} ${star}${truncateToWidth(title, titleWidth)}${metadata ? ` ${theme.fg("dim", metadata)}` : ""}`,
 				width,
 			),
 			fit(`   ${theme.fg("dim", cwd)}`, width),

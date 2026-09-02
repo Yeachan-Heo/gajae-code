@@ -22,6 +22,7 @@ function makeSessionInfo(path: string): SessionInfo {
 		id: path,
 		cwd: "/tmp/project",
 		title: "Active session",
+		starred: false,
 		created: new Date("2025-01-01T00:00:00Z"),
 		modified: new Date("2025-01-01T00:00:00Z"),
 		messageCount: 1,

@@ -37,11 +37,11 @@ There are two different listing pipelines:
    - Sorts by file `mtime` descending.
 
 2. `SessionManager.list(...)` / `SessionManager.listAll()` (resume pickers and ID matching)
-   - Reads a bounded 4KB prefix, then reverse-scans for the latest strict `header_patch` values (cwd/title) in 64KB chunks, stopping once both fields resolve.
+   - Reads a bounded 4KB prefix, then reverse-scans for the latest strict `header_patch` values (cwd/title/starred) in 64KB chunks, stopping once all mutable list fields resolve.
    - Recent patches near EOF stay cheap; when a field is still missing the scan continues past the historical 16KB window so a buried but still-canonical title remains listable without a full sequential JSONL parse of multi-MB message bodies.
-   - A transcript that never emitted a `header_patch` cannot be recognized as such without reaching BOF, so its whole file is walked. The scan therefore uses its own 64KB buffer rather than the 4KB prefix buffer: chunk size sets how many `read` syscalls a listing costs per transcript byte, and listings run on every resume, continue, and picker open.
+   - A transcript that never emitted a `header_patch`, or whose legacy metadata patches do not carry a star field, cannot rule out an earlier standalone star patch without reaching BOF, so its whole file is walked. The scan therefore uses its own 64KB buffer rather than the 4KB prefix buffer: chunk size sets how many `read` syscalls a listing costs per transcript byte, and listings run on every resume, continue, and picker open.
    - Builds `SessionInfo` objects from that projection plus prefix preview extraction.
-   - Drops sessions with zero `message` entries and sorts by `modified` descending.
+   - Drops sessions with zero `message` entries and sorts by `modified` descending; resume selectors and the sessions dashboard then stable-partition starred sessions ahead of unstarred sessions without changing ID-prefix resolution order.
 
 ### Metadata fallback behavior
 
@@ -54,6 +54,7 @@ For recent summaries (`RecentSessionInfo`):
 For `SessionInfo` list entries:
 
 - `title` is `header.title` or latest compaction `shortSummary`
+- `starred` defaults to `false` for sessions without star metadata
 - `firstMessage` is first user message text or `"(no messages)"`
 
 ## `--continue` resolution and terminal breadcrumb preference
@@ -138,6 +139,7 @@ Flow:
 - Esc to cancel
 - Ctrl+C to exit
 - fuzzy search across session id/title/cwd/first message/all messages/path
+- starred sessions are marked with `★` and appear before unstarred sessions
 
 Empty-list render behavior:
 
@@ -146,6 +148,8 @@ Empty-list render behavior:
 - Esc/Ctrl+C still work
 
 Caveat: UI text says `Press Tab to view all`, but this component currently has no Tab handler and current wiring only lists current-scope sessions.
+
+`/star` and `/unstar` update only the active session. The read-only `/sessions` dashboard displays the same star marker but never mutates session metadata. Starring is a discovery aid, not a retention or deletion guard.
 
 ## Runtime switch execution (`AgentSession.switchSession`)
 
