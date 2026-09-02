@@ -248,6 +248,78 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("✓ LIVE CATALOG");
 	});
 
+	test("resolves a repeated preset selector once per authentication refresh", async () => {
+		installTestTheme();
+		const repeatedProfiles = new Map<string, ModelProfileDefinition>([
+			[
+				"repeated-a",
+				{
+					name: "repeated-a",
+					requiredProviders: [],
+					modelMapping: { default: "flare-alias", executor: "flare-alias" },
+					source: "user",
+				},
+			],
+			[
+				"repeated-b",
+				{
+					name: "repeated-b",
+					requiredProviders: [],
+					modelMapping: { default: "flare-alias" },
+					source: "user",
+				},
+			],
+		]);
+		let catalogChanged: (() => void) | undefined;
+		let authGenerationChanged: (() => void) | undefined;
+		let resolvedAliasModel = aliasModel;
+		const registryBase = createRegistry();
+		const resolveAlias = registryBase.resolveModelByLookupAlias;
+		const getApiKeyForProvider = vi.fn(async () => "key");
+		registryBase.getApiKeyForProvider = getApiKeyForProvider;
+		const registry = registryBase as unknown as TestModelRegistry & {
+			onCatalogChanged: (listener: () => void) => () => void;
+			authStorage: { onGenerationChanged: (listener: () => void) => () => void };
+		};
+		resolveAlias.mockImplementation((_alias, lookupOptions) =>
+			lookupOptions?.candidates?.find(candidate => candidate === resolvedAliasModel),
+		);
+		registry.getModelProfiles = () => new Map(repeatedProfiles);
+		registry.getModelProfile = (name: string) => repeatedProfiles.get(name);
+		registry.getAvailableModelProfileNames = () => [...repeatedProfiles.keys()];
+		registry.onCatalogChanged = listener => {
+			catalogChanged = listener;
+			return () => {};
+		};
+		registry.authStorage = {
+			onGenerationChanged: listener => {
+				authGenerationChanged = listener;
+				return () => {};
+			},
+		};
+
+		createSelector(() => {}, { registry, sessionId: "profile-session" });
+		await Bun.sleep(10);
+		resolveAlias.mockClear();
+		getApiKeyForProvider.mockClear();
+
+		catalogChanged?.();
+
+		expect(resolveAlias).toHaveBeenCalledTimes(1);
+		expect(getApiKeyForProvider).toHaveBeenCalledWith("provider-b", "profile-session");
+
+		await Bun.sleep(10);
+		resolveAlias.mockClear();
+		getApiKeyForProvider.mockClear();
+		resolvedAliasModel = defaultModel;
+
+		authGenerationChanged?.();
+
+		expect(resolveAlias).toHaveBeenCalledTimes(1);
+		expect(resolveAlias.mock.calls[0]?.[1]?.credentialSessionId).toBe("profile-session");
+		expect(getApiKeyForProvider).toHaveBeenCalledWith("provider-a", "profile-session");
+	});
+
 	test("renders a registry preset unavailable when its configured proxy lacks the model", async () => {
 		installTestTheme();
 		const proxyProfile: ModelProfileDefinition = {

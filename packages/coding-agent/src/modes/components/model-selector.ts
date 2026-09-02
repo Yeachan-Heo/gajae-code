@@ -1497,6 +1497,25 @@ export class ModelSelectorComponent extends Container {
 		const availableModels = this.#getProfileAvailableModels();
 		const resolutionRegistry = this.#createProfileResolutionRegistry(availableModels);
 		const providers = new Set<string>();
+		// Preset groups share selectors heavily (role assignments repeat across
+		// profiles), and each `resolveModelRoleValue` call scans the candidate set
+		// while validating lookup contexts and resolving aliases. Resolve identical
+		// selectors once per refresh; the inputs are shared and only the provider is
+		// needed here. This map is deliberately local to the synchronous, pre-await
+		// snapshot below: catalog/config changes and credential-generation changes
+		// start a new refresh with a new map.
+		const resolvedProviderBySelector = new Map<string, string | undefined>();
+		const resolveSelectorProvider = (selector: string): string | undefined => {
+			if (resolvedProviderBySelector.has(selector)) return resolvedProviderBySelector.get(selector);
+			const provider = resolveModelRoleValue(selector, availableModels, {
+				settings: this.#settings,
+				modelRegistry: this.#modelRegistry,
+				aliasIntent: "preset-equivalent",
+				credentialSessionId: this.#authSessionId,
+			}).model?.provider;
+			resolvedProviderBySelector.set(selector, provider);
+			return provider;
+		};
 		for (const profiles of this.#getPresetGroups().values()) {
 			for (const profile of profiles) {
 				for (const provider of profileRequiredProviders(profile)) providers.add(provider);
@@ -1516,13 +1535,8 @@ export class ModelSelectorComponent extends Container {
 				];
 				for (const value of values) {
 					for (const selector of normalizeModelSelectorValue(value)) {
-						const resolved = resolveModelRoleValue(selector, availableModels, {
-							settings: this.#settings,
-							modelRegistry: this.#modelRegistry,
-							aliasIntent: "preset-equivalent",
-							credentialSessionId: this.#authSessionId,
-						}).model;
-						if (resolved) providers.add(resolved.provider);
+						const resolvedProvider = resolveSelectorProvider(selector);
+						if (resolvedProvider !== undefined) providers.add(resolvedProvider);
 					}
 				}
 			}
