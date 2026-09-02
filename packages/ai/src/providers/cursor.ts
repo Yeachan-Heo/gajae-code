@@ -756,17 +756,18 @@ function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): 
 		pending.delete(completion);
 		if (error != null && !cursorWriteErrors.has(request)) cursorWriteErrors.set(request, error);
 		if (typeof request.removeListener === "function") {
-			request.removeListener("close", finish);
+			request.removeListener("close", onClose);
 			request.removeListener("error", finish);
 		}
 		if (error == null) resolveWrite();
 		else rejectWrite(error);
 	};
+	const onClose = () => finish(new Error("Cursor request closed before write completed"));
 	try {
 		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
 		// test seam tolerant of a minimal writer stub as well.
 		if (typeof request.once === "function") {
-			request.once("close", () => finish(new Error("Cursor request closed before write completed")));
+			request.once("close", onClose);
 			request.once("error", finish);
 		}
 		request.write(frame, finish);
@@ -806,10 +807,17 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 		if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
 			return new Error("Invalid Connect end stream envelope");
 		}
-		const error = payload?.error;
+		if ("error" in payload && (!payload.error || typeof payload.error !== "object" || Array.isArray(payload.error))) {
+			return new Error("Invalid Connect end stream error envelope");
+		}
+		const error = payload.error as { code?: unknown; message?: unknown } | undefined;
 		if (error) {
-			const code = typeof error.code === "string" ? error.code : "unknown";
-			const message = typeof error.message === "string" ? error.message : "Unknown error";
+			const code =
+				typeof error.code === "string" ? error.code.slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH) : "unknown";
+			const message =
+				typeof error.message === "string"
+					? error.message.slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH)
+					: "Unknown error";
 			return new Error(`Connect error ${code}: ${message}`);
 		}
 		return null;

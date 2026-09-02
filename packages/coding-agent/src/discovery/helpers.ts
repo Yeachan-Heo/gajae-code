@@ -1133,7 +1133,13 @@ export async function listClaudePluginRoots(
 				const marketplace = pluginId.slice(atIndex + 1);
 
 				for (const entry of entries) {
-					if (!entry.installPath || typeof entry.installPath !== "string") {
+					if (
+						!entry ||
+						typeof entry !== "object" ||
+						Array.isArray(entry) ||
+						!entry.installPath ||
+						typeof entry.installPath !== "string"
+					) {
 						warnings.push(`Plugin ${pluginId} entry has no installPath`);
 						continue;
 					}
@@ -1184,7 +1190,13 @@ export async function listClaudePluginRoots(
 					const pluginName = pluginId.slice(0, atIndex);
 					const marketplace = pluginId.slice(atIndex + 1);
 					for (const entry of entries) {
-						if (!entry.installPath || typeof entry.installPath !== "string") {
+						if (
+							!entry ||
+							typeof entry !== "object" ||
+							Array.isArray(entry) ||
+							!entry.installPath ||
+							typeof entry.installPath !== "string"
+						) {
 							warnings.push(`Plugin ${pluginId} entry has no installPath`);
 							continue;
 						}
