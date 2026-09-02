@@ -1326,6 +1326,7 @@ async function runCommunityAppOfferFromRuntime(
 	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
 	const pinnedRuntimePath = path.join(pinDirectory, "gjc");
 	let pinDirectoryLocked = false;
+	let runtimeGroupSafe = true;
 	try {
 		const snapshot = Buffer.from(await Bun.file(runtimePath).arrayBuffer());
 		if (createHash("sha256").update(snapshot).digest("hex") !== expectedIdentity.sha256)
@@ -1346,6 +1347,17 @@ async function runCommunityAppOfferFromRuntime(
 			stderr: "inherit",
 			detached: true,
 		});
+		const waitForRuntimeGroupGone = async (): Promise<boolean> => {
+			for (let attempt = 0; attempt < 100; attempt++) {
+				try {
+					process.kill(-child.pid, 0);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+				}
+				await Bun.sleep(50);
+			}
+			return false;
+		};
 		const signalRuntimeGroup = (signal: NodeJS.Signals): void => {
 			try {
 				process.kill(-child.pid, signal);
@@ -1360,17 +1372,22 @@ async function runCommunityAppOfferFromRuntime(
 		const exitCode = await Promise.race([child.exited, Bun.sleep(180_000).then(() => 124)]);
 		if (exitCode === 124) {
 			signalRuntimeGroup("SIGTERM");
-			const cleanupExitCode = await Promise.race([child.exited, Bun.sleep(300_000).then(() => 125)]);
+			const cleanupExitCode = await Promise.race([child.exited.then(() => 0), Bun.sleep(300_000).then(() => 125)]);
 			if (cleanupExitCode === 125) {
 				signalRuntimeGroup("SIGKILL");
-				await Promise.race([child.exited, Bun.sleep(5000)]);
+				runtimeGroupSafe =
+					(await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)])) &&
+					(await waitForRuntimeGroupGone());
+			} else {
+				runtimeGroupSafe = await waitForRuntimeGroupGone();
 			}
 			throw new Error("optional macOS community app offer timed out");
 		}
+		runtimeGroupSafe = await waitForRuntimeGroupGone();
 		if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
 	} finally {
-		if (pinDirectoryLocked) await fs.promises.chmod(pinDirectory, 0o700).catch(() => undefined);
-		await fs.promises.rm(pinDirectory, { recursive: true, force: true }).catch(() => undefined);
+		if (pinDirectoryLocked && runtimeGroupSafe) await fs.promises.chmod(pinDirectory, 0o700).catch(() => undefined);
+		if (runtimeGroupSafe) await fs.promises.rm(pinDirectory, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 
