@@ -234,14 +234,24 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 	};
 	const terminateAndReap = async (): Promise<boolean> => {
 		signalProcessGroup("SIGKILL");
-		const exited = await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)]);
+		const exited = await Promise.race([
+			child.exited.then(
+				() => true,
+				() => false,
+			),
+			Bun.sleep(5000).then(() => false),
+		]);
 		return exited && (await waitForProcessGroupGone());
 	};
 	try {
+		const childExit = child.exited.then(
+			code => ({ code, reaped: true }),
+			() => ({ code: 125, reaped: false }),
+		);
 		const outputPromise = Promise.all([
 			readResponseText(new Response(child.stdout), MAX_COMMAND_OUTPUT_BYTES),
 			readResponseText(new Response(child.stderr), MAX_COMMAND_OUTPUT_BYTES),
-			child.exited,
+			childExit,
 		]);
 		const timeout = Promise.withResolvers<boolean>();
 		const timer: NodeJS.Timeout = setTimeout(() => {
@@ -268,8 +278,13 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 			const reaped = await terminateAndReap();
 			return { exitCode: 125, stdout: "", stderr: String(output.error), reaped };
 		}
-		const [stdout, stderr, exitCode] = output.value;
-		return { exitCode, stdout, stderr, reaped: await waitForProcessGroupGone() };
+		const [stdout, stderr, childResult] = output.value;
+		return {
+			exitCode: childResult.code,
+			stdout,
+			stderr,
+			reaped: childResult.reaped && (await waitForProcessGroupGone()),
+		};
 	} finally {
 		activeCommandControllers.delete(controller);
 	}
