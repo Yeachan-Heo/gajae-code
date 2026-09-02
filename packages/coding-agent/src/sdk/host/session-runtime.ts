@@ -2168,19 +2168,45 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 			);
 		if (!assistant || typeof assistant !== "object") return { hasActivity: false };
 		const content = (assistant as { content?: unknown }).content;
+		const usage = (assistant as { usage?: unknown }).usage;
+		const totalTokens =
+			usage !== null && typeof usage === "object" ? (usage as { totalTokens?: unknown }).totalTokens : undefined;
+		// Missing usage is not evidence of a zero-token turn: some compatible
+		// providers omit usage entirely. Only an explicit, finite zero is the
+		// fail-closed signal; positive usage remains valid terminal activity.
+		const hasTokenActivity =
+			totalTokens === undefined ||
+			(typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0);
 		if (typeof content === "string") {
 			const bounded = sanitizeTurnResultContent(content);
-			return { content: bounded, hasActivity: content.trim().length > 0 };
+			return { content: bounded, hasActivity: content.trim().length > 0 || hasTokenActivity };
 		}
 		if (Array.isArray(content)) {
-			const hasActivity = content.some(block => {
+			const hasContentActivity = content.some(block => {
 				if (block === null || typeof block !== "object") return false;
 				const type = (block as { type?: unknown }).type;
 				if (type === "text") {
 					const text = (block as { text?: unknown }).text;
 					return typeof text === "string" && text.trim().length > 0;
 				}
-				return typeof type === "string" && type.length > 0;
+				if (type === "thinking") {
+					const thinking = (block as { thinking?: unknown }).thinking;
+					return typeof thinking === "string" && thinking.trim().length > 0;
+				}
+				if (type === "redactedThinking") {
+					const data = (block as { data?: unknown }).data;
+					return typeof data === "string" && data.trim().length > 0;
+				}
+				if (type === "toolCall") {
+					const toolCall = block as { id?: unknown; name?: unknown };
+					return (
+						typeof toolCall.id === "string" &&
+						toolCall.id.length > 0 &&
+						typeof toolCall.name === "string" &&
+						toolCall.name.length > 0
+					);
+				}
+				return false;
 			});
 			const text = content
 				.filter(
@@ -2192,7 +2218,7 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 				)
 				.map(block => block.text)
 				.join("");
-			return { content: sanitizeTurnResultContent(text), hasActivity };
+			return { content: sanitizeTurnResultContent(text), hasActivity: hasContentActivity || hasTokenActivity };
 		}
 		return { content: sanitizeTurnResultContent(""), hasActivity: false };
 	} catch {

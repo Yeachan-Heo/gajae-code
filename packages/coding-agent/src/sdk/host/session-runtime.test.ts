@@ -4955,7 +4955,7 @@ describe("post-acceptance invocation terminalization", () => {
 		const cases = [
 			{ name: "short", agent: "SDK_OK", expected: "SDK_OK", bytes: 6, truncated: false },
 			{ name: "max", agent: "x".repeat(16_384), expected: "x".repeat(16_384), bytes: 16_384, truncated: false },
-			{ name: "blank", agent: " ", expected: undefined, bytes: 0, truncated: false },
+			{ name: "blank", agent: " ", expected: undefined, bytes: 0, truncated: false, status: "terminal_ok" },
 			{
 				name: "overflow",
 				agent: `${"😀".repeat(4_096)}tail`,
@@ -4982,7 +4982,7 @@ describe("post-acceptance invocation terminalization", () => {
 					turnId: accepted.result?.turnId,
 				});
 				if (testCase.expected === undefined) {
-					expect(result).toMatchObject({ status: "failed" });
+					expect(result).toMatchObject({ status: testCase.status });
 					expect((result as Record<string, unknown>).content).toBeUndefined();
 				} else {
 					expect(result).toMatchObject({
@@ -4998,6 +4998,156 @@ describe("post-acceptance invocation terminalization", () => {
 			} finally {
 				await rm(cwd, { recursive: true, force: true });
 			}
+		}
+	});
+	test("fails closed when an assistant turn has only empty reasoning and zero token usage", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-zero-token-empty-"));
+		try {
+			const harness = await invocationHarness("terminal-zero-token-empty", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "thinking", thinking: "" }],
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "stop",
+					},
+				],
+			});
+			const result = await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				commandId: accepted.result?.commandId,
+				turnId: accepted.result?.turnId,
+			});
+			expect(result).toMatchObject({
+				status: "failed",
+				error: { code: "prompt_failed", message: "Prompt submission failed." },
+			});
+			const successor = await harness.control("turn.prompt", { text: "successor" });
+			expect(successor).toMatchObject({ ok: true, result: { accepted: true } });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", content: "completed" }] });
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: successor.result?.commandId,
+					turnId: successor.result?.turnId,
+				}),
+			).toMatchObject({ status: "terminal_ok" });
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+	test("preserves valid textless terminal evidence", async () => {
+		const cases = [
+			{
+				name: "reasoning-only",
+				content: [{ type: "thinking", thinking: "private reasoning" }],
+				usage: { totalTokens: 0 },
+			},
+			{
+				name: "redacted-reasoning-only",
+				content: [{ type: "redactedThinking", data: "encrypted reasoning" }],
+				usage: { totalTokens: 0 },
+			},
+			{
+				name: "tool-only",
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+				usage: { totalTokens: 0 },
+			},
+			{
+				name: "usage-omitted",
+				content: [{ type: "thinking", thinking: "" }],
+				usage: undefined,
+			},
+			{
+				name: "positive-token-usage",
+				content: [{ type: "thinking", thinking: "" }],
+				usage: { totalTokens: 1 },
+			},
+		] as const;
+		for (const testCase of cases) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-valid-${testCase.name}-`));
+			try {
+				const harness = await invocationHarness(`terminal-valid-${testCase.name}`, cwd, {
+					sendUserMessage: async (_content, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						await Promise.withResolvers<void>().promise;
+					},
+				});
+				const accepted = await harness.control("turn.prompt", { text: "hello" });
+				await harness.emit("agent_start");
+				await harness.emit("agent_end", {
+					messages: [
+						{
+							role: "assistant",
+							content: testCase.content,
+							...(testCase.usage === undefined ? {} : { usage: testCase.usage }),
+						},
+					],
+				});
+				expect(
+					await settledStatus(harness, "turn.result", {
+						kind: "prompt",
+						commandId: accepted.result?.commandId,
+						turnId: accepted.result?.turnId,
+					}),
+				).toMatchObject({ status: "terminal_ok" });
+				await harness.stop();
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+	test("preserves explicit cancellation for an empty zero-token turn", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminal-empty-cancelled-"));
+		try {
+			const harness = await invocationHarness("terminal-empty-cancelled", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				stopReason: "cancelled",
+				messages: [
+					{
+						role: "assistant",
+						content: [{ type: "thinking", thinking: "" }],
+						usage: { totalTokens: 0 },
+					},
+				],
+			});
+			expect(
+				await settledStatus(harness, "turn.result", {
+					kind: "prompt",
+					commandId: accepted.result?.commandId,
+					turnId: accepted.result?.turnId,
+				}),
+			).toMatchObject({
+				status: "terminal_ok",
+				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+			});
+			await harness.stop();
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 	test("does not reuse a previous branch assistant for a new textless prompt", async () => {
