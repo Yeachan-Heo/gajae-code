@@ -12466,7 +12466,10 @@ export class AgentSession {
 		// user-interrupt abort, so it stalls until the user presses Esc. Schedule a
 		// continue so the steer is delivered promptly. A live loop (or an
 		// already-drained queue) makes the scheduled continue a no-op.
-		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForSteer()) {
+		// During an abort unwind, the abort's single rearm owns this boundary. Letting
+		// each steer schedule its own continuation can start the first queued message
+		// before the rest of the unwind cohort is admitted, splitting an `all` batch.
+		if (!this.#cancelAndSubmitInProgress && this.#abortUnwind === undefined && this.#canAutoContinueForSteer()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
 				rescheduleOnBusy: true,

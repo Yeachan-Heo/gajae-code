@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fixed `interruptMode: "wait"` steering rearm so `steeringMode: "all"` delivers every steer admitted during an abort unwind in one ordered successor turn instead of splitting the queue across continuations.
 - Coordinator projection scans now use identity-bracketed directory authority on macOS instead of failing every scan as unsupported, while root and candidate replacement races remain fail-closed.
 - The `/model` selector no longer stalls the UI thread on open, model selection, provider-tab switch, and every catalog change for credentialed users. Each `refresh("offline")` re-ran the built-in-discovery freshness filter across the whole cached catalog (thousands of models) while recomputing per model values that only vary per provider — `#getProviderEvidenceGeneration` (an AuthStorage lookup) and `#getProviderBaseUrlForDiscovery` + endpoint normalization (URL parsing). That provider-keyed work is now memoized once per provider per refresh, so on the bundled catalog with credentials `refresh("offline")` drops from ~40ms to ~15ms per interaction with identical freshness results. Complements the earlier batch canonical-selection fix.
 - Interactive OAuth account selection now handles a stale or missing pinned credential in place, preserving the session and actionable `/login` or AUTO guidance instead of creating an unhandled rejection and crash record.

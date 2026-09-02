@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
@@ -12,6 +12,15 @@ import { TempDir } from "@gajae-code/utils";
 
 function userMessage(text: string) {
 	return { role: "user" as const, content: text, timestamp: Date.now() };
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(1);
+	}
+	throw new Error("Timed out waiting for condition");
 }
 
 /**
@@ -110,6 +119,111 @@ describe("AgentSession steer-on-interrupt", () => {
 				m => m.role === "user" && JSON.stringify(m.content).includes("also handle the steer"),
 			),
 		).toBe(true);
+	});
+
+	it("drains all wait-mode steering messages into one successor turn", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const mock = createMockModel({
+			responses: [{ content: ["first done"], delayMs: 60_000 }, { content: ["handled both steers"] }],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			interruptMode: "wait",
+			steeringMode: "all",
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const first = session.prompt("first task");
+		await waitUntil(() => agent.state.isStreaming && mock.calls.length === 1);
+		await session.prompt("steer one", { streamingBehavior: "steer" });
+		await session.prompt("steer two", { streamingBehavior: "steer" });
+		expect(session.getQueuedMessages().steering).toEqual(["steer one", "steer two"]);
+
+		// The wait-mode turn must be interrupted after both steers are admitted.
+		// The provider is still blocked when the real Esc/user-interrupt path claims
+		// the abort, so the successor is exercised through settlement rearm rather
+		// than the ordinary in-loop boundary.
+		const aborting = session.abort({ cause: "user_interrupt" });
+		await aborting;
+		await first.catch(() => {});
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		const successorUserMessages = mock.calls[1]!.context.messages.filter(message => message.role === "user").map(
+			message => JSON.stringify(message.content),
+		);
+		expect(successorUserMessages.slice(-2)).toEqual([
+			JSON.stringify([{ type: "text", text: "steer one" }]),
+			JSON.stringify([{ type: "text", text: "steer two" }]),
+		]);
+	});
+
+	it("lets the abort rearm own steering admitted during unwind", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const abortHookStarted = Promise.withResolvers<void>();
+		const releaseAbortHook = Promise.withResolvers<void>();
+		const successorGate = Promise.withResolvers<void>();
+		const mock = createMockModel({
+			responses: [
+				{ content: ["first done"], delayMs: 60_000 },
+				async () => {
+					await successorGate.promise;
+					return { content: ["handled both steers"] };
+				},
+				{ content: ["unexpected extra turn"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			interruptMode: "wait",
+			steeringMode: "all",
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		vi.spyOn(session.goalRuntime, "onTaskAborted").mockImplementation(async () => {
+			abortHookStarted.resolve();
+			await releaseAbortHook.promise;
+		});
+
+		const first = session.prompt("first task");
+		await waitUntil(() => agent.state.isStreaming && mock.calls.length === 1);
+		const aborting = session.abort({ cause: "user_interrupt" });
+		await abortHookStarted.promise;
+
+		// While abort cleanup owns the boundary, each steer must remain queued for
+		// the one rearm continuation. Without that fence, the first steer starts an
+		// independent continuation before the second steer is admitted.
+		await session.steer("steer one");
+		for (let i = 0; i < 8; i++) await Promise.resolve();
+		expect(mock.calls).toHaveLength(1);
+		await session.steer("steer two");
+		expect(session.getQueuedMessages().steering).toEqual(["steer one", "steer two"]);
+
+		successorGate.resolve();
+		releaseAbortHook.resolve();
+		await aborting;
+		await first.catch(() => {});
+		await session.waitForIdle();
+
+		expect(mock.calls).toHaveLength(2);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		const successorUserMessages = mock.calls[1]!.context.messages.filter(message => message.role === "user").map(
+			message => JSON.stringify(message.content),
+		);
+		expect(successorUserMessages.slice(-2)).toEqual([
+			JSON.stringify([{ type: "text", text: "steer one" }]),
+			JSON.stringify([{ type: "text", text: "steer two" }]),
+		]);
 	});
 
 	// Execution-drain path: the steer is queued while two shared tools run. Tool A
