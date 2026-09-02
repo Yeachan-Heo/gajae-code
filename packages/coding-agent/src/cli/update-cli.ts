@@ -1358,14 +1358,21 @@ async function runCommunityAppOfferFromRuntime(
 			}
 			return false;
 		};
-		const signalRuntimeGroup = (signal: NodeJS.Signals): void => {
+		const signalRuntimeGroup = (signal: NodeJS.Signals): boolean => {
+			try {
+				process.kill(child.pid, 0);
+			} catch {
+				return false;
+			}
 			try {
 				process.kill(-child.pid, signal);
+				return true;
 			} catch {
 				try {
 					child.kill(signal);
+					return true;
 				} catch {
-					// The optional runtime may have exited between timeout stages.
+					return false;
 				}
 			}
 		};

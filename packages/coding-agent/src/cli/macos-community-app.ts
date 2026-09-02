@@ -202,14 +202,21 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		killSignal: "SIGTERM",
 		detached: true,
 	});
-	const signalProcessGroup = (signal: NodeJS.Signals): void => {
+	const signalProcessGroup = (signal: NodeJS.Signals): boolean => {
+		try {
+			process.kill(child.pid, 0);
+		} catch {
+			return false;
+		}
 		try {
 			process.kill(-child.pid, signal);
+			return true;
 		} catch {
 			try {
 				child.kill(signal);
+				return true;
 			} catch {
-				// The helper may have exited between cancellation and group signalling.
+				return false;
 			}
 		}
 	};
