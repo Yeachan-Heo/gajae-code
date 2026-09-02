@@ -176,8 +176,8 @@ describe("deep-interview crystallize contract", () => {
 						{
 							item: "The target is disputed.",
 							message_index: 1,
-							quote: "target is resolved",
-							resolution: "target is resolved",
+							quote: "target follows the selected scope",
+							resolution: "target follows the selected scope",
 						},
 					],
 					snapshot: (() => {
@@ -187,7 +187,11 @@ describe("deep-interview crystallize contract", () => {
 							end: 1,
 							messages: [
 								{ index: 0, role: "user", content: "Build a fast report." },
-								{ index: 1, role: "user", content: "The budget is 1GB; the target is resolved." },
+								{
+									index: 1,
+									role: "user",
+									content: "The budget is 1GB; the target follows the selected scope.",
+								},
 							],
 							digest: "",
 						};
@@ -220,6 +224,39 @@ describe("deep-interview crystallize contract", () => {
 								resolution: "memory budget",
 							},
 						],
+					}),
+					2,
+				),
+			),
+		).toThrow("has no fresh verbatim user anchor");
+		expect(() =>
+			crystallizeDeepInterview(
+				later(
+					input({
+						prior: first,
+						resolved_open_gaps: ["What is the memory budget?"],
+						resolved_open_gap_anchors: [
+							{
+								item: "What is the memory budget?",
+								message_index: 1,
+								quote: "memory budget xy",
+								resolution: "memory budget xy",
+							},
+						],
+						snapshot: (() => {
+							const snapshot: CrystalSnapshot = {
+								revision: 2,
+								start: 0,
+								end: 1,
+								messages: [
+									{ index: 0, role: "user", content: "Build a fast report." },
+									{ index: 1, role: "user", content: "The memory budget xy." },
+								],
+								digest: "",
+							};
+							snapshot.digest = crystalSnapshotDigest(snapshot);
+							return snapshot;
+						})(),
 					}),
 					2,
 				),
