@@ -1,6 +1,7 @@
 import type { AgentTool } from "@gajae-code/agent-core";
 import type { RawArgumentValidationResult, TSchema } from "@gajae-code/ai/types";
 import { $which } from "@gajae-code/utils";
+import { resolveBrowserBackend } from "../browser-backend";
 import type { ToolFactory, ToolSession } from ".";
 import { selectAskParameters } from "./ask-contract";
 import { isComputerCallable, isComputerLoadablePlatform } from "./computer-policy";
@@ -260,7 +261,10 @@ function availableFor(name: string, session: ToolSession, context = defaultAvail
 	if (name === "search_tool_bm25") return context.discoveryActive ?? resolveDiscoveryActive(session);
 	if (name === "calc") return Boolean(session.settings.get("calc.enabled"));
 	if (name === "skill" || name === "skill_discovery") return Boolean(session.settings.get("skill.enabled"));
-	if (name === "browser") return Boolean(session.settings.get("browser.enabled"));
+	if (name === "browser")
+		return (
+			Boolean(session.settings.get("browser.enabled")) && resolveBrowserBackend(session.settings).exposesBuiltinTool
+		);
 	if (name === "computer") return isComputerCallable(session);
 	if (name === "checkpoint" || name === "rewind")
 		return Boolean(session.settings.get("checkpoint.enabled")) && (session.taskDepth ?? 0) === 0;

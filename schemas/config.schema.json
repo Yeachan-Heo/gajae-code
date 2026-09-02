@@ -2575,6 +2575,15 @@
 					"description": "Enable the browser tool (Ulixee Hero)",
 					"default": true
 				},
+				"backend": {
+					"type": "string",
+					"enum": [
+						"native",
+						"aside"
+					],
+					"description": "Browser surface offered to the model. 'native' exposes the built-in Puppeteer browser tool. 'aside' hides it and requires every browser task to run through the Aside CLI in your live logged-in browser (requires the Aside CLI).",
+					"default": "native"
+				},
 				"headless": {
 					"type": "boolean",
 					"description": "Launch browser in headless mode (disable to show browser UI)",

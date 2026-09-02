@@ -51,6 +51,7 @@ import {
 	isBackgroundJobSupportEnabled,
 	jobElapsedMs,
 } from "../async";
+import { resolveBrowserBackend } from "../browser-backend";
 import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
@@ -3900,7 +3901,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				? await memoryBackend.buildDeveloperInstructions(agentDir, settings, session)
 				: undefined;
 
-			const appendPrompt: string | undefined = memoryInstructions ?? undefined;
+			const browserBackend = resolveBrowserBackend(settings);
+			const appendPrompt =
+				[memoryInstructions, browserBackend.developerInstructions].filter(Boolean).join("\n\n") || undefined;
 			let pluginSystemAppendices = "";
 			try {
 				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd() });

@@ -3043,6 +3043,17 @@ export const SETTINGS_SCHEMA = {
 			description: "Enable the browser tool (Ulixee Hero)",
 		},
 	},
+	"browser.backend": {
+		type: "enum",
+		values: ["native", "aside"] as const,
+		default: "native",
+		ui: {
+			tab: "tools",
+			label: "Browser Backend",
+			description:
+				"Browser surface offered to the model. 'native' exposes the built-in Puppeteer browser tool. 'aside' hides it and requires every browser task to run through the Aside CLI in your live logged-in browser (requires the Aside CLI).",
+		},
+	},
 
 	"browser.headless": {
 		type: "boolean",
