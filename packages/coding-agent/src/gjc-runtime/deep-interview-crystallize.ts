@@ -32,6 +32,8 @@ export interface CrystalInput {
 	removed_ids?: string[];
 	open_gaps?: string[];
 	conflicts?: string[];
+	resolved_open_gaps?: string[];
+	resolved_conflicts?: string[];
 	prior?: DeepInterviewCrystal;
 }
 
@@ -205,6 +207,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const gaps = normalizedGaps(value.open_gaps);
 	if (gaps.length > 2) throw new Error("broad ambiguity requires the full deep-interview flow");
 	const conflicts = normalizedGaps(value.conflicts);
+	const resolvedGaps = normalizedGaps(value.resolved_open_gaps);
+	const resolvedConflicts = normalizedGaps(value.resolved_conflicts);
 	const prior = value.prior;
 	if (prior !== undefined && !isRecord(prior)) throw new Error("prior crystal is invalid");
 	const priorCrystal = prior as DeepInterviewCrystal | undefined;
@@ -270,8 +274,14 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	});
 	const removedGoal = removedIds.some(id => priorItems.get(id)?.kind === "goal");
 	const removedIntent = removedIds.length > 0;
-	const allGaps = [...new Set([...(priorCrystal?.open_gaps ?? []), ...gaps])];
-	const allConflicts = [...new Set([...(priorCrystal?.conflicts ?? []), ...conflicts])];
+	const allGaps = [
+		...new Set([...(priorCrystal?.open_gaps ?? []), ...gaps].filter(gap => !resolvedGaps.includes(gap))),
+	];
+	const allConflicts = [
+		...new Set(
+			[...(priorCrystal?.conflicts ?? []), ...conflicts].filter(conflict => !resolvedConflicts.includes(conflict)),
+		),
+	];
 	const hasDisputed = currentItems.some(item => item.classification === "disputed");
 	const intentChanged =
 		goalChanged ||
