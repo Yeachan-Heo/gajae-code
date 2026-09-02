@@ -158,6 +158,28 @@ describe("status rail narrow-width red team", () => {
 		}
 	});
 
+	it.each([
+		["absurdly long id", `anthropic/${"long-model-name-".repeat(20)}4-5`],
+		["wide east-asian id", "provider/모델-이름-4-5"],
+		["emoji id", "provider/🦞-4-5"],
+		["single-character id", "x"],
+	])("never inverts the priority order for a %s", (_label, modelId) => {
+		const goalGlyph = theme.icon.goal || "G";
+		const modelGlyph = theme.icon.model || "⬢";
+
+		for (let width = 1; width <= 60; width += 1) {
+			const text = strip(buildRail({ modelId }).render(width).join(" "));
+			const hasContext = /\d+(?:\.\d+)?%/.test(text);
+			const hasGoal = text.includes(goalGlyph) || text.includes("Goal");
+			const hasModel = text.includes(modelGlyph) || text.includes(shortenModelId(modelId));
+
+			// A pathological label must not buy the model a place the goal or the
+			// context percentage did not earn.
+			expect({ width, ok: hasGoal || !hasModel }).toEqual({ width, ok: true });
+			expect({ width, ok: hasContext || !hasGoal }).toEqual({ width, ok: true });
+		}
+	});
+
 	it("is deterministic: the same inputs render byte-identical rows", () => {
 		for (const width of [4, 12, 24, 40]) {
 			expect(buildRail().render(width)).toEqual(buildRail().render(width));
