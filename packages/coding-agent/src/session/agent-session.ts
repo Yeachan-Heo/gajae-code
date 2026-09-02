@@ -314,6 +314,7 @@ import {
 	modeStatePath as sessionModeStatePath,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
+import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
 import {
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
@@ -4103,7 +4104,7 @@ export class AgentSession {
 							error: String(error),
 						},
 					);
-					logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+					this.#warnPersistFailure("Failed to persist terminal coordinator runtime state", error);
 				},
 			);
 			extensionDelivery = this.#queueExtensionEvent(
@@ -5830,9 +5831,7 @@ export class AgentSession {
 			: this.#appendCoordinatorPersist(persist);
 		if (barrier) this.#trackReleasedBarrierPersist(queued);
 		else this.#trackUnbarrieredCoordinatorPersist(queued);
-		void queued.catch(error =>
-			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
-		);
+		void queued.catch(error => this.#warnPersistFailure("Failed to persist terminal reconciliation outcome", error));
 	}
 
 	/**
@@ -5885,6 +5884,18 @@ export class AgentSession {
 		return queued;
 	}
 
+	/**
+	 * Report a coordinator runtime-state persist failure with its actionable detail
+	 * (error text plus the lock `reason`/`lockPath` when a lock refusal caused it). The
+	 * first failure per session per 30s window warns; repeats in the window log at debug
+	 * so a wedged lock does not emit one warn per session event.
+	 */
+	#warnPersistFailure(message: string, error: unknown, extra: Record<string, unknown> = {}): void {
+		const fields = { ...extra, ...sessionStateLockFailureFields(error) };
+		if (shouldWarnPersistFailure(this.sessionId)) logger.warn(message, fields);
+		else logger.debug(message, { ...fields, suppressed: true });
+	}
+
 	async #persistRuntimeStateInBackground(
 		event: AgentSessionEvent,
 		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
@@ -5894,7 +5905,7 @@ export class AgentSession {
 		try {
 			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
 		} catch (error) {
-			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+			this.#warnPersistFailure("Failed to persist coordinator runtime state", error, { event: event.type });
 			if (propagateFailure) throw error;
 		}
 	}
@@ -5957,7 +5968,7 @@ export class AgentSession {
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(event);
 			this.#emit(event);
 			void terminalPersistence.catch(error => {
-				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+				this.#warnPersistFailure("Failed to persist terminal coordinator runtime state", error);
 			});
 			await this.#emitExtensionEvent(event);
 			return;

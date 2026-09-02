@@ -7,10 +7,15 @@ import type { NativeExactUnlinkResult } from "@gajae-code/natives";
 import { processStartTime, removeFileLockDirForGc } from "../src/config/file-lock";
 import * as sessionStateLock from "../src/gjc-runtime/session-state-lock";
 import {
+	heldSessionStateLockPathsForTest,
 	reclaimStaleSessionStateLock,
+	releaseHeldSessionStateLocksSync,
+	resetPersistFailureWarnWindows,
 	SessionStateLockTestHooks,
 	SessionStateLockUnavailableError,
+	sessionStateLockFailureFields,
 	setSessionStateLockNativeBindings,
+	shouldWarnPersistFailure,
 	withSessionStateFileLock,
 } from "../src/gjc-runtime/session-state-lock";
 import {
@@ -60,6 +65,9 @@ afterEach(async () => {
 	SessionStateLockTestHooks.beforeTransitionSetupLstat = undefined;
 	SessionStateLockTestHooks.afterAcquireContention = undefined;
 	installExactIdentityNatives();
+	// Tests that deliberately leave a record unreleasable (replaced under the holder)
+	// keep it registered, exactly as a real force-quit would see it; drain it here.
+	releaseHeldSessionStateLocksSync();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
@@ -2405,5 +2413,103 @@ describe("coordinator session state lock", () => {
 				process.platform === "win32" ? "windows-validated" : "posix-nofollow";
 			await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
 		});
+	});
+});
+
+describe("session state lock forced-exit release", () => {
+	it("tombstones every record this process holds and removes its empty claim, then stops tracking it", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit");
+		const lockFile = `${stateFile}.lock`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		const holder = withSessionStateFileLock(stateFile, async () => {
+			markEntered();
+			await release;
+		});
+		await entered;
+		expect(heldSessionStateLockPathsForTest()).toEqual([lockFile]);
+		const before = JSON.parse(await fs.readFile(lockFile, "utf8")) as { pid: number; released?: boolean };
+		expect(before.pid).toBe(process.pid);
+		expect(before.released).toBeUndefined();
+
+		expect(releaseHeldSessionStateLocksSync()).toBe(1);
+
+		const after = JSON.parse(await fs.readFile(lockFile, "utf8")) as { pid: number; released?: boolean };
+		expect(after.released).toBe(true);
+		expect(after.pid).toBe(1);
+		expect(heldSessionStateLockPathsForTest()).toEqual([]);
+		// A second call has nothing left to release.
+		expect(releaseHeldSessionStateLocksSync()).toBe(0);
+		// A successor can take the lock immediately from the tombstone.
+		await expect(withSessionStateFileLock(stateFile, async () => "successor")).resolves.toBe("successor");
+		allowRelease();
+		// The original holder's async release sees a record it no longer owns and fails
+		// loudly instead of unlinking the successor's state.
+		await expect(holder).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+	});
+
+	it("leaves a record that changed underneath untouched", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-changed");
+		const lockFile = `${stateFile}.lock`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		const holder = withSessionStateFileLock(stateFile, async () => {
+			markEntered();
+			await release;
+		});
+		await entered;
+		const foreign = JSON.stringify({
+			pid: DEAD_PID,
+			start_time: "unknown",
+			token: "foreign-successor",
+			owner_host_id: "local-host",
+		});
+		await fs.writeFile(lockFile, foreign);
+
+		expect(releaseHeldSessionStateLocksSync()).toBe(0);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(foreign);
+		expect(heldSessionStateLockPathsForTest()).toEqual([]);
+		allowRelease();
+		await holder.catch(() => undefined);
+	});
+
+	it("tracks nothing after a normal release", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-clean");
+		await withSessionStateFileLock(stateFile, async () => undefined);
+		expect(heldSessionStateLockPathsForTest()).toEqual([]);
+		expect(releaseHeldSessionStateLocksSync()).toBe(0);
+	});
+});
+
+describe("session state lock failure diagnostics", () => {
+	it("surfaces reason and lockPath from a lock error nested in wrappers", () => {
+		const lockError = new SessionStateLockUnavailableError({
+			lockPath: "/tmp/state.json.lock.transition",
+			reason: "transition_claim_timeout",
+		});
+		const wrapped = new Error("marker unreadable", { cause: lockError });
+		const aggregate = new AggregateError([new Error("operation failed"), wrapped], "both failed");
+		expect(sessionStateLockFailureFields(aggregate)).toEqual({
+			error: String(aggregate),
+			reason: "transition_claim_timeout",
+			lockPath: "/tmp/state.json.lock.transition",
+		});
+	});
+
+	it("reports only the error text when no lock error is involved", () => {
+		const plain = new Error("disk full");
+		expect(sessionStateLockFailureFields(plain)).toEqual({ error: String(plain) });
+		expect(sessionStateLockFailureFields("string failure")).toEqual({ error: "string failure" });
+	});
+
+	it("warns once per key per 30s window", () => {
+		resetPersistFailureWarnWindows();
+		expect(shouldWarnPersistFailure("s1", 0)).toBe(true);
+		expect(shouldWarnPersistFailure("s1", 29_999)).toBe(false);
+		expect(shouldWarnPersistFailure("s2", 29_999)).toBe(true);
+		expect(shouldWarnPersistFailure("s1", 30_000)).toBe(true);
+		expect(shouldWarnPersistFailure("s1", 30_001)).toBe(false);
+		resetPersistFailureWarnWindows();
+		expect(shouldWarnPersistFailure("s1", 30_001)).toBe(true);
 	});
 });

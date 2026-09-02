@@ -465,6 +465,137 @@ export class SessionStateLockUnavailableError extends Error {
 	}
 }
 
+/**
+ * Log fields describing a persist failure: the error text plus, when a session state
+ * lock refusal sits anywhere in the cause chain, its typed `reason` and `lockPath`.
+ * Wrapping errors (`PreviousRuntimeStateReadError`, `AggregateError`) are searched
+ * so the actionable detail is never buried behind a generic message.
+ */
+export function sessionStateLockFailureFields(error: unknown): {
+	error: string;
+	reason?: SessionStateLockUnavailableReason;
+	lockPath?: string;
+} {
+	const fields: { error: string; reason?: SessionStateLockUnavailableReason; lockPath?: string } = {
+		error: String(error),
+	};
+	const seen = new Set<unknown>();
+	const queue: unknown[] = [error];
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (current === null || typeof current !== "object" || seen.has(current)) continue;
+		seen.add(current);
+		if (current instanceof SessionStateLockUnavailableError) {
+			if (current.reason !== undefined) fields.reason = current.reason;
+			if (current.lockPath !== undefined) fields.lockPath = current.lockPath;
+			if (fields.reason !== undefined && fields.lockPath !== undefined) return fields;
+		}
+		if (current instanceof AggregateError) queue.push(...current.errors);
+		if ("cause" in current) queue.push((current as { cause?: unknown }).cause);
+	}
+	return fields;
+}
+
+const PERSIST_FAILURE_WARN_WINDOW_MS = 30_000;
+const persistFailureLastWarnedAt = new Map<string, number>();
+
+/**
+ * Whether a persist failure for `key` (normally the state file path) should be logged
+ * at warn level. The first failure in every 30s window warns; repeats inside the
+ * window are the caller's cue to log at debug instead, so a wedged lock reports once
+ * per window rather than once per session event.
+ */
+export function shouldWarnPersistFailure(key: string, now = Date.now()): boolean {
+	const last = persistFailureLastWarnedAt.get(key);
+	if (last !== undefined && now - last < PERSIST_FAILURE_WARN_WINDOW_MS) return false;
+	persistFailureLastWarnedAt.set(key, now);
+	return true;
+}
+
+/** @internal Test seam: forget every persist-failure warn window. */
+export function resetPersistFailureWarnWindows(): void {
+	persistFailureLastWarnedAt.clear();
+}
+
+/**
+ * Every owner record this process currently holds, keyed by owner-record path, with
+ * the empty claim directory that record guards (transition claims only). Maintained by
+ * the acquire/release paths so a forced exit can tombstone them synchronously.
+ */
+interface HeldSessionStateLock {
+	held: LockOwnerSnapshot;
+	claimDir?: string;
+}
+
+const heldSessionStateLocks = new Map<string, HeldSessionStateLock>();
+
+/**
+ * Best-effort synchronous release of every owner record this process still holds.
+ *
+ * Meant for the forced-exit path (`postmortem.quit` after a repeated shutdown request),
+ * where the async release protocol will never get to run. Each record is re-read and
+ * only rewritten to a released tombstone while it is still byte-identical to what this
+ * process wrote; an empty claim directory it guards is then `rmdir`ed. Anything that
+ * changed underneath, or any I/O fault, is left for the dead-owner reclaim path on the
+ * next writer. Never throws; returns the number of records tombstoned.
+ */
+export function releaseHeldSessionStateLocksSync(): number {
+	let released = 0;
+	for (const [file, entry] of [...heldSessionStateLocks.entries()]) {
+		heldSessionStateLocks.delete(file);
+		// The record this process wrote already carries its host qualification; reuse it
+		// rather than resolving the installation identity asynchronously mid-exit.
+		let hostId: string | undefined;
+		try {
+			const heldOwner: unknown = JSON.parse(entry.held.bytes);
+			if (validLockOwner(heldOwner) && heldOwner.pid === process.pid) hostId = heldOwner.owner_host_id;
+		} catch {
+			hostId = undefined;
+		}
+		if (hostId === undefined) continue;
+		try {
+			const stat = fsSync.lstatSync(file, { bigint: true });
+			if (!stat.isFile() || stat.isSymbolicLink()) continue;
+			const current = fsSync.readFileSync(file);
+			if (
+				stat.dev !== entry.held.dev ||
+				stat.ino !== entry.held.ino ||
+				!current.equals(Buffer.from(entry.held.bytes, "utf8"))
+			)
+				continue;
+			const flags = POSIX_OWNER_REWRITE_FLAGS ?? fsSync.constants.O_RDWR;
+			const descriptor = fsSync.openSync(file, flags);
+			try {
+				const reopened = fsSync.fstatSync(descriptor, { bigint: true });
+				if (reopened.dev !== stat.dev || reopened.ino !== stat.ino) continue;
+				const tombstone = Buffer.from(JSON.stringify(releasedOwnerForHost(hostId)), "utf8");
+				fsSync.ftruncateSync(descriptor, 0);
+				fsSync.writeSync(descriptor, tombstone, 0, tombstone.length, 0);
+				fsSync.fsyncSync(descriptor);
+			} finally {
+				fsSync.closeSync(descriptor);
+			}
+			if (entry.claimDir !== undefined) {
+				try {
+					fsSync.rmdirSync(entry.claimDir);
+				} catch {
+					// A populated or already-removed claim is the successor's problem; the
+					// released tombstone alone is enough for the tombstone reclaim path.
+				}
+			}
+			released++;
+		} catch {
+			// Forced exit: nothing here may block or throw.
+		}
+	}
+	return released;
+}
+
+/** @internal Test seam: the owner-record paths this process currently holds. */
+export function heldSessionStateLockPathsForTest(): string[] {
+	return [...heldSessionStateLocks.keys()];
+}
+
 function lockUnavailable(
 	lockPath: string,
 	reason: SessionStateLockUnavailableReason,
@@ -2012,6 +2143,7 @@ async function withLockPathTransition<T>(
 			}
 			throw error;
 		}
+		heldSessionStateLocks.set(ownerFile, { held, claimDir: transitionDir });
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),
@@ -2025,6 +2157,7 @@ async function withLockPathTransition<T>(
 				transitionGeneration!,
 				pendingSetup.nativePath!,
 			);
+			heldSessionStateLocks.delete(ownerFile);
 		} catch (releaseError) {
 			if (ownerAccessStrategy() === "unsupported") {
 				if (outcome.ok)
@@ -2368,6 +2501,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 				cycleQuarantine,
 				budget,
 			);
+			heldSessionStateLocks.set(lockFile, { held });
 			let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 			try {
 				outcome = { ok: true, value: await operation() };
@@ -2380,6 +2514,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			let releaseFailure: { error: unknown } | undefined;
 			try {
 				await withLockPathTransition(lockFile, async () => releaseOwnerLock(lockFile, record), cycleQuarantine);
+				heldSessionStateLocks.delete(lockFile);
 			} catch (error) {
 				releaseFailure = { error };
 			}

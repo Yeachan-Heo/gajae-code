@@ -5,6 +5,10 @@ import { getBundledModel } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import {
+	resetPersistFailureWarnWindows,
+	SessionStateLockUnavailableError,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-lock";
 import * as sidecar from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
@@ -13,7 +17,7 @@ import {
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 
 const originalStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 const originalSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
@@ -92,9 +96,22 @@ describe("AgentSession terminal receipt state", () => {
 			modelRegistry,
 		});
 		const terminal = Promise.withResolvers<void>();
-		const persist = vi
-			.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent")
-			.mockRejectedValue(new Error("simulated persistence failure"));
+		resetPersistFailureWarnWindows();
+		const lockFailure = new Error("marker unreadable", {
+			cause: new SessionStateLockUnavailableError({
+				lockPath: "/tmp/runtime-state.json.lock.transition",
+				reason: "transition_claim_timeout",
+			}),
+		});
+		const persist = vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockRejectedValue(lockFailure);
+		const warned: Array<Record<string, unknown> | undefined> = [];
+		const debugged: Array<Record<string, unknown> | undefined> = [];
+		vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (message.startsWith("Failed to persist")) warned.push(context);
+		});
+		vi.spyOn(logger, "debug").mockImplementation((message, context) => {
+			if (message.startsWith("Failed to persist")) debugged.push(context);
+		});
 		session.subscribe(event => {
 			if (event.type === "agent_end") terminal.resolve();
 		});
@@ -102,6 +119,19 @@ describe("AgentSession terminal receipt state", () => {
 		await session.prompt("respond");
 		await terminal.promise;
 		expect(persist).toHaveBeenCalled();
+		expect(persist.mock.calls.length).toBeGreaterThan(1);
+		// The first failure warns with the actionable lock detail; the rest of the
+		// same session's failures inside the 30s window drop to debug.
+		expect(warned).toHaveLength(1);
+		expect(warned[0]).toMatchObject({
+			error: String(lockFailure),
+			reason: "transition_claim_timeout",
+			lockPath: "/tmp/runtime-state.json.lock.transition",
+		});
+		expect(debugged.length).toBeGreaterThanOrEqual(1);
+		for (const entry of debugged) {
+			expect(entry).toMatchObject({ reason: "transition_claim_timeout", suppressed: true });
+		}
 	});
 
 	it("publishes agent_end while terminal sidecar persistence remains pending", async () => {

@@ -15,7 +15,12 @@ import {
 	writeModelCache,
 } from "@gajae-code/ai";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
-import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import {
+	isQuietLocalDiscoveryFailure,
+	kNoAuth,
+	MODEL_ROLE_IDS,
+	ModelRegistry,
+} from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
 	resolveModelFromString,
@@ -9023,5 +9028,21 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+	});
+});
+
+describe("isQuietLocalDiscoveryFailure", () => {
+	const refused = "Unable to connect. Is the computer able to access the url?";
+
+	test("demotes an unreachable loopback endpoint", () => {
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/", refused)).toBe(true);
+		expect(isQuietLocalDiscoveryFailure("http://localhost:1234/v1", "fetch failed")).toBe(true);
+		expect(isQuietLocalDiscoveryFailure("http://[::1]:8080", "connect ECONNREFUSED ::1:8080")).toBe(true);
+	});
+
+	test("keeps remote endpoints and non-connectivity failures at warn", () => {
+		expect(isQuietLocalDiscoveryFailure("https://api.example.com/v1", refused)).toBe(false);
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/", "HTTP 500 from /api/tags")).toBe(false);
+		expect(isQuietLocalDiscoveryFailure("not a url", refused)).toBe(false);
 	});
 });

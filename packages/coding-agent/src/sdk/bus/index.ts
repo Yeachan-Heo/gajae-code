@@ -4383,7 +4383,14 @@ export function createNotificationsExtension(
 		} catch {}
 		try {
 			const delivered = await pushTerminalSessionFrame(rt, { type: "session_closed", sessionId: id });
-			if (!delivered) logger.warn("notifications: session_closed socket delivery was not acknowledged");
+			// `pushFrameAndWait` returns false when no SDK client is connected, a writer
+			// rejected the frame, or the 1s settle wait expired. A session closing with no
+			// attached client is the ordinary case, not a fault, so this is diagnostic-only.
+			if (!delivered)
+				logger.debug("notifications: session_closed socket delivery was not acknowledged", {
+					sessionId: id,
+					endpointScope: rt.endpointScope,
+				});
 		} catch (e) {
 			logger.warn(`notifications: session_closed failed: ${String(e)}`);
 		}

@@ -138,6 +138,24 @@ function redactDiscoveryUrl(value: string | URL): string {
 		return "(invalid URL)";
 	}
 }
+const LOCAL_DISCOVERY_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]", "::1", "0.0.0.0"]);
+const UNREACHABLE_DISCOVERY_PATTERN =
+	/unable to connect|econnrefused|connection refused|fetch failed|enotfound|ehostunreach/iu;
+
+/**
+ * A loopback discovery endpoint that simply is not running is the normal state of a
+ * machine without ollama/lm-studio/llama.cpp/omlx installed, and it is probed on every
+ * process start. Report that at debug; every other discovery failure stays a warning.
+ */
+export function isQuietLocalDiscoveryFailure(baseUrl: string, warning: string): boolean {
+	let host: string;
+	try {
+		host = new URL(baseUrl).hostname;
+	} catch {
+		return false;
+	}
+	return LOCAL_DISCOVERY_HOSTS.has(host) && UNREACHABLE_DISCOVERY_PATTERN.test(warning);
+}
 function stripUrlQuery(value: string): string {
 	const queryStart = value.indexOf("?");
 	if (queryStart < 0) return value;
@@ -3381,11 +3399,15 @@ export class ModelRegistry {
 			};
 		}
 		if (mergeInput.warning) {
-			logger.warn("model discovery failed for provider", {
+			const baseUrl = effectiveProviderConfig.baseUrl ?? "";
+			const fields = {
 				provider: effectiveProviderConfig.provider,
-				url: redactDiscoveryUrl(effectiveProviderConfig.baseUrl ?? ""),
+				url: redactDiscoveryUrl(baseUrl),
 				error: mergeInput.warning,
-			});
+			};
+			if (isQuietLocalDiscoveryFailure(baseUrl, mergeInput.warning))
+				logger.debug("model discovery failed for provider", fields);
+			else logger.warn("model discovery failed for provider", fields);
 		}
 		this.#providerEvidenceApiKeys.set(effectiveProviderConfig.provider, preflightApiKey);
 		return {
