@@ -475,7 +475,9 @@ export async function scanSkillsFromDir(
 				name,
 				path: skillPath,
 				loadContent: async () => {
-					const content = await readFile(skillPath, readOptions);
+					const currentSkillPath = await canonicalizePathWithinHome(_ctx, skillPath, containmentRoot, scope);
+					if (currentSkillPath !== skillPath) throw new Error("skill file escaped its plugin root");
+					const content = await readFile(currentSkillPath, readOptions);
 					if (content === null) throw new Error("skill file unavailable");
 					return parseFrontmatter(content, { source: skillPath }).body;
 				},
