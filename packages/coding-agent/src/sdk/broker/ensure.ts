@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import packageJson from "../../../package.json" with { type: "json" };
 import { SdkClient } from "../client/client";
+import { acquireFileLock, type FileLockOptions } from "../../config/file-lock";
 import { type BrokerDiscovery, brokerProcessIncarnation, isPidAlive, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
@@ -32,7 +33,10 @@ export interface EnsureBrokerSettings {
 const DISCOVERY_TIMEOUT_MS = 10_000;
 /** A process that loses the spawn lock waits this long for the winner's discovery before giving up. */
 const SPAWN_LOCK_WAIT_MS = DISCOVERY_TIMEOUT_MS + 5_000;
-const SPAWN_LOCK_NAME = "broker.spawn.lock";
+const SPAWN_LOCK_RETRY_DELAY_MS = 50;
+const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
+
+type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
 /**
  * Cross-process single-flight for the detached broker spawn (#5198).
@@ -41,53 +45,17 @@ const SPAWN_LOCK_NAME = "broker.spawn.lock";
  * its own process, so N concurrent invocations that all miss discovery each
  * spawn a broker; the losers of the runtime's ownership lock then leave
  * quarantine tombstones behind and the next start fails with
- * `quarantine_collision`. The spawn itself must be exclusive: an `O_EXCL`
- * marker holding the spawner pid. A marker whose pid is dead is reclaimed.
+ * `quarantine_collision`. The spawn itself must be exclusive across process
+ * death and PID reuse, so it uses the shared identity-bound file-lock protocol:
+ * complete owner metadata is published atomically, stale removal is bound to
+ * the exact directory generation, and ownership includes the OS incarnation.
  */
-async function acquireSpawnLock(agentDir: string): Promise<(() => Promise<void>) | undefined> {
-	const lockPath = path.join(agentDir, "sdk", SPAWN_LOCK_NAME);
-	await fs.mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 });
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const handle = await fs.open(lockPath, "wx", 0o600);
-			await handle.writeFile(`${process.pid}\n`);
-			await handle.close();
-			return async () => {
-				try {
-					if ((await fs.readFile(lockPath, "utf8")).trim() === String(process.pid)) await fs.unlink(lockPath);
-				} catch {
-					// already reclaimed
-				}
-			};
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			let holder = Number.NaN;
-			try {
-				holder = Number((await fs.readFile(lockPath, "utf8")).trim());
-			} catch {
-				// vanished between EEXIST and read: retry the exclusive create
-				continue;
-			}
-			if (Number.isSafeInteger(holder) && holder > 0 && isPidAlive(holder)) return undefined;
-			// Dead holder: reclaim and retry once.
-			try {
-				await fs.unlink(lockPath);
-			} catch {
-				// another contender reclaimed it first
-			}
-		}
-	}
-	return undefined;
-}
-
-async function waitForForeignSpawn(settings: EnsureBrokerSettings): Promise<BrokerDiscovery | undefined> {
-	const deadline = Date.now() + SPAWN_LOCK_WAIT_MS;
-	while (Date.now() < deadline) {
-		const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (discovered) return discovered;
-		await sleep(50);
-	}
-	return undefined;
+async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}): Promise<() => Promise<void>> {
+	return acquireFileLock(path.join(agentDir, "sdk", SPAWN_LOCK_TARGET_NAME), {
+		retries: Math.ceil(SPAWN_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
+		retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
+		...options,
+	});
 }
 const FIXTURE_DISCOVERY_TIMEOUT_MS = 30_000;
 // Bounded grace windows for reaping a spawned broker on failure, mirroring the
@@ -432,13 +400,9 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	}
 
 	// Only one process may spawn for this agent dir at a time; everyone else
-	// waits for that spawner's discovery. Fixture leases always spawn their own.
+	// waits for the exact lock generation to release, then rechecks discovery.
+	// Fixture leases always spawn their own.
 	const releaseSpawnLock = initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir);
-	if (!releaseSpawnLock) {
-		const discovered = await waitForForeignSpawn(settings);
-		if (discovered) return { kind: "external-discovery", discovery: discovered };
-		throw new Error("Timed out waiting for a concurrent detached SDK broker spawn to publish discovery.");
-	}
 	// The lock winner may still find a discovery published by an earlier winner
 	// that finished between our first read and the lock acquisition.
 	const discoveredUnderLock = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
