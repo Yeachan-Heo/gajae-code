@@ -766,7 +766,7 @@ function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): 
 		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
 		// test seam tolerant of a minimal writer stub as well.
 		if (typeof request.once === "function") {
-			request.once("close", finish);
+			request.once("close", () => finish(new Error("Cursor request closed before write completed")));
 			request.once("error", finish);
 		}
 		request.write(frame, finish);
@@ -803,6 +803,9 @@ interface CursorRequestWriter extends http2.ClientHttp2Stream {
 function parseConnectEndStream(data: Uint8Array): Error | null {
 	try {
 		const payload = JSON.parse(new TextDecoder().decode(data));
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+			return new Error("Invalid Connect end stream envelope");
+		}
 		const error = payload?.error;
 		if (error) {
 			const code = typeof error.code === "string" ? error.code : "unknown";
