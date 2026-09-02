@@ -200,13 +200,22 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		stderr: "pipe",
 		signal: controller.signal,
 		killSignal: "SIGTERM",
+		detached: true,
 	});
-	const terminateAndReap = async (): Promise<boolean> => {
+	const signalProcessGroup = (signal: NodeJS.Signals): void => {
 		try {
-			child.kill("SIGKILL");
+			process.kill(-child.pid, signal);
 		} catch {
-			// The command may have exited between the failure and the kill.
+			try {
+				child.kill(signal);
+			} catch {
+				// The helper may have exited between cancellation and group signalling.
+			}
 		}
+	};
+	controller.signal.addEventListener("abort", () => signalProcessGroup("SIGTERM"), { once: true });
+	const terminateAndReap = async (): Promise<boolean> => {
+		signalProcessGroup("SIGKILL");
 		return await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)]);
 	};
 	try {
@@ -401,9 +410,11 @@ export async function offerMacosCommunityApp(
 		return { status: "skipped", reason: "non-interactive terminal" };
 	}
 
+	let receivedSignal: NodeJS.Signals | undefined;
 	let cleanupUnsafe = false;
 	const rawCommand: CommandRunner = deps.command ?? runCommand;
 	const command: CommandRunner = async argv => {
+		if (receivedSignal) throw new Error(`interrupted by ${receivedSignal}`);
 		const result = await rawCommand(argv);
 		if (result.reaped === false) cleanupUnsafe = true;
 		return result;
@@ -429,7 +440,6 @@ export async function offerMacosCommunityApp(
 	let installedDestination: { path: string; identity: FileIdentity } | undefined;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
-	let receivedSignal: NodeJS.Signals | undefined;
 	const signalNames = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
 	const onSignal = (signal: NodeJS.Signals) => {
