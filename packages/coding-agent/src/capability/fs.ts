@@ -27,6 +27,10 @@ export interface ReadFileOptions {
 	readonly scope?: ReadScope;
 	/** Skip the shared lexical cache for this operation. */
 	readonly bypassCache?: boolean;
+	/** Optional physical root that the target must remain within for this read. */
+	readonly containmentRoot?: string;
+	/** Identity captured when the containment root was authorized. */
+	readonly containmentRootIdentity?: FileIdentity;
 }
 
 function resolvePath(filePath: string): string {
@@ -72,6 +76,16 @@ async function isUserAgentIdentityStable(options?: ReadFileOptions): Promise<boo
 	}
 }
 
+async function isContainmentRootIdentityStable(options?: ReadFileOptions): Promise<boolean> {
+	if (!options?.isolatedHome || !options.containmentRoot || !options.containmentRootIdentity) return true;
+	try {
+		const current = await fs.promises.stat(options.containmentRoot);
+		return sameFileIdentity(current, options.containmentRootIdentity);
+	} catch {
+		return false;
+	}
+}
+
 async function canonicalizeThroughExistingAncestor(target: string): Promise<string> {
 	const resolved = path.resolve(target);
 	const suffix: string[] = [];
@@ -104,13 +118,19 @@ async function resolveReadPath(filePath: string, options?: ReadFileOptions): Pro
 	if (!options?.isolatedHome) return lexical;
 	if (!(await isHomeIdentityStable(options))) return null;
 	if (!(await isUserAgentIdentityStable(options))) return null;
+	if (!(await isContainmentRootIdentityStable(options))) return null;
 	const roots = rootsForRead(options);
 	if (roots.length === 0) return null;
 	const [canonicalTarget, canonicalRoots] = await Promise.all([
 		canonicalizeThroughExistingAncestor(lexical),
 		Promise.all(roots.map(canonicalizeThroughExistingAncestor)),
 	]);
-	return canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget)) ? canonicalTarget : null;
+	if (!canonicalRoots.some(root => isWithinOrEqual(root, canonicalTarget))) return null;
+	if (options.containmentRoot) {
+		const canonicalContainmentRoot = await canonicalizeThroughExistingAncestor(options.containmentRoot);
+		if (!isWithinOrEqual(canonicalContainmentRoot, canonicalTarget)) return null;
+	}
+	return canonicalTarget;
 }
 
 /**
@@ -123,6 +143,7 @@ async function isCurrentIsolatedPath(abs: string, options?: ReadFileOptions): Pr
 	if (!options?.isolatedHome) return true;
 	if (!(await isHomeIdentityStable(options))) return false;
 	if (!(await isUserAgentIdentityStable(options))) return false;
+	if (!(await isContainmentRootIdentityStable(options))) return false;
 	try {
 		const current = await resolveReadPath(abs, options);
 		return current === abs;
@@ -135,7 +156,7 @@ function isSingleLinkRegularFile(stat: fs.Stats): boolean {
 	return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
 }
 
-function sameFileIdentity(left: fs.Stats, right: fs.Stats): boolean {
+function sameFileIdentity(left: Pick<fs.Stats, "dev" | "ino">, right: Pick<fs.Stats, "dev" | "ino">): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
@@ -233,6 +254,16 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 		return null;
 	} finally {
 		await opened.handle.close();
+	}
+}
+
+/** Capture a stable physical identity for an authorized containment root. */
+export async function capturePathIdentity(filePath: string): Promise<FileIdentity | null> {
+	try {
+		const stat = await fs.promises.stat(path.resolve(filePath));
+		return { dev: stat.dev, ino: stat.ino };
+	} catch {
+		return null;
 	}
 }
 

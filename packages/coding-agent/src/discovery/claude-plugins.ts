@@ -19,7 +19,7 @@ import {
 	canonicalizePathWithinHome,
 	createSourceMeta,
 	invalidateClaudePluginRoots,
-	getReadOptions,
+	getReadOptionsForContainment,
 	listClaudePluginRoots,
 	loadFilesFromDir,
 	scanSkillsFromDir,
@@ -53,7 +53,9 @@ async function readPluginManifest(
 		root.scope,
 	);
 	if (!manifestPath) return null;
-	const raw = await readFile(manifestPath, getReadOptions(ctx, root.scope));
+	const readOptions = await getReadOptionsForContainment(ctx, root.scope, root.path);
+	if (ctx.isolatedHome && !readOptions) return null;
+	const raw = await readFile(manifestPath, readOptions);
 	if (raw === null) return null;
 
 	try {
@@ -355,7 +357,9 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	for (const root of roots) {
 		const mcpPath = await canonicalizePathWithinHome(ctx, path.join(root.path, ".mcp.json"), root.path, root.scope);
 		if (!mcpPath) continue;
-		const raw = await readFile(mcpPath, getReadOptions(ctx, root.scope));
+		const readOptions = await getReadOptionsForContainment(ctx, root.scope, root.path);
+		if (ctx.isolatedHome && !readOptions) continue;
+		const raw = await readFile(mcpPath, readOptions);
 		if (raw === null) continue; // file absent — skip silently
 
 		let parsed: unknown;

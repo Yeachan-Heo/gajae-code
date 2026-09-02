@@ -13,6 +13,7 @@ import {
 } from "@gajae-code/utils";
 import type { ExtensionModule } from "../capability/extension-module";
 import {
+	capturePathIdentity,
 	type FileIdentity,
 	invalidate as invalidateFsCache,
 	type ReadFileOptions,
@@ -145,6 +146,18 @@ export function getReadOptions(
 		scope,
 		bypassCache: true,
 	};
+}
+
+export async function getReadOptionsForContainment(
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+	scope: ReadScope,
+	containmentRoot?: string,
+): Promise<ReadFileOptions | undefined> {
+	const options = getReadOptions(ctx, scope);
+	if (!options || !containmentRoot) return options;
+	const containmentRootIdentity = await capturePathIdentity(containmentRoot);
+	if (!containmentRootIdentity) return undefined;
+	return { ...options, containmentRoot, containmentRootIdentity };
 }
 
 /**
@@ -434,7 +447,8 @@ export async function scanSkillsFromDir(
 	const warnings: string[] = [];
 	const { dir, level, providerId, requireDescription = false, containmentRoot } = options;
 	const scope = options.scope ?? (level === "user" ? "user" : "project");
-	const readOptions = getReadOptions(_ctx, scope);
+	const readOptions = await getReadOptionsForContainment(_ctx, scope, containmentRoot);
+	if (_ctx.isolatedHome && containmentRoot && !readOptions) return { items, warnings };
 	const scanDir = await canonicalizePathWithinHome(_ctx, dir, containmentRoot, scope);
 	if (!scanDir) return { items, warnings };
 
@@ -571,7 +585,8 @@ export async function loadFilesFromDir<T>(
 	const items: T[] = [];
 	const warnings: string[] = [];
 	const scope = options.scope ?? (level === "user" ? "user" : "project");
-	const readOptions = getReadOptions(_ctx, scope);
+	const readOptions = await getReadOptionsForContainment(_ctx, scope, options.containmentRoot);
+	if (_ctx.isolatedHome && options.containmentRoot && !readOptions) return { items, warnings };
 	const scanDir = await canonicalizePathWithinHome(_ctx, dir, options.containmentRoot, scope);
 	if (!scanDir) return { items, warnings };
 	// Build glob pattern based on extensions and recursion
