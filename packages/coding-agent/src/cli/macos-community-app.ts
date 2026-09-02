@@ -16,6 +16,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 type CommandRunner = (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+const activeCommandControllers = new Set<AbortController>();
 
 interface ReleaseAsset {
 	name: string;
@@ -183,7 +184,14 @@ async function removeClaimedDirectory(
 }
 
 async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const child = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+	const controller = new AbortController();
+	activeCommandControllers.add(controller);
+	const child = Bun.spawn(argv, {
+		stdout: "pipe",
+		stderr: "pipe",
+		signal: controller.signal,
+		killSignal: "SIGTERM",
+	});
 	const terminateAndReap = async (): Promise<void> => {
 		try {
 			child.kill("SIGKILL");
@@ -192,32 +200,36 @@ async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: s
 		}
 		await Promise.race([child.exited, Bun.sleep(5000)]);
 	};
-	const outputPromise = Promise.all([
-		readResponseText(new Response(child.stdout), MAX_COMMAND_OUTPUT_BYTES),
-		readResponseText(new Response(child.stderr), MAX_COMMAND_OUTPUT_BYTES),
-		child.exited,
-	]);
-	const timeout = Promise.withResolvers<undefined>();
-	const timer: NodeJS.Timeout = setTimeout(() => {
-		void terminateAndReap().finally(() => timeout.resolve(undefined));
-	}, COMMAND_TIMEOUT_MS);
-	const output = await Promise.race([
-		outputPromise
-			.then(value => ({ kind: "output" as const, value }))
-			.catch(error => ({ kind: "error" as const, error })),
-		timeout.promise.then(() => ({ kind: "timeout" as const })),
-	]);
-	clearTimeout(timer);
-	if (output.kind === "timeout") {
-		await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(5000)]);
-		return { exitCode: 124, stdout: "", stderr: `command timed out: ${argv[0]}` };
+	try {
+		const outputPromise = Promise.all([
+			readResponseText(new Response(child.stdout), MAX_COMMAND_OUTPUT_BYTES),
+			readResponseText(new Response(child.stderr), MAX_COMMAND_OUTPUT_BYTES),
+			child.exited,
+		]);
+		const timeout = Promise.withResolvers<undefined>();
+		const timer: NodeJS.Timeout = setTimeout(() => {
+			void terminateAndReap().finally(() => timeout.resolve(undefined));
+		}, COMMAND_TIMEOUT_MS);
+		const output = await Promise.race([
+			outputPromise
+				.then(value => ({ kind: "output" as const, value }))
+				.catch(error => ({ kind: "error" as const, error })),
+			timeout.promise.then(() => ({ kind: "timeout" as const })),
+		]);
+		clearTimeout(timer);
+		if (output.kind === "timeout") {
+			await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(5000)]);
+			return { exitCode: 124, stdout: "", stderr: `command timed out: ${argv[0]}` };
+		}
+		if (output.kind === "error") {
+			await terminateAndReap();
+			return { exitCode: 125, stdout: "", stderr: String(output.error) };
+		}
+		const [stdout, stderr, exitCode] = output.value;
+		return { exitCode, stdout, stderr };
+	} finally {
+		activeCommandControllers.delete(controller);
 	}
-	if (output.kind === "error") {
-		await terminateAndReap();
-		return { exitCode: 125, stdout: "", stderr: String(output.error) };
-	}
-	const [stdout, stderr, exitCode] = output.value;
-	return { exitCode, stdout, stderr };
 }
 
 async function readBundleValue(bundlePath: string, key: string, command: CommandRunner): Promise<string | undefined> {
@@ -401,6 +413,7 @@ export async function offerMacosCommunityApp(
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
 	const onSignal = (signal: NodeJS.Signals) => {
 		receivedSignal = signal;
+		for (const controller of activeCommandControllers) controller.abort();
 	};
 	for (const signal of signalNames) {
 		const handler = () => onSignal(signal);
