@@ -401,7 +401,13 @@ export async function offerMacosCommunityApp(
 		return { status: "skipped", reason: "non-interactive terminal" };
 	}
 
-	const command: CommandRunner = deps.command ?? runCommand;
+	let cleanupUnsafe = false;
+	const rawCommand: CommandRunner = deps.command ?? runCommand;
+	const command: CommandRunner = async argv => {
+		const result = await rawCommand(argv);
+		if (result.reaped === false) cleanupUnsafe = true;
+		return result;
+	};
 	const homeDir = deps.homeDir ?? os.homedir();
 	try {
 		if (await findInstalledApp(homeDir, command)) return { status: "skipped", reason: "already installed" };
@@ -421,7 +427,6 @@ export async function offerMacosCommunityApp(
 	let mountAttempted = false;
 	let mountState: "none" | "unknown" | "attached" = "none";
 	let installedDestination: { path: string; identity: FileIdentity } | undefined;
-	let cleanupUnsafe = false;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
 	let receivedSignal: NodeJS.Signals | undefined;
@@ -731,7 +736,12 @@ export async function offerMacosCommunityApp(
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {
-				if (
+				if (cleanupUnsafe) {
+					removeTempRoot = false;
+					log(
+						"Optional community app cleanup warning: a native helper did not terminate safely; retaining temporary state",
+					);
+				} else if (
 					mountState === "attached" &&
 					mountIdentity &&
 					!(await sameDirectoryIdentity(mountPoint, mountIdentity))

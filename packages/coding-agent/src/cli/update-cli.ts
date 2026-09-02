@@ -1352,7 +1352,7 @@ async function runCommunityAppOfferFromRuntime(
 			} catch {
 				// The optional child may have exited at the timeout boundary.
 			}
-			const cleanupExitCode = await Promise.race([child.exited, Bun.sleep(180_000).then(() => 125)]);
+			const cleanupExitCode = await Promise.race([child.exited, Bun.sleep(300_000).then(() => 125)]);
 			if (cleanupExitCode === 125) {
 				try {
 					child.kill("SIGKILL");
