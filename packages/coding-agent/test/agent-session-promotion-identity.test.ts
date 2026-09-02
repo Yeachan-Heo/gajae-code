@@ -326,12 +326,9 @@ describe("queued promotion run identity (#4668)", () => {
 		);
 		const promptDone = session.prompt("first task");
 		await toolStarted.promise;
-		session.agent.followUp({
-			role: "user",
-			content: [{ type: "text", text: "live follow-up" }],
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		// Public API so the live follow-up gets a DISPLAY row too: a cross-store
+		// move needs two adjacent rows backed by different stores.
+		await session.followUp("live follow-up");
 		for (const text of ["deferred one", "deferred two"]) {
 			await session.sendUserMessage(text, {
 				deliverAs: "followUp",
@@ -354,12 +351,24 @@ describe("queued promotion run identity (#4668)", () => {
 		expect(session.agent.snapshotFollowUp().map(message => JSON.stringify(message))).toHaveLength(1);
 		expect(JSON.stringify(session.agent.snapshotFollowUp()[0])).toContain("live follow-up");
 
-		// A cross-store move (deferred row onto the live row) is refused, and
-		// nothing is reordered anywhere.
+		// A cross-store move is refused, and nothing is reordered anywhere. Pin the
+		// neighbour first: the refusal must come from the STORE split, not from a
+		// bounds check on the first row.
 		const rowsBefore = session.getQueuedMessageEntries().map(entry => entry.text);
-		const firstDeferred = session.getQueuedMessageEntries().find(entry => entry.text.startsWith("deferred "));
-		expect(session.moveQueuedMessageForEditing(firstDeferred?.id ?? "", "up")).toBe(false);
+		// Layout: the live row precedes the deferred rows, so moving the first
+		// deferred row UP crosses stores. Pin that neighbour so the refusal cannot
+		// come from a bounds check.
+		const crossIndex = rowsBefore.findIndex(text => text.startsWith("deferred "));
+		expect(crossIndex).toBeGreaterThan(0);
+		expect(rowsBefore[crossIndex - 1]).toBe("live follow-up");
+		const crossId = session.getQueuedMessageEntries()[crossIndex]?.id;
+		expect(session.moveQueuedMessageForEditing(crossId ?? "", "up")).toBe(false);
 		expect(session.getQueuedMessageEntries().map(entry => entry.text)).toEqual(rowsBefore);
+		// The deferred store itself kept the order the earlier move produced.
+		expect(session.clearQueue().followUp.filter(text => text.startsWith("deferred "))).toEqual([
+			"deferred two",
+			"deferred one",
+		]);
 
 		gate.resolve();
 		await promptDone;
