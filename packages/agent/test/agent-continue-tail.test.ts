@@ -38,7 +38,7 @@ describe("persisted continuation tail", () => {
 		const steeringMock = createMockModel({ responses: [{ content: ["steered"] }] });
 		const withSteering = new Agent({ streamFn: steeringMock.stream });
 		withSteering.replaceMessages([assistantMessage()]);
-		withSteering.steer(userMessage());
+		withSteering.restoreSteering([userMessage()]);
 		await expect(withSteering.continue()).resolves.toBeUndefined();
 		expect(withSteering.hasQueuedSteering()).toBe(false);
 

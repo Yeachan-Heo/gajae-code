@@ -250,14 +250,19 @@ Queue messages to inject during tool execution (steering) or after the agent wou
 
 ```typescript
 agent.setSteeringMode("one-at-a-time");
-agent.setInterruptMode("immediate");
+agent.setToolInterruptPolicy("abort_tools");
 
-// While agent is running tools
-agent.steer({
+// A steer is admitted ONLY into a live, non-aborted run.
+const admission = agent.steer({
 	role: "user",
 	content: "Stop! Do this instead.",
 	timestamp: Date.now(),
 });
+if (!admission.admitted) {
+	// admission.reason is "idle" (no run to steer) or "aborting" (the run is
+	// winding down). Nothing was queued: the caller owns routing the message,
+	// e.g. as a fresh prompt or a follow-up of the next turn.
+}
 
 // Queue a follow-up to run after the current turn completes
 agent.followUp({
@@ -267,8 +272,13 @@ agent.followUp({
 });
 ```
 
-Steering messages are checked after each tool call by default. Set `interruptMode` to `"wait"` to defer
-steering until the current turn completes.
+Steering messages are checked after each tool call by default. Set `toolInterruptPolicy` to
+`"finish_tools"` to let the running tool batch finish before the steering turn opens; the steer is
+still consumed at the next tool/turn boundary either way.
+
+A run that ends (completed, aborted, or error) never keeps steering it did not consume: the Agent
+clears its queue and reports the messages on `agent_end.disownedSteering`, so the owner decides once
+whether to re-route or drop them.
 
 ## Custom Message Types
 

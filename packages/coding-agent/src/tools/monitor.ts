@@ -229,12 +229,18 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				);
 				pendingNotifications = MAX_PENDING_MONITOR_NOTIFICATIONS;
 			}
+			if (!this.session.sendCustomMessage) {
+				logger.warn("Monitor task-notification dropped: session has no custom-message router", {
+					taskId: jobId,
+				});
+				return;
+			}
 			void this.session
-				.sendCustomMessage?.(
+				.sendCustomMessage(
 					{ customType: "task-notification", content, display: false, attribution: "agent", details },
 					{ triggerTurn: true, deliverAs: "followUp" },
 				)
-				?.catch(error => {
+				.catch(error => {
 					logger.warn("Monitor task-notification delivery failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});

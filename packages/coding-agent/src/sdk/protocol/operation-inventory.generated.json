@@ -346,7 +346,7 @@
 		"sourceFile": "packages/coding-agent/src/sdk/protocol/operation-registry.ts",
 		"sourceKind": "registry",
 		"decision": "include",
-		"sdkId": "queue.interrupt_mode.set",
+		"sdkId": "queue.tool_interrupt_policy.set",
 		"adapterMappings": {
 			"telegram": "generic_safe",
 			"discord": "generic_safe",
@@ -4754,11 +4754,11 @@
 		]
 	},
 	{
-		"sourceId": "agent_session:setInterruptMode",
+		"sourceId": "agent_session:setToolInterruptPolicy",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "include",
-		"sdkId": "queue.interrupt_mode.set",
+		"sdkId": "queue.tool_interrupt_policy.set",
 		"adapterMappings": {
 			"telegram": "generic_safe",
 			"discord": "generic_safe",

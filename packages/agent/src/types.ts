@@ -246,9 +246,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	initialScope?: AttemptScope;
 
 	/**
-	 * When to interrupt tool execution for steering messages.
-	 * - "immediate" = check after each tool call (default)
-	 * - "wait" = defer steering until the current turn completes
+	 * Whether a steering message aborts the tool calls still running in the
+	 * current batch.
+	 * - "abort_tools": abort the remaining tools and open the steering turn (default)
+	 * - "finish_tools": let the batch finish, then open the steering turn
+	 *
+	 * This never changes WHEN a steer is consumed: the loop picks it up at the
+	 * next tool/turn boundary either way.
 	 */
 	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 

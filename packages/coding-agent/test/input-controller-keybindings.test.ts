@@ -930,6 +930,7 @@ describe("InputController keybinding setup", () => {
 		expect(spies.prompt).toHaveBeenCalledWith("steer by default while busy", {
 			streamingBehavior: "steer",
 			images: undefined,
+			steerQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});
@@ -948,6 +949,7 @@ describe("InputController keybinding setup", () => {
 		expect(spies.prompt).toHaveBeenCalledWith("steer while busy", {
 			streamingBehavior: "steer",
 			images: undefined,
+			steerQueuePolicy: "sequential",
 		});
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
 	});

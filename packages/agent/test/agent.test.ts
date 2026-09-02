@@ -259,16 +259,19 @@ describe("Agent", () => {
 			createAssistantMessage([{ type: "text", text: "Initial response" }]),
 		]);
 
-		agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "Steering 1" }],
-			timestamp: Date.now(),
-		});
-		agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "Steering 2" }],
-			timestamp: Date.now() + 1,
-		});
+		// Seed the queue directly: steer() only admits into a live run.
+		agent.restoreSteering([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Steering 1" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "user",
+				content: [{ type: "text", text: "Steering 2" }],
+				timestamp: Date.now() + 1,
+			},
+		]);
 
 		await expect(agent.continue()).resolves.toBeUndefined();
 

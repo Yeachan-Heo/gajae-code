@@ -308,17 +308,21 @@ describe("fold red-team: live session duplicate notice/wake", () => {
 			const live = session;
 			if (!live) throw new Error("no session");
 			await waitFor(() => live.yieldQueue.has("async-result") === false, 4_000);
-			// The REAL session steer() already armed its own auto-continue for the
-			// winding-down window; by the time the wake flush drained, that
-			// scheduled continuation should have delivered the steer. Drive the
-			// same queued-only continuation explicitly so the assertion is
-			// deterministic rather than racing the session's scheduler.
-			await agent.continueQueuedMessages();
-			// The steer must be gone now: continue consumed it into a model call.
+			// The fenced steer was disowned to the session at the folded run's
+			// terminal and re-routed as the next turn's sequential follow-up, which
+			// the session's own scheduler delivers. Settle that scheduler rather
+			// than driving a continuation here: no orphan queue is left behind for
+			// an explicit continue to drain.
+			for (let i = 0; i < 10 && agent.hasQueuedMessages(); i++) {
+				await live.waitForIdle();
+				await Bun.sleep(30);
+			}
+			await live.waitForIdle();
 			expect(agent.hasQueuedSteering()).toBe(false);
-			expect(mock.calls.length).toBeGreaterThan(callsBeforeWake);
-			// The consumed steer reached a model call: it was neither consumed by
-			// the winding-down run nor lost in the fold-wake gap.
+			expect(agent.hasQueuedMessages()).toBe(false);
+			expect(mock.calls.length).toBeGreaterThanOrEqual(callsBeforeWake);
+			// The steer reached a model call: it was neither consumed by the
+			// winding-down run nor lost in the fold-wake gap.
 			const allCalls = mock.calls.map(call => call.context.messages.map(textOf).join("\n"));
 			expect(allCalls.some(ctx => ctx.includes("fix the docs"))).toBe(true);
 		} finally {

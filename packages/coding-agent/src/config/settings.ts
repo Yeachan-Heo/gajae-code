@@ -5408,15 +5408,30 @@ export class Settings implements NotificationSettingsReader {
 		if (configuredVersion === CONFIG_SCHEMA_VERSION) return raw;
 		if (typeof configuredVersion === "number" && configuredVersion > CONFIG_SCHEMA_VERSION) return raw;
 
-		// Migration registry v0 -> v1 -> v2. Every step is idempotent so a v1 file
-		// re-runs the v0 steps harmlessly on its way to v2.
-		// v2: interruptMode -> toolInterruptPolicy (immediate -> abort_tools, wait -> finish_tools).
-		if ("interruptMode" in raw) {
+		// Ordered migration registry. Each step runs ONLY for files below its
+		// target version: the v0 steps are not all idempotent (ask.timeout's
+		// milliseconds-to-seconds conversion would re-divide a valid v1 value),
+		// so a v1 file must skip straight to the v2 step.
+		const fromVersion = typeof configuredVersion === "number" ? configuredVersion : 0;
+		if (fromVersion < 1) this.#migrateRawSettingsV0ToV1(raw);
+		// v1 -> v2: interruptMode -> toolInterruptPolicy.
+		if (fromVersion < 2 && "interruptMode" in raw) {
 			if (!("toolInterruptPolicy" in raw)) {
-				raw.toolInterruptPolicy = raw.interruptMode === "wait" ? "finish_tools" : "abort_tools";
+				const legacy = raw.interruptMode;
+				if (legacy === "wait") raw.toolInterruptPolicy = "finish_tools";
+				else if (legacy === "immediate") raw.toolInterruptPolicy = "abort_tools";
+				// Any other value is malformed: drop it and let the schema default apply.
 			}
 			delete raw.interruptMode;
 		}
+
+		raw.configSchemaVersion = CONFIG_SCHEMA_VERSION;
+
+		return raw;
+	}
+
+	/** v0 -> v1 transforms. Runs only for files that predate schema version 1. */
+	#migrateRawSettingsV0ToV1(raw: RawSettings): void {
 		// queueMode -> steeringMode
 		normalizeSessionDirectoryMigration(raw);
 		if ("queueMode" in raw && !("steeringMode" in raw)) {
@@ -5581,10 +5596,6 @@ export class Settings implements NotificationSettingsReader {
 				delete providersObj.imageCustomKeyEnv;
 			}
 		}
-
-		raw.configSchemaVersion = CONFIG_SCHEMA_VERSION;
-
-		return raw;
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────

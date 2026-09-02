@@ -1930,7 +1930,7 @@
 		},
 		{
 			"adapterTestId": "AD-T-C20",
-			"sdkId": "queue.interrupt_mode.set",
+			"sdkId": "queue.tool_interrupt_policy.set",
 			"adapter": "telegram",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -1946,7 +1946,7 @@
 		},
 		{
 			"adapterTestId": "AD-D-C20",
-			"sdkId": "queue.interrupt_mode.set",
+			"sdkId": "queue.tool_interrupt_policy.set",
 			"adapter": "discord",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -1962,7 +1962,7 @@
 		},
 		{
 			"adapterTestId": "AD-S-C20",
-			"sdkId": "queue.interrupt_mode.set",
+			"sdkId": "queue.tool_interrupt_policy.set",
 			"adapter": "slack",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -1978,7 +1978,7 @@
 		},
 		{
 			"adapterTestId": "AD-M-C20",
-			"sdkId": "queue.interrupt_mode.set",
+			"sdkId": "queue.tool_interrupt_policy.set",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
@@ -1994,7 +1994,7 @@
 		},
 		{
 			"adapterTestId": "AD-A-C20",
-			"sdkId": "queue.interrupt_mode.set",
+			"sdkId": "queue.tool_interrupt_policy.set",
 			"adapter": "acp",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
@@ -2010,7 +2010,7 @@
 		},
 		{
 			"adapterTestId": "AD-L-C20",
-			"sdkId": "queue.interrupt_mode.set",
+			"sdkId": "queue.tool_interrupt_policy.set",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",

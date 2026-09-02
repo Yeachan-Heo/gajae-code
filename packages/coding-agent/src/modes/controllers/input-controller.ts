@@ -1683,7 +1683,7 @@ export class InputController {
 					},
 					streamingBehavior === "followUp"
 						? { streamingBehavior, followUpQueuePolicy: "sequential" }
-						: { streamingBehavior },
+						: { streamingBehavior, steerQueuePolicy: "sequential" },
 				);
 			}
 			if (this.ctx.session.isStreaming) {

@@ -569,12 +569,26 @@ describe("Settings", () => {
 		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
 	});
 
-	it("migrates a schema-version-one file idempotently to version two", async () => {
-		await writeSettings({ configSchemaVersion: 1, ask: { timeout: 30 }, interruptMode: "immediate" });
+	it("migrates a schema-version-one file to version two without re-running v0 steps", async () => {
+		// A valid v1 ask.timeout in SECONDS above the v0 millisecond heuristic must
+		// survive: re-running the v0 conversion would divide 3600 down to 4.
+		await writeSettings({ configSchemaVersion: 1, ask: { timeout: 3600 }, interruptMode: "immediate" });
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
-		expect(settings.get("ask.timeout")).toBe(30);
+		expect(settings.get("ask.timeout")).toBe(3600);
 		expect(settings.get("toolInterruptPolicy")).toBe("abort_tools");
-		expect((await readSettings()).configSchemaVersion).toBe(2);
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+	});
+
+	it("drops a malformed legacy interruptMode instead of coercing it", async () => {
+		await writeSettings({ interruptMode: "nonsense" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		// Falls back to the schema default rather than silently meaning abort_tools.
+		expect(settings.get("toolInterruptPolicy")).toBe("abort_tools");
+		const raw = await readSettings();
+		expect("interruptMode" in raw).toBe(false);
+		expect("toolInterruptPolicy" in raw).toBe(false);
 	});
 
 	it("migrates ask.timeout milliseconds once and records the current schema version", async () => {

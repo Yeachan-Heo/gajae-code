@@ -294,7 +294,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:cycleThinkingLevel": "thinking.cycle",
 	"agent_session:setSteeringMode": "queue.steering_mode.set",
 	"agent_session:setFollowUpMode": "queue.follow_up_mode.set",
-	"agent_session:setInterruptMode": "queue.interrupt_mode.set",
+	"agent_session:setToolInterruptPolicy": "queue.tool_interrupt_policy.set",
 	"agent_session:compact": "compaction.run",
 	"agent_session:setAutoCompactionEnabled": "compaction.auto.set",
 	"agent_session:setAutoRetryEnabled": "retry.auto.set",

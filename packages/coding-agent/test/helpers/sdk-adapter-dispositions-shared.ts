@@ -237,7 +237,7 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 		case "queue.follow_up_mode.set":
 			return { mode: "one-at-a-time" };
 		case "queue.tool_interrupt_policy.set":
-			return { mode: "wait" };
+			return { mode: "finish_tools" };
 		case "bash.execute":
 			return { cmd: "printf adapter-disposition" };
 		case "session.resume":

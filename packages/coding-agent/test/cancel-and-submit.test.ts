@@ -223,6 +223,50 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(s.isStreaming).toBe(false);
 	});
 
+	it("keeps live-run steers as steers of the replacement turn, applied after its response", async () => {
+		// R6: the aborted turn's admitted steers must stay STEERING of the
+		// replacement run (re-admitted after the replacement is answered), not be
+		// re-labelled as follow-ups drained one turn at a time.
+		const { agent, session: s } = buildGatedStreamingSession();
+		const activePrompt = s.prompt("active stream");
+		await waitForStreaming(s);
+		let promoted = 0;
+		await s.sendUserMessage("steer-A", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		await s.steer("steer-B");
+		expect(agent.snapshotQueues().steering.map(messageText)).toEqual(["steer-A", "steer-B"]);
+
+		// The replacement run is seeded with the old steers at acceptance, with the
+		// run's initial steering poll skipped: the opening model call answers the
+		// replacement prompt and the steers are consumed at the first turn boundary.
+		let steeringAtReplacementStart: string[] | undefined;
+		const unsubscribe = s.subscribe(event => {
+			if (event.type === "agent_start" && steeringAtReplacementStart === undefined)
+				steeringAtReplacementStart = agent.snapshotQueues().steering.map(messageText);
+		});
+		expect(await s.cancelAndSubmit("send now")).toEqual({ kind: "submitted" });
+		unsubscribe();
+		await activePrompt;
+		for (let i = 0; i < 20 && agent.hasQueuedMessages(); i++) {
+			await s.waitForIdle();
+			await Bun.sleep(20);
+		}
+		await s.waitForIdle();
+
+		expect(steeringAtReplacementStart).toEqual(["steer-A", "steer-B"]);
+		const texts = agent.state.messages.map(messageText);
+		expect(texts).toContain("send now");
+		expect(texts.indexOf("send now")).toBeLessThan(texts.indexOf("steer-A"));
+		expect(texts).toContain("steer-B");
+		// The external steer's SDK ownership hook settles exactly once.
+		expect(promoted).toBe(1);
+		expect(agent.snapshotQueues()).toEqual({ steering: [], followUp: [] });
+	});
+
 	it("active provider stream × rollback(finalization failure) restores queues without an outcome seam", async () => {
 		const { session: s } = buildGatedStreamingSession();
 		const cause = new Error("finalization failed");

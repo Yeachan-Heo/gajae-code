@@ -99,15 +99,21 @@ describe("Agent steering admission", () => {
 		expect(lastCall.context.messages.some(m => JSON.stringify(m.content).includes("abandoned"))).toBe(false);
 	});
 
-	it("leaves steering in place on agent_end while an admission fence is armed", async () => {
+	it("disowns fenced steering too: the Agent never keeps an ended run's queue", async () => {
 		const h = liveRunHarness();
 		h.agent.setSteeringAdmissionFence(() => true);
+		const disowned: string[] = [];
+		h.agent.subscribe(event => {
+			if (event.type === "agent_end")
+				for (const message of event.disownedSteering ?? []) disowned.push(String(message.content));
+		});
 		const run = h.agent.prompt("go");
 		await h.entered;
 		expect(h.agent.steer(userMessage("held for the wake turn")).admitted).toBe(true);
 		h.release();
 		await run;
-		expect(h.agent.hasQueuedSteering()).toBe(true);
+		expect(disowned).toEqual(["held for the wake turn"]);
+		expect(h.agent.hasQueuedSteering()).toBe(false);
 	});
 
 	it("reports queued steering distinctly from follow-ups", () => {
@@ -175,23 +181,29 @@ describe("Agent steering admission", () => {
 		await run;
 	});
 
-	it("steeringMode all still delivers a sequential-marked steer on its own", async () => {
+	it("steeringMode all batches adjacent steers and isolates a sequential-marked one", async () => {
 		const h = liveRunHarness();
 		h.agent.setSteeringMode("all");
 		const run = h.agent.prompt("go");
 		await h.entered;
-		expect(h.agent.steer(userMessage("batch-1")).admitted).toBe(true);
+		// Two adjacent unmarked steers on EITHER side of one marked steer: a
+		// regression to one-at-a-time would split the pairs, so the per-call
+		// batches below distinguish batching from sequential draining.
+		for (const text of ["a", "b"]) expect(h.agent.steer(userMessage(text)).admitted).toBe(true);
 		expect(h.agent.steer(userMessage("solo"), { forceOneAtATime: true }).admitted).toBe(true);
-		expect(h.agent.steer(userMessage("batch-2")).admitted).toBe(true);
+		for (const text of ["c", "d"]) expect(h.agent.steer(userMessage(text)).admitted).toBe(true);
 		h.release();
 		await run;
-		// Poll 1 took batch-1 (up to the sequential mark), poll 2 took solo alone,
-		// poll 3 took batch-2: three separate model calls after the tool turn.
-		const userTextsPerCall = h.mock.calls.map(call =>
-			call.context.messages.filter(m => m.role === "user").map(m => JSON.stringify(m.content)),
-		);
-		expect(userTextsPerCall.at(-1)?.some(t => t.includes("batch-2"))).toBe(true);
-		expect(h.mock.calls.length).toBe(4);
+		// New user messages contributed by each model call, in order.
+		const perCall: string[][] = [];
+		let seen = 0;
+		for (const call of h.mock.calls) {
+			const users = call.context.messages.filter(m => m.role === "user").map(m => String(m.content));
+			perCall.push(users.slice(seen));
+			seen = users.length;
+		}
+		// call 1: the prompt; call 2 (after the tool): [a, b]; call 3: [solo]; call 4: [c, d].
+		expect(perCall.slice(1)).toEqual([["a", "b"], ["solo"], ["c", "d"]]);
 	});
 
 	it("restoreSteering is a no-op for an empty snapshot", () => {

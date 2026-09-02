@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ToolChoice } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { prompt, untilAborted } from "@gajae-code/utils";
+import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
@@ -66,8 +66,16 @@ export function queueResolveHandler(
 	const queue = session.getToolChoiceQueue?.();
 
 	const steerReminder = (): void => {
+		if (!session.sendCustomMessage) {
+			// The reminder is a degraded model's only model-visible route back to the
+			// standing resolve handler; a missing router must be visible.
+			logger.warn("Resolve reminder dropped: session has no custom-message router", {
+				toolName: options.sourceToolName,
+			});
+			return;
+		}
 		void session
-			.sendCustomMessage?.(
+			.sendCustomMessage(
 				{
 					customType: "resolve-reminder",
 					content: [
@@ -81,7 +89,12 @@ export function queueResolveHandler(
 				},
 				{ deliverAs: "steer" },
 			)
-			?.catch(() => undefined);
+			.catch(error => {
+				logger.warn("Resolve reminder delivery failed", {
+					toolName: options.sourceToolName,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
 	};
 
 	// Re-evaluated on every push (including apply-error re-pushes) so a runtime

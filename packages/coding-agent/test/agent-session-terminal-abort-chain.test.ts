@@ -1017,14 +1017,20 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			terminal: { scope: "turn" },
 		});
 		expect(proof).toBeDefined();
-		// The follow-up must SURVIVE the abort purge: the pre-fix steering
-		// purge removed every non-steer message from BOTH queues.
-		expect(session.agent.snapshotQueues().followUp.length).toBe(1);
-		// And it must be rearmed and consumed under a fresh lineage (the mock
-		// model answers it).
+		// The follow-up must SURVIVE the abort purge (the pre-fix steering purge
+		// removed every non-steer message from BOTH queues) and be DELIVERED under
+		// a fresh lineage. Delivery is the strong proof: a purge would also drain
+		// the queue, but only a surviving message reaches the model.
 		await waitFor(
 			() => session.agent.snapshotQueues().followUp.length === 0,
 			"external follow-up rearmed and consumed",
+		);
+		await waitFor(
+			() =>
+				session.agent.state.messages.some(
+					message => message.role === "user" && JSON.stringify(message.content).includes("external follow-up"),
+				),
+			"external follow-up delivered to the model",
 		);
 		await promptPromise;
 	}, 30_000);

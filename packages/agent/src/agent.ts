@@ -267,9 +267,13 @@ export interface AgentOptions {
 	followUpMode?: "all" | "one-at-a-time";
 
 	/**
-	 * When to interrupt tool execution for steering messages.
-	 * - "immediate": check after each tool call (default)
-	 * - "wait": defer steering until the current turn completes
+	 * Whether a steering message aborts the tool calls still running in the
+	 * current batch.
+	 * - "abort_tools": abort the remaining tools and open the steering turn (default)
+	 * - "finish_tools": let the batch finish, then open the steering turn
+	 *
+	 * This never changes WHEN a steer is consumed: the loop picks it up at the
+	 * next tool/turn boundary either way.
 	 */
 	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 	/** Cooperative pause checkpoint passed through to AgentLoopConfig.shouldPause. */
@@ -433,6 +437,13 @@ export interface AgentPromptOptions {
 	fallbackManaged?: boolean;
 	/** Continue a cooperative maintenance checkpoint under its existing logical run and cancellation domain. */
 	maintenanceContinuation?: boolean;
+	/**
+	 * Skip the loop's INITIAL steering poll for this run. Used when the caller
+	 * seeds the steering queue at run acceptance but the run's first model call
+	 * must answer its own prompt first; the steering is then consumed at the
+	 * first turn boundary instead of being merged into the opening call.
+	 */
+	skipInitialSteeringPoll?: boolean;
 	/** Called synchronously after this invocation claims the agent run, before asynchronous provider work. */
 	onRunAccepted?: (handle: AttemptRunHandle, acceptance: { consumedQueuedMessages: readonly AgentMessage[] }) => void;
 	/** Called once immediately before every managed upstream request. */
@@ -1415,21 +1426,8 @@ export class Agent {
 	}
 
 	/**
-	 * Remove ALL queued STEERING messages without touching the follow-up queue.
-	 * Used by the terminal-abort path to purge steering queued for the aborted
-	 * turn (the loop may exit on the abort signal without polling it); the
-	 * follow-up queue is preserved because it may carry owned-completion
-	 * resumes that must still deliver.
-	 */
-	clearSteeringMessages(): void {
-		this.#steeringQueue = [];
-	}
-
-	/**
 	 * Remove queued steering/follow-up messages matching `predicate`, preserving
-	 * order of the rest. `scope` restricts the removal to one queue — the
-	 * terminal-abort steering purge must not wipe the follow-up queue, which
-	 * the owned-completion resume policy preserves.
+	 * order of the rest. `scope` restricts the removal to one queue.
 	 */
 	removeQueuedMessages(
 		predicate: (message: AgentMessage) => boolean,
@@ -2001,6 +1999,13 @@ export class Agent {
 				if (this.#steeringAdmissionFence?.() === true) {
 					return [];
 				}
+				// An aborted run cannot deliver steering: the loop hands drained
+				// messages back and ends. Dequeuing here would fire the in-run
+				// consumption hook for a message the run never delivers, so its SDK
+				// submission would settle as consumed instead of removed at disown.
+				if (abortController.signal.aborted) {
+					return [];
+				}
 				const queued = this.#dequeueSteeringMessages();
 				if (this.#activeRunId !== runId) {
 					this.#steeringQueue = [...queued, ...this.#steeringQueue];
@@ -2364,11 +2369,11 @@ export class Agent {
 		};
 		if (handle) terminalEvent.scope = handle.scope;
 		// The run is over: nothing will poll the steering queue again. Disown
-		// whatever it still holds so no later, unrelated run can consume it, and
-		// hand it to the owner on the terminal event to re-route or drop once.
-		// An armed admission fence (a fold winding this turn down) is the owner
-		// explicitly holding the queue for the wake turn: leave it in place.
-		if (this.#steeringQueue.length > 0 && this.#steeringAdmissionFence?.() !== true) {
+		// whatever it still holds — unconditionally, so no ownership exception can
+		// leave an ended run's steering behind for an unrelated run to consume —
+		// and hand it to the owner on the terminal event to re-route, hold, or
+		// drop exactly once.
+		if (this.#steeringQueue.length > 0) {
 			terminalEvent.disownedSteering = this.#steeringQueue;
 			this.#steeringQueue = [];
 		}
