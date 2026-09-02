@@ -34,7 +34,15 @@ export interface CrystalInput {
 	conflicts?: string[];
 	resolved_open_gaps?: string[];
 	resolved_conflicts?: string[];
+	resolved_open_gap_anchors?: CrystalResolutionAnchor[];
+	resolved_conflict_anchors?: CrystalResolutionAnchor[];
 	prior?: DeepInterviewCrystal;
+}
+
+export interface CrystalResolutionAnchor {
+	item: string;
+	message_index: number;
+	quote: string;
 }
 
 export interface CrystalDelta {
@@ -199,6 +207,36 @@ function validateResolutions(
 	}
 }
 
+function validateResolutionAnchors(
+	resolutions: readonly string[],
+	value: unknown,
+	snapshot: CrystalSnapshot,
+	field: string,
+	afterIndex: number,
+): void {
+	if (resolutions.length === 0 && value === undefined) return;
+	if (!Array.isArray(value) || value.length !== resolutions.length)
+		throw new Error(`${field} must contain one anchor per resolution`);
+	const seen = new Set<string>();
+	for (const [index, raw] of value.entries()) {
+		if (!isRecord(raw)) throw new Error(`${field}[${index}] must be an object`);
+		const item = text(raw.item, `${field}[${index}].item`, 500);
+		const messageIndex = integer(raw.message_index, `${field}[${index}].message_index`);
+		const quote = text(raw.quote, `${field}[${index}].quote`, 500);
+		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
+		if (
+			!resolutions.includes(item) ||
+			seen.has(item) ||
+			messageIndex <= afterIndex ||
+			!message ||
+			message.role !== "user" ||
+			!message.content.includes(quote)
+		)
+			throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
+		seen.add(item);
+	}
+}
+
 function validateRemovedIds(value: unknown): string[] {
 	if (!Array.isArray(value) || value.length > MAX_ITEMS) throw new Error("removed_ids must be a bounded array");
 	const ids = value.map((id, index) => text(id, `removed_ids[${index}]`, 128));
@@ -259,6 +297,24 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			: -1;
 	validateResolutions(resolvedGaps, snapshot, "resolved_open_gaps", priorEnd);
 	validateResolutions(resolvedConflicts, snapshot, "resolved_conflicts", priorEnd);
+	if (gaps.some(gap => resolvedGaps.includes(gap)))
+		throw new Error("open_gaps and resolved_open_gaps must be disjoint");
+	if (conflicts.some(conflict => resolvedConflicts.includes(conflict)))
+		throw new Error("conflicts and resolved_conflicts must be disjoint");
+	validateResolutionAnchors(
+		resolvedGaps,
+		value.resolved_open_gap_anchors,
+		snapshot,
+		"resolved_open_gap_anchors",
+		priorEnd,
+	);
+	validateResolutionAnchors(
+		resolvedConflicts,
+		value.resolved_conflict_anchors,
+		snapshot,
+		"resolved_conflict_anchors",
+		priorEnd,
+	);
 	const priorItems = new Map(canonicalPriorItems.map(item => [item.id, item]));
 	if (removedIds.some(id => !priorItems.has(id)))
 		throw new Error("removed crystallize item is not present in prior crystal");
