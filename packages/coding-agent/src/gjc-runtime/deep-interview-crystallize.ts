@@ -183,9 +183,18 @@ function normalizedGaps(value: unknown): string[] {
 	return value.map((gap, index) => text(gap, `open_gaps[${index}]`, 500));
 }
 
-function validateResolutions(resolutions: readonly string[], snapshot: CrystalSnapshot, field: string): void {
+function validateResolutions(
+	resolutions: readonly string[],
+	snapshot: CrystalSnapshot,
+	field: string,
+	afterIndex: number,
+): void {
 	for (const resolution of resolutions) {
-		if (!snapshot.messages.some(message => message.role === "user" && message.content.includes(resolution)))
+		if (
+			!snapshot.messages.some(
+				message => message.index > afterIndex && message.role === "user" && message.content.includes(resolution),
+			)
+		)
 			throw new Error(`${field} must be supported by verbatim user evidence`);
 	}
 }
@@ -216,8 +225,6 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const conflicts = normalizedGaps(value.conflicts);
 	const resolvedGaps = normalizedGaps(value.resolved_open_gaps);
 	const resolvedConflicts = normalizedGaps(value.resolved_conflicts);
-	validateResolutions(resolvedGaps, snapshot, "resolved_open_gaps");
-	validateResolutions(resolvedConflicts, snapshot, "resolved_conflicts");
 	const prior = value.prior;
 	if (prior !== undefined && !isRecord(prior)) throw new Error("prior crystal is invalid");
 	const priorCrystal = prior as DeepInterviewCrystal | undefined;
@@ -246,6 +253,12 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			throw new Error("prior crystal is invalid");
 		canonicalPriorItems = validateItems(priorCrystal.items);
 	}
+	const priorEnd =
+		priorCrystal && isRecord(priorCrystal.source) && typeof priorCrystal.source.end === "number"
+			? priorCrystal.source.end
+			: -1;
+	validateResolutions(resolvedGaps, snapshot, "resolved_open_gaps", priorEnd);
+	validateResolutions(resolvedConflicts, snapshot, "resolved_conflicts", priorEnd);
 	const priorItems = new Map(canonicalPriorItems.map(item => [item.id, item]));
 	if (removedIds.some(id => !priorItems.has(id)))
 		throw new Error("removed crystallize item is not present in prior crystal");
