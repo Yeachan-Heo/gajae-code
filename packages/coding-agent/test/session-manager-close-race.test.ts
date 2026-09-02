@@ -25,7 +25,11 @@
 
 import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
-import { SessionManager, type SessionManagerCloseOutcome } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	SessionManager,
+	type SessionManagerCloseOutcome,
+	type SessionMessageEntry,
+} from "@gajae-code/coding-agent/session/session-manager";
 import {
 	MemorySessionStorage,
 	type SessionStorage,
@@ -357,12 +361,20 @@ describe("SessionManager close/appendMessage race", () => {
 		if (opened.kind === "error") throw new Error("Expected strict open");
 		const entry = opened.manager.getBranch().find(candidate => candidate.type === "message");
 		if (entry?.type !== "message") throw new Error("Expected legacy message");
-		opened.manager.applyEntryMessageUpdates([{ ...entry, message: { ...entry.message, content: "updated" } }]);
+		const updatedEntry: SessionMessageEntry = {
+			...entry,
+			message: { role: "user", content: [{ type: "text", text: "updated" }], timestamp: 0 },
+		};
+		opened.manager.applyEntryMessageUpdates([updatedEntry]);
 
 		let lateMutationError: unknown;
 		storage.onSyncClose = () => {
 			try {
-				opened.manager.appendMessage({ role: "user", content: "late", timestamp: Date.now() });
+				opened.manager.appendMessage({
+					role: "user",
+					content: [{ type: "text", text: "late" }],
+					timestamp: Date.now(),
+				});
 			} catch (error) {
 				lateMutationError = error;
 			}
