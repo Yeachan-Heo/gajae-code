@@ -3069,6 +3069,7 @@ export class AgentSession {
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
 	#disposeRunPromise: Promise<void> | undefined;
+	#disposeCallerPromise: Promise<void> | undefined;
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
@@ -3692,37 +3693,29 @@ export class AgentSession {
 			releaseEntry();
 			throw error;
 		}
-		await options?.onAfterReadyForTests?.();
-		if (
-			entry.released ||
-			(this.#sessionAdmissionClosed && !closedSelectionAuthorized()) ||
-			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
-		) {
-			entry.released = true;
-			entry.settled.resolve();
-			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
-			this.#activateNextSessionAdmission();
-			throw this.#sessionAdmissionBusyError();
-		}
-		// Re-check the handoff fence after activation: a prompt queued before the
-		// transition began must not start once the fence is up.
-		if (kind === "prompt" && this.#handoffTransitionActive) {
-			entry.released = true;
-			entry.settled.resolve();
-			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
-			this.#activateNextSessionAdmission();
-			throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
-				code: "busy",
-			});
-		}
-
-		const release = () => {
-			releaseEntry();
-		};
 		try {
+			await options?.onAfterReadyForTests?.();
+			if (
+				entry.released ||
+				(this.#sessionAdmissionClosed && !closedSelectionAuthorized()) ||
+				((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
+			) {
+				throw this.#sessionAdmissionBusyError();
+			}
+			// Re-check the handoff fence after activation: a prompt queued before the
+			// transition began must not start once the fence is up.
+			if (kind === "prompt" && this.#handoffTransitionActive) {
+				throw Object.assign(new AgentBusyError("Cannot start a turn while a handoff is in progress."), {
+					code: "busy",
+				});
+			}
+
+			const release = () => {
+				releaseEntry();
+			};
 			return await this.#sessionAdmissionContext.run(entry, () => body({ release }));
 		} finally {
-			release();
+			releaseEntry();
 		}
 	}
 
@@ -8969,33 +8962,42 @@ export class AgentSession {
 	 */
 	dispose(): Promise<void> {
 		this.#evalExecutionDisposing = true;
-		if (this.#disposeRunPromise) return this.#disposeRunPromise;
-		this.#disposeDeadline = Date.now() + SIGNAL_TEARDOWN_TIMEOUT_MS;
-		this.#abortAdmissionEpoch++;
-		this.#isDisposed = true;
-		this.#disposeAbortController.abort();
-		// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
-		// admission here would put that unbounded prompt ahead of the abort budget.
-		this.#disposeAdmissionClosed = this.#closeSessionAdmission({ waitForActive: false });
-		this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
-		this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#abortActiveMidRunBarriers();
-		this.abortCompaction();
-		this.abortRetry();
-		this.#quarantineAgentRunResources();
-		this.agent.abort();
-		this.agent.setMainAttemptScopeObserver(undefined);
-		this.#disconnectFromAgent();
-		const teardown = this.#dispose();
-		this.#disposeRunPromise = teardown;
-		const timeout = Promise.withResolvers<never>();
-		const timer = setTimeout(() => timeout.reject(new SessionDisposalIncompleteError()), SIGNAL_TEARDOWN_TIMEOUT_MS);
-		timer.unref?.();
-		const boundedTeardown = Promise.race([teardown, timeout.promise]);
-		void boundedTeardown.finally(() => clearTimeout(timer)).catch(() => {});
-		void teardown.catch(() => {});
+		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
+		if (!this.#disposeRunPromise) {
+			this.#disposeDeadline = Date.now() + SIGNAL_TEARDOWN_TIMEOUT_MS;
+			this.#abortAdmissionEpoch++;
+			this.#isDisposed = true;
+			this.#disposeAbortController.abort();
+			// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
+			// admission here would put that unbounded prompt ahead of the abort budget.
+			this.#disposeAdmissionClosed = this.#closeSessionAdmission({ waitForActive: false });
+			this.#disposePostPromptDrain = this.#cancelPostPromptTasks();
+			this.#settleDeliveredOwnedRegistrations(this.#pendingNextTurnMessages.map(entry => entry.message));
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#abortActiveMidRunBarriers();
+			this.abortCompaction();
+			this.abortRetry();
+			this.#quarantineAgentRunResources();
+			this.agent.abort();
+			this.agent.setMainAttemptScopeObserver(undefined);
+			this.#disconnectFromAgent();
+			this.#disposeRunPromise = this.#dispose();
+			void this.#disposeRunPromise.catch(() => {});
+		}
+		const teardown = this.#disposeRunPromise;
+		const boundedTeardown = Promise.race([
+			teardown,
+			Bun.sleep(SIGNAL_TEARDOWN_TIMEOUT_MS).then(() => {
+				throw new SessionDisposalIncompleteError();
+			}),
+		]);
+		this.#disposeCallerPromise = boundedTeardown;
+		void boundedTeardown
+			.finally(() => {
+				if (this.#disposeCallerPromise === boundedTeardown) this.#disposeCallerPromise = undefined;
+			})
+			.catch(() => {});
 		return boundedTeardown;
 	}
 

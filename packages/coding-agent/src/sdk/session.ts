@@ -4578,6 +4578,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null);
 		{
 			const originalDispose = session.dispose.bind(session);
+			const awaitCompleteDispose = async (): Promise<void> => {
+				for (;;) {
+					try {
+						await originalDispose();
+						return;
+					} catch (error) {
+						if (!isSessionDisposalIncompleteError(error)) throw error;
+					}
+				}
+			};
 			let cleanupPromise: Promise<void> | undefined;
 			const finishCleanup = async (): Promise<void> => {
 				if (cleanupPromise) return cleanupPromise;
@@ -4628,7 +4638,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (isSessionDisposalIncompleteError(error)) {
 						void (async () => {
 							try {
-								await session.dispose();
+								await awaitCompleteDispose();
 							} finally {
 								try {
 									await finishCleanup();
@@ -4888,7 +4898,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 					// The first call is intentionally bounded for startup callers. Join the
 					// retained teardown before releasing the resources it still owns.
-					await session.dispose();
+					await awaitCompleteDispose();
 				}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);
