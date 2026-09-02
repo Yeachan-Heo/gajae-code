@@ -1595,7 +1595,9 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			);
 			expect(await nestedMove).toMatchObject({
 				status: "rejected",
-				error: { message: "Session working directory changed while this tool executed; retry against the new cwd." },
+				error: {
+					message: "Session working directory changed while this tool executed; retry against the new cwd.",
+				},
 			});
 			expect(sessionManager.getCwd()).toBe(cwd);
 			releaseSibling.resolve();
