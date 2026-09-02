@@ -10893,6 +10893,7 @@ export class AgentSession {
 	 * Changes take effect before the next model call.
 	 */
 	async setActiveToolsByName(toolNames: string[]): Promise<void> {
+		this.#assertNoSessionTransitionAdmission();
 		await this.#applyActiveToolsByName(toolNames);
 	}
 
@@ -11550,6 +11551,7 @@ export class AgentSession {
 
 	/** Pin one OAuth credential for this session scope and persist the minimal intent. */
 	async setCredentialPin(provider: string, selector: AuthCredentialSelector): Promise<void> {
+		this.#assertNoSessionTransitionAdmission();
 		const scopeId = this.credentialSessionId;
 		const authStorage = this.#modelRegistry.authStorage;
 		const authStorageOwner = this.#modelRegistry.getAuthStorageOwner();
@@ -11569,6 +11571,7 @@ export class AgentSession {
 
 	/** Mask persistent/global selection for this session and restore AUTO ranking. */
 	async setCredentialAuto(provider: string): Promise<void> {
+		this.#assertNoSessionTransitionAdmission();
 		const scopeId = this.credentialSessionId;
 		this.#modelRegistry.authStorage.setSessionCredentialAuto(provider, scopeId);
 		this.sessionManager.appendCustomEntry("auth-credential-pin", {
@@ -11622,6 +11625,7 @@ export class AgentSession {
 	}
 
 	setPlanModeState(state: PlanModeState | undefined): void {
+		this.#assertNoSessionTransitionAdmission();
 		this.#planModeState = state;
 		if (state?.enabled) {
 			this.#planReferenceSent = false;
@@ -13629,6 +13633,7 @@ export class AgentSession {
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
+		this.#assertNoSessionTransitionAdmission();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -13653,6 +13658,7 @@ export class AgentSession {
 		if (typeof text !== "string" || (text.trim().length === 0 && !hasUsableImage))
 			throw Object.assign(new Error("Prompt must not be empty."), { code: "invalid_input" });
 		this.#assertRecoveryHydrationPromoted();
+		this.#assertNoSessionTransitionAdmission();
 		if (text.startsWith("/")) {
 			this.#throwIfExtensionCommand(text);
 		}
@@ -14228,6 +14234,11 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		if (options?.triggerTurn) {
+			this.#assertNoSessionTransitionAdmission();
+		} else {
+			this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: true });
+		}
 		const appMessage: CustomMessage<T> = {
 			role: "custom",
 			customType: message.customType,
@@ -16582,11 +16593,13 @@ export class AgentSession {
 
 			// Emit session_switch event with reason "fork" to hooks
 			if (this.#extensionRunner) {
-				await this.#extensionRunner.emit({
-					type: "session_switch",
-					reason: "fork",
-					previousSessionFile,
-				});
+				await this.#emitInternalTransitionEvent(() =>
+					this.#extensionRunner!.emit({
+						type: "session_switch",
+						reason: "fork",
+						previousSessionFile,
+					}),
+				);
 			}
 
 			return true;
@@ -16614,6 +16627,7 @@ export class AgentSession {
 			onMutationStarted?: () => void;
 		},
 	): Promise<void> {
+		this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: true });
 		const identityAdmission = this.#captureSessionIdentityAdmission();
 		this.#assertSessionIdentityAdmission(identityAdmission);
 		const previousEditMode = this.#resolveActiveEditMode();
@@ -17122,6 +17136,7 @@ export class AgentSession {
 		},
 		// biome-ignore lint/suspicious/noConfusingVoidType: Existing session adapters return Promise<void>; a scope is optional.
 	): Promise<TemporaryProviderSessionScope | void> {
+		this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: true });
 		if (options?.signal?.aborted) return;
 		const suppliedScope = options?.providerSessionScope;
 		if (suppliedScope && this.#temporaryProviderSessionScopes.at(-1)?.token !== suppliedScope) return;
@@ -17689,6 +17704,7 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		this.#assertNoSessionTransitionAdmission();
 		this.#applyThinkingLevel(level, persist, false);
 	}
 
@@ -17725,6 +17741,7 @@ export class AgentSession {
 	 * Set thinking level from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
+		this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: true });
 		const previousThinkingLevel = this.thinkingLevel;
 		if (!persist) {
 			this.#applyThinkingLevel(
@@ -17854,6 +17871,7 @@ export class AgentSession {
 	}
 
 	setThinkingVisibility(visibility: "visible" | "hidden", persist: boolean = false): void {
+		this.#assertNoSessionTransitionAdmission();
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingVisibilityMutationRevision++;
 		this.#thinkingVisibilityLiveMutationRevision++;
@@ -17869,6 +17887,7 @@ export class AgentSession {
 	 * Set thinking visibility from a control surface. Global changes commit before affecting live state.
 	 */
 	async setThinkingVisibilityForControl(visibility: "visible" | "hidden", persist: boolean): Promise<void> {
+		this.#assertNoSessionTransitionAdmission({ allowInternalTransitionEmission: true });
 		if (!persist) {
 			this.setThinkingVisibility(visibility);
 			return;
