@@ -364,14 +364,23 @@ describe("queued promotion run identity (#4668)", () => {
 		const crossId = session.getQueuedMessageEntries()[crossIndex]?.id;
 		expect(session.moveQueuedMessageForEditing(crossId ?? "", "up")).toBe(false);
 		expect(session.getQueuedMessageEntries().map(entry => entry.text)).toEqual(rowsBefore);
-		// The deferred store itself kept the order the earlier move produced.
-		expect(session.clearQueue().followUp.filter(text => text.startsWith("deferred "))).toEqual([
-			"deferred two",
-			"deferred one",
-		]);
 
+		// Behavioural proof that the DEFERRED BACKING STORE was reordered and not
+		// just its display mirror: the store is released when the run ends, so the
+		// order the two messages are DELIVERED in is observable in history.
 		gate.resolve();
 		await promptDone;
+		for (let i = 0; i < 20; i++) {
+			const seen = session.agent.state.messages.filter(message => JSON.stringify(message).includes("deferred "));
+			if (seen.length >= 2) break;
+			await session.waitForIdle();
+			await Bun.sleep(20);
+		}
+		const deliveredOrder = session.agent.state.messages
+			.map(message => JSON.stringify(message))
+			.filter(text => text.includes("deferred "))
+			.map(text => (text.includes("deferred two") ? "deferred two" : "deferred one"));
+		expect(deliveredOrder.slice(0, 2)).toEqual(["deferred two", "deferred one"]);
 	});
 
 	it("does not fire removal for external SDK follow-ups preserved by the abort purge (#4668)", async () => {
