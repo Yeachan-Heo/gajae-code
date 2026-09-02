@@ -2549,14 +2549,22 @@ export class AgentSession {
 	}
 
 	/**
-	 * One-shot: the queued work includes an independent root request that must
-	 * NOT run under a terminally fenced lineage. Consumed at the final
-	 * synchronous boundary before a continuation enters `agent.continue*`, so a
-	 * fresh identity is minted only when a run actually starts — never at
-	 * enqueue (which would race the ending run's event settlement) and never
-	 * lost when a busy owner defers delivery.
+	 * Queued messages that are independent ROOT requests: they must not run under
+	 * a terminally fenced lineage, so a fresh identity is minted when one of them
+	 * is actually delivered. Tracked per message rather than as a session latch,
+	 * so removing the message (queue edit, producer purge, queue clear) removes
+	 * its requirement too and no unrelated continuation inherits it. The mint
+	 * happens at the last synchronous point before `agent.continue*` entry —
+	 * never at enqueue, which would race the ending run's event settlement, and
+	 * never lost when a busy owner defers delivery.
 	 */
-	#pendingFreshRootLineage = false;
+	#freshRootLineageRequests = new WeakSet<AgentMessage>();
+
+	/** True when a queued message still carries an unfulfilled fresh-root requirement. */
+	#hasQueuedFreshRootRequest(): boolean {
+		const { steering, followUp } = this.agent.snapshotQueues();
+		return [...steering, ...followUp].some(message => this.#freshRootLineageRequests.has(message));
+	}
 
 	/**
 	 * Disposition of steering the current run leaves unconsumed when it exits.
@@ -7278,10 +7286,11 @@ export class AgentSession {
 									// its fresh identity HERE: the last synchronous point before
 									// agent.continue* entry, so a cancelled/emptied continuation never
 									// leaves the session on an identity that escapes the fence.
-									if (this.#pendingFreshRootLineage) {
-										this.#pendingFreshRootLineage = false;
-										if (this.agent.hasQueuedMessages()) this.#resumeFromOwnedCompletion();
-									}
+									// A queued independent root request mints its fresh identity HERE:
+									// the last synchronous point before agent.continue* entry, so a
+									// cancelled or emptied continuation never leaves the session on an
+									// identity that escapes the fence.
+									if (this.#hasQueuedFreshRootRequest()) this.#resumeFromOwnedCompletion();
 									if (this.#isTurnContinuationBlocked()) {
 										skip("terminal_turn");
 										return;
@@ -12668,12 +12677,7 @@ export class AgentSession {
 	 * routing, disown re-routing, held-steering fallback, a run's terminal): the
 	 * run that would have polled the queue is gone, so nothing else owns it.
 	 */
-	#scheduleQueuedDelivery(delayMs?: number, mintFreshRootLineage = false): void {
-		// Record the intent BEFORE the deliverability gate: when a bash/eval/retry/
-		// compaction owner defers delivery, that owner's completion schedules an
-		// ordinary continuation later, and the fresh-root requirement has to survive
-		// until whichever attempt actually delivers.
-		if (mintFreshRootLineage) this.#pendingFreshRootLineage = true;
+	#scheduleQueuedDelivery(delayMs?: number): void {
 		if (this.#cancelAndSubmitInProgress || !this.#canDeliverQueuedMessages()) return;
 		this.#scheduleAgentContinue({
 			...(delayMs === undefined ? {} : { delayMs }),
@@ -13186,11 +13190,14 @@ export class AgentSession {
 					return;
 				}
 				this.agent.followUp(appMessage, { forceOneAtATime: true });
-				if (independentOfTurn) this.#externalFollowUps.add(appMessage);
-				// A fresh lineage is minted at the delivery attempt, not here: the
-				// aborted run's events may still be settling and mutating the session's
-				// attempt identity now would race them.
-				this.#scheduleQueuedDelivery(undefined, this.#isTurnContinuationBlocked());
+				if (independentOfTurn) {
+					this.#externalFollowUps.add(appMessage);
+					// Past a retained terminal fence this message is a NEW root: record
+					// the requirement on the message itself so it survives a deferred
+					// delivery and disappears with the message if it is removed.
+					if (this.#isTurnContinuationBlocked()) this.#freshRootLineageRequests.add(appMessage);
+				}
+				this.#scheduleQueuedDelivery();
 			}
 			return;
 		}
@@ -13606,8 +13613,6 @@ export class AgentSession {
 		this.#followUpMessages = [];
 		this.#deferredSdkFollowUps = [];
 		this.agent.clearAllQueues();
-		// The queued work a pending fresh-root intent referred to is gone.
-		this.#pendingFreshRootLineage = false;
 		// Every dropped message leaves without consumption: terminalize its
 		// accepted SDK submission boundedly (#4668 review P1).
 		this.#fireQueuedRemovalHooks([...steeringQueued, ...followUpQueued, ...deferredQueued]);

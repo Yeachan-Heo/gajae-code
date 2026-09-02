@@ -773,46 +773,44 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(recordedProviderContexts().some(text => text.includes("stale preview reminder"))).toBe(false);
 	}, 30_000);
 
-	it("keeps the fresh-root requirement when a busy owner defers the post-terminal delivery", async () => {
-		// An independent root request queued after a terminal abort may be deferred
-		// by a busy owner (bash/eval/retry/compaction). The fresh-root requirement
-		// must survive that deferral: whichever attempt eventually delivers has to
-		// mint the new identity, or the retained fence rejects it forever.
-		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("external notice answered")];
+	it("scopes the fresh-root requirement to its own queued message", async () => {
+		// The requirement to run under a NEW lineage belongs to the specific queued
+		// root request. Removing that request must remove its requirement too: a
+		// later turn-owned continuation must not inherit a fresh identity and
+		// escape the terminal fence.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("should not run")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId ?? "run";
 		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		await promptPromise;
+		const callsAfterAbort = recordedProviderContexts().length;
 
-		// Pretend a busy owner holds the session when the message is queued, so the
-		// enqueue-time schedule is refused and only a later attempt can deliver.
-		let busy = true;
-		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => busy });
-		try {
-			await session.sendCustomMessage(
-				{ customType: "ext-notice", content: "deferred external notice", display: false, attribution: "agent" },
-				{ deliverAs: "steer", origin: "external" },
-			);
-			expect(session.agent.hasQueuedMessages()).toBe(true);
-			busy = false;
-		} finally {
-			delete (session as unknown as Record<string, unknown>).isCompacting;
-		}
-		// A later independent send schedules delivery; the deferred message's
-		// fresh-root requirement is still pending, so BOTH are delivered instead of
-		// the first one being stranded behind the retained fence.
+		// An independent root request past the fence, queued and then withdrawn
+		// before it could be delivered.
+		await session.sendUserMessage("withdrawn root request", { deliverAs: "steer" });
+		const [entry] = session.getQueuedMessageEntries();
+		expect(entry?.text).toBe("withdrawn root request");
+		expect(session.removeQueuedMessageForEditing(entry?.id ?? "")).toBe("withdrawn root request");
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+
+		// A turn-owned reminder now arrives. It must still be dropped by the fence:
+		// the withdrawn request's requirement left with it.
 		await session.sendCustomMessage(
-			{ customType: "ext-notice", content: "second external notice", display: false, attribution: "agent" },
-			{ deliverAs: "steer", origin: "external" },
+			{
+				customType: "resolve-reminder",
+				content: "turn-owned after withdrawal",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "steer" },
 		);
-		await waitFor(() => !session.agent.hasQueuedMessages(), "deferred external notices delivered");
 		await session.waitForIdle();
-		const delivered = session.agent.state.messages
-			.filter(message => message.role === "custom")
-			.map(message => String(message.content));
-		expect(delivered.some(text => text.includes("deferred external notice"))).toBe(true);
-		expect(delivered.some(text => text.includes("second external notice"))).toBe(true);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(recordedProviderContexts().length).toBe(callsAfterAbort);
+		expect(
+			session.agent.state.messages.some(message => JSON.stringify(message).includes("turn-owned after withdrawal")),
+		).toBe(false);
 	}, 30_000);
 
 	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {
