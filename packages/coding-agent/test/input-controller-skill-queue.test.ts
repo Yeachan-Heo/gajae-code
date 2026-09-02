@@ -594,8 +594,13 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		const executable = [...queuedBefore.steering, ...queuedBefore.followUp];
 		expect(executable).toHaveLength(2);
 
+		// The chip must describe where the executable message actually landed: an
+		// idle session reroutes the steer to follow-up work, so a chip still shown
+		// as "Steer" would mislabel it.
 		const [entry] = session.getQueuedMessageEntries();
 		expect(entry?.text).toBe("/skill:foo bar");
+		expect(entry?.mode).toBe("followUp");
+		expect(session.getQueuedMessages().steering).toEqual([]);
 		expect(session.removeQueuedMessageForEditing(entry?.id ?? "")).toBe("/skill:foo bar");
 
 		// The VISIBLE chip's executable message is gone; the hidden reminder is not.
@@ -603,6 +608,47 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		const remaining = [...queuedAfter.steering, ...queuedAfter.followUp];
 		expect(remaining).toHaveLength(1);
 		expect(JSON.stringify(remaining[0])).toContain("hidden reminder");
+	});
+
+	it("E6c: reordering a visible chip past a hidden message moves the right executable message", async () => {
+		// A display index is not an Agent queue index: with a hidden display:false
+		// message occupying an executable slot, a positional reorder would move the
+		// hidden message while the UI moved the chip.
+		fixture = await createRealSession();
+		const { session } = fixture;
+		await session.sendCustomMessage(
+			{ customType: "resolve-reminder", content: "hidden reminder", display: false, attribution: "agent" },
+			{ deliverAs: "steer" },
+		);
+		for (const text of ["chip one", "chip two"]) {
+			const tag = session.enqueueCustomMessageDisplay(text, "steer");
+			await session.sendCustomMessage(
+				{
+					customType: "skill-prompt",
+					content: text,
+					display: false,
+					attribution: "user",
+					details: { __pendingDisplayTag: tag },
+				},
+				{ deliverAs: "steer" },
+			);
+		}
+		const executableTextOf = (message: unknown): string => JSON.stringify(message);
+		const before = session.agent.snapshotFollowUp().map(executableTextOf);
+		expect(before[0]).toContain("hidden reminder");
+		expect(before[1]).toContain("chip one");
+		expect(before[2]).toContain("chip two");
+
+		const entries = session.getQueuedMessageEntries();
+		expect(entries.map(entry => entry.text)).toEqual(["chip one", "chip two"]);
+		expect(session.moveQueuedMessageForEditing(entries[1]?.id ?? "", "up")).toBe(true);
+
+		// The two chips swapped; the hidden reminder kept its slot.
+		const after = session.agent.snapshotFollowUp().map(executableTextOf);
+		expect(after[0]).toContain("hidden reminder");
+		expect(after[1]).toContain("chip two");
+		expect(after[2]).toContain("chip one");
+		expect(session.getQueuedMessageEntries().map(entry => entry.text)).toEqual(["chip two", "chip one"]);
 	});
 
 	it("E7: popLastQueuedMessage on a tagged entry leaves no orphan tag state", async () => {

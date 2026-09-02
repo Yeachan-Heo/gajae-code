@@ -13774,8 +13774,20 @@ export class AgentSession {
 		const fromIndex = queue.findIndex(entry => entry.sequence === sequence);
 		if (fromIndex === -1) return false;
 		const toIndex = direction === "up" ? fromIndex - 1 : fromIndex + 1;
+		if (toIndex < 0 || toIndex >= queue.length) return false;
+		// Identity-based reorder, for the same reason removal is: a display index is
+		// NOT an Agent queue index. Hidden `display:false` custom messages occupy
+		// executable slots without a chip, so mapping the visible position straight
+		// onto the Agent queue reorders an unrelated message while the UI moves the
+		// chip. Resolve both endpoints from the bound messages instead.
+		const fromMessage = queue[fromIndex]?.message;
+		const toMessage = queue[toIndex]?.message;
+		const executable = mode === "steer" ? this.agent.snapshotSteering() : this.agent.snapshotFollowUp();
+		const agentFrom = fromMessage === undefined ? fromIndex : executable.indexOf(fromMessage);
+		const agentTo = toMessage === undefined ? toIndex : executable.indexOf(toMessage);
+		if (agentFrom === -1 || agentTo === -1) return false;
 		const agentMoved =
-			mode === "steer" ? this.agent.moveSteer(fromIndex, toIndex) : this.agent.moveFollowUp(fromIndex, toIndex);
+			mode === "steer" ? this.agent.moveSteer(agentFrom, agentTo) : this.agent.moveFollowUp(agentFrom, agentTo);
 		if (!agentMoved) return false;
 		return this.#moveQueuedDisplayEntry(queue, fromIndex, toIndex);
 	}
