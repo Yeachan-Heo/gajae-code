@@ -32,6 +32,19 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 			message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				received.push(frame);
+				if (frame.type === "event_replay") {
+					socket.send(
+						JSON.stringify({
+							type: "event_replay_result",
+							id: frame.id,
+							ok: true,
+							events: [],
+							generation: 1,
+							lastSeq: 0,
+						}),
+					);
+					return;
+				}
 				socket.send(JSON.stringify({ type: "control_response", id: frame.id, ok: true, cleared: true }));
 			},
 		},
@@ -75,7 +88,24 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 			stdout: "pipe",
 			stderr: "pipe",
 		});
+		const reader = child.stdout.getReader();
+		const decoder = new TextDecoder();
+		let stdoutBuffer = "";
+		const readResponse = async (): Promise<Record<string, unknown>> => {
+			for (;;) {
+				const newline = stdoutBuffer.indexOf("\n");
+				if (newline >= 0) {
+					const line = stdoutBuffer.slice(0, newline);
+					stdoutBuffer = stdoutBuffer.slice(newline + 1);
+					return JSON.parse(line) as Record<string, unknown>;
+				}
+				const chunk = await reader.read();
+				if (chunk.done) throw new Error("MCP stdio closed before returning a response");
+				stdoutBuffer += decoder.decode(chunk.value, { stream: true });
+			}
+		};
 		child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" })}\n`);
+		const toolListResponse = await readResponse();
 		child.stdin.write(
 			`${JSON.stringify({
 				jsonrpc: "2.0",
@@ -87,16 +117,13 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 				},
 			})}\n`,
 		);
+		const controlResponse = await readResponse();
 		await child.stdin.end();
-		const stdout = await new Response(child.stdout).text();
 		const stderr = await new Response(child.stderr).text();
 		const exitCode = await child.exited;
 		expect(exitCode, stderr).toBe(0);
 
-		const responses = stdout
-			.trim()
-			.split("\n")
-			.map(line => JSON.parse(line) as Record<string, unknown>);
+		const responses = [toolListResponse, controlResponse];
 		const toolList = responses.find(response => response.id === 1)?.result as {
 			tools?: Array<Record<string, unknown>>;
 		};
