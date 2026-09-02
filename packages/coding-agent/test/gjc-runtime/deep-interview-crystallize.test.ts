@@ -7,7 +7,10 @@ import {
 	crystallizeDeepInterview,
 	crystalSnapshotDigest,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
-import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import {
+	deepInterviewStatePath,
+	runNativeDeepInterviewCommand,
+} from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 
 function input(overrides: Partial<CrystalInput> = {}): CrystalInput {
 	const messages = [{ index: 0, role: "user" as const, content: "Build a fast report." }];
@@ -40,6 +43,19 @@ function later(value: CrystalInput, revision: number): CrystalInput {
 	const snapshot = { ...value.snapshot, revision };
 	snapshot.digest = crystalSnapshotDigest(snapshot);
 	return { ...value, snapshot, current_revision: revision };
+}
+
+function withFreshUserEvidence(value: CrystalInput, content: string): CrystalInput {
+	const index = value.snapshot.end + 1;
+	const snapshot: CrystalSnapshot = {
+		revision: value.snapshot.revision + 1,
+		start: value.snapshot.start,
+		end: index,
+		messages: [...value.snapshot.messages, { index, role: "user", content }],
+		digest: "",
+	};
+	snapshot.digest = crystalSnapshotDigest(snapshot);
+	return { ...value, snapshot, current_revision: snapshot.revision };
 }
 
 describe("deep-interview crystallize contract", () => {
@@ -264,6 +280,34 @@ describe("deep-interview crystallize contract", () => {
 		).toThrow("has no fresh verbatim user anchor");
 	});
 
+	it("rejects unrelated user text as resolution evidence for a blocking gap", () => {
+		const first = crystallizeDeepInterview(input({ open_gaps: ["What is the maximum memory budget?"] }));
+		const messages: CrystalSnapshot["messages"] = [
+			{ index: 0, role: "user", content: "Build a fast report." },
+			{ index: 1, role: "user", content: "Blue sky today" },
+		];
+		const snapshot: CrystalSnapshot = { revision: 2, start: 0, end: 1, messages, digest: "" };
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					prior: first,
+					snapshot,
+					current_revision: 2,
+					resolved_open_gaps: ["What is the maximum memory budget?"],
+					resolved_open_gap_anchors: [
+						{
+							item: "What is the maximum memory budget?",
+							message_index: 1,
+							quote: "Blue sky today",
+							resolution: "Blue sky today",
+						},
+					],
+				}),
+			),
+		).toThrow("has no relevant verbatim user anchor");
+	});
+
 	it("marks conflicting evidence stale", () => {
 		const crystal = crystallizeDeepInterview(input({ conflicts: ["Later message contradicts the goal."] }));
 		expect(crystal.lifecycle).toBe("stale");
@@ -273,7 +317,7 @@ describe("deep-interview crystallize contract", () => {
 	it("records additive changes while preserving unchanged items", () => {
 		const first = crystallizeDeepInterview(input());
 		const second = crystallizeDeepInterview(
-			later(
+			withFreshUserEvidence(
 				input({
 					prior: first,
 					items: [
@@ -283,11 +327,11 @@ describe("deep-interview crystallize contract", () => {
 							kind: "acceptance_criterion",
 							classification: "confirmed",
 							statement: "Respond quickly",
-							anchor: { message_index: 0, quote: "fast" },
+							anchor: { message_index: 1, quote: "respond quickly" },
 						},
 					],
 				}),
-				2,
+				"The report must respond quickly.",
 			),
 		);
 		expect(second.spec_version).toBe(2);
@@ -298,9 +342,19 @@ describe("deep-interview crystallize contract", () => {
 	it("replaces a changed goal", () => {
 		const first = crystallizeDeepInterview(input());
 		const second = crystallizeDeepInterview(
-			later(
-				input({ prior: first, items: [{ ...first.items[0]!, statement: "Build a dashboard" }, first.items[1]!] }),
-				2,
+			withFreshUserEvidence(
+				input({
+					prior: first,
+					items: [
+						{
+							...first.items[0]!,
+							statement: "Build a dashboard",
+							anchor: { message_index: 1, quote: "Build a dashboard" },
+						},
+						first.items[1]!,
+					],
+				}),
+				"Build a dashboard instead.",
 			),
 		);
 		expect(second.delta.kind).toBe("goal-replaced");
@@ -310,16 +364,50 @@ describe("deep-interview crystallize contract", () => {
 	it("invalidates approval when a constraint changes", () => {
 		const first = crystallizeDeepInterview(input());
 		const second = crystallizeDeepInterview(
-			later(
+			withFreshUserEvidence(
 				input({
 					prior: first,
-					items: [first.items[0]!, { ...first.items[1]!, statement: "Respond within 50 ms" }],
+					items: [
+						first.items[0]!,
+						{
+							...first.items[1]!,
+							statement: "Respond within 50 ms",
+							anchor: { message_index: 1, quote: "within 50 ms" },
+						},
+					],
 				}),
-				2,
+				"The report must respond within 50 ms.",
 			),
 		);
 		expect(second.delta.kind).toBe("intent-changed");
 		expect(second.delta.approval_invalidated).toBe(true);
+	});
+
+	it("rejects changed confirmed intent anchored only before the prior Crystal boundary", () => {
+		const first = crystallizeDeepInterview(input());
+		const messages: CrystalSnapshot["messages"] = [
+			{ index: 0, role: "user", content: "Build a fast report." },
+			{ index: 1, role: "assistant", content: "Acknowledged." },
+		];
+		const snapshot: CrystalSnapshot = { revision: 2, start: 0, end: 1, messages, digest: "" };
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					prior: first,
+					snapshot,
+					current_revision: 2,
+					items: [
+						first.items[0]!,
+						{
+							...first.items[1]!,
+							statement: "Respond within 50 ms",
+							anchor: { message_index: 0, quote: "fast" },
+						},
+					],
+				}),
+			),
+		).toThrow("changed confirmed item constraint:latency requires fresh user evidence");
 	});
 
 	it("rejects a stale or tampered snapshot", () => {
@@ -425,6 +513,56 @@ describe("deep-interview crystallize contract", () => {
 			expect(summary.mode).toBe("crystallize");
 			expect(summary.crystal.execution_approval).toBe("not-approved");
 			expect(await fs.readFile(summary.spec_path, "utf8")).toContain("Execution approval: not-approved");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not reactivate an inactive deep-interview state through crystallization", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-inactive-"));
+		const sessionId = "crystallize-inactive";
+		const statePath = deepInterviewStatePath(root, sessionId);
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const value = input();
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.mkdir(path.dirname(statePath), { recursive: true });
+			const inactiveState = {
+				skill: "deep-interview",
+				session_id: sessionId,
+				active: false,
+				current_phase: "handoff",
+				state: {},
+			};
+			const before = `${JSON.stringify(inactiveState)}\n`;
+			await fs.writeFile(statePath, before);
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: value.snapshot.messages[0]!.content },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(value),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"must-not-revive",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("cannot crystallize an inactive deep-interview state");
+			expect(await fs.readFile(statePath, "utf8")).toBe(before);
+			await expect(fs.access(path.join(path.dirname(statePath), "..", "specs"))).rejects.toThrow();
 		} finally {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
