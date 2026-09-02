@@ -803,6 +803,13 @@ export type AgentEvent =
 			stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
 			/** Present iff `stopReason === "maintenance"`; the maintenance outcome. */
 			maintenanceOutcome?: MidRunMaintenanceOutcome;
+			/**
+			 * Steering that was admitted into this run but never consumed before it
+			 * ended (the loop exited on abort, error, pause, or completion without a
+			 * further poll). The Agent clears its queue on every run exit; the owner
+			 * decides once here whether to re-route or drop these messages.
+			 */
+			disownedSteering?: AgentMessage[];
 			/** Present iff `AgentTelemetryConfig` was supplied on this run. */
 			telemetry?: AgentRunSummary;
 			coverage?: AgentRunCoverage;

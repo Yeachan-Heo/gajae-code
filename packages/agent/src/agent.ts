@@ -1248,6 +1248,15 @@ export class Agent {
 		this.#followUpQueue.push(m);
 	}
 
+	/**
+	 * Mark a follow-up message for prompt-by-prompt delivery under `all` mode
+	 * without queueing it. Used when a message is restored ahead of the queue
+	 * (e.g. steering disowned by an ended run and re-routed as a follow-up).
+	 */
+	markFollowUpSequential(m: AgentMessage): void {
+		this.#followUpForceOneAtATime.add(m);
+	}
+
 	clearSteeringQueue() {
 		this.#steeringQueue = [];
 	}
@@ -2342,6 +2351,15 @@ export class Agent {
 			scope: handle?.scope,
 		};
 		if (handle) terminalEvent.scope = handle.scope;
+		// The run is over: nothing will poll the steering queue again. Disown
+		// whatever it still holds so no later, unrelated run can consume it, and
+		// hand it to the owner on the terminal event to re-route or drop once.
+		// An armed admission fence (a fold winding this turn down) is the owner
+		// explicitly holding the queue for the wake turn: leave it in place.
+		if (this.#steeringQueue.length > 0 && this.#steeringAdmissionFence?.() !== true) {
+			terminalEvent.disownedSteering = this.#steeringQueue;
+			this.#steeringQueue = [];
+		}
 		if (domain) {
 			setAgentTerminalOwnerContext(terminalEvent, {
 				resourceRunId,

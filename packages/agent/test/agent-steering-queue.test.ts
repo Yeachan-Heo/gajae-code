@@ -60,7 +60,7 @@ describe("Agent steering admission", () => {
 		await h.entered;
 		const admission = h.agent.steer(userMessage("mid-run"));
 		expect(admission.admitted).toBe(true);
-		if (admission.admitted) expect(admission.runId).toBe(h.agent.activeRunId);
+		if (admission.admitted) expect(admission.runId).toBe(h.agent.activeRunId ?? -1);
 		expect(h.agent.hasQueuedSteering()).toBe(true);
 		h.release();
 		await run;
@@ -76,6 +76,41 @@ describe("Agent steering admission", () => {
 		expect(h.agent.hasQueuedSteering()).toBe(false);
 		h.release();
 		await run;
+	});
+
+	it("disowns unconsumed steering on agent_end and clears the queue", async () => {
+		const h = liveRunHarness();
+		const ends: Array<{ disowned: string[] }> = [];
+		h.agent.subscribe(event => {
+			if (event.type === "agent_end")
+				ends.push({
+					disowned: (event.disownedSteering ?? []).map(m => (m.role === "user" ? String(m.content) : m.role)),
+				});
+		});
+		const run = h.agent.prompt("go");
+		await h.entered;
+		expect(h.agent.steer(userMessage("admitted then abandoned")).admitted).toBe(true);
+		// Abort while the tool is parked: the loop exits without polling again.
+		h.agent.abort();
+		h.release();
+		await run;
+		expect(ends).toEqual([{ disowned: ["admitted then abandoned"] }]);
+		expect(h.agent.hasQueuedSteering()).toBe(false);
+		// No later run can pick it up.
+		await h.agent.prompt("next");
+		const lastCall = h.mock.calls.at(-1)!;
+		expect(lastCall.context.messages.some(m => JSON.stringify(m.content).includes("abandoned"))).toBe(false);
+	});
+
+	it("leaves steering in place on agent_end while an admission fence is armed", async () => {
+		const h = liveRunHarness();
+		h.agent.setSteeringAdmissionFence(() => true);
+		const run = h.agent.prompt("go");
+		await h.entered;
+		expect(h.agent.steer(userMessage("held for the wake turn")).admitted).toBe(true);
+		h.release();
+		await run;
+		expect(h.agent.hasQueuedSteering()).toBe(true);
 	});
 
 	it("reports queued steering distinctly from follow-ups", () => {

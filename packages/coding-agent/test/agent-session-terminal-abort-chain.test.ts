@@ -649,35 +649,36 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		await promptPromise;
 	}, 30_000);
-	it("terminal abort keeps the steering display aligned with the purge decisions", async () => {
-		// Review thread P2: the display list must mirror which executable
-		// messages were actually purged — preserved post-snapshot external
-		// steers stay visible and purged internal steers disappear, so the
-		// positional editing APIs never remove a different preserved steer.
+	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {
+		// Review thread P2: the display list must mirror what the run's disowned
+		// steering became — a purged internal steer disappears everywhere, and a
+		// preserved post-snapshot external steer is re-routed (queue AND display)
+		// as a follow-up of the fresh turn, so the positional editing APIs never
+		// address a stale entry.
 		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("steer answered")];
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
 		// An internal steer admitted into the live turn before the abort wins:
-		// purged with the aborted turn's other continuations.
+		// dropped with the aborted turn's other continuations.
 		await session.steer("stale internal steer");
 		// A client steer admitted after the abort admission snapshot: preserved.
 		session.captureTerminalAbortSteeringSnapshot();
 		await session.sendUserMessage("client steer", { deliverAs: "steer" });
 		expect(session.getQueuedMessages().steering).toEqual(["stale internal steer", "client steer"]);
+		let observed: { steering: readonly string[]; followUp: readonly string[] } | undefined;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end" && observed === undefined) observed = session.getQueuedMessages();
+		});
 		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
-		const queued = session.getQueuedMessages();
-		expect(queued.steering).toEqual(["client steer"]);
-		expect(session.agent.snapshotSteering()).toHaveLength(1);
-		// Positional editing stays aligned with the executable queue: removing
-		// the displayed entry removes the preserved steer (not a stale internal
-		// entry at the same index).
-		const [entry] = session.getQueuedMessageEntries();
-		expect(entry?.mode).toBe("steer");
-		const removed = session.removeQueuedMessageForEditing(entry?.id ?? "");
-		expect(removed).toBe("client steer");
-		expect(session.agent.hasQueuedSteering()).toBe(false);
-		expect(session.getQueuedMessages().steering).toHaveLength(0);
+		unsubscribe();
+		// At the aborted run's terminal: internal steer gone, client steer
+		// re-routed as the next turn's follow-up in both queue and display.
+		expect(observed).toEqual({ steering: [], followUp: ["client steer"] });
+		expect(session.agent.snapshotSteering()).toHaveLength(0);
+		// The rearm then consumes it as a fresh turn.
+		await waitFor(() => !session.agent.hasQueuedMessages(), "client steer consumed");
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 		await promptPromise;
 	}, 30_000);
 

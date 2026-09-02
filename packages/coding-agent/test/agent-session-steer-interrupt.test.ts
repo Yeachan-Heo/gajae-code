@@ -515,4 +515,84 @@ describe("AgentSession steer-on-interrupt", () => {
 		expect(userTexts.some(t => t.includes("steer-early"))).toBe(true);
 		expect(assistantCount(s)).toBe(2);
 	});
+
+	function blockingHarness(responses: Array<{ content: unknown[] }>) {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		const started = Promise.withResolvers<void>();
+		let release: (() => void) | undefined;
+		const tool = {
+			name: "blocks",
+			description: "Blocks until released.",
+			parameters: { type: "object" as const, properties: {} },
+			execute: async (_args: unknown, signal?: AbortSignal) => {
+				started.resolve();
+				await new Promise<void>(resolve => {
+					release = resolve;
+					signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return { content: [{ type: "text" as const, text: "tool finished" }] };
+			},
+		};
+		const mock = createMockModel({ responses: responses as never });
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [tool as never], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		const s = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		return { s, mock, started: started.promise, release: () => release?.() };
+	}
+
+	it("drops steering the run disowns on a non-user abort and fires its hook exactly once", async () => {
+		const h = blockingHarness([
+			{ content: [{ type: "toolCall", name: "blocks", arguments: {} }] },
+			{ content: ["should not run"] },
+		]);
+		session = h.s;
+		const running = h.s.prompt("run the blocking tool").catch(() => {});
+		await h.started;
+		const promotions: unknown[] = [];
+		await h.s.sendUserMessage("steer for the dying turn", {
+			deliverAs: "steer",
+			onQueuedPromoted: promotion => {
+				promotions.push(promotion);
+			},
+		});
+		expect(h.s.getQueuedMessages().steering).toEqual(["steer for the dying turn"]);
+		await h.s.abort({ cause: "internal" });
+		h.release();
+		await running;
+		await settle(h.s);
+		// The SDK correlation settles exactly once (in-run consumption at the
+		// aborting tool boundary, or removal at disown), never twice and never
+		// as a promotion to a fresh run.
+		expect(promotions).toHaveLength(1);
+		expect(promotions[0]).toMatchObject({ startsOwnRun: false });
+		expect(h.s.agent.hasQueuedMessages()).toBe(false);
+		expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(h.mock.calls).toHaveLength(1);
+	});
+
+	it("re-routes steering the run disowns on a user interrupt as the next turn", async () => {
+		const h = blockingHarness([
+			{ content: [{ type: "toolCall", name: "blocks", arguments: {} }] },
+			{ content: ["handled steering"] },
+		]);
+		session = h.s;
+		const running = h.s.prompt("run the blocking tool").catch(() => {});
+		await h.started;
+		await h.s.steer("stop and do this instead");
+		await h.s.abort({ cause: "user_interrupt" });
+		h.release();
+		await running;
+		await settle(h.s);
+		expect(h.s.agent.hasQueuedMessages()).toBe(false);
+		expect(h.s.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		const users = h.s.agent.state.messages.filter(m => m.role === "user").map(m => JSON.stringify(m.content));
+		expect(users.some(t => t.includes("stop and do this instead"))).toBe(true);
+		expect(assistantCount(h.s)).toBe(2);
+	});
 });

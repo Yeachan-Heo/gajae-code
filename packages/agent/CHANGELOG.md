@@ -5,6 +5,7 @@
 ### Changed
 
 - `Agent.steer()` now performs enqueue-time admission and returns a `SteerAdmission` result. A steer is pushed onto the steering queue only while a run is live and its signal is not aborted; otherwise it returns `{ admitted: false, reason: "idle" | "aborting" }` and queues nothing. A steer submitted after a turn ended, or during an abort, can no longer sit orphaned in the queue and get consumed by whichever unrelated later prompt polls it first. Callers that need delivery when no run is live route the message themselves (the coding-agent session queues it as a sequential follow-up owned by the next turn).
+- Every run exit now disowns steering it admitted but never consumed: `Agent` clears its steering queue when the run's `agent_end` is finalized (completed, aborted, cancelled, error, or `forceAbort`) and reports the messages on the event's new `disownedSteering` field, so the owner decides once what happens to them and no later, unrelated run can consume them. An armed steering-admission fence (a fold winding the turn down for a wake turn) keeps the queue in place. Added `Agent.markFollowUpSequential()` for callers that restore a message ahead of the follow-up queue but still want prompt-by-prompt delivery under `followUpMode: "all"`.
 
 ## [0.16.0] - 2026-09-02
 

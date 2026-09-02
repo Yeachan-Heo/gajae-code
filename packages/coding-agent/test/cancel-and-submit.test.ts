@@ -328,16 +328,26 @@ describe("AgentSession.cancelAndSubmit", () => {
 	});
 
 	it("committed queue-head removes only the selected duplicate-text display", async () => {
-		const { session: s } = buildSession();
+		const { session: s } = buildGatedStreamingSession();
+		void s.prompt("active stream").catch(() => {});
+		await waitForStreaming(s);
 		await s.steer("duplicate queued text");
 		await s.steer("duplicate queued text");
 		const [selected, remaining] = s.getQueuedMessageEntries();
 		if (!selected || !remaining) throw new Error("expected duplicate queued entries");
 
+		// Observe the queue at the moment the new turn starts: the follow-up is
+		// consumed by that turn as soon as its first response completes.
+		let entriesAtNewTurn: ReturnType<AgentSession["getQueuedMessageEntries"]> | undefined;
+		const unsubscribe = s.subscribe(event => {
+			if (event.type === "agent_start" && entriesAtNewTurn === undefined)
+				entriesAtNewTurn = s.getQueuedMessageEntries();
+		});
 		expect(await s.cancelAndSubmit(selected.text, { queuedEntryId: selected.id })).toEqual({ kind: "submitted" });
-		expect(s.getQueuedMessageEntries()).toEqual([
-			expect.objectContaining({ text: remaining.text, mode: "followUp" }),
-		]);
+		unsubscribe();
+		// The unselected steer of the aborted turn is re-queued as a follow-up of
+		// the new turn; exactly one duplicate-text display remains.
+		expect(entriesAtNewTurn).toEqual([expect.objectContaining({ text: remaining.text, mode: "followUp" })]);
 	});
 
 	it("committed queue-head preserves the original image-bearing queued message", async () => {
