@@ -6719,26 +6719,77 @@ function extractStringProperty(source: string, name: string, startIndex = 0): st
 	return decodeJsonStringFragment(source.slice(valueStart));
 }
 
-function extractBooleanProperty(source: string, name: string): boolean | undefined {
-	const propertyIndex = source.indexOf(`"${name}"`);
-	if (propertyIndex === -1) return undefined;
-	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
-	if (colonIndex === -1) return undefined;
-	const value = source.slice(colonIndex + 1).trimStart();
-	if (value.startsWith("true")) return true;
-	if (value.startsWith("false")) return false;
-	return undefined;
+function extractTopLevelPrimitiveProperty(source: string, name: string): string | undefined {
+	let depth = 0;
+	let latest: string | undefined;
+	for (let index = 0; index < source.length; index++) {
+		const char = source.charCodeAt(index);
+		if (char === 0x7b || char === 0x5b) {
+			depth++;
+			continue;
+		}
+		if (char === 0x7d || char === 0x5d) {
+			depth--;
+			continue;
+		}
+		if (char !== 0x22) continue;
+
+		const keyStart = index;
+		let escaped = false;
+		for (index++; index < source.length; index++) {
+			const stringChar = source.charCodeAt(index);
+			if (escaped) {
+				escaped = false;
+				continue;
+			}
+			if (stringChar === 0x5c) {
+				escaped = true;
+				continue;
+			}
+			if (stringChar === 0x22) break;
+		}
+		if (index >= source.length || depth !== 1) continue;
+
+		let key: unknown;
+		try {
+			key = JSON.parse(source.slice(keyStart, index + 1));
+		} catch {
+			continue;
+		}
+		if (key !== name) continue;
+
+		let valueStart = index + 1;
+		while (valueStart < source.length && /\s/.test(source[valueStart]!)) valueStart++;
+		if (source.charCodeAt(valueStart) !== 0x3a) continue;
+		valueStart++;
+		while (valueStart < source.length && /\s/.test(source[valueStart]!)) valueStart++;
+
+		let valueEnd = valueStart;
+		while (
+			valueEnd < source.length &&
+			source[valueEnd] !== "," &&
+			source[valueEnd] !== "}" &&
+			!/\s/.test(source[valueEnd]!)
+		)
+			valueEnd++;
+		latest = source.slice(valueStart, valueEnd);
+		index = valueEnd - 1;
+	}
+	return latest;
 }
 
-function extractIntegerProperty(source: string, name: string): number | undefined {
-	const propertyIndex = source.indexOf(`"${name}"`);
-	if (propertyIndex === -1) return undefined;
-	const colonIndex = source.indexOf(":", propertyIndex + name.length + 2);
-	if (colonIndex === -1) return undefined;
-	const match = /^\s*(-?\d+)/.exec(source.slice(colonIndex + 1));
-	if (!match) return undefined;
-	const value = Number(match[1]);
+function extractTopLevelIntegerProperty(source: string, name: string): number | undefined {
+	const token = extractTopLevelPrimitiveProperty(source, name);
+	if (token === undefined || !/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(token)) return undefined;
+	const value = Number(token);
 	return Number.isSafeInteger(value) ? value : undefined;
+}
+
+function extractTopLevelBooleanProperty(source: string, name: string): boolean | undefined {
+	const token = extractTopLevelPrimitiveProperty(source, name);
+	if (token === "true") return true;
+	if (token === "false") return false;
+	return undefined;
 }
 
 function countMessageMarkers(content: string): number {
@@ -6791,8 +6842,8 @@ function parseSessionListHeader(
 ): SessionListHeader | undefined {
 	const firstLineEnd = content.indexOf("\n");
 	const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
-	const inlineStarred = extractBooleanProperty(firstLine, "starred");
-	const starredPatchVersion = extractIntegerProperty(firstLine, "starredPatchVersion") === 1 ? 1 : undefined;
+	const inlineStarred = extractTopLevelBooleanProperty(firstLine, "starred");
+	const starredPatchVersion = extractTopLevelIntegerProperty(firstLine, "starredPatchVersion") === 1 ? 1 : undefined;
 	const parsedHeader = entries[0];
 	if (parsedHeader?.type === "session" && typeof parsedHeader.id === "string") {
 		return {
@@ -6816,7 +6867,7 @@ function parseSessionListHeader(
 	return {
 		type: "session",
 		id,
-		version: extractIntegerProperty(firstLine, "version"),
+		version: extractTopLevelIntegerProperty(firstLine, "version"),
 		cwd: extractStringProperty(firstLine, "cwd"),
 		title: extractStringProperty(firstLine, "title"),
 		starred: inlineStarred,

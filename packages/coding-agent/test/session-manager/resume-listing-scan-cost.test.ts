@@ -207,4 +207,77 @@ describe("resume listing trailing-patch scan cost", () => {
 			starred: true,
 		});
 	});
+
+	it("fails closed on inexact or non-top-level oversized header capabilities", async () => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-invalid-capability-"));
+		const cwd = path.join(testDir, "cwd");
+		const sessionDir = path.join(testDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(sessionDir, { recursive: true });
+		const padding = "x".repeat(8 * 1024);
+		const cases = [
+			{ id: "fractional", capability: `"starredPatchVersion":1.5,"parentSession":${JSON.stringify(padding)}` },
+			{
+				id: "nested",
+				capability: `"metadata":{"starredPatchVersion":1},"parentSession":${JSON.stringify(padding)}`,
+			},
+			{
+				id: "duplicate",
+				capability: `"starredPatchVersion":1,"starredPatchVersion":0,"parentSession":${JSON.stringify(padding)}`,
+			},
+			{
+				id: "late",
+				capability: `"parentSession":${JSON.stringify(padding)},"starredPatchVersion":1`,
+			},
+		];
+
+		for (const { id, capability } of cases) {
+			const header = `{"type":"session","version":${CURRENT_SESSION_VERSION},"id":"${id}","timestamp":"2026-08-16T00:00:00.000Z","cwd":${JSON.stringify(cwd)},"title":"${id}",${capability}}`;
+			const message = JSON.stringify({
+				type: "message",
+				id: `${id}-message`,
+				parentId: null,
+				timestamp: "2026-08-16T00:00:01.000Z",
+				message: { role: "user", content: "hello", timestamp: 1 },
+			});
+			const starPatch = JSON.stringify({ type: "header_patch", patch: { starred: true } });
+			fs.writeFileSync(path.join(sessionDir, `${id}.jsonl`), `${header}\n${message}\n${starPatch}\n`);
+		}
+
+		const candidates = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		for (const { id } of cases) {
+			expect(candidates.find(item => item.id === id)?.starred).toBe(false);
+		}
+	});
+
+	it("uses top-level last-value semantics for inline star state", async () => {
+		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-inline-star-"));
+		const cwd = path.join(testDir, "cwd");
+		const sessionDir = path.join(testDir, "sessions");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(sessionDir, { recursive: true });
+		const padding = JSON.stringify("x".repeat(8 * 1024));
+		const cases = [
+			{ id: "nested-star", fields: '"metadata":{"starred":true}', expected: false },
+			{ id: "duplicate-false", fields: '"starred":true,"starred":false', expected: false },
+			{ id: "duplicate-true", fields: '"starred":false,"starred":true', expected: true },
+		];
+
+		for (const { id, fields } of cases) {
+			const header = `{"type":"session","version":${CURRENT_SESSION_VERSION},"starredPatchVersion":1,"id":"${id}","timestamp":"2026-08-16T00:00:00.000Z","cwd":${JSON.stringify(cwd)},"title":"${id}",${fields},"parentSession":${padding}}`;
+			const message = JSON.stringify({
+				type: "message",
+				id: `${id}-message`,
+				parentId: null,
+				timestamp: "2026-08-16T00:00:01.000Z",
+				message: { role: "user", content: "hello", timestamp: 1 },
+			});
+			fs.writeFileSync(path.join(sessionDir, `${id}.jsonl`), `${header}\n${message}\n`);
+		}
+
+		const candidates = await SessionManager.listForResumePickerReadOnly(cwd, sessionDir);
+		for (const { id, expected } of cases) {
+			expect(candidates.find(item => item.id === id)?.starred).toBe(expected);
+		}
+	});
 });

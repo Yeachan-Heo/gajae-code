@@ -96,7 +96,7 @@ Notes:
 
 - `version` is optional in v1 files; absence means v1.
 - `starredPatchVersion: 1` declares that the transcript can contain standalone star patches. It lets discovery skip star scans for older v5 transcripts while keeping their existing title/cwd patch lookup bounded.
-- `starred` is optional and defaults to `false`. `/star` and `/unstar` persist changes through append-only `header_patch` records; writers checkpoint the current star state beside later title/cwd patches so reverse discovery remains bounded. Starring affects discovery order only and does not protect a session from explicit deletion or retention pruning.
+- `starred` is optional and defaults to `false`. `/star` and `/unstar` persist changes through append-only `header_patch` records; writers checkpoint the current star state beside later title/cwd patches so reverse discovery remains bounded. Starring adds no star-aware branch to ID resolution, `--continue`, deletion, or retention pruning and never protects a session. Like every transcript append, the metadata write updates the file's ordinary modification time, which those existing policies may already consume.
 - `parentSession` is an opaque lineage string. Current code writes either a session id or a session path depending on flow (`fork`, `forkFrom`, `createBranchedSession`, or explicit `newSession({ parentSession })`). Treat as metadata, not a typed foreign key.
 
 ### Entry Base (`SessionEntryBase`)
