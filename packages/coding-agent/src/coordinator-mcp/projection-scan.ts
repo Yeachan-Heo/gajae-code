@@ -195,10 +195,10 @@ function trimProjectionRootPath(dir: string): string {
 }
 
 /**
- * Windows has no descriptor-relative `openat` binding in Node. Keep the root pathname
- * authoritative by checking its identity before and after every mutable-path operation.
+ * Node exposes no descriptor-relative `openat` binding on Windows or macOS. Keep the
+ * root pathname authoritative by checking its identity around every path operation.
  */
-async function openProjectionDirectoryWindowsSafe(dir: string): Promise<ProjectionScanDirectory> {
+async function openProjectionDirectoryPathBracketed(dir: string): Promise<ProjectionScanDirectory> {
 	const rootPath = trimProjectionRootPath(dir);
 	let opened: import("node:fs").BigIntStats;
 	try {
@@ -226,8 +226,8 @@ async function openProjectionDirectoryWindowsSafe(dir: string): Promise<Projecti
 	};
 
 	const entryPath = (entry: string): string => {
-		// Directory entries come from readdir and are therefore single components on
-		// Windows. Keep the invariant explicit so an injected or corrupted entry can
+		// Directory entries come from readdir and are therefore single components.
+		// Keep the invariant explicit so an injected or corrupted entry can
 		// never turn a child operation into mutable pathname traversal.
 		if (
 			entry.length === 0 ||
@@ -290,7 +290,7 @@ async function openProjectionDirectoryWindowsSafe(dir: string): Promise<Projecti
  */
 async function openProjectionDirectorySafe(dir: string): Promise<ProjectionScanDirectory> {
 	const platform = projectionPlatform();
-	if (platform === "win32") return openProjectionDirectoryWindowsSafe(dir);
+	if (platform === "win32" || platform === "darwin") return openProjectionDirectoryPathBracketed(dir);
 	if (platform !== "linux") throw new ProjectionScanUnsupportedError();
 	const noFollow = fs.constants.O_NOFOLLOW;
 	const nonBlock = fs.constants.O_NONBLOCK;

@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Coordinator projection scans now use identity-bracketed directory authority on macOS instead of failing every scan as unsupported, while root and candidate replacement races remain fail-closed.
 - Interactive OAuth account selection now handles a stale or missing pinned credential in place, preserving the session and actionable `/login` or AUTO guidance instead of creating an unhandled rejection and crash record.
 - Named-worktree SDK session.create now gives git worktree add/reuse and workspace install independent 30s budgets instead of charging them against the child 10s semantic-readiness clock. Prep timeouts stay typed and terminal (`worktree_preparation_timeout` / `dependency_preparation_timeout`); Coordinator and ACP preserve those codes instead of collapsing them to `unavailable` or `broker_compensation_unobserved`. Ordinary no-worktree sessions stay 10s/21s.
 - SDK session-index scan/replay now explicitly documents and regression-tests the

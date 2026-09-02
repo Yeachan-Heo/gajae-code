@@ -347,11 +347,22 @@ describe("empty .gjc-delete-* latch", () => {
 		expect(scan.incomplete).toBe(false);
 	});
 
-	it("Test 1 Windows authority: root replacement fails closed", async () => {
-		const dir = await tempRoot("gjc-scan-win-root-race-");
+	// The darwin pathname-bracketed authority reads candidates with O_NOFOLLOW, which
+	// Windows Node does not expose, so the darwin hook cannot be exercised on a Windows host.
+	const pathBracketedPlatforms = (
+		[
+			["Windows", "win32", "win"],
+			["macOS", "darwin", "darwin"],
+		] as const
+	).filter(([, platform]) => platform !== "darwin" || process.platform !== "win32");
+
+	it.each(
+		pathBracketedPlatforms,
+	)("Test 1 %s authority: root replacement fails closed", async (_label, platform, prefix) => {
+		const dir = await tempRoot(`gjc-scan-${prefix}-root-race-`);
 		const replacement = `${dir}-replacement`;
 		tempDirs.push(replacement);
-		ProjectionScanTestHooks.platform = "win32";
+		ProjectionScanTestHooks.platform = platform;
 		await fs.writeFile(path.join(dir, "original.json"), JSON.stringify({ session_id: "original" }));
 
 		const realReaddir = fs.readdir;
@@ -489,9 +500,22 @@ describe("empty .gjc-delete-* latch", () => {
 		}
 	});
 
-	it("Test 1 Windows authority: unsupported platform remains fail-closed", async () => {
-		const dir = await tempRoot("gjc-scan-unsupported-platform-");
+	it.skipIf(process.platform === "win32")("Test 1 macOS authority: stable regular JSON remains readable", async () => {
+		const dir = await tempRoot("gjc-scan-darwin-stable-");
 		ProjectionScanTestHooks.platform = "darwin";
+		await fs.writeFile(path.join(dir, "stable.json"), JSON.stringify({ session_id: "stable" }));
+
+		const scan = await listCoordinatorJsonFiles(dir);
+
+		expect(scan.values).toEqual([{ session_id: "stable" }]);
+		expect(scan.parsed).toBe(1);
+		expect(scan.raced).toBe(0);
+		expect(scan.incomplete).toBe(false);
+	});
+
+	it("Test 1 unsupported platform remains fail-closed", async () => {
+		const dir = await tempRoot("gjc-scan-unsupported-platform-");
+		ProjectionScanTestHooks.platform = "freebsd";
 		await fs.writeFile(path.join(dir, "foreign.json"), JSON.stringify({ session_id: "foreign" }));
 
 		const scan = await listCoordinatorJsonFiles(dir);
