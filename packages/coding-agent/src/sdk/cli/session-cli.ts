@@ -42,6 +42,7 @@ import {
 	type SdkTailItemV1,
 	SESSION_ROWS_VERSION,
 	stripSecretFields,
+	tailItemKey,
 	toCheckpointRecordV1,
 	toRetentionGapV1,
 	toSessionRowV1,
@@ -985,13 +986,6 @@ function extractTranscriptPage(response: unknown): { items: unknown[]; complete:
 	};
 }
 
-function tailItemKey(item: SdkTailItemV1): string {
-	if (item.generation !== undefined && item.seq !== undefined)
-		return `${item.kind}\u0000${item.generation}\u0000${item.seq}`;
-	if (item.id !== undefined) return `${item.kind}\u0000${item.id}`;
-	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
-}
-
 function mergeTailItems(
 	target: SdkTailItemV1[],
 	seen: Set<string>,
@@ -1158,11 +1152,13 @@ function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | und
 	return toTailItemV1(
 		{
 			kind: frame.name,
+			...(frame.revision === undefined ? {} : { revision: frame.revision }),
 			...(seq === undefined ? {} : { generation: frame.generation, seq }),
 			payload: frame.body,
 		},
 		{
 			kind: frame.name,
+			...(frame.revision === undefined ? {} : { revision: frame.revision }),
 			...(seq === undefined ? {} : { generation: frame.generation, seq }),
 		},
 	);
@@ -1487,8 +1483,7 @@ async function runLiveTail(
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
-		if (item.revision === undefined && checkpoint?.revision !== undefined) item.revision = checkpoint.revision;
-		// If checkpoint was undefined, queue for later stamping? For now leave without rev
+		if (item.revision === undefined && checkpoint !== undefined) item.revision = checkpoint.revision;
 		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, [item], include));
 	};
 

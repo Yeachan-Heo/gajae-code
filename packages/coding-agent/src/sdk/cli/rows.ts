@@ -78,6 +78,15 @@ export interface SdkTailEnvelopeV1 {
 	items: SdkTailItemV1[];
 }
 
+export function tailItemKey(item: SdkTailItemV1): string {
+	// (generation, seq) restarts per revision; without the revision two turns'
+	// first frames share "1:1" and the second is silently dropped (#5200).
+	if (item.generation !== undefined && item.seq !== undefined)
+		return `${item.kind}\u0000${item.revision ?? ""}\u0000${item.generation}\u0000${item.seq}`;
+	if (item.id !== undefined) return `${item.kind}\u0000${item.id}`;
+	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
+}
+
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;
 
 /** Recursively removes secret-shaped fields (defense in depth for DTO output). */
@@ -228,7 +237,9 @@ export function toTailItemV1(
 	const item: SdkTailItemV1 = {
 		kind,
 		...(payloadId !== undefined ? { id: payloadId } : id !== undefined ? { id } : {}),
-		...(typeof value.revision === "number" ? { revision: value.revision } : {}),
+		...(typeof value.revision === "number" && Number.isSafeInteger(value.revision) && value.revision >= 0
+			? { revision: value.revision }
+			: {}),
 		...(typeof value.generation === "number" ? { generation: value.generation } : {}),
 		...(typeof value.seq === "number" ? { seq: value.seq } : {}),
 		payload: stripSecretFields(payload),
