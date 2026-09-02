@@ -686,7 +686,7 @@ export async function ensureLaunchWorktreeCancellable(
 		let dirty = isWorktreeDirty(plan.worktreePath);
 		if (plan.detached) {
 			if (!existingAtPath.detached) {
-				throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
+				throw worktreeTargetMismatchGuard(plan, existingAtPath);
 			}
 			if (existingAtPath.head !== plan.baseRef) {
 				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
@@ -694,7 +694,7 @@ export async function ensureLaunchWorktreeCancellable(
 				dirty = false;
 			}
 		} else if (existingAtPath.branchRef !== expectedBranchRef) {
-			throw new Error(formatWorktreeTargetMismatch(plan, existingAtPath));
+			throw worktreeTargetMismatchGuard(plan, existingAtPath);
 		}
 		return {
 			...plan,
