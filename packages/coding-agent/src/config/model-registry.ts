@@ -138,8 +138,7 @@ function redactDiscoveryUrl(value: string | URL): string {
 		return "(invalid URL)";
 	}
 }
-const UNREACHABLE_DISCOVERY_PATTERN =
-	/unable to connect|econnrefused|connection refused|enotfound|ehostunreach|econnreset/iu;
+const UNREACHABLE_DISCOVERY_PATTERN = /unable to connect|econnrefused|connection refused|enotfound|ehostunreach/iu;
 
 /** Whether `hostname` (as `URL.hostname` reports it) names this machine's loopback. */
 function isLoopbackDiscoveryHost(hostname: string): boolean {

@@ -523,27 +523,39 @@ export function resetPersistFailureWarnWindows(): void {
 }
 
 /**
- * Every owner record this process currently holds, keyed by owner-record path, with
- * the empty claim directory that record guards (transition claims only) and that
- * directory's captured generation. Maintained by the acquire/release paths so a forced
- * exit can tombstone them synchronously.
+ * Every owner record this process currently holds, keyed by owner-record path.
+ * Maintained by the acquire/release paths so a forced exit can tombstone them
+ * synchronously. Transition claim DIRECTORIES are deliberately not tracked: the
+ * released sidecar alone lets the next writer reclaim the claim after its grace, and a
+ * pathname `rmdir` here could never be bound to the directory generation atomically.
  */
-interface HeldSessionStateLock {
-	held: LockOwnerSnapshot;
-	claim?: { dir: string; generation: TransitionDirectoryGeneration };
-}
+const heldSessionStateLocks = new Map<string, LockOwnerSnapshot>();
 
-const heldSessionStateLocks = new Map<string, HeldSessionStateLock>();
+/**
+ * Write `payload` in full at offset 0 through `descriptor`, retrying short writes.
+ * Returns whether every byte landed.
+ */
+function writeFullyAtStartSync(descriptor: number, payload: Buffer): boolean {
+	let written = 0;
+	while (written < payload.length) {
+		const chunk = fsSync.writeSync(descriptor, payload, written, payload.length - written, written);
+		if (chunk <= 0) return false;
+		written += chunk;
+	}
+	return true;
+}
 
 /**
  * Rewrite one held owner record to a released tombstone, synchronously, and only while
  * the object behind the descriptor is still EXACTLY the record this process wrote.
  *
- * The bytes are compared through the opened descriptor, never through the pathname, so
- * an in-place mutation between any earlier look and the write cannot be overwritten.
- * The tombstone is written in full and length-checked BEFORE the old tail is truncated:
- * a short or failed write leaves the original record (or a superset of it) rather than
- * a malformed one that the fail-closed reclaimers would refuse forever.
+ * Identity, size, and bytes are all validated through the opened descriptor, never the
+ * pathname. The replacement is the tombstone JSON padded with trailing whitespace to
+ * EXACTLY the original length: valid JSON to every reader, and no truncate step, so
+ * there is no window in which the file holds tombstone bytes plus an old tail. A write
+ * that stops short is retried, and if it still cannot complete the original bytes are
+ * written back through the same descriptor so a partially overwritten record never
+ * outlives this call. A tombstone longer than the original is not attempted at all.
  */
 function tombstoneHeldOwnerRecordSync(file: string, held: LockOwnerSnapshot, hostId: string): boolean {
 	const flags = POSIX_OWNER_REWRITE_FLAGS ?? fsSync.constants.O_RDWR;
@@ -561,9 +573,22 @@ function tombstoneHeldOwnerRecordSync(file: string, held: LockOwnerSnapshot, hos
 		const current = Buffer.alloc(expected.length);
 		if (fsSync.readSync(descriptor, current, 0, expected.length, 0) !== expected.length) return false;
 		if (!current.equals(expected)) return false;
-		const tombstone = Buffer.from(JSON.stringify(releasedOwnerForHost(hostId)), "utf8");
-		if (fsSync.writeSync(descriptor, tombstone, 0, tombstone.length, 0) !== tombstone.length) return false;
-		if (tombstone.length < expected.length) fsSync.ftruncateSync(descriptor, tombstone.length);
+		const tombstoneJson = JSON.stringify(releasedOwnerForHost(hostId));
+		if (Buffer.byteLength(tombstoneJson, "utf8") > expected.length) return false;
+		const tombstone = Buffer.from(tombstoneJson.padEnd(expected.length, " "), "utf8");
+		let landed = false;
+		try {
+			landed = writeFullyAtStartSync(descriptor, tombstone);
+		} finally {
+			if (!landed) {
+				try {
+					writeFullyAtStartSync(descriptor, expected);
+				} catch {
+					// Restoration is itself best-effort on a failing descriptor.
+				}
+			}
+		}
+		if (!landed) return false;
 		fsSync.fsyncSync(descriptor);
 		return true;
 	} catch {
@@ -579,42 +604,28 @@ function tombstoneHeldOwnerRecordSync(file: string, held: LockOwnerSnapshot, hos
  * Meant for the forced-exit path (`postmortem.quit` after a repeated shutdown request),
  * where the async release protocol will never get to run. Each record is rewritten to a
  * released tombstone only while it is still byte-identical to what this process wrote
- * (see {@link tombstoneHeldOwnerRecordSync}); an empty claim directory it guards is
- * then `rmdir`ed only while it still carries the generation captured at acquisition.
- * Anything that changed underneath, or any I/O fault, is left for the dead-owner
- * reclaim path on the next writer. Never throws; returns the number of records
- * tombstoned.
+ * (see {@link tombstoneHeldOwnerRecordSync}). A transition claim directory is left in
+ * place: its released sidecar is exactly what `reclaimStaleTransitionClaim` removes
+ * identity-bound after the grace window. Anything that changed underneath, or any I/O
+ * fault, is left for the dead-owner reclaim path on the next writer. Never throws;
+ * returns the number of records tombstoned.
  */
 export function releaseHeldSessionStateLocksSync(): number {
 	let released = 0;
-	for (const [file, entry] of [...heldSessionStateLocks.entries()]) {
+	for (const [file, held] of [...heldSessionStateLocks.entries()]) {
 		heldSessionStateLocks.delete(file);
 		// The record this process wrote already carries its host qualification; reuse it
 		// rather than resolving the installation identity asynchronously mid-exit.
 		let hostId: string | undefined;
 		try {
-			const heldOwner: unknown = JSON.parse(entry.held.bytes);
+			const heldOwner: unknown = JSON.parse(held.bytes);
 			if (validLockOwner(heldOwner) && heldOwner.pid === process.pid) hostId = heldOwner.owner_host_id;
 		} catch {
 			hostId = undefined;
 		}
 		if (hostId === undefined) continue;
 		try {
-			if (!tombstoneHeldOwnerRecordSync(file, entry.held, hostId)) continue;
-			if (entry.claim !== undefined) {
-				try {
-					const current = fsSync.lstatSync(entry.claim.dir, { bigint: true });
-					if (
-						current.isDirectory() &&
-						sameTransitionGeneration(transitionGenerationFromStat(current), entry.claim.generation)
-					)
-						fsSync.rmdirSync(entry.claim.dir);
-				} catch {
-					// A replaced, populated, or already-removed claim is the successor's
-					// problem; the released tombstone alone satisfies the tombstone reclaimer.
-				}
-			}
-			released++;
+			if (tombstoneHeldOwnerRecordSync(file, held, hostId)) released++;
 		} catch {
 			// Forced exit: nothing here may block or throw.
 		}
@@ -2174,10 +2185,7 @@ async function withLockPathTransition<T>(
 			}
 			throw error;
 		}
-		heldSessionStateLocks.set(ownerFile, {
-			held,
-			claim: { dir: transitionDir, generation: transitionGeneration },
-		});
+		heldSessionStateLocks.set(ownerFile, held);
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),
@@ -2536,7 +2544,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 					const acquired = await acquireOwnerLock(lockFile, owner, cycleQuarantine);
 					// Register the instant the record exists, before the acquisition claim
 					// is released: a forced exit during that release must still see it.
-					heldSessionStateLocks.set(lockFile, { held: acquired });
+					heldSessionStateLocks.set(lockFile, acquired);
 					return acquired;
 				},
 				cycleQuarantine,

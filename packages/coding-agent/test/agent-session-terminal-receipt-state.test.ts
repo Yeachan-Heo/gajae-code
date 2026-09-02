@@ -178,7 +178,10 @@ describe("AgentSession terminal receipt state", () => {
 			sdkRunCapability: createSdkRunCapability("terminal-receipt-sdk-token"),
 		});
 		await terminal.promise;
-		await Bun.sleep(25);
+		// Dispose drains every queued coordinator persist, so no late warn can land after
+		// the assertion.
+		await session.dispose();
+		session = undefined;
 
 		// One warn for the whole session in the window, carrying the lock diagnostics;
 		// no second, unsuppressed warn from the SDK publication path.

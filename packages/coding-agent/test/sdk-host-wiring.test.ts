@@ -6263,6 +6263,57 @@ test("session teardown drains admitted direct gate resolution before detaching i
 		registerController.mockRestore();
 	}
 });
+for (const attached of [false, true]) {
+	test(`session_closed non-delivery logs at ${attached ? "warn with an attached client" : "debug with no client"}`, async () => {
+		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-session-closed-level-"));
+		dirs.push(cwd);
+		const sessionId = `session-closed-level-${attached ? "attached" : "empty"}-${Date.now()}`;
+		const sessionContext = context(cwd, sessionId);
+		const warned: Array<Record<string, unknown> | undefined> = [];
+		const debugged: Array<Record<string, unknown> | undefined> = [];
+		const warnSpy = spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (message.includes("session_closed")) warned.push(context);
+		});
+		const debugSpy = spyOn(logger, "debug").mockImplementation((message, context) => {
+			if (message.includes("session_closed")) debugged.push(context);
+		});
+		const pushFrameAndWait = spyOn(NotificationServer.prototype, "pushFrameAndWait").mockResolvedValue(false);
+		process.env.GJC_NOTIFICATIONS = "1";
+		try {
+			const handlers = start(sessionContext);
+			const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+			await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+			if (attached) {
+				const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+				const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+				sockets.push(socket);
+				await new Promise<void>((resolve, reject) => {
+					socket.addEventListener("open", () => resolve(), { once: true });
+					socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+				});
+				// Wait for the server side to count the authenticated connection.
+				await waitFor(
+					() => warned.length > 0 || debugged.length > 0 || socket.readyState === WebSocket.OPEN,
+					"socket open",
+				);
+			}
+			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
+			if (attached) {
+				expect(warned).toHaveLength(1);
+				expect(warned[0]).toMatchObject({ sessionId, attachedClients: 1 });
+				expect(debugged).toHaveLength(0);
+			} else {
+				expect(warned).toHaveLength(0);
+				expect(debugged).toHaveLength(1);
+				expect(debugged[0]).toMatchObject({ sessionId, attachedClients: 0 });
+			}
+		} finally {
+			pushFrameAndWait.mockRestore();
+			warnSpy.mockRestore();
+			debugSpy.mockRestore();
+		}
+	});
+}
 test("SDK runtime bounds gate resolution drain at a finite ceiling", () => {
 	// GATE_RESOLUTION_QUIESCENCE_MS is a finite constant that bounds
 	// waitForGateResolutionQuiescence. The original PR removed the bound

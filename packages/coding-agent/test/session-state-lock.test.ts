@@ -2500,7 +2500,7 @@ describe("session state lock forced-exit release", () => {
 		await holder.catch(() => undefined);
 	});
 
-	it("refuses to truncate when the tombstone write is short", async () => {
+	it("restores the original bytes when the tombstone write fails after a differing prefix", async () => {
 		const { stateFile } = await seededRunningSession("lock-forced-exit-short-write");
 		const lockFile = `${stateFile}.lock`;
 		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
@@ -2512,33 +2512,61 @@ describe("session state lock forced-exit release", () => {
 		await entered;
 		const original = await fs.readFile(lockFile, "utf8");
 		const realWriteSync = fsSync.writeSync;
+		let tombstoneWrites = 0;
 		const writeSpy = vi.spyOn(fsSync, "writeSync").mockImplementation(((
 			fd: number,
 			buffer: NodeJS.ArrayBufferView,
-			_offset?: number | null,
-			_length?: number | null,
+			offset?: number | null,
+			length?: number | null,
 			position?: number | null,
-		): number =>
-			// Emulate a short write: only the first byte lands.
-			realWriteSync(fd, buffer as Uint8Array, 0, 1, position ?? null)) as typeof fsSync.writeSync);
+		): number => {
+			const text = Buffer.from(buffer as Uint8Array).toString("utf8");
+			if (text.includes('"released":true')) {
+				tombstoneWrites++;
+				// First attempt lands a differing 12-byte prefix, then the descriptor dies.
+				if (tombstoneWrites === 1) return realWriteSync(fd, buffer as Uint8Array, 0, 12, position ?? null);
+				throw Object.assign(new Error("EIO"), { code: "EIO" });
+			}
+			return realWriteSync(fd, buffer as Uint8Array, offset ?? 0, length ?? undefined, position ?? null);
+		}) as typeof fsSync.writeSync);
 		try {
 			expect(releaseHeldSessionStateLocksSync()).toBe(0);
 		} finally {
 			writeSpy.mockRestore();
 		}
-		// The record is not a malformed tombstone: its length is unchanged (first byte
-		// of the tombstone is `{`, identical to the original), so no truncation happened.
-		const after = await fs.readFile(lockFile, "utf8");
-		expect(after.length).toBe(original.length);
-		expect(after).toBe(original);
+		expect(tombstoneWrites).toBe(2);
+		// The partially overwritten record was restored: never a malformed tombstone.
+		expect(await fs.readFile(lockFile, "utf8")).toBe(original);
 		allowRelease();
-		// The pwrite bumped mtime, so the holder's identity-bound async release refuses
+		// The restore bumped mtime, so the holder's identity-bound async release refuses
 		// rather than unlinking by name; that refusal is the protocol working.
 		await holder.catch(() => undefined);
 	});
 
-	it("leaves a transition claim directory that was replaced under it alone", async () => {
-		const { stateFile } = await seededRunningSession("lock-forced-exit-claim-replaced");
+	it("writes a same-length padded tombstone that every reader parses", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-padded");
+		const lockFile = `${stateFile}.lock`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		const holder = withSessionStateFileLock(stateFile, async () => {
+			markEntered();
+			await release;
+		});
+		await entered;
+		const originalLength = (await fs.stat(lockFile)).size;
+		expect(releaseHeldSessionStateLocksSync()).toBe(1);
+		const after = await fs.readFile(lockFile, "utf8");
+		expect(Buffer.byteLength(after, "utf8")).toBe(originalLength);
+		expect(after.endsWith(" ")).toBe(true);
+		expect(JSON.parse(after)).toMatchObject({ released: true, pid: 1 });
+		// The padded tombstone is reclaimable through the ordinary path.
+		await expect(withSessionStateFileLock(stateFile, async () => "successor")).resolves.toBe("successor");
+		allowRelease();
+		await holder.catch(() => undefined);
+	});
+
+	it("tombstones a held transition sidecar but never rmdirs its claim directory", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-claim-kept");
 		const lockFile = `${stateFile}.lock`;
 		const transitionDir = `${lockFile}.transition`;
 		const transitionOwner = `${transitionDir}.owner`;
@@ -2554,12 +2582,12 @@ describe("session state lock forced-exit release", () => {
 		const holder = withSessionStateFileLock(stateFile, async () => undefined);
 		await entered;
 		expect(heldSessionStateLockPathsForTest()).toEqual(expect.arrayContaining([transitionOwner, lockFile]));
-		// A successor replaces the (empty) claim directory with a fresh one.
+		// A successor replaces the (empty) claim directory with a populated one.
 		await fs.rmdir(transitionDir);
 		await fs.mkdir(transitionDir);
 		await fs.writeFile(path.join(transitionDir, "successor-marker"), "");
 
-		releaseHeldSessionStateLocksSync();
+		expect(releaseHeldSessionStateLocksSync()).toBeGreaterThanOrEqual(1);
 
 		expect(fsSync.existsSync(path.join(transitionDir, "successor-marker"))).toBe(true);
 		expect(JSON.parse(await fs.readFile(transitionOwner, "utf8"))).toMatchObject({ released: true });
