@@ -581,6 +581,26 @@ describe("Settings", () => {
 		expect("interruptMode" in raw).toBe(false);
 	});
 
+	it("normalizes an out-of-range schema marker instead of treating it as a future schema", async () => {
+		// A malformed marker must not slip past the future-schema guard unmigrated:
+		// it normalizes to 0 and the ordered registry runs from the start.
+		await writeSettings({ configSchemaVersion: -3, interruptMode: "wait" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+	});
+
+	it("normalizes a fractional schema marker above current instead of skipping migrations", async () => {
+		// The future-schema guard must see the NORMALIZED version: 2.5 floors to 2
+		// (already current) while 1.5 floors to 1 and still runs the v1 -> v2 step.
+		await writeSettings({ configSchemaVersion: 2.5, interruptMode: "wait" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("toolInterruptPolicy")).toBe("abort_tools");
+		expect((await readSettings()).interruptMode).toBe("wait");
+	});
+
 	it("floors a malformed schema marker instead of re-running earlier migrations", async () => {
 		// A fractional marker must not be read as "unmigrated": the v0 ask.timeout
 		// conversion would re-divide an already-migrated value. Flooring 1.5 to 1

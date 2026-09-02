@@ -5404,30 +5404,38 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Apply registered schema migrations once, using configSchemaVersion as the durable marker. */
 	#migrateRawSettings(raw: RawSettings): RawSettings {
-		const configuredVersion = raw.configSchemaVersion;
-		if (configuredVersion === CONFIG_SCHEMA_VERSION) return raw;
-		if (typeof configuredVersion === "number" && configuredVersion > CONFIG_SCHEMA_VERSION) return raw;
-		// A malformed marker (fractional, negative, non-finite) still has to be
-		// ordered against the registry, and guessing "unmigrated" would re-run the
-		// non-idempotent v0 steps over already-migrated values. Floor it to the
-		// nearest completed version instead, and report the malformed input.
+		// Normalize the marker ONCE, before every version decision: a malformed
+		// value (fractional, negative, non-finite) must not be read as a future
+		// schema by one guard and as unmigrated by the next.
+		const rawVersion = raw.configSchemaVersion;
 		const malformedVersion =
-			configuredVersion !== undefined &&
-			(typeof configuredVersion !== "number" || !Number.isInteger(configuredVersion) || configuredVersion < 0);
+			rawVersion !== undefined &&
+			(typeof rawVersion !== "number" ||
+				!Number.isFinite(rawVersion) ||
+				!Number.isInteger(rawVersion) ||
+				rawVersion < 0);
 		if (malformedVersion) {
 			logger.warn("Settings: config has a malformed configSchemaVersion; migrating from the floored version", {
-				configSchemaVersion: String(configuredVersion),
+				configSchemaVersion: String(rawVersion),
 			});
 		}
+		// A malformed finite marker normalizes to the nearest completed version; a
+		// non-finite one carries no version information at all and normalizes to 0
+		// so it can never be mistaken for a future schema.
+		const configuredVersion =
+			typeof rawVersion === "number"
+				? Number.isFinite(rawVersion)
+					? Math.max(0, Math.floor(rawVersion))
+					: 0
+				: rawVersion;
+		if (configuredVersion === CONFIG_SCHEMA_VERSION) return raw;
+		if (typeof configuredVersion === "number" && configuredVersion > CONFIG_SCHEMA_VERSION) return raw;
 
 		// Ordered migration registry. Each step runs ONLY for files below its
 		// target version: the v0 steps are not all idempotent (ask.timeout's
 		// milliseconds-to-seconds conversion would re-divide a valid v1 value),
 		// so a v1 file must skip straight to the v2 step.
-		const fromVersion =
-			typeof configuredVersion === "number" && Number.isFinite(configuredVersion)
-				? Math.max(0, Math.floor(configuredVersion))
-				: 0;
+		const fromVersion = typeof configuredVersion === "number" ? configuredVersion : 0;
 		if (fromVersion < 1) this.#migrateRawSettingsV0ToV1(raw);
 		// v1 -> v2: interruptMode -> toolInterruptPolicy.
 		if (fromVersion < 2 && "interruptMode" in raw) {

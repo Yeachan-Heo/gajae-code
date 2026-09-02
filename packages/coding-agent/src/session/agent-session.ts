@@ -12650,11 +12650,24 @@ export class AgentSession {
 	 * routing, disown re-routing, held-steering fallback, a run's terminal): the
 	 * run that would have polled the queue is gone, so nothing else owns it.
 	 */
-	#scheduleQueuedDelivery(delayMs?: number): void {
+	#scheduleQueuedDelivery(delayMs?: number, mintFreshLineage = false): void {
 		if (this.#cancelAndSubmitInProgress || !this.#canDeliverQueuedMessages()) return;
+		let minted = !mintFreshLineage;
 		this.#scheduleAgentContinue({
 			...(delayMs === undefined ? {} : { delayMs }),
-			shouldContinue: () => this.#canDeliverQueuedMessages() && this.agent.hasQueuedMessages(),
+			shouldContinue: () => {
+				if (!this.#canDeliverQueuedMessages() || !this.agent.hasQueuedMessages()) return false;
+				// Mint the fresh lineage at the delivery attempt (inside the scheduled
+				// task, after the previous run settled), never at enqueue: the queued
+				// work is an independent root request and must not run under a
+				// terminally fenced lineage, but mutating attempt identity while the
+				// old run is still settling would race its event handling.
+				if (!minted) {
+					minted = true;
+					this.#resumeFromOwnedCompletion();
+				}
+				return true;
+			},
 			rescheduleOnBusy: true,
 			continueQueuedOnly: true,
 		});
@@ -13145,23 +13158,29 @@ export class AgentSession {
 			this.#assertNoHandoffTransition();
 			const sequential = options.steerQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined;
 			if (!this.agent.steer(appMessage, sequential).admitted) {
-				// No live run to steer. A terminally aborted turn retains its
-				// continuation fence, so a queued delivery scheduled under that
-				// lineage would be skipped as terminal_turn and stranded. Classify
-				// explicitly: an independently triggered message (triggerTurn) is a
-				// NEW root request and gets a fresh lineage; a message produced by the
-				// aborted turn's own machinery (a preview/plan reminder) is dropped
-				// with its removal disposition instead of leaking into a later turn.
-				if (this.#isTurnContinuationBlocked()) {
-					if (options.triggerTurn !== true) {
-						this.#settleDeliveredOwnedRegistrations([appMessage]);
-						return;
+				// No live run to steer, so this becomes next-turn work. Provenance —
+				// never the caller's `triggerTurn` delivery preference — decides what a
+				// terminal abort's retained fence does with it: genuine user input and
+				// an independent external producer are root requests of their own and
+				// survive; a continuation produced by the aborted turn's own machinery
+				// (preview/plan reminder) is dropped with its removal disposition
+				// rather than leaking into an unrelated later turn.
+				const independentOfTurn = appMessage.attribution === "user" || options.origin === "external";
+				if (this.#isTurnContinuationBlocked() && !independentOfTurn) {
+					const displayTag = readPendingDisplayTag(appMessage.details);
+					if (displayTag !== undefined) {
+						this.#steeringMessages = this.#steeringMessages.filter(entry => entry.tag !== displayTag);
+						this.#followUpMessages = this.#followUpMessages.filter(entry => entry.tag !== displayTag);
 					}
-					this.#resumeFromOwnedCompletion();
+					this.#settleDeliveredOwnedRegistrations([appMessage]);
+					return;
 				}
 				this.agent.followUp(appMessage, { forceOneAtATime: true });
-				this.#externalFollowUps.add(appMessage);
-				this.#scheduleQueuedDelivery();
+				if (independentOfTurn) this.#externalFollowUps.add(appMessage);
+				// A fresh lineage is minted at the delivery attempt, not here: the
+				// aborted run's events may still be settling and mutating the session's
+				// attempt identity now would race them.
+				this.#scheduleQueuedDelivery(undefined, this.#isTurnContinuationBlocked());
 			}
 			return;
 		}

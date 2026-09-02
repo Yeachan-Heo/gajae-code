@@ -692,6 +692,61 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await promptPromise;
 	}, 30_000);
 
+	it("classifies a post-terminal custom steer by provenance, not by its triggerTurn flag", async () => {
+		// A terminally aborted turn keeps its continuation fence. A custom steer
+		// arriving afterwards must be classified by WHERE IT CAME FROM: genuine
+		// user input survives as its own root request, while a continuation the
+		// aborted turn's own machinery produced is dropped with its display chip.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("user steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
+		await promptPromise;
+
+		// Turn-owned reminder: agent-attributed, no external origin, carries a
+		// display chip. Dropped, and its chip must not linger in the queue pane.
+		const tag = session.enqueueCustomMessageDisplay("stale preview reminder", "steer");
+		await session.sendCustomMessage(
+			{
+				customType: "resolve-reminder",
+				content: "stale preview reminder",
+				display: false,
+				attribution: "agent",
+				details: { __pendingDisplayTag: tag },
+			},
+			{ deliverAs: "steer" },
+		);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		// A `triggerTurn: true` flag on the SAME turn-owned message must not buy
+		// it a fresh root turn.
+		await session.sendCustomMessage(
+			{ customType: "resolve-reminder", content: "stale but eager", display: false, attribution: "agent" },
+			{ deliverAs: "steer", triggerTurn: true },
+		);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+
+		// Genuine user input survives the fence and is delivered as a fresh root.
+		await session.sendCustomMessage(
+			{ customType: "user-skill", content: "user says do this instead", display: false, attribution: "user" },
+			{ deliverAs: "steer" },
+		);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "user custom steer delivered");
+		await session.waitForIdle();
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && String(message.content).includes("user says do this instead"),
+			),
+		).toBe(true);
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && String(message.content).includes("stale preview reminder"),
+			),
+		).toBe(false);
+	}, 30_000);
+
 	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {
 		// Review thread P2: the display list must mirror what the run's disowned
 		// steering became — a purged internal steer disappears everywhere, and a
