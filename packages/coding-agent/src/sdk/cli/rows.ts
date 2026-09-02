@@ -81,10 +81,39 @@ export interface SdkTailEnvelopeV1 {
 export function tailItemKey(item: SdkTailItemV1): string {
 	// (generation, seq) restarts per revision; without the revision two turns'
 	// first frames share "1:1" and the second is silently dropped (#5200).
-	if (item.generation !== undefined && item.seq !== undefined)
+	if (item.generation !== undefined && item.seq !== undefined) {
+		if (item.revision === undefined)
+			throw new Error("Cannot key a positioned tail item without its authoritative revision.");
 		return `${item.kind}\u0000${item.revision ?? ""}\u0000${item.generation}\u0000${item.seq}`;
+	}
 	if (item.id !== undefined) return `${item.kind}\u0000${item.id}`;
 	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
+}
+
+/** Holds positioned live frames until the checkpoint can stamp their authoritative revision. */
+export class TailRevisionBuffer {
+	#pending: SdkTailItemV1[] = [];
+	#revision: number | undefined;
+
+	push(item: SdkTailItemV1): SdkTailItemV1[] {
+		if (item.revision !== undefined || item.generation === undefined || item.seq === undefined) return [item];
+		if (this.#revision === undefined) {
+			this.#pending.push(item);
+			return [];
+		}
+		item.revision = this.#revision;
+		return [item];
+	}
+
+	resolve(revision: number): SdkTailItemV1[] {
+		if (!Number.isSafeInteger(revision) || revision < 0)
+			throw new Error("Tail revision must be a non-negative integer.");
+		this.#revision = revision;
+		const pending = this.#pending;
+		this.#pending = [];
+		for (const item of pending) item.revision = revision;
+		return pending;
+	}
 }
 
 const SECRET_FIELD = /(?:secret|token|password|credential|authorization|api[_-]?key)/i;

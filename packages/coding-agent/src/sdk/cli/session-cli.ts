@@ -42,6 +42,7 @@ import {
 	type SdkTailItemV1,
 	SESSION_ROWS_VERSION,
 	stripSecretFields,
+	TailRevisionBuffer,
 	tailItemKey,
 	toCheckpointRecordV1,
 	toRetentionGapV1,
@@ -1402,6 +1403,7 @@ async function runLiveTail(
 	// evidence.
 	const seenTranscript = new Set<string>();
 	const seenEvents = new Set<string>();
+	const liveRevisionBuffer = new TailRevisionBuffer();
 	let checkpoint: SdkCheckpointRecordV1 | undefined;
 	let gap: SdkRetentionGapV1 | undefined;
 	let liveReason: TailExitReason | undefined;
@@ -1483,8 +1485,7 @@ async function runLiveTail(
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
-		if (item.revision === undefined && checkpoint !== undefined) item.revision = checkpoint.revision;
-		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, [item], include));
+		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, liveRevisionBuffer.push(item), include));
 	};
 
 	return await withRouter(
@@ -1506,6 +1507,10 @@ async function runLiveTail(
 			const extraction = extractCheckpoint(checkpointResponse);
 			checkpoint = extraction.record;
 			gap = extraction.gap;
+			if (checkpoint !== undefined)
+				applyLifecycle(
+					mergeEventTailItems(eventItems, seenEvents, liveRevisionBuffer.resolve(checkpoint.revision), include),
+				);
 			if (gap !== undefined && args.strict === true)
 				throw new SdkSessionCliError(
 					"retention_gap",
