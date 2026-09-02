@@ -2549,6 +2549,16 @@ export class AgentSession {
 	}
 
 	/**
+	 * One-shot: the queued work includes an independent root request that must
+	 * NOT run under a terminally fenced lineage. Consumed at the final
+	 * synchronous boundary before a continuation enters `agent.continue*`, so a
+	 * fresh identity is minted only when a run actually starts — never at
+	 * enqueue (which would race the ending run's event settlement) and never
+	 * lost when a busy owner defers delivery.
+	 */
+	#pendingFreshRootLineage = false;
+
+	/**
 	 * Disposition of steering the current run leaves unconsumed when it exits.
 	 * Set by the abort paths before the run ends and consumed exactly once by
 	 * `#settleDisownedSteering` on the run's `agent_end`. Absent means the run
@@ -7264,6 +7274,14 @@ export class AgentSession {
 									// denied at the final synchronous boundary before agent.continue
 									// entry; no await intervenes between this check and method entry.
 									// Owned-completion deliveries are NOT affected (they use followUp).
+									// An independent root request queued after a terminal abort mints
+									// its fresh identity HERE: the last synchronous point before
+									// agent.continue* entry, so a cancelled/emptied continuation never
+									// leaves the session on an identity that escapes the fence.
+									if (this.#pendingFreshRootLineage) {
+										this.#pendingFreshRootLineage = false;
+										if (this.agent.hasQueuedMessages()) this.#resumeFromOwnedCompletion();
+									}
 									if (this.#isTurnContinuationBlocked()) {
 										skip("terminal_turn");
 										return;
@@ -12650,24 +12668,16 @@ export class AgentSession {
 	 * routing, disown re-routing, held-steering fallback, a run's terminal): the
 	 * run that would have polled the queue is gone, so nothing else owns it.
 	 */
-	#scheduleQueuedDelivery(delayMs?: number, mintFreshLineage = false): void {
+	#scheduleQueuedDelivery(delayMs?: number, mintFreshRootLineage = false): void {
+		// Record the intent BEFORE the deliverability gate: when a bash/eval/retry/
+		// compaction owner defers delivery, that owner's completion schedules an
+		// ordinary continuation later, and the fresh-root requirement has to survive
+		// until whichever attempt actually delivers.
+		if (mintFreshRootLineage) this.#pendingFreshRootLineage = true;
 		if (this.#cancelAndSubmitInProgress || !this.#canDeliverQueuedMessages()) return;
-		let minted = !mintFreshLineage;
 		this.#scheduleAgentContinue({
 			...(delayMs === undefined ? {} : { delayMs }),
-			shouldContinue: () => {
-				if (!this.#canDeliverQueuedMessages() || !this.agent.hasQueuedMessages()) return false;
-				// Mint the fresh lineage at the delivery attempt (inside the scheduled
-				// task, after the previous run settled), never at enqueue: the queued
-				// work is an independent root request and must not run under a
-				// terminally fenced lineage, but mutating attempt identity while the
-				// old run is still settling would race its event handling.
-				if (!minted) {
-					minted = true;
-					this.#resumeFromOwnedCompletion();
-				}
-				return true;
-			},
+			shouldContinue: () => this.#canDeliverQueuedMessages() && this.agent.hasQueuedMessages(),
 			rescheduleOnBusy: true,
 			continueQueuedOnly: true,
 		});
@@ -13596,6 +13606,8 @@ export class AgentSession {
 		this.#followUpMessages = [];
 		this.#deferredSdkFollowUps = [];
 		this.agent.clearAllQueues();
+		// The queued work a pending fresh-root intent referred to is gone.
+		this.#pendingFreshRootLineage = false;
 		// Every dropped message leaves without consumption: terminalize its
 		// accepted SDK submission boundedly (#4668 review P1).
 		this.#fireQueuedRemovalHooks([...steeringQueued, ...followUpQueued, ...deferredQueued]);

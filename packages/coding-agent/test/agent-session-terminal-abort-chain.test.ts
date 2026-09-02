@@ -736,6 +736,20 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			session.agent.state.messages.some(message => JSON.stringify(message).includes("stale but eager"));
 		expect(eagerInHistory()).toBe(false);
 
+		// An agent-attributed message from an INDEPENDENT external producer (the
+		// trusted-adapter origin bit) is also a root request of its own.
+		await session.sendCustomMessage(
+			{ customType: "ext-notice", content: "external producer notice", display: false, attribution: "agent" },
+			{ deliverAs: "steer", origin: "external" },
+		);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "external-origin custom steer delivered");
+		await session.waitForIdle();
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && String(message.content).includes("external producer notice"),
+			),
+		).toBe(true);
+
 		// Genuine user input survives the fence and is delivered as a fresh root.
 		await session.sendCustomMessage(
 			{ customType: "user-skill", content: "user says do this instead", display: false, attribution: "user" },
@@ -757,6 +771,48 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(eagerInHistory()).toBe(false);
 		expect(recordedProviderContexts().some(text => text.includes("stale but eager"))).toBe(false);
 		expect(recordedProviderContexts().some(text => text.includes("stale preview reminder"))).toBe(false);
+	}, 30_000);
+
+	it("keeps the fresh-root requirement when a busy owner defers the post-terminal delivery", async () => {
+		// An independent root request queued after a terminal abort may be deferred
+		// by a busy owner (bash/eval/retry/compaction). The fresh-root requirement
+		// must survive that deferral: whichever attempt eventually delivers has to
+		// mint the new identity, or the retained fence rejects it forever.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("external notice answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		await session.abortPromptAndWait(handle, { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
+		await promptPromise;
+
+		// Pretend a busy owner holds the session when the message is queued, so the
+		// enqueue-time schedule is refused and only a later attempt can deliver.
+		let busy = true;
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => busy });
+		try {
+			await session.sendCustomMessage(
+				{ customType: "ext-notice", content: "deferred external notice", display: false, attribution: "agent" },
+				{ deliverAs: "steer", origin: "external" },
+			);
+			expect(session.agent.hasQueuedMessages()).toBe(true);
+			busy = false;
+		} finally {
+			delete (session as unknown as Record<string, unknown>).isCompacting;
+		}
+		// A later independent send schedules delivery; the deferred message's
+		// fresh-root requirement is still pending, so BOTH are delivered instead of
+		// the first one being stranded behind the retained fence.
+		await session.sendCustomMessage(
+			{ customType: "ext-notice", content: "second external notice", display: false, attribution: "agent" },
+			{ deliverAs: "steer", origin: "external" },
+		);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "deferred external notices delivered");
+		await session.waitForIdle();
+		const delivered = session.agent.state.messages
+			.filter(message => message.role === "custom")
+			.map(message => String(message.content));
+		expect(delivered.some(text => text.includes("deferred external notice"))).toBe(true);
+		expect(delivered.some(text => text.includes("second external notice"))).toBe(true);
 	}, 30_000);
 
 	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {

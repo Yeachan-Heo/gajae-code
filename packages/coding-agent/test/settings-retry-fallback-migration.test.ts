@@ -172,6 +172,23 @@ describe("retry.fallbackChains migration", () => {
 		expect((await readGlobal()).retry).toBeUndefined();
 	});
 
+	test("still migrates a malformed marker that normalizes to the current version", async () => {
+		// A `2.5` marker normalizes to the CURRENT version, so it is not a future
+		// schema: reading it raw here would skip legacy fallback migration entirely
+		// while the migration registry treated the same file as current.
+		await writeGlobal({
+			configSchemaVersion: 2.5,
+			modelRoles: { default: "global/head" },
+			retry: { fallbackChains: { default: ["global/tail"] } },
+		});
+
+		const settings = await Settings.init({ agentDir: root, cwd: root });
+		// The legacy tail folded into the role chain and the legacy key is gone:
+		// proof the fallback migration was not skipped as a future schema.
+		expect(settings.getModelRole("default")).toEqual(["global/head", "global/tail"]);
+		expect((await readGlobal()).retry).toBeUndefined();
+	});
+
 	test("does not rewrite a config from a newer schema version", async () => {
 		const futureConfig = {
 			configSchemaVersion: 3,

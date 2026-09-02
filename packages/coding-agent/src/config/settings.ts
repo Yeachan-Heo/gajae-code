@@ -1526,15 +1526,19 @@ export class Settings implements NotificationSettingsReader {
 				this.#hasInvalidNotificationGlobal = true;
 			}
 		}
+		// ONE normalized marker feeds every version decision (future-schema,
+		// migration-pending, and the ordered registry in #migrateRawSettings): a
+		// malformed value must never be read as a future schema here — which would
+		// skip legacy migration entirely — and as unmigrated by the registry.
+		const configSchemaVersion = normalizeConfigSchemaVersion(parsedRaw.configSchemaVersion);
 		this.#futureSchemaVersion =
 			filePath === this.#configPath &&
-			typeof parsedRaw.configSchemaVersion === "number" &&
-			parsedRaw.configSchemaVersion > CONFIG_SCHEMA_VERSION;
+			configSchemaVersion !== undefined &&
+			configSchemaVersion > CONFIG_SCHEMA_VERSION;
 
-		const configSchemaVersion = parsedRaw.configSchemaVersion;
 		if (
 			filePath === this.#configPath &&
-			(typeof configSchemaVersion !== "number" || configSchemaVersion < CONFIG_SCHEMA_VERSION)
+			(configSchemaVersion === undefined || configSchemaVersion < CONFIG_SCHEMA_VERSION)
 		) {
 			this.#schemaMigrationPending = true;
 		}
@@ -2088,7 +2092,7 @@ export class Settings implements NotificationSettingsReader {
 						return false;
 					}
 					const schemaVersion = (root as Record<string, unknown> | null | undefined)?.configSchemaVersion;
-					if (typeof schemaVersion === "number" && schemaVersion > CONFIG_SCHEMA_VERSION) {
+					if ((normalizeConfigSchemaVersion(schemaVersion) ?? 0) > CONFIG_SCHEMA_VERSION) {
 						this.#warnLegacyFallbackMigration(
 							`Settings: database workflow migration skipped: ${this.#configPath} is a future config schema (configSchemaVersion ${schemaVersion} > ${CONFIG_SCHEMA_VERSION}); leaving legacy rows for the next load`,
 						);
@@ -2339,7 +2343,7 @@ export class Settings implements NotificationSettingsReader {
 				// sets #futureSchemaVersion, so it must check the target schema
 				// itself and never patch it or consume the legacy source.
 				const targetSchemaVersion = (tx.root as Record<string, unknown> | null | undefined)?.configSchemaVersion;
-				if (typeof targetSchemaVersion === "number" && targetSchemaVersion > CONFIG_SCHEMA_VERSION) {
+				if ((normalizeConfigSchemaVersion(targetSchemaVersion) ?? 0) > CONFIG_SCHEMA_VERSION) {
 					this.#warnLegacyFallbackMigration(
 						`Settings: config-root workflow migration skipped: ${target} is a future config schema (configSchemaVersion ${targetSchemaVersion} > ${CONFIG_SCHEMA_VERSION})`,
 					);
@@ -3581,7 +3585,7 @@ export class Settings implements NotificationSettingsReader {
 				// read-only across Settings; never patch it (mirrors the config-root
 				// migration guard) so a future schema cannot inherit stale keys.
 				const targetSchemaVersion = (tx.root as Record<string, unknown> | null | undefined)?.configSchemaVersion;
-				if (typeof targetSchemaVersion === "number" && targetSchemaVersion > CONFIG_SCHEMA_VERSION) {
+				if ((normalizeConfigSchemaVersion(targetSchemaVersion) ?? 0) > CONFIG_SCHEMA_VERSION) {
 					this.#warnLegacyFallbackMigration(
 						`Settings: project workflow migration skipped: ${target} is a future config schema (configSchemaVersion ${targetSchemaVersion} > ${CONFIG_SCHEMA_VERSION})`,
 					);
@@ -4098,7 +4102,7 @@ export class Settings implements NotificationSettingsReader {
 		markerPath = `${source}.fallback-invalid`,
 	): Promise<void> {
 		const targetSchemaVersion = (tx.root as Record<string, unknown> | null | undefined)?.configSchemaVersion;
-		if (typeof targetSchemaVersion === "number" && targetSchemaVersion > CONFIG_SCHEMA_VERSION) return;
+		if ((normalizeConfigSchemaVersion(targetSchemaVersion) ?? 0) > CONFIG_SCHEMA_VERSION) return;
 		if (tx.root !== undefined && (tx.root === null || typeof tx.root !== "object" || Array.isArray(tx.root))) {
 			return;
 		}
@@ -4827,7 +4831,7 @@ export class Settings implements NotificationSettingsReader {
 				// guard) would rewrite configuration an older binary treats as
 				// read-only.
 				const targetSchemaVersion = (tx.root as Record<string, unknown> | null | undefined)?.configSchemaVersion;
-				if (typeof targetSchemaVersion === "number" && targetSchemaVersion > CONFIG_SCHEMA_VERSION) {
+				if ((normalizeConfigSchemaVersion(targetSchemaVersion) ?? 0) > CONFIG_SCHEMA_VERSION) {
 					return;
 				}
 				// Unset only while the target still matches the migration's fallback
