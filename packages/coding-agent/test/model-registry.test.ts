@@ -3328,6 +3328,38 @@ describe("ModelRegistry", () => {
 			expect(getOpenAICompat(registry.find("openai", "gpt-5.4"))?.extraBody).toEqual({ source: "proxy" });
 		});
 
+		test("dynamically discovered built-in model survives a later offline refresh", async () => {
+			// Regression: the built-in discovery freshness filter memoizes provider-keyed
+			// evidence per provider instead of recomputing it per model. A model that was
+			// freshly discovered online must still pass the offline freshness filter (its
+			// provider evidence is current) and remain in the catalog.
+			writeRawModelsJson({
+				openai: {
+					baseUrl: "https://my-proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-responses",
+					models: [{ id: "gpt-5.4" }],
+				},
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			using _hook = mockOpenAiCompatibleModels("https://my-proxy.example.com/v1/models", ["gpt-5.4", "gpt-5.5"]);
+			await registry.refreshProvider("openai", "online");
+			const discoveredIds = getModelsForProvider(registry, "openai")
+				.map(model => model.id)
+				.sort();
+			expect(discoveredIds).toContain("gpt-5.5");
+
+			// The offline refresh re-runs the memoized built-in freshness filter over
+			// the whole cached catalog; the provider's evidence is still current, so the
+			// exact discovered id set must be preserved (not dropped by the filter).
+			await registry.refresh("offline");
+			const afterOfflineIds = getModelsForProvider(registry, "openai")
+				.map(model => model.id)
+				.sort();
+			expect(afterOfflineIds).toEqual(discoveredIds);
+		});
+
 		test("modelOverrides still apply after discoverable refresh", async () => {
 			writeRawModelsJson({
 				openai: {

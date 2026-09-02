@@ -3032,27 +3032,71 @@ export class ModelRegistry {
 				? { ...result, invalidatesPublishedState }
 				: { ...result, current: false, models: [], fetched: false, invalidatesPublishedState };
 		});
-		const currentBuiltInDiscovered = builtInDiscovered.filter(model => {
-			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
-			const currentEndpoint = this.#normalizeDiscoveryEvidenceEndpoint(
-				this.#getProviderBaseUrlForDiscovery(model.provider) ?? model.baseUrl ?? "",
-			);
-			const canUseCredentialDerivedXiaomiEndpoint =
-				model.provider === "xiaomi" &&
-				this.#providerEvidenceApiKeys.get("xiaomi")?.startsWith("tp-") === true &&
-				this.#runtimeProviderOverrides.get("xiaomi")?.baseUrl === undefined &&
-				this.#providerOverrides.get("xiaomi")?.baseUrl === undefined &&
-				resolveProviderBaseUrlFromEnv("xiaomi") === undefined;
+		// Every field below except `model.baseUrl` and `model.id` depends only on
+		// `model.provider`. The built-in catalog carries thousands of models across
+		// only a few dozen providers, and `#getProviderEvidenceGeneration` reaches
+		// into AuthStorage while `#getProviderBaseUrlForDiscovery` parses URLs, so
+		// recomputing per model turned this filter into a per-refresh UI-thread
+		// stall. Memoize the provider-keyed work once per provider.
+		interface BuiltInProviderEvidenceState {
+			evidence:
+				| {
+						fresh: boolean;
+						modelIds: ReadonlySet<string>;
+						profileModelIds?: ReadonlySet<string>;
+						profileFresh?: boolean;
+						profileEndpoint?: string;
+						authGeneration: string;
+						endpoint: string;
+				  }
+				| undefined;
+			expectedAuthGeneration: string | undefined;
+			authGenerationThrew: boolean;
+			providerBaseEndpoint: string | undefined;
+			canUseCredentialDerivedXiaomiEndpoint: boolean;
+		}
+		const builtInProviderStates = new Map<string, BuiltInProviderEvidenceState>();
+		const builtInProviderStateFor = (provider: string): BuiltInProviderEvidenceState => {
+			const cached = builtInProviderStates.get(provider);
+			if (cached) return cached;
+			let expectedAuthGeneration: string | undefined;
+			let authGenerationThrew = false;
 			try {
+				expectedAuthGeneration = this.#getProviderEvidenceGeneration(
+					provider,
+					this.#providerEvidenceApiKeys.get(provider),
+				);
+			} catch {
+				authGenerationThrew = true;
+			}
+			const providerBaseUrl = this.#getProviderBaseUrlForDiscovery(provider);
+			const state: BuiltInProviderEvidenceState = {
+				evidence: this.#descriptorDiscoveryEvidence.get(provider),
+				expectedAuthGeneration,
+				authGenerationThrew,
+				providerBaseEndpoint:
+					providerBaseUrl !== undefined ? this.#normalizeDiscoveryEvidenceEndpoint(providerBaseUrl) : undefined,
+				canUseCredentialDerivedXiaomiEndpoint:
+					provider === "xiaomi" &&
+					this.#providerEvidenceApiKeys.get("xiaomi")?.startsWith("tp-") === true &&
+					this.#runtimeProviderOverrides.get("xiaomi")?.baseUrl === undefined &&
+					this.#providerOverrides.get("xiaomi")?.baseUrl === undefined &&
+					resolveProviderBaseUrlFromEnv("xiaomi") === undefined,
+			};
+			builtInProviderStates.set(provider, state);
+			return state;
+		};
+		const currentBuiltInDiscovered = builtInDiscovered.filter(model => {
+			const state = builtInProviderStateFor(model.provider);
+			const { evidence } = state;
+			if (evidence === undefined || state.authGenerationThrew) return false;
+			if (evidence.authGeneration !== state.expectedAuthGeneration) return false;
+			try {
+				const currentEndpoint =
+					state.providerBaseEndpoint ?? this.#normalizeDiscoveryEvidenceEndpoint(model.baseUrl ?? "");
 				return (
-					evidence !== undefined &&
-					evidence.authGeneration ===
-						this.#getProviderEvidenceGeneration(
-							model.provider,
-							this.#providerEvidenceApiKeys.get(model.provider),
-						) &&
 					(evidence.endpoint === currentEndpoint ||
-						(canUseCredentialDerivedXiaomiEndpoint &&
+						(state.canUseCredentialDerivedXiaomiEndpoint &&
 							evidence.endpoint === this.#normalizeDiscoveryEvidenceEndpoint(model.baseUrl ?? ""))) &&
 					evidence.modelIds.has(model.id)
 				);
