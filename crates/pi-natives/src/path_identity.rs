@@ -1975,6 +1975,12 @@ pub(crate) mod platform {
 	/// pathological signal storm turning a retry loop into a hang.
 	const EINTR_RETRY_LIMIT: u32 = 8;
 
+	// A single process may issue concurrent writes for the same skill path through
+	// the native API. Serialize publication transactions so a writer cannot be
+	// mistaken for an attacker after a legitimate successor atomically replaces
+	// its final name between the post-rename identity checks.
+	static SECURE_SKILL_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 	// Test-only fault injection: the next N calls into the no-replace rename
 	// primitive report a synthetic EINTR before the real syscall runs, letting
 	// tests exercise the restart loop without racing a real signal.
@@ -5151,6 +5157,9 @@ pub(crate) mod platform {
 		content: &str,
 		file_mode: u32,
 	) -> NativeSecureSkillWriteResult {
+		let _publication_guard = SECURE_SKILL_WRITE_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
 		let directory_mode = if file_mode == 0o600 { 0o700 } else { 0o755 };
 		let root = match open_or_create_skill_root(root_path, directory_mode) {
 			Ok(value) => value,
