@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Postmortem now has a synchronous terminal-cleanup phase that runs after bounded async cleanup and again from the process exit event, allowing idempotent resource sweeps to release ownership acquired by cleanup callbacks themselves before signals, fatal errors, or `quit()` terminate the process.
+
 ## [0.16.0] - 2026-09-02
 
 ## [0.15.6] - 2026-08-30

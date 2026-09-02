@@ -38,7 +38,6 @@ import type {
 import type { CompactOptions } from "../extensibility/extensions/types";
 import { resolveSkillSlashCommands, type Skill } from "../extensibility/skills";
 import { BUILTIN_SLASH_COMMANDS, loadSlashCommands } from "../extensibility/slash-commands";
-import { releaseHeldSessionStateLocksSync } from "../gjc-runtime/session-state-lock";
 import { getLspStartupWarningMessage, LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
 import {
 	createStarReminderBeforeAgentStartContributor,
@@ -1693,11 +1692,9 @@ export class InteractiveMode implements InteractiveModeContext {
 				this.#shutdownEscalated = true;
 				logger.warn("Escalating repeated interactive shutdown request");
 				this.session.abort();
-				// The forced exit never reaches the async lock release protocol, so tombstone
-				// every session-state owner record this process still holds now; otherwise
-				// each becomes dead-owner debris every later resume must reclaim first.
-				const released = releaseHeldSessionStateLocksSync();
-				if (released > 0) logger.warn("Released held session state locks before forced exit", { released });
+				// Session-state locks are swept by postmortem's synchronous terminal phase,
+				// after bounded async cleanup. Sweeping here would be too early: the runtime
+				// state finalizer can acquire another lock while postmortem cleanup runs.
 				void postmortem.quit(1);
 			}
 			return;

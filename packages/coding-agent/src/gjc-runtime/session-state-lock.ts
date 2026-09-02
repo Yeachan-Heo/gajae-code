@@ -7,6 +7,7 @@ import type {
 	NativeDirectoryTreeSnapshot,
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
+import { postmortem } from "@gajae-code/utils";
 import {
 	type GenericFileLockDirIdentity,
 	genericFileLockDirStaleVerdict,
@@ -523,15 +524,12 @@ export function resetPersistFailureWarnWindows(): void {
 }
 
 /**
- * Every owner record this process currently holds, keyed by owner-record path. A
- * transition owner also carries the canonical path and captured generation of the claim
- * directory it guards, which is the authority an identity-bound removal needs.
+ * Every owner record this process currently holds, keyed by owner-record path.
  * Maintained by the acquire/release paths so a forced exit can tombstone them
  * synchronously.
  */
 interface HeldSessionStateLock {
 	held: LockOwnerSnapshot;
-	claim?: { nativePath: string; generation: TransitionDirectoryGeneration };
 }
 
 const heldSessionStateLocks = new Map<string, HeldSessionStateLock>();
@@ -606,19 +604,19 @@ function tombstoneHeldOwnerRecordSync(file: string, held: LockOwnerSnapshot, hos
 /**
  * Best-effort synchronous release of every owner record this process still holds.
  *
- * Meant for the forced-exit path (`postmortem.quit` after a repeated shutdown request),
- * where the async release protocol will never get to run. Each record is rewritten to a
- * released tombstone only while it is still byte-identical to what this process wrote
- * (see {@link tombstoneHeldOwnerRecordSync}).
+ * Meant for postmortem's synchronous terminal phase, where the async release protocol
+ * will never get to run. Each record is rewritten to a released tombstone only while it
+ * is still byte-identical to what this process wrote (see
+ * {@link tombstoneHeldOwnerRecordSync}).
  *
- * A transition owner's claim directory is then removed through the same identity-bound
- * primitive the async protocol uses ({@link removeOwnedTransitionClaim}: tree snapshot
- * plus an exact generation match), never by pathname. Order matters: the tombstone is
- * written FIRST, so a refused or failed removal degrades to the released-sidecar path
- * that `reclaimStaleTransitionClaim` completes after its grace window rather than
- * stranding a live claim. Anything that changed underneath, or any I/O fault, is left
- * for the dead-owner reclaim path on the next writer. Never throws; returns the number
- * of records tombstoned.
+ * Transition claim directories are deliberately NOT removed here. A directory can be
+ * deleted and recreated with a generation tuple that aliases the old one on filesystems
+ * with inode reuse or coarse timestamp identity; taking a fresh tree snapshot would then
+ * authorize deletion of the successor rather than prove continued ownership. The
+ * released owner sidecar lets the ordinary reclaimer remove the claim after its grace
+ * window, by which time a concurrent acquirer can publish its own owner record.
+ * Anything that changed underneath, or any I/O fault, is left for the dead-owner reclaim
+ * path on the next writer. Never throws; returns the number of records tombstoned.
  */
 export function releaseHeldSessionStateLocksSync(): number {
 	let released = 0;
@@ -637,20 +635,19 @@ export function releaseHeldSessionStateLocksSync(): number {
 		try {
 			if (!tombstoneHeldOwnerRecordSync(file, entry.held, hostId)) continue;
 			released++;
-			if (entry.claim !== undefined) {
-				try {
-					removeOwnedTransitionClaim(entry.claim.nativePath, entry.claim.generation);
-				} catch {
-					// The native binding may be unavailable or throw mid-exit. The released
-					// sidecar already authorizes the ordinary reclaimer, so refusal is safe.
-				}
-			}
 		} catch {
 			// Forced exit: nothing here may block or throw.
 		}
 	}
 	return released;
 }
+
+// Run after every bounded postmortem cleanup, not before it. Cleanup callbacks can
+// acquire session-state locks themselves (the runtime-state finalizer does), so an early
+// sweep would miss exactly the records a cleanup deadline can strand.
+postmortem.registerTerminalCleanup("coordinator-session-state-locks", () => {
+	releaseHeldSessionStateLocksSync();
+});
 
 /** @internal Test seam: the owner-record paths this process currently holds. */
 export function heldSessionStateLockPathsForTest(): string[] {
@@ -2203,10 +2200,7 @@ async function withLockPathTransition<T>(
 			}
 			throw error;
 		}
-		heldSessionStateLocks.set(ownerFile, {
-			held,
-			claim: { nativePath: pendingSetup.nativePath!, generation: transitionGeneration },
-		});
+		heldSessionStateLocks.set(ownerFile, { held });
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),

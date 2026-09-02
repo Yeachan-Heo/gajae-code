@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Forced process exits now tombstone every session-state lock still held after postmortem cleanup, including locks acquired by the runtime-state finalizer during signal, fatal-exception, or repeated-shutdown handling. Forced cleanup leaves transition claim directories for grace-period reclaim instead of risking deletion of a concurrently recreated successor claim.
 - Fixed `interruptMode: "wait"` steering rearm so `steeringMode: "all"` delivers every steer admitted during an abort unwind in one ordered successor turn instead of splitting the queue across continuations.
 - Sessions can now be marked with `/star` and `/unstar`; starred sessions persist in append-only metadata, display a `★` in resume and read-only dashboard views, and sort ahead of unstarred sessions without changing deletion or retention behavior.
 - Coordinator projection scans now use identity-bracketed directory authority on macOS instead of failing every scan as unsupported, while root and candidate replacement races remain fail-closed.

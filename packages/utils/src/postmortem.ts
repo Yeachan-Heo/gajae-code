@@ -40,6 +40,14 @@ type StdoutWriteCallback = (error?: Error | null) => void;
 
 // Internal list of active cleanup callbacks (in registration order)
 const callbackList: ((reason: Reason) => Promise<void> | void)[] = [];
+interface TerminalCleanupCallback {
+	id: string;
+	callback: (reason: Reason) => void;
+}
+
+// Synchronous last-chance callbacks run after bounded async cleanup and again from the
+// process exit event. They must be idempotent: process.exit() reaches both boundaries.
+const terminalCallbackList: TerminalCleanupCallback[] = [];
 // Tracks cleanup run state (to prevent recursion/reentry issues)
 let cleanupStage: "idle" | "running" | "complete" = "idle";
 let cleanupPromise: Promise<void> | undefined;
@@ -49,6 +57,19 @@ const stdoutEpipeClassifier = createProcessStdoutEpipeClassifier();
 
 function shouldSuppressCleanupLogging(quiet: boolean): boolean {
 	return quiet || quietShutdownStarted;
+}
+
+/** Run last-chance synchronous cleanup immediately before the process terminates. */
+function runTerminalCleanup(reason: Reason, quiet = false): void {
+	for (const entry of terminalCallbackList.toReversed()) {
+		try {
+			entry.callback(reason);
+		} catch (error) {
+			if (shouldSuppressCleanupLogging(quiet)) continue;
+			const err = error instanceof Error ? error : new Error(String(error));
+			logger.error("Terminal cleanup callback failed", { err, id: entry.id, stack: err.stack });
+		}
+	}
 }
 
 /**
@@ -637,7 +658,10 @@ async function exitQuietlyForAttributableStdoutEpipe(reason: Reason): Promise<vo
 	process.exitCode = BROKEN_PIPE_EXIT_CODE;
 	await runCleanupBounded(reason, { quiet: true });
 	// An ordinary fatal that arrived during quiet cleanup takes precedence.
-	if (process.exitCode === BROKEN_PIPE_EXIT_CODE) process.exit(BROKEN_PIPE_EXIT_CODE);
+	if (process.exitCode === BROKEN_PIPE_EXIT_CODE) {
+		runTerminalCleanup(reason, true);
+		process.exit(BROKEN_PIPE_EXIT_CODE);
+	}
 }
 
 async function handleFatalError(label: string, reason: unknown, cleanupReason: Reason): Promise<void> {
@@ -665,6 +689,7 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 		});
 	}
 	await runCleanupBounded(cleanupReason);
+	runTerminalCleanup(cleanupReason);
 	process.exit(1);
 }
 
@@ -673,6 +698,7 @@ if (isMainThread) {
 	process
 		.on("SIGINT", async () => {
 			await runCleanupBounded(Reason.SIGINT);
+			runTerminalCleanup(Reason.SIGINT);
 			process.exit(130); // 128 + SIGINT (2)
 		})
 		.on("SIGUSR1", () => {
@@ -689,14 +715,17 @@ if (isMainThread) {
 			await handleFatalError("Unhandled Rejection", reason, Reason.UNHANDLED_REJECTION);
 		})
 		.on("exit", async () => {
+			runTerminalCleanup(Reason.EXIT);
 			void runCleanup(Reason.EXIT); // fire and forget (exit imminent)
 		})
 		.on("SIGTERM", async () => {
 			await runCleanupBounded(Reason.SIGTERM);
+			runTerminalCleanup(Reason.SIGTERM);
 			process.exit(143); // 128 + SIGTERM (15)
 		})
 		.on("SIGHUP", async () => {
 			await runCleanupBounded(Reason.SIGHUP);
+			runTerminalCleanup(Reason.SIGHUP);
 			process.exit(129); // 128 + SIGHUP (1)
 		});
 } else {
@@ -705,6 +734,7 @@ if (isMainThread) {
 	// they would swallow errors before the worker's own handlers (self.addEventListener)
 	// can report failures back to the parent thread.
 	process.on("exit", () => {
+		runTerminalCleanup(Reason.EXIT);
 		void runCleanup(Reason.EXIT);
 	});
 }
@@ -760,6 +790,25 @@ export function register(id: string, callback: (reason: Reason) => void | Promis
 	// Register callback as "armed" (active).
 	callbackList.push(exec);
 	return cancel;
+}
+
+/**
+ * Register synchronous last-chance cleanup that runs after bounded async cleanup and
+ * immediately before every process-terminal exit path (signals, fatal errors, quit,
+ * and the process exit event).
+ *
+ * A callback may run twice for one termination because `process.exit()` subsequently
+ * emits `exit`; it MUST therefore be synchronous and idempotent. This phase exists for
+ * resources acquired by an async cleanup callback itself, which an earlier sweep cannot
+ * observe and which must still be released when the async cleanup deadline expires.
+ */
+export function registerTerminalCleanup(id: string, callback: (reason: Reason) => void): () => void {
+	const entry = { id, callback };
+	terminalCallbackList.push(entry);
+	return () => {
+		const index = terminalCallbackList.indexOf(entry);
+		if (index >= 0) terminalCallbackList.splice(index, 1);
+	};
 }
 
 /**
@@ -832,6 +881,7 @@ export async function quit(code: number = 0): Promise<void> {
 
 	const exitAfterCleanup = async (): Promise<void> => {
 		await awaitCleanupWithDeadline(Reason.MANUAL);
+		runTerminalCleanup(Reason.MANUAL);
 		await waitForProcessOutputDrain();
 		process.exit(code);
 	};
