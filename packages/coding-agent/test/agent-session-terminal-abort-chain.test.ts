@@ -786,12 +786,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		await promptPromise;
 		const callsAfterAbort = recordedProviderContexts().length;
 
-		// An independent root request past the fence, queued and then withdrawn
-		// before it could be delivered.
-		await session.sendUserMessage("withdrawn root request", { deliverAs: "steer" });
-		const [entry] = session.getQueuedMessageEntries();
-		expect(entry?.text).toBe("withdrawn root request");
-		expect(session.removeQueuedMessageForEditing(entry?.id ?? "")).toBe("withdrawn root request");
+		// An independent root request past the fence — the external-custom route
+		// that actually carries the fresh-root marking — queued and then withdrawn
+		// through the production producer-purge path before it could be delivered.
+		await session.sendCustomMessage(
+			{ customType: "ext-notice", content: "withdrawn root request", display: false, attribution: "agent" },
+			{ deliverAs: "steer", origin: "external" },
+		);
+		expect(session.agent.snapshotQueues().followUp).toHaveLength(1);
+		const purged = session.purgeQueuedCustomMessages(message => message.customType === "ext-notice");
+		expect(purged.totalExecutable).toBe(1);
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 
 		// A turn-owned reminder now arrives. It must still be dropped by the fence:
