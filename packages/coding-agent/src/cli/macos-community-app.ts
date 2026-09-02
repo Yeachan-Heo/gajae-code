@@ -764,7 +764,8 @@ export async function offerMacosCommunityApp(
 				} else if (mountState === "none") {
 					// The attach attempt completed without establishing a mount.
 				} else {
-					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+					const detach = await rawCommand(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+					if (detach.reaped === false) cleanupUnsafe = true;
 					if (detach.reaped === false) {
 						removeTempRoot = false;
 						log("Optional community app cleanup warning: detach helper did not terminate safely");
