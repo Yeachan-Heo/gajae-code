@@ -39,7 +39,10 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
-import { resolveLoopbackOpenAIBaseUrl } from "@gajae-code/ai/utils/discovery/openai-compatible";
+import {
+	detectDiscoveredApiFamily,
+	resolveLoopbackOpenAIBaseUrl,
+} from "@gajae-code/ai/utils/discovery/openai-compatible";
 
 // Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
 // modules at startup. Must match the provider OAuth modules.
@@ -271,6 +274,44 @@ export function getRoleInfo(role: string, settings: Settings): RoleInfo {
 type ProviderValidationMode = "models-config" | "runtime-register";
 
 const OPENAI_REQUEST_TRANSFORM_APIS = new Set<Api>(["openai-completions", "openai-responses"]);
+
+const OPENAI_FAMILY_APIS = new Set<Api>([
+	"openai-completions",
+	"openai-responses",
+	"openai-codex-responses",
+	"azure-openai-responses",
+]);
+
+/** Whether an api uses an OpenAI-shaped request/response transport. */
+function isOpenAIFamilyApi(api: Api): boolean {
+	return OPENAI_FAMILY_APIS.has(api);
+}
+
+/**
+ * The most frequent OpenAI-family api among statically-configured models, used
+ * as the default api for auto-enabled `/v1/models` discovery on a custom
+ * provider that sets `api` only per model. Returns `undefined` when no
+ * configured model uses an OpenAI-family api (e.g. an Anthropic-only base),
+ * which suppresses auto-discovery for that provider.
+ */
+function dominantOpenAIFamilyModelApi(models: readonly { api?: string }[] | undefined): Api | undefined {
+	if (!models || models.length === 0) return undefined;
+	const counts = new Map<Api, number>();
+	for (const model of models) {
+		const api = model.api as Api | undefined;
+		if (api === undefined || !isOpenAIFamilyApi(api)) continue;
+		counts.set(api, (counts.get(api) ?? 0) + 1);
+	}
+	let best: Api | undefined;
+	let bestCount = 0;
+	for (const [api, count] of counts) {
+		if (count > bestCount) {
+			best = api;
+			bestCount = count;
+		}
+	}
+	return best;
+}
 
 function getKnownProviderApis(providerName: string): Set<Api> {
 	const apis = new Set<Api>();
@@ -2674,17 +2715,46 @@ export class ModelRegistry {
 				keylessProviders.add(providerName);
 			}
 
-			if (providerConfig.discovery && providerConfig.api) {
+			// Explicit discovery config is authoritative. Otherwise auto-enable
+			// OpenAI-compatible `/v1/models` discovery for any custom provider that
+			// declares an OpenAI-family `api` and a `baseUrl`: a subscription-style
+			// gateway (e.g. CLIProxyAPI) then auto-populates `/model` with its live
+			// catalog and auto-routes each model's wire family, with no manual
+			// `discovery:` block. It stays optional so an endpoint without
+			// `/v1/models` degrades to the configured static models instead of
+			// failing. Providers that route through the local `openaiCompat` proxy
+			// already register their own discovery above, so skip them here.
+			const effectiveDiscoveryBaseUrl = providerConfig.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName);
+			// The default api for discovered models: the provider-level `api` when
+			// set, otherwise the most common OpenAI-family `api` among the
+			// statically-configured models. For withfox-style configs that only set
+			// `api` per model (`openai-responses` for gpt, `anthropic-messages` for
+			// claude), this preserves the intended OpenAI transport for discovered
+			// OpenAI models while `detectDiscoveredApiFamily` still flips claude ids
+			// to Anthropic.
+			const providerApi =
+				(providerConfig.api as Api | undefined) ??
+				dominantOpenAIFamilyModelApi(providerConfig.models as { api?: string }[] | undefined);
+			const autoDiscovery: ProviderDiscovery | undefined =
+				!providerConfig.discovery &&
+				!localOpenAICompat &&
+				providerApi !== undefined &&
+				isOpenAIFamilyApi(providerApi) &&
+				effectiveDiscoveryBaseUrl !== undefined
+					? { type: "openai-models-list" }
+					: undefined;
+			const effectiveDiscovery = providerConfig.discovery ?? autoDiscovery;
+			if (effectiveDiscovery && providerApi) {
 				discoverableProviders.push({
 					provider: providerName,
-					api: providerConfig.api as Api,
-					baseUrl: providerConfig.baseUrl ?? resolveProviderBaseUrlFromEnv(providerName),
+					api: providerApi,
+					baseUrl: effectiveDiscoveryBaseUrl,
 					headers: providerConfig.headers,
 					compat: providerConfig.compat,
 					requestTransform: providerConfig.requestTransform,
 					cacheRetention: providerConfig.cacheRetention,
-					discovery: providerConfig.discovery,
-					optional: false,
+					discovery: effectiveDiscovery,
+					optional: !providerConfig.discovery,
 				});
 			}
 
@@ -3831,16 +3901,41 @@ export class ModelRegistry {
 		return this.#applyProviderModelOverrides(providerConfig.provider, discovered);
 	}
 
-	#resolveDiscoveredModelApi(providerConfig: DiscoveryProviderConfig, modelId: string): Api {
-		let api = providerConfig.api;
+	#resolveDiscoveredModelApi(
+		providerConfig: DiscoveryProviderConfig,
+		modelId: string,
+		entry?: { id?: unknown; owned_by?: unknown },
+	): Api {
+		// 1. Explicit per-prefix routing from models.yml always wins — the user
+		//    stated the transport for these ids, so never second-guess it.
 		let matchedPrefixLength = -1;
+		let prefixApi: Api | undefined;
 		for (const [prefix, routedApi] of Object.entries(providerConfig.discovery.apiByModelPrefix ?? {})) {
 			if (modelId.startsWith(prefix) && prefix.length > matchedPrefixLength) {
-				api = routedApi;
+				prefixApi = routedApi;
 				matchedPrefixLength = prefix.length;
 			}
 		}
-		return api;
+		if (prefixApi !== undefined) return prefixApi;
+		// 2. For OpenAI-compatible gateways that can front both OpenAI and
+		//    Anthropic upstreams (e.g. CLIProxyAPI), auto-detect the wire family
+		//    per model from the `/v1/models` `owned_by` owner and the model id.
+		//    A mixed gateway then routes `claude-*` through Anthropic Messages
+		//    with zero manual config. OpenAI-family models keep the provider's
+		//    configured OpenAI transport (e.g. `openai-responses` vs
+		//    `openai-completions`) rather than being forced to chat-completions,
+		//    because a `/v1/models` list cannot reveal which OpenAI API the
+		//    gateway expects. Only override to `openai-completions` when the
+		//    provider default is not itself an OpenAI-family api.
+		if (providerConfig.discovery.type === "openai-models-list") {
+			const detected = detectDiscoveredApiFamily(entry ?? { id: modelId });
+			if (detected === "anthropic-messages") return "anthropic-messages";
+			if (detected === "openai-completions") {
+				return isOpenAIFamilyApi(providerConfig.api) ? providerConfig.api : "openai-completions";
+			}
+		}
+		// 3. Fall back to the provider-level default api.
+		return providerConfig.api;
 	}
 
 	async #discoverModelsDevProvider(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
@@ -3957,7 +4052,7 @@ export class ModelRegistry {
 				item.max_tokens,
 				item.max_output_tokens,
 			);
-			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
+			const api = this.#resolveDiscoveredModelApi(providerConfig, id, item);
 			discovered.push(
 				enrichModelThinking({
 					id,

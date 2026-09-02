@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import {
+	detectDiscoveredApiFamily,
 	fetchOpenAICompatibleModels,
 	isSafeCatalogModelId,
 	resolveLoopbackOpenAIBaseUrl,
@@ -269,5 +270,43 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 		for (const endpoint of rejected) {
 			expect(resolveLoopbackOpenAIBaseUrl(endpoint, fallback)).toBe(fallback);
 		}
+	});
+});
+
+describe("detectDiscoveredApiFamily", () => {
+	it("routes by owned_by owner first", () => {
+		expect(detectDiscoveredApiFamily({ id: "whatever", owned_by: "anthropic" })).toBe("anthropic-messages");
+		expect(detectDiscoveredApiFamily({ id: "whatever", owned_by: "openai" })).toBe("openai-completions");
+		expect(detectDiscoveredApiFamily({ id: "whatever", owned_by: "open-ai" })).toBe("openai-completions");
+	});
+
+	it("owner signal wins over a conflicting id", () => {
+		// A gateway that owns a claude id under an openai account still declares
+		// the true upstream via owned_by; trust the owner.
+		expect(detectDiscoveredApiFamily({ id: "claude-opus-5", owned_by: "openai" })).toBe("openai-completions");
+		expect(detectDiscoveredApiFamily({ id: "gpt-5.6", owned_by: "anthropic" })).toBe("anthropic-messages");
+	});
+
+	it("falls back to the model id when owner is missing or unknown", () => {
+		expect(detectDiscoveredApiFamily({ id: "claude-opus-5" })).toBe("anthropic-messages");
+		expect(detectDiscoveredApiFamily({ id: "claude-sonnet-4-20250514", owned_by: "proxy" })).toBe(
+			"anthropic-messages",
+		);
+		expect(detectDiscoveredApiFamily({ id: "gpt-5.6-sol" })).toBe("openai-completions");
+		expect(detectDiscoveredApiFamily({ id: "gpt-image-1.5" })).toBe("openai-completions");
+		expect(detectDiscoveredApiFamily({ id: "o1-preview" })).toBe("openai-completions");
+		expect(detectDiscoveredApiFamily({ id: "codex-auto-review" })).toBe("openai-completions");
+	});
+
+	it("matches namespaced ids and dotted separators", () => {
+		expect(detectDiscoveredApiFamily({ id: "vendor/claude.opus" })).toBe("anthropic-messages");
+		expect(detectDiscoveredApiFamily({ id: "pool:gpt-4o" })).toBe("openai-completions");
+	});
+
+	it("returns undefined when neither signal is conclusive", () => {
+		expect(detectDiscoveredApiFamily({ id: "llama-3-8b" })).toBeUndefined();
+		expect(detectDiscoveredApiFamily({ id: "mistral-large", owned_by: "mistralai" })).toBeUndefined();
+		expect(detectDiscoveredApiFamily({ id: 123 })).toBeUndefined();
+		expect(detectDiscoveredApiFamily({})).toBeUndefined();
 	});
 });

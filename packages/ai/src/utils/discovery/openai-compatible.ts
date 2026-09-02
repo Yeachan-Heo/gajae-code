@@ -53,6 +53,44 @@ export function isSafeCatalogModelId(value: unknown): value is string {
 }
 
 /**
+ * The two wire families a mixed OpenAI-compatible gateway (e.g. CLIProxyAPI)
+ * can front. A gateway exposes an OpenAI-shaped `/v1/models` catalog but may
+ * proxy Anthropic models that must be driven through the Anthropic Messages
+ * transport rather than OpenAI Chat Completions.
+ */
+export type DiscoveredApiFamily = "anthropic-messages" | "openai-completions";
+
+const ANTHROPIC_OWNER_PATTERN = /\banthropic\b/i;
+const OPENAI_OWNER_PATTERN = /\b(openai|open-ai)\b/i;
+// Anthropic model ids are consistently `claude-*` across every gateway; the
+// `owned_by` owner string is the primary signal and the id is the fallback.
+const ANTHROPIC_MODEL_ID_PATTERN = /(^|[/:])claude[-.]/i;
+const OPENAI_MODEL_ID_PATTERN = /(^|[/:])(gpt[-.]?|o[1-9]|codex|text-|chatgpt|davinci|dall-e|gpt-image|whisper|tts-)/i;
+
+/**
+ * Infer the wire API family for one discovered model on a mixed
+ * OpenAI-compatible gateway.
+ *
+ * Uses the `owned_by` owner string first (authoritative when the gateway
+ * populates it — `"anthropic"` / `"openai"`), then falls back to the model id
+ * (`claude-*` → Anthropic, `gpt-*`/`o1`/`codex`/… → OpenAI). Returns
+ * `undefined` when neither signal is conclusive so the caller can keep the
+ * provider-level default instead of guessing.
+ */
+export function detectDiscoveredApiFamily(entry: {
+	id?: unknown;
+	owned_by?: unknown;
+}): DiscoveredApiFamily | undefined {
+	const owner = typeof entry.owned_by === "string" ? entry.owned_by : "";
+	if (ANTHROPIC_OWNER_PATTERN.test(owner)) return "anthropic-messages";
+	if (OPENAI_OWNER_PATTERN.test(owner)) return "openai-completions";
+	const id = typeof entry.id === "string" ? entry.id : "";
+	if (ANTHROPIC_MODEL_ID_PATTERN.test(id)) return "anthropic-messages";
+	if (OPENAI_MODEL_ID_PATTERN.test(id)) return "openai-completions";
+	return undefined;
+}
+
+/**
  * Minimal OpenAI-style model entry shape consumed by discovery.
  *
  * Providers may return additional fields; this type only captures
