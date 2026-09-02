@@ -154,6 +154,25 @@ describe("deep-interview crystallize contract", () => {
 		expect(crystal.lifecycle).toBe("needs-questions");
 	});
 
+	it("allows explicit resolution of prior gaps and conflicts", () => {
+		const first = crystallizeDeepInterview(
+			input({ open_gaps: ["What is the memory budget?"], conflicts: ["The target is disputed."] }),
+		);
+		const second = crystallizeDeepInterview(
+			later(
+				input({
+					prior: first,
+					resolved_open_gaps: ["What is the memory budget?"],
+					resolved_conflicts: ["The target is disputed."],
+				}),
+				2,
+			),
+		);
+		expect(second.lifecycle).toBe("ready");
+		expect(second.open_gaps).toEqual([]);
+		expect(second.conflicts).toEqual([]);
+	});
+
 	it("marks conflicting evidence stale", () => {
 		const crystal = crystallizeDeepInterview(input({ conflicts: ["Later message contradicts the goal."] }));
 		expect(crystal.lifecycle).toBe("stale");
