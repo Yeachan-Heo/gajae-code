@@ -157,6 +157,39 @@ describe("session title source persistence", () => {
 		expect(listedUnstarred.find(candidate => candidate.path === sessionFile)?.starred).toBe(false);
 	});
 
+	it("upgrades a pre-star transcript once before appending its first star patch", async () => {
+		const sessionFile = path.join(cwd, "pre-star.jsonl");
+		const records = [
+			{
+				type: "session",
+				version: CURRENT_SESSION_VERSION,
+				id: "pre-star",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd,
+			},
+			{
+				type: "message",
+				id: "user",
+				parentId: null,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				message: { role: "user", content: "legacy", timestamp: 1 },
+			},
+		];
+		fs.writeFileSync(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+
+		const session = await SessionManager.open(sessionFile);
+		expect(await session.setSessionStarred(true)).toBe(true);
+
+		const persisted = fs
+			.readFileSync(sessionFile, "utf8")
+			.trimEnd()
+			.split("\n")
+			.map(line => JSON.parse(line));
+		expect(persisted[0]).toMatchObject({ type: "session", starredPatchVersion: 1 });
+		expect(persisted.at(-1)).toEqual({ type: "header_patch", patch: { starred: true } });
+		expect((await SessionManager.listForResumePickerReadOnly(cwd, cwd))[0]?.starred).toBe(true);
+	});
+
 	it("restores in-memory star state when persistence fails", async () => {
 		const session = SessionManager.create(cwd);
 		session.appendMessage({ role: "user", content: "keep this", timestamp: 1 });
@@ -181,6 +214,23 @@ describe("session title source persistence", () => {
 				cwd: "/tmp",
 			},
 			{ type: "header_patch", patch: { starred: "yes" } },
+		]
+			.map(record => JSON.stringify(record))
+			.join("\n");
+
+		expect(parseSessionEntries(content)[0]).not.toHaveProperty("starred");
+	});
+
+	it("ignores star patches on transcripts without the star capability", () => {
+		const content = [
+			{
+				type: "session",
+				version: 5,
+				id: "pre-star-capability",
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: "/tmp",
+			},
+			{ type: "header_patch", patch: { starred: true } },
 		]
 			.map(record => JSON.stringify(record))
 			.join("\n");
@@ -475,8 +525,11 @@ describe("session title source persistence", () => {
 						.trimEnd()
 						.split("\n")
 						.filter(line => line.includes('"type":"header_patch"'));
-					expect(patchLines).toHaveLength(1);
-					expect(JSON.parse(patchLines[0]!)).toEqual({ type: "header_patch", patch: { cwd: destinationCwd } });
+					expect(patchLines).toHaveLength(2);
+					expect(patchLines.map(line => JSON.parse(line))).toEqual([
+						{ type: "header_patch", patch: { starred: false } },
+						{ type: "header_patch", patch: { cwd: destinationCwd } },
+					]);
 				},
 			);
 		}

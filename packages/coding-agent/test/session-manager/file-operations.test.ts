@@ -467,6 +467,7 @@ describe("getRecentSessions", () => {
 				{
 					type: "session",
 					version: CURRENT_SESSION_VERSION,
+					starredPatchVersion: 1,
 					id,
 					timestamp: "2025-01-01T00:00:00Z",
 					cwd: "/tmp",

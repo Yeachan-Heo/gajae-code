@@ -22,12 +22,19 @@ describe("resume listing trailing-patch scan cost", () => {
 		testDir = undefined;
 	});
 
-	function writeTranscript(sessionDir: string, cwd: string, sessionId: string, targetBytes: number): string {
+	function writeTranscript(
+		sessionDir: string,
+		cwd: string,
+		sessionId: string,
+		targetBytes: number,
+		starCapable = true,
+	): string {
 		const sessionFile = path.join(sessionDir, `${sessionId}.jsonl`);
 		const lines: string[] = [
 			JSON.stringify({
 				type: "session",
 				version: CURRENT_SESSION_VERSION,
+				...(starCapable ? { starredPatchVersion: 1 } : {}),
 				id: sessionId,
 				timestamp: "2026-08-16T00:00:00.000Z",
 				cwd,
@@ -106,14 +113,14 @@ describe("resume listing trailing-patch scan cost", () => {
 		expect(counter.reads()).toBeLessThan(readsAtFourKiB / 4);
 	});
 
-	it("scans to BOF when a legacy metadata patch has no star state", async () => {
+	it("keeps legacy metadata patches bounded when the star capability is absent", async () => {
 		testDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-resume-scan-legacy-patch-"));
 		const cwd = path.join(testDir, "cwd");
 		const sessionDir = path.join(testDir, "sessions");
 		fs.mkdirSync(cwd, { recursive: true });
 		fs.mkdirSync(sessionDir, { recursive: true });
 
-		const sessionFile = writeTranscript(sessionDir, cwd, "scan-legacy-patch", 4 * 1024 * 1024);
+		const sessionFile = writeTranscript(sessionDir, cwd, "scan-legacy-patch", 4 * 1024 * 1024, false);
 		fs.appendFileSync(
 			sessionFile,
 			`${JSON.stringify({
@@ -130,8 +137,9 @@ describe("resume listing trailing-patch scan cost", () => {
 			starred: false,
 		});
 
-		// The reader cannot prove that an earlier star patch does not exist until BOF.
-		expect(counter.bytes()).toBeGreaterThanOrEqual(size / 2);
+		// A transcript without the star capability cannot contain star patches, so
+		// resolving its title/cwd patch retains the pre-feature bounded behavior.
+		expect(counter.bytes()).toBeLessThan(size / 2);
 	});
 
 	it("still stops early when every mutable header field is patched near EOF", async () => {

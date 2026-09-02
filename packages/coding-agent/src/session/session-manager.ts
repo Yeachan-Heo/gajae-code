@@ -246,6 +246,7 @@ export interface SessionHeader {
 	id: string;
 	title?: string; // Auto-generated title from first message
 	titleSource?: "auto" | "user";
+	starredPatchVersion?: 1;
 	starred?: boolean;
 	timestamp: string;
 	cwd: string;
@@ -2715,7 +2716,7 @@ function applyHeaderPatch(header: SessionHeader, patch: HeaderPatchRecord["patch
 	if (patch.cwd !== undefined) header.cwd = patch.cwd;
 	if (patch.title !== undefined) header.title = patch.title;
 	if (patch.titleSource !== undefined) header.titleSource = patch.titleSource;
-	if (patch.starred !== undefined) header.starred = patch.starred;
+	if (header.starredPatchVersion === 1 && patch.starred !== undefined) header.starred = patch.starred;
 }
 
 function isEntryPatchRecord(record: SessionPatchRecord): record is EntryPatchRecord {
@@ -4658,7 +4659,7 @@ async function getSortedSessions(
 						)
 							return undefined;
 						if (typeof header.version === "number" && header.version >= 4) {
-							for (const patch of await readSessionListTrailingPatches(candidate.path, storage)) {
+							for (const patch of await readSessionListTrailingPatches(candidate.path, storage, false)) {
 								applySessionListHeaderPatch(header as unknown as SessionListHeader, patch);
 							}
 						}
@@ -6582,19 +6583,22 @@ async function readSessionListPrefix(file: string, storage: SessionStorage, buff
 async function readSessionListTrailingPatches(
 	file: string,
 	storage: SessionStorage,
+	includeStarred: boolean,
 ): Promise<HeaderPatchRecord["patch"][]> {
 	if (!(storage instanceof FileSessionStorage)) {
 		const content = await storage.readText(file);
 		const entries = parseSessionEntries(content);
 		const header = entries[0] as SessionHeader | undefined;
-		return header?.type === "session" ? [{ cwd: header.cwd, title: header.title, starred: header.starred }] : [];
+		return header?.type === "session"
+			? [{ cwd: header.cwd, title: header.title, ...(includeStarred ? { starred: header.starred } : {}) }]
+			: [];
 	}
 
 	const size = storage.statSync(file).size;
 	if (size <= SESSION_LIST_PREFIX_BYTES) return [];
 	const latest: HeaderPatchRecord["patch"] = {};
 	let position = size;
-	// Reverse-scan from EOF in fixed chunks. Stop once every mutable list field
+	// Reverse-scan from EOF in fixed chunks. Stop once every requested mutable list field
 	// resolves so recent patches stay cheap. Continue past the historical 16 KiB
 	// window when a field is still missing so a buried but canonically valid
 	// header_patch remains listable without a full sequential JSONL parse (#3633).
@@ -6604,15 +6608,16 @@ async function readSessionListTrailingPatches(
 	// A transcript with no header_patch at all — the common case — cannot be
 	// recognized as such without reaching BOF, so the chunk size sets how many
 	// read syscalls a resume costs per transcript byte.
-	// Legacy metadata patches without a star field likewise scan to BOF because
-	// an earlier standalone star patch cannot otherwise be ruled out.
 	let trailingFragment = Buffer.alloc(0);
 	const chunkSize = Math.min(size, SESSION_LIST_TRAILING_PATCH_BYTES);
 	const buffer = Buffer.allocUnsafe(chunkSize);
 	const headerPatchMarker = Buffer.from("header_patch");
 	const handle = await fs.promises.open(file, "r");
 	try {
-		while (position > 0 && (latest.cwd === undefined || latest.title === undefined || latest.starred === undefined)) {
+		while (
+			position > 0 &&
+			(latest.cwd === undefined || latest.title === undefined || (includeStarred && latest.starred === undefined))
+		) {
 			const start = Math.max(0, position - chunkSize);
 			const length = position - start;
 			const { bytesRead } = await handle.read(buffer, 0, length, start);
@@ -6645,7 +6650,7 @@ async function readSessionListTrailingPatches(
 						if (latest.cwd === undefined && typeof record.patch.cwd === "string") latest.cwd = record.patch.cwd;
 						if (latest.title === undefined && typeof record.patch.title === "string")
 							latest.title = record.patch.title;
-						if (latest.starred === undefined && typeof record.patch.starred === "boolean")
+						if (includeStarred && latest.starred === undefined && typeof record.patch.starred === "boolean")
 							latest.starred = record.patch.starred;
 					} catch {
 						// Ignore malformed or partial records exactly as the canonical loader does.
@@ -6763,6 +6768,7 @@ interface SessionListHeader {
 
 	cwd?: string;
 	title?: string;
+	starredPatchVersion?: 1;
 	starred?: boolean;
 	parentSession?: string;
 	timestamp?: string;
@@ -6780,6 +6786,7 @@ function parseSessionListHeader(
 			version: typeof parsedHeader.version === "number" ? parsedHeader.version : undefined,
 			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
 			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
+			starredPatchVersion: parsedHeader.starredPatchVersion === 1 ? 1 : undefined,
 			starred: typeof parsedHeader.starred === "boolean" ? parsedHeader.starred : undefined,
 			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
 			timestamp: typeof parsedHeader.timestamp === "string" ? parsedHeader.timestamp : undefined,
@@ -6824,8 +6831,9 @@ async function collectSessionFromFile(
 		const entries = parseSessionEntries(content).map(entry => entry as unknown as Record<string, unknown>);
 		const header = parseSessionListHeader(content, entries);
 		if (!header) return undefined;
+		if (header.starredPatchVersion !== 1) header.starred = undefined;
 		if (typeof header.version === "number" && header.version >= 4 && header.version <= CURRENT_SESSION_VERSION) {
-			for (const patch of await readSessionListTrailingPatches(file, storage)) {
+			for (const patch of await readSessionListTrailingPatches(file, storage, header.starredPatchVersion === 1)) {
 				applySessionListHeaderPatch(header, patch);
 			}
 		}
@@ -8192,6 +8200,7 @@ export class SessionManager {
 			header: {
 				type: "session",
 				version: CURRENT_SESSION_VERSION,
+				starredPatchVersion: 1,
 				id: sessionId,
 				timestamp,
 				cwd: this.cwd,
@@ -16917,13 +16926,14 @@ export class SessionManager {
 
 	isSessionStarred(): boolean {
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		return header?.starred === true;
+		return header?.starredPatchVersion === 1 && header.starred === true;
 	}
 
 	async setSessionStarred(starred: boolean): Promise<boolean> {
 		this.#assertRecoveryHydrationWritable();
 		const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		if (!header || (header.starred === true) === starred) return false;
+		if (!header || this.isSessionStarred() === starred) return false;
+		await this.#ensureStarPatchCapability(header);
 		const previous = header.starred;
 		try {
 			await this.#appendHeaderPatch({ starred });
@@ -16931,6 +16941,27 @@ export class SessionManager {
 		} catch (error) {
 			if (previous === undefined) delete header.starred;
 			else header.starred = previous;
+			this.#headerExportRevision++;
+			throw error;
+		}
+	}
+
+	async #ensureStarPatchCapability(header: SessionHeader): Promise<void> {
+		if (header.starredPatchVersion === 1) return;
+		const previousStarred = header.starred;
+		const previousRewriteRequired = this.#needsFullRewriteOnNextPersist;
+		header.starredPatchVersion = 1;
+		delete header.starred;
+		this.#headerExportRevision++;
+		if (!this.persist || !this.#sessionFile || !this.#storage.existsSync(this.#sessionFile)) return;
+		this.#needsFullRewriteOnNextPersist = true;
+		try {
+			await this.#persistPatches([{ type: "header_patch", patch: {} }]);
+		} catch (error) {
+			delete header.starredPatchVersion;
+			if (previousStarred === undefined) delete header.starred;
+			else header.starred = previousStarred;
+			this.#needsFullRewriteOnNextPersist = previousRewriteRequired;
 			this.#headerExportRevision++;
 			throw error;
 		}
@@ -16972,7 +17003,14 @@ export class SessionManager {
 		if (!header) return;
 		applyHeaderPatch(header, patch);
 		this.#headerExportRevision++;
-		await this.#persistPatch({ type: "header_patch", patch });
+		const records: HeaderPatchRecord[] =
+			header.starredPatchVersion === 1 && patch.starred === undefined
+				? [
+						{ type: "header_patch", patch: { starred: header.starred === true } },
+						{ type: "header_patch", patch },
+					]
+				: [{ type: "header_patch", patch }];
+		await this.#persistPatches(records);
 	}
 
 	#appendManagedRecordsSync(records: readonly (FileEntry | SessionPatchRecord)[]): void {
@@ -17003,10 +17041,6 @@ export class SessionManager {
 			this.#managedPersistExpectedIdentity = receipt.identity;
 			this.#publishSessionCommitMarkerSync(receipt.descriptor);
 		});
-	}
-
-	async #persistPatch(record: SessionPatchRecord): Promise<void> {
-		await this.#persistPatches([record]);
 	}
 
 	async #persistPatches(records: readonly SessionPatchRecord[]): Promise<void> {
