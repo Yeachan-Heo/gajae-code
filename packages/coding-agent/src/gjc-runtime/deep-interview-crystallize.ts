@@ -183,6 +183,13 @@ function normalizedGaps(value: unknown): string[] {
 	return value.map((gap, index) => text(gap, `open_gaps[${index}]`, 500));
 }
 
+function validateResolutions(resolutions: readonly string[], snapshot: CrystalSnapshot, field: string): void {
+	for (const resolution of resolutions) {
+		if (!snapshot.messages.some(message => message.role === "user" && message.content.includes(resolution)))
+			throw new Error(`${field} must be supported by verbatim user evidence`);
+	}
+}
+
 function validateRemovedIds(value: unknown): string[] {
 	if (!Array.isArray(value) || value.length > MAX_ITEMS) throw new Error("removed_ids must be a bounded array");
 	const ids = value.map((id, index) => text(id, `removed_ids[${index}]`, 128));
@@ -209,6 +216,8 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 	const conflicts = normalizedGaps(value.conflicts);
 	const resolvedGaps = normalizedGaps(value.resolved_open_gaps);
 	const resolvedConflicts = normalizedGaps(value.resolved_conflicts);
+	validateResolutions(resolvedGaps, snapshot, "resolved_open_gaps");
+	validateResolutions(resolvedConflicts, snapshot, "resolved_conflicts");
 	const prior = value.prior;
 	if (prior !== undefined && !isRecord(prior)) throw new Error("prior crystal is invalid");
 	const priorCrystal = prior as DeepInterviewCrystal | undefined;
