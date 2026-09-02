@@ -1365,7 +1365,12 @@ function assertRelocationRuntimeStateIdentity(previous: Record<string, unknown>,
 		throw new PreviousRuntimeStateReadError();
 }
 
-function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
+/**
+ * The runtime-state document a context writes to, or `null` when it has no session
+ * identity. Exported so callers can key per-document policy (log suppression, metrics)
+ * on the same identity the writer resolves, including the explicit env override.
+ */
+export function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
 	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (explicit) return explicit;
 	if (!context.sessionId.trim()) return null;

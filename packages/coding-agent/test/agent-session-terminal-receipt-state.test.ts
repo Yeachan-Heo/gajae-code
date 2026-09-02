@@ -192,6 +192,66 @@ describe("AgentSession terminal receipt state", () => {
 		});
 	});
 
+	it("names the runtime-state document in every persist-failure log", async () => {
+		// The suppression window is keyed by this document (see #warnPersistFailure), so
+		// the field is both the operator's identity for the failure and the proof that
+		// the caller keys on the resolved document rather than on the session id.
+		// `shouldWarnPersistFailure` key independence itself is covered in
+		// session-state-lock.test.ts.
+		resetPersistFailureWarnWindows();
+		tempDir = TempDir.createSync("@gjc-terminal-persistence-document-");
+		const document = path.join(tempDir.path(), "doc-a.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = document;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "document-session";
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled model");
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: createMockModel({ responses: [{ content: ["done"] }] }).stream,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockRejectedValue(
+			new Error("marker unreadable", {
+				cause: new SessionStateLockUnavailableError({
+					lockPath: `${document}.lock.transition`,
+					reason: "transition_claim_timeout",
+				}),
+			}),
+		);
+		const warned: Array<Record<string, unknown> | undefined> = [];
+		const debugged: Array<Record<string, unknown> | undefined> = [];
+		vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (/persist/iu.test(message)) warned.push(context);
+		});
+		vi.spyOn(logger, "debug").mockImplementation((message, context) => {
+			if (/persist/iu.test(message)) debugged.push(context);
+		});
+		const terminal = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") terminal.resolve();
+		});
+
+		await session.prompt("respond");
+		await terminal.promise;
+		await session.dispose();
+		session = undefined;
+
+		// One warn for the document, every in-window repeat demoted, and BOTH levels
+		// name the document they failed on.
+		expect(warned).toHaveLength(1);
+		expect(warned[0]).toMatchObject({ stateFile: document, reason: "transition_claim_timeout" });
+		expect(debugged.length).toBeGreaterThanOrEqual(1);
+		for (const entry of debugged) expect(entry).toMatchObject({ stateFile: document, suppressed: true });
+	});
+
 	it("publishes agent_end while terminal sidecar persistence remains pending", async () => {
 		tempDir = TempDir.createSync("@gjc-terminal-persistence-pending-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));

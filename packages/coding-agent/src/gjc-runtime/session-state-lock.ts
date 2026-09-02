@@ -523,13 +523,18 @@ export function resetPersistFailureWarnWindows(): void {
 }
 
 /**
- * Every owner record this process currently holds, keyed by owner-record path.
+ * Every owner record this process currently holds, keyed by owner-record path. A
+ * transition owner also carries the canonical path and captured generation of the claim
+ * directory it guards, which is the authority an identity-bound removal needs.
  * Maintained by the acquire/release paths so a forced exit can tombstone them
- * synchronously. Transition claim DIRECTORIES are deliberately not tracked: the
- * released sidecar alone lets the next writer reclaim the claim after its grace, and a
- * pathname `rmdir` here could never be bound to the directory generation atomically.
+ * synchronously.
  */
-const heldSessionStateLocks = new Map<string, LockOwnerSnapshot>();
+interface HeldSessionStateLock {
+	held: LockOwnerSnapshot;
+	claim?: { nativePath: string; generation: TransitionDirectoryGeneration };
+}
+
+const heldSessionStateLocks = new Map<string, HeldSessionStateLock>();
 
 /**
  * Write `payload` in full at offset 0 through `descriptor`, retrying short writes.
@@ -604,28 +609,42 @@ function tombstoneHeldOwnerRecordSync(file: string, held: LockOwnerSnapshot, hos
  * Meant for the forced-exit path (`postmortem.quit` after a repeated shutdown request),
  * where the async release protocol will never get to run. Each record is rewritten to a
  * released tombstone only while it is still byte-identical to what this process wrote
- * (see {@link tombstoneHeldOwnerRecordSync}). A transition claim directory is left in
- * place: its released sidecar is exactly what `reclaimStaleTransitionClaim` removes
- * identity-bound after the grace window. Anything that changed underneath, or any I/O
- * fault, is left for the dead-owner reclaim path on the next writer. Never throws;
- * returns the number of records tombstoned.
+ * (see {@link tombstoneHeldOwnerRecordSync}).
+ *
+ * A transition owner's claim directory is then removed through the same identity-bound
+ * primitive the async protocol uses ({@link removeOwnedTransitionClaim}: tree snapshot
+ * plus an exact generation match), never by pathname. Order matters: the tombstone is
+ * written FIRST, so a refused or failed removal degrades to the released-sidecar path
+ * that `reclaimStaleTransitionClaim` completes after its grace window rather than
+ * stranding a live claim. Anything that changed underneath, or any I/O fault, is left
+ * for the dead-owner reclaim path on the next writer. Never throws; returns the number
+ * of records tombstoned.
  */
 export function releaseHeldSessionStateLocksSync(): number {
 	let released = 0;
-	for (const [file, held] of [...heldSessionStateLocks.entries()]) {
+	for (const [file, entry] of [...heldSessionStateLocks.entries()]) {
 		heldSessionStateLocks.delete(file);
 		// The record this process wrote already carries its host qualification; reuse it
 		// rather than resolving the installation identity asynchronously mid-exit.
 		let hostId: string | undefined;
 		try {
-			const heldOwner: unknown = JSON.parse(held.bytes);
+			const heldOwner: unknown = JSON.parse(entry.held.bytes);
 			if (validLockOwner(heldOwner) && heldOwner.pid === process.pid) hostId = heldOwner.owner_host_id;
 		} catch {
 			hostId = undefined;
 		}
 		if (hostId === undefined) continue;
 		try {
-			if (tombstoneHeldOwnerRecordSync(file, held, hostId)) released++;
+			if (!tombstoneHeldOwnerRecordSync(file, entry.held, hostId)) continue;
+			released++;
+			if (entry.claim !== undefined) {
+				try {
+					removeOwnedTransitionClaim(entry.claim.nativePath, entry.claim.generation);
+				} catch {
+					// The native binding may be unavailable or throw mid-exit. The released
+					// sidecar already authorizes the ordinary reclaimer, so refusal is safe.
+				}
+			}
 		} catch {
 			// Forced exit: nothing here may block or throw.
 		}
@@ -2184,7 +2203,10 @@ async function withLockPathTransition<T>(
 			}
 			throw error;
 		}
-		heldSessionStateLocks.set(ownerFile, held);
+		heldSessionStateLocks.set(ownerFile, {
+			held,
+			claim: { nativePath: pendingSetup.nativePath!, generation: transitionGeneration },
+		});
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),
@@ -2543,7 +2565,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 					const acquired = await acquireOwnerLock(lockFile, owner, cycleQuarantine);
 					// Register the instant the record exists, before the acquisition claim
 					// is released: a forced exit during that release must still see it.
-					heldSessionStateLocks.set(lockFile, acquired);
+					heldSessionStateLocks.set(lockFile, { held: acquired });
 					return acquired;
 				},
 				cycleQuarantine,

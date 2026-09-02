@@ -327,6 +327,7 @@ import {
 	recoverCoordinatorRuntimeStateRescope,
 	registerCoordinatorRuntimeStateFinalizer,
 	relocateCoordinatorRuntimeStateForRescope,
+	runtimeStateFileForContext,
 	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
 import {
@@ -5886,13 +5887,25 @@ export class AgentSession {
 
 	/**
 	 * Report a coordinator runtime-state persist failure with its actionable detail
-	 * (error text plus the lock `reason`/`lockPath` when a lock refusal caused it). The
-	 * first failure per session per 30s window warns; repeats in the window log at debug
-	 * so a wedged lock does not emit one warn per session event.
+	 * (error text plus the lock `reason`/`lockPath` when a lock refusal caused it).
+	 *
+	 * The 30s window is keyed by the runtime-state DOCUMENT, resolved through the same
+	 * function the writer uses, so a wedged lock reports once per document rather than
+	 * once per session event — and two documents never suppress each other, even when
+	 * one session is rescoped onto a different path mid-run.
 	 */
 	#warnPersistFailure(message: string, error: unknown, extra: Record<string, unknown> = {}): void {
-		const fields = { ...extra, ...sessionStateLockFailureFields(error) };
-		if (shouldWarnPersistFailure(this.sessionId)) logger.warn(message, fields);
+		const stateFile = runtimeStateFileForContext({
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		});
+		const fields = {
+			...extra,
+			...sessionStateLockFailureFields(error),
+			...(stateFile === null ? {} : { stateFile }),
+		};
+		if (shouldWarnPersistFailure(stateFile ?? `session:${this.sessionId}`)) logger.warn(message, fields);
 		else logger.debug(message, { ...fields, suppressed: true });
 	}
 

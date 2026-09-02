@@ -34,7 +34,7 @@ import {
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
-import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
+import { $credentialEnv, hookFetch, logger, Snowflake } from "@gajae-code/utils";
 
 describe("model roles", () => {
 	test("default is the only built-in model role", () => {
@@ -4145,6 +4145,48 @@ describe("ModelRegistry", () => {
 		});
 	});
 	describe("runtime discovery", () => {
+		// The pure classifier is covered at the end of this file. These two drive the REAL
+		// logging callsite, so they fail if it ever returns to an unconditional warn.
+		async function refreshWithUnreachableDiscovery(baseUrl: string): Promise<{
+			warned: string[];
+			debugged: string[];
+		}> {
+			writeRawModelsJson({
+				ollama: { baseUrl, api: "openai-completions", auth: "none", discovery: { type: "ollama" } },
+			});
+			using _hook = hookFetch(() => {
+				throw new Error("Unable to connect. Is the computer able to access the url?");
+			});
+			const warned: string[] = [];
+			const debugged: string[] = [];
+			const warnSpy = vi.spyOn(logger, "warn").mockImplementation(message => {
+				if (message === "model discovery failed for provider") warned.push(message);
+			});
+			const debugSpy = vi.spyOn(logger, "debug").mockImplementation(message => {
+				if (message === "model discovery failed for provider") debugged.push(message);
+			});
+			try {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("ollama", "online");
+			} finally {
+				warnSpy.mockRestore();
+				debugSpy.mockRestore();
+			}
+			return { warned, debugged };
+		}
+
+		test("logs an unreachable loopback discovery endpoint at debug", async () => {
+			const { warned, debugged } = await refreshWithUnreachableDiscovery("http://127.0.0.1:11434/v1");
+			expect(debugged.length).toBeGreaterThanOrEqual(1);
+			expect(warned).toEqual([]);
+		});
+
+		test("keeps an unreachable remote discovery endpoint at warn", async () => {
+			const { warned, debugged } = await refreshWithUnreachableDiscovery("https://ollama.example.com/v1");
+			expect(warned.length).toBeGreaterThanOrEqual(1);
+			expect(debugged).toEqual([]);
+		});
+
 		test("auto-discovers ollama models without provider config", async () => {
 			using _hook = mockOllamaDiscovery(["phi4-mini"]);
 			const restoreOllamaBaseUrl = setEnvForTest("OLLAMA_BASE_URL", "http://127.0.0.1:11434");

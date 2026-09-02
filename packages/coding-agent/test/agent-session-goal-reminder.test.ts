@@ -352,7 +352,21 @@ describe("AgentSession active goal reminders", () => {
 					throw new Error("Timed out waiting for coordinator runtime-state failure containment");
 				}),
 			]);
-			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", { event: "turn_start" });
+			// The warn now carries the actionable error text, but the sidecar payload it
+			// failed on must still never reach the log fields.
+			const persistCall = warnSpy.mock.calls.find(
+				([message]) => message === "Failed to persist coordinator runtime state",
+			);
+			expect(persistCall).toBeDefined();
+			const persistFields = persistCall?.[1] as Record<string, unknown>;
+			expect(persistFields).toMatchObject({ event: "turn_start" });
+			expect(typeof persistFields.error).toBe("string");
+			// Exact allow-list: the only fields permitted are the event, the error text, and
+			// the document path. Anything else risks carrying sidecar contents into logs.
+			expect(Object.keys(persistFields).sort()).toEqual(["error", "event", "stateFile"]);
+			expect(persistFields.stateFile).toBe(stateFile);
+			expect(JSON.stringify(persistFields)).not.toContain("must-not-reach-logs");
+			expect(JSON.stringify(persistFields)).not.toContain("private_payload");
 		} finally {
 			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;

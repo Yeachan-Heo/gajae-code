@@ -2565,7 +2565,75 @@ describe("session state lock forced-exit release", () => {
 		await holder.catch(() => undefined);
 	});
 
-	it("tombstones a held transition sidecar but never rmdirs its claim directory", async () => {
+	it("removes its own empty claim directory through the identity-bound primitive", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-claim-owned");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const transitionOwner = `${transitionDir}.owner`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async file => {
+			if (file !== transitionOwner) return;
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+			markEntered();
+			await release;
+		};
+		let treeRemovals = 0;
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			exactRemoveDirectoryTree(target, snapshot) {
+				treeRemovals++;
+				return exactIdentityNativeBindings.exactRemoveDirectoryTree(target, snapshot);
+			},
+		}));
+		const holder = withSessionStateFileLock(stateFile, async () => undefined);
+		await entered;
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+
+		expect(releaseHeldSessionStateLocksSync()).toBe(2);
+
+		// The claim this process owns is gone, removed under its captured generation.
+		expect(treeRemovals).toBeGreaterThanOrEqual(1);
+		expect(fsSync.existsSync(transitionDir)).toBe(false);
+		expect(JSON.parse(await fs.readFile(transitionOwner, "utf8"))).toMatchObject({ released: true });
+		allowRelease();
+		await holder.catch(() => undefined);
+	});
+
+	it("survives a native binding that throws while removing its claim", async () => {
+		const { stateFile } = await seededRunningSession("lock-forced-exit-claim-throws");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const transitionOwner = `${transitionDir}.owner`;
+		const { promise: entered, resolve: markEntered } = Promise.withResolvers<void>();
+		const { promise: release, resolve: allowRelease } = Promise.withResolvers<void>();
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async file => {
+			if (file !== transitionOwner) return;
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+			markEntered();
+			await release;
+		};
+		const holder = withSessionStateFileLock(stateFile, async () => undefined);
+		await entered;
+		setSessionStateLockNativeBindings(() => ({
+			...exactIdentityNativeBindings,
+			snapshotDirectoryTree() {
+				throw new Error("native snapshot unavailable during forced exit");
+			},
+		}));
+
+		// The throw is contained: both records are still tombstoned and the claim is
+		// left for the ordinary released-sidecar reclaimer.
+		expect(releaseHeldSessionStateLocksSync()).toBe(2);
+		expect(fsSync.existsSync(transitionDir)).toBe(true);
+		expect(JSON.parse(await fs.readFile(transitionOwner, "utf8"))).toMatchObject({ released: true });
+		allowRelease();
+		await holder.catch(() => undefined);
+		installExactIdentityNatives();
+		await fs.rm(transitionDir, { recursive: true, force: true });
+	});
+
+	it("leaves a claim directory a successor replaced under it alone", async () => {
 		const { stateFile } = await seededRunningSession("lock-forced-exit-claim-kept");
 		const lockFile = `${stateFile}.lock`;
 		const transitionDir = `${lockFile}.transition`;
