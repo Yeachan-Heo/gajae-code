@@ -390,7 +390,10 @@ describe("SessionManager close/appendMessage race", () => {
 			.split("\n")
 			.map(line => JSON.parse(line));
 		expect(rewritten[0]).toMatchObject({ type: "session", version: 5 });
-		expect(rewritten[1]).toMatchObject({ type: "message", message: { content: "updated" } });
+		expect(rewritten[1]).toMatchObject({
+			type: "message",
+			message: { content: [{ type: "text", text: "updated" }] },
+		});
 	});
 });
 
