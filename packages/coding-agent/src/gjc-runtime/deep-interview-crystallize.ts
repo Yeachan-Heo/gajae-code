@@ -43,6 +43,7 @@ export interface CrystalResolutionAnchor {
 	item: string;
 	message_index: number;
 	quote: string;
+	resolution: string;
 }
 
 export interface CrystalDelta {
@@ -191,22 +192,6 @@ function normalizedGaps(value: unknown): string[] {
 	return value.map((gap, index) => text(gap, `open_gaps[${index}]`, 500));
 }
 
-function validateResolutions(
-	resolutions: readonly string[],
-	snapshot: CrystalSnapshot,
-	field: string,
-	afterIndex: number,
-): void {
-	for (const resolution of resolutions) {
-		if (
-			!snapshot.messages.some(
-				message => message.index > afterIndex && message.role === "user" && message.content.includes(resolution),
-			)
-		)
-			throw new Error(`${field} must be supported by verbatim user evidence`);
-	}
-}
-
 function validateResolutionAnchors(
 	resolutions: readonly string[],
 	value: unknown,
@@ -223,6 +208,7 @@ function validateResolutionAnchors(
 		const item = text(raw.item, `${field}[${index}].item`, 500);
 		const messageIndex = integer(raw.message_index, `${field}[${index}].message_index`);
 		const quote = text(raw.quote, `${field}[${index}].quote`, 500);
+		const resolution = text(raw.resolution, `${field}[${index}].resolution`, 500);
 		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
 		if (
 			!resolutions.includes(item) ||
@@ -230,7 +216,9 @@ function validateResolutionAnchors(
 			messageIndex <= afterIndex ||
 			!message ||
 			message.role !== "user" ||
-			!message.content.includes(quote)
+			!message.content.includes(quote) ||
+			!message.content.includes(resolution) ||
+			resolution === item
 		)
 			throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
 		seen.add(item);
@@ -295,8 +283,6 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		priorCrystal && isRecord(priorCrystal.source) && typeof priorCrystal.source.end === "number"
 			? priorCrystal.source.end
 			: -1;
-	validateResolutions(resolvedGaps, snapshot, "resolved_open_gaps", priorEnd);
-	validateResolutions(resolvedConflicts, snapshot, "resolved_conflicts", priorEnd);
 	if (gaps.some(gap => resolvedGaps.includes(gap)))
 		throw new Error("open_gaps and resolved_open_gaps must be disjoint");
 	if (conflicts.some(conflict => resolvedConflicts.includes(conflict)))
