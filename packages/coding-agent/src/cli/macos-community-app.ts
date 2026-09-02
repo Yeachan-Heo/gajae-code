@@ -392,7 +392,7 @@ export async function offerMacosCommunityApp(
 	let mountPoint: string | undefined;
 	let mountIdentity: FileIdentity | undefined;
 	let mountAttempted = false;
-	let mountAttached = false;
+	let mountState: "none" | "unknown" | "attached" = "none";
 	let installedDestination: { path: string; identity: FileIdentity } | undefined;
 	let destinationRoot: string | undefined;
 	let destinationRootIdentity: FileIdentity | undefined;
@@ -486,7 +486,7 @@ export async function offerMacosCommunityApp(
 		throwIfInterrupted();
 		const mountPointBeforeAttachIdentity = await fileIdentity(mountPoint);
 		mountAttempted = true;
-		mountAttached = true;
+		mountState = "unknown";
 		let attach: { exitCode: number; stdout: string; stderr: string };
 		try {
 			attach = await command([
@@ -506,7 +506,11 @@ export async function offerMacosCommunityApp(
 				(observedMountIdentity.dev !== mountPointBeforeAttachIdentity.dev ||
 					observedMountIdentity.ino !== mountPointBeforeAttachIdentity.ino);
 			mountIdentity = mountChanged ? observedMountIdentity : undefined;
-			mountAttached = Boolean(mountIdentity);
+			mountState = mountChanged
+				? "attached"
+				: observedMountIdentity && mountPointBeforeAttachIdentity
+					? "none"
+					: "unknown";
 			throw error;
 		}
 		throwIfInterrupted();
@@ -517,7 +521,16 @@ export async function offerMacosCommunityApp(
 			(observedMountIdentity.dev !== mountPointBeforeAttachIdentity.dev ||
 				observedMountIdentity.ino !== mountPointBeforeAttachIdentity.ino);
 		mountIdentity = attach.exitCode === 0 || mountChanged ? observedMountIdentity : undefined;
-		mountAttached = Boolean(mountIdentity);
+		mountState =
+			attach.exitCode === 0
+				? mountIdentity
+					? "attached"
+					: "unknown"
+				: mountChanged
+					? "attached"
+					: observedMountIdentity && mountPointBeforeAttachIdentity
+						? "none"
+						: "unknown";
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		if (!mountIdentity) return failure("the mounted volume was not a real directory", log);
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
@@ -652,25 +665,29 @@ export async function offerMacosCommunityApp(
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
 			try {
-				if (mountAttached && mountIdentity && !(await sameDirectoryIdentity(mountPoint, mountIdentity))) {
+				if (
+					mountState === "attached" &&
+					mountIdentity &&
+					!(await sameDirectoryIdentity(mountPoint, mountIdentity))
+				) {
 					removeTempRoot = false;
 					log("Optional community app cleanup warning: mountpoint identity changed; refusing detach");
-				} else if (mountAttached && !mountIdentity) {
+				} else if (mountState === "unknown") {
 					removeTempRoot = false;
 					log("Optional community app cleanup warning: mount identity was unavailable; refusing pathname detach");
-				} else if (!mountAttached && !mountIdentity) {
+				} else if (mountState === "none") {
 					// The attach attempt completed without establishing a mount.
 				} else {
 					const detach = await command(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
 					if (detach.exitCode !== 0) {
-						if (mountAttached) removeTempRoot = false;
+						removeTempRoot = false;
 						log("Optional community app cleanup warning: hdiutil could not detach the temporary DMG");
 					} else {
-						mountAttached = false;
+						mountState = "none";
 					}
 				}
 			} catch (error) {
-				if (mountAttached) removeTempRoot = false;
+				if (mountState !== "none") removeTempRoot = false;
 				log(`Optional community app cleanup warning: failed to detach the temporary DMG: ${String(error)}`);
 			}
 		}

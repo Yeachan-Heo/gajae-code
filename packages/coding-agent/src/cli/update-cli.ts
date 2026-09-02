@@ -1345,14 +1345,22 @@ async function runCommunityAppOfferFromRuntime(
 			stdout: "inherit",
 			stderr: "inherit",
 		});
-		const exitCode = await Promise.race([child.exited, Bun.sleep(120_000).then(() => 124)]);
+		const exitCode = await Promise.race([child.exited, Bun.sleep(180_000).then(() => 124)]);
 		if (exitCode === 124) {
 			try {
-				child.kill("SIGKILL");
+				child.kill("SIGTERM");
 			} catch {
 				// The optional child may have exited at the timeout boundary.
 			}
-			await Promise.race([child.exited, Bun.sleep(5000)]);
+			const cleanupExitCode = await Promise.race([child.exited, Bun.sleep(30_000).then(() => 125)]);
+			if (cleanupExitCode === 125) {
+				try {
+					child.kill("SIGKILL");
+				} catch {
+					// The optional child may have exited at the cleanup boundary.
+				}
+				await Promise.race([child.exited, Bun.sleep(5000)]);
+			}
 			throw new Error("optional macOS community app offer timed out");
 		}
 		if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
