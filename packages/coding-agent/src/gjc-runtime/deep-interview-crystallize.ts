@@ -210,6 +210,9 @@ function validateResolutionAnchors(
 		const quote = text(raw.quote, `${field}[${index}].quote`, 500);
 		const resolution = text(raw.resolution, `${field}[${index}].resolution`, 500);
 		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
+		const itemWords = new Set(item.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? []);
+		const resolutionWords = resolution.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? [];
+		const introducesNewTerm = resolutionWords.some(word => word.length >= 2 && !itemWords.has(word));
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
@@ -218,7 +221,9 @@ function validateResolutionAnchors(
 			message.role !== "user" ||
 			!message.content.includes(quote) ||
 			!message.content.includes(resolution) ||
-			resolution === item
+			resolution === item ||
+			resolutionWords.length < 2 ||
+			!introducesNewTerm
 		)
 			throw new Error(`${field}[${index}] has no fresh verbatim user anchor`);
 		seen.add(item);
