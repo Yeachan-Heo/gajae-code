@@ -15,7 +15,14 @@ const MAX_CHECKSUM_BYTES = 128 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const FETCH_TIMEOUT_MS = 30_000;
 const COMMAND_TIMEOUT_MS = 120_000;
-type CommandRunner = (argv: string[]) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+interface CommandResult {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+	timedOut?: boolean;
+	reaped?: boolean;
+}
+type CommandRunner = (argv: string[]) => Promise<CommandResult>;
 const activeCommandControllers = new Set<AbortController>();
 
 interface ReleaseAsset {
@@ -185,7 +192,7 @@ async function removeClaimedDirectory(
 	}
 }
 
-async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+async function runCommand(argv: string[]): Promise<CommandResult> {
 	const controller = new AbortController();
 	activeCommandControllers.add(controller);
 	const child = Bun.spawn(argv, {
@@ -194,13 +201,13 @@ async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: s
 		signal: controller.signal,
 		killSignal: "SIGTERM",
 	});
-	const terminateAndReap = async (): Promise<void> => {
+	const terminateAndReap = async (): Promise<boolean> => {
 		try {
 			child.kill("SIGKILL");
 		} catch {
 			// The command may have exited between the failure and the kill.
 		}
-		await Promise.race([child.exited, Bun.sleep(5000)]);
+		return await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)]);
 	};
 	try {
 		const outputPromise = Promise.all([
@@ -208,27 +215,33 @@ async function runCommand(argv: string[]): Promise<{ exitCode: number; stdout: s
 			readResponseText(new Response(child.stderr), MAX_COMMAND_OUTPUT_BYTES),
 			child.exited,
 		]);
-		const timeout = Promise.withResolvers<undefined>();
+		const timeout = Promise.withResolvers<boolean>();
 		const timer: NodeJS.Timeout = setTimeout(() => {
-			void terminateAndReap().finally(() => timeout.resolve(undefined));
+			void terminateAndReap().then(reaped => timeout.resolve(reaped));
 		}, COMMAND_TIMEOUT_MS);
 		const output = await Promise.race([
 			outputPromise
 				.then(value => ({ kind: "output" as const, value }))
 				.catch(error => ({ kind: "error" as const, error })),
-			timeout.promise.then(() => ({ kind: "timeout" as const })),
+			timeout.promise.then(reaped => ({ kind: "timeout" as const, reaped })),
 		]);
 		clearTimeout(timer);
 		if (output.kind === "timeout") {
 			await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(5000)]);
-			return { exitCode: 124, stdout: "", stderr: `command timed out: ${argv[0]}` };
+			return {
+				exitCode: 124,
+				stdout: "",
+				stderr: `command timed out: ${argv[0]}`,
+				timedOut: true,
+				reaped: output.reaped,
+			};
 		}
 		if (output.kind === "error") {
-			await terminateAndReap();
-			return { exitCode: 125, stdout: "", stderr: String(output.error) };
+			const reaped = await terminateAndReap();
+			return { exitCode: 125, stdout: "", stderr: String(output.error), reaped };
 		}
 		const [stdout, stderr, exitCode] = output.value;
-		return { exitCode, stdout, stderr };
+		return { exitCode, stdout, stderr, reaped: true };
 	} finally {
 		activeCommandControllers.delete(controller);
 	}
@@ -502,7 +515,7 @@ export async function offerMacosCommunityApp(
 		const mountPointBeforeAttachIdentity = await fileIdentity(mountPoint);
 		mountAttempted = true;
 		mountState = "unknown";
-		let attach: { exitCode: number; stdout: string; stderr: string };
+		let attach: CommandResult;
 		try {
 			attach = await command([
 				"/usr/bin/hdiutil",
@@ -529,6 +542,11 @@ export async function offerMacosCommunityApp(
 			throw error;
 		}
 		throwIfInterrupted();
+		if (attach.reaped === false) {
+			mountIdentity = undefined;
+			mountState = "unknown";
+			return failure("the DMG attachment helper did not terminate safely", log);
+		}
 		const observedMountIdentity = await fileIdentity(mountPoint);
 		const mountChanged =
 			observedMountIdentity &&
