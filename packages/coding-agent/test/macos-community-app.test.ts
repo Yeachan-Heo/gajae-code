@@ -52,6 +52,18 @@ describe("macOS community app offer guards", () => {
 					platform: "darwin",
 					stdinIsTTY: true,
 					stdoutIsTTY: true,
+					env: { CI: "false", GITHUB_ACTIONS: "0" },
+					prompt: async () => false,
+					command: async () => ({ exitCode: 1, stdout: "", stderr: "" }),
+				})
+			).reason,
+		).toBe("cancelled");
+		expect(
+			(
+				await offerMacosCommunityApp({
+					platform: "darwin",
+					stdinIsTTY: true,
+					stdoutIsTTY: true,
 					env: { [COMMUNITY_APP_SUPPRESS_ENV]: "1" },
 				})
 			).status,
@@ -254,6 +266,7 @@ describe("macOS community app verified installation", () => {
 		});
 		expect(result.status).toBe("installed");
 		expect(calls.some(call => call[0] === "/usr/bin/codesign")).toBe(true);
+		expect(calls.filter(call => call[0] === "/usr/sbin/spctl")).toHaveLength(2);
 		expect(calls.some(call => call[0] === "/usr/bin/hdiutil" && call[1] === "detach")).toBe(true);
 		expect(calls.some(call => call[0] === "/usr/bin/open")).toBe(true);
 		expect(await fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app"))).toBeTruthy();
@@ -272,6 +285,7 @@ describe("macOS community app verified installation", () => {
 				if (url.includes("/releases/latest")) {
 					return new Response(
 						JSON.stringify({
+							tag_name: "v1.0.0",
 							assets: [
 								{ name: dmgName, browser_download_url: dmgUrl },
 								{ name: `${dmgName}.sha256`, browser_download_url: checksumUrl },
@@ -284,6 +298,7 @@ describe("macOS community app verified installation", () => {
 			},
 		});
 		expect(failedCopy.status).toBe("failed");
+		expect(calls.some(call => call[0] === "/usr/bin/ditto" && failCopy)).toBe(true);
 		await expect(fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app"))).rejects.toThrow();
 	});
 });

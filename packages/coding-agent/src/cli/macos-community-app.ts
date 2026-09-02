@@ -13,7 +13,8 @@ const MAX_DMG_BYTES = 512 * 1024 * 1024;
 const MAX_RELEASE_BYTES = 1024 * 1024;
 const MAX_CHECKSUM_BYTES = 128 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
-const FETCH_TIMEOUT_MS = 30_000;
+const METADATA_FETCH_TIMEOUT_MS = 30_000;
+const ASSET_FETCH_TIMEOUT_MS = 10 * 60_000;
 const COMMAND_TIMEOUT_MS = 120_000;
 interface CommandResult {
 	exitCode: number;
@@ -135,6 +136,48 @@ async function readResponseBytes(response: Response, maxBytes: number): Promise<
 
 async function readResponseText(response: Response, maxBytes: number): Promise<string> {
 	return new TextDecoder().decode(await readResponseBytes(response, maxBytes));
+}
+
+async function writeResponseToFileAndHash(
+	response: Response,
+	handle: fs.FileHandle,
+	maxBytes: number,
+): Promise<string> {
+	const declaredLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+		throw new Error(`DMG exceeds the ${maxBytes} byte safety limit`);
+	}
+	const hash = createHash("sha256");
+	let total = 0;
+	const writeChunk = async (chunk: Uint8Array): Promise<void> => {
+		total += chunk.byteLength;
+		if (total > maxBytes) throw new Error(`DMG exceeds the ${maxBytes} byte safety limit`);
+		hash.update(chunk);
+		let offset = 0;
+		while (offset < chunk.byteLength) {
+			const { bytesWritten } = await handle.write(chunk, offset, chunk.byteLength - offset, null);
+			if (bytesWritten === 0) throw new Error("DMG staging write made no progress");
+			offset += bytesWritten;
+		}
+	};
+	if (!response.body) {
+		await writeChunk(new Uint8Array(await response.arrayBuffer()));
+		return hash.digest("hex");
+	}
+	const reader = response.body.getReader();
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (value) await writeChunk(value);
+		}
+	} catch (error) {
+		await reader.cancel().catch(() => undefined);
+		throw error;
+	} finally {
+		reader.releaseLock();
+	}
+	return hash.digest("hex");
 }
 
 type FileIdentity = { dev: bigint; ino: bigint };
@@ -427,19 +470,25 @@ function failure(reason: string, log: (message: string) => void): CommunityAppOf
 	return { status: "failed", reason };
 }
 
+function environmentFlagEnabled(value: string | undefined): boolean {
+	if (!value) return false;
+	const normalized = value.trim().toLowerCase();
+	return normalized !== "0" && normalized !== "false" && normalized !== "no" && normalized !== "off";
+}
+
 export async function offerMacosCommunityApp(
 	deps: CommunityAppOfferDependencies = {},
 ): Promise<CommunityAppOfferResult> {
 	const platform = deps.platform ?? process.platform;
 	const env = deps.env ?? process.env;
-	const log = deps.log ?? (message => process.stderr.write(`${message}\n`));
+	const log = deps.log ?? (() => undefined);
 	if (platform !== "darwin") return { status: "skipped", reason: "unsupported platform" };
 	if (env[COMMUNITY_APP_SUPPRESS_ENV] === "1" || env[COMMUNITY_APP_SUPPRESS_ENV]?.toLowerCase() === "true") {
 		return { status: "skipped", reason: "suppressed by environment" };
 	}
 	if (
-		env.CI ||
-		env.GITHUB_ACTIONS ||
+		environmentFlagEnabled(env.CI) ||
+		environmentFlagEnabled(env.GITHUB_ACTIONS) ||
 		env.GJC_NONINTERACTIVE === "1" ||
 		env.GJC_NONINTERACTIVE?.toLowerCase() === "true"
 	) {
@@ -474,7 +523,7 @@ export async function offerMacosCommunityApp(
 	const arch = deps.arch ?? process.arch;
 	if (!isMacArchitecture(arch)) return failure(`unsupported macOS architecture ${arch}`, log);
 	const fetchImpl = deps.fetchImpl ?? fetch;
-	const fetchOptions = (): RequestInit => ({ signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+	const fetchOptions = (timeoutMs: number): RequestInit => ({ signal: AbortSignal.timeout(timeoutMs) });
 	let tempRoot: string | undefined;
 	let tempRootIdentity: FileIdentity | undefined;
 	let mountPoint: string | undefined;
@@ -513,7 +562,7 @@ export async function offerMacosCommunityApp(
 					"User-Agent": "gjc-community-app-offer",
 					"X-GitHub-Api-Version": "2022-11-28",
 				},
-				signal: fetchOptions().signal,
+				signal: fetchOptions(METADATA_FETCH_TIMEOUT_MS).signal,
 			},
 		);
 		if (!releaseResponse.ok)
@@ -538,17 +587,14 @@ export async function offerMacosCommunityApp(
 		)
 			return failure("the release has no trusted DMG checksum", log);
 		const [dmgResponse, checksumResponse] = await Promise.all([
-			fetchImpl(dmg.browser_download_url, fetchOptions()),
-			fetchImpl(checksumAsset.browser_download_url, fetchOptions()),
+			fetchImpl(dmg.browser_download_url, fetchOptions(ASSET_FETCH_TIMEOUT_MS)),
+			fetchImpl(checksumAsset.browser_download_url, fetchOptions(METADATA_FETCH_TIMEOUT_MS)),
 		]);
 		if (!dmgResponse.ok || !checksumResponse.ok)
 			return failure("the canonical release assets could not be downloaded", log);
-		const dmgBytes = await readResponseBytes(dmgResponse, MAX_DMG_BYTES);
 		const expected = parseChecksum(await readResponseText(checksumResponse, MAX_CHECKSUM_BYTES), dmg.name);
 		throwIfInterrupted();
 		if (!expected) return failure("the published checksum does not name the DMG", log);
-		const actual = createHash("sha256").update(dmgBytes).digest("hex");
-		if (actual !== expected) return failure("the DMG checksum did not match", log);
 
 		tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-"));
 		tempRootIdentity = await fileIdentity(tempRoot);
@@ -559,15 +605,17 @@ export async function offerMacosCommunityApp(
 			return failure("the temporary root identity changed", log);
 		await fs.mkdir(mountPoint);
 		const dmgHandle = await fs.open(dmgPath, "wx");
+		let actual: string;
 		try {
-			await dmgHandle.writeFile(dmgBytes);
+			actual = await writeResponseToFileAndHash(dmgResponse, dmgHandle, MAX_DMG_BYTES);
 		} finally {
 			await dmgHandle.close();
 		}
-		const stagedDmgStat = await fs.lstat(dmgPath).catch(() => undefined);
+		if (actual !== expected) return failure("the DMG checksum did not match", log);
+		const stagedDmgStat = await fs.lstat(dmgPath, { bigint: true }).catch(() => undefined);
 		if (!stagedDmgStat?.isFile() || stagedDmgStat.isSymbolicLink())
 			return failure("the staged DMG path was unsafe", log);
-		const stagedDmgIdentity: FileIdentity = { dev: BigInt(stagedDmgStat.dev), ino: BigInt(stagedDmgStat.ino) };
+		const stagedDmgIdentity: FileIdentity = { dev: stagedDmgStat.dev, ino: stagedDmgStat.ino };
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity))) return failure("the staged DMG identity changed", log);
 		if (!(await sameDirectoryIdentity(tempRoot, tempRootIdentity)))
 			return failure("the temporary root identity changed before attach", log);
@@ -642,6 +690,8 @@ export async function offerMacosCommunityApp(
 		if (!executablePath) return failure("the app bundle executable path was unsafe", log);
 		const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", sourceApp]);
 		if (signature.exitCode !== 0) return failure("the app bundle signature could not be verified", log);
+		const policyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", sourceApp]);
+		if (policyAssessment.exitCode !== 0) return failure("Gatekeeper rejected the app bundle", log);
 		const archCheck = await command(["/usr/bin/lipo", "-archs", executablePath]);
 		const executableArch = arch === "x64" ? "x86_64" : arch;
 		if (archCheck.exitCode !== 0 || !archCheck.stdout.split(/\s+/).includes(executableArch))
@@ -711,6 +761,12 @@ export async function offerMacosCommunityApp(
 			throw new Error("copied app signature helper did not terminate safely");
 		}
 		if (copiedSignature.exitCode !== 0) throw new Error("the copied app signature could not be verified");
+		const copiedPolicyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", destination]);
+		if (copiedPolicyAssessment.reaped === false) {
+			cleanupUnsafe = true;
+			throw new Error("copied app Gatekeeper helper did not terminate safely");
+		}
+		if (copiedPolicyAssessment.exitCode !== 0) throw new Error("Gatekeeper rejected the copied app bundle");
 		const copiedArchCheck = await command(["/usr/bin/lipo", "-archs", copiedExecutablePath]);
 		if (copiedArchCheck.reaped === false) {
 			cleanupUnsafe = true;
