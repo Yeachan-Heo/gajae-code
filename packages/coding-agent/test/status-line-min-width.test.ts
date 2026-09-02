@@ -73,6 +73,26 @@ beforeAll(async () => {
 	await initTheme();
 });
 
+/**
+ * Same rail without the environment-dependent `git` and `path` segments, so a
+ * wide row can be asserted as an exact string on any machine.
+ */
+function buildPlainRail(): StatusLineComponent {
+	const component = new StatusLineComponent(createSession(), { version: "9.9.9" });
+	component.updateSettings({
+		preset: "custom",
+		leftSegments: ["model", "mode"],
+		rightSegments: ["session_name"],
+		separator: "slash",
+		showSkillHud: false,
+		showActionHints: false,
+		sessionAccent: false,
+		maxRows: 1,
+	});
+	component.setGoalModeStatus({ enabled: true, paused: false });
+	return component;
+}
+
 describe("shortenModelId", () => {
 	it.each([
 		["anthropic/claude-sonnet-4-5-20250929", "sonnet-4.5"],
@@ -142,6 +162,36 @@ describe("status rail survives very small widths", () => {
 		}
 	});
 
+	it("shows the goal indicator at every width from its glyph threshold upward", () => {
+		const goalGlyph = theme.icon.goal || "G";
+		const modelName = shortenModelId(MODEL_ID);
+		const modelGlyph = theme.icon.model || modelName.slice(0, 1);
+
+		const widths: number[] = [];
+		const goalAt = new Map<number, boolean>();
+		const modelAt = new Map<number, boolean>();
+		for (let width = 4; width <= 120; width += 1) {
+			const text = strip(buildRail().render(width).join(" "));
+			widths.push(width);
+			goalAt.set(width, text.includes(goalGlyph) || text.includes("Goal"));
+			modelAt.set(width, text.includes(modelName) || text.includes(modelGlyph));
+		}
+
+		const goalThreshold = widths.find(width => goalAt.get(width) === true);
+		const modelThreshold = widths.find(width => modelAt.get(width) === true);
+		expect(goalThreshold).toBeDefined();
+		expect(modelThreshold).toBeDefined();
+
+		// The goal indicator appears no later than the model name: it may only
+		// vanish below the width where the model already vanished.
+		expect(goalThreshold ?? 0).toBeLessThanOrEqual(modelThreshold ?? 0);
+
+		// Presence is monotonic in width -- no hole where a wider rail loses the
+		// indicator a narrower one kept.
+		const missingAbove = widths.filter(width => width >= (goalThreshold ?? 0) && goalAt.get(width) !== true);
+		expect(missingAbove).toEqual([]);
+	});
+
 	it("suppresses the overflow marker once the rail is narrow", () => {
 		for (let width = 4; width <= 30; width += 1) {
 			expect(strip(buildRail().render(width).join(" "))).not.toContain("…+");
@@ -172,6 +222,20 @@ describe("status rail survives very small widths", () => {
 		// Segment chrome (spaced separators) proves this is the normal rail rather
 		// than the compact priority row, whose separators carry no spaces.
 		expect(wide).toContain(" / ");
+	});
+
+	it("renders exact rows at the widths where the normal rail returns", () => {
+		// `git` and `path` are environment-dependent, so the exact-string cases at
+		// 40 and 80 use the rail without them. Both widths sit above the compact
+		// row's engagement point: the priority row must not hijack them.
+		const modelIcon = theme.icon.model ? `${theme.icon.model} ` : "";
+		const goalLabel = theme.icon.goal ? `${theme.icon.goal} Goal` : "Goal";
+		const fill = (count: number): string => theme.boxRound.horizontal.repeat(count);
+
+		expect(strip(buildPlainRail().render(40)[0])).toBe(` ${modelIcon}sonnet-4.5 · 18.3% / ${goalLabel} …+2`);
+		expect(strip(buildPlainRail().render(80)[0])).toBe(
+			` ${modelIcon}sonnet-4.5 · 18.3% / ${goalLabel} ${fill(29)} MinWidth / v9.9.9 `,
+		);
 	});
 
 	it("keeps the goal glyph in its status color", () => {
