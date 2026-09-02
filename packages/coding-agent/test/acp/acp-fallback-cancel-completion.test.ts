@@ -74,6 +74,9 @@ describe("ACP production cancellation completion", () => {
 		const controlOperations: string[] = [];
 		let promptSocket: TestSocket | undefined;
 		let abortAcknowledged = true;
+		let promptNumber = 0;
+		let commandId = "prompt-command-0";
+		let turnId = "prompt-turn-0";
 
 		server = Bun.serve({
 			hostname: "127.0.0.1",
@@ -138,6 +141,9 @@ describe("ACP production cancellation completion", () => {
 					if (typeof frame.operation === "string") controlOperations.push(frame.operation);
 					if (frame.operation === "turn.prompt") {
 						promptSocket = socket;
+						promptNumber += 1;
+						commandId = `prompt-command-${promptNumber}`;
+						turnId = `prompt-turn-${promptNumber}`;
 						promptWaiters.shift()?.resolve();
 					}
 					socket.send(
@@ -147,7 +153,7 @@ describe("ACP production cancellation completion", () => {
 							ok: true,
 							result:
 								frame.operation === "turn.prompt"
-									? { commandId: "prompt-command", turnId: "prompt-turn", accepted: true }
+									? { commandId, turnId, accepted: true }
 									: frame.operation === "turn.abort"
 										? abortAcknowledged
 											? (() => {
@@ -246,8 +252,8 @@ describe("ACP production cancellation completion", () => {
 			JSON.stringify({
 				type: "agent_end",
 				sessionId: created.sessionId,
-				commandId: "prompt-command",
-				turnId: "prompt-turn",
+				commandId,
+				turnId,
 				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
 			}),
 		);
@@ -278,8 +284,8 @@ describe("ACP production cancellation completion", () => {
 			JSON.stringify({
 				type: "agent_end",
 				sessionId: created.sessionId,
-				commandId: "prompt-command",
-				turnId: "prompt-turn",
+				commandId,
+				turnId,
 				outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 			}),
 		);

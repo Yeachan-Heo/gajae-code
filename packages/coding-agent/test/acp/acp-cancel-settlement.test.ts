@@ -20,7 +20,7 @@ type Fixture = {
 	agent: AcpAgent;
 	sessionId: string;
 	updates: SessionNotification[];
-	promptDelivered: Promise<void>;
+	waitForPromptDelivery(): Promise<void>;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: string): void;
 	sendToolStart(toolCallId: string): void;
@@ -89,11 +89,12 @@ export function createFixture(
 		const cwd = path.join(tempDir.path(), "workspace");
 		const token = "acp-cancel-settlement-token";
 		const sessionId = "cancel-settlement-session";
-		const commandId = "cancel-settlement-command";
-		const turnId = "cancel-settlement-turn";
+		let promptNumber = 0;
+		let commandId = "cancel-settlement-command-0";
+		let turnId = "cancel-settlement-turn-0";
 		const updates: SessionNotification[] = [];
 		const queryCalls: string[] = [];
-		const delivered = Promise.withResolvers<void>();
+		const promptDeliveryWaiters: Array<PromiseWithResolvers<void>> = [];
 		const abort = new AbortController();
 		let promptSocket: TestSocket | undefined;
 		let server!: ReturnType<typeof Bun.serve>;
@@ -216,7 +217,10 @@ export function createFixture(
 					if (frame.type !== "control_request") return;
 					if (frame.operation === "turn.prompt") {
 						promptSocket = socket;
-						delivered.resolve();
+						promptNumber += 1;
+						commandId = `cancel-settlement-command-${promptNumber}`;
+						turnId = `cancel-settlement-turn-${promptNumber}`;
+						promptDeliveryWaiters.shift()?.resolve();
 						if (options.deferPromptAcknowledgement && !deferredPromptAckUsed) {
 							deferredPromptAckUsed = true;
 							pendingPromptAck = { socket, id: frame.id };
@@ -301,7 +305,11 @@ export function createFixture(
 			agent,
 			sessionId: created.sessionId,
 			updates,
-			promptDelivered: delivered.promise,
+			waitForPromptDelivery: () => {
+				const waiter = Promise.withResolvers<void>();
+				promptDeliveryWaiters.push(waiter);
+				return waiter.promise;
+			},
 			sendStopped,
 			sendFailed,
 			sendToolStart,
@@ -361,7 +369,7 @@ test("cancel ACK with a suppressed terminal settles the prompt exactly once as c
 			settleCount++;
 			return result;
 		});
-		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "prompt delivery");
 		// The turn owns correlated async activity; keep a tool call outstanding.
 		fixture.sendToolStart("tool-1");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
@@ -375,7 +383,7 @@ test("cancel ACK with a suppressed terminal settles the prompt exactly once as c
 		);
 		// The next prompt must be accepted, not refused with `conflict`.
 		const next = prompt(fixture, "prompt after cancel");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after cancel")).toEqual({ stopReason: "end_turn" });
 		const idleBeforeSecond = idlePhaseUpdates(fixture.updates);
@@ -394,10 +402,12 @@ test("a late terminal after cancelled settlement stays closed and cannot double-
 			settleCount++;
 			return result;
 		});
-		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "prompt delivery");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		expect(await bounded(pending, "cancelled settlement")).toEqual({ stopReason: "cancelled" });
 		expect(settleCount).toBe(1);
+		const idleAfterSettlement = idlePhaseUpdates(fixture.updates);
+		await waitFor(() => idlePhaseUpdates(fixture.updates) > idleAfterSettlement, "cancelled-settlement idle phase");
 		const updatesAfterSettlement = fixture.updates.length;
 		const queriesAfterSettlement = fixture.queryCalls.length;
 		// The aborted run's terminal arrives after the grace: it must stay closed.
@@ -424,17 +434,18 @@ test("an SDK transport identity change around cancellation settlement does not l
 			settled = result;
 			return result;
 		});
-		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "prompt delivery");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		// SDK WebSocket reconnect around cancellation settlement (issue suspected path).
 		fixture.reconnect();
-		const result = await bounded(pending, "cancelled settlement after reconnect");
-		expect(settleCount).toBe(1);
-		expect(result).toEqual({ stopReason: "cancelled" });
-		expect(settled).toEqual({ stopReason: "cancelled" });
+		await expect(bounded(pending, "connection ownership-loss settlement")).rejects.toThrow(
+			/prompt owner connection was lost/i,
+		);
+		expect(settleCount).toBe(0);
+		expect(settled).toBeUndefined();
 		// The turn is over; a follow-up prompt must be accepted.
 		const next = prompt(fixture, "prompt after reconnect");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after reconnect")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -450,7 +461,7 @@ test("a prompt acknowledgement rejected mid-cancel still settles the prompt exac
 			settleCount++;
 			return result;
 		});
-		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "prompt delivery");
 		expect(fixture.hasPendingPromptAcknowledgement()).toBe(true);
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		// The SDK rejects the still-pending turn.prompt control request after the abort.
@@ -464,7 +475,7 @@ test("a prompt acknowledgement rejected mid-cancel still settles the prompt exac
 			"catch-path cancelled idle with gjcRunning false",
 		);
 		const next = prompt(fixture, "prompt after rejected ack");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after rejected ack")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -480,7 +491,7 @@ test("a wedged ACP transport cannot hold the acknowledged cancel settlement host
 			settleCount++;
 			return result;
 		});
-		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "prompt delivery");
 		// The client stops draining the stream: every session/update write now hangs.
 		fixture.hangSessionUpdates();
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
@@ -495,7 +506,7 @@ test("a wedged ACP transport cannot hold the acknowledged cancel settlement host
 		fixture.releaseSessionUpdates();
 		await waitFor(() => idleWithGjcRunningFalse(fixture.updates) >= 1, "released idle after wedged cancel");
 		const next = prompt(fixture, "prompt after wedged transport");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "second prompt delivery");
 		fixture.sendStopped("end_turn");
 		expect(await bounded(next, "prompt after wedged transport")).toEqual({ stopReason: "end_turn" });
 	} finally {
@@ -509,7 +520,7 @@ test("idle is emitted exactly once for a cancelled settlement and stays consiste
 		const idleBefore = idlePhaseUpdates(fixture.updates);
 		const runningFalseBefore = idleWithGjcRunningFalse(fixture.updates);
 		const pending = prompt(fixture, "idle consistency");
-		await bounded(fixture.promptDelivered, "prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "prompt delivery");
 		await bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "cancel acknowledgement");
 		expect(await bounded(pending, "cancelled settlement")).toEqual({ stopReason: "cancelled" });
 		await waitFor(() => idleWithGjcRunningFalse(fixture.updates) > runningFalseBefore, "cancelled-settlement idle");
@@ -520,7 +531,7 @@ test("idle is emitted exactly once for a cancelled settlement and stays consiste
 				(update.update as { _meta?: { gjcPhase?: string } })._meta?.gjcPhase === "working",
 		).length;
 		const next = prompt(fixture, "idle consistency next turn");
-		await bounded(fixture.promptDelivered, "second prompt delivery");
+		await bounded(fixture.waitForPromptDelivery(), "second prompt delivery");
 		// The host reports the new turn as working.
 		await waitFor(
 			() =>

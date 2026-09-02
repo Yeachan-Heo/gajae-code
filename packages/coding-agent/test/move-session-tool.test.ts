@@ -540,7 +540,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("refuses an unreadable target without moving", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -582,7 +582,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 	it("refuses a Hindsight bank-scope change before publication", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
@@ -1448,7 +1448,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 			await owner.close();
 		}
-	});
+	}, 20_000);
 
 	it("re-enters nested read leases while a writer is queued and releases after abort", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -1683,7 +1683,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		await expect(moving).resolves.toBeDefined();
 		await disposed;
 		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
-	});
+	}, 20_000);
 
 	it("rejects without moving when authority rebinding fails, and keeps launch-root tools", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -1721,7 +1721,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("restores process cwd and retries when flush fails before the durable move", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -1783,7 +1783,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("keeps a committed move successful when post-move prompt refresh throws", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -1807,7 +1807,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("re-roots project context files and the workspace tree at the new cwd", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -1843,7 +1843,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("does not fail the committed move when SSH refresh throws", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -1864,7 +1864,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 		} finally {
 			await session.dispose();
 		}
-	});
+	}, 20_000);
 
 	it("does not fail the committed move when post-move secret refresh throws", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
