@@ -185,6 +185,11 @@ describe("deep-interview crystallize contract", () => {
 		expect(second.lifecycle).toBe("ready");
 		expect(second.open_gaps).toEqual([]);
 		expect(second.conflicts).toEqual([]);
+		expect(() =>
+			crystallizeDeepInterview(
+				later(input({ prior: first, resolved_open_gaps: ["What is the memory budget?"] }), 2),
+			),
+		).toThrow("resolved_open_gaps must be supported by verbatim user evidence");
 	});
 
 	it("marks conflicting evidence stale", () => {
