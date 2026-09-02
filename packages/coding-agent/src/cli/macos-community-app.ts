@@ -679,6 +679,7 @@ export async function offerMacosCommunityApp(
 		}
 		return { status: "installed", reason: destination };
 	} catch (error) {
+		let partialState = "retained for safety";
 		if (installedDestination) {
 			try {
 				if (
@@ -687,19 +688,24 @@ export async function offerMacosCommunityApp(
 					destinationRootIdentity &&
 					(await sameDirectoryIdentity(destinationRoot, destinationRootIdentity)) &&
 					(await sameDirectoryIdentity(installedDestination.path, installedDestination.identity))
-				)
-					await removeClaimedDirectory(
+				) {
+					const removed = await removeClaimedDirectory(
 						installedDestination.path,
 						installedDestination.identity,
 						destinationRoot,
 						destinationRootIdentity,
 						log,
 					);
+					if (removed) partialState = "removed";
+				}
 			} catch (cleanupError) {
 				log(`Optional community app cleanup warning: failed to remove partial app state: ${String(cleanupError)}`);
 			}
 		}
-		return failure(error instanceof Error ? error.message : String(error), log);
+		return failure(
+			`${error instanceof Error ? error.message : String(error)}; partial app state ${partialState}`,
+			log,
+		);
 	} finally {
 		let removeTempRoot = true;
 		if (mountAttempted && mountPoint) {
