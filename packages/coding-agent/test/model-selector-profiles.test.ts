@@ -275,7 +275,7 @@ describe("model selector profiles", () => {
 		let resolvedAliasModel = aliasModel;
 		const registryBase = createRegistry();
 		const resolveAlias = registryBase.resolveModelByLookupAlias;
-		const getApiKeyForProvider = vi.fn(async () => "key");
+		const getApiKeyForProvider = vi.fn(async () => "key" as const);
 		registryBase.getApiKeyForProvider = getApiKeyForProvider;
 		const registry = registryBase as unknown as TestModelRegistry & {
 			onCatalogChanged: (listener: () => void) => () => void;
