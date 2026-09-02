@@ -299,6 +299,72 @@ describe("queued promotion run identity (#4668)", () => {
 		await promptDone;
 	});
 
+	it("reorders deferred SDK follow-ups within their own store and refuses cross-store moves", async () => {
+		// A deferred SDK follow-up is held OUTSIDE the Agent queue, so its display
+		// row has no Agent index. Reordering must act on the deferred store, and a
+		// move that would cross stores must be refused rather than silently moving
+		// an unrelated live message.
+		const gate = Promise.withResolvers<void>();
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool: AgentTool<typeof echoSchema, EchoParams> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: echoSchema,
+			async execute() {
+				toolStarted.resolve();
+				await gate.promise;
+				return { content: [{ type: "text", text: "done" }] };
+			},
+		};
+		session = buildSession(
+			[
+				{ content: [{ type: "toolCall", name: "echo", arguments: { value: "first" } }] },
+				{ content: ["first answer"] },
+			],
+			blockingTool,
+		);
+		const promptDone = session.prompt("first task");
+		await toolStarted.promise;
+		session.agent.followUp({
+			role: "user",
+			content: [{ type: "text", text: "live follow-up" }],
+			attribution: "user",
+			timestamp: Date.now(),
+		});
+		for (const text of ["deferred one", "deferred two"]) {
+			await session.sendUserMessage(text, {
+				deliverAs: "followUp",
+				sdkRunCapability: createSdkRunCapability(`deferred-move-${text}`),
+			} as never);
+		}
+		const entries = session.getQueuedMessageEntries();
+		const deferredRows = entries.filter(entry => entry.text.startsWith("deferred "));
+		expect(deferredRows.map(entry => entry.text)).toEqual(["deferred one", "deferred two"]);
+
+		// Both endpoints deferred: the move applies inside the deferred store.
+		expect(session.moveQueuedMessageForEditing(deferredRows[1]?.id ?? "", "up")).toBe(true);
+		expect(
+			session
+				.getQueuedMessageEntries()
+				.filter(entry => entry.text.startsWith("deferred "))
+				.map(entry => entry.text),
+		).toEqual(["deferred two", "deferred one"]);
+		// The live follow-up kept its own slot.
+		expect(session.agent.snapshotFollowUp().map(message => JSON.stringify(message))).toHaveLength(1);
+		expect(JSON.stringify(session.agent.snapshotFollowUp()[0])).toContain("live follow-up");
+
+		// A cross-store move (deferred row onto the live row) is refused, and
+		// nothing is reordered anywhere.
+		const rowsBefore = session.getQueuedMessageEntries().map(entry => entry.text);
+		const firstDeferred = session.getQueuedMessageEntries().find(entry => entry.text.startsWith("deferred "));
+		expect(session.moveQueuedMessageForEditing(firstDeferred?.id ?? "", "up")).toBe(false);
+		expect(session.getQueuedMessageEntries().map(entry => entry.text)).toEqual(rowsBefore);
+
+		gate.resolve();
+		await promptDone;
+	});
+
 	it("does not fire removal for external SDK follow-ups preserved by the abort purge (#4668)", async () => {
 		// Exact-head review: the abort purge preserves external SDK follow-ups
 		// (they independently requested the next root turn), so their promotion

@@ -7307,18 +7307,13 @@ export class AgentSession {
 										skip("queue_drained");
 										return;
 									}
-									// A scheduled same-turn continuation of a terminally aborted turn is
-									// denied at the final synchronous boundary before agent.continue
-									// entry; no await intervenes between this check and method entry.
-									// Owned-completion deliveries are NOT affected (they use followUp).
-									// An independent root request queued after a terminal abort mints
-									// its fresh identity HERE: the last synchronous point before
-									// agent.continue* entry, so a cancelled/emptied continuation never
-									// leaves the session on an identity that escapes the fence.
-									// A queued independent root request mints its fresh identity HERE:
-									// the last synchronous point before agent.continue* entry, so a
-									// cancelled or emptied continuation never leaves the session on an
-									// identity that escapes the fence.
+									// Final synchronous boundary before agent.continue* entry; no await
+									// intervenes between here and method entry. A same-turn continuation
+									// of a terminally aborted turn is denied here, while an independent
+									// root request queued past that fence mints its fresh identity here —
+									// so a cancelled or emptied continuation never leaves the session on
+									// an identity that escapes the fence. Owned-completion deliveries are
+									// NOT affected (they use followUp).
 									if (this.#hasQueuedFreshRootRequest()) this.#resumeFromOwnedCompletion();
 									if (this.#isTurnContinuationBlocked()) {
 										skip("terminal_turn");
@@ -13783,6 +13778,23 @@ export class AgentSession {
 		const fromMessage = queue[fromIndex]?.message;
 		const toMessage = queue[toIndex]?.message;
 		const executable = mode === "steer" ? this.agent.snapshotSteering() : this.agent.snapshotFollowUp();
+		const fromDeferred = fromMessage !== undefined && this.#deferredSdkFollowUps.includes(fromMessage);
+		const toDeferred = toMessage !== undefined && this.#deferredSdkFollowUps.includes(toMessage);
+		// A deferred SDK follow-up is held OUTSIDE the Agent queue, so its display
+		// row cannot be reordered against live messages: the two rows live in
+		// different backing stores and no single index describes both. Reorder
+		// within the deferred store when both rows are deferred; refuse a
+		// cross-store move rather than silently moving an unrelated message.
+		if (fromDeferred || toDeferred) {
+			if (!fromDeferred || !toDeferred || fromMessage === undefined || toMessage === undefined) return false;
+			const deferredFrom = this.#deferredSdkFollowUps.indexOf(fromMessage);
+			const deferredTo = this.#deferredSdkFollowUps.indexOf(toMessage);
+			if (deferredFrom === -1 || deferredTo === -1) return false;
+			const [moved] = this.#deferredSdkFollowUps.splice(deferredFrom, 1);
+			if (moved === undefined) return false;
+			this.#deferredSdkFollowUps.splice(deferredTo, 0, moved);
+			return this.#moveQueuedDisplayEntry(queue, fromIndex, toIndex);
+		}
 		const agentFrom = fromMessage === undefined ? fromIndex : executable.indexOf(fromMessage);
 		const agentTo = toMessage === undefined ? toIndex : executable.indexOf(toMessage);
 		if (agentFrom === -1 || agentTo === -1) return false;
