@@ -25,6 +25,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolResultMessage,
+	Usage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
@@ -1071,18 +1072,19 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let terminalAdmissionMode: "open" | "raw-eof" | "closed" = "open";
 		let responseEnded = false;
 		let queueDrained = false;
+		let postTurnEndedCheckpointTimer: NodeJS.Timeout | undefined;
 		let endStreamError: Error | null = null;
 		const pendingBuffer = new CursorPendingBuffer();
 		let bufferedObservationOffset = 0;
 		let bufferedObservationTurnEnded = false;
-		const closeTerminalAdmission = (): void => {
+		const closeTerminalAdmission = (pauseRequest = true): void => {
 			terminalAdmissionMode = "closed";
 			transportWatchdogClosed = true;
 			if (transportWatchdog) {
 				clearTimeout(transportWatchdog);
 				transportWatchdog = null;
 			}
-			h2Request?.pause();
+			if (pauseRequest) h2Request?.pause();
 		};
 		const sealExecAdmissionAtRawEof = (): void => {
 			if (terminalAdmissionMode !== "open") return;
@@ -1103,10 +1105,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (!queueDrained) return;
 			if (endStreamError) {
 				settleBehindFence(() => settleH2(endStreamError));
-			} else if (sawTurnEnded) {
+			} else if (sawTurnEnded && responseEnded) {
 				// A drained turnEnded is the successful terminal condition; Cursor
 				// may leave the HTTP/2 response open after sending it.
 				settleBehindFence(() => settleH2());
+			} else if (sawTurnEnded && !postTurnEndedCheckpointTimer) {
+				// Cursor may send a final conversation checkpoint immediately after
+				// turnEnded without an END_STREAM frame. Give that non-executable
+				// message a bounded grace window before publishing the terminal.
+				postTurnEndedCheckpointTimer = setTimeout(() => {
+					postTurnEndedCheckpointTimer = undefined;
+					settleBehindFence(() => settleH2());
+				}, 25);
 			} else if (responseEnded) {
 				settleBehindFence(() => settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded")));
 			}
@@ -1476,7 +1486,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const usageState: UsageState = { sawTokenDelta: false };
+			const usageState: UsageState = {
+				sawTokenDelta: false,
+				conversationUsedTokens: 0,
+				checkpointOutputTokens: 0,
+				hasConversationCheckpoint: false,
+			};
 
 			const state: BlockState = {
 				get currentTextBlock() {
@@ -1681,10 +1696,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 				while (pendingBuffer.length >= 5) {
 					if (terminalBoundarySeen) {
-						pendingBuffer.clear();
-						bufferedObservationOffset = 0;
-						bufferedObservationTurnEnded = false;
-						break;
+						const flags = pendingBuffer.byteAt(0);
+						const msgLen = pendingBuffer.readUInt32BE(1);
+						if (pendingBuffer.length < 5 + msgLen) {
+							if (responseEnded) pendingBuffer.clear();
+							break;
+						}
+						const messageBytes = pendingBuffer.subarray(5, msgLen);
+						pendingBuffer.consume(5 + msgLen);
+						if (flags & CONNECT_END_STREAM_FLAG) {
+							responseEnded = true;
+							pendingBuffer.clear();
+							continue;
+						}
+						try {
+							const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+							if (serverMessage.message.case === "conversationCheckpointUpdate") {
+								applyBufferedNonExecMessage(serverMessage);
+							}
+						} catch {
+							// A validated terminal boundary makes all non-checkpoint bytes tail.
+						}
+						continue;
 					}
 					const flags = pendingBuffer.byteAt(0);
 					const msgLen = pendingBuffer.readUInt32BE(1);
@@ -1744,6 +1777,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
+						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
 						if (isTurnEnded) {
 							// Record the boundary at parse time, before the queued handler runs,
 							// so a following coalesced END_STREAM cannot race ahead of the
@@ -1751,7 +1785,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							sawTurnEnded = true;
 							terminalBoundarySeen = true;
 							terminalBoundaryObserved = false;
-							closeTerminalAdmission();
+							closeTerminalAdmission(false);
+							if (!processingPausedForExec && !processingPausedForQueue) h2Request?.resume();
+						}
+						if (isConversationCheckpoint && terminalBoundarySeen) {
+							applyBufferedNonExecMessage(serverMessage);
+							continue;
 						}
 						if (atBufferedTerminalBoundary && !isTurnEnded) continue;
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
@@ -1898,7 +1937,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							// to replace this validated terminal success.
 							terminalBoundarySeen = true;
 							terminalBoundaryObserved = false;
-							closeTerminalAdmission();
+							closeTerminalAdmission(false);
 							drainMessageQueue();
 						}
 						// A single HTTP/2 data chunk can contain hundreds of valid,
@@ -1976,6 +2015,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 
 			h2Request.on("data", (chunk: Buffer) => {
+				if (terminalBoundarySeen) {
+					const remaining = CURSOR_MAX_PENDING_SERVER_BYTES - pendingBuffer.length;
+					if (remaining > 0) pendingBuffer.append(chunk.subarray(0, remaining));
+					processPendingBuffer?.();
+					return;
+				}
 				let offset = 0;
 				while (
 					offset < chunk.length &&
@@ -2056,6 +2101,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				});
 			}
 
+			finalizeCursorUsage(output, usageState);
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
@@ -2101,6 +2147,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (heartbeatTimer) {
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
+			}
+			if (postTurnEndedCheckpointTimer) {
+				clearTimeout(postTurnEndedCheckpointTimer);
+				postTurnEndedCheckpointTimer = undefined;
 			}
 			if (h2Request && h2RequestErrorHandler) {
 				h2Request.removeListener("error", h2RequestErrorHandler);
@@ -2148,6 +2198,9 @@ interface BlockState {
 
 interface UsageState {
 	sawTokenDelta: boolean;
+	conversationUsedTokens: number;
+	checkpointOutputTokens: number;
+	hasConversationCheckpoint: boolean;
 }
 
 async function handleServerMessage(
@@ -4115,17 +4168,45 @@ function handleConversationCheckpointUpdate(
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 ): void {
 	onConversationCheckpoint?.(checkpoint);
-	if (usageState.sawTokenDelta) {
-		return;
-	}
 	const usedTokens = checkpoint.tokenDetails?.usedTokens ?? 0;
-	if (usedTokens <= 0) {
+	if (!checkpoint.tokenDetails) {
 		return;
 	}
-	if (output.usage.output !== usedTokens) {
-		output.usage.output = usedTokens;
-		output.usage.totalTokens = output.usage.input + output.usage.output;
-	}
+	usageState.conversationUsedTokens = usedTokens;
+	usageState.checkpointOutputTokens = output.usage.output;
+	usageState.hasConversationCheckpoint = true;
+}
+
+/** Derive prompt usage from Cursor's whole-conversation checkpoint total. */
+export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageState): void {
+	const used = usageState.conversationUsedTokens;
+	if (!usageState.hasConversationCheckpoint && used <= 0) return;
+	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
+	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
+	output.usage.totalTokens = output.usage.input + output.usage.output;
+}
+
+export function finalizeCursorUsageForTest(
+	usedTokens: number,
+	outputTokens: number,
+	options: { checkpointOutputTokens?: number; hasConversationCheckpoint?: boolean } = {},
+): Usage {
+	const usage: Usage = {
+		input: 0,
+		output: outputTokens,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: outputTokens,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	finalizeCursorUsage({ usage } as AssistantMessage, {
+		sawTokenDelta: true,
+		conversationUsedTokens: usedTokens,
+		checkpointOutputTokens:
+			options.checkpointOutputTokens ?? ((options.hasConversationCheckpoint ?? usedTokens > 0) ? outputTokens : 0),
+		hasConversationCheckpoint: options.hasConversationCheckpoint ?? usedTokens > 0,
+	});
+	return usage;
 }
 
 function createBlobId(data: Uint8Array): Uint8Array {
