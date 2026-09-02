@@ -212,7 +212,10 @@ function validateResolutionAnchors(
 		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
 		const itemWords = new Set(item.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? []);
 		const resolutionWords = resolution.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? [];
-		const introducesNewTerm = resolutionWords.some(word => word.length >= 2 && !itemWords.has(word));
+		const genericResolutionWords = new Set(["ok", "yes", "done", "resolved", "confirmed", "accepted", "fine"]);
+		const introducesNewTerm = resolutionWords.some(
+			word => word.length >= 3 && !itemWords.has(word) && !genericResolutionWords.has(word),
+		);
 		if (
 			!resolutions.includes(item) ||
 			seen.has(item) ||
