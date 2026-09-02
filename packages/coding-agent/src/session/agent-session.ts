@@ -3754,6 +3754,8 @@ export class AgentSession {
 			}
 			throw this.#sessionAdmissionBusyError();
 		}
+		const ownsStartupPromptWaiter =
+			kind === "prompt" && options?.idleDelivery !== true && options?.startupPromptWaiterRelease === undefined;
 		const releaseStartupPromptWaiter =
 			kind === "prompt" && options?.idleDelivery !== true
 				? (options?.startupPromptWaiterRelease ?? this.#reserveStartupPromptWaiter())
@@ -3765,7 +3767,7 @@ export class AgentSession {
 			try {
 				await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(startupSignal), startupSignal);
 			} finally {
-				releaseStartupPromptWaiter?.();
+				if (ownsStartupPromptWaiter) releaseStartupPromptWaiter?.();
 			}
 			if (options?.idleDelivery === true) await this.#awaitStartupPromptWaiters(startupSignal);
 		}
@@ -4810,7 +4812,11 @@ export class AgentSession {
 					return true;
 				};
 				try {
-					await this.#awaitStartupTurnBarrier();
+				await this.#awaitStartupTurnBarrier(signal);
+				// Explicit prompts reserve a waiter before they await startup readiness.
+				// Keep the idle wake behind those prompts so releasing the barrier cannot
+				// reorder an explicit turn ahead of its already-admitted request.
+				await this.#awaitStartupPromptWaiters(signal);
 					if (
 						this.#isDisposed ||
 						this.#sessionTransitionKind !== undefined ||
