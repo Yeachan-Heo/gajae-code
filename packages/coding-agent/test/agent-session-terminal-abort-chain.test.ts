@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
 import { getBundledModel } from "@gajae-code/ai";
-import { createMockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
+import { createMockModel, type MockModel, type MockResponse } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
@@ -70,6 +70,10 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	let tempDir: string;
 	let authStorage: AuthStorage | undefined;
 	let scriptedResponses: MockResponse[];
+	let mockModelRef: MockModel | undefined;
+	/** Every provider request's serialized context, for negative delivery proofs. */
+	const recordedProviderContexts = (): string[] =>
+		(mockModelRef?.calls ?? []).map(call => JSON.stringify(call.context.messages));
 	let manager: AsyncJobManager;
 	let bashToolRef: BashTool;
 	let toolSession: ToolSession;
@@ -123,6 +127,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		const mock = createMockModel({
 			handler: () => scriptedResponses.shift() ?? stopReply("done"),
 		});
+		mockModelRef = mock;
 
 		const agent = new Agent({
 			getApiKey: () => "test-key",
@@ -721,12 +726,15 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
 
 		// A `triggerTurn: true` flag on the SAME turn-owned message must not buy
-		// it a fresh root turn.
+		// it a fresh root turn: not queued, never persisted, never sent.
 		await session.sendCustomMessage(
 			{ customType: "resolve-reminder", content: "stale but eager", display: false, attribution: "agent" },
 			{ deliverAs: "steer", triggerTurn: true },
 		);
 		expect(session.agent.hasQueuedMessages()).toBe(false);
+		const eagerInHistory = () =>
+			session.agent.state.messages.some(message => JSON.stringify(message).includes("stale but eager"));
+		expect(eagerInHistory()).toBe(false);
 
 		// Genuine user input survives the fence and is delivered as a fresh root.
 		await session.sendCustomMessage(
@@ -745,6 +753,10 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				message => message.role === "custom" && String(message.content).includes("stale preview reminder"),
 			),
 		).toBe(false);
+		// Neither dropped message survived into history or a provider request.
+		expect(eagerInHistory()).toBe(false);
+		expect(recordedProviderContexts().some(text => text.includes("stale but eager"))).toBe(false);
+		expect(recordedProviderContexts().some(text => text.includes("stale preview reminder"))).toBe(false);
 	}, 30_000);
 
 	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {

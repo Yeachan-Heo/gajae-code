@@ -4136,7 +4136,7 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
-export { CONFIG_SCHEMA_VERSION } from "./config-schema-version";
+export { CONFIG_SCHEMA_VERSION, normalizeConfigSchemaVersion } from "./config-schema-version";
 
 export type SettingsSchemaIssue = {
 	path: string;

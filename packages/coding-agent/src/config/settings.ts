@@ -70,6 +70,7 @@ import {
 	type GroupPrefix,
 	type GroupTypeMap,
 	getDefault,
+	normalizeConfigSchemaVersion,
 	reconcileSettingsSchema,
 	SETTINGS_SCHEMA,
 	type SettingPath,
@@ -5404,30 +5405,14 @@ export class Settings implements NotificationSettingsReader {
 
 	/** Apply registered schema migrations once, using configSchemaVersion as the durable marker. */
 	#migrateRawSettings(raw: RawSettings): RawSettings {
-		// Normalize the marker ONCE, before every version decision: a malformed
-		// value (fractional, negative, non-finite) must not be read as a future
-		// schema by one guard and as unmigrated by the next.
 		const rawVersion = raw.configSchemaVersion;
-		const malformedVersion =
-			rawVersion !== undefined &&
-			(typeof rawVersion !== "number" ||
-				!Number.isFinite(rawVersion) ||
-				!Number.isInteger(rawVersion) ||
-				rawVersion < 0);
-		if (malformedVersion) {
-			logger.warn("Settings: config has a malformed configSchemaVersion; migrating from the floored version", {
+		const configuredVersion = normalizeConfigSchemaVersion(rawVersion);
+		if (rawVersion !== undefined && rawVersion !== configuredVersion) {
+			logger.warn("Settings: config has a malformed configSchemaVersion; migrating from the normalized version", {
 				configSchemaVersion: String(rawVersion),
+				normalized: String(configuredVersion),
 			});
 		}
-		// A malformed finite marker normalizes to the nearest completed version; a
-		// non-finite one carries no version information at all and normalizes to 0
-		// so it can never be mistaken for a future schema.
-		const configuredVersion =
-			typeof rawVersion === "number"
-				? Number.isFinite(rawVersion)
-					? Math.max(0, Math.floor(rawVersion))
-					: 0
-				: rawVersion;
 		if (configuredVersion === CONFIG_SCHEMA_VERSION) return raw;
 		if (typeof configuredVersion === "number" && configuredVersion > CONFIG_SCHEMA_VERSION) return raw;
 

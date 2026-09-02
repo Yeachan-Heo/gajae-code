@@ -68,8 +68,12 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 	runner.initialize(
 		// ExtensionActions
 		{
+			// Extension sends are INDEPENDENT producers, never continuations of the
+			// current turn: the trusted adapter classifies them so a terminal abort
+			// preserves them instead of dropping them as turn-owned work. Extensions
+			// never supply this bit themselves.
 			sendMessage: (message, sendOptions) => {
-				session.sendCustomMessage(message, sendOptions).catch(e => {
+				session.sendCustomMessage(message, { ...sendOptions, origin: "external" }).catch(e => {
 					reportSendError("extension_send", e instanceof Error ? e : new Error(String(e)));
 				});
 			},

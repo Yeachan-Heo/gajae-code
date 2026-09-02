@@ -2114,12 +2114,17 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 			if (extensionRunner && !options.preflightProbe) {
 				extensionRunner.initialize(
 					{
+						// Extension sends are INDEPENDENT producers (see runtime-init):
+						// classify them at the trusted adapter so a terminal abort keeps
+						// them rather than dropping them as turn-owned continuations.
 						sendMessage: (message, options) => {
-							const sendPromise = session.sendCustomMessage(message, options).catch(e => {
-								logger.error("Extension sendMessage failed", {
-									error: e instanceof Error ? e.message : String(e),
+							const sendPromise = session
+								.sendCustomMessage(message, { ...options, origin: "external" })
+								.catch(e => {
+									logger.error("Extension sendMessage failed", {
+										error: e instanceof Error ? e.message : String(e),
+									});
 								});
-							});
 							pendingExtensionMessages.push(sendPromise);
 						},
 						sendUserMessage: (content, options) => {
