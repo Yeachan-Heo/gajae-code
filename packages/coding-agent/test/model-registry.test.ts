@@ -34,7 +34,7 @@ import {
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { addApiCompatibleProvider } from "@gajae-code/coding-agent/setup/provider-onboarding";
-import { $credentialEnv, hookFetch, logger, Snowflake } from "@gajae-code/utils";
+import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
 
 describe("model roles", () => {
 	test("default is the only built-in model role", () => {
