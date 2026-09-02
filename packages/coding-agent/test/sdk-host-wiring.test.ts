@@ -6287,25 +6287,25 @@ for (const attached of [false, true]) {
 				const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
 				const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
 				sockets.push(socket);
+				const serverFrames: unknown[] = [];
+				socket.addEventListener("message", event => serverFrames.push(String(event.data)));
 				await new Promise<void>((resolve, reject) => {
 					socket.addEventListener("open", () => resolve(), { once: true });
 					socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
 				});
-				// Wait for the server side to count the authenticated connection.
-				await waitFor(
-					() => warned.length > 0 || debugged.length > 0 || socket.readyState === WebSocket.OPEN,
-					"socket open",
-				);
+				// A frame from the server proves the connection is AUTHENTICATED and counted
+				// server-side; `readyState === OPEN` alone only proves the client's view.
+				await waitFor(() => serverFrames.length > 0, "server frame proving registration");
 			}
 			await handlers.get("session_shutdown")!({ type: "session_shutdown" }, sessionContext);
 			if (attached) {
 				expect(warned).toHaveLength(1);
-				expect(warned[0]).toMatchObject({ sessionId, attachedClients: 1 });
+				expect(warned[0]).toMatchObject({ sessionId, endpointScope: "default", attachedClients: 1 });
 				expect(debugged).toHaveLength(0);
 			} else {
 				expect(warned).toHaveLength(0);
 				expect(debugged).toHaveLength(1);
-				expect(debugged[0]).toMatchObject({ sessionId, attachedClients: 0 });
+				expect(debugged[0]).toMatchObject({ sessionId, endpointScope: "default", attachedClients: 0 });
 			}
 		} finally {
 			pushFrameAndWait.mockRestore();

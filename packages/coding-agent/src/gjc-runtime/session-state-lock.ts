@@ -1822,7 +1822,6 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 	);
 }
 
-/** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
 /**
  * Recover a transition claim this process stranded in a prior failed release.
  *

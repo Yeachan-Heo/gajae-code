@@ -2587,10 +2587,13 @@ describe("session state lock forced-exit release", () => {
 		await fs.mkdir(transitionDir);
 		await fs.writeFile(path.join(transitionDir, "successor-marker"), "");
 
-		expect(releaseHeldSessionStateLocksSync()).toBeGreaterThanOrEqual(1);
+		// BOTH registered records are tombstoned, not just the sidecar.
+		expect(releaseHeldSessionStateLocksSync()).toBe(2);
+		expect(heldSessionStateLockPathsForTest()).toEqual([]);
 
 		expect(fsSync.existsSync(path.join(transitionDir, "successor-marker"))).toBe(true);
 		expect(JSON.parse(await fs.readFile(transitionOwner, "utf8"))).toMatchObject({ released: true });
+		expect(JSON.parse(await fs.readFile(lockFile, "utf8"))).toMatchObject({ released: true, pid: 1 });
 		allowRelease();
 		await holder.catch(() => undefined);
 		await fs.rm(transitionDir, { recursive: true, force: true });
