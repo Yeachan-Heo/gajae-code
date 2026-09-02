@@ -206,6 +206,25 @@ describe("deep-interview crystallize contract", () => {
 				later(input({ prior: first, resolved_open_gaps: ["What is the memory budget?"] }), 2),
 			),
 		).toThrow("resolved_open_gap_anchors must contain one anchor per resolution");
+		expect(() =>
+			crystallizeDeepInterview(
+				later(
+					input({
+						prior: first,
+						resolved_open_gaps: ["What is the memory budget?"],
+						resolved_open_gap_anchors: [
+							{
+								item: "What is the memory budget?",
+								message_index: 1,
+								quote: "memory budget",
+								resolution: "memory budget",
+							},
+						],
+					}),
+					2,
+				),
+			),
+		).toThrow("has no fresh verbatim user anchor");
 	});
 
 	it("marks conflicting evidence stale", () => {
