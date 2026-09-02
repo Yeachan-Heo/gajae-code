@@ -1376,22 +1376,29 @@ async function runCommunityAppOfferFromRuntime(
 				}
 			}
 		};
-		const exitCode = await Promise.race([child.exited, Bun.sleep(180_000).then(() => 124)]);
-		if (exitCode === 124) {
+		const childExit = child.exited.then(
+			code => ({ code, reaped: true }),
+			() => ({ code: 125, reaped: false }),
+		);
+		const exitCode = await Promise.race([childExit, Bun.sleep(180_000).then(() => ({ code: 124, reaped: false }))]);
+		if (exitCode.code === 124) {
 			signalRuntimeGroup("SIGTERM");
-			const cleanupExitCode = await Promise.race([child.exited.then(() => 0), Bun.sleep(300_000).then(() => 125)]);
-			if (cleanupExitCode === 125) {
+			const cleanupExitCode = await Promise.race([
+				childExit,
+				Bun.sleep(300_000).then(() => ({ code: 125, reaped: false })),
+			]);
+			if (cleanupExitCode.code === 125) {
 				signalRuntimeGroup("SIGKILL");
 				runtimeGroupSafe =
-					(await Promise.race([child.exited.then(() => true), Bun.sleep(5000).then(() => false)])) &&
+					(await Promise.race([childExit.then(result => result.reaped), Bun.sleep(5000).then(() => false)])) &&
 					(await waitForRuntimeGroupGone());
 			} else {
-				runtimeGroupSafe = await waitForRuntimeGroupGone();
+				runtimeGroupSafe = cleanupExitCode.reaped && (await waitForRuntimeGroupGone());
 			}
 			throw new Error("optional macOS community app offer timed out");
 		}
-		runtimeGroupSafe = await waitForRuntimeGroupGone();
-		if (exitCode !== 0) throw new Error(`optional macOS community app offer exited ${exitCode}`);
+		runtimeGroupSafe = exitCode.reaped && (await waitForRuntimeGroupGone());
+		if (exitCode.code !== 0) throw new Error(`optional macOS community app offer exited ${exitCode.code}`);
 	} finally {
 		if (pinDirectoryLocked && runtimeGroupSafe) await fs.promises.chmod(pinDirectory, 0o700).catch(() => undefined);
 		if (runtimeGroupSafe) await fs.promises.rm(pinDirectory, { recursive: true, force: true }).catch(() => undefined);
