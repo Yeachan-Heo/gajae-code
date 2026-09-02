@@ -165,10 +165,20 @@ describe("deep-interview crystallize contract", () => {
 					resolved_open_gaps: ["What is the memory budget?"],
 					resolved_conflicts: ["The target is disputed."],
 					resolved_open_gap_anchors: [
-						{ item: "What is the memory budget?", message_index: 1, quote: "memory budget" },
+						{
+							item: "What is the memory budget?",
+							message_index: 1,
+							quote: "budget is 1GB",
+							resolution: "budget is 1GB",
+						},
 					],
 					resolved_conflict_anchors: [
-						{ item: "The target is disputed.", message_index: 1, quote: "target is disputed" },
+						{
+							item: "The target is disputed.",
+							message_index: 1,
+							quote: "target is resolved",
+							resolution: "target is resolved",
+						},
 					],
 					snapshot: (() => {
 						const snapshot: CrystalSnapshot = {
@@ -177,7 +187,7 @@ describe("deep-interview crystallize contract", () => {
 							end: 1,
 							messages: [
 								{ index: 0, role: "user", content: "Build a fast report." },
-								{ index: 1, role: "user", content: "What is the memory budget? The target is disputed." },
+								{ index: 1, role: "user", content: "The budget is 1GB; the target is resolved." },
 							],
 							digest: "",
 						};
@@ -195,7 +205,7 @@ describe("deep-interview crystallize contract", () => {
 			crystallizeDeepInterview(
 				later(input({ prior: first, resolved_open_gaps: ["What is the memory budget?"] }), 2),
 			),
-		).toThrow("resolved_open_gaps must be supported by verbatim user evidence");
+		).toThrow("resolved_open_gap_anchors must contain one anchor per resolution");
 	});
 
 	it("marks conflicting evidence stale", () => {
