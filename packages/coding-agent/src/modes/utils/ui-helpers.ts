@@ -1091,6 +1091,11 @@ export class UiHelpers {
 
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", options?: ComposerSubmissionOptions): void {
 		const entry: CompactionQueuedMessage = { text, mode };
+		// A composer steer keeps the same one-per-poll delivery it would have had
+		// without compaction: the mark has to survive the park/replay round trip.
+		if (mode === "steer") {
+			entry.steerQueuePolicy = "sequential";
+		}
 		if (mode === "followUp") {
 			entry.followUpQueuePolicy = "sequential";
 		}
@@ -1113,6 +1118,11 @@ export class UiHelpers {
 	#compactionFollowUpQueuePolicy(message: CompactionQueuedMessage): "sequential" | undefined {
 		if (message.mode !== "followUp") return undefined;
 		return message.followUpQueuePolicy ?? "sequential";
+	}
+
+	#compactionSteerQueuePolicy(message: CompactionQueuedMessage): "sequential" | undefined {
+		if (message.mode !== "steer") return undefined;
+		return message.steerQueuePolicy ?? "sequential";
 	}
 
 	async #deliverQueuedSkillMessage(message: CompactionQueuedMessage): Promise<boolean> {
@@ -1163,7 +1173,10 @@ export class UiHelpers {
 							streamingBehavior: message.mode,
 							followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(message),
 						}
-					: { streamingBehavior: message.mode };
+					: {
+							streamingBehavior: message.mode,
+							steerQueuePolicy: this.#compactionSteerQueuePolicy(message),
+						};
 			await this.ctx.session.promptCustomMessage(
 				{
 					customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -1196,7 +1209,10 @@ export class UiHelpers {
 				? this.ctx.session.followUp(message.text, undefined, {
 						followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(message),
 					})
-				: this.ctx.session.steer(message.text),
+				: this.ctx.session.prompt(message.text, {
+						streamingBehavior: "steer",
+						steerQueuePolicy: this.#compactionSteerQueuePolicy(message),
+					}),
 		);
 	}
 
@@ -1310,7 +1326,10 @@ export class UiHelpers {
 							streamingBehavior: "followUp" as const,
 							followUpQueuePolicy: this.#compactionFollowUpQueuePolicy(firstPrompt),
 						}
-					: { streamingBehavior: "steer" as const };
+					: {
+							streamingBehavior: "steer" as const,
+							steerQueuePolicy: this.#compactionSteerQueuePolicy(firstPrompt),
+						};
 			const promptPromise = this.ctx.session.prompt(firstPrompt.text, firstPromptOptions).catch((error: unknown) => {
 				disposeFirstPrompt();
 				restoreQueue(error);

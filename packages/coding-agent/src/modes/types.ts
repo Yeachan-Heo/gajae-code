@@ -41,6 +41,8 @@ export type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
 	followUpQueuePolicy?: "sequential";
+	/** Composer steers stay one per poll even under `steeringMode: "all"`. */
+	steerQueuePolicy?: "sequential";
 };
 
 export type SubmittedUserInput = {

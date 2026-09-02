@@ -272,6 +272,52 @@ describe("InputController #invokeSkillCommand (E1-E3)", () => {
 		expect(ctx.compactionQueuedMessages).toEqual([]);
 	});
 
+	it("E3d: compaction replay keeps composer steers one per poll", async () => {
+		// A composer steer parked during compaction must keep its sequential
+		// delivery across the park/replay round trip: under steeringMode "all" an
+		// unmarked replay would batch the remaining steers into one poll.
+		const { ctx, prompt, promptCustomMessage } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: false,
+		});
+		// The stub context omits a few surfaces the compaction flush touches.
+		(ctx as unknown as { showStatus: (text: string) => void }).showStatus = () => {};
+		(ctx as unknown as { recordLocalSubmission: (text: string) => () => void }).recordLocalSubmission =
+			() => () => {};
+		(ctx.session as unknown as { clearQueue: () => void }).clearQueue = () => {};
+		const uiHelpers = new UiHelpers(ctx);
+		// Queue through the production entry point so the mark is recorded, not
+		// hand-written into the queue.
+		uiHelpers.queueCompactionMessage("plain steer one", "steer");
+		uiHelpers.queueCompactionMessage("/skill:test-skill from compaction", "steer");
+		uiHelpers.queueCompactionMessage("plain steer two", "steer");
+		expect(ctx.compactionQueuedMessages.map(entry => entry.steerQueuePolicy)).toEqual([
+			"sequential",
+			"sequential",
+			"sequential",
+		]);
+
+		await uiHelpers.flushCompactionQueue();
+
+		// The first entry opens the turn; every later steer carries the sequential
+		// mark so it occupies its own poll.
+		const steerPromptOptions = prompt.mock.calls
+			.filter(call => (call[1] as { streamingBehavior?: string } | undefined)?.streamingBehavior === "steer")
+			.map(call => call[1]);
+		expect(ctx.showError).not.toHaveBeenCalled();
+		expect(steerPromptOptions.length).toBeGreaterThanOrEqual(2);
+		for (const options of steerPromptOptions) {
+			expect(options).toMatchObject({ streamingBehavior: "steer", steerQueuePolicy: "sequential" });
+		}
+		// The skill entry replays through the custom-message path with the same mark.
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(promptCustomMessage.mock.calls[0]?.[1]).toEqual({
+			streamingBehavior: "steer",
+			steerQueuePolicy: "sequential",
+		});
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
 	it("E3: not streaming -> enqueueCustomMessageDisplay NOT called and tag absent", async () => {
 		const { ctx, editor, enqueueCustomMessageDisplay, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,
@@ -520,6 +566,43 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		await Promise.resolve();
 
 		expect(session.getQueuedMessages().steering).toEqual([]);
+	});
+
+	it("E6b: a hidden custom steer ahead of a visible chip cannot be misaddressed by chip removal", async () => {
+		// Tagged chips are removed by IDENTITY, not by queue position: a hidden
+		// display:false custom steer occupying an earlier Agent queue slot must not
+		// make the visible chip's removal delete the hidden message instead.
+		fixture = await createRealSession();
+		const { session } = fixture;
+		// Hidden internal message first (no chip of its own), then a visible chip.
+		await session.sendCustomMessage(
+			{ customType: "resolve-reminder", content: "hidden reminder", display: false, attribution: "agent" },
+			{ deliverAs: "steer" },
+		);
+		const visibleTag = session.enqueueCustomMessageDisplay("/skill:foo bar", "steer");
+		await session.sendCustomMessage(
+			{
+				customType: "skill-prompt",
+				content: "/skill:foo bar",
+				display: false,
+				attribution: "user",
+				details: { __pendingDisplayTag: visibleTag },
+			},
+			{ deliverAs: "steer" },
+		);
+		const queuedBefore = session.agent.snapshotQueues();
+		const executable = [...queuedBefore.steering, ...queuedBefore.followUp];
+		expect(executable).toHaveLength(2);
+
+		const [entry] = session.getQueuedMessageEntries();
+		expect(entry?.text).toBe("/skill:foo bar");
+		expect(session.removeQueuedMessageForEditing(entry?.id ?? "")).toBe("/skill:foo bar");
+
+		// The VISIBLE chip's executable message is gone; the hidden reminder is not.
+		const queuedAfter = session.agent.snapshotQueues();
+		const remaining = [...queuedAfter.steering, ...queuedAfter.followUp];
+		expect(remaining).toHaveLength(1);
+		expect(JSON.stringify(remaining[0])).toContain("hidden reminder");
 	});
 
 	it("E7: popLastQueuedMessage on a tagged entry leaves no orphan tag state", async () => {

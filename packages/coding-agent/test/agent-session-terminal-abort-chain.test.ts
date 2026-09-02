@@ -516,11 +516,16 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.getPendingNextTurnMessagesForTests()).toHaveLength(0);
 	}, 20_000);
 
-	it("terminal abort purges steering queued for the aborted turn but keeps owned-completion follow-ups", async () => {
-		scriptedResponses = [stopReply("ok")];
-		await session.prompt("first turn");
-		// A steer is queued just before the terminal abort wins.
-		session.agent.steer({
+	it("terminal abort disowns steering admitted into the aborted turn but keeps owned-completion follow-ups", async () => {
+		// The steer must be ADMITTED into a live run for the purge/disown decision
+		// to mean anything: steering a finished turn is refused at admission (R1),
+		// which would make the empty-queue assertion below pass for the wrong
+		// reason. Park a tool so the turn is live, admit, then abort terminally.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("must not run")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const callsBeforeAbort = recordedProviderContexts().length;
+		const admission = session.agent.steer({
 			role: "custom",
 			customType: "steer-test",
 			content: [{ type: "text", text: "stale steer" }],
@@ -528,15 +533,26 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			details: {},
 			timestamp: Date.now(),
 		});
+		expect(admission.admitted).toBe(true);
+		expect(session.agent.hasQueuedSteering()).toBe(true);
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
 			graceMs: TEST_ABORT_GRACE_MS,
 			terminal: { scope: "turn" },
 		});
-		// The queued steering is purged so it cannot alter the next user turn;
-		// the follow-up queue is untouched (owned-completion resumes still deliver).
+		await promptPromise;
+		// Disowned and dropped: it cannot alter a later turn, and no provider
+		// request ever carried it. The follow-up queue is untouched
+		// (owned-completion resumes still deliver).
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		expect(session.agent.snapshotQueues().followUp).toHaveLength(0);
-	}, 20_000);
+		await session.waitForIdle();
+		expect(
+			recordedProviderContexts()
+				.slice(callsBeforeAbort)
+				.some(text => text.includes("stale steer")),
+		).toBe(false);
+		expect(session.agent.state.messages.some(message => JSON.stringify(message).includes("stale steer"))).toBe(false);
+	}, 30_000);
 	it("terminal abort preserves client steering admitted after the abort snapshot", async () => {
 		// Review thread P1: a client turn.prompt/steer accepted while the abort
 		// is in flight (past its snapshot) is an independent root-turn request

@@ -2560,6 +2560,35 @@ export class AgentSession {
 	 */
 	#freshRootLineageRequests = new WeakSet<AgentMessage>();
 
+	/**
+	 * Bind a tag-only display chip (registered by `enqueueCustomMessageDisplay`
+	 * before dispatch) to the executable message that was actually queued, and
+	 * move it to the list matching how the message was queued.
+	 *
+	 * Without the binding the chip keeps no identity link, so edit/remove/pop fall
+	 * back to POSITIONAL addressing against the Agent queue — and a hidden
+	 * `display:false` custom message occupying an earlier queue slot makes that
+	 * index point at the wrong message. Migrating the entry also keeps the chip's
+	 * mode honest when a requested steer is rerouted to a follow-up.
+	 */
+	#bindCustomDisplayEntry(message: AgentMessage, mode: "steer" | "followUp"): void {
+		const tag = message.role === "custom" ? readPendingDisplayTag(message.details) : undefined;
+		if (tag === undefined) return;
+		const from = mode === "steer" ? this.#followUpMessages : this.#steeringMessages;
+		const to = mode === "steer" ? this.#steeringMessages : this.#followUpMessages;
+		const already = to.find(entry => entry.tag === tag);
+		if (already) {
+			already.message = message;
+			return;
+		}
+		const index = from.findIndex(entry => entry.tag === tag);
+		if (index === -1) return;
+		const [entry] = from.splice(index, 1);
+		if (!entry) return;
+		entry.message = message;
+		to.push(entry);
+	}
+
 	/** True when a queued message still carries an unfulfilled fresh-root requirement. */
 	#hasQueuedFreshRootRequest(): boolean {
 		const { steering, followUp } = this.agent.snapshotQueues();
@@ -13171,7 +13200,9 @@ export class AgentSession {
 			// (cron, monitor, skill) must not steer against the outgoing turn.
 			this.#assertNoHandoffTransition();
 			const sequential = options.steerQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined;
-			if (!this.agent.steer(appMessage, sequential).admitted) {
+			if (this.agent.steer(appMessage, sequential).admitted) {
+				this.#bindCustomDisplayEntry(appMessage, "steer");
+			} else {
 				// No live run to steer, so this becomes next-turn work. Provenance —
 				// never the caller's `triggerTurn` delivery preference — decides what a
 				// terminal abort's retained fence does with it: genuine user input and
@@ -13190,6 +13221,9 @@ export class AgentSession {
 					return;
 				}
 				this.agent.followUp(appMessage, { forceOneAtATime: true });
+				// The chip now describes follow-up work: keep its mode and identity
+				// aligned with where the executable message actually landed.
+				this.#bindCustomDisplayEntry(appMessage, "followUp");
 				if (independentOfTurn) {
 					this.#externalFollowUps.add(appMessage);
 					// Past a retained terminal fence this message is a NEW root: record
@@ -13215,6 +13249,7 @@ export class AgentSession {
 				appMessage,
 				options?.followUpQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined,
 			);
+			this.#bindCustomDisplayEntry(appMessage, "followUp");
 			// The session can report streaming while no agent loop owns the queue
 			// (post-prompt unwind): without a scheduled delivery a cron/monitor
 			// notification would sit queued until unrelated activity.
