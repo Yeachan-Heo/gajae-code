@@ -1326,7 +1326,7 @@ describe("agentLoop with AgentMessage", () => {
 		const config: AgentLoopConfig = {
 			model: mock.model,
 			convertToLlm: identityConverter,
-			interruptMode: "immediate",
+			toolInterruptPolicy: "abort_tools",
 			getSteeringMessages: async () => {
 				// Return steering message after tool execution has started
 				if (executed.length >= 1 && !queuedDelivered) {

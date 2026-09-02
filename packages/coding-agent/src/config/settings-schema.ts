@@ -1579,14 +1579,15 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	interruptMode: {
+	toolInterruptPolicy: {
 		type: "enum",
-		values: ["immediate", "wait"] as const,
-		default: "immediate",
+		values: ["abort_tools", "finish_tools"] as const,
+		default: "abort_tools",
 		ui: {
 			tab: "interaction",
-			label: "Interrupt Mode",
-			description: "When steering messages interrupt tool execution",
+			label: "Tool Interrupt Policy",
+			description:
+				"Whether a steering message aborts the tools still running in the current batch (abort_tools) or lets them finish first (finish_tools). Never changes when a steer is consumed: it is always picked up at the next tool/turn boundary either way.",
 		},
 	},
 

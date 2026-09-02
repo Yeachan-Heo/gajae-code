@@ -5006,7 +5006,7 @@ async function executeToolCalls(
 	const tools = currentContext.tools;
 	const {
 		getSteeringMessages,
-		interruptMode = "immediate",
+		toolInterruptPolicy = "abort_tools",
 		getToolContext,
 		transformToolCallArguments,
 		intentTracing,
@@ -5020,7 +5020,7 @@ async function executeToolCalls(
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
-	const shouldInterruptImmediately = interruptMode !== "wait";
+	const shouldInterruptImmediately = toolInterruptPolicy !== "finish_tools";
 	const steeringAbortController = new AbortController();
 	const toolSignals = [
 		...(signal ? [signal] : []),

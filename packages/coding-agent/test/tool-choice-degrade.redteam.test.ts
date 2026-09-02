@@ -59,7 +59,9 @@ function createSession(options: {
 			: {
 					buildToolChoice: () => options.legacyChoice,
 				}),
-		steer: (message: { customType: string; content: string; details?: unknown }) => options.steers?.push(message),
+		sendCustomMessage: async (message: { customType: string; content: string; details?: unknown }) => {
+			options.steers?.push(message);
+		},
 	} as unknown as ToolSession;
 }
 

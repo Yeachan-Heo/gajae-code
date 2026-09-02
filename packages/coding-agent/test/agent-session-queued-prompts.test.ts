@@ -109,7 +109,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 			"compaction.enabled": false,
 			steeringMode: "one-at-a-time",
 			followUpMode: "one-at-a-time",
-			interruptMode: "immediate",
+			toolInterruptPolicy: "abort_tools",
 		});
 		session = buildSession([], settings);
 		const canWrite = spyOn(settings, "canWriteDurableConfig").mockReturnValue(false);
@@ -118,14 +118,14 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		try {
 			expect(() => session!.setSteeringMode("all")).toThrow("Repair config.yml");
 			expect(() => session!.setFollowUpMode("all")).toThrow("Repair config.yml");
-			expect(() => session!.setInterruptMode("wait")).toThrow("Repair config.yml");
+			expect(() => session!.setToolInterruptPolicy("finish_tools")).toThrow("Repair config.yml");
 
 			expect(session.agent.getSteeringMode()).toBe("one-at-a-time");
 			expect(session.agent.getFollowUpMode()).toBe("one-at-a-time");
-			expect(session.agent.getInterruptMode()).toBe("immediate");
+			expect(session.agent.getToolInterruptPolicy()).toBe("abort_tools");
 			expect(settings.getGlobal("steeringMode")).toBe("one-at-a-time");
 			expect(settings.getGlobal("followUpMode")).toBe("one-at-a-time");
-			expect(settings.getGlobal("interruptMode")).toBe("immediate");
+			expect(settings.getGlobal("toolInterruptPolicy")).toBe("abort_tools");
 			expect(set).not.toHaveBeenCalled();
 		} finally {
 			canWrite.mockRestore();

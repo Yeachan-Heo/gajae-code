@@ -163,7 +163,7 @@ describe("config CLI schema coverage", () => {
 	it("reports invalid settings through config doctor JSON", async () => {
 		await Bun.write(
 			path.join(testAgentDir, "config.yml"),
-			"configSchemaVersion: 1\nnotifications:\n  enabled: invalid\n",
+			"configSchemaVersion: 2\nnotifications:\n  enabled: invalid\n",
 		);
 		resetSettingsForTest();
 		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -320,7 +320,7 @@ describe("config CLI schema coverage", () => {
 
 describe("config doctor vendor-separated delegation advisory", () => {
 	const vendorSeparatedRoles = [
-		"configSchemaVersion: 1",
+		"configSchemaVersion: 2",
 		"modelRoles:",
 		"  default: anthropic/claude-opus-5:medium",
 		"task:",
@@ -350,7 +350,7 @@ describe("config doctor vendor-separated delegation advisory", () => {
 	it("stays silent for a single-vendor layout with task.eager false", async () => {
 		expect(
 			await doctorAdvisories([
-				"configSchemaVersion: 1",
+				"configSchemaVersion: 2",
 				"modelRoles:",
 				"  default: openai-codex/gpt-5.6-sol:low",
 				"task:",
@@ -473,7 +473,7 @@ describe("config CLI durable persistence", () => {
 		const realTarget = path.join(testAgentDir, "real-config.yml");
 		const otherTarget = path.join(testAgentDir, "other-config.yml");
 		const configPath = path.join(testAgentDir, "config.yml");
-		const initialConfig = "configSchemaVersion: 1\ncolorBlindMode: false\n";
+		const initialConfig = "configSchemaVersion: 2\ncolorBlindMode: false\n";
 		await fs.writeFile(realTarget, initialConfig, "utf8");
 		await fs.writeFile(otherTarget, initialConfig, "utf8");
 		await fs.symlink(realTarget, configPath);

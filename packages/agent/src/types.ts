@@ -250,7 +250,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * - "immediate" = check after each tool call (default)
 	 * - "wait" = defer steering until the current turn completes
 	 */
-	interruptMode?: "immediate" | "wait";
+	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 
 	/**
 	 * Optional session identifier forwarded to LLM providers.
@@ -332,7 +332,7 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	/**
 	 * Returns steering messages to inject into the conversation mid-run.
 	 *
-	 * Called after each tool execution to check for user interruptions unless interruptMode is "wait".
+	 * Called after each tool execution to check for user interruptions unless toolInterruptPolicy is "finish_tools".
 	 * If messages are returned, remaining tool calls are skipped and
 	 * these messages are added to the context before the next LLM call.
 	 */

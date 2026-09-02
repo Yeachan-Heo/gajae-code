@@ -379,8 +379,6 @@ export interface ToolSession {
 	buildToolChoice?(toolName: string): ToolChoice | undefined;
 	/** Build a named tool-choice decision, preserving whether exact named forcing survived capability degradation. */
 	buildToolChoiceResult?(toolName: string): import("../utils/tool-choice").NamedToolChoiceResult;
-	/** Steer a hidden custom message into the conversation (e.g. a preview reminder). */
-	steer?(message: { customType: string; content: string; details?: unknown }): void;
 	/** Peek the currently in-flight tool-choice queue directive's invocation handler. Used by the `resolve` tool to dispatch to the pending action. */
 	peekQueueInvoker?(): ((input: unknown) => Promise<unknown> | unknown) | undefined;
 	/** Peek the long-lived "standing" resolve handler registered by a mode (e.g. plan mode).

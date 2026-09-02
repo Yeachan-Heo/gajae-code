@@ -7,4 +7,4 @@
  * this dependency-light module so the resolver can import it without pulling in
  * the TUI/AI-heavy settings schema.
  */
-export const CONFIG_SCHEMA_VERSION = 1;
+export const CONFIG_SCHEMA_VERSION = 2;

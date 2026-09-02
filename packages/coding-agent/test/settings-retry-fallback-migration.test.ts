@@ -174,7 +174,7 @@ describe("retry.fallbackChains migration", () => {
 
 	test("does not rewrite a config from a newer schema version", async () => {
 		const futureConfig = {
-			configSchemaVersion: 2,
+			configSchemaVersion: 3,
 			modelRoles: { default: "future/head" },
 			retry: { fallbackChains: { default: ["future/tail"] } },
 		};

@@ -154,8 +154,8 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 					session.setFollowUpMode(mode);
 					return true;
 				}
-				if (kind === "interrupt" && (mode === "immediate" || mode === "wait")) {
-					session.setInterruptMode(mode);
+				if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
+					session.setToolInterruptPolicy(mode);
 					return true;
 				}
 				return false;

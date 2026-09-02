@@ -1063,6 +1063,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** When set to "sequential", this follow-up is delivered one prompt at a time even if followUpMode is "all". */
 	followUpQueuePolicy?: "respect-mode" | "sequential";
+	/** When set to "sequential", this steer is delivered on its own even if steeringMode is "all". */
+	steerQueuePolicy?: "respect-mode" | "sequential";
 	/** Optional tool choice override for the next LLM call. */
 	toolChoice?: ToolChoice;
 	/** Send as developer/system message instead of user. Providers that support it use the developer role; others fall back to user. */
@@ -10581,8 +10583,8 @@ export class AgentSession {
 	}
 
 	/** Current interrupt mode */
-	get interruptMode(): "immediate" | "wait" {
-		return this.agent.getInterruptMode();
+	get toolInterruptPolicy(): "abort_tools" | "finish_tools" {
+		return this.agent.getToolInterruptPolicy();
 	}
 
 	/** Current session file path, or undefined if sessions are disabled */
@@ -10669,7 +10671,7 @@ export class AgentSession {
 			thinking: this.#thinkingLevel ?? "off",
 			steeringMode: this.steeringMode,
 			followUpMode: this.followUpMode,
-			interruptMode: this.interruptMode,
+			toolInterruptPolicy: this.toolInterruptPolicy,
 		};
 	}
 
@@ -11563,7 +11565,10 @@ export class AgentSession {
 					claimsGenuineUserIntent,
 				});
 			} else {
-				await this.#queueSteer(expandedText, options?.images, { claimsGenuineUserIntent });
+				await this.#queueSteer(expandedText, options?.images, {
+					claimsGenuineUserIntent,
+					forceOneAtATime: options.steerQueuePolicy === "sequential",
+				});
 			}
 			if (workflowIntentDiff) {
 				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
@@ -11593,7 +11598,10 @@ export class AgentSession {
 							claimsGenuineUserIntent,
 						});
 					} else {
-						await this.#queueSteer(expandedText, options?.images, { claimsGenuineUserIntent });
+						await this.#queueSteer(expandedText, options?.images, {
+							claimsGenuineUserIntent,
+							forceOneAtATime: options.steerQueuePolicy === "sequential",
+						});
 					}
 					if (workflowIntentDiff) {
 						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
@@ -12391,8 +12399,8 @@ export class AgentSession {
 					this.setFollowUpMode(mode);
 					return true;
 				}
-				if (kind === "interrupt" && (mode === "immediate" || mode === "wait")) {
-					this.setInterruptMode(mode);
+				if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
+					this.setToolInterruptPolicy(mode);
 					return true;
 				}
 				return false;
@@ -12568,6 +12576,7 @@ export class AgentSession {
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			external?: boolean;
 			sdkRunToken?: string;
+			forceOneAtATime?: boolean;
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
@@ -12581,7 +12590,7 @@ export class AgentSession {
 		// prompt still in preflight, aborting) has no run to steer, so it is routed
 		// as a sequential follow-up owned by the next turn instead of being parked
 		// in a queue nobody owns.
-		const admission = this.agent.steer(message);
+		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
 			await this.#queueFollowUp(text, images, {
 				forceOneAtATime: true,
@@ -16707,13 +16716,13 @@ export class AgentSession {
 	}
 
 	/**
-	 * Set interrupt mode.
+	 * Set the tool interrupt policy (whether a steer aborts in-flight tools).
 	 * Saves to settings.
 	 */
-	setInterruptMode(mode: "immediate" | "wait"): void {
+	setToolInterruptPolicy(policy: "abort_tools" | "finish_tools"): void {
 		this.#assertDurableSettingsWritable();
-		this.agent.setInterruptMode(mode);
-		this.settings.set("interruptMode", mode);
+		this.agent.setToolInterruptPolicy(policy);
+		this.settings.set("toolInterruptPolicy", policy);
 	}
 
 	// =========================================================================

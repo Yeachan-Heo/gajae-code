@@ -23,11 +23,8 @@ function liveRunHarness() {
 		},
 	};
 	const mock = createMockModel({
-		responses: [
-			{ content: [{ type: "toolCall", name: "wait", arguments: {} }] },
-			{ content: ["after"] },
-			{ content: ["x"] },
-		],
+		responses: [{ content: [{ type: "toolCall", name: "wait", arguments: {} }] }],
+		handler: { content: ["reply"] },
 	});
 	const agent = new Agent({
 		initialState: { model: mock.model, systemPrompt: ["test"], tools: [waitTool], messages: [] },
@@ -146,7 +143,7 @@ describe("Agent steering admission", () => {
 		expect(after[1]).toMatchObject({ content: "b" });
 	});
 
-	it("waitForSteeringArrival resolves on arrival, on a pre-queued steer, and on abort without consuming", async () => {
+	it("waitForSteeringArrival resolves only on a NEW arrival or abort, never on a pre-queued steer", async () => {
 		const h = liveRunHarness();
 		const run = h.agent.prompt("go");
 		await h.entered;
@@ -156,7 +153,17 @@ describe("Agent steering admission", () => {
 		await pending;
 		expect(h.agent.hasQueuedSteering()).toBe(true);
 
-		await h.agent.waitForSteeringArrival(new AbortController().signal);
+		// Already queued: a fresh wait must NOT resolve (a stale message must not
+		// interrupt the next observation window); only abort settles it.
+		const stale = new AbortController();
+		let staleResolved = false;
+		const staleWait = h.agent.waitForSteeringArrival(stale.signal).then(() => {
+			staleResolved = true;
+		});
+		await Bun.sleep(5);
+		expect(staleResolved).toBe(false);
+		stale.abort();
+		await staleWait;
 
 		h.agent.clearSteeringQueue();
 		const controller = new AbortController();
@@ -166,6 +173,25 @@ describe("Agent steering admission", () => {
 		expect(h.agent.hasQueuedSteering()).toBe(false);
 		h.release();
 		await run;
+	});
+
+	it("steeringMode all still delivers a sequential-marked steer on its own", async () => {
+		const h = liveRunHarness();
+		h.agent.setSteeringMode("all");
+		const run = h.agent.prompt("go");
+		await h.entered;
+		expect(h.agent.steer(userMessage("batch-1")).admitted).toBe(true);
+		expect(h.agent.steer(userMessage("solo"), { forceOneAtATime: true }).admitted).toBe(true);
+		expect(h.agent.steer(userMessage("batch-2")).admitted).toBe(true);
+		h.release();
+		await run;
+		// Poll 1 took batch-1 (up to the sequential mark), poll 2 took solo alone,
+		// poll 3 took batch-2: three separate model calls after the tool turn.
+		const userTextsPerCall = h.mock.calls.map(call =>
+			call.context.messages.filter(m => m.role === "user").map(m => JSON.stringify(m.content)),
+		);
+		expect(userTextsPerCall.at(-1)?.some(t => t.includes("batch-2"))).toBe(true);
+		expect(h.mock.calls.length).toBe(4);
 	});
 
 	it("restoreSteering is a no-op for an empty snapshot", () => {

@@ -53,7 +53,7 @@ sources above.
 | Thinking | `cycle_thinking_level` | `thinking.cycle` | retired doc; registry:82; dispatch:174-175 |
 | Queue modes | `set_steering_mode` | `queue.steering_mode.set` | retired doc; registry:84; dispatch:178-179 |
 | Queue modes | `set_follow_up_mode` | `queue.follow_up_mode.set` | retired doc; registry:85; dispatch:180-181 |
-| Queue modes | `set_interrupt_mode` | `queue.interrupt_mode.set` | retired doc; registry:86; dispatch:182-183 |
+| Queue modes | `set_interrupt_mode` | `queue.tool_interrupt_policy.set` | retired doc; registry:86; dispatch:182-183; renamed from `queue.interrupt_mode.set` (values `abort_tools` / `finish_tools`) |
 | Compaction | `compact` | Partial SDK equivalent: `compaction.run` takes no input and loses retired `customInstructions` | `6e147d58~1:docs/rpc.md:111`; registry:87; dispatch:184-185 |
 | Compaction | `set_auto_compaction` | `compaction.auto.set` | retired doc; registry:88; dispatch:186-187 |
 | Retry | `set_auto_retry` | `retry.auto.set` | retired doc; registry:89; dispatch:188-189 |

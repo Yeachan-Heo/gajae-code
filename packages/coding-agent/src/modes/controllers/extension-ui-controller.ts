@@ -591,8 +591,8 @@ export class ExtensionUiController {
 					this.ctx.session.setFollowUpMode(mode);
 					return true;
 				}
-				if (kind === "interrupt" && (mode === "immediate" || mode === "wait")) {
-					this.ctx.session.setInterruptMode(mode);
+				if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
+					this.ctx.session.setToolInterruptPolicy(mode);
 					return true;
 				}
 				return false;
@@ -821,8 +821,8 @@ export class ExtensionUiController {
 					this.ctx.session.setFollowUpMode(mode);
 					return true;
 				}
-				if (kind === "interrupt" && (mode === "immediate" || mode === "wait")) {
-					this.ctx.session.setInterruptMode(mode);
+				if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
+					this.ctx.session.setToolInterruptPolicy(mode);
 					return true;
 				}
 				return false;
@@ -962,8 +962,8 @@ export class ExtensionUiController {
 								this.ctx.session.setFollowUpMode(mode);
 								return true;
 							}
-							if (kind === "interrupt" && (mode === "immediate" || mode === "wait")) {
-								this.ctx.session.setInterruptMode(mode);
+							if (kind === "tool_interrupt" && (mode === "abort_tools" || mode === "finish_tools")) {
+								this.ctx.session.setToolInterruptPolicy(mode);
 								return true;
 							}
 							return false;
@@ -973,7 +973,7 @@ export class ExtensionUiController {
 						getConfigItems: () => ({
 							steeringMode: this.ctx.session.steeringMode,
 							followUpMode: this.ctx.session.followUpMode,
-							interruptMode: this.ctx.session.interruptMode,
+							toolInterruptPolicy: this.ctx.session.toolInterruptPolicy,
 						}),
 						getBranchCandidates: () => this.ctx.sessionManager.getTree(),
 						getExtensions: () => this.ctx.session.extensionRunner?.getExtensionPaths() ?? [],

@@ -66,15 +66,22 @@ export function queueResolveHandler(
 	const queue = session.getToolChoiceQueue?.();
 
 	const steerReminder = (): void => {
-		session.steer?.({
-			customType: "resolve-reminder",
-			content: [
-				"<system-reminder>",
-				"This is a preview. Call the `resolve` tool to apply or discard these changes.",
-				"</system-reminder>",
-			].join("\n"),
-			details: { toolName: options.sourceToolName },
-		});
+		void session
+			.sendCustomMessage?.(
+				{
+					customType: "resolve-reminder",
+					content: [
+						"<system-reminder>",
+						"This is a preview. Call the `resolve` tool to apply or discard these changes.",
+						"</system-reminder>",
+					].join("\n"),
+					display: false,
+					attribution: "agent",
+					details: { toolName: options.sourceToolName },
+				},
+				{ deliverAs: "steer" },
+			)
+			?.catch(() => undefined);
 	};
 
 	// Re-evaluated on every push (including apply-error re-pushes) so a runtime

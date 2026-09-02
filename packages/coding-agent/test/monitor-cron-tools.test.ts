@@ -34,7 +34,6 @@ function createSession(settings: Settings, options: SessionOptions = {}): ToolSe
 		getSessionSpawns: () => null,
 		getSessionId: () => "test-session",
 		getAgentId: () => agentId,
-		steer: (msg: { customType: string; content: string; details?: unknown }) => options.steered?.push(msg),
 		sendCustomMessage: async (msg: { customType: string; content: string; details?: unknown }) => {
 			options.steered?.push({ customType: msg.customType, content: msg.content, details: msg.details });
 		},

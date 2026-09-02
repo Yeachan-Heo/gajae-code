@@ -1366,14 +1366,14 @@
 			"description": "How to drain follow-up messages after a turn completes",
 			"default": "one-at-a-time"
 		},
-		"interruptMode": {
+		"toolInterruptPolicy": {
 			"type": "string",
 			"enum": [
-				"immediate",
-				"wait"
+				"abort_tools",
+				"finish_tools"
 			],
-			"description": "When steering messages interrupt tool execution",
-			"default": "immediate"
+			"description": "Whether a steering message aborts the tools still running in the current batch (abort_tools) or lets them finish first (finish_tools). Never changes when a steer is consumed: it is always picked up at the next tool/turn boundary either way.",
+			"default": "abort_tools"
 		},
 		"busyPromptMode": {
 			"type": "string",

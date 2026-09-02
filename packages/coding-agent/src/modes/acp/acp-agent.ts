@@ -715,11 +715,11 @@ const ACP_CONFIG_OPTIONS = [
 		],
 	},
 	{
-		id: "interruptMode",
-		name: "Interrupt mode",
+		id: "toolInterruptPolicy",
+		name: "Tool interrupt policy",
 		options: [
-			{ value: "immediate", name: "Immediate" },
-			{ value: "wait", name: "Wait" },
+			{ value: "abort_tools", name: "Abort running tools" },
+			{ value: "finish_tools", name: "Finish running tools" },
 		],
 	},
 ] as const;
@@ -727,7 +727,7 @@ const ACP_CONFIG_OPTIONS = [
 const ACP_CONFIG_CONTROL_OPERATIONS: Record<string, string> = {
 	steeringMode: "queue.steering_mode.set",
 	followUpMode: "queue.follow_up_mode.set",
-	interruptMode: "queue.interrupt_mode.set",
+	toolInterruptPolicy: "queue.tool_interrupt_policy.set",
 };
 
 function configValues(query: unknown): Map<string, string> {

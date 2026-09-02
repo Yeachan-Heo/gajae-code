@@ -291,7 +291,7 @@ describe("autorouting typed settings contract", () => {
 		const cwd = path.join(root, "workspace");
 		await fs.mkdir(agentDir, { recursive: true });
 		await fs.mkdir(cwd, { recursive: true });
-		const config = "configSchemaVersion: 1\ntask:\n  autorouting:\n    enabled: false\n    preset: anthropic\n";
+		const config = "configSchemaVersion: 2\ntask:\n  autorouting:\n    enabled: false\n    preset: anthropic\n";
 		const configPath = path.join(agentDir, "config.yml");
 		await Bun.write(configPath, config);
 		try {

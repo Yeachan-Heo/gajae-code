@@ -5408,7 +5408,15 @@ export class Settings implements NotificationSettingsReader {
 		if (configuredVersion === CONFIG_SCHEMA_VERSION) return raw;
 		if (typeof configuredVersion === "number" && configuredVersion > CONFIG_SCHEMA_VERSION) return raw;
 
-		// Migration registry v0 -> v1.
+		// Migration registry v0 -> v1 -> v2. Every step is idempotent so a v1 file
+		// re-runs the v0 steps harmlessly on its way to v2.
+		// v2: interruptMode -> toolInterruptPolicy (immediate -> abort_tools, wait -> finish_tools).
+		if ("interruptMode" in raw) {
+			if (!("toolInterruptPolicy" in raw)) {
+				raw.toolInterruptPolicy = raw.interruptMode === "wait" ? "finish_tools" : "abort_tools";
+			}
+			delete raw.interruptMode;
+		}
 		// queueMode -> steeringMode
 		normalizeSessionDirectoryMigration(raw);
 		if ("queueMode" in raw && !("steeringMode" in raw)) {

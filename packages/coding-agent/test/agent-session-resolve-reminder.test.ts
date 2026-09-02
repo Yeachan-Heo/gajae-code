@@ -41,16 +41,10 @@ describe("AgentSession resolve reminder", () => {
 						{
 							getToolChoiceQueue: () => session.toolChoiceQueue,
 							buildToolChoice: (name: string) => buildNamedToolChoice(name, session.model!),
-							steer: (msg: { customType: string; content: string; details?: unknown }) =>
-								session.agent.steer({
-									role: "custom",
-									customType: msg.customType,
-									content: msg.content,
-									display: false,
-									details: msg.details,
-									attribution: "agent",
-									timestamp: Date.now(),
-								}),
+							sendCustomMessage: (
+								msg: { customType: string; content: string; details?: unknown },
+								opts?: { deliverAs?: "steer" | "followUp" },
+							) => session.sendCustomMessage({ ...msg, display: false, attribution: "agent" }, opts),
 						} as unknown as ToolSession,
 						{
 							label: "AST Edit: 1 replacement in 1 file",

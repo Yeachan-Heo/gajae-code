@@ -2244,8 +2244,8 @@ export class SelectorController {
 			case "followUpMode":
 				this.ctx.session.setFollowUpMode(value as "all" | "one-at-a-time");
 				break;
-			case "interruptMode":
-				this.ctx.session.setInterruptMode(value as "immediate" | "wait");
+			case "toolInterruptPolicy":
+				this.ctx.session.setToolInterruptPolicy(value as "abort_tools" | "finish_tools");
 				break;
 			case "thinkingLevel":
 			case "defaultThinkingLevel":

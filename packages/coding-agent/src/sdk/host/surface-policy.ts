@@ -34,7 +34,7 @@ const CONTROL_BINDINGS: Readonly<Record<string, string | undefined>> = {
 	"thinking.cycle": "cycleThinkingLevel",
 	"queue.steering_mode.set": "setQueueMode",
 	"queue.follow_up_mode.set": "setQueueMode",
-	"queue.interrupt_mode.set": "setQueueMode",
+	"queue.tool_interrupt_policy.set": "setQueueMode",
 	"todo.replace": "sdkControl",
 	"permission_mode.set": "sdkControl",
 	"skill.invoke": "invokeSkill",

@@ -590,7 +590,7 @@ describe("skipped tools without spans", () => {
 				model: mock.model,
 				convertToLlm: identityConverter,
 				telemetry: { tracer },
-				interruptMode: "immediate",
+				toolInterruptPolicy: "abort_tools",
 				getSteeringMessages: async () => {
 					// First call is at runLoopBody startup BEFORE any chat happens —
 					// suppress it so the tools actually start. Return steering on the
@@ -655,7 +655,7 @@ describe("regressions: agent loop telemetry/run summary", () => {
 				model: mock.model,
 				convertToLlm: identityConverter,
 				telemetry: { tracer },
-				interruptMode: "immediate",
+				toolInterruptPolicy: "abort_tools",
 				getSteeringMessages: async () => {
 					callCount.n += 1;
 					// Pre-chat poll (call 1) returns nothing so tools start;

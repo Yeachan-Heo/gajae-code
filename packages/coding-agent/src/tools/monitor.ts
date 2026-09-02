@@ -229,19 +229,16 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 				);
 				pendingNotifications = MAX_PENDING_MONITOR_NOTIFICATIONS;
 			}
-			const sendPromise = this.session.sendCustomMessage?.(
-				{ customType: "task-notification", content, display: false, attribution: "agent", details },
-				{ triggerTurn: true, deliverAs: "followUp" },
-			);
-			if (sendPromise) {
-				void sendPromise.catch(error => {
+			void this.session
+				.sendCustomMessage?.(
+					{ customType: "task-notification", content, display: false, attribution: "agent", details },
+					{ triggerTurn: true, deliverAs: "followUp" },
+				)
+				?.catch(error => {
 					logger.warn("Monitor task-notification delivery failed", {
 						error: error instanceof Error ? error.message : String(error),
 					});
 				});
-			} else {
-				this.session.steer?.({ customType: "task-notification", content, details });
-			}
 		};
 		const schedulePersistentNotification = (line: string) => {
 			latestLine = line;

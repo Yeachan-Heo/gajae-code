@@ -232,10 +232,10 @@ describe("fold red-team: live session duplicate notice/wake", () => {
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [waitTool], messages: [] },
-			// The production session constructs the Agent with interruptMode
+			// The production session constructs the Agent with toolInterruptPolicy
 			// "immediate" (the in-tool steering poll); mirror it so the probe
 			// exercises the real steer-during-execution path.
-			interruptMode: "immediate",
+			toolInterruptPolicy: "abort_tools",
 			steeringMode: "one-at-a-time",
 			streamFn: mock.stream,
 		});

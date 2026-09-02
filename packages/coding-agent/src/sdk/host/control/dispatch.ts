@@ -291,8 +291,8 @@ function invoke(
 			return surface.setQueueMode("steering", input.mode);
 		case "queue.follow_up_mode.set":
 			return surface.setQueueMode("follow_up", input.mode);
-		case "queue.interrupt_mode.set":
-			return surface.setQueueMode("interrupt", input.mode);
+		case "queue.tool_interrupt_policy.set":
+			return surface.setQueueMode("tool_interrupt", input.mode);
 		case "compaction.run":
 			return surface.runCompaction();
 		case "compaction.auto.set":

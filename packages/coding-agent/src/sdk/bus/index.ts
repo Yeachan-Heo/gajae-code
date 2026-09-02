@@ -3526,7 +3526,7 @@ function sdkControlSurface(
 		setQueueMode: (kind, mode) => {
 			if (!bindings.has("setQueueMode"))
 				return unavailable(`queue.${kind}_mode.set`, "no session queue-mode seam is installed")();
-			if (!ctx.setQueueMode(kind as "steering" | "follow_up" | "interrupt", mode))
+			if (!ctx.setQueueMode(kind as "steering" | "follow_up" | "tool_interrupt", mode))
 				throw Object.assign(new Error("Invalid queue mode."), { code: "invalid_input" });
 			return { changed: true };
 		},

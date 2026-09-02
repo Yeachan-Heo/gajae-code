@@ -91,7 +91,7 @@ const controls = [
 	["permission_mode.set", "Set permission mode."],
 	["queue.steering_mode.set", "Set steering queue mode."],
 	["queue.follow_up_mode.set", "Set follow-up queue mode."],
-	["queue.interrupt_mode.set", "Set interrupt queue mode."],
+	["queue.tool_interrupt_policy.set", "Set whether a steer aborts or finishes in-flight tools."],
 	["compaction.run", "Run context compaction."],
 	["compaction.auto.set", "Set automatic compaction."],
 	["retry.auto.set", "Set automatic retry."],

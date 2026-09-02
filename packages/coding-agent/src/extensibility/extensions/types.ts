@@ -511,7 +511,7 @@ export interface ExtensionContext {
 	/** Run a control-surface mutation inside the session admission boundary. */
 	withSdkControlMutation?<T>(body: () => Promise<T>): Promise<T>;
 	cycleThinkingLevel(): ThinkingLevel | undefined;
-	setQueueMode(kind: "steering" | "follow_up" | "interrupt", mode: unknown): boolean;
+	setQueueMode(kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown): boolean;
 	getSkillState(): unknown;
 	getConfigItems(): unknown;
 	getBranchCandidates(): unknown;
@@ -1672,7 +1672,7 @@ export interface ExtensionContextActions {
 	getActiveModelProfile?: () => string | undefined;
 	withSdkControlMutation?: <T>(body: () => Promise<T>) => Promise<T>;
 	cycleThinkingLevel?: () => ThinkingLevel | undefined;
-	setQueueMode?: (kind: "steering" | "follow_up" | "interrupt", mode: unknown) => boolean;
+	setQueueMode?: (kind: "steering" | "follow_up" | "tool_interrupt", mode: unknown) => boolean;
 	getSkillState?: () => unknown;
 	getConfigItems?: () => unknown;
 	getBranchCandidates?: () => unknown;

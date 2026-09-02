@@ -623,7 +623,7 @@ describe("autorouting boundary red-team: config and panel atomicity", () => {
 		await mkdir(agentDir, { recursive: true });
 		await mkdir(cwd, { recursive: true });
 		const config =
-			"# preserve\r\nconfigSchemaVersion: 1\r\ntask:\r\n  autorouting:\r\n    enabled: false\r\n    preset: anthropic\r\n\r\n";
+			"# preserve\r\nconfigSchemaVersion: 2\r\ntask:\r\n  autorouting:\r\n    enabled: false\r\n    preset: anthropic\r\n\r\n";
 		const configPath = path.join(agentDir, "config.yml");
 		await writeFile(configPath, config);
 		const settings = await Settings.loadForScope({ cwd, agentDir });

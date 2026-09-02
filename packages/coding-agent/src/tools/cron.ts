@@ -453,13 +453,10 @@ function deliverCronFire(record: CronScheduleRecord): Promise<void> | undefined 
 		cron_expression: record.snapshot.cron_expression,
 		recurring: record.snapshot.recurring,
 	};
-	const sendPromise = record.session.sendCustomMessage?.(
+	return record.session.sendCustomMessage?.(
 		{ customType: "cron-fire", content, display: false, attribution: "agent", details },
 		{ triggerTurn: true, deliverAs: "followUp" },
 	);
-	if (sendPromise) return sendPromise;
-	record.session.steer?.({ customType: "cron-fire", content, details });
-	return undefined;
 }
 
 function scheduleRecord(ownerId: string | undefined, state: OwnerScheduleState, record: CronScheduleRecord): void {

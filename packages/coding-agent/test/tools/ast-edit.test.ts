@@ -101,7 +101,6 @@ describe("ast_edit tool schema", () => {
 				createTestSession(tempDir, {
 					getToolChoiceQueue: () => queue,
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
-					steer: () => {},
 				}),
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
@@ -146,7 +145,6 @@ describe("ast_edit tool schema", () => {
 				createTestSession(tempDir, {
 					getToolChoiceQueue: () => queue,
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
-					steer: () => {},
 				}),
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
@@ -196,7 +194,6 @@ describe("ast_edit tool schema", () => {
 				createTestSession(tempDir, {
 					getToolChoiceQueue: () => queue,
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
-					steer: () => {},
 				}),
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");
@@ -252,7 +249,6 @@ describe("ast_edit tool schema", () => {
 				createTestSession(tempDir, {
 					getToolChoiceQueue: () => queue,
 					buildToolChoice: () => ({ type: "tool" as const, name: "resolve" }),
-					steer: () => {},
 				}),
 			);
 			const tool = tools.find(entry => entry.name === "ast_edit");

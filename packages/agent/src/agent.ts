@@ -271,7 +271,7 @@ export interface AgentOptions {
 	 * - "immediate": check after each tool call (default)
 	 * - "wait": defer steering until the current turn completes
 	 */
-	interruptMode?: "immediate" | "wait";
+	toolInterruptPolicy?: "abort_tools" | "finish_tools";
 	/** Cooperative pause checkpoint passed through to AgentLoopConfig.shouldPause. */
 	shouldPause?: AgentLoopConfig["shouldPause"];
 
@@ -489,9 +489,10 @@ export class Agent {
 	#steeringWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
+	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
-	#interruptMode: "immediate" | "wait";
+	#toolInterruptPolicy: "abort_tools" | "finish_tools";
 	#sessionId?: string;
 	#providerSessionId?: string;
 	#metadata?: Record<string, unknown>;
@@ -600,7 +601,7 @@ export class Agent {
 		this.#transformContext = opts.transformContext;
 		this.#steeringMode = opts.steeringMode || "one-at-a-time";
 		this.#followUpMode = opts.followUpMode || "one-at-a-time";
-		this.#interruptMode = opts.interruptMode || "immediate";
+		this.#toolInterruptPolicy = opts.toolInterruptPolicy || "abort_tools";
 		this.streamFn = opts.streamFn || streamSimple;
 		this.#sessionId = opts.sessionId;
 		this.#providerSessionId = opts.providerSessionId;
@@ -1137,12 +1138,12 @@ export class Agent {
 		return this.#followUpMode;
 	}
 
-	setInterruptMode(mode: "immediate" | "wait") {
-		this.#interruptMode = mode;
+	setToolInterruptPolicy(policy: "abort_tools" | "finish_tools") {
+		this.#toolInterruptPolicy = policy;
 	}
 
-	getInterruptMode(): "immediate" | "wait" {
-		return this.#interruptMode;
+	getToolInterruptPolicy(): "abort_tools" | "finish_tools" {
+		return this.#toolInterruptPolicy;
 	}
 
 	setTools(t: AgentTool<any>[]) {
@@ -1199,24 +1200,26 @@ export class Agent {
 	 * its signal is not aborted, so a steer can never be orphaned in the queue
 	 * waiting for whichever unrelated run polls next.
 	 */
-	steer(m: AgentMessage): SteerAdmission {
+	steer(m: AgentMessage, options?: { forceOneAtATime?: boolean }): SteerAdmission {
 		assertUserImagePlaceholdersHavePayload([m]);
 		const runId = this.#activeRunId;
 		if (runId === undefined || !this.#state.isStreaming) return { admitted: false, reason: "idle" };
 		if (this.#abortController?.signal.aborted) return { admitted: false, reason: "aborting" };
+		if (options?.forceOneAtATime) this.#steeringForceOneAtATime.add(m);
 		this.#steeringQueue.push(m);
 		for (const notify of [...this.#steeringWaiters]) notify();
 		return { admitted: true, runId };
 	}
 
 	/**
-	 * Resolves when a steering message is queued (or is already queued), or when
-	 * `signal` aborts. The queue is not consumed. Long observation tools use this
+	 * Resolves when a steering message is admitted AFTER this wait started, or
+	 * when `signal` aborts. The queue is not consumed and a message already
+	 * queued before the wait does not resolve it. Long observation tools use this
 	 * to end their wait early so a busy user message is handled at the next tool
 	 * boundary instead of after the full wait window.
 	 */
 	waitForSteeringArrival(signal: AbortSignal): Promise<void> {
-		if (this.#steeringQueue.length > 0 || signal.aborted) return Promise.resolve();
+		if (signal.aborted) return Promise.resolve();
 		const { promise, resolve } = Promise.withResolvers<void>();
 		let settled = false;
 		const settle = () => {
@@ -1228,7 +1231,6 @@ export class Agent {
 		};
 		this.#steeringWaiters.add(settle);
 		signal.addEventListener("abort", settle, { once: true });
-		if (this.#steeringQueue.length > 0 || signal.aborted) settle();
 		return promise;
 	}
 
@@ -1329,8 +1331,18 @@ export class Agent {
 			}
 			return [];
 		}
-		const steering = this.#steeringQueue.slice();
-		this.#steeringQueue = [];
+		// "all" batches within ONE poll only; a per-message sequential mark still
+		// delivers that message on its own, mirroring the follow-up override.
+		const first = this.#steeringQueue[0];
+		if (!first) return [];
+		if (this.#steeringForceOneAtATime.has(first)) {
+			this.#steeringQueue = this.#steeringQueue.slice(1);
+			return [first];
+		}
+		const forcedIndex = this.#steeringQueue.findIndex(message => this.#steeringForceOneAtATime.has(message));
+		const takeCount = forcedIndex === -1 ? this.#steeringQueue.length : forcedIndex;
+		const steering = this.#steeringQueue.slice(0, takeCount);
+		this.#steeringQueue = this.#steeringQueue.slice(takeCount);
 		return steering;
 	}
 
@@ -1879,7 +1891,7 @@ export class Agent {
 			repetitionPenalty: this.#repetitionPenalty,
 			serviceTier: this.#serviceTier,
 			hideThinkingSummary: this.#hideThinkingSummary,
-			interruptMode: this.#interruptMode,
+			toolInterruptPolicy: this.#toolInterruptPolicy,
 			sessionId: this.#sessionId,
 			providerSessionId: this.#providerSessionId,
 			metadata: this.#metadataResolver ? undefined : this.#metadata,

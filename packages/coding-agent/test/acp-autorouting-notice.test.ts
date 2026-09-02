@@ -114,13 +114,13 @@ async function waitForSession(agent: AcpAgent, cwd: string): Promise<{ sessionId
 	]);
 }
 
-const inactiveConfig = `configSchemaVersion: 1
+const inactiveConfig = `configSchemaVersion: 2
 task:
   autorouting:
     enabled: true
 `;
 
-const activeConfig = `configSchemaVersion: 1
+const activeConfig = `configSchemaVersion: 2
 task:
   autorouting:
     enabled: true
@@ -129,7 +129,7 @@ task:
         - anthropic/claude-sonnet-4
 `;
 
-const disabledConfig = `configSchemaVersion: 1
+const disabledConfig = `configSchemaVersion: 2
 task:
   autorouting:
     enabled: false
