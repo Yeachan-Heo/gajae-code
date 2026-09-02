@@ -446,7 +446,7 @@ describe("issue #4769: every writer is discovered by every reader", () => {
 		expect(report.actions.length).toBeGreaterThan(0);
 
 		const migratedPath = path.join(profile, "skills", "migrated-skill", "SKILL.md");
-		expect(await fs.readFile(migratedPath, "utf8")).toContain("migrated-skill");
+		expect(await Bun.file(migratedPath).text()).toContain("migrated-skill");
 
 		const { skills } = await loadSkills({ cwd: project });
 		expect(skills.map(skill => skill.name)).toContain("migrated-skill");
