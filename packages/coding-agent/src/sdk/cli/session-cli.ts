@@ -1486,7 +1486,7 @@ async function runLiveTail(
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
-										if (item.revision === undefined && checkpoint?.revision !== undefined) item.revision = checkpoint.revision;
+		if (item.revision === undefined && checkpoint?.revision !== undefined) item.revision = checkpoint.revision;
 		// If checkpoint was undefined, queue for later stamping? For now leave without rev
 		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, [item], include));
 	};
