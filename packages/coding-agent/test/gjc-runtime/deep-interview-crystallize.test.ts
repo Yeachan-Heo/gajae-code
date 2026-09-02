@@ -164,6 +164,20 @@ describe("deep-interview crystallize contract", () => {
 					prior: first,
 					resolved_open_gaps: ["What is the memory budget?"],
 					resolved_conflicts: ["The target is disputed."],
+					snapshot: (() => {
+						const snapshot: CrystalSnapshot = {
+							revision: 2,
+							start: 0,
+							end: 1,
+							messages: [
+								{ index: 0, role: "user", content: "Build a fast report." },
+								{ index: 1, role: "user", content: "What is the memory budget? The target is disputed." },
+							],
+							digest: "",
+						};
+						snapshot.digest = crystalSnapshotDigest(snapshot);
+						return snapshot;
+					})(),
 				}),
 				2,
 			),
