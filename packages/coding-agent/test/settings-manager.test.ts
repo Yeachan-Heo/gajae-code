@@ -581,6 +581,19 @@ describe("Settings", () => {
 		expect("interruptMode" in raw).toBe(false);
 	});
 
+	it("floors a malformed schema marker instead of re-running earlier migrations", async () => {
+		// A fractional marker must not be read as "unmigrated": the v0 ask.timeout
+		// conversion would re-divide an already-migrated value. Flooring 1.5 to 1
+		// runs only the v1 -> v2 step.
+		await writeSettings({ configSchemaVersion: 1.5, ask: { timeout: 3600 }, interruptMode: "wait" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		expect(settings.get("ask.timeout")).toBe(3600);
+		expect(settings.get("toolInterruptPolicy")).toBe("finish_tools");
+		const raw = await readSettings();
+		expect(raw.configSchemaVersion).toBe(2);
+		expect("interruptMode" in raw).toBe(false);
+	});
+
 	it("drops a malformed legacy interruptMode instead of coercing it", async () => {
 		await writeSettings({ interruptMode: "nonsense" });
 		const settings = await Settings.init({ cwd: projectDir, agentDir });

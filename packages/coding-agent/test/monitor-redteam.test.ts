@@ -27,7 +27,6 @@ function makeSession(ownerId: string, queue: QueuedMessage[], settings: Settings
 		getSessionSpawns: () => null,
 		getSessionId: () => `session-${ownerId}`,
 		getAgentId: () => ownerId,
-		steer: (msg: { customType: string; content: string; details?: unknown }) => queue.push(msg as QueuedMessage),
 		sendCustomMessage: async (msg: { customType: string; content: string; details?: unknown }) => {
 			queue.push(msg as QueuedMessage);
 		},

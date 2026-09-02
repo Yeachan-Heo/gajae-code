@@ -26,7 +26,9 @@ function createSession(options: {
 			exactNamed: options.exactNamed,
 			resolved: undefined,
 		}),
-		steer: (message: { customType: string; content: string; details?: unknown }) => options.steers?.push(message),
+		sendCustomMessage: async (message: { customType: string; content: string; details?: unknown }) => {
+			options.steers?.push(message);
+		},
 		...(options.standing
 			? {
 					peekStandingResolveHandler: () => options.standing?.current,

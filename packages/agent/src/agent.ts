@@ -546,7 +546,7 @@ export class Agent {
 	#onHarmonyLeak?: (event: HarmonyAuditEvent) => void | Promise<void>;
 	#onBeforeYield?: () => Promise<void> | void;
 	#shouldPause?: AgentLoopConfig["shouldPause"];
-	/** While set and returning true, steering is neither admitted nor dequeued. */
+	/** While set and returning true, the run does not DEQUEUE steering (admission is unaffected). */
 	#steeringAdmissionFence?: () => boolean;
 	#maintainContext?: AgentLoopConfig["maintainContext"];
 	#telemetry?: AgentLoopConfig["telemetry"];
@@ -952,7 +952,9 @@ export class Agent {
 	 * immediate-interrupt path), so a cooperative stop alone cannot prevent one
 	 * more old-turn model call once a steering message has already been dequeued.
 	 * While the fence returns true the poll yields no messages AND does not
-	 * dequeue, so the queue survives intact for the next turn.
+	 * dequeue, so the winding-down run cannot consume it. The message is not
+	 * retained past the run's terminal either: `agent_end.disownedSteering`
+	 * hands it to the owner, which re-routes it onto the next turn.
 	 */
 	setSteeringAdmissionFence(fn: (() => boolean) | undefined): void {
 		this.#steeringAdmissionFence = fn;
@@ -1994,8 +1996,8 @@ export class Agent {
 					return [];
 				}
 				// Fenced: yield nothing and dequeue nothing, so a steer submitted while a
-				// fold is being claimed is neither consumed by the run being wound down
-				// nor lost.
+				// fold is being claimed is not consumed by the run being wound down. It
+				// is not lost either: the terminal disowns it to the owner.
 				if (this.#steeringAdmissionFence?.() === true) {
 					return [];
 				}

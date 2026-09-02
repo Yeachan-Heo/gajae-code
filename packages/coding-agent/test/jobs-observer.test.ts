@@ -33,7 +33,6 @@ function createCronSession(ownerId = OWNER, delivery?: () => Promise<void>): Too
 		hasUI: false,
 		getSessionId: () => "test-session",
 		getAgentId: () => ownerId,
-		steer: () => {},
 		sendCustomMessage: async () => delivery?.(),
 		allocateOutputArtifact: async () => ({}),
 	} as unknown as ToolSession;

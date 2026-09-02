@@ -649,6 +649,49 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		expect(session.agent.hasQueuedSteering()).toBe(false);
 		await promptPromise;
 	}, 30_000);
+	it("narrows overlapping terminal dispositions monotonically at the run's single terminal", async () => {
+		// The two abort admissions of ONE live run compose into a single disposition
+		// consumed at that run's terminal. Settling the OLDER (looser) admission
+		// last must not widen the newer one: only steering admitted after the
+		// highest snapshot survives.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("late steer answered")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
+		const handle = session.agent.activeResourceRunId ?? "run";
+		// Abort A admitted first (looser: everything after its snapshot survives).
+		const tokenA = session.captureTerminalAbortSteeringSnapshot();
+		expect(tokenA).toBeDefined();
+		await session.sendUserMessage("between-A-and-B", { deliverAs: "steer" });
+		// Abort B admitted second (stricter: only steering after B survives).
+		const tokenB = session.captureTerminalAbortSteeringSnapshot();
+		expect(tokenB).toBeDefined();
+		await session.sendUserMessage("after-B", { deliverAs: "steer" });
+		expect(session.getQueuedMessages().steering).toEqual(["between-A-and-B", "after-B"]);
+
+		let followUpAtTerminal: readonly string[] | undefined;
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "agent_end" && followUpAtTerminal === undefined)
+				followUpAtTerminal = session.getQueuedMessages().followUp;
+		});
+		// B registers its (stricter) disposition, then A registers its looser one;
+		// the run is still live, so both compose before the terminal settles it.
+		await Promise.all([
+			session.abortPromptAndWait(handle, {
+				graceMs: TEST_ABORT_GRACE_MS,
+				terminal: { scope: "turn", steeringSnapshotToken: tokenB },
+			}),
+			session.abortPromptAndWait(handle, {
+				graceMs: TEST_ABORT_GRACE_MS,
+				terminal: { scope: "turn", steeringSnapshotToken: tokenA },
+			}),
+		]);
+		unsubscribe();
+		// Only the post-B steer survived: A's looser predicate could not widen B's.
+		expect(followUpAtTerminal).toEqual(["after-B"]);
+		expect(session.agent.snapshotSteering()).toEqual([]);
+		await promptPromise;
+	}, 30_000);
+
 	it("terminal abort keeps the queue display aligned with the disown decisions", async () => {
 		// Review thread P2: the display list must mirror what the run's disowned
 		// steering became — a purged internal steer disappears everywhere, and a

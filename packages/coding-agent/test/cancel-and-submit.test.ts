@@ -92,8 +92,10 @@ describe("AgentSession.cancelAndSubmit", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected bundled test model");
 		let streamCalls = 0;
-		const streamFn: StreamFn = (_requestedModel, _context, options) => {
+		const requests: AgentMessage[][] = [];
+		const streamFn: StreamFn = (_requestedModel, context, options) => {
 			streamCalls++;
+			requests.push([...(context.messages as AgentMessage[])]);
 			const stream = new AssistantMessageEventStream();
 			if (streamCalls > 1) {
 				queueMicrotask(() => {
@@ -130,7 +132,11 @@ describe("AgentSession.cancelAndSubmit", () => {
 			settings,
 			modelRegistry: new ModelRegistry(authStorage),
 		});
-		return { agent, session };
+		return {
+			agent,
+			session,
+			requestUserTexts: () => requests.map(messages => messages.filter(m => m.role === "user").map(messageText)),
+		};
 	}
 
 	async function waitForStreaming(s: AgentSession): Promise<void> {
@@ -227,7 +233,7 @@ describe("AgentSession.cancelAndSubmit", () => {
 		// R6: the aborted turn's admitted steers must stay STEERING of the
 		// replacement run (re-admitted after the replacement is answered), not be
 		// re-labelled as follow-ups drained one turn at a time.
-		const { agent, session: s } = buildGatedStreamingSession();
+		const { agent, session: s, requestUserTexts } = buildGatedStreamingSession();
 		const activePrompt = s.prompt("active stream");
 		await waitForStreaming(s);
 		let promoted = 0;
@@ -258,6 +264,20 @@ describe("AgentSession.cancelAndSubmit", () => {
 		await s.waitForIdle();
 
 		expect(steeringAtReplacementStart).toEqual(["steer-A", "steer-B"]);
+		// The replacement's OPENING request must carry only its own prompt (this is
+		// what skipInitialSteeringPoll buys); the restored steers arrive together in
+		// a later request of the same run.
+		const contexts = requestUserTexts();
+		const opening = contexts.findIndex(texts => texts.includes("send now"));
+		expect(opening).toBeGreaterThanOrEqual(0);
+		expect(contexts[opening]).not.toContain("steer-A");
+		expect(contexts[opening]).not.toContain("steer-B");
+		// Both restored steers are delivered by later requests of the same run, in
+		// submission order (this session runs the default one-at-a-time mode).
+		const firstSteer = contexts.findIndex(texts => texts.includes("steer-A"));
+		const secondSteer = contexts.findIndex(texts => texts.includes("steer-B"));
+		expect(firstSteer).toBeGreaterThan(opening);
+		expect(secondSteer).toBeGreaterThanOrEqual(firstSteer);
 		const texts = agent.state.messages.map(messageText);
 		expect(texts).toContain("send now");
 		expect(texts.indexOf("send now")).toBeLessThan(texts.indexOf("steer-A"));

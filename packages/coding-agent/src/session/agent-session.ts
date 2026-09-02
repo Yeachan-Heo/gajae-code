@@ -13145,7 +13145,22 @@ export class AgentSession {
 			this.#assertNoHandoffTransition();
 			const sequential = options.steerQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined;
 			if (!this.agent.steer(appMessage, sequential).admitted) {
+				// No live run to steer. A terminally aborted turn retains its
+				// continuation fence, so a queued delivery scheduled under that
+				// lineage would be skipped as terminal_turn and stranded. Classify
+				// explicitly: an independently triggered message (triggerTurn) is a
+				// NEW root request and gets a fresh lineage; a message produced by the
+				// aborted turn's own machinery (a preview/plan reminder) is dropped
+				// with its removal disposition instead of leaking into a later turn.
+				if (this.#isTurnContinuationBlocked()) {
+					if (options.triggerTurn !== true) {
+						this.#settleDeliveredOwnedRegistrations([appMessage]);
+						return;
+					}
+					this.#resumeFromOwnedCompletion();
+				}
 				this.agent.followUp(appMessage, { forceOneAtATime: true });
+				this.#externalFollowUps.add(appMessage);
 				this.#scheduleQueuedDelivery();
 			}
 			return;

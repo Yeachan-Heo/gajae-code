@@ -5407,12 +5407,27 @@ export class Settings implements NotificationSettingsReader {
 		const configuredVersion = raw.configSchemaVersion;
 		if (configuredVersion === CONFIG_SCHEMA_VERSION) return raw;
 		if (typeof configuredVersion === "number" && configuredVersion > CONFIG_SCHEMA_VERSION) return raw;
+		// A malformed marker (fractional, negative, non-finite) still has to be
+		// ordered against the registry, and guessing "unmigrated" would re-run the
+		// non-idempotent v0 steps over already-migrated values. Floor it to the
+		// nearest completed version instead, and report the malformed input.
+		const malformedVersion =
+			configuredVersion !== undefined &&
+			(typeof configuredVersion !== "number" || !Number.isInteger(configuredVersion) || configuredVersion < 0);
+		if (malformedVersion) {
+			logger.warn("Settings: config has a malformed configSchemaVersion; migrating from the floored version", {
+				configSchemaVersion: String(configuredVersion),
+			});
+		}
 
 		// Ordered migration registry. Each step runs ONLY for files below its
 		// target version: the v0 steps are not all idempotent (ask.timeout's
 		// milliseconds-to-seconds conversion would re-divide a valid v1 value),
 		// so a v1 file must skip straight to the v2 step.
-		const fromVersion = typeof configuredVersion === "number" ? configuredVersion : 0;
+		const fromVersion =
+			typeof configuredVersion === "number" && Number.isFinite(configuredVersion)
+				? Math.max(0, Math.floor(configuredVersion))
+				: 0;
 		if (fromVersion < 1) this.#migrateRawSettingsV0ToV1(raw);
 		// v1 -> v2: interruptMode -> toolInterruptPolicy.
 		if (fromVersion < 2 && "interruptMode" in raw) {

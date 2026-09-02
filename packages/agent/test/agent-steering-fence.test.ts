@@ -91,7 +91,8 @@ describe("Agent steering admission fence", () => {
 		const disowned: string[] = [];
 		h.agent.subscribe(event => {
 			if (event.type === "agent_end")
-				for (const message of event.disownedSteering ?? []) disowned.push(String(message.content));
+				for (const message of event.disownedSteering ?? [])
+					disowned.push(message.role === "user" ? String(message.content) : message.role);
 		});
 		const run = h.agent.prompt("run tool");
 		await h.entered;
