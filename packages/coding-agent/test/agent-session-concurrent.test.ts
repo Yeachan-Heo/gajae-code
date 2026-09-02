@@ -117,7 +117,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Start first prompt (don't await, it will block until abort)
 		const firstPrompt = session.prompt("First message");
 
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// Second prompt should reject
 		await expect(session.prompt("Second message")).rejects.toBeInstanceOf(AgentBusyError);
@@ -211,7 +211,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// steer should work while streaming. Capture the queued state before
 		// awaiting steer(): async steering may immediately resume/consume the
@@ -230,7 +230,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// followUp should work while streaming
 		expect(() => session.followUp("Follow-up message")).not.toThrow();
@@ -246,7 +246,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start first prompt (blocks until abort)
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// With no explicit deliverAs, a busy session should queue as steering
 		// rather than throw AgentBusyError.
@@ -264,7 +264,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		expect(session.isStreaming).toBe(false);
 		const send = session.sendUserMessage("Idle message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 		expect(session.queuedMessageCount).toBe(0);
 
 		// Cleanup
@@ -701,7 +701,7 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		// Start a turn that blocks until abort.
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// The exact crash path: SDK steering during an active turn with absent content.
 		// Previously this threw TypeError synchronously inside the promise, crashing the
@@ -838,7 +838,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		});
 
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// Mirrors the todo_write failure reminder: hidden, agent-attributed, and
 		// explicitly not triggering a turn of its own.
@@ -874,7 +874,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		await createSession();
 
 		const firstPrompt = session.prompt("First message");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		session.sendCustomMessage(
 			{
@@ -1012,15 +1012,17 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(appendOnly).not.toBeUndefined();
 		appendOnly?.syncMessages([{ role: "user", content: "switch-provider-marker" }]);
 		expect(appendOnly?.log.length).toBe(1);
+		// Idle session: a steer has no live run to be admitted into, so the
+		// session routes it as a follow-up owned by the next turn.
 		await session.steer("pre-switch steering");
-		expect(session.getQueuedMessages().steering).toEqual(["pre-switch steering"]);
-		expect(agent.snapshotSteering()).toHaveLength(1);
+		expect(session.getQueuedMessages().followUp).toEqual(["pre-switch steering"]);
+		expect(agent.snapshotFollowUp()).toHaveLength(1);
 
 		expect(await session.switchSession(targetSessionFile)).toBe(true);
 		expect(appendOnly?.log.length).toBe(0);
 
-		expect(session.getQueuedMessages().steering).toEqual(["queued by switch hook"]);
-		expect(agent.snapshotSteering()).toHaveLength(1);
+		expect(session.getQueuedMessages().followUp).toEqual(["queued by switch hook"]);
+		expect(agent.snapshotFollowUp()).toHaveLength(1);
 	});
 
 	// Regression: a subscriber that fires the next prompt synchronously from the
@@ -1593,7 +1595,7 @@ describe("AgentSession TTSR resume gate", () => {
 
 		// Start prompt (will trigger TTSR and create resume gate)
 		const promptPromise = session.prompt("Write some Rust code");
-		await waitFor(() => session.isStreaming);
+		await waitFor(() => session.agent.state.isStreaming);
 
 		// Abort session — prompt() should unblock
 		await session.abort();

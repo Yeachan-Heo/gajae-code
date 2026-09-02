@@ -273,8 +273,9 @@ describe("AgentSession deep-interview continuation", () => {
 		await emitAssistantStop(300);
 		expect(continueSpy).toHaveBeenCalledTimes(2);
 
+		// Idle session: the steer is routed as a follow-up owned by the next turn.
 		await session.steer("keep interviewing");
-		const [queued] = session.agent.snapshotSteering();
+		const [queued] = session.agent.snapshotFollowUp();
 		if (queued?.role !== "user") throw new Error("Expected queued user message");
 		session.agent.emitExternalEvent({ type: "turn_start" });
 		session.agent.emitExternalEvent({ type: "message_start", message: queued });
@@ -292,19 +293,20 @@ describe("AgentSession deep-interview continuation", () => {
 		await activateWorkflow("deep-interview");
 		const continued = Promise.withResolvers<void>();
 		const continueSpy = vi.spyOn(session.agent, "continue").mockImplementation(async () => continued.resolve());
+		// Idle session: steers are routed as sequential follow-ups owned by the next turns.
 		await session.steer("steer A");
 		await session.steer("steer B");
-		const [first, second] = session.agent.snapshotSteering();
+		const [first, second] = session.agent.snapshotFollowUp();
 		if (!first || !second) throw new Error("Expected two queued steering messages");
 
 		await deliverQueuedUserTurn(first);
-		expect(session.getQueuedMessages().steering).toEqual(["steer B"]);
+		expect(session.getQueuedMessages().followUp).toEqual(["steer B"]);
 		await emitTerminalStopAfterDeepInterviewCheck({ ...createAssistantMessage("A stopped."), timestamp: 1 });
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(developerReminders()).toHaveLength(0);
 
 		await deliverQueuedUserTurn(second);
-		expect(session.getQueuedMessages().steering).toEqual([]);
+		expect(session.getQueuedMessages().followUp).toEqual([]);
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(developerReminders()).toHaveLength(0);
 		await emitTerminalStopAfterDeepInterviewCheck({ ...createAssistantMessage("B stopped."), timestamp: 2 });
@@ -423,7 +425,7 @@ describe("AgentSession deep-interview continuation", () => {
 		const continuationCalls = continueSpy.mock.calls.length;
 		const queuedContinuationCalls = continueQueuedSpy.mock.calls.length;
 
-		const [queued] = session.agent.snapshotSteering();
+		const [queued] = session.agent.snapshotFollowUp();
 		if (queued?.role !== "user") throw new Error("Expected queued user message");
 		session.agent.emitExternalEvent({ type: "turn_start" });
 		session.agent.emitExternalEvent({ type: "message_start", message: queued });
@@ -725,18 +727,19 @@ describe("AgentSession deep-interview continuation", () => {
 		}
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 		expect(continueSpy).toHaveBeenCalledTimes(2);
-		expect(continueQueuedSpy).toHaveBeenCalledTimes(5);
-		expect(session.getQueuedMessages().steering).toEqual([
+		expect(continueQueuedSpy).toHaveBeenCalledTimes(6);
+		// The session reports streaming but no agent run is live, so every steer is
+		// refused at admission and routed as a follow-up in submission order.
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		expect(session.getQueuedMessages().followUp).toEqual([
 			"synthetic",
+			"agent-attributed",
 			"stream-steer",
+			"stream-follow-up",
 			"busy-default",
 			"explicit-steer",
-			"public-steer",
-		]);
-		expect(session.getQueuedMessages().followUp).toEqual([
-			"agent-attributed",
-			"stream-follow-up",
 			"explicit-follow-up",
+			"public-steer",
 			"public-follow-up",
 		]);
 	});

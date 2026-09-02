@@ -29,24 +29,27 @@ const isTask = (taskId: string) => (m: CustomMessage) =>
 describe("AgentSession purgeQueuedCustomMessages", () => {
 	it("purges executable followUp and steer queues while preserving unrelated order", async () => {
 		const { agent, session } = await createSession();
-		agent.steer({
-			role: "custom",
-			customType: "task-notification",
-			content: "drop steer",
-			display: false,
-			details: { taskId: "bg_1", __pendingDisplayTag: "s1" },
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
-		agent.steer({
-			role: "custom",
-			customType: "task-notification",
-			content: "keep steer",
-			display: false,
-			details: { taskId: "bg_2", __pendingDisplayTag: "s2" },
-			attribution: "agent",
-			timestamp: Date.now(),
-		});
+		// Seed the steering queue directly: steer() only admits into a live run.
+		agent.restoreSteering([
+			{
+				role: "custom",
+				customType: "task-notification",
+				content: "drop steer",
+				display: false,
+				details: { taskId: "bg_1", __pendingDisplayTag: "s1" },
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+			{
+				role: "custom",
+				customType: "task-notification",
+				content: "keep steer",
+				display: false,
+				details: { taskId: "bg_2", __pendingDisplayTag: "s2" },
+				attribution: "agent",
+				timestamp: Date.now(),
+			},
+		]);
 		agent.followUp({
 			role: "custom",
 			customType: "task-notification",

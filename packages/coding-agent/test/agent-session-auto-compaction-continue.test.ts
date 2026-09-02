@@ -520,12 +520,15 @@ describe("AgentSession auto-compaction continuation", () => {
 
 		sessionManager.appendMessage({ role: "user", content: "resumable boundary", timestamp: Date.now() - 1 });
 		session.agent.appendMessage({ role: "user", content: "resumable boundary", timestamp: Date.now() - 1 });
-		session.agent.steer({
-			role: "user",
-			content: [{ type: "text", text: "Queued steer" }],
-			attribution: "user",
-			timestamp: Date.now(),
-		});
+		// Seed the steering queue directly: steer() only admits into a live run.
+		session.agent.restoreSteering([
+			{
+				role: "user",
+				content: [{ type: "text", text: "Queued steer" }],
+				attribution: "user",
+				timestamp: Date.now(),
+			},
+		]);
 		const overflow = assistantMessage({
 			stopReason: "error",
 			errorMessage: "prompt is too long: 1000001 tokens > 1000000 maximum",

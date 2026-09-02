@@ -2775,16 +2775,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return m ? buildNamedToolChoice(name, m) : undefined;
 			},
 			buildToolChoiceResult: name => buildNamedToolChoiceResult(name, session.model),
-			steer: msg =>
-				session.agent.steer({
-					role: "custom",
-					customType: msg.customType,
-					content: msg.content,
-					display: false,
-					details: msg.details,
-					attribution: "agent",
-					timestamp: Date.now(),
-				}),
+			steer: msg => {
+				void session
+					.sendCustomMessage(
+						{
+							customType: msg.customType,
+							content: msg.content,
+							display: false,
+							details: msg.details,
+							attribution: "agent",
+						},
+						{ deliverAs: "steer" },
+					)
+					.catch(error => {
+						logger.warn("ToolSession.steer delivery failed", {
+							customType: msg.customType,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					});
+			},
 			sendCustomMessage: (msg, opts) => session.sendCustomMessage(msg, opts),
 			purgeQueuedCustomMessages: predicate => session.purgeQueuedCustomMessages(predicate),
 			peekQueueInvoker: () => session.peekQueueInvoker(),

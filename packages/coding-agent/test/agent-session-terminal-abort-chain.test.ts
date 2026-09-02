@@ -578,13 +578,14 @@ describe("terminal abort registers a turn scope so left-running owned work class
 	}, 30_000);
 
 	it("terminal abort blocks client steering admitted before the abort snapshot", async () => {
-		// Review thread P1: an SDK steer queued BEFORE the terminal abort begins
-		// is an accepted-pre-close continuation of the aborted attempt, which
-		// the terminal-abort contract requires to be blocked — the abort exits
-		// the loop and only rearms follow-ups, so a stale steer would otherwise
-		// remain queued and alter the next prompt.
-		scriptedResponses = [stopReply("ok")];
-		await session.prompt("first turn");
+		// Review thread P1: an SDK steer admitted into the live turn BEFORE the
+		// terminal abort begins is an accepted-pre-close continuation of the
+		// aborted attempt, which the terminal-abort contract requires to be
+		// blocked — the abort exits the loop and only rearms post-snapshot
+		// steers, so a stale steer would otherwise alter the next prompt.
+		scriptedResponses = [bashCall("sleep 2", "call_hold_turn"), stopReply("unused")];
+		const promptPromise = session.prompt("hold the turn").catch(() => {});
+		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		await session.sendUserMessage("pre-abort steer", { deliverAs: "steer" });
 		expect(session.agent.hasQueuedSteering()).toBe(true);
 		await session.abortPromptAndWait(session.agent.activeResourceRunId ?? "run", {
@@ -592,6 +593,22 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			terminal: { scope: "turn" },
 		});
 		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		await promptPromise;
+	}, 20_000);
+
+	it("refuses a steer at admission when no turn is live instead of parking it for the next abort", async () => {
+		// Enqueue-time admission: with the turn already finished there is no run
+		// to steer, so the session routes the request as a follow-up owned by
+		// the next turn — never as steering the terminal-abort purge has to
+		// reason about.
+		scriptedResponses = [stopReply("ok"), stopReply("delivered")];
+		await session.prompt("first turn");
+		await session.sendUserMessage("post-turn steer", { deliverAs: "steer" });
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		await waitFor(() => !session.agent.hasQueuedMessages(), "post-turn steer delivered as its own turn");
+		await session.waitForIdle();
+		expect(session.agent.state.messages.filter(m => m.role === "assistant")).toHaveLength(2);
 	}, 20_000);
 
 	it("terminal abort keeps each abort's steering snapshot scoped to its own admission", async () => {
@@ -641,15 +658,13 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		const promptPromise = session.prompt("hold the turn").catch(() => {});
 		await waitFor(() => session.agent.activeResourceRunId !== undefined, "active run handle");
 		const handle = session.agent.activeResourceRunId;
-		// Settle the hold turn's abort first so the queue state is stable (no
-		// live loop to poll, and the terminal fence blocks idle auto-continues).
-		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
-		// An internal steer queued just before the abort wins: purged with the
-		// aborted turn's other continuations.
+		// An internal steer admitted into the live turn before the abort wins:
+		// purged with the aborted turn's other continuations.
 		await session.steer("stale internal steer");
 		// A client steer admitted after the abort admission snapshot: preserved.
 		session.captureTerminalAbortSteeringSnapshot();
 		await session.sendUserMessage("client steer", { deliverAs: "steer" });
+		expect(session.getQueuedMessages().steering).toEqual(["stale internal steer", "client steer"]);
 		await session.abortPromptAndWait(handle ?? "run", { graceMs: TEST_ABORT_GRACE_MS, terminal: { scope: "turn" } });
 		const queued = session.getQueuedMessages();
 		expect(queued.steering).toEqual(["client steer"]);

@@ -500,19 +500,24 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(await s.cancelAndSubmit("send now again")).toEqual({ kind: "refused", reason: "duplicate" });
 		deferred.resolve({ kind: "timeout" });
 		await expect(first).resolves.toEqual({ kind: "rolled_back", outcome: { kind: "timeout" } });
+		// No live run: the steer submitted during the atomic window is not
+		// admitted as steering and lands in the follow-up queue instead.
 		expect(stores(s)).toEqual({
 			...before,
-			agent: { ...before.agent, steering: [...before.agent.steering, "queued during atomic window"] },
-			display: { ...before.display, steering: [...before.display.steering, "queued during atomic window"] },
+			agent: { ...before.agent, followUp: [...before.agent.followUp, "queued during atomic window"] },
+			display: { ...before.display, followUp: [...before.display.followUp, "queued during atomic window"] },
 		});
 	});
 
-	it("no live token × steer-on-interrupt remains unchanged", async () => {
+	it("no live token × idle steer is refused at admission, not resumed by interrupt", async () => {
 		const { agent, session: s } = buildSession();
 		await s.prompt("seed");
 		await s.waitForIdle();
-		agent.steer({ role: "user", content: "idle steer", timestamp: 1 });
-		expect(s.hasQueuedSteering).toBe(true);
+		expect(agent.steer({ role: "user", content: "idle steer", timestamp: 1 })).toEqual({
+			admitted: false,
+			reason: "idle",
+		});
+		expect(s.hasQueuedSteering).toBe(false);
 		await s.abort({ cause: "user_interrupt" });
 		await s.waitForIdle();
 		expect(agent.snapshotQueues().steering).toEqual([]);

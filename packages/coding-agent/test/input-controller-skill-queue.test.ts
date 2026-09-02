@@ -551,12 +551,14 @@ describe("AgentSession custom-role tag dequeue (E4-E7)", () => {
 		fixture = await createRealSession();
 		const { session } = fixture;
 
+		// Idle session: a steer has no live run to be admitted into, so it lands in
+		// the follow-up queue too; pop order still follows newest insertion.
 		await session.steer("first steer");
 		await session.followUp("latest follow-up");
 
 		expect(session.popLastQueuedMessage()).toBe("latest follow-up");
-		expect(session.getQueuedMessages().steering).toEqual(["first steer"]);
-		expect(session.getQueuedMessages().followUp).toEqual([]);
+		expect(session.getQueuedMessages().steering).toEqual([]);
+		expect(session.getQueuedMessages().followUp).toEqual(["first steer"]);
 
 		expect(session.popLastQueuedMessage()).toBe("first steer");
 		expect(session.getQueuedMessages().steering).toEqual([]);

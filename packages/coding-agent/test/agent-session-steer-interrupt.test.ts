@@ -82,22 +82,20 @@ describe("AgentSession steer-on-interrupt", () => {
 		}
 	}
 
-	it("resumes queued steering after a user interrupt", async () => {
+	it("a steer after the turn ended is never parked in the agent queue", async () => {
 		session = buildSession([{ content: ["first done"] }, { content: ["handled steering"] }]);
 
 		await promptAndWaitForAssistant(session, "first task");
 		expect(assistantCount(session)).toBe(1);
 
-		// User queues a steer, then interrupts.
-		session.agent.steer(userMessage("also handle the steer"));
-		expect(session.agent.hasQueuedSteering()).toBe(true);
+		// Enqueue-time admission: no live run, so the Agent refuses the steer
+		// instead of orphaning it for whichever run polls next.
+		expect(session.agent.steer(userMessage("also handle the steer"))).toEqual({ admitted: false, reason: "idle" });
+		expect(session.agent.hasQueuedSteering()).toBe(false);
 
 		await session.abort({ cause: "user_interrupt" });
 		await session.waitForIdle();
-
-		// The queued steering was drained and produced a second turn.
-		expect(session.agent.hasQueuedSteering()).toBe(false);
-		expect(assistantCount(session)).toBe(2);
+		expect(assistantCount(session)).toBe(1);
 	});
 
 	it("delivers a steer queued while the agent is idle without a user interrupt", async () => {
@@ -449,19 +447,72 @@ describe("AgentSession steer-on-interrupt", () => {
 		expect(stopReasons).toEqual(["toolUse", "stop"]);
 	});
 
-	it("does not resume queued steering after a non-user abort", async () => {
-		session = buildSession([{ content: ["first done"] }, { content: ["should not run"] }]);
+	it("routes an idle steer as the next turn instead of leaving it for an abort to resume", async () => {
+		session = buildSession([{ content: ["first done"] }, { content: ["delivered later"] }]);
 
 		await promptAndWaitForAssistant(session, "first task");
 		expect(assistantCount(session)).toBe(1);
 
-		session.agent.steer(userMessage("queued steer"));
-
-		// Default cause is a teardown/internal abort: must NOT resume.
-		await session.abort();
+		// Idle: the session routes the non-admitted steer as a follow-up owned by
+		// the next turn and auto-continues into it.
+		await session.steer("queued steer");
 		await session.waitForIdle();
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(assistantCount(session)).toBe(2);
+	});
 
-		expect(session.agent.hasQueuedSteering()).toBe(true);
-		expect(assistantCount(session)).toBe(1);
+	async function settle(s: AgentSession): Promise<void> {
+		for (let i = 0; i < 5; i++) {
+			await s.waitForIdle();
+			await Bun.sleep(20);
+		}
+		await s.waitForIdle();
+	}
+
+	// The unwind window: agent_end fired (agent idle) while the session still
+	// reports streaming. Every steer surface must behave the same here — none may
+	// leave an orphan in the Agent queue.
+	it("delivers a custom steer and a public steer identically during the post-prompt unwind", async () => {
+		for (const surface of ["custom", "public"] as const) {
+			const s = buildSession([{ content: ["p0"] }, { content: ["p1"] }]);
+			session = s;
+			let sessionStreamingAtAgentEnd: boolean | undefined;
+			const unsubscribe = s.agent.subscribe(event => {
+				if (event.type !== "agent_end" || sessionStreamingAtAgentEnd !== undefined) return;
+				sessionStreamingAtAgentEnd = s.isStreaming;
+				const send =
+					surface === "custom"
+						? s.sendCustomMessage(
+								{ customType: "test-steer", content: "in-unwind", display: false, attribution: "agent" },
+								{ deliverAs: "steer" },
+							)
+						: s.steer("in-unwind");
+				void send.catch(() => {});
+			});
+			await promptAndWaitForAssistant(s, "p0");
+			await settle(s);
+			unsubscribe();
+			expect(sessionStreamingAtAgentEnd, surface).toBe(true);
+			expect(s.agent.hasQueuedSteering(), surface).toBe(false);
+			expect(s.agent.hasQueuedMessages(), surface).toBe(false);
+			expect(assistantCount(s), surface).toBe(2);
+			await s.dispose();
+			session = undefined;
+		}
+	});
+
+	it("queues a steer-behavior prompt submitted during another prompt's preflight instead of refusing it", async () => {
+		session = buildSession([{ content: ["first"] }, { content: ["second"] }]);
+		const s = session;
+		const run = s.prompt("p0");
+		// No await: the agent is idle and p0 is still acquiring session admission.
+		expect(s.agent.state.isStreaming).toBe(false);
+		await s.prompt("steer-early", { streamingBehavior: "steer" });
+		await run;
+		await settle(s);
+		expect(s.agent.hasQueuedMessages()).toBe(false);
+		const userTexts = s.agent.state.messages.filter(m => m.role === "user").map(m => JSON.stringify(m.content));
+		expect(userTexts.some(t => t.includes("steer-early"))).toBe(true);
+		expect(assistantCount(s)).toBe(2);
 	});
 });

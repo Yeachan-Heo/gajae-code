@@ -11455,7 +11455,15 @@ export class AgentSession {
 
 		// If streaming, queue via steer() or followUp() based on option.
 		// Abort unwind is awaited above so a successor is not busy against leftover in-flight.
-		if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
+		// An explicit streamingBehavior submitted while another prompt still holds
+		// or awaits session admission (agent idle, session not yet live) is queued
+		// as well: entering admission behind that prompt would only get this
+		// message cancelled by the predecessor's preflight reset and lost.
+		const promptAdmissionContended =
+			options?.streamingBehavior !== undefined &&
+			(this.#activeSessionAdmission?.kind === "prompt" ||
+				this.#sessionAdmissionQueue.some(entry => entry.kind === "prompt"));
+		if ((this.#isLiveTurnBusy() || promptAdmissionContended) && !waitedForAbortUnwind) {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
@@ -11478,6 +11486,32 @@ export class AgentSession {
 		await this.#withSessionAdmission(
 			"prompt",
 			async admission => {
+				// A prompt that carries an explicit streamingBehavior and was admitted
+				// behind another prompt (that prompt reset the preflight generation
+				// while this one waited in the admission queue) is a busy submission:
+				// queue it against the now-live turn instead of cancelling it.
+				if (
+					options?.streamingBehavior !== undefined &&
+					this.#isPromptPreflightCancelled(admissionGeneration, admissionSignal) &&
+					options.preflightSignal?.aborted !== true &&
+					!this.#abortUnwind
+				) {
+					admission.release();
+					if (options.streamingBehavior === "followUp") {
+						await this.#queueFollowUp(expandedText, options?.images, {
+							forceOneAtATime: options.followUpQueuePolicy === "sequential",
+							claimsGenuineUserIntent,
+						});
+					} else {
+						await this.#queueSteer(expandedText, options?.images, { claimsGenuineUserIntent });
+					}
+					if (workflowIntentDiff) {
+						this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+					}
+					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					else options?.onPreflightAccepted?.();
+					return;
+				}
 				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
 				if (workflowIntentDiff) {
 					this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
@@ -12452,6 +12486,22 @@ export class AgentSession {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		// Enqueue-time admission: the Agent only accepts a steer into a live,
+		// non-aborted run. Anything else (idle, unwinding after agent_end, another
+		// prompt still in preflight, aborting) has no run to steer, so it is routed
+		// as a sequential follow-up owned by the next turn instead of being parked
+		// in a queue nobody owns.
+		const admission = this.agent.steer(message);
+		if (!admission.admitted) {
+			await this.#queueFollowUp(text, images, {
+				forceOneAtATime: true,
+				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
+				onPromoted: options?.onPromoted,
+				sdkRunToken: options?.sdkRunToken,
+			});
+			this.#scheduleNonAdmittedSteerContinuation();
+			return;
+		}
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
@@ -12463,25 +12513,25 @@ export class AgentSession {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
-		this.agent.steer(message);
-		// A live agent loop polls the steering queue at every tool/turn boundary
-		// and consumes this message on its own. But when a steer is queued while no
-		// loop is actively running — e.g. the session still reports busy only
-		// because a finished prompt is unwinding (deferred agent_end / post-prompt
-		// work) — nothing delivers it until the next explicit prompt or a
-		// user-interrupt abort, so it stalls until the user presses Esc. Schedule a
-		// continue so the steer is delivered promptly. A live loop (or an
-		// already-drained queue) makes the scheduled continue a no-op.
-		// During an abort unwind, the abort's single rearm owns this boundary. Letting
-		// each steer schedule its own continuation can start the first queued message
-		// before the rest of the unwind cohort is admitted, splitting an `all` batch.
-		if (!this.#cancelAndSubmitInProgress && this.#abortUnwind === undefined && this.#canAutoContinueForSteer()) {
-			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
-				rescheduleOnBusy: true,
-				continueQueuedOnly: true,
-			});
-		}
+	}
+
+	/**
+	 * A steer that was not admitted into a live run was requeued as a follow-up.
+	 * `#queueFollowUp` already schedules delivery when the session is idle; this
+	 * covers the unwind window where the session still reports busy only because
+	 * a finished prompt is unwinding (deferred agent_end / post-prompt work), so
+	 * the follow-up gate refuses while no loop actually owns the queue. A live
+	 * loop, a prompt still in preflight, or a drained queue makes the scheduled
+	 * continue a no-op.
+	 */
+	#scheduleNonAdmittedSteerContinuation(): void {
+		if (this.#cancelAndSubmitInProgress || !this.#canAutoContinueForSteer()) return;
+		if (this.#canAutoContinueForFollowUp()) return;
+		this.#scheduleAgentContinue({
+			shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedMessages(),
+			rescheduleOnBusy: true,
+			continueQueuedOnly: true,
+		});
 	}
 
 	/**
@@ -12955,8 +13005,14 @@ export class AgentSession {
 					appMessage,
 					options.followUpQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined,
 				);
-			} else {
-				this.agent.steer(appMessage);
+				return;
+			}
+			// Steer only into a live run. During the post-prompt unwind the session
+			// still reports streaming while no loop owns the queue, so a non-admitted
+			// steer becomes a sequential follow-up delivered by the next turn.
+			if (!this.agent.steer(appMessage).admitted) {
+				this.agent.followUp(appMessage, { forceOneAtATime: true });
+				this.#scheduleNonAdmittedSteerContinuation();
 			}
 			return;
 		}

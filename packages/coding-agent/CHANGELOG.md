@@ -22,6 +22,7 @@
 	applying to session-index rows so the #5181 crash class cannot recur.
 
 - GJC plugin TAR/TGZ installs now bound archive input and aggregate gzip expansion before extraction, preventing compressed bundles from exhausting memory while preserving valid concatenated gzip members.
+- Steering is now admitted only into a live agent run. A steer submitted when no run is live — after a turn ended, during the post-prompt unwind window where the session still reports streaming, while another prompt is in preflight, or while an abort is unwinding — is no longer parked in the Agent steering queue where it was invisible to the queue display and consumed by whichever unrelated later prompt polled it first (appearing turn after turn, or being drained silently by the first Esc). The session now routes such a steer as a sequential follow-up owned by the next turn and auto-continues into it, so `session.steer()`, `prompt(..., { streamingBehavior: "steer" })`, `sendUserMessage(..., { deliverAs: "steer" })`, `sendCustomMessage(..., { deliverAs: "steer" })`, SDK `turn.steer`, and `ToolSession.steer` all behave identically. A steer-behavior prompt submitted while another prompt is still acquiring session admission is queued against that prompt's turn instead of being rejected with `busy` and lost.
 
 ## [0.16.0] - 2026-09-02
 

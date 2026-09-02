@@ -20,9 +20,8 @@ function user(content: string) {
 describe("Agent queue predicate removal", () => {
 	it("removeQueuedMessages removes matching steer and follow-up messages while preserving order", () => {
 		const agent = new Agent();
-		agent.steer(user("keep-steer-1"));
-		agent.steer(custom("drop-steer", "bg_1"));
-		agent.steer(user("keep-steer-2"));
+		// Seed the queue directly: steer() only admits into a live run.
+		agent.restoreSteering([user("keep-steer-1"), custom("drop-steer", "bg_1"), user("keep-steer-2")]);
 		agent.followUp(custom("drop-follow", "bg_1"));
 		agent.followUp(user("keep-follow-1"));
 		agent.followUp(custom("keep-other", "bg_2"));

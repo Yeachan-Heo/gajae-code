@@ -454,6 +454,13 @@ export type AgentQueueSnapshot = {
 	followUp: AgentMessage[];
 };
 
+/**
+ * Result of `Agent.steer()`. A steer is admitted only into a live, non-aborted
+ * run; otherwise the message is NOT queued and the caller (the session) owns
+ * routing it — as a fresh prompt when idle, or after the unwind when aborting.
+ */
+export type SteerAdmission = { admitted: true; runId: number } | { admitted: false; reason: "idle" | "aborting" };
+
 export class Agent {
 	#state: AgentState = {
 		systemPrompt: [],
@@ -1187,11 +1194,19 @@ export class Agent {
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 * Delivered after current tool execution, skips remaining tools.
+	 *
+	 * Enqueue-time admission: the message is pushed only when a run is live and
+	 * its signal is not aborted, so a steer can never be orphaned in the queue
+	 * waiting for whichever unrelated run polls next.
 	 */
-	steer(m: AgentMessage) {
+	steer(m: AgentMessage): SteerAdmission {
 		assertUserImagePlaceholdersHavePayload([m]);
+		const runId = this.#activeRunId;
+		if (runId === undefined || !this.#state.isStreaming) return { admitted: false, reason: "idle" };
+		if (this.#abortController?.signal.aborted) return { admitted: false, reason: "aborting" };
 		this.#steeringQueue.push(m);
 		for (const notify of [...this.#steeringWaiters]) notify();
+		return { admitted: true, runId };
 	}
 
 	/**

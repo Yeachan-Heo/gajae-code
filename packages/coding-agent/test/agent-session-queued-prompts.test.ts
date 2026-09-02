@@ -146,7 +146,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		// Start the first turn but do not await — it blocks on the gate so the
 		// session stays busy while we queue.
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		// Queue two prompts as next-turn work (the "queue" busy behavior).
 		await session.prompt("p2", { streamingBehavior: "followUp" });
@@ -211,7 +211,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		session.setFollowUpMode("all");
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("p2", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
 		await session.prompt("p3", { streamingBehavior: "followUp", followUpQueuePolicy: "sequential" });
@@ -239,7 +239,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("steer me", { streamingBehavior: "steer" });
 		await session.prompt("queue me", { streamingBehavior: "followUp" });
@@ -271,7 +271,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("steer me", { streamingBehavior: "steer" });
 		await session.prompt("queue older", { streamingBehavior: "followUp" });
@@ -304,7 +304,7 @@ describe("AgentSession queued prompts (issue #434)", () => {
 		]);
 
 		const first = session.prompt("p1");
-		await waitUntil(() => session!.isStreaming);
+		await waitUntil(() => session!.agent.state.isStreaming);
 
 		await session.prompt("queue older", { streamingBehavior: "followUp" });
 		await session.prompt("queue newest", { streamingBehavior: "followUp" });
