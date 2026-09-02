@@ -500,6 +500,7 @@ export class Agent {
 	#steeringWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
+	#followUpBatches = new WeakMap<AgentMessage, readonly AgentMessage[]>();
 	#steeringForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
 	#followUpMode: "all" | "one-at-a-time";
@@ -1272,6 +1273,12 @@ export class Agent {
 		this.#followUpForceOneAtATime.add(m);
 	}
 
+	/** Preserve one atomic delivery cohort when messages are re-routed into the follow-up queue. */
+	markFollowUpBatch(messages: readonly AgentMessage[]): void {
+		const first = messages[0];
+		if (first && messages.length > 1) this.#followUpBatches.set(first, messages.slice());
+	}
+
 	clearSteeringQueue() {
 		this.#steeringQueue = [];
 	}
@@ -1360,17 +1367,21 @@ export class Agent {
 	}
 
 	#dequeueFollowUpMessages(): AgentMessage[] {
-		if (this.#followUpMode === "one-at-a-time") {
-			if (this.#followUpQueue.length > 0) {
-				const first = this.#followUpQueue[0];
-				this.#followUpQueue = this.#followUpQueue.slice(1);
-				return [first];
-			}
-			return [];
-		}
-
 		const first = this.#followUpQueue[0];
 		if (!first) return [];
+		const batch = this.#followUpBatches.get(first);
+		if (batch) {
+			this.#followUpBatches.delete(first);
+			if (batch.every((message, index) => this.#followUpQueue[index] === message)) {
+				this.#followUpQueue = this.#followUpQueue.slice(batch.length);
+				return [...batch];
+			}
+		}
+		if (this.#followUpMode === "one-at-a-time") {
+			this.#followUpQueue = this.#followUpQueue.slice(1);
+			return [first];
+		}
+
 		if (this.#followUpForceOneAtATime.has(first)) {
 			this.#followUpQueue = this.#followUpQueue.slice(1);
 			return [first];

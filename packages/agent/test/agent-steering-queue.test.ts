@@ -236,4 +236,21 @@ describe("Agent steering admission", () => {
 		expect(after[0]).toMatchObject({ content: "a" });
 		expect(after[1]).toMatchObject({ content: "b" });
 	});
+
+	it("delivers a marked follow-up cohort atomically under one-at-a-time mode", async () => {
+		const mock = createMockModel({ responses: [{ content: ["seeded"] }, { content: ["batched"] }] });
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: mock.stream,
+		});
+		await agent.prompt("seed");
+		const cohort = [userMessage("a"), userMessage("b")];
+		agent.markFollowUpBatch(cohort);
+		agent.restoreFollowUp(cohort);
+		await agent.continueQueuedMessages();
+
+		const users = mock.calls[1]!.context.messages.filter(message => message.role === "user");
+		expect(users.slice(-2).map(message => message.content)).toEqual(["a", "b"]);
+		expect(mock.calls).toHaveLength(2);
+	});
 });

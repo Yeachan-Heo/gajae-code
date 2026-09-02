@@ -128,7 +128,7 @@ describe("AgentSession steer-on-interrupt", () => {
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			interruptMode: "wait",
+			toolInterruptPolicy: "finish_tools",
 			steeringMode: "all",
 			streamFn: mock.stream,
 		});
@@ -181,7 +181,7 @@ describe("AgentSession steer-on-interrupt", () => {
 		const agent = new Agent({
 			getApiKey: provider => `${provider}-test-key`,
 			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			interruptMode: "wait",
+			toolInterruptPolicy: "finish_tools",
 			steeringMode: "all",
 			streamFn: mock.stream,
 		});
@@ -198,14 +198,15 @@ describe("AgentSession steer-on-interrupt", () => {
 		const aborting = session.abort({ cause: "user_interrupt" });
 		await abortHookStarted.promise;
 
-		// While abort cleanup owns the boundary, each steer must remain queued for
-		// the one rearm continuation. Without that fence, the first steer starts an
-		// independent continuation before the second steer is admitted.
+		// While abort cleanup owns the boundary, enqueue-time admission rejects each
+		// steer from the dying run and routes the cohort as follow-ups for the one
+		// rearm continuation. Without that fence, the first message starts an
+		// independent continuation before the second message is queued.
 		await session.steer("steer one");
 		for (let i = 0; i < 8; i++) await Promise.resolve();
 		expect(mock.calls).toHaveLength(1);
 		await session.steer("steer two");
-		expect(session.getQueuedMessages().steering).toEqual(["steer one", "steer two"]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: ["steer one", "steer two"] });
 
 		successorGate.resolve();
 		releaseAbortHook.resolve();

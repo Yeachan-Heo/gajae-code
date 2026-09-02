@@ -2502,6 +2502,10 @@ export class AgentSession {
 	// continuation of the aborted attempt that the contract requires to be
 	// blocked (review thread P1).
 	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
+	/** Steers explicitly requested as one-per-poll; preserve this policy if a run disowns them into follow-ups. */
+	readonly #sequentialSteerMessages = new WeakSet<AgentMessage>();
+	/** Non-admitted steers collected while one abort unwind owns delivery. */
+	#abortUnwindSteerFallbacks: AgentMessage[] = [];
 	/** Per-message SDK requester-ownership correlation for queued client steers:
 	 *  fired exactly once when the steer's run accepts it — via the idle
 	 *  auto-continue or the terminal-abort rearm (review thread P1). */
@@ -2666,7 +2670,20 @@ export class AgentSession {
 		// follow-up queued after them, preserving submission order. Marking
 		// each as sequential first, then restoring ahead of the existing queue,
 		// keeps the existing follow-ups' identity and per-message marks intact.
-		for (const message of rearmed) this.agent.markFollowUpSequential(message);
+		let batch: AgentMessage[] = [];
+		const flushBatch = () => {
+			if (batch.length > 1) this.agent.markFollowUpBatch(batch);
+			batch = [];
+		};
+		for (const message of rearmed) {
+			if (this.#sequentialSteerMessages.has(message)) {
+				flushBatch();
+				this.agent.markFollowUpSequential(message);
+			} else if (this.agent.getSteeringMode() === "all") {
+				batch.push(message);
+			}
+		}
+		flushBatch();
 		this.agent.restoreFollowUp(rearmed);
 		this.#followUpMessages = [...rearmedDisplays, ...this.#followUpMessages];
 		for (const message of rearmed) {
@@ -12654,14 +12671,18 @@ export class AgentSession {
 		const admission = this.agent.steer(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
 		if (!admission.admitted) {
 			await this.#queueFollowUp(text, images, {
-				forceOneAtATime: true,
+				forceOneAtATime: options?.forceOneAtATime,
 				claimsGenuineUserIntent: options?.claimsGenuineUserIntent,
 				onPromoted: options?.onPromoted,
 				sdkRunToken: options?.sdkRunToken,
+				onQueued: message => {
+					if (this.#abortUnwind && !options?.forceOneAtATime) this.#abortUnwindSteerFallbacks.push(message);
+				},
 			});
 			this.#scheduleNonAdmittedSteerContinuation();
 			return;
 		}
+		if (options?.forceOneAtATime) this.#sequentialSteerMessages.add(message);
 		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
@@ -12722,6 +12743,7 @@ export class AgentSession {
 			claimsGenuineUserIntent?: boolean;
 			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
+			onQueued?: (message: AgentMessage) => void;
 		},
 	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
@@ -12731,6 +12753,7 @@ export class AgentSession {
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		options?.onQueued?.(message);
 		// Display entry carries the message identity so positional editing can never
 		// misaddress a deferred SDK follow-up held outside the Agent live queue.
 		const displayEntry = this.#createQueuedDisplayEntry(displayText, undefined, message);
@@ -12814,6 +12837,7 @@ export class AgentSession {
 	 * Gate for idle-path follow-up auto-continue. See `#queueFollowUp` for rationale.
 	 */
 	#canAutoContinueForFollowUp(): boolean {
+		if (this.#abortUnwind) return false;
 		if (this.isStreaming) return false;
 		if (this.isCompacting) return false;
 		if (this.isBashRunning) return false;
@@ -12848,6 +12872,7 @@ export class AgentSession {
 	 * compaction/bash/eval owns the session and defers delivery.
 	 */
 	#canDeliverQueuedMessages(): boolean {
+		if (this.#abortUnwind) return false;
 		if (this.agent.state.isStreaming) return false;
 		if (this.isRetrying) return false;
 		if (this.isCompacting) return false;
@@ -12864,11 +12889,19 @@ export class AgentSession {
 	 * false here because it polls the steering queue itself.
 	 */
 	#canAutoContinueForSteer(): boolean {
+		if (this.#abortUnwind) return false;
 		if (this.agent.state.isStreaming) return false;
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
+	}
+
+	#finalizeAbortUnwindSteerBatch(): void {
+		if (this.agent.getSteeringMode() === "all" && this.#abortUnwindSteerFallbacks.length > 1) {
+			this.agent.markFollowUpBatch(this.#abortUnwindSteerFallbacks);
+		}
+		this.#abortUnwindSteerFallbacks = [];
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
@@ -13196,6 +13229,7 @@ export class AgentSession {
 			this.#assertNoHandoffTransition();
 			const sequential = options.steerQueuePolicy === "sequential" ? { forceOneAtATime: true } : undefined;
 			if (this.agent.steer(appMessage, sequential).admitted) {
+				if (sequential) this.#sequentialSteerMessages.add(appMessage);
 				this.#bindCustomDisplayEntry(appMessage, "steer");
 			} else {
 				// No live run to steer, so this becomes next-turn work. Provenance —
@@ -13215,7 +13249,8 @@ export class AgentSession {
 					this.#settleDeliveredOwnedRegistrations([appMessage]);
 					return;
 				}
-				this.agent.followUp(appMessage, { forceOneAtATime: true });
+				this.agent.followUp(appMessage, sequential);
+				if (this.#abortUnwind && !sequential) this.#abortUnwindSteerFallbacks.push(appMessage);
 				// The chip now describes follow-up work: keep its mode and identity
 				// aligned with where the executable message actually landed.
 				this.#bindCustomDisplayEntry(appMessage, "followUp");
@@ -14323,6 +14358,7 @@ export class AgentSession {
 					this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
 				this.#flushPendingBackgroundExchanges();
 				await this.#awaitAbortedTurnTerminal();
+				this.#finalizeAbortUnwindSteerBatch();
 				// Steering disowned by the aborted run was re-routed as follow-ups
 				// on its agent_end; a user interrupt resumes into them promptly.
 				if (
@@ -14349,6 +14385,7 @@ export class AgentSession {
 			// No run was live to end (or its terminal already settled): the
 			// disposition must not leak into an unrelated later run's exit.
 			this.#disownedSteeringDisposition = undefined;
+			this.#abortUnwindSteerFallbacks = [];
 			this.#abortUnwind = undefined;
 			this.#abortForceRecoveryStarted = false;
 			unwind.resolve();
