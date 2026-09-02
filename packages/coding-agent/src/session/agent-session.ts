@@ -17595,7 +17595,9 @@ export class AgentSession {
 					throw new CompactionCancelledError();
 				}
 				// Take this invocation's state snapshot for the summarizer context.
-				const compactionStateSnapshot = await this.#compactionStateSnapshot({ trackWorkflowRecoveryProgress: true });
+				const compactionStateSnapshot = await this.#compactionStateSnapshot({
+					trackWorkflowRecoveryProgress: true,
+				});
 				if (!this.model) {
 					throw new Error("No model selected");
 				}

@@ -78,7 +78,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 				`\t\tconst signals = globalThis.${runtimeSignalStoreKey} ?? (globalThis.${runtimeSignalStoreKey} = []);`,
 				'\t\tsignals.push("compaction:end:" + (event.aborted ? "aborted" : "ok"));',
 				"\t});",
-				"\tpi.on(\"session_compact\", async () => {",
+				'\tpi.on("session_compact", async () => {',
 				`\t\tconst gate = globalThis.${autoPostAppendGateStoreKey};`,
 				"\t\tif (gate?.wait) {",
 				"\t\t\tgate.started = true;",

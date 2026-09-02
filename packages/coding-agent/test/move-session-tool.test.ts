@@ -1589,10 +1589,12 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			});
 			await siblingEntered.promise;
 
-			const nestedMove = sessionManager.runWithCwdReadLease(() => sessionManager.moveTo(repoA)).then(
-				() => ({ status: "fulfilled" as const }),
-				error => ({ status: "rejected" as const, error }),
-			);
+			const nestedMove = sessionManager
+				.runWithCwdReadLease(() => sessionManager.moveTo(repoA))
+				.then(
+					() => ({ status: "fulfilled" as const }),
+					error => ({ status: "rejected" as const, error }),
+				);
 			expect(await nestedMove).toMatchObject({
 				status: "rejected",
 				error: {

@@ -10870,7 +10870,10 @@ export class SessionManager {
 		if (this.#cwdMoveAdmissionClosing || this.#cwdMoveAdmissionClosed)
 			throw new Error("Session cwd move admission is closed.");
 		const transitionOwner = this.#cwdTransitionOwner;
-		if (this.#strictClosePending && (transitionOwner === undefined || cwdTransitionAls.getStore() !== transitionOwner))
+		if (
+			this.#strictClosePending &&
+			(transitionOwner === undefined || cwdTransitionAls.getStore() !== transitionOwner)
+		)
 			throw new Error("Session manager is closing.");
 		const readLease = cwdReadLeaseAls.getStore();
 		const rootLease =
@@ -11254,8 +11257,7 @@ export class SessionManager {
 			sourceHandle?: { stat: (opts: { bigint: true }) => Promise<fs.BigIntStats> };
 		},
 	): Promise<void> {
-		if (this.#strictClosePending && !this.#ownsCwdTransition())
-			throw new Error("Session manager is closing.");
+		if (this.#strictClosePending && !this.#ownsCwdTransition()) throw new Error("Session manager is closing.");
 		if (!this.#ownsCwdTransition()) {
 			return this.runExclusiveCwdMoveTransition(() => this.moveTo(newCwd, options));
 		}
@@ -11723,7 +11725,6 @@ export class SessionManager {
 			throw error;
 		}
 		if (residentTransition) this.#commitResidentTextStoreTransition(residentTransition);
-
 
 		// Update terminal breadcrumb only after the durable cwd transition succeeds.
 		if (this.#sessionFile) {
