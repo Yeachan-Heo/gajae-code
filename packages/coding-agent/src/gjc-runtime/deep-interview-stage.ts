@@ -14,6 +14,7 @@ import {
 } from "./deep-interview-state";
 import { sessionStateDir } from "./session-layout";
 import { resolveGjcSessionForWrite, SessionResolutionError, writeSessionActivityMarker } from "./session-resolution";
+import { migrateWorkflowState } from "./state-migrations";
 import { runNativeStateCommand } from "./state-runtime";
 import {
 	persistedStateRevision,
@@ -376,7 +377,7 @@ async function readCurrentState(cwd: string, sessionId: string): Promise<Current
 	if (read.kind === "absent")
 		return { value: {}, revision: 0, sha256: workflowEnvelopeContentSha256({}), exists: false };
 	return {
-		value: read.value,
+		value: migrateWorkflowState(read.value, "deep-interview").state,
 		revision: persistedStateRevision(read.value),
 		sha256: workflowEnvelopeContentSha256(read.value),
 		exists: true,
@@ -949,6 +950,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 						for (const field of [
 							"crystal",
 							"execution_approval",
+							"execution_approval_receipt",
 							"intent_contract",
 							"intent_contract_required",
 						] as const)
