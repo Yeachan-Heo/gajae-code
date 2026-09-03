@@ -294,6 +294,18 @@ export class SlackLiveProvider implements SlackProviderClient, SlackDiagnosticPr
 		return message;
 	}
 
+	async addReaction(input: { channel: string; timestamp: string; name: string; signal?: AbortSignal }): Promise<void> {
+		await this.#api(
+			"reactions.add",
+			{
+				channel: input.channel,
+				timestamp: input.timestamp,
+				name: input.name,
+			},
+			input.signal,
+		);
+	}
+
 	async findMessageByClientMsgId(input: {
 		channel: string;
 		clientMsgId: string;

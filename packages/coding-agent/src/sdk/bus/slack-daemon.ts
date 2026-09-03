@@ -59,6 +59,7 @@ function slackPublicationClientMsgId(publicationId: string): string {
 // Durable filesystem publication leases must outlast one event-loop and persistence turn.
 const MIN_PUBLICATION_LEASE_MS = 100;
 const RETIREMENT_DRAIN_MS = 5_000;
+const INBOUND_REACTION = "eyes";
 
 type SlackProviderWorkScope = {
 	sessionId: string;
@@ -479,6 +480,12 @@ export class SlackNotificationDaemon {
 		this.#inflightInbound.add(inflightKey);
 		try {
 			await this.options.provider.ack(envelope.envelope_id);
+			const messageTs = text(inbound.event.ts);
+			if (messageTs) {
+				void this.options.provider
+					.addReaction({ channel: inbound.channelId, timestamp: messageTs, name: INBOUND_REACTION })
+					.catch(() => undefined);
+			}
 			return await this.#dispatchInbound(claim);
 		} finally {
 			this.#inflightInbound.delete(inflightKey);

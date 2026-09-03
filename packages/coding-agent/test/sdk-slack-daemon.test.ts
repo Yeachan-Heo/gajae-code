@@ -15,6 +15,7 @@ import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
 class FakeSlack {
 	handler: ((envelope: SlackSocketEnvelope) => void | Promise<void>) | undefined;
 	acks: string[] = [];
+	reactions: Array<{ channel: string; timestamp: string; name: string }> = [];
 	posts: Array<{ channel: string; text: string; threadTs?: string; clientMsgId: string }> = [];
 	knownMessages = new Map<string, { channel: string; ts: string; client_msg_id: string }>();
 	knownTimestamps = new Set<string>();
@@ -61,6 +62,10 @@ class FakeSlack {
 	async ack(envelopeId: string): Promise<void> {
 		this.acks.push(envelopeId);
 		await this.onAck?.(envelopeId);
+	}
+
+	async addReaction(input: { channel: string; timestamp: string; name: string }): Promise<void> {
+		this.reactions.push(input);
 	}
 
 	waitForPostStartCount(count: number): Promise<void> {
@@ -312,6 +317,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			const duplicate = await daemon.handleEnvelope(messageEnvelope("duplicate", "event-1", root.rootTs!));
 			expect([accepted, rejected, duplicate]).toEqual([true, false, false]);
 			expect(fake.acks).toEqual(["accepted", "rejected", "duplicate"]);
+			expect(fake.reactions).toEqual([{ channel: "C1", timestamp: "2.event-1", name: "eyes" }]);
 			expect(injected).toHaveLength(1);
 		});
 	});

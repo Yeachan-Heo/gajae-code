@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import { SessionIndex } from "../src/sdk/broker/session-index";
-import { ChatDaemonRuntime } from "../src/sdk/bus/chat-daemon-runtime";
+import {
+	ChatDaemonRuntime,
+	publicationIdForFinalChatAnswer,
+	shouldPublishChatFrame,
+} from "../src/sdk/bus/chat-daemon-runtime";
 import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore, conversationStorePath } from "../src/sdk/bus/conversation-store";
 import type {
@@ -265,6 +269,32 @@ describe("chat daemon worker", () => {
 	let root = "";
 	afterEach(async () => {
 		if (root) await fs.rm(root, { recursive: true, force: true });
+	});
+
+	it("keeps lean chat delivery to finalized assistant answers", () => {
+		expect(shouldPublishChatFrame({ type: "identity_header" }, "lean")).toBe(false);
+		expect(shouldPublishChatFrame({ type: "agent_start" }, "lean")).toBe(false);
+		expect(shouldPublishChatFrame({ type: "activity" }, "lean")).toBe(false);
+		expect(
+			shouldPublishChatFrame(
+				{ type: "turn_stream", phase: "finalized", finalAnswer: true, text: "final answer" },
+				"lean",
+			),
+		).toBe(true);
+		expect(shouldPublishChatFrame({ type: "turn_stream", phase: "finalized", text: "lead-in" }, "lean")).toBe(false);
+		expect(shouldPublishChatFrame({ type: "identity_header" }, "verbose")).toBe(true);
+	});
+
+	it("uses one publication identity for duplicate finalized answer frames", () => {
+		const frame = {
+			type: "turn_stream",
+			phase: "finalized",
+			finalAnswer: true,
+			messageRef: "assistant-message-1",
+		};
+		expect(publicationIdForFinalChatAnswer("session", frame)).toBe("turn:session:assistant-message-1");
+		expect(publicationIdForFinalChatAnswer("session", { ...frame, finalAnswer: false })).toBeUndefined();
+		expect(publicationIdForFinalChatAnswer("session", { ...frame, messageRef: "" })).toBeUndefined();
 	});
 
 	it("creates a real configured runtime, maps event threads, routes safe replies, handles lifecycle transitions, and cleans up", async () => {
@@ -1110,6 +1140,19 @@ describe("chat daemon worker", () => {
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "direct missing phase" });
 		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndirect finalized");
 		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndirect missing phase");
+		const duplicateFinal = {
+			type: "turn_stream",
+			phase: "finalized",
+			sessionId: "session",
+			finalAnswer: true,
+			messageRef: "final-answer-1",
+			text: "deduplicated final",
+		};
+		client.handler?.(duplicateFinal);
+		client.handler?.({ ...duplicateFinal });
+		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndeduplicated final");
+		await Bun.sleep(10);
+		expect(provider.posts.filter(post => post.text === "GJC turn stream\ndeduplicated final")).toHaveLength(1);
 		const rootTs = provider.posts[0]?.clientMsgId === undefined ? undefined : "1.1";
 		expect(rootTs).toBeDefined();
 		const command = (eventId: string, clientMsgId: string, text: string): SlackSocketEnvelope => ({

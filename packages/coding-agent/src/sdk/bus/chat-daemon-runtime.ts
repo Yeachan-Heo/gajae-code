@@ -92,6 +92,36 @@ function isReservedIdentity(name: string | undefined): boolean {
 	return isLifecycleEvent(name) || isControlPlaneFrameType(name);
 }
 
+/**
+ * Chat notifications in lean mode are an answer surface, not a mirror of the
+ * session protocol. Lifecycle, identity, and activity frames remain available
+ * to verbose consumers, while finalized answers and action-needed events are
+ * delivered in lean mode.
+ */
+export function shouldPublishChatFrame(
+	frame: Record<string, unknown>,
+	verbosity: "lean" | "verbose" | undefined,
+): boolean {
+	if (verbosity !== "lean") return frame.type !== "turn_stream" || frame.phase !== "live";
+	return frame.type === "turn_stream" && frame.phase === "finalized" && frame.finalAnswer === true;
+}
+
+/**
+ * A final answer's message ref identifies its one rendered message even when
+ * the SDK transport delivers an unpositioned duplicate frame.
+ */
+export function publicationIdForFinalChatAnswer(sessionId: string, frame: Record<string, unknown>): string | undefined {
+	if (
+		frame.type !== "turn_stream" ||
+		frame.phase !== "finalized" ||
+		frame.finalAnswer !== true ||
+		typeof frame.messageRef !== "string" ||
+		frame.messageRef.length === 0
+	)
+		return undefined;
+	return `turn:${sessionId}:${frame.messageRef}`;
+}
+
 /** One delivered frame reduced to a single event identity. */
 type CorrelatedFrame = SessionRouterFrame;
 
@@ -571,8 +601,9 @@ export class ChatDaemonRuntime {
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
 		await this.#attachmentBarriers.get(attachment.sessionId);
 		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
-		const publicationId = correlated.publicationId;
 		const normalizedFrame = correlated.body;
+		const publicationId =
+			publicationIdForFinalChatAnswer(attachment.sessionId, normalizedFrame) ?? correlated.publicationId;
 		const bodyType = typeof normalizedFrame.type === "string" ? normalizedFrame.type : undefined;
 		if (isControlPlaneFrameType(correlated.name) || isControlPlaneFrameType(bodyType)) return;
 		if (normalizedFrame.type === "turn_stream" && normalizedFrame.phase === "live") return;
@@ -607,6 +638,11 @@ export class ChatDaemonRuntime {
 			return;
 		}
 		if (!notification) return;
+		if (
+			notification.type === "frame" &&
+			!shouldPublishChatFrame(normalizedFrame, this.input.config.presentation?.verbosity)
+		)
+			return;
 		const payload = this.#presentation?.fanout(notification)[0];
 		const body = payload?.body;
 		const content =
