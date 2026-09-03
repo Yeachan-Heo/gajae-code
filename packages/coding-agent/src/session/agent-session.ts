@@ -6110,19 +6110,20 @@ export class AgentSession {
 	 */
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
-		const context = this.#captureCoordinatorRuntimeStatePersistContext();
 		const observation = this.#coordinatorToolObservations.get(event);
 		const admission = this.#agentEventAdmission.get(event);
 		const barrier = admission?.persistBarrier;
 		if (barrier) {
 			const run = async () => {
 				await barrier;
+				const context = this.#captureCoordinatorRuntimeStatePersistContext();
 				await this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure);
 			};
 			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
 			this.#trackReleasedBarrierPersist(queued);
 			return queued;
 		}
+		const context = this.#captureCoordinatorRuntimeStatePersistContext();
 		const generation = admission?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
@@ -9204,12 +9205,10 @@ export class AgentSession {
 			const drained = await awaitDisposeStep("async job manager", ownedAsyncManager.dispose({ timeoutMs: 3_000 }));
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
+				// AsyncJobManager.dispose projects undelivered work into terminal failure
+				// evidence and clears every live handle before returning false. This is a
+				// degraded terminal outcome, not retained mutation authority.
 				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
-				disposeFailures.push({
-					label: "async job manager",
-					error: new Error("Async job manager disposal remained incomplete."),
-					critical: true,
-				});
 			}
 			if (drained !== false && AsyncJobManager.instance() === ownedAsyncManager) {
 				AsyncJobManager.setInstance(undefined);
