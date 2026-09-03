@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { crystalSnapshotDigest } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
 import { runNativeDeepInterviewCommand } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
 import {
 	createDeepInterviewIntentManifest,
@@ -13,10 +14,46 @@ import {
 	modeStatePath,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+import { reconcileWorkflowSkillState, runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
+import { stampWorkflowEnvelopeChecksum } from "../../src/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const TEST_SESSION_ID = "test-session";
+
+function readyCrystal(): Record<string, unknown> {
+	const messages = [{ index: 0, role: "user" as const, content: "Build the approved feature." }];
+	return {
+		schema_version: 1,
+		spec_version: 1,
+		lifecycle: "ready",
+		source: {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages,
+			digest: crystalSnapshotDigest({ revision: 1, start: 0, end: 0, messages }),
+		},
+		items: [
+			{
+				id: "goal:approved-feature",
+				kind: "goal",
+				classification: "confirmed",
+				statement: "Build the approved feature",
+				anchor: { message_index: 0, quote: "Build the approved feature." },
+			},
+		],
+		open_gaps: [],
+		conflicts: [],
+		delta: {
+			kind: "none",
+			changed_ids: [],
+			added_ids: ["goal:approved-feature"],
+			preserved_ids: [],
+			approval_invalidated: false,
+		},
+		execution_approval: "not-approved",
+	};
+}
 
 function restoreSessionId(sessionId: string | undefined): void {
 	if (sessionId === undefined) delete process.env.GJC_SESSION_ID;
@@ -136,7 +173,7 @@ describe("gjc state handoff", () => {
 				spec_path: specPath,
 				spec_sha256: createHash("sha256").update("# Crystal\n").digest("hex"),
 				state: {
-					crystal: { lifecycle: "ready" },
+					crystal: readyCrystal(),
 					execution_approval: "not-approved",
 					rounds: [],
 					established_facts: [],
@@ -156,6 +193,107 @@ describe("gjc state handoff", () => {
 			expect(handoff.status).toBe(0);
 		});
 	});
+	it("rejects execution approval when no canonical ready Crystal exists", async () => {
+		await withTempCwd(async cwd => {
+			const specPath = path.join(cwd, "legacy.md");
+			await fs.writeFile(specPath, "# Legacy\n");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: 2,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				spec_sha256: createHash("sha256").update("# Legacy\n").digest("hex"),
+				state: { rounds: [], established_facts: [] },
+			});
+			const before = await fs.readFile(callerPath, "utf-8");
+			const result = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("requires a ready canonical Crystal");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
+		});
+	});
+	it("rejects execution approval for tampered canonical Crystal state", async () => {
+		await withTempCwd(async cwd => {
+			const specPath = path.join(cwd, "crystal.md");
+			await fs.writeFile(specPath, "# Crystal\n");
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const stamped = stampWorkflowEnvelopeChecksum(
+				{
+					skill: "deep-interview",
+					version: 2,
+					active: true,
+					current_phase: "handoff",
+					spec_path: specPath,
+					spec_sha256: createHash("sha256").update("# Crystal\n").digest("hex"),
+					state: {
+						crystal: readyCrystal(),
+						execution_approval: "not-approved",
+						rounds: [],
+						established_facts: [],
+					},
+				},
+				callerPath,
+			);
+			const tampered = stamped as Record<string, unknown>;
+			(tampered.state as Record<string, unknown>).rounds = [{ round: 99 }];
+			await writeJson(callerPath, tampered);
+			const before = await fs.readFile(callerPath, "utf-8");
+			const result = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("approval refuses tampered mode-state");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
+		});
+	});
+	it("rejects execution approval through generic and reconcile state writers", async () => {
+		await withTempCwd(async cwd => {
+			const statePath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			await writeJson(statePath, {
+				skill: "deep-interview",
+				version: 2,
+				active: true,
+				current_phase: "interviewing",
+				state: { rounds: [] },
+			});
+			const generic = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({
+						state: {
+							execution_approval: "approved",
+							execution_approval_receipt: { method: "explicit-state-action" },
+						},
+					}),
+					"--json",
+				],
+				cwd,
+			);
+			expect(generic.status).toBe(2);
+			expect(generic.stderr).toContain("immutable through generic state write");
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd,
+					mode: "deep-interview",
+					sessionId: TEST_SESSION_ID,
+					active: true,
+					phase: "interviewing",
+					payload: {
+						state: {
+							rounds: [],
+							execution_approval: "approved",
+							execution_approval_receipt: { method: "explicit-state-action" },
+						},
+					},
+				}),
+			).rejects.toThrow("immutable through runtime reconciliation");
+			const after = await readJson(statePath);
+			expect((after?.state as Record<string, unknown>).execution_approval).toBeUndefined();
+		});
+	});
 	it("does not let a handoff request grant ready-Crystal execution approval", async () => {
 		await withTempCwd(async cwd => {
 			const specPath = path.join(cwd, "crystal.md");
@@ -168,7 +306,7 @@ describe("gjc state handoff", () => {
 				current_phase: "handoff",
 				spec_path: specPath,
 				spec_sha256: createHash("sha256").update("# Crystal\n").digest("hex"),
-				state: { crystal: { lifecycle: "ready" }, execution_approval: "not-approved" },
+				state: { crystal: readyCrystal(), execution_approval: "not-approved" },
 			});
 			const before = await fs.readFile(callerPath, "utf-8");
 			const result = await runNativeStateCommand(
@@ -192,7 +330,7 @@ describe("gjc state handoff", () => {
 				current_phase: "handoff",
 				spec_path: specPath,
 				spec_sha256: createHash("sha256").update("# Crystal\n").digest("hex"),
-				state: { crystal: { lifecycle: "ready" }, execution_approval: "not-approved" },
+				state: { crystal: readyCrystal(), execution_approval: "not-approved" },
 			});
 			const result = await runNativeStateCommand(
 				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
