@@ -498,6 +498,9 @@ describe("install.sh binary-first contract", () => {
 			'while [ -n "$OFFER_RUNTIME_SIGNAL" ] && kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do',
 		);
 		expect(installer).not.toContain('kill -KILL "$OFFER_RUNTIME_PID"');
+		expect(installer).toContain('community_app_offer_suppressed');
+		expect(installer).toContain('"$OFFER_RUNTIME" macos-community-app-offer < /dev/tty');
+		expect(installer).toContain('"$OFFER_RUNTIME" --supports-macos-community-app');
 	});
 
 	test("reaps the optional runtime before deleting its snapshot after repeated signals", async () => {
@@ -512,6 +515,7 @@ describe("install.sh binary-first contract", () => {
 		const payload = `#!/bin/sh
 if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
 if [ "$1" = "--smoke-test" ]; then exit 0; fi
+if [ "$1" = "--supports-macos-community-app" ]; then exit 0; fi
 if [ "$1" = "macos-community-app-offer" ]; then
   printf '%s|%s\n' "$$" "$0" > "$GJC_TEST_OFFER_MARKER"
   trap 'printf "TERM\\n" >> "$GJC_TEST_OFFER_SIGNAL"; sleep 1; exit 0' TERM
@@ -534,6 +538,9 @@ exit 0
 				HOME: sandbox.root,
 				GITHUB_TOKEN: "",
 				GH_TOKEN: "",
+				CI: "false",
+				GITHUB_ACTIONS: "false",
+				GJC_NONINTERACTIVE: "false",
 				GJC_TEST_OFFER_MARKER: markerPath,
 				GJC_TEST_OFFER_SIGNAL: signalPath,
 			},

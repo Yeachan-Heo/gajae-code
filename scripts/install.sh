@@ -385,6 +385,21 @@ This installer never downloads Bun."
     fi
 }
 
+community_app_offer_suppressed() {
+    no_offer=$(printf '%s' "${GJC_NO_COMMUNITY_APP:-}" | tr '[:upper:]' '[:lower:]')
+    case "$no_offer" in
+        1|true|yes|on) return 0 ;;
+    esac
+    for marker in "${CI:-}" "${GITHUB_ACTIONS:-}" "${GJC_NONINTERACTIVE:-}"; do
+        normalized_marker=$(printf '%s' "$marker" | tr '[:upper:]' '[:lower:]')
+        case "$normalized_marker" in
+            ""|0|false|no|off) ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 detect_platform() {
     OS="$(uname -s)"
     ARCH="$(uname -m)"
@@ -682,22 +697,28 @@ install_binary() {
     # The verified runtime owns the optional macOS community-app flow so fresh
     # installs and `gjc update` share the same supply-chain checks. The offer is
     # strictly best-effort and must never change a successful GJC install.
-    if [ "$PLATFORM" = "darwin" ]; then
+    if [ "$PLATFORM" = "darwin" ] && ! community_app_offer_suppressed; then
         OFFER_RUNTIME_ACTIVE=1
         OFFER_RUNTIME_DIR=$(mktemp -d "${INSTALL_DIR}/.gjc-community-app.XXXXXX" 2>/dev/null || true)
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && cp -p "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
             if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
-                "$OFFER_RUNTIME" macos-community-app-offer &
-                OFFER_RUNTIME_PID=$!
-                if [ -n "$OFFER_RUNTIME_SIGNAL" ]; then
-                    kill -s "$OFFER_RUNTIME_SIGNAL" "$OFFER_RUNTIME_PID" 2>/dev/null || true
-                fi
-                wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
-                while [ -n "$OFFER_RUNTIME_SIGNAL" ] && kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do
+                if "$OFFER_RUNTIME" --supports-macos-community-app </dev/null >/dev/null 2>&1; then
+                    if [ -t 1 ] && [ -r /dev/tty ]; then
+                        "$OFFER_RUNTIME" macos-community-app-offer < /dev/tty &
+                    else
+                        "$OFFER_RUNTIME" macos-community-app-offer &
+                    fi
+                    OFFER_RUNTIME_PID=$!
+                    if [ -n "$OFFER_RUNTIME_SIGNAL" ]; then
+                        kill -s "$OFFER_RUNTIME_SIGNAL" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                    fi
                     wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
-                done
-                OFFER_RUNTIME_PID=""
+                    while [ -n "$OFFER_RUNTIME_SIGNAL" ] && kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do
+                        wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                    done
+                    OFFER_RUNTIME_PID=""
+                fi
             fi
             chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
             rm -rf "$OFFER_RUNTIME_DIR" || true
