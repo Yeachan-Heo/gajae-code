@@ -622,7 +622,8 @@
           "read",
           "write",
           "clear",
-          "handoff"
+          "handoff",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"
@@ -731,6 +732,10 @@
       },
       {
         "name": "handoff",
+        "surface": "command-positional"
+      },
+      {
+        "name": "approve-execution",
         "surface": "command-positional"
       },
       {
