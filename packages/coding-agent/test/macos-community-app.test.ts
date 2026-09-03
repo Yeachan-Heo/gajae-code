@@ -121,6 +121,15 @@ describe("macOS community app offer guards", () => {
 		await fs.symlink(path.join(macOSRoot, "GajaeCode"), path.join(macOSRoot, "Link"));
 		expect(await resolveCommunityAppExecutableForTest(root, "Link")).toBeUndefined();
 		await fs.rm(path.join(root, "Contents"), { recursive: true, force: true });
+		await fs.mkdir(path.join(root, "Contents", "MacOS", "Resources"), { recursive: true });
+		await fs.writeFile(path.join(root, "Contents", "Info.plist"), "fixture");
+		await fs.writeFile(path.join(root, "Contents", "MacOS", "GajaeCode"), "fixture");
+		await fs.symlink(
+			path.join(root, "Contents", "MacOS", "GajaeCode"),
+			path.join(root, "Contents", "MacOS", "Resources", "AbsoluteLink"),
+		);
+		expect(await resolveCommunityAppExecutableForTest(root, "GajaeCode")).toBeUndefined();
+		await fs.rm(path.join(root, "Contents"), { recursive: true, force: true });
 		const outside = path.join(path.dirname(root), "community-app-outside");
 		await fs.mkdir(path.join(outside, "MacOS"), { recursive: true });
 		await fs.writeFile(path.join(outside, "Info.plist"), "fixture");
@@ -544,5 +553,58 @@ describe("macOS community app attach cleanup", () => {
 		const tempRoot = path.dirname(mountPoint);
 		expect(await fs.stat(tempRoot)).toBeTruthy();
 		await fs.rm(tempRoot, { recursive: true, force: true });
+	});
+
+	test("captures an attached mount before honoring an interruption", async () => {
+		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
+		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
+		const dmg = new Uint8Array([14, 15, 16]);
+		const abortController = new AbortController();
+		const before = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
+		const calls: string[][] = [];
+		const command = async (argv: string[]) => {
+			calls.push(argv);
+			if (argv[0] === "/usr/bin/mdfind") return { exitCode: 1, stdout: "", stderr: "" };
+			if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "attach") {
+				const mount = argv[argv.indexOf("-mountpoint") + 1];
+				const replacement = `${mount}-attached`;
+				await fs.mkdir(replacement);
+				await fs.rm(mount, { recursive: true, force: true });
+				await fs.rename(replacement, mount);
+				abortController.abort();
+				return { exitCode: 0, stdout: "", stderr: "" };
+			}
+			if (argv[0] === "/usr/bin/hdiutil" && argv[1] === "detach") return { exitCode: 0, stdout: "", stderr: "" };
+			return { exitCode: 1, stdout: "", stderr: "" };
+		};
+		const result = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			signal: abortController.signal,
+			command,
+			cleanupCommand: command,
+			fetchImpl: async url => {
+				if (url.includes("/releases/latest"))
+					return new Response(
+						JSON.stringify({
+							tag_name: "v1.0.0",
+							assets: [
+								{ name: dmgName, browser_download_url: dmgUrl },
+								{ name: `${dmgName}.sha256`, browser_download_url: `${dmgUrl}.sha256` },
+							],
+						}),
+					);
+				if (url === dmgUrl) return new Response(dmg);
+				return new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${dmgName}\n`);
+			},
+		});
+		expect(result.status).toBe("failed");
+		expect(calls.some(call => call[0] === "/usr/bin/hdiutil" && call[1] === "detach")).toBe(true);
+		const after = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
+		expect(after).toEqual(before);
 	});
 });

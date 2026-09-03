@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isCompiledBinary, isEnoent, redactCrashSecrets, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, logger, redactCrashSecrets, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -1585,7 +1585,7 @@ export async function runUpdateCommand(
 				try {
 					await (deps.offerCommunityApp ?? (() => offerMacosCommunityApp()))();
 				} catch (error) {
-					console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
+					logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
 				}
 			}
 			record("update_install_completed", { channel, result: "installed", installMethod: target.method });
@@ -1640,7 +1640,7 @@ export async function runUpdateCommand(
 		try {
 			await (deps.offerCommunityApp ?? (() => offerMacosCommunityApp()))();
 		} catch (error) {
-			console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
+			logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
 		}
 	}
 	record("update_install_completed", { channel, result: "installed", installMethod: target.method });
