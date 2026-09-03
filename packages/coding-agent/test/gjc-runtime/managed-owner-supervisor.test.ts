@@ -33,7 +33,11 @@ function startSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
-	options: { forceMissingChildStartMarker?: string; forceMissingNativeReferenceMarker?: string } = {},
+	options: {
+		forceMissingChildStartMarker?: string;
+		forceMissingNativeReferenceMarker?: string;
+		generation?: string;
+	} = {},
 ) {
 	const forcedMissingPidRead = options.forceMissingChildStartMarker
 		? `if (pidReads === 1) { appendFileSync(${JSON.stringify(options.forceMissingChildStartMarker)}, "forced-missing-child-start:" + actualPid + "\\n"); return 2_000_000_000; }`
@@ -52,7 +56,7 @@ function startSupervisor(
 			...process.env,
 			GJC_TMUX_OWNER_STATE_DIR: stateDir,
 			GJC_COORDINATOR_SESSION_ID: "session-2681",
-			GJC_TMUX_OWNER_GENERATION: "generation-2681",
+			GJC_TMUX_OWNER_GENERATION: options.generation ?? "generation-2681",
 			GJC_MANAGED_OWNER_RUN_ID: "run-2681",
 			GJC_MANAGED_OWNER_INCARNATION: "incarnation-2681",
 			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify(command),
@@ -64,7 +68,11 @@ async function runSupervisor(
 	stateDir: string,
 	command: string[],
 	env: Record<string, string> = {},
-	options: { forceMissingChildStartMarker?: string; forceMissingNativeReferenceMarker?: string } = {},
+	options: {
+		forceMissingChildStartMarker?: string;
+		forceMissingNativeReferenceMarker?: string;
+		generation?: string;
+	} = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
 	const child = startSupervisor(stateDir, command, env, options);
 	const [stdout, stderr, exitCode] = await Promise.all([
@@ -193,6 +201,30 @@ describe("managed owner supervisor", () => {
 				"managed_owner_staged_terminal_before_publication",
 			);
 			expect(await replaceOwnerGeneration(stateDir, "session-2681", "generation-2682")).toBe("generation-2682");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("journals a staged terminal when an older owner generation is current", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2680");
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", "process.exit(23)"],
+				{ GJC_TMUX_OWNER_GENERATION_STAGED: "1" },
+				{ generation: "generation-2681" },
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
+			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+			expect(await Bun.file(paths.stagedTerminalFile).json()).toMatchObject({
+				kind: "staged_owner_terminal",
+				generation: "generation-2681",
+				exit_code: 23,
+			});
+			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-2681")).rejects.toThrow(
+				"managed_owner_staged_terminal_before_publication",
+			);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}

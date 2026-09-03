@@ -193,7 +193,8 @@ export default class Index extends Command {
 					// Persistence is diagnostic only; never replace the actionable refusal.
 				}
 				process.stderr.write(`${guard.message}\n`);
-				process.exit(1);
+				process.exitCode = 1;
+				return;
 			}
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
