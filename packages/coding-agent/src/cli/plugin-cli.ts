@@ -886,7 +886,9 @@ async function handleLink(manager: PluginManager, paths: string[], flags: { json
 	}
 }
 
-async function collectMarketplaceDoctorChecks(): Promise<Array<{ name: string; status: "ok" | "warning" | "error"; message: string }>> {
+async function collectMarketplaceDoctorChecks(): Promise<
+	Array<{ name: string; status: "ok" | "warning" | "error"; message: string }>
+> {
 	const extra: Array<{ name: string; status: "ok" | "warning" | "error"; message: string }> = [];
 	try {
 		const mktMgr = await makeMarketplaceManager();

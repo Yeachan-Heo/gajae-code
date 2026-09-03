@@ -1,20 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir } from "@gajae-code/utils";
-import { findRepoRoot } from "../capability/fs";
+import { getPluginsDir, getTrustedHomeDir } from "@gajae-code/utils";
+import { findRepoRoot, invalidate as invalidateFsCache } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import {
-	compareSkillOrder,
-	listClaudePluginRoots,
-	SOURCE_PATHS,
-	scanSkillsFromDir,
-} from "../discovery/helpers";
-import { invalidate as invalidateFsCache } from "../capability/fs";
-import { getPluginsDir } from "@gajae-code/utils";
+import { compareSkillOrder, listClaudePluginRoots, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import type { Skill } from "./skills";
@@ -261,10 +254,7 @@ async function collectPluginSkillDirs(
 	}
 }
 
-async function diagnoseCustomDir(
-	expandedDir: string,
-	diagnostics: string[],
-): Promise<boolean> {
+async function diagnoseCustomDir(expandedDir: string, diagnostics: string[]): Promise<boolean> {
 	try {
 		const stat = await fs.lstat(expandedDir);
 		if (stat.isSymbolicLink()) {
@@ -571,12 +561,15 @@ export async function findRuntimeSkillByName(
 			for (const entry of pluginDirs) {
 				if (!sourceEnabled(entry.level, policy)) continue;
 				scanJobs.push(
-					scanSkillsFromDir({ cwd, home, repoRoot: home }, {
-						dir: entry.dir,
-						providerId: "plugin",
-						level: entry.level,
-						requireDescription: true,
-					}).then(result => {
+					scanSkillsFromDir(
+						{ cwd, home, repoRoot: home },
+						{
+							dir: entry.dir,
+							providerId: "plugin",
+							level: entry.level,
+							requireDescription: true,
+						},
+					).then(result => {
 						for (const skill of result.items) skill.name = `${entry.pluginName}:${skill.name}`;
 						return result.items.map(skill => ({ skill, source: entry.level as RuntimeSkillDiscoverySource }));
 					}),
