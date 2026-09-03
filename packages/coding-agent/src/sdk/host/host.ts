@@ -47,6 +47,8 @@ export type SessionActivationGate = (input: { sessionId: string; generation: num
 export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	control?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
 	query?: (connectionId: string, frame: SdkFrame) => unknown | Promise<unknown>;
+	/** Supplies the durable transcript revision stamped on ordinary emitted events. */
+	eventRevision?: () => number | undefined;
 	/** Test/lifecycle seam invoked synchronously before fire-and-forget dispatch. */
 	onFrameAdmitted?: (connectionId: string, frame: SdkFrame) => void;
 	/** Synchronously rejects external input while a runtime is being replaced. */
@@ -199,7 +201,7 @@ function has(frame: SdkFrame, field: string): boolean {
 
 /** Adapter-based session host; bus wiring owns NotificationServer creation and transport framing. */
 export class SessionSdkHost {
-	readonly events = new SessionEventStream();
+	readonly events: SessionEventStream;
 	readonly reverse: ReverseLeaseRuntime;
 	readonly #options: SessionSdkHostOptions;
 	#started = false;
@@ -214,6 +216,7 @@ export class SessionSdkHost {
 
 	constructor(options: SessionSdkHostOptions) {
 		this.#options = options;
+		this.events = new SessionEventStream({ revisionProvider: options.eventRevision });
 		this.reverse = new ReverseLeaseRuntime({
 			sendFrame: options.sendFrame,
 			installDefinitions: options.installProviderDefinitions,

@@ -32,11 +32,20 @@ export class SessionEventStream {
 	#frames: EventFrame[] = [];
 	readonly #ringSize: number;
 	readonly #resyncQueries: string[];
+	readonly #revisionProvider: (() => number | undefined) | undefined;
 
-	constructor(options: { generation?: number; ringSize?: number; resyncQueryIds?: string[] } = {}) {
+	constructor(
+		options: {
+			generation?: number;
+			ringSize?: number;
+			resyncQueryIds?: string[];
+			revisionProvider?: () => number | undefined;
+		} = {},
+	) {
 		this.#generation = options.generation ?? 0;
 		this.#ringSize = options.ringSize ?? 256;
 		this.#resyncQueries = options.resyncQueryIds ?? ["Q01", "Q02", "Q03"];
+		this.#revisionProvider = options.revisionProvider;
 	}
 
 	get generation(): number {
@@ -54,7 +63,21 @@ export class SessionEventStream {
 	}
 
 	emit(frame: SdkFrame): EventFrame {
-		const event: EventFrame = { ...frame, type: "event", generation: this.#generation, seq: ++this.#seq };
+		const suppliedRevision = frame.revision;
+		const providedRevision = this.#revisionProvider?.();
+		const revision =
+			typeof suppliedRevision === "number" && Number.isSafeInteger(suppliedRevision) && suppliedRevision >= 0
+				? suppliedRevision
+				: typeof providedRevision === "number" && Number.isSafeInteger(providedRevision) && providedRevision >= 0
+					? providedRevision
+					: undefined;
+		const event: EventFrame = {
+			...frame,
+			type: "event",
+			...(revision === undefined ? {} : { revision }),
+			generation: this.#generation,
+			seq: ++this.#seq,
+		};
 		this.#frames.push(event);
 		if (this.#frames.length > this.#ringSize) this.#frames.shift();
 		return event;

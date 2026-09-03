@@ -1220,6 +1220,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const transport = memoryTransport();
 		const runtime = new SessionSdkSessionRuntime({
 			transport,
+			eventRevision: () => 7,
 			control: async (_connectionId, frame) => ({ id: frame.id, ok: true, result: { operation: frame.operation } }),
 			query: async (_connectionId, frame) => ({ id: frame.id, ok: true, result: { query: frame.query } }),
 		});
@@ -1239,7 +1240,7 @@ describe("SessionSdkSessionRuntime", () => {
 		});
 		transport.feed("client", { type: "query_request", id: "query", query: "Q18", input: {} });
 		await Bun.sleep(0);
-		expect(transport.broadcasts.some(frame => frame.kind === "session_ready")).toBe(true);
+		expect(transport.broadcasts).toContainEqual(expect.objectContaining({ kind: "session_ready", revision: 7 }));
 		expect(transport.sent).toEqual(
 			expect.arrayContaining([
 				expect.objectContaining({ type: "event_replay_result", id: "replay", ok: true }),

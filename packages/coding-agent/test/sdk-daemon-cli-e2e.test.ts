@@ -24,6 +24,13 @@ function isExplicitTailReplay(frame: Record<string, unknown>): boolean {
 	return frame.type === "event_replay" && typeof frame.connectionId === "string";
 }
 
+function withCheckpointRevision(
+	event: Record<string, unknown>,
+	checkpoint: { revision: number },
+): Record<string, unknown> {
+	return event.revision === undefined ? { ...event, revision: checkpoint.revision } : event;
+}
+
 // Delay applied to the explicit tail replay response so live frames pushed at
 // request time provably reach the client first.
 const EXPLICIT_REPLAY_DELAY_MS = 250;
@@ -212,7 +219,7 @@ describe("SDK session CLI", () => {
 								return;
 							}
 							for (const event of earlyLiveEvents) {
-								socket.send(JSON.stringify(event));
+								socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
 								wireLog.push(`live_sent:${event.kind}:${event.seq}`);
 							}
 							const events = explicitReplayEvents;
@@ -233,7 +240,8 @@ describe("SDK session CLI", () => {
 									});
 									socket.send(lastReplayPayload);
 									wireLog.push("explicit_replay_result");
-									for (const event of deferredLiveEvents) socket.send(JSON.stringify(event));
+									for (const event of deferredLiveEvents)
+										socket.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
 								} catch {
 									// connection already closed
 								}
@@ -261,7 +269,7 @@ describe("SDK session CLI", () => {
 								for (const event of pending)
 									for (const target of openSockets) {
 										try {
-											target.send(JSON.stringify(event));
+											target.send(JSON.stringify(withCheckpointRevision(event, checkpointRecord)));
 										} catch {
 											// connection already closed
 										}
@@ -777,6 +785,53 @@ describe("SDK session CLI", () => {
 				item => item.kind === "turn_start" && item.revision === 7 && item.generation === 1 && item.seq === 1,
 			),
 		).toHaveLength(1);
+	}, 60_000);
+
+	it("orders lifecycle positions by revision before generation and sequence", async () => {
+		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
+		earlyLiveEvents = [
+			{
+				type: "event",
+				revision: 2,
+				generation: 1,
+				seq: 1,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				revision: 1,
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live" },
+			},
+		];
+		deferredLiveEvents = [
+			{
+				type: "event",
+				revision: 2,
+				generation: 1,
+				seq: 2,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const items = (JSON.parse(tail.stdout).result?.items ?? []) as Array<Record<string, unknown>>;
+		expect(
+			items.map(item => ({ kind: item.kind, revision: item.revision, generation: item.generation, seq: item.seq })),
+		).toEqual([
+			{ kind: "turn_end", revision: 1, generation: 1, seq: 1 },
+			{ kind: "turn_start", revision: 2, generation: 1, seq: 1 },
+			{ kind: "turn_end", revision: 2, generation: 1, seq: 2 },
+		]);
 	}, 60_000);
 
 	// Out-of-band ordering: the Router delivers live frames as they arrive, while

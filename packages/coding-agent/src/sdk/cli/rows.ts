@@ -93,22 +93,21 @@ export function tailItemKey(item: SdkTailItemV1): string {
 /** Holds positioned live frames until the checkpoint can stamp their authoritative revision. */
 export class TailRevisionBuffer {
 	#pending: SdkTailItemV1[] = [];
-	#revision: number | undefined;
+	#resolved = false;
 
 	push(item: SdkTailItemV1): SdkTailItemV1[] {
 		if (item.revision !== undefined || item.generation === undefined || item.seq === undefined) return [item];
-		if (this.#revision === undefined) {
+		if (!this.#resolved) {
 			this.#pending.push(item);
 			return [];
 		}
-		item.revision = this.#revision;
-		return [item];
+		throw new Error("A positioned live tail item arrived without an authoritative revision after checkpoint.");
 	}
 
 	resolve(revision: number): SdkTailItemV1[] {
 		if (!Number.isSafeInteger(revision) || revision < 0)
 			throw new Error("Tail revision must be a non-negative integer.");
-		this.#revision = revision;
+		this.#resolved = true;
 		const pending = this.#pending;
 		this.#pending = [];
 		for (const item of pending) item.revision = revision;
