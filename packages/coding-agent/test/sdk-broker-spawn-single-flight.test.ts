@@ -316,6 +316,24 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 	}
 }, 45_000);
 
+it("stale broker client teardown cannot extend an expired retirement deadline", async () => {
+	const { closeBrokerClientBeforeDeadline } = await import("../src/sdk/broker/ensure");
+	const stalled = Promise.withResolvers<void>();
+	let closeCalls = 0;
+	await closeBrokerClientBeforeDeadline(
+		{
+			close() {
+				closeCalls += 1;
+				return stalled.promise;
+			},
+		},
+		Date.now() - 1,
+	);
+	expect(closeCalls).toBe(1);
+	stalled.resolve();
+	await stalled.promise;
+});
+
 it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
 	const dir = await temp();
 	const readBrokerDiscovery = brokerDiscovery.readBrokerDiscovery;

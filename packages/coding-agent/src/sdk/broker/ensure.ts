@@ -314,19 +314,30 @@ function sameBrokerOwner(left: BrokerOwnerIdentity | null, right: BrokerOwnerIde
 	);
 }
 
+/** Start client teardown, but never await it past the retirement operation's absolute deadline. */
+export async function closeBrokerClientBeforeDeadline(
+	client: { close(): Promise<void> },
+	deadline: number,
+): Promise<void> {
+	const close = client.close();
+	void close.catch(() => undefined);
+	const remainingMs = deadline - Date.now();
+	if (remainingMs <= 0) return;
+	await Promise.race([close, Bun.sleep(remainingMs)]);
+}
+
 async function retireStaleBrokerGeneration(stale: BrokerDiscovery, settings: EnsureBrokerSettings): Promise<void> {
 	const deadline = Date.now() + STALE_BROKER_RETIREMENT_TIMEOUT_MS;
 	let shutdownSucceeded = false;
 	try {
 		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-<<<<<<< HEAD
 		if (!current || !sameBrokerOwner(current, stale)) return;
 		const client = await SdkClient.connect(current.url, current.token, { timeoutMs: 2_000, deadline });
 		try {
 			await client.global("broker.shutdown", {});
 			shutdownSucceeded = true;
 		} finally {
-			await client.close().catch(() => {});
+			await closeBrokerClientBeforeDeadline(client, deadline).catch(() => undefined);
 		}
 	} catch {}
 	if (!shutdownSucceeded) {
