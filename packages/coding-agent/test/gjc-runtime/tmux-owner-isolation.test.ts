@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, it, spyOn } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -430,6 +431,45 @@ describe("tmux owner isolation", () => {
 		20_000,
 	);
 
+	it("authenticates lifecycle mutations against the durable capability record", async () => {
+		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-capability-"));
+		const sessionId = "capability-session";
+		const generation = "capability-generation";
+		const token = "a".repeat(64);
+		const paths = lifecyclePaths(state, sessionId, generation);
+		try {
+			await fs.mkdir(paths.root, { recursive: true });
+			await Bun.write(
+				paths.protocolTokenFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
+					generation,
+					token_sha256: crypto.createHash("sha256").update(token).digest("hex"),
+				}),
+			);
+			const request = {
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: state,
+				socket_key: "socket",
+				observer: "sidecar",
+				observed_at: "2026-01-01T00:00:00.000Z",
+				signal: "EXIT",
+				exit_code: 0,
+				exit_kind: "cleanup",
+				reason: "test",
+				auth_token: token,
+			} as const;
+			expect(isTrustedOwnerIsolationProtocolRequest(request)).toBe(true);
+			expect(isTrustedOwnerIsolationProtocolRequest({ ...request, auth_token: `${"b".repeat(63)}b` })).toBe(false);
+		} finally {
+			await fs.rm(state, { recursive: true, force: true });
+		}
+	});
+
 	it("rejects a multi-line owner-isolation request without entering an interactive path", async () => {
 		const result = await runOwnerIsolationEntry(
 			[process.execPath, ownerIsolationCliEntry, ownerIsolationFlag],
@@ -648,6 +688,21 @@ describe("tmux owner isolation", () => {
 		expect(calls[0]?.argv).not.toContain("sh");
 		expect(calls[0]?.argv).not.toContain("-c");
 		expect(calls[0]?.argv).not.toContain(calls[0]?.stdin ?? "");
+	});
+
+	it("rejects a scoped bootstrap envelope before recording its attempt", () => {
+		const attempts: string[] = [];
+		const oversizedRequest = {
+			...request,
+			tmux_argv: [...request.tmux_argv.slice(0, -1), "x".repeat(TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)],
+		};
+		const result = planTmuxOwnerIsolationSync(oversizedRequest, {
+			readCallerCgroup: () => "0::/caller.service",
+			probeServer: () => ({ state: "absent" }),
+			recordAttempt: input => attempts.push(input.attempt.token),
+		});
+		expect(result).toMatchObject({ ok: false, code: "scope_unavailable", diagnostic: "bootstrap_request_too_large" });
+		expect(attempts).toEqual([]);
 	});
 
 	it("rejects a scoped receipt when its creating server was replaced", () => {
@@ -1806,7 +1861,7 @@ describe("tmux owner isolation", () => {
 				}),
 			).rejects.toThrow("owner_term_verdict_timeout");
 			await expect(
-				fs.access(`${lifecyclePaths(state, "session", generation).intentFile}.expired`),
+				fs.access(`${lifecyclePaths(state, "session", generation).intentFile}.dispatched`),
 			).resolves.toBeNull();
 		}
 		await replaceOwnerGeneration(state, "session", "replayed");
@@ -2040,6 +2095,65 @@ describe("tmux owner isolation", () => {
 				}
 			});
 		}
+
+		it("does not retry after dispatch until the original observer reconciles it", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-dispatched-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const input = intentInput(new Date(Date.now() + 600_000).toISOString());
+				await expect(
+					closeExactTmuxOwner(
+						{
+							stateDir: state,
+							sessionId: "session",
+							generation: "generation",
+							serverKey: "socket",
+							pid: process.pid,
+							startTime: "start",
+							dispatchId: input.dispatch_id,
+							createdAt: input.created_at,
+							expiresAt: input.expires_at,
+						},
+						{
+							readStartTime: async () => "start",
+							sendSigterm: async () => undefined,
+							waitForVerdict: async () => null,
+							cleanupSession: async () => undefined,
+						},
+					),
+				).rejects.toThrow("owner_term_verdict_timeout");
+				const paths = lifecyclePaths(state, "session", "generation");
+				const dispatched = JSON.parse(await Bun.file(`${paths.intentFile}.dispatched`).text()) as {
+					intent_id: string;
+					dispatch_id: string;
+				};
+				const dispatchedIntentId = dispatched.intent_id;
+				expect(dispatched).toMatchObject({ intent_id: expect.any(String), dispatch_id: input.dispatch_id });
+				await expect(createOwnerIntent(state, input)).rejects.toThrow("owner_intent_replay");
+				const observation = {
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: "session",
+					owner_generation: "generation",
+					state_dir: state,
+					socket_key: "socket",
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: 0,
+					exit_kind: "exit",
+					reason: "test",
+					operator_dispatch_id: input.dispatch_id,
+					operator_intent_id: dispatchedIntentId,
+				} as const;
+				const observed = await observeOwnerTerminal(observation);
+				expect(observed.classification).toBe("expected_operator_shutdown");
+				expect(await Bun.file(paths.intentFile).exists()).toBe(false);
+				expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
 
 		it("does not let a late observer use a retryable marker to publish owner loss", async () => {
 			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-stale-observer-"));

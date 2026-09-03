@@ -27,6 +27,7 @@ import {
 	isValidOwnerVerdict,
 	lifecyclePaths,
 	type ObserveTerminalRequest,
+	type OwnerGenerationBaseline,
 	type OwnerIntent,
 	type OwnerVerdict,
 	observeOwnerTerminal,
@@ -1734,7 +1735,6 @@ export async function persistCoordinatorLaunchFailureState(input: {
 						: null;
 					const activeGeneration = baseline?.state === "current" ? baseline.generation : null;
 					const previousManagedEvidence = previousOwner !== null;
-					if (input.managedLaunch && baseline?.state !== "absent") return;
 					if (ownerMetadataComplete && baseline === undefined) return;
 					// Any owner generation already represented by the state file requires an
 					// authenticated, still-current caller. Do not turn an unavailable
@@ -1772,7 +1772,11 @@ export async function persistCoordinatorLaunchFailureState(input: {
 							throw error;
 						}
 					}
-					await writeStateFileSync(stateFile, input.payload, keyId);
+					const payload =
+						activeGeneration !== null && ownerMetadataValid && sessionId && ownerGeneration === activeGeneration
+							? { ...input.payload, owner_generation: ownerGeneration }
+							: input.payload;
+					await writeStateFileSync(stateFile, payload, keyId);
 				}),
 		);
 	await serializeStateFileWrite(
@@ -1968,7 +1972,7 @@ async function runtimeStateOwnerGenerationFence(
 	const previousGeneration = typeof rawPreviousGeneration === "string" ? rawPreviousGeneration.trim() : null;
 	const owner = context.ownerTerminal;
 	if (!owner) return previousGeneration === null;
-	let current: Awaited<ReturnType<typeof captureOwnerGenerationBaseline>>;
+	let current: OwnerGenerationBaseline;
 	try {
 		current = await captureOwnerGenerationBaseline(owner.stateDir, identity.sessionId);
 	} catch {
@@ -2963,8 +2967,7 @@ async function observeOwnerTerminalPostmortem(
 			(process.env.GJC_MANAGED_OWNER_SUPERVISED === "1" ||
 				(process.env.GJC_TMUX_LAUNCHED === "1" && process.platform === "win32")) &&
 			reason === postmortem.Reason.SIGTERM &&
-			(!owner.operatorDispatchId || !owner.operatorIntentId) &&
-			intentStatus !== "none"
+			(!owner.operatorDispatchId || !owner.operatorIntentId)
 		)
 			return null;
 		const now = new Date().toISOString();
@@ -3121,17 +3124,26 @@ async function persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 	}
 	if (payload) await writeStateFileSync(stateFile, payload);
 }
+export interface PersistCoordinatorRuntimeStateFromPostmortemOptions {
+	stateFile?: string;
+	ownerTerminalVerdict?: OwnerVerdict | null;
+}
+
 export async function persistCoordinatorRuntimeStateFromPostmortem(
 	reason: postmortem.Reason,
 	context: RuntimeStateContext,
+	options: PersistCoordinatorRuntimeStateFromPostmortemOptions = {},
 ): Promise<void> {
-	const stateFile = runtimeStateFileForContext(context);
+	const stateFile = options.stateFile ?? runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
 		context = await contextWithManagedOwnerGeneration(context);
-	const ownerTerminalVerdict = context.ownerTerminal
-		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, context.sessionId)
-		: null;
+	const ownerTerminalVerdict =
+		options.ownerTerminalVerdict !== undefined
+			? options.ownerTerminalVerdict
+			: context.ownerTerminal
+				? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, context.sessionId)
+				: null;
 	let identity: RuntimeStateIdentity;
 	try {
 		identity = normalizedIdentity(context);
@@ -3239,6 +3251,27 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 		}
 		throw error;
 	});
+}
+
+/** Finalizes an externally observed managed-owner shutdown in its tagged runtime-state file. */
+export async function persistCoordinatorRuntimeStateFromOwnerVerdict(
+	stateFile: string,
+	ownerTerminal: OwnerTerminalContext,
+	verdict: OwnerVerdict,
+): Promise<void> {
+	const previous = readPreviousPayload(stateFile);
+	const cwd = typeof previous.cwd === "string" && previous.cwd.trim() ? previous.cwd : ownerTerminal.stateDir;
+	const sessionFile = typeof previous.session_file === "string" ? previous.session_file : null;
+	await persistCoordinatorRuntimeStateFromPostmortem(
+		postmortem.Reason.SIGTERM,
+		{
+			sessionId: verdict.session_id,
+			cwd,
+			sessionFile,
+			ownerTerminal: { ...ownerTerminal, generationPublished: true },
+		},
+		{ stateFile, ownerTerminalVerdict: verdict },
+	);
 }
 
 export function registerCoordinatorRuntimeStateFinalizer(

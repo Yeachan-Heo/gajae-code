@@ -301,7 +301,7 @@ describe("gjc-session create public owner lifecycle", () => {
 		expect(await Bun.file(path.join(state, "started.json")).exists()).toBe(true);
 	});
 
-	test("accepts a relative worktree path and passes protocol auth to the supervisor", async () => {
+	test("accepts a relative worktree path and passes protocol auth only to the supervisor", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-relative-")); roots.push(root);
 		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root);
 		const name = `relative-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
@@ -312,7 +312,11 @@ describe("gjc-session create public owner lifecycle", () => {
 		});
 		expect(result.exitCode, result.stderr.toString()).toBe(0);
 		const create = await Bun.file(createScript).text();
-		expect(create).toContain('"GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN"');
+		const launchLine = create.split("\n").find(line => line.startsWith("LAUNCH=("));
+		expect(launchLine).toBeDefined();
+		expect(launchLine).toContain("GJC_TMUX_OWNER_PROTOCOL_TOKEN");
+		expect(launchLine).toContain('python3 "$STATE_DIR/supervisor.py"');
+		expect(create).toContain("child_environment.pop(\"GJC_TMUX_OWNER_PROTOCOL_TOKEN\", None)");
 	});
 
 test("fails closed for malformed plans before creating an owner", async () => {

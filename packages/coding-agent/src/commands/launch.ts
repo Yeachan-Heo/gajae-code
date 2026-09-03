@@ -42,6 +42,7 @@ export async function persistCoordinatorLaunchFailure(
 	if (!stateFile) return;
 	const sessionId = env[GJC_COORDINATOR_SESSION_ID_ENV]?.trim() || null;
 	const ownerGenerationPublished = env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] !== "1";
+	const ownerGeneration = env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null;
 	const message = error instanceof Error ? error.message : String(error);
 	const code = message.split(":", 1)[0] || "launch_failed";
 	const now = new Date().toISOString();
@@ -67,15 +68,13 @@ export async function persistCoordinatorLaunchFailure(
 			truncated: false,
 		},
 		error: { code, message, recoverable: true },
-		...(sessionId && ownerGenerationPublished
-			? { owner_generation: env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null }
-			: {}),
+		...(sessionId && ownerGenerationPublished ? { owner_generation: ownerGeneration } : {}),
 	};
 	await persistCoordinatorLaunchFailureState({
 		stateFile,
 		cwd,
 		sessionId,
-		ownerGeneration: ownerGenerationPublished ? (env[GJC_TMUX_OWNER_GENERATION_ENV] ?? null) : null,
+		ownerGeneration,
 		ownerStateDir: env[GJC_TMUX_OWNER_STATE_DIR_ENV] ?? null,
 		ownerServerKey: env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? null,
 		managedLaunch: env.GJC_TMUX_LAUNCHED === "1",

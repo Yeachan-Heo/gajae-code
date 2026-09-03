@@ -724,13 +724,6 @@ export function planTmuxOwnerIsolationSync(request: PlanRequest, probe: OwnerIso
 			baseline,
 			expires_at: new Date(Date.now() + 7_000).toISOString(),
 		};
-
-		probe.recordAttempt({
-			stateDir: request.state_dir,
-			sessionId: request.session_id,
-			generation: request.owner_generation,
-			attempt,
-		});
 		const expectedScope = `gjc-owner-${token}.scope`;
 		const bootstrap: BootstrapRequest = {
 			schema_version: 1,
@@ -744,6 +737,14 @@ export function planTmuxOwnerIsolationSync(request: PlanRequest, probe: OwnerIso
 			attempt,
 		};
 		const stdinLine = JSON.stringify(bootstrap);
+		if (Buffer.byteLength(stdinLine) > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)
+			return failure("scope_unavailable", "bootstrap_request_too_large");
+		probe.recordAttempt({
+			stateDir: request.state_dir,
+			sessionId: request.session_id,
+			generation: request.owner_generation,
+			attempt,
+		});
 		return {
 			schema_version: 1,
 			ok: true,
@@ -1011,7 +1012,6 @@ export async function planTmuxOwnerIsolation(request: PlanRequest, probe: OwnerI
 			baseline,
 			expires_at: new Date(Date.now() + 7_000).toISOString(),
 		};
-		await writeAttempt(request.state_dir, request.session_id, request.owner_generation, attempt);
 		const expectedScope = `gjc-owner-${token}.scope`;
 		const bootstrap: BootstrapRequest = {
 			schema_version: 1,
@@ -1025,6 +1025,9 @@ export async function planTmuxOwnerIsolation(request: PlanRequest, probe: OwnerI
 			attempt,
 		};
 		const stdinLine = JSON.stringify(bootstrap);
+		if (Buffer.byteLength(stdinLine) > TMUX_OWNER_ISOLATION_MAX_LINE_BYTES)
+			return failure("scope_unavailable", "bootstrap_request_too_large");
+		await writeAttempt(request.state_dir, request.session_id, request.owner_generation, attempt);
 		return {
 			schema_version: 1,
 			ok: true,
@@ -1281,6 +1284,7 @@ export interface LifecyclePaths {
 	generation: string;
 	generationFile: string;
 	generationMarkerFile: string;
+	protocolTokenFile: string;
 	intentFile: string;
 	verdictFile: string;
 	verdictAliasFile: string;
@@ -1302,6 +1306,7 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		generation,
 		generationFile: path.join(root, "generation.json"),
 		generationMarkerFile: path.join(root, `generation-${encodeURIComponent(generation)}.published.json`),
+		protocolTokenFile: path.join(root, `protocol-token-${encodeURIComponent(generation)}.json`),
 		intentFile: path.join(root, `intent-${generation}.json`),
 		verdictFile: path.join(root, `verdict-${generation}.json`),
 		verdictAliasFile: path.join(root, "verdict.json"),
@@ -1789,15 +1794,18 @@ export function publishOwnerGenerationSync(request: PublishGenerationRequest): P
 /**
  * Prior-intent markers that permanently block a new close intent.
  *
- * `.consumed` proves the close actually reached its verdict, and `.invalidated` marks a
- * generation that was superseded by a replacement owner. Neither may be retried.
+ * `.consumed` proves the close actually reached its verdict, `.invalidated` marks a
+ * generation that was superseded by a replacement owner, and `.dispatched` records a
+ * delivered SIGTERM whose verdict timed out. None may be retried because doing so would
+ * supersede an authorization that may still be consumed by a late observer.
  */
-const BLOCKING_INTENT_SUFFIXES = [".consumed", ".invalidated"] as const;
+const BLOCKING_INTENT_SUFFIXES = [".consumed", ".invalidated", ".dispatched"] as const;
 
 /**
  * Prior-intent markers that record an attempt which provably did NOT consume the session:
  * `.cancelled` is written when the generation moved or the SIGTERM dispatch threw, and
- * `.expired` when the intent lapsed or no matching verdict arrived.
+ * `.expired` when the intent lapsed before dispatch. A `.dispatched` marker is written when
+ * SIGTERM was delivered but no matching verdict arrived before the close caller's deadline.
  *
  * The intent path is keyed on the owner generation, and that generation does not rotate while
  * the tmux session lives. Treating these as replay therefore wedged the session permanently:
@@ -1935,11 +1943,41 @@ async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string,
 	return false;
 }
 
+/** Returns the suffix of an archived intent matching one exact dispatch. */
+async function archivedOwnerIntentSuffix(
+	paths: LifecyclePaths,
+	dispatchId: string,
+	intentId?: string,
+): Promise<string | null> {
+	let entries: string[];
+	try {
+		entries = await fs.readdir(paths.root);
+	} catch {
+		throw new Error("stale_terminal_evidence_unavailable");
+	}
+	const prefix = `${path.basename(paths.intentFile)}.`;
+	for (const entry of entries) {
+		if (!entry.startsWith(prefix)) continue;
+		const suffix = /^(cancelled|expired|consumed|invalidated|dispatched)$/.exec(entry.slice(prefix.length));
+		if (!suffix) continue;
+		try {
+			const archived = await readNoFollowJson(path.join(paths.root, entry));
+			if (archived === null || !isValidOwnerIntent(archived) || !nonEmpty(archived.dispatch_id))
+				throw new Error("stale_terminal_evidence_unavailable");
+			if (archived.dispatch_id === dispatchId && (intentId === undefined || archived.intent_id === intentId))
+				return `.${suffix[1]!}`;
+		} catch {
+			throw new Error("stale_terminal_evidence_unavailable");
+		}
+	}
+	return null;
+}
+
 /** Renames an intent only while the expected dispatch still owns the live path. */
 async function renameIntentIfCurrent(
 	paths: LifecyclePaths,
 	intentId: string,
-	suffix: ".cancelled" | ".expired" | ".consumed",
+	suffix: ".cancelled" | ".expired" | ".consumed" | ".dispatched",
 	lockToken?: string,
 ): Promise<boolean> {
 	const token = lockToken ?? (await acquireOwnerGenerationLock(paths, "intent-transition"));
@@ -1954,7 +1992,7 @@ async function renameIntentIfCurrent(
 async function renameIntentIfCurrentWithoutLock(
 	paths: LifecyclePaths,
 	intentId: string,
-	suffix: ".cancelled" | ".expired" | ".consumed",
+	suffix: ".cancelled" | ".expired" | ".consumed" | ".dispatched",
 ): Promise<boolean> {
 	const current = await readOwnerIntentStrict(paths.intentFile);
 	if (current?.intent_id !== intentId) return false;
@@ -2269,7 +2307,15 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 			}
 			return reconcileTerminalArtifacts(paths, published);
 		}
-		const intent = await readOwnerIntentStrict(paths.intentFile);
+		let intent = await readOwnerIntentStrict(paths.intentFile);
+		if (!intent && observation.operator_dispatch_id !== undefined) {
+			const archivedSuffix = await archivedOwnerIntentSuffix(
+				paths,
+				observation.operator_dispatch_id,
+				observation.operator_intent_id,
+			);
+			if (archivedSuffix === ".dispatched") intent = await readOwnerIntentStrict(`${paths.intentFile}.dispatched`);
+		}
 		const recoveredJournal = await readJson<{
 			schema_version?: number;
 			observation?: unknown;
@@ -2316,8 +2362,10 @@ async function observeOwnerTerminalExclusive(request: ObserveTerminalRequest): P
 				intent.intent_id !== observation.operator_intent_id
 			)
 				throw new Error("stale_terminal_observation");
-			if (!intent && (await hasArchivedOwnerIntent(paths, dispatchId, observation.operator_intent_id)))
-				throw new Error("stale_terminal_observation");
+			if (!intent) {
+				const archivedSuffix = await archivedOwnerIntentSuffix(paths, dispatchId, observation.operator_intent_id);
+				if (archivedSuffix && archivedSuffix !== ".dispatched") throw new Error("stale_terminal_observation");
+			}
 		}
 		if (observation.operator_intent_id !== undefined && !observation.operator_dispatch_id)
 			throw new Error("stale_terminal_observation");
@@ -2408,7 +2456,7 @@ async function reconcileConsumedIntent(paths: LifecyclePaths, intentId: string):
 		if (consumed?.intent_id !== intentId) throw new Error("owner_intent_consumption_failed");
 		return;
 	}
-	for (const suffix of RETRYABLE_INTENT_SUFFIXES) {
+	for (const suffix of [...RETRYABLE_INTENT_SUFFIXES, ".dispatched"] as const) {
 		const marker = `${paths.intentFile}${suffix}`;
 		if (!(await intentMarkerExists(marker))) continue;
 		const retry = await readOwnerIntentStrict(marker);
@@ -2625,6 +2673,7 @@ export async function closeExactTmuxOwner(
 	const generationLockToken = await acquireOwnerGenerationLock(paths, request.sessionId);
 	if (!generationLockToken) throw new Error("generation_lock_contended");
 	let intent: OwnerIntent;
+	let dispatched = false;
 	try {
 		if ((await deps.readStartTime(request.pid)) !== request.startTime) throw new Error("owner_pid_identity_mismatch");
 		if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
@@ -2662,6 +2711,7 @@ export async function closeExactTmuxOwner(
 			if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
 				throw new Error("owner_generation_mismatch");
 			await deps.sendSigterm(request.pid, intent);
+			dispatched = true;
 		} catch (error: unknown) {
 			await renameIntentIfCurrent(paths, intent.intent_id, ".cancelled", generationLockToken);
 			throw error;
@@ -2671,7 +2721,7 @@ export async function closeExactTmuxOwner(
 	}
 	const verdict = await deps.waitForVerdict();
 	if (!verdict || verdict.intent_id !== intent.intent_id || verdict.classification !== "expected_operator_shutdown") {
-		await renameIntentIfCurrent(paths, intent.intent_id, ".expired");
+		await renameIntentIfCurrent(paths, intent.intent_id, dispatched ? ".dispatched" : ".expired");
 		throw new Error("owner_term_verdict_timeout");
 	}
 	await deps.cleanupSession();
@@ -2923,11 +2973,22 @@ export function isTrustedOwnerIsolationProtocolRequest(
 			return false;
 		return controlArgv.length > 0 && isTrustedTmuxOwnerIsolationArgv(request.tmux_argv);
 	}
-	return (
-		nonEmpty(request.auth_token) &&
-		/^[a-f0-9]{64}$/.test(request.auth_token) &&
-		request.auth_token === process.env.GJC_TMUX_OWNER_PROTOCOL_TOKEN
-	);
+	if (!nonEmpty(request.auth_token) || !/^[a-f0-9]{64}$/.test(request.auth_token)) return false;
+	try {
+		const capability = readNoFollowJsonSync(
+			lifecyclePaths(request.state_dir, request.session_id, request.owner_generation).protocolTokenFile,
+		);
+		return (
+			isRecord(capability) &&
+			Object.keys(capability).length === 4 &&
+			capability.schema_version === 1 &&
+			capability.session_id === request.session_id &&
+			capability.generation === request.owner_generation &&
+			capability.token_sha256 === crypto.createHash("sha256").update(request.auth_token).digest("hex")
+		);
+	} catch {
+		return false;
+	}
 }
 function isTerminalSignal(value: unknown): value is TerminalSignal {
 	return (

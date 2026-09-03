@@ -22,6 +22,7 @@ import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
+	persistCoordinatorRuntimeStateFromOwnerVerdict,
 } from "./session-state-sidecar";
 import {
 	assertGjcTmuxMutationAuthoritySync,
@@ -1875,7 +1876,7 @@ export async function forceCloseGjcTmuxSession(
 	const dispatchId = crypto.randomUUID();
 	const verdictDeadline = now().getTime() + FORCE_CLOSE_VERDICT_TIMEOUT_MS;
 	let operatorVerdict: Promise<OwnerVerdict> | null = deps.waitForOwnerExitVerdict?.() ?? null;
-	await closeExactTmuxOwner(
+	const ownerVerdict = await closeExactTmuxOwner(
 		{
 			stateDir: identity.stateDir,
 			sessionId: identity.sessionId,
@@ -1960,6 +1961,18 @@ export async function forceCloseGjcTmuxSession(
 			},
 		},
 	);
+	if (await Bun.file(actualStateFile).exists())
+		await persistCoordinatorRuntimeStateFromOwnerVerdict(
+			actualStateFile,
+			{
+				generation: identity.generation,
+				stateDir: identity.stateDir,
+				socketKey: identity.socketKey,
+				operatorDispatchId: dispatchId,
+				operatorIntentId: ownerVerdict.intent_id,
+			},
+			ownerVerdict,
+		);
 	return session;
 }
 

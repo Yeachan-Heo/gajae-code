@@ -129,6 +129,7 @@ describe("managed owner supervisor", () => {
 	it("does not persist or forward a Broker-redacted child command", async () => {
 		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
 		try {
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
 			const result = await runSupervisor(
 				stateDir,
 				[
@@ -136,12 +137,40 @@ describe("managed owner supervisor", () => {
 					"-e",
 					"if (process.env.GJC_MANAGED_OWNER_COMMAND_JSON || process.env.GJC_MANAGED_OWNER_REDACT_COMMAND) process.exit(19)",
 				],
-				{ GJC_MANAGED_OWNER_REDACT_COMMAND: "1" },
+				{ GJC_MANAGED_OWNER_REDACT_COMMAND: "1", GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
 			);
 			expect(result.exitCode, result.stderr).toBe(0);
 			const root = lifecyclePaths(stateDir, "session-2681", "generation-2681").root;
 			const files = await fs.readdir(root);
 			expect(files.filter(file => file.includes("binding") || file.includes("receipt"))).toEqual([]);
+			expect(
+				await Bun.file(lifecyclePaths(stateDir, "session-2681", "generation-2681").verdictFile).json(),
+			).toMatchObject({
+				signal: "EXIT",
+				result: "cleanup",
+				classification: "non_operator_cleanup",
+			});
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it("publishes command-independent evidence for a redacted abort", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			await replaceOwnerGeneration(stateDir, "session-2681", "generation-2681");
+			const result = await runSupervisor(stateDir, fastSigabrtCommand(), {
+				GJC_MANAGED_OWNER_REDACT_COMMAND: "1",
+				GJC_TMUX_OWNER_SERVER_KEY: "server-key",
+			});
+			expect(result.exitCode, result.stderr).toBe(134);
+			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+			expect(await Bun.file(paths.verdictFile).exists()).toBe(true);
+			expect(await Bun.file(paths.verdictFile).json()).toMatchObject({
+				signal: "UNKNOWN",
+				result: "owner_lost",
+				classification: "unexpected_owner_loss",
+			});
+			expect(await Bun.file(paths.incidentFile).exists()).toBe(true);
 		} finally {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
@@ -248,9 +277,9 @@ describe("managed owner supervisor", () => {
 				session_id: sessionId,
 				signal: "EXIT",
 				exit_code: 0,
-				result: "exit",
+				result: "cleanup",
 				observer: "raw_monitor",
-				classification: "unexpected_owner_loss",
+				classification: "non_operator_cleanup",
 			});
 			expect(resolveManagedOwnerPredecessorSync(stateDir, sessionId, baseline)).toBeUndefined();
 		} finally {
