@@ -1721,6 +1721,6 @@ describe("createAgentSession MCP discovery prompt gating", () => {
 				await resumedSession.dispose();
 			}
 		},
-		SLOW_SDK_TEST_TIMEOUT_MS,
+		FALLBACK_SDK_TEST_TIMEOUT_MS,
 	);
 });

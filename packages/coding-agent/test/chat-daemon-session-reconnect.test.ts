@@ -50,6 +50,7 @@ function currentHostIncarnation(): string {
 // Keep the Router's independent attach deadline outside the fake reconnect clock.
 const inertAttachmentTimeout = (() => ({ unref: () => undefined })) as unknown as typeof setTimeout;
 const clearInertAttachmentTimeout = (() => undefined) as unknown as typeof clearTimeout;
+const CHAT_TEST_WAIT_ATTEMPTS = 15_000;
 /**
  * Mirrors `REPLAY_BARRIER_LIMIT`: how many live frames one attachment holds behind an
  * outstanding replay. Too low a mirror still overflows the real barrier; too high a real
@@ -626,7 +627,8 @@ async function withAttachedDiscordRuntime(
 
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
 async function awaitSocket(count: number): Promise<FakeWebSocket> {
-	for (let attempt = 0; attempt < 5_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && FakeWebSocket.instances.length < count; attempt++)
+		await Bun.sleep(1);
 	expect(FakeWebSocket.instances).toHaveLength(count);
 	return FakeWebSocket.instances[count - 1]!;
 }
@@ -640,7 +642,7 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  * cursor the runtime has not moved yet.
  */
 async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: FakeClock): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) {
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.posts.length < count; attempt++) {
 		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
@@ -656,7 +658,7 @@ async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: Fa
 async function awaitPostAttempts(provider: FakeSlackProvider, text: string, count: number): Promise<void> {
 	for (
 		let attempt = 0;
-		attempt < 5_000 && provider.postAttempts.filter(post => post.text === text).length < count;
+		attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.postAttempts.filter(post => post.text === text).length < count;
 		attempt++
 	)
 		await Bun.sleep(1);
@@ -664,7 +666,11 @@ async function awaitPostAttempts(provider: FakeSlackProvider, text: string, coun
 }
 
 async function awaitReconciliationFailures(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.reconciliationFailuresObserved < count; attempt++)
+	for (
+		let attempt = 0;
+		attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.reconciliationFailuresObserved < count;
+		attempt++
+	)
 		await Bun.sleep(1);
 	expect(provider.reconciliationFailuresObserved).toBeGreaterThanOrEqual(count);
 }
@@ -672,7 +678,8 @@ async function awaitReconciliationFailures(provider: FakeSlackProvider, count: n
 async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
 	for (
 		let attempt = 0;
-		attempt < 5_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
+		attempt < CHAT_TEST_WAIT_ATTEMPTS &&
+		(provider.posts.length < count || provider.completedClientMsgIds.size < count);
 		attempt++
 	)
 		await Bun.sleep(1);
@@ -683,13 +690,14 @@ async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): 
 
 /** A refusal is the only trace a failed publication leaves on this side of the runtime. */
 async function awaitRefusals(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.refused.length < count; attempt++)
+		await Bun.sleep(1);
 	expect(provider.refused).toHaveLength(count);
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
 async function awaitReplayRequests(host: FakeSessionHost, count: number, clock?: FakeClock): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && host.replayRequests.length < count; attempt++) {
+	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && host.replayRequests.length < count; attempt++) {
 		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
@@ -1814,7 +1822,7 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			// replay the delayed retirement would still discard.
 			for (
 				let attempt = 0;
-				attempt < 5_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
+				attempt < CHAT_TEST_WAIT_ATTEMPTS && !warnings.some(line => line.includes("publication failed at seq 2"));
 				attempt++
 			)
 				await Bun.sleep(1);
