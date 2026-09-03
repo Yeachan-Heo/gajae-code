@@ -338,6 +338,7 @@ type AttachedSession = {
 	replayPending: boolean;
 	replayPendingSince?: number;
 	replayPendingToken?: object;
+	drainingHeldSeq?: number;
 	readyTail: Promise<void>;
 	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
@@ -1901,9 +1902,11 @@ export class SessionRouter {
 	async #reinitializeAttachment(attached: AttachedSession): Promise<void> {
 		// A prior ready tail may be waiting for publication work carried by the dead
 		// socket. Chaining the reconnect behind it prevents the replacement from even
-		// issuing replay. Replacing the hold array fences that old replay tail while
-		// already-enqueued publication keeps its own independent settlement.
-		if (attached.barrier.held) attached.barrier.held = [];
+		// issuing replay. Replace its hold-array identity to fence that tail, but carry
+		// forward frames it had not started draining; the active draining sequence is
+		// already represented by the independent frame tail.
+		if (attached.barrier.held)
+			attached.barrier.held = attached.barrier.held.filter(entry => entry.seq !== attached.drainingHeldSeq);
 		const replayToken = {};
 		attached.replayPending = true;
 		attached.replayPendingSince = Date.now();
@@ -2296,7 +2299,14 @@ export class SessionRouter {
 				return;
 			}
 			const batch = held.splice(0, held.length).sort((left, right) => left.seq - right.seq);
-			for (const entry of batch) await this.#enqueueFrame(attached, entry.frame, "ordered");
+			for (const entry of batch) {
+				attached.drainingHeldSeq = entry.seq;
+				try {
+					await this.#enqueueFrame(attached, entry.frame, "ordered");
+				} finally {
+					if (attached.drainingHeldSeq === entry.seq) attached.drainingHeldSeq = undefined;
+				}
+			}
 		}
 	}
 
@@ -2413,7 +2423,7 @@ export class SessionRouter {
 				}
 				const retained = events
 					.map(event => readSequence(event.seq))
-					.find(seq => seq !== undefined && seq <= gap.toSeq);
+					.find(seq => seq !== undefined && seq >= gap.fromSeq && seq <= gap.toSeq);
 				if (retained !== undefined) {
 					this.#failBarrier(
 						attached,

@@ -951,6 +951,34 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 	});
 }, 20_000);
 
+test("an acknowledged replay prefix does not conflict with a later conceded gap", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
+		await withSerializedFakeTransport(async clock => {
+			const host = new FakeSessionHost();
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.emit("one");
+			await awaitCompletedPosts(provider, 1);
+			host.drop();
+			host.emitGated();
+			host.emit("three");
+			host.replayRewind = 1;
+			host.forcedGap = { kind: "sequence_gap", fromSeq: 2, toSeq: 2, resyncQueries: ["Q01"] };
+
+			reconcile();
+			host.accept(await awaitSocket(2));
+			await awaitPosts(provider, 2, clock);
+
+			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
+			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
+				`chat daemon replay conceded a retention gap (sequences 2-2 are gone from the host); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+			]);
+		});
+	});
+}, 20_000);
+
 test("stopping the runtime while a replay is pending neither hangs nor publishes what is held", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
 		await withSerializedFakeTransport(async () => {
@@ -1520,7 +1548,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 				"GJC notice\ntail",
 			]);
 			expect(warnings.filter(line => line.includes("conceded a retention gap"))).toEqual([
-				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host, 1 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
+				`chat daemon replay conceded a retention gap (sequences 1-2 are gone from the host, 2 of them recovered from live delivery); session ${SESSION_ID} generation ${GENERATION} resumes at seq 3.`,
 			]);
 
 			// The recovered frame did not strand the cursor below the conceded range: the
