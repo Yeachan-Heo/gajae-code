@@ -288,12 +288,6 @@ const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
 const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
 const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
-// A started non-abortable mutation must settle before the exec terminal is
-// published, but settlement cannot be allowed to hang the turn forever: once
-// the exec deadline has fired, a mutation that still has not settled is capped
-// by a grace window (deadline/4, min 5s) before the fence publishes anyway.
-const CURSOR_NON_ABORTABLE_GRACE_MIN_MS = 5_000;
-const CURSOR_NON_ABORTABLE_GRACE_DIVISOR = 4;
 const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
 
 interface CursorPendingChunk {
@@ -477,12 +471,10 @@ export function cursorExecDeadlineMsForTest(idleTimeoutMs: number | undefined): 
 	return Math.max(CURSOR_MIN_EXEC_DEADLINE_MS, idleTimeoutMs * CURSOR_EXEC_DEADLINE_MULTIPLIER);
 }
 
-/** Bounded settlement proof for a started non-abortable Cursor exec. */
+/** Settlement proof for a started non-abortable Cursor exec. */
 export interface CursorNonAbortableSettlement {
 	/** Resolves when the marked mutation settles; never rejects. */
 	settled: Promise<void>;
-	/** Rejects once the deadline fired and the mutation missed the settlement grace window; never resolves. */
-	exceeded: Promise<never>;
 }
 
 function runWithCursorExecDeadline<T>(
@@ -502,22 +494,13 @@ function runWithCursorExecDeadline<T>(
 	const abortController = (reason?: Error): void => {
 		if (!controller.signal.aborted) controller.abort(reason);
 	};
-	const settlementExceeded = Promise.withResolvers<never>();
-	// The fence observes `exceeded` through Promise.race; keep this branch silent.
-	settlementExceeded.promise.catch(() => {});
 	let settled = false;
 	let nonAbortableStarted = false;
 	let abortError: Error | undefined;
 	let timer: NodeJS.Timeout | undefined;
-	let graceTimer: NodeJS.Timeout | undefined;
-	const graceMs = Math.max(
-		CURSOR_NON_ABORTABLE_GRACE_MIN_MS,
-		Math.round(deadlineMs / CURSOR_NON_ABORTABLE_GRACE_DIVISOR),
-	);
 
 	const cleanup = () => {
 		if (timer) clearTimeout(timer);
-		if (graceTimer) clearTimeout(graceTimer);
 		if (signal) signal.removeEventListener("abort", onAbort);
 	};
 	const settle = (settlement: () => void) => {
@@ -527,30 +510,11 @@ function runWithCursorExecDeadline<T>(
 		onWrapperFinished?.();
 		settlement();
 	};
-	// A started non-abortable mutation defers rejection until it settles, but not
-	// forever: once the deadline (or caller abort) has fired, a mutation that
-	// still has not settled within the grace window caps the settlement fence.
-	const armSettlementGrace = (): void => {
-		if (settled || graceTimer) return;
-		graceTimer = setTimeout(() => {
-			if (settled) return;
-			settlementExceeded.reject(
-				new Error(
-					`Cursor non-abortable exec exceeded its ${deadlineMs}ms deadline and did not settle within ${graceMs}ms`,
-				),
-			);
-			// Cap the wrapper itself: rejecting makes the queued handler throw, so
-			// the queue's error path runs settleBehindFence and the terminal is
-			// published even though the mutation may still be running detached.
-			settle(() => result.reject(abortError ?? new Error("Cursor non-abortable exec settlement timed out")));
-		}, graceMs);
-	};
 	const onAbort = () => {
 		if (signal) {
 			abortError = cursorAbortError(signal);
 			abortController(abortError);
-			if (nonAbortableStarted) armSettlementGrace();
-			else settle(() => result.reject(abortError!));
+			if (!nonAbortableStarted) settle(() => result.reject(abortError!));
 		}
 	};
 	onControllerReady?.(abortController);
@@ -568,8 +532,7 @@ function runWithCursorExecDeadline<T>(
 		// still bounds how long this turn waits for the handler promise.
 		abortError = new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`);
 		abortController(abortError);
-		if (nonAbortableStarted) armSettlementGrace();
-		else settle(() => result.reject(abortError!));
+		if (!nonAbortableStarted) settle(() => result.reject(abortError!));
 	}, deadlineMs);
 	void operation(controller.signal, () => {
 		if (nonAbortableStarted) return;
@@ -577,15 +540,8 @@ function runWithCursorExecDeadline<T>(
 			throw new CursorExecAdmissionClosedError();
 		}
 		nonAbortableStarted = true;
-		// A mutation marked after the deadline already fired starts its grace
-		// window immediately instead of escaping the cap.
-		if (abortError !== undefined) armSettlementGrace();
 		onNonAbortableStarted?.({
-			// `result` may reject at the bounded fence cap while the actual
-			// mutation is still running. Settlement ownership must follow the
-			// operation, not the wrapper, or a retry can overlap the mutation.
 			settled: operationCompletion.promise,
-			exceeded: settlementExceeded.promise,
 		});
 	}).then(
 		value => {
@@ -600,6 +556,15 @@ function runWithCursorExecDeadline<T>(
 		},
 	);
 	return result.promise;
+}
+
+/** Exported for production-bridge coverage of non-abortable terminal ordering. */
+export function runWithCursorExecDeadlineForTest<T>(
+	operation: (signal: AbortSignal, markNonAbortable: () => void) => Promise<T>,
+	signal: AbortSignal | undefined,
+	deadlineMs: number,
+): Promise<T> {
+	return runWithCursorExecDeadline(operation, signal, deadlineMs);
 }
 
 interface CursorLogEntry {
@@ -1177,18 +1142,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		// Terminal publication (caller abort, transport error, or stream end)
 		// must wait for any started non-abortable mutation to settle: a network
 		// reset mid-exec otherwise publishes the terminal and lets a retry start
-		// while the filesystem mutation is still running. Settlement is bounded:
-		// a mutation that missed its grace window cannot hold the fence (and the
-		// transport) open forever.
+		// while the filesystem mutation is still running. Non-abortable means the
+		// mutation promise itself is the terminal boundary; publishing earlier
+		// would permit a post-terminal filesystem commit.
 		const settleBehindFence = (publish: () => void): void => {
 			if (pendingNonAbortableExec) {
-				void Promise.race([pendingNonAbortableExec.settled, pendingNonAbortableExec.exceeded])
-					.finally(publish)
-					.catch(() => {
-						// The `exceeded` branch is the fence cap firing: publish already
-						// ran through .finally; swallow so the race rejection cannot
-						// surface as an unhandled rejection after the terminal.
-					});
+				void pendingNonAbortableExec.settled.then(publish);
 				return;
 			}
 			publish();

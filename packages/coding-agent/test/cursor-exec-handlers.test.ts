@@ -6,10 +6,14 @@
  * and call them without the class instance. Before the constructor binding fix this threw:
  *   "undefined is not an object (evaluating 'this.#optionsForCall')"
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { create } from "@bufbuild/protobuf";
 import type { AgentEvent, AgentTool } from "@gajae-code/agent-core";
 import { dispatchedToolIdentity } from "@gajae-code/agent-core";
+import { runWithCursorExecDeadlineForTest } from "@gajae-code/ai/providers/cursor";
 import {
 	DeleteArgsSchema,
 	DiagnosticsArgsSchema,
@@ -23,6 +27,9 @@ import {
 	ShellArgsSchema,
 	WriteArgsSchema,
 } from "@gajae-code/ai/providers/cursor/gen/agent_pb";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 import { CursorExecHandlers } from "../src/cursor";
 
 function makeTool(name: string): AgentTool {
@@ -45,6 +52,18 @@ function makeHandlers(): CursorExecHandlers {
 		["lsp", makeTool("lsp")],
 	]);
 	return new CursorExecHandlers({ cwd: process.cwd(), tools } as never);
+}
+
+function createToolSession(cwd: string): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		getSessionFile: () => path.join(cwd, "session.jsonl"),
+		getSessionSpawns: () => "*",
+		getArtifactsDir: () => path.join(cwd, "artifacts"),
+		allocateOutputArtifact: async () => ({ id: "artifact-1", path: path.join(cwd, "artifact-1.log") }),
+		settings: Settings.isolated(),
+	};
 }
 
 describe("CursorExecHandlers detached invocation (#484)", () => {
@@ -221,6 +240,78 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		expect(outcome).toEqual({ ok: true });
 		expect(archiveMutationCount).toBe(1);
 	});
+
+	for (const termination of ["caller abort", "local deadline"] as const) {
+		it(`keeps the ${termination} terminal behind a production archive commit`, async () => {
+			const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-archive-terminal-"));
+			const archivePath = path.join(tmpDir, "state.zip");
+			const commitStarted = Promise.withResolvers<void>();
+			const releaseCommit = Promise.withResolvers<void>();
+			const operationSettled = Promise.withResolvers<void>();
+			const realRename = fs.rename.bind(fs);
+			let mutationCount = 0;
+			let mutationCountAtTerminal: number | undefined;
+			let terminalPublished = false;
+			const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+				if (String(to) === archivePath) {
+					commitStarted.resolve();
+					await releaseCommit.promise;
+					await realRename(from, to);
+					mutationCount += 1;
+					return;
+				}
+				await realRename(from, to);
+			});
+
+			try {
+				const writeTool = new WriteTool(createToolSession(tmpDir));
+				const handlers = new CursorExecHandlers({ cwd: tmpDir, tools: new Map([["write", writeTool]]) } as never);
+				const controller = new AbortController();
+				const pending = runWithCursorExecDeadlineForTest(
+					async (signal, markNonAbortable) => {
+						try {
+							return await handlers.piWrite({
+								args: create(PiWriteExecArgsSchema, { path: "state.zip:entry.txt", content: "next" }),
+								toolCallId: `archive-${termination}`,
+								signal,
+								markNonAbortable,
+							});
+						} finally {
+							operationSettled.resolve();
+						}
+					},
+					termination === "caller abort" ? controller.signal : undefined,
+					20,
+				)
+					.then(
+						() => undefined,
+						() => undefined,
+					)
+					.then(() => {
+						terminalPublished = true;
+						mutationCountAtTerminal = mutationCount;
+					});
+
+				await commitStarted.promise;
+				if (termination === "caller abort") controller.abort(new Error("caller cancelled archive write"));
+				await Bun.sleep(5_200);
+				const terminalPublishedBeforeCommit = terminalPublished;
+				releaseCommit.resolve();
+				await operationSettled.promise;
+				await pending;
+
+				expect(terminalPublishedBeforeCommit).toBe(false);
+				expect(mutationCountAtTerminal).toBe(1);
+				expect(mutationCount).toBe(1);
+				await Bun.sleep(20);
+				expect(mutationCount).toBe(1);
+			} finally {
+				releaseCommit.resolve();
+				rename.mockRestore();
+				await fs.rm(tmpDir, { recursive: true, force: true });
+			}
+		}, 7_000);
+	}
 
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();
