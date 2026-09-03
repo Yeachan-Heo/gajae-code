@@ -670,14 +670,12 @@ export async function ensureLaunchWorktreeCancellable(
 	const listedAtPath = findWorktreeByPath(allWorktrees, plan.worktreePath);
 	const existingAtPath = readWorktreeEntryFromPath(plan.repoRoot, plan.worktreePath);
 	if (listedAtPath && !existingAtPath) {
-		if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
-		throw new Error(
-			[
-				"worktree_path_unavailable",
-				"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
-				`Path: ${formatBucketPath(plan.worktreePath)}`,
-				"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
-			].join("\n"),
+		if (fs.existsSync(plan.worktreePath)) throw launchGuard("worktree_path_conflict", plan.worktreePath);
+		throw launchGuardLines(
+			"worktree_path_unavailable",
+			"The requested launch worktree is still registered by Git but its directory is unavailable or locked.",
+			`Path: ${formatBucketPath(plan.worktreePath)}`,
+			"Safe remediation: inspect the worktree lock and remove or repair it with git worktree remove/prune when it is no longer needed, then relaunch. GJC did not delete or replace the entry.",
 		);
 	}
 	const expectedBranchRef = plan.branchName ? `refs/heads/${plan.branchName}` : null;
@@ -689,7 +687,7 @@ export async function ensureLaunchWorktreeCancellable(
 				throw worktreeTargetMismatchGuard(plan, existingAtPath);
 			}
 			if (existingAtPath.head !== plan.baseRef) {
-				if (dirty) throw new Error(`worktree_dirty:${plan.worktreePath}`);
+				if (dirty) throw launchGuard("worktree_dirty", plan.worktreePath);
 				runGit(plan.worktreePath, ["checkout", "--detach", plan.baseRef]);
 				dirty = false;
 			}
@@ -706,9 +704,9 @@ export async function ensureLaunchWorktreeCancellable(
 		};
 	}
 
-	if (fs.existsSync(plan.worktreePath)) throw new Error(`worktree_path_conflict:${plan.worktreePath}`);
+	if (fs.existsSync(plan.worktreePath)) throw launchGuard("worktree_path_conflict", plan.worktreePath);
 	if (plan.branchName && hasBranchInUse(allWorktrees, plan.branchName, plan.worktreePath)) {
-		throw new Error(`branch_in_use:${plan.branchName}`);
+		throw launchGuard("branch_in_use", plan.branchName);
 	}
 
 	ensureBucketDirUsable(path.dirname(plan.worktreePath));
@@ -866,7 +864,8 @@ function installWorkspaceDependencies(
 		if (fileSystemErrorCode(error) === "ENOENT") return;
 		throw error;
 	}
-	if (!installed.isDirectory() || installed.isSymbolicLink()) throw new Error("worktree_dependency_install_not_local");
+	if (!installed.isDirectory() || installed.isSymbolicLink())
+		throw launchGuard("worktree_dependency_install_not_local");
 }
 
 async function installWorkspaceDependenciesCancellable(
