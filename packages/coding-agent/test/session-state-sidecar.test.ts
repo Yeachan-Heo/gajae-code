@@ -25,6 +25,7 @@ import {
 	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
 	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
+	GJC_TMUX_OWNER_GENERATION_STAGED_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 	markCoordinatorRuntimeStateRescopePublishing,
@@ -2131,6 +2132,53 @@ describe("coordinator runtime state sidecar", () => {
 			},
 		);
 		expect((await readPayload(stateFile)).owner_generation).toBe(replacement);
+	});
+
+	it("promotes a still-staged child after its exact generation is published", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "staged-child.json");
+		const sessionId = "staged-child";
+		const generation = "33333333-3333-4333-8333-333333333333";
+		const keys = [
+			GJC_TMUX_OWNER_GENERATION_ENV,
+			GJC_TMUX_OWNER_GENERATION_STAGED_ENV,
+			GJC_TMUX_OWNER_STATE_DIR_ENV,
+			GJC_TMUX_OWNER_SERVER_KEY_ENV,
+		];
+		const previous = new Map(keys.map(key => [key, process.env[key]]));
+		try {
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			process.env[GJC_TMUX_OWNER_GENERATION_ENV] = generation;
+			process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] = "1";
+			process.env[GJC_TMUX_OWNER_STATE_DIR_ENV] = root;
+			process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] = "tmux";
+			await Bun.write(
+				stateFile,
+				JSON.stringify({
+					schema_version: 1,
+					session_id: sessionId,
+					state: "running",
+					cwd: root,
+					workdir: root,
+					session_file: null,
+				}),
+			);
+
+			await persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, { sessionId, cwd: root });
+			expect((await readPayload(stateFile)).owner_generation).toBeUndefined();
+
+			await replaceOwnerGeneration(root, sessionId, generation);
+			await persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, { sessionId, cwd: root });
+			expect((await readPayload(stateFile)).owner_generation).toBe(generation);
+			expect(process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV]).toBe("1");
+		} finally {
+			for (const key of keys) {
+				const value = previous.get(key);
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 
 	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {

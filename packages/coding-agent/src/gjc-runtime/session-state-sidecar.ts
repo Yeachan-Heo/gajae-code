@@ -1962,10 +1962,21 @@ async function writeStateFile(stateFile: string, payload: Record<string, unknown
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload)}\n`);
 }
 
-function contextWithManagedOwnerGeneration(context: RuntimeStateContext): RuntimeStateContext {
+async function contextWithManagedOwnerGeneration(context: RuntimeStateContext): Promise<RuntimeStateContext> {
 	if (context.ownerTerminal) return context;
-	const ownerTerminal = ownerTerminalContextFromEnvironment();
+	let ownerTerminal = ownerTerminalContextFromEnvironment();
 	if (ownerTerminal === "invalid") throw new PreviousRuntimeStateReadError();
+	if (ownerTerminal?.generationPublished === false) {
+		const generation = await captureOwnerGenerationBaseline(ownerTerminal.stateDir, context.sessionId).catch(() => ({
+			state: "absent" as const,
+		}));
+		if (
+			generation.state === "current" &&
+			generation.session_id === context.sessionId &&
+			generation.generation === ownerTerminal.generation
+		)
+			ownerTerminal = { ...ownerTerminal, generationPublished: true };
+	}
 	return ownerTerminal ? { ...context, ownerTerminal } : context;
 }
 
@@ -2056,7 +2067,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 	if (!state) {
 		const activityPhase = toolActivityPhaseForEvent(event);
 		if (!activityPhase) return;
-		const activityContext = contextWithManagedOwnerGeneration(context);
+		const activityContext = await contextWithManagedOwnerGeneration(context);
 		await persistCoordinatorRuntimeToolActivity(
 			event,
 			activityContext,
@@ -2067,7 +2078,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 		);
 		return;
 	}
-	context = contextWithManagedOwnerGeneration(context);
+	context = await contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
 		stateFile,
@@ -2147,7 +2158,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 ): Promise<void> {
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
-	context = contextWithManagedOwnerGeneration(context);
+	context = await contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
 		stateFile,
@@ -3091,7 +3102,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 	const stateFile = runtimeStateFileForContext(context);
 	if (!stateFile) return;
 	if (!context.ownerTerminal && !context.ownerTerminalMetadataInvalid)
-		context = contextWithManagedOwnerGeneration(context);
+		context = await contextWithManagedOwnerGeneration(context);
 	const ownerTerminalVerdict = context.ownerTerminal
 		? await observeOwnerTerminalPostmortem(reason, context.ownerTerminal, context.sessionId)
 		: null;
