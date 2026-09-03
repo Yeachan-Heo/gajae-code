@@ -389,6 +389,20 @@ describe("gjc state handoff", () => {
 			);
 			expect(generic.status).toBe(2);
 			expect(generic.stderr).toContain("approved Crystal lifecycle is immutable through generic state write");
+			const nested = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ state: { current_phase: "interviewing" } }),
+					"--force",
+					"--json",
+				],
+				cwd,
+			);
+			expect(nested.status).toBe(2);
+			expect(nested.stderr).toContain("approved Crystal lifecycle is immutable through generic state write");
 			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 		});
