@@ -1,6 +1,7 @@
 import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
@@ -397,6 +398,36 @@ it("two OS processes reclaim a dead holder without overlapping critical sections
 		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.spawn.lock");
 	} finally {
 		for (const child of children) child.kill("SIGKILL");
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
+
+it("a transient exact stale-removal refusal stays fail-closed and retries acquisition", async () => {
+	const { acquireSpawnLockForTest } = await import("../src/sdk/broker/ensure");
+	const dir = await temp();
+	const ready = path.join(dir, "holder.ready");
+	const journal = path.join(dir, "journal");
+	const holder = spawnLockWorker(dir, ready, journal, "holder", 60_000);
+	const exactRemoveDirectoryTree = native.exactRemoveDirectoryTree;
+	let refused = false;
+	const removalSpy = spyOn(native, "exactRemoveDirectoryTree").mockImplementation((...args) => {
+		if (!refused) {
+			refused = true;
+			return { ok: false, code: "io_error" };
+		}
+		return exactRemoveDirectoryTree(...args);
+	});
+	try {
+		await waitForFile(ready);
+		holder.kill("SIGKILL");
+		await holder.exited;
+		const release = await acquireSpawnLockForTest(dir, { retries: 20, retryDelayMs: 10 });
+		expect(refused).toBeTrue();
+		await release();
+		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.spawn.lock");
+	} finally {
+		removalSpy.mockRestore();
+		holder.kill("SIGKILL");
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 30_000);

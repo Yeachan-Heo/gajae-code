@@ -964,7 +964,15 @@ async function staleLockSnapshot(
 
 async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSnapshot): Promise<boolean> {
 	if (!snapshot.stale) return false;
-	return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
+	try {
+		return (await removeFileLockDirForGc(lockPath, snapshot.owner, snapshot.identity)) === "removed";
+	} catch {
+		// Exact removal refusal is not authority to fail or mutate by another path.
+		// Keep contending: a concurrent reclaimer may already be completing the same
+		// dead generation, while a persistent refusal remains fail-closed until the
+		// normal retry budget reports the still-held lock.
+		return false;
+	}
 }
 
 /**
