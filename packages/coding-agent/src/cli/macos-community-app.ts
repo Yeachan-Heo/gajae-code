@@ -818,9 +818,17 @@ export async function offerMacosCommunityApp(
 		if (!(await hasExpectedDeveloperIdSignature(sourceApp, command)))
 			return failure("the app bundle was signed by an unexpected publisher", log);
 		const policyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", sourceApp]);
+		if (policyAssessment.reaped === false) {
+			cleanupUnsafe = true;
+			return failure("Gatekeeper helper did not terminate safely", log);
+		}
 		if (policyAssessment.exitCode !== 0) return failure("Gatekeeper rejected the app bundle", log);
 		const archCheck = await command(["/usr/bin/lipo", "-archs", executablePath]);
 		const executableArch = arch === "x64" ? "x86_64" : arch;
+		if (archCheck.reaped === false) {
+			cleanupUnsafe = true;
+			return failure("architecture helper did not terminate safely", log);
+		}
 		if (archCheck.exitCode !== 0 || !archCheck.stdout.split(/\s+/).includes(executableArch))
 			return failure(`the app bundle does not contain ${arch} code`, log);
 		if (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))
@@ -940,8 +948,21 @@ export async function offerMacosCommunityApp(
 			if (!(await sameDirectoryIdentity(destination, currentExistingDestinationIdentity)))
 				throw new Error("the existing destination identity changed before replacement");
 			if (await isVerifiedCommunityApp(destination, arch, command)) {
+				try {
+					const stagedRemoved = await removeClaimedDirectory(
+						stagingDestination,
+						stagingIdentity,
+						currentDestinationRoot,
+						destinationRootIdentity,
+						log,
+					);
+					if (!stagedRemoved) throw new Error("the staged app bundle could not be removed after detecting an existing verified installation");
+				} catch (error) {
+					throw new Error(
+						`concurrent verified installation detected but staged bundle cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
 				installedDestination = undefined;
-				await fs.rm(stagingDestination, { recursive: true, force: true });
 				return { status: "skipped", reason: "already installed" };
 			}
 			const removed = await removeClaimedDirectory(
