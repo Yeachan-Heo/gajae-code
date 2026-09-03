@@ -2122,6 +2122,8 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	if (current.kind !== "valid")
 		throw new StateCommandError(2, "approve-execution requires valid active deep-interview state");
 	const envelope = normalizeDeepInterviewEnvelope(current.value) as Record<string, unknown>;
+	if (envelope.version !== WORKFLOW_STATE_VERSION)
+		throw new StateCommandError(2, "approve-execution requires current deep-interview state version");
 	if (envelope.active !== true)
 		throw new StateCommandError(2, "approve-execution requires active deep-interview state");
 	if (envelope.current_phase !== "handoff")
