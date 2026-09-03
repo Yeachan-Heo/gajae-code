@@ -73,6 +73,7 @@ function foldVia(adapter: FoldAdapter): void {
 		remainingIntent: undefined,
 		foldedAt: Date.now(),
 		cwdSensitive: adapter.cwdSensitive,
+		reason: "chord",
 	});
 }
 

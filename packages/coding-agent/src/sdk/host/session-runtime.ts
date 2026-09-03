@@ -5335,9 +5335,37 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			},
 		});
 		if (isAutoroutingInactive(api)) markAutoroutingInactive(runtime.host);
-		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
+		const disposeWorkflowGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
+		// Every fold (steer, chord, auto-background timer, `bash.background`)
+		// publishes one replayable `bash_folded` frame; `runtime.jobs.list`
+		// `foldReason` remains the source of truth clients reconcile against after
+		// a replay, since a replayed frame may describe a job that has since ended.
+		const disposeFold = ctx.onJobFold?.(event => {
+			try {
+				runtime.emitEvent({
+					type: "bash_folded",
+					sessionId,
+					jobId: event.jobId,
+					generation: event.generation,
+					reason: event.reason,
+				});
+			} catch (error) {
+				// The fold already happened; publication failure must not affect it,
+				// but it must leave evidence because a client relying on the event
+				// instead of runtime.jobs.list would otherwise never learn of the fold.
+				logger.warn("sdk: bash_folded publication failed", {
+					jobId: event.jobId,
+					reason: event.reason,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		});
+		const disposeGate = (): void => {
+			disposeWorkflowGate?.();
+			disposeFold?.();
+		};
 		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
 		const registerBroker = async (): Promise<void> => {

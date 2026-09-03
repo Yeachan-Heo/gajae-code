@@ -45,7 +45,7 @@ import {
 	starReminderLaunchGate,
 } from "../reminders/star-reminder";
 import type { NotificationSessionReconcileResult, NotificationSessionStatus } from "../sdk/bus/session-control";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import type { AgentSession, AgentSessionEvent, AsyncJobSnapshotItem } from "../session/agent-session";
 import type { HistoryStorage } from "../session/history-storage";
 import type { SessionContext, SessionManager } from "../session/session-manager";
 import { getRecentSessions, getSessionMessageEntryId } from "../session/session-manager";
@@ -186,18 +186,42 @@ export function getComposerPlaceholder(
 	return buildComposerPlaceholder(keybindings, context, options);
 }
 
+/** Running background work split into the three kinds the activity indicator names. */
+export interface BackgroundActivityTally {
+	subagents: number;
+	backgroundBash: number;
+	monitors: number;
+}
+
+/**
+ * Classify running jobs for the activity indicator using the three locked
+ * predicates: subagents are `task` jobs carrying subagent metadata, monitors
+ * are flagged by `metadata.monitor`, and background bash is a `bash` job that
+ * is not a monitor. A running job matching none of them (a task job without
+ * subagent metadata) is outside this indicator and is not counted.
+ */
+export function tallyBackgroundActivity(running: readonly AsyncJobSnapshotItem[]): BackgroundActivityTally {
+	const tally: BackgroundActivityTally = { subagents: 0, backgroundBash: 0, monitors: 0 };
+	for (const item of running) {
+		if (item.type === "task" && item.metadata?.subagent !== undefined) tally.subagents += 1;
+		else if (item.metadata?.monitor === true) tally.monitors += 1;
+		else if (item.type === "bash" && item.metadata?.backgrounded === true) tally.backgroundBash += 1;
+	}
+	return tally;
+}
+
 export function resolveActivityIndicatorMessage(
 	foregroundActive: boolean,
-	activeBackgroundTasks: number,
+	activity: BackgroundActivityTally,
 	foregroundMessage: string,
 ): string | undefined {
-	const backgroundCount = Math.max(0, Math.trunc(activeBackgroundTasks));
-	if (foregroundActive) {
-		if (backgroundCount === 0) return foregroundMessage;
-		return `${foregroundMessage} · ${backgroundCount} background task${backgroundCount === 1 ? "" : "s"}`;
-	}
-	if (backgroundCount === 0) return undefined;
-	return `Background: ${backgroundCount} task${backgroundCount === 1 ? "" : "s"}…`;
+	const parts: string[] = [];
+	if (activity.subagents > 0) parts.push(`${activity.subagents} subagent${activity.subagents === 1 ? "" : "s"}`);
+	if (activity.backgroundBash > 0) parts.push(`${activity.backgroundBash} background bash`);
+	if (activity.monitors > 0) parts.push(`${activity.monitors} monitor${activity.monitors === 1 ? "" : "s"}`);
+
+	if (foregroundActive) return parts.length === 0 ? foregroundMessage : `${foregroundMessage} · ${parts.join(", ")}`;
+	return parts.length === 0 ? undefined : `Background: ${parts.join(", ")}…`;
 }
 const WELCOME_RESERVED_CONTAINER_CHILD_LIMIT = 8;
 const COMPOSER_RIGHT_GUTTER_WIDTH = 1;
@@ -1926,8 +1950,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return main && dim ? { main, dim } : undefined;
 	}
 
-	#activeBackgroundTaskCount(): number {
-		return this.session.getAsyncJobSnapshot()?.running.length ?? 0;
+	#activeBackgroundActivity(): BackgroundActivityTally {
+		return tallyBackgroundActivity(this.session.getAsyncJobSnapshot()?.running ?? []);
 	}
 
 	#stopLoadingAnimation(): void {
@@ -1946,7 +1970,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const message = resolveActivityIndicatorMessage(
 			foregroundActive,
-			this.#activeBackgroundTaskCount(),
+			this.#activeBackgroundActivity(),
 			this.#pendingWorkingMessage ?? this.#defaultWorkingMessage,
 		);
 		if (!message) {

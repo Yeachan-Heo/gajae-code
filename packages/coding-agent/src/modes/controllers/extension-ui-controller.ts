@@ -39,6 +39,7 @@ import {
 	SYNTHETIC_PROVIDER_ID,
 	syntheticNamespaceCollision,
 } from "../../sdk/model-profile-model";
+import { bashBackgroundControlError } from "../../session/fold-coordinator";
 import { createReadonlySessionManager } from "../../session/session-manager";
 import { parseThinkingLevel } from "../../thinking";
 import type { TodoPhase } from "../../tools/todo-write";
@@ -311,12 +312,11 @@ export class ExtensionUiController {
 					throw Object.assign(new Error("No retry backoff is pending."), { code: "retry_not_pending" });
 				session.retryNow();
 				return { retried: true, immediate: true };
-			case "bash.background":
-				if (!(await session.requestForegroundBashBackground()))
-					throw Object.assign(new Error("The active bash command cannot be moved to a managed background job."), {
-						code: "not_foldable",
-					});
-				return { backgrounded: true };
+			case "bash.background": {
+				const outcome = await session.requestForegroundBashBackgroundOutcome("sdk_control");
+				if (outcome.status !== "folded") throw bashBackgroundControlError(outcome);
+				return { backgrounded: true, jobId: outcome.jobId };
+			}
 			case "compaction.auto.set":
 				session.setAutoCompactionEnabled(input.on === true);
 				return { changed: true };

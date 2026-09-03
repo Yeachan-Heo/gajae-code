@@ -174,6 +174,14 @@ describe("sdk session list scope filtering", () => {
 			cwdSelection,
 		);
 		expect(filtered.sessions.map(candidate => candidate.sessionId)).toEqual(["s-plain"]);
+		const allSelection = await resolveSessionListSelection("all", plain);
+		expect(allSelection.descriptor.worktreeRoot).toBeUndefined();
+		const everything = await filterSessionRowsByScope(
+			[row("s-plain", plain), row("s-git", tempRoot)],
+			"all",
+			allSelection,
+		);
+		expect(everything.sessions.map(candidate => candidate.sessionId).sort()).toEqual(["s-git", "s-plain"]);
 	});
 
 	test("removed row workspaces are excluded deterministically with a warning", async () => {

@@ -59,15 +59,39 @@ function toInputCapabilities(value: unknown): ("text" | "image")[] {
 	return supportsImage ? ["text", "image"] : ["text"];
 }
 
-async function fetchModelsDevPayload(fetchImpl: typeof fetch = fetch): Promise<unknown> {
-	const response = await fetchImpl(MODELS_DEV_URL, {
-		method: "GET",
-		headers: { Accept: "application/json" },
-	});
-	if (!response.ok) {
-		throw new Error(`models.dev fetch failed: ${response.status}`);
+/**
+ * models.dev serves one catalog document describing every provider, and a
+ * discovery pass resolves several providers from it. Downloads are coalesced
+ * per fetch implementation so one pass transfers the catalog once instead of
+ * once per provider; the window is short enough that a later refresh still
+ * observes catalog updates.
+ */
+const MODELS_DEV_PAYLOAD_TTL_MS = 60_000;
+const modelsDevPayloadCache = new WeakMap<typeof fetch, { at: number; payload: Promise<unknown> }>();
+
+export async function fetchModelsDevPayload(fetchImpl: typeof fetch = fetch): Promise<unknown> {
+	const now = Date.now();
+	const cached = modelsDevPayloadCache.get(fetchImpl);
+	if (cached && now - cached.at < MODELS_DEV_PAYLOAD_TTL_MS) return cached.payload;
+	const payload = (async () => {
+		const response = await fetchImpl(MODELS_DEV_URL, {
+			method: "GET",
+			headers: { Accept: "application/json" },
+			signal: AbortSignal.timeout(5_000),
+		});
+		if (!response.ok) {
+			throw new Error(`models.dev fetch failed: ${response.status}`);
+		}
+		return (await response.json()) as unknown;
+	})();
+	const entry = { at: now, payload };
+	modelsDevPayloadCache.set(fetchImpl, entry);
+	try {
+		return await payload;
+	} catch (error) {
+		if (modelsDevPayloadCache.get(fetchImpl) === entry) modelsDevPayloadCache.delete(fetchImpl);
+		throw error;
 	}
-	return response.json();
 }
 
 function anthropicToolChoiceCompat(modelId: string): Pick<Model<"anthropic-messages">, "compat"> {

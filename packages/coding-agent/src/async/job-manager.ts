@@ -68,9 +68,25 @@ export function jobElapsedMs(job: Pick<AsyncJob, "startTime" | "endTime">, now: 
 	return Math.max(0, (job.endTime ?? now) - job.startTime);
 }
 
+/**
+ * Why a foreground wait left the foreground. Every fold path names its
+ * trigger so job snapshots and SDK clients can tell a user steer from the
+ * chord, the auto-background timer, or the explicit `bash.background` control.
+ */
+export type FoldReason = "steer" | "chord" | "timer" | "sdk_control";
+
+/** A fold observed by the manager; published to SDK clients as `bash_folded`. */
+export interface JobFoldEvent {
+	jobId: string;
+	generation: string;
+	reason: FoldReason;
+}
+
 export interface AsyncJobMetadata {
 	/** Set once a foreground wait has been folded, so surfacing can show folded work. */
 	backgrounded?: boolean;
+	/** Why a foreground wait was folded; absent for jobs started directly in the background (`async: true`). */
+	foldReason?: FoldReason;
 	subagent?: {
 		id: string;
 		agent: string;
@@ -271,6 +287,7 @@ interface AsyncJobDelivery {
 	label: string;
 	status: AsyncJob["status"];
 	backgrounded: boolean;
+	foldReason?: FoldReason;
 	text: string;
 	originalBytes?: number;
 	truncated?: boolean;
@@ -290,6 +307,7 @@ interface AsyncJobReceiptClaim {
 	label: string;
 	status: AsyncJob["status"];
 	backgrounded: boolean;
+	foldReason?: FoldReason;
 	ownerId?: string;
 }
 
@@ -331,6 +349,8 @@ export interface AsyncJobSnapshotEntry {
 	status: AsyncJob["status"];
 	generation: string;
 	backgrounded: boolean;
+	/** Present when `backgrounded` was set by a fold; absent for direct background starts. */
+	foldReason?: FoldReason;
 	deliveryState: JobDeliveryState;
 }
 
@@ -995,6 +1015,8 @@ export class AsyncJobManager {
 			this.#changeListeners.delete(cb);
 		};
 	}
+
+	readonly #foldListeners = new Set<(event: JobFoldEvent) => void>();
 
 	#notifyChange(): void {
 		for (const cb of this.#changeListeners) {
@@ -2307,6 +2329,7 @@ export class AsyncJobManager {
 				status: job.status,
 				generation: job.generation,
 				backgrounded: job.metadata?.backgrounded === true,
+				foldReason: job.metadata?.foldReason,
 				deliveryState,
 			};
 		});
@@ -2329,6 +2352,7 @@ export class AsyncJobManager {
 				status: delivery.status,
 				generation: delivery.generation,
 				backgrounded: delivery.backgrounded,
+				foldReason: delivery.foldReason,
 				deliveryState: "pending",
 			});
 		}
@@ -2344,6 +2368,7 @@ export class AsyncJobManager {
 				status: delivery.status,
 				generation: delivery.generation,
 				backgrounded: delivery.backgrounded,
+				foldReason: delivery.foldReason,
 				deliveryState: "pending",
 			});
 		}
@@ -2359,6 +2384,7 @@ export class AsyncJobManager {
 				status: claim.status,
 				generation: claim.generation,
 				backgrounded: claim.backgrounded,
+				foldReason: claim.foldReason,
 				deliveryState: "pending",
 			});
 		}
@@ -2408,6 +2434,7 @@ export class AsyncJobManager {
 			label: job.label,
 			status: job.status,
 			backgrounded: job.metadata?.backgrounded === true,
+			foldReason: job.metadata?.foldReason,
 			text,
 			attempt: 0,
 			nextAttemptAt: Date.now(),
@@ -2426,6 +2453,7 @@ export class AsyncJobManager {
 			label: job.label,
 			status: job.status,
 			backgrounded: job.metadata?.backgrounded === true,
+			foldReason: job.metadata?.foldReason,
 			ownerId: job.ownerId,
 		});
 		this.#notifyChange();
@@ -2632,17 +2660,62 @@ export class AsyncJobManager {
 	}
 
 	/**
-	 * Mark a running job as backgrounded (folded out of its foreground call).
-	 * Read by getJobsSnapshot so folded work stays visible; safe to call twice.
+	 * Subscribe to fold events. Fires once per successful `markBackgrounded`
+	 * transition (never on the idempotent repeat), so a subscriber can publish
+	 * exactly one `bash_folded` frame per fold. Listener errors are isolated.
 	 */
-	markBackgrounded(jobId: string, generation: string): boolean {
+	onFold(cb: (event: JobFoldEvent) => void): () => void {
+		this.#foldListeners.add(cb);
+		return () => {
+			this.#foldListeners.delete(cb);
+		};
+	}
+
+	/**
+	 * Mark a job that was launched directly in the background (`bash` with
+	 * `async: true`). It never had a foreground wait, so this is not a fold: no
+	 * `foldReason` is recorded and no fold listener fires.
+	 */
+	markStartedInBackground(jobId: string, generation: string): boolean {
 		const job = this.#jobs.get(jobId);
 		if (!job || job.generation !== generation) return false;
+		if (job.metadata?.backgrounded === true) return true;
 		job.metadata = { ...job.metadata, backgrounded: true };
 		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
 			if (delivery.jobId === jobId && delivery.generation === generation) delivery.backgrounded = true;
 		}
 		this.#notifyChange();
+		return true;
+	}
+
+	/**
+	 * Mark a running job as backgrounded (folded out of its foreground call).
+	 * Read by getJobsSnapshot so folded work stays visible; safe to call twice.
+	 * The first transition records `reason` and notifies fold listeners; a
+	 * repeat keeps the original reason and emits nothing.
+	 */
+	markBackgrounded(jobId: string, generation: string, reason: FoldReason): boolean {
+		const job = this.#jobs.get(jobId);
+		if (!job || job.generation !== generation) return false;
+		if (job.metadata?.backgrounded === true) return true;
+		job.metadata = { ...job.metadata, backgrounded: true, foldReason: reason };
+		for (const delivery of [...this.#deliveries, ...this.#inFlightDeliveries]) {
+			if (delivery.jobId === jobId && delivery.generation === generation) {
+				delivery.backgrounded = true;
+				delivery.foldReason = reason;
+			}
+		}
+		this.#notifyChange();
+		const event: JobFoldEvent = { jobId, generation, reason };
+		for (const cb of this.#foldListeners) {
+			try {
+				cb(event);
+			} catch (error) {
+				logger.warn("Async job fold listener failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
 		return true;
 	}
 
@@ -2772,6 +2845,7 @@ export class AsyncJobManager {
 		this.#ownerSubagentShutdownLeases.clear();
 		this.#notifyChange();
 		this.#changeListeners.clear();
+		this.#foldListeners.clear();
 		return disposalCompleted;
 	}
 
@@ -3145,6 +3219,7 @@ export class AsyncJobManager {
 			label: job.label,
 			status: job.status,
 			backgrounded: job.metadata?.backgrounded === true,
+			foldReason: job.metadata?.foldReason,
 			text: deliveryText.text,
 			originalBytes: deliveryText.originalBytes,
 			truncated: deliveryText.truncated,

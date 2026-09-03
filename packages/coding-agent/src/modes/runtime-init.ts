@@ -18,6 +18,7 @@ import {
 	syntheticNamespaceCollision,
 } from "../sdk/model-profile-model";
 import type { AgentSession } from "../session/agent-session";
+import { bashBackgroundControlError } from "../session/fold-coordinator";
 import { parseThinkingLevel } from "../thinking";
 import type { TodoPhase } from "../tools/todo-write";
 
@@ -199,6 +200,7 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				return { bytes: new Uint8Array(await file.slice(start, end).arrayBuffer()), totalBytes: file.size };
 			},
 			getJobs: () => session.getAsyncJobSnapshot(),
+			onJobFold: listener => session.onJobFold(listener),
 			setSdkPermissionProvider: provider => session.setSdkPermissionProvider(provider),
 			setSdkClientBridge: bridge => session.setClientBridge(bridge),
 			sdkControl: async (operation, input) => {
@@ -347,12 +349,9 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 						return { retried: true, immediate: true };
 					}
 					case "bash.background": {
-						if (!(await session.requestForegroundBashBackground()))
-							throw Object.assign(
-								new Error("The active bash command cannot be moved to a managed background job."),
-								{ code: "not_foldable" },
-							);
-						return { backgrounded: true };
+						const outcome = await session.requestForegroundBashBackgroundOutcome("sdk_control");
+						if (outcome.status !== "folded") throw bashBackgroundControlError(outcome);
+						return { backgrounded: true, jobId: outcome.jobId };
 					}
 					case "compaction.auto.set":
 						session.setAutoCompactionEnabled(input.on === true);

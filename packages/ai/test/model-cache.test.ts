@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
 	closeModelCache,
 	insertModelCacheIfAbsent,
+	publishModelCacheIfNotUpdatedAfter,
 	readModelCache,
 	updateModelCacheIfUnchanged,
 	writeModelCache,
@@ -209,6 +210,52 @@ describe("model cache migrations", () => {
 		expect(
 			readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => observedAt, dbPath)?.models[0]?.name,
 		).toBe("Concurrent B");
+	});
+
+	it("rejects a late publication after a newer row is published", () => {
+		const discoveryStartedAt = 1_700_000_000_000;
+		const newerPublicationAt = discoveryStartedAt + 1;
+		writeModelCache(
+			"ollama-cloud",
+			discoveryStartedAt - 1,
+			[createModel("dynamic-old", "Dynamic Old")],
+			true,
+			"static",
+			dbPath,
+			["dynamic-old"],
+			"provenance-old",
+		);
+		writeModelCache(
+			"ollama-cloud",
+			newerPublicationAt,
+			[createModel("dynamic-new", "Dynamic New")],
+			true,
+			"static",
+			dbPath,
+			["dynamic-new"],
+			"provenance-new",
+		);
+
+		const published = publishModelCacheIfNotUpdatedAfter(
+			"ollama-cloud",
+			discoveryStartedAt,
+			discoveryStartedAt + 2,
+			[createModel("dynamic-old", "Dynamic Old")],
+			true,
+			"static",
+			dbPath,
+			["dynamic-old"],
+			"provenance-old",
+		);
+
+		expect(published).toBe(false);
+		expect(readModelCache("ollama-cloud", TTL_MS, () => newerPublicationAt, dbPath)).toMatchObject({
+			authoritative: true,
+			updatedAt: newerPublicationAt,
+			dynamicModelIds: ["dynamic-new"],
+			dynamicModelProvenance: "provenance-new",
+			models: [expect.objectContaining({ id: "dynamic-new" })],
+		});
 	});
 
 	it("inserts a cache row only when the provider is absent", () => {

@@ -201,6 +201,8 @@ import {
 	type AsyncJobDeliveryState,
 	AsyncJobManager,
 	asyncJobEndpointId as deriveAsyncJobEndpointId,
+	type FoldReason,
+	type JobFoldEvent,
 	type OwnerSubagentShutdownLease,
 } from "../async";
 import { reset as resetCapabilities } from "../capability";
@@ -457,7 +459,13 @@ import {
 } from "./contribution-prep";
 import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
-import { describeFoldReceipt, FOLD_WAKE_MERGE_WINDOW_MS, type FoldAdapter, FoldCoordinator } from "./fold-coordinator";
+import {
+	describeFoldReceipt,
+	FOLD_WAKE_MERGE_WINDOW_MS,
+	type FoldAdapter,
+	FoldCoordinator,
+	type ForegroundFoldOutcome,
+} from "./fold-coordinator";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
 	type BashExecutionMessage,
@@ -9575,22 +9583,76 @@ export class AgentSession {
 	}
 
 	/**
+	 * Subscribe to folds of this session's foreground waits. Backed by the
+	 * session-owned manager (or the process-global instance for legacy setups)
+	 * so the SDK host can publish one `bash_folded` frame per fold.
+	 */
+	onJobFold(listener: (event: JobFoldEvent) => void): () => void {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (!manager) return () => {};
+		const ownerId = this.#agentId;
+		return manager.onFold(event => {
+			if (ownerId && manager.getJob(event.jobId)?.ownerId !== ownerId) return;
+			listener(event);
+		});
+	}
+
+	/**
 	 * Ask the active managed foreground bash call to return as a background job.
 	 * Returns false when no supported foreground tool is currently backgroundable.
+	 * `reason` names the trigger (`chord` for the keybinding, `sdk_control` for
+	 * the `bash.background` control) and is recorded on the folded job.
 	 */
-	async requestForegroundBashBackground(): Promise<boolean> {
-		if (!this.#foldCoordinator.hasFoldableParticipant()) return false;
+	async requestForegroundBashBackground(reason: FoldReason = "chord", adapter?: FoldAdapter): Promise<boolean> {
+		return (await this.requestForegroundBashBackgroundOutcome(reason, adapter)).status === "folded";
+	}
+
+	/**
+	 * Typed variant of {@link requestForegroundBashBackground} for the SDK
+	 * `bash.background` control (C52), which must distinguish "this fold moved
+	 * the wait" from "an earlier fold already moved it" from "nothing to fold".
+	 *
+	 * `already_backgrounded` is reported when no wait is foldable but this
+	 * session still has a running job that a fold (steer, chord, timer, or a
+	 * prior control call) moved out of the foreground: `metadata.foldReason` is
+	 * set only by folds, never by `async: true` starts, so it is the exact
+	 * evidence that the wait the client is asking about has already left.
+	 */
+	async requestForegroundBashBackgroundOutcome(
+		reason: FoldReason = "chord",
+		adapter?: FoldAdapter,
+	): Promise<ForegroundFoldOutcome> {
+		if (!this.#foldCoordinator.hasFoldableParticipant()) {
+			return this.#hasRunningFoldedJob() ? { status: "already_backgrounded" } : { status: "no_active_bash" };
+		}
 		try {
-			const result = await this.#foldCoordinator.requestFold();
-			return result.status === "folded";
+			const result = await this.#foldCoordinator.requestFold(adapter, reason);
+			if (result.status === "folded") {
+				if (reason === "steer") {
+					this.emitNotice(
+						"info",
+						`Folded ${result.receipt.label} into background job ${result.receipt.jobId} so your message can be handled now.`,
+						"fold",
+					);
+				}
+				return { status: "folded", jobId: result.receipt.jobId };
+			}
+			if (result.status === "unavailable" && this.#hasRunningFoldedJob()) return { status: "already_backgrounded" };
+			return { status: "not_foldable", reason: result.reason };
 		} catch (error) {
 			logger.warn("Foreground fold request failed", {
 				error: error instanceof Error ? error.message : String(error),
 			});
-			return false;
+			return { status: "not_foldable", reason: error instanceof Error ? error.message : String(error) };
 		}
 	}
 
+	#hasRunningFoldedJob(): boolean {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (!manager) return false;
+		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
+		return manager.getRunningJobs(ownerFilter).some(job => job.metadata?.foldReason !== undefined);
+	}
 	/**
 	 * Get all configured tool names (built-in via --tools or default, plus custom tools).
 	 */

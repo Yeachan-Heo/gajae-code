@@ -3,7 +3,7 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
+import { type AsyncJob, AsyncJobManager, type FoldReason, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import jobDescription from "../prompts/tools/job.md" with { type: "text" };
@@ -50,6 +50,8 @@ interface JobSnapshot {
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
 	durationMs: number;
+	/** Present when the job was folded out of a foreground wait. */
+	foldReason?: FoldReason;
 	resultText?: string;
 	errorText?: string;
 }
@@ -344,6 +346,7 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 				status: latest.status as JobSnapshot["status"],
 				label: latest.label,
 				durationMs: jobElapsedMs(latest, now),
+				...(current?.metadata?.foldReason ? { foldReason: current.metadata.foldReason } : {}),
 				...(latest.resultText ? { resultText: latest.resultText } : {}),
 				...(latest.errorText ? { errorText: latest.errorText } : {}),
 			};

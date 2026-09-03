@@ -5,7 +5,7 @@ import type { Component } from "@gajae-code/tui";
 import { getKeybindings, ImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { AsyncJobManager } from "../async";
+import { AsyncJobManager, type FoldReason } from "../async";
 import { type BashArtifactSaveResult, type BashResult, executeBash } from "../exec/bash-executor";
 
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -25,6 +25,7 @@ import type {
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
+import type { FoldAdapter } from "../session/fold-coordinator";
 import {
 	DEFAULT_ARTIFACT_MAX_BYTES,
 	OutputSink,
@@ -85,6 +86,18 @@ function sliceTextAfterUtf8ByteOffset(text: string, offsetBytes: number): string
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
 
 export const BASH_DEFAULT_PREVIEW_LINES = 10;
+/**
+ * A user steer folds a running foreground bash call only after it has been
+ * running at least this long. Shorter commands finish normally and the steer is
+ * consumed at the ordinary tool boundary, so a quick `git status` never turns
+ * into a background job plus a wake-up turn.
+ */
+export const STEER_FOLD_GRACE_MS = 2_000;
+
+/** Model-facing line appended to a steer-folded background-start result. */
+export function steerFoldReasonLine(jobId: string): string {
+	return `Folded into background job ${jobId} because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.`;
+}
 
 const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
@@ -488,6 +501,8 @@ export interface BashToolDetails {
 	timeoutSeconds?: number;
 	requestedTimeoutSeconds?: number;
 	terminalId?: string;
+	/** Why the foreground wait was folded, when this result is a background-start after a fold. */
+	foldReason?: FoldReason;
 	async?: {
 		state: "running" | "completed" | "failed";
 		jobId: string;
@@ -934,7 +949,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		label: string,
 		previewText: string,
 		timeoutSec: number,
-		options: { requestedTimeoutSec?: number; notices?: readonly string[]; terminalId?: string } = {},
+		options: {
+			requestedTimeoutSec?: number;
+			notices?: readonly string[];
+			terminalId?: string;
+			foldReason?: FoldReason;
+		} = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
 			timeoutSeconds: timeoutSec,
@@ -946,6 +966,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (options.requestedTimeoutSec !== undefined && options.requestedTimeoutSec !== timeoutSec) {
 			details.requestedTimeoutSeconds = options.requestedTimeoutSec;
 		}
+		if (options.foldReason !== undefined) details.foldReason = options.foldReason;
 		const lines: string[] = [];
 		const trimmedPreview = previewText.trimEnd();
 		if (trimmedPreview.length > 0) {
@@ -955,6 +976,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			lines.push(...options.notices, "");
 		}
 		lines.push(`Background job ${jobId} started: ${label}`);
+		if (options.foldReason === "steer") lines.push(steerFoldReasonLine(jobId));
 		lines.push("Result will be delivered automatically when complete.");
 		lines.push(
 			`You can use \`job\` to poll until complete, but prefer to continue with another task in the meanwhile if it's not blocking.`,
@@ -1115,24 +1137,107 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		return AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
 	}
 
+	/**
+	 * Whether a queued user steer may fold the running foreground wait. Mirrors
+	 * the loop's own steer admission: `busyPromptMode=queue` never admits a
+	 * steer into the busy run, and `toolInterruptPolicy=finish_tools` explicitly
+	 * lets the tool finish, so neither may fold. The
+	 * auto-background setting is deliberately not consulted: like the chord,
+	 * a steer fold is a user action.
+	 *
+	 * Fails closed: a session that cannot prove its tool interrupt policy or
+	 * report newly admitted steering is not steer-foldable.
+	 */
+	#steerFoldEnabled(): boolean {
+		const { waitForUserSteering, getToolInterruptPolicy, requestForegroundBashBackground } = this.session;
+		if (!waitForUserSteering || !getToolInterruptPolicy || !requestForegroundBashBackground) return false;
+		if (this.session.settings.get("busyPromptMode") !== "steer") return false;
+		return getToolInterruptPolicy() === "abort_tools";
+	}
+
+	/**
+	 * Fold `adapter` on the first user steer that ARRIVES after the wait has run
+	 * for {@link STEER_FOLD_GRACE_MS} since `startedAt`. A steer already queued
+	 * when the wait starts, or one that arrives inside the grace window, never
+	 * folds: the command finishes normally and that steer is consumed at the
+	 * ordinary tool boundary. The watcher keeps observing so a later qualifying
+	 * steer still folds, and re-checks the gates at that moment so a
+	 * `busyPromptMode`/`toolInterruptPolicy` change during the command is honored.
+	 * Returns a stop function; call it when the wait settles. No-op when steer
+	 * folding is gated off at start.
+	 */
+	#watchSteerForFold(adapter: FoldAdapter, startedAt: number): () => void {
+		if (!this.#steerFoldEnabled()) return () => {};
+		const waitForSteer = this.session.waitForUserSteering;
+		const requestFold = this.session.requestForegroundBashBackground;
+		if (!waitForSteer || !requestFold) return () => {};
+		const watch = new AbortController();
+		const observe = async (): Promise<void> => {
+			while (!watch.signal.aborted) {
+				await waitForSteer(watch.signal);
+				if (watch.signal.aborted) return;
+				if (Date.now() - startedAt < STEER_FOLD_GRACE_MS) continue;
+				if (!this.#steerFoldEnabled()) continue;
+				await requestFold("steer", adapter);
+				return;
+			}
+		};
+		observe().catch((error: unknown) => {
+			logger.warn("Steer-triggered fold failed", {
+				jobId: adapter.jobId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
+		return () => watch.abort();
+	}
+
+	/**
+	 * Race a managed job against the auto-background threshold, an explicit fold
+	 * (chord / SDK control / steer), and abort. A steer that arrives once the
+	 * command has run for {@link STEER_FOLD_GRACE_MS} requests a `steer` fold,
+	 * which settles this wait through the same `backgroundRequest` path as the
+	 * chord; a steer inside the grace window is ignored here and consumed at the
+	 * ordinary tool boundary once the command finishes.
+	 */
 	async #waitForManagedBashJob(
 		job: ManagedBashJobHandle,
 		thresholdMs: number,
 		signal?: AbortSignal,
-		backgroundRequest?: Promise<void>,
-	): Promise<ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" }> {
+		backgroundRequest?: Promise<FoldReason>,
+		foldAdapter?: FoldAdapter,
+	): Promise<ManagedBashJobCompletion | { kind: "running"; reason: FoldReason } | { kind: "aborted" }> {
 		if (signal?.aborted) {
 			return { kind: "aborted" };
 		}
 
-		const threshold = Promise.withResolvers<{ kind: "running" }>();
-		const thresholdTimer = setTimeout(() => threshold.resolve({ kind: "running" }), Math.max(0, thresholdMs));
-		const waiters: Array<Promise<ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" }>> = [
-			job.completion,
-			threshold.promise,
-		];
+		const startedAt = Date.now();
+		const threshold = Promise.withResolvers<{ kind: "running"; reason: FoldReason }>();
+		const thresholdTimer = setTimeout(
+			() => {
+				const requestFold = this.session.requestForegroundBashBackground;
+				if (!foldAdapter || !requestFold) {
+					threshold.resolve({ kind: "running", reason: "timer" });
+					return;
+				}
+				void requestFold("timer", foldAdapter)
+					.then(folded => {
+						if (!folded) threshold.resolve({ kind: "running", reason: "timer" });
+					})
+					.catch(error => {
+						logger.warn("Timer-triggered fold failed", {
+							jobId: foldAdapter.jobId,
+							error: error instanceof Error ? error.message : String(error),
+						});
+						threshold.resolve({ kind: "running", reason: "timer" });
+					});
+			},
+			Math.max(0, thresholdMs),
+		);
+		const waiters: Array<
+			Promise<ManagedBashJobCompletion | { kind: "running"; reason: FoldReason } | { kind: "aborted" }>
+		> = [job.completion, threshold.promise];
 		if (backgroundRequest) {
-			waiters.push(backgroundRequest.then(() => ({ kind: "running" as const })));
+			waiters.push(backgroundRequest.then(reason => ({ kind: "running" as const, reason })));
 		}
 
 		let onAbort: (() => void) | undefined;
@@ -1142,9 +1247,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			signal.addEventListener("abort", onAbort, { once: true });
 			waiters.push(aborted.promise);
 		}
+
+		const stopSteerWatch =
+			backgroundRequest && foldAdapter ? this.#watchSteerForFold(foldAdapter, startedAt) : () => {};
 		try {
 			return await Promise.race(waiters);
 		} finally {
+			stopSteerWatch();
 			clearTimeout(thresholdTimer);
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 		}
@@ -1657,7 +1766,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			});
 			const jobGeneration = asyncManager.getJob(job.jobId)?.generation ?? job.jobId;
 			job.setBackgrounded(true);
-			asyncManager.markBackgrounded(job.jobId, jobGeneration);
+			asyncManager.markStartedInBackground(job.jobId, jobGeneration);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
@@ -1711,13 +1820,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const jobGeneration = ownedManager.getJob(job.jobId)?.generation ?? job.jobId;
 			if (startBackgrounded) {
 				job.setBackgrounded(true);
-				ownedManager.markBackgrounded(job.jobId, jobGeneration);
+				ownedManager.markStartedInBackground(job.jobId, jobGeneration);
 				return this.#buildBackgroundStartResult(job.jobId, job.label, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
 				});
 			}
-			const backgroundRequest = Promise.withResolvers<void>();
+			const backgroundRequest = Promise.withResolvers<FoldReason>();
 			// Exactly one party may settle the foreground caller. detachObserver (the
 			// fold won) and resolveForegroundObserver (a completion was handed back
 			// after a failed fold) share this flag, so a race cannot double-settle.
@@ -1727,7 +1836,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				foregroundSettled = true;
 				return "resolved";
 			};
-			const unregisterBackgroundRequest = this.session.registerForegroundFoldParticipant?.({
+			const managedFoldAdapter: FoldAdapter = {
 				kind: "bash-managed",
 				jobId: job.jobId,
 				jobGeneration,
@@ -1746,24 +1855,26 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const current = ownedManager.getJob(job.jobId);
 					return current?.generation === jobGeneration ? current : undefined;
 				},
-				detachObserver: () => {
+				detachObserver: receipt => {
 					const outcome = settleForeground();
 					if (outcome === "resolved") {
 						job.setBackgrounded(true);
-						ownedManager.markBackgrounded(job.jobId, jobGeneration);
-						backgroundRequest.resolve();
+						ownedManager.markBackgrounded(job.jobId, jobGeneration, receipt.reason);
+						backgroundRequest.resolve(receipt.reason);
 					}
 					return outcome;
 				},
 				resolveForegroundObserver: () => settleForeground(),
-			});
-			let waitResult: ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" };
+			};
+			const unregisterBackgroundRequest = this.session.registerForegroundFoldParticipant?.(managedFoldAdapter);
+			let waitResult: ManagedBashJobCompletion | { kind: "running"; reason: FoldReason } | { kind: "aborted" };
 			try {
 				waitResult = await this.#waitForManagedBashJob(
 					job,
 					autoBackgroundWaitMs,
 					signal,
 					backgroundRequest.promise,
+					managedFoldAdapter,
 				);
 			} finally {
 				unregisterBackgroundRequest?.();
@@ -1791,10 +1902,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				throw new ToolAbortError(formatManagedAbortFailure(undefined, undefined, job.getLatestText()));
 			}
 			job.setBackgrounded(true);
-			ownedManager.markBackgrounded(job.jobId, jobGeneration);
+			ownedManager.markBackgrounded(job.jobId, jobGeneration, waitResult.reason);
 			return this.#buildBackgroundStartResult(job.jobId, job.label, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
+				foldReason: waitResult.reason,
 			});
 		}
 
@@ -2323,9 +2435,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			void bridgeHandle.completion.finally(unregisterOwnerCleanup);
 			registerOwnedIfLineaged(bridgeManager, toolCallId, bridgeJobId, bridgeEndpointId);
 
-			const bridgeFoldRequest = Promise.withResolvers<void>();
+			const bridgeFoldRequest = Promise.withResolvers<FoldReason>();
 			const bridgeOriginatingTurn = ctx?.attemptScope !== undefined;
-			const unregisterBridgeFold = this.session.registerForegroundFoldParticipant?.({
+			const bridgeFoldAdapter: FoldAdapter = {
 				kind: "client-terminal",
 				jobId: bridgeJobId,
 				jobGeneration: bridgeGeneration,
@@ -2342,25 +2454,27 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					const current = bridgeManager.getJob(bridgeJobId);
 					return current?.generation === bridgeGeneration ? current : undefined;
 				},
-				detachObserver: () => {
+				detachObserver: receipt => {
 					const outcome = settleBridgeForeground();
 					if (outcome === "resolved") {
 						bridgeHandle.setBackgrounded(true);
-						bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration);
-						bridgeFoldRequest.resolve();
+						bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration, receipt.reason);
+						bridgeFoldRequest.resolve(receipt.reason);
 					}
 					return outcome;
 				},
 				resolveForegroundObserver: () => settleBridgeForeground(),
-			});
+			};
+			const unregisterBridgeFold = this.session.registerForegroundFoldParticipant?.(bridgeFoldAdapter);
 
-			let bridgeWait: ManagedBashJobCompletion | { kind: "running" } | { kind: "aborted" };
+			let bridgeWait: ManagedBashJobCompletion | { kind: "running"; reason: FoldReason } | { kind: "aborted" };
 			try {
 				bridgeWait = await this.#waitForManagedBashJob(
 					bridgeHandle,
 					this.#autoBackgroundEnabled ? this.#resolveAutoBackgroundWaitMs(timeoutMs) : timeoutMs + 1_000,
 					signal,
 					bridgeFoldRequest.promise,
+					bridgeFoldAdapter,
 				);
 			} finally {
 				unregisterBridgeFold?.();
@@ -2395,11 +2509,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// Folded (or auto-backgrounded): the remote terminal keeps running and its
 			// result arrives as a background completion.
 			bridgeHandle.setBackgrounded(true);
-			bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration);
+			bridgeManager.markBackgrounded(bridgeJobId, bridgeGeneration, bridgeWait.reason);
 			return this.#buildBackgroundStartResult(bridgeJobId, bridgeLabel, bridgeHandle.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
 				notices: pendingNotices,
 				terminalId: handle.terminalId,
+				foldReason: bridgeWait.reason,
 			});
 		}
 
@@ -2521,7 +2636,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							},
 						);
 						void controls.terminalCompletion.finally(unregisterPtyOwnerCleanup);
-						ptyFoldUnregister = this.session.registerForegroundFoldParticipant?.({
+						const ptyStartedAt = Date.now();
+						const ptyFoldAdapter: FoldAdapter = {
 							kind: "bash-pty",
 							jobId: ptyJobId,
 							jobGeneration: ptyGeneration,
@@ -2538,12 +2654,13 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								const current = ptyManager.getJob(ptyJobId);
 								return current?.generation === ptyGeneration ? current : undefined;
 							},
-							detachObserver: () => {
+							detachObserver: receipt => {
 								// Output-only continuation: stdin forwarding ends here and the
 								// process is never killed or restarted by folding.
 								const started = this.#buildBackgroundStartResult(ptyJobId, ptyLabel, "", timeoutSec, {
 									requestedTimeoutSec,
 									notices: pendingNotices,
+									foldReason: receipt.reason,
 								});
 								const outcome = controls.detachObserver(
 									interactiveResultFromText(this.#extractTextResult(started)),
@@ -2551,13 +2668,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								if (outcome === "resolved") {
 									controls.detachForegroundCancellation();
 									ptyBackgrounded = true;
-									ptyManager.markBackgrounded(ptyJobId, ptyGeneration);
+									ptyManager.markBackgrounded(ptyJobId, ptyGeneration, receipt.reason);
 									ptyFoldResult = started;
 								}
 								return outcome;
 							},
 							resolveForegroundObserver: () => "already-settled",
-						});
+						};
+						const unregisterPtyFold = this.session.registerForegroundFoldParticipant?.(ptyFoldAdapter);
+						const stopPtySteerWatch = this.#watchSteerForFold(ptyFoldAdapter, ptyStartedAt);
+						ptyFoldUnregister = () => {
+							stopPtySteerWatch();
+							unregisterPtyFold?.();
+						};
 					},
 					onFoldKey: () => {
 						const now = Date.now();

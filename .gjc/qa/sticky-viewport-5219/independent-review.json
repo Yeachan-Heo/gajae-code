@@ -1,0 +1,258 @@
+{
+  "schema_version": 2,
+  "manifest_sha256": "c86031679130826aa5b6720b6c7f95bbd2e07b2fa334392e45406aa4aafbc1bd",
+  "reviewer_identity": "independent-terminal-reviewer",
+  "reviewer_role": "independent-terminal-reviewer",
+  "fixture_revision": "sticky-viewport-showcase-v2",
+  "expected_entry_count": 20,
+  "observed_entry_count": 20,
+  "final": "accept",
+  "checked_keys": [
+    "live-overflow/80x24/unicode-color",
+    "live-overflow/120x36/unicode-color",
+    "manual-history/80x24/unicode-color",
+    "manual-history/120x36/unicode-color",
+    "manual-new-output/80x24/unicode-color",
+    "manual-new-output/120x36/unicode-color",
+    "multiline-editor-hooks-pet/80x24/unicode-color",
+    "multiline-editor-hooks-pet/120x36/unicode-color",
+    "capacity-many/80x24/unicode-color",
+    "capacity-many/120x36/unicode-color",
+    "capacity-one/80x24/unicode-color",
+    "capacity-one/120x36/unicode-color",
+    "capacity-zero/80x24/unicode-color",
+    "capacity-zero/120x36/unicode-color",
+    "selection-boundary/80x24/unicode-color",
+    "selection-boundary/120x36/unicode-color",
+    "manual-new-output/80x24/ascii-no-color",
+    "capacity-zero/48x10/ascii-no-color",
+    "multiline-editor-hooks-pet/48x10/unicode-color",
+    "narrow-cjk/48x10/unicode-color"
+  ],
+  "defects": [],
+  "artifact_decision": "accept",
+  "cjk_semantic_line_breaks": "accept",
+  "host_matrix": "accept",
+  "per_key_results": [
+    {
+      "key": "live-overflow/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "live-overflow/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "manual-history/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "manual-history/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "manual-new-output/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "manual-new-output/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "multiline-editor-hooks-pet/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "multiline-editor-hooks-pet/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-many/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-many/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-one/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-one/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-zero/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-zero/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "selection-boundary/80x24/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "selection-boundary/120x36/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "manual-new-output/80x24/ascii-no-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "capacity-zero/48x10/ascii-no-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "multiline-editor-hooks-pet/48x10/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    },
+    {
+      "key": "narrow-cjk/48x10/unicode-color",
+      "result": "accept",
+      "notes": "All required artifacts match the stage-03 contract.",
+      "artifact_checks": {
+        "terminal_txt": true,
+        "terminal_ansi_txt": true,
+        "terminal_html": true,
+        "metadata_json": true
+      }
+    }
+  ]
+}

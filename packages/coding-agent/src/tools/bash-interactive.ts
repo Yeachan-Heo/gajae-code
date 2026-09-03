@@ -377,6 +377,7 @@ export async function runInteractiveBashPty(
 	let observer: BashInteractiveOverlayComponent | undefined;
 	let settleForeground: ((result: BashInteractiveResult) => void) | undefined;
 	let settled = false;
+	let inputAttached = true;
 	const foreground = Promise.withResolvers<BashInteractiveResult>();
 	const terminal = Promise.withResolvers<BashInteractiveResult>();
 
@@ -449,6 +450,10 @@ export async function runInteractiveBashPty(
 			options.signal?.removeEventListener("abort", forwardForegroundAbort);
 		},
 		detachObserver: (foldResult: BashInteractiveResult) => {
+			// Stop accepting bytes synchronously at the ownership-transfer boundary.
+			// Overlay teardown may be deferred by the host, so disposal alone is not
+			// a sufficient input fence for a folded, output-only PTY.
+			inputAttached = false;
 			const outcome = settle(foldResult);
 			if (outcome === "resolved") observer = undefined;
 			return outcome;
@@ -476,15 +481,19 @@ export async function runInteractiveBashPty(
 					// Escape explicitly force-kills, while disposal never kills the work.
 					component.setHandlers(
 						data => {
+							if (!inputAttached) return;
 							try {
 								session.write(data);
 							} catch {
 								// ignore writes after the command exits
 							}
 						},
-						options.onDismiss ?? (() => session.kill()),
+						() => {
+							if (!inputAttached) return;
+							(options.onDismiss ?? (() => session.kill()))();
+						},
 						() => {},
-						options.onFoldKey ?? (() => false),
+						() => inputAttached && (options.onFoldKey?.() ?? false),
 					);
 					observer = component;
 					return component;

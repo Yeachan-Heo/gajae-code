@@ -5,6 +5,7 @@ import * as os from "node:os";
 import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import packageJson from "../../../package.json" with { type: "json" };
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { SdkClient, SdkClientError } from "../client";
@@ -101,6 +102,10 @@ type ResolvedBrokerSettings = {
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterOrphanGraceMs: number;
 };
+export function resolveBrokerPackageGeneration(): string {
+	const v = (packageJson as { version?: unknown }).version;
+	return typeof v === "string" && v.length > 0 ? v : "unknown";
+}
 
 function modelResolutionCwd(input: Record<string, unknown>): string | undefined {
 	const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
@@ -1284,7 +1289,7 @@ export class Broker {
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
-			packageGeneration: settings.packageGeneration ?? "unknown",
+			packageGeneration: settings.packageGeneration ?? resolveBrokerPackageGeneration(),
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),

@@ -301,6 +301,7 @@ describe("fold red-team: live session duplicate notice/wake", () => {
 						remainingIntent: undefined,
 						foldedAt: Date.now(),
 						cwdSensitive: true,
+						reason: "chord",
 					}),
 			});
 			// The real 800ms merge-window flush (not a manual flush) drives the

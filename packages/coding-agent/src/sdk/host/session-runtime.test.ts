@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
 import type { Settings } from "../../config/settings";
 import type { ExtensionAPI, ExtensionContext, ExtensionTranscriptEntry } from "../../extensibility/extensions";
@@ -1248,6 +1249,110 @@ describe("SessionSdkSessionRuntime", () => {
 		);
 		await runtime.stop();
 	});
+	test("SDK-only host publishes one replayable bash_folded frame per fold and drops the subscription on shutdown", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-bash-folded-"));
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			sendUserMessage: async () => {},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			onJobFold: (listener: (event: { jobId: string; generation: string; reason: string }) => void) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		} as unknown as ExtensionContext;
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			expect(listeners.size).toBe(1);
+			for (const listener of listeners) listener({ jobId: "bg_7", generation: "bg_7:1", reason: "steer" });
+			transport.feed("client", { type: "event_replay", id: "fold-replay", sinceSeq: 0 });
+			await Bun.sleep(0);
+			const replay = transport.sent.find(
+				frame => frame.type === "event_replay_result" && frame.id === "fold-replay",
+			) as { events?: Array<{ kind?: unknown; payload?: Record<string, unknown> }> } | undefined;
+			const folded = replay?.events?.filter(event => event.kind === "bash_folded") ?? [];
+			expect(folded).toEqual([
+				expect.objectContaining({
+					kind: "bash_folded",
+					payload: {
+						type: "bash_folded",
+						sessionId: transport.sessionId,
+						jobId: "bg_7",
+						generation: "bg_7:1",
+						reason: "steer",
+					},
+				}),
+			]);
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+		}
+		expect(listeners.size).toBe(0);
+	});
+
+	test("SDK-only host logs a bash_folded publication failure and keeps the fold replayable", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-bash-folded-fail-"));
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+			sendUserMessage: async () => {},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		const broadcastFrame = transport.broadcastFrame?.bind(transport);
+		let failNextBroadcast = false;
+		transport.broadcastFrame = frame => {
+			if (failNextBroadcast && frame.kind === "bash_folded") {
+				failNextBroadcast = false;
+				throw new Error("broadcast socket closed");
+			}
+			broadcastFrame?.(frame);
+		};
+		createSdkSessionRuntimeExtension(api, { agentDir: cwd, createTransport: async () => transport });
+		const listeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
+		const ctx = {
+			...extensionContext(transport.sessionId, cwd),
+			onJobFold: (listener: (event: { jobId: string; generation: string; reason: string }) => void) => {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		} as unknown as ExtensionContext;
+		const warnings: Array<{ message: string; data?: Record<string, unknown> }> = [];
+		const warn = spyOn(logger, "warn").mockImplementation((message, data) => {
+			warnings.push({ message: String(message), data: data as Record<string, unknown> | undefined });
+		});
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			failNextBroadcast = true;
+			// The listener call must not throw back into the manager: publication failure is evidence, not a fold error.
+			for (const listener of listeners) listener({ jobId: "bg_9", generation: "bg_9:1", reason: "chord" });
+			expect(warnings.filter(entry => entry.message === "sdk: bash_folded publication failed")).toEqual([
+				expect.objectContaining({
+					data: expect.objectContaining({ jobId: "bg_9", reason: "chord", error: "broadcast socket closed" }),
+				}),
+			]);
+			// The frame was appended to the ring before the broadcast failed, so it still replays.
+			transport.feed("client", { type: "event_replay", id: "fold-replay-fail", sinceSeq: 0 });
+			await Bun.sleep(0);
+			const replay = transport.sent.find(
+				frame => frame.type === "event_replay_result" && frame.id === "fold-replay-fail",
+			) as { events?: Array<{ kind?: unknown; payload?: Record<string, unknown> }> } | undefined;
+			expect(replay?.events?.filter(event => event.kind === "bash_folded")).toEqual([
+				expect.objectContaining({ payload: expect.objectContaining({ jobId: "bg_9", reason: "chord" }) }),
+			]);
+		} finally {
+			warn.mockRestore();
+			await handlers.get("session_shutdown")?.({}, ctx);
+		}
+	});
+
 	test("SDK-only host admits, replays, and conflicts terminal abort requests durably", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-abort-"));
 		const operatorCapability = "runtime-terminal-abort-capability";

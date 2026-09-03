@@ -3,9 +3,20 @@ import { randomUUID } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import packageJson from "../../../package.json" with { type: "json" };
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
+
+function resolveExpectedBrokerGeneration(): string {
+	const v = (packageJson as { version?: unknown }).version;
+	return typeof v === "string" && v.length > 0 ? v : "unknown";
+}
+
+function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
+	if (!discovery) return false;
+	return discovery.packageGeneration === resolveExpectedBrokerGeneration();
+}
 export interface EnsureBrokerSettings {
 	agentDir: string;
 	heartbeatTtlMs?: number;
@@ -248,6 +259,40 @@ function fixtureLeaseUnavailable(): Error {
 	return new Error("fixture_broker_lease_unavailable");
 }
 
+const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 5_000;
+const STALE_BROKER_POLL_MS = 50;
+
+async function retireStaleBrokerGeneration(stale: BrokerDiscovery, settings: EnsureBrokerSettings): Promise<void> {
+	let shutdownSucceeded = false;
+	try {
+		const { SdkClient } = await import("../client/client");
+		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (!current || current.ownerId !== stale.ownerId || current.pid !== stale.pid) return;
+		const client = await SdkClient.connect(current.url, current.token, { timeoutMs: 2_000 });
+		try {
+			await client.global("broker.shutdown", {});
+			shutdownSucceeded = true;
+		} finally {
+			await client.close().catch(() => {});
+		}
+	} catch {}
+	if (!shutdownSucceeded) {
+		try {
+			if (brokerProcessIncarnation(stale.pid) === stale.incarnation) {
+				try {
+					process.kill(stale.pid, "SIGTERM");
+				} catch {}
+			}
+		} catch {}
+	}
+	// Wait for the stale identity to disappear (owner-fenced: pid+incarnation).
+	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
+	while (Date.now() < deadline) {
+		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (!current || current.pid !== stale.pid || current.incarnation !== stale.incarnation) break;
+		await sleep(STALE_BROKER_POLL_MS);
+	}
+}
 function createFixtureLeaseFromChild(child: ChildProcess, terminate: () => Promise<void>): ExactFixtureBrokerLease {
 	let termination: Promise<void> | undefined;
 	const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null || child.pid === undefined;
@@ -300,11 +345,24 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		if (priorOwner.canReuse(existing)) return { kind: "prior-local-owner", discovery: existing!, owner: priorOwner };
 		await priorOwner.stop();
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (discoveredAfterCleanup) return { kind: "external-discovery", discovery: discoveredAfterCleanup };
+		if (discoveredAfterCleanup && isBrokerGenerationCompatible(discoveredAfterCleanup))
+			return { kind: "external-discovery", discovery: discoveredAfterCleanup };
+		// A stale-generation discovery after cleanup must not be reused — fall through to replacement.
+		if (!discoveredAfterCleanup) {
+			// no discovery left after cleanup — fall through to spawn
+		} else {
+			await retireStaleBrokerGeneration(discoveredAfterCleanup, settings);
+			const afterRetire = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+			if (afterRetire && isBrokerGenerationCompatible(afterRetire))
+				return { kind: "external-discovery", discovery: afterRetire };
+		}
 	} else if (existing) {
-		return { kind: "external-discovery", discovery: existing };
+		if (isBrokerGenerationCompatible(existing)) return { kind: "external-discovery", discovery: existing };
+		await retireStaleBrokerGeneration(existing, settings);
+		const afterRetire = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (afterRetire && isBrokerGenerationCompatible(afterRetire))
+			return { kind: "external-discovery", discovery: afterRetire };
 	}
-
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
 	const spawnLog = await openBrokerSpawnLog(settings.agentDir);
 	// A stale marker must never be misattributed to this spawn; clear it first.

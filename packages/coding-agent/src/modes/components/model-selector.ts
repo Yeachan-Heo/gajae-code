@@ -22,6 +22,7 @@ import {
 	normalizeTierMap,
 	validateAutoroutingSetup,
 } from "../../config/autorouting-contract";
+import type { BillingPath } from "../../config/billing-path";
 import {
 	getProxyRoutableProviders,
 	inspectProxyProviderId,
@@ -30,7 +31,6 @@ import {
 	rewriteSelectorForProxy,
 	tryResolveProxyProviderId,
 } from "../../config/model-profile-activation";
-
 import { isModelProfileProviderAvailable } from "../../config/model-profile-contract";
 import {
 	deriveModelProfileMappedProviders,
@@ -429,6 +429,9 @@ export class ModelSelectorComponent extends Container {
 	#imageRoleFilter: boolean = false;
 	#smartRoutingPanel?: SmartRoutingPanelComponent;
 	#smartRoutingPreviewBuilder?: (draft: AutoroutingSetup) => SmartRoutingPreview;
+	#isBillingDismissed?: (key: string) => boolean;
+	#markBillingDismissed?: (key: string) => void;
+	#pendingBillingNoticeKey?: string;
 
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
@@ -455,6 +458,10 @@ export class ModelSelectorComponent extends Container {
 			smartRoutingPreview?: (draft: AutoroutingSetup) => SmartRoutingPreview;
 			/** Open the smart-routing panel directly instead of the preset landing. */
 			smartRoutingOnly?: boolean;
+			/** Test seam: synchronous persisted-dismissal check to avoid async render churn. */
+			isBillingDismissed?: (key: string) => boolean;
+			/** Test seam: record that a billing notice was shown/dismissed. */
+			markBillingDismissed?: (key: string) => void;
 		},
 	) {
 		super();
@@ -468,6 +475,8 @@ export class ModelSelectorComponent extends Container {
 		this.#temporaryOnly = options?.temporaryOnly ?? false;
 		this.#authSessionId = options?.sessionId;
 		this.#smartRoutingPreviewBuilder = options?.smartRoutingPreview;
+		this.#isBillingDismissed = (options as any)?.isBillingDismissed;
+		this.#markBillingDismissed = (options as any)?.markBillingDismissed;
 		this.#currentModel = _currentModel;
 		this.#currentThinkingLevel = options?.currentThinkingLevel;
 		this.#activeModelProfile = options?.activeModelProfile;
@@ -1719,12 +1728,24 @@ export class ModelSelectorComponent extends Container {
 		return lines;
 	}
 
+	#billingPathForModel(model: Model): BillingPath | undefined {
+		try {
+			const fn = (
+				this.#modelRegistry as unknown as { getBillingPath?: (m: Model, s?: string) => BillingPath | undefined }
+			).getBillingPath;
+			if (typeof fn === "function") return fn.call(this.#modelRegistry, model, this.#authSessionId);
+		} catch {}
+		return undefined;
+	}
+
 	#formatAssignedModelLabel(model: Model, thinkingLevel: ThinkingLevel | undefined): string {
 		const modelLabel = sanitizeText(`${model.provider}/${model.id}`).replace(/\s+/g, " ").trim();
 		let label = modelLabel;
 		if (thinkingLevel && thinkingLevel !== ThinkingLevel.Inherit) {
 			label += ` (${getThinkingLevelMetadata(thinkingLevel).label})`;
 		}
+		const billing = this.#billingPathForModel(model)?.label;
+		if (billing) label += ` [${billing}]`;
 		return truncateToWidth(label, ROLE_BINDING_MAX_WIDTH);
 	}
 
@@ -1928,6 +1949,27 @@ export class ModelSelectorComponent extends Container {
 			this.#listContainer.addChild(new Spacer(1));
 			this.#listContainer.addChild(new Text(theme.fg("warning", `  ${this.#presetLoginHint}`), 0, 0));
 		}
+		// One-time metered billing notice for the currently selected model (first bind per credential source)
+		try {
+			const sel = this.#getSelectedItem?.() as any;
+			const m = sel?.model as any;
+			if (m && this.#viewMode === "models") {
+				const bp = this.#billingPathForModel(m);
+				if (bp && !(this.#isBillingDismissed?.(bp.dismissKey) ?? false)) {
+					this.#listContainer.addChild(new Spacer(1));
+					this.#listContainer.addChild(
+						new Text(
+							theme.fg("warning", `  Billing: ${bp.label} — charges may apply. Press d to dismiss.`),
+							0,
+							0,
+						),
+					);
+					this.#pendingBillingNoticeKey = bp.dismissKey;
+				} else {
+					this.#pendingBillingNoticeKey = undefined;
+				}
+			}
+		} catch {}
 		const previewProfile = this.#getProfileByName(this.#previewProfileName);
 		if (previewProfile) this.#renderPresetPreview(previewProfile);
 	}
@@ -2089,6 +2131,8 @@ export class ModelSelectorComponent extends Container {
 			) {
 				roleBadgeTokens.push(theme.icon.fast);
 			}
+			const billingLabel = this.#billingPathForModel(item.model)?.label;
+			if (billingLabel) roleBadgeTokens.push(theme.fg("warning", `[${billingLabel}]`));
 			const badgeText = roleBadgeTokens.length > 0 ? ` ${roleBadgeTokens.join(" ")}` : "";
 
 			let line = "";
@@ -2321,6 +2365,16 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 
+		if (keyData === "d" || keyData === "D") {
+			if (this.#pendingBillingNoticeKey) {
+				try {
+					this.#markBillingDismissed?.(this.#pendingBillingNoticeKey);
+				} catch {}
+				this.#pendingBillingNoticeKey = undefined;
+				this.#updateList();
+				return;
+			}
+		}
 		// Pass everything else to search input
 		this.#searchInput.handleInput(keyData);
 		this.#filterModels(this.#searchInput.getValue());

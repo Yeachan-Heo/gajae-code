@@ -1,7 +1,7 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { $env, logger } from "@gajae-code/utils";
-import type { AsyncJobManager } from "../async";
+import type { AsyncJobManager, FoldReason } from "../async";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
@@ -240,12 +240,14 @@ export interface ToolSession {
 	registerForegroundFoldParticipant?: (adapter: FoldAdapter) => () => void;
 	/** Whether a foreground wait is currently foldable into a background job. */
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
-	/** Request that the active foreground wait fold into a background job, if supported. */
-	requestForegroundBashBackground?: () => Promise<boolean>;
+	/** Request that a foreground wait fold into a background job, if supported. `reason` names the trigger; `adapter` targets a specific wait instead of the newest registration. */
+	requestForegroundBashBackground?: (reason?: FoldReason, adapter?: FoldAdapter) => Promise<boolean>;
+	/** Current tool interrupt policy; `finish_tools` lets the running tool finish, so a steer must not fold it. */
+	getToolInterruptPolicy?: () => "abort_tools" | "finish_tools";
 
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
-	/** Resolves when the session queues user steering (or `signal` aborts) without consuming it; wait-style tools use this to end their observation early. */
+	/** Resolves on a steer admitted after the wait starts, or when `signal` aborts, without consuming the steer. */
 	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;

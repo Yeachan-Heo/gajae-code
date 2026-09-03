@@ -1,6 +1,11 @@
 import { sanitizeText } from "@gajae-code/utils";
 import { applyFinalCodexGpt56ContextCap } from "./context-cap-policy";
-import { insertModelCacheIfAbsent, readModelCache, updateModelCacheIfUnchanged, writeModelCache } from "./model-cache";
+import {
+	insertModelCacheIfAbsent,
+	publishModelCacheIfNotUpdatedAfter,
+	readModelCache,
+	updateModelCacheIfUnchanged,
+} from "./model-cache";
 import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
@@ -252,8 +257,9 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 		}
 		const repairedModels = mergeDynamicModels(staticModels, cachedModels);
 		if (options.canPublishCache?.() ?? true) {
-			writeModelCache(
+			publishModelCacheIfNotUpdatedAfter(
 				options.providerId,
+				cache.updatedAt,
 				now(),
 				repairedModels,
 				true,
@@ -274,6 +280,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 		};
 	}
 
+	const discoveryStartedAt = shouldFetchFromNetwork ? now() : undefined;
 	const [fetchedModelsDevModels, fetchedDynamicModels] = shouldFetchFromNetwork
 		? await Promise.all([fetchModelsDev(options), dynamicFetcher ? fetchDynamicModels(dynamicFetcher) : null])
 		: [null, null];
@@ -304,9 +311,10 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			const snapshotModels = applyFinalCodexGpt56ContextCap(
 				mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), dynamicModels),
 			);
-			if (options.canPublishCache?.() ?? true) {
-				writeModelCache(
+			if (discoveryStartedAt !== undefined && (options.canPublishCache?.() ?? true)) {
+				publishModelCacheIfNotUpdatedAfter(
 					options.providerId,
+					discoveryStartedAt,
 					now(),
 					snapshotModels,
 					true,

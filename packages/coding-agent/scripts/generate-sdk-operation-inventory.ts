@@ -141,6 +141,7 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:hasForegroundBashBackgroundRequestHandler":
 		"internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:requestForegroundBashBackground": "internal accessor/plumbing, not a user-facing SDK control seam",
+	"agent_session:onJobFold": "internal fold-event plumbing feeding the bash_folded event frame, not a control seam",
 
 	"agent_session:getSelectedMCPToolNames": "internal accessor/plumbing, not a user-facing control seam",
 	"agent_session:isToolDiscoveryEnabled": "internal accessor/plumbing, not a user-facing control seam",
@@ -306,6 +307,7 @@ const SEAM_TO_SDK: Readonly<Record<string, string>> = {
 	"agent_session:moveQueuedMessageForEditing": "queue.message.move",
 	"agent_session:executeBash": "bash.execute",
 	"agent_session:abortBash": "bash.abort",
+	"agent_session:requestForegroundBashBackgroundOutcome": "bash.background",
 	"agent_session:switchSession": "session.switch",
 	"agent_session:branch": "session.branch",
 	"agent_session:handoff": "session.handoff",

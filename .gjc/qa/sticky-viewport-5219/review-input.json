@@ -1,0 +1,91 @@
+{
+  "schema_version": 2,
+  "manifest_sha256": "c86031679130826aa5b6720b6c7f95bbd2e07b2fa334392e45406aa4aafbc1bd",
+  "command_or_replay_source": "bun packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts --out .gjc/qa/sticky-viewport-<run>",
+  "capture_timestamp": "1970-01-01T00:00:00.000Z",
+  "fixture_source": "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+  "fixed_clock": true,
+  "live_pty": false,
+  "network": false,
+  "expected_keys": [
+    "live-overflow/80x24/unicode-color",
+    "live-overflow/120x36/unicode-color",
+    "manual-history/80x24/unicode-color",
+    "manual-history/120x36/unicode-color",
+    "manual-new-output/80x24/unicode-color",
+    "manual-new-output/120x36/unicode-color",
+    "multiline-editor-hooks-pet/80x24/unicode-color",
+    "multiline-editor-hooks-pet/120x36/unicode-color",
+    "capacity-many/80x24/unicode-color",
+    "capacity-many/120x36/unicode-color",
+    "capacity-one/80x24/unicode-color",
+    "capacity-one/120x36/unicode-color",
+    "capacity-zero/80x24/unicode-color",
+    "capacity-zero/120x36/unicode-color",
+    "selection-boundary/80x24/unicode-color",
+    "selection-boundary/120x36/unicode-color",
+    "manual-new-output/80x24/ascii-no-color",
+    "capacity-zero/48x10/ascii-no-color",
+    "multiline-editor-hooks-pet/48x10/unicode-color",
+    "narrow-cjk/48x10/unicode-color"
+  ],
+  "author_identity": "capture-sticky-viewport-showcase",
+  "executor_identity": "capture-sticky-viewport-showcase",
+  "required_artifacts": [
+    "terminal.txt",
+    "terminal-ansi.txt",
+    "terminal.html",
+    "metadata.json"
+  ],
+  "acceptance_version": "sticky-viewport-stage-03",
+  "design_version": "modes-design-sticky-viewport-v3",
+  "host_matrix": {
+    "capture_host": "VirtualTerminal",
+    "live_pty": false,
+    "network": false
+  },
+  "provenance": {
+    "capture_mode": "production-tui-virtual-terminal",
+    "live_pty": false,
+    "network": false,
+    "fixed_clock": true,
+    "author_identity": "capture-sticky-viewport-showcase",
+    "executor_identity": "capture-sticky-viewport-showcase",
+    "git_head": "37ce0360d9755f79567b968e22a420bfd6c90d9b",
+    "oracle_commit": "37ce0360d9755f79567b968e22a420bfd6c90d9b",
+    "git_diff_scope": [
+      "Cargo.lock",
+      "Cargo.toml",
+      "bun.lock",
+      "crates",
+      "packages/agent/src",
+      "packages/ai/src",
+      "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts",
+      "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts",
+      "packages/coding-agent/src",
+      "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts",
+      "packages/natives/native",
+      "packages/stats/src",
+      "packages/tui/src",
+      "packages/tui/test/virtual-terminal.ts",
+      "packages/utils/src"
+    ],
+    "git_diff_binary_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "source_sha256": {
+      "packages/coding-agent/test/fixtures/tui/sticky-viewport-showcase.ts": "f93ad57595e69c72f82ce04a69825db373b4c44b8018f7da0a5c960d904ad2ed",
+      "packages/coding-agent/scripts/capture-sticky-viewport-showcase.ts": "6f1c4ebb53b8e15cafd4da8bc69d6fdad79466e18b45c08a734f1f3f6138d25a",
+      "packages/coding-agent/scripts/verify-sticky-viewport-showcase.ts": "5b75a1a87ed78b2dbb8a4cb05b6b41067b753624ee78b62bb7baa3cd3deb62a3",
+      "packages/coding-agent/src/modes/interactive-mode.ts": "dc9cae46ccac36f49eef61e2bd4e2fd142a40059df877d98565905123aa82eae",
+      "packages/coding-agent/src/modes/components/irc-sidebar.ts": "538b06bece50815e85194bdb024bff9014181004a971a2ddf0fa4040779e699d",
+      "packages/tui/src/tui.ts": "398cd35524bbf86ed47c5af5ee711e6870f3091879c91738b4d1bcae8f5acb53"
+    }
+  },
+  "narrow_cjk": {
+    "entry_key": "narrow-cjk/48x10/unicode-color",
+    "phrase_boundaries": [
+      "의미 있는 문장 경계",
+      "意味のある文の境界",
+      "保留语义短语边界"
+    ]
+  }
+}

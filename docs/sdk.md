@@ -153,6 +153,16 @@ broker-bound CLI, or Coordinator MCP instead.
 Reasons: `already_answered`, `unknown_action`, `invalid_answer`,
 `resolver_unavailable`, `idempotency_conflict`, `unauthorized`.
 
+`bash_folded` — a foreground bash wait left the foreground and became a background job. Emitted once per fold into the replayable session event ring (so late-connecting clients receive it on `event_replay`), with `generic_safe` adapter disposition:
+
+```json
+{ "type": "bash_folded", "sessionId": "sess-1", "jobId": "bg_3", "generation": "bg_3:1", "reason": "steer" }
+```
+
+- `reason` is `steer` (a user steer arrived while the command had run past the 2 s grace window), `chord` (the `app.tool.backgroundFold` keybinding), `timer` (`bash.autoBackground`), or `sdk_control` (the `bash.background` control).
+- A replayed frame may describe a job that has since finished. `runtime.jobs.list` is the source of truth: each running/recent job carries `metadata.backgrounded` and, whenever it is `true` because of a fold, `metadata.foldReason` with the same values. The `bash.background` control (C52) returns `{ backgrounded: true, jobId }` on a fresh fold, `already_backgrounded` when no wait is foldable but a running job of this session was already folded (by steer, chord, timer, or a prior control call), `no_active_bash` when nothing is running or foldable, and `not_foldable` when a live wait refused the fold.
+- A `turn.steer` that folds a running bash behaves exactly like a TUI steer: the steer is consumed by the same turn at the tool boundary immediately after the fold result; `turn.steer_status` is unchanged.
+
 The frames above are the internal transport contract implemented by SDK-core attachments. Managed adapters may receive optional server → client frames they can render or ignore: `identity_header` (one-time per-session repo/branch/machine header; Telegram topic-capable sessions additionally carry `telegramTopicsEnabled`), `context_update` (last message, task, goal, token usage, model, diff), `turn_stream` (live/finalized turn output), `image_attachment` (agent-produced images), `activity` (busy/idle, drives the typing indicator), `inbound_ack` (delivery state of an injected user message), `session_closed` (endpoint teardown; threaded adapters may delete/archive the remote conversation), `config_update` (current verbosity/redact), `hello` (server capability/version), and `pong`.
 
 ### Internal inbound frames

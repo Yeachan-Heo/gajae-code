@@ -1225,6 +1225,8 @@ interface SessionRuntime {
 	disposeGateTerminalController: () => void;
 	disposeAckRecoveryParticipant: () => void;
 	disposeGateEmitterListener: () => void;
+	/** Deregisters this session's job-fold listener (`bash_folded`). */
+	disposeFoldListener: () => void;
 	/** Aborts and fences side turns while notification delivery is disabled. */
 	disableEphemeralTurns: () => void;
 	waitForGateResolutionQuiescence: () => Promise<void>;
@@ -4400,6 +4402,9 @@ export function createNotificationsExtension(
 		try {
 			rt.disposeGateEmitterListener();
 		} catch {}
+		try {
+			rt.disposeFoldListener();
+		} catch {}
 		rt.gatePresentations?.dispose();
 		try {
 			rt.disposeGateTerminalController();
@@ -6995,6 +7000,7 @@ export function createNotificationsExtension(
 				]);
 			},
 			disposeGateEmitterListener: () => {},
+			disposeFoldListener: () => {},
 			trackGateResolution,
 			waitForGateResolutionQuiescence: async () => {
 				await Promise.allSettled(inFlightGateResolutions);
@@ -8019,6 +8025,20 @@ export function createNotificationsExtension(
 			};
 			activeRuntime.disposeGateEmitterListener = registerWorkflowGateEmitterListener(id, attachWorkflowGate);
 			if (ctx.workflowGate) attachWorkflowGate(ctx.workflowGate);
+			// Every fold (steer, chord, auto-background timer, `bash.background`)
+			// publishes one replayable `bash_folded` frame. `runtime.jobs.list`
+			// `foldReason` remains the source of truth clients reconcile against after
+			// a replay, since a replayed frame may describe a job that has since ended.
+			activeRuntime.disposeFoldListener =
+				ctx.onJobFold?.(event => {
+					emitSessionEvent(activeRuntime, {
+						type: "bash_folded",
+						sessionId: id,
+						jobId: event.jobId,
+						generation: event.generation,
+						reason: event.reason,
+					});
+				}) ?? (() => {});
 			finishStartup({ status: "started", runtime: initializedRuntime });
 			return { status: "started", runtime: initializedRuntime };
 		} catch (e) {

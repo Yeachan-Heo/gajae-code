@@ -68,7 +68,7 @@ async function routerHarness(
 		},
 		request: async frame => {
 			frames.push(frame);
-			return frame.type === "event_replay" ? { events: [] } : { ok: true };
+			return frame.type === "event_replay" ? { ok: true, generation: 7, lastSeq: 0, events: [] } : { ok: true };
 		},
 		close: async () => undefined,
 		send: frame => frames.push(frame),
@@ -90,6 +90,13 @@ async function routerHarness(
 		},
 	});
 	await router.start();
+	const readinessDeadline = Date.now() + 5_000;
+	while ((!subscription || !router.attachment(sessionId)) && Date.now() < readinessDeadline) await Bun.sleep(5);
+	if (!subscription || !router.attachment(sessionId)) {
+		await router.stop();
+		fs.rmSync(root, { recursive: true, force: true });
+		throw new Error("Router did not publish Telegram and SDK capabilities before the readiness deadline");
+	}
 	return {
 		router,
 		index,

@@ -3061,6 +3061,17 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:onJobFold",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal fold-event plumbing feeding the bash_folded event frame, not a control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:requestForegroundBashBackground",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
@@ -3070,6 +3081,24 @@
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
 		}
+	},
+	{
+		"sourceId": "agent_session:requestForegroundBashBackgroundOutcome",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "include",
+		"sdkId": "bash.background",
+		"adapterMappings": {
+			"telegram": "prohibited",
+			"discord": "prohibited",
+			"slack": "prohibited",
+			"mcp": "generic_safe",
+			"acp": "generic_safe",
+			"daemonCli": "generic_safe"
+		},
+		"testIds": [
+			"packages/coding-agent/test/sdk-operation-inventory.test.ts"
+		]
 	},
 	{
 		"sourceId": "agent_session:getAllToolNames",

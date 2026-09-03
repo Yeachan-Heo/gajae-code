@@ -19,10 +19,15 @@ const model = (provider: string, id: string): Model =>
 
 function fakeRegistry(
 	profiles: ModelProfileDefinition[],
-	options: { profilesAfterRefresh?: ModelProfileDefinition[]; modelsAfterRefresh?: Model[] } = {},
+	options: {
+		profilesAfterRefresh?: ModelProfileDefinition[];
+		modelsAfterRefresh?: Model[];
+		excludeModelsFromProfileActivationUntilRefresh?: boolean;
+	} = {},
 ) {
 	let activeProfiles = profiles;
 	let activeModels = [model("profile-provider", "default"), model("cli-provider", "explicit")];
+	let profileActivationModelsRefreshed = false;
 	const registry = {
 		refreshCalls: [] as string[],
 		refreshInBackgroundCalls: [] as string[],
@@ -31,10 +36,15 @@ function fakeRegistry(
 		getAvailableModelProfileNames: () => activeProfiles.map(profile => profile.name).sort(),
 		getApiKeyForProvider: async () => "key",
 		getAll: () => activeModels,
+		getAvailableForProfileActivation: () =>
+			options.excludeModelsFromProfileActivationUntilRefresh && !profileActivationModelsRefreshed
+				? []
+				: activeModels,
 		async refresh(strategy = "online-if-uncached") {
 			registry.refreshCalls.push(strategy);
 			activeProfiles = options.profilesAfterRefresh ?? activeProfiles;
 			activeModels = options.modelsAfterRefresh ?? activeModels;
+			profileActivationModelsRefreshed = true;
 		},
 		refreshInBackground(strategy = "online-if-uncached") {
 			registry.refreshInBackgroundCalls.push(strategy);
@@ -446,6 +456,66 @@ test("lifecycle startup refreshes online when cached default profile resolution 
 	await applyStartupModelProfiles({
 		session,
 		settings: Settings.isolated({ "modelProfile.default": "refreshed-profile" }),
+		modelRegistry: registry as never,
+		parsedArgs: { default: false },
+		preferCachedModels: true,
+		preferCachedDefaultProfile: true,
+	});
+
+	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(registry.refreshInBackgroundCalls).toEqual([]);
+	expect(session.model?.provider).toBe("refreshed-provider");
+	expect(session.model?.id).toBe("new");
+});
+
+test("lifecycle startup without a configured profile does not refresh or replace the existing model", async () => {
+	const initialModel = model("initial-provider", "initial");
+	const session = fakeSession(initialModel);
+	const registry = fakeRegistry([]);
+
+	await applyStartupModelProfiles({
+		session,
+		settings: Settings.isolated(),
+		modelRegistry: registry as never,
+		parsedArgs: { default: false },
+		preferCachedModels: true,
+		preferCachedDefaultProfile: true,
+	});
+
+	expect(registry.refreshCalls).toEqual([]);
+	expect(registry.refreshInBackgroundCalls).toEqual([]);
+	expect(session.setModelTemporaryCalls).toEqual([]);
+	expect(session.model).toBe(initialModel);
+});
+
+test("lifecycle startup refreshes and retries a cached default excluded by fresh provider evidence", async () => {
+	const session = fakeSession();
+	const registry = fakeRegistry(
+		[
+			{
+				name: "cached-default",
+				requiredProviders: ["profile-provider"],
+				modelMapping: { default: "profile-provider/default:medium" },
+				source: "user",
+			},
+		],
+		{
+			profilesAfterRefresh: [
+				{
+					name: "cached-default",
+					requiredProviders: ["refreshed-provider"],
+					modelMapping: { default: "refreshed-provider/new:high" },
+					source: "user",
+				},
+			],
+			modelsAfterRefresh: [model("refreshed-provider", "new")],
+			excludeModelsFromProfileActivationUntilRefresh: true,
+		},
+	);
+
+	await applyStartupModelProfiles({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": "cached-default" }),
 		modelRegistry: registry as never,
 		parsedArgs: { default: false },
 		preferCachedModels: true,

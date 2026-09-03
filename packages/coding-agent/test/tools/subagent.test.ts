@@ -855,10 +855,10 @@ describe("SubagentTool", () => {
 		const toolSession = {
 			...createSession(),
 			waitForUserSteering: (signal: AbortSignal) => {
-				const steering = Promise.withResolvers<void>();
-				const onAbort = () => steering.resolve();
-				steeringResolve = steering.resolve;
-				if (signal.aborted) steering.resolve();
+				const steering = Promise.withResolvers<number | undefined>();
+				const onAbort = () => steering.resolve(undefined);
+				steeringResolve = () => steering.resolve(1);
+				if (signal.aborted) steering.resolve(undefined);
 				else signal.addEventListener("abort", onAbort, { once: true });
 				return steering.promise;
 			},

@@ -939,11 +939,28 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 		} else if (!state) {
 			checks.push({ name: "daemon", level: "ok", detail: "no daemon ownership record (none running)" });
 		} else if (!daemon.alive) {
-			checks.push({
-				name: "daemon",
-				level: "warn",
-				detail: `daemon owner pid ${daemon.pid} is not alive; run recovery to clear the stale lock`,
-			});
+			let lockPresent = false;
+			try {
+				const daemonDir = daemonPaths(opts.settings.getAgentDir()).dir;
+				const files = await fs.readdir(daemonDir);
+				const lockName = path.basename(daemonPaths(opts.settings.getAgentDir()).lock);
+				lockPresent = files.includes(lockName);
+			} catch {
+				lockPresent = false;
+			}
+			if (lockPresent) {
+				checks.push({
+					name: "daemon",
+					level: "warn",
+					detail: `daemon owner pid ${daemon.pid} is not alive; run recovery to clear the stale lock`,
+				});
+			} else {
+				checks.push({
+					name: "daemon",
+					level: "warn",
+					detail: `daemon owner pid ${daemon.pid} is not alive; no lock present (daemon exited cleanly)`,
+				});
+			}
 		} else if (!daemon.heartbeatFresh) {
 			checks.push({ name: "daemon", level: "warn", detail: `daemon pid ${daemon.pid} heartbeat is stale` });
 		} else if (telegramConfigured && !daemon.identityMatches) {
