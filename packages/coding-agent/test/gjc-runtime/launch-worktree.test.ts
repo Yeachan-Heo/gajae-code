@@ -773,6 +773,8 @@ describe("launch guard classification", () => {
 	it("classifies path conflicts on the cancellable preparation path", async () => {
 		const repo = await createRepo("gjc-cancellable-guard-");
 		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "occupied" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
 		await fs.mkdir(path.dirname(plan.worktreePath), { recursive: true });
 		await Bun.write(plan.worktreePath, "occupied\n");
 
