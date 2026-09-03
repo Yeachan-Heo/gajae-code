@@ -714,6 +714,7 @@ export async function runSessionHost(
 						modelRegistry: session.modelRegistry,
 						parsedArgs: parsed,
 						startupThinkingLevel,
+						preferCachedModels: true,
 					});
 		await beforeCutoff(modelProfileStartup);
 		throwIfCutoff();

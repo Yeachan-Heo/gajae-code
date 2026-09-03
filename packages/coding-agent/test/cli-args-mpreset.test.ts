@@ -403,6 +403,59 @@ test("interactive continuation applies cached default and --mpreset profiles bef
 	).toEqual(["profile-provider/default:medium", "profile-provider/default:high"]);
 });
 
+test("lifecycle startup applies a cached default profile without blocking on online refresh", async () => {
+	const session = fakeSession();
+	const registry = fakeRegistry([
+		{
+			name: "default-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+	]);
+
+	await applyStartupModelProfiles({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": "default-profile" }),
+		modelRegistry: registry as never,
+		parsedArgs: { default: false },
+		preferCachedModels: true,
+	});
+
+	expect(registry.refreshCalls).toEqual([]);
+	expect(registry.refreshInBackgroundCalls).toEqual(["online-if-uncached"]);
+	expect(session.model?.provider).toBe("profile-provider");
+	expect(session.model?.id).toBe("default");
+});
+
+test("lifecycle startup refreshes online when cached default profile resolution fails", async () => {
+	const session = fakeSession();
+	const registry = fakeRegistry(
+		[
+			{
+				name: "refreshed-profile",
+				requiredProviders: ["refreshed-provider"],
+				modelMapping: { default: "refreshed-provider/new:high" },
+				source: "user",
+			},
+		],
+		{ modelsAfterRefresh: [model("refreshed-provider", "new")] },
+	);
+
+	await applyStartupModelProfiles({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": "refreshed-profile" }),
+		modelRegistry: registry as never,
+		parsedArgs: { default: false },
+		preferCachedModels: true,
+	});
+
+	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(registry.refreshInBackgroundCalls).toEqual([]);
+	expect(session.model?.provider).toBe("refreshed-provider");
+	expect(session.model?.id).toBe("new");
+});
+
 test("interactive continuation refreshes online only when cached --mpreset resolution fails", async () => {
 	const session = fakeSession();
 	const registry = fakeRegistry(

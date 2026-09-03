@@ -484,7 +484,8 @@ async function applyStartupModelProfilesWithPolicy(
 	// deferred `--model <pattern>` path resolved inside createAgentSession.
 	const explicitModel = args.parsedArgs.model ? (args.startupModel ?? args.session.model) : undefined;
 	const defaultProfile = args.settings.get("modelProfile.default");
-	const preferCachedProfiles = args.preferCachedModels === true && args.parsedArgs.mpreset !== undefined;
+	const preferCachedProfiles =
+		args.preferCachedModels === true && (defaultProfile !== undefined || args.parsedArgs.mpreset !== undefined);
 	const applyConfiguredProfiles = async (): Promise<boolean> => {
 		let applied = true;
 		if (defaultProfile) {
