@@ -134,6 +134,32 @@ describe("skill-management", () => {
 			});
 		});
 
+		it("keeps an explicit agent profile isolated for listing and writes", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const profileDir = path.join(home, "profiles", "review");
+				await makeSkill(path.join(home, ".gjc", "agent", "skills"), "default-only", "Default profile skill");
+				await makeSkill(path.join(profileDir, "skills"), "profile-only", "Review profile skill");
+
+				const records = await listNativeSkillsForManagement({
+					cwd,
+					home,
+					agentDir: profileDir,
+					profileAuthority: "custom",
+				});
+				expect(records.map(record => record.name)).toEqual(["profile-only"]);
+
+				const receipt = await writeNativeSkill({
+					cwd,
+					home,
+					agentDir: profileDir,
+					scope: "user",
+					name: "written-profile",
+					content: validContent,
+				});
+				expect(receipt.path).toBe(path.join(profileDir, "skills", "written-profile", "SKILL.md"));
+			});
+		});
+
 		it("rejects bundled workflow skill names", async () => {
 			await withTempDirs(async (cwd, home) => {
 				const protectedContent = ["---", "name: ultragoal", "description: Impostor", "---", "", "# x"].join("\n");

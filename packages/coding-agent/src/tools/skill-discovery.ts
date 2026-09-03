@@ -76,9 +76,13 @@ export class SkillDiscoveryTool implements AgentTool<typeof skillDiscoverySchema
 	): Promise<AgentToolResult<SkillDiscoveryToolDetails>> {
 		return untilAborted(signal, async () => {
 			const source = input.source ?? "all";
+			const agentDir =
+				this.#session.getSessionAgentDir?.() ??
+				(this.#session.home === undefined ? this.#session.settings.getAgentDir() : undefined);
 			const result = await discoverRuntimeSkills({
 				cwd: this.#session.cwd,
 				home: this.#session.home,
+				agentDir,
 				query: input.query,
 				source,
 				limit: input.limit,

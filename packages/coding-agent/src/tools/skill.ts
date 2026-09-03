@@ -165,6 +165,9 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 				);
 			}
 
+			const agentDir =
+				this.#session.getSessionAgentDir?.() ??
+				(this.#session.home === undefined ? this.#session.settings.getAgentDir() : undefined);
 			const skill =
 				skills.find(s => s.name === requestedName) ??
 				(await findRuntimeSkillByName(
@@ -172,6 +175,7 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 					requestedName,
 					this.#getRuntimeSkillPolicy(),
 					this.#session.home,
+					agentDir,
 				));
 			if (!skill) {
 				const available = formatAvailableSkills(skills);

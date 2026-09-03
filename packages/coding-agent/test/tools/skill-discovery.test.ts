@@ -120,6 +120,30 @@ describe("SkillDiscoveryTool", () => {
 		}
 	});
 
+	it("discovers runtime skills from the session's custom agent profile", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-skills-cwd-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-profile-skills-home-"));
+		const profileDir = path.join(home, "profiles", "review");
+		try {
+			await makeSkill(path.join(home, ".gjc", "agent", "skills"), "default-only", "Default profile skill");
+			await makeSkill(path.join(profileDir, "skills"), "profile-only", "Review profile skill");
+			const settings = runtimeSkillSettings();
+			const tool = new SkillDiscoveryTool(
+				createSession(cwd, {
+					settings,
+					home,
+					getSessionAgentDir: () => profileDir,
+				}),
+			);
+
+			const discovery = await tool.execute("call", { source: "user" });
+			expect(discovery.details?.candidates.map(candidate => candidate.name)).toEqual(["profile-only"]);
+		} finally {
+			await safeRm(cwd, { recursive: true, force: true });
+			await safeRm(home, { recursive: true, force: true });
+		}
+	});
+
 	it("does not classify home .gjc skills as project skills while walking up", async () => {
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-home-skill-boundary-"));
 		const cwd = path.join(home, "work", "project", "nested");

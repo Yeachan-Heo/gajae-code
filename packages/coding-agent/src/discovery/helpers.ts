@@ -4,8 +4,6 @@ import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/natives";
 import {
 	CONFIG_DIR_NAME,
-	getAgentDir,
-	getAgentProfileAuthority,
 	getConfigDirName,
 	getPluginsDir,
 	getProjectDir,
@@ -150,7 +148,7 @@ export function getUserSkillScanDirs(
 	}
 	return [
 		...new Set([
-			path.join(home, SOURCE_PATHS.native.userAgent, "skills"),
+			path.join(resolvedAgentDir, "skills"),
 			path.join(home, SOURCE_PATHS.native.userBase, "skills"),
 			path.join(home, ".gjc", "skills"),
 		]),

@@ -581,7 +581,6 @@ class DirResolver {
 	}
 
 	/** Agent subdirectory, with optional XDG override. */
-	/** Agent subdirectory, with optional XDG override. */
 	agentSubdir(userAgentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
 		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");

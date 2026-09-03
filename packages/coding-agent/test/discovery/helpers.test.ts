@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import { parseFrontmatter } from "@gajae-code/utils";
+import { getUserSkillScanDirs, resolveUserAgentDir, SOURCE_PATHS } from "../../src/discovery/helpers";
 
 describe("parseFrontmatter", () => {
 	const parse = (content: string) => parseFrontmatter(content, { source: "tests:frontmatter", level: "off" });
@@ -274,5 +276,36 @@ Body content`;
 		const result = parseFrontmatter(content, { source: "tests:frontmatter", level: "off", normalize: false });
 		expect(result.frontmatter).toEqual({});
 		expect(result.body).toBe(content);
+	});
+});
+
+describe("getUserSkillScanDirs", () => {
+	test("isolates custom agent profiles from default legacy roots", () => {
+		const home = "/tmp/gjc-skill-profile-home";
+		const defaultAgentDir = resolveUserAgentDir(home);
+		const customAgentDir = path.join(home, "profiles", "review");
+
+		expect(getUserSkillScanDirs(home, customAgentDir, "custom")).toEqual([path.join(customAgentDir, "skills")]);
+		expect(getUserSkillScanDirs(home, defaultAgentDir, "default")).toEqual([
+			...new Set([
+				path.join(home, SOURCE_PATHS.native.userAgent, "skills"),
+				path.join(home, SOURCE_PATHS.native.userBase, "skills"),
+				path.join(home, ".gjc", "skills"),
+			]),
+		]);
+	});
+
+	test("honors an explicit custom authority even when paths currently coincide", () => {
+		const home = "/tmp/gjc-skill-profile-home";
+		const defaultAgentDir = resolveUserAgentDir(home);
+
+		expect(getUserSkillScanDirs(home, defaultAgentDir, "custom")).toEqual([path.join(defaultAgentDir, "skills")]);
+	});
+
+	test("keeps an XDG-resolved default agent directory as the canonical root", () => {
+		const home = "/tmp/gjc-skill-profile-home";
+		const xdgAgentDir = path.join(home, ".local", "share", "gjc", "agent");
+
+		expect(getUserSkillScanDirs(home, xdgAgentDir, "default")[0]).toBe(path.join(xdgAgentDir, "skills"));
 	});
 });
