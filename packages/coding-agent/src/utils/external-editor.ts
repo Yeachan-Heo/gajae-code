@@ -65,8 +65,22 @@ const ENABLE_ECHO_INPUT = 0x0004;
 const ENABLE_WINDOW_INPUT = 0x0008;
 const ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
 
-function prepareWindowsConsoleForExternalEditor(): void {
-	if (process.platform !== "win32") return;
+interface RawModeInput {
+	setRawMode?: (mode: boolean) => unknown;
+}
+
+export function prepareWindowsConsoleForExternalEditor(
+	platform: NodeJS.Platform = process.platform,
+	input: RawModeInput = process.stdin,
+): void {
+	if (platform !== "win32") return;
+	// Native Windows terminals can expose stdin through a ConPTY pipe rather than
+	// a console input handle. In that case GetConsoleMode/SetConsoleMode below
+	// cannot re-arm the input stream, but the runtime's TTY implementation can.
+	try {
+		input.setRawMode?.(true);
+	} catch {}
+
 	try {
 		const kernel32 = dlopen("kernel32.dll", {
 			GetStdHandle: { args: [FFIType.i32], returns: FFIType.ptr },

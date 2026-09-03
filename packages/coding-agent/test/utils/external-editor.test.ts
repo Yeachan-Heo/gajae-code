@@ -1,5 +1,23 @@
 import { describe, expect, it } from "bun:test";
-import { shouldUseExternalEditorShell, trimEditorTrailingNewline } from "../../src/utils/external-editor";
+import {
+	prepareWindowsConsoleForExternalEditor,
+	shouldUseExternalEditorShell,
+	trimEditorTrailingNewline,
+} from "../../src/utils/external-editor";
+
+describe("prepareWindowsConsoleForExternalEditor", () => {
+	it("reasserts runtime raw mode for Windows pseudo-terminals", () => {
+		const modes: boolean[] = [];
+		prepareWindowsConsoleForExternalEditor("win32", { setRawMode: mode => modes.push(mode) });
+		expect(modes).toEqual([true]);
+	});
+
+	it("does not touch raw mode on POSIX", () => {
+		const modes: boolean[] = [];
+		prepareWindowsConsoleForExternalEditor("linux", { setRawMode: mode => modes.push(mode) });
+		expect(modes).toEqual([]);
+	});
+});
 
 describe("shouldUseExternalEditorShell", () => {
 	it("spawns native Windows executables directly", () => {
