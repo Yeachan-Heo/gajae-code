@@ -790,21 +790,19 @@ describe("launch guard classification", () => {
 		expect(guard?.code).toBe("worktree_path_conflict");
 	});
 
-	it("rolls back an exact worktree created as the cancellable deadline expires", async () => {
+	it("retains an exact worktree created as the cancellable deadline expires", async () => {
 		const repo = await createRepo("gjc-cancellable-rollback-");
 		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline" });
 		expect(plan.enabled).toBe(true);
 		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
-		let reads = 0;
-
 		await expect(
 			ensureLaunchWorktreeCancellable(plan, {
-				deadlineAt: 50,
-				now: () => (++reads < 6 ? 0 : 100),
+				deadlineAt: 5_000,
+				now: () => (fsSync.existsSync(plan.worktreePath) ? 10_000 : 0),
 			}),
 		).rejects.toBeInstanceOf(Error);
-		expect(await Bun.file(plan.worktreePath).exists()).toBe(false);
-		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toBe("");
+		expect(fsSync.existsSync(plan.worktreePath)).toBe(true);
+		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toContain(plan.branchName ?? "");
 	});
 
 	it("retains a raced dirty worktree instead of force-removing user changes", async () => {
@@ -876,7 +874,7 @@ describe("launch guard classification", () => {
 		expect(run("git", ["rev-parse", plan.branchName ?? ""], repo)).not.toBe(plan.baseRef);
 	});
 
-	it("removes a timed-out clean worktree for a pre-existing branch without deleting the branch", async () => {
+	it("retains a timed-out clean worktree for a pre-existing branch", async () => {
 		const repo = await createRepo("gjc-cancellable-existing-");
 		const sourceBranch = run("git", ["branch", "--show-current"], repo);
 		run("git", ["checkout", "-b", "deadline-existing"], repo);
@@ -888,15 +886,13 @@ describe("launch guard classification", () => {
 		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-existing" });
 		expect(plan.enabled).toBe(true);
 		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
-		let reads = 0;
-
 		await expect(
 			ensureLaunchWorktreeCancellable(plan, {
-				deadlineAt: 50,
-				now: () => (++reads < 6 ? 0 : 100),
+				deadlineAt: 5_000,
+				now: () => (fsSync.existsSync(plan.worktreePath) ? 10_000 : 0),
 			}),
 		).rejects.toBeInstanceOf(Error);
-		expect(await Bun.file(plan.worktreePath).exists()).toBe(false);
+		expect(fsSync.existsSync(plan.worktreePath)).toBe(true);
 		expect(run("git", ["rev-parse", "deadline-existing"], repo)).toBe(existingHead);
 	});
 

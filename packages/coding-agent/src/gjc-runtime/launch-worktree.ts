@@ -649,23 +649,6 @@ function ensureLaunchWorktreeSync(
 	};
 }
 
-function removeCleanAbortedLaunchWorktree(plan: GjcLaunchWorktreePlan, createdBranch: boolean): void {
-	if (runGit(plan.worktreePath, ["status", "--porcelain", "--ignored", "--untracked-files=all"]).trim().length > 0)
-		return;
-	try {
-		runGit(plan.repoRoot, ["worktree", "remove", plan.worktreePath]);
-	} catch {
-		return;
-	}
-	if (createdBranch && plan.branchName) {
-		try {
-			runGit(plan.repoRoot, ["update-ref", "-d", `refs/heads/${plan.branchName}`, plan.baseRef]);
-		} catch {
-			// Compare-and-delete refused a raced branch update; retain it for inspection.
-		}
-	}
-}
-
 export async function ensureLaunchWorktreeCancellable(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
 	options: LaunchWorktreeAbortOptions = {},
@@ -734,23 +717,7 @@ export async function ensureLaunchWorktreeCancellable(
 	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
 	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
 
-	let result: { stdout: string; stderr: string; exitCode: number };
-	try {
-		result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
-	} catch (error) {
-		if (error instanceof WorktreePreparationTimeoutError) {
-			const created = findWorktreeByPath(listWorktrees(plan.repoRoot), plan.worktreePath);
-			const expectedBranch = plan.branchName ? `refs/heads/${plan.branchName}` : null;
-			const createdBranch = Boolean(plan.branchName && !branchAlreadyExisted);
-			const owned =
-				created &&
-				!plan.detached &&
-				created.branchRef === expectedBranch &&
-				(!createdBranch || created.head === plan.baseRef);
-			if (owned) removeCleanAbortedLaunchWorktree(plan, createdBranch);
-		}
-		throw error;
-	}
+	const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
 	if (result.exitCode !== 0) {
 		const stderr = sanitizeWorktreeDiagnostic(result.stderr.trim());
 		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw launchGuard("branch_in_use", plan.branchName);
