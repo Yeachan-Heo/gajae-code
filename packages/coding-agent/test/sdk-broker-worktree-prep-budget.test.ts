@@ -314,8 +314,15 @@ test("worktreePlan plus supplied child 5-tuple is invalid_input", async () => {
 }, 20_000);
 test("dependency install failures redact TOKEN= values from the thrown message", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-prep-secret-"));
+	const previousPath = process.env.PATH;
 	try {
 		const repo = await createRepo(root);
+		const fakeBin = path.join(root, "bin");
+		await fs.mkdir(fakeBin, { recursive: true });
+		const fakeNpm = path.join(fakeBin, "npm");
+		await fs.writeFile(fakeNpm, "#!/usr/bin/env bash\necho 'TOKEN=secret install failed' >&2\nexit 23\n");
+		await fs.chmod(fakeNpm, 0o755);
+		process.env.PATH = `${fakeBin}:${previousPath ?? ""}`;
 		await fs.writeFile(
 			path.join(repo, "package.json"),
 			JSON.stringify({
@@ -341,6 +348,8 @@ test("dependency install failures redact TOKEN= values from the thrown message",
 		expect(message).toContain("worktree_dependency");
 		expect(message).not.toMatch(/TOKEN=secret/i);
 	} finally {
+		if (previousPath === undefined) delete process.env.PATH;
+		else process.env.PATH = previousPath;
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
