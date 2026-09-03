@@ -1882,7 +1882,8 @@ export class ModelRegistry {
 			const refreshGeneration = this.#catalogRefreshGeneration;
 			this.#suspendRebuild();
 			try {
-				this.#reloadStaticModels();
+				// A provider refresh only updates discovery for this provider.
+				// Static catalog changes are serialized through refresh().
 				for (const selector of this.#suppressedSelectors.keys()) {
 					if (selector.startsWith(`${providerId}/`)) {
 						this.#suppressedSelectors.delete(selector);

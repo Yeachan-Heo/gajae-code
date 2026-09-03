@@ -93,6 +93,49 @@ describe("custom provider auto model discovery", () => {
 		expect(ids).toContain("llama-3-70b");
 	});
 
+	test("keeps the current static catalog during a provider-only refresh", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  withfox:",
+				"    baseUrl: https://first.example.test/v1",
+				"    api: openai-completions",
+				"    apiKey: sk-withfox",
+				"    auth: apiKey",
+				"    models:",
+				"      - id: first-static-model",
+			].join("\n"),
+		);
+		const requested: string[] = [];
+		using _hook = hookFetch(input => {
+			requested.push(String(input));
+			return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  withfox:",
+				"    baseUrl: https://second.example.test/v1",
+				"    api: openai-completions",
+				"    apiKey: sk-withfox",
+				"    auth: apiKey",
+				"    models:",
+				"      - id: second-static-model",
+			].join("\n"),
+		);
+
+		await registry.refreshProvider("withfox", "online");
+
+		expect(requested).toEqual(["https://first.example.test/v1/models"]);
+		expect(registry.find("withfox", "first-static-model")).toBeDefined();
+		expect(registry.find("withfox", "second-static-model")).toBeUndefined();
+	});
+
 	test("auto-classifies the wire api family per discovered model", async () => {
 		fs.writeFileSync(
 			modelsPath,
