@@ -789,4 +789,21 @@ describe("launch guard classification", () => {
 		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
 		expect(guard?.code).toBe("worktree_path_conflict");
 	});
+
+	it("rolls back an exact worktree created as the cancellable deadline expires", async () => {
+		const repo = await createRepo("gjc-cancellable-rollback-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => (++reads < 6 ? 0 : 100),
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(plan.worktreePath).exists()).toBe(false);
+		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toBe("");
+	});
 });

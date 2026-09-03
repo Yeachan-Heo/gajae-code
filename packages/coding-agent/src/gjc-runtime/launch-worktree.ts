@@ -717,7 +717,25 @@ export async function ensureLaunchWorktreeCancellable(
 	else if (branchAlreadyExisted) args.push(plan.worktreePath, plan.branchName ?? "");
 	else args.push("-b", plan.branchName ?? "", plan.worktreePath, plan.baseRef);
 
-	const result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
+	let result: { stdout: string; stderr: string; exitCode: number };
+	try {
+		result = await spawnProcessGroup(["git", ...args], plan.repoRoot, options, timeout);
+	} catch (error) {
+		if (error instanceof WorktreePreparationTimeoutError) {
+			const created = findWorktreeByPath(listWorktrees(plan.repoRoot), plan.worktreePath);
+			const expectedBranch = plan.branchName ? `refs/heads/${plan.branchName}` : null;
+			const owned =
+				created &&
+				(plan.detached ? created.detached && created.head === plan.baseRef : created.branchRef === expectedBranch);
+			if (owned)
+				removeOwnedLaunchWorktree(plan, {
+					created: true,
+					reused: false,
+					createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
+				});
+		}
+		throw error;
+	}
 	if (result.exitCode !== 0) {
 		const stderr = sanitizeWorktreeDiagnostic(result.stderr.trim());
 		if (plan.branchName && BRANCH_IN_USE_PATTERN.test(stderr)) throw launchGuard("branch_in_use", plan.branchName);

@@ -575,6 +575,36 @@ describe("GJC tmux session management", () => {
 		expect(buildGjcTmuxExactOptionTarget("custom-gjc")).toBe("=custom-gjc:");
 	});
 
+	it("bounds generated session names for long branch names", () => {
+		const name = buildGjcTmuxSessionName({}, { branch: `feature/${"long-".repeat(80)}`, now: 1, id: "abcdefgh" });
+
+		expect(name.length).toBeLessThanOrEqual(128);
+		expect(name).toStartWith("gajae_code_");
+		expect(name).toEndWith("1_abcdefgh");
+	});
+
+	it("rejects owner metadata that could alter a guarded tmux format", () => {
+		const env = { GJC_TMUX_COMMAND: "tmux" };
+		const calls: string[][] = [];
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation(command => {
+			const commandArgv = argv(command);
+			calls.push(commandArgv);
+			if (commandArgv.includes("list-sessions"))
+				return spawnResult(
+					0,
+					"managed\t1\t0\t1770000000\t1\troot\t0\t\tmain\tmain\t/repo\tsession-1\t/tmp/runtime-state.json\tgeneration,#{pid}\t\t$1\n",
+				);
+			if (commandArgv.includes("show-options"))
+				return spawnResult(0, commandArgv.at(-1) === "@gjc-owner-generation" ? "generation,#{pid}\n" : "1\n");
+			if (commandArgv.includes("display-message")) return spawnResult(0, "$1\n");
+			return spawnResult(0, "");
+		});
+		injectSafeMutationProof();
+
+		expect(() => removeGjcTmuxSession("managed", env)).toThrow("gjc_tmux_owner_unverifiable");
+		expect(calls.some(command => command.includes("if-shell"))).toBe(false);
+	});
+
 	it("builds a window-qualified exact target for tmux option commands", () => {
 		// tmux 3.6a only resolves the exact session for option commands when the
 		// target is window-qualified (`=NAME:`); a bare `=NAME` does not (#580).
