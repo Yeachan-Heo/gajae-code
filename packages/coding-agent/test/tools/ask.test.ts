@@ -370,6 +370,25 @@ describe("AskTool cancellation", () => {
 		expect(select.mock.calls[0]?.[2]?.timeout).toBeGreaterThan(0);
 	});
 
+	it("does not mark a single option as recommended", async () => {
+		const tool = new AskTool(createSession());
+		const select = vi.fn(async (_prompt: string, options: string[], dialogOptions) => {
+			expect(options).toEqual(["yes", "Other (type your own)"]);
+			expect(dialogOptions?.initialIndex).toBeUndefined();
+			return "yes";
+		});
+
+		await tool.execute(
+			"call-single-option-no-recommendation",
+			{
+				questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }], recommended: 0 }],
+			},
+			undefined,
+			undefined,
+			createContext({ select }),
+		);
+	});
+
 	it("auto-selects the first option when timeout elapses without a selected option", async () => {
 		const tool = new AskTool(
 			createSession({

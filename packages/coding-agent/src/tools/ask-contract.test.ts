@@ -11,18 +11,30 @@ const baseQuestion = {
 describe("ask option contract", () => {
 	test("rejects custom-input pseudo-options", () => {
 		for (const label of [
-			"Other",
 			"Other (type your own)",
 			"Type your own",
 			"custom input",
 			"직접 입력",
 			"직접 입력으로 추가",
+			"  OTHER（SPECIFY）  ",
+			"other…",
+			"write your own",
+			"enter manually",
+			"기타",
+			"기타 입력",
 		]) {
 			const result = ordinaryAskSchema.safeParse({
 				questions: [{ ...baseQuestion, options: [{ label }, { label: "Cancel" }], recommended: 0 }],
 			});
 			expect(result.success, label).toBe(false);
 		}
+	});
+
+	test("accepts a genuine Other domain value", () => {
+		const result = ordinaryAskSchema.safeParse({
+			questions: [{ ...baseQuestion, options: [{ label: "Other" }, { label: "Cancel" }] }],
+		});
+		expect(result.success).toBe(true);
 	});
 
 	test("accepts ordinary recommended options", () => {

@@ -26,17 +26,18 @@ function deepInterviewBoundedString(maximum: number) {
 	});
 }
 
-const RESERVED_CUSTOM_INPUT_OPTION_PATTERNS: readonly RegExp[] = [
-	/^other$/i,
-	/\bother\s*\(\s*type\s+your\s+own\s*\)/i,
-	/\btype\s+your\s+own\b/i,
-	/\bcustom\s+input\b/i,
-	/직접\s*입력/,
-];
-
 function isReservedCustomInputOptionLabel(label: string): boolean {
-	const normalized = label.trim().replace(/\s+/g, " ");
-	return RESERVED_CUSTOM_INPUT_OPTION_PATTERNS.some(pattern => pattern.test(normalized));
+	const unicodeNormalized = label.normalize("NFKC").toLowerCase().trim();
+	if (/^other[\p{P}\p{S}]+/u.test(unicodeNormalized)) return true;
+	const normalized = unicodeNormalized.replace(/[\p{P}\p{S}]+/gu, " ").replace(/\s+/g, " ");
+	return (
+		/\bother\s+(?:type\s+your\s+own|specify|please\s+specify)\b/.test(normalized) ||
+		/(?:\b)(?:type|write)\s+your\s+own\b/.test(normalized) ||
+		/\benter\s+manually\b/.test(normalized) ||
+		/\bcustom\s+input\b/.test(normalized) ||
+		/직접\s*입력/u.test(normalized) ||
+		/기타(?:\s*입력)?/u.test(normalized)
+	);
 }
 
 const OptionItem = z.object({
