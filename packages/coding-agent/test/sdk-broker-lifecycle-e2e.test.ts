@@ -676,6 +676,69 @@ test("session host exact cutoff writes proven pre-session absence", async () => 
 	}
 });
 
+test("session host opts cached default profiles into lifecycle startup only", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-cached-default-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "cached-default-policy";
+	const effectMarker = "cached-default-policy-marker";
+	const deadlines = deriveLifecycleDeadlines(Date.now(), 60_000);
+	const names = [
+		"GJC_AGENT_DIR",
+		"GJC_STATE_ROOT",
+		"GJC_LIFECYCLE_REQUEST_ID",
+		"GJC_SDK_LIFECYCLE_REQUEST",
+		"GJC_SDK_TEST_IN_MEMORY_SESSION",
+	] as const;
+	const previous = names.map(name => process.env[name]);
+	let captured:
+		| {
+				preferCachedModels: boolean | undefined;
+				preferCachedDefaultProfile: boolean | undefined;
+		  }
+		| undefined;
+	try {
+		await fs.mkdir(path.join(stateRoot, "sdk"), { recursive: true });
+		await fs.writeFile(
+			path.join(stateRoot, "sdk", `${sessionId}.lifecycle.json`),
+			JSON.stringify({ pid: process.pid, effectMarker, incarnation: "test-incarnation" }),
+		);
+		process.env.GJC_AGENT_DIR = agentDir;
+		process.env.GJC_STATE_ROOT = stateRoot;
+		process.env.GJC_LIFECYCLE_REQUEST_ID = effectMarker;
+		process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
+		process.env.GJC_SDK_LIFECYCLE_REQUEST = JSON.stringify({
+			operation: "session.create",
+			sessionId,
+			cwd: root,
+			stateRoot,
+			effectMarker,
+			...deadlines,
+		});
+		await expect(
+			runSessionHost({
+				cwd: root,
+				processIncarnation: () => "test-incarnation",
+				applyStartupModelProfiles: async options => {
+					captured = {
+						preferCachedModels: options.preferCachedModels,
+						preferCachedDefaultProfile: options.preferCachedDefaultProfile,
+					};
+					throw new Error("stop-after-profile-policy-capture");
+				},
+			}),
+		).rejects.toThrow("stop-after-profile-policy-capture");
+		expect(captured).toEqual({ preferCachedModels: true, preferCachedDefaultProfile: true });
+	} finally {
+		names.forEach((name, index) => {
+			const value = previous[index];
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		});
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("session host fails closed when its lifecycle effect marker is corrupt", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-corrupt-marker-"));
 	const agentDir = path.join(root, "agent");

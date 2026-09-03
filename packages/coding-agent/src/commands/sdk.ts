@@ -405,11 +405,13 @@ export async function runSessionHost(
 		sleep?: (ms: number) => Promise<void>;
 		cwd?: string;
 		processIncarnation?: (pid: number) => string | undefined;
+		applyStartupModelProfiles?: typeof applyStartupModelProfiles;
 	} = {},
 ): Promise<void> {
 	const now = timing.now ?? Date.now;
 	const sleep = timing.sleep ?? (async ms => await Bun.sleep(ms));
 	const readIncarnation = timing.processIncarnation ?? processIncarnation;
+	const applyModelProfiles = timing.applyStartupModelProfiles ?? applyStartupModelProfiles;
 	const request = readSessionLifecycleLaunchRequest(process.env.GJC_SDK_LIFECYCLE_REQUEST, now());
 	const agentDir = process.env.GJC_AGENT_DIR;
 	if (!agentDir) throw new Error("GJC_AGENT_DIR is required for sdk session-host-internal.");
@@ -708,7 +710,7 @@ export async function runSessionHost(
 		const modelProfileStartup =
 			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
 				? new Promise<void>(() => {})
-				: applyStartupModelProfiles({
+				: applyModelProfiles({
 						session,
 						settings: session.settings,
 						modelRegistry: session.modelRegistry,
