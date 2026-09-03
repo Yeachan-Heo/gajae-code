@@ -154,7 +154,7 @@ describe("skill-management", () => {
 					agentDir: profileDir,
 					scope: "user",
 					name: "written-profile",
-					content: validContent,
+					content: validContent.replace("name: my-skill", "name: written-profile"),
 				});
 				expect(receipt.path).toBe(path.join(profileDir, "skills", "written-profile", "SKILL.md"));
 			});
