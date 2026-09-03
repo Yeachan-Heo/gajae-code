@@ -17,6 +17,7 @@ import {
 import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_SUPERVISED_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
@@ -539,7 +540,7 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 	const supervisorEnv: Record<string, string> = context.managedOwnerSupervisor
 		? {
 				GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([...command, ...childArgs]),
-				GJC_MANAGED_OWNER_SUPERVISED: "1",
+				[MANAGED_OWNER_SUPERVISED_ENV]: "1",
 				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
 			}
 		: {};
