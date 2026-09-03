@@ -1,6 +1,9 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { visibleWidth } from "@gajae-code/tui";
-import { resetSettingsForTest, Settings, settings } from "../src/config/settings";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
 import type { StatusLineSegmentId } from "../src/config/settings-schema";
 import {
 	normalizeStatusLineCommandOptions,
@@ -138,6 +141,86 @@ describe("status line command segment", () => {
 			component.dispose();
 		}
 	});
+
+	it("refreshes an idle command without another incidental render", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-status-line-refresh-${Date.now()}.txt`);
+		const quotedMarker = marker.replaceAll("'", "'\\''");
+		const command =
+			`count=0; if [ -f '${quotedMarker}' ]; then count=$(cat '${quotedMarker}'); fi; ` +
+			`count=$((count + 1)); printf '%s' "$count" > '${quotedMarker}'; printf 'refresh-%s' "$count"`;
+		let component: StatusLineComponent | undefined;
+		try {
+			component = makeComponent(command, { refreshMs: 100 }, undefined, () => {
+				component?.render(120);
+			});
+			component.render(120);
+			const deadline = Date.now() + 2_000;
+			let fileText = "";
+			while (Date.now() < deadline) {
+				fileText = await Bun.file(marker)
+					.text()
+					.catch(() => "");
+				if (fileText === "2") break;
+				await Bun.sleep(10);
+			}
+			expect(fileText).toBe("2");
+		} finally {
+			component?.dispose();
+			await fs.rm(marker, { force: true });
+		}
+	});
+
+	it("does not execute a command supplied only by project-scoped status settings", async () => {
+		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-status-line-project-"));
+		const marker = path.join(os.tmpdir(), `gjc-status-line-project-command-${Date.now()}.txt`);
+		const quotedMarker = marker.replaceAll("'", "'\\''");
+		const command = `printf project-command > '${quotedMarker}'`;
+		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await Bun.write(
+			path.join(projectDir, ".gjc", "config.yml"),
+			`statusLine:\n  preset: custom\n  leftSegments:\n    - command\n  segmentOptions:\n    command:\n      command: ${JSON.stringify(command)}\n`,
+		);
+		const sessionSettings = await Settings.loadForScope({
+			cwd: projectDir,
+			agentDir: path.join(projectDir, "agent"),
+		});
+		const component = makeComponent(command, {}, sessionSettings);
+		try {
+			component.render(120);
+			await Bun.sleep(150);
+			expect(
+				await Bun.file(marker)
+					.text()
+					.catch(() => ""),
+			).toBe("");
+		} finally {
+			component.dispose();
+			await sessionSettings.close();
+			await fs.rm(marker, { force: true });
+			await fs.rm(projectDir, { recursive: true, force: true });
+		}
+	});
+
+	it("cancels an active command when the status component is disposed", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-status-line-dispose-${Date.now()}.txt`);
+		const quotedMarker = marker.replaceAll("'", "'\\''");
+		const component = makeComponent(`sleep 1; printf disposed-command > '${quotedMarker}'`, {
+			timeoutMs: 5_000,
+		});
+		try {
+			component.render(120);
+			component.dispose();
+			await Bun.sleep(1_200);
+			expect(
+				await Bun.file(marker)
+					.text()
+					.catch(() => ""),
+			).toBe("");
+		} finally {
+			component.dispose();
+			await fs.rm(marker, { force: true });
+		}
+	});
 });
 
 async function waitForRendered(
@@ -154,26 +237,47 @@ async function waitForRendered(
 	return rendered;
 }
 
-function makeComponent(command: string, overrides: { timeoutMs?: number } = {}): StatusLineComponent {
-	const component = new StatusLineComponent({
-		state: { messages: [] },
-		settings,
-		isStreaming: false,
-		isFastModeActive: () => false,
-		modelRegistry: { isUsingOAuth: () => false },
-		sessionManager: {
-			getUsageStatistics: () => ({
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				premiumRequests: 0,
-				cost: 0,
-			}),
-			getSessionName: () => "command-test",
-		},
-		getAsyncJobSnapshot: () => ({ running: [] }),
-	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0]);
+function makeComponent(
+	command: string,
+	overrides: { timeoutMs?: number; refreshMs?: number } = {},
+	sessionSettings?: Settings,
+	onUpdate?: () => void,
+): StatusLineComponent {
+	const resolvedSettings =
+		sessionSettings ??
+		Settings.isolated({
+			"statusLine.leftSegments": ["command"],
+			"statusLine.segmentOptions": {
+				command: {
+					command,
+					timeoutMs: overrides.timeoutMs,
+					refreshMs: overrides.refreshMs ?? 250,
+					maxLength: 40,
+				},
+			},
+		});
+	const component = new StatusLineComponent(
+		{
+			state: { messages: [] },
+			settings: resolvedSettings,
+			isStreaming: false,
+			isFastModeActive: () => false,
+			modelRegistry: { isUsingOAuth: () => false },
+			sessionManager: {
+				getUsageStatistics: () => ({
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					premiumRequests: 0,
+					cost: 0,
+				}),
+				getSessionName: () => "command-test",
+			},
+			getAsyncJobSnapshot: () => ({ running: [] }),
+		} as unknown as ConstructorParameters<typeof StatusLineComponent>[0],
+		{ onUpdate },
+	);
 	component.updateSettings({
 		preset: "custom",
 		leftSegments: ["command" as StatusLineSegmentId],
@@ -186,7 +290,7 @@ function makeComponent(command: string, overrides: { timeoutMs?: number } = {}):
 			command: {
 				command,
 				timeoutMs: overrides.timeoutMs,
-				refreshMs: 250,
+				refreshMs: overrides.refreshMs ?? 250,
 				maxLength: 40,
 			},
 		},

@@ -6,9 +6,10 @@
 
 - Fixed the steer-triggered bash fold being skipped under `toolInterruptPolicy: finish_tools`: a composer steer over a long foreground `bash` was aborted instead of folded because the fold gate wrongly treated the policy as an exclusion. `finish_tools` governs sibling tools in the batch, not the fold; the fold kills nothing and now applies under both policies. A tmux dogfood driver (`scripts/dogfood/steer-fold-tmux.sh`) proves the real binary folds, answers the steer in the same turn, and wakes on completion.
 - Added the `command` status-line segment for user-produced HUD content. It runs
-  configured shell commands in the background with cached refreshes, bounded
-  timeout/output, ANSI sanitization, placeholder degradation, and custom-editor
-  configuration while preserving synchronous TUI rendering.
+  configured user/global shell commands in the background with scheduled cached
+  refreshes, bounded timeout/output, ANSI sanitization, placeholder degradation,
+  disposal cancellation, and custom-editor configuration while preserving
+  synchronous TUI rendering; project-scoped settings cannot trigger execution.
 
 
 ## [0.16.1] - 2026-09-03

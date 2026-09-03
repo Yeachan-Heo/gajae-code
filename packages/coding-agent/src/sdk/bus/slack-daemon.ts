@@ -1496,7 +1496,11 @@ export class SlackNotificationDaemon {
 				updatedAt: this.#now(),
 			});
 		});
-		return sessionId && receipt ? { key, endpoint, sessionId, receipt } : undefined;
+		if (!sessionId || !receipt) {
+			await this.#journal.terminalize(effectId, { status: "rejected" });
+			return undefined;
+		}
+		return { key, endpoint, sessionId, receipt };
 	}
 
 	async #dispatchInbound(claim: {
@@ -2020,7 +2024,8 @@ export class SlackNotificationDaemon {
 				current.seenEventIds.includes(routing.eventId) ||
 				current.seenInteractionIds.includes(routing.interactionId) ||
 				current.seenRetryKeys.includes(routing.retryKey) ||
-				(routing.kind === "action" && replyableActionId(current.pendingActionId) !== routing.actionId)
+				(routing.kind === "action" && replyableActionId(current.pendingActionId) !== routing.actionId) ||
+				(routing.kind === "message" && replyableActionId(current.pendingActionId) !== undefined)
 			)
 				return current;
 			receipt = {
