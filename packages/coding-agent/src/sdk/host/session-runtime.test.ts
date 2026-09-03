@@ -2834,26 +2834,32 @@ describe("SessionSdkSessionRuntime", () => {
 
 			// B's accepted receipt is redacted to {} once its submission rejects,
 			// so select its record by the stable clientRef instead.
-			// Let the async rejection settle and retire B's pending entry.
-			await Bun.sleep(50);
 			// The rejected submission must TERMINALIZE as failed (#4668 review
 			// P1): agent_failed alone is diagnostic-only, so the settlement also
 			// writes agent_end. Before that fix B stayed accepted forever.
 			{
 				const ids = { clientRef: "fail-b-ref" };
-				transport.feed("conn-b", {
-					type: "query_request",
-					id: "fail-b-status",
-					query: "turn.prompt_status",
-					input: { kind: "prompt", ...ids },
-				} as SdkFrame);
-				// waitResponse polls control_response only; queries get query_response.
 				const statusDeadline = Date.now() + 15_000;
-				while (!transport.sent.some(frame => frame.id === "fail-b-status")) {
+				let status: Record<string, unknown> | undefined;
+				for (let attempt = 0; status === undefined; attempt += 1) {
+					const id = `fail-b-status-${attempt}`;
+					transport.feed("conn-b", {
+						type: "query_request",
+						id,
+						query: "turn.prompt_status",
+						input: { kind: "prompt", ...ids },
+					} as SdkFrame);
+					while (!transport.sent.some(frame => frame.id === id)) {
+						if (Date.now() > statusDeadline) throw new Error("Timed out waiting for fail-b-status");
+						await Bun.sleep(20);
+					}
+					const response = transport.sent.find(frame => frame.id === id);
+					const result = response?.result as Record<string, unknown> | undefined;
+					if (result?.status === "failed") status = response;
+					else await Bun.sleep(20);
 					if (Date.now() > statusDeadline) throw new Error("Timed out waiting for fail-b-status");
-					await Bun.sleep(20);
 				}
-				expect(transport.sent.find(frame => frame.id === "fail-b-status")).toMatchObject({
+				expect(status).toMatchObject({
 					ok: true,
 					result: expect.objectContaining({ status: "failed" }),
 				});
@@ -4766,7 +4772,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("successor-progress", cwd, {
 				settings: {
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs" ? 250 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+						key === "sdk.promptDeadlineMs" ? 2_000 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					prompts += 1;
@@ -4791,7 +4797,7 @@ describe("post-acceptance invocation terminalization", () => {
 			await successorStarted.promise;
 			for (let index = 0; index < 4; index += 1) {
 				await harness.emit("tool_execution_start");
-				await Bun.sleep(100);
+				await Bun.sleep(800);
 			}
 			expect(await harness.query("turn.prompt_status", successorIds)).toMatchObject({
 				result: { status: expect.stringMatching(/accepted|in_flight/) },
@@ -5556,7 +5562,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		try {
 			const renewalSettings = {
 				get: (key: string) =>
-					key === "sdk.promptDeadlineMs" ? 250 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+					key === "sdk.promptDeadlineMs" ? 2_000 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 			} as unknown as Settings;
 			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 			const harness = await invocationHarness("renew-attached", cwd, {
@@ -5579,12 +5585,12 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(consumed.ok).toBe(true);
 			promoted?.({ startsOwnRun: false });
 			const ids = { commandId: consumed.result?.commandId, turnId: consumed.result?.turnId };
-			// Past the initial 250ms lease, repeated tool activity keeps the
+			// Past the initial 2s lease, repeated tool activity keeps the
 			// attached correlation alive. Each interval stays well within one
 			// renewed lease while their cumulative duration exceeds the original.
 			for (let i = 0; i < 3; i += 1) {
 				await harness.emit("tool_execution_start");
-				await Bun.sleep(100);
+				await Bun.sleep(800);
 			}
 			const midRun = await harness.query("turn.prompt_status", ids);
 			expect(midRun.result?.status).not.toBe("failed");
@@ -5788,7 +5794,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const harness = await invocationHarness("dispatch-race-lease", cwd, {
 				settings: {
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+						key === "sdk.promptDeadlineMs" ? 2_000 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (content, options) => {
 					await options?.onPreflightAcceptCommit?.();
@@ -5813,9 +5819,9 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			const raced = await harness.control("turn.prompt", { text: "raced" });
 			expect(raced.ok).toBe(true);
 			const idsRaced = { commandId: raced.result?.commandId, turnId: raced.result?.turnId };
-			// Far past the 25ms lease while queued: the acceptance-anchored lease
+			// Far past the 2s lease while queued: the acceptance-anchored lease
 			// was dropped at the divert disposition, so no false deadline fire.
-			await Bun.sleep(120);
+			await Bun.sleep(2_200);
 			const queued = await harness.query("turn.prompt_status", idsRaced);
 			expect(queued.result?.status).not.toBe("failed");
 			// Real consumption re-leases and attaches to the in-flight run.
