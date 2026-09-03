@@ -70,6 +70,7 @@ import {
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
+import { type BillingPath, deriveBillingPath } from "./billing-path";
 import { ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
 import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
@@ -116,6 +117,7 @@ import {
 } from "./provider-selection-policy";
 import { type Settings, settings } from "./settings";
 
+export type { BillingPath, BillingPathKind } from "./billing-path";
 export type { EffectiveProviderAuth, ProviderSelectionPolicy } from "./provider-selection-policy";
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
@@ -5052,6 +5054,18 @@ export class ModelRegistry {
 	 */
 	getEffectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
 		return this.#effectiveProviderAuth(provider, sessionId);
+	}
+
+	/**
+	 * Billing path for a resolved binding — derived at the point the binding
+	 * resolves credentials (model.api + credential provenance). Not a
+	 * provider-name allowlist: a custom OpenAI-compatible provider bound
+	 * to a metered gateway is "metered-api" exactly like a first-party
+	 * key. Only the billing category is ever disclosed.
+	 */
+	getBillingPath(model: Model<Api>, sessionId?: string): BillingPath | undefined {
+		const effectiveAuth = this.#effectiveProviderAuth(model.provider, sessionId);
+		return deriveBillingPath(model.provider, model.api as Api, effectiveAuth);
 	}
 
 	/**

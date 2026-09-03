@@ -164,7 +164,8 @@ export const STICKY_VIEWPORT_FRAME_TEXT_WITNESS: Readonly<Record<StickyViewportS
 	"manual-new-output/80x24/unicode-color": "7f4ba77d435fa9a565af7e2b4139ca3f3f96281bb270f487cf1c7130b6759bc2",
 	"manual-new-output/120x36/unicode-color": "7a991015ee9cf5b3ca3e61098dad74ebb73937ad3fed03cd3c9899dc872abfd4",
 	"multiline-editor-hooks-pet/80x24/unicode-color": "31dca1a342ac71668275578c6fd9130a3cf877329ec5831383534b303dd62a67",
-	"multiline-editor-hooks-pet/120x36/unicode-color": "808d4c6570baa89f7794cbf4a851cf3a4ab8ba66b6e801bcfb40bef3240eb85d",
+	"multiline-editor-hooks-pet/120x36/unicode-color":
+		"808d4c6570baa89f7794cbf4a851cf3a4ab8ba66b6e801bcfb40bef3240eb85d",
 	"capacity-many/80x24/unicode-color": "aca409aca28d0ca73f709f7bcd27c45b4a806cf675e2d5004c5d9d20afebc0b4",
 	"capacity-many/120x36/unicode-color": "2fdda6be14cd09998152adcb3ccf78649f8f3ec70ddf5459891e86be85facfd2",
 	"capacity-one/80x24/unicode-color": "e1a60324216cd566ae501a072c0aa78bf5b9d025bf445b2449b97ccaae7bb287",
