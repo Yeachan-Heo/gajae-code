@@ -471,17 +471,30 @@ test("a reconnect before abort acknowledgement does not report the prompt as can
 		},
 	});
 	try {
+		let settleCount = 0;
 		const pending = prompt(fixture, "reconnect before abort acknowledgement").then(
-			resolved => ({ resolved }),
-			(error: unknown) => ({ rejected: error as { code?: string } }),
+			resolved => {
+				settleCount++;
+				return { resolved };
+			},
+			(error: unknown) => {
+				settleCount++;
+				return { rejected: error as { code?: string } };
+			},
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		const cancel = fixture.agent.cancel({ sessionId: fixture.sessionId }).catch(() => undefined);
 		await bounded(fixture.abortDelivered, "abort delivery");
 		fixture.reconnect();
-		expect(await Promise.race([pending, Bun.sleep(250).then(() => ({ pending: true }))])).toEqual({ pending: true });
+		const promptOutcome = await bounded(pending, "connection-closed before abort acknowledgement");
+		expect(promptOutcome).toEqual({
+			rejected: expect.objectContaining({ code: "connection_closed" }),
+		});
+		expect(settleCount).toBe(1);
 		abortGate.resolve();
 		await bounded(cancel, "abort completion");
+		expect(settleCount).toBe(1);
+		expect(await bounded(pending, "retired prompt after late abort acknowledgement")).toEqual(promptOutcome);
 	} finally {
 		abortGate.resolve();
 		fixture.dispose();
@@ -498,9 +511,16 @@ test("a reconnect before a failed abort does not leave the prompt cancelled", as
 		},
 	});
 	try {
+		let settleCount = 0;
 		const pending = prompt(fixture, "reconnect before failed abort").then(
-			resolved => ({ resolved }),
-			(error: unknown) => ({ rejected: error as { code?: string } }),
+			resolved => {
+				settleCount++;
+				return { resolved };
+			},
+			(error: unknown) => {
+				settleCount++;
+				return { rejected: error as { code?: string } };
+			},
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		const cancel = fixture.agent.cancel({ sessionId: fixture.sessionId });
@@ -510,16 +530,22 @@ test("a reconnect before a failed abort does not leave the prompt cancelled", as
 		);
 		await bounded(fixture.abortDelivered, "abort delivery");
 		fixture.reconnect();
-		expect(await Promise.race([pending, Bun.sleep(250).then(() => ({ pending: true }))])).toEqual({ pending: true });
+		const promptOutcome = await bounded(pending, "connection-closed before failed abort acknowledgement");
+		expect(promptOutcome).toEqual({
+			rejected: expect.objectContaining({ code: "connection_closed" }),
+		});
+		expect(settleCount).toBe(1);
 		abortGate.resolve();
 		const abortOutcome = await bounded(cancelOutcome, "failed abort result");
 		if (!("rejected" in abortOutcome)) throw new Error("Expected abort failure");
 		expect(
 			abortOutcome.rejected.code === "abort_unacknowledged" || abortOutcome.rejected.code === "uncertain_after_send",
 		).toBe(true);
-		expect(await bounded(pending, "connection-closed after failed abort")).toEqual({
-			rejected: expect.objectContaining({ code: "connection_closed" }),
-		});
+		expect(settleCount).toBe(1);
+		expect(await bounded(pending, "retired prompt after failed abort acknowledgement")).toEqual(promptOutcome);
+		// The synthetic hello invalidates the old Router attachment; allow its bounded
+		// reconciliation to publish the successor before sending the follow-up prompt.
+		await Bun.sleep(2_500);
 		const next = prompt(fixture, "prompt after failed abort reconnect");
 		await waitFor(() => fixture.promptDeliveryCount() === 2, "prompt after failed abort reconnect");
 		fixture.sendStopped("end_turn");
