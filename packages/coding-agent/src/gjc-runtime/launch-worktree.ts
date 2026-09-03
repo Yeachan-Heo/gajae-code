@@ -740,11 +740,13 @@ export async function ensureLaunchWorktreeCancellable(
 		if (error instanceof WorktreePreparationTimeoutError) {
 			const created = findWorktreeByPath(listWorktrees(plan.repoRoot), plan.worktreePath);
 			const expectedBranch = plan.branchName ? `refs/heads/${plan.branchName}` : null;
+			const createdBranch = Boolean(plan.branchName && !branchAlreadyExisted);
 			const owned =
 				created &&
-				created.head === plan.baseRef &&
-				(plan.detached ? created.detached : created.branchRef === expectedBranch);
-			if (owned) removeCleanAbortedLaunchWorktree(plan, Boolean(plan.branchName && !branchAlreadyExisted));
+				!plan.detached &&
+				created.branchRef === expectedBranch &&
+				(!createdBranch || created.head === plan.baseRef);
+			if (owned) removeCleanAbortedLaunchWorktree(plan, createdBranch);
 		}
 		throw error;
 	}
