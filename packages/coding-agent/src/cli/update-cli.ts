@@ -6,7 +6,6 @@
  * rather than overwritten. Source checkouts and dev-links are never replaced.
  */
 
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -31,6 +30,7 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
+import { offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -57,39 +57,10 @@ export interface InstalledVersionVerification {
 	ok: boolean;
 	actual?: string;
 	path?: string;
-	identity?: RuntimeFileIdentity;
 	versionOutput?: string;
 	smokeTestFailed?: boolean;
 	smokeTestOutput?: string;
 	cleanupWarning?: string;
-}
-
-export interface RuntimeFileIdentity {
-	dev: string;
-	ino: string;
-	size: string;
-	sha256: string;
-}
-
-async function runtimeSha256(runtimePath: string): Promise<string> {
-	return createHash("sha256")
-		.update(Buffer.from(await Bun.file(runtimePath).arrayBuffer()))
-		.digest("hex");
-}
-
-async function captureRuntimeIdentity(runtimePath: string): Promise<RuntimeFileIdentity | undefined> {
-	const stat = await fs.promises.lstat(runtimePath, { bigint: true }).catch(() => undefined);
-	if (!stat?.isFile() || stat.isSymbolicLink()) return undefined;
-	return {
-		dev: stat.dev.toString(),
-		ino: stat.ino.toString(),
-		size: stat.size.toString(),
-		sha256: await runtimeSha256(runtimePath),
-	};
-}
-
-function sameRuntimeIdentity(left: RuntimeFileIdentity, right: RuntimeFileIdentity): boolean {
-	return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.sha256 === right.sha256;
 }
 
 export interface PackageManagerUpdateResult {
@@ -580,24 +551,14 @@ async function verifyInstalledRuntime(
 	expectedVersion: string,
 	runtimePath?: string,
 ): Promise<InstalledVersionVerification> {
-	const resolvedRuntimePath = runtimePath ?? resolveGjcPath();
-	if (!resolvedRuntimePath) return { ok: false };
-	const initialIdentity = await captureRuntimeIdentity(resolvedRuntimePath);
-	if (!initialIdentity) return { ok: false, path: resolvedRuntimePath };
-	const versionResult = await verifyInstalledVersion(expectedVersion, resolvedRuntimePath);
+	const versionResult = await verifyInstalledVersion(expectedVersion, runtimePath ?? resolveGjcPath());
 	if (!versionResult.ok || !versionResult.path) {
 		return versionResult;
 	}
 	try {
 		const smokeResult = await $`${versionResult.path} --smoke-test`.quiet().nothrow();
 		if (smokeResult.exitCode === 0) {
-			const finalIdentity = await captureRuntimeIdentity(versionResult.path);
-			if (!finalIdentity || !sameRuntimeIdentity(initialIdentity, finalIdentity))
-				return { ...versionResult, ok: false };
-			return {
-				...versionResult,
-				identity: finalIdentity,
-			};
+			return versionResult;
 		}
 		return {
 			...versionResult,
@@ -1303,116 +1264,9 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
-	offerCommunityApp?: (runtimePath: string, identity?: RuntimeFileIdentity) => Promise<void>;
+	offerCommunityApp?: () => Promise<void>;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
-}
-
-async function runCommunityAppOfferFromRuntime(
-	runtimePath: string,
-	expectedIdentity?: RuntimeFileIdentity,
-): Promise<void> {
-	const runtimeStat = await fs.promises.lstat(runtimePath);
-	if (!runtimeStat.isFile() || runtimeStat.isSymbolicLink())
-		throw new Error("verified runtime path is not a regular file");
-	if (!expectedIdentity) throw new Error("verified runtime identity is unavailable");
-	if (
-		runtimeStat.dev.toString() !== expectedIdentity.dev ||
-		runtimeStat.ino.toString() !== expectedIdentity.ino ||
-		runtimeStat.size.toString() !== expectedIdentity.size ||
-		(await runtimeSha256(runtimePath)) !== expectedIdentity.sha256
-	)
-		throw new Error("verified runtime identity changed before optional offer");
-	const pinDirectory = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gjc-community-app-runtime-"));
-	const pinnedRuntimePath = path.join(pinDirectory, "gjc");
-	let pinDirectoryLocked = false;
-	let runtimeGroupSafe = true;
-	try {
-		const snapshot = Buffer.from(await Bun.file(runtimePath).arrayBuffer());
-		if (createHash("sha256").update(snapshot).digest("hex") !== expectedIdentity.sha256)
-			throw new Error("verified runtime content changed before optional offer");
-		await fs.promises.writeFile(pinnedRuntimePath, snapshot, { flag: "wx", mode: 0o500 });
-		await fs.promises.chmod(pinDirectory, 0o500);
-		pinDirectoryLocked = true;
-		const pinnedStat = await fs.promises.lstat(pinnedRuntimePath);
-		if (
-			!pinnedStat.isFile() ||
-			pinnedStat.isSymbolicLink() ||
-			(await runtimeSha256(pinnedRuntimePath)) !== expectedIdentity.sha256
-		)
-			throw new Error("verified runtime snapshot changed before optional offer");
-		const child = Bun.spawn([pinnedRuntimePath, "macos-community-app-offer"], {
-			stdin: "inherit",
-			stdout: "inherit",
-			stderr: "inherit",
-			detached: true,
-		});
-		let runtimeLeaderExited = false;
-		child.exited.then(
-			() => {
-				runtimeLeaderExited = true;
-			},
-			() => {
-				runtimeLeaderExited = true;
-			},
-		);
-		const waitForRuntimeGroupGone = async (): Promise<boolean> => {
-			for (let attempt = 0; attempt < 100; attempt++) {
-				try {
-					process.kill(-child.pid, 0);
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
-				}
-				await Bun.sleep(50);
-			}
-			return false;
-		};
-		const signalRuntimeGroup = (signal: NodeJS.Signals): boolean => {
-			if (runtimeLeaderExited) return false;
-			try {
-				process.kill(child.pid, 0);
-			} catch {
-				return false;
-			}
-			try {
-				process.kill(-child.pid, signal);
-				return true;
-			} catch {
-				try {
-					child.kill(signal);
-					return true;
-				} catch {
-					return false;
-				}
-			}
-		};
-		const childExit = child.exited.then(
-			code => ({ code, reaped: true }),
-			() => ({ code: 125, reaped: false }),
-		);
-		const exitCode = await Promise.race([childExit, Bun.sleep(180_000).then(() => ({ code: 124, reaped: false }))]);
-		if (exitCode.code === 124) {
-			signalRuntimeGroup("SIGTERM");
-			const cleanupExitCode = await Promise.race([
-				childExit,
-				Bun.sleep(300_000).then(() => ({ code: 125, reaped: false })),
-			]);
-			if (cleanupExitCode.code === 125) {
-				signalRuntimeGroup("SIGKILL");
-				runtimeGroupSafe =
-					(await Promise.race([childExit.then(result => result.reaped), Bun.sleep(5000).then(() => false)])) &&
-					(await waitForRuntimeGroupGone());
-			} else {
-				runtimeGroupSafe = cleanupExitCode.reaped && (await waitForRuntimeGroupGone());
-			}
-			throw new Error("optional macOS community app offer timed out");
-		}
-		runtimeGroupSafe = exitCode.reaped && (await waitForRuntimeGroupGone());
-		if (exitCode.code !== 0) throw new Error(`optional macOS community app offer exited ${exitCode.code}`);
-	} finally {
-		if (pinDirectoryLocked && runtimeGroupSafe) await fs.promises.chmod(pinDirectory, 0o700).catch(() => undefined);
-		if (runtimeGroupSafe) await fs.promises.rm(pinDirectory, { recursive: true, force: true }).catch(() => undefined);
-	}
 }
 
 export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
@@ -1714,7 +1568,6 @@ export async function runUpdateCommand(
 
 	if (target.method === "migrate" && decision.install && !opts.force && !opts.check) {
 		let migrationVerified = false;
-		let migrationIdentity: RuntimeFileIdentity | undefined;
 		const releaseLock = await acquireBinaryUpdateLock(target.path);
 		try {
 			const verification = await verifyTarget(release, target.path);
@@ -1723,7 +1576,6 @@ export async function runUpdateCommand(
 				record("update_install_started", { channel, installMethod: target.method });
 				printVerifiedMigrationTarget(target, release.version);
 				migrationVerified = true;
-				migrationIdentity = verification.identity;
 			}
 		} finally {
 			await releaseLock();
@@ -1731,7 +1583,7 @@ export async function runUpdateCommand(
 		if (migrationVerified) {
 			if ((deps.platform ?? process.platform) === "darwin") {
 				try {
-					await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(target.path, migrationIdentity);
+					await (deps.offerCommunityApp ?? (() => offerMacosCommunityApp()))();
 				} catch (error) {
 					console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
 				}
@@ -1764,16 +1616,12 @@ export async function runUpdateCommand(
 	}
 
 	let installedVersion: string | undefined;
-	let installedRuntimePath: string | undefined;
-	let installedRuntimeIdentity: RuntimeFileIdentity | undefined;
 	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
 		if (verification?.path) {
 			installedVersion = release.version;
-			installedRuntimePath = verification.path;
-			installedRuntimeIdentity = verification.identity;
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
@@ -1788,12 +1636,9 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
-	if (installedVersion && installedRuntimePath && (deps.platform ?? process.platform) === "darwin") {
+	if (installedVersion && (deps.platform ?? process.platform) === "darwin") {
 		try {
-			await (deps.offerCommunityApp ?? runCommunityAppOfferFromRuntime)(
-				installedRuntimePath,
-				installedRuntimeIdentity,
-			);
+			await (deps.offerCommunityApp ?? (() => offerMacosCommunityApp()))();
 		} catch (error) {
 			console.warn(chalk.yellow(`Warning: optional macOS community app offer failed: ${error}`));
 		}

@@ -46,6 +46,7 @@ BINARY_REQUESTED=0
 OFFER_RUNTIME_DIR=""
 OFFER_RUNTIME_ACTIVE=""
 OFFER_RUNTIME_SIGNAL=""
+OFFER_RUNTIME_PID=""
 
 usage() {
     cat <<'EOF'
@@ -103,9 +104,16 @@ cleanup() {
 }
 
 trap cleanup EXIT
-handle_int() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then OFFER_RUNTIME_SIGNAL=INT; else cleanup; exit 130; fi; }
-handle_term() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then OFFER_RUNTIME_SIGNAL=TERM; else cleanup; exit 143; fi; }
-handle_hup() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then OFFER_RUNTIME_SIGNAL=HUP; else cleanup; exit 129; fi; }
+forward_offer_signal() {
+    [ -z "$OFFER_RUNTIME_SIGNAL" ] || return 0
+    OFFER_RUNTIME_SIGNAL="$1"
+    if [ -n "$OFFER_RUNTIME_PID" ]; then
+        kill -s "$1" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+    fi
+}
+handle_int() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal INT; else cleanup; exit 130; fi; }
+handle_term() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal TERM; else cleanup; exit 143; fi; }
+handle_hup() { if [ -n "$OFFER_RUNTIME_ACTIVE" ]; then forward_offer_signal HUP; else cleanup; exit 129; fi; }
 trap handle_int INT
 trap handle_term TERM
 trap handle_hup HUP
@@ -680,7 +688,16 @@ install_binary() {
         OFFER_RUNTIME="${OFFER_RUNTIME_DIR}/gjc"
         if [ -n "$OFFER_RUNTIME_DIR" ] && [ ! -L "$DEST_PATH" ] && [ -f "$DEST_PATH" ] && cp -p "$DEST_PATH" "$OFFER_RUNTIME" 2>/dev/null; then
             if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
-                "$OFFER_RUNTIME" macos-community-app-offer || true
+                "$OFFER_RUNTIME" macos-community-app-offer &
+                OFFER_RUNTIME_PID=$!
+                if [ -n "$OFFER_RUNTIME_SIGNAL" ]; then
+                    kill -s "$OFFER_RUNTIME_SIGNAL" "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                fi
+                wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                while [ -n "$OFFER_RUNTIME_SIGNAL" ] && kill -0 "$OFFER_RUNTIME_PID" 2>/dev/null; do
+                    wait "$OFFER_RUNTIME_PID" 2>/dev/null || true
+                done
+                OFFER_RUNTIME_PID=""
             fi
             chmod 700 "$OFFER_RUNTIME_DIR" 2>/dev/null || true
             rm -rf "$OFFER_RUNTIME_DIR" || true
