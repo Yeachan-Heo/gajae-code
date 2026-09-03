@@ -1354,7 +1354,6 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				const existingInner = isPlainObject(existingPayload.state) ? existingPayload.state : {};
 				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
 				assertDeepInterviewExecutionApprovalUnchanged(existingPayload, merged, "generic state write");
-				assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "generic state write");
 				if (existingPayload.active === false && merged.active !== false)
 					throw new StateCommandError(2, "generic state write cannot reactivate inactive deep-interview state");
 				if (existingInner.crystal === undefined && mergedInner.crystal !== undefined)
@@ -1405,6 +1404,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
 				if (isPlainObject(mergedInner.crystal) && mergedInner.crystal.lifecycle !== "ready")
 					merged.current_phase = "interviewing";
+				assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "generic state write");
 			}
 			merged.version = WORKFLOW_STATE_VERSION;
 			if (typeof merged.active !== "boolean") merged.active = true;
