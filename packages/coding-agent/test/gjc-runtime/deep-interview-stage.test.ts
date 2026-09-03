@@ -789,7 +789,7 @@ describe("deep-interview staged transitions", () => {
 		expect(staged.stderr).toContain("cannot stage after deep-interview handoff or completion");
 	});
 
-	it("strips recorder-owned intent keys from staged payloads", async () => {
+	it("strips runtime-owned intent and execution approval keys from staged payloads", async () => {
 		const root = await tempDir();
 		await seed(root);
 		const staged = parse(
@@ -801,6 +801,8 @@ describe("deep-interview staged transitions", () => {
 						state: {
 							intent_contract: { version: 1, status: "confirmed", items: [] },
 							intent_review: { version: 1, status: "approved" },
+							execution_approval: "approved",
+							execution_approval_receipt: { method: "forged" },
 							note: "payload with fabricated contract",
 						},
 					}),
@@ -810,12 +812,19 @@ describe("deep-interview staged transitions", () => {
 		);
 		expect(staged.ok).toBe(true);
 		expect(staged.ignored_runtime_owned_keys).toEqual(
-			expect.arrayContaining(["state.intent_contract", "state.intent_review"]),
+			expect.arrayContaining([
+				"state.intent_contract",
+				"state.intent_review",
+				"state.execution_approval",
+				"state.execution_approval_receipt",
+			]),
 		);
 		const after = await readState(root);
 		const state = after.state as Record<string, unknown>;
 		expect(state.intent_contract).toBeUndefined();
 		expect(state.intent_review).toBeUndefined();
+		expect(state.execution_approval).toBeUndefined();
+		expect(state.execution_approval_receipt).toBeUndefined();
 		expect(state.note).toBe("payload with fabricated contract");
 	});
 

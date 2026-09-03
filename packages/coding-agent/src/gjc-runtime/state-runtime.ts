@@ -1096,6 +1096,10 @@ async function reconcileWorkflowSkillStateUnlocked(
 	if (mode === "deep-interview") {
 		assertDeepInterviewEnvelopeInputLimits(merged);
 		assertDeepInterviewExecutionApprovalUnchanged(existingPayload, merged, "runtime reconciliation");
+		const existingInner = isPlainObject(existingPayload.state) ? existingPayload.state : {};
+		const mergedInner = isPlainObject(merged.state) ? merged.state : {};
+		if (JSON.stringify(mergedInner.crystal) !== JSON.stringify(existingInner.crystal))
+			throw new StateCommandError(2, "canonical Crystal is immutable through runtime reconciliation");
 	}
 	merged.skill = mode;
 	merged.current_phase = trimmedPhase;
@@ -1599,7 +1603,7 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
 
 async function assertDeepInterviewHandoffReady(
 	state: Record<string, unknown>,
-	options: { allowPlanningHandoff?: boolean } = {},
+	options: { requireExecutionApproval?: boolean } = {},
 ): Promise<void> {
 	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
 	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
@@ -1629,9 +1633,9 @@ async function assertDeepInterviewHandoffReady(
 			throw new StateCommandError(2, "deep-interview crystallized handoff requires a persisted spec");
 		if (createHash("sha256").update(content).digest("hex") !== expectedSha)
 			throw new StateCommandError(2, "deep-interview crystallized handoff spec hash mismatch");
-		if (inner.execution_approval !== "approved" && !options.allowPlanningHandoff)
+		if (inner.execution_approval !== "approved" && options.requireExecutionApproval)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
-		if (!options.allowPlanningHandoff) {
+		if (options.requireExecutionApproval) {
 			const approval = isPlainObject(inner.execution_approval_receipt)
 				? inner.execution_approval_receipt
 				: undefined;
@@ -1645,11 +1649,13 @@ async function assertDeepInterviewHandoffReady(
 			)
 				throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
 		}
-		if (options.allowPlanningHandoff) return;
+		return;
 	}
 	if (inner.intent_contract === undefined) {
 		if (inner.intent_contract_required === true)
 			throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
+		if (options.requireExecutionApproval)
+			throw new StateCommandError(2, "deep-interview execution handoff requires a ready approved Crystal");
 		return;
 	}
 	assertDeepInterviewIntentManifest(inner.intent_contract);
@@ -1769,7 +1775,7 @@ async function handleHandoffUnlocked(
 			: migrateWorkflowState(existingCaller, caller).state;
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
-			allowPlanningHandoff: callee === "ralplan" || callee === "autoresearch",
+			requireExecutionApproval: callee === "ultragoal",
 		});
 
 	// Runtime callees have no native mode-state to clear later, so do not
@@ -2067,6 +2073,18 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	const crystal = requireReadyCanonicalCrystal(inner.crystal);
 	const approvedAt = nowIso();
 	const mutationId = `deep-interview:approve-execution:${approvedAt}`;
+	const publicationReceipt = isPlainObject(envelope.receipt) ? envelope.receipt : undefined;
+	const publicationChecksum = isPlainObject(publicationReceipt?.content_sha256)
+		? publicationReceipt.content_sha256
+		: undefined;
+	if (
+		inner.execution_approval !== "approved" &&
+		(publicationReceipt?.owner !== "gjc-runtime" ||
+			publicationReceipt.command !== "gjc deep-interview crystallize" ||
+			typeof publicationChecksum?.value !== "string" ||
+			publicationChecksum.value.length !== 64)
+	)
+		throw new StateCommandError(2, "approve-execution requires a canonically published Crystal receipt");
 	const integrityWarning = await warnAndAuditOutOfBandIfNeeded(
 		cwd,
 		selectors.gjcSessionId,
@@ -2075,7 +2093,7 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		{ mutationId },
 	);
 	if (integrityWarning) throw new StateCommandError(2, `${integrityWarning}; approval refuses tampered mode-state`);
-	await assertDeepInterviewHandoffReady(envelope, { allowPlanningHandoff: true });
+	await assertDeepInterviewHandoffReady(envelope);
 	const existingReceipt = isPlainObject(inner.execution_approval_receipt)
 		? inner.execution_approval_receipt
 		: undefined;
