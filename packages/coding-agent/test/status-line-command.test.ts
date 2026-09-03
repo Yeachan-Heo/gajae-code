@@ -97,41 +97,62 @@ describe("status line command segment", () => {
 
 	it("does not block the render while a slow command is running", async () => {
 		const component = makeComponent("sleep 0.2; printf too-late", { timeoutMs: 50 });
-		const started = performance.now();
-		const initial = Bun.stripANSI(component.render(120).join("\n"));
-		const elapsed = performance.now() - started;
+		try {
+			const started = performance.now();
+			const initial = Bun.stripANSI(component.render(120).join("\n"));
+			const elapsed = performance.now() - started;
 
-		expect(elapsed).toBeLessThan(100);
-		expect(initial).toContain("…");
+			expect(elapsed).toBeLessThan(100);
+			expect(initial).toContain("…");
 
-		await Bun.sleep(150);
-		const afterTimeout = Bun.stripANSI(component.render(120).join("\n"));
-		expect(afterTimeout).toContain("?");
-		expect(afterTimeout).not.toContain("too-late");
+			const afterTimeout = await waitForRendered(component, rendered => rendered.includes("?"));
+			expect(afterTimeout).toContain("?");
+			expect(afterTimeout).not.toContain("too-late");
+		} finally {
+			component.dispose();
+		}
 	});
 
 	it("keeps command failures out of the status row", async () => {
 		const component = makeComponent("printf leaked-error >&2; exit 7");
-		component.render(120);
+		try {
+			component.render(120);
 
-		await Bun.sleep(100);
-		const rendered = Bun.stripANSI(component.render(120).join("\n"));
-
-		expect(rendered).toContain("?");
-		expect(rendered).not.toContain("leaked-error");
+			const rendered = await waitForRendered(component, rendered => rendered.includes("?"));
+			expect(rendered).toContain("?");
+			expect(rendered).not.toContain("leaked-error");
+		} finally {
+			component.dispose();
+		}
 	});
 
 	it("renders successful command output asynchronously", async () => {
 		const component = makeComponent("printf 'custom-hud-value'");
-		const initial = Bun.stripANSI(component.render(120).join("\n"));
-		expect(initial).not.toContain("custom-hud-value");
+		try {
+			const initial = Bun.stripANSI(component.render(120).join("\n"));
+			expect(initial).not.toContain("custom-hud-value");
 
-		await Bun.sleep(100);
-		const rendered = Bun.stripANSI(component.render(120).join("\n"));
-		expect(rendered).toContain("custom-hud-value");
-		component.dispose();
+			const rendered = await waitForRendered(component, rendered => rendered.includes("custom-hud-value"));
+			expect(rendered).toContain("custom-hud-value");
+		} finally {
+			component.dispose();
+		}
 	});
 });
+
+async function waitForRendered(
+	component: StatusLineComponent,
+	predicate: (rendered: string) => boolean,
+): Promise<string> {
+	const deadline = Date.now() + 1500;
+	let rendered = "";
+	while (Date.now() < deadline) {
+		rendered = Bun.stripANSI(component.render(120).join("\n"));
+		if (predicate(rendered)) return rendered;
+		await Bun.sleep(10);
+	}
+	return rendered;
+}
 
 function makeComponent(command: string, overrides: { timeoutMs?: number } = {}): StatusLineComponent {
 	const component = new StatusLineComponent({
