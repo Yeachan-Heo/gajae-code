@@ -1094,7 +1094,13 @@ describe("chat daemon worker", () => {
 		client.replayEvents = [
 			{ type: "event", name: "session_ready", sessionId: "session", generation: 1, seq: 1 },
 			{ type: "turn_stream", phase: "live", sessionId: "session", text: "replayed live" },
-			{ type: "turn_stream", phase: "finalized", sessionId: "session", text: "replayed finalized" },
+			{
+				type: "turn_stream",
+				phase: "finalized",
+				finalAnswer: true,
+				sessionId: "session",
+				text: "replayed finalized",
+			},
 			{ type: "turn_stream", sessionId: "session", text: "replayed missing phase" },
 		];
 		const runtime = new ChatDaemonRuntime(
@@ -1127,7 +1133,8 @@ describe("chat daemon worker", () => {
 		);
 		await runtime.start();
 		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\nreplayed finalized");
-		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\nreplayed missing phase");
+		await Bun.sleep(10);
+		expect(provider.posts.some(post => post.text === "GJC turn stream\nreplayed missing phase")).toBe(false);
 		client.handler?.({ type: "turn_stream", phase: "live", sessionId: "session", text: "direct live" });
 		client.handler?.({
 			type: "event",
@@ -1136,10 +1143,17 @@ describe("chat daemon worker", () => {
 		});
 		await Bun.sleep(10);
 		expect(provider.posts.some(post => /(?:replayed|direct|wrapped) live/.test(post.text))).toBe(false);
-		client.handler?.({ type: "turn_stream", phase: "finalized", sessionId: "session", text: "direct finalized" });
+		client.handler?.({
+			type: "turn_stream",
+			phase: "finalized",
+			finalAnswer: true,
+			sessionId: "session",
+			text: "direct finalized",
+		});
 		client.handler?.({ type: "turn_stream", sessionId: "session", text: "direct missing phase" });
 		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndirect finalized");
-		await provider.waitForPostCount(1, post => post.text === "GJC turn stream\ndirect missing phase");
+		await Bun.sleep(10);
+		expect(provider.posts.some(post => post.text === "GJC turn stream\ndirect missing phase")).toBe(false);
 		const duplicateFinal = {
 			type: "turn_stream",
 			phase: "finalized",

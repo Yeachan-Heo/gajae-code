@@ -194,6 +194,17 @@ describe("SlackLiveProvider fake Socket Mode protocol", () => {
 		]);
 	});
 
+	it("adds a reaction through the Slack Web API", async () => {
+		const fixture = setup([response({ ok: true })]);
+		await fixture.provider.addReaction({ channel: "C1", timestamp: "2.0", name: "eyes" });
+		expect(fixture.requests[0]?.url).toBe("https://slack.com/api/reactions.add");
+		expect([...new URLSearchParams(String(fixture.requests[0]?.init?.body))]).toEqual([
+			["channel", "C1"],
+			["timestamp", "2.0"],
+			["name", "eyes"],
+		]);
+	});
+
 	it("bounds rate-limit retry and exposes no credential in typed errors", async () => {
 		const fixture = setup([
 			response({ ok: false }, 429, { "retry-after": "120" }),
