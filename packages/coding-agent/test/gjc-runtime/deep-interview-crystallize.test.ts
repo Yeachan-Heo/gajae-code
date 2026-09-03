@@ -148,6 +148,69 @@ describe("deep-interview crystallize contract", () => {
 			).toThrow("verbatim user anchor");
 		}
 	});
+	it("requires fresh evidence when inferred material becomes confirmed", () => {
+		const first = crystallizeDeepInterview(
+			input({
+				items: [
+					input().items[0]!,
+					{ id: "constraint:latency", kind: "constraint", classification: "inferred", statement: "Fast response" },
+				],
+			}),
+		);
+		const snapshot: CrystalSnapshot = {
+			revision: 2,
+			start: 0,
+			end: 1,
+			messages: [...input().snapshot.messages, { index: 1, role: "assistant", content: "Acknowledged." }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					prior: first,
+					snapshot,
+					current_revision: 2,
+					items: [
+						input().items[0]!,
+						{
+							...input().items[1]!,
+							classification: "confirmed",
+							anchor: { message_index: 0, quote: "fast" },
+						},
+					],
+				}),
+			),
+		).toThrow("changed confirmed item constraint:latency requires fresh user evidence");
+	});
+	it("accepts Unicode resolution evidence", () => {
+		const first = crystallizeDeepInterview(input({ open_gaps: ["메모리 예산은 얼마인가?"] }));
+		const snapshot: CrystalSnapshot = {
+			revision: 2,
+			start: 0,
+			end: 1,
+			messages: [...input().snapshot.messages, { index: 1, role: "user", content: "메모리 예산은 1GB입니다." }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		const resolved = crystallizeDeepInterview(
+			input({
+				prior: first,
+				snapshot,
+				current_revision: 2,
+				resolved_open_gaps: ["메모리 예산은 얼마인가?"],
+				resolved_open_gap_anchors: [
+					{
+						item: "메모리 예산은 얼마인가?",
+						message_index: 1,
+						quote: "메모리 예산은 1GB입니다.",
+						resolution: "메모리 예산은 1GB입니다.",
+					},
+				],
+			}),
+		);
+		expect(resolved.lifecycle).toBe("ready");
+	});
 	it("does not preserve a confirmed-to-inferred downgrade", () => {
 		const prior = crystallizeDeepInterview(input());
 		const downgraded = later(
@@ -513,6 +576,123 @@ describe("deep-interview crystallize contract", () => {
 			expect(summary.mode).toBe("crystallize");
 			expect(summary.crystal.execution_approval).toBe("not-approved");
 			expect(await fs.readFile(summary.spec_path, "utf8")).toContain("Execution approval: not-approved");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects malformed transcript messages instead of omitting them from the source revision", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-malformed-transcript-"));
+		const sessionId = "crystallize-malformed-transcript";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { content: "this message has no role" },
+				})}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"malformed",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("live session transcript contains a malformed message");
+			await expect(fs.access(deepInterviewStatePath(root, sessionId))).rejects.toThrow();
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("clears approval provenance when a later Crystal supersedes an approved one", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-approval-reset-"));
+		const sessionId = "crystallize-approval-reset";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const first = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"first",
+					"--json",
+				],
+				root,
+			);
+			expect(first.status).toBe(0);
+			const approved = await runNativeDeepInterviewCommand(
+				["approve-execution", "--session-id", sessionId, "--json"],
+				root,
+			);
+			expect(approved.status).toBe(0);
+
+			const snapshot: CrystalSnapshot = {
+				revision: 2,
+				start: 0,
+				end: 1,
+				messages: [...input().snapshot.messages, { index: 1, role: "user", content: "Keep the report fast." }],
+				digest: "",
+			};
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			await fs.appendFile(
+				sessionFile,
+				`${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Keep the report fast." },
+				})}\n`,
+			);
+			const second = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input({ snapshot, current_revision: 2 })),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"second",
+					"--json",
+				],
+				root,
+			);
+			expect(second.status).toBe(0);
+			const state = JSON.parse(await fs.readFile(deepInterviewStatePath(root, sessionId), "utf8")) as Record<
+				string,
+				unknown
+			>;
+			const inner = state.state as Record<string, unknown>;
+			expect(inner.execution_approval).toBe("not-approved");
+			expect(inner.execution_approval_receipt).toBeUndefined();
 		} finally {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
