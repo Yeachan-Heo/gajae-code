@@ -449,11 +449,13 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 							session.setFollowUpMode(input.mode);
 							return { changed: true };
 						});
-					case "queue.interrupt_mode.set":
+					case "queue.tool_interrupt_policy.set":
 						return await withSdkControlMutation(async () => {
-							if (input.mode !== "immediate" && input.mode !== "wait")
-								throw Object.assign(new Error("Queue interrupt mode is unavailable."), { code: "unavailable" });
-							session.setInterruptMode(input.mode);
+							if (input.mode !== "abort_tools" && input.mode !== "finish_tools")
+								throw Object.assign(new Error("Queue tool interrupt policy is unavailable."), {
+									code: "unavailable",
+								});
+							session.setToolInterruptPolicy(input.mode);
 							return { changed: true };
 						});
 					case "queue.message.remove": {

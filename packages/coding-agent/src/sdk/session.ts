@@ -51,7 +51,7 @@ import {
 	jobElapsedMs,
 } from "../async";
 import { resolveBrowserBackend } from "../browser-backend";
-import { loadCapability, reset as resetCapabilities, resolveProfileAuthority } from "../capability";
+import { loadCapability, resolveProfileAuthority } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
