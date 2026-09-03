@@ -13,6 +13,7 @@ workspace and invite it to the selected channel. Configure only the scopes and
 event subscriptions the adapter needs:
 
 - `chat:write` to post session roots, replies, and closure markers
+- `reactions:write` to mark accepted inbound messages with 👀 while GJC works
 - `channels:history` for a public channel, or the corresponding history scope
   for the channel type in use
 - the message event subscription for the selected channel type
@@ -60,6 +61,11 @@ than SDK availability or command execution. After the ACK, the worker dispatches
 the claimed effect asynchronously; a restart can replay the claim, and a retry
 cannot create a second injection. Do not treat an ACK as confirmation that the SDK
 operation completed.
+
+After a valid inbound message is durably claimed, the adapter adds a 👀 reaction
+to that Slack message. It means GJC accepted the message and is awaiting the
+agent's answer; it is not a completion signal. This requires the `reactions:write`
+scope listed above. A reaction failure never blocks the accepted turn.
 
 Each session starts with one root message. Root creation uses a caller-generated
 client message ID scoped to the configured workspace and channel, plus

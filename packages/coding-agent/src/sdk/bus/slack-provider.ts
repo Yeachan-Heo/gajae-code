@@ -57,6 +57,7 @@ export interface SlackProviderClient {
 		threadTs?: string;
 		signal?: AbortSignal;
 	}): Promise<SlackMessageSearchResult | null>;
+	addReaction?(input: { channel: string; timestamp: string; name: string; signal?: AbortSignal }): Promise<void>;
 	/**
 	 * Prove that an operator-supplied timestamp addresses a real message in the
 	 * requested channel. Adoption of an existing root is refused when a client
@@ -106,6 +107,10 @@ export class SlackProvider {
 		signal?: AbortSignal;
 	}): Promise<SlackMessageSearchResult | null> {
 		return (await this.client.findMessageByClientMsgId?.(input)) ?? null;
+	}
+
+	async addReaction(input: { channel: string; timestamp: string; name: string; signal?: AbortSignal }): Promise<void> {
+		await this.client.addReaction?.(input);
 	}
 
 	/** Fail-closed root verification: a client without this capability can never confirm a root. */

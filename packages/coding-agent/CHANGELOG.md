@@ -4,6 +4,7 @@
 
 - Primary model binding now rejects GPT-5.6 Sol when the selected openai-codex OAuth account is known to be below the Pro tier, preventing a raw entitlement failure on the first turn and preserving the prior model on a failed selection.
 
+- Slack lean notifications now publish only finalized assistant answers and actionable states instead of the internal lifecycle, identity, and activity frame stream. Final answer delivery uses the message reference as a durable publication identity, so repeated unpositioned SDK frames no longer post duplicate replies; accepted inbound Slack messages receive a 👀 reaction while GJC awaits the agent's answer.
 - Fixed the steer-triggered bash fold being skipped under `toolInterruptPolicy: finish_tools`: a composer steer over a long foreground `bash` was aborted instead of folded because the fold gate wrongly treated the policy as an exclusion. `finish_tools` governs sibling tools in the batch, not the fold; the fold kills nothing and now applies under both policies. A tmux dogfood driver (`scripts/dogfood/steer-fold-tmux.sh`) proves the real binary folds, answers the steer in the same turn, and wakes on completion.
 
 ## [0.16.1] - 2026-09-03
