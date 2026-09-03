@@ -70,7 +70,12 @@ const PLANNED_ADMIN_VERBS = ["graph", "prune", "migrate", "force-overwrite"] as 
 
 const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	{ name: "input", type: "string", appliesToVerbs: ["write", "api", "crystallize"] },
-	{ name: "mode", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: [...STATE_VERBS] },
+	{
+		name: "mode",
+		type: "enum",
+		enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS],
+		appliesToVerbs: [...STATE_VERBS, "approve-execution"],
+	},
 	{
 		name: "session-id",
 		type: "string",
@@ -86,6 +91,7 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 			"discard",
 			"read",
 			"write",
+			"approve-execution",
 		],
 	},
 	{ name: "thread-id", type: "string", appliesToVerbs: ["write", "clear", "handoff"] },
