@@ -52,6 +52,17 @@ describe("workflow manifest phase sets", () => {
 		);
 	});
 
+	it("exposes deep-interview crystallize and explicit approval command contracts", () => {
+		const manifest = getSkillManifest("deep-interview");
+		const verbNames = manifest.verbs.map(item => item.name);
+		expect(verbNames).toContain("crystallize");
+		expect(verbNames).toContain("approve-execution");
+		for (const argument of ["input", "session-id", "slug", "json"]) {
+			expect(manifest.typedArgs.find(item => item.name === argument)?.appliesToVerbs).toContain("crystallize");
+		}
+		expect(manifest.typedArgs.find(item => item.name === "json")?.appliesToVerbs).toContain("approve-execution");
+	});
+
 	it("routes new ralplan runs through intent while retaining the legacy in-flight review edge", () => {
 		const manifest = getSkillManifest("ralplan");
 		expect(manifest.states.map(state => state.id)).toContain("intent");
