@@ -624,7 +624,7 @@ export class ChatDaemonRuntime {
 			await this.#slack.notify(
 				sessionId,
 				content,
-				notification.type === "action_needed" ? notification.id : undefined,
+				notification.type === "action_needed" && notification.kind === "ask" ? notification.id : undefined,
 				attachment.generation,
 				publicationId,
 			);

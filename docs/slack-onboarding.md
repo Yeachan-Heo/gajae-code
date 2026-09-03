@@ -2,7 +2,8 @@
 
 This is the managed Slack Socket Mode notification adapter. It is an SDK client:
 local GJC sessions continue to own loopback SDK endpoints, and Slack provides a
-per-session message thread for notifications and replies.
+per-session message thread for notifications, pending-action replies, and new
+user turns.
 
 ## Prerequisites
 
@@ -29,7 +30,7 @@ API calls.
 - `--slack-app-token`
 - `--slack-workspace-id`
 - `--slack-channel-id`
-- `--slack-authorized-user-id` for the single Slack user authorized to submit replies and `/sdk` commands
+- `--slack-authorized-user-id` for the single Slack user authorized to submit thread messages and `/sdk` commands
 
 Without `--slack-authorized-user-id`, the adapter remains outbound-only: every inbound envelope is acknowledged but denied before it can create a durable claim or reach an SDK endpoint. The user ID is an identifier, not a secret. It also accepts `--redact`. Provide secret values from an approved local secret mechanism, not shell history, committed configuration, tickets, screenshots, or chat. Setup writes:
 
@@ -48,6 +49,12 @@ Without `--slack-authorized-user-id`, the adapter remains outbound-only: every i
 
 The daemon validates the configured workspace, channel, and paired user before durably claiming an inbound effect or sending its Socket Mode acknowledgement. The durable claim records the paired actor identity, replay identity, protected-effect reference, and captured endpoint generation; it never records Socket Mode cursors, endpoint tokens, or message bodies. Rejected, bot-authored, unauthorized, and already-claimed envelopes are acknowledged without an SDK endpoint call.
 
+Within an active mapped thread, plain text answers the latest pending ask when
+one exists; otherwise it starts a new `user_message` turn. `/sdk` prefixes retain
+their command behavior. Idle notifications are status-only and never become
+replyable actions. Messages outside the active root thread remain ignored, so a
+shared channel does not route unrelated conversation or other bots into GJC.
+
 Acknowledgement latency is therefore bounded by local durable-claim work rather
 than SDK availability or command execution. After the ACK, the worker dispatches
 the claimed effect asynchronously; a restart can replay the claim, and a retry
@@ -55,14 +62,17 @@ cannot create a second injection. Do not treat an ACK as confirmation that the S
 operation completed.
 
 Each session starts with one root message. Root creation uses a caller-generated
-client message ID and reconciliation lookup, preventing a duplicate root after
-an uncertain post. When a session closes, the daemon posts a closure marker. A
-resume starts a new immutable root, so replies to the old root are rejected and
-cannot steer the resumed session.
+client message ID scoped to the configured workspace and channel, plus
+reconciliation lookup, preventing both a duplicate root after an uncertain post
+and accidental reuse of a root from a previous home channel. When a session
+closes, the daemon posts a closure marker. A resume starts a new immutable root,
+so replies to the old root are rejected and cannot steer the resumed session.
 
-Events, retried deliveries, event contexts, and interaction/message identifiers
-are deduplicated in the durable claim before a reply is injected into the captured
-current endpoint generation. After a Socket Mode reconnect, Slack may redeliver an
+Event IDs, retried deliveries, and interaction/message identifiers are
+deduplicated in the durable claim before input is injected into the captured
+current endpoint generation. `event_context` is retained as routing metadata but
+is not a dedupe key because Slack can reuse it across distinct messages in the
+same channel context. After a Socket Mode reconnect, Slack may redeliver an
 envelope; the new delivery is acknowledged after its claim is recognized and
 cannot cause a second injection.
 

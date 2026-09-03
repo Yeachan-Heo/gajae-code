@@ -145,13 +145,14 @@ type SlackInboundRouting = {
 	interactionId: string;
 	retryKey: string;
 	eventContext?: string;
-	kind: "action" | "command";
+	kind: "action" | "command" | "message";
 	actionId?: string;
 };
 
 type SlackInboundEffectPayload =
 	| { type: "reply"; id: string; answer: string; idempotencyKey: string; routing: SlackInboundRouting }
-	| { type: "command"; content: string; idempotencyKey: string; routing: SlackInboundRouting };
+	| { type: "command"; content: string; idempotencyKey: string; routing: SlackInboundRouting }
+	| { type: "user_message"; sessionId: string; text: string; idempotencyKey: string; routing: SlackInboundRouting };
 
 type SlackRootPublication = {
 	conversation: SlackConversation;
@@ -169,7 +170,11 @@ function messageFromEnvelope(
 	| undefined {
 	if (!payload || typeof payload !== "object") return undefined;
 	const eventPayload = payload as EventsPayload;
-	if (eventPayload.type !== "events_api" || !eventPayload.event || eventPayload.event.type !== "message")
+	if (
+		(eventPayload.type !== "events_api" && eventPayload.type !== "event_callback") ||
+		!eventPayload.event ||
+		eventPayload.event.type !== "message"
+	)
 		return undefined;
 	const eventId = text(eventPayload.event_id);
 	const teamId = text(eventPayload.team_id);
@@ -189,6 +194,10 @@ function messageFromEnvelope(
 
 function nextRecord(record: SlackConversation, update: Partial<SlackConversation>): SlackConversation {
 	return normalizeSlackConversation({ ...record, ...update, generation: record.generation + 1 });
+}
+
+function replyableActionId(actionId: string | undefined): string | undefined {
+	return actionId?.startsWith("idle:") ? undefined : actionId;
 }
 
 /**
@@ -852,7 +861,7 @@ export class SlackNotificationDaemon {
 			publicationId === undefined
 				? undefined
 				: await this.#publicationAttempt(
-						`root:${sessionId}:${publicationId}`,
+						`root:${this.options.teamId}:${this.options.channelId}:${sessionId}:${publicationId}`,
 						clientMsgId => `root:${sessionId}:${clientMsgId}`,
 					);
 		const existing = await this.findSession(sessionId, false);
@@ -1215,7 +1224,7 @@ export class SlackNotificationDaemon {
 			publicationId === undefined
 				? undefined
 				: await this.#publicationAttempt(
-						`root:${sessionId}:${publicationId}`,
+						`root:${this.options.teamId}:${this.options.channelId}:${sessionId}:${publicationId}`,
 						clientMsgId => `root:${sessionId}:${clientMsgId}`,
 					);
 		return (await this.#resumeWithRootPublication(sessionId, body, endpointGeneration, rootPublication?.clientMsgId))
@@ -1395,7 +1404,10 @@ export class SlackNotificationDaemon {
 		const interactionId = text(inbound.event.client_msg_id) ?? inbound.eventId;
 		const retryKey = `${inbound.eventId}:${interactionId}`;
 		const inboundText = text(inbound.event.text);
-		const command = inboundText?.startsWith("/sdk ") ?? false;
+		if (!inboundText) return undefined;
+		const command = inboundText.startsWith("/sdk ");
+		const actionId = command ? undefined : replyableActionId(record.pendingActionId);
+		const kind: SlackInboundRouting["kind"] = command ? "command" : actionId ? "action" : "message";
 
 		const idempotencyKey = `slack:${inbound.teamId}:${inbound.channelId}:${inbound.rootTs}:${actorId}:${inbound.eventId}:${interactionId}`;
 		const effectId = `inbound:${inbound.teamId}:${inbound.channelId}:${inbound.rootTs}:${actorId}:${inbound.eventId}:${interactionId}`;
@@ -1409,21 +1421,26 @@ export class SlackNotificationDaemon {
 			actorId,
 			retryKey,
 			eventContext: inbound.eventContext,
-			kind: command ? "command" : "action",
-			...(command ? {} : record.pendingActionId ? { actionId: record.pendingActionId } : {}),
+			kind,
+			...(actionId ? { actionId } : {}),
 		};
-		const initialPayload: SlackInboundEffectPayload | undefined = command
-			? { type: "command", content: inboundText!, idempotencyKey, routing }
-			: record.pendingActionId
-				? { type: "reply", id: record.pendingActionId, answer: inboundText ?? "", idempotencyKey, routing }
-				: undefined;
+		const initialPayload: SlackInboundEffectPayload = command
+			? { type: "command", content: inboundText, idempotencyKey, routing }
+			: actionId
+				? { type: "reply", id: actionId, answer: inboundText, idempotencyKey, routing }
+				: { type: "user_message", sessionId: record.sessionId, text: inboundText, idempotencyKey, routing };
 		const existingEffect = await this.#journal.read<SlackInboundEffectPayload>(effectId);
 		const payload = existingEffect?.payload ?? initialPayload;
-		if (!payload) return undefined;
+		const dispatchKind = payload.routing.kind;
 		await this.#rescheduleAfterEffectTransition(
 			this.#journal.enqueue({
 				id: effectId,
-				kind: command ? "sdk.inbound.command" : "sdk.inbound.reply",
+				kind:
+					dispatchKind === "command"
+						? "sdk.inbound.command"
+						: dispatchKind === "action"
+							? "sdk.inbound.reply"
+							: "sdk.inbound.user_message",
 				transport: "slack",
 				sessionId: record.sessionId,
 				endpointGeneration: endpoint.generation,
@@ -1443,8 +1460,7 @@ export class SlackNotificationDaemon {
 				candidate =>
 					candidate.eventId === inbound.eventId ||
 					candidate.interactionId === interactionId ||
-					candidate.retryKey === retryKey ||
-					(inbound.eventContext !== undefined && candidate.eventContext === inbound.eventContext),
+					candidate.retryKey === retryKey,
 			);
 			if (existing) {
 				sessionId = current.sessionId;
@@ -1455,8 +1471,8 @@ export class SlackNotificationDaemon {
 				current.seenEventIds.includes(inbound.eventId) ||
 				current.seenInteractionIds.includes(interactionId) ||
 				current.seenRetryKeys.includes(retryKey) ||
-				(inbound.eventContext !== undefined && current.seenContextIds.includes(inbound.eventContext)) ||
-				(!command && !current.pendingActionId)
+				(dispatchKind === "action" && replyableActionId(current.pendingActionId) !== payload.routing.actionId) ||
+				(dispatchKind === "message" && replyableActionId(current.pendingActionId) !== undefined)
 			)
 				return current;
 			sessionId = current.sessionId;
@@ -1466,8 +1482,8 @@ export class SlackNotificationDaemon {
 				interactionId,
 				retryKey,
 				eventContext: inbound.eventContext,
-				kind: command ? "command" : "action",
-				...(command ? {} : { actionId: current.pendingActionId }),
+				kind: dispatchKind,
+				...(dispatchKind === "action" ? { actionId: payload.routing.actionId } : {}),
 				endpointGeneration: endpoint.generation,
 				...(current.attachmentAuthorityId === undefined
 					? {}
@@ -1753,7 +1769,9 @@ export class SlackNotificationDaemon {
 				effect.transport !== "slack" ||
 				effect.state === "terminal" ||
 				!effect.sessionId ||
-				(effect.kind !== "sdk.inbound.command" && effect.kind !== "sdk.inbound.reply")
+				(effect.kind !== "sdk.inbound.command" &&
+					effect.kind !== "sdk.inbound.reply" &&
+					effect.kind !== "sdk.inbound.user_message")
 			)
 				continue;
 			const adopted = await this.#adoptOrphanInbound(effect as ChatEffect<SlackInboundEffectPayload>);
@@ -1800,7 +1818,9 @@ export class SlackNotificationDaemon {
 			text(routing.interactionId) !== undefined &&
 			routing.retryKey === `${routing.eventId}:${routing.interactionId}` &&
 			(routing.eventContext === undefined || text(routing.eventContext) !== undefined) &&
-			(routing.kind === "command" || (routing.kind === "action" && text(routing.actionId) !== undefined))
+			(routing.kind === "command" ||
+				routing.kind === "message" ||
+				(routing.kind === "action" && text(routing.actionId) !== undefined))
 		);
 	}
 	#matchesInboundEffect(effect: ChatEffect<SlackInboundEffectPayload>, receipt: SlackInboundDispatchReceipt): boolean {
@@ -1834,7 +1854,11 @@ export class SlackNotificationDaemon {
 				(payload.type === "reply" &&
 					routing.kind === "action" &&
 					effect.kind === "sdk.inbound.reply" &&
-					payload.id === routing.actionId))
+					payload.id === routing.actionId) ||
+				(payload.type === "user_message" &&
+					routing.kind === "message" &&
+					effect.kind === "sdk.inbound.user_message" &&
+					payload.sessionId === effect.sessionId))
 		);
 	}
 	#sameInboundReceipt(left: SlackInboundDispatchReceipt, right: SlackInboundDispatchReceipt): boolean {
@@ -1874,7 +1898,9 @@ export class SlackNotificationDaemon {
 			if (
 				effect.transport !== "slack" ||
 				effect.state !== "terminal" ||
-				(effect.kind !== "sdk.inbound.command" && effect.kind !== "sdk.inbound.reply")
+				(effect.kind !== "sdk.inbound.command" &&
+					effect.kind !== "sdk.inbound.reply" &&
+					effect.kind !== "sdk.inbound.user_message")
 			)
 				continue;
 			const payload = effect.payload as SlackInboundEffectPayload;
@@ -1964,7 +1990,11 @@ export class SlackNotificationDaemon {
 				(payload.type === "reply" &&
 					routing.kind === "action" &&
 					effect.kind === "sdk.inbound.reply" &&
-					payload.id === routing.actionId));
+					payload.id === routing.actionId) ||
+				(payload.type === "user_message" &&
+					routing.kind === "message" &&
+					effect.kind === "sdk.inbound.user_message" &&
+					payload.sessionId === effect.sessionId));
 		let receipt: SlackInboundDispatchReceipt | undefined;
 		await this.store.transact(key, current => {
 			if (
@@ -1980,8 +2010,7 @@ export class SlackNotificationDaemon {
 				candidate =>
 					candidate.eventId === routing.eventId ||
 					candidate.interactionId === routing.interactionId ||
-					candidate.retryKey === routing.retryKey ||
-					(routing.eventContext !== undefined && candidate.eventContext === routing.eventContext),
+					candidate.retryKey === routing.retryKey,
 			);
 			if (existing) {
 				if (this.#matchesInboundEffect(effect, existing)) receipt = existing;
@@ -1991,8 +2020,8 @@ export class SlackNotificationDaemon {
 				current.seenEventIds.includes(routing.eventId) ||
 				current.seenInteractionIds.includes(routing.interactionId) ||
 				current.seenRetryKeys.includes(routing.retryKey) ||
-				(routing.eventContext !== undefined && current.seenContextIds.includes(routing.eventContext)) ||
-				(routing.kind === "action" && current.pendingActionId !== routing.actionId)
+				(routing.kind === "action" && replyableActionId(current.pendingActionId) !== routing.actionId) ||
+				(routing.kind === "message" && replyableActionId(current.pendingActionId) !== undefined)
 			)
 				return current;
 			receipt = {

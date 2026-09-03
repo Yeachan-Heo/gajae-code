@@ -986,6 +986,38 @@ describe("chat daemon worker", () => {
 		expect((await readConversation())?.pendingActionId).toBe("action-to-resolve");
 		restartedClient.handler?.({ type: "action_resolved", sessionId: "session", id: "action-to-resolve" });
 		await waitForConversation(conversation => conversation?.pendingActionId === undefined);
+		const idleDelivered = restartedProvider.waitForPostCount(1, post => post.text.includes("Agent idle"));
+		restartedClient.handler?.({
+			type: "action_needed",
+			sessionId: "session",
+			id: "idle:session#1",
+			kind: "idle",
+			question: "Agent idle",
+			options: [],
+		});
+		await idleDelivered;
+		expect((await readConversation())?.pendingActionId).toBeUndefined();
+		const userMessageSent = restartedClient.waitForSent(
+			frame => frame.type === "user_message" && frame.sessionId === "session" && frame.text === "next task",
+		);
+		await restartedProvider.handler?.({
+			envelope_id: "user-message-envelope",
+			payload: {
+				type: "event_callback",
+				event_id: "user-message-event",
+				team_id: "team",
+				event: {
+					type: "message",
+					channel: "channel",
+					ts: "3.1",
+					thread_ts: persisted?.rootTs,
+					user: "human",
+					text: "next task",
+					client_msg_id: "user-message-id",
+				},
+			},
+		});
+		await userMessageSent;
 		await restartedRuntime.stop();
 	});
 	// Wider timeout than bun:test's 5000ms default: this exercises a full

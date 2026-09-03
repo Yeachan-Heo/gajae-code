@@ -6,7 +6,7 @@ export interface SlackInboundDispatchReceipt {
 	interactionId: string;
 	retryKey: string;
 	eventContext?: string;
-	kind: "action" | "command";
+	kind: "action" | "command" | "message";
 	actionId?: string;
 	/** The endpoint generation and SDK effect captured before Socket Mode ACK. */
 	endpointGeneration: number;

@@ -239,12 +239,18 @@ function messageEnvelope(
 	envelopeId: string,
 	eventId: string,
 	rootTs: string,
-	overrides: { actorId?: string; clientMsgId?: string; eventContext?: string; text?: string } = {},
+	overrides: {
+		actorId?: string;
+		clientMsgId?: string;
+		eventContext?: string;
+		payloadType?: "event_callback" | "events_api";
+		text?: string;
+	} = {},
 ): SlackSocketEnvelope {
 	return {
 		envelope_id: envelopeId,
 		payload: {
-			type: "events_api",
+			type: overrides.payloadType ?? "event_callback",
 			event_id: eventId,
 			event_context: overrides.eventContext,
 			team_id: "T1",
@@ -262,6 +268,37 @@ function messageEnvelope(
 }
 
 describe("SlackNotificationDaemon fake-provider acceptance", () => {
+	it("scopes deterministic root publication identities to the configured channel", async () => {
+		const firstAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-one-"));
+		const secondAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-two-"));
+		const fake = new FakeSlack();
+		const createDaemon = (agentDir: string, channelId: string) =>
+			new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId,
+				provider: new SlackProvider(fake),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+				authorizeActor: actorId => actorId === "U1",
+			});
+		const first = createDaemon(firstAgentDir, "C1");
+		const second = createDaemon(secondAgentDir, "C2");
+		try {
+			await first.notify("session", "ready", undefined, 1, "publication");
+			await second.notify("session", "ready", undefined, 1, "publication");
+			const roots = fake.posts.filter(post => post.threadTs === undefined);
+			expect(roots.map(post => post.channel)).toEqual(["C1", "C2"]);
+			expect(new Set(roots.map(post => post.clientMsgId)).size).toBe(2);
+		} finally {
+			await Promise.all([first.stop(), second.stop()]);
+			await Promise.all([
+				fs.rm(firstAgentDir, { recursive: true, force: true }),
+				fs.rm(secondAgentDir, { recursive: true, force: true }),
+			]);
+		}
+	});
+
 	it("acknowledges accepted, rejected, and duplicate envelopes before their outcome", async () => {
 		await withDaemon(async (daemon, fake, injected) => {
 			const root = await daemon.postRoot("session", "root");
@@ -1098,7 +1135,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
-	it("deduplicates event retries, event contexts, and interaction/message identifiers", async () => {
+	it("deduplicates event and interaction identifiers without treating event context as unique", async () => {
 		await withDaemon(async (daemon, _fake, injected) => {
 			const root = await daemon.postRoot("session", "root");
 			await daemon.notify("session", "question", "event-1");
@@ -1120,12 +1157,25 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					eventContext: "context-2",
 				}),
 			);
+			await daemon.handleEnvelope(
+				messageEnvelope("same-context", "event-3", root.rootTs!, {
+					clientMsgId: "interaction-3",
+					eventContext: "context-1",
+					text: "next turn",
+				}),
+			);
 			expect(injected).toEqual([
 				expect.objectContaining({
 					type: "reply",
 					id: "event-1",
 					answer: "reply",
 					idempotencyKey: "slack:T1:C1:1.1:U1:event-1:interaction-1",
+				}),
+				expect.objectContaining({
+					type: "user_message",
+					sessionId: "session",
+					text: "next turn",
+					idempotencyKey: "slack:T1:C1:1.1:U1:event-3:interaction-3",
 				}),
 			]);
 		});
@@ -1516,7 +1566,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			await fs.rm(agentDir, { recursive: true, force: true });
 		}
 	});
-	it("claims /sdk event, context, and retry identifiers before command dispatch", async () => {
+	it("claims /sdk event and retry identifiers before command dispatch", async () => {
 		const commands: Array<{ sessionId: string; content: string }> = [];
 		await withDaemon(
 			async (daemon, _fake) => {
@@ -1544,8 +1594,11 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 							text: "/sdk status",
 						}),
 					),
-				).toBe(false);
-				expect(commands).toEqual([{ sessionId: "session", content: "/sdk status" }]);
+				).toBe(true);
+				expect(commands).toEqual([
+					{ sessionId: "session", content: "/sdk status" },
+					{ sessionId: "session", content: "/sdk status" },
+				]);
 			},
 			{
 				onCommand: async (sessionId, content) => {
@@ -1702,7 +1755,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
-	it("rejects an action after durable resolution", async () => {
+	it("starts a user turn after durable action resolution", async () => {
 		await withDaemon(async (daemon, _fake, injected) => {
 			const root = await daemon.postRoot("session", "root");
 			await daemon.notify("session", "question", "resolved-action");
@@ -1711,8 +1764,14 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				await daemon.handleEnvelope(
 					messageEnvelope("stale", "stale-event", root.rootTs!, { clientMsgId: "stale-id" }),
 				),
-			).toBe(false);
-			expect(injected).toEqual([]);
+			).toBe(true);
+			expect(injected).toEqual([
+				expect.objectContaining({
+					type: "user_message",
+					sessionId: "session",
+					text: "reply",
+				}),
+			]);
 		});
 	});
 
