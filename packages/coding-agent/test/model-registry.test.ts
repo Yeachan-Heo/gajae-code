@@ -15,7 +15,12 @@ import {
 	writeModelCache,
 } from "@gajae-code/ai";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
-import { kNoAuth, MODEL_ROLE_IDS, ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import {
+	isQuietLocalDiscoveryFailure,
+	kNoAuth,
+	MODEL_ROLE_IDS,
+	ModelRegistry,
+} from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
 	resolveModelFromString,
@@ -9023,5 +9028,36 @@ describe("ModelRegistry", () => {
 				getApiKeySpy.mockRestore();
 			}
 		});
+	});
+});
+
+describe("isQuietLocalDiscoveryFailure", () => {
+	const refused = Object.assign(new Error("unable to connect"), { code: "ECONNREFUSED" });
+
+	test("accepts structured connection-refused evidence for loopback", () => {
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/v1", refused.message, refused)).toBe(true);
+		expect(isQuietLocalDiscoveryFailure("http://[::1]:1234/v1", refused.message, { cause: refused })).toBe(true);
+	});
+
+	test("keeps DNS, routing, and generic message failures noisy", () => {
+		expect(
+			isQuietLocalDiscoveryFailure(
+				"http://127.0.0.1:11434/v1",
+				"unable to connect",
+				Object.assign(new Error("unable to connect"), { code: "ENOTFOUND" }),
+			),
+		).toBe(false);
+		expect(
+			isQuietLocalDiscoveryFailure(
+				"http://127.0.0.1:11434/v1",
+				"connection refused",
+				Object.assign(new Error("connection refused"), { code: "EHOSTUNREACH" }),
+			),
+		).toBe(false);
+		expect(isQuietLocalDiscoveryFailure("http://127.0.0.1:11434/v1", "connection refused")).toBe(false);
+	});
+
+	test("keeps structured connection refusal for a remote host at warn", () => {
+		expect(isQuietLocalDiscoveryFailure("https://ollama.example.com/v1", refused.message, refused)).toBe(false);
 	});
 });

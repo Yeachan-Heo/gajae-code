@@ -138,6 +138,67 @@ function redactDiscoveryUrl(value: string | URL): string {
 		return "(invalid URL)";
 	}
 }
+
+/** Whether a structured transport code proves that no listener accepted the connection. */
+function isConnectionRefusedDiscoveryCode(value: unknown): boolean {
+	if (typeof value === "string") {
+		const normalized = value.replace(/[^A-Za-z0-9]/gu, "").toUpperCase();
+		return normalized === "ECONNREFUSED" || normalized === "CONNECTIONREFUSED" || normalized === "ERRCONNECTIONREFUSED";
+	}
+	if (typeof value !== "number" || !Number.isInteger(value)) return false;
+	// ECONNREFUSED errno values used by the supported runtimes/OSes.
+	return value === 61 || value === -61 || value === 111 || value === -111 || value === 10061 || value === -10061;
+}
+
+function isConnectionRefusedDiscoveryEvidence(error: unknown): boolean {
+	const seen = new Set<unknown>();
+	const queue: unknown[] = [error];
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (current === null || typeof current !== "object" || seen.has(current)) continue;
+		seen.add(current);
+		for (const field of ["code", "errno", "errorCode", "transportCode"]) {
+			let value: unknown;
+			try {
+				value = Reflect.get(current, field);
+			} catch {
+				value = undefined;
+			}
+			if (isConnectionRefusedDiscoveryCode(value)) return true;
+		}
+		for (const field of ["cause", "error", "transport"]) {
+			let nested: unknown;
+			try {
+				nested = Reflect.get(current, field);
+			} catch {
+				nested = undefined;
+			}
+			if (nested !== undefined) queue.push(nested);
+		}
+	}
+	return false;
+}
+
+/** Whether `hostname` (as `URL.hostname` reports it) names this machine's loopback. */
+function isLoopbackDiscoveryHost(hostname: string): boolean {
+	if (hostname === "localhost" || hostname === "[::1]" || hostname === "::1") return true;
+	return /^127(?:\.\d{1,3}){3}$/u.test(hostname);
+}
+
+/**
+ * A loopback discovery endpoint that is proven to have no listener is the normal state of
+ * a machine without a local model server. Structured transport evidence is required when
+ * available; DNS, routing, proxy, TLS, and HTTP failures remain warnings.
+ */
+export function isQuietLocalDiscoveryFailure(baseUrl: string, _warning: string, evidence?: unknown): boolean {
+	let host: string;
+	try {
+		host = new URL(baseUrl).hostname;
+	} catch {
+		return false;
+	}
+	return isLoopbackDiscoveryHost(host) && evidence !== undefined && isConnectionRefusedDiscoveryEvidence(evidence);
+}
 function stripUrlQuery(value: string): string {
 	const queryStart = value.indexOf("?");
 	if (queryStart < 0) return value;
@@ -3341,6 +3402,8 @@ export class ModelRegistry {
 					(evidence.authGeneration !== authGenerationBeforeDiscovery || evidence.endpoint !== endpoint)))
 				? "online"
 				: strategy;
+		let discoveryFailureEvidence: unknown;
+
 		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, refreshStrategy, {
 			cacheDbPath: this.#cacheDbPath,
 			requiresAuth: provider =>
@@ -3353,11 +3416,17 @@ export class ModelRegistry {
 							baseUrl: provider.baseUrl,
 						}),
 			isAuthenticated,
-			fetchModels: async (provider, apiKey) =>
-				this.#sanitizeDiscoverableModelsForCache(
-					provider,
-					await this.#discoverModelsByProviderType(provider, apiKey),
-				),
+			fetchModels: async (provider, apiKey) => {
+				try {
+					return this.#sanitizeDiscoverableModelsForCache(
+						provider,
+						await this.#discoverModelsByProviderType(provider, apiKey),
+					);
+				} catch (error) {
+					discoveryFailureEvidence = error;
+					throw error;
+				}
+			},
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
 			cacheDynamicModelProvenance: cacheLookupProvenance,
 			canPublishCache: () => isCurrentEndpoint() && isCurrentProviderRefresh(),
@@ -3381,11 +3450,15 @@ export class ModelRegistry {
 			};
 		}
 		if (mergeInput.warning) {
-			logger.warn("model discovery failed for provider", {
+			const baseUrl = effectiveProviderConfig.baseUrl ?? "";
+			const fields = {
 				provider: effectiveProviderConfig.provider,
-				url: redactDiscoveryUrl(effectiveProviderConfig.baseUrl ?? ""),
+				url: redactDiscoveryUrl(baseUrl),
 				error: mergeInput.warning,
-			});
+			};
+			if (isQuietLocalDiscoveryFailure(baseUrl, mergeInput.warning, discoveryFailureEvidence))
+				logger.debug("model discovery failed for provider", fields);
+			else logger.warn("model discovery failed for provider", fields);
 		}
 		this.#providerEvidenceApiKeys.set(effectiveProviderConfig.provider, preflightApiKey);
 		return {
