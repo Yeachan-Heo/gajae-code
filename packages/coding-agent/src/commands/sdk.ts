@@ -1092,6 +1092,9 @@ export default class Sdk extends Command {
 		try {
 			broker = await withBrokerStartupLock(agentDir, async () => {
 				if (await readBrokerDiscovery(agentDir)) return undefined;
+				const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
+				if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
+					await Bun.sleep(startupDelayMs);
 				const candidate = new Broker({
 					agentDir,
 					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(

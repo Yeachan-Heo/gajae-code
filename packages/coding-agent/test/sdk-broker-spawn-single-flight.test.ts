@@ -120,6 +120,52 @@ it("independent broker bootstrap children serialize before Broker.start", async 
 	}
 }, 30_000);
 
+it("the parent discovery budget covers child-fence contention plus a full startup attempt", async () => {
+	const { withBrokerStartupLock } = await import("../src/sdk/broker/ensure");
+	const dir = await temp();
+	const entered = Promise.withResolvers<void>();
+	const unblock = Promise.withResolvers<void>();
+	const holder = withBrokerStartupLock(dir, async () => {
+		entered.resolve();
+		await unblock.promise;
+	});
+	let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
+	try {
+		await entered.promise;
+		child = Bun.spawn(
+			[process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir],
+			{
+				cwd: import.meta.dir,
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "3000" },
+			},
+		);
+		await Bun.sleep(8_000);
+		unblock.resolve();
+		await holder;
+		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect({ code, error }).toEqual({ code: 0, error: "" });
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(discovery).not.toBeNull();
+		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock");
+	} finally {
+		unblock.resolve();
+		await holder.catch(() => undefined);
+		child?.kill("SIGTERM");
+		await brokerOwnerForTest(dir)?.stop();
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir).catch(() => null);
+		if (discovery)
+			try {
+				process.kill(discovery.pid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
+
 it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
 	const dir = await temp();
 	const readBrokerDiscovery = brokerDiscovery.readBrokerDiscovery;

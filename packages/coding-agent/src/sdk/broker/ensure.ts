@@ -30,12 +30,14 @@ export interface EnsureBrokerSettings {
 	env?: NodeJS.ProcessEnv;
 }
 
-const DISCOVERY_TIMEOUT_MS = 10_000;
+const BROKER_PUBLICATION_TIMEOUT_MS = 10_000;
+const STARTUP_LOCK_WAIT_MS = BROKER_PUBLICATION_TIMEOUT_MS - 1_000;
+/** Parent budget covers a full child-fence wait followed by one normal publication attempt. */
+const DISCOVERY_TIMEOUT_MS = STARTUP_LOCK_WAIT_MS + BROKER_PUBLICATION_TIMEOUT_MS;
 /** A process that loses the spawn lock waits this long for the winner's discovery before giving up. */
 const SPAWN_LOCK_WAIT_MS = DISCOVERY_TIMEOUT_MS + 5_000;
 const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
-const STARTUP_LOCK_WAIT_MS = DISCOVERY_TIMEOUT_MS - 1_000;
 const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
