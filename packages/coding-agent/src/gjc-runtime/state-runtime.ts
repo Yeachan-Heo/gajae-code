@@ -32,7 +32,7 @@ import {
 } from "../skill-state/workflow-state-contract";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { applyAmbiguityFloorToEnvelope } from "./deep-interview-ambiguity";
-import { crystalSnapshotDigest } from "./deep-interview-crystallize";
+import { crystalMarkdown, crystalSnapshotDigest, type DeepInterviewCrystal } from "./deep-interview-crystallize";
 import {
 	assertDeepInterviewEnvelopeInputLimits,
 	assertDeepInterviewInputWithinLimit,
@@ -44,7 +44,7 @@ import {
 	mergeDeepInterviewEnvelope,
 	normalizeDeepInterviewEnvelope,
 } from "./deep-interview-state";
-import { activeSnapshotPath, auditPath, modeStatePath, sessionStateDir } from "./session-layout";
+import { activeSnapshotPath, auditPath, modeStatePath, sessionSpecsDir, sessionStateDir } from "./session-layout";
 import {
 	resolveGjcSessionForRead,
 	resolveGjcSessionForWrite,
@@ -1047,6 +1047,7 @@ export async function reconcileWorkflowSkillState(options: {
 	return withWorkflowStateLock(
 		path.relative(options.cwd, modeStateFile(options.cwd, options.mode, sessionId)),
 		async () => reconcileWorkflowSkillStateUnlocked(options, sessionId),
+		{ cwd: options.cwd },
 	);
 }
 
@@ -1337,6 +1338,8 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				const existingInner = isPlainObject(existingPayload.state) ? existingPayload.state : {};
 				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
 				assertDeepInterviewExecutionApprovalUnchanged(existingPayload, merged, "generic state write");
+				if (existingPayload.active === false && merged.active !== false)
+					throw new StateCommandError(2, "generic state write cannot reactivate inactive deep-interview state");
 				if (existingInner.crystal === undefined && mergedInner.crystal !== undefined)
 					throw new StateCommandError(2, "generic state write cannot introduce canonical Crystal state");
 				if (existingInner.intent_contract === undefined && mergedInner.intent_contract !== undefined)
@@ -1603,7 +1606,7 @@ function requireReadyCanonicalCrystal(value: unknown): Record<string, unknown> {
 
 async function assertDeepInterviewHandoffReady(
 	state: Record<string, unknown>,
-	options: { requireExecutionApproval?: boolean } = {},
+	options: { cwd?: string; sessionId?: string; requireExecutionApproval?: boolean } = {},
 ): Promise<void> {
 	const specPath = typeof state.spec_path === "string" ? state.spec_path : undefined;
 	const expectedSha = typeof state.spec_sha256 === "string" ? state.spec_sha256 : undefined;
@@ -1631,8 +1634,25 @@ async function assertDeepInterviewHandoffReady(
 		const crystal = requireReadyCanonicalCrystal(inner.crystal);
 		if (!specPath || !expectedSha || content === undefined)
 			throw new StateCommandError(2, "deep-interview crystallized handoff requires a persisted spec");
+		if (options.cwd && options.sessionId) {
+			const specsRoot = path.resolve(sessionSpecsDir(options.cwd, options.sessionId));
+			const relativeSpec = path.relative(specsRoot, path.resolve(specPath));
+			if (relativeSpec.startsWith("..") || path.isAbsolute(relativeSpec))
+				throw new StateCommandError(2, "deep-interview crystallized handoff requires a session-scoped spec");
+		}
 		if (createHash("sha256").update(content).digest("hex") !== expectedSha)
 			throw new StateCommandError(2, "deep-interview crystallized handoff spec hash mismatch");
+		let canonicalContent: string;
+		try {
+			canonicalContent = crystalMarkdown(crystal as unknown as DeepInterviewCrystal);
+		} catch {
+			throw new StateCommandError(2, "deep-interview crystallized handoff requires complete canonical evidence");
+		}
+		if (canonicalContent !== content)
+			throw new StateCommandError(
+				2,
+				"deep-interview crystallized handoff spec is not the canonical Crystal rendering",
+			);
 		if (inner.execution_approval !== "approved" && options.requireExecutionApproval)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
 		if (options.requireExecutionApproval) {
@@ -1651,11 +1671,11 @@ async function assertDeepInterviewHandoffReady(
 		}
 		return;
 	}
+	if (options.requireExecutionApproval)
+		throw new StateCommandError(2, "deep-interview execution handoff requires a ready approved Crystal");
 	if (inner.intent_contract === undefined) {
 		if (inner.intent_contract_required === true)
 			throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
-		if (options.requireExecutionApproval)
-			throw new StateCommandError(2, "deep-interview execution handoff requires a ready approved Crystal");
 		return;
 	}
 	assertDeepInterviewIntentManifest(inner.intent_contract);
@@ -1754,6 +1774,20 @@ async function handleHandoffUnlocked(
 		!(existingCaller.current_phase === "handoff" && existingCaller.handoff_to === callee)
 	)
 		throw new StateCommandError(2, `gjc state ${caller} handoff: caller is not active`);
+	if (caller === "deep-interview" && callee === "ultragoal") {
+		const receipt = isPlainObject(existingCaller.receipt) ? existingCaller.receipt : undefined;
+		const checksum = isPlainObject(receipt?.content_sha256) ? receipt.content_sha256 : undefined;
+		if (
+			checksum?.algorithm !== "sha256" ||
+			typeof checksum?.value !== "string" ||
+			checksum.value.length !== 64 ||
+			checksum.covered_path !== path.resolve(callerPath)
+		)
+			throw new StateCommandError(2, "deep-interview execution handoff requires checksummed canonical state");
+		const integrityWarning = await warnAndAuditOutOfBandIfNeeded(cwd, sessionId, callerPath, "deep-interview");
+		if (integrityWarning)
+			throw new StateCommandError(2, `${integrityWarning}; execution handoff refuses tampered mode-state`);
+	}
 
 	const handoffAt = nowIso();
 	const mutationId = `${caller}:handoff:${callee}:${handoffAt}`;
@@ -1775,6 +1809,8 @@ async function handleHandoffUnlocked(
 			: migrateWorkflowState(existingCaller, caller).state;
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
+			cwd,
+			sessionId,
 			requireExecutionApproval: callee === "ultragoal",
 		});
 
@@ -2081,8 +2117,10 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		inner.execution_approval !== "approved" &&
 		(publicationReceipt?.owner !== "gjc-runtime" ||
 			publicationReceipt.command !== "gjc deep-interview crystallize" ||
+			publicationChecksum?.algorithm !== "sha256" ||
 			typeof publicationChecksum?.value !== "string" ||
-			publicationChecksum.value.length !== 64)
+			publicationChecksum.value.length !== 64 ||
+			publicationChecksum.covered_path !== path.resolve(statePath))
 	)
 		throw new StateCommandError(2, "approve-execution requires a canonically published Crystal receipt");
 	const integrityWarning = await warnAndAuditOutOfBandIfNeeded(
@@ -2093,7 +2131,7 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		{ mutationId },
 	);
 	if (integrityWarning) throw new StateCommandError(2, `${integrityWarning}; approval refuses tampered mode-state`);
-	await assertDeepInterviewHandoffReady(envelope);
+	await assertDeepInterviewHandoffReady(envelope, { cwd, sessionId: selectors.gjcSessionId });
 	const existingReceipt = isPlainObject(inner.execution_approval_receipt)
 		? inner.execution_approval_receipt
 		: undefined;
