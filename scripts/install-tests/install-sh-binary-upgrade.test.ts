@@ -499,7 +499,7 @@ describe("install.sh binary-first contract", () => {
 		);
 		expect(installer).not.toContain('kill -KILL "$OFFER_RUNTIME_PID"');
 		expect(installer).toContain('community_app_offer_suppressed');
-		expect(installer).toContain('"$OFFER_RUNTIME" macos-community-app-offer < /dev/tty');
+		expect(installer).toContain('"$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty');
 		expect(installer).toContain('"$OFFER_RUNTIME" --supports-macos-community-app');
 	});
 
@@ -516,7 +516,7 @@ describe("install.sh binary-first contract", () => {
 if [ "$1" = "--version" ]; then echo "gjc/${VERSION}"; exit 0; fi
 if [ "$1" = "--smoke-test" ]; then exit 0; fi
 if [ "$1" = "--supports-macos-community-app" ]; then exit 0; fi
-if [ "$1" = "macos-community-app-offer" ]; then
+if [ "$1" = "--internal-macos-community-app-offer" ]; then
   printf '%s|%s\n' "$$" "$0" > "$GJC_TEST_OFFER_MARKER"
   trap 'printf "TERM\\n" >> "$GJC_TEST_OFFER_SIGNAL"; sleep 1; exit 0' TERM
   while :; do sleep 1; done

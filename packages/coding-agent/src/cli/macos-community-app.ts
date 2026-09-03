@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +9,8 @@ import * as postmortem from "@gajae-code/utils/postmortem";
 
 export const COMMUNITY_APP_REPOSITORY = "devswha/gajae-code-app";
 export const COMMUNITY_APP_BUNDLE_ID = "app.gajae.desktop";
+export const COMMUNITY_APP_TEAM_ID = "5987KT43TJ";
+export const COMMUNITY_APP_SIGNING_AUTHORITY = "Developer ID Application: sangwoo ha";
 export const COMMUNITY_APP_SUPPRESS_ENV = "GJC_NO_COMMUNITY_APP";
 const GITHUB_API_ORIGIN = "https://api.github.com";
 const GITHUB_RELEASE_ORIGIN = "https://github.com";
@@ -19,7 +21,10 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const METADATA_FETCH_TIMEOUT_MS = 30_000;
 const ASSET_FETCH_TIMEOUT_MS = 10 * 60_000;
 const COMMAND_TIMEOUT_MS = 120_000;
-const CLEANUP_COMMAND_TIMEOUT_MS = 3_000;
+const CLEANUP_COMMAND_TIMEOUT_MS = 1_000;
+const HELPER_REAP_TIMEOUT_MS = 750;
+const HELPER_REAP_POLL_ATTEMPTS = 10;
+const HELPER_OUTPUT_SETTLE_GRACE_MS = 250;
 interface CommandResult {
 	exitCode: number;
 	stdout: string;
@@ -215,13 +220,22 @@ async function removeClaimedDirectory(
 	parentIdentity: FileIdentity,
 	log: (message: string) => void,
 ): Promise<boolean> {
-	if (!(await sameDirectoryIdentity(parentPath, parentIdentity)) || !(await sameDirectoryIdentity(filePath, identity)))
+	if (!(await sameDirectoryIdentity(parentPath, parentIdentity))) {
+		log("Optional community app cleanup warning: parent identity changed before removal");
 		return false;
+	}
+	if (!(await sameDirectoryIdentity(filePath, identity))) {
+		log("Optional community app cleanup warning: claimed directory identity changed before removal");
+		return false;
+	}
 	const quarantineRoot = path.join(parentPath, `.gjc-community-app-cleanup-${process.pid}-${Date.now().toString(16)}`);
 	try {
 		await fs.mkdir(quarantineRoot, { mode: 0o700 });
 		const quarantineIdentity = await fileIdentity(quarantineRoot);
-		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) return false;
+		if (!quarantineIdentity || !(await sameDirectoryIdentity(parentPath, parentIdentity))) {
+			log("Optional community app cleanup warning: quarantine identity changed before removal");
+			return false;
+		}
 		const tombstone = path.join(quarantineRoot, path.basename(filePath));
 		await fs.rename(filePath, tombstone);
 		if (
@@ -233,7 +247,8 @@ async function removeClaimedDirectory(
 			return false;
 		}
 		await fs.rm(tombstone, { recursive: true, force: true });
-		if (await sameDirectoryIdentity(quarantineRoot, quarantineIdentity)) await fs.rm(quarantineRoot, { force: true });
+		if (await sameDirectoryIdentity(quarantineRoot, quarantineIdentity))
+			await fs.rm(quarantineRoot, { force: true, recursive: true });
 		return true;
 	} catch (error) {
 		log(`Optional community app cleanup warning: failed to remove partial app state: ${String(error)}`);
@@ -252,7 +267,7 @@ async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promi
 		detached: true,
 	});
 	const waitForSpawnGroupGone = async (): Promise<boolean> => {
-		for (let attempt = 0; attempt < 100; attempt++) {
+		for (let attempt = 0; attempt < HELPER_REAP_POLL_ATTEMPTS; attempt++) {
 			try {
 				process.kill(-child.pid, 0);
 			} catch (error) {
@@ -290,13 +305,25 @@ async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promi
 		}
 		captureDescendants(processRef);
 	})();
-	const terminateAndReap = async (gracefulMs: number): Promise<boolean> => {
-		captureDescendants(processRef);
-		const rootExited = await processRef.terminate({ group: false, gracefulMs, timeoutMs: 5_000 });
-		const descendantResults = await Promise.all(
-			[...descendants.values()].map(descendant => descendant.terminate({ gracefulMs: -1, timeoutMs: 5_000 })),
-		);
-		return rootExited && descendantResults.every(Boolean) && (await waitForSpawnGroupGone());
+	let terminationPromise: Promise<boolean> | undefined;
+	const terminateAndReap = (gracefulMs: number): Promise<boolean> => {
+		if (!terminationPromise) {
+			terminationPromise = (async () => {
+				captureDescendants(processRef);
+				const rootExited = await processRef.terminate({
+					group: false,
+					gracefulMs,
+					timeoutMs: HELPER_REAP_TIMEOUT_MS,
+				});
+				const descendantResults = await Promise.all(
+					[...descendants.values()].map(descendant =>
+						descendant.terminate({ gracefulMs: -1, timeoutMs: HELPER_REAP_TIMEOUT_MS }),
+					),
+				);
+				return rootExited && descendantResults.every(Boolean) && (await waitForSpawnGroupGone());
+			})();
+		}
+		return terminationPromise;
 	};
 	controller.signal.addEventListener(
 		"abort",
@@ -327,7 +354,7 @@ async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promi
 		]);
 		clearTimeout(timer);
 		if (output.kind === "timeout") {
-			await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(5000)]);
+			await Promise.race([outputPromise.catch(() => undefined), Bun.sleep(HELPER_OUTPUT_SETTLE_GRACE_MS)]);
 			return {
 				exitCode: 124,
 				stdout: "",
@@ -448,7 +475,42 @@ async function resolveVerifiedExecutable(bundlePath: string, executable: string)
 	return executablePath;
 }
 
-async function findInstalledApp(homeDir: string, command: CommandRunner): Promise<string | undefined> {
+async function hasExpectedDeveloperIdSignature(bundlePath: string, command: CommandRunner): Promise<boolean> {
+	const result = await command(["/usr/bin/codesign", "--display", "--verbose=4", bundlePath]);
+	if (result.exitCode !== 0 || result.reaped === false) return false;
+	const details = `${result.stdout}\n${result.stderr}`;
+	return (
+		details.includes(`Authority=${COMMUNITY_APP_SIGNING_AUTHORITY}`) &&
+		details.includes(`TeamIdentifier=${COMMUNITY_APP_TEAM_ID}`)
+	);
+}
+
+async function isVerifiedCommunityApp(
+	bundlePath: string,
+	arch: "arm64" | "x64",
+	command: CommandRunner,
+): Promise<boolean> {
+	if (!(await isExpectedBundle(bundlePath, command))) return false;
+	const executable = await readBundleValue(bundlePath, "CFBundleExecutable", command);
+	const executablePath = executable ? await resolveVerifiedExecutable(bundlePath, executable) : undefined;
+	if (!executablePath) return false;
+	const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", bundlePath]);
+	if (signature.exitCode !== 0 || signature.reaped === false) return false;
+	if (!(await hasExpectedDeveloperIdSignature(bundlePath, command))) return false;
+	const policyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", bundlePath]);
+	if (policyAssessment.exitCode !== 0 || policyAssessment.reaped === false) return false;
+	const archCheck = await command(["/usr/bin/lipo", "-archs", executablePath]);
+	const executableArch = arch === "x64" ? "x86_64" : arch;
+	return (
+		archCheck.exitCode === 0 && archCheck.reaped !== false && archCheck.stdout.split(/\s+/).includes(executableArch)
+	);
+}
+
+async function findInstalledApp(
+	homeDir: string,
+	arch: "arm64" | "x64",
+	command: CommandRunner,
+): Promise<string | undefined> {
 	const candidates = [
 		path.join(homeDir, "Applications", "Gajae Code App.app"),
 		path.join(homeDir, "Applications", "Gajae-Code-App.app"),
@@ -456,7 +518,7 @@ async function findInstalledApp(homeDir: string, command: CommandRunner): Promis
 		"/Applications/Gajae-Code-App.app",
 	];
 	for (const candidate of candidates) {
-		if (await isExpectedBundle(candidate, command)) return candidate;
+		if (await isVerifiedCommunityApp(candidate, arch, command)) return candidate;
 	}
 	const result = await command(["/usr/bin/mdfind", `kMDItemCFBundleIdentifier == '${COMMUNITY_APP_BUNDLE_ID}'`]);
 	if (result.exitCode !== 0) return undefined;
@@ -464,7 +526,7 @@ async function findInstalledApp(homeDir: string, command: CommandRunner): Promis
 		.split(/\r?\n/)
 		.map(line => line.trim())
 		.filter(Boolean)) {
-		if (await isExpectedBundle(candidate, command)) return candidate;
+		if (await isVerifiedCommunityApp(candidate, arch, command)) return candidate;
 	}
 	return undefined;
 }
@@ -587,8 +649,10 @@ export async function offerMacosCommunityApp(
 		return result;
 	};
 	const homeDir = deps.homeDir ?? os.homedir();
+	const arch = deps.arch ?? process.arch;
+	if (!isMacArchitecture(arch)) return finishOwnership(failure(`unsupported macOS architecture ${arch}`, log));
 	try {
-		if (await findInstalledApp(homeDir, command))
+		if (await findInstalledApp(homeDir, arch, command))
 			return finishOwnership({ status: "skipped", reason: "already installed" });
 		if (!(await (deps.prompt ?? (() => defaultPrompt(fetchAbortSignal)))()))
 			return finishOwnership({ status: "skipped", reason: "cancelled" });
@@ -596,8 +660,6 @@ export async function offerMacosCommunityApp(
 		return finishOwnership(failure(error instanceof Error ? error.message : String(error), log));
 	}
 
-	const arch = deps.arch ?? process.arch;
-	if (!isMacArchitecture(arch)) return finishOwnership(failure(`unsupported macOS architecture ${arch}`, log));
 	const fetchImpl = deps.fetchImpl ?? fetch;
 	const fetchOptions = (timeoutMs: number): RequestInit => ({
 		signal: AbortSignal.any([fetchAbortSignal, AbortSignal.timeout(timeoutMs)]),
@@ -613,6 +675,7 @@ export async function offerMacosCommunityApp(
 	let destinationRootIdentity: FileIdentity | undefined;
 	const throwIfInterrupted = () => {
 		if (receivedSignal) throw new Error(`community app offer interrupted by ${receivedSignal}`);
+		if (fetchAbortSignal.aborted) throw new Error("community app offer interrupted");
 	};
 	try {
 		const releaseResponse = await fetchImpl(
@@ -750,7 +813,10 @@ export async function offerMacosCommunityApp(
 		const executablePath = await resolveVerifiedExecutable(sourceApp, executable);
 		if (!executablePath) return failure("the app bundle executable path was unsafe", log);
 		const signature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", sourceApp]);
-		if (signature.exitCode !== 0) return failure("the app bundle signature could not be verified", log);
+		if (signature.exitCode !== 0 || signature.reaped === false)
+			return failure("the app bundle signature could not be verified", log);
+		if (!(await hasExpectedDeveloperIdSignature(sourceApp, command)))
+			return failure("the app bundle was signed by an unexpected publisher", log);
 		const policyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", sourceApp]);
 		if (policyAssessment.exitCode !== 0) return failure("Gatekeeper rejected the app bundle", log);
 		const archCheck = await command(["/usr/bin/lipo", "-archs", executablePath]);
@@ -780,24 +846,27 @@ export async function offerMacosCommunityApp(
 		if (!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)))
 			return failure("the Applications destination identity changed", log);
 		throwIfInterrupted();
-		try {
-			await fs.mkdir(destination);
-		} catch {
-			return failure("the destination already contains an app bundle", log);
-		}
-		const destinationIdentity = await fileIdentity(destination);
-		if (!destinationIdentity) throw new Error("the destination claim was not a regular directory");
-		installedDestination = { path: destination, identity: destinationIdentity };
+		const existingDestination = await fs.lstat(destination).catch(() => undefined);
+		if (existingDestination && (!existingDestination.isDirectory() || existingDestination.isSymbolicLink()))
+			return failure("the destination already contains an unsafe path", log);
+		const existingDestinationIdentity = existingDestination ? await fileIdentity(destination) : undefined;
+		if (existingDestination && !existingDestinationIdentity)
+			return failure("the existing destination identity was unavailable", log);
+		const stagingDestination = path.join(currentDestinationRoot, `.${appEntry.name}.${randomUUID()}.tmp`);
+		await fs.mkdir(stagingDestination);
+		const stagingIdentity = await fileIdentity(stagingDestination);
+		if (!stagingIdentity) throw new Error("the staging destination claim was not a regular directory");
+		installedDestination = { path: stagingDestination, identity: stagingIdentity };
 		if (
 			!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
-			!(await sameDirectoryIdentity(destination, destinationIdentity))
+			!(await sameDirectoryIdentity(stagingDestination, stagingIdentity))
 		)
-			throw new Error("the destination identity changed before copy");
+			throw new Error("the staging destination identity changed before copy");
 		throwIfInterrupted();
 		if (!mountIdentity || !(await sameDirectoryIdentity(mountPoint, mountIdentity)))
 			throw new Error("the mounted volume identity changed before copy");
 		if (!(await isExpectedBundle(sourceApp, command))) throw new Error("the mounted app bundle changed before copy");
-		const copy = await command(["/usr/bin/ditto", sourceApp, destination]);
+		const copy = await command(["/usr/bin/ditto", sourceApp, stagingDestination]);
 		throwIfInterrupted();
 		if (copy.reaped === false) {
 			cleanupUnsafe = true;
@@ -806,23 +875,38 @@ export async function offerMacosCommunityApp(
 		if (copy.exitCode !== 0) throw new Error("copying the verified app bundle failed");
 		if (
 			!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
-			!(await sameDirectoryIdentity(destination, destinationIdentity))
+			!(await sameDirectoryIdentity(stagingDestination, stagingIdentity))
 		)
-			throw new Error("the destination identity changed after copy");
-		if (!(await isExpectedBundle(destination, command))) throw new Error("the copied app bundle identity changed");
-		const copiedExecutable = await readBundleValue(destination, "CFBundleExecutable", command);
+			throw new Error("the staging destination identity changed after copy");
+		if (!(await isExpectedBundle(stagingDestination, command)))
+			throw new Error("the copied app bundle identity changed");
+		const copiedExecutable = await readBundleValue(stagingDestination, "CFBundleExecutable", command);
 		const copiedExecutablePath = copiedExecutable
-			? await resolveVerifiedExecutable(destination, copiedExecutable)
+			? await resolveVerifiedExecutable(stagingDestination, copiedExecutable)
 			: undefined;
 		if (!copiedExecutable || copiedExecutable !== executable || !copiedExecutablePath)
 			throw new Error("the copied app executable identity changed");
-		const copiedSignature = await command(["/usr/bin/codesign", "--verify", "--deep", "--strict", destination]);
+		const copiedSignature = await command([
+			"/usr/bin/codesign",
+			"--verify",
+			"--deep",
+			"--strict",
+			stagingDestination,
+		]);
 		if (copiedSignature.reaped === false) {
 			cleanupUnsafe = true;
 			throw new Error("copied app signature helper did not terminate safely");
 		}
 		if (copiedSignature.exitCode !== 0) throw new Error("the copied app signature could not be verified");
-		const copiedPolicyAssessment = await command(["/usr/sbin/spctl", "--assess", "--type", "execute", destination]);
+		if (!(await hasExpectedDeveloperIdSignature(stagingDestination, command)))
+			throw new Error("the copied app was signed by an unexpected publisher");
+		const copiedPolicyAssessment = await command([
+			"/usr/sbin/spctl",
+			"--assess",
+			"--type",
+			"execute",
+			stagingDestination,
+		]);
 		if (copiedPolicyAssessment.reaped === false) {
 			cleanupUnsafe = true;
 			throw new Error("copied app Gatekeeper helper did not terminate safely");
@@ -835,6 +919,44 @@ export async function offerMacosCommunityApp(
 		}
 		if (copiedArchCheck.exitCode !== 0 || !copiedArchCheck.stdout.split(/\s+/).includes(executableArch))
 			throw new Error("the copied app architecture changed");
+		const currentExistingDestination = await fs.lstat(destination).catch(() => undefined);
+		if (
+			currentExistingDestination &&
+			(!currentExistingDestination.isDirectory() || currentExistingDestination.isSymbolicLink())
+		)
+			throw new Error("the destination changed to an unsafe path before replacement");
+		const currentExistingDestinationIdentity = currentExistingDestination
+			? await fileIdentity(destination)
+			: undefined;
+		if (
+			existingDestinationIdentity
+				? !currentExistingDestinationIdentity ||
+					currentExistingDestinationIdentity.dev !== existingDestinationIdentity.dev ||
+					currentExistingDestinationIdentity.ino !== existingDestinationIdentity.ino
+				: currentExistingDestinationIdentity
+		)
+			throw new Error("the existing destination identity changed before replacement");
+		if (currentExistingDestinationIdentity) {
+			if (!(await sameDirectoryIdentity(destination, currentExistingDestinationIdentity)))
+				throw new Error("the existing destination identity changed before replacement");
+			if (await isVerifiedCommunityApp(destination, arch, command)) {
+				installedDestination = undefined;
+				await fs.rm(stagingDestination, { recursive: true, force: true });
+				return { status: "skipped", reason: "already installed" };
+			}
+			const removed = await removeClaimedDirectory(
+				destination,
+				currentExistingDestinationIdentity,
+				currentDestinationRoot,
+				destinationRootIdentity,
+				log,
+			);
+			if (!removed) throw new Error("the existing app bundle could not be replaced safely");
+		}
+		await fs.rename(stagingDestination, destination);
+		const destinationIdentity = await fileIdentity(destination);
+		if (!destinationIdentity) throw new Error("the installed destination identity was unavailable");
+		installedDestination = { path: destination, identity: destinationIdentity };
 		if (
 			!(await sameDirectoryIdentity(currentDestinationRoot, destinationRootIdentity)) ||
 			!(await sameDirectoryIdentity(destination, destinationIdentity))

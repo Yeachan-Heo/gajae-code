@@ -6,7 +6,9 @@ import * as path from "node:path";
 import {
 	abortActiveCommunityAppCommandsForTest,
 	COMMUNITY_APP_BUNDLE_ID,
+	COMMUNITY_APP_SIGNING_AUTHORITY,
 	COMMUNITY_APP_SUPPRESS_ENV,
+	COMMUNITY_APP_TEAM_ID,
 	communityAppAssetMatchesArchitectureForTest,
 	offerMacosCommunityApp,
 	parseCommunityAppChecksumForTest,
@@ -162,6 +164,7 @@ describe("macOS community app offer guards", () => {
 
 	test("escalates cancellation when a native helper ignores SIGTERM", async () => {
 		if (process.platform === "win32") return;
+		const started = performance.now();
 		const dir = await tempDir();
 		const markerPath = path.join(dir, "helper.json");
 		const helperPath = path.join(dir, "helper.ts");
@@ -190,6 +193,7 @@ await Promise.withResolvers().promise;
 		expect(result.reaped).toBe(true);
 		expect(() => process.kill(helperPid, 0)).toThrow();
 		expect(() => process.kill(-helperPid, 0)).toThrow();
+		expect(performance.now() - started).toBeLessThan(5_000);
 	});
 
 	test("reaps same-group descendants after the helper leader exits", async () => {
@@ -282,6 +286,7 @@ describe("macOS community app verified installation", () => {
 		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
 		const checksumUrl = `${dmgUrl}.sha256`;
 		const calls: string[][] = [];
+		let signingTeam = COMMUNITY_APP_TEAM_ID;
 		let failCopy = false;
 		const command = async (argv: string[]) => {
 			calls.push(argv);
@@ -305,6 +310,12 @@ describe("macOS community app verified installation", () => {
 				if (failCopy) return { exitCode: 1, stdout: "", stderr: "copy failed" };
 				await fs.cp(argv[1], argv[2], { recursive: true });
 			}
+			if (argv[0] === "/usr/bin/codesign" && argv.includes("--display"))
+				return {
+					exitCode: 0,
+					stdout: "",
+					stderr: `Authority=${COMMUNITY_APP_SIGNING_AUTHORITY}\nTeamIdentifier=${signingTeam}\n`,
+				};
 			return { exitCode: 0, stdout: argv[0] === "/usr/bin/lipo" ? "arm64" : "", stderr: "" };
 		};
 		const result = await offerMacosCommunityApp({
@@ -340,6 +351,67 @@ describe("macOS community app verified installation", () => {
 		expect(calls.some(call => call[0] === "/usr/bin/open")).toBe(true);
 		expect(await fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app"))).toBeTruthy();
 		await fs.rm(path.join(homeDir, "Applications", "Gajae Code App.app"), { recursive: true, force: true });
+		await fs.mkdir(path.join(homeDir, "Applications", "Gajae Code App.app", "Contents"), { recursive: true });
+		const repaired = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir,
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			command,
+			cleanupCommand: command,
+			log: message => calls.push(["log", message]),
+			fetchImpl: async url => {
+				if (url.includes("/releases/latest"))
+					return new Response(
+						JSON.stringify({
+							tag_name: "v1.0.0",
+							assets: [
+								{ name: dmgName, browser_download_url: dmgUrl },
+								{ name: `${dmgName}.sha256`, browser_download_url: checksumUrl },
+							],
+						}),
+					);
+				if (url === dmgUrl) return new Response(dmg);
+				return new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${dmgName}\n`);
+			},
+		});
+		expect(repaired.status).toBe("installed");
+		expect(
+			await fs.stat(path.join(homeDir, "Applications", "Gajae Code App.app", "Contents", "MacOS", "GajaeCode")),
+		).toBeTruthy();
+		await fs.rm(path.join(homeDir, "Applications", "Gajae Code App.app"), { recursive: true, force: true });
+		signingTeam = "WRONGTEAM1";
+		const wrongSigner = await offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			homeDir,
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			command,
+			cleanupCommand: command,
+			fetchImpl: async url => {
+				if (url.includes("/releases/latest"))
+					return new Response(
+						JSON.stringify({
+							tag_name: "v1.0.0",
+							assets: [
+								{ name: dmgName, browser_download_url: dmgUrl },
+								{ name: `${dmgName}.sha256`, browser_download_url: checksumUrl },
+							],
+						}),
+					);
+				if (url === dmgUrl) return new Response(dmg);
+				return new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${dmgName}\n`);
+			},
+		});
+		expect(wrongSigner.status).toBe("failed");
+		expect(wrongSigner.reason).toContain("unexpected publisher");
+		signingTeam = COMMUNITY_APP_TEAM_ID;
 		failCopy = true;
 		const failedCopy = await offerMacosCommunityApp({
 			platform: "darwin",

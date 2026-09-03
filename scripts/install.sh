@@ -705,9 +705,9 @@ install_binary() {
             if chmod 500 "$OFFER_RUNTIME" 2>/dev/null && chmod 500 "$OFFER_RUNTIME_DIR" 2>/dev/null && [ -f "$OFFER_RUNTIME" ] && verify_checksum "$BINARY" "$OFFER_RUNTIME" optional; then
                 if "$OFFER_RUNTIME" --supports-macos-community-app </dev/null >/dev/null 2>&1; then
                     if [ -t 1 ] && [ -r /dev/tty ]; then
-                        "$OFFER_RUNTIME" macos-community-app-offer < /dev/tty &
+                        "$OFFER_RUNTIME" --internal-macos-community-app-offer < /dev/tty &
                     else
-                        "$OFFER_RUNTIME" macos-community-app-offer &
+                        "$OFFER_RUNTIME" --internal-macos-community-app-offer &
                     fi
                     OFFER_RUNTIME_PID=$!
                     if [ -n "$OFFER_RUNTIME_SIGNAL" ]; then

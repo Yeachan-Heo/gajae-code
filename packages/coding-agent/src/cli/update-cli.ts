@@ -30,7 +30,6 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
-import { offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -1264,7 +1263,9 @@ export interface UpdateCommandDependencies {
 	restartDaemon?: (settings: Settings) => Promise<void>;
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
-	offerCommunityApp?: () => Promise<void>;
+	offerCommunityApp?: (runtimePath: string) => Promise<void>;
+	spawnCommunityApp?: (argv: string[]) => Promise<number>;
+	supportsCommunityApp?: (runtimePath: string) => Promise<boolean>;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
@@ -1327,6 +1328,38 @@ async function recoverManagedNotifications(settings: Settings): Promise<void> {
 async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
 	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
 	return await child.exited;
+}
+
+async function spawnCommunityAppOffer(argv: string[]): Promise<number> {
+	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+	return await child.exited;
+}
+
+async function supportsCommunityAppOffer(runtimePath: string): Promise<boolean> {
+	const child = Bun.spawn([runtimePath, "--supports-macos-community-app"], {
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+	return exitCode === 0 && stdout.trim() === "macos-community-app-offer";
+}
+
+async function runCommunityAppOfferFromRuntime(
+	runtimePath: string,
+	deps: Pick<UpdateCommandDependencies, "offerCommunityApp" | "spawnCommunityApp" | "supportsCommunityApp">,
+): Promise<void> {
+	if (deps.offerCommunityApp) {
+		await deps.offerCommunityApp(runtimePath);
+		return;
+	}
+	const supports = await (deps.supportsCommunityApp ?? supportsCommunityAppOffer)(runtimePath);
+	if (!supports) return;
+	const exitCode = await (deps.spawnCommunityApp ?? spawnCommunityAppOffer)([
+		runtimePath,
+		"--internal-macos-community-app-offer",
+	]);
+	if (exitCode !== 0) throw new Error(`the verified runtime community app offer exited ${exitCode}`);
 }
 
 async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {
@@ -1583,7 +1616,7 @@ export async function runUpdateCommand(
 		if (migrationVerified) {
 			if ((deps.platform ?? process.platform) === "darwin") {
 				try {
-					await (deps.offerCommunityApp ?? (() => offerMacosCommunityApp()))();
+					await runCommunityAppOfferFromRuntime(target.path, deps);
 				} catch (error) {
 					logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
 				}
@@ -1616,12 +1649,14 @@ export async function runUpdateCommand(
 	}
 
 	let installedVersion: string | undefined;
+	let installedRuntimePath: string | undefined;
 	record("update_install_started", { channel, installMethod: target.method });
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
 		if (verification?.path) {
 			installedVersion = release.version;
+			installedRuntimePath = verification.path;
 			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
 		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
@@ -1636,9 +1671,9 @@ export async function runUpdateCommand(
 	// The installed runtime completes recovery before this old updater process
 	// refreshes opt-in local definitions, avoiding stale-module daemon control.
 	await refreshDefaults();
-	if (installedVersion && (deps.platform ?? process.platform) === "darwin") {
+	if (installedVersion && installedRuntimePath && (deps.platform ?? process.platform) === "darwin") {
 		try {
-			await (deps.offerCommunityApp ?? (() => offerMacosCommunityApp()))();
+			await runCommunityAppOfferFromRuntime(installedRuntimePath, deps);
 		} catch (error) {
 			logger.warn(`Warning: optional macOS community app offer failed: ${error}`);
 		}
