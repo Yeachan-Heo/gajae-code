@@ -1922,7 +1922,7 @@ export class AcpAgent implements Agent {
 			// return the semantically meaningful `cancelled` stop reason, so that Clients
 			// can reliably confirm the cancellation." Surfacing the transport's `busy`
 			// rejection instead would show the user a spurious error for their own cancel.
-			if (record.cancelRequested) {
+			if (record.cancelRequested && waiter.cancelAcknowledged) {
 				record.cancelRequested = false;
 				// The client's turn is settled by the return; the advisory idle publication
 				// must not gate it and must still be attempted so the running phase is
@@ -2058,7 +2058,8 @@ export class AcpAgent implements Agent {
 
 	async #settleCancelledPrompt(id: string, record: SessionRecord, waiter: PromptWaiter): Promise<void> {
 		// The authoritative terminal wins whenever it arrives in time; this only runs
-		// when nothing settled the prompt the client already asked to cancel.
+		// when nothing settled the prompt after the SDK acknowledged the cancellation.
+		if (!waiter.cancelAcknowledged) return;
 		if (this.#sessions.get(id) !== record || record.activePrompt !== waiter || waiter.settled) return;
 		if (waiter.terminalReserved) return;
 		record.activePrompt = undefined;
@@ -2896,6 +2897,14 @@ export class AcpAgent implements Agent {
 			if (reconnected) {
 				const waiter = record.activePrompt;
 				if (waiter && !waiter.settled && !waiter.terminal) {
+					// A successful abort acknowledgement is authoritative for this prompt even
+					// when the SDK transport changes identity during the cancellation grace.
+					// Treating the reconnect as owner loss would replace the acknowledged
+					// cancellation with connection_closed and leave cancellation nondeterministic.
+					if (record.cancelRequested && waiter.cancelAcknowledged) {
+						await this.#settleCancelledPrompt(id, record, waiter);
+						return;
+					}
 					record.activePrompt = undefined;
 					record.busy = record.backgroundBusy;
 					clearPromptWatchdog(waiter);
