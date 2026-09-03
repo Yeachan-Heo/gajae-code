@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { getSkillManifest } from "../../src/gjc-runtime/workflow-manifest";
+import { getSkillManifest, typedArgsFor } from "../../src/gjc-runtime/workflow-manifest";
 
 describe("workflow manifest phase sets", () => {
 	it("preserves the resolved phase memberships for every workflow skill", () => {
@@ -58,11 +58,25 @@ describe("workflow manifest phase sets", () => {
 		expect(verbNames).toContain("crystallize");
 		expect(verbNames).toContain("approve-execution");
 		for (const argument of ["input", "session-id", "slug", "json"]) {
-			expect(manifest.typedArgs.find(item => item.name === argument)?.appliesToVerbs).toContain("crystallize");
+			expect(
+				typedArgsFor("deep-interview", "crystallize").find(item => item.name === argument)?.appliesToVerbs,
+			).toContain("crystallize");
 		}
 		for (const argument of ["mode", "session-id", "json"]) {
 			expect(manifest.typedArgs.find(item => item.name === argument)?.appliesToVerbs).toContain("approve-execution");
 		}
+		const seen = new Set<string>();
+		for (const argument of manifest.typedArgs) {
+			for (const verb of new Set(manifest.verbs.map(item => item.name))) {
+				if (argument.appliesToVerbs !== undefined && !argument.appliesToVerbs.includes(verb)) continue;
+				const key = `${verb}:${argument.name}`;
+				expect(seen.has(key)).toBe(false);
+				seen.add(key);
+			}
+		}
+		const crystallizeInput = typedArgsFor("deep-interview", "crystallize").filter(item => item.name === "input");
+		expect(crystallizeInput).toHaveLength(1);
+		expect(crystallizeInput[0]?.required).toBe(true);
 	});
 
 	it("routes new ralplan runs through intent while retaining the legacy in-flight review edge", () => {
