@@ -5,9 +5,13 @@
 - Primary model binding now rejects GPT-5.6 Sol when the selected openai-codex OAuth account is known to be below the Pro tier, preventing a raw entitlement failure on the first turn and preserving the prior model on a failed selection.
 
 - Fixed the steer-triggered bash fold being skipped under `toolInterruptPolicy: finish_tools`: a composer steer over a long foreground `bash` was aborted instead of folded because the fold gate wrongly treated the policy as an exclusion. `finish_tools` governs sibling tools in the batch, not the fold; the fold kills nothing and now applies under both policies. A tmux dogfood driver (`scripts/dogfood/steer-fold-tmux.sh`) proves the real binary folds, answers the steer in the same turn, and wakes on completion.
+- Added the `command` status-line segment for user-produced HUD content. It runs
+  configured shell commands in the background with cached refreshes, bounded
+  timeout/output, ANSI sanitization, placeholder degradation, and custom-editor
+  configuration while preserving synchronous TUI rendering.
+
 
 ## [0.16.1] - 2026-09-03
-
 - Broker-launched SDK sessions now activate an already-cached default model profile before refreshing provider catalogs in the background, preventing redundant online discovery from consuming the fixed semantic-readiness window while preserving strict refresh fallback when cached profile resolution fails.
 - Native Windows external editors now launch executable commands directly instead of through `cmd.exe` and reassert runtime raw input for ConPTY-backed terminals, preventing the shell or cooked-mode handoff from swallowing the first editor keystroke; `.cmd` and `.bat` editor commands retain shell execution.
 - Slack Socket Mode now accepts real `event_callback` payloads, routes ordinary active-thread text as new user turns when no ask is pending, keeps idle notifications non-replyable, deduplicates distinct messages without treating shared `event_context` metadata as event identity, and scopes deterministic root message IDs to the configured workspace and channel.

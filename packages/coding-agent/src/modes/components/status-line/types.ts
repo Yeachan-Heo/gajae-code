@@ -64,6 +64,11 @@ export interface SegmentContext {
 			resetUnit?: "m" | "h";
 		}>;
 	} | null;
+	command?: {
+		output: string | null;
+		failed: boolean;
+		pending: boolean;
+	};
 }
 
 export interface RenderedSegment {

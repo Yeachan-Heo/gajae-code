@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 
 import { type Component, truncateToWidth, visibleWidth } from "@gajae-code/tui";
-import { formatCount, getProjectDir } from "@gajae-code/utils";
+import { formatCount, getProjectDir, logger } from "@gajae-code/utils";
 import {
 	type AppKeybinding,
 	KEYBINDINGS,
@@ -19,6 +19,11 @@ import type { ActionRegistry, FocusDomain } from "../action-registry";
 import { EMPTY_JOBS_SNAPSHOT, type JobsSnapshot } from "../jobs-observer";
 import { sanitizeStatusText } from "../shared";
 import { renderSkillHudBar } from "./skill-hud/render";
+import {
+	normalizeStatusLineCommandOptions,
+	runStatusLineCommand,
+	type StatusLineCommandOptions,
+} from "./status-line/command";
 import { lookupCurrentPrCached } from "./status-line/gh";
 import {
 	canReuseCachedPr,
@@ -40,6 +45,7 @@ export interface StatusLineSegmentOptions {
 	git?: { showBranch?: boolean; showStaged?: boolean; showUnstaged?: boolean; showUntracked?: boolean };
 	time?: { format?: "12h" | "24h"; showSeconds?: boolean };
 	usage?: { mode?: "used" | "remaining" };
+	command?: StatusLineCommandOptions;
 }
 
 export interface StatusLineSettings {
@@ -62,6 +68,7 @@ export interface StatusLineComponentOptions {
 	getKeybindings?: () => KeybindingsManager;
 	focusDomain?: FocusDomain;
 	keyDisplayContext?: KeyDisplayContext;
+	onUpdate?: () => void;
 }
 
 export interface StatusLineActionHint {
@@ -155,6 +162,8 @@ export class StatusLineComponent implements Component {
 	#branchInFlight = false;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
+	#onUpdate: (() => void) | null = null;
+	#disposed = false;
 	#autoCompactEnabled: boolean = true;
 	#hookStatuses: Map<string, string> = new Map();
 	#subagentCount: number = 0;
@@ -198,6 +207,15 @@ export class StatusLineComponent implements Component {
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
 
+	// Configured command segment cache. Command execution is always backgrounded;
+	// rendering only reads these bounded, last-known values.
+	#commandConfigKey: string | undefined;
+	#commandOutput: string | null = null;
+	#commandFailed = false;
+	#commandFetchedAt = 0;
+	#commandInFlightKey: string | undefined;
+	#commandDiagnosticKey: string | undefined;
+
 	constructor(
 		private readonly session: AgentSession,
 		options: StatusLineComponentOptions = {},
@@ -218,6 +236,7 @@ export class StatusLineComponent implements Component {
 		this.#getKeybindings = options.getKeybindings;
 		this.#focusDomain = options.focusDomain ?? "composer";
 		this.#keyDisplayContext = options.keyDisplayContext;
+		this.#onUpdate = options.onUpdate ?? null;
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
@@ -300,10 +319,101 @@ export class StatusLineComponent implements Component {
 	}
 
 	dispose(): void {
+		this.#disposed = true;
+		this.#onBranchChange = null;
+		this.#onUpdate = null;
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
 		}
+	}
+
+	#notifyUpdate(): void {
+		if (this.#onUpdate) this.#onUpdate();
+		else this.#onBranchChange?.();
+	}
+
+	#logCommandDiagnostic(key: string, message: string, details: Record<string, unknown> = {}): void {
+		if (this.#commandDiagnosticKey === key) return;
+		this.#commandDiagnosticKey = key;
+		logger.warn(message, details);
+	}
+
+	#refreshCommandInBackground(options: StatusLineCommandOptions | undefined): string {
+		const resolved = normalizeStatusLineCommandOptions(options);
+		const key = JSON.stringify(resolved);
+		if (this.#commandConfigKey !== key) {
+			this.#commandConfigKey = key;
+			this.#commandOutput = null;
+			this.#commandFailed = false;
+			this.#commandFetchedAt = 0;
+			this.#commandDiagnosticKey = undefined;
+			this.#renderedRowsCache = undefined;
+		}
+
+		if (!resolved.command) {
+			this.#commandFailed = true;
+			this.#logCommandDiagnostic(key, "Status line command segment is configured without a command");
+			return key;
+		}
+
+		const now = Date.now();
+		if (this.#commandInFlightKey === key || now - this.#commandFetchedAt < resolved.refreshMs) return key;
+
+		this.#commandInFlightKey = key;
+		let shellConfig: { shell: string; args: string[]; env: Record<string, string> };
+		try {
+			shellConfig = this.session.settings.getShellConfig();
+		} catch (error) {
+			this.#commandInFlightKey = undefined;
+			this.#commandFailed = true;
+			this.#commandFetchedAt = Date.now();
+			this.#logCommandDiagnostic(key, "Status line command shell configuration failed", {
+				error: sanitizeStatusText(error instanceof Error ? error.message : String(error)).slice(0, 256),
+			});
+			return key;
+		}
+
+		void runStatusLineCommand(resolved.command, {
+			cwd: getProjectDir(),
+			shell: shellConfig.shell,
+			shellArgs: shellConfig.args,
+			env: shellConfig.env,
+			timeoutMs: resolved.timeoutMs,
+		})
+			.then(result => {
+				if (this.#disposed || this.#commandConfigKey !== key) return;
+				this.#commandFetchedAt = Date.now();
+				if (result.timedOut || result.exitCode !== 0) {
+					this.#commandFailed = true;
+					this.#logCommandDiagnostic(key, "Status line command failed", {
+						exitCode: result.exitCode,
+						timedOut: result.timedOut,
+						stderr: result.stderr,
+						outputTruncated: result.outputTruncated,
+					});
+				} else {
+					this.#commandOutput = result.stdout;
+					this.#commandFailed = false;
+					this.#commandDiagnosticKey = undefined;
+				}
+				this.#renderedRowsCache = undefined;
+				this.#notifyUpdate();
+			})
+			.catch(error => {
+				if (this.#disposed || this.#commandConfigKey !== key) return;
+				this.#commandFetchedAt = Date.now();
+				this.#commandFailed = true;
+				this.#logCommandDiagnostic(key, "Status line command could not start", {
+					error: sanitizeStatusText(error instanceof Error ? error.message : String(error)).slice(0, 256),
+				});
+				this.#renderedRowsCache = undefined;
+				this.#notifyUpdate();
+			})
+			.finally(() => {
+				if (this.#commandInFlightKey === key) this.#commandInFlightKey = undefined;
+			});
+		return key;
 	}
 
 	invalidate(): void {
@@ -633,6 +743,10 @@ export class StatusLineComponent implements Component {
 		// treats a null value as hidden, so gating here is behavior-identical.
 		const prSegmentActive =
 			effectiveSettings.leftSegments.includes("pr") || effectiveSettings.rightSegments.includes("pr");
+		const commandSegmentActive =
+			effectiveSettings.leftSegments.includes("command") || effectiveSettings.rightSegments.includes("command");
+		const commandOptions = normalizeStatusLineCommandOptions(effectiveSettings.segmentOptions.command);
+		const commandKey = commandSegmentActive ? this.#refreshCommandInBackground(commandOptions) : undefined;
 
 		return {
 			session: this.session,
@@ -654,6 +768,13 @@ export class StatusLineComponent implements Component {
 				pr: prSegmentActive ? this.#lookupPr() : null,
 			},
 			usage: this.#cachedUsage,
+			command: commandKey
+				? {
+						output: this.#commandOutput,
+						failed: this.#commandFailed,
+						pending: this.#commandInFlightKey === commandKey,
+					}
+				: undefined,
 		};
 	}
 
