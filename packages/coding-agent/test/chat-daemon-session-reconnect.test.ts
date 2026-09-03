@@ -927,7 +927,7 @@ test("a live frame delivered before the resume replay answers is published in se
 
 test("a replayed frame at or below the cursor is dropped instead of published a second time", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withSerializedFakeTransport(async () => {
+		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -944,7 +944,7 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 
 			reconcile();
 			host.accept(await awaitSocket(2));
-			await awaitPosts(provider, 2);
+			await awaitPosts(provider, 2, clock);
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 		});
@@ -1447,7 +1447,7 @@ test("a conceded gap carries the cursor over the loss even when the retained suf
 }, 20_000);
 test("a conceded gap publishes the sequences live delivery already carried instead of dropping them", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withSerializedFakeTransport(async () => {
+		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost(2);
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1469,7 +1469,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			reconcile();
 			const replacement = await awaitSocket(2);
 			host.accept(replacement);
-			await awaitReplayRequests(host, 2);
+			await awaitReplayRequests(host, 2, clock);
 
 			// All three ride the replacement socket ahead of the answer, and all three are
 			// still queued behind the stalled publish when it arrives, so the gap the answer
@@ -1508,8 +1508,8 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			host.stallReplay = false;
 			reconcile();
 			host.accept(await awaitSocket(3));
-			await awaitReplayRequests(host, 3);
-			await awaitPosts(provider, 3);
+			await awaitReplayRequests(host, 3, clock);
+			await awaitPosts(provider, 3, clock);
 			await Bun.sleep(20);
 
 			// The host evicted the sequence, but live delivery kept it: the two producers
@@ -1526,7 +1526,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 			// The recovered frame did not strand the cursor below the conceded range: the
 			// stream continues on the socket it already has, in sequence, exactly once.
 			host.emit("after gap");
-			await awaitPosts(provider, 4);
+			await awaitPosts(provider, 4, clock);
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual([
 				"GJC notice\none",

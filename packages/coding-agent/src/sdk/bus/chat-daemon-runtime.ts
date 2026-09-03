@@ -471,7 +471,14 @@ export class ChatDaemonRuntime {
 	}
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
+		const revivedTransport = this.#attachments.get(attachment.sessionId) === attachment;
 		this.#attachments.set(attachment.sessionId, attachment);
+		if (revivedTransport) {
+			this.#presentation?.connectSession(attachment.sessionId, {
+				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
+			});
+			return;
+		}
 		const discord = this.#discord;
 		const slack = this.#slack;
 		const barrier = (async () => {

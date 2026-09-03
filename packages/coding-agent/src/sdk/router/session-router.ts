@@ -1899,44 +1899,46 @@ export class SessionRouter {
 	}
 
 	async #reinitializeAttachment(attached: AttachedSession): Promise<void> {
-		const previous = attached.readyTail;
+		// A prior ready tail may be waiting for publication work carried by the dead
+		// socket. Chaining the reconnect behind it prevents the replacement from even
+		// issuing replay. Replacing the hold array fences that old replay tail while
+		// already-enqueued publication keeps its own independent settlement.
+		if (attached.barrier.held) attached.barrier.held = [];
 		const replayToken = {};
 		attached.replayPending = true;
 		attached.replayPendingSince = Date.now();
 		attached.replayPendingToken = replayToken;
-		const current = previous
-			.catch(() => undefined)
-			.then(async () => {
-				if (!this.#attachmentLive(attached)) return;
-				const proven = await this.#readProvenEndpoint(attached.indexed);
-				if (
-					!proven ||
-					proven.endpoint.url !== attached.endpoint.url ||
-					proven.endpoint.token !== attached.endpoint.token ||
-					proven.endpoint.pid !== attached.pid ||
-					!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
-				) {
-					await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
-					return;
-				}
-				attached.initializingPublication = true;
-				try {
-					void Promise.resolve()
-						.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
-						.catch(error => {
-							this.#detachNotification(attached, "cancelled");
-							logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
-						});
-					await this.#deps.onAttachmentReady?.(attached.capability);
-					await this.#deps.onReplayReady?.();
-				} catch {
-					await this.#retireAttachment(attached);
-					return;
-				} finally {
-					attached.initializingPublication = false;
-				}
-				if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
-			});
+		const current = Promise.resolve().then(async () => {
+			if (!this.#attachmentLive(attached)) return;
+			const proven = await this.#readProvenEndpoint(attached.indexed);
+			if (
+				!proven ||
+				proven.endpoint.url !== attached.endpoint.url ||
+				proven.endpoint.token !== attached.endpoint.token ||
+				proven.endpoint.pid !== attached.pid ||
+				!sameEndpointIdentity(attached.endpointIdentity, proven.identity)
+			) {
+				await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
+				return;
+			}
+			attached.initializingPublication = true;
+			try {
+				void Promise.resolve()
+					.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
+					.catch(error => {
+						this.#detachNotification(attached, "cancelled");
+						logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
+					});
+				await this.#deps.onAttachmentReady?.(attached.capability);
+				await this.#deps.onReplayReady?.();
+			} catch {
+				await this.#retireAttachment(attached);
+				return;
+			} finally {
+				attached.initializingPublication = false;
+			}
+			if (this.#attachmentLive(attached)) await this.#replayAttachment(attached, attached.cursor.seq);
+		});
 		attached.readyTail = current.finally(() => {
 			if (attached.replayPendingToken === replayToken) {
 				attached.replayPending = false;
@@ -2374,7 +2376,7 @@ export class SessionRouter {
 				this.#failBarrier(attached, "replay response contained a malformed event");
 				return;
 			}
-			let previousSeq = sinceSeq;
+			let previousSeq = -1;
 			for (const event of events) {
 				if (event.type !== "event") {
 					this.#failBarrier(attached, "replay response contained a non-event frame");
