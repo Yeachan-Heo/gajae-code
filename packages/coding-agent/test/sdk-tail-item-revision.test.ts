@@ -28,6 +28,15 @@ test("tail items carry the ring revision so generation:seq is unique across revi
 	expect(
 		toTailItemV1({ kind: "event", revision: -1, generation: 1, seq: 0, payload: {} }, { kind: "event" }).revision,
 	).toBeUndefined();
+	const invalidFallback = toTailItemV1(
+		{ kind: "event", generation: 1, seq: 0, payload: {} },
+		{ kind: "event", revision: -1 },
+	);
+	expect(invalidFallback.revision).toBeUndefined();
+	expect(() => tailItemKey(invalidFallback)).toThrow("authoritative revision");
+	expect(() => tailItemKey({ kind: "event", revision: -1, generation: 1, seq: 0, payload: {} })).toThrow(
+		"authoritative revision",
+	);
 });
 
 test("a positioned live item cannot be keyed before its authoritative checkpoint revision", () => {

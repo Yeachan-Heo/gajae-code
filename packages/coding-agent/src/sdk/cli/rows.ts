@@ -82,9 +82,9 @@ export function tailItemKey(item: SdkTailItemV1): string {
 	// (generation, seq) restarts per revision; without the revision two turns'
 	// first frames share "1:1" and the second is silently dropped (#5200).
 	if (item.generation !== undefined && item.seq !== undefined) {
-		if (item.revision === undefined)
+		if (item.revision === undefined || !Number.isSafeInteger(item.revision) || item.revision < 0)
 			throw new Error("Cannot key a positioned tail item without its authoritative revision.");
-		return `${item.kind}\u0000${item.revision ?? ""}\u0000${item.generation}\u0000${item.seq}`;
+		return `${item.kind}\u0000${item.revision}\u0000${item.generation}\u0000${item.seq}`;
 	}
 	if (item.id !== undefined) return `${item.kind}\u0000${item.id}`;
 	return `${item.kind}\u0000${JSON.stringify(item.payload)}`;
@@ -272,7 +272,13 @@ export function toTailItemV1(
 		...(typeof value.seq === "number" ? { seq: value.seq } : {}),
 		payload: stripSecretFields(payload),
 	};
-	if (fallback.revision !== undefined && item.revision === undefined) item.revision = fallback.revision;
+	if (
+		fallback.revision !== undefined &&
+		Number.isSafeInteger(fallback.revision) &&
+		fallback.revision >= 0 &&
+		item.revision === undefined
+	)
+		item.revision = fallback.revision;
 	if (fallback.generation !== undefined && item.generation === undefined) item.generation = fallback.generation;
 	if (fallback.seq !== undefined && item.seq === undefined) item.seq = fallback.seq;
 	return item;
