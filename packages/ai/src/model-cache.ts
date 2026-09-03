@@ -157,6 +157,48 @@ export function writeModelCache<TApi extends Api>(
 	}
 }
 
+export function writeModelCacheIfNotNewer<TApi extends Api>(
+	providerId: string,
+	requestStartedAt: number,
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath?: string,
+	dynamicModelIds?: readonly string[],
+	dynamicModelProvenance?: string,
+): boolean {
+	try {
+		const result = getDb(dbPath).run(
+			`INSERT INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(provider_id) DO UPDATE SET
+				 version = excluded.version,
+				 updated_at = excluded.updated_at,
+				 authoritative = excluded.authoritative,
+				 static_fingerprint = excluded.static_fingerprint,
+				 dynamic_model_ids = excluded.dynamic_model_ids,
+				 dynamic_model_provenance = excluded.dynamic_model_provenance,
+				 models = excluded.models
+			 WHERE model_cache.updated_at <= ?`,
+			[
+				providerId,
+				CACHE_SCHEMA_VERSION,
+				updatedAt,
+				authoritative ? 1 : 0,
+				staticFingerprint,
+				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
+				dynamicModelProvenance ?? null,
+				JSON.stringify(models),
+				requestStartedAt,
+			],
+		);
+		return result.changes === 1;
+	} catch {
+		return false;
+	}
+}
+
 export function insertModelCacheIfAbsent<TApi extends Api>(
 	providerId: string,
 	updatedAt: number,

@@ -9,6 +9,7 @@ import {
 	readModelCache,
 	updateModelCacheIfUnchanged,
 	writeModelCache,
+	writeModelCacheIfNotNewer,
 } from "../src/model-cache";
 import type { Model } from "../src/types";
 
@@ -246,6 +247,49 @@ describe("model cache migrations", () => {
 			dynamicModelIds: ["writer"],
 			dynamicModelProvenance: "provenance-w",
 			models: [expect.objectContaining({ id: "writer" })],
+		});
+	});
+
+	it("keeps a newer publication authoritative over a late older discovery", () => {
+		const olderAt = 1_700_000_000_000;
+		const discoveryStartedAt = olderAt + 1;
+		const newerAt = olderAt + 2;
+		const olderModels = [createModel("older", "Older")];
+		const newerModels = [createModel("newer", "Newer")];
+
+		writeModelCache("ollama-cloud", olderAt, olderModels, true, "static", dbPath, ["older"], "provenance");
+		expect(
+			writeModelCacheIfNotNewer(
+				"ollama-cloud",
+				discoveryStartedAt,
+				newerAt,
+				newerModels,
+				true,
+				"static",
+				dbPath,
+				["newer"],
+				"provenance",
+			),
+		).toBe(true);
+
+		expect(
+			writeModelCacheIfNotNewer(
+				"ollama-cloud",
+				discoveryStartedAt,
+				newerAt + 1,
+				olderModels,
+				true,
+				"static",
+				dbPath,
+				["older"],
+				"provenance",
+			),
+		).toBe(false);
+		expect(readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => newerAt, dbPath)).toMatchObject({
+			authoritative: true,
+			updatedAt: newerAt,
+			dynamicModelIds: ["newer"],
+			models: [expect.objectContaining({ id: "newer" })],
 		});
 	});
 
