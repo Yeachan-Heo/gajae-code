@@ -430,9 +430,23 @@ function stackFramesOnly(fatal: FatalDiagnostic): string {
 	)
 		return fatal.stack.slice(header.length).replace(/^\r?\n/, "");
 	const firstBreak = fatal.stack.indexOf("\n");
+	const firstLine = firstBreak === -1 ? fatal.stack : fatal.stack.slice(0, firstBreak);
+	if (/^\s*at\s+/.test(firstLine)) return fatal.stack;
+	const codedHeaderEnd = firstLine.indexOf("]: ");
+	const codedHeader =
+		firstLine.startsWith(`${fatal.name} [`) && codedHeaderEnd > fatal.name.length + 2
+			? firstLine.slice(0, codedHeaderEnd + 3)
+			: "";
+	if (
+		codedHeader &&
+		fatal.stack.startsWith(`${codedHeader}${fatal.message}`) &&
+		(fatal.stack.length === codedHeader.length + fatal.message.length ||
+			fatal.stack[codedHeader.length + fatal.message.length] === "\n" ||
+			fatal.stack[codedHeader.length + fatal.message.length] === "\r")
+	)
+		return fatal.stack.slice(codedHeader.length + fatal.message.length).replace(/^\r?\n/, "");
 	if (firstBreak === -1) return "";
-	const firstLine = fatal.stack.slice(0, firstBreak);
-	return firstLine === fatal.name || firstLine.startsWith(`${fatal.name}: `)
+	return firstLine === fatal.name || firstLine.startsWith(`${fatal.name}: `) || codedHeader
 		? fatal.stack.slice(firstBreak + 1)
 		: fatal.stack;
 }
