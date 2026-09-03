@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
 import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../../src/modes/acp/acp-agent";
+import { AcpSdkAdapter } from "../../src/sdk/acp/adapter";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import {
 	type ExactSessionAuthorityFixture,
@@ -520,6 +521,35 @@ test("a reconnect before a failed abort does not leave the prompt cancelled", as
 		expect("resolved" in promptOutcome ? promptOutcome.resolved.stopReason : undefined).not.toBe("cancelled");
 	} finally {
 		abortGate.resolve();
+		fixture.dispose();
+	}
+});
+
+test("a failed abort during provider preflight leaves the prompt recoverable", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: { turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	const providerPreflight = Promise.withResolvers<void>();
+	const releaseProviderPreflight = Promise.withResolvers<void>();
+	const ensureProviders = vi.spyOn(AcpSdkAdapter.prototype, "ensureProviders").mockImplementation(async () => {
+		providerPreflight.resolve();
+		await releaseProviderPreflight.promise;
+	});
+	try {
+		const pending = prompt(fixture, "abort during provider preflight");
+		await bounded(providerPreflight.promise, "provider preflight");
+		await expect(fixture.agent.cancel({ sessionId: fixture.sessionId })).rejects.toMatchObject({
+			code: "abort_unacknowledged",
+		});
+		releaseProviderPreflight.resolve();
+		await bounded(fixture.promptDelivered, "prompt delivery after failed preflight abort");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt recovery after failed preflight abort")).toEqual({
+			stopReason: "end_turn",
+		});
+	} finally {
+		releaseProviderPreflight.resolve();
+		ensureProviders.mockRestore();
 		fixture.dispose();
 	}
 });

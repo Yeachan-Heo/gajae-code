@@ -1699,9 +1699,13 @@ export class AcpAgent implements Agent {
 		try {
 			await record.adapter.ensureProviders();
 		} catch (error) {
-			if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (waiter.settled || record.activePrompt !== waiter) {
 				this.#retiredPromptAcknowledgements.delete(params.sessionId);
-				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				return await response;
+			}
+			if (record.cancelRequested && waiter.cancelAcknowledged) {
+				this.#retiredPromptAcknowledgements.delete(params.sessionId);
+				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				return await response;
 			}
 			if (record.activePrompt === waiter) {
@@ -1712,9 +1716,13 @@ export class AcpAgent implements Agent {
 			}
 			throw error;
 		}
-		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+		if (waiter.settled || record.activePrompt !== waiter) {
 			this.#retiredPromptAcknowledgements.delete(params.sessionId);
-			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+		if (record.cancelRequested && waiter.cancelAcknowledged) {
+			this.#retiredPromptAcknowledgements.delete(params.sessionId);
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
 		}
 
@@ -1739,8 +1747,11 @@ export class AcpAgent implements Agent {
 			);
 		}
 		waiter.dispatched = true;
-		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
-			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+		if (waiter.settled || record.activePrompt !== waiter) {
+			return await response;
+		}
+		if (record.cancelRequested && waiter.cancelAcknowledged) {
+			await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
 		}
 
@@ -2006,11 +2017,6 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			if (waiter && !waiter.dispatched) {
-				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
-				waiter.cancelAttemptResolve?.(true);
-				return;
-			}
 			if (!waiter) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
