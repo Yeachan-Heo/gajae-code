@@ -4,7 +4,7 @@
  * Primary provider for GJC native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { logger, normalizePathForComparison, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
@@ -29,6 +29,7 @@ import {
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
 	getExtensionNameFromPath,
+	getUserSkillScanDirs,
 	loadFilesFromDir,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
@@ -40,10 +41,6 @@ const DESCRIPTION = "Native GJC configuration from ~/.gjc and .gjc/";
 const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
-
-function getUserAgentDirs(): string[] {
-	return [PATHS.userAgent];
-}
 
 /**
  * GJC's user-scope config directory.
@@ -92,16 +89,26 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	return result;
 }
 
-function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: string; depth: number }> {
+function getAncestorDirs(
+	cwd: string,
+	stopAt?: string | null,
+	excludeDir?: string,
+): Array<{ dir: string; depth: number }> {
 	const ancestors: Array<{ dir: string; depth: number }> = [];
-	let current = cwd;
+	let current = path.resolve(cwd);
 	let depth = 0;
+	let normalizedCurrent = normalizePathForComparison(current);
+	const resolvedStop = stopAt ? path.resolve(stopAt) : undefined;
+	const normalizedStop = resolvedStop ? normalizePathForComparison(resolvedStop) : undefined;
+	const resolvedExclude = excludeDir ? path.resolve(excludeDir) : undefined;
+	const normalizedExclude = resolvedExclude ? normalizePathForComparison(resolvedExclude) : undefined;
 	while (true) {
-		ancestors.push({ dir: current, depth });
-		if (stopAt && current === stopAt) break;
+		if (normalizedCurrent !== normalizedExclude) ancestors.push({ dir: current, depth });
+		if (normalizedStop && normalizedCurrent === normalizedStop) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
+		normalizedCurrent = normalizePathForComparison(current);
 		depth++;
 	}
 	return ancestors;
@@ -110,8 +117,9 @@ function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: stri
 async function findNearestProjectConfigDir(
 	cwd: string,
 	repoRoot?: string | null,
+	home?: string,
 ): Promise<{ dir: string; depth: number } | null> {
-	for (const ancestor of getAncestorDirs(cwd, repoRoot)) {
+	for (const ancestor of getAncestorDirs(cwd, repoRoot ?? home, repoRoot ? undefined : home)) {
 		for (const projectConfigDir of getProjectConfigDirs()) {
 			const configDir = await ifNonEmptyDir(ancestor.dir, projectConfigDir);
 			if (configDir) return { dir: configDir, depth: ancestor.depth };
@@ -280,20 +288,21 @@ registerProvider<MCPServer>(mcpCapability.id, {
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
 
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userPath = path.join(ctx.home, userAgentDir, "SYSTEM.md");
-		const userContent = await readFile(userPath);
-		if (userContent) {
-			items.push({
-				path: userPath,
-				content: userContent,
-				level: "user",
-				_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
-			});
-		}
+	// User scope is the agent directory — the directory `gjc config path` prints
+	// and the only user-scope seam. A profile is a separate scope; the default
+	// profile's home-relative SYSTEM.md is not read under one.
+	const userPath = path.join(resolveUserAgentDir(ctx), "SYSTEM.md");
+	const userContent = await readFile(userPath);
+	if (userContent) {
+		items.push({
+			path: userPath,
+			content: userContent,
+			level: "user",
+			_source: createSourceMeta(PROVIDER_ID, userPath, "user"),
+		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot, ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
 		const projectContent = await readFile(projectPath);
@@ -321,9 +330,7 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 	// Walk up from cwd finding .gjc/skills/ in ancestors (closest first)
-	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home).filter(
-		({ dir }) => path.resolve(dir) !== path.resolve(ctx.home),
-	);
+	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home, ctx.repoRoot ? undefined : ctx.home);
 	const projectScans = ancestors.flatMap(({ dir }) =>
 		getProjectConfigDirs().map(projectConfigDir =>
 			scanSkillsFromDir(ctx, {
@@ -335,15 +342,9 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		),
 	);
 
-	// User-level scan from the active agent-directory profile.
-	const userSkillDirs = [
-		...new Set([
-			path.join(resolveUserAgentDir(ctx), "skills"),
-			path.join(ctx.home, PATHS.userBase, "skills"),
-			path.join(ctx.home, ".gjc", "skills"),
-		]),
-	];
-	const userScans = userSkillDirs.map(dir =>
+	// User-level scan from the selected agent-directory profile plus documented
+	// default-profile legacy scan roots.
+	const userScans = getUserSkillScanDirs(ctx.home, resolveUserAgentDir(ctx), ctx.profileAuthority).map(dir =>
 		scanSkillsFromDir(ctx, {
 			dir,
 			providerId: PROVIDER_ID,
@@ -404,33 +405,41 @@ registerProvider<SlashCommand>(slashCommandCapability.id, {
 async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const items: Rule[] = [];
 	const warnings: string[] = [];
+	const configDirs = await getConfigDirs(ctx);
+	const projectConfigDirs = configDirs.filter(({ level }) => level === "project");
+	const userConfigDirs = configDirs.filter(({ level }) => level === "user");
 
-	for (const { dir, level } of await getConfigDirs(ctx)) {
-		const rulesDir = path.join(dir, "rules");
-		const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
-			extensions: ["md", "mdc"],
-			transform: (name, content, path, source) =>
-				buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
-		});
-		items.push(...result.items);
-		if (result.warnings) warnings.push(...result.warnings);
-	}
+	const loadRulesFromDirs = async (dirs: Array<{ dir: string; level: "user" | "project" }>) => {
+		for (const { dir, level } of dirs) {
+			const rulesDir = path.join(dir, "rules");
+			const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
+				extensions: ["md", "mdc"],
+				transform: (name, content, path, source) =>
+					buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
+			});
+			items.push(...result.items);
+			if (result.warnings) warnings.push(...result.warnings);
+		}
+	};
 
 	// Top-level RULES.md is a sticky always-apply rule. The context-file
 	// discovery contract treats it as the file "re-injected near the current
 	// turn so they keep hold across long conversations".
-	// User scope:    ~/.gjc/agent/RULES.md
+	// User scope:    <agentDir>/RULES.md (a profile is a separate user scope;
+	//                the default profile's home-relative copy is not read)
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
-	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
-	const userRule = await loadStickyRulesFile(userRulesFile, "user");
-	if (userRule) items.push(userRule);
-
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot, ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
 		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
 		if (projectRule) items.push(projectRule);
 	}
+	await loadRulesFromDirs(projectConfigDirs);
+
+	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
+	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	if (userRule) items.push(userRule);
+	await loadRulesFromDirs(userConfigDirs);
 
 	return { items, warnings };
 }
@@ -938,7 +947,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = path.join(ctx.home, PATHS.userAgent, "AGENTS.md");
+	const userPath = path.join(resolveUserAgentDir(ctx), "AGENTS.md");
 	const userContent = await readFile(userPath);
 	if (userContent) {
 		items.push({
@@ -949,7 +958,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot, ctx.home);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
 		const projectContent = await readFile(projectPath);

@@ -438,9 +438,11 @@ class DirResolver {
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
 	#rootDirs: Record<XdgCategory, string>;
+	#defaultRootDirs: Record<XdgCategory, string>;
 	#agentDirs: Record<XdgCategory, string>;
 
 	readonly #rootCache = new Map<string, string>();
+	readonly #defaultRootCache = new Map<string, string>();
 	readonly #agentCache = new Map<string, string>();
 
 	constructor(agentDirOverride?: string, snapshot = projectEnvSnapshot()) {
@@ -463,7 +465,7 @@ class DirResolver {
 		// the parent reading `$XDG_STATE_HOME/gjc/python-gateway` while the child
 		// read `<agentDir>/python-gateway`. Splitting a live store in half is worse
 		// than the narrower complaint it was meant to answer.
-		const isDefault = this.agentDir === defaultAgent;
+		const isDefault = normalizePathForComparison(this.agentDir) === normalizePathForComparison(defaultAgent);
 		// That decision is then *sticky*. Recomputing it later from path shape is
 		// what let a pinned agent directory silently change storage lane when a home
 		// refresh made it coincide with the new default: `getAgentDir()` looked
@@ -471,8 +473,13 @@ class DirResolver {
 		this.#xdgEligible = isDefault;
 
 		this.#rootDirs = { data: this.configRoot, state: this.configRoot, cache: this.configRoot };
+		this.#defaultRootDirs = { data: this.configRoot, state: this.configRoot, cache: this.configRoot };
 		this.#agentDirs = { data: this.agentDir, state: this.agentDir, cache: this.agentDir };
 		this.refreshCategoryDirs(snapshot, isDefault);
+	}
+
+	get profileAuthority(): "default" | "custom" {
+		return this.#xdgEligible ? "default" : "custom";
 	}
 
 	/**
@@ -491,7 +498,7 @@ class DirResolver {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
 		let xdgCache: string | undefined;
-		if ((process.platform === "linux" || process.platform === "darwin") && isDefault) {
+		if (process.platform === "linux" || process.platform === "darwin") {
 			const resolveIf = (envVar: string) => {
 				const value = trustedValue(envVar, snapshot);
 				if (!value) return undefined;
@@ -506,15 +513,20 @@ class DirResolver {
 			xdgState = resolveIf("XDG_STATE_HOME");
 			xdgCache = resolveIf("XDG_CACHE_HOME");
 		}
-		this.#rootDirs = {
+		this.#defaultRootDirs = {
 			data: xdgData ?? this.configRoot,
 			state: xdgState ?? this.configRoot,
 			cache: xdgCache ?? this.configRoot,
 		};
+		this.#rootDirs = {
+			data: isDefault ? (xdgData ?? this.configRoot) : this.configRoot,
+			state: isDefault ? (xdgState ?? this.configRoot) : this.configRoot,
+			cache: isDefault ? (xdgCache ?? this.configRoot) : this.configRoot,
+		};
 		this.#agentDirs = {
-			data: xdgData ?? this.agentDir,
-			state: xdgState ?? this.agentDir,
-			cache: xdgCache ?? this.agentDir,
+			data: isDefault ? (xdgData ?? this.agentDir) : this.agentDir,
+			state: isDefault ? (xdgState ?? this.agentDir) : this.agentDir,
+			cache: isDefault ? (xdgCache ?? this.agentDir) : this.agentDir,
 		};
 	}
 
@@ -543,6 +555,7 @@ class DirResolver {
 		// its path coincide with (or diverge from) the new default.
 		this.refreshCategoryDirs(this.#projectEnv, this.#xdgEligible);
 		this.#rootCache.clear();
+		this.#defaultRootCache.clear();
 		this.#agentCache.clear();
 	}
 
@@ -568,10 +581,11 @@ class DirResolver {
 	}
 
 	/** Agent subdirectory, with optional XDG override. */
+	/** Agent subdirectory, with optional XDG override. */
 	agentSubdir(userAgentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
 		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
-		if (!userAgentDir || userAgentDir === this.agentDir) {
+		if (!userAgentDir || normalizePathForComparison(userAgentDir) === normalizePathForComparison(this.agentDir)) {
 			const cached = this.#agentCache.get(subdir);
 			if (cached) return cached;
 			const base = xdg ? this.#agentDirs[xdg] : this.agentDir;
@@ -580,6 +594,19 @@ class DirResolver {
 			return result;
 		}
 		return path.join(userAgentDir, subdir);
+	}
+
+	/** Config-root subdirectory for the resolver-owned default profile. */
+	rootSubdirForDefaultProfile(subdir: string, xdg?: XdgCategory): string {
+		this.refreshConfigDirOverride();
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
+		const cacheKey = `${xdg ?? "config"}:${subdir}`;
+		const cached = this.#defaultRootCache.get(cacheKey);
+		if (cached) return cached;
+		const base = xdg ? this.#defaultRootDirs[xdg] : this.configRoot;
+		const result = path.join(base, subdir);
+		this.#defaultRootCache.set(cacheKey, result);
+		return result;
 	}
 
 	get configDirName(): string {
@@ -654,6 +681,11 @@ export function getAgentDir(): string {
 	return dirs.agentDir;
 }
 
+/** Resolver-owned profile classification, stable across HOME refreshes. */
+export function getAgentProfileAuthority(): "default" | "custom" {
+	return dirs.profileAuthority;
+}
+
 export function getConfigDirName(): string {
 	dirs.refreshConfigDirOverride();
 	return dirs.configDirName;
@@ -721,6 +753,11 @@ export function getPluginsDir(home?: string): string {
 		}
 	}
 	return dirs.rootSubdir("plugins", "data");
+}
+
+/** Get the default-profile plugin directory without ambient profile authority. */
+export function getDefaultPluginsDir(): string {
+	return dirs.rootSubdirForDefaultProfile("plugins", "data");
 }
 
 /** Where npm installs packages (~/.gjc/plugins/node_modules). */
@@ -972,9 +1009,9 @@ export function getMCPConfigPath(scope: "user" | "project", cwd: string = getPro
 }
 
 /** Get the SSH config file path. */
-export function getSSHConfigPath(scope: "user" | "project", cwd: string = getProjectDir()): string {
+export function getSSHConfigPath(scope: "user" | "project", cwd: string = getProjectDir(), agentDir?: string): string {
 	if (scope === "user") {
-		return path.join(getAgentDir(), "ssh.json");
+		return path.join(agentDir ?? getAgentDir(), "ssh.json");
 	}
 	return path.join(getProjectAgentDir(cwd), "ssh.json");
 }

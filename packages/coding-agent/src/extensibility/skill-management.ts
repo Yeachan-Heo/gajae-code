@@ -14,13 +14,19 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir, parseFrontmatter } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getTrustedHomeDir,
+	normalizePathForComparison,
+	parseFrontmatter,
+} from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import { compareSkillOrder, getUserSkillScanDirs, resolveUserAgentDir, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 export type SkillScope = "project" | "user";
 export type ConventionSkillHost = "claude" | "codex";
@@ -61,6 +67,7 @@ export interface ConventionSkillImportSource {
 export interface WriteNativeSkillInput {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
 	scope: SkillScope;
 	name: string;
 	content: string;
@@ -131,27 +138,27 @@ export async function getProjectSkillDirs(
 }
 
 /** Canonical user skill directories in precedence order (same resolution as runtime discovery). */
-export function getUserSkillDirs(home: string): string[] {
-	return [
-		...new Set([
-			path.join(home, SOURCE_PATHS.native.userAgent, "skills"),
-			path.join(home, SOURCE_PATHS.native.userBase, "skills"),
-			path.join(home, ".gjc", "skills"),
-		]),
-	];
+export function getUserSkillDirs(home: string, agentDir?: string, profileAuthority?: "default" | "custom"): string[] {
+	return getUserSkillScanDirs(home, agentDir, profileAuthority);
 }
 
 /**
  * The canonical directory a write targets for a scope: the repo root (or `cwd`)
- * `.gjc/skills` for project scope, the canonical `<config>/agent/skills` user
- * root for user scope (honoring `GJC_CONFIG_DIR` / `PI_CONFIG_DIR`).
+ * `.gjc/skills` for project scope, the agent directory's `skills` root for user
+ * scope — the same directory every reader scans first (`gjc config path` prints
+ * it; `--agent-dir` / `GJC_CODING_AGENT_DIR` / `setAgentDir()` move it).
  */
 export async function resolveNativeSkillScopeDir(
 	cwd: string,
 	scope: SkillScope,
-	home = getRuntimeHome(),
+	_home?: string,
+	agentDir?: string,
 ): Promise<string> {
-	if (scope === "user") return path.join(home, SOURCE_PATHS.native.userAgent, "skills");
+	const home = _home ?? getRuntimeHome();
+	if (scope === "user") {
+		const resolvedAgentDir = agentDir ?? (_home === undefined ? getAgentDir() : resolveUserAgentDir(home));
+		return path.join(path.resolve(resolvedAgentDir), "skills");
+	}
 	const repoRoot = await findRepoRoot(cwd);
 	return path.join(repoRoot ?? path.resolve(cwd), ".gjc", "skills");
 }
@@ -174,14 +181,28 @@ function isDisabledByExtension(name: string, disabledExtensions: string[] | unde
 export async function listNativeSkillsForManagement(options: {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
+	/** Resolver-owned profile classification; unlike path comparison, this survives HOME refreshes. */
+	profileAuthority?: "default" | "custom";
 	policy?: SkillManagementPolicy;
 }): Promise<ManagedSkillRecord[]> {
+	const homeWasInjected = options.home !== undefined;
 	const home = options.home ?? getRuntimeHome();
+	const agentDir = options.agentDir ?? (homeWasInjected ? resolveUserAgentDir(home) : getAgentDir());
+	const profileAuthority =
+		options.profileAuthority ??
+		(options.agentDir !== undefined
+			? normalizePathForComparison(options.agentDir) === normalizePathForComparison(getAgentDir())
+				? getAgentProfileAuthority()
+				: "custom"
+			: !homeWasInjected
+				? getAgentProfileAuthority()
+				: undefined);
 	const policy = options.policy;
 	const projectTrusted = resolveSkillScopeTrust(policy ?? {}, "project");
 	const userTrusted = resolveSkillScopeTrust(policy ?? {}, "user");
 
-	const scanJobs: Array<Promise<{ dir: string; items: CapabilitySkill[] }>> = [];
+	const scanJobs: Array<Promise<{ dir: string; scope: SkillScope; items: CapabilitySkill[] }>> = [];
 	const projectDirs = await getProjectSkillDirs(options.cwd, home);
 	if (projectTrusted) {
 		for (const dir of projectDirs.dirs) {
@@ -189,17 +210,17 @@ export async function listNativeSkillsForManagement(options: {
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: projectDirs.repoRoot },
 					{ dir, providerId: "runtime", level: "project", requireDescription: true },
-				).then(result => ({ dir, items: result.items })),
+				).then(result => ({ dir, scope: "project" as const, items: result.items })),
 			);
 		}
 	}
 	if (userTrusted) {
-		for (const dir of getUserSkillDirs(home)) {
+		for (const dir of getUserSkillDirs(home, agentDir, profileAuthority)) {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd: options.cwd, home, repoRoot: home },
 					{ dir, providerId: "runtime", level: "user", requireDescription: true },
-				).then(result => ({ dir, items: result.items })),
+				).then(result => ({ dir, scope: "user" as const, items: result.items })),
 			);
 		}
 	}
@@ -208,8 +229,7 @@ export async function listNativeSkillsForManagement(options: {
 	const seenNames = new Set<string>();
 	const seenPaths = new Set<string>();
 
-	for (const { dir, items } of await Promise.all(scanJobs)) {
-		const scope: SkillScope = path.resolve(dir).startsWith(`${path.resolve(home)}${path.sep}`) ? "user" : "project";
+	for (const { dir, scope, items } of await Promise.all(scanJobs)) {
 		const source = scope === "project" ? "project .gjc/skills" : `user ${dir}`;
 		for (const skill of items) {
 			const realPath = await safeRealpath(skill.path);
@@ -274,7 +294,7 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 		typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : name;
 	if (BUILT_IN_SKILL_NAMES.has(effectiveName)) throw new SkillNameProtectedError(effectiveName);
 
-	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home ?? getRuntimeHome());
+	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
 	const skillDir = path.join(directory, effectiveName);
 	await fs.mkdir(skillDir, { recursive: true });
 	const filePath = path.join(skillDir, "SKILL.md");

@@ -1,6 +1,11 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir } from "@gajae-code/utils";
+import {
+	getAgentDir,
+	getAgentProfileAuthority,
+	getTrustedHomeDir,
+	normalizePathForComparison,
+} from "@gajae-code/utils";
 import { findRepoRoot } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
@@ -8,7 +13,7 @@ import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { loadMarketplaceSkills } from "../discovery/claude-plugins";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import { compareSkillOrder, getUserSkillScanDirs, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import { loadSkills, type Skill } from "./skills";
@@ -41,6 +46,9 @@ export interface RuntimeSkillDiscoveryResult {
 export interface DiscoverRuntimeSkillsOptions {
 	cwd: string;
 	home?: string;
+	agentDir?: string;
+	/** Resolver-owned profile classification; unlike path comparison, this survives HOME refreshes. */
+	profileAuthority?: "default" | "custom";
 	query?: string;
 	limit?: number;
 	source?: RuntimeSkillDiscoverySource | "all";
@@ -107,16 +115,12 @@ function ancestorDirs(cwd: string, stop: string, home: string): string[] {
 	return dirs;
 }
 
-function getUserSkillDirs(home: string): string[] {
-	const canonicalUserDir = SOURCE_PATHS.native.userAgent;
-	const configuredLegacyDir = SOURCE_PATHS.native.userBase;
-	return [
-		...new Set([
-			path.join(home, canonicalUserDir, "skills"),
-			path.join(home, configuredLegacyDir, "skills"),
-			path.join(home, ".gjc", "skills"),
-		]),
-	];
+function getUserSkillDirs(home: string, agentDir = getAgentDir(), profileAuthority?: "default" | "custom"): string[] {
+	return getUserSkillScanDirs(home, agentDir, profileAuthority);
+}
+
+function resolveRuntimeAgentDir(home: string, agentDir: string | undefined, homeWasInjected: boolean): string {
+	return agentDir ?? (homeWasInjected ? path.join(home, SOURCE_PATHS.native.userAgent) : getAgentDir());
 }
 
 /**
@@ -380,10 +384,20 @@ export function describeDisabledSkillScopes(
 export async function discoverRuntimeSkills(
 	options: DiscoverRuntimeSkillsOptions,
 ): Promise<RuntimeSkillDiscoveryResult> {
+	const hasExplicitHome = options.home !== undefined;
 	const home = options.home ?? getRuntimeHome();
 	const source = options.source ?? "all";
 	const policy = options.policy;
 	const diagnostics: string[] = [];
+	const agentDir = resolveRuntimeAgentDir(home, options.agentDir, hasExplicitHome);
+	const profileAuthority =
+		options.profileAuthority ??
+		(!hasExplicitHome
+			? options.agentDir !== undefined &&
+				normalizePathForComparison(options.agentDir) !== normalizePathForComparison(getAgentDir())
+				? "custom"
+				: getAgentProfileAuthority()
+			: undefined);
 	const scanJobs: Array<Promise<ScanJobResult>> = [];
 	const projectDirs = await getProjectSkillDirs(options.cwd, home);
 	const projectContext = { cwd: options.cwd, home, repoRoot: projectDirs.repoRoot };
@@ -393,7 +407,7 @@ export async function discoverRuntimeSkills(
 		}
 	}
 	if ((source === "all" || source === "user") && sourceEnabled("user", policy)) {
-		for (const dir of getUserSkillDirs(home)) {
+		for (const dir of getUserSkillDirs(home, agentDir, profileAuthority)) {
 			scanJobs.push(
 				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `user ${dir}`, "user", 100),
 			);
@@ -497,16 +511,29 @@ export async function findRuntimeSkillByName(
 	cwd: string,
 	name: string,
 	policy?: SkillsSettings,
-	home = getRuntimeHome(),
+	home?: string,
+	agentDir?: string,
+	profileAuthority?: "default" | "custom",
 ): Promise<Skill | undefined> {
 	const normalized = name.trim();
 	if (!normalized) return undefined;
 	if (BUILT_IN_SKILL_NAMES.has(normalized)) return undefined;
+	const hasExplicitHome = home !== undefined;
+	const resolvedHome = home ?? getRuntimeHome();
+	const resolvedAgentDir = resolveRuntimeAgentDir(resolvedHome, agentDir, hasExplicitHome);
+	const resolvedProfileAuthority =
+		profileAuthority ??
+		(!hasExplicitHome
+			? agentDir !== undefined && normalizePathForComparison(agentDir) !== normalizePathForComparison(getAgentDir())
+				? "custom"
+				: getAgentProfileAuthority()
+			: undefined);
 	const loaded = await loadSkills({
 		...policy,
 		cwd,
-		home,
-		agentDir: path.join(home, SOURCE_PATHS.native.userAgent),
+		home: resolvedHome,
+		agentDir: resolvedAgentDir,
+		profileAuthority: resolvedProfileAuthority,
 	});
 	return loaded.skills.find(skill => skill.name === normalized);
 }
