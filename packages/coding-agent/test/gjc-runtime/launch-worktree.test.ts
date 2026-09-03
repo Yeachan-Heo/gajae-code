@@ -806,4 +806,25 @@ describe("launch guard classification", () => {
 		expect(await Bun.file(plan.worktreePath).exists()).toBe(false);
 		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toBe("");
 	});
+
+	it("retains a raced dirty worktree instead of force-removing user changes", async () => {
+		const repo = await createRepo("gjc-cancellable-dirty-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-dirty" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) fsSync.writeFileSync(path.join(plan.worktreePath, "raced-user-file.txt"), "keep\n");
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "raced-user-file.txt")).text()).toBe("keep\n");
+		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toContain(plan.branchName ?? "");
+	});
 });

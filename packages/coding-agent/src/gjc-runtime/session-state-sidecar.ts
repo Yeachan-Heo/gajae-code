@@ -37,6 +37,7 @@ import {
 
 /** Managed tmux owner provenance propagated only to the launched child process. */
 export const GJC_TMUX_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
+export const GJC_TMUX_OWNER_GENERATION_STAGED_ENV = "GJC_TMUX_OWNER_GENERATION_STAGED";
 export const GJC_TMUX_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
 export const GJC_COORDINATOR_SESSION_STATE_FILE_ENV = "GJC_COORDINATOR_SESSION_STATE_FILE";
@@ -2838,7 +2839,7 @@ export function ownerTerminalContextFromEnvironment(): OwnerTerminalContext | "i
 		generation: normalizedGeneration,
 		stateDir: normalizedStateDir,
 		socketKey: normalizedSocketKey,
-		...(process.env.GJC_TMUX_OWNER_GENERATION_STAGED === "1" ? { generationPublished: false } : {}),
+		...(process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] === "1" ? { generationPublished: false } : {}),
 	};
 }
 

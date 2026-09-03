@@ -649,6 +649,22 @@ function ensureLaunchWorktreeSync(
 	};
 }
 
+function removeCleanAbortedLaunchWorktree(plan: GjcLaunchWorktreePlan, createdBranch: boolean): void {
+	if (isWorktreeDirty(plan.worktreePath)) return;
+	try {
+		runGit(plan.repoRoot, ["worktree", "remove", plan.worktreePath]);
+	} catch {
+		return;
+	}
+	if (createdBranch && plan.branchName) {
+		try {
+			runGit(plan.repoRoot, ["branch", "-D", plan.branchName]);
+		} catch {
+			// The worktree was removed safely; a raced branch update remains for inspection.
+		}
+	}
+}
+
 export async function ensureLaunchWorktreeCancellable(
 	plan: GjcLaunchWorktreePlan | { enabled: false },
 	options: LaunchWorktreeAbortOptions = {},
@@ -727,12 +743,7 @@ export async function ensureLaunchWorktreeCancellable(
 			const owned =
 				created &&
 				(plan.detached ? created.detached && created.head === plan.baseRef : created.branchRef === expectedBranch);
-			if (owned)
-				removeOwnedLaunchWorktree(plan, {
-					created: true,
-					reused: false,
-					createdBranch: Boolean(plan.branchName && !branchAlreadyExisted),
-				});
+			if (owned) removeCleanAbortedLaunchWorktree(plan, Boolean(plan.branchName && !branchAlreadyExisted));
 		}
 		throw error;
 	}
