@@ -144,7 +144,8 @@
       {
         "appliesToVerbs": [
           "write",
-          "api"
+          "api",
+          "crystallize"
         ],
         "name": "input",
         "type": "string"
@@ -177,6 +178,7 @@
           "doctor",
           "kickoff",
           "write-spec",
+          "crystallize",
           "write-artifact",
           "stage",
           "check",
@@ -245,7 +247,9 @@
       },
       {
         "appliesToVerbs": [
-          "doctor"
+          "doctor",
+          "crystallize",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"
@@ -429,7 +433,8 @@
       {
         "appliesToVerbs": [
           "write",
-          "api"
+          "api",
+          "crystallize"
         ],
         "name": "input",
         "type": "string"
@@ -462,6 +467,7 @@
           "doctor",
           "kickoff",
           "write-spec",
+          "crystallize",
           "write-artifact",
           "stage",
           "check",
@@ -530,7 +536,9 @@
       },
       {
         "appliesToVerbs": [
-          "doctor"
+          "doctor",
+          "crystallize",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"
@@ -582,7 +590,8 @@
       },
       {
         "appliesToVerbs": [
-          "write-spec"
+          "write-spec",
+          "crystallize"
         ],
         "name": "slug",
         "type": "string"
@@ -615,6 +624,7 @@
       {
         "appliesToVerbs": [
           "write-spec",
+          "crystallize",
           "stage",
           "check",
           "apply",
@@ -631,7 +641,8 @@
       {
         "appliesToVerbs": [
           "stage",
-          "write"
+          "write",
+          "crystallize"
         ],
         "name": "input",
         "required": true,
@@ -700,6 +711,10 @@
       },
       {
         "name": "write-spec",
+        "surface": "command-flag"
+      },
+      {
+        "name": "crystallize",
         "surface": "command-flag"
       },
       {
@@ -990,7 +1005,8 @@
       {
         "appliesToVerbs": [
           "write",
-          "api"
+          "api",
+          "crystallize"
         ],
         "name": "input",
         "type": "string"
@@ -1023,6 +1039,7 @@
           "doctor",
           "kickoff",
           "write-spec",
+          "crystallize",
           "write-artifact",
           "stage",
           "check",
@@ -1091,7 +1108,9 @@
       },
       {
         "appliesToVerbs": [
-          "doctor"
+          "doctor",
+          "crystallize",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"
@@ -1378,7 +1397,8 @@
       {
         "appliesToVerbs": [
           "write",
-          "api"
+          "api",
+          "crystallize"
         ],
         "name": "input",
         "type": "string"
@@ -1411,6 +1431,7 @@
           "doctor",
           "kickoff",
           "write-spec",
+          "crystallize",
           "write-artifact",
           "stage",
           "check",
@@ -1479,7 +1500,9 @@
       },
       {
         "appliesToVerbs": [
-          "doctor"
+          "doctor",
+          "crystallize",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"

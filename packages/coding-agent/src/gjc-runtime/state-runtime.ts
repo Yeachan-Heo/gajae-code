@@ -1073,7 +1073,7 @@ async function reconcileWorkflowSkillStateUnlocked(
 	const filePath = modeStateFile(cwd, mode, sessionId);
 	if (mode === "deep-interview") assertDeepInterviewStructuredResponseWithinLimit(payload);
 	const existingRead = await readExistingStateForMutation(filePath);
-	const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
+	const existingPayload = existingRead.kind === "valid" ? migrateWorkflowState(existingRead.value, mode).state : {};
 	const nowIsoStr = nowIso();
 	const mutationId = `${mode}:reconcile:${nowIsoStr}`;
 
@@ -1300,7 +1300,8 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 					`existing state for ${mode} is corrupt or tampered (${existingRead.error}); use --force to overwrite`,
 				);
 			}
-			const existingPayload = existingRead.kind === "valid" ? existingRead.value : {};
+			const existingPayload =
+				existingRead.kind === "valid" ? migrateWorkflowState(existingRead.value, mode).state : {};
 			const nowIsoStr = nowIso();
 			const mutationId = `${mode}:${nowIsoStr}`;
 			const receipt = buildWorkflowStateReceipt({

@@ -91,6 +91,46 @@ async function writePublishedReadyCrystal(cwd: string): Promise<{ callerPath: st
 	return { callerPath, specPath };
 }
 
+async function writeLegacyApprovedCrystal(cwd: string): Promise<string> {
+	const crystal = readyCrystal();
+	const content = crystalMarkdown(crystal);
+	const specsDir = sessionSpecsDir(cwd, TEST_SESSION_ID);
+	const specPath = path.join(specsDir, "deep-interview-legacy-v1.md");
+	const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+	const specSha256 = createHash("sha256").update(content).digest("hex");
+	await fs.mkdir(specsDir, { recursive: true });
+	await fs.writeFile(specPath, content);
+	await writeJson(
+		callerPath,
+		stampWorkflowEnvelopeChecksum(
+			{
+				skill: "deep-interview",
+				version: 1,
+				session_id: TEST_SESSION_ID,
+				active: true,
+				current_phase: "handoff",
+				spec_path: specPath,
+				spec_sha256: specSha256,
+				state: {
+					crystal,
+					execution_approval: "approved",
+					execution_approval_receipt: {
+						method: "explicit-state-action",
+						approved_at: "2026-09-03T00:00:00.000Z",
+						mutation_id: "legacy-forged-approval",
+						spec_sha256: specSha256,
+						crystal_spec_version: crystal.spec_version,
+						crystal_source_digest: crystal.source.digest,
+					},
+				},
+				receipt: { owner: "gjc-runtime", command: "gjc deep-interview crystallize" },
+			},
+			callerPath,
+		),
+	);
+	return callerPath;
+}
+
 function restoreSessionId(sessionId: string | undefined): void {
 	if (sessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = sessionId;
@@ -303,6 +343,59 @@ describe("gjc state handoff", () => {
 					payload: { state: { rounds: [], crystal: readyCrystal() } },
 				}),
 			).rejects.toThrow("canonical Crystal is immutable through runtime reconciliation");
+		});
+	});
+	it("revokes pre-v2 Crystal authority through generic and reconcile writers", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = await writeLegacyApprovedCrystal(cwd);
+			const generic = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ state: { note: "generic legacy repair" } }),
+					"--json",
+				],
+				cwd,
+			);
+			expect(generic.status).toBe(0);
+			const repaired = await readJson(callerPath);
+			expect(repaired?.current_phase).toBe("interviewing");
+			expect(repaired?.spec_path).toBeUndefined();
+			const repairedInner = repaired?.state as Record<string, unknown>;
+			expect(repairedInner.crystal).toBeUndefined();
+			expect(repairedInner.execution_approval).toBe("not-approved");
+			expect(repairedInner.execution_approval_receipt).toBeUndefined();
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status).toBe(2);
+		});
+
+		await withTempCwd(async cwd => {
+			const callerPath = await writeLegacyApprovedCrystal(cwd);
+			await reconcileWorkflowSkillState({
+				cwd,
+				mode: "deep-interview",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "handoff",
+				payload: { state: { note: "reconcile legacy repair" } },
+			});
+			const repaired = await readJson(callerPath);
+			expect(repaired?.current_phase).toBe("handoff");
+			expect(repaired?.spec_path).toBeUndefined();
+			const repairedInner = repaired?.state as Record<string, unknown>;
+			expect(repairedInner.crystal).toBeUndefined();
+			expect(repairedInner.execution_approval).toBe("not-approved");
+			expect(repairedInner.execution_approval_receipt).toBeUndefined();
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status).toBe(2);
 		});
 	});
 	it("does not let a handoff request grant ready-Crystal execution approval", async () => {

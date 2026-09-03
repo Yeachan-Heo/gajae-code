@@ -69,7 +69,7 @@ const STATE_VERBS = ["read", "write", "clear", "contract", "handoff", "doctor"] 
 const PLANNED_ADMIN_VERBS = ["graph", "prune", "migrate", "force-overwrite"] as const;
 
 const COMMON_TYPED_ARGS: TypedArgSpec[] = [
-	{ name: "input", type: "string", appliesToVerbs: ["write", "api"] },
+	{ name: "input", type: "string", appliesToVerbs: ["write", "api", "crystallize"] },
 	{ name: "mode", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: [...STATE_VERBS] },
 	{
 		name: "session-id",
@@ -78,6 +78,7 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 			...STATE_VERBS,
 			"kickoff",
 			"write-spec",
+			"crystallize",
 			"write-artifact",
 			"stage",
 			"check",
@@ -93,7 +94,7 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 	{ name: "replace", type: "boolean", appliesToVerbs: ["write"] },
 	{ name: "force", type: "boolean", appliesToVerbs: ["write", "clear", "handoff"] },
 	{ name: "skill", type: "enum", enumValues: [...CANONICAL_GJC_WORKFLOW_SKILLS], appliesToVerbs: ["doctor"] },
-	{ name: "json", type: "boolean", appliesToVerbs: ["doctor"] },
+	{ name: "json", type: "boolean", appliesToVerbs: ["doctor", "crystallize", "approve-execution"] },
 ];
 
 function verb(name: string, surface: WorkflowVerb["surface"]): WorkflowVerb {
@@ -176,7 +177,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 		],
 		verbs: [
 			...stateVerbs(),
-			...flagVerbs(["kickoff", "write-spec"]),
+			...flagVerbs(["kickoff", "write-spec", "crystallize"]),
 			...positionalVerbs([
 				"stage",
 				"check",
@@ -197,7 +198,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ name: "threshold", type: "number", appliesToVerbs: ["kickoff"] },
 			{ name: "threshold-source", type: "string", appliesToVerbs: ["kickoff"] },
 			{ name: "stage", type: "enum", enumValues: ["final"], appliesToVerbs: ["write-spec"] },
-			{ name: "slug", type: "string", appliesToVerbs: ["write-spec"] },
+			{ name: "slug", type: "string", appliesToVerbs: ["write-spec", "crystallize"] },
 			{ name: "spec", type: "string", required: true, appliesToVerbs: ["write-spec"] },
 			{ name: "handoff", type: "enum", enumValues: ["ralplan"], appliesToVerbs: ["write-spec"] },
 			{ name: "deliberate", type: "boolean", appliesToVerbs: ["write-spec"] },
@@ -206,6 +207,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 				type: "boolean",
 				appliesToVerbs: [
 					"write-spec",
+					"crystallize",
 					"stage",
 					"check",
 					"apply",
@@ -217,7 +219,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 					"approve-execution",
 				],
 			},
-			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write"] },
+			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write", "crystallize"] },
 			{ name: "reset", type: "boolean", appliesToVerbs: ["write"] },
 			{
 				name: "for",
