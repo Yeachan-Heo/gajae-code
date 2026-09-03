@@ -402,19 +402,17 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	// Only one process may spawn for this agent dir at a time; everyone else
 	// waits for the exact lock generation to release, then rechecks discovery.
 	// Fixture leases always spawn their own.
+	let spawnLog: BrokerSpawnLog | undefined;
 	const releaseSpawnLock = initiator === "fixture-lease" ? async () => {} : await acquireSpawnLock(settings.agentDir);
-	// The lock winner may still find a discovery published by an earlier winner
-	// that finished between our first read and the lock acquisition.
-	const discoveredUnderLock = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-	if (discoveredUnderLock) {
-		await releaseSpawnLock();
-		return { kind: "external-discovery", discovery: discoveredUnderLock };
-	}
-	const command = resolveSdkInternalSpawnCommand("broker-internal");
-	const spawnLog = await openBrokerSpawnLog(settings.agentDir);
-	// A stale marker must never be misattributed to this spawn; clear it first.
-	await clearBrokerStartupFailureMarker(settings.agentDir);
 	try {
+		// The lock winner may still find a discovery published by an earlier winner
+		// that finished between our first read and the lock acquisition.
+		const discoveredUnderLock = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (discoveredUnderLock) return { kind: "external-discovery", discovery: discoveredUnderLock };
+		const command = resolveSdkInternalSpawnCommand("broker-internal");
+		spawnLog = await openBrokerSpawnLog(settings.agentDir);
+		// A stale marker must never be misattributed to this spawn; clear it first.
+		await clearBrokerStartupFailureMarker(settings.agentDir);
 		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 			detached: true,
 			stdio: ["ignore", "ignore", spawnLog ? spawnLog.handle.fd : "ignore"],

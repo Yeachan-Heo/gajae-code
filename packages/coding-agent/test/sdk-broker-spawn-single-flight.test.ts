@@ -1,7 +1,8 @@
-import { expect, it } from "bun:test";
+import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
+import * as brokerDiscovery from "../src/sdk/broker/discovery";
+import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
 const ensureModule = path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts");
@@ -56,7 +57,7 @@ it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and 
 			invocations.map(async child => ({ code: await child.exited, out: await new Response(child.stdout).text() })),
 		);
 		for (const result of results) expect(result.code).toBe(0);
-		const discovery = await readBrokerDiscovery(dir, undefined);
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir, undefined);
 		expect(discovery).toBeDefined();
 		brokerPids.add(discovery!.pid);
 		const sdk = path.join(dir, "sdk");
@@ -82,6 +83,32 @@ it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and 
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 60_000);
+
+it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
+	const dir = await temp();
+	const readBrokerDiscovery = brokerDiscovery.readBrokerDiscovery;
+	let reads = 0;
+	const readSpy = spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(async (...args) => {
+		reads += 1;
+		if (reads === 1) return null;
+		if (reads === 2) throw new Error("injected under-lock discovery failure");
+		return readBrokerDiscovery(...args);
+	});
+	try {
+		await expect(ensureBroker({ agentDir: dir })).rejects.toThrow("injected under-lock discovery failure");
+		readSpy.mockRestore();
+		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.spawn.lock");
+
+		const discovery = await ensureBroker({ agentDir: dir });
+		expect(discovery.pid).toBeGreaterThan(0);
+		expect(await brokerDiscovery.readBrokerDiscovery(dir)).toMatchObject({ pid: discovery.pid });
+		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.spawn.lock");
+	} finally {
+		readSpy.mockRestore();
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
 
 it("the spawn lock rejects an incomplete published owner instead of acquiring over it", async () => {
 	const { acquireSpawnLockForTest } = await import("../src/sdk/broker/ensure");
