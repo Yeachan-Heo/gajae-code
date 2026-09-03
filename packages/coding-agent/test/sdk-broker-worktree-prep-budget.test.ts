@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	DependencyPreparationTimeoutError,
 	ensureReusableNodeModules,
 	planLaunchWorktree,
 	WorktreePreparationTimeoutError,
@@ -174,6 +175,56 @@ test("RED B: worktree prep timeout does not spawn a child", async () => {
 		setEnsureReusableNodeModulesForTest(broker, undefined);
 		setLifecycleCommandResolverForTest(broker, undefined);
 		setLifecycleTimingForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 20_000);
+
+test("dependency prep timeout retains the created worktree and concurrent content", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-prep-budget-retain-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	try {
+		const repo = await createRepo(root);
+		await fs.appendFile(path.join(repo, ".gitignore"), "/ignored-dependency.txt\n");
+		for (const args of [
+			["add", ".gitignore"],
+			["commit", "-m", "ignore dependency output"],
+		]) {
+			const result = Bun.spawnSync(["git", ...args], { cwd: repo, stdout: "pipe", stderr: "pipe" });
+			if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+		}
+		const planned = planLaunchWorktree(repo, { enabled: true, detached: false, name: "dependency-timeout" });
+		if (!planned.enabled) throw new Error("expected worktree plan");
+		setEnsureReusableNodeModulesForTest(broker, async (_sourceRoot, worktreePath) => {
+			await fs.writeFile(path.join(worktreePath, "README"), "tracked change\n");
+			await fs.writeFile(path.join(worktreePath, "untracked-dependency.txt"), "untracked\n");
+			await fs.writeFile(path.join(worktreePath, "ignored-dependency.txt"), "ignored\n");
+			throw new DependencyPreparationTimeoutError();
+		});
+		await broker.start();
+
+		const response = await broker.handleRequest(
+			"session.create",
+			{
+				cwd: repo,
+				stateRoot: path.join(repo, ".gjc", "state"),
+				target: { worktree: { enabled: true, name: "dependency-timeout" } },
+				worktreePreparationTimeoutMs: 5_000,
+				dependencyPreparationTimeoutMs: 5_000,
+				readinessTimeoutMs: 4_000,
+			},
+			"prep-budget-retain",
+		);
+
+		expect(response).toMatchObject({ ok: false, error: { code: "dependency_preparation_timeout" } });
+		expect(await fs.readFile(path.join(planned.worktreePath, "README"), "utf8")).toBe("tracked change\n");
+		expect(await fs.readFile(path.join(planned.worktreePath, "untracked-dependency.txt"), "utf8")).toBe(
+			"untracked\n",
+		);
+		expect(await fs.readFile(path.join(planned.worktreePath, "ignored-dependency.txt"), "utf8")).toBe("ignored\n");
+	} finally {
+		setEnsureReusableNodeModulesForTest(broker, undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
