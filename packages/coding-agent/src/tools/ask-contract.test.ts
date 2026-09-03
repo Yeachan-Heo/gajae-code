@@ -15,6 +15,7 @@ describe("ask option contract", () => {
 			"Type your own",
 			"custom input",
 			"직접 입력",
+			"1. 직접 입력",
 			"직접 입력으로 추가",
 			"  OTHER（SPECIFY）  ",
 			"other…",
@@ -33,6 +34,13 @@ describe("ask option contract", () => {
 	test("accepts a genuine Other domain value", () => {
 		const result = ordinaryAskSchema.safeParse({
 			questions: [{ ...baseQuestion, options: [{ label: "Other" }, { label: "Cancel" }] }],
+		});
+		expect(result.success).toBe(true);
+	});
+
+	test("accepts descriptive labels that merely contain custom-input words", () => {
+		const result = ordinaryAskSchema.safeParse({
+			questions: [{ ...baseQuestion, options: [{ label: "Deploy Other (type your own)" }, { label: "Cancel" }] }],
 		});
 		expect(result.success).toBe(true);
 	});

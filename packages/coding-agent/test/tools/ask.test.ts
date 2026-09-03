@@ -3121,6 +3121,46 @@ describe("AskTool deep-interview recorder persistence", () => {
 		);
 	});
 
+	it("omits single-option recommendations from workflow gates", async () => {
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Keep current"] })),
+		};
+
+		const result = await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-single-option-workflow-gate",
+			{
+				questions: [
+					{
+						id: "single",
+						question: "Only one safe action remains.",
+						options: [{ label: "Keep current" }],
+						recommended: 0,
+					},
+				],
+			},
+			undefined,
+			undefined,
+			undefined,
+		);
+
+		const gate = (
+			gateEmitter.emitGate.mock.calls as unknown as Array<
+				[
+					{
+						options: Array<{ description?: string; label: string }>;
+					},
+				]
+			>
+		)[0]?.[0];
+		expect(gate?.options).toHaveLength(1);
+		expect(gate?.options[0]?.label).toBe("Keep current");
+		expect(gate?.options[0]?.description).toBeUndefined();
+		expect(result.details?.selectedOptions).toEqual(["Keep current"]);
+	});
+
 	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
 		// Regression: a durable workflow-gate emitter now exists for every session and
 		// its supportsRemoteGateAnswers() is always true. Attended TUI asks must still use the local

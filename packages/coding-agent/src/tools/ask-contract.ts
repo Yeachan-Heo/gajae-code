@@ -27,17 +27,28 @@ function deepInterviewBoundedString(maximum: number) {
 }
 
 function isReservedCustomInputOptionLabel(label: string): boolean {
-	const unicodeNormalized = label.normalize("NFKC").toLowerCase().trim();
-	if (/^other[\p{P}\p{S}]+/u.test(unicodeNormalized)) return true;
-	const normalized = unicodeNormalized.replace(/[\p{P}\p{S}]+/gu, " ").replace(/\s+/g, " ");
-	return (
-		/\bother\s+(?:type\s+your\s+own|specify|please\s+specify)\b/.test(normalized) ||
-		/(?:\b)(?:type|write)\s+your\s+own\b/.test(normalized) ||
-		/\benter\s+manually\b/.test(normalized) ||
-		/\bcustom\s+input\b/.test(normalized) ||
-		/직접\s*입력/u.test(normalized) ||
-		/기타(?:\s*입력)?/u.test(normalized)
-	);
+	const withoutNumbering = label
+		.normalize("NFKC")
+		.toLowerCase()
+		.trim()
+		.replace(/^\d+[.)]\s+/u, "");
+	if (/^other[\p{P}\p{S}\s]*$/u.test(withoutNumbering) && withoutNumbering !== "other") return true;
+	const wordsOnly = withoutNumbering
+		.replace(/[\p{P}\p{S}]+/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	const englishPseudoOptions = new Set([
+		"other type your own",
+		"other specify",
+		"other please specify",
+		"type your own",
+		"write your own",
+		"enter manually",
+		"custom input",
+	]);
+	if (englishPseudoOptions.has(wordsOnly)) return true;
+	const compact = wordsOnly.replace(/\s+/g, "");
+	return ["직접입력", "직접입력으로추가", "기타", "기타입력"].includes(compact);
 }
 
 const OptionItem = z.object({
