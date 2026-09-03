@@ -1736,6 +1736,73 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
+	it("adopts an orphaned message effect after pending action state changes", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-orphan-message-"));
+		try {
+			const first = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+			});
+			const root = await first.postRoot("session", "root");
+			const effectId = `inbound:T1:C1:${root.rootTs}:U1:message-event:message-id`;
+			const idempotencyKey = `slack:T1:C1:${root.rootTs}:U1:message-event:message-id`;
+			await new ChatEffectJournal({ agentDir, transport: "slack" }).enqueue({
+				id: effectId,
+				kind: "sdk.inbound.user_message",
+				transport: "slack",
+				sessionId: "session",
+				endpointGeneration: 1,
+				payload: {
+					type: "user_message",
+					sessionId: "session",
+					text: "persisted prompt",
+					idempotencyKey,
+					routing: {
+						teamId: "T1",
+						channelId: "C1",
+						rootTs: root.rootTs!,
+						attachmentAuthorityId: "session:1",
+						actorId: "U1",
+						eventId: "message-event",
+						interactionId: "message-id",
+						retryKey: "message-event:message-id",
+						kind: "message",
+					},
+				},
+			});
+			await first.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, pendingActionId: "new-action" } : current,
+			);
+			await first.stop();
+
+			const replayed: Array<Record<string, unknown>> = [];
+			const restarted = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
+				}),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			await restarted.start();
+			expect(replayed).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "persisted prompt" }),
+			]);
+			await restarted.stop();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("durably accepts ordered controls using their stable inbound key", async () => {
 		const commands: string[] = [];
 		await withDaemon(
