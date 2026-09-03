@@ -972,6 +972,7 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).toContain("BROKER_CHILD_ENV='enabled'");
 		expect(innerCommand).toContain('GJC_MANAGED_OWNER_COMMAND_JSON=\'["child-command","--safe"]\'');
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
+		expect(innerCommand).toContain("GJC_MANAGED_OWNER_SUPERVISED='1'");
 	});
 
 	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
