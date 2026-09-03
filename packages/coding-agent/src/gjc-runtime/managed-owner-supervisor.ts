@@ -156,7 +156,6 @@ async function recordStagedTerminal(
 		return await withOwnerGenerationLifecycleLock(stateDir, sessionId, generation, async () => {
 			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
 			if (baseline.state === "current" && baseline.generation === generation) return "published";
-			if (baseline.state !== "absent") return "failed";
 			await writeDurableExclusive(lifecyclePaths(stateDir, sessionId, generation).stagedTerminalFile, journal);
 			return "recorded";
 		});
