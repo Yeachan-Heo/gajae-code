@@ -8702,7 +8702,7 @@ describe("ModelRegistry", () => {
 			writeRawModelsJson({ vllm: { baseUrl: "http://127.0.0.1:9000/v1", apiKey: "fresh-vllm-key" } });
 			const updatedAt = new Date(Date.now() + 1000);
 			fs.utimesSync(modelsJsonPath, updatedAt, updatedAt);
-			await registry.refreshProvider("openai", "offline");
+			await registry.refresh("offline");
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
