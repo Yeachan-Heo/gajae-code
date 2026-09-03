@@ -227,6 +227,7 @@ async function withDaemon(
 		};
 		authorizeActor?: ((actorId: string) => boolean | Promise<boolean>) | false;
 		now?: () => number;
+		resolveAttachment?: (sessionId: string) => Promise<SessionAttachment | null>;
 	} = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-daemon-"));
@@ -244,27 +245,29 @@ async function withDaemon(
 			channelId: "C1",
 			provider: new SlackProvider(fake),
 			randomId: () => `client-id-${++id}`,
-			resolveAttachment: async sessionId => {
-				if (endpointGeneration === undefined) return null;
-				return {
-					...endpoint(sessionId, endpointGeneration),
-					send: (
-						frame: Record<string, unknown>,
-						sendOptions?: {
-							beforeDispatch?: () => void;
-							dispatchFence?: (dispatch: () => Promise<void>) => Promise<void>;
+			resolveAttachment:
+				options.resolveAttachment ??
+				(async sessionId => {
+					if (endpointGeneration === undefined) return null;
+					return {
+						...endpoint(sessionId, endpointGeneration),
+						send: (
+							frame: Record<string, unknown>,
+							sendOptions?: {
+								beforeDispatch?: () => void;
+								dispatchFence?: (dispatch: () => Promise<void>) => Promise<void>;
+							},
+						) => {
+							if (attachment) return attachment.send(frame, sendOptions);
+							const dispatch = async () => {
+								sendOptions?.beforeDispatch?.();
+								injected.push(frame);
+							};
+							return sendOptions?.dispatchFence ? sendOptions.dispatchFence(dispatch) : dispatch();
 						},
-					) => {
-						if (attachment) return attachment.send(frame, sendOptions);
-						const dispatch = async () => {
-							sendOptions?.beforeDispatch?.();
-							injected.push(frame);
-						};
-						return sendOptions?.dispatchFence ? sendOptions.dispatchFence(dispatch) : dispatch();
-					},
-					sendMaintenance: () => {},
-				};
-			},
+						sendMaintenance: () => {},
+					};
+				}),
 			now: options.now,
 			onCommand: options.onCommand
 				? async (sessionId, content, resolvedAttachment, idempotencyKey, beforeDispatch, dispatchFence) => {
@@ -335,6 +338,32 @@ function messageEnvelope(
 }
 
 describe("SlackNotificationDaemon fake-provider acceptance", () => {
+	it("migrates persisted attachment and effect authority after device binding", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+				const conversation = await daemon.notify("session", "root");
+				authorityId = "device-bound-authority";
+				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
+
+				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
+				const migrated = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session" && record.rootTs === conversation.rootTs,
+				);
+				expect(migrated?.attachmentAuthorityId).toBe("device-bound-authority");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(record => record.kind === "provider-post");
+				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
+					"device-bound-authority",
+				);
+			},
+			{
+				resolveAttachment: async sessionId => ({ ...endpoint(sessionId), authorityId }),
+			},
+		);
+	});
+
 	it("scopes deterministic root publication identities to the configured channel", async () => {
 		const firstAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-one-"));
 		const secondAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-two-"));
