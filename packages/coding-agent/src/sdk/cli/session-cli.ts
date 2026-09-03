@@ -613,14 +613,15 @@ async function workspaceIdentity(target: string): Promise<WorkspaceIdentity> {
 /**
  * Resolves the list selection from `--repo` (default: process cwd) under the
  * effective scope. Outside Git, `repo`/`worktree` fail typed and actionable —
- * they never broaden to `all`; `cwd` remains an exact canonical match.
+ * they never broaden to `all`; `cwd` remains an exact canonical match, and
+ * `all` ignores the selection entirely so it works outside any checkout.
  */
 export async function resolveSessionListSelection(
 	scope: SdkSessionListScope,
 	repoArg: string | undefined,
 ): Promise<SdkSessionListSelection> {
 	const selection = await workspaceIdentity(repoArg ?? process.cwd());
-	if (scope !== "cwd" && !selection.repoRoot)
+	if (scope !== "cwd" && scope !== "all" && !selection.repoRoot)
 		throw new SdkSessionCliError(
 			"not_a_repository",
 			`--scope ${scope} requires a Git repository, but "${selection.canonicalPath}" is outside any Git checkout. ` +
