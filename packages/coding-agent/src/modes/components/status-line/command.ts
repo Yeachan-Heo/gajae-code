@@ -110,6 +110,7 @@ export async function runStatusLineCommand(
 		shellArgs: readonly string[];
 		env: Record<string, string>;
 		timeoutMs: number;
+		signal?: AbortSignal;
 	},
 ): Promise<StatusLineCommandResult> {
 	const proc = Bun.spawn([options.shell, ...options.shellArgs, command], {
@@ -122,13 +123,25 @@ export async function runStatusLineCommand(
 		...(process.platform === "win32" ? { windowsHide: true } : {}),
 	});
 
-	const killProcessGroup = (): void => {
-		try {
-			if (process.platform !== "win32" && proc.pid) {
-				process.kill(-proc.pid, "SIGKILL");
-			} else {
-				proc.kill();
+	let timedOut = false;
+	let termination: Promise<void> | undefined;
+	const terminateProcessTree = async (): Promise<void> => {
+		if (process.platform === "win32" && proc.pid) {
+			try {
+				const taskkill = Bun.spawn(["taskkill", "/pid", String(proc.pid), "/t", "/f"], {
+					stdout: "ignore",
+					stderr: "ignore",
+					windowsHide: true,
+				});
+				await taskkill.exited;
+				return;
+			} catch {
+				// Fall through to the direct kill if taskkill is unavailable.
 			}
+		}
+		try {
+			if (process.platform !== "win32" && proc.pid) process.kill(-proc.pid, "SIGKILL");
+			else proc.kill();
 		} catch {
 			try {
 				proc.kill();
@@ -137,27 +150,41 @@ export async function runStatusLineCommand(
 			}
 		}
 	};
-
-	let timedOut = false;
+	const terminate = (): void => {
+		termination ??= terminateProcessTree();
+	};
+	let aborted = false;
+	const onAbort = (): void => {
+		aborted = true;
+		terminate();
+	};
+	if (options.signal?.aborted) onAbort();
+	else options.signal?.addEventListener("abort", onAbort, { once: true });
 	const timeout = setTimeout(() => {
 		timedOut = true;
-		killProcessGroup();
+		terminate();
 	}, options.timeoutMs);
 
 	try {
+		const exitCodePromise = proc.exited.then(async exitCode => {
+			if (termination) await termination;
+			return exitCode;
+		});
 		const [stdout, stderr, exitCode] = await Promise.all([
 			readBounded(proc.stdout, STATUS_LINE_COMMAND_MAX_OUTPUT_BYTES),
 			readBounded(proc.stderr, STATUS_LINE_COMMAND_MAX_DIAGNOSTIC_BYTES),
-			proc.exited,
+			exitCodePromise,
 		]);
+		if (termination) await termination;
 		return {
 			stdout: stdout.text,
 			stderr: boundedDiagnostic(stderr.text),
 			exitCode: exitCode ?? 1,
-			timedOut,
+			timedOut: timedOut || aborted,
 			outputTruncated: stdout.truncated,
 		};
 	} finally {
 		clearTimeout(timeout);
+		options.signal?.removeEventListener("abort", onAbort);
 	}
 }

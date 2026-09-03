@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 
 import { type Component, truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import { formatCount, getProjectDir, logger } from "@gajae-code/utils";
+import { getShellConfig } from "@gajae-code/utils/shell-config";
 import {
 	type AppKeybinding,
 	KEYBINDINGS,
@@ -214,6 +215,8 @@ export class StatusLineComponent implements Component {
 	#commandFailed = false;
 	#commandFetchedAt = 0;
 	#commandInFlightKey: string | undefined;
+	#commandAbortController: AbortController | undefined;
+	#commandRefreshTimer: ReturnType<typeof setTimeout> | undefined;
 	#commandDiagnosticKey: string | undefined;
 
 	constructor(
@@ -322,6 +325,8 @@ export class StatusLineComponent implements Component {
 		this.#disposed = true;
 		this.#onBranchChange = null;
 		this.#onUpdate = null;
+		this.#cancelCommandExecution();
+		this.#clearCommandRefreshTimer();
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
@@ -339,10 +344,64 @@ export class StatusLineComponent implements Component {
 		logger.warn(message, details);
 	}
 
+	#clearCommandRefreshTimer(): void {
+		if (this.#commandRefreshTimer) {
+			clearTimeout(this.#commandRefreshTimer);
+			this.#commandRefreshTimer = undefined;
+		}
+	}
+
+	#cancelCommandExecution(): void {
+		this.#commandAbortController?.abort();
+		this.#commandAbortController = undefined;
+		this.#commandInFlightKey = undefined;
+	}
+
+	#disableCommandSegment(): void {
+		this.#clearCommandRefreshTimer();
+		this.#cancelCommandExecution();
+		this.#commandConfigKey = undefined;
+		this.#commandOutput = null;
+		this.#commandFailed = false;
+		this.#commandFetchedAt = 0;
+		this.#commandDiagnosticKey = undefined;
+	}
+
+	#armCommandRefreshTimer(key: string, refreshMs: number): void {
+		this.#clearCommandRefreshTimer();
+		if (this.#disposed || this.#commandConfigKey !== key) return;
+		this.#commandRefreshTimer = setTimeout(
+			() => {
+				this.#commandRefreshTimer = undefined;
+				if (this.#disposed || this.#commandConfigKey !== key) return;
+				this.#notifyUpdate();
+			},
+			Math.max(0, refreshMs),
+		);
+		this.#commandRefreshTimer.unref?.();
+	}
+
+	#trustedCommandOptions(): StatusLineCommandOptions | undefined {
+		const globalLeft = this.session.settings.getGlobal("statusLine.leftSegments");
+		const globalRight = this.session.settings.getGlobal("statusLine.rightSegments");
+		const includesCommand = (value: unknown): boolean => Array.isArray(value) && value.includes("command");
+		if (!includesCommand(globalLeft) && !includesCommand(globalRight)) return undefined;
+
+		const globalSegmentOptions = this.session.settings.getGlobal("statusLine.segmentOptions");
+		if (!globalSegmentOptions || typeof globalSegmentOptions !== "object" || Array.isArray(globalSegmentOptions)) {
+			return undefined;
+		}
+		const commandOptions = (globalSegmentOptions as Record<string, unknown>).command;
+		const resolved = normalizeStatusLineCommandOptions(commandOptions);
+		return resolved.command ? resolved : undefined;
+	}
+
 	#refreshCommandInBackground(options: StatusLineCommandOptions | undefined): string {
 		const resolved = normalizeStatusLineCommandOptions(options);
 		const key = JSON.stringify(resolved);
 		if (this.#commandConfigKey !== key) {
+			this.#clearCommandRefreshTimer();
+			this.#cancelCommandExecution();
 			this.#commandConfigKey = key;
 			this.#commandOutput = null;
 			this.#commandFailed = false;
@@ -358,19 +417,31 @@ export class StatusLineComponent implements Component {
 		}
 
 		const now = Date.now();
-		if (this.#commandInFlightKey === key || now - this.#commandFetchedAt < resolved.refreshMs) return key;
+		if (this.#commandInFlightKey === key) return key;
+		const elapsed = now - this.#commandFetchedAt;
+		if (this.#commandFetchedAt > 0 && elapsed < resolved.refreshMs) {
+			this.#armCommandRefreshTimer(key, resolved.refreshMs - elapsed);
+			return key;
+		}
+		this.#clearCommandRefreshTimer();
 
 		this.#commandInFlightKey = key;
+		const abortController = new AbortController();
+		this.#commandAbortController = abortController;
 		let shellConfig: { shell: string; args: string[]; env: Record<string, string> };
 		try {
-			shellConfig = this.session.settings.getShellConfig();
+			shellConfig = getShellConfig(this.session.settings.getGlobal("shellPath"));
 		} catch (error) {
-			this.#commandInFlightKey = undefined;
+			if (this.#commandInFlightKey === key && this.#commandAbortController === abortController) {
+				this.#commandInFlightKey = undefined;
+				this.#commandAbortController = undefined;
+			}
 			this.#commandFailed = true;
 			this.#commandFetchedAt = Date.now();
 			this.#logCommandDiagnostic(key, "Status line command shell configuration failed", {
 				error: sanitizeStatusText(error instanceof Error ? error.message : String(error)).slice(0, 256),
 			});
+			this.#armCommandRefreshTimer(key, resolved.refreshMs);
 			return key;
 		}
 
@@ -380,6 +451,7 @@ export class StatusLineComponent implements Component {
 			shellArgs: shellConfig.args,
 			env: shellConfig.env,
 			timeoutMs: resolved.timeoutMs,
+			signal: abortController.signal,
 		})
 			.then(result => {
 				if (this.#disposed || this.#commandConfigKey !== key) return;
@@ -411,7 +483,10 @@ export class StatusLineComponent implements Component {
 				this.#notifyUpdate();
 			})
 			.finally(() => {
-				if (this.#commandInFlightKey === key) this.#commandInFlightKey = undefined;
+				if (this.#commandInFlightKey !== key || this.#commandAbortController !== abortController) return;
+				this.#commandInFlightKey = undefined;
+				this.#commandAbortController = undefined;
+				this.#armCommandRefreshTimer(key, resolved.refreshMs);
 			});
 		return key;
 	}
@@ -745,8 +820,9 @@ export class StatusLineComponent implements Component {
 			effectiveSettings.leftSegments.includes("pr") || effectiveSettings.rightSegments.includes("pr");
 		const commandSegmentActive =
 			effectiveSettings.leftSegments.includes("command") || effectiveSettings.rightSegments.includes("command");
-		const commandOptions = normalizeStatusLineCommandOptions(effectiveSettings.segmentOptions.command);
-		const commandKey = commandSegmentActive ? this.#refreshCommandInBackground(commandOptions) : undefined;
+		const commandOptions = commandSegmentActive ? this.#trustedCommandOptions() : undefined;
+		const commandKey = commandOptions ? this.#refreshCommandInBackground(commandOptions) : undefined;
+		if (!commandKey) this.#disableCommandSegment();
 
 		return {
 			session: this.session,
@@ -935,6 +1011,7 @@ export class StatusLineComponent implements Component {
 		const left: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
 		for (const segId of effectiveSettings.leftSegments) {
+			if (segId === "command" && !ctx.command) continue;
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				left.push(highlightSegment(segId, rendered.content));
@@ -955,6 +1032,7 @@ export class StatusLineComponent implements Component {
 						this.#keyDisplayContext,
 					);
 		for (const segId of effectiveSettings.rightSegments) {
+			if (segId === "command" && !ctx.command) continue;
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				right.push(highlightSegment(segId, rendered.content));
