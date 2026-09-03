@@ -502,8 +502,42 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 				// fall through to cleanup + failure
 			}
 		}
-		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
 		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
+		const trustedMarker = marker && child.pid !== undefined && marker.pid === child.pid ? marker : undefined;
+		const startupLockPath = path.join(settings.agentDir, "sdk", STARTUP_LOCK_TARGET_NAME);
+		let startupFenceContention =
+			exitedBeforeDiscovery &&
+			trustedMarker?.reason.startsWith(`Failed to acquire lock for ${startupLockPath} after `) === true;
+		if (!startupFenceContention && exitedBeforeDiscovery && child.exitCode !== 0) {
+			try {
+				startupFenceContention = (await fs.stat(`${startupLockPath}.lock`)).isDirectory();
+			} catch {
+				// The marker is best-effort and the fence may have been released
+				// between the child exit and this observation.
+			}
+		}
+		if (startupFenceContention) {
+			// A launcher can die after its detached child acquires the startup fence.
+			// The replacement child may exhaust its own fence wait before the incumbent
+			// reaches the end of its publication allowance, so keep the parent attached
+			// to the exact agent dir and give that incumbent one final bounded chance to
+			// publish before treating the replacement failure as terminal.
+			const recoveryDeadline = Math.min(deadline, Date.now() + BROKER_PUBLICATION_TIMEOUT_MS);
+			while (Date.now() < recoveryDeadline) {
+				try {
+					const incumbent = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+					if (incumbent && isBrokerGenerationCompatible(incumbent)) {
+						await owner.stop();
+						return { kind: "external-discovery", discovery: incumbent };
+					}
+				} catch {
+					// Keep the bounded retry alive; a transient read failure is not
+					// authority to classify the incumbent as failed.
+				}
+				await sleep(50);
+			}
+		}
+		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
 		// A marker only wins over the generic fallback when it was written by the
 		// exact child this call just spawned and reaped. The pre-spawn clear
 		// already prevents an old marker from surviving to this point, but a
@@ -511,7 +545,6 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		// still write a marker between the clear and this read; the pid binding
 		// rejects that marker instead of misattributing a foreign failure to this
 		// spawn's caller.
-		const trustedMarker = marker && child.pid !== undefined && marker.pid === child.pid ? marker : undefined;
 		const failure = spawnError
 			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 			: exitedBeforeDiscovery

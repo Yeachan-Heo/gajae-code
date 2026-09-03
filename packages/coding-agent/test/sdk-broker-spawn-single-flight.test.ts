@@ -228,6 +228,53 @@ it("independent broker bootstrap children serialize before Broker.start", async 
 	}
 }, 30_000);
 
+it("retries discovery after a launcher dies while its child holds the startup fence", async () => {
+	const dir = await temp();
+	let first: Bun.Subprocess<"ignore", "ignore", "ignore"> | undefined;
+	let replacementPid: number | undefined;
+	try {
+		first = Bun.spawn(
+			[process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir],
+			{
+				cwd: import.meta.dir,
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "12000" },
+			},
+		);
+		await waitForFile(path.join(dir, "sdk", "broker.startup.lock", "info"));
+		first.kill("SIGKILL");
+		await first.exited;
+
+		const replacement = Bun.spawn(
+			[process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir],
+			{
+				cwd: import.meta.dir,
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+			},
+		);
+		const [code, error] = await Promise.all([replacement.exited, new Response(replacement.stderr).text()]);
+		expect({ code, error }).toEqual({ code: 0, error: "" });
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(discovery).not.toBeNull();
+		replacementPid = discovery!.pid;
+		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock");
+	} finally {
+		first?.kill("SIGKILL");
+		if (replacementPid !== undefined)
+			try {
+				process.kill(replacementPid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await Bun.sleep(300);
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
+
 it("the parent discovery budget covers child-fence contention plus a full startup attempt", async () => {
 	const dir = await temp();
 	const entered = Promise.withResolvers<void>();
