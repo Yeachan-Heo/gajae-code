@@ -30,8 +30,8 @@ export interface EnsureBrokerSettings {
 	env?: NodeJS.ProcessEnv;
 }
 
-const BROKER_PUBLICATION_TIMEOUT_MS = 10_000;
-const STARTUP_LOCK_WAIT_MS = BROKER_PUBLICATION_TIMEOUT_MS - 1_000;
+const BROKER_PUBLICATION_TIMEOUT_MS = 15_000;
+const STARTUP_LOCK_WAIT_MS = 9_000;
 const STALE_BROKER_RETIREMENT_TIMEOUT_MS = 5_000;
 /** Parent budget covers stale retirement, a full child-fence wait, and one publication attempt. */
 const DISCOVERY_TIMEOUT_MS = STALE_BROKER_RETIREMENT_TIMEOUT_MS + STARTUP_LOCK_WAIT_MS + BROKER_PUBLICATION_TIMEOUT_MS;

@@ -271,7 +271,7 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 	const { withBrokerStartupLock } = await import("../src/sdk/broker/ensure");
 	const dir = await temp();
 	const ready = path.join(dir, "expiring-stale.ready");
-	const stale = spawnExpiringStaleDiscoveryWorker(dir, ready, 18_000);
+	const stale = spawnExpiringStaleDiscoveryWorker(dir, ready, 19_000);
 	const entered = Promise.withResolvers<void>();
 	const unblock = Promise.withResolvers<void>();
 	const holder = withBrokerStartupLock(dir, async () => {
@@ -288,10 +288,10 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
-				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "7000" },
+				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "10000" },
 			},
 		);
-		await Bun.sleep(13_000);
+		await Bun.sleep(14_000);
 		unblock.resolve();
 		await holder;
 		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
@@ -314,7 +314,7 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 			}
 		await fs.rm(dir, { recursive: true, force: true });
 	}
-}, 45_000);
+}, 55_000);
 
 it("stale broker client teardown cannot extend an expired retirement deadline", async () => {
 	const { closeBrokerClientBeforeDeadline } = await import("../src/sdk/broker/ensure");
