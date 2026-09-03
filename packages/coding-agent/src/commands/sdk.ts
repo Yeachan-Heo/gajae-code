@@ -13,7 +13,7 @@ import { initTheme } from "../modes/theme/theme";
 import { ACP_MCP_REQUEST_TIMEOUT_MS, ACP_MCP_STARTUP_HEADROOM_MS } from "../sdk/acp/mcp";
 import { Broker } from "../sdk/broker/broker";
 import { readBrokerDiscovery } from "../sdk/broker/discovery";
-import { withBrokerStartupLock } from "../sdk/broker/ensure";
+import { reconcileBrokerGenerationForStartup, withBrokerStartupLock } from "../sdk/broker/ensure";
 import { completeBrokerProcess } from "../sdk/broker/internal";
 import {
 	type LifecycleTranscriptEvidence,
@@ -1091,7 +1091,7 @@ export default class Sdk extends Command {
 		let broker: Broker | undefined;
 		try {
 			broker = await withBrokerStartupLock(agentDir, async () => {
-				if (await readBrokerDiscovery(agentDir)) return undefined;
+				if (await reconcileBrokerGenerationForStartup({ agentDir })) return undefined;
 				const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 				if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
 					await Bun.sleep(startupDelayMs);

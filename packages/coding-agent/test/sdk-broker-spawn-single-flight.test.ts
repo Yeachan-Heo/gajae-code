@@ -1,10 +1,12 @@
 import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import packageJson from "../package.json" with { type: "json" };
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
+const brokerModule = path.resolve(import.meta.dir, "../src/sdk/broker/broker.ts");
 const ensureModule = path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts");
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-spawn-race-"));
 type LockWorker = Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -32,6 +34,19 @@ function spawnLockWorker(dir: string, ready: string, journal: string, label: str
 		await Bun.sleep(${holdMs});
 		await fs.appendFile(${JSON.stringify(journal)}, ${JSON.stringify(`${label}:end\n`)});
 		await release();
+	`;
+	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+}
+
+function spawnStaleBrokerWorker(dir: string, ready: string): LockWorker {
+	const source = `
+		import * as fs from "node:fs/promises";
+		import { Broker } from ${JSON.stringify(brokerModule)};
+		const broker = new Broker({ agentDir: ${JSON.stringify(dir)}, packageGeneration: "pr5204-stale-generation" });
+		const discovery = await broker.start();
+		await fs.writeFile(${JSON.stringify(ready)}, JSON.stringify(discovery));
+		process.once("SIGTERM", () => void broker.stop());
+		await broker.completion;
 	`;
 	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 }
@@ -76,6 +91,56 @@ it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and 
 		for (const pid of brokerPids)
 			try {
 				process.kill(pid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await Bun.sleep(300);
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 60_000);
+
+it("concurrent CLI replacement composes stale-generation fencing with single-flight spawn", async () => {
+	const dir = await temp();
+	const ready = path.join(dir, "stale.ready");
+	const staleBroker = spawnStaleBrokerWorker(dir, ready);
+	let currentPid: number | undefined;
+	try {
+		await waitForFile(ready);
+		const stale = JSON.parse(await fs.readFile(ready, "utf8")) as brokerDiscovery.BrokerDiscovery;
+		const invocations = Array.from({ length: 6 }, () =>
+			Bun.spawn([process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir], {
+				cwd: import.meta.dir,
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		);
+		const results = await Promise.all(
+			invocations.map(async child => ({
+				code: await child.exited,
+				error: await new Response(child.stderr).text(),
+			})),
+		);
+		expect(results).toEqual(results.map(() => ({ code: 0, error: "" })));
+
+		const replacement = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(replacement).not.toBeNull();
+		expect(replacement).toMatchObject({ packageGeneration: packageJson.version });
+		expect(replacement!.ownerId).not.toBe(stale.ownerId);
+		currentPid = replacement!.pid;
+		const ps = Bun.spawnSync(["ps", "-Ao", "args="]).stdout.toString();
+		expect(
+			ps.split("\n").filter(line => line.includes("broker-internal") && line.includes(`--agent-dir ${dir}`)),
+		).toHaveLength(1);
+		const sdkEntries = await fs.readdir(path.join(dir, "sdk"));
+		expect(sdkEntries).not.toContain("broker.spawn.lock");
+		expect(sdkEntries).not.toContain("broker.startup.lock");
+		expect(sdkEntries.filter(name => name.startsWith(".broker.lock.stale-"))).toEqual([]);
+	} finally {
+		staleBroker.kill("SIGTERM");
+		await staleBroker.exited;
+		if (currentPid !== undefined)
+			try {
+				process.kill(currentPid, "SIGTERM");
 			} catch {
 				// gone
 			}

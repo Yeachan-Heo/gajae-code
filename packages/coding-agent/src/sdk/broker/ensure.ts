@@ -15,7 +15,7 @@ function resolveExpectedBrokerGeneration(): string {
 	return typeof v === "string" && v.length > 0 ? v : "unknown";
 }
 
-function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
+export function isBrokerGenerationCompatible(discovery: BrokerDiscovery | null): boolean {
 	if (!discovery) return false;
 	return discovery.packageGeneration === resolveExpectedBrokerGeneration();
 }
@@ -344,6 +344,18 @@ async function retireStaleBrokerGeneration(stale: BrokerDiscovery, settings: Ens
 		await sleep(STALE_BROKER_POLL_MS);
 	}
 }
+
+/** Reconcile an observed broker generation before entering a startup critical section. */
+export async function reconcileBrokerGenerationForStartup(
+	settings: EnsureBrokerSettings,
+): Promise<BrokerDiscovery | undefined> {
+	const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (!current) return undefined;
+	if (isBrokerGenerationCompatible(current)) return current;
+	await retireStaleBrokerGeneration(current, settings);
+	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	return replacement && isBrokerGenerationCompatible(replacement) ? replacement : undefined;
+}
 function createFixtureLeaseFromChild(child: ChildProcess, terminate: () => Promise<void>): ExactFixtureBrokerLease {
 	let termination: Promise<void> | undefined;
 	const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null || child.pid === undefined;
@@ -398,21 +410,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 		if (discoveredAfterCleanup && isBrokerGenerationCompatible(discoveredAfterCleanup))
 			return { kind: "external-discovery", discovery: discoveredAfterCleanup };
-		// A stale-generation discovery after cleanup must not be reused — fall through to replacement.
-		if (!discoveredAfterCleanup) {
-			// no discovery left after cleanup — fall through to spawn
-		} else {
-			await retireStaleBrokerGeneration(discoveredAfterCleanup, settings);
-			const afterRetire = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-			if (afterRetire && isBrokerGenerationCompatible(afterRetire))
-				return { kind: "external-discovery", discovery: afterRetire };
-		}
+		// Stale-generation retirement is serialized under the spawn lock below.
 	} else if (existing) {
 		if (isBrokerGenerationCompatible(existing)) return { kind: "external-discovery", discovery: existing };
-		await retireStaleBrokerGeneration(existing, settings);
-		const afterRetire = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (afterRetire && isBrokerGenerationCompatible(afterRetire))
-			return { kind: "external-discovery", discovery: afterRetire };
+		// Stale-generation retirement is serialized under the spawn lock below.
 	}
 
 	// Only one process may spawn for this agent dir at a time; everyone else
@@ -423,7 +424,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 	try {
 		// The lock winner may still find a discovery published by an earlier winner
 		// that finished between our first read and the lock acquisition.
-		const discoveredUnderLock = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		const discoveredUnderLock = await reconcileBrokerGenerationForStartup(settings);
 		if (discoveredUnderLock) return { kind: "external-discovery", discovery: discoveredUnderLock };
 		const command = resolveSdkInternalSpawnCommand("broker-internal");
 		spawnLog = await openBrokerSpawnLog(settings.agentDir);
@@ -452,6 +453,10 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			try {
 				const discovered = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 				if (discovered) {
+					if (!isBrokerGenerationCompatible(discovered)) {
+						await sleep(50);
+						continue;
+					}
 					if (owner.markReady(discovered)) {
 						return initiator === "fixture-lease"
 							? { kind: "local-started-fixture", discovery: discovered, owner, child }
@@ -475,7 +480,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			try {
 				for (let retry = 0; retry < 20; retry++) {
 					const winner = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-					if (winner) {
+					if (winner && isBrokerGenerationCompatible(winner)) {
 						await owner.stop();
 						return { kind: "external-discovery", discovery: winner };
 					}
