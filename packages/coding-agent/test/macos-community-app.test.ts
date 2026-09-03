@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	abortActiveCommunityAppCommandsForTest,
 	COMMUNITY_APP_BUNDLE_ID,
 	COMMUNITY_APP_SUPPRESS_ENV,
 	communityAppAssetMatchesArchitectureForTest,
@@ -150,6 +151,62 @@ describe("macOS community app offer guards", () => {
 		expect(performance.now() - started).toBeLessThan(10_000);
 	});
 
+	test("escalates cancellation when a native helper ignores SIGTERM", async () => {
+		if (process.platform === "win32") return;
+		const dir = await tempDir();
+		const markerPath = path.join(dir, "helper.json");
+		const helperPath = path.join(dir, "helper.ts");
+		await fs.writeFile(
+			helperPath,
+			`const markerPath = Bun.argv.at(-1);
+if (!markerPath) throw new Error("missing marker path");
+await Bun.write(markerPath, JSON.stringify({ pid: process.pid }));
+process.on("SIGTERM", () => {});
+await Promise.withResolvers().promise;
+`,
+		);
+		const command = runCommunityAppCommandForTest([process.execPath, helperPath, markerPath]);
+		let helperPid: number | undefined;
+		for (let attempt = 0; attempt < 100; attempt++) {
+			const marker = await fs.readFile(markerPath, "utf8").catch(() => undefined);
+			if (marker) {
+				helperPid = (JSON.parse(marker) as { pid: number }).pid;
+				break;
+			}
+			await Bun.sleep(50);
+		}
+		if (!helperPid) throw new Error("helper did not start");
+		abortActiveCommunityAppCommandsForTest();
+		const result = await command;
+		expect(result.reaped).toBe(true);
+		expect(() => process.kill(helperPid, 0)).toThrow();
+		expect(() => process.kill(-helperPid, 0)).toThrow();
+	});
+
+	test("reaps same-group descendants after the helper leader exits", async () => {
+		if (process.platform === "win32") return;
+		const dir = await tempDir();
+		const markerPath = path.join(dir, "descendant.json");
+		const helperPath = path.join(dir, "leader.ts");
+		await fs.writeFile(
+			helperPath,
+			`const markerPath = Bun.argv.at(-1);
+if (!markerPath) throw new Error("missing marker path");
+const descendant = Bun.spawn([process.execPath, "-e", "process.on('SIGTERM', () => {}); await Promise.withResolvers().promise"], {
+	stdout: "ignore",
+	stderr: "ignore",
+});
+await Bun.write(markerPath, JSON.stringify({ descendantPid: descendant.pid }));
+await Bun.sleep(100);
+process.exit(0);
+`,
+		);
+		const result = await runCommunityAppCommandForTest([process.execPath, helperPath, markerPath]);
+		const { descendantPid } = JSON.parse(await fs.readFile(markerPath, "utf8")) as { descendantPid: number };
+		expect(result.reaped).toBe(true);
+		expect(() => process.kill(descendantPid, 0)).toThrow();
+	}, 12_000);
+
 	test("fails closed when the canonical release or checksum is unavailable", async () => {
 		const command = async () => ({ exitCode: 1, stdout: "", stderr: "" });
 		const logs: string[] = [];
@@ -161,6 +218,7 @@ describe("macOS community app offer guards", () => {
 			stdoutIsTTY: true,
 			prompt: async () => true,
 			command,
+			cleanupCommand: command,
 			log: message => logs.push(message),
 			fetchImpl: async () => new Response("missing", { status: 404 }),
 		});
@@ -175,6 +233,7 @@ describe("macOS community app offer guards", () => {
 			stdoutIsTTY: true,
 			prompt: async () => true,
 			command,
+			cleanupCommand: command,
 			fetchImpl: async url => {
 				if (url.includes("/releases/latest")) {
 					return new Response(
@@ -248,6 +307,7 @@ describe("macOS community app verified installation", () => {
 			stdoutIsTTY: true,
 			prompt: async () => true,
 			command,
+			cleanupCommand: command,
 			fetchImpl: async url => {
 				if (url.includes("/releases/latest")) {
 					return new Response(
@@ -281,6 +341,7 @@ describe("macOS community app verified installation", () => {
 			stdoutIsTTY: true,
 			prompt: async () => true,
 			command,
+			cleanupCommand: command,
 			fetchImpl: async url => {
 				if (url.includes("/releases/latest")) {
 					return new Response(
@@ -336,6 +397,7 @@ describe("macOS community app attach cleanup", () => {
 				stdoutIsTTY: true,
 				prompt: async () => true,
 				command,
+				cleanupCommand: command,
 				fetchImpl: async url => {
 					if (url.includes("/releases/latest"))
 						return new Response(
@@ -401,6 +463,7 @@ describe("macOS community app attach cleanup", () => {
 			stdoutIsTTY: true,
 			prompt: async () => true,
 			command,
+			cleanupCommand: command,
 			log: message => logs.push(message),
 			fetchImpl: async url => {
 				if (url.includes("/releases/latest"))

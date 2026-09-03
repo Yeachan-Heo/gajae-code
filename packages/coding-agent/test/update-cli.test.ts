@@ -888,11 +888,12 @@ describe("update-cli managed notification recovery", () => {
 						calls.push("refresh");
 					},
 					offerCommunityApp: async () => {
+						calls.push("offer");
 						throw new Error("detach failed");
 					},
 				},
 			);
-			expect(calls).toEqual(["recovery", "refresh"]);
+			expect(calls).toEqual(["recovery", "refresh", "offer"]);
 		});
 
 		it("does not preflight a migration target when the release decision is already up to date", async () => {

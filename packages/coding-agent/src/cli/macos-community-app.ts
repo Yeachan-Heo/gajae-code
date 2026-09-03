@@ -3,6 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
+import type { Process as NativeProcess } from "@gajae-code/natives";
+import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import * as postmortem from "@gajae-code/utils/postmortem";
 
 export const COMMUNITY_APP_REPOSITORY = "devswha/gajae-code-app";
 export const COMMUNITY_APP_BUNDLE_ID = "app.gajae.desktop";
@@ -16,6 +19,7 @@ const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
 const METADATA_FETCH_TIMEOUT_MS = 30_000;
 const ASSET_FETCH_TIMEOUT_MS = 10 * 60_000;
 const COMMAND_TIMEOUT_MS = 120_000;
+const CLEANUP_COMMAND_TIMEOUT_MS = 3_000;
 interface CommandResult {
 	exitCode: number;
 	stdout: string;
@@ -49,6 +53,7 @@ export interface CommunityAppOfferDependencies {
 	fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 	prompt?: () => Promise<boolean>;
 	command?: CommandRunner;
+	cleanupCommand?: CommandRunner;
 	log?: (message: string) => void;
 }
 
@@ -235,7 +240,7 @@ async function removeClaimedDirectory(
 	}
 }
 
-async function runCommand(argv: string[]): Promise<CommandResult> {
+async function runCommand(argv: string[], timeoutMs = COMMAND_TIMEOUT_MS): Promise<CommandResult> {
 	const controller = new AbortController();
 	activeCommandControllers.add(controller);
 	const child = Bun.spawn(argv, {
@@ -245,36 +250,7 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		killSignal: "SIGTERM",
 		detached: true,
 	});
-	let leaderExited = false;
-	child.exited.then(
-		() => {
-			leaderExited = true;
-		},
-		() => {
-			leaderExited = true;
-		},
-	);
-	const signalProcessGroup = (signal: NodeJS.Signals): boolean => {
-		if (leaderExited) return false;
-		try {
-			process.kill(child.pid, 0);
-		} catch {
-			return false;
-		}
-		try {
-			process.kill(-child.pid, signal);
-			return true;
-		} catch {
-			try {
-				child.kill(signal);
-				return true;
-			} catch {
-				return false;
-			}
-		}
-	};
-	controller.signal.addEventListener("abort", () => signalProcessGroup("SIGTERM"), { once: true });
-	const waitForProcessGroupGone = async (): Promise<boolean> => {
+	const waitForSpawnGroupGone = async (): Promise<boolean> => {
 		for (let attempt = 0; attempt < 100; attempt++) {
 			try {
 				process.kill(-child.pid, 0);
@@ -285,17 +261,49 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		}
 		return false;
 	};
-	const terminateAndReap = async (): Promise<boolean> => {
-		signalProcessGroup("SIGKILL");
-		const exited = await Promise.race([
-			child.exited.then(
-				() => true,
-				() => false,
-			),
-			Bun.sleep(5000).then(() => false),
-		]);
-		return exited && (await waitForProcessGroupGone());
+	const processRef = nativeProcessBindings().Process.fromPid(child.pid);
+	if (!processRef) {
+		child.kill("SIGKILL");
+		await Promise.race([child.exited.catch(() => undefined), Bun.sleep(500)]);
+		const reaped = await waitForSpawnGroupGone();
+		activeCommandControllers.delete(controller);
+		return {
+			exitCode: 125,
+			stdout: "",
+			stderr: `could not bind helper process identity: ${argv[0]}`,
+			reaped,
+		};
+	}
+	const descendants = new Map<string, NativeProcess>();
+	const captureDescendants = (parent: NativeProcess): void => {
+		for (const descendant of parent.children()) {
+			descendants.set(descendant.incarnation, descendant);
+			captureDescendants(descendant);
+		}
 	};
+	let trackingDescendants = true;
+	const descendantTracker = (async () => {
+		while (trackingDescendants) {
+			captureDescendants(processRef);
+			await Bun.sleep(25);
+		}
+		captureDescendants(processRef);
+	})();
+	const terminateAndReap = async (gracefulMs: number): Promise<boolean> => {
+		captureDescendants(processRef);
+		const rootExited = await processRef.terminate({ group: false, gracefulMs, timeoutMs: 5_000 });
+		const descendantResults = await Promise.all(
+			[...descendants.values()].map(descendant => descendant.terminate({ gracefulMs: -1, timeoutMs: 5_000 })),
+		);
+		return rootExited && descendantResults.every(Boolean) && (await waitForSpawnGroupGone());
+	};
+	controller.signal.addEventListener(
+		"abort",
+		() => {
+			void terminateAndReap(500);
+		},
+		{ once: true },
+	);
 	try {
 		const childExit = child.exited.then(
 			code => ({ code, reaped: true }),
@@ -308,8 +316,8 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 		]);
 		const timeout = Promise.withResolvers<boolean>();
 		const timer: NodeJS.Timeout = setTimeout(() => {
-			void terminateAndReap().then(reaped => timeout.resolve(reaped));
-		}, COMMAND_TIMEOUT_MS);
+			void terminateAndReap(500).then(reaped => timeout.resolve(reaped));
+		}, timeoutMs);
 		const output = await Promise.race([
 			outputPromise
 				.then(value => ({ kind: "output" as const, value }))
@@ -328,17 +336,20 @@ async function runCommand(argv: string[]): Promise<CommandResult> {
 			};
 		}
 		if (output.kind === "error") {
-			const reaped = await terminateAndReap();
+			const reaped = await terminateAndReap(-1);
 			return { exitCode: 125, stdout: "", stderr: String(output.error), reaped };
 		}
 		const [stdout, stderr, childResult] = output.value;
+		const reaped = childResult.reaped && (await terminateAndReap(0));
 		return {
 			exitCode: childResult.code,
 			stdout,
 			stderr,
-			reaped: childResult.reaped && (await waitForProcessGroupGone()),
+			reaped,
 		};
 	} finally {
+		trackingDescendants = false;
+		await descendantTracker;
 		activeCommandControllers.delete(controller);
 	}
 }
@@ -505,36 +516,18 @@ export async function offerMacosCommunityApp(
 
 	let receivedSignal: NodeJS.Signals | undefined;
 	let cleanupUnsafe = false;
-	const rawCommand: CommandRunner = deps.command ?? runCommand;
+	const providedCommand = deps.command;
+	const rawCommand: CommandRunner = providedCommand ?? runCommand;
+	const cleanupCommand: CommandRunner = deps.cleanupCommand ?? (argv => runCommand(argv, CLEANUP_COMMAND_TIMEOUT_MS));
 	const command: CommandRunner = async argv => {
 		if (receivedSignal) throw new Error(`interrupted by ${receivedSignal}`);
 		const result = await rawCommand(argv);
 		if (result.reaped === false) cleanupUnsafe = true;
 		return result;
 	};
-	const homeDir = deps.homeDir ?? os.homedir();
-	try {
-		if (await findInstalledApp(homeDir, command)) return { status: "skipped", reason: "already installed" };
-		if (!(await (deps.prompt ?? defaultPrompt)())) return { status: "skipped", reason: "cancelled" };
-	} catch (error) {
-		return failure(error instanceof Error ? error.message : String(error), log);
-	}
-
-	const arch = deps.arch ?? process.arch;
-	if (!isMacArchitecture(arch)) return failure(`unsupported macOS architecture ${arch}`, log);
-	const fetchImpl = deps.fetchImpl ?? fetch;
-	const fetchOptions = (timeoutMs: number): RequestInit => ({ signal: AbortSignal.timeout(timeoutMs) });
-	let tempRoot: string | undefined;
-	let tempRootIdentity: FileIdentity | undefined;
-	let mountPoint: string | undefined;
-	let mountIdentity: FileIdentity | undefined;
-	let mountAttempted = false;
-	let mountState: "none" | "unknown" | "attached" = "none";
-	let installedDestination: { path: string; identity: FileIdentity } | undefined;
-	let destinationRoot: string | undefined;
-	let destinationRootIdentity: FileIdentity | undefined;
 	const signalNames = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
+	const offerSettled = Promise.withResolvers<void>();
 	const onSignal = (signal: NodeJS.Signals) => {
 		receivedSignal = signal;
 		for (const controller of activeCommandControllers) controller.abort();
@@ -550,6 +543,40 @@ export async function offerMacosCommunityApp(
 			if (handler) process.removeListener(signal, handler);
 		}
 	};
+	const unregisterPostmortemCleanup = postmortem.register("macos-community-app-offer", async reason => {
+		if (reason === postmortem.Reason.SIGINT) onSignal("SIGINT");
+		else if (reason === postmortem.Reason.SIGTERM) onSignal("SIGTERM");
+		else if (reason === postmortem.Reason.SIGHUP) onSignal("SIGHUP");
+		await offerSettled.promise;
+	});
+	const finishOwnership = (result: CommunityAppOfferResult): CommunityAppOfferResult => {
+		offerSettled.resolve();
+		unregisterPostmortemCleanup();
+		removeSignalHandlers();
+		return result;
+	};
+	const homeDir = deps.homeDir ?? os.homedir();
+	try {
+		if (await findInstalledApp(homeDir, command))
+			return finishOwnership({ status: "skipped", reason: "already installed" });
+		if (!(await (deps.prompt ?? defaultPrompt)())) return finishOwnership({ status: "skipped", reason: "cancelled" });
+	} catch (error) {
+		return finishOwnership(failure(error instanceof Error ? error.message : String(error), log));
+	}
+
+	const arch = deps.arch ?? process.arch;
+	if (!isMacArchitecture(arch)) return finishOwnership(failure(`unsupported macOS architecture ${arch}`, log));
+	const fetchImpl = deps.fetchImpl ?? fetch;
+	const fetchOptions = (timeoutMs: number): RequestInit => ({ signal: AbortSignal.timeout(timeoutMs) });
+	let tempRoot: string | undefined;
+	let tempRootIdentity: FileIdentity | undefined;
+	let mountPoint: string | undefined;
+	let mountIdentity: FileIdentity | undefined;
+	let mountAttempted = false;
+	let mountState: "none" | "unknown" | "attached" = "none";
+	let installedDestination: { path: string; identity: FileIdentity } | undefined;
+	let destinationRoot: string | undefined;
+	let destinationRootIdentity: FileIdentity | undefined;
 	const throwIfInterrupted = () => {
 		if (receivedSignal) throw new Error(`community app offer interrupted by ${receivedSignal}`);
 	};
@@ -864,7 +891,7 @@ export async function offerMacosCommunityApp(
 				} else if (mountState === "none") {
 					// The attach attempt completed without establishing a mount.
 				} else {
-					const detach = await rawCommand(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
+					const detach = await cleanupCommand(["/usr/bin/hdiutil", "detach", mountPoint, "-force"]);
 					if (detach.reaped === false) cleanupUnsafe = true;
 					if (detach.reaped === false) {
 						removeTempRoot = false;
@@ -890,6 +917,8 @@ export async function offerMacosCommunityApp(
 		} else if (tempRoot) {
 			log("Optional community app cleanup warning: temporary root identity changed; refusing recursive removal");
 		}
+		offerSettled.resolve();
+		unregisterPostmortemCleanup();
 		removeSignalHandlers();
 	}
 }
@@ -911,6 +940,10 @@ export async function resolveCommunityAppExecutableForTest(
 
 export async function runCommunityAppCommandForTest(
 	argv: string[],
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+): Promise<{ exitCode: number; stdout: string; stderr: string; reaped?: boolean }> {
 	return runCommand(argv);
+}
+
+export function abortActiveCommunityAppCommandsForTest(): void {
+	for (const controller of activeCommandControllers) controller.abort();
 }
