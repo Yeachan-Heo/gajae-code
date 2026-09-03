@@ -96,6 +96,31 @@ function collectEffectReferences(value: unknown, references: Set<string>): void 
 	}
 }
 
+function rewriteAttachmentAuthorityIds(value: unknown, previous: string, current: string): unknown {
+	if (Array.isArray(value)) {
+		let changed = false;
+		const rewritten = value.map(entry => {
+			const next = rewriteAttachmentAuthorityIds(entry, previous, current);
+			changed ||= next !== entry;
+			return next;
+		});
+		return changed ? rewritten : value;
+	}
+	if (!value || typeof value !== "object") return value;
+	let changed = false;
+	const rewritten = Object.fromEntries(
+		Object.entries(value).map(([key, entry]) => {
+			const next =
+				key === "attachmentAuthorityId" && entry === previous
+					? current
+					: rewriteAttachmentAuthorityIds(entry, previous, current);
+			changed ||= next !== entry;
+			return [key, next];
+		}),
+	);
+	return changed ? rewritten : value;
+}
+
 function nonEmpty(value: string, name: string): void {
 	if (!value) throw new Error(`Chat effect ${name} is required`);
 }
@@ -156,6 +181,31 @@ export class ChatEffectJournal {
 
 	async list(): Promise<ChatEffect[]> {
 		return Object.values((await this.#store.load()).conversations);
+	}
+
+	/** Rewrite pre-device-binding effect payloads after Router proves the current endpoint. */
+	async migrateAttachmentAuthorityId(
+		sessionId: string,
+		endpointGeneration: number,
+		previousAuthorityId: string,
+		currentAuthorityId: string,
+	): Promise<void> {
+		if (!previousAuthorityId || !currentAuthorityId || previousAuthorityId === currentAuthorityId) return;
+		for (const effect of await this.list()) {
+			if (effect.sessionId !== sessionId || effect.endpointGeneration !== endpointGeneration) continue;
+			await this.#store.transact(effect.id, current => {
+				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
+					return current;
+				const payload = rewriteAttachmentAuthorityIds(current.payload, previousAuthorityId, currentAuthorityId);
+				if (payload === current.payload) return current;
+				return {
+					...current,
+					generation: current.generation + 1,
+					payload,
+					updatedAt: this.#now(),
+				};
+			});
+		}
 	}
 
 	async replayable(transport: "discord" | "slack", endpointGeneration: number): Promise<ChatEffect[]> {

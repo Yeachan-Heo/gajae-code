@@ -211,6 +211,44 @@ function inbound(threadId: string, id: string, generation = 1, customId?: string
 }
 
 describe("DiscordNotificationDaemon fake-provider acceptance", () => {
+	test("migrates persisted attachment and effect authority after device binding", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, _provider, agentDir) => {
+				const conversation = await daemon.notify({
+					sessionId: "session",
+					endpointGeneration: 1,
+					attachmentAuthorityId: authorityId,
+					content: "root",
+				});
+				authorityId = "device-bound-authority";
+				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
+
+				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				const migrated = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session" && record.threadId === conversation.threadId,
+				);
+				expect(migrated?.attachmentAuthorityId).toBe("device-bound-authority");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				const effect = (await journal.list()).find(record => record.kind === "post-message");
+				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
+					"device-bound-authority",
+				);
+			},
+			{
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId,
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			},
+		);
+	});
+
 	test("reconciles an uncertain create by nonce instead of creating a second thread", async () => {
 		await withDaemon(async (daemon, provider) => {
 			provider.failCreateAfterPersist = true;

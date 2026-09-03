@@ -1098,7 +1098,46 @@ export class SlackNotificationDaemon {
 		return active;
 	}
 
-	/** Posts a safe command outcome to the active mapped root thread. */
+	/** Migrate pre-device-binding mapping and effect authority after Router proof. */
+	async migrateAttachmentAuthority(
+		sessionId: string,
+		endpointGeneration: number,
+		previousAuthorityId: string,
+		currentAuthorityId: string,
+	): Promise<void> {
+		if (!previousAuthorityId || !currentAuthorityId || previousAuthorityId === currentAuthorityId) return;
+		const document = await this.store.load();
+		for (const key of Object.keys(document.conversations)) {
+			await this.store.transact(key, current => {
+				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
+					return current;
+				let receiptChanged = false;
+				const inboundDispatches = current.inboundDispatches?.map(receipt => {
+					if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
+					receiptChanged = true;
+					return { ...receipt, attachmentAuthorityId: currentAuthorityId };
+				});
+				const attachmentAuthorityId =
+					current.attachmentAuthorityId === previousAuthorityId
+						? currentAuthorityId
+						: current.attachmentAuthorityId;
+				if (attachmentAuthorityId === current.attachmentAuthorityId && !receiptChanged) return current;
+				return nextRecord(current, {
+					attachmentAuthorityId,
+					...(inboundDispatches === undefined ? {} : { inboundDispatches }),
+					updatedAt: this.#now(),
+				});
+			});
+		}
+		await this.#journal.migrateAttachmentAuthorityId(
+			sessionId,
+			endpointGeneration,
+			previousAuthorityId,
+			currentAuthorityId,
+		);
+	}
+
+	/** Posts a safe command outcome to the active mapped root. */
 	async postCommandResult(sessionId: string, content: string): Promise<boolean> {
 		return await this.#track(this.#postCommandResult(sessionId, content));
 	}

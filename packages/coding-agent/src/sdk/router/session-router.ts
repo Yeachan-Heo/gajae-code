@@ -36,13 +36,7 @@ export interface SessionEndpointIdentity {
 	readonly ino: bigint;
 }
 
-/**
- * Exact identity of one attached SDK session endpoint. Providers persist it next to
- * their conversation state and re-prove it before every resume, so it must be derived
- * in exactly one place: a caller that recomputes the digest by hand silently stops
- * matching the moment the bound fields change.
- */
-export function sessionAttachmentAuthorityId(input: {
+export interface SessionAttachmentAuthorityInput {
 	sessionId: string;
 	generation: number;
 	pid: number;
@@ -51,14 +45,22 @@ export function sessionAttachmentAuthorityId(input: {
 	token: string;
 	/** Proven no-follow endpoint identity, when the caller has one. */
 	endpointIdentity?: SessionEndpointIdentity;
-}): string {
+}
+
+/**
+ * Exact identity of one attached SDK session endpoint. Providers persist it next to
+ * their conversation state and re-prove it before every resume, so it must be derived
+ * in exactly one place: a caller that recomputes the digest by hand silently stops
+ * matching the moment the bound fields change.
+ */
+function createSessionAttachmentAuthorityId(input: SessionAttachmentAuthorityInput, includeDevice: boolean): string {
 	const endpointAuthorityDigest = crypto
 		.createHash("sha256")
 		.update(JSON.stringify({ url: input.url, token: input.token }))
 		.digest("hex");
 	const endpointIdentity = input.endpointIdentity
 		? {
-				dev: input.endpointIdentity.dev.toString(),
+				...(includeDevice ? { dev: input.endpointIdentity.dev.toString() } : {}),
 				mtimeMs: input.endpointIdentity.mtimeMs,
 				mtimeNs: input.endpointIdentity.mtimeNs.toString(),
 				ctimeNs: input.endpointIdentity.ctimeNs.toString(),
@@ -81,10 +83,21 @@ export function sessionAttachmentAuthorityId(input: {
 		.digest("hex");
 }
 
+export function sessionAttachmentAuthorityId(input: SessionAttachmentAuthorityInput): string {
+	return createSessionAttachmentAuthorityId(input, true);
+}
+
+/** Digest used by pre-device-binding provider records during one-time migration. */
+function sessionAttachmentLegacyAuthorityId(input: SessionAttachmentAuthorityInput): string {
+	return createSessionAttachmentAuthorityId(input, false);
+}
+
 /** The only capability a provider may retain for an attached SDK session. */
 export interface SessionAttachment {
 	readonly sessionId: string;
 	readonly authorityId?: string;
+	/** Pre-device-binding authority ID; valid only for one-time migration after current proof. */
+	readonly legacyAuthorityId?: string;
 	/** Current Router-owned transport identity for this exact attachment's reverse leases. */
 	readonly connectionId?: string;
 	readonly generation: number;
@@ -1666,6 +1679,15 @@ export class SessionRouter {
 		void publication.promise.catch(() => undefined);
 		const capability: SessionAttachment = Object.freeze({
 			authorityId: sessionAttachmentAuthorityId({
+				sessionId: indexed.sessionId,
+				generation: indexed.endpointGeneration,
+				pid: indexed.pid,
+				endpointMtimeMs: indexed.endpointMtimeMs,
+				url: endpoint.url,
+				token: endpoint.token,
+				endpointIdentity,
+			}),
+			legacyAuthorityId: sessionAttachmentLegacyAuthorityId({
 				sessionId: indexed.sessionId,
 				generation: indexed.endpointGeneration,
 				pid: indexed.pid,

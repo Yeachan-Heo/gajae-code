@@ -502,6 +502,26 @@ export class ChatDaemonRuntime {
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
 		const revivedTransport = this.#attachments.get(attachment.sessionId) === attachment;
+		if (
+			attachment.legacyAuthorityId &&
+			attachment.authorityId &&
+			attachment.legacyAuthorityId !== attachment.authorityId
+		) {
+			if (this.#discord)
+				await this.#discord.migrateAttachmentAuthority(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.legacyAuthorityId,
+					attachment.authorityId,
+				);
+			if (this.#slack)
+				await this.#slack.migrateAttachmentAuthority(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.legacyAuthorityId,
+					attachment.authorityId,
+				);
+		}
 		this.#attachments.set(attachment.sessionId, attachment);
 		if (revivedTransport) {
 			this.#presentation?.connectSession(attachment.sessionId, {
