@@ -590,12 +590,12 @@ export async function findRuntimeSkillByName(
 	}
 	if (policy?.enabled === true) {
 		try {
-			const pluginDirs = await collectPluginSkillDirs(home, cwd);
+			const pluginDirs = await collectPluginSkillDirs(resolvedHome, cwd);
 			for (const entry of pluginDirs) {
 				if (!sourceEnabled(entry.level, policy)) continue;
 				scanJobs.push(
 					scanSkillsFromDir(
-						{ cwd, home, repoRoot: home },
+						{ cwd, home: resolvedHome, repoRoot: resolvedHome },
 						{
 							dir: entry.dir,
 							providerId: "plugin",
