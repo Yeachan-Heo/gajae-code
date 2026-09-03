@@ -149,6 +149,7 @@ try {
 			GJC_COORDINATOR_SESSION_ID: sessionId,
 			GJC_MANAGED_OWNER_RUN_ID: runId,
 			GJC_MANAGED_OWNER_INCARNATION: incarnation,
+			GJC_MANAGED_OWNER_SUPERVISED: "1",
 			GJC_MANAGED_OWNER_COMMAND_JSON: JSON.stringify([process.execPath, childScript]),
 		};
 		isolatedServers.push({ env, stateDir, scopeName });

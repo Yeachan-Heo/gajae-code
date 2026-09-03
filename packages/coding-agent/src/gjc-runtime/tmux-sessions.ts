@@ -12,6 +12,7 @@ import {
 	MANAGED_OWNER_INCARNATION_ENV,
 	MANAGED_OWNER_REDACT_COMMAND_ENV,
 	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_SUPERVISED_ENV,
 	MANAGED_OWNER_SUPERVISOR_ARG,
 } from "./managed-owner-supervisor";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
@@ -726,6 +727,7 @@ export function createGjcTmuxSession(
 					[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),
 					[MANAGED_OWNER_INCARNATION_ENV]: crypto.randomUUID(),
 					[MANAGED_OWNER_REDACT_COMMAND_ENV]: "1",
+					[MANAGED_OWNER_SUPERVISED_ENV]: "1",
 				}
 			: {}),
 	};
