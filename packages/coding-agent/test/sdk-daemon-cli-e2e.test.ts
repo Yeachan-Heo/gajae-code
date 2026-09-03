@@ -126,6 +126,7 @@ describe("SDK session CLI", () => {
 	// the reply so the live frames provably land first.
 	let explicitReplayEvents: Record<string, unknown>[] | undefined;
 	let earlyLiveEvents: Record<string, unknown>[] = [];
+	let preCheckpointLiveEvents: Record<string, unknown>[] = [];
 	let wireLog: string[] = [];
 	// Retained transcript rows served by `transcript.list`. Non-empty rows make
 	// the checkpoint advertise a cursor so the CLI actually drains the page.
@@ -149,6 +150,7 @@ describe("SDK session CLI", () => {
 		openSockets = new Set();
 		explicitReplayEvents = undefined;
 		earlyLiveEvents = [];
+		preCheckpointLiveEvents = [];
 		wireLog = [];
 		transcriptRows = [];
 		checkpointRecord = { revision: 1, generation: 1, seq: 0, idle: false };
@@ -324,6 +326,10 @@ describe("SDK session CLI", () => {
 									}),
 								);
 								return;
+							}
+							for (const event of preCheckpointLiveEvents) {
+								socket.send(JSON.stringify(event));
+								wireLog.push(`pre_checkpoint_live_sent:${event.kind}:${event.seq}`);
 							}
 							socket.send(
 								JSON.stringify({
@@ -746,6 +752,31 @@ describe("SDK session CLI", () => {
 		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
 		expect(tail.exitCode, tail.stderr).toBe(0);
 		expect(JSON.parse(tail.stdout).result).toMatchObject({ terminal: true });
+	}, 60_000);
+
+	it("stamps a positioned pre-checkpoint live frame before deduping its replayed copy", async () => {
+		checkpointRecord = { revision: 7, generation: 1, seq: 0, idle: false };
+		const duplicatedStart = {
+			type: "event",
+			generation: 1,
+			seq: 1,
+			kind: "turn_start",
+			payload: { type: "turn_start", sessionId: "live" },
+		};
+		preCheckpointLiveEvents = [duplicatedStart];
+		replayEvents = [duplicatedStart];
+		deferredLiveEvents = [{ type: "event", generation: 1, seq: 2, kind: "turn_end", payload: { type: "turn_end" } }];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		expect(wireLog).toContain("pre_checkpoint_live_sent:turn_start:1");
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const items = (JSON.parse(tail.stdout).result?.items ?? []) as Array<Record<string, unknown>>;
+		expect(
+			items.filter(
+				item => item.kind === "turn_start" && item.revision === 7 && item.generation === 1 && item.seq === 1,
+			),
+		).toHaveLength(1);
 	}, 60_000);
 
 	// Out-of-band ordering: the Router delivers live frames as they arrive, while
