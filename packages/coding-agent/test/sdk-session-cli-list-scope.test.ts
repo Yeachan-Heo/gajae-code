@@ -375,6 +375,19 @@ describe("scope exclusion warnings are bounded", () => {
 		expect(result.descriptor).toEqual({ scope: "all", path: path.join(tempRoot, "not-a-repository") });
 	});
 
+	test("resolves a real relative workspace named unknown instead of treating it as a sentinel", async () => {
+		const repo = await makeRepo("unknown");
+		const originalCwd = process.cwd();
+		process.chdir(tempRoot);
+		try {
+			const result = await resolveSessionListSelection("cwd", "unknown");
+			expect(result.descriptor.path).toBe(repo);
+			expect(result.selection.repoRoot).toBe(repo);
+		} finally {
+			process.chdir(originalCwd);
+		}
+	});
+
 	test("never matches the unknown locator to cwd", async () => {
 		const repo = await makeRepo("unknown-cwd");
 		const unknownPath = path.join(repo, "unknown");

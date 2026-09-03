@@ -259,7 +259,10 @@ function branchExists(repoRoot: string, branchName: string): boolean {
 }
 
 function validateBranchName(repoRoot: string, branchName: string): void {
-	if (/^@\{-\d+\}$/.test(branchName)) throw launchGuard("invalid_worktree_branch", branchName);
+	// Git expands every `@{-n}` token before validating the ref, including
+	// accepted forms such as `@{-1}/suffix` and `@{-1}x`. Those are checkout
+	// history shorthands, not stable branch names for a durable worktree.
+	if (/@\{-\d+\}/.test(branchName)) throw launchGuard("invalid_worktree_branch", branchName);
 	const result = Bun.spawnSync(["git", "check-ref-format", "--branch", branchName], {
 		cwd: repoRoot,
 		stdout: "pipe",
