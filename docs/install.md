@@ -122,8 +122,10 @@ when no canonical published release is available. A yes answer uses only the
 repository's published macOS DMG and SHA-256, verifies its bundle identity,
 signature, and architecture, installs to a user-writable Applications folder,
 and launches with macOS `open`. GJC never uses `sudo`, disables Gatekeeper, or
-removes quarantine metadata. Any app-specific failure leaves the GJC install
-or update successful and unchanged.
+removes quarantine metadata. The accepted signer is pinned to the community
+app's Developer ID Application authority and Team ID `5987KT43TJ`; a different
+publisher is rejected even if generic Gatekeeper assessment succeeds. Any
+app-specific failure leaves the GJC install or update successful and unchanged.
 
 Set `GJC_NO_COMMUNITY_APP=1` for unattended environments, package automation,
 or repeated installs. The flag suppresses only this optional offer.
