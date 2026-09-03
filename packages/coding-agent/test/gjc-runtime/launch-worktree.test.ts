@@ -738,6 +738,19 @@ describe("launch guard classification", () => {
 		expect(guard?.message.startsWith("invalid_worktree_branch:")).toBe(true);
 	});
 
+	it("rejects checkout-history shorthand variants before Git expands them", async () => {
+		const repo = await createRepo("gjc-guard-history-shorthand-");
+		for (const branch of ["@{-1}/suffix", "@{-1}x"]) {
+			let caught: unknown;
+			try {
+				prepareLaunchWorktree(repo, ["--worktree", branch]);
+			} catch (error) {
+				caught = error;
+			}
+			expect(asLaunchWorktreeGuardError(caught)?.code).toBe("invalid_worktree_branch");
+		}
+	});
+
 	it("redacts secrets and bounds captured branch diagnostics", async () => {
 		const repo = await createRepo("gjc-guard-diagnostic-bounds-");
 		const secret = "SuperSecretToken123456";
