@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import * as http2 from "node:http2";
-import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, fromJson, type JsonValue, toBinary } from "@bufbuild/protobuf";
 import {
 	buildCursorHistoryForTest,
 	buildCursorRequestContextRules,
@@ -14,6 +14,7 @@ import type { AgentRunRequest, AgentServerMessage } from "../src/providers/curso
 import {
 	type AgentClientMessage,
 	AgentClientMessageSchema,
+	AgentRunRequestSchema,
 	AgentServerMessageSchema,
 	ConversationStateStructureSchema,
 	ConversationTokenDetailsSchema,
@@ -47,19 +48,16 @@ function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
 	streamCursor(cursorModel, context, {
 		apiKey: "test-token",
 		onPayload: payload => {
-			if (isAgentRunRequest(payload)) {
-				resolve(payload);
-			} else {
-				reject(new Error("Cursor payload was not an AgentRunRequest"));
+			try {
+				JSON.stringify(payload);
+				resolve(fromJson(AgentRunRequestSchema, payload as JsonValue));
+			} catch (error) {
+				reject(error);
 			}
 			throw new Error("stop after capturing Cursor payload");
 		},
 	});
 	return promise;
-}
-
-function isAgentRunRequest(payload: unknown): payload is AgentRunRequest {
-	return !!payload && typeof payload === "object" && "$typeName" in payload;
 }
 
 function frameServerMessage(message: AgentServerMessage): Buffer {
@@ -140,7 +138,6 @@ function createReadSuccessResult(output: string) {
 		},
 	});
 }
-
 describe("Cursor resolveExecHandler execHandlers binding", () => {
 	it("invokes handler with correct this when passed as bound method", async () => {
 		const sentinel = { tag: "bound-correctly" };

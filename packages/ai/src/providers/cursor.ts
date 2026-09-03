@@ -689,7 +689,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			conversationUsageContextCache.set(conversationId, usageContext);
 			const reusableCachedState =
 				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext) ? cachedState : undefined;
-			const { requestBytes, conversationState } = buildGrpcRequest(model, context, options, {
+			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
 				conversationState: reusableCachedState,
@@ -3459,7 +3459,7 @@ function extractImages(content: (TextContent | ImageContent)[]) {
 		);
 }
 
-function buildGrpcRequest(
+async function buildGrpcRequest(
 	model: Model<"cursor-agent">,
 	context: Context,
 	options: CursorOptions | undefined,
@@ -3468,11 +3468,11 @@ function buildGrpcRequest(
 		blobStore: Map<string, Uint8Array>;
 		conversationState?: ConversationStateStructure;
 	},
-): {
+): Promise<{
 	requestBytes: Uint8Array;
 	blobStore: Map<string, Uint8Array>;
 	conversationState: ConversationStateStructure;
-} {
+}> {
 	const blobStore = state.blobStore;
 
 	const systemPromptIds = buildCursorSystemPromptJsons(context.systemPrompt, model.id).map(json =>
@@ -3558,7 +3558,7 @@ function buildGrpcRequest(
 		displayName: model.name,
 	});
 
-	const runRequest = create(AgentRunRequestSchema, {
+	let runRequest = create(AgentRunRequestSchema, {
 		conversationState,
 		action,
 		modelDetails,
@@ -3573,7 +3573,13 @@ function buildGrpcRequest(
 			: {}),
 	});
 
-	options?.onPayload?.(runRequest, model, options?.attemptScope);
+	if (options?.onPayload) {
+		const payload = toJson(AgentRunRequestSchema, runRequest);
+		const replacement = await options.onPayload(payload, model, options.attemptScope);
+		if (replacement !== undefined) {
+			runRequest = fromJson(AgentRunRequestSchema, replacement as JsonValue);
+		}
+	}
 
 	// Tools are sent later via requestContext (exec handshake)
 
