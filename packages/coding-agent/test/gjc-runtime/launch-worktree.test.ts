@@ -852,4 +852,53 @@ describe("launch guard classification", () => {
 		expect(await Bun.file(path.join(plan.worktreePath, "committed-user-file.txt")).text()).toBe("keep\n");
 		expect(run("git", ["rev-parse", plan.branchName ?? ""], repo)).not.toBe(plan.baseRef);
 	});
+
+	it("removes a timed-out clean worktree for a pre-existing branch without deleting the branch", async () => {
+		const repo = await createRepo("gjc-cancellable-existing-");
+		const sourceBranch = run("git", ["branch", "--show-current"], repo);
+		run("git", ["checkout", "-b", "deadline-existing"], repo);
+		fsSync.writeFileSync(path.join(repo, "existing.txt"), "existing\n");
+		run("git", ["add", "existing.txt"], repo);
+		run("git", ["commit", "-m", "existing branch"], repo);
+		const existingHead = run("git", ["rev-parse", "HEAD"], repo);
+		run("git", ["checkout", sourceBranch], repo);
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-existing" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => (++reads < 6 ? 0 : 100),
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(plan.worktreePath).exists()).toBe(false);
+		expect(run("git", ["rev-parse", "deadline-existing"], repo)).toBe(existingHead);
+	});
+
+	it("retains a detached worktree when a commit races timeout cleanup", async () => {
+		const repo = await createRepo("gjc-cancellable-detached-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: true, name: null });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) {
+						fsSync.writeFileSync(path.join(plan.worktreePath, "detached-user-file.txt"), "keep\n");
+						run("git", ["add", "detached-user-file.txt"], plan.worktreePath);
+						run("git", ["commit", "-m", "detached user work"], plan.worktreePath);
+					}
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "detached-user-file.txt")).text()).toBe("keep\n");
+		expect(run("git", ["rev-parse", "HEAD"], plan.worktreePath)).not.toBe(plan.baseRef);
+	});
 });
