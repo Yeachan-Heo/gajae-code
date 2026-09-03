@@ -1238,6 +1238,18 @@ export interface OwnerIntent {
 	expires_at: string;
 	state: "pending";
 }
+export interface StagedOwnerTerminalJournal {
+	schema_version: 1;
+	kind: "staged_owner_terminal";
+	generation: string;
+	session_id: string;
+	run_id: string;
+	incarnation: string;
+	observed_at: string;
+	signal: TerminalSignal;
+	exit_code: number | null;
+	reason: string;
+}
 export interface OwnerVerdict {
 	schema_version: 1;
 	generation: string;
@@ -1291,6 +1303,7 @@ export interface LifecyclePaths {
 	incidentFile: string;
 	lockDatabaseFile: string;
 	journalFile: string;
+	stagedTerminalFile: string;
 }
 export function lifecyclePaths(stateDir: string, sessionId: string, generation: string): LifecyclePaths {
 	try {
@@ -1314,6 +1327,7 @@ export function lifecyclePaths(stateDir: string, sessionId: string, generation: 
 		incidentFile: path.join(root, `incident-${generation}.json`),
 		lockDatabaseFile: path.join(root, "owner-locks.sqlite"),
 		journalFile: path.join(root, `verdict-${generation}.journal`),
+		stagedTerminalFile: path.join(root, `staged-terminal-${encodeURIComponent(generation)}.json`),
 	};
 }
 
@@ -1345,6 +1359,7 @@ export async function replaceOwnerGeneration(
 	const token = await acquireOwnerGenerationLock(paths, sessionId);
 	if (!token) throw new Error("generation_lock_contended");
 	try {
+		assertNoStagedOwnerTerminal(paths);
 		const previous = await captureOwnerGenerationBaseline(stateDir, sessionId);
 		if (expectedBaseline && !sameOwnerGenerationBaseline(previous, expectedBaseline))
 			throw new Error("generation_baseline_changed");
@@ -1386,7 +1401,17 @@ export async function withOwnerGenerationLock<T>(
 	sessionId: string,
 	operation: () => Promise<T>,
 ): Promise<T> {
-	const paths = lifecyclePaths(stateDir, sessionId, "baseline");
+	return await withOwnerGenerationLifecycleLock(stateDir, sessionId, "baseline", operation);
+}
+
+/** Serializes one operation with publication for a specific staged generation. */
+export async function withOwnerGenerationLifecycleLock<T>(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	operation: () => Promise<T>,
+): Promise<T> {
+	const paths = lifecyclePaths(stateDir, sessionId, generation);
 	const token = await acquireOwnerGenerationLock(paths, sessionId);
 	if (!token) throw new Error("generation_lock_contended");
 	try {
@@ -1394,6 +1419,15 @@ export async function withOwnerGenerationLock<T>(
 	} finally {
 		await releaseVerdictLock(token);
 	}
+}
+
+/** Refuses to publish a generation whose staged supervisor already recorded a terminal exit. */
+function assertNoStagedOwnerTerminal(paths: LifecyclePaths): void {
+	const journal = readNoFollowJsonSync(paths.stagedTerminalFile);
+	if (journal === null) return;
+	if (!isValidStagedOwnerTerminalJournal(journal, { generation: paths.generation }))
+		throw new Error("managed_owner_staged_terminal_evidence_untrusted");
+	throw new Error("managed_owner_staged_terminal_before_publication");
 }
 
 export type OwnerGenerationBaseline =
@@ -1511,6 +1545,20 @@ export function resolveManagedOwnerPredecessorSync(
 		if (receipt) receipts.add(receipt[1]!);
 	}
 	const completionFile = path.basename(lifecyclePaths(stateDir, sessionId, baseline.generation).verdictFile);
+	const stagedTerminalFile = path.basename(
+		lifecyclePaths(stateDir, sessionId, baseline.generation).stagedTerminalFile,
+	);
+	if (entries.includes(stagedTerminalFile)) {
+		const authority = openRecoveryFsRootNative()(root);
+		try {
+			const journal = exactManagedOwnerJson(authority, stagedTerminalFile);
+			if (!isValidStagedOwnerTerminalJournal(journal, { generation: baseline.generation, sessionId }))
+				throw new Error("managed_owner_replacement_evidence_untrusted");
+		} finally {
+			authority.close();
+		}
+		throw new Error("managed_owner_replacement_evidence_ambiguous");
+	}
 	if (entries.includes(completionFile)) {
 		const authority = openRecoveryFsRootNative()(root);
 		try {
@@ -1733,6 +1781,7 @@ export function replaceOwnerGenerationSync(
 	if (!db) throw new Error("generation_lock_contended");
 	const temporaryGeneration = `${paths.generationFile}.${crypto.randomUUID()}.tmp`;
 	try {
+		assertNoStagedOwnerTerminal(paths);
 		if (!isOwnerGenerationBaselineCurrentSync(stateDir, sessionId, expectedBaseline))
 			throw new Error("baseline_generation_changed");
 		const previous = captureOwnerGenerationBaselineSync(stateDir, sessionId);
@@ -1799,7 +1848,7 @@ export function publishOwnerGenerationSync(request: PublishGenerationRequest): P
  * delivered SIGTERM whose verdict timed out. None may be retried because doing so would
  * supersede an authorization that may still be consumed by a late observer.
  */
-const BLOCKING_INTENT_SUFFIXES = [".consumed", ".invalidated", ".dispatched"] as const;
+const BLOCKING_INTENT_SUFFIXES = [".consumed", ".invalidated", ".dispatched", ".dispatching"] as const;
 
 /**
  * Prior-intent markers that record an attempt which provably did NOT consume the session:
@@ -1919,6 +1968,28 @@ async function archiveSupersededIntent(file: string, expectedIntentId: string): 
 	if (!archived || archived.intent_id !== expectedIntentId) throw new Error("owner_intent_replay");
 }
 
+/** Persists a blocking marker before a signal is attempted, covering a caller crash in the handoff. */
+async function markIntentDispatching(paths: LifecyclePaths, intent: OwnerIntent): Promise<void> {
+	const marker = `${paths.intentFile}.dispatching`;
+	const handle = await fs.open(marker, "wx", 0o600).catch(error => {
+		if (isCode(error, "EEXIST")) throw new Error("owner_intent_replay");
+		throw error;
+	});
+	try {
+		await handle.writeFile(`${JSON.stringify(intent)}\n`);
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	await fsyncDirectory(paths.root);
+}
+
+/** Retains the pre-dispatch marker as superseded audit evidence before finalizing the intent. */
+async function archiveDispatchingIntent(paths: LifecyclePaths, intentId: string): Promise<void> {
+	const marker = `${paths.intentFile}.dispatching`;
+	if (await intentMarkerExists(marker)) await archiveSupersededIntent(marker, intentId);
+}
+
 /** Returns whether a dispatch belongs to an archived, non-consuming intent attempt. */
 async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string, intentId?: string): Promise<boolean> {
 	let entries: string[];
@@ -1930,6 +2001,7 @@ async function hasArchivedOwnerIntent(paths: LifecyclePaths, dispatchId: string,
 	const prefix = `${path.basename(paths.intentFile)}.`;
 	for (const entry of entries) {
 		if (!entry.startsWith(prefix)) continue;
+		if (!/^(cancelled|expired|consumed|invalidated|dispatched)$/u.test(entry.slice(prefix.length))) continue;
 		try {
 			const archived = await readNoFollowJson(path.join(paths.root, entry));
 			if (archived === null || !isValidOwnerIntent(archived) || !nonEmpty(archived.dispatch_id))
@@ -2446,6 +2518,7 @@ async function reconcileConsumedIntent(paths: LifecyclePaths, intentId: string):
 	const current = await readOwnerIntentStrict(paths.intentFile);
 	if (current) {
 		if (current.intent_id !== intentId) return;
+		await archiveDispatchingIntent(paths, intentId);
 		if (!(await renameIntentIfCurrentWithoutLock(paths, intentId, ".consumed")))
 			throw new Error("owner_intent_consumption_failed");
 		return;
@@ -2567,6 +2640,43 @@ export function isCanonicalUtcTimestamp(value: unknown): value is string {
 				? 30
 				: 31;
 	return day >= 1 && day <= daysInMonth;
+}
+
+export function isValidStagedOwnerTerminalJournal(
+	value: unknown,
+	identity: { generation: string; sessionId?: string },
+): value is StagedOwnerTerminalJournal {
+	return (
+		isRecord(value) &&
+		hasExactKeys(value, [
+			"schema_version",
+			"kind",
+			"generation",
+			"session_id",
+			"run_id",
+			"incarnation",
+			"observed_at",
+			"signal",
+			"exit_code",
+			"reason",
+		]) &&
+		value.schema_version === 1 &&
+		value.kind === "staged_owner_terminal" &&
+		typeof value.generation === "string" &&
+		typeof value.session_id === "string" &&
+		typeof value.run_id === "string" &&
+		typeof value.incarnation === "string" &&
+		value.generation === identity.generation &&
+		(identity.sessionId === undefined || value.session_id === identity.sessionId) &&
+		isSafePathComponent(value.generation, "owner generation") &&
+		isSafePathComponent(value.session_id, "owner session id") &&
+		isSafePathComponent(value.run_id, "owner run id") &&
+		isSafePathComponent(value.incarnation, "owner incarnation") &&
+		isCanonicalUtcTimestamp(value.observed_at) &&
+		isTerminalSignal(value.signal) &&
+		(value.exit_code === null || Number.isSafeInteger(value.exit_code)) &&
+		nonEmpty(value.reason)
+	);
 }
 
 /** Strictly validate a complete persisted verdict, optionally against its observation. */
@@ -2710,9 +2820,14 @@ export async function closeExactTmuxOwner(
 				throw new Error("owner_pid_identity_mismatch");
 			if (!(await isCurrentOwnerGeneration(request.stateDir, request.sessionId, request.generation)))
 				throw new Error("owner_generation_mismatch");
+			await markIntentDispatching(paths, intent);
 			await deps.sendSigterm(request.pid, intent);
 			dispatched = true;
 		} catch (error: unknown) {
+			// Once the pre-dispatch marker exists, an exception from the signal transport does
+			// not prove non-delivery. Keep the live intent and its blocking marker so a late
+			// observer can reconcile the authorization instead of allowing a retry to supersede it.
+			if (await intentMarkerExists(`${paths.intentFile}.dispatching`)) throw error;
 			await renameIntentIfCurrent(paths, intent.intent_id, ".cancelled", generationLockToken);
 			throw error;
 		}
@@ -2721,6 +2836,7 @@ export async function closeExactTmuxOwner(
 	}
 	const verdict = await deps.waitForVerdict();
 	if (!verdict || verdict.intent_id !== intent.intent_id || verdict.classification !== "expected_operator_shutdown") {
+		await archiveDispatchingIntent(paths, intent.intent_id);
 		await renameIntentIfCurrent(paths, intent.intent_id, dispatched ? ".dispatched" : ".expired");
 		throw new Error("owner_term_verdict_timeout");
 	}

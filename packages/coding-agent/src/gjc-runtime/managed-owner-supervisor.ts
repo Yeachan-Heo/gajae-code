@@ -6,12 +6,15 @@ import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { readLinuxProcStartTime } from "./linux-proc";
 import { assertSafePathComponent } from "./session-layout";
 import {
+	captureOwnerGenerationBaseline,
 	isValidOwnerIntent,
 	lifecyclePaths,
 	type OwnerIntent,
 	observeOwnerTerminal,
 	readNoFollowJsonSync,
+	type StagedOwnerTerminalJournal,
 	type TerminalSignal,
+	withOwnerGenerationLifecycleLock,
 } from "./tmux-owner-isolation";
 
 export const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -25,6 +28,7 @@ export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
 /** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
 export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 const GJC_TMUX_OWNER_SERVER_KEY_ENV = "GJC_TMUX_OWNER_SERVER_KEY";
+const GJC_TMUX_OWNER_GENERATION_STAGED_ENV = "GJC_TMUX_OWNER_GENERATION_STAGED";
 const MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE = 75;
 
 let bootstrapSigtermPending = false;
@@ -122,6 +126,44 @@ async function writeDurableExclusive(file: string, value: object): Promise<void>
 	if (JSON.stringify(persisted) !== JSON.stringify(value)) throw new Error("managed_owner_durable_reread_failed");
 }
 
+type StagedTerminalJournalResult = "not-staged" | "published" | "recorded" | "failed";
+
+async function recordStagedTerminal(
+	stateDir: string,
+	sessionId: string,
+	generation: string,
+	runId: string,
+	incarnation: string,
+	signal: TerminalSignal,
+	exitCode: number,
+	observedAt: string,
+): Promise<StagedTerminalJournalResult> {
+	if (process.env[GJC_TMUX_OWNER_GENERATION_STAGED_ENV] !== "1") return "not-staged";
+	const journal: StagedOwnerTerminalJournal = {
+		schema_version: 1,
+		kind: "staged_owner_terminal",
+		generation,
+		session_id: sessionId,
+		run_id: runId,
+		incarnation,
+		observed_at: observedAt,
+		signal,
+		exit_code: exitCode,
+		reason: "managed_owner_supervisor_staged_terminal",
+	};
+	try {
+		return await withOwnerGenerationLifecycleLock(stateDir, sessionId, generation, async () => {
+			const baseline = await captureOwnerGenerationBaseline(stateDir, sessionId);
+			if (baseline.state === "current" && baseline.generation === generation) return "published";
+			if (baseline.state !== "absent") return "failed";
+			await writeDurableExclusive(lifecyclePaths(stateDir, sessionId, generation).stagedTerminalFile, journal);
+			return "recorded";
+		});
+	} catch {
+		return "failed";
+	}
+}
+
 function childCommand(): string[] {
 	const command = JSON.parse(requiredEnvironment(MANAGED_OWNER_COMMAND_ENV)) as unknown;
 	if (!Array.isArray(command) || command.length === 0 || command.some(value => typeof value !== "string" || !value))
@@ -204,6 +246,20 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) {
 		const exitCode = await child.exited;
+		const stagedJournal = await recordStagedTerminal(
+			stateDir,
+			sessionId,
+			generation,
+			runId,
+			incarnation,
+			normalizeTerminalSignal(child.signalCode),
+			exitCode,
+			new Date().toISOString(),
+		);
+		if (stagedJournal === "failed" || stagedJournal === "recorded") {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
 		if (child.signalCode === "SIGABRT" && (await publishRedactedTerminal(exitCode))) {
 			process.exitCode = 134;
 			return;
@@ -220,9 +276,27 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	const childProcess = nativeProcessBindings().Process.fromPid(child.pid);
 	if (!childProcess) {
 		const exitCode = await child.exited;
+		const stagedJournal = await recordStagedTerminal(
+			stateDir,
+			sessionId,
+			generation,
+			runId,
+			incarnation,
+			normalizeTerminalSignal(child.signalCode),
+			exitCode,
+			new Date().toISOString(),
+		);
+		if (stagedJournal === "failed" || stagedJournal === "recorded") {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
+			return;
+		}
 		if (child.signalCode === "SIGABRT") {
 			if (!binding && (await publishRedactedTerminal(exitCode))) {
 				process.exitCode = 134;
+				return;
+			}
+			if (!binding) {
+				process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 				return;
 			}
 			if (binding) {
@@ -318,7 +392,17 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	process.removeListener("SIGTERM", relaySigterm);
 	const terminalIntent = relayedIntent as OwnerIntent | null;
 	const terminalObservedAt = new Date().toISOString();
-	let terminalPublicationFailed = false;
+	const stagedJournal = await recordStagedTerminal(
+		stateDir,
+		sessionId,
+		generation,
+		runId,
+		incarnation,
+		normalizeTerminalSignal(child.signalCode),
+		exitCode,
+		terminalObservedAt,
+	);
+	let terminalPublicationFailed = stagedJournal === "failed" || stagedJournal === "recorded";
 	if (child.signalCode !== "SIGABRT" && sigtermRelayed && terminalObservedAt && terminalIntent) {
 		try {
 			await observeOwnerTerminal({
@@ -386,6 +470,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	if (child.signalCode === "SIGABRT") {
 		if (!binding && (await publishRedactedTerminal(exitCode))) {
 			process.exitCode = 134;
+			return;
+		}
+		if (stagedJournal === "failed" || stagedJournal === "recorded") {
+			process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
 			return;
 		}
 		if (binding) {

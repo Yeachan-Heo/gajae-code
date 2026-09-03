@@ -889,7 +889,15 @@ describe("GJC tmux session management", () => {
 				{ platform: "win32" },
 			),
 		).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
-		expect(plannedArgv?.slice(0, -1)).toEqual(["tmux", "new-session", "-d", "-s", "psmux-session"]);
+		expect(plannedArgv?.slice(0, -1)).toEqual([
+			"tmux",
+			"new-session",
+			"-d",
+			"-s",
+			"psmux-session",
+			"-c",
+			process.cwd(),
+		]);
 
 		const innerCommand = plannedArgv?.at(-1);
 		const encodedMatch = innerCommand?.match(/-EncodedCommand\s+(\S+)/);
