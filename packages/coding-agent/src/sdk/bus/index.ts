@@ -4382,8 +4382,14 @@ export function createNotificationsExtension(
 			rt.workflowGate?.setRuntimeTurnProvider?.(null);
 		} catch {}
 		try {
+			const attachedClients = rt.server.clientCount();
 			const delivered = await pushTerminalSessionFrame(rt, { type: "session_closed", sessionId: id });
-			if (!delivered) logger.warn("notifications: session_closed socket delivery was not acknowledged");
+			if (!delivered) {
+				const fields = { sessionId: id, endpointScope: rt.endpointScope, attachedClients };
+				if (attachedClients > 0)
+					logger.warn("notifications: session_closed socket delivery was not acknowledged", fields);
+				else logger.debug("notifications: session_closed had no attached client to acknowledge", fields);
+			}
 		} catch (e) {
 			logger.warn(`notifications: session_closed failed: ${String(e)}`);
 		}
