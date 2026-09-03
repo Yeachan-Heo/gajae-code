@@ -517,8 +517,13 @@ test("a reconnect before a failed abort does not leave the prompt cancelled", as
 		expect(
 			abortOutcome.rejected.code === "abort_unacknowledged" || abortOutcome.rejected.code === "uncertain_after_send",
 		).toBe(true);
-		const promptOutcome = await Promise.race([pending, Bun.sleep(250).then(() => ({ pending: true }))]);
-		expect("resolved" in promptOutcome ? promptOutcome.resolved.stopReason : undefined).not.toBe("cancelled");
+		expect(await bounded(pending, "connection-closed after failed abort")).toEqual({
+			rejected: expect.objectContaining({ code: "connection_closed" }),
+		});
+		const next = prompt(fixture, "prompt after failed abort reconnect");
+		await waitFor(() => fixture.promptDeliveryCount() === 2, "prompt after failed abort reconnect");
+		fixture.sendStopped("end_turn");
+		expect(await bounded(next, "prompt after failed abort reconnect completion")).toEqual({ stopReason: "end_turn" });
 	} finally {
 		abortGate.resolve();
 		fixture.dispose();
