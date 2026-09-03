@@ -360,26 +360,35 @@ describe("gjc state handoff", () => {
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 		});
 	});
-	it("rejects approved Crystal execution handoff outside the active handoff phase", async () => {
+	it("rejects attempts to rewrite approved Crystal lifecycle before execution handoff", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
 			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
 			expect(approval.status).toBe(0);
-			await reconcileWorkflowSkillState({
-				cwd,
-				mode: "deep-interview",
-				sessionId: TEST_SESSION_ID,
-				active: true,
-				phase: "interviewing",
-				payload: {},
-			});
 			const before = await fs.readFile(callerPath, "utf-8");
-			const handoff = await runNativeStateCommand(
-				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+			await expect(
+				reconcileWorkflowSkillState({
+					cwd,
+					mode: "deep-interview",
+					sessionId: TEST_SESSION_ID,
+					active: true,
+					phase: "interviewing",
+					payload: {},
+				}),
+			).rejects.toThrow("approved Crystal lifecycle is immutable through runtime reconciliation");
+			const generic = await runNativeStateCommand(
+				[
+					"write",
+					"--mode",
+					"deep-interview",
+					"--input",
+					JSON.stringify({ current_phase: "interviewing" }),
+					"--json",
+				],
 				cwd,
 			);
-			expect(handoff.status).toBe(2);
-			expect(handoff.stderr).toContain("execution handoff requires active handoff phase");
+			expect(generic.status).toBe(2);
+			expect(generic.stderr).toContain("approved Crystal lifecycle is immutable through generic state write");
 			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 		});

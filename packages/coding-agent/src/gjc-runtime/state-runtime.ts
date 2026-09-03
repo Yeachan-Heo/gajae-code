@@ -140,6 +140,20 @@ function assertDeepInterviewExecutionApprovalUnchanged(
 		throw new StateCommandError(2, `crystallized execution approval provenance is immutable through ${surface}`);
 }
 
+function assertApprovedDeepInterviewLifecycleUnchanged(
+	existingEnvelope: Record<string, unknown>,
+	mergedEnvelope: Record<string, unknown>,
+	surface: string,
+): void {
+	const existingInner = isPlainObject(existingEnvelope.state) ? existingEnvelope.state : {};
+	if (existingInner.execution_approval !== "approved") return;
+	if (
+		mergedEnvelope.active !== existingEnvelope.active ||
+		mergedEnvelope.current_phase !== existingEnvelope.current_phase
+	)
+		throw new StateCommandError(2, `approved Crystal lifecycle is immutable through ${surface}`);
+}
+
 async function readInputJson(value: string | undefined, cwd: string): Promise<Record<string, unknown> | undefined> {
 	if (value === undefined) return undefined;
 	const trimmed = value.trim();
@@ -1105,6 +1119,8 @@ async function reconcileWorkflowSkillStateUnlocked(
 	merged.skill = mode;
 	merged.current_phase = trimmedPhase;
 	merged.active = active;
+	if (mode === "deep-interview")
+		assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "runtime reconciliation");
 	merged.version = WORKFLOW_STATE_VERSION;
 	merged.updated_at = nowIsoStr;
 	merged.receipt = receipt;
@@ -1338,6 +1354,7 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<StateC
 				const existingInner = isPlainObject(existingPayload.state) ? existingPayload.state : {};
 				const mergedInner = isPlainObject(merged.state) ? merged.state : {};
 				assertDeepInterviewExecutionApprovalUnchanged(existingPayload, merged, "generic state write");
+				assertApprovedDeepInterviewLifecycleUnchanged(existingPayload, merged, "generic state write");
 				if (existingPayload.active === false && merged.active !== false)
 					throw new StateCommandError(2, "generic state write cannot reactivate inactive deep-interview state");
 				if (existingInner.crystal === undefined && mergedInner.crystal !== undefined)
