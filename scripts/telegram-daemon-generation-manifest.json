@@ -526,7 +526,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:HEARTBEAT_TTL_MS": "62255b5467995d21d3f929c863278ca3e815102001c51ca6d66840e1522ff990",
     "telegram:packages/coding-agent/src/sdk/bus/daemon-paths.ts:daemonPaths": "1bd6ae51096fedb95d47149b977f8a40e7f814a774ecfce21e027aac268b0379",
     "telegram:packages/coding-agent/src/sdk/bus/index.ts:buildIdentity": "246ad10dd6341037a20379a8544736039584d36482f6b2d44e3054f5e7f87724",
-    "telegram:packages/coding-agent/src/sdk/bus/index.ts:createNotificationsExtension": "b4ef7a58ff8e25e57204115b3e52c47cacdbacaa005b667b8552c5e3ea32fa51",
+    "telegram:packages/coding-agent/src/sdk/bus/index.ts:createNotificationsExtension": "68ebe1e38168eed1de8eac11a593cc46e1f02180dfa73b78c05af87e3e2853a2",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:DaemonTransitionLock": "0fb018a6384bff312aab0345012936f7e0609e4691c841919426ad3d75841dcb",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:NATIVE_PATH_IDENTITY_CONTRACT_VERSION": "ec669ef396909ce429e08ce4fa9a78b5f0106d8cedf967e634c6ae6974830b8a",
     "telegram:packages/coding-agent/src/sdk/bus/notification-service.ts:acquireDaemonTransitionLock": "0115500fcb5c5797008d607bd69694579c5b372420310f265d33a4759364decc",
