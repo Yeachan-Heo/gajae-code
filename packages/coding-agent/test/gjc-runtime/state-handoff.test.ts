@@ -360,6 +360,30 @@ describe("gjc state handoff", () => {
 			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
 		});
 	});
+	it("rejects approved Crystal execution handoff outside the active handoff phase", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(0);
+			await reconcileWorkflowSkillState({
+				cwd,
+				mode: "deep-interview",
+				sessionId: TEST_SESSION_ID,
+				active: true,
+				phase: "interviewing",
+				payload: {},
+			});
+			const before = await fs.readFile(callerPath, "utf-8");
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status).toBe(2);
+			expect(handoff.stderr).toContain("execution handoff requires active handoff phase");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
+			await expect(fs.access(modeStatePath(cwd, TEST_SESSION_ID, "ultragoal"))).rejects.toThrow();
+		});
+	});
 	it("rejects legacy final-spec execution handoff without a ready approved Crystal", async () => {
 		await withTempCwd(async cwd => {
 			const specPath = path.join(cwd, "legacy.md");

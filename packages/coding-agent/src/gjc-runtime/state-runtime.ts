@@ -1775,6 +1775,8 @@ async function handleHandoffUnlocked(
 	)
 		throw new StateCommandError(2, `gjc state ${caller} handoff: caller is not active`);
 	if (caller === "deep-interview" && callee === "ultragoal") {
+		if (existingCaller.active !== true || existingCaller.current_phase !== "handoff")
+			throw new StateCommandError(2, "deep-interview execution handoff requires active handoff phase");
 		const receipt = isPlainObject(existingCaller.receipt) ? existingCaller.receipt : undefined;
 		const checksum = isPlainObject(receipt?.content_sha256) ? receipt.content_sha256 : undefined;
 		if (
