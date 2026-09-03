@@ -7,6 +7,7 @@ import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
 const brokerModule = path.resolve(import.meta.dir, "../src/sdk/broker/broker.ts");
+const discoveryModule = path.resolve(import.meta.dir, "../src/sdk/broker/discovery.ts");
 const ensureModule = path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts");
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-spawn-race-"));
 type LockWorker = Bun.Subprocess<"ignore", "pipe", "pipe">;
@@ -47,6 +48,40 @@ function spawnStaleBrokerWorker(dir: string, ready: string): LockWorker {
 		await fs.writeFile(${JSON.stringify(ready)}, JSON.stringify(discovery));
 		process.once("SIGTERM", () => void broker.stop());
 		await broker.completion;
+	`;
+	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+}
+
+function spawnExpiringStaleDiscoveryWorker(dir: string, ready: string, lifetimeMs: number): LockWorker {
+	const source = `
+		import * as fs from "node:fs/promises";
+		import { brokerProcessIncarnation, writeBrokerDiscovery } from ${JSON.stringify(discoveryModule)};
+		const startedAt = Date.now();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("stale worker incarnation unavailable");
+		process.on("SIGTERM", () => {});
+		let published = false;
+		while (Date.now() - startedAt < ${lifetimeMs}) {
+			await writeBrokerDiscovery(${JSON.stringify(dir)}, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "pr5204-expiring-stale",
+				ownerId: "pr5204-expiring-stale-owner",
+				pid: process.pid,
+				incarnation,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "pr5204-expiring-stale-token",
+				startedAt,
+				heartbeatAt: Date.now(),
+			});
+			if (!published) {
+				published = true;
+				await fs.writeFile(${JSON.stringify(ready)}, "ready");
+			}
+			await Bun.sleep(100);
+		}
 	`;
 	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 }
@@ -230,6 +265,55 @@ it("the parent discovery budget covers child-fence contention plus a full startu
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 30_000);
+
+it("the parent budget composes stale retirement, child-fence contention, and startup", async () => {
+	const { withBrokerStartupLock } = await import("../src/sdk/broker/ensure");
+	const dir = await temp();
+	const ready = path.join(dir, "expiring-stale.ready");
+	const stale = spawnExpiringStaleDiscoveryWorker(dir, ready, 18_000);
+	const entered = Promise.withResolvers<void>();
+	const unblock = Promise.withResolvers<void>();
+	const holder = withBrokerStartupLock(dir, async () => {
+		entered.resolve();
+		await unblock.promise;
+	});
+	let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
+	try {
+		await Promise.all([waitForFile(ready), entered.promise]);
+		child = Bun.spawn(
+			[process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir],
+			{
+				cwd: import.meta.dir,
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "7000" },
+			},
+		);
+		await Bun.sleep(13_000);
+		unblock.resolve();
+		await holder;
+		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect({ code, error }).toEqual({ code: 0, error: "" });
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+		expect(discovery).toMatchObject({ packageGeneration: packageJson.version });
+		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock");
+	} finally {
+		unblock.resolve();
+		await holder.catch(() => undefined);
+		stale.kill("SIGKILL");
+		child?.kill("SIGTERM");
+		await Promise.all([stale.exited, child?.exited]);
+		const discovery = await brokerDiscovery.readBrokerDiscovery(dir).catch(() => null);
+		if (discovery)
+			try {
+				process.kill(discovery.pid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 45_000);
 
 it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
 	const dir = await temp();
