@@ -184,7 +184,12 @@ const RUNTIME_OWNED_ENVELOPE_KEYS = [
  * `invalid intent contract`, bricking the interview until a destructive
  * `clear --force`. The recorder is the only writer that can lock intent.
  */
-const RECORDER_OWNED_STATE_KEYS = ["intent_contract", "intent_review"] as const;
+const RUNTIME_OWNED_STATE_KEYS = [
+	"intent_contract",
+	"intent_review",
+	"execution_approval",
+	"execution_approval_receipt",
+] as const;
 
 /**
  * Remove sanitizer-owned keys from a staged payload and classify the
@@ -213,7 +218,7 @@ function sanitizeStagedPayload(payload: Record<string, unknown>): {
 	}
 	if (isPlainObject(next.state)) {
 		const state = { ...(next.state as Record<string, unknown>) };
-		for (const key of RECORDER_OWNED_STATE_KEYS) {
+		for (const key of RUNTIME_OWNED_STATE_KEYS) {
 			if (key in state) {
 				delete state[key];
 				ignoredKeys.push(`state.${key}`);
