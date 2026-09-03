@@ -420,6 +420,7 @@ test("lifecycle startup applies a cached default profile without blocking on onl
 		modelRegistry: registry as never,
 		parsedArgs: { default: false },
 		preferCachedModels: true,
+		preferCachedDefaultProfile: true,
 	});
 
 	expect(registry.refreshCalls).toEqual([]);
@@ -448,12 +449,42 @@ test("lifecycle startup refreshes online when cached default profile resolution 
 		modelRegistry: registry as never,
 		parsedArgs: { default: false },
 		preferCachedModels: true,
+		preferCachedDefaultProfile: true,
 	});
 
 	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
 	expect(registry.refreshInBackgroundCalls).toEqual([]);
 	expect(session.model?.provider).toBe("refreshed-provider");
 	expect(session.model?.id).toBe("new");
+});
+
+test("interactive default-only startup retains its foreground refresh policy", async () => {
+	const session = fakeSession();
+	const registry = fakeRegistry([
+		{
+			name: "default-profile",
+			requiredProviders: ["profile-provider"],
+			modelMapping: { default: "profile-provider/default:medium" },
+			source: "user",
+		},
+	]);
+
+	await applyStartupModelProfilesForRoot({
+		session,
+		settings: Settings.isolated({ "modelProfile.default": "default-profile" }),
+		modelRegistry: registry as never,
+		parsedArgs: { default: false },
+		startupModel: undefined,
+		startupThinkingLevel: undefined,
+		isInteractive: true,
+		hasInteractiveTerminal: true,
+		initialMessage: undefined,
+		initialMessages: [],
+		resumeAction: "open-idle",
+	});
+
+	expect(registry.refreshCalls).toEqual(["online-if-uncached"]);
+	expect(registry.refreshInBackgroundCalls).toEqual([]);
 });
 
 test("interactive continuation refreshes online only when cached --mpreset resolution fails", async () => {
