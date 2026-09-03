@@ -30,6 +30,7 @@ import {
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
 	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
+	persistCoordinatorLaunchFailureState,
 	persistCoordinatorRuntimeInputReady,
 	persistCoordinatorRuntimeStateFromEvent,
 	persistCoordinatorRuntimeStateFromPostmortem,
@@ -2253,6 +2254,48 @@ describe("coordinator runtime state sidecar", () => {
 			ownerTerminal: { generation, stateDir: root, socketKey: "tmux", generationPublished: false },
 		});
 		expect((await readPayload(stateFile)).owner_generation).toBe(generation);
+	});
+
+	it("persists a managed launch failure when its staged generation is already published", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "staged-launch-failure.json");
+		const sessionId = "staged-launch-failure";
+		const generation = await replaceOwnerGeneration(root, sessionId, "66666666-6666-4666-8666-666666666666");
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				owner_generation: generation,
+			}),
+		);
+
+		await persistCoordinatorLaunchFailureState({
+			stateFile,
+			cwd: root,
+			sessionId,
+			ownerGeneration: generation,
+			ownerStateDir: root,
+			ownerServerKey: "tmux",
+			managedLaunch: true,
+			payload: {
+				schema_version: 1,
+				session_id: sessionId,
+				state: "errored",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			},
+			signingRequired: false,
+			keyId: null,
+		});
+
+		expect((await readPayload(stateFile)).owner_generation).toBe(generation);
+		expect((await readPayload(stateFile)).state).toBe("errored");
 	});
 
 	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {

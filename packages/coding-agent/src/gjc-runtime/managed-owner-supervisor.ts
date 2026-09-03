@@ -179,13 +179,39 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		stderr: "inherit",
 		env: childEnvironment,
 	});
-	if (redactCommand) {
-		process.exitCode = await child.exited;
-		return;
-	}
+	const publishRedactedTerminal = async (exitCode: number): Promise<boolean> => {
+		if (!redactCommand) return false;
+		try {
+			await observeOwnerTerminal({
+				schema_version: 1,
+				op: "observe_terminal",
+				session_id: sessionId,
+				owner_generation: generation,
+				state_dir: stateDir,
+				socket_key: process.env[GJC_TMUX_OWNER_SERVER_KEY_ENV] ?? "",
+				observer: "raw_monitor",
+				observed_at: new Date().toISOString(),
+				signal: normalizeTerminalSignal(child.signalCode),
+				exit_code: exitCode,
+				exit_kind: child.signalCode ? "owner_lost" : exitCode === 0 ? "cleanup" : "exit",
+				reason: exitCode === 0 ? "owner_exit" : "managed_owner_supervisor_unexpected_exit",
+			});
+			return true;
+		} catch {
+			return false;
+		}
+	};
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) {
-		await child.exited;
+		const exitCode = await child.exited;
+		if (child.signalCode === "SIGABRT" && (await publishRedactedTerminal(exitCode))) {
+			process.exitCode = 134;
+			return;
+		}
+		if (await publishRedactedTerminal(exitCode)) {
+			process.exitCode = exitCode;
+			return;
+		}
 		// Without the child's immutable start identity, its terminal status cannot
 		// be attributed to this owner. Do not mint an unexpected-loss verdict.
 		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
@@ -195,6 +221,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	if (!childProcess) {
 		const exitCode = await child.exited;
 		if (child.signalCode === "SIGABRT") {
+			if (!binding && (await publishRedactedTerminal(exitCode))) {
+				process.exitCode = 134;
+				return;
+			}
 			if (binding) {
 				const receipt: ManagedOwnerSigabrtReceipt = {
 					schema_version: 2,
@@ -218,6 +248,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 			process.exitCode = 134;
 			return;
 		}
+		if (await publishRedactedTerminal(exitCode)) {
+			process.exitCode = exitCode;
+			return;
+		}
 		// The native process handle is required for exact child ownership. The
 		// start-time evidence alone is insufficient for a non-SIGABRT verdict.
 		process.exitCode = MANAGED_OWNER_TERMINAL_PUBLICATION_UNCERTAIN_EXIT_CODE;
@@ -228,6 +262,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	let childExited = false;
 	let sigtermRelayed = false;
 	let relayedIntent: OwnerIntent | null = null;
+	let relayedAt: string | null = null;
 	const relaySigterm = () => {
 		// Latch the first successful delivery and the intent snapshot that authorized it.
 		// A later intent cannot retroactively authorize an already-delivered signal. When
@@ -271,6 +306,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		}
 		sigtermRelayed = true;
 		relayedIntent = candidateIntent;
+		relayedAt = new Date().toISOString();
 	};
 	sigtermPending ||= bootstrapSigtermPending;
 	process.removeListener("SIGTERM", captureBootstrapSigterm);
@@ -293,7 +329,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				state_dir: stateDir,
 				socket_key: process.env.GJC_TMUX_OWNER_SERVER_KEY ?? "",
 				observer: "raw_monitor",
-				observed_at: terminalObservedAt,
+				observed_at: relayedAt ?? terminalObservedAt,
 				signal: "SIGTERM",
 				exit_code: exitCode,
 				exit_kind: "supervisor_child_exit",
@@ -304,7 +340,11 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		} catch {
 			terminalPublicationFailed = true;
 		}
-	} else if (child.signalCode !== "SIGABRT" && (sigtermRelayed || child.signalCode || exitCode !== 0)) {
+	} else if (
+		child.signalCode !== "SIGABRT" &&
+		exitCode !== 75 &&
+		(sigtermRelayed || child.signalCode || exitCode !== 0)
+	) {
 		try {
 			await observeOwnerTerminal({
 				schema_version: 1,
@@ -336,7 +376,7 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 				observed_at: terminalObservedAt,
 				signal: "EXIT",
 				exit_code: exitCode,
-				exit_kind: "exit",
+				exit_kind: "cleanup",
 				reason: "owner_exit",
 			});
 		} catch {
@@ -344,6 +384,10 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		}
 	}
 	if (child.signalCode === "SIGABRT") {
+		if (!binding && (await publishRedactedTerminal(exitCode))) {
+			process.exitCode = 134;
+			return;
+		}
 		if (binding) {
 			const receipt: ManagedOwnerSigabrtReceipt = {
 				schema_version: 2,
