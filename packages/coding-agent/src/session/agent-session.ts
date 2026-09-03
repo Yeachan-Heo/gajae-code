@@ -317,9 +317,9 @@ import {
 } from "../gjc-runtime/session-layout";
 import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
 import {
-	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	hasCoordinatorRuntimeStateRescopeJournal,
 	markCoordinatorRuntimeStateRescopePublishing,
 	ownerTerminalContextFromEnvironment,
@@ -2359,7 +2359,6 @@ interface CanonicalMessageAdmission {
 	release: () => void;
 }
 
-
 type CoordinatorRuntimeStatePersistContext = {
 	sessionId: string;
 	cwd: string;
@@ -4268,7 +4267,6 @@ export class AgentSession {
 							error: String(error),
 						},
 					);
-
 				},
 			);
 			extensionDelivery = this.#queueExtensionEvent(
@@ -5991,7 +5989,12 @@ export class AgentSession {
 		if (barrier) this.#trackReleasedBarrierPersist(queued);
 		else this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
-			this.#warnPersistFailure("Failed to persist terminal reconciliation outcome", error, context.stateFile, context.sessionId),
+			this.#warnPersistFailure(
+				"Failed to persist terminal reconciliation outcome",
+				error,
+				context.stateFile,
+				context.sessionId,
+			),
 		);
 	}
 
@@ -6004,7 +6007,9 @@ export class AgentSession {
 		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		const stateFile =
 			explicitStateFile ||
-			(context.sessionId.trim() ? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json") : null);
+			(context.sessionId.trim()
+				? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json")
+				: null);
 		return { ...context, stateFile };
 	}
 

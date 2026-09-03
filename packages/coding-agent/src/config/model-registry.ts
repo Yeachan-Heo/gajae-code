@@ -143,7 +143,9 @@ function redactDiscoveryUrl(value: string | URL): string {
 function isConnectionRefusedDiscoveryCode(value: unknown): boolean {
 	if (typeof value === "string") {
 		const normalized = value.replace(/[^A-Za-z0-9]/gu, "").toUpperCase();
-		return normalized === "ECONNREFUSED" || normalized === "CONNECTIONREFUSED" || normalized === "ERRCONNECTIONREFUSED";
+		return (
+			normalized === "ECONNREFUSED" || normalized === "CONNECTIONREFUSED" || normalized === "ERRCONNECTIONREFUSED"
+		);
 	}
 	if (typeof value !== "number" || !Number.isInteger(value)) return false;
 	// ECONNREFUSED errno values used by the supported runtimes/OSes.

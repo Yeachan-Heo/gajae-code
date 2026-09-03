@@ -11,8 +11,8 @@ import {
 	resetPersistFailureWarnWindows,
 	SessionStateLockTestHooks,
 	SessionStateLockUnavailableError,
-	setSessionStateLockNativeBindings,
 	sessionStateLockFailureFields,
+	setSessionStateLockNativeBindings,
 	shouldWarnPersistFailure,
 	withSessionStateFileLock,
 } from "../src/gjc-runtime/session-state-lock";

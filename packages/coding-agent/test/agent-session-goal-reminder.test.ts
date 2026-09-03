@@ -5,12 +5,12 @@ import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import * as sidecar from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
-import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -367,7 +367,6 @@ describe("AgentSession active goal reminders", () => {
 			expect(Object.keys(persistFields).sort()).toEqual(["error", "event", "stateFile"]);
 			expect(JSON.stringify(persistFields)).not.toContain("must-not-reach-logs");
 			expect(JSON.stringify(persistFields)).not.toContain("private_payload");
-
 		} finally {
 			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;
@@ -415,7 +414,11 @@ describe("AgentSession active goal reminders", () => {
 					throw new Error("Timed out waiting for delayed coordinator runtime-state failure");
 				}),
 			]);
-			expect(persist.mock.calls[0]?.[1]).toMatchObject({ sessionId: session.sessionId, cwd: cwdA, stateFile: stateFileA });
+			expect(persist.mock.calls[0]?.[1]).toMatchObject({
+				sessionId: session.sessionId,
+				cwd: cwdA,
+				stateFile: stateFileA,
+			});
 			expect(stateFileA).not.toBe(stateFileB);
 			expect(warned).toHaveLength(1);
 			expect(warned[0]).toMatchObject({ stateFile: stateFileA, error: String(failure), event: "turn_start" });

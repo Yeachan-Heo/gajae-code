@@ -498,7 +498,9 @@ export function sessionStateLockFailureFields(error: unknown): {
 
 function boundedPersistFailureClassPart(value: unknown, fallback: string): string {
 	if (typeof value !== "string" && typeof value !== "number") return fallback;
-	const normalized = String(value).replace(/[^A-Za-z0-9_.-]/gu, "_").slice(0, 64);
+	const normalized = String(value)
+		.replace(/[^A-Za-z0-9_.-]/gu, "_")
+		.slice(0, 64);
 	return normalized || fallback;
 }
 
@@ -514,8 +516,8 @@ function persistFailureProperty(value: unknown, name: string): unknown {
 function persistFailureConstructorName(error: unknown): string {
 	if (error === null) return "null";
 	if (typeof error !== "object" && typeof error !== "function") return typeof error;
-	const constructor = persistFailureProperty(error, "constructor");
-	const name = persistFailureProperty(constructor, "name");
+	const ctor = persistFailureProperty(error, "constructor");
+	const name = persistFailureProperty(ctor, "name");
 	return typeof name === "string" && name.length > 0 ? name : "Object";
 }
 
