@@ -271,8 +271,9 @@ async function authoritativeConversationSnapshot(
 		for (const entry of entries.slice(1)) {
 			if (entry.type !== "message") continue;
 			const index = messages.length;
-			const message = entry.message as unknown as Record<string, unknown>;
-			if (typeof message.role !== "string") continue;
+			const message = entry.message as unknown;
+			if (!isRecord(message) || typeof message.role !== "string")
+				throw new DeepInterviewCommandError(2, "live session transcript contains a malformed message");
 			const projectedContent =
 				typeof message.content === "string"
 					? message.content
@@ -537,7 +538,8 @@ async function handleCrystallizeUnlocked(
 	}
 	if (specPath && specContent)
 		await updateWorkflowTransactionJournal(cwd, sessionId, mutationId!, { steps: ["artifact", "index"] });
-	const state = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
+	const state: Record<string, unknown> = { ...(existing.state ?? {}), crystal, execution_approval: "not-approved" };
+	delete state.execution_approval_receipt;
 	const envelope = {
 		...existing,
 		active: true,
