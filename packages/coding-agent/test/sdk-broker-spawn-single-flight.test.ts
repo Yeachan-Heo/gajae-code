@@ -3,8 +3,15 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
+import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
-import { brokerOwnerForTest, ensureBroker } from "../src/sdk/broker/ensure";
+import {
+	acquireSpawnLockForTest,
+	brokerOwnerForTest,
+	closeBrokerClientBeforeDeadline,
+	ensureBroker,
+	withBrokerStartupLock,
+} from "../src/sdk/broker/ensure";
 
 const cli = path.resolve(import.meta.dir, "../src/cli.ts");
 const brokerModule = path.resolve(import.meta.dir, "../src/sdk/broker/broker.ts");
@@ -194,7 +201,7 @@ it("independent broker bootstrap children serialize before Broker.start", async 
 			stderr: "pipe",
 		}),
 	);
-	let discovery: Awaited<ReturnType<typeof brokerDiscovery.readBrokerDiscovery>> = null;
+	let discovery: BrokerDiscovery | null = null;
 	try {
 		const deadline = Date.now() + 10_000;
 		while (!discovery && Date.now() < deadline) {
@@ -222,7 +229,6 @@ it("independent broker bootstrap children serialize before Broker.start", async 
 }, 30_000);
 
 it("the parent discovery budget covers child-fence contention plus a full startup attempt", async () => {
-	const { withBrokerStartupLock } = await import("../src/sdk/broker/ensure");
 	const dir = await temp();
 	const entered = Promise.withResolvers<void>();
 	const unblock = Promise.withResolvers<void>();
@@ -268,7 +274,6 @@ it("the parent discovery budget covers child-fence contention plus a full startu
 }, 30_000);
 
 it("the parent budget composes stale retirement, child-fence contention, and startup", async () => {
-	const { withBrokerStartupLock } = await import("../src/sdk/broker/ensure");
 	const dir = await temp();
 	const ready = path.join(dir, "expiring-stale.ready");
 	const stale = spawnExpiringStaleDiscoveryWorker(dir, ready, 19_000);
@@ -317,7 +322,6 @@ it("the parent budget composes stale retirement, child-fence contention, and sta
 }, 55_000);
 
 it("stale broker client teardown cannot extend an expired retirement deadline", async () => {
-	const { closeBrokerClientBeforeDeadline } = await import("../src/sdk/broker/ensure");
 	const stalled = Promise.withResolvers<void>();
 	let closeCalls = 0;
 	await closeBrokerClientBeforeDeadline(
@@ -361,7 +365,6 @@ it("releases the spawn lock when the under-lock discovery read fails so the next
 }, 30_000);
 
 it("the spawn lock rejects an incomplete published owner instead of acquiring over it", async () => {
-	const { acquireSpawnLockForTest } = await import("../src/sdk/broker/ensure");
 	const dir = await temp();
 	try {
 		await fs.mkdir(path.join(dir, "sdk", "broker.spawn.lock"), { recursive: true });
@@ -421,7 +424,6 @@ it("two OS processes reclaim a dead holder without overlapping critical sections
 }, 30_000);
 
 it("a transient exact stale-removal refusal stays fail-closed and retries acquisition", async () => {
-	const { acquireSpawnLockForTest } = await import("../src/sdk/broker/ensure");
 	const dir = await temp();
 	const ready = path.join(dir, "holder.ready");
 	const journal = path.join(dir, "journal");
@@ -451,7 +453,6 @@ it("a transient exact stale-removal refusal stays fail-closed and retries acquis
 }, 30_000);
 
 it("a recycled live PID does not keep a dead spawn-lock generation alive", async () => {
-	const { acquireSpawnLockForTest } = await import("../src/sdk/broker/ensure");
 	const dir = await temp();
 	const ready = path.join(dir, "holder.ready");
 	const journal = path.join(dir, "journal");
