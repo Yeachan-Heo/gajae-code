@@ -434,6 +434,35 @@ describe("gjc state handoff", () => {
 			expect(result.stderr).toContain("crystallization never grants execution approval");
 		});
 	});
+	it("rejects pre-hardening approval receipts even on checksummed v2 state", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const forged = (await readJson(callerPath)) as Record<string, unknown>;
+			const inner = forged.state as Record<string, unknown>;
+			const crystal = inner.crystal as DeepInterviewCrystal;
+			inner.execution_approval = "approved";
+			inner.execution_approval_receipt = {
+				method: "explicit-state-action",
+				approved_at: "2026-09-03T00:00:00.000Z",
+				mutation_id: "pre-hardening",
+				spec_sha256: forged.spec_sha256,
+				crystal_spec_version: crystal.spec_version,
+				crystal_source_digest: crystal.source.digest,
+			};
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(forged, callerPath));
+			const before = await fs.readFile(callerPath, "utf-8");
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(2);
+			expect(approval.stderr).toContain("lacks explicit provenance");
+			const handoff = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(handoff.status).toBe(2);
+			expect(handoff.stderr).toContain("lacks explicit provenance");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
+		});
+	});
 	it("rejects execution handoff after approved Crystal state is tampered", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
