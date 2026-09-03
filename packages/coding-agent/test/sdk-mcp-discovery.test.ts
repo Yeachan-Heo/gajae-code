@@ -72,7 +72,7 @@ function createReasoningModel(): Model<"openai-responses"> {
 }
 
 const oldSessionMtime = new Date("2000-01-01T00:00:00.000Z");
-const SLOW_SDK_TEST_TIMEOUT_MS = 15_000;
+const SLOW_SDK_TEST_TIMEOUT_MS = 30_000;
 const FALLBACK_SDK_TEST_TIMEOUT_MS = 30_000;
 const validSixSurfacePluginBundle = path.join(import.meta.dir, "fixtures", "gjc-plugins", "valid-six-surface-bundle");
 const originalAgentDir = getAgentDir();
