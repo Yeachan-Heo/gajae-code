@@ -17,6 +17,17 @@ describe("prepareWindowsConsoleForExternalEditor", () => {
 		prepareWindowsConsoleForExternalEditor("linux", { setRawMode: mode => modes.push(mode) });
 		expect(modes).toEqual([]);
 	});
+
+	it("keeps console preparation best effort when runtime raw mode fails", () => {
+		let attempts = 0;
+		prepareWindowsConsoleForExternalEditor("win32", {
+			setRawMode: () => {
+				attempts++;
+				throw new Error("raw mode unavailable");
+			},
+		});
+		expect(attempts).toBe(1);
+	});
 });
 
 describe("shouldUseExternalEditorShell", () => {
