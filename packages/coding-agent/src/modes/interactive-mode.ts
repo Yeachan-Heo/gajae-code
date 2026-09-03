@@ -745,6 +745,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			version: this.#version,
 			focusDomain: "composer",
 			keyDisplayContext: this.#keyDisplayContext,
+			onUpdate: () => {
+				this.updateEditorChrome();
+				this.ui.requestRender();
+			},
 		});
 		this.statusLine.setAutoCompactEnabled(session.autoCompactionEnabled);
 

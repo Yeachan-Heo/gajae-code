@@ -69,6 +69,38 @@ All tokens below are required in `colors`.
 
 `statusLineSep`, `statusLineModel`, `statusLinePath`, `statusLineGitClean`, `statusLineGitDirty`, `statusLineContext`, `statusLineSpend`, `statusLineStaged`, `statusLineDirty`, `statusLineUntracked`, `statusLineOutput`, `statusLineCost`, `statusLineSubagents`
 
+## User-produced status content
+
+The `command` segment is the supported way to put user-produced content in the
+status line. It is configured alongside a custom segment layout:
+
+```yaml
+statusLine:
+  preset: custom
+  leftSegments: [model, command]
+  segmentOptions:
+    command:
+      command: "git branch --show-current"
+      refreshMs: 5000
+      timeoutMs: 500
+      maxLength: 80
+```
+
+The command runs in the configured shell from the project directory. GJC starts
+it in the background and renders the last successful value while the next
+refresh is pending, so a slow command cannot block TUI rendering. Each run has
+a bounded timeout (50–10,000 ms), stdout is capped before decoding, and the
+displayed value is ANSI/control-character sanitized and width-bounded (1–256
+columns). A timeout, non-zero exit, or launch failure leaves the last value in
+place; when no value exists, the segment shows a placeholder and records a
+bounded logger diagnostic. The normal status-line `maxRows` layout still owns
+final row fitting and overflow behavior.
+
+This is an explicit arbitrary-command execution boundary: review commands in
+project and user configuration before enabling the segment. The command is not
+executed unless `command` is present in an active `leftSegments` or
+`rightSegments` list.
+
 ## Optional tokens
 
 ### `export` section (optional)

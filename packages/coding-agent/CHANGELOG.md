@@ -7,6 +7,10 @@
 - Fixed the steer-triggered bash fold being skipped under `toolInterruptPolicy: finish_tools`: a composer steer over a long foreground `bash` was aborted instead of folded because the fold gate wrongly treated the policy as an exclusion. `finish_tools` governs sibling tools in the batch, not the fold; the fold kills nothing and now applies under both policies. A tmux dogfood driver (`scripts/dogfood/steer-fold-tmux.sh`) proves the real binary folds, answers the steer in the same turn, and wakes on completion.
 - SDK session tails now preserve authoritative transcript revisions in item identity and lifecycle ordering, close the pre-checkpoint live/replay dedupe race, and recover held live frames across reconnect replay without losing ordered delivery.
 - `/model` provider-tab refreshes now reuse the already loaded static catalog and update only the selected provider's discovery state, avoiding repeated signed preset registry work while retaining full-catalog refresh behavior for static configuration changes.
+- Added the `command` status-line segment for user-produced HUD content. It runs
+  configured shell commands in the background with cached refreshes, bounded
+  timeout/output, ANSI sanitization, placeholder degradation, and custom-editor
+  configuration while preserving synchronous TUI rendering.
 
 ## [0.16.1] - 2026-09-03
 - Broker-launched SDK sessions now activate an already-cached default model profile before refreshing provider catalogs in the background, preventing redundant online discovery from consuming the fixed semantic-readiness window while preserving strict refresh fallback when cached profile resolution fails.

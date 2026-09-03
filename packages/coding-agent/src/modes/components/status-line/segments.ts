@@ -1,12 +1,13 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { TERMINAL } from "@gajae-code/tui";
+import { TERMINAL, truncateToWidth } from "@gajae-code/tui";
 import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@gajae-code/utils";
 import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath } from "../../../tools/render-utils";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
+import { normalizeStatusLineCommandOptions } from "./command";
 import { getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
 import { shortenModelId } from "./model-name";
 import type { RenderedSegment, SegmentContext, StatusLineSegment, StatusLineSegmentId } from "./types";
@@ -523,6 +524,26 @@ const cacheWriteSegment: StatusLineSegment = {
 	},
 };
 
+const commandSegment: StatusLineSegment = {
+	id: "command",
+	render(ctx) {
+		const state = ctx.command;
+		if (!state) return { content: theme.fg("dim", "?"), visible: true };
+
+		if (typeof state.output === "string") {
+			const text = truncateToWidth(
+				sanitizeStatusText(state.output),
+				normalizeStatusLineCommandOptions(ctx.options.command).maxLength,
+			);
+			if (text) return { content: theme.fg("statusLineOutput", text), visible: true };
+		}
+
+		if (state.failed) return { content: theme.fg("dim", "?"), visible: true };
+		if (state.pending) return { content: theme.fg("dim", "…"), visible: true };
+		return { content: "", visible: false };
+	},
+};
+
 const sessionNameSegment: StatusLineSegment = {
 	id: "session_name",
 	render(ctx) {
@@ -611,16 +632,22 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	hostname: hostnameSegment,
 	cache_read: cacheReadSegment,
 	cache_write: cacheWriteSegment,
+	command: commandSegment,
 	session_name: sessionNameSegment,
 	usage: usageSegment,
 };
 
 export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {
-	const segment = SEGMENTS[id];
-	if (!segment) {
-		return { content: "", visible: false };
+	const segment = typeof id === "string" ? SEGMENTS[id] : undefined;
+	if (!segment || typeof segment.render !== "function") {
+		const label = truncateToWidth(sanitizeStatusText(String(id)), 20);
+		return { content: theme.fg("warning", `?unknown:${label || "segment"}`), visible: true };
 	}
-	return segment.render(ctx);
+	try {
+		return segment.render(ctx);
+	} catch {
+		return { content: theme.fg("dim", "?"), visible: true };
+	}
 }
 
 export const ALL_SEGMENT_IDS: StatusLineSegmentId[] = Object.keys(SEGMENTS) as StatusLineSegmentId[];

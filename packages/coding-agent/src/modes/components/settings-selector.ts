@@ -215,6 +215,8 @@ function mergeSegmentOptions(
 		git: base?.git || overrides?.git ? { ...(base?.git ?? {}), ...(overrides?.git ?? {}) } : undefined,
 		time: base?.time || overrides?.time ? { ...(base?.time ?? {}), ...(overrides?.time ?? {}) } : undefined,
 		usage: base?.usage || overrides?.usage ? { ...(base?.usage ?? {}), ...(overrides?.usage ?? {}) } : undefined,
+		command:
+			base?.command || overrides?.command ? { ...(base?.command ?? {}), ...(overrides?.command ?? {}) } : undefined,
 	};
 }
 
@@ -424,6 +426,22 @@ class StatusLineCustomEditor extends Container {
 						),
 				});
 			}
+			if (id === "command") {
+				items.push({
+					id: "option.command.command",
+					label: "Command: command",
+					description: "Shell command whose sanitized stdout is shown in the status line.",
+					currentValue: this.#draft.segmentOptions.command?.command ?? "",
+					submenu: (currentValue, done) =>
+						new TextInputSubmenu(
+							"Status line command",
+							"Runs in the configured shell with a short timeout and cached refreshes.",
+							currentValue,
+							value => done(value),
+							() => done(),
+						),
+				});
+			}
 		}
 
 		items.push(
@@ -592,6 +610,12 @@ class StatusLineCustomEditor extends Container {
 				this.#draft.segmentOptions.usage = {
 					...(this.#draft.segmentOptions.usage ?? {}),
 					mode: value === "remaining" ? "remaining" : "used",
+				};
+				break;
+			case "command.command":
+				this.#draft.segmentOptions.command = {
+					...(this.#draft.segmentOptions.command ?? {}),
+					command: value,
 				};
 				break;
 		}
