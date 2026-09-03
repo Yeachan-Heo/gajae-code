@@ -1492,6 +1492,75 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		await sessionManager.close();
 	});
 
+	it("closeStrict fences a queued cwd move before releasing manager ownership", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const activeStarted = Promise.withResolvers<void>();
+		const releaseActive = Promise.withResolvers<void>();
+		const active = sessionManager.runExclusiveCwdMoveTransition(async () => {
+			activeStarted.resolve();
+			await releaseActive.promise;
+		});
+		await activeStarted.promise;
+		const queued = sessionManager.moveTo(repoA).then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+
+		const closing = sessionManager.closeStrict();
+		releaseActive.resolve();
+		await active;
+
+		expect(await queued).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
+		expect(await closing).toEqual({ kind: "closed" });
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+	});
+
+	it("close fences queued cwd moves and waits for an admitted reader", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwd = path.join(tempDir, "root");
+		const repoA = path.join(cwd, "repo-a");
+		fs.mkdirSync(repoA, { recursive: true });
+		const sessionManager = SessionManager.create(cwd, SessionManager.managedDestination(cwd, tempDir));
+		const readerStarted = Promise.withResolvers<void>();
+		const releaseReader = Promise.withResolvers<void>();
+		const reader = sessionManager.runWithCwdReadLease(async () => {
+			readerStarted.resolve();
+			await releaseReader.promise;
+		});
+		await readerStarted.promise;
+		const queued = sessionManager.moveTo(repoA).then(
+			() => ({ status: "fulfilled" as const }),
+			error => ({ status: "rejected" as const, error }),
+		);
+		let closeSettled = false;
+		const closing = sessionManager.close().finally(() => {
+			closeSettled = true;
+		});
+
+		await Promise.resolve();
+		expect(closeSettled).toBe(false);
+		expect(await queued).toMatchObject({
+			status: "rejected",
+			error: { message: "Session cwd move admission is closed." },
+		});
+		await expect(sessionManager.runWithCwdReadLease(async () => {})).rejects.toThrow("Session manager is closing.");
+
+		releaseReader.resolve();
+		await reader;
+		await closing;
+		expect(closeSettled).toBe(true);
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(cwd));
+	});
+
 	it("suspends its own cwd read lease while acquiring move authority", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);

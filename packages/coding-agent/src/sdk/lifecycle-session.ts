@@ -1,5 +1,5 @@
 import { parseModelString } from "../config/model-resolver";
-import type { AgentSession } from "../session/agent-session";
+import { type AgentSession, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { type CreateAgentSessionOptions, createAgentSession } from "./session";
 import {
 	lifecycleMcpStartupTimeoutOption,
@@ -106,7 +106,12 @@ export async function createLifecycleAgentSession(
 			const expected = parseModelString(modelId);
 			const expectedSelector = expected ? `${expected.provider}/${expected.id}` : modelId;
 			if (!activeSelector || activeSelector.toLowerCase() !== expectedSelector.toLowerCase()) {
-				await result.session.dispose().catch(() => {});
+				try {
+					await result.session.dispose();
+				} catch (error) {
+					if (!isSessionDisposalIncompleteError(error)) throw error;
+					await result.session.awaitDisposeCompletion();
+				}
 				throw new Error(
 					`Model "${modelId}" not found. Use --list-models to see available models.${
 						activeSelector ? ` Session resolved ${activeSelector} instead.` : ""

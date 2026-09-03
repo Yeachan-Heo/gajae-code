@@ -7,7 +7,11 @@ import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { AgentSession, WorkerIntegrationRequestScheduler } from "@gajae-code/coding-agent/session/agent-session";
+import {
+	AgentSession,
+	type AgentSessionConfig,
+	WorkerIntegrationRequestScheduler,
+} from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
@@ -17,6 +21,26 @@ describe("AgentSession abort timeout", () => {
 	let tempDir: TempDir | undefined;
 	let authStorage: AuthStorage | undefined;
 	let session: AgentSession | undefined;
+
+	async function createDisposableSession(overrides: Partial<AgentSessionConfig> = {}): Promise<AgentSession> {
+		tempDir = TempDir.createSync("@gjc-disposal-boundary-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const mock = createMockModel();
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(tempDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+			...overrides,
+		});
+		return session;
+	}
 
 	afterEach(async () => {
 		if (session) {
@@ -508,6 +532,7 @@ describe("AgentSession abort timeout", () => {
 		};
 		let streamStarted = false;
 		let toolStarted = false;
+		let toolEffects = 0;
 		const holdTool: AgentTool = {
 			name: "hold",
 			label: "Hold",
@@ -516,6 +541,7 @@ describe("AgentSession abort timeout", () => {
 			execute: async () => {
 				toolStarted = true;
 				await releaseHeldTool.promise;
+				toolEffects += 1;
 				return { content: [{ type: "text" as const, text: "released" }] };
 			},
 		};
@@ -548,7 +574,7 @@ describe("AgentSession abort timeout", () => {
 		const prompt = activeSession.prompt("Start a stream that ignores abort.");
 		let disposed = false;
 		// Keep a regression from consuming the suite's hook timeout and hiding the
-		// failed elapsed-time assertion. A correct dispose returns before this fires.
+		// failed incomplete-disposition assertion.
 		const safetyRelease = setTimeout(() => {
 			releaseHeldTool.resolve();
 			heldStream.end(response);
@@ -579,31 +605,36 @@ describe("AgentSession abort timeout", () => {
 			});
 
 			teardownStarted = true;
+			activeSession.setDisposeTimeoutForTests(50);
 			const started = Date.now();
-			await activeSession.dispose();
-			disposed = true;
+			await expect(activeSession.dispose()).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
 			const elapsed = Date.now() - started;
 
 			expect(await queuedSelectionResult).toMatchObject({
 				status: "rejected",
 				error: { name: "AgentBusyError", code: "busy" },
 			});
-			// Since #3894 the agent loop emits a synthetic aborted result for tool
-			// calls that outlive their signal, so the turn terminates on its own and
-			// `waitForIdle` settles well inside the 2s force-abort budget. Burning
-			// that budget would mean the loop is hanging again.
-			expect(elapsed).toBeLessThan(2_000);
+			// Logical Agent idle is not physical tool terminality. The public deadline
+			// must report incomplete while the admitted tool still owns its cwd lease.
+			expect(elapsed).toBeLessThan(1_000);
 			expect(forcedAbort).not.toHaveBeenCalled();
 			expect(forceAbortResults).toEqual([]);
 			expect(agent.state.isStreaming).toBe(false);
+			expect(toolEffects).toBe(0);
 
-			const branchIdsAfterDispose = sessionManager.getBranch().map(entry => entry.id);
+			const branchIdsAtIncomplete = sessionManager.getBranch().map(entry => entry.id);
 			releaseHeldTool.resolve();
 			heldStream.end(response);
 			await prompt;
+			await activeSession.awaitDisposeCompletion();
+			disposed = true;
 			await Bun.sleep(10);
 
-			expect(sessionManager.getBranch().map(entry => entry.id)).toEqual(branchIdsAfterDispose);
+			expect(branchIdsAtIncomplete.length).toBeGreaterThan(0);
+			expect(sessionManager.getBranch()).toEqual([]);
+			expect(toolEffects).toBe(1);
+			await Promise.resolve();
+			expect(toolEffects).toBe(1);
 			expect(agentEndsAfterTeardownStarted).toBe(0);
 		} finally {
 			clearTimeout(safetyRelease);
@@ -612,9 +643,168 @@ describe("AgentSession abort timeout", () => {
 			try {
 				await prompt;
 			} finally {
-				if (!disposed) await activeSession.dispose();
+				if (!disposed) await activeSession.awaitDisposeCompletion();
 				session = undefined;
 			}
+		}
+	});
+
+	it("uses one caller deadline, retains cleanup ownership, and never duplicates a timed-out cleanup", async () => {
+		const activeSession = await createDisposableSession();
+		activeSession.setDisposeTimeoutForTests(50);
+		const cleanupStarted = Promise.withResolvers<void>();
+		const releaseCleanup = Promise.withResolvers<void>();
+		let cleanupStarts = 0;
+		let cleanupEffects = 0;
+		activeSession.registerToolSessionCleanup(async () => {
+			cleanupStarts += 1;
+			cleanupStarted.resolve();
+			await releaseCleanup.promise;
+			cleanupEffects += 1;
+		});
+
+		vi.useFakeTimers();
+		try {
+			const first = activeSession.dispose();
+			await cleanupStarted.promise;
+			vi.advanceTimersByTime(50);
+			await expect(first).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+
+			const retryStarted = Date.now();
+			await expect(activeSession.dispose()).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+			expect(Date.now() - retryStarted).toBe(0);
+			expect(cleanupStarts).toBe(1);
+			expect(cleanupEffects).toBe(0);
+
+			releaseCleanup.resolve();
+			await activeSession.awaitDisposeCompletion();
+			expect(cleanupStarts).toBe(1);
+			expect(cleanupEffects).toBe(1);
+			await activeSession.dispose();
+			await Promise.resolve();
+			expect(cleanupEffects).toBe(1);
+			session = undefined;
+		} finally {
+			releaseCleanup.resolve();
+			vi.useRealTimers();
+		}
+	});
+
+	it("retains worker and post-prompt work until successful disposal settlement", async () => {
+		const workerStarted = Promise.withResolvers<void>();
+		const releaseWorker = Promise.withResolvers<void>();
+		let workerEffects = 0;
+		const activeSession = await createDisposableSession({
+			workerIntegrationRequest: async () => {
+				workerStarted.resolve();
+				await releaseWorker.promise;
+				workerEffects += 1;
+			},
+			workerIntegrationTimeoutMs: 5,
+		});
+		activeSession.setDisposeTimeoutForTests(50);
+		const postPromptStarted = Promise.withResolvers<void>();
+		const releasePostPrompt = Promise.withResolvers<void>();
+		let postPromptEffects = 0;
+		activeSession.trackPostPromptTaskForTests(
+			(async () => {
+				postPromptStarted.resolve();
+				await releasePostPrompt.promise;
+				postPromptEffects += 1;
+			})(),
+		);
+		activeSession.requestWorkerIntegrationForTests();
+
+		vi.useFakeTimers();
+		try {
+			const disposing = activeSession.dispose();
+			await postPromptStarted.promise;
+			vi.advanceTimersByTime(50);
+			await expect(disposing).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+			expect(postPromptEffects).toBe(0);
+
+			releasePostPrompt.resolve();
+			await workerStarted.promise;
+			releaseWorker.resolve();
+			await activeSession.awaitDisposeCompletion();
+			expect(postPromptEffects).toBe(1);
+			expect(workerEffects).toBe(1);
+			await Promise.resolve();
+			expect({ postPromptEffects, workerEffects }).toEqual({ postPromptEffects: 1, workerEffects: 1 });
+			session = undefined;
+		} finally {
+			releasePostPrompt.resolve();
+			releaseWorker.resolve();
+			vi.useRealTimers();
+		}
+	});
+
+	it("fences delayed coordinator persistence before successful disposal", async () => {
+		const activeSession = await createDisposableSession();
+		activeSession.setDisposeTimeoutForTests(50);
+		const stateFile = path.join(tempDir!.path(), "runtime-state.json");
+		const previousStateFile = process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
+		process.env.GJC_COORDINATOR_SESSION_STATE_FILE = stateFile;
+		const releasePersist = Promise.withResolvers<void>();
+		const persist = activeSession.queueCoordinatorRuntimeStatePersistForTests(
+			{ type: "turn_start" },
+			releasePersist.promise,
+		);
+
+		vi.useFakeTimers();
+		try {
+			const disposing = activeSession.dispose();
+			vi.advanceTimersByTime(50);
+			await expect(disposing).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+			expect(await Bun.file(stateFile).exists()).toBe(false);
+
+			releasePersist.resolve();
+			await persist;
+			await activeSession.awaitDisposeCompletion();
+			expect(await Bun.file(stateFile).exists()).toBe(false);
+			session = undefined;
+		} finally {
+			releasePersist.resolve();
+			if (previousStateFile === undefined) delete process.env.GJC_COORDINATOR_SESSION_STATE_FILE;
+			else process.env.GJC_COORDINATOR_SESSION_STATE_FILE = previousStateFile;
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not report successful disposal before backend and SessionManager close are terminal", async () => {
+		const activeSession = await createDisposableSession();
+		activeSession.setDisposeTimeoutForTests(50);
+		const releaseBackend = Promise.withResolvers<void>();
+		let backendEffects = 0;
+		let closeEffects = 0;
+		vi.spyOn(activeSession.memoryBackend, "dispose").mockImplementation(async () => {
+			await releaseBackend.promise;
+			backendEffects += 1;
+		});
+		const originalCloseStrict = activeSession.sessionManager.closeStrict.bind(activeSession.sessionManager);
+		vi.spyOn(activeSession.sessionManager, "closeStrict").mockImplementation(async () => {
+			const outcome = await originalCloseStrict();
+			closeEffects += 1;
+			return outcome;
+		});
+
+		vi.useFakeTimers();
+		try {
+			const disposing = activeSession.dispose();
+			vi.advanceTimersByTime(50);
+			await expect(disposing).rejects.toMatchObject({ name: "SessionDisposalIncompleteError" });
+			expect({ backendEffects, closeEffects }).toEqual({ backendEffects: 0, closeEffects: 0 });
+
+			releaseBackend.resolve();
+			await activeSession.awaitDisposeCompletion();
+			expect({ backendEffects, closeEffects }).toEqual({ backendEffects: 1, closeEffects: 1 });
+			await activeSession.dispose();
+			await Promise.resolve();
+			expect({ backendEffects, closeEffects }).toEqual({ backendEffects: 1, closeEffects: 1 });
+			session = undefined;
+		} finally {
+			releaseBackend.resolve();
+			vi.useRealTimers();
 		}
 	});
 });

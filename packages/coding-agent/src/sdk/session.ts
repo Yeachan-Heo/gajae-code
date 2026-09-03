@@ -4574,20 +4574,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 		// Attach the live session to the pre-registered ref so peers can route IRC
 		// messages here. Refresh sessionFile in case it was unavailable at pre-register
-		// time. The dispose wrapper below unregisters on teardown.
+		// time. The registered terminal cleanup below unregisters on teardown.
 		agentRegistry.attachSession(resolvedAgentId, session, sessionManager.getSessionFile() ?? null);
 		{
-			const originalDispose = session.dispose.bind(session);
-			const awaitCompleteDispose = async (): Promise<void> => {
-				for (;;) {
-					try {
-						await originalDispose();
-						return;
-					} catch (error) {
-						if (!isSessionDisposalIncompleteError(error)) throw error;
-					}
-				}
-			};
 			let cleanupPromise: Promise<void> | undefined;
 			const finishCleanup = async (): Promise<void> => {
 				if (cleanupPromise) return cleanupPromise;
@@ -4624,45 +4613,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					if (failures.length > 0) throw new AggregateError(failures, "SDK disposal cleanup failed.");
 				})();
 				cleanupPromise = cleanup;
-				void cleanup.catch(() => {
-					if (cleanupPromise === cleanup) cleanupPromise = undefined;
-				});
+				void cleanup.catch(() => {});
 				return cleanup;
 			};
-			session.dispose = async () => {
-				const boundedDispose = originalDispose();
-				try {
-					await boundedDispose;
-					await finishCleanup();
-				} catch (error) {
-					if (isSessionDisposalIncompleteError(error)) {
-						void (async () => {
-							try {
-								await awaitCompleteDispose();
-							} finally {
-								try {
-									await finishCleanup();
-								} catch (cleanupError) {
-									logger.warn("Deferred SDK disposal cleanup failed", {
-										error: safeErrorForLog(cleanupError),
-									});
-								}
-							}
-						})().catch(error => {
-							logger.warn("Deferred SDK teardown failed", { error: safeErrorForLog(error) });
-						});
-						throw error;
-					}
-					try {
-						await finishCleanup();
-					} catch (cleanupError) {
-						logger.warn("SDK disposal cleanup failed after terminal teardown error", {
-							error: safeErrorForLog(cleanupError),
-						});
-					}
-					throw error;
-				}
-			};
+			session.registerToolSessionCleanup(finishCleanup);
 		}
 
 		if (model?.api === "openai-codex-responses") {
@@ -4898,7 +4852,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 					// The first call is intentionally bounded for startup callers. Join the
 					// retained teardown before releasing the resources it still owns.
-					await awaitCompleteDispose();
+					await session.awaitDisposeCompletion();
 				}
 			} else {
 				if (hasRegistered) agentRegistry.unregister(resolvedAgentId);

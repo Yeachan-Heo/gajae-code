@@ -39,6 +39,7 @@ import {
 	SdkStartupRollbackTracker,
 } from "../sdk/startup-capability";
 import { runSdkServe } from "../sdk/transport/serve-cli";
+import { isSessionDisposalIncompleteError } from "../session/agent-session";
 import {
 	type CapturedSessionTranscriptSnapshot,
 	type ResumeSessionIdentity,
@@ -599,22 +600,32 @@ export async function runSessionHost(
 		throw created.failure;
 	}
 	const { session, capability, rollback, startDeferredMemoryBackend } = created;
+	let lifecycleTranscriptPath: string | undefined;
+	session.registerToolSessionTransitionCleanup(async () => {
+		await session.sessionManager.ensureOnDisk();
+		lifecycleTranscriptPath = session.sessionManager.getSessionFile();
+	});
 	let sessionDisposal: Promise<void> | undefined;
 	const disposeSession = (): Promise<void> => {
-		sessionDisposal ??= session.dispose().catch(() => {});
+		sessionDisposal ??= (async () => {
+			try {
+				await session.dispose();
+			} catch (error) {
+				if (!isSessionDisposalIncompleteError(error)) throw error;
+				await session.awaitDisposeCompletion();
+			}
+		})();
 		return sessionDisposal;
 	};
 	let disposal: Promise<LifecycleTranscriptEvidence | undefined> | undefined;
 	const disposeAndCapture = (): Promise<LifecycleTranscriptEvidence | undefined> => {
 		disposal ??= (async () => {
 			await disposeSession();
+			if (!lifecycleTranscriptPath) return undefined;
 			try {
-				await session.sessionManager.ensureOnDisk();
-				const transcriptPath = session.sessionManager.getSessionFile();
-				if (!transcriptPath) return undefined;
 				const [bytes, stat] = await Promise.all([
-					fs.readFile(transcriptPath),
-					fs.stat(transcriptPath, { bigint: true }),
+					fs.readFile(lifecycleTranscriptPath),
+					fs.stat(lifecycleTranscriptPath, { bigint: true }),
 				]);
 				const digest = createHash("sha256").update(bytes).digest("hex");
 				return {

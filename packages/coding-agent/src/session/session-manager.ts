@@ -10995,6 +10995,7 @@ export class SessionManager {
 		// The writer's own async context already holds exclusive access; taking a
 		// read lease there would wait on itself.
 		if (owner !== undefined && cwdTransitionAls.getStore() === owner) return fn();
+		if (this.#strictClosePending || this.#cwdMoveAdmissionClosed) throw new Error("Session manager is closing.");
 		while (this.#cwdWriterPending > 0) await this.#cwdTransitionTail.catch(() => {});
 		if (this.#cwdReaderCount === 0) {
 			const { promise, resolve } = Promise.withResolvers<void>();
@@ -11032,6 +11033,10 @@ export class SessionManager {
 	/** Wait for any in-flight exclusive cwd transition to settle. */
 	async joinCwdTransition(): Promise<void> {
 		await this.#cwdTransitionTail;
+	}
+
+	async joinCwdReaders(): Promise<void> {
+		while (this.#cwdReaderCount > 0) await this.#cwdReadersIdle;
 	}
 
 	async closeCwdMoveAdmission(): Promise<void> {
@@ -16197,7 +16202,9 @@ export class SessionManager {
 
 	/** Close the persistent writer after flushing all pending data. */
 	async close(): Promise<void> {
+		await this.closeCwdMoveAdmission();
 		await this.joinCwdTransition();
+		await this.joinCwdReaders();
 		SessionManager.releaseProcessCwdOwnership(this);
 		// Drain any uncommitted prepared successors before releasing resources so
 		// dispose/shutdown retains exact cleanup authority (#3138).
@@ -16259,14 +16266,20 @@ export class SessionManager {
 	 */
 	async closeStrict(): Promise<SessionManagerCloseOutcome> {
 		this.#strictClosePending = true;
+		await this.closeCwdMoveAdmission();
+		await this.joinCwdTransition();
+		await this.joinCwdReaders();
 		// Drain staged successors on the strict ACP dispose path as well as best-effort close (#3138).
+		let preparedCleanupError: Error | undefined;
 		try {
 			await this.#retryPreparedNewSessionCleanups();
 		} catch (error) {
+			preparedCleanupError = toError(error);
 			logger.warn("Prepared session cleanup during closeStrict failed; retained for retry", {
-				error: toError(error).message,
+				error: preparedCleanupError.message,
 			});
 		}
+		if (preparedCleanupError) return { kind: "close_failed_retryable", error: preparedCleanupError };
 		let priorPersistError = this.#persistError;
 		if (this.#needsFullRewriteOnNextPersist && (!this.#readOnlyResume || this.#strictResumeMutationPending)) {
 			await this.#persistChain.catch(() => {});

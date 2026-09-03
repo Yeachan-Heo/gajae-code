@@ -1578,8 +1578,12 @@ interface EphemeralTurnResult {
 const SIGNAL_TEARDOWN_TIMEOUT_MS = 5_000;
 
 export class SessionDisposalIncompleteError extends Error {
-	constructor() {
-		super("Session disposal exceeded its bounded caller deadline.");
+	constructor(label?: string) {
+		super(
+			label
+				? `Session disposal exceeded its bounded caller deadline while waiting for ${label}.`
+				: "Session disposal exceeded its bounded caller deadline.",
+		);
 		this.name = "SessionDisposalIncompleteError";
 	}
 }
@@ -2038,6 +2042,7 @@ function sanitizePostPublicationError(error: string | undefined): string | undef
 
 export class WorkerIntegrationRequestScheduler {
 	#inFlight: Promise<WorkerIntegrationOutcome> | undefined = undefined;
+	#ownedRequests = new Set<Promise<void>>();
 	#pending = false;
 
 	constructor(
@@ -2065,6 +2070,12 @@ export class WorkerIntegrationRequestScheduler {
 		return outcome;
 	}
 
+	async joinOwnedRequests(): Promise<void> {
+		while (this.#ownedRequests.size > 0) {
+			await Promise.allSettled([...this.#ownedRequests]);
+		}
+	}
+
 	#start(): void {
 		this.#pending = false;
 		const controller = new AbortController();
@@ -2074,6 +2085,8 @@ export class WorkerIntegrationRequestScheduler {
 		} catch {
 			request = Promise.reject(new Error("Worker integration request failed before dispatch."));
 		}
+		this.#ownedRequests.add(request);
+		void request.finally(() => this.#ownedRequests.delete(request)).catch(() => {});
 		let timeout: ReturnType<typeof setTimeout> | undefined;
 		const deadline = new Promise<WorkerIntegrationOutcome>(resolve => {
 			timeout = setTimeout(() => {
@@ -3070,10 +3083,16 @@ export class AgentSession {
 	#isDisposed = false;
 	#disposeRunPromise: Promise<void> | undefined;
 	#disposeCallerPromise: Promise<void> | undefined;
+	#disposeCompleted = false;
+	#disposeTerminalError: unknown;
 	readonly #disposeAbortController = new AbortController();
 	#disposeAdmissionClosed: Promise<void> | undefined;
 	#disposePostPromptDrain: Promise<void> | undefined;
 	#disposeDeadline = 0;
+	#disposeDeadlineTimer: NodeJS.Timeout | undefined;
+	#disposeDeadlineExpired: PromiseWithResolvers<void> | undefined;
+	#disposeTimeoutMs = SIGNAL_TEARDOWN_TIMEOUT_MS;
+	#disposeActiveStepLabel: string | undefined;
 	readonly #toolSessionCleanups = new Set<() => Promise<void> | void>();
 	readonly #toolSessionTransitionCleanups = new Set<() => Promise<void> | void>();
 	readonly #deferredOwnerShutdownFinalizations = new Set<Promise<void>>();
@@ -5597,21 +5616,26 @@ export class AgentSession {
 
 	async #runToolSessionTransitionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionTransitionCleanups);
-		this.#toolSessionTransitionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
-		for (const result of results) {
-			if (result.status === "rejected")
-				logger.warn("Tool session transition cleanup failed", { error: String(result.reason) });
+		const failures: unknown[] = [];
+		for (let index = 0; index < results.length; index++) {
+			const result = results[index]!;
+			if (result.status === "fulfilled") this.#toolSessionTransitionCleanups.delete(cleanups[index]!);
+			else failures.push(result.reason);
 		}
+		if (failures.length > 0) throw new AggregateError(failures, "Tool session transition cleanup failed.");
 	}
 
 	async #runToolSessionCleanups(): Promise<void> {
 		const cleanups = Array.from(this.#toolSessionCleanups);
-		this.#toolSessionCleanups.clear();
 		const results = await Promise.allSettled(cleanups.map(async cleanup => await cleanup()));
-		for (const result of results) {
-			if (result.status === "rejected") logger.warn("Tool session cleanup failed", { error: String(result.reason) });
+		const failures: unknown[] = [];
+		for (let index = 0; index < results.length; index++) {
+			const result = results[index]!;
+			if (result.status === "fulfilled") this.#toolSessionCleanups.delete(cleanups[index]!);
+			else failures.push(result.reason);
 		}
+		if (failures.length > 0) throw new AggregateError(failures, "Tool session cleanup failed.");
 	}
 
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
@@ -8962,11 +8986,19 @@ export class AgentSession {
 	 */
 	dispose(): Promise<void> {
 		this.#evalExecutionDisposing = true;
+		if (this.#disposeCompleted) return Promise.resolve();
+		if (this.#disposeTerminalError !== undefined) return Promise.reject(this.#disposeTerminalError);
 		if (this.#disposeCallerPromise) return this.#disposeCallerPromise;
 		if (!this.#disposeRunPromise) {
-			this.#disposeDeadline = Date.now() + SIGNAL_TEARDOWN_TIMEOUT_MS;
+			this.#disposeDeadline = Date.now() + this.#disposeTimeoutMs;
+			this.#disposeDeadlineExpired = Promise.withResolvers<void>();
+			this.#disposeDeadlineTimer = setTimeout(() => this.#disposeDeadlineExpired?.resolve(), this.#disposeTimeoutMs);
+			this.#disposeDeadlineTimer.unref?.();
 			this.#abortAdmissionEpoch++;
 			this.#isDisposed = true;
+			// Invalidate every coordinator event admitted before disposal. Handlers may
+			// still unwind, but their captured generation can no longer enqueue a write.
+			this.#coordinatorPersistGeneration += 1;
 			this.#disposeAbortController.abort();
 			// Disposal owns a bounded Agent abort below. Waiting for the active prompt's
 			// admission here would put that unbounded prompt ahead of the abort budget.
@@ -8982,14 +9014,31 @@ export class AgentSession {
 			this.agent.abort();
 			this.agent.setMainAttemptScopeObserver(undefined);
 			this.#disconnectFromAgent();
-			this.#disposeRunPromise = this.#dispose();
+			this.#disposeRunPromise = this.#dispose()
+				.then(
+					() => {
+						this.#disposeCompleted = true;
+					},
+					error => {
+						this.#disposeTerminalError = error;
+						throw error;
+					},
+				)
+				.finally(() => {
+					if (this.#disposeDeadlineTimer) clearTimeout(this.#disposeDeadlineTimer);
+					this.#disposeDeadlineTimer = undefined;
+				});
 			void this.#disposeRunPromise.catch(() => {});
 		}
 		const teardown = this.#disposeRunPromise;
+		const deadlineExpired = this.#disposeDeadlineExpired;
+		if (!deadlineExpired || Date.now() >= this.#disposeDeadline) {
+			return Promise.reject(new SessionDisposalIncompleteError(this.#disposeActiveStepLabel));
+		}
 		const boundedTeardown = Promise.race([
 			teardown,
-			Bun.sleep(SIGNAL_TEARDOWN_TIMEOUT_MS).then(() => {
-				throw new SessionDisposalIncompleteError();
+			deadlineExpired.promise.then(() => {
+				throw new SessionDisposalIncompleteError(this.#disposeActiveStepLabel);
 			}),
 		]);
 		this.#disposeCallerPromise = boundedTeardown;
@@ -9001,6 +9050,24 @@ export class AgentSession {
 		return boundedTeardown;
 	}
 
+	/** Join the retained teardown owner without allocating another public deadline. */
+	awaitDisposeCompletion(): Promise<void> {
+		return this.#disposeRunPromise ?? this.dispose();
+	}
+
+	setDisposeTimeoutForTests(timeoutMs: number): void {
+		if (this.#disposeRunPromise) throw new Error("Cannot change the disposal timeout after disposal has started.");
+		this.#disposeTimeoutMs = Math.max(0, timeoutMs);
+	}
+
+	trackPostPromptTaskForTests(task: Promise<void>): void {
+		this.#trackPostPromptTask(task, this.#selectionFenceGeneration);
+	}
+
+	requestWorkerIntegrationForTests(): void {
+		this.#requestWorkerIntegrationAttempt();
+	}
+
 	/** Cancel the active logical run domain, including managed continuations detached from Agent's active attempt. */
 	#quarantineAgentRunResources(): void {
 		const resourceRunId = this.agent.currentManagedLogicalRunId ?? this.agent.activeResourceRunId;
@@ -9008,23 +9075,33 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
+		const disposeFailures: Array<{ label: string; error: unknown; critical: boolean }> = [];
 		const awaitDisposeStep = async <T>(
 			label: string,
 			operation: Promise<T>,
 			critical = false,
 		): Promise<T | undefined> => {
+			this.#disposeActiveStepLabel = label;
 			try {
 				return await operation;
 			} catch (error) {
-				if (critical) throw error;
+				disposeFailures.push({ label, error, critical });
 				logger.warn("Session dispose step failed", { label, error: String(error) });
 				return undefined;
+			} finally {
+				if (this.#disposeActiveStepLabel === label) this.#disposeActiveStepLabel = undefined;
+			}
+		};
+		const drainCoordinatorEventHandlers = async (): Promise<void> => {
+			while (this.#coordinatorEventHandlers.size > 0) {
+				await Promise.allSettled([...this.#coordinatorEventHandlers]);
 			}
 		};
 		const admissionClosed = this.#disposeAdmissionClosed ?? this.#closeSessionAdmission();
 		await awaitDisposeStep("session admission close", admissionClosed);
 		await awaitDisposeStep("cwd move admission close", this.sessionManager.closeCwdMoveAdmission());
 		await awaitDisposeStep("admitted cwd transition", this.sessionManager.joinCwdTransition(), true);
+		await awaitDisposeStep("active cwd readers", this.sessionManager.joinCwdReaders(), true);
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
 		// before any await) so callers cannot race a start against teardown.
@@ -9066,17 +9143,18 @@ export class AgentSession {
 		await awaitDisposeStep("agent end publication", this.#agentEndPublicationPromise);
 		await awaitDisposeStep("queued extension events", this.#queuedExtensionEvents);
 		await awaitDisposeStep("agent end handling", this.#agentEndHandlingPromise);
+		await awaitDisposeStep("coordinator event handlers", drainCoordinatorEventHandlers(), true);
 		// Drain the sidecar write order for the same reason the two queues above are
 		// drained: each entry writes under the native identity-bound state-file lock, so a
 		// a still-queued write would run after the session that owns it is gone — releasing
 		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
 		// the addon after the runtime tore down the context it was scheduled in. The chain
 		// is already failure-absorbing, so this only waits.
-		await awaitDisposeStep("coordinator persistence", this.#coordinatorPersistQueue);
+		await awaitDisposeStep("coordinator persistence", this.#coordinatorPersistQueue, true);
 		// Terminal publication records its reconciliation from a promise reaction, which
 		// can append after the queue snapshot above was awaited. Drain the tracked writes
 		// again so disposal cannot return while that late reconciliation still owns a lock.
-		await awaitDisposeStep("unbarriered coordinator persistence", this.#drainUnbarrieredCoordinatorPersists());
+		await awaitDisposeStep("unbarriered coordinator persistence", this.#drainUnbarrieredCoordinatorPersists(), true);
 		this.#pendingBackgroundExchanges = [];
 		this.#drainTerminalOwnedYieldEntries();
 
@@ -9095,12 +9173,17 @@ export class AgentSession {
 		this.#workflowGateEmitter?.fence?.();
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
-		await awaitDisposeStep("worker integration", this.#flushWorkerIntegrationAttempt());
+		await awaitDisposeStep("worker integration", this.#flushWorkerIntegrationAttempt(), true);
+		await awaitDisposeStep(
+			"worker integration ownership",
+			this.#workerIntegrationScheduler?.joinOwnedRequests() ?? Promise.resolve(),
+			true,
+		);
 		// Worker integration completion can enqueue terminal reconciliation while the
 		// flush above is pending; drain that late producer before disposal resolves.
-		await awaitDisposeStep("post-worker coordinator persistence", this.#coordinatorPersistQueue);
-		await awaitDisposeStep("post-worker unbarriered persistence", this.#drainUnbarrieredCoordinatorPersists());
-		await awaitDisposeStep("post-prompt tasks", this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks());
+		await awaitDisposeStep("post-worker coordinator persistence", this.#coordinatorPersistQueue, true);
+		await awaitDisposeStep("post-worker unbarriered persistence", this.#drainUnbarrieredCoordinatorPersists(), true);
+		await awaitDisposeStep("post-prompt tasks", this.#disposePostPromptDrain ?? this.#cancelPostPromptTasks(), true);
 		// Cancel jobs this agent registered so a subagent's teardown doesn't
 		// leak its background bash/task work into the parent's manager. Only
 		// the session that owns the manager goes on to dispose it (which itself
@@ -9122,13 +9205,18 @@ export class AgentSession {
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
 				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
+				disposeFailures.push({
+					label: "async job manager",
+					error: new Error("Async job manager disposal remained incomplete."),
+					critical: true,
+				});
 			}
-			if (AsyncJobManager.instance() === ownedAsyncManager) {
+			if (drained !== false && AsyncJobManager.instance() === ownedAsyncManager) {
 				AsyncJobManager.setInstance(undefined);
 			}
 		}
-		await awaitDisposeStep("tool session transition cleanups", this.#runToolSessionTransitionCleanups());
-		await awaitDisposeStep("tool session cleanups", this.#runToolSessionCleanups());
+		await awaitDisposeStep("tool session transition cleanups", this.#runToolSessionTransitionCleanups(), true);
+		await awaitDisposeStep("tool session cleanups", this.#runToolSessionCleanups(), true);
 		// Only disconnect the MCP manager THIS session owns (top-level sessions that
 		// connected plugin-bundle MCP servers). Subagents and callers that merely
 		// observe the process-global manager must never tear down a manager they do
@@ -9159,12 +9247,7 @@ export class AgentSession {
 		this.#unregisterMovePublicationListener = undefined;
 		this.#unregisterAfterMoveListener?.();
 		this.#unregisterAfterMoveListener = undefined;
-		await awaitDisposeStep(
-			"browser tab release",
-			releaseTabsForOwner(this.sessionManager.getSessionId()).catch((error: unknown) =>
-				logger.warn("session dispose: releaseTabsForOwner failed", { error }),
-			),
-		);
+		await awaitDisposeStep("browser tab release", releaseTabsForOwner(this.sessionManager.getSessionId()), true);
 		const pythonExecutionsSettled = await awaitDisposeStep(
 			"Python execution preparation",
 			this.#prepareEvalExecutionsForDispose(),
@@ -9180,9 +9263,11 @@ export class AgentSession {
 		// Disconnect the agent event listener BEFORE closing session resources so a late
 		// provider/tool message_end cannot append to the closing SessionManager.
 		this.#disconnectFromAgent();
-		await awaitDisposeStep("memory backend", this.memoryBackend.dispose());
-		if (this.#workspaceTreeService) await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose());
-		if (this.#networkPrewarmService) await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose());
+		await awaitDisposeStep("memory backend", this.memoryBackend.dispose(), true);
+		if (this.#workspaceTreeService)
+			await awaitDisposeStep("workspace tree", this.#workspaceTreeService.dispose(), true);
+		if (this.#networkPrewarmService)
+			await awaitDisposeStep("network prewarm", this.#networkPrewarmService.dispose(), true);
 		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
 		let criticalDisposeError: unknown;
 		try {
@@ -9203,7 +9288,15 @@ export class AgentSession {
 		}
 		this.#eventListeners = [];
 		this.#rebuildEventListenerSnapshot();
-		if (criticalDisposeError !== undefined) throw criticalDisposeError;
+		if (criticalDisposeError !== undefined) {
+			disposeFailures.push({ label: "session manager close", error: criticalDisposeError, critical: true });
+		}
+		if (disposeFailures.length > 0) {
+			throw new AggregateError(
+				disposeFailures.map(failure => failure.error),
+				`Session disposal did not reach a terminal state: ${disposeFailures.map(failure => failure.label).join(", ")}`,
+			);
+		}
 	}
 
 	async #closeSessionManagerForDispose(): Promise<void> {
