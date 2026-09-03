@@ -10,6 +10,7 @@ import { buildDefaultTmuxLaunchPlan } from "@gajae-code/coding-agent/gjc-runtime
 import {
 	asLaunchWorktreeGuardError,
 	ensureLaunchWorktree,
+	ensureLaunchWorktreeCancellable,
 	ensureReusableNodeModules,
 	LaunchWorktreeGuardError,
 	parseLaunchWorktreeMode,
@@ -767,5 +768,23 @@ describe("launch guard classification", () => {
 	it("passes an already-classified guard through unchanged", () => {
 		const guard = new LaunchWorktreeGuardError("worktree_dirty", "worktree_dirty:/repo");
 		expect(asLaunchWorktreeGuardError(guard)).toBe(guard);
+	});
+
+	it("classifies path conflicts on the cancellable preparation path", async () => {
+		const repo = await createRepo("gjc-cancellable-guard-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "occupied" });
+		await fs.mkdir(path.dirname(plan.worktreePath), { recursive: true });
+		await Bun.write(plan.worktreePath, "occupied\n");
+
+		let caught: unknown;
+		try {
+			await ensureLaunchWorktreeCancellable(plan);
+		} catch (error) {
+			caught = error;
+		}
+
+		const guard = asLaunchWorktreeGuardError(caught);
+		expect(guard).toBeInstanceOf(LaunchWorktreeGuardError);
+		expect(guard?.code).toBe("worktree_path_conflict");
 	});
 });
