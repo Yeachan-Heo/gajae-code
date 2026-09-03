@@ -1678,7 +1678,8 @@ async function assertDeepInterviewHandoffReady(
 				? inner.execution_approval_receipt
 				: undefined;
 			if (
-				approval?.method !== "explicit-state-action" ||
+				approval?.schema_version !== 1 ||
+				approval.method !== "explicit-state-action" ||
 				typeof approval.approved_at !== "string" ||
 				typeof approval.mutation_id !== "string" ||
 				approval.spec_sha256 !== expectedSha ||
@@ -2156,8 +2157,13 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		? inner.execution_approval_receipt
 		: undefined;
 	if (inner.execution_approval === "approved") {
-		if (existingReceipt?.method !== "explicit-state-action")
+		if (existingReceipt?.schema_version !== 1 || existingReceipt.method !== "explicit-state-action")
 			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+		await assertDeepInterviewHandoffReady(envelope, {
+			cwd,
+			sessionId: selectors.gjcSessionId,
+			requireExecutionApproval: true,
+		});
 		return {
 			status: 0,
 			stdout: `${JSON.stringify({ skill: "deep-interview", execution_approval: "approved", state_path: statePath })}\n`,
@@ -2165,6 +2171,7 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	}
 	inner.execution_approval = "approved";
 	inner.execution_approval_receipt = {
+		schema_version: 1,
 		method: "explicit-state-action",
 		approved_at: approvedAt,
 		mutation_id: mutationId,
