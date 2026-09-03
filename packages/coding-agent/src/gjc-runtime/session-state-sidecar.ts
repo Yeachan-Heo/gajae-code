@@ -1431,7 +1431,11 @@ function basePayload(input: {
 		branch: branchForContext(input.context),
 		session_file: identity.sessionFile,
 		...(activity === undefined ? {} : { activity }),
-		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
+		...(input.context.ownerTerminal &&
+		input.context.ownerGenerationPublished !== false &&
+		input.context.ownerTerminal.generationPublished !== false
+			? { owner_generation: input.context.ownerTerminal.generation }
+			: {}),
 	};
 	return payload;
 }
@@ -3101,7 +3105,11 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 		const generation = await captureOwnerGenerationBaseline(context.ownerTerminal.stateDir, identity.sessionId).catch(
 			() => ({ state: "absent" as const }),
 		);
-		context = { ...context, ownerGenerationPublished: generation.state === "current" };
+		context = {
+			...context,
+			ownerGenerationPublished:
+				generation.state === "current" && generation.generation === context.ownerTerminal.generation,
+		};
 	}
 	let ownerSessionRoot: string;
 	try {

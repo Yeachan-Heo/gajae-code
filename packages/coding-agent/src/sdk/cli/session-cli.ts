@@ -717,21 +717,18 @@ export function boundWarningSources(
 		remaining -= retained.length;
 		retainedCounts.set(source, retained.length);
 	}
-	const summarySources = omitted.filter(item => item.count > (retainedCounts.get(item.source) ?? 0));
 	const retainedTotal = () => [...retainedCounts.values()].reduce((total, count) => total + count, 0);
-	for (const item of [...summarySources].reverse()) {
-		while (
-			(retainedCounts.get(item.source) ?? 0) > 0 &&
-			retainedTotal() > SESSION_LIST_WARNING_LIMIT - summarySources.length
-		) {
-			retainedCounts.set(item.source, (retainedCounts.get(item.source) ?? 0) - 1);
-		}
+	const summarySources = () => omitted.filter(item => item.count > (retainedCounts.get(item.source) ?? 0));
+	while (retainedTotal() + summarySources().length > SESSION_LIST_WARNING_LIMIT) {
+		const retainedSource = [...sources].reverse().find(source => (retainedCounts.get(source) ?? 0) > 0);
+		if (!retainedSource) break;
+		retainedCounts.set(retainedSource, (retainedCounts.get(retainedSource) ?? 0) - 1);
 	}
 	const samples = sources.flatMap(source => source.entries.slice(0, retainedCounts.get(source) ?? 0));
 	return [
 		...samples,
 		...omitted
-			.filter(item => summarySources.includes(item))
+			.filter(item => summarySources().includes(item))
 			.map(item => ({ item, count: item.count - (retainedCounts.get(item.source) ?? 0) }))
 			.filter(({ count }) => count > 0)
 			.map(({ item, count }) => item.source.describeOmitted(count)),

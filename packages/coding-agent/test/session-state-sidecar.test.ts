@@ -2088,6 +2088,51 @@ describe("coordinator runtime state sidecar", () => {
 		}
 	});
 
+	it("does not stamp an unpublished owner generation before replacement", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "staged-owner.json");
+		const sessionId = "staged-owner";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{
+				sessionId,
+				cwd: root,
+				ownerTerminal: {
+					generation: "11111111-1111-4111-8111-111111111111",
+					stateDir: root,
+					socketKey: "tmux",
+					generationPublished: false,
+				},
+			},
+		);
+		expect((await readPayload(stateFile)).owner_generation).toBeUndefined();
+
+		const replacement = await replaceOwnerGeneration(root, sessionId, "22222222-2222-4222-8222-222222222222");
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "agent_start" },
+			{
+				sessionId,
+				cwd: root,
+				ownerTerminal: { generation: replacement, stateDir: root, socketKey: "tmux" },
+			},
+		);
+		expect((await readPayload(stateFile)).owner_generation).toBe(replacement);
+	});
+
 	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {
 		const root = await tempRoot();
 		const stateFile = path.join(root, "state.json");

@@ -176,7 +176,9 @@ export function buildGjcTmuxSessionName(
 	if (explicit?.trim()) return assertSafeGjcTmuxSessionName(explicit);
 	const timestamp = (context.now ?? Date.now()).toString(36);
 	const id = context.id ?? randomTmuxSessionSuffix();
-	const branchSlug = context.branch ? `${buildGjcTmuxSessionSlug(context.branch)}_` : "";
+	const fixed = `${GJC_TMUX_SESSION_PREFIX}${timestamp}_${id}`;
+	const branchBudget = Math.max(0, 128 - fixed.length - 1);
+	const branchSlug = context.branch ? `${buildGjcTmuxSessionSlug(context.branch).slice(0, branchBudget)}_` : "";
 	return assertSafeGjcTmuxSessionName(`${GJC_TMUX_SESSION_PREFIX}${branchSlug}${timestamp}_${id}`);
 }
 

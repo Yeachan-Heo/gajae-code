@@ -1140,6 +1140,12 @@ function tmuxCommandArgument(value: string): string {
 	return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("$", "\\$").replaceAll("`", "\\`")}"`;
 }
 
+function safeTmuxFormatIdentity(value: string | undefined): string | undefined {
+	if (value === undefined) return undefined;
+	if (!/^[A-Za-z0-9_.-]{1,128}$/.test(value)) throw new Error("gjc_tmux_owner_unverifiable");
+	return value;
+}
+
 /**
  * Build the guard predicate for an exact tmux session mutation.
  *
@@ -1159,13 +1165,15 @@ function guardedTmuxSessionPredicate(
 ): string {
 	const safeNativeSessionId = safeNativeTmuxSessionId(nativeSessionId);
 	const safeSessionName = assertSafeGjcTmuxSessionName(sessionName);
-	const ownerGenerationPredicate = expectedOwnerGeneration
-		? `#{==:#{${GJC_TMUX_OWNER_GENERATION_OPTION}},${expectedOwnerGeneration}}`
+	const safeOwnerGeneration = safeTmuxFormatIdentity(expectedOwnerGeneration);
+	const safePsmuxIncarnation = safeTmuxFormatIdentity(expectedPsmuxIncarnation);
+	const ownerGenerationPredicate = safeOwnerGeneration
+		? `#{==:#{${GJC_TMUX_OWNER_GENERATION_OPTION}},${safeOwnerGeneration}}`
 		: "1";
 	const serverPidPredicate = expectedServer.pidProven === false ? "1" : `#{==:#{pid},${expectedServer.pid}}`;
-	if (!expectedPsmuxIncarnation)
+	if (!safePsmuxIncarnation)
 		return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${safeNativeSessionId}},#{&&:#{==:#{session_name},${safeSessionName}},${ownerGenerationPredicate}}}}`;
-	const psmuxIncarnationPredicate = `#{==:#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}},${expectedPsmuxIncarnation}}`;
+	const psmuxIncarnationPredicate = `#{==:#{${GJC_TMUX_PSMUX_INCARNATION_OPTION}},${safePsmuxIncarnation}}`;
 	return `#{&&:${serverPidPredicate},#{&&:#{==:#{session_id},${safeNativeSessionId}},#{&&:#{==:#{session_name},${safeSessionName}},#{&&:${ownerGenerationPredicate},${psmuxIncarnationPredicate}}}}}`;
 }
 

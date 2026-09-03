@@ -294,11 +294,25 @@ describe("gjc-session create public owner lifecycle", () => {
 	});
 
 	test("accepts scoped plans with exactly the owner bootstrap stdin line", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-scoped-")); roots.push(root);
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-scoped-日本-")); roots.push(root);
 		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root, "scoped");
-		const name = `scoped-日本-${Date.now()}`; sessions.push({ name, socket: `gjc-${name.replace(/[^A-Za-z0-9_.-]/g, "_")}` });
+		const name = `scoped-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
 		expect(Bun.spawnSync(["bash", createScript, name, dir], { env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }) }).exitCode).toBe(0);
 		expect(await Bun.file(path.join(state, "started.json")).exists()).toBe(true);
+	});
+
+	test("accepts a relative worktree path and passes protocol auth to the supervisor", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-create-relative-")); roots.push(root);
+		const dir = await worktree(root); const state = path.join(root, "state"); const bin = await fixture(root);
+		const name = `relative-${Date.now()}`; sessions.push({ name, socket: `gjc-${name}` });
+		const relative = path.relative(root, dir);
+		const result = Bun.spawnSync(["bash", createScript, name, relative], {
+			cwd: root,
+			env: env({ GJC_BIN: bin, GJC_SESSION_STATE_DIR: state }),
+		});
+		expect(result.exitCode, result.stderr.toString()).toBe(0);
+		const create = await Bun.file(createScript).text();
+		expect(create).toContain('"GJC_TMUX_OWNER_PROTOCOL_TOKEN=$PROTOCOL_TOKEN"');
 	});
 
 test("fails closed for malformed plans before creating an owner", async () => {
