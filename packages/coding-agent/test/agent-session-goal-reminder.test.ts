@@ -5,10 +5,12 @@ import type { AssistantMessage, ToolCall } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
+import * as sidecar from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import type { GoalModeState } from "@gajae-code/coding-agent/goals/state";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
@@ -352,12 +354,79 @@ describe("AgentSession active goal reminders", () => {
 					throw new Error("Timed out waiting for coordinator runtime-state failure containment");
 				}),
 			]);
-			expect(warnSpy).toHaveBeenCalledWith("Failed to persist coordinator runtime state", { event: "turn_start" });
+			const persistCall = warnSpy.mock.calls.find(
+				([message]) => message === "Failed to persist coordinator runtime state",
+			);
+			expect(persistCall).toBeDefined();
+			const persistFields = persistCall?.[1] as Record<string, unknown>;
+			expect(persistFields).toMatchObject({
+				event: "turn_start",
+				stateFile,
+				error: expect.any(String),
+			});
+			expect(Object.keys(persistFields).sort()).toEqual(["error", "event", "stateFile"]);
+			expect(JSON.stringify(persistFields)).not.toContain("must-not-reach-logs");
+			expect(JSON.stringify(persistFields)).not.toContain("private_payload");
+
 		} finally {
 			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;
 			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
 			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+		}
+	});
+
+	it("attributes a delayed persist failure to the document captured before a rescope", async () => {
+		const cwdA = path.join(tempDir.path(), "cwd-a");
+		const cwdB = path.join(tempDir.path(), "cwd-b");
+		const stateFileA = path.join(sessionRuntimeDir(cwdA, session.sessionId), "runtime-state.json");
+		const stateFileB = path.join(sessionRuntimeDir(cwdB, session.sessionId), "runtime-state.json");
+		const previousStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const previousSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+		const admitted = Promise.withResolvers<void>();
+		const releaseFailure = Promise.withResolvers<void>();
+		const failure = new Error("persist failed after document rescope");
+		let currentCwd = cwdA;
+		const cwdSpy = vi.spyOn(session.sessionManager, "getCwd").mockImplementation(() => currentCwd);
+		const persist = vi.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent").mockImplementation(async () => {
+			admitted.resolve();
+			await releaseFailure.promise;
+			throw failure;
+		});
+		const warned: Array<Record<string, unknown>> = [];
+		const warningLogged = Promise.withResolvers<void>();
+		const warnSpy = vi.spyOn(logger, "warn").mockImplementation((message, metadata) => {
+			if (message === "Failed to persist coordinator runtime state") {
+				warned.push(metadata ?? {});
+				warningLogged.resolve();
+			}
+		});
+		const sessionFileEnv = GJC_COORDINATOR_SESSION_STATE_FILE_ENV;
+		delete process.env[sessionFileEnv];
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = session.sessionId;
+		try {
+			session.agent.emitExternalEvent({ type: "turn_start" });
+			await admitted.promise;
+			currentCwd = cwdB;
+			releaseFailure.resolve();
+			await Promise.race([
+				warningLogged.promise,
+				Bun.sleep(1_000).then(() => {
+					throw new Error("Timed out waiting for delayed coordinator runtime-state failure");
+				}),
+			]);
+			expect(persist.mock.calls[0]?.[1]).toMatchObject({ sessionId: session.sessionId, cwd: cwdA, stateFile: stateFileA });
+			expect(stateFileA).not.toBe(stateFileB);
+			expect(warned).toHaveLength(1);
+			expect(warned[0]).toMatchObject({ stateFile: stateFileA, error: String(failure), event: "turn_start" });
+		} finally {
+			if (previousStateFile === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = previousStateFile;
+			if (previousSessionId === undefined) delete process.env[GJC_COORDINATOR_SESSION_ID_ENV];
+			else process.env[GJC_COORDINATOR_SESSION_ID_ENV] = previousSessionId;
+			cwdSpy.mockRestore();
+			persist.mockRestore();
+			warnSpy.mockRestore();
 		}
 	});
 });

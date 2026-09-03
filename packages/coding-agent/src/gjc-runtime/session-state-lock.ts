@@ -465,6 +465,110 @@ export class SessionStateLockUnavailableError extends Error {
 	}
 }
 
+/**
+ * Log fields describing a persist failure: the error text plus, when a session state
+ * lock refusal sits anywhere in the cause chain, its typed `reason` and `lockPath`.
+ * Wrapping errors (`PreviousRuntimeStateReadError`, `AggregateError`) are searched
+ * so the actionable detail is never buried behind a generic message.
+ */
+export function sessionStateLockFailureFields(error: unknown): {
+	error: string;
+	reason?: SessionStateLockUnavailableReason;
+	lockPath?: string;
+} {
+	const fields: { error: string; reason?: SessionStateLockUnavailableReason; lockPath?: string } = {
+		error: String(error),
+	};
+	const seen = new Set<unknown>();
+	const queue: unknown[] = [error];
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (current === null || typeof current !== "object" || seen.has(current)) continue;
+		seen.add(current);
+		if (current instanceof SessionStateLockUnavailableError) {
+			if (current.reason !== undefined) fields.reason = current.reason;
+			if (current.lockPath !== undefined) fields.lockPath = current.lockPath;
+			if (fields.reason !== undefined && fields.lockPath !== undefined) return fields;
+		}
+		if (current instanceof AggregateError) queue.push(...current.errors);
+		if ("cause" in current) queue.push((current as { cause?: unknown }).cause);
+	}
+	return fields;
+}
+
+function boundedPersistFailureClassPart(value: unknown, fallback: string): string {
+	if (typeof value !== "string" && typeof value !== "number") return fallback;
+	const normalized = String(value).replace(/[^A-Za-z0-9_.-]/gu, "_").slice(0, 64);
+	return normalized || fallback;
+}
+
+function persistFailureProperty(value: unknown, name: string): unknown {
+	if (value === null || (typeof value !== "object" && typeof value !== "function")) return undefined;
+	try {
+		return Reflect.get(value, name);
+	} catch {
+		return undefined;
+	}
+}
+
+function persistFailureConstructorName(error: unknown): string {
+	if (error === null) return "null";
+	if (typeof error !== "object" && typeof error !== "function") return typeof error;
+	const constructor = persistFailureProperty(error, "constructor");
+	const name = persistFailureProperty(constructor, "name");
+	return typeof name === "string" && name.length > 0 ? name : "Object";
+}
+
+/**
+ * Build a bounded warn-window partition without including arbitrary error text. Typed lock
+ * refusals use their stable reason; all other failures use the root constructor and the
+ * first structured `code`/`errno` found in the error/cause chain.
+ */
+function persistFailureClass(error: unknown): string {
+	const lockFields = sessionStateLockFailureFields(error);
+	if (lockFields.reason !== undefined) return `reason:${lockFields.reason}`;
+	const seen = new Set<unknown>();
+	const queue: unknown[] = [error];
+	let code: unknown;
+	let errno: unknown;
+	while (queue.length > 0) {
+		const current = queue.shift();
+		if (current === null || typeof current !== "object" || seen.has(current)) continue;
+		seen.add(current);
+		code ??= persistFailureProperty(current, "code");
+		errno ??= persistFailureProperty(current, "errno");
+		if (code !== undefined && errno !== undefined) break;
+		if (current instanceof AggregateError) queue.push(...current.errors);
+		const cause = persistFailureProperty(current, "cause");
+		if (cause !== undefined) queue.push(cause);
+	}
+	return `error:${boundedPersistFailureClassPart(persistFailureConstructorName(error), "Object")}:code=${boundedPersistFailureClassPart(code, "none")}:errno=${boundedPersistFailureClassPart(errno, "none")}`;
+}
+
+export const PERSIST_FAILURE_WARN_WINDOW_MS = 30_000;
+const persistFailureLastWarnedAt = new Map<string, number>();
+
+/**
+ * Whether a persist failure should be logged at warn level. The first failure for each
+ * document and stable failure class in a 30s window warns; repeats are the caller's cue
+ * to log at debug instead.
+ */
+export function shouldWarnPersistFailure(key: string, error: unknown, now = Date.now()): boolean {
+	for (const [otherKey, warnedAt] of persistFailureLastWarnedAt) {
+		if (now - warnedAt >= PERSIST_FAILURE_WARN_WINDOW_MS) persistFailureLastWarnedAt.delete(otherKey);
+	}
+	const scopedKey = `${key}\u0000${persistFailureClass(error)}`;
+	const last = persistFailureLastWarnedAt.get(scopedKey);
+	if (last !== undefined && now - last < PERSIST_FAILURE_WARN_WINDOW_MS) return false;
+	persistFailureLastWarnedAt.set(scopedKey, now);
+	return true;
+}
+
+/** @internal Test seam: forget every persist-failure warn window. */
+export function resetPersistFailureWarnWindows(): void {
+	persistFailureLastWarnedAt.clear();
+}
+
 function lockUnavailable(
 	lockPath: string,
 	reason: SessionStateLockUnavailableReason,

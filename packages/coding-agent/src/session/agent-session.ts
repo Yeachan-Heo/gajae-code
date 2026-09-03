@@ -312,9 +312,12 @@ import {
 import {
 	assertNonEmptyGjcSessionId,
 	modeStatePath as sessionModeStatePath,
+	sessionRuntimeDir,
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
+import { sessionStateLockFailureFields, shouldWarnPersistFailure } from "../gjc-runtime/session-state-lock";
 import {
+	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	type CoordinatorToolObservation,
 	clearCoordinatorRuntimeStateRescope,
 	hasCoordinatorRuntimeStateRescopeJournal,
@@ -2356,6 +2359,13 @@ interface CanonicalMessageAdmission {
 	release: () => void;
 }
 
+
+type CoordinatorRuntimeStatePersistContext = {
+	sessionId: string;
+	cwd: string;
+	sessionFile: string | undefined;
+	stateFile: string | null;
+};
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -4186,11 +4196,8 @@ export class AgentSession {
 		lease: RunResourceProducerLease | undefined,
 		workerIntegrationSettled: boolean,
 	): Promise<void> {
-		const publicationContext = {
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		};
+		const publicationContext = this.#captureCoordinatorRuntimeStatePersistContext();
+
 		const publicationScope = (pending as AgentSessionEvent & { scope?: AttemptScopeRef }).scope as
 			| AttemptScope
 			| undefined;
@@ -4261,7 +4268,7 @@ export class AgentSession {
 							error: String(error),
 						},
 					);
-					logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
+
 				},
 			);
 			extensionDelivery = this.#queueExtensionEvent(
@@ -4281,9 +4288,7 @@ export class AgentSession {
 					),
 				);
 				await extensionDelivery;
-				void terminalPersistence.catch(error =>
-					logger.warn("Terminal persistence continued after SDK publication", { error }),
-				);
+				void terminalPersistence;
 			} else {
 				// Non-SDK/public publication has already awaited worker integration above.
 			}
@@ -5944,7 +5949,7 @@ export class AgentSession {
 	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
 
 	#recordPostPublicationOutcome(
-		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
+		context: CoordinatorRuntimeStatePersistContext,
 		correlationId: string | undefined,
 		kind: "worker_integration" | "terminal_persistence",
 		outcome: { status: "completed" | "failed" | "timed_out"; error?: string },
@@ -5964,19 +5969,12 @@ export class AgentSession {
 		const persist = async () => {
 			if (barrier) {
 				await barrier;
-				return await persistCoordinatorWorkerIntegrationOutcome(
-					{
-						sessionId: this.sessionId,
-						cwd: this.sessionManager.getCwd(),
-						sessionFile: this.sessionManager.getSessionFile(),
-					},
-					{
-						...outcome,
-						kind,
-						correlationId,
-						error: sanitizePostPublicationError(outcome.error),
-					},
-				);
+				return await persistCoordinatorWorkerIntegrationOutcome(context, {
+					...outcome,
+					kind,
+					correlationId,
+					error: sanitizePostPublicationError(outcome.error),
+				});
 			}
 			return generation === this.#coordinatorPersistGeneration
 				? await persistCoordinatorWorkerIntegrationOutcome(context, {
@@ -5993,8 +5991,21 @@ export class AgentSession {
 		if (barrier) this.#trackReleasedBarrierPersist(queued);
 		else this.#trackUnbarrieredCoordinatorPersist(queued);
 		void queued.catch(error =>
-			logger.warn("Failed to persist terminal reconciliation outcome", { error: String(error) }),
+			this.#warnPersistFailure("Failed to persist terminal reconciliation outcome", error, context.stateFile, context.sessionId),
 		);
+	}
+
+	#captureCoordinatorRuntimeStatePersistContext(): CoordinatorRuntimeStatePersistContext {
+		const context = {
+			sessionId: this.sessionId,
+			cwd: this.sessionManager.getCwd(),
+			sessionFile: this.sessionManager.getSessionFile(),
+		};
+		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
+		const stateFile =
+			explicitStateFile ||
+			(context.sessionId.trim() ? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json") : null);
+		return { ...context, stateFile };
 	}
 
 	/**
@@ -6011,32 +6022,19 @@ export class AgentSession {
 	 */
 	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent, propagateFailure = false): Promise<void> {
 		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
+		const context = this.#captureCoordinatorRuntimeStatePersistContext();
 		const observation = this.#coordinatorToolObservations.get(event);
 		const admission = this.#agentEventAdmission.get(event);
 		const barrier = admission?.persistBarrier;
 		if (barrier) {
 			const run = async () => {
 				await barrier;
-				await this.#persistRuntimeStateInBackground(
-					event,
-					{
-						sessionId: this.sessionId,
-						cwd: this.sessionManager.getCwd(),
-						sessionFile: this.sessionManager.getSessionFile(),
-					},
-					observation,
-					propagateFailure,
-				);
+				await this.#persistRuntimeStateInBackground(event, context, observation, propagateFailure);
 			};
 			const queued = barrier.then(() => this.#appendCoordinatorPersist(run));
 			this.#trackReleasedBarrierPersist(queued);
 			return queued;
 		}
-		const context = {
-			sessionId: this.sessionId,
-			cwd: this.sessionManager.getCwd(),
-			sessionFile: this.sessionManager.getSessionFile(),
-		};
 		const generation = admission?.persistGeneration ?? this.#coordinatorPersistGeneration;
 		const run = () =>
 			generation === this.#coordinatorPersistGeneration
@@ -6049,16 +6047,39 @@ export class AgentSession {
 
 	async #persistRuntimeStateInBackground(
 		event: AgentSessionEvent,
-		context: { sessionId: string; cwd: string; sessionFile: string | undefined },
+		context: CoordinatorRuntimeStatePersistContext,
 		observation: CoordinatorToolObservation | undefined,
 		propagateFailure: boolean,
 	): Promise<void> {
 		try {
 			await persistCoordinatorRuntimeStateFromEvent(event, context, observation);
 		} catch (error) {
-			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
+			this.#warnPersistFailure(
+				"Failed to persist coordinator runtime state",
+				error,
+				context.stateFile,
+				context.sessionId,
+				{ event: event.type },
+			);
 			if (propagateFailure) throw error;
 		}
+	}
+
+	#warnPersistFailure(
+		message: string,
+		error: unknown,
+		stateFile: string | null,
+		sessionId: string,
+		extra: Record<string, unknown> = {},
+	): void {
+		const fields = {
+			...extra,
+			...sessionStateLockFailureFields(error),
+			...(stateFile === null ? {} : { stateFile }),
+		};
+		const key = stateFile ?? `session:${sessionId}`;
+		if (shouldWarnPersistFailure(key, error)) logger.warn(message, fields);
+		else logger.debug(message, { ...fields, suppressed: true });
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent, eventLease?: RunResourceProducerLease): Promise<void> {
@@ -6118,9 +6139,7 @@ export class AgentSession {
 			// Do not let a lock-hostile sidecar suppress the terminal event itself.
 			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(event);
 			this.#emit(event);
-			void terminalPersistence.catch(error => {
-				logger.warn("Failed to persist terminal coordinator runtime state", { error: String(error) });
-			});
+			void terminalPersistence;
 			await this.#emitExtensionEvent(event);
 			return;
 		}

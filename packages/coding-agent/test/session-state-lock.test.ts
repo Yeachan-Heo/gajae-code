@@ -8,9 +8,12 @@ import { processStartTime, removeFileLockDirForGc } from "../src/config/file-loc
 import * as sessionStateLock from "../src/gjc-runtime/session-state-lock";
 import {
 	reclaimStaleSessionStateLock,
+	resetPersistFailureWarnWindows,
 	SessionStateLockTestHooks,
 	SessionStateLockUnavailableError,
 	setSessionStateLockNativeBindings,
+	sessionStateLockFailureFields,
+	shouldWarnPersistFailure,
 	withSessionStateFileLock,
 } from "../src/gjc-runtime/session-state-lock";
 import {
@@ -2405,5 +2408,51 @@ describe("coordinator session state lock", () => {
 				process.platform === "win32" ? "windows-validated" : "posix-nofollow";
 			await expect(withSessionStateFileLock(stateFile, async () => "reacquired")).resolves.toBe("reacquired");
 		});
+	});
+});
+
+describe("session state lock failure diagnostics", () => {
+	it("surfaces typed lock fields from nested causes without leaking wrapper data", () => {
+		const lockError = new SessionStateLockUnavailableError({
+			lockPath: "/tmp/runtime-state.json.lock.transition",
+			reason: "transition_claim_timeout",
+		});
+		const wrapped = new Error("marker unreadable", { cause: lockError });
+		const aggregate = new AggregateError([new Error("unrelated"), wrapped], "persist failed");
+
+		expect(sessionStateLockFailureFields(aggregate)).toEqual({
+			error: String(aggregate),
+			reason: "transition_claim_timeout",
+			lockPath: "/tmp/runtime-state.json.lock.transition",
+		});
+	});
+
+	it("partitions warn windows by document and stable failure class", () => {
+		const timeout = new SessionStateLockUnavailableError({
+			lockPath: "/tmp/a.lock.transition",
+			reason: "transition_claim_timeout",
+		});
+		const acquire = new SessionStateLockUnavailableError({
+			lockPath: "/tmp/a.lock",
+			reason: "acquire_timeout",
+		});
+		const diskFull = Object.assign(new Error("disk full: first message"), { code: "ENOSPC" });
+		const diskFullAgain = Object.assign(new Error("disk full: different message"), { code: "ENOSPC" });
+		const permission = Object.assign(new Error("permission denied"), { code: "EACCES" });
+
+		resetPersistFailureWarnWindows();
+		expect(shouldWarnPersistFailure("document-a", timeout, 0)).toBe(true);
+		expect(shouldWarnPersistFailure("document-a", timeout, 5_000)).toBe(false);
+		expect(shouldWarnPersistFailure("document-a", acquire, 5_000)).toBe(true);
+		expect(shouldWarnPersistFailure("document-b", timeout, 5_000)).toBe(true);
+		expect(shouldWarnPersistFailure("document-a", diskFull, 5_000)).toBe(true);
+		expect(shouldWarnPersistFailure("document-a", diskFullAgain, 5_001)).toBe(false);
+		expect(shouldWarnPersistFailure("document-a", permission, 5_001)).toBe(true);
+
+		resetPersistFailureWarnWindows();
+		expect(shouldWarnPersistFailure("old", diskFull, 0)).toBe(true);
+		expect(shouldWarnPersistFailure("current", diskFull, 29_999)).toBe(true);
+		expect(shouldWarnPersistFailure("old", diskFullAgain, 30_000)).toBe(true);
+		expect(shouldWarnPersistFailure("current", diskFullAgain, 30_000)).toBe(false);
 	});
 });

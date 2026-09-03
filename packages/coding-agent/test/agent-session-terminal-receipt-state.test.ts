@@ -13,7 +13,7 @@ import {
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 
 const originalStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 const originalSessionId = process.env[GJC_COORDINATOR_SESSION_ID_ENV];
@@ -95,6 +95,11 @@ describe("AgentSession terminal receipt state", () => {
 		const persist = vi
 			.spyOn(sidecar, "persistCoordinatorRuntimeStateFromEvent")
 			.mockRejectedValue(new Error("simulated persistence failure"));
+		const persistWarnings: Array<Record<string, unknown> | undefined> = [];
+		vi.spyOn(logger, "warn").mockImplementation((message, context) => {
+			if (message === "Failed to persist coordinator runtime state") persistWarnings.push(context);
+		});
+
 		session.subscribe(event => {
 			if (event.type === "agent_end") terminal.resolve();
 		});
@@ -102,6 +107,8 @@ describe("AgentSession terminal receipt state", () => {
 		await session.prompt("respond");
 		await terminal.promise;
 		expect(persist).toHaveBeenCalled();
+		expect(persistWarnings).toHaveLength(1);
+		expect(persistWarnings[0]).toMatchObject({ error: "Error: simulated persistence failure" });
 	});
 
 	it("publishes agent_end while terminal sidecar persistence remains pending", async () => {
