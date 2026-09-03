@@ -14,12 +14,14 @@ All deep-interview state operations go through this command — no gjc state nee
   apply               Commit the staged draft with runtime-owned revision+sha CAS
   discard             Remove the pending draft
   clear               Clear deep-interview state for the session (lifecycle passthrough)
+  approve-execution   Record the user's separate approval for a ready Crystal
   handoff             Hand off to the next workflow skill (lifecycle passthrough)
   --crystallize       Promote a bounded conversation snapshot into a versioned Crystal
 
 Ambiguity is runtime-owned: apply/write derive current_ambiguity from the latest valid scored
 round and clamp it to the deterministic floor. Sessions resolve from --session-id, payload
-session_id, or GJC_SESSION_ID.`;
+session_id, or GJC_SESSION_ID. A relative GJC_SESSION_FILE is resolved against the requested
+workspace cwd, never the process launch directory.`;
 	static strict = false;
 	static flags = {
 		quick: Flags.boolean({ description: "Seed a quick deep-interview run" }),
@@ -55,6 +57,7 @@ session_id, or GJC_SESSION_ID.`;
 		'$ gjc deep-interview stage --for record-round --input \'{"state":{"rounds":[{"round":1,"round_key":"r1"}]}}\' --json',
 		"$ gjc deep-interview check --json",
 		"$ gjc deep-interview apply --json",
+		"$ gjc deep-interview approve-execution --json",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md",
 		"$ gjc deep-interview --write --stage final --slug my-feature --spec ./final-spec.md --deliberate",
 		"$ gjc deep-interview --crystallize --input @conversation.json --slug my-feature --json",
