@@ -339,6 +339,7 @@ type AttachedSession = {
 	replayPendingSince?: number;
 	replayPendingToken?: object;
 	drainingHeldSeq?: number;
+	drainingHeldBatch?: HeldFrame[];
 	readyTail: Promise<void>;
 	readonly publication: { promise: Promise<void>; resolve: () => void; reject: (reason?: unknown) => void };
 	dispose: () => void;
@@ -1905,8 +1906,13 @@ export class SessionRouter {
 		// issuing replay. Replace its hold-array identity to fence that tail, but carry
 		// forward frames it had not started draining; the active draining sequence is
 		// already represented by the independent frame tail.
-		if (attached.barrier.held)
-			attached.barrier.held = attached.barrier.held.filter(entry => entry.seq !== attached.drainingHeldSeq);
+		if (attached.barrier.held) {
+			const carried = [...(attached.drainingHeldBatch ?? []), ...attached.barrier.held];
+			attached.drainingHeldBatch = undefined;
+			attached.barrier.held = carried
+				.filter(entry => entry.seq !== attached.drainingHeldSeq)
+				.filter((entry, index, entries) => entries.findIndex(candidate => candidate.seq === entry.seq) === index);
+		}
 		const replayToken = {};
 		attached.replayPending = true;
 		attached.replayPendingSince = Date.now();
@@ -2299,14 +2305,19 @@ export class SessionRouter {
 				return;
 			}
 			const batch = held.splice(0, held.length).sort((left, right) => left.seq - right.seq);
-			for (const entry of batch) {
+			attached.drainingHeldBatch = batch;
+			for (;;) {
+				const entry = batch.shift();
+				if (!entry) break;
 				attached.drainingHeldSeq = entry.seq;
 				try {
 					await this.#enqueueFrame(attached, entry.frame, "ordered");
 				} finally {
 					if (attached.drainingHeldSeq === entry.seq) attached.drainingHeldSeq = undefined;
 				}
+				if (attached.barrier.held !== held) return;
 			}
+			if (attached.drainingHeldBatch === batch) attached.drainingHeldBatch = undefined;
 		}
 	}
 

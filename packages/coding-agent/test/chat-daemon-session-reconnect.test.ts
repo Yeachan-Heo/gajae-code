@@ -987,6 +987,50 @@ test("an acknowledged replay prefix does not conflict with a later conceded gap"
 	});
 }, 20_000);
 
+test("a reconnect preserves every unstarted frame from a blocked held batch", async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+		await withSerializedFakeTransport(async clock => {
+			const host = new FakeSessionHost(0);
+			const starting = runtime.start();
+			host.accept(await awaitSocket(1));
+			await starting;
+
+			host.drop();
+			host.stallReplay = true;
+			reconcile();
+			const replacement = await awaitSocket(2);
+			host.accept(replacement);
+			await awaitReplayRequests(host, 2);
+			host.emit("one");
+			host.emit("two");
+			host.emit("three");
+			await Bun.sleep(100);
+			provider.stallPosts();
+			replacement.deliver({
+				type: "event_replay_result",
+				id: host.lastReplayId,
+				ok: true,
+				events: [],
+				generation: GENERATION,
+				lastSeq: 0,
+			});
+			await awaitPosts(provider, 1);
+
+			host.stallReplay = false;
+			replacement.deliver({ type: "hello", connectionId: "replacement-incarnation" });
+			await awaitReplayRequests(host, 3);
+
+			provider.releasePosts();
+			await awaitPosts(provider, 3, clock);
+			expect(provider.posts.map(post => post.text)).toEqual([
+				"GJC notice\none",
+				"GJC notice\ntwo",
+				"GJC notice\nthree",
+			]);
+		});
+	});
+}, 30_000);
+
 test("stopping the runtime while a replay is pending neither hangs nor publishes what is held", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
 		await withSerializedFakeTransport(async () => {
