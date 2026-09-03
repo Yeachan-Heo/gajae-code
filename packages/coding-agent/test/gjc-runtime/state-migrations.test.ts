@@ -64,6 +64,33 @@ describe("state migrations", () => {
 		});
 	});
 
+	it("revokes Crystal execution authority from migrated deep-interview state", () => {
+		const result = normalizeLegacyState(
+			{
+				version: 1,
+				active: true,
+				current_phase: "handoff",
+				spec_path: "/tmp/forged.md",
+				spec_sha256: "a".repeat(64),
+				state: {
+					crystal: { lifecycle: "ready" },
+					execution_approval: "approved",
+					execution_approval_receipt: { method: "explicit-state-action" },
+				},
+			},
+			"deep-interview",
+		);
+
+		expect(result.changed).toBe(true);
+		expect(result.state.current_phase).toBe("interviewing");
+		expect(result.state.spec_path).toBeUndefined();
+		expect(result.state.spec_sha256).toBeUndefined();
+		const inner = result.state.state as Record<string, unknown>;
+		expect(inner.crystal).toBeUndefined();
+		expect(inner.execution_approval).toBe("not-approved");
+		expect(inner.execution_approval_receipt).toBeUndefined();
+	});
+
 	it("emits schema-valid migrated envelopes without requiring a checksum", () => {
 		const { state } = normalizeLegacyState(
 			{
