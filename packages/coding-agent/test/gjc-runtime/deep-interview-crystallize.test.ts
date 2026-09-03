@@ -1,16 +1,24 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	type CrystalInput,
 	type CrystalSnapshot,
 	crystallizeDeepInterview,
+	crystalMarkdown,
 	crystalSnapshotDigest,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-crystallize";
 import {
 	deepInterviewStatePath,
 	runNativeDeepInterviewCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/deep-interview-runtime";
+import { sessionSpecsDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
+import {
+	beginWorkflowTransactionJournal,
+	readWorkflowTransactionJournal,
+	updateWorkflowTransactionJournal,
+} from "@gajae-code/coding-agent/gjc-runtime/state-writer";
 
 function input(overrides: Partial<CrystalInput> = {}): CrystalInput {
 	const messages = [{ index: 0, role: "user" as const, content: "Build a fast report." }];
@@ -183,33 +191,62 @@ describe("deep-interview crystallize contract", () => {
 			),
 		).toThrow("changed confirmed item constraint:latency requires fresh user evidence");
 	});
-	it("accepts Unicode resolution evidence", () => {
-		const first = crystallizeDeepInterview(input({ open_gaps: ["메모리 예산은 얼마인가?"] }));
+	it("accepts unspaced Korean, Chinese, and Japanese resolution evidence", () => {
+		for (const { gap, answer } of [
+			{ gap: "메모리 예산은 얼마인가?", answer: "메모리 예산은 1GB입니다." },
+			{ gap: "内存预算是多少？", answer: "内存预算是1GB。" },
+			{ gap: "メモリ予算はいくらですか？", answer: "メモリ予算は1GBです。" },
+		]) {
+			const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
+			const snapshot: CrystalSnapshot = {
+				revision: 2,
+				start: 0,
+				end: 1,
+				messages: [...input().snapshot.messages, { index: 1, role: "user", content: answer }],
+				digest: "",
+			};
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			const resolved = crystallizeDeepInterview(
+				input({
+					prior: first,
+					snapshot,
+					current_revision: 2,
+					resolved_open_gaps: [gap],
+					resolved_open_gap_anchors: [{ item: gap, message_index: 1, quote: answer, resolution: answer }],
+				}),
+			);
+			expect(resolved.lifecycle).toBe("ready");
+		}
+	});
+	it("rejects unrelated unspaced CJK resolution evidence", () => {
+		const gap = "内存预算是多少？";
+		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
 		const snapshot: CrystalSnapshot = {
 			revision: 2,
 			start: 0,
 			end: 1,
-			messages: [...input().snapshot.messages, { index: 1, role: "user", content: "메모리 예산은 1GB입니다." }],
+			messages: [...input().snapshot.messages, { index: 1, role: "user", content: "今日は良い天気です。" }],
 			digest: "",
 		};
 		snapshot.digest = crystalSnapshotDigest(snapshot);
-		const resolved = crystallizeDeepInterview(
-			input({
-				prior: first,
-				snapshot,
-				current_revision: 2,
-				resolved_open_gaps: ["메모리 예산은 얼마인가?"],
-				resolved_open_gap_anchors: [
-					{
-						item: "메모리 예산은 얼마인가?",
-						message_index: 1,
-						quote: "메모리 예산은 1GB입니다.",
-						resolution: "메모리 예산은 1GB입니다.",
-					},
-				],
-			}),
-		);
-		expect(resolved.lifecycle).toBe("ready");
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					prior: first,
+					snapshot,
+					current_revision: 2,
+					resolved_open_gaps: [gap],
+					resolved_open_gap_anchors: [
+						{
+							item: gap,
+							message_index: 1,
+							quote: "今日は良い天気です。",
+							resolution: "今日は良い天気です。",
+						},
+					],
+				}),
+			),
+		).toThrow("has no relevant verbatim user anchor");
 	});
 	it("does not preserve a confirmed-to-inferred downgrade", () => {
 		const prior = crystallizeDeepInterview(input());
@@ -616,6 +653,150 @@ describe("deep-interview crystallize contract", () => {
 			expect(result.status).toBe(2);
 			expect(result.stderr).toContain("live session transcript contains a malformed message");
 			await expect(fs.access(deepInterviewStatePath(root, sessionId))).rejects.toThrow();
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects adjacent non-text projections without persisting a Crystal", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-adjacent-non-text-"));
+		const sessionId = "crystallize-adjacent-non-text";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: [{ type: "image" }, { type: "image" }] },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const snapshot: CrystalSnapshot = {
+				revision: 1,
+				start: 0,
+				end: 0,
+				messages: [{ index: 0, role: "user", content: "[image][image]" }],
+				digest: "",
+			};
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(
+						input({
+							snapshot,
+							items: [{ ...input().items[0]!, anchor: { message_index: 0, quote: "][" } }],
+						}),
+					),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"adjacent",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).not.toBe(0);
+			expect(result.stderr).toContain("verbatim user anchor");
+			await expect(fs.access(deepInterviewStatePath(root, sessionId))).rejects.toThrow();
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects unsupported transcript content without persisting a Crystal", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-unsupported-content-"));
+		const sessionId = "crystallize-unsupported-content";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: [{ type: "sticker" }] },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input()),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"unsupported",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).not.toBe(0);
+			expect(result.stderr).toContain("unsupported message content");
+			await expect(fs.access(deepInterviewStatePath(root, sessionId))).rejects.toThrow();
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reuses and completes a pending Crystal journal by publication identity", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-journal-retry-"));
+		const sessionId = "crystallize-journal-retry";
+		const slug = "retry";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const statePath = deepInterviewStatePath(root, sessionId);
+		const specPath = path.join(sessionSpecsDir(root, sessionId), `deep-interview-${slug}-v1.md`);
+		const indexPath = path.join(sessionSpecsDir(root, sessionId), "deep-interview-index.jsonl");
+		const mutationId = `crystal:${sessionId}:1:${createHash("sha256").update(`${slug}\0${specPath}`).digest("hex")}`;
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			await beginWorkflowTransactionJournal({
+				cwd: root,
+				sessionId,
+				mutationId,
+				paths: [specPath, indexPath, statePath],
+			});
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const result = await runNativeDeepInterviewCommand(
+				["--crystallize", "--input", JSON.stringify(input()), "--session-id", sessionId, "--slug", slug, "--json"],
+				root,
+			);
+			expect(result.status).toBe(0);
+			expect(await readWorkflowTransactionJournal(root, sessionId, mutationId)).toBeUndefined();
+			expect(await fs.readFile(specPath, "utf8")).toBe(crystalMarkdown(crystallizeDeepInterview(input())));
+
+			await beginWorkflowTransactionJournal({
+				cwd: root,
+				sessionId,
+				mutationId,
+				paths: [specPath, indexPath, statePath],
+			});
+			await updateWorkflowTransactionJournal(root, sessionId, mutationId, { steps: ["artifact", "index"] });
+			const beforeFailedRecovery = await fs.readFile(statePath, "utf8");
+			await fs.rm(specPath);
+			const failedRecovery = await runNativeDeepInterviewCommand(
+				["--crystallize", "--input", JSON.stringify(input()), "--session-id", sessionId, "--slug", slug, "--json"],
+				root,
+			);
+			expect(failedRecovery.status).toBe(2);
+			expect(failedRecovery.stderr).toContain("pending Crystal artifact verification failed");
+			expect(await fs.readFile(statePath, "utf8")).toBe(beforeFailedRecovery);
+			expect((await readWorkflowTransactionJournal(root, sessionId, mutationId))?.status).toBe("pending");
 		} finally {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
