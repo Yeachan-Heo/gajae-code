@@ -69,7 +69,7 @@ const STATE_VERBS = ["read", "write", "clear", "contract", "handoff", "doctor"] 
 const PLANNED_ADMIN_VERBS = ["graph", "prune", "migrate", "force-overwrite"] as const;
 
 const COMMON_TYPED_ARGS: TypedArgSpec[] = [
-	{ name: "input", type: "string", appliesToVerbs: ["write", "api", "crystallize"] },
+	{ name: "input", type: "string", appliesToVerbs: ["write", "api"] },
 	{
 		name: "mode",
 		type: "enum",
@@ -89,8 +89,6 @@ const COMMON_TYPED_ARGS: TypedArgSpec[] = [
 			"check",
 			"apply",
 			"discard",
-			"read",
-			"write",
 			"approve-execution",
 		],
 	},
@@ -211,21 +209,9 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "json",
 				type: "boolean",
-				appliesToVerbs: [
-					"write-spec",
-					"crystallize",
-					"stage",
-					"check",
-					"apply",
-					"discard",
-					"read",
-					"write",
-					"clear",
-					"handoff",
-					"approve-execution",
-				],
+				appliesToVerbs: ["write-spec", "stage", "check", "apply", "discard", "read", "write", "clear", "handoff"],
 			},
-			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "write", "crystallize"] },
+			{ name: "input", type: "string", required: true, appliesToVerbs: ["stage", "crystallize"] },
 			{ name: "reset", type: "boolean", appliesToVerbs: ["write"] },
 			{
 				name: "for",
