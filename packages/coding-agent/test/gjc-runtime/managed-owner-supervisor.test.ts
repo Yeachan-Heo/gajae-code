@@ -175,6 +175,54 @@ describe("managed owner supervisor", () => {
 			await fs.rm(stateDir, { recursive: true, force: true });
 		}
 	});
+	it("journals a staged terminal and refuses generation publication", async () => {
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		try {
+			const result = await runSupervisor(stateDir, [process.execPath, "-e", "process.exit(23)"], {
+				GJC_TMUX_OWNER_GENERATION_STAGED: "1",
+			});
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
+			const paths = lifecyclePaths(stateDir, "session-2681", "generation-2681");
+			expect(await Bun.file(paths.stagedTerminalFile).json()).toMatchObject({
+				kind: "staged_owner_terminal",
+				generation: "generation-2681",
+				session_id: "session-2681",
+				exit_code: 23,
+			});
+			await expect(replaceOwnerGeneration(stateDir, "session-2681", "generation-2681")).rejects.toThrow(
+				"managed_owner_staged_terminal_before_publication",
+			);
+			expect(await replaceOwnerGeneration(stateDir, "session-2681", "generation-2682")).toBe("generation-2682");
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
+	it.each([
+		"forceMissingChildStartMarker",
+		"forceMissingNativeReferenceMarker",
+	] as const)("fails closed when redacted SIGABRT evidence cannot be published through %s", async option => {
+		if (process.platform !== "linux") return;
+		const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-owner-"));
+		const sessionId = "session-2681";
+		const generation = "generation-2681";
+		const markerFile = path.join(stateDir, `${option}.marker`);
+		try {
+			await replaceOwnerGeneration(stateDir, sessionId, generation);
+			const childScript = `import { unlink } from "node:fs/promises"; import { lifecyclePaths } from ${JSON.stringify(
+				path.join(repoRoot, "packages", "coding-agent", "src", "gjc-runtime", "tmux-owner-isolation.ts"),
+			)}; await unlink(lifecyclePaths(process.env.GJC_TMUX_OWNER_STATE_DIR!, process.env.GJC_COORDINATOR_SESSION_ID!, process.env.GJC_TMUX_OWNER_GENERATION!).generationFile); process.kill(process.pid, "SIGABRT");`;
+			const result = await runSupervisor(
+				stateDir,
+				[process.execPath, "-e", childScript],
+				{ GJC_MANAGED_OWNER_REDACT_COMMAND: "1", GJC_TMUX_OWNER_SERVER_KEY: "server-key" },
+				{ [option]: markerFile },
+			);
+			expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(75);
+			expect(await Bun.file(lifecyclePaths(stateDir, sessionId, generation).verdictFile).exists()).toBe(false);
+		} finally {
+			await fs.rm(stateDir, { recursive: true, force: true });
+		}
+	});
 
 	it("records SIGABRT through the missing native child reference path", async () => {
 		if (process.platform !== "linux") return;

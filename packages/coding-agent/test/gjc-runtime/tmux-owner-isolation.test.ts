@@ -1789,7 +1789,7 @@ describe("tmux owner isolation", () => {
 		}
 	});
 
-	it("cancels failed and expires nonauthorizing current-generation SIGTERM intents without cleanup", async () => {
+	it("retains uncertain dispatches and expires nonauthorizing current-generation intents without cleanup", async () => {
 		const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-"));
 		let signals = 0;
 		let cleanups = 0;
@@ -1820,8 +1820,19 @@ describe("tmux owner isolation", () => {
 			closeExactTmuxOwner(requestFor("dispatch-failure", "2099-01-01T00:00:00.000Z"), dependencies),
 		).rejects.toThrow("dispatch_failed");
 		await expect(
-			fs.access(`${lifecyclePaths(state, "session", "dispatch-failure").intentFile}.cancelled`),
+			fs.access(`${lifecyclePaths(state, "session", "dispatch-failure").intentFile}.dispatching`),
 		).resolves.toBeNull();
+		await expect(
+			createOwnerIntent(state, {
+				generation: "dispatch-failure",
+				session_id: "session",
+				server_key: "socket",
+				expected_terminal: { signal: "SIGTERM", result: "owner_term_then_session_cleanup" },
+				dispatch_id: "retry",
+				created_at: "2026-01-01T00:00:00.000Z",
+				expires_at: "2099-01-01T00:00:00.000Z",
+			}),
+		).rejects.toThrow("owner_intent_replay");
 		await replaceOwnerGeneration(state, "session", "expired");
 		await expect(
 			closeExactTmuxOwner(requestFor("expired", "2020-01-01T00:00:00.000Z"), dependencies),
@@ -2150,6 +2161,38 @@ describe("tmux owner isolation", () => {
 				expect(observed.classification).toBe("expected_operator_shutdown");
 				expect(await Bun.file(paths.intentFile).exists()).toBe(false);
 				expect(await Bun.file(`${paths.intentFile}.consumed`).exists()).toBe(true);
+			} finally {
+				await fs.rm(state, { recursive: true, force: true });
+			}
+		});
+
+		it("reconciles an intent retained across an uncertain dispatch", async () => {
+			const state = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-owner-intent-dispatching-"));
+			try {
+				await replaceOwnerGeneration(state, "session", "generation");
+				const intent = await createOwnerIntent(state, intentInput(futureDeadline()));
+				const paths = lifecyclePaths(state, "session", "generation");
+				await fs.writeFile(`${paths.intentFile}.dispatching`, `${JSON.stringify(intent)}\n`);
+				const observed = await observeOwnerTerminal({
+					schema_version: 1,
+					op: "observe_terminal",
+					session_id: "session",
+					owner_generation: "generation",
+					state_dir: state,
+					socket_key: "socket",
+					observer: "sidecar",
+					observed_at: new Date().toISOString(),
+					signal: "SIGTERM",
+					exit_code: 0,
+					exit_kind: "exit",
+					reason: "test",
+					operator_dispatch_id: intent.dispatch_id,
+					operator_intent_id: intent.intent_id,
+				});
+				expect(observed.classification).toBe("expected_operator_shutdown");
+				await expect(fs.access(paths.intentFile)).rejects.toThrow();
+				await expect(fs.access(`${paths.intentFile}.dispatching`)).rejects.toThrow();
+				await expect(fs.access(`${paths.intentFile}.consumed`)).resolves.toBeNull();
 			} finally {
 				await fs.rm(state, { recursive: true, force: true });
 			}
