@@ -191,7 +191,7 @@ describe("launch worktree reservation", () => {
 			winner = fulfilled[0]?.value;
 			if (!winner) throw new Error("Expected one worktree reservation winner.");
 			const loser = rejected[0];
-			if (loser?.status !== "rejected") throw new Error("Expected one worktree reservation loser.");
+			if (!loser || loser.status !== "rejected") throw new Error("Expected one worktree reservation loser.");
 			const message = loser.reason instanceof Error ? loser.reason.message : String(loser.reason);
 			expect(message).toStartWith(`worktree_in_use:${worktreePath}`);
 		} finally {

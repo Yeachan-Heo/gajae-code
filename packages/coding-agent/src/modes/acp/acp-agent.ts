@@ -3141,7 +3141,7 @@ export class AcpAgent implements Agent {
 		id: string,
 		notification: SessionNotification,
 		adapter: AcpSdkAdapter,
-		_publicationGeneration: number,
+		publicationGeneration: number,
 	): void {
 		const prior = this.#failureDiagnosticTails.get(id) ?? Promise.resolve();
 		const task = prior.then(async () => {

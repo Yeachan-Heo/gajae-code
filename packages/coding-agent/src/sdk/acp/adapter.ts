@@ -875,7 +875,7 @@ export class AcpSdkAdapter {
 
 	#expiredOwnedLeaseFrame(frame: Record<string, unknown>): boolean {
 		const response = this.#leaseErrorFrame(frame);
-		if (response?.ok !== false) return false;
+		if (!response || response.ok !== false) return false;
 		const leaseId = typeof response.leaseId === "string" ? response.leaseId : "";
 		const connectionId = typeof response.connectionId === "string" ? response.connectionId : "";
 		if (!leaseId || !this.#ownsLeaseId(leaseId)) return false;
