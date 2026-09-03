@@ -50,6 +50,7 @@ export interface CommunityAppOfferDependencies {
 	homeDir?: string;
 	stdinIsTTY?: boolean;
 	stdoutIsTTY?: boolean;
+	signal?: AbortSignal;
 	fetchImpl?: (url: string, init?: RequestInit) => Promise<Response>;
 	prompt?: () => Promise<boolean>;
 	command?: CommandRunner;
@@ -528,8 +529,13 @@ export async function offerMacosCommunityApp(
 	const signalNames = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 	const signalHandlers = new Map<NodeJS.Signals, () => void>();
 	const offerSettled = Promise.withResolvers<void>();
+	const fetchAbortController = new AbortController();
+	const fetchAbortSignal = deps.signal
+		? AbortSignal.any([deps.signal, fetchAbortController.signal])
+		: fetchAbortController.signal;
 	const onSignal = (signal: NodeJS.Signals) => {
 		receivedSignal = signal;
+		fetchAbortController.abort();
 		for (const controller of activeCommandControllers) controller.abort();
 	};
 	for (const signal of signalNames) {
@@ -567,7 +573,9 @@ export async function offerMacosCommunityApp(
 	const arch = deps.arch ?? process.arch;
 	if (!isMacArchitecture(arch)) return finishOwnership(failure(`unsupported macOS architecture ${arch}`, log));
 	const fetchImpl = deps.fetchImpl ?? fetch;
-	const fetchOptions = (timeoutMs: number): RequestInit => ({ signal: AbortSignal.timeout(timeoutMs) });
+	const fetchOptions = (timeoutMs: number): RequestInit => ({
+		signal: AbortSignal.any([fetchAbortSignal, AbortSignal.timeout(timeoutMs)]),
+	});
 	let tempRoot: string | undefined;
 	let tempRootIdentity: FileIdentity | undefined;
 	let mountPoint: string | undefined;
