@@ -821,6 +821,7 @@ export interface BuildSystemPromptOptions {
 	skills?: Skill[];
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
+	agentDir?: string;
 	appendPrompt?: string;
 	repeatToolDescriptions?: boolean;
 }
@@ -834,6 +835,7 @@ export interface BuildSystemPromptOptions {
 export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}): Promise<BuildSystemPromptResult> {
 	return await buildSystemPromptInternal({
 		cwd: options.cwd,
+		agentDir: options.agentDir,
 		skills: options.skills,
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
@@ -1581,7 +1583,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session-context build, tool creation, MCP discovery, and extension discovery.
 		const contextFilesResultPromise = options.contextFiles
 			? Promise.resolve({ contextFiles: options.contextFiles, warnings: [] })
-			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd });
+			: logger.time("discoverContextFiles", loadContextFilesResultInternal, { cwd, agentDir });
 		contextFilesResultPromise.catch(() => {});
 		const promptTemplatesPromise = options.promptTemplates
 			? Promise.resolve(options.promptTemplates)
@@ -2334,7 +2336,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		 */
 		const applyRescopedReadState = async (to: string): Promise<void> => {
 			try {
-				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
+				const rediscovered = await loadContextFilesResultInternal({ cwd: to, agentDir });
 				contextFiles = rediscovered.contextFiles;
 			} catch (error) {
 				logger.warn("Failed to re-discover context files after session rescope", {
@@ -3913,6 +3915,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Live cwd: the prompt is rebuilt after a rescope, and describing the
 				// retired launcher root there is what makes the model pick wrong paths.
 				cwd: getLiveCwd(),
+				agentDir,
 				skills,
 				contextFiles,
 				tools: promptTools,

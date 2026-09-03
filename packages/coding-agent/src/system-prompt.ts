@@ -235,6 +235,8 @@ export async function resolvePromptInput(input: string | undefined, description:
 export interface LoadContextFilesOptions {
 	/** Working directory to start walking up from. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory backing native user-scope context and system prompt files. */
+	agentDir?: string;
 }
 
 function dedupeExactContextFiles(
@@ -265,7 +267,7 @@ export async function loadProjectContextFilesResult(
 	options: LoadContextFilesOptions = {},
 ): Promise<ProjectContextFilesResult> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
-	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd });
+	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd, agentDir: options.agentDir });
 	const items = result.items as ContextFile[];
 
 	// Native user-global context applies everywhere and is least specific, so it
@@ -311,7 +313,10 @@ export async function loadProjectContextFiles(
 export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {}): Promise<string | null> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
-	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, { cwd: resolvedCwd });
+	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, {
+		cwd: resolvedCwd,
+		agentDir: options.agentDir,
+	});
 
 	if (result.items.length === 0) return null;
 
@@ -374,6 +379,8 @@ export interface BuildSystemPromptOptions {
 	skillsSettings?: SkillsSettings;
 	/** Working directory. Default: getProjectDir() */
 	cwd?: string;
+	/** Agent directory backing native user-scope prompt discovery. */
+	agentDir?: string;
 	/** Pre-loaded context files (skips discovery if provided). */
 	contextFiles?: Array<{ path: string; content: string; depth?: number }>;
 	/** Skills provided directly to system prompt construction. */
@@ -603,10 +610,14 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 
 	const systemPromptCustomizationPromise = logger.time("loadSystemPromptFiles", loadSystemPromptFiles, {
 		cwd: resolvedCwd,
+		agentDir: options.agentDir,
 	});
 	const contextFilesPromise = providedContextFiles
 		? Promise.resolve({ contextFiles: providedContextFiles, warnings: [] })
-		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, { cwd: resolvedCwd });
+		: logger.time("loadProjectContextFiles", loadProjectContextFilesResult, {
+				cwd: resolvedCwd,
+				agentDir: options.agentDir,
+			});
 	const workspaceTreePromise =
 		providedWorkspaceTree !== undefined
 			? Promise.resolve(providedWorkspaceTree)
