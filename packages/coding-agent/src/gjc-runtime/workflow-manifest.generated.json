@@ -144,8 +144,7 @@
       {
         "appliesToVerbs": [
           "write",
-          "api",
-          "crystallize"
+          "api"
         ],
         "name": "input",
         "type": "string"
@@ -185,8 +184,6 @@
           "check",
           "apply",
           "discard",
-          "read",
-          "write",
           "approve-execution"
         ],
         "name": "session-id",
@@ -435,8 +432,7 @@
       {
         "appliesToVerbs": [
           "write",
-          "api",
-          "crystallize"
+          "api"
         ],
         "name": "input",
         "type": "string"
@@ -476,8 +472,6 @@
           "check",
           "apply",
           "discard",
-          "read",
-          "write",
           "approve-execution"
         ],
         "name": "session-id",
@@ -628,7 +622,6 @@
       {
         "appliesToVerbs": [
           "write-spec",
-          "crystallize",
           "stage",
           "check",
           "apply",
@@ -636,8 +629,7 @@
           "read",
           "write",
           "clear",
-          "handoff",
-          "approve-execution"
+          "handoff"
         ],
         "name": "json",
         "type": "boolean"
@@ -645,7 +637,6 @@
       {
         "appliesToVerbs": [
           "stage",
-          "write",
           "crystallize"
         ],
         "name": "input",
@@ -1009,8 +1000,7 @@
       {
         "appliesToVerbs": [
           "write",
-          "api",
-          "crystallize"
+          "api"
         ],
         "name": "input",
         "type": "string"
@@ -1050,8 +1040,6 @@
           "check",
           "apply",
           "discard",
-          "read",
-          "write",
           "approve-execution"
         ],
         "name": "session-id",
@@ -1403,8 +1391,7 @@
       {
         "appliesToVerbs": [
           "write",
-          "api",
-          "crystallize"
+          "api"
         ],
         "name": "input",
         "type": "string"
@@ -1444,8 +1431,6 @@
           "check",
           "apply",
           "discard",
-          "read",
-          "write",
           "approve-execution"
         ],
         "name": "session-id",
