@@ -179,6 +179,7 @@ export const __sessionStateSidecarPerfCounters = {
 /** Test-only barriers for deterministic rescope transaction race coverage. */
 export const __sessionStateSidecarTestHooks: {
 	afterRescopeLocksAcquired?: () => void | Promise<void>;
+	afterOwnerGenerationLockAcquired?: () => void | Promise<void>;
 	beforeRescopeJournalWrite?: (cwd: string) => void | Promise<void>;
 	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
 	beforeRescopePublish?: () => void | Promise<void>;
@@ -1904,11 +1905,31 @@ async function withRuntimeStateWriterLocks<T>(
 	stateFile: string,
 	context: RuntimeStateContext,
 	sessionId: string,
-	operation: () => Promise<T>,
+	operation: (lockedContext: RuntimeStateContext) => Promise<T>,
 ): Promise<T> {
 	const owner = context.ownerTerminal;
-	const transaction = () => withCoordinatorTransactionLock(stateFile, operation);
-	return owner ? await withOwnerGenerationLock(owner.stateDir, sessionId, transaction) : await transaction();
+	const transaction = (lockedContext: RuntimeStateContext) =>
+		withCoordinatorTransactionLock(stateFile, async () => await operation(lockedContext));
+	if (!owner) return await transaction(context);
+	return await withOwnerGenerationLock(owner.stateDir, sessionId, async () => {
+		await __sessionStateSidecarTestHooks.afterOwnerGenerationLockAcquired?.();
+		let lockedContext = context;
+		if (owner.generationPublished === false) {
+			const generation = await captureOwnerGenerationBaseline(owner.stateDir, sessionId).catch(() => ({
+				state: "absent" as const,
+			}));
+			if (
+				generation.state === "current" &&
+				generation.session_id === sessionId &&
+				generation.generation === owner.generation
+			)
+				lockedContext = {
+					...context,
+					ownerTerminal: { ...owner, generationPublished: true },
+				};
+		}
+		return await transaction(lockedContext);
+	});
 }
 
 /**
@@ -1964,19 +1985,8 @@ async function writeStateFile(stateFile: string, payload: Record<string, unknown
 
 async function contextWithManagedOwnerGeneration(context: RuntimeStateContext): Promise<RuntimeStateContext> {
 	if (context.ownerTerminal) return context;
-	let ownerTerminal = ownerTerminalContextFromEnvironment();
+	const ownerTerminal = ownerTerminalContextFromEnvironment();
 	if (ownerTerminal === "invalid") throw new PreviousRuntimeStateReadError();
-	if (ownerTerminal?.generationPublished === false) {
-		const generation = await captureOwnerGenerationBaseline(ownerTerminal.stateDir, context.sessionId).catch(() => ({
-			state: "absent" as const,
-		}));
-		if (
-			generation.state === "current" &&
-			generation.session_id === context.sessionId &&
-			generation.generation === ownerTerminal.generation
-		)
-			ownerTerminal = { ...ownerTerminal, generationPublished: true };
-	}
 	return ownerTerminal ? { ...context, ownerTerminal } : context;
 }
 
@@ -2003,13 +2013,13 @@ async function persistCoordinatorRuntimeToolActivity(
 				stateFile,
 				context,
 				identity.sessionId,
-				async () =>
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
-						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						// A tool event that lands after the session settled must never
 						// resurrect it into a live-looking state.
 						if (previous.state === "completed" || previous.state === "errored") return;
@@ -2024,7 +2034,7 @@ async function persistCoordinatorRuntimeToolActivity(
 						await writeStateFileSync(
 							stateFile,
 							{
-								...stampRuntimeStateOwnerGeneration(previous, context),
+								...stampRuntimeStateOwnerGeneration(previous, lockedContext),
 								activity: nextRuntimeToolActivity(priorActivity, {
 									phase,
 									label,
@@ -2087,14 +2097,14 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 				stateFile,
 				context,
 				identity.sessionId,
-				async () =>
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const nowMs = Date.now();
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
-						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						const finalResponse = finalResponseForEvent(event);
 						const terminalReceipt =
 							state === "completed" || state === "errored"
@@ -2105,7 +2115,7 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								: null;
 						const payload = {
 							...basePayload({
-								context,
+								context: lockedContext,
 								previous,
 								state,
 								now,
@@ -2167,13 +2177,13 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 				stateFile,
 				context,
 				identity.sessionId,
-				async () =>
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						if (Object.keys(previous).length === 0) return;
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
-						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						const now = new Date().toISOString();
 						const terminalPersistenceFailed =
 							outcome.kind === "terminal_persistence" && outcome.status !== "completed";
@@ -2190,7 +2200,7 @@ export async function persistCoordinatorWorkerIntegrationOutcome(
 									: "Worker integration failed after terminal publication."),
 						);
 						const payload = {
-							...stampRuntimeStateOwnerGeneration(previous, context),
+							...stampRuntimeStateOwnerGeneration(previous, lockedContext),
 							...(terminalPersistenceFailed
 								? {
 										state: "errored",
@@ -3138,29 +3148,29 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 				stateFile,
 				context,
 				identity.sessionId,
-				async () =>
+				async lockedContext =>
 					await withStateFileLock(stateFile, async () => {
-						assertNoRuntimeStateRescopeJournal(context, identity);
+						assertNoRuntimeStateRescopeJournal(lockedContext, identity);
 						const previous = readPreviousPayload(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity, stateFile);
-						if (!(await runtimeStateOwnerGenerationFence(previous, context, identity))) return;
+						if (!(await runtimeStateOwnerGenerationFence(previous, lockedContext, identity))) return;
 						if (shouldPreserveTerminalPayload(previous as RuntimeStateSidecarPayload, identity)) return;
 						// The immutable owner verdict remains in its lifecycle artifact; never replace a
 						// complete agent terminal payload merely to mirror that verdict here.
-						if (context.ownerTerminalMetadataInvalid) {
+						if (lockedContext.ownerTerminalMetadataInvalid) {
 							await persistInvalidOwnerTerminalMetadata(
 								reason,
-								context,
+								lockedContext,
 								stateFile,
 								identity.sessionId,
 								previous,
 							);
 							return;
 						}
-						if (context.ownerTerminal) {
+						if (lockedContext.ownerTerminal) {
 							await persistCoordinatorRuntimeStateFromOwnerTerminalPostmortem(
 								reason,
-								context,
+								lockedContext,
 								stateFile,
 								identity.sessionId,
 								previous,
@@ -3177,7 +3187,7 @@ export async function persistCoordinatorRuntimeStateFromPostmortem(
 						const details = postmortemExitDetails(reason, previousForDetails, identity.cwd);
 						const payload = {
 							...basePayload({
-								context,
+								context: lockedContext,
 								previous,
 								state: details.state,
 								now,

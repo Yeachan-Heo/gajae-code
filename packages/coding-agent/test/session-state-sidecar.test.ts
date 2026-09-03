@@ -112,6 +112,7 @@ function git(cwd: string, args: string[]): void {
 afterEach(async () => {
 	FileLockTestHooks.afterParentMkdir = undefined;
 	__sessionStateSidecarTestHooks.afterRescopeLocksAcquired = undefined;
+	__sessionStateSidecarTestHooks.afterOwnerGenerationLockAcquired = undefined;
 	__sessionStateSidecarTestHooks.beforeRescopeJournalWrite = undefined;
 	__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
 	__sessionStateSidecarTestHooks.beforeRescopePublish = undefined;
@@ -2179,6 +2180,79 @@ describe("coordinator runtime state sidecar", () => {
 				else process.env[key] = value;
 			}
 		}
+	});
+
+	it("promotes a published staged owner while holding the generation lock", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "staged-race.json");
+		const sessionId = "staged-race";
+		const generation = "44444444-4444-4444-8444-444444444444";
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			}),
+		);
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		__sessionStateSidecarTestHooks.afterOwnerGenerationLockAcquired = async () => {
+			entered.resolve();
+			await release.promise;
+		};
+		const context = {
+			sessionId,
+			cwd: root,
+			ownerTerminal: { generation, stateDir: root, socketKey: "tmux", generationPublished: false },
+		};
+		const write = persistCoordinatorRuntimeStateFromEvent({ type: "agent_start" }, context);
+		await entered.promise;
+		let publicationSettled = false;
+		const publication = replaceOwnerGeneration(root, sessionId, generation).finally(() => {
+			publicationSettled = true;
+		});
+		await Bun.sleep(20);
+		expect(publicationSettled).toBe(false);
+		release.resolve();
+		await write;
+		expect((await readPayload(stateFile)).owner_generation).toBeUndefined();
+		await publication;
+		__sessionStateSidecarTestHooks.afterOwnerGenerationLockAcquired = undefined;
+		await persistCoordinatorRuntimeStateFromEvent({ type: "turn_start" }, context);
+		expect((await readPayload(stateFile)).owner_generation).toBe(generation);
+	});
+
+	it("stamps a published staged generation on the postmortem finalizer path", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "staged-finalizer.json");
+		const sessionId = "staged-finalizer";
+		const generation = await replaceOwnerGeneration(root, sessionId, "55555555-5555-4555-8555-555555555555");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
+			sessionId,
+			cwd: root,
+			ownerTerminal: { generation, stateDir: root, socketKey: "tmux", generationPublished: false },
+		});
+		expect((await readPayload(stateFile)).owner_generation).toBe(generation);
 	});
 
 	it("persists the immutable owner-terminal verdict with public-safe metadata", async () => {
