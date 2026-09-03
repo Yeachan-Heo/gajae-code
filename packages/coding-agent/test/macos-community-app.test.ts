@@ -365,6 +365,63 @@ describe("macOS community app verified installation", () => {
 });
 
 describe("macOS community app attach cleanup", () => {
+	test("aborts an in-flight DMG stream and removes its temporary root", async () => {
+		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
+		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
+		const dmg = new Uint8Array([11, 12, 13]);
+		const before = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
+		const abortController = new AbortController();
+		const calls: string[][] = [];
+		const offer = offerMacosCommunityApp({
+			platform: "darwin",
+			arch: "arm64",
+			env: {},
+			stdinIsTTY: true,
+			stdoutIsTTY: true,
+			prompt: async () => true,
+			signal: abortController.signal,
+			command: async argv => {
+				calls.push(argv);
+				return { exitCode: argv[0] === "/usr/bin/mdfind" ? 1 : 0, stdout: "", stderr: "" };
+			},
+			fetchImpl: async (url, init) => {
+				if (url.includes("/releases/latest"))
+					return new Response(
+						JSON.stringify({
+							tag_name: "v1.0.0",
+							assets: [
+								{ name: dmgName, browser_download_url: dmgUrl },
+								{ name: `${dmgName}.sha256`, browser_download_url: `${dmgUrl}.sha256` },
+							],
+						}),
+					);
+				if (url === dmgUrl) {
+					return new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								controller.enqueue(dmg);
+								init?.signal?.addEventListener("abort", () => controller.error(new Error("aborted")), {
+									once: true,
+								});
+							},
+						}),
+					);
+				}
+				return new Response(`${createHash("sha256").update(dmg).digest("hex")}  ${dmgName}\n`);
+			},
+		});
+		for (let attempt = 0; attempt < 100; attempt++) {
+			const current = (await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-"));
+			if (current.some(name => !before.has(name))) break;
+			await Bun.sleep(25);
+		}
+		abortController.abort();
+		expect((await offer).status).toBe("failed");
+		expect(calls.some(call => call[0] === "/usr/bin/hdiutil" && call[1] === "detach")).toBe(false);
+		const after = new Set((await fs.readdir(os.tmpdir())).filter(name => name.startsWith("gjc-community-app-")));
+		expect(after).toEqual(before);
+	});
+
 	test("removes temporary state when attach returns failure or throws before mounting", async () => {
 		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
 		const dmgUrl = `https://github.com/devswha/gajae-code-app/releases/download/v1.0.0/${dmgName}`;
