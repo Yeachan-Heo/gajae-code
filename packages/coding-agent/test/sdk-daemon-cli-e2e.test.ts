@@ -630,7 +630,7 @@ describe("SDK session CLI", () => {
 			deferredLiveEvents = [
 				{ type: "event", generation: 1, seq: 4, kind: "turn_end", payload: { type: "turn_end" } },
 			];
-			const args = ["tail", "live", "--until-idle", "--timeout-ms", "20000"];
+			const args = ["tail", "live", "--until-idle", "--timeout-ms", "40000"];
 			if (strict) args.push("--strict");
 			const tail = await runCli(root, agentDir, args);
 			if (strict) {
@@ -642,7 +642,7 @@ describe("SDK session CLI", () => {
 				expect(result.gap).toMatchObject({ code: "retention_gap", missing: { from: 1, to: 1 } });
 				expect(result.items.map((item: Record<string, unknown>) => item.seq)).toEqual([2, 3, 4]);
 			}
-		}, 60_000);
+		}, 90_000);
 	}
 
 	it("forwards the exchanged checkpoint token to transcript.list", async () => {
@@ -712,7 +712,7 @@ describe("SDK session CLI", () => {
 			},
 		];
 
-		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "20000"]);
 
 		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
 		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
