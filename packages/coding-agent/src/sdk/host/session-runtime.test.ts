@@ -5554,9 +5554,13 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		// renewal wiring at the SDK boundary.
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-renew-attached-"));
 		try {
+			const renewalSettings = {
+				get: (key: string) =>
+					key === "sdk.promptDeadlineMs" ? 250 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+			} as unknown as Settings;
 			let promoted: ((promotion: { startsOwnRun: boolean }) => void) | undefined;
 			const harness = await invocationHarness("renew-attached", cwd, {
-				settings: zeroProgressSettings,
+				settings: renewalSettings,
 				sendUserMessage: async (content, options) => {
 					await options?.onPreflightAcceptCommit?.();
 					if (content === "consumed") {
@@ -5575,12 +5579,12 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(consumed.ok).toBe(true);
 			promoted?.({ startsOwnRun: false });
 			const ids = { commandId: consumed.result?.commandId, turnId: consumed.result?.turnId };
-			// Past the 25ms lease, repeated tool activity keeps the attached
-			// correlation alive: without renewal it would already be
-			// prompt_deadline_exceeded by the first sleep boundary.
+			// Past the initial 250ms lease, repeated tool activity keeps the
+			// attached correlation alive. Each interval stays well within one
+			// renewed lease while their cumulative duration exceeds the original.
 			for (let i = 0; i < 3; i += 1) {
 				await harness.emit("tool_execution_start");
-				await Bun.sleep(15);
+				await Bun.sleep(100);
 			}
 			const midRun = await harness.query("turn.prompt_status", ids);
 			expect(midRun.result?.status).not.toBe("failed");
