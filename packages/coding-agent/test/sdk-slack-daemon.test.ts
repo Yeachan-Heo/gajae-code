@@ -243,7 +243,9 @@ function messageEnvelope(
 		actorId?: string;
 		clientMsgId?: string;
 		eventContext?: string;
+		botId?: string;
 		payloadType?: "event_callback" | "events_api";
+		subtype?: string;
 		text?: string;
 	} = {},
 ): SlackSocketEnvelope {
@@ -260,6 +262,8 @@ function messageEnvelope(
 				ts: `2.${eventId}`,
 				thread_ts: rootTs,
 				user: overrides.actorId ?? "U1",
+				bot_id: overrides.botId,
+				subtype: overrides.subtype,
 				text: overrides.text ?? "reply",
 				client_msg_id: overrides.clientMsgId,
 			},
@@ -351,6 +355,25 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				},
 			},
 		);
+	});
+
+	it("rejects bot, edited, and thread-broadcast messages in mapped threads", async () => {
+		await withDaemon(async (daemon, fake, injected) => {
+			const root = await daemon.postRoot("session", "root");
+			const cases = [
+				["bot", { botId: "B1" }],
+				["edited", { subtype: "message_changed" }],
+				["broadcast", { subtype: "thread_broadcast" }],
+				["integration", { subtype: "file_share" }],
+			] as const;
+			for (const [name, overrides] of cases) {
+				expect(await daemon.handleEnvelope(messageEnvelope(name, `${name}-event`, root.rootTs!, overrides))).toBe(
+					false,
+				);
+			}
+			expect(fake.acks).toEqual(["bot", "edited", "broadcast", "integration"]);
+			expect(injected).toEqual([]);
+		});
 	});
 
 	it("fails closed when no Slack principal is paired", async () => {
@@ -1660,6 +1683,59 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
+	it("replays persisted message classification after pending action state changes", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-message-replay-"));
+		try {
+			const firstProvider = new FakeSlack();
+			const first = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(firstProvider),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			const root = await first.postRoot("session", "root");
+			firstProvider.onAck = async () => {
+				throw new Error("crash after ACK");
+			};
+			await expect(
+				first.handleEnvelope(
+					messageEnvelope("first", "message-event", root.rootTs!, {
+						clientMsgId: "message-id",
+						text: "persisted prompt",
+					}),
+				),
+			).rejects.toThrow("crash after ACK");
+			await first.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, pendingActionId: "new-action" } : current,
+			);
+
+			const replayed: Array<Record<string, unknown>> = [];
+			const restarted = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(new FakeSlack()),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					send: (frame: Record<string, unknown>) => replayed.push(frame),
+					sendMaintenance: () => {},
+				}),
+				authorizeActor: actorId => actorId === "U1",
+			});
+			await restarted.start();
+			expect(replayed).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "persisted prompt" }),
+			]);
+			await restarted.stop();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("durably accepts ordered controls using their stable inbound key", async () => {
 		const commands: string[] = [];
 		await withDaemon(
@@ -1771,6 +1847,26 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 					sessionId: "session",
 					text: "reply",
 				}),
+			]);
+		});
+	});
+
+	it("does not revive a stale idle notification id as a reply action", async () => {
+		await withDaemon(async (daemon, _fake, injected) => {
+			const root = await daemon.postRoot("session", "root");
+			await daemon.store.transact("T1:C1:intent:session", current =>
+				current ? { ...current, generation: current.generation + 1, pendingActionId: "idle:session#1" } : current,
+			);
+			expect(
+				await daemon.handleEnvelope(
+					messageEnvelope("stale-idle", "stale-idle-event", root.rootTs!, {
+						clientMsgId: "stale-idle-message",
+						text: "fresh prompt",
+					}),
+				),
+			).toBe(true);
+			expect(injected).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "fresh prompt" }),
 			]);
 		});
 	});

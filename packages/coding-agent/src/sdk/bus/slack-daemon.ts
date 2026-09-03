@@ -458,7 +458,7 @@ export class SlackNotificationDaemon {
 		const actorId = text(inbound.event.user);
 		if (
 			inbound.event.bot_id ||
-			inbound.event.subtype === "bot_message" ||
+			inbound.event.subtype !== undefined ||
 			actorId === this.options.botUserId ||
 			!actorId ||
 			!(await this.#actorAuthorized(actorId))
