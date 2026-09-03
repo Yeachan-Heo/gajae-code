@@ -176,7 +176,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					anchorMessage.role !== "user" ||
 					/\[(?:image|audio|video|file|content)\]/i.test(item.anchor.quote) ||
 					/^(?:\[?(?:image|audio|video|file|content)\]?)+$/i.test(item.anchor.quote.trim()) ||
-					/^(?:\[[^\]]+\])+$/.test(anchorMessage.content) ||
+					/^\[[^\]]+\]$/.test(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote)
 				)
 					throw new Error(`confirmed item ${id} has no verbatim user anchor`);
@@ -240,8 +240,8 @@ function validateResolutionAnchors(
 		const quote = text(raw.quote, `${field}[${index}].quote`, 500);
 		const resolution = text(raw.resolution, `${field}[${index}].resolution`, 500);
 		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
-		const itemWords = new Set(item.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? []);
-		const resolutionWords = resolution.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? [];
+		const itemWords = new Set(item.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
+		const resolutionWords = resolution.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
 		const genericResolutionWords = new Set(["ok", "yes", "done", "resolved", "confirmed", "accepted", "fine"]);
 		const introducesNewTerm = resolutionWords.some(
 			word => word.length >= 3 && !itemWords.has(word) && !genericResolutionWords.has(word),
@@ -350,8 +350,7 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 		left.id === right.id &&
 		left.kind === right.kind &&
 		left.statement === right.statement &&
-		(left.classification === right.classification ||
-			(right.classification === "inferred" && left.classification === "confirmed"));
+		left.classification === right.classification;
 	for (const item of items) {
 		const previous = priorItems.get(item.id);
 		if (
