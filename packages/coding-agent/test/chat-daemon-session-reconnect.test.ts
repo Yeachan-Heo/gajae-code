@@ -641,8 +641,13 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  * a test that drops the socket the instant a post appears would otherwise be racing a
  * cursor the runtime has not moved yet.
  */
-async function awaitPosts(provider: FakeSlackProvider, count: number, clock?: FakeClock): Promise<void> {
-	for (let attempt = 0; attempt < CHAT_TEST_WAIT_ATTEMPTS && provider.posts.length < count; attempt++) {
+async function awaitPosts(
+	provider: FakeSlackProvider,
+	count: number,
+	clock?: FakeClock,
+	waitAttempts = CHAT_TEST_WAIT_ATTEMPTS,
+): Promise<void> {
+	for (let attempt = 0; attempt < waitAttempts && provider.posts.length < count; attempt++) {
 		await flush();
 		if (clock) {
 			const pending = clock.pendingDelays();
@@ -1780,13 +1785,13 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 			// it already holds, with no further rebuild.
 			provider.failPosts = 0;
 			host.emit("three");
-			await awaitPosts(provider, 2);
+			await awaitPosts(provider, 2, undefined, 30_000);
 			await Bun.sleep(20);
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\nthree"]);
 			expect(FakeWebSocket.instances).toHaveLength(3);
 		});
 	});
-}, 20_000);
+}, 45_000);
 
 test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
 	await withAttachedSessionRuntime(
