@@ -650,7 +650,8 @@ function ensureLaunchWorktreeSync(
 }
 
 function removeCleanAbortedLaunchWorktree(plan: GjcLaunchWorktreePlan, createdBranch: boolean): void {
-	if (isWorktreeDirty(plan.worktreePath)) return;
+	if (runGit(plan.worktreePath, ["status", "--porcelain", "--ignored", "--untracked-files=all"]).trim().length > 0)
+		return;
 	try {
 		runGit(plan.repoRoot, ["worktree", "remove", plan.worktreePath]);
 	} catch {
