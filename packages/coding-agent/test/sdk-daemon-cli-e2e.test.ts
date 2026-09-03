@@ -401,7 +401,7 @@ describe("SDK session CLI", () => {
 			JSON.stringify({ sessionId: "live", pid: process.pid, url: `ws://127.0.0.1:${endpointServer.port}`, token }),
 		);
 		const endpointMtimeMs = (await fs.stat(endpointPath)).mtimeMs;
-		broker = new Broker({ agentDir, packageGeneration: "test" });
+		broker = new Broker({ agentDir });
 		await broker.start();
 		await broker.index.append({
 			type: "host_registered",
@@ -1639,7 +1639,7 @@ describe("SDK session CLI", () => {
 
 	it("selects the broker specified by --agent-dir over the ambient agent directory", async () => {
 		const alternateAgentDir = path.join(root, "alternate-agent");
-		const alternateBroker = new Broker({ agentDir: alternateAgentDir, packageGeneration: "test" });
+		const alternateBroker = new Broker({ agentDir: alternateAgentDir });
 		await alternateBroker.start();
 		try {
 			await alternateBroker.index.append({

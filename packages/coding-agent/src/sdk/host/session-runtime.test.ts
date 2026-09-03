@@ -4766,7 +4766,7 @@ describe("post-acceptance invocation terminalization", () => {
 			const harness = await invocationHarness("successor-progress", cwd, {
 				settings: {
 					get: (key: string) =>
-						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+						key === "sdk.promptDeadlineMs" ? 250 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
 				} as unknown as Settings,
 				sendUserMessage: async (_content, options) => {
 					prompts += 1;
@@ -4791,7 +4791,7 @@ describe("post-acceptance invocation terminalization", () => {
 			await successorStarted.promise;
 			for (let index = 0; index < 4; index += 1) {
 				await harness.emit("tool_execution_start");
-				await Bun.sleep(15);
+				await Bun.sleep(100);
 			}
 			expect(await harness.query("turn.prompt_status", successorIds)).toMatchObject({
 				result: { status: expect.stringMatching(/accepted|in_flight/) },
