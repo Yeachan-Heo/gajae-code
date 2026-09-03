@@ -79,8 +79,9 @@ Read-only snapshot path:
 - Read-only inspection: call with `list: true` for the same snapshot data without waiting on completion.
 
 Foreground fold contract:
-- The `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold managed non-PTY Bash, ACP client-terminal, and PTY waits into the same job manager.
-- Folded completion wakes a fresh turn with a receipt containing bounded output, the original request, and a `job` retrieval handle. The original command deadline remains active and `job tail` is available while the job runs.
+- The `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold managed non-PTY Bash, ACP client-terminal, and PTY waits into the same job manager. A user steer admitted into the live run folds the same waits automatically after a fixed 2 s grace window (`STEER_FOLD_GRACE_MS`) when `busyPromptMode=steer` and `toolInterruptPolicy=abort_tools`.
+- A steer fold appends `Folded into background job <id> because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.` to the background-start result. Every fold records `metadata.foldReason` (`steer` | `chord` | `timer` | `sdk_control`); `list: true` snapshots expose it as `foldReason`, and the SDK `runtime.jobs.list` payload carries it beside `backgrounded`. The manager emits one `onFold` notification per fold, which the SDK host publishes as a replayable `bash_folded` frame.
+- Chord/timer/SDK-control folds wake a fresh turn on completion with a receipt containing bounded output, the original request, and a `job` retrieval handle. A steer fold keeps the current turn running so the steer is consumed immediately; the job's completion still wakes a later turn. The original command deadline remains active and `job tail` is available while the job runs.
 - PTY overlay disposal is non-owning; explicit Escape and `job cancel` stop the PTY through its lifecycle hook. `task` and `subagent` waits are not foldable.
 
 Spawn paths that produce jobs:

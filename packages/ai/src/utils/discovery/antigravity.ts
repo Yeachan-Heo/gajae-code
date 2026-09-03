@@ -218,13 +218,22 @@ export async function fetchAntigravityDiscoveryModels(
 			continue;
 		}
 
+		const surfacedModelIds = new Set<string>();
+		for (const sort of parsed.agentModelSorts ?? []) {
+			for (const group of sort.groups ?? []) {
+				for (const modelId of group.modelIds ?? []) {
+					surfacedModelIds.add(modelId);
+				}
+			}
+		}
+
 		const models: Model<"google-gemini-cli">[] = [];
 
 		for (const [modelId, model] of Object.entries(parsed.models ?? {})) {
 			if (ANTIGRAVITY_DISCOVERY_DENYLIST.has(modelId) || isRetiredModelKey(targetProvider, modelId)) {
 				continue;
 			}
-			if (model.isInternal === true) {
+			if (model.isInternal === true && !surfacedModelIds.has(modelId)) {
 				continue;
 			}
 

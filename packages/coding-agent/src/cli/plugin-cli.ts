@@ -886,11 +886,40 @@ async function handleLink(manager: PluginManager, paths: string[], flags: { json
 	}
 }
 
+async function collectMarketplaceDoctorChecks(): Promise<
+	Array<{ name: string; status: "ok" | "warning" | "error"; message: string }>
+> {
+	const extra: Array<{ name: string; status: "ok" | "warning" | "error"; message: string }> = [];
+	try {
+		const mktMgr = await makeMarketplaceManager();
+		const installed = await mktMgr.listInstalledPlugins();
+		for (const summary of installed) {
+			for (const entry of summary.entries) {
+				let exists = false;
+				try {
+					const { statSync } = await import("node:fs");
+					statSync(entry.installPath);
+					exists = true;
+				} catch {}
+				if (!exists) {
+					extra.push({
+						name: `marketplace:${summary.id}:${entry.scope}`,
+						status: "error",
+						message: `Marketplace plugin "${summary.id}" (${entry.scope}) references missing cache dir "${entry.installPath}" (v${entry.version}); reinstall or upgrade the plugin`,
+					});
+				}
+			}
+		}
+	} catch {}
+	return extra;
+}
+
 async function handleDoctor(
 	manager: PluginManager,
 	flags: { json?: boolean; fix?: boolean; migratePlugins?: boolean },
 ): Promise<void> {
 	const checks = await manager.doctor({ fix: flags.fix });
+	checks.push(...(await collectMarketplaceDoctorChecks()));
 	try {
 		const statuses = flags.migratePlugins
 			? await runGjcPluginMigrationPreflight(getProjectDir())

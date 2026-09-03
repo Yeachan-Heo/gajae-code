@@ -247,6 +247,7 @@ export class ExtensionRunner {
 	#getArtifactRangeFn: ExtensionContextActions["getArtifactRange"] = undefined;
 
 	#getJobsFn: ExtensionContextActions["getJobs"] = undefined;
+	#onJobFoldFn: ExtensionContextActions["onJobFold"] = undefined;
 	#sdkControlFn: ExtensionContextActions["sdkControl"] = undefined;
 	#setSdkPermissionProviderFn: ExtensionContextActions["setSdkPermissionProvider"] = undefined;
 	#setSdkClientBridgeFn: ExtensionContextActions["setSdkClientBridge"] = undefined;
@@ -378,6 +379,7 @@ export class ExtensionRunner {
 		this.#getArtifactRangeFn = contextActions.getArtifactRange;
 
 		this.#getJobsFn = contextActions.getJobs;
+		this.#onJobFoldFn = contextActions.onJobFold;
 		this.#sdkControlFn = contextActions.sdkControl;
 		this.#setSdkPermissionProviderFn = contextActions.setSdkPermissionProvider;
 		this.#setSdkClientBridgeFn = contextActions.setSdkClientBridge;
@@ -662,6 +664,7 @@ export class ExtensionRunner {
 			getArtifactRange: (id, offset, length) => this.#getArtifactRangeFn?.(id, offset, length),
 
 			getJobs: () => this.#getJobsFn?.(),
+			onJobFold: listener => this.#onJobFoldFn?.(listener) ?? (() => {}),
 			sdkControl: (operation, input) => this.#sdkControlFn?.(operation, input),
 			setSdkPermissionProvider: provider => this.#setSdkPermissionProviderFn?.(provider),
 			setSdkClientBridge: bridge => this.#setSdkClientBridgeFn?.(bridge),
@@ -679,6 +682,7 @@ export class ExtensionRunner {
 				...(this.#getExtensionsFn ? ["getExtensions"] : []),
 				...(this.#getArtifactRangeFn ? ["getArtifactRange"] : []),
 				...(this.#getJobsFn ? ["getJobs"] : []),
+				...(this.#onJobFoldFn ? ["onJobFold"] : []),
 				...(this.#sdkControlFn ? ["sdkControl"] : []),
 				...(this.#invokeSkillFn ? ["invokeSkill"] : []),
 				...(this.#setPlanModeFn ? ["setPlanMode"] : []),

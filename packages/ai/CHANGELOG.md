@@ -4,10 +4,13 @@
 
 ### Added
 
+- Exported `fetchModelsDevPayload` from `provider-models/openai-compat` and coalesced its downloads. models.dev publishes one catalog document describing every provider, but each models.dev-backed provider downloaded it separately, so a single discovery pass transferred the same payload once per provider (and `packages/coding-agent` kept a second downloader of its own). Downloads are now shared per fetch implementation for a 60s window, failures are not retained, and `coding-agent` model discovery consumes the same fetcher.
+
 - Exported `detectDiscoveredApiFamily` from `utils/discovery/openai-compatible`: infers the wire API family (`anthropic-messages` vs `openai-completions`) for a discovered model on a mixed OpenAI-compatible gateway, using the OpenAI `owned_by` owner first and the model id (`claude-*` vs `gpt-*`/`o1`/`codex`/…) as fallback, returning `undefined` when inconclusive. Consumed by custom-provider auto model discovery in `packages/coding-agent`.
 
 ### Fixed
 
+- Antigravity discovery now keeps mid-rollout models that the backend marks `isInternal` when the same response surfaces them through `agentModelSorts`. Internal models absent from the IDE's surfaced model groups remain hidden, and denylisted or retired selectors still take precedence.
 - Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.
 - `glm-zcode` login instructions now warn users who have the ZCode desktop app installed to cancel the browser's `zcode://` open prompt. The app exchanges the single-use authorization code itself, so a code pasted afterwards is rejected by the broker (`500 {"code":2007}`) and the documented paste flow failed without explanation.
 

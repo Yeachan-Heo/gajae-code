@@ -47,6 +47,7 @@ const MODEL_PRESET_REGISTRY_MAX_STATE_BYTES = 32 * 1024 * 1024;
 const MODEL_PRESET_REGISTRY_MAX_HISTORY = 4;
 const MODEL_PRESET_REGISTRY_MAX_RETENTION_ANCESTRY = 64;
 const MODEL_PRESET_REGISTRY_MAX_ERROR_BYTES = 1024;
+const MODEL_PRESET_REGISTRY_IDENTITY_SKELETON_CACHE_MAX = 200_000;
 const MODEL_PRESET_REGISTRY_FETCH_TIMEOUT_MS = 8_000;
 const REVISION_PATTERN = /^[0-9]{8}$/;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
@@ -592,10 +593,23 @@ function assertSafeRegistryDocument(value: unknown, location = "$"): void {
 	}
 }
 
+/**
+ * Confusable folding is a pure string function evaluated once per identity per
+ * document, and startup validates the same catalog identities repeatedly. The
+ * bounded memo keeps the fold cost proportional to the distinct identity count
+ * instead of the number of validation passes.
+ */
+const identitySkeletonCache = new Map<string, string>();
+
 function identitySkeleton(value: string): string {
-	return [...value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()]
+	const cached = identitySkeletonCache.get(value);
+	if (cached !== undefined) return cached;
+	const skeleton = [...value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase()]
 		.map(character => IDENTITY_HOMOGLYPHS.get(character) ?? character)
 		.join("");
+	if (identitySkeletonCache.size >= MODEL_PRESET_REGISTRY_IDENTITY_SKELETON_CACHE_MAX) identitySkeletonCache.clear();
+	identitySkeletonCache.set(value, skeleton);
+	return skeleton;
 }
 
 function assertUniqueRegistryNames(values: readonly string[], label: string): void {
@@ -824,23 +838,21 @@ function assertProfilePresetReferences(
 	}
 }
 
-function validateGeneration(
+function validateGenerationUncached(
 	generation: AcceptedGeneration,
 	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
-	allowRevoked = false,
-): AcceptedGeneration {
-	const manifest = ModelPresetRegistryManifestSchema.parse(generation.manifest);
+	allowRevoked: boolean,
+): void {
+	const { manifest, snapshot, profiles, presets } = generation;
 	assertSafeRegistryDocument(manifest);
 	verifyManifest(manifest, trustedKeys, allowRevoked);
 	assertManifestBindings(manifest);
-	const snapshotBytes = new TextEncoder().encode(canonicalModelPresetRegistryJson(generation.snapshot));
+	const snapshotBytes = new TextEncoder().encode(canonicalModelPresetRegistryJson(snapshot));
 	assertContentDescriptor(snapshotBytes, manifest.signed.snapshot, "Cached registry snapshot");
-	const snapshot = ModelPresetRegistrySnapshotSchema.parse(generation.snapshot);
 	assertSafeRegistryDocument(snapshot);
 	assertSnapshotBindings(manifest, snapshot);
-	const profileBytes = new TextEncoder().encode(canonicalModelPresetRegistryJson(generation.profiles));
+	const profileBytes = new TextEncoder().encode(canonicalModelPresetRegistryJson(profiles));
 	assertContentDescriptor(profileBytes, manifest.signed.contents.profiles, "Cached registry profiles");
-	const profiles = ModelPresetRegistryProfilesSchema.parse(generation.profiles);
 	assertSafeRegistryDocument(profiles);
 	assertRegistryIdentityPolicy(profiles);
 	if (
@@ -848,9 +860,8 @@ function validateGeneration(
 		profiles.profiles.length !== manifest.signed.contents.profiles.count
 	)
 		throw new Error("Cached registry profile identity is invalid.");
-	const presetBytes = new TextEncoder().encode(canonicalModelPresetRegistryJson(generation.presets));
+	const presetBytes = new TextEncoder().encode(canonicalModelPresetRegistryJson(presets));
 	assertContentDescriptor(presetBytes, manifest.signed.contents.presets, "Cached registry presets");
-	const presets = ModelPresetRegistryPresetsSchema.parse(generation.presets);
 	assertSafeRegistryDocument(presets);
 	assertRegistryIdentityPolicy(presets);
 	if (
@@ -859,24 +870,73 @@ function validateGeneration(
 	)
 		throw new Error("Cached registry preset identity is invalid.");
 	assertProfilePresetReferences(profiles, presets);
-	const manifestSha256 = sha256(canonicalModelPresetRegistryJson(manifest));
-	if (manifestSha256 !== generation.manifestSha256) throw new Error("Cached registry manifest digest is invalid.");
+	if (sha256(canonicalModelPresetRegistryJson(manifest)) !== generation.manifestSha256)
+		throw new Error("Cached registry manifest digest is invalid.");
 	assertSafeRegistryDocument(generation.retainedProfiles);
 	assertSafeRegistryDocument(generation.retainedPresets);
 	assertSafeRegistryDocument(generation.retainedDynamicProviders);
-	const effectiveProfiles = ModelPresetRegistryProfilesSchema.parse({
+	const effectiveProfiles: ModelPresetRegistryProfiles = {
 		...profiles,
 		dynamicProviders: [...generation.retainedDynamicProviders, ...profiles.dynamicProviders],
 		profiles: [...generation.retainedProfiles, ...profiles.profiles],
-	});
-	const effectivePresets = ModelPresetRegistryPresetsSchema.parse({
+	};
+	const effectivePresets: ModelPresetRegistryPresets = {
 		...presets,
 		presets: [...generation.retainedPresets, ...presets.presets],
-	});
+	};
 	assertRegistryIdentityPolicy(effectiveProfiles);
 	assertRegistryIdentityPolicy(effectivePresets);
 	assertProfilePresetReferences(effectiveProfiles, effectivePresets);
-	return { ...generation, manifest, snapshot, profiles, presets, manifestSha256 };
+}
+
+/**
+ * Signature and binding verification is a pure function of the generation, the
+ * trusted key set, and the revocation allowance, and one accepted-registry read
+ * verifies the same generation objects from several recovery angles. The memo
+ * records both outcomes per (generation, keys, allowance) so a startup read
+ * verifies each cached generation exactly once instead of once per angle.
+ */
+type GenerationValidationOutcome = { ok: true } | { ok: false; error: unknown };
+
+const generationValidationCache = new WeakMap<
+	AcceptedGeneration,
+	WeakMap<ReadonlyMap<string, ModelPresetRegistryTrustedKey>, Map<boolean, GenerationValidationOutcome>>
+>();
+
+/**
+ * Every caller supplies a generation whose documents were already schema-parsed
+ * (cache reads through `parseState`, refresh through `parseCanonicalDocument`),
+ * so this asserts the cryptographic and structural bindings and returns the
+ * input rather than re-deriving an identical parse.
+ */
+function validateGeneration(
+	generation: AcceptedGeneration,
+	trustedKeys: ReadonlyMap<string, ModelPresetRegistryTrustedKey>,
+	allowRevoked = false,
+): AcceptedGeneration {
+	let byKeys = generationValidationCache.get(generation);
+	if (!byKeys) {
+		byKeys = new WeakMap();
+		generationValidationCache.set(generation, byKeys);
+	}
+	let byAllowance = byKeys.get(trustedKeys);
+	if (!byAllowance) {
+		byAllowance = new Map();
+		byKeys.set(trustedKeys, byAllowance);
+	}
+	const memoized = byAllowance.get(allowRevoked);
+	if (memoized) {
+		if (!memoized.ok) throw memoized.error;
+		return generation;
+	}
+	try {
+		validateGenerationUncached(generation, trustedKeys, allowRevoked);
+	} catch (error) {
+		byAllowance.set(allowRevoked, { ok: false, error });
+		throw error;
+	}
+	byAllowance.set(allowRevoked, { ok: true });
+	return generation;
 }
 
 function readJsonSync(file: string): unknown | undefined {
@@ -1488,9 +1548,92 @@ function acceptedRegistryFromState(
 	};
 }
 
+/**
+ * Accepted-registry reads are pure over the on-disk state, backup, and control
+ * files, and a single launch resolves the registry from several subsystems.
+ * The memo keys on the content digest of those inputs, so any byte change from
+ * any writer (refresh, rollback, pin, tampering) is re-verified from scratch
+ * while an unchanged launch pays the verification cost once. Digesting the
+ * inputs is bounded by their size cap and stays far below the signature,
+ * schema, and canonical-form work it replaces.
+ */
+const acceptedRegistryReadCache = new Map<string, { fingerprint: string; value: AcceptedModelPresetRegistry }>();
+
+function cloneAcceptedModelPresetRegistry(value: AcceptedModelPresetRegistry): AcceptedModelPresetRegistry {
+	return {
+		...value,
+		profiles: new Map(
+			[...value.profiles].map(([id, profile]) => [id, structuredClone(profile)] as [string, ModelProfileDefinition]),
+		),
+		presets: structuredClone(value.presets),
+		dynamicProviders: [...value.dynamicProviders],
+		retainedProfiles: [...value.retainedProfiles],
+		retainedPresets: [...value.retainedPresets],
+	};
+}
+
+function registryFileFingerprint(file: string): string {
+	try {
+		return sha256(fsSync.readFileSync(file));
+	} catch {
+		return "absent";
+	}
+}
+
+function acceptedRegistryFingerprint(
+	agentDir: string,
+	dependencies: Omit<ModelPresetRegistryDependencies, "agentDir">,
+): string {
+	const paths = registryPaths(agentDir);
+	return [
+		refreshDependencyId(effectiveTrustedKeys(dependencies, agentDir) as object),
+		...[paths.state, paths.backup, paths.control].map(registryFileFingerprint),
+	].join("|");
+}
+
+async function registryFileFingerprintAsync(file: string): Promise<string> {
+	try {
+		return sha256(new Uint8Array(await Bun.file(file).arrayBuffer()));
+	} catch {
+		return "absent";
+	}
+}
+
+async function acceptedRegistryFingerprintAsync(
+	agentDir: string,
+	dependencies: Omit<ModelPresetRegistryDependencies, "agentDir">,
+): Promise<string> {
+	const paths = registryPaths(agentDir);
+	const files = await Promise.all(
+		[paths.state, paths.backup, paths.control].map(file => registryFileFingerprintAsync(file)),
+	);
+	return [refreshDependencyId(effectiveTrustedKeys(dependencies, agentDir) as object), ...files].join("|");
+}
+
+/** Only the dependency-free startup read is memoized; injected dependencies always recompute. */
+function acceptedRegistryReadIsCacheable(dependencies: Omit<ModelPresetRegistryDependencies, "agentDir">): boolean {
+	return Object.keys(dependencies).length === 0;
+}
+
 export function loadAcceptedModelPresetRegistry(
 	agentDir = getAgentDir(),
 	dependencies: Omit<ModelPresetRegistryDependencies, "agentDir"> = {},
+): AcceptedModelPresetRegistry {
+	if (!acceptedRegistryReadIsCacheable(dependencies) || environmentDisabled())
+		return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
+	const fingerprint = acceptedRegistryFingerprint(agentDir, dependencies);
+	const cached = acceptedRegistryReadCache.get(agentDir);
+	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
+	const value = loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
+	const verifiedFingerprint = acceptedRegistryFingerprint(agentDir, dependencies);
+	if (verifiedFingerprint !== fingerprint) return loadAcceptedModelPresetRegistryUncached(agentDir, dependencies);
+	acceptedRegistryReadCache.set(agentDir, { fingerprint, value });
+	return cloneAcceptedModelPresetRegistry(value);
+}
+
+function loadAcceptedModelPresetRegistryUncached(
+	agentDir: string,
+	dependencies: Omit<ModelPresetRegistryDependencies, "agentDir">,
 ): AcceptedModelPresetRegistry {
 	if (environmentDisabled())
 		return {
@@ -1551,6 +1694,22 @@ export function loadAcceptedModelPresetRegistry(
 export async function loadAcceptedModelPresetRegistryAsync(
 	agentDir = getAgentDir(),
 	dependencies: Omit<ModelPresetRegistryDependencies, "agentDir"> = {},
+): Promise<AcceptedModelPresetRegistry> {
+	if (!acceptedRegistryReadIsCacheable(dependencies) || environmentDisabled())
+		return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
+	const fingerprint = await acceptedRegistryFingerprintAsync(agentDir, dependencies);
+	const cached = acceptedRegistryReadCache.get(agentDir);
+	if (cached && cached.fingerprint === fingerprint) return cloneAcceptedModelPresetRegistry(cached.value);
+	const value = await loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
+	const verifiedFingerprint = await acceptedRegistryFingerprintAsync(agentDir, dependencies);
+	if (verifiedFingerprint !== fingerprint) return loadAcceptedModelPresetRegistryAsyncUncached(agentDir, dependencies);
+	acceptedRegistryReadCache.set(agentDir, { fingerprint, value });
+	return cloneAcceptedModelPresetRegistry(value);
+}
+
+async function loadAcceptedModelPresetRegistryAsyncUncached(
+	agentDir: string,
+	dependencies: Omit<ModelPresetRegistryDependencies, "agentDir">,
 ): Promise<AcceptedModelPresetRegistry> {
 	if (environmentDisabled())
 		return {

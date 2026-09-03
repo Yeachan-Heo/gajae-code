@@ -32,6 +32,33 @@ function createAntigravityModel(id: string, name: string): Model<Api> {
 }
 
 describe("Antigravity model discovery", () => {
+	async function resolveDiscoveryPayload(payload: unknown): Promise<Model<Api>[]> {
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-ai-antigravity-model-cache-"));
+		cacheDirs.push(cacheDir);
+		const cacheDbPath = join(cacheDir, "models.db");
+		const fetcher = (async () =>
+			new Response(JSON.stringify(payload), {
+				headers: { "content-type": "application/json" },
+			})) as unknown as typeof fetch;
+
+		const { models } = await resolveProviderModels<Api>(
+			{
+				providerId: "google-antigravity",
+				staticModels: [],
+				cacheDbPath,
+				fetchDynamicModels: () =>
+					fetchAntigravityDiscoveryModels({
+						token: "test-token",
+						endpoint: "https://antigravity.example.test",
+						fetcher,
+					}),
+			},
+			"online",
+		);
+
+		return models;
+	}
+
 	function createDiscoveryFetcher(): typeof fetch {
 		return (async () =>
 			new Response(
@@ -85,6 +112,48 @@ describe("Antigravity model discovery", () => {
 		});
 
 		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low", "gemini-3.7-flash-tiered"]);
+	});
+
+	it("resolves an internal mid-rollout model surfaced by agentModelSorts", async () => {
+		const models = await resolveDiscoveryPayload({
+			models: {
+				"gemini-future-flash-medium": {
+					displayName: "Gemini Future Flash (Medium)",
+					isInternal: true,
+					supportsImages: true,
+					supportsThinking: true,
+				},
+			},
+			agentModelSorts: [{ groups: [{ modelIds: ["gemini-future-flash-medium"] }] }],
+		});
+
+		expect(models.map(model => model.id)).toEqual(["gemini-future-flash-medium"]);
+	});
+
+	it("keeps genuinely internal models absent from agentModelSorts hidden", async () => {
+		const models = await resolveDiscoveryPayload({
+			models: {
+				"internal-evaluation-model": {
+					displayName: "Internal Evaluation Model",
+					isInternal: true,
+				},
+			},
+			agentModelSorts: [{ groups: [{ modelIds: ["public-model"] }] }],
+		});
+
+		expect(models).toEqual([]);
+	});
+
+	it("keeps denylisted and retired models hidden when agentModelSorts surfaces them", async () => {
+		const models = await resolveDiscoveryPayload({
+			models: {
+				chat_20706: { displayName: "Denylisted", isInternal: true },
+				"gemini-3.1-pro-high": { displayName: "Retired", isInternal: true },
+			},
+			agentModelSorts: [{ groups: [{ modelIds: ["chat_20706", "gemini-3.1-pro-high"] }] }],
+		});
+
+		expect(models).toEqual([]);
 	});
 
 	it("keeps gemini-3.1-pro-high when discovery targets google-gemini-cli", async () => {

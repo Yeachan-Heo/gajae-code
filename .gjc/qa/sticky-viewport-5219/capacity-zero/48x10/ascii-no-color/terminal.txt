@@ -1,0 +1,10 @@
+ ⬢ sonnet-4.5 · 0.0% ───────── vsticky-viewport 
+hook: ready                                     
+╭─────────────────────────────────────────────╮ 
+│ > capacity-zero composer                    │ 
+╰─────────────────────────────────────────────╯ 
+reserved suffix row 1                           
+reserved suffix row 2                           
+reserved suffix row 3                           
+reserved suffix row 4                           
+reserved suffix row 5                           

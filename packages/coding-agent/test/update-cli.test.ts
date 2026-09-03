@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
+	assertSupportedLinuxLibcForTest,
 	buildReleaseBinaryUrlForTest,
 	compareVersionsForTest,
 	defaultUserBinaryPathForTest,
@@ -167,6 +168,36 @@ describe("update-cli install target detection", () => {
 });
 
 describe("update-cli binary release assets", () => {
+	it("does not mistake an installed musl loader for the active libc", () => {
+		expect(() => assertSupportedLinuxLibcForTest("2.35", true)).not.toThrow();
+	});
+
+	it("detects a genuine musl host when no glibc runtime is active", () => {
+		expect(() => assertSupportedLinuxLibcForTest(undefined, true)).toThrow("Unsupported libc: musl");
+	});
+
+	it("fails closed when neither an active glibc runtime nor a musl loader can be detected", () => {
+		expect(() => assertSupportedLinuxLibcForTest(undefined, false)).toThrow(
+			"Unable to verify an active glibc runtime",
+		);
+	});
+
+	it("does not accept an empty glibc runtime report", () => {
+		expect(() => assertSupportedLinuxLibcForTest("   ", true)).toThrow("Unsupported libc: musl");
+	});
+
+	it("does not accept an unparseable glibc runtime report", () => {
+		expect(() => assertSupportedLinuxLibcForTest("not-a-version", true)).toThrow("Unsupported libc: musl");
+		expect(() => assertSupportedLinuxLibcForTest("not-a-version", false)).toThrow(
+			"Unable to verify an active glibc runtime",
+		);
+		expect(() => assertSupportedLinuxLibcForTest("2.x", false)).toThrow("Unable to verify an active glibc runtime");
+	});
+
+	it("accepts a trimmed major-minor glibc runtime report", () => {
+		expect(() => assertSupportedLinuxLibcForTest(" 2.35 ", true)).not.toThrow();
+	});
+
 	it("downloads fallback binaries from the current owner release repository", () => {
 		expect(buildReleaseBinaryUrlForTest("0.2.3", "linux", "x64")).toBe(
 			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64",

@@ -68,7 +68,7 @@ describe("JobsObserver", () => {
 		const backgroundedId = registerMonitor(manager, "folded monitor");
 		const backgrounded = manager.getJob(backgroundedId);
 		if (!backgrounded) throw new Error("expected backgrounded monitor job");
-		manager.markBackgrounded(backgroundedId, backgrounded.generation);
+		manager.markBackgrounded(backgroundedId, backgrounded.generation, "chord");
 		registerMonitor(manager, "active monitor");
 
 		const snapshot = observer.getSnapshot();

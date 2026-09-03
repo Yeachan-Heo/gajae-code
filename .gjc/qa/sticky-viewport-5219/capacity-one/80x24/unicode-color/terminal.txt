@@ -1,0 +1,24 @@
+ assistant 0: transcript output remains         │                               
+ ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport 
+hook: ready                                                                     
+╭─────────────────────────────────────────────────────────────────────────────╮ 
+│ > capacity-one composer                                                     │ 
+╰─────────────────────────────────────────────────────────────────────────────╯ 
+reserved suffix row 1                                                           
+reserved suffix row 2                                                           
+reserved suffix row 3                                                           
+reserved suffix row 4                                                           
+reserved suffix row 5                                                           
+reserved suffix row 6                                                           
+reserved suffix row 7                                                           
+reserved suffix row 8                                                           
+reserved suffix row 9                                                           
+reserved suffix row 10                                                          
+reserved suffix row 11                                                          
+reserved suffix row 12                                                          
+reserved suffix row 13                                                          
+reserved suffix row 14                                                          
+reserved suffix row 15                                                          
+reserved suffix row 16                                                          
+reserved suffix row 17                                                          
+reserved suffix row 18                                                          

@@ -1,13 +1,13 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedHomeDir } from "@gajae-code/utils";
-import { findRepoRoot } from "../capability/fs";
+import { getPluginsDir, getTrustedHomeDir } from "@gajae-code/utils";
+import { findRepoRoot, invalidate as invalidateFsCache } from "../capability/fs";
 import type { Skill as CapabilitySkill } from "../capability/skill";
 import type { SkillsSettings } from "../config/settings-schema";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
 import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/claude";
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
-import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
+import { compareSkillOrder, listClaudePluginRoots, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { expandTilde } from "../tools/path-utils";
 import type { Skill } from "./skills";
@@ -234,6 +234,53 @@ function pushDiagnostic(diagnostics: string[], message: string): void {
 	if (diagnostics.length < MAX_DIAGNOSTICS) diagnostics.push(message);
 }
 
+async function collectPluginSkillDirs(
+	home: string,
+	cwd: string,
+): Promise<Array<{ dir: string; pluginName: string; level: "user" | "project" }>> {
+	// Ensure the underlying installed_plugins.json fs cache is current — install/upgrade
+	// writers already invalidate via clearPluginRootsAndCaches; this is a defensive
+	// fallback so a stale in-memory cache cannot mask a disabled/removed plugin.
+	invalidateFsCache(`${getPluginsDir(home)}/installed_plugins.json`);
+	try {
+		const { roots } = await listClaudePluginRoots(home, cwd);
+		return roots.map(root => ({
+			dir: `${root.path}/skills`,
+			pluginName: root.plugin,
+			level: root.scope,
+		}));
+	} catch {
+		return [];
+	}
+}
+
+async function diagnoseCustomDir(expandedDir: string, diagnostics: string[]): Promise<boolean> {
+	try {
+		const stat = await fs.lstat(expandedDir);
+		if (stat.isSymbolicLink()) {
+			try {
+				await fs.stat(expandedDir);
+			} catch {
+				pushDiagnostic(
+					diagnostics,
+					`skills.customDirectories entry "${expandedDir}" is a dangling symlink (target missing, likely a purged plugin cache dir); fix or remove it`,
+				);
+				return true;
+			}
+		}
+		return false;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			pushDiagnostic(
+				diagnostics,
+				`skills.customDirectories entry "${expandedDir}" does not exist (missing directory, likely a purged plugin cache dir); fix or remove it`,
+			);
+			return true;
+		}
+		return false;
+	}
+}
+
 async function scanProjectOrUserDir(
 	ctx: { cwd: string; home: string; repoRoot: string | null },
 	dir: string,
@@ -376,6 +423,44 @@ export async function discoverRuntimeSkills(
 		}
 	}
 
+	// Marketplace plugin skills: version-stable, enabled-only.
+	// Uses the same trust gate as native user/project scopes and the same
+	// discovery root (<installPath>/skills) the capability provider uses,
+	// namespaced as `plugin:skillName`.
+	if (policy?.enabled === true) {
+		const pluginDirs = await collectPluginSkillDirs(home, options.cwd);
+		for (const entry of pluginDirs) {
+			if (entry.level === "project" && !(source === "all" || source === "project")) continue;
+			if (entry.level === "user" && !(source === "all" || source === "user")) continue;
+			if (!sourceEnabled(entry.level, policy)) continue;
+			const label = `plugin ${entry.pluginName} skills`;
+			scanJobs.push(
+				(async () => {
+					const pluginCtx = { cwd: options.cwd, home, repoRoot: home };
+					const result = await scanSkillsFromDir(pluginCtx, {
+						dir: entry.dir,
+						providerId: "plugin",
+						level: entry.level,
+						requireDescription: true,
+					});
+					for (const skill of result.items) {
+						skill.name = `${entry.pluginName}:${skill.name}`;
+					}
+					return {
+						items: result.items.map(skill => ({ skill, source: entry.level as RuntimeSkillDiscoverySource })),
+						warnings: result.warnings ?? [],
+						label,
+					};
+				})(),
+			);
+		}
+	}
+	if (policy?.enabled === true && policy.customDirectories && policy.customDirectories.length > 0) {
+		for (const dir of getCustomSkillDirs(policy, home)) {
+			await diagnoseCustomDir(dir, diagnostics);
+		}
+	}
+
 	const settled = await Promise.all(scanJobs.map(job => job.catch(error => ({ error: String(error), label: "" }))));
 
 	const seenNames = new Set<string>();
@@ -469,6 +554,28 @@ export async function findRuntimeSkillByName(
 				).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
 			);
 		}
+	}
+	if (policy?.enabled === true) {
+		try {
+			const pluginDirs = await collectPluginSkillDirs(home, cwd);
+			for (const entry of pluginDirs) {
+				if (!sourceEnabled(entry.level, policy)) continue;
+				scanJobs.push(
+					scanSkillsFromDir(
+						{ cwd, home, repoRoot: home },
+						{
+							dir: entry.dir,
+							providerId: "plugin",
+							level: entry.level,
+							requireDescription: true,
+						},
+					).then(result => {
+						for (const skill of result.items) skill.name = `${entry.pluginName}:${skill.name}`;
+						return result.items.map(skill => ({ skill, source: entry.level as RuntimeSkillDiscoverySource }));
+					}),
+				);
+			}
+		} catch {}
 	}
 	for (const entry of (await Promise.all(scanJobs)).flat()) {
 		if (entry.skill.name === normalized && isAllowedByPolicy(entry.skill, policy, [])) {

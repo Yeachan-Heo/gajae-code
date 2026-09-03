@@ -227,7 +227,7 @@ describe("fold red-team: exactly-once wake and notice across retry + rearm combi
 			const jobId = manager.register("bash", "folded-deadletter", async () => "payload");
 			const target = manager.getJob(jobId);
 			if (!target) throw new Error("expected job");
-			manager.markBackgrounded(jobId, target.generation);
+			manager.markBackgrounded(jobId, target.generation, "chord");
 			const probe = probeFor(target, "folded-deadletter");
 			h.coordinator.registerParticipant(probe.adapter);
 			await h.coordinator.requestFold();

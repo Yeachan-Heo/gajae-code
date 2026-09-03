@@ -55,6 +55,10 @@ function lockRetryElapsedMs(budget: LockRetryBudget): number {
 	return Math.max(0, performance.now() - budget.startedAt);
 }
 
+function lockRetryExhausted(budget: LockRetryBudget): boolean {
+	return lockRetryElapsedMs(budget) >= LOCK_ACQUIRE_TIMEOUT_MS;
+}
+
 async function waitForLockRetry(budget: LockRetryBudget): Promise<boolean> {
 	budget.attempts++;
 	const remainingMs = LOCK_ACQUIRE_TIMEOUT_MS - lockRetryElapsedMs(budget);
@@ -410,6 +414,8 @@ export const SessionStateLockTestHooks: {
 	forcedQuarantineName?: string;
 	/** @internal Observes bounded acquisition retries without changing their timing. */
 	afterAcquireContention?: (lockFile: string, attempt: number, elapsedMs: number) => void;
+	/** @internal Runs after transition mkdir contention and before stale-claim inspection. */
+	afterTransitionClaimContention?: (transitionDir: string) => void | Promise<void>;
 } = {};
 
 /** Raised when the lock could not be acquired; callers map it to their own refusal. */
@@ -1494,6 +1500,7 @@ async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<
 type SessionStateLockReclaimResult =
 	| "absent_or_changed"
 	| "legacy_directory_unprovenanced"
+	| "owner_removed"
 	| "owner_live_or_unverifiable"
 	| "owner_record_fresh"
 	| "owner_unprovenanced"
@@ -1532,7 +1539,8 @@ async function reclaimStaleOwnerRecord(
 	// A successor that took the path in the final window keeps it; this call just loses.
 	if (outcome === "refused")
 		throw new SessionStateLockUnavailableError(new Error("Stale owner record could not be reclaimed."));
-	return outcome === "removed" || outcome === "absent" ? "reclaimed" : "absent_or_changed";
+	if (outcome === "removed") return "owner_removed";
+	return "absent_or_changed";
 }
 
 /**
@@ -1664,14 +1672,18 @@ async function releaseTransitionClaim(
 	}
 }
 
-async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName: string): Promise<void> {
-	const stat = await fs.lstat(transitionDir, { bigint: true }).catch(() => null);
-	if (!stat) return;
+async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName: string): Promise<boolean> {
+	let stat: fsSync.BigIntStats;
+	try {
+		stat = await fs.lstat(transitionDir, { bigint: true });
+	} catch {
+		return false;
+	}
 	// Regular-file claims belong to the superseded protocol. They retain the old
 	// exact-identity stale path; released PID-1 tombstones deliberately require
 	// explicit cleanup before this atomic-directory protocol can take over.
 	if (stat.isFile()) {
-		await reclaimStaleOwnerRecord(
+		const reclaimed = await reclaimStaleOwnerRecord(
 			transitionDir,
 			{
 				afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
@@ -1679,41 +1691,41 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 			},
 			quarantineName,
 		);
-		return;
+		return reclaimed === "owner_removed";
 	}
 	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
 	const ownerSnapshot = await captureRegularLockOwner(`${transitionDir}.owner`);
-	if (!ownerSnapshot) return;
+	if (!ownerSnapshot) return false;
 	let owner: unknown;
 	try {
 		owner = JSON.parse(ownerSnapshot.bytes);
 	} catch {
-		return;
+		return false;
 	}
-	if (!validLockOwner(owner)) return;
+	if (!validLockOwner(owner)) return false;
 	await SessionStateLockTestHooks.afterTransitionStaleInspection?.(transitionDir);
 	if (owner.released === true) {
 		// A released record is safe only when it is qualified by this installation.
 		// Never let a shared-volume tombstone, an absent identity, or a legacy foreign
 		// identity authorize removal of a claim this process cannot own.
-		if (owner.owner_host_id === undefined) return;
+		if (owner.owner_host_id === undefined) return false;
 		const currentHost = await currentOwnerHostId();
 		const legacyHost = await currentLegacyOwnerHostId();
-		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return;
-		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return;
+		if (owner.owner_host_id !== currentHost && owner.owner_host_id !== legacyHost) return false;
+		if (Date.now() - Number(ownerSnapshot.mtimeNs / 1_000_000n) < RELEASED_TRANSITION_GRACE_MS) return false;
 	} else if (await lockOwnerIsAlive(owner)) {
 		// Only a host-qualified owner whose pid is PROVEN dead (ESRCH, or a live pid
 		// with a provably different incarnation) authorizes reclaim. The generation
 		// + exact-tree checks below then bind the removal to the very directory
 		// inspected here, on every platform; a claim stranded by a force-quit
 		// (`postmortem.quit`) would otherwise wall the session directory forever.
-		return;
+		return false;
 	}
 	const generation = transitionGenerationFromStat(stat);
 	const nativePath = await canonicalOwnedTransitionPath(transitionDir).catch(() => null);
-	if (!nativePath) return;
+	if (!nativePath) return false;
 	const captured = nativeSessionStateLock().snapshotDirectoryTree(nativePath);
-	if (!captured.ok || !captured.snapshot) return;
+	if (!captured.ok || !captured.snapshot) return false;
 	const root = captured.snapshot.entries.find(entry => entry.relativePath === "");
 	if (
 		!root ||
@@ -1724,13 +1736,12 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		root.mtimeNs !== String(generation.mtimeNs) ||
 		root.ctimeNs !== String(generation.ctimeNs)
 	)
-		return;
-	if (captured.snapshot.entries.length !== 1) return;
+		return false;
+	if (captured.snapshot.entries.length !== 1) return false;
 	const removed = nativeSessionStateLock().exactRemoveDirectoryTree(nativePath, captured.snapshot);
 	if (removed.ok || removed.code === "not_found") {
-		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
-		return;
+		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		return removed.ok;
 	}
 	if (
 		removed.code === "cleanup_pending" &&
@@ -1746,9 +1757,8 @@ async function reclaimStaleTransitionClaim(transitionDir: string, quarantineName
 		// collision on POSIX. rmdir never follows a directory's contents and refuses if a
 		// successor populated the detached path.
 		await removeTransitionDir(removed.detachedPath);
-		const ownerRemoval = exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
-		if (ownerRemoval !== "removed" && ownerRemoval !== "absent") return;
-		return;
+		exactUnlinkOwnerRecord(`${transitionDir}.owner`, ownerSnapshot, quarantineName);
+		return true;
 	}
 	throw new SessionStateLockUnavailableError(
 		new Error(`Stale transition claim could not be reclaimed (${removed.code ?? "unknown"}).`),
@@ -2012,7 +2022,12 @@ async function withLockPathTransition<T>(
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
 			if (code !== "EEXIST" && !isTransientLockError(error)) throw new SessionStateLockUnavailableError(error);
-			await reclaimStaleTransitionClaim(transitionDir, quarantineName);
+			await SessionStateLockTestHooks.afterTransitionClaimContention?.(transitionDir);
+			if (await reclaimStaleTransitionClaim(transitionDir, quarantineName)) {
+				if (lockRetryExhausted(budget))
+					throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
+				continue;
+			}
 			if (!(await waitForLockRetry(budget)))
 				throw lockUnavailable(transitionDir, "transition_claim_timeout", budget, error);
 			continue;

@@ -1150,6 +1150,67 @@ function formatRegistryProvenance(version: string, registry: string | undefined)
 	return `Version ${version} was resolved from ${registry}; GitHub release assets may not exist for a version that was never published there.`;
 }
 
+interface ProcessReportWithLibc {
+	header?: {
+		glibcVersionRuntime?: unknown;
+	};
+}
+
+const GLIBC_VERSION_PATTERN = /^\d+\.\d+$/u;
+
+function reportedGlibcVersion(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const version = value.trim();
+	return GLIBC_VERSION_PATTERN.test(version) ? version : undefined;
+}
+
+function runtimeGlibcVersion(): string | undefined {
+	try {
+		const report = process.report?.getReport?.() as ProcessReportWithLibc | undefined;
+		return reportedGlibcVersion(report?.header?.glibcVersionRuntime);
+	} catch {
+		return undefined;
+	}
+}
+
+function hasMuslLoader(): boolean {
+	return (
+		fs.existsSync("/lib/ld-musl-x86_64.so.1") ||
+		fs.existsSync("/lib/ld-musl-aarch64.so.1") ||
+		fs.existsSync("/lib/ld-musl-armhf.so.1")
+	);
+}
+
+type LinuxLibc = "glibc" | "musl" | "unknown";
+
+function detectLinuxLibcFromSignals(glibcVersionRuntime: string | undefined, muslLoaderPresent: boolean): LinuxLibc {
+	if (reportedGlibcVersion(glibcVersionRuntime) !== undefined) return "glibc";
+	return muslLoaderPresent ? "musl" : "unknown";
+}
+
+function detectLinuxLibc(): LinuxLibc {
+	return detectLinuxLibcFromSignals(runtimeGlibcVersion(), hasMuslLoader());
+}
+
+function unsupportedLinuxLibcReason(libc: LinuxLibc): string | undefined {
+	if (libc === "glibc") return undefined;
+	return libc === "musl"
+		? "Unsupported libc: musl. Prebuilt Linux binaries are glibc-only. See docs/install.md"
+		: "Unable to verify an active glibc runtime. Prebuilt Linux binaries are glibc-only. See docs/install.md";
+}
+
+function assertSupportedLinuxLibc(libc: LinuxLibc): void {
+	const reason = unsupportedLinuxLibcReason(libc);
+	if (reason) throw new Error(formatUnsupportedTargetMessage(reason));
+}
+
+export function assertSupportedLinuxLibcForTest(
+	glibcVersionRuntime: string | undefined,
+	muslLoaderPresent: boolean,
+): void {
+	assertSupportedLinuxLibc(detectLinuxLibcFromSignals(glibcVersionRuntime, muslLoaderPresent));
+}
+
 /**
  * Download a release binary to a target path, replacing an existing file.
  */
@@ -1158,18 +1219,8 @@ async function updateViaBinaryAt(
 	expectedVersion: string,
 	registry?: string,
 ): Promise<InstalledVersionVerification> {
-	if (
-		process.platform === "linux" &&
-		(fs.existsSync("/lib/ld-musl-x86_64.so.1") ||
-			fs.existsSync("/lib/ld-musl-aarch64.so.1") ||
-			fs.existsSync("/lib/ld-musl-armhf.so.1"))
-	) {
-		throw new Error(
-			formatUnsupportedTargetMessage(
-				"Unsupported libc: musl. Prebuilt Linux binaries are glibc-only. See docs/install.md",
-			),
-		);
-	}
+	const linuxLibc = process.platform === "linux" ? detectLinuxLibc() : undefined;
+	if (linuxLibc !== undefined) assertSupportedLinuxLibc(linuxLibc);
 	const binaryName = getBinaryName();
 	const url = buildReleaseBinaryUrl(expectedVersion);
 	const registryNote = formatRegistryProvenance(expectedVersion, registry);

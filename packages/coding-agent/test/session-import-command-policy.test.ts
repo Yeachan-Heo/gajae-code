@@ -65,6 +65,15 @@ type AcpPromptFixture = {
 	dispose: () => void;
 };
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await Bun.sleep(10);
+	}
+	throw new Error("waitFor timed out");
+}
+
 async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 	const tempDir = TempDir.createSync("@acp-import-policy-");
 	const agentDir = path.join(tempDir.path(), "agent");
@@ -273,6 +282,15 @@ describe("session import command transport policy", () => {
 				sessionId: fixture.sessionId,
 				prompt: [{ type: "text", text: "/unknown-command" }],
 			});
+			await waitFor(() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "agent_message_chunk" &&
+						update.update.content.type === "text" &&
+						update.update.content.text.includes("fixture response"),
+				),
+			);
+			await Bun.sleep(0);
 			await fixture.agent.prompt({
 				sessionId: fixture.sessionId,
 				prompt: [{ type: "text", text: "normal prompt" }],

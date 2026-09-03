@@ -1,0 +1,24 @@
+ user                                           │                               
+                                                │                               
+ assistant 45: transcript output remains        │                               
+ selectable                                     │                               
+                                                │                               
+                                                │                               
+ user                                           │                               
+                                                │                               
+ assistant 46: transcript output remains        │                               
+ selectable                                     │                               
+                                                │                               
+                                                │                               
+ user                                           │                               
+                                                │                               
+ assistant 47: transcript output remains        │                               
+ selectable                                     │                               
+                                                │                               
+pending: queued composer input                                                  
+BTW: production viewport evidence                                               
+ ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────── vsticky-viewport 
+hook: ready                                                                     
+╭─────────────────────────────────────────────────────────────────────────────╮ 
+│ > capture cursor                                                            │ 
+╰─────────────────────────────────────────────────────────────────────────────╯ 

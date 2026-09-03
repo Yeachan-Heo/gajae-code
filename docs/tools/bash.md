@@ -86,8 +86,11 @@ Stdout and stderr are merged before the model sees them. Non-zero exit codes are
 
 6. Foreground fold
    - The remappable `app.tool.backgroundFold` chord (Alt+Shift+B by default; Cmd+B on macOS) can fold a running managed non-PTY Bash wait, ACP client-terminal wait, or PTY wait into a manager-owned job.
-   - The foreground turn stops cleanly after the result boundary; completion wakes a later turn with a receipt containing output, original intent, and a `job` retrieval handle.
-   - Folded jobs retain their original deadline and live `job tail` output. PTY observer disposal is non-owning; `job cancel` kills the live PTY through the manager lifecycle.
+   - A user steer admitted into the live run folds the same three surfaces automatically once the command has run for `STEER_FOLD_GRACE_MS` (2000 ms, exported from `bash.ts`, not configurable). Steers inside the grace window let the command finish normally. The steer fold fires only while `busyPromptMode` is `steer` and `toolInterruptPolicy` is `abort_tools`; the `bash.autoBackground` setting is not consulted.
+   - Every fold records `metadata.foldReason` on the job (`steer` | `chord` | `timer` | `sdk_control`) through `AsyncJobManager.markBackgrounded(jobId, generation, reason)`. `async: true` jobs are backgrounded without a fold reason (`markStartedInBackground`).
+   - The background-start result carries `details.foldReason`; a steer fold appends `Folded into background job <id> because a user steer arrived; the command keeps running with its original timeout and its result will wake a later turn.`
+   - Chord, timer, and SDK-control folds stop the foreground turn cleanly after the result boundary; completion wakes a later turn with a receipt containing output, original intent, and a `job` retrieval handle. A steer fold does NOT end the turn: the same run consumes the steer at the tool boundary right after the fold result (subagent-await parity), remaining parallel tools in that batch are skipped, and the job's completion wakes a later turn.
+   - Folded jobs retain their original deadline and live `job tail` output. PTY observer disposal is non-owning; `job cancel` kills the live PTY through the manager lifecycle. Esc still aborts and kills the foreground command; a steer never kills it.
 
 ## Side Effects
 - Filesystem

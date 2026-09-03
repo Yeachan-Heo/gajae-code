@@ -1,0 +1,38 @@
+# Canonical author identities for `git shortlog`, `git log`, and contributor stats.
+#
+# Some contributors have committed under more than one display name from the same
+# address, so identity-based views split one person into several entries. Each line
+# below maps an alias to the name that address used most often in `origin/dev`.
+#
+# Only same-address, unambiguous cases are listed: addresses whose most-used name is
+# tied are left out rather than guessing how a contributor prefers to be shown.
+#
+# Add an alias with:
+#   Preferred Name <preferred@email> Other Name <same@email>
+
+chulmin-dev <kcm1805@gmail.com> kcm1805 <kcm1805@gmail.com>
+chulmin-dev <kcm1805@gmail.com> chulmin <kcm1805@gmail.com>
+Dayum_gud <239489026+project820@users.noreply.github.com> project820 <239489026+project820@users.noreply.github.com>
+dbc-hbin <dion9310@gmail.com> hanbinnoh <dion9310@gmail.com>
+DoYunHa <102889891+HaD0Yun@users.noreply.github.com> HaD0Yun <102889891+HaD0Yun@users.noreply.github.com>
+Hako <devswha@gmail.com> devswha <devswha@gmail.com>
+hoon-ch <hun9211@gmail.com> hoon_ch <hun9211@gmail.com>
+J Choi <25876626+chiznoir@users.noreply.github.com> chiznoir <25876626+chiznoir@users.noreply.github.com>
+Jaeyun Ha <jaeyunha0317@gmail.com> jaeyunha <jaeyunha0317@gmail.com>
+Kim dayoun <dayoooun@gmail.com> Dayoooun <dayoooun@gmail.com>
+larrabee <larrabee.kor@gmail.com> larrabee-kor <larrabee.kor@gmail.com>
+mj.lee <mj.lee@wavebridge.com> 이민재(Minjae Lee) <mj.lee@wavebridge.com>
+mj.lee <mj.lee@wavebridge.com> MJ Lee <mj.lee@wavebridge.com>
+Nahwan Kim <me@nahwan.kim> nahwan-kim <me@nahwan.kim>
+Pro Catsy <project.catsy@gmail.com> Studio-Aeon <project.catsy@gmail.com>
+probe <re2rar@gmail.com> probepark <re2rar@gmail.com>
+sJ00C <kaja974546@gmail.com> DevSJ <kaja974546@gmail.com>
+snowykr <snowykr22@gmail.com> Jun Koo <snowykr22@gmail.com>
+snowykr <snowykr22@gmail.com> Jun, Koo <snowykr22@gmail.com>
+snowykr <snowykr22@gmail.com> user.email <snowykr22@gmail.com>
+Woojin Lee <writerwoody@gmail.com> 10kH <writerwoody@gmail.com>
+Yeachan Heo <yeachan.heo@gmail.com> Bellman <yeachan.heo@gmail.com>
+YEONWOO CHOI <32544727+twoimo@users.noreply.github.com> twoimo <32544727+twoimo@users.noreply.github.com>
+Yongbeom Gwon <ybgwon96@gmail.com> YONGBEOM GWON <ybgwon96@gmail.com>
+김도겸 <rlaehrua930@naver.com> Dogyeom Kim <rlaehrua930@naver.com>
+나형진 <hyeongjin.na@musinsa.com> 나형진(Hyeongjin Na) <hyeongjin.na@musinsa.com>

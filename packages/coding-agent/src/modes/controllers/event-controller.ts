@@ -57,6 +57,17 @@ export const __eventControllerPerfCounters = {
 };
 
 const COMPLETION_NOTIFY_COMMAND_TIMEOUT_MS = 10_000;
+const TEXTLESS_LENGTH_WARNING =
+	'Response ended with stopReason "length" before producing visible text or a tool call. Check the model\'s output and context token limits (maxTokens in models.yml) or lower the reasoning level (/reasoning), then retry.';
+
+function isTextlessLengthStop(message: AssistantMessage | undefined): boolean {
+	return (
+		message?.stopReason === "length" &&
+		!message.content.some(
+			block => (block.type === "text" && block.text.trim().length > 0) || block.type === "toolCall",
+		)
+	);
+}
 
 interface CompletionNotifyPayload {
 	type: "agent-turn-complete";
@@ -904,7 +915,7 @@ export class EventController {
 		}
 	}
 
-	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
+	async #handleAgentEnd(event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		this.ctx.setWorkingMessage(undefined);
 		stopInteractiveActivityIndicator(this.ctx, { foregroundSettled: true });
 		if (this.ctx.streamingComponent) {
@@ -929,6 +940,14 @@ export class EventController {
 		this.ctx.ui.requestRender();
 		this.#scheduleIdleCompaction();
 		emitHostStatus("finished");
+		const lastAssistant = this.ctx.session.getLastAssistantMessage();
+		if (
+			event.stopReason !== "cancelled" &&
+			event.stopReason !== "maintenance" &&
+			isTextlessLengthStop(lastAssistant)
+		) {
+			this.ctx.showWarning(TEXTLESS_LENGTH_WARNING);
+		}
 		this.sendCompletionNotification();
 		this.ctx.promptSuggestion?.onAgentEnd();
 	}
@@ -1204,13 +1223,20 @@ export class EventController {
 		// errored — those are not "Task complete" events. Mirrors the gate
 		// already used by #currentContextTokens, #handleMessageEnd, and the
 		// retry / TTSR / compaction skip paths across agent-session.ts.
-		const last = this.ctx.session.getLastAssistantMessage?.();
+		const last = this.ctx.session.getLastAssistantMessage();
 		if (last?.stopReason === "aborted" || last?.stopReason === "error") return;
 
 		const sessionName = this.ctx.sessionManager.getSessionName();
-		const title = sessionName ? `${sessionName}: Complete` : "Complete";
+		const textlessLengthStop = isTextlessLengthStop(last);
+		const title = textlessLengthStop
+			? sessionName
+				? `${sessionName}: Output limit reached`
+				: "Output limit reached"
+			: sessionName
+				? `${sessionName}: Complete`
+				: "Complete";
 		const summary = summaryFromMessage(last, 1000);
-		const body = summary ?? "Complete";
+		const body = textlessLengthStop ? TEXTLESS_LENGTH_WARNING : (summary ?? "Complete");
 		const sessionManager = this.ctx.sessionManager as { getCwd?: () => string; getSessionId?: () => string };
 		const payload: CompletionNotifyPayload = {
 			type: "agent-turn-complete",

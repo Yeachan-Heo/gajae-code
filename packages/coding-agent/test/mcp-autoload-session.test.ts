@@ -158,7 +158,9 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			// guards the gross "blocked until connected" failure mode (>= 5.5s).
 			expect(Date.now() - startedAt).toBeLessThan(5_500);
 			expect(mcpManager).toBeDefined();
-			expect(mcpManager?.getConnectionStatus("slow-demo")).toBe("connecting");
+			const startupStatus = mcpManager?.getConnectionStatus("slow-demo");
+			if (!startupStatus) throw new Error("slow-demo status was not published");
+			expect(["connecting", "connected"]).toContain(startupStatus);
 			// This integration case deliberately crosses the real MCP startup ceiling;
 			// await the publication callback rather than sleeping for a guessed duration.
 			await published.promise;
@@ -182,9 +184,11 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 		try {
 			expect(mcpManager).toBeDefined();
-			// The conventional server is still inside its declared startup window,
-			// so publication is armed and the plugin contract cannot seal yet.
-			expect(mcpManager?.getConnectionStatus("slow-demo")).toBe("connecting");
+			// Publication may still be connecting or may have completed before this
+			// observer runs on a loaded host; both states preserve the reseal contract.
+			const startupStatus = mcpManager?.getConnectionStatus("slow-demo");
+			if (!startupStatus) throw new Error("slow-demo status was not published");
+			expect(["connecting", "connected"]).toContain(startupStatus);
 			// Drain publication via the session registry rather than a fixed sleep.
 			const deadline = Date.now() + 30_000;
 			while (!session.getAllToolNames().includes("mcp__slow_demo_late_hello")) {

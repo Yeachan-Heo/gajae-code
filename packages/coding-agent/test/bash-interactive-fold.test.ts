@@ -17,16 +17,20 @@ import {
 
 interface CapturedComponent {
 	dispose?: () => void;
+	handleInput?: (data: string) => void;
 }
 
 /** Fake overlay host that exposes the component and the `done` callback. */
-function createTestUi(captured?: { component?: CapturedComponent }): NonNullable<AgentToolContext["ui"]> {
+function createTestUi(
+	captured?: { component?: CapturedComponent },
+	options: { deferDispose?: boolean } = {},
+): NonNullable<AgentToolContext["ui"]> {
 	return {
 		custom<T>(factory: unknown): Promise<T> {
 			const result = Promise.withResolvers<T>();
 			let component: CapturedComponent | undefined;
 			const done = (value: T) => {
-				component?.dispose?.();
+				if (!options.deferDispose) component?.dispose?.();
 				result.resolve(value);
 			};
 			try {
@@ -242,6 +246,41 @@ describe("interactive PTY fold ownership", () => {
 			const outcome = await controls.terminalCompletion;
 			// The run ended on its own deadline, not by being killed at fold time.
 			expect(outcome.timedOut || outcome.exitCode !== 0).toBe(true);
+		} finally {
+			resetSettingsForTest();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("stops forwarding input immediately after folding while the process keeps producing output", async () => {
+		const dir = await tempDir();
+		try {
+			await Settings.init({ inMemory: true, cwd: dir });
+			const marker = path.join(dir, "folded-input.txt");
+			const captured: { component?: CapturedComponent } = {};
+			let controls: InteractivePtyControls | undefined;
+
+			const foregroundPromise = runInteractiveBashPty(createTestUi(captured, { deferDispose: true }), {
+				command: `if read -r -t 0.5 line; then printf '%s' "$line" > ${marker}; else printf 'NO-INPUT' > ${marker}; fi; printf 'OUTPUT-CONTINUED\\n'`,
+				cwd: dir,
+				timeoutMs: 20_000,
+				onControls: next => {
+					controls = next;
+				},
+			});
+
+			await waitFor(() => captured.component?.handleInput !== undefined && controls !== undefined);
+			if (!controls || !captured.component?.handleInput) throw new Error("expected live PTY controls and overlay");
+			expect(controls.detachObserver(FOLD_RESULT)).toBe("resolved");
+			captured.component.handleInput("MUST-NOT-REACH-PTY\r");
+			captured.component.handleInput("\x1b");
+
+			const foreground = await foregroundPromise;
+			expect(foreground.output).toBe("folded into a background job");
+			const outcome = await controls.terminalCompletion;
+			expect(outcome.output).toContain("OUTPUT-CONTINUED");
+			expect(await Bun.file(marker).text()).toBe("NO-INPUT");
+			captured.component.dispose?.();
 		} finally {
 			resetSettingsForTest();
 			await fs.rm(dir, { recursive: true, force: true });

@@ -1,0 +1,36 @@
+ assistant 35: transcript output remains selectable                               │                                     
+                                                                                  │                                     
+                                                                                  │                                     
+ user                                                                             │                                     
+                                                                                  │                                     
+ assistant 36: transcript output remains selectable                               │                                     
+                                                                                  │                                     
+                                                                                  │                                     
+ user                                                                             │                                     
+                                                                                  │                                     
+ assistant 37: transcript output remains selectable                               │                                     
+                                                                                  │                                     
+                                                                                  │                                     
+ user                                                                             │                                     
+                                                                                  │                                     
+ assistant 38: transcript output remains selectable                               │                                     
+                                                                                  │                                     
+                                                                                  │                                     
+ user                                                                             │                                     
+                                                                                  │                                     
+ assistant 39: transcript output remains selectable                               │                                     
+                                                                                  │                                     
+                                                                                  │                                     
+ user                                                                             │                                     
+                                                                                  │                                     
+ assistant 40: transcript output remains selectable                               │                                     
+                                                                                  │                                     
+                                                                                  │                                     
+ user                                                                             │                                     
+                                                                                  │                                     
+ assistant 41: transcript output remains selectable                               │                                     
+ ⬢ sonnet-4.5 · 0.0% ───────────────────────────────────────────────────────────────────────────────── vsticky-viewport 
+hook: ready                                                                                                             
+╭─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮ 
+│ > manual-history composer                                                                                           │ 
+╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ 

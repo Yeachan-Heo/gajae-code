@@ -8566,3 +8566,90 @@ for (const attached of [false, true]) {
 		}
 	});
 }
+test("SDK host publishes one replayable bash_folded frame per fold and runtime.jobs.list carries foldReason", async () => {
+	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-bash-folded-"));
+	dirs.push(cwd);
+	const sessionId = `sdk-bash-folded-${Date.now()}`;
+	const foldListeners = new Set<(event: { jobId: string; generation: string; reason: string }) => void>();
+	const jobs = {
+		running: [
+			{
+				id: "bg_1",
+				type: "bash",
+				status: "running",
+				label: "sleep 30",
+				startTime: Date.now(),
+				metadata: { backgrounded: true, foldReason: "steer" },
+			},
+		],
+		recent: [],
+		delivery: { queued: 0, inFlight: 0, deliveriesDrained: true },
+	};
+	const sessionContext = {
+		...context(cwd, sessionId),
+		getJobs: () => jobs,
+		onJobFold: (listener: (event: { jobId: string; generation: string; reason: string }) => void) => {
+			foldListeners.add(listener);
+			return () => foldListeners.delete(listener);
+		},
+	};
+	const handlers = start(sessionContext);
+	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sessionId}.json`);
+	await waitFor(() => fs.existsSync(endpointFile), "SDK endpoint");
+	const endpoint = JSON.parse(fs.readFileSync(endpointFile, "utf8")) as { url: string; token: string };
+	const frames: Record<string, unknown>[] = [];
+	const socket = new WebSocket(`${endpoint.url}/?token=${encodeURIComponent(endpoint.token)}`);
+	sockets.push(socket);
+	socket.addEventListener("message", event => frames.push(JSON.parse(String(event.data))));
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener("open", () => resolve(), { once: true });
+		socket.addEventListener("error", () => reject(new Error("WS error")), { once: true });
+	});
+	try {
+		await waitFor(() => foldListeners.size === 1, "fold listener registration");
+		for (const listener of foldListeners) listener({ jobId: "bg_1", generation: "gen-1", reason: "steer" });
+		// A second markBackgrounded on the same job never re-notifies (manager
+		// contract); a distinct fold does. Replay must retain exactly one frame per fold.
+		for (const listener of foldListeners) listener({ jobId: "bg_2", generation: "gen-2", reason: "chord" });
+
+		socket.send(JSON.stringify({ type: "event_replay", id: "fold-replay", sinceSeq: 0 }));
+		await waitFor(
+			() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "fold-replay"),
+			"fold replay",
+		);
+		const replay = frames.find(frame => frame.type === "event_replay_result" && frame.id === "fold-replay") as {
+			events?: Array<{ kind?: unknown; payload?: Record<string, unknown> }>;
+		};
+		const folded = replay.events?.filter(event => event.payload?.type === "bash_folded") ?? [];
+		expect(folded).toEqual([
+			expect.objectContaining({
+				kind: "bash_folded",
+				payload: { type: "bash_folded", sessionId, jobId: "bg_1", generation: "gen-1", reason: "steer" },
+			}),
+			expect.objectContaining({
+				kind: "bash_folded",
+				payload: { type: "bash_folded", sessionId, jobId: "bg_2", generation: "gen-2", reason: "chord" },
+			}),
+		]);
+
+		// runtime.jobs.list exposes foldReason beside backgrounded.
+		socket.send(JSON.stringify({ type: "query_request", id: "jobs", query: "runtime.jobs.list" }));
+		await waitFor(() => frames.some(frame => frame.type === "query_response" && frame.id === "jobs"), "jobs query");
+		const jobsResponse = frames.find(frame => frame.type === "query_response" && frame.id === "jobs") as {
+			ok?: boolean;
+			page?: {
+				items?: Array<{
+					running?: Array<{ id: string; metadata?: { foldReason?: string; backgrounded?: boolean } }>;
+				}>;
+			};
+		};
+		expect(jobsResponse.ok).toBe(true);
+		expect(jobsResponse.page?.items?.[0]?.running?.[0]?.metadata).toMatchObject({
+			backgrounded: true,
+			foldReason: "steer",
+		});
+	} finally {
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown" }, sessionContext);
+	}
+	expect(foldListeners.size).toBe(0);
+}, 30_000);

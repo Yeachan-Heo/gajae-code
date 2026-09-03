@@ -39,6 +39,7 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
+import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
 import {
 	detectDiscoveredApiFamily,
 	resolveLoopbackOpenAIBaseUrl,
@@ -69,6 +70,7 @@ import {
 } from "../sdk/providers";
 import type { AuthStorage, OAuthCredential } from "../session/auth-storage";
 import type { ActiveSearchModelContext, WebSearchMode } from "../web/search/types";
+import { type BillingPath, deriveBillingPath } from "./billing-path";
 import { ConfigError, ConfigFile } from "./config-file";
 import { isAuthenticated, kNoAuth } from "./model-auth";
 import { type ConfiguredModelBindings, ModelBindingsApplier } from "./model-bindings-applier";
@@ -115,6 +117,7 @@ import {
 } from "./provider-selection-policy";
 import { type Settings, settings } from "./settings";
 
+export type { BillingPath, BillingPathKind } from "./billing-path";
 export type { EffectiveProviderAuth, ProviderSelectionPolicy } from "./provider-selection-policy";
 export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, ModelEquivalenceConfig };
 
@@ -2801,6 +2804,8 @@ export class ModelRegistry {
 			const autoDiscovery: ProviderDiscovery | undefined =
 				!providerConfig.discovery &&
 				!localOpenAICompat &&
+				providerName !== "vllm" &&
+				providerName !== "sglang" &&
 				providerApi !== undefined &&
 				isOpenAIFamilyApi(providerApi) &&
 				effectiveDiscoveryBaseUrl !== undefined
@@ -4060,12 +4065,7 @@ export class ModelRegistry {
 	async #discoverModelsDevProvider(providerConfig: DiscoveryProviderConfig): Promise<Model<Api>[]> {
 		const baseUrl = providerConfig.baseUrl;
 		if (!baseUrl) throw new Error(`Provider "${providerConfig.provider}" requires baseUrl for models.dev discovery.`);
-		const response = await fetch("https://models.dev/api.json", {
-			headers: { Accept: "application/json" },
-			signal: AbortSignal.timeout(5_000),
-		});
-		if (!response.ok) throw new Error(`HTTP ${response.status} from https://models.dev/api.json`);
-		const payload: unknown = await response.json();
+		const payload: unknown = await fetchModelsDevPayload();
 		if (!isRecord(payload)) return [];
 		const catalogProvider = payload[providerConfig.discovery.modelsDevProvider ?? providerConfig.provider];
 		if (!isRecord(catalogProvider) || !isRecord(catalogProvider.models)) return [];
@@ -5054,6 +5054,18 @@ export class ModelRegistry {
 	 */
 	getEffectiveProviderAuth(provider: string, sessionId?: string): EffectiveProviderAuth {
 		return this.#effectiveProviderAuth(provider, sessionId);
+	}
+
+	/**
+	 * Billing path for a resolved binding — derived at the point the binding
+	 * resolves credentials (model.api + credential provenance). Not a
+	 * provider-name allowlist: a custom OpenAI-compatible provider bound
+	 * to a metered gateway is "metered-api" exactly like a first-party
+	 * key. Only the billing category is ever disclosed.
+	 */
+	getBillingPath(model: Model<Api>, sessionId?: string): BillingPath | undefined {
+		const effectiveAuth = this.#effectiveProviderAuth(model.provider, sessionId);
+		return deriveBillingPath(model.provider, model.api as Api, effectiveAuth);
 	}
 
 	/**

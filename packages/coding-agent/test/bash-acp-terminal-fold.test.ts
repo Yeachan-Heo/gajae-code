@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import { AsyncJobManager } from "../src/async";
+import { AsyncJobManager, type FoldReason, type JobFoldEvent } from "../src/async";
 import { JobsObserver } from "../src/modes/jobs-observer";
 import type {
 	ClientBridge,
@@ -7,9 +7,9 @@ import type {
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../src/session/client-bridge";
-import type { FoldAdapter } from "../src/session/fold-coordinator";
+import { type FoldAdapter, FoldCoordinator } from "../src/session/fold-coordinator";
 import type { ToolSession } from "../src/tools";
-import { BashTool } from "../src/tools/bash";
+import { BashTool, STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "../src/tools/bash";
 
 interface Harness {
 	session: ToolSession;
@@ -73,6 +73,7 @@ function foldVia(adapter: FoldAdapter): void {
 		remainingIntent: undefined,
 		foldedAt: Date.now(),
 		cwdSensitive: adapter.cwdSensitive,
+		reason: "chord",
 	});
 }
 
@@ -634,4 +635,92 @@ describe("BashTool ACP terminal fold", () => {
 		expect(killCalls).toBe(1);
 		expect(releaseCalls).toBe(1);
 	});
+
+	it("folds a client terminal on a post-grace user steer with the steer reason line and retains the remote handle", async () => {
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-steer-fold",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => ({ output: "acp step 1\n", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const createSpy = spyOn(bridge, "createTerminal");
+		const releaseSpy = spyOn(handle, "release");
+		const killSpy = spyOn(handle, "kill");
+
+		const h = makeHarness(bridge);
+		// Enqueue-time steering seam + real coordinator so the fold is driven by a
+		// newly admitted steer, not a manual detach. Full Agent admission is covered
+		// by sdk-steer-fold-live-session.test.ts.
+		const steeringWaiters = new Set<() => void>();
+		const steer = () => {
+			for (const resolve of [...steeringWaiters]) resolve();
+		};
+		const coordinator = new FoldCoordinator({
+			hasActiveTurn: () => true,
+			armSteeringFence: () => () => {},
+			requestStop: () => {},
+			captureRemainingIntent: () => undefined,
+			deliverParked: () => {},
+		});
+		const folds: JobFoldEvent[] = [];
+		h.manager.onFold(event => folds.push(event));
+		const baseGet = h.session.settings.get.bind(h.session.settings);
+		const session = {
+			...h.session,
+			settings: {
+				...h.session.settings,
+				get: (key: string) => (key === "busyPromptMode" ? "steer" : baseGet(key as never)),
+			},
+			registerForegroundFoldParticipant: (adapter: FoldAdapter) => coordinator.registerParticipant(adapter),
+			hasForegroundBashBackgroundRequestHandler: () => coordinator.hasFoldableParticipant(),
+			requestForegroundBashBackground: async (reason?: FoldReason, adapter?: FoldAdapter) =>
+				(await coordinator.requestFold(adapter, reason)).status === "folded",
+			getToolInterruptPolicy: () => "abort_tools" as const,
+			waitForUserSteering: (signal: AbortSignal) => {
+				if (signal.aborted) return Promise.resolve();
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const settle = () => {
+					steeringWaiters.delete(settle);
+					signal.removeEventListener("abort", settle);
+					resolve();
+				};
+				steeringWaiters.add(settle);
+				signal.addEventListener("abort", settle, { once: true });
+				return promise;
+			},
+		} as unknown as ToolSession;
+		const tool = new BashTool(session);
+		const resultPromise = tool.execute("call-steer-fold", { command: "sleep 30" }, undefined, () => {});
+		await waitFor(() => coordinator.hasFoldableParticipant());
+
+		// Inside the grace window: the steer is left for the boundary, nothing folds.
+		steer();
+		await Bun.sleep(200);
+		expect(folds).toHaveLength(0);
+		expect(coordinator.hasFoldableParticipant()).toBe(true);
+
+		await Bun.sleep(STEER_FOLD_GRACE_MS);
+		steer();
+		const result = await resultPromise;
+
+		expect(result.details?.async?.state).toBe("running");
+		expect(result.details?.terminalId).toBe("term-steer-fold");
+		expect(result.details?.foldReason).toBe("steer");
+		const jobId = result.details?.async?.jobId;
+		if (!jobId) throw new Error("expected steer-folded ACP job id");
+		expect(result.content.find(block => block.type === "text")?.text).toContain(steerFoldReasonLine(jobId));
+		expect(h.manager.getJob(jobId)?.metadata).toMatchObject({ backgrounded: true, foldReason: "steer" });
+		expect(folds).toEqual([{ jobId, generation: h.manager.getJob(jobId)!.generation, reason: "steer" }]);
+		expect(createSpy).toHaveBeenCalledTimes(1);
+		expect(releaseSpy).not.toHaveBeenCalled();
+		expect(killSpy).not.toHaveBeenCalled();
+
+		exit.resolve({ exitCode: 0, signal: null });
+		await waitFor(() => h.delivered.length === 1);
+		expect(h.delivered[0]?.text).toContain("acp step 1");
+		await waitFor(() => releaseSpy.mock.calls.length === 1);
+	}, 15_000);
 });

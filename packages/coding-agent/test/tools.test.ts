@@ -258,6 +258,7 @@ function foldViaAdapter(adapter: FoldAdapter): void {
 		remainingIntent: undefined,
 		foldedAt: Date.now(),
 		cwdSensitive: adapter.cwdSensitive,
+		reason: "chord",
 	});
 }
 

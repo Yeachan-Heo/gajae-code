@@ -36,6 +36,7 @@ import type {
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
 import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";
+import type { JobFoldEvent } from "../../async/job-manager";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { ModelSelectorValue } from "../../config/model-selector-value";
@@ -527,6 +528,8 @@ export interface ExtensionContext {
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 
 	getJobs(): unknown;
+	/** Subscribe to foreground-wait folds (`bash_folded`). Returns an unsubscribe function. */
+	onJobFold?(listener: (event: JobFoldEvent) => void): () => void;
 	/** Typed skill and mode controls exposed to the SDK host. */
 	invokeSkill?(
 		name: string,
@@ -1687,6 +1690,8 @@ export interface ExtensionContextActions {
 		| undefined
 		| Promise<{ bytes: Uint8Array; totalBytes: number } | undefined>;
 	getJobs?: () => unknown;
+	/** Subscribe to foreground-wait folds so the SDK host can publish `bash_folded`. Returns an unsubscribe. */
+	onJobFold?: (listener: (event: JobFoldEvent) => void) => () => void;
 	setSdkPermissionProvider?: (
 		provider:
 			| ((
