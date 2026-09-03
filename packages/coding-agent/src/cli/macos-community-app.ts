@@ -412,6 +412,8 @@ async function validateBundleLayout(bundlePath: string): Promise<boolean> {
 			const stat = await fs.lstat(entryPath).catch(() => undefined);
 			if (!stat) return false;
 			if (stat.isSymbolicLink()) {
+				const linkTarget = await fs.readlink(entryPath).catch(() => undefined);
+				if (!linkTarget || path.isAbsolute(linkTarget)) return false;
 				const resolved = await fs.realpath(entryPath).catch(() => undefined);
 				if (!resolved || (resolved !== bundleReal && !resolved.startsWith(`${bundleReal}${path.sep}`)))
 					return false;
@@ -467,12 +469,23 @@ async function findInstalledApp(homeDir: string, command: CommandRunner): Promis
 	return undefined;
 }
 
-async function defaultPrompt(): Promise<boolean> {
+async function defaultPrompt(signal?: AbortSignal): Promise<boolean> {
 	const readline = createInterface({ input: process.stdin, output: process.stdout });
+	const interrupted = Promise.withResolvers<string>();
+	const onAbort = () => {
+		readline.close();
+		interrupted.reject(new Error("community app offer interrupted"));
+	};
+	if (signal?.aborted) onAbort();
+	else signal?.addEventListener("abort", onAbort, { once: true });
 	try {
-		const answer = await readline.question("Install Gajae Code App (experimental, community-built)? [y/N] ");
+		const answer = await Promise.race([
+			readline.question("Install Gajae Code App (experimental, community-built)? [y/N] "),
+			interrupted.promise,
+		]);
 		return /^y(?:es)?$/i.test(answer.trim());
 	} finally {
+		signal?.removeEventListener("abort", onAbort);
 		readline.close();
 	}
 }
@@ -486,6 +499,17 @@ function environmentFlagEnabled(value: string | undefined): boolean {
 	if (!value) return false;
 	const normalized = value.trim().toLowerCase();
 	return normalized !== "0" && normalized !== "false" && normalized !== "no" && normalized !== "off";
+}
+
+function signalExitCode(signal: "SIGINT" | "SIGTERM" | "SIGHUP"): number {
+	switch (signal) {
+		case "SIGINT":
+			return 130;
+		case "SIGTERM":
+			return 143;
+		case "SIGHUP":
+			return 129;
+	}
 }
 
 export async function offerMacosCommunityApp(
@@ -515,7 +539,7 @@ export async function offerMacosCommunityApp(
 		return { status: "skipped", reason: "non-interactive terminal" };
 	}
 
-	let receivedSignal: NodeJS.Signals | undefined;
+	let receivedSignal: "SIGINT" | "SIGTERM" | "SIGHUP" | undefined;
 	let cleanupUnsafe = false;
 	const providedCommand = deps.command;
 	const rawCommand: CommandRunner = providedCommand ?? runCommand;
@@ -533,7 +557,7 @@ export async function offerMacosCommunityApp(
 	const fetchAbortSignal = deps.signal
 		? AbortSignal.any([deps.signal, fetchAbortController.signal])
 		: fetchAbortController.signal;
-	const onSignal = (signal: NodeJS.Signals) => {
+	const onSignal = (signal: "SIGINT" | "SIGTERM" | "SIGHUP") => {
 		receivedSignal = signal;
 		fetchAbortController.abort();
 		for (const controller of activeCommandControllers) controller.abort();
@@ -559,13 +583,15 @@ export async function offerMacosCommunityApp(
 		offerSettled.resolve();
 		unregisterPostmortemCleanup();
 		removeSignalHandlers();
+		if (receivedSignal) process.exitCode = signalExitCode(receivedSignal);
 		return result;
 	};
 	const homeDir = deps.homeDir ?? os.homedir();
 	try {
 		if (await findInstalledApp(homeDir, command))
 			return finishOwnership({ status: "skipped", reason: "already installed" });
-		if (!(await (deps.prompt ?? defaultPrompt)())) return finishOwnership({ status: "skipped", reason: "cancelled" });
+		if (!(await (deps.prompt ?? (() => defaultPrompt(fetchAbortSignal)))()))
+			return finishOwnership({ status: "skipped", reason: "cancelled" });
 	} catch (error) {
 		return finishOwnership(failure(error instanceof Error ? error.message : String(error), log));
 	}
@@ -684,7 +710,6 @@ export async function offerMacosCommunityApp(
 					: "unknown";
 			throw error;
 		}
-		throwIfInterrupted();
 		if (attach.reaped === false) {
 			mountIdentity = undefined;
 			mountState = "unknown";
@@ -707,6 +732,7 @@ export async function offerMacosCommunityApp(
 					: observedMountIdentity && mountPointBeforeAttachIdentity
 						? "none"
 						: "unknown";
+		throwIfInterrupted();
 		if (attach.exitCode !== 0) return failure("the DMG could not be mounted safely", log);
 		if (!mountIdentity) return failure("the mounted volume was not a real directory", log);
 		if (!(await samePathIdentity(dmgPath, stagedDmgIdentity)))
@@ -928,6 +954,7 @@ export async function offerMacosCommunityApp(
 		offerSettled.resolve();
 		unregisterPostmortemCleanup();
 		removeSignalHandlers();
+		if (receivedSignal) process.exitCode = signalExitCode(receivedSignal);
 	}
 }
 

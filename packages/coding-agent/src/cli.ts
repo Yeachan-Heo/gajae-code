@@ -28,6 +28,7 @@ if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 process.title = APP_NAME;
 const rootHelpFlags = ["--help", "-h", "help"];
 const versionFlags = ["--version", "-v"];
+const MACOS_COMMUNITY_APP_CAPABILITY_ARG = "--supports-macos-community-app";
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
 const TMUX_OWNER_ISOLATION_ARG = "--internal-tmux-owner-isolation";
@@ -450,6 +451,10 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	if (argv[0] === "--smoke-test") {
 		await runSmokeTest();
+		return;
+	}
+	if (argv.length === 1 && argv[0] === MACOS_COMMUNITY_APP_CAPABILITY_ARG) {
+		process.stdout.write("macos-community-app-offer\n");
 		return;
 	}
 	if (argv.length === 1 && argv[0] === "macos-community-app-offer") {
