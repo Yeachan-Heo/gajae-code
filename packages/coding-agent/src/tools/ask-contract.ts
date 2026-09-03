@@ -26,8 +26,43 @@ function deepInterviewBoundedString(maximum: number) {
 	});
 }
 
+function isReservedCustomInputOptionLabel(label: string): boolean {
+	const withoutNumbering = label
+		.normalize("NFKC")
+		.toLowerCase()
+		.trim()
+		.replace(/^\d+[.)]\s+/u, "");
+	if (/^other[\p{P}\p{S}\s]*$/u.test(withoutNumbering) && withoutNumbering !== "other") return true;
+	const wordsOnly = withoutNumbering
+		.replace(/[\p{P}\p{S}]+/gu, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+	const englishPseudoOptions = new Set([
+		"other type your own",
+		"other specify",
+		"other please specify",
+		"type your own",
+		"write your own",
+		"enter manually",
+		"custom input",
+	]);
+	if (englishPseudoOptions.has(wordsOnly)) return true;
+	const compact = wordsOnly.replace(/\s+/g, "");
+	return ["직접입력", "직접입력으로추가", "기타", "기타입력"].includes(compact);
+}
+
 const OptionItem = z.object({
-	label: z.string().describe("display label"),
+	label: z
+		.string()
+		.describe("display label")
+		.superRefine((value, context) => {
+			if (isReservedCustomInputOptionLabel(value))
+				context.addIssue({
+					code: "custom",
+					message:
+						"ask option labels must not imitate the reserved custom-input control; omit the pseudo-option and let the Ask UI add Other (type your own)",
+				});
+		}),
 });
 
 const DEEP_INTERVIEW_INTENT_ID_PATTERN = /^(artifact|surface|integration|constraint):[a-z0-9][a-z0-9._/-]{0,127}$/;

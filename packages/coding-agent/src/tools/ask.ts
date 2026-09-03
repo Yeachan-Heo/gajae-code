@@ -158,7 +158,8 @@ function getDoneOptionLabel(): string {
 	return success ? `${success} Done selecting` : "Done selecting";
 }
 
-function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
+export function validRecommendedIndex(recommended: number | undefined, optionCount: number): number | undefined {
+	if (optionCount <= 1) return undefined;
 	return typeof recommended === "number" &&
 		Number.isFinite(recommended) &&
 		Number.isInteger(recommended) &&
@@ -350,7 +351,7 @@ async function askSingleQuestion(
 	options: AskSingleQuestionOptions = {},
 ): Promise<SelectionResult> {
 	const {
-		recommended,
+		recommended: requestedRecommended,
 		timeout,
 		signal,
 		initialSelection,
@@ -358,6 +359,7 @@ async function askSingleQuestion(
 		scrollTitleRows,
 		autoSelectOnTimeout = true,
 	} = options;
+	const recommended = validRecommendedIndex(requestedRecommended, optionLabels.length);
 	const doneLabel = getDoneOptionLabel();
 	const otherOptionLabel = options.otherOptionLabel ?? OTHER_OPTION;
 	const clarificationOptionLabel = options.clarificationOptionLabel;
@@ -1118,6 +1120,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 			},
 		) => {
 			const rawOptionLabels = q.options.map(o => o.label);
+			const recommended = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 			const questionIndex = params.questions.indexOf(q);
 			const emptyCustomAttempt = options?.emptyCustomAttempt ?? 0;
 			// Route headless asks through the SDK workflow-gate emitter; a connected
@@ -1128,7 +1131,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					question: q.question,
 					options: q.options,
 					multi: q.multi,
-					recommended: q.recommended,
+					recommended,
 					deepInterview: q.deepInterview,
 					workflowGate: q.workflowGate,
 					allowEmpty: q.multi === true && params.questions.length > 1,
@@ -1177,12 +1180,11 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 								}),
 							}
 						: options?.previous;
-				const recommendedIndex = validRecommendedIndex(q.recommended, rawOptionLabels.length);
 				activeRemoteRequest = {
 					question: displayQuestion,
 					options: remoteSelectorOptions,
 					interaction: "selector",
-					...(recommendedIndex === undefined ? {} : { recommendedIndex }),
+					...(recommended === undefined ? {} : { recommendedIndex: recommended }),
 					...(timeout === undefined || timeout === null ? {} : { timeoutMs: timeout }),
 					...(clarificationOptionLabel ? { transitionCount: 2 } : { transitionCount: 1 }),
 					multi: q.multi === true,
@@ -1204,7 +1206,7 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 					cancelled,
 					timedOut,
 				} = await askSingleQuestion(ui, displayQuestion, optionLabels, q.multi ?? false, {
-					recommended: q.recommended,
+					recommended,
 					timeout: timeout ?? undefined,
 					signal,
 					initialSelection,
@@ -1221,8 +1223,8 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 							question: displayQuestion,
 							options: state.interaction === "selector" ? remoteSelectorOptions : [],
 							interaction: state.interaction,
-							...(state.interaction === "selector" && recommendedIndex !== undefined
-								? { recommendedIndex }
+							...(state.interaction === "selector" && recommended !== undefined
+								? { recommendedIndex: recommended }
 								: {}),
 							...(state.interaction === "selector" && timeout !== undefined && timeout !== null
 								? { timeoutMs: timeout }

@@ -370,6 +370,25 @@ describe("AskTool cancellation", () => {
 		expect(select.mock.calls[0]?.[2]?.timeout).toBeGreaterThan(0);
 	});
 
+	it("does not mark a single option as recommended", async () => {
+		const tool = new AskTool(createSession());
+		const select = vi.fn(async (_prompt: string, options: string[], dialogOptions) => {
+			expect(options).toEqual(["yes", "Other (type your own)"]);
+			expect(dialogOptions?.initialIndex).toBeUndefined();
+			return "yes";
+		});
+
+		await tool.execute(
+			"call-single-option-no-recommendation",
+			{
+				questions: [{ id: "confirm", question: "Proceed?", options: [{ label: "yes" }], recommended: 0 }],
+			},
+			undefined,
+			undefined,
+			createContext({ select }),
+		);
+	});
+
 	it("auto-selects the first option when timeout elapses without a selected option", async () => {
 		const tool = new AskTool(
 			createSession({
@@ -2184,6 +2203,64 @@ describe("AskTool deep-interview rendering middleware", () => {
 		expect(result.details?.customInput).toBe("Use my own boundary");
 	});
 
+	it("routes Context 추가 follow-up through automatic Other custom input without pseudo-options", async () => {
+		const tool = new AskTool(createSession());
+		const rawQuestion = [
+			"Round 6 | Component: Context 추가 custom-input 확인 흐름 | Targeting: Criteria | Why now: follow-up input must use the runtime custom-input control | Ambiguity: 8%",
+			"",
+			"Context 추가 후 더 알려줄 내용을 입력하세요.",
+		].join("\n");
+		const submittedContext = "추가 context는 자동 customInput으로만 기록";
+		const forbiddenPseudoOptions = ["직접 입력으로 추가", "직접 입력", "Other", "custom input", "type your own"];
+		const editor = vi.fn(async () => {
+			throw new Error("inline custom input should avoid fallback editor");
+		});
+		const select = vi.fn(async (_prompt: string, options: string[], dialogOptions) => {
+			expect(options).toEqual([
+				"1. 현재 해석 유지",
+				"2. 취소",
+				"3. Other (type your own)",
+				"4. Ask about these choices",
+			]);
+			expect(dialogOptions?.initialIndex).toBeUndefined();
+			expect(dialogOptions?.customInput?.optionLabel).toBe("3. Other (type your own)");
+			for (const forbidden of forbiddenPseudoOptions) {
+				expect(options.slice(0, 2)).not.toContain(forbidden);
+			}
+			dialogOptions?.customInput?.onSubmit(submittedContext);
+			return dialogOptions?.customInput?.optionLabel;
+		});
+		const context = createContext({ select, editor });
+
+		const result = await tool.execute(
+			"call-deep-interview-context-add-follow-up",
+			{
+				questions: [
+					{
+						id: "context-add-follow-up",
+						question: rawQuestion,
+						options: [{ label: "현재 해석 유지" }, { label: "취소" }],
+						deepInterview: deepInterviewMeta(),
+						workflowGate: { stage: "deep-interview", kind: "question" },
+					},
+				],
+			},
+			undefined,
+			undefined,
+			context,
+		);
+
+		expect(result.details?.question).toBe(rawQuestion);
+		expect(result.details?.options).toEqual(["현재 해석 유지", "취소"]);
+		for (const forbidden of forbiddenPseudoOptions) {
+			expect(result.details?.options).not.toContain(forbidden);
+		}
+		expect(result.details?.selectedOptions).toEqual([]);
+		expect(result.details?.customInput).toBe(submittedContext);
+		expect(result.details?.clarificationQuestion).toBeUndefined();
+		expect(editor).not.toHaveBeenCalled();
+	});
+
 	it("opts deep-interview selector prompts into local prompt scrolling", async () => {
 		const tool = new AskTool(createSession());
 		const rawQuestion = [
@@ -3042,6 +3119,46 @@ describe("AskTool deep-interview recorder persistence", () => {
 		expect(ralplanGateEmitter.emitGate).toHaveBeenCalledWith(
 			expect.objectContaining({ stage: "ralplan", kind: "approval" }),
 		);
+	});
+
+	it("omits single-option recommendations from workflow gates", async () => {
+		const gateEmitter = {
+			supportsRemoteGateAnswers: () => true,
+			emitGate: vi.fn(async () => ({ selected: ["Keep current"] })),
+		};
+
+		const result = await new AskTool(
+			createSession({ hasUI: false, getWorkflowGateEmitter: () => gateEmitter } as Partial<ToolSession>),
+		).execute(
+			"call-single-option-workflow-gate",
+			{
+				questions: [
+					{
+						id: "single",
+						question: "Only one safe action remains.",
+						options: [{ label: "Keep current" }],
+						recommended: 0,
+					},
+				],
+			},
+			undefined,
+			undefined,
+			undefined,
+		);
+
+		const gate = (
+			gateEmitter.emitGate.mock.calls as unknown as Array<
+				[
+					{
+						options: Array<{ description?: string; label: string }>;
+					},
+				]
+			>
+		)[0]?.[0];
+		expect(gate?.options).toHaveLength(1);
+		expect(gate?.options[0]?.label).toBe("Keep current");
+		expect(gate?.options[0]?.description).toBeUndefined();
+		expect(result.details?.selectedOptions).toEqual(["Keep current"]);
 	});
 
 	it("prefers the local interactive UI over the workflow gate when a UI context is present", async () => {
