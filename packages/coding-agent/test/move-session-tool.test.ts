@@ -690,6 +690,7 @@ describe.serial("move_session tool (agent-invokable session rescope)", () => {
 			const startup = startDeferredMemoryBackend!();
 			await startupEntered.promise;
 			const move = session.getToolByName("move_session")!.execute("move-deferred-hindsight-race", { path: cwdB });
+			void move.catch(() => undefined);
 			releaseStartup.resolve();
 			await startup;
 			await expect(move).rejects.toThrow(/Hindsight bank scope and queued retains are launch-bound/);
