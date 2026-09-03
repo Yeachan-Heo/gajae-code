@@ -806,7 +806,7 @@ After the spec is written, mark it `pending approval` and present execution opti
 
 2. **Execute with ultragoal (only when spec is already implementation-ready and really simple)**
    - Description: "Goal-tracked autonomous execution — drives the spec to completion with verification. Skip ralplan refinement only when the spec is concrete, low-risk, and trivially small."
-   - Action: Invoke `/skill:ultragoal` with the spec file path as context only after the user explicitly selects this execution option. The spec replaces ultragoal planning input. Recommend this only when the spec needs no further planning; otherwise route through ralplan refinement first.
+   - Action: Only after the user explicitly selects this execution option, record that distinct approval through `gjc deep-interview approve-execution --json`, then invoke `/skill:ultragoal` with the spec file path as context. The handoff itself never grants approval and rejects an unapproved Crystal. The spec replaces ultragoal planning input. Recommend this only when the spec needs no further planning; otherwise route through ralplan refinement first.
 
 3. **Continue research with autoresearch (research continuation, not execution)**
    - Description: "Feed the crystallized spec into an autoresearch mission to deepen research grounding before any implementation planning. This is not an execution path and implements nothing."
@@ -816,7 +816,7 @@ After the spec is written, mark it `pending approval` and present execution opti
    - Description: "Continue interviewing to improve clarity (current: {score}%)"
    - Action: Return to Phase 2 interview loop.
 
-**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan` or `/skill:ultragoal`) inside the agent session. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/_session-{sessionid}/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. Implementation handoff defaults to `/skill:ultragoal`. The autoresearch option is a research continuation only and never an execution path. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
+**IMPORTANT:** On explicit execution selection, **MUST** use the chosen bundled GJC workflow skill entrypoint (`/skill:ralplan` or `/skill:ultragoal`) inside the agent session. Before an approved Crystal can enter `/skill:ultragoal`, persist the user's separate execution decision with `gjc deep-interview approve-execution --json`; never attach approval to the handoff command. `gjc ralplan` is a native CLI that accepts the documented skill flags and seeds local `.gjc/_session-{sessionid}/state` receipts; agent sessions should still drive the consensus loop through `/skill:ralplan`. Implementation handoff defaults to `/skill:ultragoal`. The autoresearch option is a research continuation only and never an execution path. Do NOT implement directly. The deep-interview agent is a requirements agent, not an execution agent. If oversized initial context was summarized, pass the spec and prompt-safe summary forward, not the raw oversized source material. Without explicit execution selection, stop with the spec marked `pending approval`.
 
 ### Phase 5b: Handoff before chain
 

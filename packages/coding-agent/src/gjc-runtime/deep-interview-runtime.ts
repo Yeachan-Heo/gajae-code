@@ -198,6 +198,10 @@ async function authoritativeConversationSnapshot(
 	messages: Array<{ index: number; role: string; content: string }>;
 }> {
 	let sessionFile = process.env.GJC_SESSION_FILE?.trim();
+	// The native command accepts an explicit workspace cwd, which may differ from
+	// process.cwd(). Resolve relative managed transcript paths against that same
+	// workspace so transcript identity and content cannot drift with process launch location.
+	if (sessionFile) sessionFile = path.resolve(cwd, sessionFile);
 	if (!sessionFile) {
 		const candidates = [...listProjectSessionTranscriptFiles(cwd)];
 		const pending = [getSessionsDir()];
@@ -1374,6 +1378,8 @@ export async function runNativeDeepInterviewCommand(
 ): Promise<DeepInterviewCommandResult> {
 	try {
 		const [firstArg, ...restArgs] = args;
+		if (firstArg === "approve-execution")
+			return await runNativeStateCommand(["approve-execution", "--mode", "deep-interview", ...restArgs], cwd);
 		if (isDeepInterviewStageVerb(firstArg)) return await runDeepInterviewStageCommand(firstArg, restArgs, cwd);
 		if (hasFlag(args, "--crystallize")) return await handleCrystallize(args, cwd);
 		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd, options.agentDir);

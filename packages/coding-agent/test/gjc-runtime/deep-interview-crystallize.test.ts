@@ -520,6 +520,79 @@ describe("deep-interview crystallize contract", () => {
 		}
 	});
 
+	it("resolves a relative GJC_SESSION_FILE against the requested workspace", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-relative-workspace-"));
+		const processRoot = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-relative-process-"));
+		const relativeSessionFile = path.join("sessions", "conversation.jsonl");
+		const workspaceSessionFile = path.join(root, relativeSessionFile);
+		const wrongSessionFile = path.join(processRoot, relativeSessionFile);
+		const sessionId = "crystallize-relative-session";
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		const previousCwd = process.cwd();
+		try {
+			await fs.mkdir(path.dirname(workspaceSessionFile), { recursive: true });
+			await fs.mkdir(path.dirname(wrongSessionFile), { recursive: true });
+			const header = `${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n`;
+			await fs.writeFile(
+				workspaceSessionFile,
+				`${header}${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Correct workspace transcript" },
+				})}\n`,
+			);
+			await fs.writeFile(
+				wrongSessionFile,
+				`${header}${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Wrong process transcript" },
+				})}\n`,
+			);
+			const messages: CrystalSnapshot["messages"] = [
+				{ index: 0, role: "user", content: "Correct workspace transcript" },
+			];
+			const snapshot: CrystalSnapshot = { revision: 1, start: 0, end: 0, messages, digest: "" };
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			const value = input({
+				snapshot,
+				current_revision: 1,
+				items: [
+					{
+						id: "goal:workspace",
+						kind: "goal",
+						classification: "confirmed",
+						statement: "Use the correct workspace transcript",
+						anchor: { message_index: 0, quote: "Correct workspace transcript" },
+					},
+				],
+			});
+			process.env.GJC_SESSION_FILE = relativeSessionFile;
+			process.chdir(processRoot);
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(value),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"relative-session-file",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			const summary = JSON.parse(result.stdout ?? "{}");
+			expect(summary.crystal.source.messages).toEqual(messages);
+			expect(summary.crystal.source.messages[0].content).not.toBe("Wrong process transcript");
+		} finally {
+			process.chdir(previousCwd);
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+			await fs.rm(processRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("does not reactivate an inactive deep-interview state through crystallization", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-inactive-"));
 		const sessionId = "crystallize-inactive";
