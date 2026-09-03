@@ -156,6 +156,15 @@ function isSingleLinkRegularFile(stat: fs.Stats): boolean {
 	return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1;
 }
 
+/** Reject hard-linked executable or configuration files in isolated discovery. */
+export async function isSingleLinkRegularFileAt(filePath: string): Promise<boolean> {
+	try {
+		return isSingleLinkRegularFile(await fs.promises.lstat(filePath));
+	} catch {
+		return false;
+	}
+}
+
 function sameFileIdentity(left: Pick<fs.Stats, "dev" | "ino">, right: Pick<fs.Stats, "dev" | "ino">): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
@@ -236,6 +245,16 @@ export async function readFile(filePath: string, options?: ReadFileOptions): Pro
 	const useCache = !options?.bypassCache && !options?.isolatedHome;
 	if (useCache && contentCache.has(abs)) {
 		return contentCache.get(abs) ?? null;
+	}
+	if (!options?.isolatedHome) {
+		try {
+			const content = await Bun.file(abs).text();
+			if (useCache) contentCache.set(abs, content);
+			return content;
+		} catch {
+			if (useCache) contentCache.set(abs, null);
+			return null;
+		}
 	}
 
 	const opened = await openIsolatedFile(abs, options);
@@ -320,6 +339,25 @@ export async function readFileSize(filePath: string, options?: ReadFileOptions):
 	}
 }
 
+async function validateDirectoryPath(
+	abs: string,
+	options: ReadFileOptions | undefined,
+	authorized: fs.Stats | null,
+): Promise<boolean> {
+	if (!options?.isolatedHome) return true;
+	if (authorized === null) return false;
+	if (!(await isHomeIdentityStable(options))) return false;
+	if (!(await isUserAgentIdentityStable(options))) return false;
+	try {
+		const current = await fs.promises.stat(abs);
+		return (
+			current.isDirectory() && sameFileIdentity(current, authorized) && (await isCurrentIsolatedPath(abs, options))
+		);
+	} catch {
+		return false;
+	}
+}
+
 export async function readDirEntries(dirPath: string, options?: ReadFileOptions): Promise<fs.Dirent[]> {
 	let abs: string | null;
 	try {
@@ -338,6 +376,17 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	const authorized = await statAuthorizedPath(abs, options);
 	if (options?.isolatedHome && authorized === null) return [];
 	try {
+		// Linux can enumerate a pinned directory descriptor through /proc. Node
+		// does not expose an equivalent descriptor path on macOS or Windows, so
+		// use direct readdir only after validating the authorized path both before
+		// and after the read. This keeps valid explicit-home directories visible
+		// instead of silently treating them as empty on those platforms.
+		if (options?.isolatedHome && process.platform !== "linux") {
+			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
+			if (!(await validateDirectoryPath(abs, options, authorized))) return [];
+			if (useCache) dirCache.set(abs, entries);
+			return entries;
+		}
 		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
 		const directoryOnly = fs.constants.O_DIRECTORY ?? 0;
 		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow | directoryOnly);

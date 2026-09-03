@@ -24,7 +24,7 @@ import {
 	TurnEndedUpdateSchema,
 	WebSearchRequestQuerySchema,
 } from "../src/providers/cursor/gen/agent_pb";
-import { stream as streamModel } from "../src/stream";
+import { stream as streamModel, streamSimple } from "../src/stream";
 import type { AssistantMessage, Context, CursorExecHandlers, Model } from "../src/types";
 
 const cursorModel: Model<"cursor-agent"> = {
@@ -103,6 +103,20 @@ async function collectTerminal(
 	return { events, result: await stream.result() };
 }
 
+async function collectSimpleTerminal(
+	baseUrl: string,
+	options: {
+		streamFirstEventTimeoutMs?: number;
+		streamIdleTimeoutMs?: number;
+		signal?: AbortSignal;
+	},
+): Promise<{ events: unknown[]; result: AssistantMessage }> {
+	const stream = streamSimple({ ...cursorModel, baseUrl }, baseContext, { apiKey: "test-token", ...options });
+	const events: unknown[] = [];
+	for await (const event of stream) events.push(event);
+	return { events, result: await stream.result() };
+}
+
 function isTerminalEvent(event: unknown): boolean {
 	if (!event || typeof event !== "object") return false;
 	const type = (event as { type?: unknown }).type;
@@ -114,6 +128,125 @@ describe("Cursor raw transport watchdog", () => {
 		expect(cursorExecDeadlineMsForTest(undefined)).toBe(480_000);
 		expect(cursorExecDeadlineMsForTest(0)).toBe(480_000);
 		expect(cursorExecDeadlineMsForTest(120_000)).toBe(480_000);
+	});
+
+	it("preserves streamSimple first-event and disabled-idle watchdog overrides", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+		});
+		const controller = new AbortController();
+		const pending = collectSimpleTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 5,
+			streamIdleTimeoutMs: 0,
+		});
+		let timedOut = false;
+		const outcome = await Promise.race([
+			pending,
+			Bun.sleep(250).then(() => {
+				timedOut = true;
+				controller.abort(new Error("streamSimple watchdog test timed out"));
+				return undefined;
+			}),
+		]);
+		if (!outcome) await pending;
+		expect(timedOut).toBe(false);
+		expect(outcome?.result.stopReason).toBe("error");
+		expect(outcome?.result.errorMessage).toContain("first transport event");
+	});
+
+	it("preserves a streamSimple idle watchdog override", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "interactionUpdate",
+						value: create(InteractionUpdateSchema, {
+							message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+						}),
+					}),
+				10,
+			);
+		});
+		const controller = new AbortController();
+		const pending = collectSimpleTerminal(baseUrl, {
+			signal: controller.signal,
+			streamFirstEventTimeoutMs: 500,
+			streamIdleTimeoutMs: 5,
+		});
+		let timedOut = false;
+		const outcome = await Promise.race([
+			pending,
+			Bun.sleep(250).then(() => {
+				timedOut = true;
+				controller.abort(new Error("streamSimple idle watchdog test timed out"));
+				return undefined;
+			}),
+		]);
+		if (!outcome) await pending;
+		expect(timedOut).toBe(false);
+		expect(outcome?.result.stopReason).toBe("error");
+		expect(outcome?.result.errorMessage).toContain("stalled");
+	});
+
+	it("does not reserve detached-mutation capacity for ordinary execs", async () => {
+		const serverStreams: http2.ServerHttp2Stream[] = [];
+		const release = Promise.withResolvers<void>();
+		let executions = 0;
+		const execFrame = buildServerMessageFrame({
+			case: "execServerMessage",
+			value: create(ExecServerMessageSchema, {
+				id: 1,
+				message: { case: "piReadArgs", value: create(PiReadExecArgsSchema, { path: "/tmp/quota" }) },
+			}),
+		});
+		const turnEndedFrame = buildServerMessageFrame({
+			case: "interactionUpdate",
+			value: create(InteractionUpdateSchema, {
+				message: { case: "turnEnded", value: create(TurnEndedUpdateSchema, {}) },
+			}),
+		});
+		const endFrame = frameConnectMessage(new Uint8Array(), CONNECT_END_STREAM_FLAG);
+		const baseUrl = await createCursorServer(stream => {
+			serverStreams.push(stream);
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			setTimeout(() => stream.write(execFrame), 10);
+		});
+		const pending = Array.from({ length: 65 }, (_, index) =>
+			collectTerminal(baseUrl, {
+				conversationId: `ordinary-exec-quota-${index}`,
+				streamFirstEventTimeoutMs: 500,
+				streamIdleTimeoutMs: 500,
+				execHandlers: {
+					piRead: async call => {
+						executions += 1;
+						await release.promise;
+						return {
+							role: "toolResult",
+							toolCallId: call.toolCallId,
+							toolName: "read",
+							content: [],
+							isError: false,
+							timestamp: Date.now(),
+						};
+					},
+				},
+			}),
+		);
+		const settleTimer = setTimeout(() => {
+			release.resolve();
+			for (const stream of serverStreams) {
+				if (!stream.closed && !stream.destroyed) stream.end(Buffer.concat([turnEndedFrame, endFrame]));
+			}
+		}, 100);
+		try {
+			await Promise.all(pending);
+			expect(executions).toBe(65);
+		} finally {
+			clearTimeout(settleTimer);
+			release.resolve();
+		}
 	});
 
 	it("starts the first-event budget before large request-context rule construction", async () => {

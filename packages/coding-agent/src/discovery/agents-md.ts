@@ -5,7 +5,7 @@
  * This handles AGENTS.md files that live in project root (not in config directories
  * like .OpenAI code backend/ or .gemini/, which are handled by their respective providers).
  */
-import type { Stats } from "node:fs";
+import type * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { registerProvider } from "../capability";
@@ -30,7 +30,7 @@ export type AgentsMdReader = (
 	options?: { noFollow?: boolean; home?: string; homeIdentity?: FileIdentity },
 ) => Promise<{ content: string | null; byteLength: number; tooLarge: boolean }>;
 
-function sameFileIdentity(left: Stats, right: Stats): boolean {
+function sameFileIdentity(left: fsSync.Stats, right: fsSync.Stats): boolean {
 	return left.dev === right.dev && left.ino === right.ino;
 }
 
@@ -49,7 +49,7 @@ async function readBoundedAgentsMdFile(
 			return false;
 		}
 	};
-	let before: Stats | undefined;
+	let before: fsSync.Stats | undefined;
 	let canonicalPath: string | undefined;
 	try {
 		if (!(await homeIsStable())) return { content: null, byteLength: 0, tooLarge: false };

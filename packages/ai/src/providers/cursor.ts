@@ -453,8 +453,8 @@ function cursorAbortError(signal: AbortSignal): Error {
 
 /** Marker failures must escape resolveExecHandler instead of becoming a late wire response. */
 class CursorExecAdmissionClosedError extends Error {
-	constructor() {
-		super("Cursor non-abortable exec was marked after wrapper terminalization");
+	constructor(message = "Cursor non-abortable exec was marked after wrapper terminalization") {
+		super(message);
 		this.name = "CursorExecAdmissionClosedError";
 	}
 }
@@ -656,21 +656,21 @@ async function waitForCursorWrites(
 				if (!onTimeout) closeStalledCursorRequest(request);
 				throw error;
 			}
-			const timeoutPromise = new Promise<never>((_resolve, reject) => {
-				timeout = setTimeout(() => {
-					const error = new Error(`Cursor request write drain timed out after ${boundedTimeoutMs}ms`);
-					// Reject first so teardown callbacks that synchronously complete or
-					// fail a write cannot replace the deterministic timeout outcome.
-					reject(error);
-					try {
-						onTimeout?.(error);
-					} catch {
-						// The transport teardown callback is best effort.
-					}
-					if (!onTimeout) closeStalledCursorRequest(request);
-				}, remainingMs);
-			});
-			timeoutPromise.catch(() => {});
+			const timeoutDeferred = Promise.withResolvers<never>();
+			timeoutDeferred.promise.catch(() => {});
+			timeout = setTimeout(() => {
+				const error = new Error(`Cursor request write drain timed out after ${boundedTimeoutMs}ms`);
+				// Reject first so teardown callbacks that synchronously complete or
+				// fail a write cannot replace the deterministic timeout outcome.
+				timeoutDeferred.reject(error);
+				try {
+					onTimeout?.(error);
+				} catch {
+					// The transport teardown callback is best effort.
+				}
+				if (!onTimeout) closeStalledCursorRequest(request);
+			}, remainingMs);
+			const timeoutPromise = timeoutDeferred.promise;
 			await Promise.race([writesDone, timeoutPromise]);
 			if (timeout) {
 				clearTimeout(timeout);
@@ -700,32 +700,26 @@ export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | nu
  */
 function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
 	if (isClosedCursorRequest(request)) return false;
-	let resolveWrite!: () => void;
-	let rejectWrite!: (error: unknown) => void;
 	let completed = false;
-	let completion!: Promise<void>;
+	const completion = Promise.withResolvers<void>();
 	const pending = pendingCursorWrites.get(request) ?? new Set<Promise<void>>();
 	pendingCursorWrites.set(request, pending);
-	completion = new Promise<void>((resolve, reject) => {
-		resolveWrite = resolve;
-		rejectWrite = reject;
-	});
 	// The final request drain observes this rejection, but an asynchronous writer
 	// callback can run before that drain starts. Mark it handled immediately so a
 	// late transport error cannot surface as an unhandled rejection in the gap.
-	completion.catch(() => {});
-	pending.add(completion);
+	completion.promise.catch(() => {});
+	pending.add(completion.promise);
 	const finish = (error?: unknown) => {
 		if (completed) return;
 		completed = true;
-		pending.delete(completion);
+		pending.delete(completion.promise);
 		if (error != null && !cursorWriteErrors.has(request)) cursorWriteErrors.set(request, error);
 		if (typeof request.removeListener === "function") {
 			request.removeListener("close", onClose);
 			request.removeListener("error", finish);
 		}
-		if (error == null) resolveWrite();
-		else rejectWrite(error);
+		if (error == null) completion.resolve();
+		else completion.reject(error);
 	};
 	const onClose = () => finish(new Error("Cursor request closed before write completed"));
 	try {
@@ -1807,8 +1801,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							// response. Its deadline is independent from raw transport
 							// progress, and pausing the request supplies bounded backpressure.
 							if (isExecutable) {
-								mutationSlotReserved = reserveCursorMutationLock(conversationId);
-								if (!mutationSlotReserved) throw new Error("Cursor mutation lock capacity exhausted");
 								clearTransportWatchdog();
 								execInFlight = true;
 							}
@@ -1840,16 +1832,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										options?.signal,
 										cursorExecDeadlineMsForTest(idleTimeoutMs),
 										settlement => {
-											if (mutationSlotReserved) {
-												releaseCursorMutationLockReservation(conversationId);
-												mutationSlotReserved = false;
+											if (!reserveCursorMutationLock(conversationId)) {
+												throw new CursorExecAdmissionClosedError(
+													"Cursor non-abortable mutation capacity exhausted",
+												);
 											}
+											mutationSlotReserved = true;
 											pendingNonAbortableExec = settlement;
 											const lock = settlement.settled.then(
 												() => undefined,
 												() => undefined,
 											);
 											registerCursorMutationLock(conversationId, lock);
+											releaseCursorMutationLockReservation(conversationId);
+											mutationSlotReserved = false;
 										},
 										() => {
 											if (mutationSlotReserved) {

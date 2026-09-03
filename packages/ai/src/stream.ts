@@ -944,6 +944,8 @@ function mapOptionsForApi<TApi extends Api>(
 		repetitionPenalty: options?.repetitionPenalty,
 		maxTokens: resolveDefaultRequestMaxTokens(model, options?.maxTokens),
 		signal: options?.signal,
+		streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
+		streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
 		apiKey: apiKey || options?.apiKey,
 		fallbackManaged: options?.fallbackManaged,
 		fallbackAttempt: options?.fallbackAttempt,

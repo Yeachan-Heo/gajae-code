@@ -18,6 +18,7 @@ import { type SSHHost, sshCapability } from "@gajae-code/coding-agent/capability
 import { type SystemPrompt, systemPromptCapability } from "@gajae-code/coding-agent/capability/system-prompt";
 import { toolCapability } from "@gajae-code/coding-agent/capability/tool";
 import { getAgentDir, resetAgentDirFromEnvironment, setAgentDir } from "@gajae-code/utils";
+import { type MCPServer, mcpCapability } from "../src/capability/mcp";
 import { Settings } from "../src/config/settings";
 // Register all discovery providers as a side effect.
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
@@ -249,14 +250,41 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 	);
 
 	test.skipIf(process.platform === "linux")(
-		"isolated directory reads do not fall back to a path when descriptor enumeration is unavailable",
+		"isolated directory reads remain available when descriptor enumeration is unavailable",
 		async () => {
 			const directory = path.join(home, "enumeration");
 			await writeFile(path.join(directory, "entry.txt"), "entry");
 
-			expect(await readDirEntries(directory, { isolatedHome: true, home })).toEqual([]);
+			expect((await readDirEntries(directory, { isolatedHome: true, home })).map(entry => entry.name)).toEqual([
+				"entry.txt",
+			]);
 		},
 	);
+
+	test("explicit home defaults an omitted cwd to the supplied profile", async () => {
+		await writeFile(path.join(home, ".gjc", "agent", "SYSTEM.md"), "# supplied home system");
+
+		const result = await loadCapabilityForHome<SystemPrompt>(systemPromptCapability.id, home, {
+			providers: ["native"],
+		});
+
+		expect(result.items.map(item => item.content)).toEqual(["# supplied home system"]);
+	});
+
+	test("explicit home checks cwd-only project roots at cwd rather than every ancestor", async () => {
+		const outside = path.join(tempDir, "outside-mcp");
+		const nestedProject = path.join(project, "nested");
+		await fs.mkdir(nestedProject, { recursive: true });
+		await writeFile(path.join(outside, "mcp.json"), JSON.stringify({ mcpServers: {} }));
+		await fs.symlink(outside, path.join(project, "mcp.json"), "file");
+
+		const result = await loadCapabilityForHome<MCPServer>(mcpCapability.id, home, {
+			cwd: nestedProject,
+			providers: ["mcp-json"],
+		});
+
+		expect(result.items).toEqual([]);
+	});
 
 	test("isolated Cline reads bypass a poisoned same-lexical cache entry", async () => {
 		const decoyFile = path.join(tempDir, "process-decoy", "clinerules");
@@ -488,14 +516,17 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		const directTarget = path.join(tempDir, "outside-direct.ts");
 		const indexTarget = path.join(tempDir, "outside-index.ts");
 		const manifestTarget = path.join(tempDir, "outside-manifest.ts");
+		const hardlinkTarget = path.join(tempDir, "outside-hardlink.ts");
 		await writeFile(directTarget, "export default {};");
 		await writeFile(indexTarget, "export default {};");
 		await writeFile(manifestTarget, "export default {};");
+		await writeFile(hardlinkTarget, "export default {};");
 		await fs.mkdir(path.join(extensionsDir, "indexed"), { recursive: true });
 		await fs.mkdir(path.join(extensionsDir, "declared"), { recursive: true });
 		await fs.symlink(directTarget, path.join(extensionsDir, "direct.ts"), "file");
 		await fs.symlink(indexTarget, path.join(extensionsDir, "indexed", "index.ts"), "file");
 		await fs.symlink(manifestTarget, path.join(extensionsDir, "declared", "outside.ts"), "file");
+		await fs.link(hardlinkTarget, path.join(extensionsDir, "hardlinked.ts"));
 		await writeFile(
 			path.join(extensionsDir, "declared", "package.json"),
 			JSON.stringify({ gjc: { extensions: ["./outside.ts"] } }),
@@ -508,6 +539,21 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 
 		expect(result.items).toEqual([]);
 		expect(result.warnings).toEqual([]);
+	});
+
+	test.skipIf(process.platform === "win32")("explicit home excludes hard-linked native hook candidates", async () => {
+		const outsideHook = path.join(tempDir, "outside-hook.ts");
+		const isolatedHook = path.join(home, ".gjc", "agent", "hooks", "pre", "foreign.ts");
+		await writeFile(outsideHook, "export default {};");
+		await fs.mkdir(path.dirname(isolatedHook), { recursive: true });
+		await fs.link(outsideHook, isolatedHook);
+
+		const result = await loadCapabilityForHome(hookCapability.id, home, {
+			cwd: project,
+			providers: ["native"],
+		});
+
+		expect(result.items).toEqual([]);
 	});
 
 	test("explicit home uses the physical home boundary for nested non-Git projects", async () => {

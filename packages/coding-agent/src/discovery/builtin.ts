@@ -10,7 +10,7 @@ import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { type Extension, type ExtensionManifest, extensionCapability } from "../capability/extension";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
-import { type ReadScope, readDirEntries, readFile } from "../capability/fs";
+import { isSingleLinkRegularFileAt, type ReadScope, readDirEntries, readFile } from "../capability/fs";
 import { type Hook, hookCapability } from "../capability/hook";
 import { type Instruction, instructionCapability } from "../capability/instruction";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
@@ -833,6 +833,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 
 			const hookPath = await canonicalBuiltinPath(ctx, path.join(typeDir, entry.name), readScopeForLevel(level));
 			if (!hookPath) continue;
+			if (ctx.isolatedHome && !(await isSingleLinkRegularFileAt(hookPath))) continue;
 			const baseName = entry.name.includes(".") ? entry.name.slice(0, entry.name.lastIndexOf(".")) : entry.name;
 			const tool = baseName === "*" ? "*" : baseName;
 

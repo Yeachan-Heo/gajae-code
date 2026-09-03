@@ -68,6 +68,8 @@ const EXPLICIT_HOME_PROVIDER_ROOTS = [
 	{ providerIds: ["ssh-json"], user: null, project: ".ssh.json" },
 ] as const;
 
+const ANCESTOR_SCOPED_PROJECT_PROVIDERS = new Set(["agents", "agents-md", "cline"]);
+
 function isWithinOrEqual(root: string, candidate: string): boolean {
 	const relative = path.relative(root, candidate);
 	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
@@ -122,9 +124,12 @@ async function assertExplicitHomeRoots(
 	providerIds: ReadonlySet<string>,
 ): Promise<void> {
 	const userRoots = new Map<string, string>();
-	const projectRoots = new Map<string, string>();
-	const addRoot = (roots: Map<string, string>, root: string, label: string): void => {
-		if (!roots.has(root)) roots.set(root, label);
+	const projectRoots = new Map<string, { label: string; walksAncestors: boolean }>();
+	const addUserRoot = (root: string, label: string): void => {
+		if (!userRoots.has(root)) userRoots.set(root, label);
+	};
+	const addProjectRoot = (root: string, label: string, walksAncestors = false): void => {
+		if (!projectRoots.has(root)) projectRoots.set(root, { label, walksAncestors });
 	};
 
 	// Resolve aliases before selecting roots. For example, the registered
@@ -133,8 +138,13 @@ async function assertExplicitHomeRoots(
 	for (const source of EXPLICIT_HOME_PROVIDER_ROOTS) {
 		if (!source.providerIds.some(providerId => providerIds.has(providerId))) continue;
 		const label = source.providerIds.join("/");
-		if (source.user) addRoot(userRoots, path.join(canonicalHome, source.user), `${label} user root`);
-		if (source.project) addRoot(projectRoots, source.project, `${label} project root`);
+		if (source.user) addUserRoot(path.join(canonicalHome, source.user), `${label} user root`);
+		if (source.project)
+			addProjectRoot(
+				source.project,
+				`${label} project root`,
+				source.providerIds.some(providerId => ANCESTOR_SCOPED_PROJECT_PROVIDERS.has(providerId)),
+			);
 	}
 
 	// Native and SSH providers use the managed agent directory for user scope,
@@ -144,39 +154,39 @@ async function assertExplicitHomeRoots(
 	const usesNative = providerIds.has("native");
 	const usesSsh = providerIds.has("ssh-json");
 	if ((usesNative || usesSsh) && !explicitAgentDir)
-		addRoot(userRoots, path.join(canonicalHome, getConfigDirName(), "agent"), "user agent directory");
+		addUserRoot(path.join(canonicalHome, getConfigDirName(), "agent"), "user agent directory");
 	if (usesNative || usesSsh) {
 		// Native and SSH project discovery are fixed to `.gjc`; configured project
 		// roots are validated only by adapters that actually consume them below.
-		addRoot(projectRoots, ".gjc", "native/SSH project registry root");
+		addProjectRoot(".gjc", "native/SSH project registry root");
 	}
 
 	// The marketplace provider derives its user registry from the XDG-aware
 	// helper rather than a fixed `<home>/.gjc/plugins` path.
 	if (providerIds.has("claude-plugins")) {
-		addRoot(projectRoots, path.join(getConfigDirName(), "plugins"), "project plugin registry root");
-		addRoot(userRoots, getPluginsDir(canonicalHome), "plugin registry root");
+		addProjectRoot(path.join(getConfigDirName(), "plugins"), "project plugin registry root", true);
+		addUserRoot(getPluginsDir(canonicalHome), "plugin registry root");
 	}
 
 	await Promise.all(
 		[...userRoots.entries()].map(([root, label]) => canonicalizeContainedPath(canonicalHome, root, label)),
 	);
 
-	// Project discovery walks from cwd toward the home boundary. Validate every
-	// provider root at each ancestor so a symlinked non-native project registry
-	// cannot redirect a read outside the explicit profile.
-	let current = cwd;
-	while (true) {
-		await Promise.all(
-			[...projectRoots.entries()].map(([relativeRoot, label]) =>
-				canonicalizeContainedPath(canonicalHome, path.join(current, relativeRoot), label),
-			),
-		);
-		if (current === canonicalHome) break;
-		const parent = path.dirname(current);
-		if (parent === current) break;
-		current = parent;
-	}
+	// Validate only the roots at the boundaries their providers actually inspect.
+	// Cwd-only providers must not fail because an unrelated ancestor contains a
+	// symlinked config file; ancestor-scoped providers retain the full walk.
+	await Promise.all(
+		[...projectRoots.entries()].map(async ([relativeRoot, { label, walksAncestors }]) => {
+			let current = cwd;
+			while (true) {
+				await canonicalizeContainedPath(canonicalHome, path.join(current, relativeRoot), label);
+				if (!walksAncestors || current === canonicalHome) break;
+				const parent = path.dirname(current);
+				if (parent === current) break;
+				current = parent;
+			}
+		}),
+	);
 }
 
 /** Settings manager for persistence (if set) */
@@ -442,11 +452,9 @@ export async function loadCapabilityForHome<T>(
 	// getAgentDir() is deliberately not consulted: an explicit home must never
 	// read another profile's SYSTEM/RULES/AGENTS, skills, commands, hooks,
 	// settings, or executable descriptors.
-	const lexicalCwd = path.resolve(options.cwd ?? getProjectDir());
-	const [canonicalHome, cwd] = await Promise.all([
-		canonicalizeThroughExistingAncestor(resolvedHome),
-		canonicalizeThroughExistingAncestor(lexicalCwd),
-	]);
+	const canonicalHome = await canonicalizeThroughExistingAncestor(resolvedHome);
+	const lexicalCwd = options.cwd === undefined ? canonicalHome : path.resolve(options.cwd);
+	const cwd = await canonicalizeThroughExistingAncestor(lexicalCwd);
 	const homeStats = await fs.stat(canonicalHome);
 	const homeIdentity = { dev: homeStats.dev, ino: homeStats.ino };
 	// Every explicit-home cwd must resolve inside the supplied physical home.
