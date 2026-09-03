@@ -352,6 +352,35 @@ describe("multi-line fatal messages", () => {
 		expect(contents).toContain("    at secondFrame (fixture.ts:2:1)");
 	});
 
+	it("preserves a lone headerless frame", () => {
+		const target = tempCrashLog();
+		recordFatalCrash(
+			"Uncaught Exception",
+			{ name: "Error", message: "boom", stack: "    at onlyFrame (fixture.ts:1:1)" },
+			{ path: target },
+		);
+
+		expect(fs.readFileSync(target, "utf8")).toContain("    at onlyFrame (fixture.ts:1:1)");
+	});
+
+	it("strips coded V8 stack headers without duplicating the message", () => {
+		const target = tempCrashLog();
+		recordFatalCrash(
+			"Uncaught Exception",
+			{
+				name: "AssertionError",
+				message: "boom",
+				stack: "AssertionError [ERR_ASSERTION]: boom\n    at onlyFrame (fixture.ts:1:1)",
+			},
+			{ path: target },
+		);
+
+		const contents = fs.readFileSync(target, "utf8");
+		expect(contents).toContain("AssertionError: boom");
+		expect(contents).toContain("    at onlyFrame (fixture.ts:1:1)");
+		expect(contents).not.toContain("AssertionError [ERR_ASSERTION]: boom");
+	});
+
 	it("prints each line of a multi-line message exactly once on stderr", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-crash-multiline-"));
 		const script = path.join(dir, "throw-multiline.ts");
