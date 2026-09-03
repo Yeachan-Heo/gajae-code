@@ -103,6 +103,21 @@ function migrateV1ToV2(state: Record<string, unknown>, skill: CanonicalGjcWorkfl
 	return migrated;
 }
 
+function revokeMigratedDeepInterviewAuthority(state: Record<string, unknown>): Record<string, unknown> {
+	const migrated = cloneRecord(state);
+	if (migrated.state && typeof migrated.state === "object" && !Array.isArray(migrated.state)) {
+		const inner = cloneRecord(migrated.state as Record<string, unknown>);
+		delete inner.crystal;
+		delete inner.execution_approval_receipt;
+		inner.execution_approval = "not-approved";
+		migrated.state = inner;
+	}
+	for (const key of ["spec_path", "spec_sha256", "spec_slug", "spec_stage"] as const) delete migrated[key];
+	migrated.current_phase = "interviewing";
+	if ("phase" in migrated) migrated.phase = "interviewing";
+	return migrated;
+}
+
 const MIGRATIONS: Record<number, WorkflowStateMigration> = {
 	1: migrateV1ToV2,
 };
@@ -121,6 +136,11 @@ export function migrateWorkflowState(raw: Record<string, unknown>, skill: string
 		state = MIGRATIONS[version](state, canonicalSkill);
 		version += 1;
 		changed = true;
+	}
+	if (canonicalSkill === "deep-interview") {
+		const revoked = revokeMigratedDeepInterviewAuthority(state);
+		if (!recordsEqual(state, revoked)) changed = true;
+		state = revoked;
 	}
 
 	return { state, fromVersion, toVersion: version, changed };
@@ -144,7 +164,8 @@ export function normalizeLegacyState(raw: Record<string, unknown>, skill: string
 	state.receipt = receiptWithRequiredFields(state.receipt, canonicalSkill);
 
 	const migrated = migrateWorkflowState(state, canonicalSkill).state;
-	return { state: migrated, changed: !recordsEqual(raw, migrated) };
+	const safeState = canonicalSkill === "deep-interview" ? revokeMigratedDeepInterviewAuthority(migrated) : migrated;
+	return { state: safeState, changed: !recordsEqual(raw, safeState) };
 }
 
 export async function migrateAndPersistLegacyState(
