@@ -797,7 +797,7 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		(expected.endpointFileId === undefined || current.endpointFileId === expected.endpointFileId) &&
+		current.endpointFileId === expected.endpointFileId &&
 		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
 		(expected.hostIncarnation === undefined || current.hostIncarnation === expected.hostIncarnation) &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
