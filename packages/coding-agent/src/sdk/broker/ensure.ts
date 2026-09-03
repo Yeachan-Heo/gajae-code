@@ -5,8 +5,8 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import packageJson from "../../../package.json" with { type: "json" };
 import { SdkClient } from "../client/client";
-import { acquireFileLock, type FileLockOptions } from "../../config/file-lock";
-import { type BrokerDiscovery, brokerProcessIncarnation, isPidAlive, readBrokerDiscovery } from "./discovery";
+import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
+import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 
@@ -35,6 +35,8 @@ const DISCOVERY_TIMEOUT_MS = 10_000;
 const SPAWN_LOCK_WAIT_MS = DISCOVERY_TIMEOUT_MS + 5_000;
 const SPAWN_LOCK_RETRY_DELAY_MS = 50;
 const SPAWN_LOCK_TARGET_NAME = "broker.spawn";
+const STARTUP_LOCK_WAIT_MS = DISCOVERY_TIMEOUT_MS - 1_000;
+const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
@@ -55,6 +57,18 @@ async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}
 		retries: Math.ceil(SPAWN_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
 		retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
 		...options,
+	});
+}
+
+/**
+ * Child-owned fence for the interval from bootstrap through discovery publication.
+ * The parent-held spawn lock prevents ordinary stampedes; this second fence keeps
+ * startup single-flight if that detached child's launcher dies and its lock is reclaimed.
+ */
+export function withBrokerStartupLock<T>(agentDir: string, operation: () => Promise<T>): Promise<T> {
+	return withFileLock(path.join(agentDir, "sdk", STARTUP_LOCK_TARGET_NAME), operation, {
+		retries: Math.ceil(STARTUP_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
+		retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
 	});
 }
 const FIXTURE_DISCOVERY_TIMEOUT_MS = 30_000;
@@ -419,14 +433,15 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			env: brokerSpawnEnvironment(command, settings.env),
 			...(command.kind === "bun-source" ? { cwd: command.cwd } : {}),
 		});
-		// The child holds its own duplicate of the descriptor; this one is done.
-		await spawnLog?.handle.close();
-		child.unref();
 		let spawnError: Error | undefined;
 		child.once("error", error => {
 			spawnError = error;
 		});
 		const owner = registerBrokerOwner(settings.agentDir, child);
+		child.unref();
+		// The child holds its own duplicate of the descriptor. Failure to close the
+		// parent's diagnostic handle must not discard exact ownership of a live child.
+		await spawnLog?.handle.close().catch(() => undefined);
 		const discoveryTimeoutMs = initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS;
 		const deadline = Date.now() + discoveryTimeoutMs;
 		let discoveryError: unknown;

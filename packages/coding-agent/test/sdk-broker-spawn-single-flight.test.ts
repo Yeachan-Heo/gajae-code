@@ -84,6 +84,42 @@ it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and 
 	}
 }, 60_000);
 
+it("independent broker bootstrap children serialize before Broker.start", async () => {
+	const dir = await temp();
+	const children = Array.from({ length: 3 }, () =>
+		Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdout: "pipe",
+			stderr: "pipe",
+		}),
+	);
+	let discovery: Awaited<ReturnType<typeof brokerDiscovery.readBrokerDiscovery>> = null;
+	try {
+		const deadline = Date.now() + 10_000;
+		while (!discovery && Date.now() < deadline) {
+			discovery = await brokerDiscovery.readBrokerDiscovery(dir);
+			if (!discovery) await Bun.sleep(20);
+		}
+		expect(discovery).not.toBeNull();
+		const losers = children.filter(child => child.pid !== discovery!.pid);
+		const loserCodes = await Promise.all(losers.map(child => child.exited));
+		expect(loserCodes).toEqual(losers.map(() => 0));
+		const sdkEntries = await fs.readdir(path.join(dir, "sdk"));
+		expect(sdkEntries).not.toContain("broker.startup.lock");
+		expect(sdkEntries.filter(name => name.startsWith(".broker.lock.stale-"))).toEqual([]);
+	} finally {
+		for (const child of children) child.kill("SIGTERM");
+		if (discovery)
+			try {
+				process.kill(discovery.pid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await Promise.all(children.map(child => child.exited));
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
+
 it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
 	const dir = await temp();
 	const readBrokerDiscovery = brokerDiscovery.readBrokerDiscovery;
