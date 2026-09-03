@@ -3,12 +3,26 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 import { Broker, resolveBrokerPackageGeneration } from "../src/sdk/broker/broker";
+import type { BrokerDiscovery } from "../src/sdk/broker/discovery";
 import { readBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { ensureBroker } from "../src/sdk/broker/ensure";
+import { brokerOwnerIdentityMatchesForTest, ensureBroker } from "../src/sdk/broker/ensure";
 
 const currentGeneration = (packageJson as { version: string }).version;
 
 describe("sdk broker stale-generation fence (#5227)", () => {
+	test("stale retirement requires the exact broker process incarnation", () => {
+		const stale = {
+			ownerId: "stale-owner",
+			pid: 4242,
+			incarnation: "linux:old",
+		} satisfies Pick<BrokerDiscovery, "ownerId" | "pid" | "incarnation">;
+
+		expect(brokerOwnerIdentityMatchesForTest(stale, stale)).toBe(true);
+		expect(brokerOwnerIdentityMatchesForTest({ ...stale, incarnation: "linux:new" }, stale)).toBe(false);
+		expect(brokerOwnerIdentityMatchesForTest({ ...stale, pid: 4243 }, stale)).toBe(false);
+		expect(brokerOwnerIdentityMatchesForTest({ ...stale, ownerId: "replacement-owner" }, stale)).toBe(false);
+	});
+
 	test("broker publishes current package generation, never unknown", async () => {
 		const agentDir = await fs.mkdtemp(path.join(import.meta.dir, "../.tmp-gen-"));
 		const broker = new Broker({ agentDir });
@@ -27,7 +41,7 @@ describe("sdk broker stale-generation fence (#5227)", () => {
 		const agentDir = await fs.mkdtemp(path.join(import.meta.dir, "../.tmp-stale-"));
 		// Start a broker that claims to be old generation "unknown"
 		const staleBroker = new Broker({ agentDir, packageGeneration: "unknown" });
-		let staleDiscovery: Awaited<ReturnType<typeof staleBroker.start>>;
+		let staleDiscovery: BrokerDiscovery;
 		try {
 			staleDiscovery = await staleBroker.start();
 			expect(staleDiscovery.packageGeneration).toBe("unknown");

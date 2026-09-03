@@ -4,6 +4,7 @@ import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import packageJson from "../../../package.json" with { type: "json" };
+import { SdkClient } from "../client/client";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
 import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
@@ -262,12 +263,19 @@ function fixtureLeaseUnavailable(): Error {
 const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 5_000;
 const STALE_BROKER_POLL_MS = 50;
 
+type BrokerOwnerIdentity = Pick<BrokerDiscovery, "ownerId" | "pid" | "incarnation">;
+
+function sameBrokerOwner(left: BrokerOwnerIdentity | null, right: BrokerOwnerIdentity): boolean {
+	return Boolean(
+		left && left.ownerId === right.ownerId && left.pid === right.pid && left.incarnation === right.incarnation,
+	);
+}
+
 async function retireStaleBrokerGeneration(stale: BrokerDiscovery, settings: EnsureBrokerSettings): Promise<void> {
 	let shutdownSucceeded = false;
 	try {
-		const { SdkClient } = await import("../client/client");
 		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (!current || current.ownerId !== stale.ownerId || current.pid !== stale.pid) return;
+		if (!current || !sameBrokerOwner(current, stale)) return;
 		const client = await SdkClient.connect(current.url, current.token, { timeoutMs: 2_000 });
 		try {
 			await client.global("broker.shutdown", {});
@@ -289,7 +297,7 @@ async function retireStaleBrokerGeneration(stale: BrokerDiscovery, settings: Ens
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		if (!current || current.pid !== stale.pid || current.incarnation !== stale.incarnation) break;
+		if (!sameBrokerOwner(current, stale)) break;
 		await sleep(STALE_BROKER_POLL_MS);
 	}
 }
@@ -534,6 +542,13 @@ export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBroker
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
 export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 	return owners.get(agentDir);
+}
+/** Test hook: verifies the complete broker owner identity used during stale retirement. */
+export function brokerOwnerIdentityMatchesForTest(
+	left: BrokerOwnerIdentity | null,
+	right: BrokerOwnerIdentity,
+): boolean {
+	return sameBrokerOwner(left, right);
 }
 /** Test hook: drives the detached-broker reap on a controllable child surface. */
 export function reapSpawnedBrokerForTest(child: ChildProcess, timing: ReapTiming = DEFAULT_REAP_TIMING): Promise<void> {
