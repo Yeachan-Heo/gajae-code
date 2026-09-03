@@ -121,6 +121,8 @@ const TRACE_SOURCE_EXTENSIONS = new Set([
 	".yaml",
 ]);
 
+const DEEP_INTERVIEW_NON_TEXT_CONTENT_TYPES = new Set(["image", "audio", "video", "file", "content"]);
+
 interface DeepInterviewTraceSummary {
 	enabled: true;
 	generated_at: string;
@@ -274,19 +276,34 @@ async function authoritativeConversationSnapshot(
 			const message = entry.message as unknown;
 			if (!isRecord(message) || typeof message.role !== "string")
 				throw new DeepInterviewCommandError(2, "live session transcript contains a malformed message");
-			const projectedContent =
-				typeof message.content === "string"
-					? message.content
-					: Array.isArray(message.content)
-						? message.content
-								.filter(item => item && typeof item === "object" && !Array.isArray(item))
-								.map(item =>
-									typeof (item as Record<string, unknown>).text === "string"
-										? (item as Record<string, unknown>).text
-										: `[${typeof (item as Record<string, unknown>).type === "string" ? (item as Record<string, unknown>).type : "content"}]`,
-								)
-								.join("")
-						: "";
+			let projectedContent: string;
+			if (typeof message.content === "string") {
+				projectedContent = message.content;
+			} else if (Array.isArray(message.content)) {
+				const projectedParts: string[] = [];
+				for (const item of message.content) {
+					if (!isRecord(item) || typeof item.type !== "string")
+						throw new DeepInterviewCommandError(
+							2,
+							"live session transcript contains unsupported message content",
+						);
+					if (item.type === "text") {
+						if (typeof item.text !== "string")
+							throw new DeepInterviewCommandError(2, "live session transcript contains malformed text content");
+						projectedParts.push(item.text);
+					} else if (DEEP_INTERVIEW_NON_TEXT_CONTENT_TYPES.has(item.type)) {
+						projectedParts.push(`[${item.type}]`);
+					} else {
+						throw new DeepInterviewCommandError(
+							2,
+							"live session transcript contains unsupported message content",
+						);
+					}
+				}
+				projectedContent = projectedParts.join("");
+			} else {
+				throw new DeepInterviewCommandError(2, "live session transcript contains malformed message content");
+			}
 			messages.push({ index, role: message.role, content: projectedContent.normalize("NFC").trim() });
 		}
 		if (messages.length === 0) throw new DeepInterviewCommandError(2, "live session transcript has no messages");
@@ -428,7 +445,7 @@ async function handleCrystallizeUnlocked(
 		const specMatch = /^deep-interview-(.+)-v[0-9]+\.md$/.exec(specName);
 		const recoverySlug = specMatch?.[1];
 		if (!recoverySlug) throw new DeepInterviewCommandError(2, "canonical Crystal publication identity is invalid");
-		const recoveryMutationId = `crystal:${sessionId}:${priorSpecVersion}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}\0${existingSpecHash}`).digest("hex")}`;
+		const recoveryMutationId = `crystal:${sessionId}:${priorSpecVersion}:${createHash("sha256").update(`${recoverySlug}\0${existingSpecPath}`).digest("hex")}`;
 		const pending = await readWorkflowTransactionJournal(cwd, sessionId, recoveryMutationId);
 		if (
 			pending &&
@@ -490,7 +507,7 @@ async function handleCrystallizeUnlocked(
 	const specHash = specContent ? createHash("sha256").update(specContent).digest("hex") : undefined;
 	const mutationId =
 		specPath && specHash
-			? `crystal:${sessionId}:${crystal.spec_version}:${createHash("sha256").update(`${slug}\0${specPath}\0${specHash}`).digest("hex")}`
+			? `crystal:${sessionId}:${crystal.spec_version}:${createHash("sha256").update(`${slug}\0${specPath}`).digest("hex")}`
 			: undefined;
 	if (mutationId) {
 		const existingJournal = await readWorkflowTransactionJournal(cwd, sessionId, mutationId);

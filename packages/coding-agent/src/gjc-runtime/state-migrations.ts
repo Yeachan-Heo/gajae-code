@@ -163,8 +163,11 @@ export function normalizeLegacyState(raw: Record<string, unknown>, skill: string
 	if (typeof state.updated_at !== "string") state.updated_at = new Date().toISOString();
 	state.receipt = receiptWithRequiredFields(state.receipt, canonicalSkill);
 
-	const migrated = migrateWorkflowState(state, canonicalSkill).state;
-	const safeState = canonicalSkill === "deep-interview" ? revokeMigratedDeepInterviewAuthority(migrated) : migrated;
+	const migrated = migrateWorkflowState(state, canonicalSkill);
+	const safeState =
+		canonicalSkill === "deep-interview" && migrated.fromVersion < WORKFLOW_STATE_VERSION
+			? revokeMigratedDeepInterviewAuthority(migrated.state)
+			: migrated.state;
 	return { state: safeState, changed: !recordsEqual(raw, safeState) };
 }
 

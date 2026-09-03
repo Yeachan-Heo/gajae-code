@@ -64,6 +64,35 @@ describe("state migrations", () => {
 		});
 	});
 
+	it("preserves current-version deep-interview Crystal authorization during migration", () => {
+		const current = {
+			version: WORKFLOW_STATE_VERSION,
+			skill: "deep-interview",
+			active: true,
+			current_phase: "handoff",
+			updated_at: "2026-01-01T00:00:00.000Z",
+			spec_path: "/tmp/deep-interview-approved.md",
+			spec_sha256: "a".repeat(64),
+			spec_slug: "approved",
+			spec_stage: "final",
+			state: {
+				crystal: { lifecycle: "ready", spec_version: 2 },
+				execution_approval: "approved",
+				execution_approval_receipt: { method: "explicit-state-action" },
+			},
+		};
+
+		const migrated = migrateWorkflowState(current, "deep-interview");
+		expect(migrated.changed).toBe(false);
+		expect(migrated.state).toBe(current);
+
+		const normalized = normalizeLegacyState(current, "deep-interview");
+		expect(normalized.state.current_phase).toBe("handoff");
+		expect(normalized.state.spec_path).toBe(current.spec_path);
+		expect((normalized.state.state as Record<string, unknown>).crystal).toEqual(current.state.crystal);
+		expect((normalized.state.state as Record<string, unknown>).execution_approval).toBe("approved");
+	});
+
 	it("revokes Crystal execution authority from migrated deep-interview state", () => {
 		const result = normalizeLegacyState(
 			{

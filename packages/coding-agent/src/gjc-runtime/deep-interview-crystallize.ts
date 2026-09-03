@@ -72,6 +72,7 @@ const MAX_ITEMS = 128;
 const MAX_TEXT = 10_000;
 const ITEM_KINDS: readonly CrystalItemKind[] = ["goal", "constraint", "decision", "acceptance_criterion", "non_goal"];
 const CLASSIFICATIONS: readonly CrystalClassification[] = ["confirmed", "inferred", "disputed"];
+const EVIDENCE_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "word" });
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -176,7 +177,7 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 					anchorMessage.role !== "user" ||
 					/\[(?:image|audio|video|file|content)\]/i.test(item.anchor.quote) ||
 					/^(?:\[?(?:image|audio|video|file|content)\]?)+$/i.test(item.anchor.quote.trim()) ||
-					/^\[[^\]]+\]$/.test(anchorMessage.content) ||
+					/^(?:\[[^\]]+\])+$/.test(anchorMessage.content) ||
 					!anchorMessage.content.includes(item.anchor.quote)
 				)
 					throw new Error(`confirmed item ${id} has no verbatim user anchor`);
@@ -190,6 +191,14 @@ function normalizedGaps(value: unknown): string[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value) || value.length > 16) throw new Error("open_gaps must be a bounded array");
 	return value.map((gap, index) => text(gap, `open_gaps[${index}]`, 500));
+}
+
+function isMeaningfulEvidenceWord(value: string): boolean {
+	const codePointLength = [...value].length;
+	return (
+		codePointLength >= 3 ||
+		(codePointLength >= 2 && /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(value))
+	);
 }
 
 function evidenceTerms(value: string): Set<string> {
@@ -216,9 +225,10 @@ function evidenceTerms(value: string): Set<string> {
 		"with",
 	]);
 	return new Set(
-		(value.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []).filter(
-			term => [...term].length >= 3 && !ignored.has(term),
-		),
+		[...EVIDENCE_SEGMENTER.segment(value.toLocaleLowerCase())]
+			.filter(part => part.isWordLike)
+			.map(part => part.segment)
+			.filter(term => isMeaningfulEvidenceWord(term) && !ignored.has(term)),
 	);
 }
 
@@ -240,11 +250,17 @@ function validateResolutionAnchors(
 		const quote = text(raw.quote, `${field}[${index}].quote`, 500);
 		const resolution = text(raw.resolution, `${field}[${index}].resolution`, 500);
 		const message = snapshot.messages.find(candidate => candidate.index === messageIndex);
-		const itemWords = new Set(item.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? []);
-		const resolutionWords = resolution.toLocaleLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+		const itemWords = new Set(
+			[...EVIDENCE_SEGMENTER.segment(item.toLocaleLowerCase())]
+				.filter(part => part.isWordLike)
+				.map(part => part.segment),
+		);
+		const resolutionWords = [...EVIDENCE_SEGMENTER.segment(resolution.toLocaleLowerCase())]
+			.filter(part => part.isWordLike)
+			.map(part => part.segment);
 		const genericResolutionWords = new Set(["ok", "yes", "done", "resolved", "confirmed", "accepted", "fine"]);
 		const introducesNewTerm = resolutionWords.some(
-			word => word.length >= 3 && !itemWords.has(word) && !genericResolutionWords.has(word),
+			word => isMeaningfulEvidenceWord(word) && !itemWords.has(word) && !genericResolutionWords.has(word),
 		);
 		const itemTerms = evidenceTerms(item);
 		const resolutionTerms = evidenceTerms(resolution);
