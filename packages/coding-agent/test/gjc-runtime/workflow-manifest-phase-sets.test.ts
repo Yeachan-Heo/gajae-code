@@ -60,7 +60,9 @@ describe("workflow manifest phase sets", () => {
 		for (const argument of ["input", "session-id", "slug", "json"]) {
 			expect(manifest.typedArgs.find(item => item.name === argument)?.appliesToVerbs).toContain("crystallize");
 		}
-		expect(manifest.typedArgs.find(item => item.name === "json")?.appliesToVerbs).toContain("approve-execution");
+		for (const argument of ["mode", "session-id", "json"]) {
+			expect(manifest.typedArgs.find(item => item.name === argument)?.appliesToVerbs).toContain("approve-execution");
+		}
 	});
 
 	it("routes new ralplan runs through intent while retaining the legacy in-flight review edge", () => {
