@@ -1052,7 +1052,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 }, 20_000);
 
 test("a replay refused on a live socket loses no event and leaves the cursor below the gap", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
 		await withSerializedFakeTransport(async clock => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1060,7 +1060,8 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitFrameSettlement(GENERATION, 1);
+			expect(provider.posts).toHaveLength(1);
 
 			host.drop();
 			host.emit("two");
