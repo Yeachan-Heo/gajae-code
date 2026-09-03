@@ -913,6 +913,14 @@ async function handleWrite(args: readonly string[], cwd: string): Promise<Record
 				);
 			}
 			const current = await readCurrentState(cwd, sessionId);
+			const currentInner = isPlainObject(current.value.state) ? current.value.state : {};
+			if (reset && currentInner.crystal !== undefined) {
+				throw new DeepInterviewStageError(
+					"DI_STAGE_MERGE_REJECTED",
+					"reset cannot rewrite canonical Crystal state",
+					"clear the workflow explicitly or continue through the approval and handoff lifecycle",
+				);
+			}
 			const nowIso = new Date().toISOString();
 			const syntheticDraft: DeepInterviewStageDraft = {
 				version: DRAFT_VERSION,
