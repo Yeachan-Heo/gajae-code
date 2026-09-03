@@ -157,7 +157,8 @@
           "clear",
           "contract",
           "handoff",
-          "doctor"
+          "doctor",
+          "approve-execution"
         ],
         "enumValues": [
           "deep-interview",
@@ -185,7 +186,8 @@
           "apply",
           "discard",
           "read",
-          "write"
+          "write",
+          "approve-execution"
         ],
         "name": "session-id",
         "type": "string"
@@ -446,7 +448,8 @@
           "clear",
           "contract",
           "handoff",
-          "doctor"
+          "doctor",
+          "approve-execution"
         ],
         "enumValues": [
           "deep-interview",
@@ -474,7 +477,8 @@
           "apply",
           "discard",
           "read",
-          "write"
+          "write",
+          "approve-execution"
         ],
         "name": "session-id",
         "type": "string"
@@ -1018,7 +1022,8 @@
           "clear",
           "contract",
           "handoff",
-          "doctor"
+          "doctor",
+          "approve-execution"
         ],
         "enumValues": [
           "deep-interview",
@@ -1046,7 +1051,8 @@
           "apply",
           "discard",
           "read",
-          "write"
+          "write",
+          "approve-execution"
         ],
         "name": "session-id",
         "type": "string"
@@ -1410,7 +1416,8 @@
           "clear",
           "contract",
           "handoff",
-          "doctor"
+          "doctor",
+          "approve-execution"
         ],
         "enumValues": [
           "deep-interview",
@@ -1438,7 +1445,8 @@
           "apply",
           "discard",
           "read",
-          "write"
+          "write",
+          "approve-execution"
         ],
         "name": "session-id",
         "type": "string"

@@ -463,6 +463,21 @@ describe("gjc state handoff", () => {
 			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
 		});
 	});
+	it("rejects approval grants from pre-v2 canonical-looking state", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = await writeLegacyApprovedCrystal(cwd);
+			const legacy = (await readJson(callerPath)) as Record<string, unknown>;
+			const inner = legacy.state as Record<string, unknown>;
+			inner.execution_approval = "not-approved";
+			delete inner.execution_approval_receipt;
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(legacy, callerPath));
+			const before = await fs.readFile(callerPath, "utf-8");
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(2);
+			expect(approval.stderr).toContain("requires current deep-interview state version");
+			expect(await fs.readFile(callerPath, "utf-8")).toBe(before);
+		});
+	});
 	it("rejects execution handoff after approved Crystal state is tampered", async () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
