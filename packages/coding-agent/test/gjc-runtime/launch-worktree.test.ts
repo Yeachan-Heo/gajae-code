@@ -827,4 +827,29 @@ describe("launch guard classification", () => {
 		expect(await Bun.file(path.join(plan.worktreePath, "raced-user-file.txt")).text()).toBe("keep\n");
 		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toContain(plan.branchName ?? "");
 	});
+
+	it("retains a clean committed race instead of deleting its branch", async () => {
+		const repo = await createRepo("gjc-cancellable-commit-");
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-commit" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) {
+						fsSync.writeFileSync(path.join(plan.worktreePath, "committed-user-file.txt"), "keep\n");
+						run("git", ["add", "committed-user-file.txt"], plan.worktreePath);
+						run("git", ["commit", "-m", "user work"], plan.worktreePath);
+					}
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "committed-user-file.txt")).text()).toBe("keep\n");
+		expect(run("git", ["rev-parse", plan.branchName ?? ""], repo)).not.toBe(plan.baseRef);
+	});
 });

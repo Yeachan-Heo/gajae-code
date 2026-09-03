@@ -658,9 +658,9 @@ function removeCleanAbortedLaunchWorktree(plan: GjcLaunchWorktreePlan, createdBr
 	}
 	if (createdBranch && plan.branchName) {
 		try {
-			runGit(plan.repoRoot, ["branch", "-D", plan.branchName]);
+			runGit(plan.repoRoot, ["update-ref", "-d", `refs/heads/${plan.branchName}`, plan.baseRef]);
 		} catch {
-			// The worktree was removed safely; a raced branch update remains for inspection.
+			// Compare-and-delete refused a raced branch update; retain it for inspection.
 		}
 	}
 }
@@ -742,7 +742,8 @@ export async function ensureLaunchWorktreeCancellable(
 			const expectedBranch = plan.branchName ? `refs/heads/${plan.branchName}` : null;
 			const owned =
 				created &&
-				(plan.detached ? created.detached && created.head === plan.baseRef : created.branchRef === expectedBranch);
+				created.head === plan.baseRef &&
+				(plan.detached ? created.detached : created.branchRef === expectedBranch);
 			if (owned) removeCleanAbortedLaunchWorktree(plan, Boolean(plan.branchName && !branchAlreadyExisted));
 		}
 		throw error;
