@@ -240,7 +240,7 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 				stdin: "ignore",
 				stdout: "ignore",
 				stderr: "ignore",
-				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "12000" },
+				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "10000" },
 			},
 		);
 		await waitForFile(path.join(dir, "sdk", "broker.startup.lock", "info"));
