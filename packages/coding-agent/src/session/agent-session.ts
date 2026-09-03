@@ -9205,14 +9205,16 @@ export class AgentSession {
 			const drained = await awaitDisposeStep("async job manager", ownedAsyncManager.dispose({ timeoutMs: 3_000 }));
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
-				// AsyncJobManager.dispose projects undelivered work into terminal failure
-				// evidence and clears every live handle before returning false. This is a
-				// degraded terminal outcome, not retained mutation authority.
 				logger.warn("Async job completion deliveries still pending during dispose", { ...deliveryState });
 			}
-			if (drained !== false && AsyncJobManager.instance() === ownedAsyncManager) {
-				AsyncJobManager.setInstance(undefined);
+			if (drained === false) {
+				await awaitDisposeStep(
+					"async job manager retained runners",
+					ownedAsyncManager.awaitRetainedDisposalCompletion(),
+					true,
+				);
 			}
+			if (AsyncJobManager.instance() === ownedAsyncManager) AsyncJobManager.setInstance(undefined);
 		}
 		await awaitDisposeStep("tool session transition cleanups", this.#runToolSessionTransitionCleanups(), true);
 		await awaitDisposeStep("tool session cleanups", this.#runToolSessionCleanups(), true);

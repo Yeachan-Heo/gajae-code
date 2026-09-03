@@ -1444,6 +1444,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// running and its stale completion reaches the successor.
 		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
 		const owned = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const releaseOwned = Promise.withResolvers<void>();
+		let ownedEffects = 0;
 		let transitionSession: AgentSession | undefined;
 		try {
 			AsyncJobManager.setInstance(foreign);
@@ -1454,10 +1456,19 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				id: "foreign-owner-job",
 				ownerId: "sub-route-1",
 			});
-			owned.register("task", "owned job", () => Promise.withResolvers<never>().promise, {
-				id: "owned-owner-job",
-				ownerId: "sub-route-1",
-			});
+			owned.register(
+				"task",
+				"owned job",
+				async () => {
+					await releaseOwned.promise;
+					ownedEffects += 1;
+					return "owned complete";
+				},
+				{
+					id: "owned-owner-job",
+					ownerId: "sub-route-1",
+				},
+			);
 			expect(foreign.getJob("foreign-owner-job")?.status).toBe("running");
 			expect(owned.getJob("owned-owner-job")?.status).toBe("running");
 
@@ -1484,13 +1495,22 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				agentId: "sub-route-1",
 				ownedAsyncJobManager: owned,
 			});
-			await transitionSession.dispose();
+			transitionSession.setDisposeTimeoutForTests(50);
+			await expect(transitionSession.dispose()).rejects.toMatchObject({
+				name: "SessionDisposalIncompleteError",
+			});
+			await Bun.sleep(3_100);
+			expect(ownedEffects).toBe(0);
+			releaseOwned.resolve();
+			await transitionSession.awaitDisposeCompletion();
 			// The OWNED manager's same-owner job was torn down; the FOREIGN
 			// (process-global) manager's same-owner job is untouched — proving
 			// cleanup resolved through the session-owned manager.
 			expect(foreign.getJob("foreign-owner-job")?.status).toBe("running");
 			expect(owned.getJob("owned-owner-job")).toBeUndefined();
+			expect(ownedEffects).toBe(1);
 		} finally {
+			releaseOwned.resolve();
 			AsyncJobManager.setInstance(manager);
 			AsyncJobManager.unregisterManager(foreign);
 			AsyncJobManager.unregisterManager(owned);
@@ -1506,6 +1526,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// B's.
 		const foreign = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
 		const owned = new AsyncJobManager({ maxRunningJobs: 2, onJobComplete: () => {} });
+		const releaseOwned = Promise.withResolvers<void>();
 		let snapshotSession: AgentSession | undefined;
 		try {
 			AsyncJobManager.setInstance(foreign);
@@ -1513,10 +1534,18 @@ describe("terminal abort registers a turn scope so left-running owned work class
 				id: "snap-foreign",
 				ownerId: "sub-snap-1",
 			});
-			owned.register("bash", "owned job", () => Promise.withResolvers<never>().promise, {
-				id: "snap-owned",
-				ownerId: "sub-snap-1",
-			});
+			owned.register(
+				"bash",
+				"owned job",
+				async () => {
+					await releaseOwned.promise;
+					return "owned complete";
+				},
+				{
+					id: "snap-owned",
+					ownerId: "sub-snap-1",
+				},
+			);
 
 			const mock = createMockModel({ handler: () => stopReply("done") });
 			const agent = new Agent({
@@ -1543,6 +1572,7 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(snapshot?.running.some(job => job.id === "snap-owned")).toBe(true);
 			expect(snapshot?.running.some(job => job.id === "snap-foreign")).toBe(false);
 		} finally {
+			releaseOwned.resolve();
 			AsyncJobManager.setInstance(manager);
 			AsyncJobManager.unregisterManager(foreign);
 			AsyncJobManager.unregisterManager(owned);
@@ -1805,13 +1835,15 @@ describe("terminal abort registers a turn scope so left-running owned work class
 		// deliveries — an already-completed delivery pending in A's manager
 		// could be injected after A's context was cleared, while a same-owner
 		// delivery in B was discarded.
+		const releaseForeignDelivery = Promise.withResolvers<void>();
+		const releaseOwnedDelivery = Promise.withResolvers<void>();
 		const foreign = new AsyncJobManager({
 			maxRunningJobs: 4,
-			onJobComplete: () => Promise.withResolvers<never>().promise,
+			onJobComplete: () => releaseForeignDelivery.promise,
 		});
 		const owned = new AsyncJobManager({
 			maxRunningJobs: 4,
-			onJobComplete: () => Promise.withResolvers<never>().promise,
+			onJobComplete: () => releaseOwnedDelivery.promise,
 		});
 		const ownerId = "xlumo-owner";
 		let clearSession: AgentSession | undefined;
@@ -1862,6 +1894,8 @@ describe("terminal abort registers a turn scope so left-running owned work class
 			expect(owned.getDeliveryState({ ownerId }).pendingJobIds).not.toContain("xlumo-owned");
 			expect(foreign.getDeliveryState({ ownerId }).pendingJobIds).toContain("xlumo-foreign");
 		} finally {
+			releaseForeignDelivery.resolve();
+			releaseOwnedDelivery.resolve();
 			AsyncJobManager.setInstance(manager);
 			AsyncJobManager.unregisterManager(foreign);
 			AsyncJobManager.unregisterManager(owned);

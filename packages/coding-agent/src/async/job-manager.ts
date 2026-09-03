@@ -650,6 +650,7 @@ export class AsyncJobManager {
 	}
 
 	readonly #jobs = new Map<string, AsyncJob>();
+	#retainedDisposalCompletion: Promise<void> = Promise.resolve();
 	readonly #deliveries: AsyncJobDelivery[] = [];
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
@@ -673,7 +674,6 @@ export class AsyncJobManager {
 	readonly #maxDeadLetterOverflowOwners: number;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
-	#disposing = false;
 	#runningOwnerCleanups = false;
 	readonly #subagentRecords = new Map<string, SubagentRecord>();
 	readonly #terminalEvents = new Map<string, TerminalEvent>();
@@ -2780,6 +2780,17 @@ export class AsyncJobManager {
 		// registration keeps the original protection (cleanups cannot register fresh
 		// work) without disabling delivery. Errors in cleanups are logged, never
 		// escalated.
+		const unsettledJobPromises = new Set<Promise<void>>();
+		const jobIdsByPromise = new Map<Promise<void>, string>();
+		for (const job of this.#jobs.values()) {
+			const promise = job.promise;
+			unsettledJobPromises.add(promise);
+			jobIdsByPromise.set(promise, job.id);
+			void promise.then(
+				() => unsettledJobPromises.delete(promise),
+				() => unsettledJobPromises.delete(promise),
+			);
+		}
 		this.#registrationClosed = true;
 		this.#clearEvictionTimers();
 		this.#runningOwnerCleanups = true;
@@ -2788,7 +2799,6 @@ export class AsyncJobManager {
 		} finally {
 			this.#runningOwnerCleanups = false;
 		}
-		this.#disposing = true;
 		this.cancelAll();
 		for (const tombstone of this.#monitorTombstones.values()) {
 			try {
@@ -2807,13 +2817,22 @@ export class AsyncJobManager {
 		const remainingDeliveryMs = Math.max(0, disposalDeadline - Date.now());
 		const drained = await this.drainDeliveries({ timeoutMs: remainingDeliveryMs });
 		if (!drained) this.#projectUndeliveredDisposalFailures();
-		const disposalCompleted = waitResult.completed && drained;
+		const retainedAuthority = new Set<Promise<void>>(unsettledJobPromises);
+		for (const delivery of this.#inFlightDeliveries) {
+			if (delivery.promise) retainedAuthority.add(delivery.promise);
+		}
+		this.#retainedDisposalCompletion = Promise.allSettled(retainedAuthority).then(() => {});
+		const physicalStuckJobIds = [...unsettledJobPromises]
+			.map(promise => jobIdsByPromise.get(promise))
+			.filter((id): id is string => id !== undefined);
+		const stuckJobIds = [...new Set([...waitResult.stuckJobIds, ...physicalStuckJobIds])];
+		const disposalCompleted = waitResult.completed && drained && retainedAuthority.size === 0;
 		this.#lastDisposeDiagnostics = {
-			stuckJobIds: waitResult.stuckJobIds,
+			stuckJobIds,
 			deliveriesDrained: disposalCompleted,
 		};
-		if (waitResult.stuckJobIds.length > 0) {
-			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds: waitResult.stuckJobIds });
+		if (stuckJobIds.length > 0) {
+			logger.warn("Async job manager dispose timed out waiting for jobs", { stuckJobIds });
 		}
 		this.#clearEvictionTimers();
 		this.#disposed = true;
@@ -2847,6 +2866,10 @@ export class AsyncJobManager {
 		this.#changeListeners.clear();
 		this.#foldListeners.clear();
 		return disposalCompleted;
+	}
+
+	awaitRetainedDisposalCompletion(): Promise<void> {
+		return this.#retainedDisposalCompletion;
 	}
 
 	#projectUndeliveredDisposalFailures(): void {

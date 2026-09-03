@@ -137,6 +137,53 @@ describe("AsyncJobManager.failNow", () => {
 		expect(delivered).toEqual(["cleanup failure"]);
 	});
 
+	test("retains a failNow runner that outlives the disposal deadline", async () => {
+		const releaseRunner = Promise.withResolvers<void>();
+		let runnerEffects = 0;
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const jobId = manager.register(
+			"bash",
+			"held remote",
+			async () => {
+				await releaseRunner.promise;
+				runnerEffects += 1;
+				return "late runner result";
+			},
+			{ id: "bridge-held-runner", ownerId: "0-Main" },
+		);
+		const generation = manager.getJob(jobId)?.generation ?? "";
+		manager.registerOwnerCleanup("0-Main", () => {
+			manager.failNow(jobId, generation, "cleanup failure");
+		});
+
+		expect(await manager.dispose({ timeoutMs: 30 })).toBe(false);
+		expect(runnerEffects).toBe(0);
+		releaseRunner.resolve();
+		await manager.awaitRetainedDisposalCompletion();
+		expect(runnerEffects).toBe(1);
+	});
+
+	test("retains an in-flight delivery callback that outlives the disposal deadline", async () => {
+		const deliveryStarted = Promise.withResolvers<void>();
+		const releaseDelivery = Promise.withResolvers<void>();
+		let deliveryEffects = 0;
+		const manager = new AsyncJobManager({
+			onJobComplete: async () => {
+				deliveryStarted.resolve();
+				await releaseDelivery.promise;
+				deliveryEffects += 1;
+			},
+		});
+		manager.register("bash", "held delivery", async () => "done", { id: "bridge-held-delivery" });
+		await deliveryStarted.promise;
+
+		expect(await manager.dispose({ timeoutMs: 30 })).toBe(false);
+		expect(deliveryEffects).toBe(0);
+		releaseDelivery.resolve();
+		await manager.awaitRetainedDisposalCompletion();
+		expect(deliveryEffects).toBe(1);
+	});
+
 	test("retries cleanup-triggered delivery failures before dead-lettering", async () => {
 		let attempts = 0;
 		const manager = new AsyncJobManager({
