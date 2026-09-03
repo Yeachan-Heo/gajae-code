@@ -161,7 +161,7 @@ interface ResolvedSelectors {
 // `clear` resolves like a read (explicit -> payload -> env -> latest-activity marker)
 // per the spec: read/status/clear may fall back to the most-recent session. Commands
 // that create or mutate new state roots still require an explicit/env session id.
-const WRITE_SESSION_ACTIONS = new Set<StateAction>(["write", "handoff", "prune", "migrate"]);
+const WRITE_SESSION_ACTIONS = new Set<StateAction>(["write", "approve-execution", "handoff", "prune", "migrate"]);
 
 async function resolveSelectors(args: readonly string[], cwd: string, action: StateAction): Promise<ResolvedSelectors> {
 	const classification = classifyStateArgv(args);
@@ -1591,7 +1591,7 @@ async function assertDeepInterviewHandoffReady(
 			const approval = isPlainObject(inner.execution_approval_receipt)
 				? inner.execution_approval_receipt
 				: undefined;
-			if (approval?.method !== "explicit-cli-flag" || typeof approval.approved_at !== "string")
+			if (approval?.method !== "explicit-state-action" || typeof approval.approved_at !== "string")
 				throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
 		}
 		if (options.allowPlanningHandoff) return;
@@ -1712,21 +1712,6 @@ async function handleHandoffUnlocked(args: readonly string[], cwd: string): Prom
 					unknown
 				>)
 			: migrateWorkflowState(existingCaller, caller).state;
-	if (caller === "deep-interview" && callee === "ultragoal") {
-		const inner = isPlainObject(normalizedCaller.state) ? normalizedCaller.state : {};
-		if (typeof normalizedCaller.spec_path !== "string" || typeof normalizedCaller.spec_sha256 !== "string")
-			throw new StateCommandError(2, "ultragoal handoff requires a persisted Crystal specification");
-		if (isPlainObject(inner.crystal) && inner.crystal.lifecycle === "ready") {
-			if (!hasFlag(args, "--approve-execution"))
-				throw new StateCommandError(2, "ultragoal handoff requires explicit execution approval");
-			inner.execution_approval = "approved";
-			inner.execution_approval_receipt = {
-				method: "explicit-cli-flag",
-				approved_at: handoffAt,
-				mutation_id: mutationId,
-			};
-		}
-	}
 	if (caller === "deep-interview")
 		await assertDeepInterviewHandoffReady(normalizedCaller, {
 			allowPlanningHandoff: callee === "ralplan" || callee === "autoresearch",
@@ -1996,6 +1981,89 @@ async function handleHandoff(args: readonly string[], cwd: string): Promise<Stat
 	// `process.cwd()`.
 	const handoffLock = path.join(sessionStateDir(cwd, selectors.gjcSessionId), "handoff");
 	return withWorkflowStateLock(handoffLock, async () => handleHandoffUnlocked(args, cwd), { cwd });
+}
+
+async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSelectors): Promise<StateCommandResult> {
+	if (selectors.mode !== "deep-interview")
+		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
+	const statePath = modeStateFile(cwd, "deep-interview", selectors.gjcSessionId);
+	const current = await readExistingStateForMutation(statePath);
+	if (current.kind !== "valid")
+		throw new StateCommandError(2, "approve-execution requires valid active deep-interview state");
+	const envelope = normalizeDeepInterviewEnvelope(current.value) as Record<string, unknown>;
+	if (envelope.active !== true)
+		throw new StateCommandError(2, "approve-execution requires active deep-interview state");
+	await assertDeepInterviewHandoffReady(envelope, { allowPlanningHandoff: true });
+	const inner = isPlainObject(envelope.state) ? envelope.state : {};
+	const existingReceipt = isPlainObject(inner.execution_approval_receipt)
+		? inner.execution_approval_receipt
+		: undefined;
+	if (inner.execution_approval === "approved") {
+		if (existingReceipt?.method !== "explicit-state-action")
+			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
+		return {
+			status: 0,
+			stdout: `${JSON.stringify({ skill: "deep-interview", execution_approval: "approved", state_path: statePath })}\n`,
+		};
+	}
+	const approvedAt = nowIso();
+	const mutationId = `deep-interview:approve-execution:${approvedAt}`;
+	inner.execution_approval = "approved";
+	inner.execution_approval_receipt = {
+		method: "explicit-state-action",
+		approved_at: approvedAt,
+		mutation_id: mutationId,
+	};
+	envelope.state = inner;
+	envelope.updated_at = approvedAt;
+	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(statePath, envelope, {
+		cwd,
+		policy: "source",
+		lockHeld: true,
+		receipt: {
+			cwd,
+			skill: "deep-interview",
+			owner: "gjc-state-cli",
+			command: "gjc state deep-interview approve-execution",
+			sessionId: selectors.gjcSessionId,
+			nowIso: approvedAt,
+			mutationId,
+			verb: "approve-execution",
+		},
+		audit: {
+			category: "state",
+			verb: "approve-execution",
+			owner: "gjc-state-cli",
+			sessionId: selectors.gjcSessionId,
+			skill: "deep-interview",
+			mutationId,
+		},
+	});
+	await syncSkillActiveState({
+		cwd,
+		skill: "deep-interview",
+		active: true,
+		phase: typeof envelope.current_phase === "string" ? envelope.current_phase : "handoff",
+		sessionId: selectors.gjcSessionId,
+		threadId: selectors.threadId,
+		turnId: selectors.turnId,
+		source: "gjc-state-cli",
+		hud: buildHudForMode("deep-interview", envelope),
+		sourceRevision: writeResult.revision,
+	});
+	await touchStateActivityMarker(cwd, selectors.gjcSessionId, statePath);
+	return {
+		status: 0,
+		stdout: `${JSON.stringify({ skill: "deep-interview", execution_approval: "approved", state_path: statePath, mutation_id: mutationId })}\n`,
+	};
+}
+
+async function handleApproveExecution(args: readonly string[], cwd: string): Promise<StateCommandResult> {
+	const selectors = await resolveSelectors(args, cwd, "approve-execution");
+	if (selectors.mode !== "deep-interview")
+		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
+	const statePath = modeStateFile(cwd, "deep-interview", selectors.gjcSessionId);
+	return withWorkflowStateLock(statePath, () => handleApproveExecutionUnlocked(cwd, selectors), { cwd });
 }
 
 async function handleContract(args: readonly string[], cwd: string): Promise<StateCommandResult> {
@@ -2336,6 +2404,8 @@ export async function runNativeStateCommand(args: string[], cwd = process.cwd())
 				return await handleClear(args, cwd);
 			case "contract":
 				return await handleContract(args, cwd);
+			case "approve-execution":
+				return await handleApproveExecution(args, cwd);
 			case "status":
 				return await handleStatus(args, cwd);
 			case "doctor":
