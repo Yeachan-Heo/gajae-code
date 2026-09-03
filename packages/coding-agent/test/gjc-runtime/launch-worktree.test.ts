@@ -828,6 +828,29 @@ describe("launch guard classification", () => {
 		expect(run("git", ["branch", "--list", plan.branchName ?? ""], repo)).toContain(plan.branchName ?? "");
 	});
 
+	it("retains raced ignored content instead of removing it as a clean worktree", async () => {
+		const repo = await createRepo("gjc-cancellable-ignored-");
+		fsSync.appendFileSync(path.join(repo, ".gitignore"), "/ignored-user-file.txt\n");
+		run("git", ["add", ".gitignore"], repo);
+		run("git", ["commit", "-m", "ignore generated user content"], repo);
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-ignored" });
+		expect(plan.enabled).toBe(true);
+		if (!plan.enabled) throw new Error("expected an enabled worktree plan");
+		let reads = 0;
+
+		await expect(
+			ensureLaunchWorktreeCancellable(plan, {
+				deadlineAt: 50,
+				now: () => {
+					reads += 1;
+					if (reads === 6) fsSync.writeFileSync(path.join(plan.worktreePath, "ignored-user-file.txt"), "keep\n");
+					return reads < 6 ? 0 : 100;
+				},
+			}),
+		).rejects.toBeInstanceOf(Error);
+		expect(await Bun.file(path.join(plan.worktreePath, "ignored-user-file.txt")).text()).toBe("keep\n");
+	});
+
 	it("retains a clean committed race instead of deleting its branch", async () => {
 		const repo = await createRepo("gjc-cancellable-commit-");
 		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "deadline-commit" });
