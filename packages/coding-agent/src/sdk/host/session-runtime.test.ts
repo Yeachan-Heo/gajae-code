@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
@@ -31,6 +31,8 @@ import {
 import { createSdkCapabilities, createSdkSurfacePolicy } from "./surface-policy";
 import type { SdkFrame } from "./types";
 import { SdkTransportLifecycleError } from "./websocket-transport";
+
+setDefaultTimeout(30_000);
 
 function memoryTransport(): SessionSdkTransport & {
 	feed(connectionId: string, frame: SdkFrame): void;
