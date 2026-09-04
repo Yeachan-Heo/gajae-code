@@ -95,8 +95,10 @@ describe("capability-scoped function hooks", () => {
 		const runtime = new ExtensionRuntime();
 		let networkCapability: unknown = "unset";
 		let provenance: unknown;
+		let exposesHostTag = true;
 		const extension = await loadExtensionFromFactory(
 			api => {
+				exposesHostTag = "tagFunctionHookHandler" in api.pi;
 				api.registerFunctionHook(
 					"tool_call",
 					async (invocation, capabilities, next) => {
@@ -122,6 +124,7 @@ describe("capability-scoped function hooks", () => {
 		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
 		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
 		expect(networkCapability).toBeUndefined();
+		expect(exposesHostTag).toBe(false);
 		expect(provenance).toEqual({
 			source: "extension",
 			extensionId: "project-extension",
@@ -426,6 +429,23 @@ describe("capability-scoped function hooks", () => {
 			),
 		]);
 		expect((await runner.emitToolCall(toolCall()))?.block).toBe(true);
+	});
+
+	test("rejects transformations for unsupported lifecycle events", async () => {
+		const runner = makeRunner([
+			registration(
+				"resources_discover",
+				async () => ({
+					action: "continue",
+					event: { type: "resources_discover", cwd: 42 } as never,
+				}),
+				{ capabilities: ["ui.transform"] },
+				0,
+			),
+		]);
+		const original = { type: "resources_discover", cwd: process.cwd(), reason: "startup" } as const;
+		const result = await runner.emitFunctionHooks(original);
+		expect(result).toEqual({ action: "continue", event: original });
 	});
 
 	test("rejects malformed transformed tool-result content", async () => {

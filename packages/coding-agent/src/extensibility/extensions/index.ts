@@ -3,7 +3,29 @@
  */
 
 export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from "../slash-commands";
-export * from "./function-hooks";
+export {
+	attenuateFunctionHookGrant,
+	cloneFunctionHookData,
+	compatibilityFunctionHookGrant,
+	createFunctionHookCapabilities,
+	DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+	FUNCTION_HOOK_CAPABILITIES,
+	functionHookDenyAllowed,
+	functionHookEventIdentityMatches,
+	functionHookGrantHash,
+	functionHookGrantOperations,
+	functionHookPayloadHash,
+	functionHookTransformAllowed,
+	intersectFunctionHookGrants,
+	isPlainFunctionHookData,
+	isSafeFunctionHookValue,
+	isValidFunctionHookEventValue,
+	normalizeFunctionHookGrant,
+	readConstrainedFunctionHookFile,
+	redactFunctionHookValue,
+	sanitizeFunctionHookReason,
+	validateFunctionHookTarget,
+} from "./function-hooks";
 export {
 	discoverAndLoadExtensions,
 	ExtensionRuntimeNotInitializedError,

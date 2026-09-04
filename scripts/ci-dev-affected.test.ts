@@ -1432,6 +1432,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/extensibility/gjc-plugins/registry.ts",
 			"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts",
 			"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts",
+			"packages/coding-agent/src/sdk/session.ts",
 		];
 		for (const changedSource of changedSources) {
 			const keys = targeted([changedSource]).map(task => task.key);
@@ -1457,6 +1458,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const tasks = targeted(["packages/coding-agent/src/session/agent-session.ts"]);
 		const keys = tasks.map(task => task.key);
 		expect(keys).toContain("test:packages/coding-agent/test/agent-session-concurrent.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/agent-session-promotion-identity.test.ts");
 		expect(keys).toContain("test:packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts");
 	});

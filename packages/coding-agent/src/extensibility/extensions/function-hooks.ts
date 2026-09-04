@@ -590,7 +590,7 @@ export function isValidFunctionHookEventValue(event: ExtensionEvent): boolean {
 					(event.metadata === undefined || isSafeFunctionHookValue(event.metadata))
 				);
 			default:
-				return true;
+				return false;
 		}
 	} catch {
 		return false;
@@ -811,7 +811,14 @@ function deepFreezeFunctionHookData<T>(value: T, seen = new WeakSet<object>()): 
 export function functionHookTransformAllowed(event: ExtensionEvent, grant: FunctionHookGrant): boolean {
 	const operations = expandedOperations(grant.capabilities);
 	if (event.type === "tool_call" || event.type === "tool_result") return operations.has("tool.transform");
-	return operations.has("ui.transform");
+	if (
+		event.type === "input" ||
+		event.type === "context" ||
+		event.type === "before_agent_start" ||
+		event.type === "before_provider_request"
+	)
+		return operations.has("ui.transform");
+	return false;
 }
 
 export function functionHookDenyAllowed(event: ExtensionEvent, grant: FunctionHookGrant): boolean {

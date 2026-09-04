@@ -150,6 +150,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/extensibility/gjc-plugins/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 	"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/sdk/session.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 };
 
 export interface PackageManifest {
