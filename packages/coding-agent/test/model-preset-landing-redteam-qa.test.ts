@@ -206,6 +206,7 @@ describe("preset landing adversarial QA", () => {
 		expect(registry.refresh).not.toHaveBeenCalled();
 		expect(registry.getAvailable).not.toHaveBeenCalled();
 		expect(registry.getCanonicalModelSelections).not.toHaveBeenCalled();
+		expect(registry.getAvailableForProfileActivation).toHaveBeenCalled();
 
 		selector.handleInput("g");
 		const text = await rendered(selector);

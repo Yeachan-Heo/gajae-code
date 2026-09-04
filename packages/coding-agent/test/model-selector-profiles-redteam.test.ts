@@ -305,7 +305,7 @@ describe("model selector profile red-team", () => {
 
 		expect(selector.__testSelectedPresetRowIdentity()).toBe("browse");
 		selector.handleInput("\n");
-		const rendered = normalizeRenderedText(selector.render(240).join("\n"));
+		const rendered = await renderSelector(selector);
 
 		expect(rendered).toContain("Models");
 		expect(rendered).toContain("provider-a/default");
