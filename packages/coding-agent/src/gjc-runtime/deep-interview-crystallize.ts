@@ -173,14 +173,26 @@ function validateItems(value: unknown, snapshot?: CrystalSnapshot): CrystalItem[
 				);
 				if (!anchorMessage)
 					throw new Error(`confirmed item ${id} anchor message ${item.anchor!.message_index} is missing`);
+				const normalizedStatement = item.statement
+					.normalize("NFC")
+					.toLocaleLowerCase()
+					.replace(/[^\p{L}\p{N}]+/gu, " ")
+					.trim();
+				const normalizedQuote = item.anchor.quote
+					.normalize("NFC")
+					.toLocaleLowerCase()
+					.replace(/[^\p{L}\p{N}]+/gu, " ")
+					.trim();
 				if (
 					anchorMessage.role !== "user" ||
-					/\[(?:image|audio|video|file|content)\]/i.test(item.anchor.quote) ||
-					/^(?:\[?(?:image|audio|video|file|content)\]?)+$/i.test(item.anchor.quote.trim()) ||
+					/\[(?:image|audio|video|file|content|toolCall|thinking)\]/i.test(item.anchor.quote) ||
+					/^(?:\[?(?:image|audio|video|file|content|toolCall|thinking)\]?)+$/i.test(item.anchor.quote.trim()) ||
 					/^(?:\[[^\]]+\])+$/.test(anchorMessage.content) ||
-					!anchorMessage.content.includes(item.anchor.quote)
+					!anchorMessage.content.includes(item.anchor.quote) ||
+					normalizedQuote.length === 0 ||
+					(!normalizedStatement.includes(normalizedQuote) && !normalizedQuote.includes(normalizedStatement))
 				)
-					throw new Error(`confirmed item ${id} has no verbatim user anchor`);
+					throw new Error(`confirmed item ${id} has no statement-bound verbatim user anchor`);
 			}
 		}
 		return item;
@@ -209,8 +221,14 @@ function evidenceTerms(value: string): Set<string> {
 		"does",
 		"for",
 		"how",
+		"make",
 		"must",
+		"need",
+		"needs",
+		"requirement",
+		"requirements",
 		"should",
+		"support",
 		"that",
 		"the",
 		"this",
@@ -223,6 +241,9 @@ function evidenceTerms(value: string): Set<string> {
 		"why",
 		"will",
 		"with",
+		"want",
+		"use",
+		"using",
 	]);
 	return new Set(
 		[...EVIDENCE_SEGMENTER.segment(value.toLocaleLowerCase())]

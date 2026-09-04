@@ -19,8 +19,12 @@ import {
 	sessionSpecsDir,
 	sessionStateDir,
 } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { reconcileWorkflowSkillState, runNativeStateCommand } from "../../src/gjc-runtime/state-runtime";
-import { stampWorkflowEnvelopeChecksum } from "../../src/gjc-runtime/state-writer";
+import {
+	reconcileWorkflowSkillState,
+	runNativeStateCommand,
+	type StateCommandResult,
+} from "../../src/gjc-runtime/state-runtime";
+import { stampWorkflowEnvelopeChecksum, withWorkflowStateLock } from "../../src/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const TEST_SESSION_ID = "test-session";
@@ -432,6 +436,20 @@ describe("gjc state handoff", () => {
 			);
 			expect(result.status).toBe(2);
 			expect(result.stderr).toContain("crystallization never grants execution approval");
+		});
+	});
+	it("enforces a locked Round-0 contract for crystallized planning handoff", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const state = (await readJson(callerPath)) as Record<string, unknown>;
+			(state.state as Record<string, unknown>).intent_contract_required = true;
+			await writeJson(callerPath, stampWorkflowEnvelopeChecksum(state, callerPath));
+			const result = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+				cwd,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("requires a locked Round 0 intent contract");
 		});
 	});
 	it("rejects pre-hardening approval receipts even on checksummed v2 state", async () => {
@@ -857,6 +875,79 @@ describe("gjc state handoff", () => {
 			expect(caller?.active).toBe(false);
 			expect(caller?.handoff_to).toBe("ralplan");
 			expect(await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID))).toBeNull();
+		});
+	});
+
+	it("serializes the callee read-modify-write with sanctioned callee writers", async () => {
+		await withTempCwd(async cwd => {
+			const callerPath = modeStatePath(cwd, TEST_SESSION_ID, "deep-interview");
+			const calleePath = modeStatePath(cwd, TEST_SESSION_ID, "ralplan");
+			await writeJson(callerPath, {
+				skill: "deep-interview",
+				version: 1,
+				active: true,
+				current_phase: "interviewing",
+			});
+			let settled = false;
+			let handoff: Promise<StateCommandResult> | undefined;
+			await withWorkflowStateLock(
+				calleePath,
+				async () => {
+					handoff = runNativeStateCommand(
+						["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"],
+						cwd,
+					).then(result => {
+						settled = true;
+						return result;
+					});
+					await Bun.sleep(25);
+					expect(settled).toBe(false);
+					await writeJson(calleePath, {
+						skill: "ralplan",
+						version: 1,
+						active: false,
+						current_phase: "final",
+						note: "concurrent sanctioned update",
+					});
+				},
+				{ cwd },
+			);
+			const result = await handoff!;
+			expect(result.status).toBe(0);
+			expect((await readJson(calleePath))?.note).toBe("concurrent sanctioned update");
+		});
+	});
+
+	it("recovers an approved ultragoal handoff after caller persistence", async () => {
+		await withTempCwd(async cwd => {
+			const { callerPath } = await writePublishedReadyCrystal(cwd);
+			const approval = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(approval.status).toBe(0);
+			const handoffAt = "2026-09-04T00:00:00.000Z";
+			const mutationId = `deep-interview:handoff:ultragoal:${handoffAt}`;
+			const priorFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER;
+			const originalToISOString = Date.prototype.toISOString;
+			Date.prototype.toISOString = () => handoffAt;
+			process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER = mutationId;
+			try {
+				const failed = await runNativeStateCommand(
+					["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+					cwd,
+				);
+				expect(failed.status).toBe(1);
+			} finally {
+				Date.prototype.toISOString = originalToISOString;
+				restoreEnvironmentValue("GJC_STATE_HANDOFF_FAIL_AFTER_CALLER", priorFailpoint);
+			}
+			expect((await readJson(callerPath))?.active).toBe(false);
+			const recovered = await runNativeStateCommand(
+				["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(recovered.status).toBe(0);
+			const active = await readJson(activeSnapshotPath(cwd, TEST_SESSION_ID));
+			const skills = (active?.active_skills as Array<Record<string, unknown>>) ?? [];
+			expect(skills.find(entry => entry.skill === "ultragoal")?.active).toBe(true);
 		});
 	});
 
