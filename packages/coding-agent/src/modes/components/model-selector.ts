@@ -571,10 +571,15 @@ export class ModelSelectorComponent extends Container {
 			});
 		}
 
-		// Advisory drift only, and only while the smart-routing panel is mounted. This
-		// must not call refreshState: that would discard the user's unsaved draft.
+		// Proxy changes invalidate preset availability. Provider-order changes are
+		// advisory only while smart routing is mounted and must not discard its draft.
 		this.#unsubscribeProviderOrderChanged = this.#settings.onChanged?.(path => {
-			if (this.#disposed || path !== "modelProviderOrder") return;
+			if (this.#disposed) return;
+			if (path === "modelProfile.proxyProvider" || path === "modelProfile.proxyMode") {
+				if (this.#viewMode === "presets") void this.#refreshProviderAuth();
+				return;
+			}
+			if (path !== "modelProviderOrder") return;
 			if (this.#viewMode !== "smart-routing") return;
 			const panel = this.#smartRoutingPanel;
 			if (!panel) return;
@@ -2575,6 +2580,11 @@ export class ModelSelectorComponent extends Container {
 				this.#onSelectCallback({ kind: "deleteProfile", profileName: this.#previewProfileName });
 				return;
 			}
+			if (this.#providerAuthPending) {
+				this.#presetLoginHint = "Refreshing preset availability...";
+				this.#renderPresetLanding();
+				return;
+			}
 			const missing = this.#getMissingProviders(profile);
 			if (missing.length > 0) {
 				this.#presetLoginHint = `Run ${missing.map(provider => `/login ${provider}`).join(", ")}`;
@@ -2627,6 +2637,11 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		if (row.kind === "group") {
+			if (this.#providerAuthPending) {
+				this.#presetLoginHint = "Refreshing preset availability...";
+				this.#renderPresetLanding();
+				return;
+			}
 			// A group is a list of alternative presets; only surface a login hint
 			// when none of its members are usable. A partially-usable group stays
 			// navigable so the user can drill in and pick a usable member.
@@ -2647,6 +2662,11 @@ export class ModelSelectorComponent extends Container {
 				this.#expandSelectedPresetProvider();
 			}
 			this.#presetLoginHint = undefined;
+			this.#renderPresetLanding();
+			return;
+		}
+		if (this.#providerAuthPending && !isCustomUserProfile(row.profile)) {
+			this.#presetLoginHint = "Refreshing preset availability...";
 			this.#renderPresetLanding();
 			return;
 		}
@@ -2687,7 +2707,7 @@ export class ModelSelectorComponent extends Container {
 			this.#presetLoginHint = undefined;
 			this.#clampPresetCursor();
 		}
-		this.#renderPresetLanding();
+		void this.#refreshProviderAuth();
 		this.#tui.requestRender();
 	}
 
