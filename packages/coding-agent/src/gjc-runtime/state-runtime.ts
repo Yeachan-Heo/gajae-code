@@ -1648,6 +1648,40 @@ async function assertDeepInterviewHandoffReady(
 	const envelope = normalizeDeepInterviewEnvelope(state);
 	const inner = envelope.state;
 	if (!inner) return;
+	const assertLockedIntentContract = (): void => {
+		if (inner.intent_contract === undefined) {
+			if (inner.intent_contract_required === true)
+				throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
+			return;
+		}
+		assertDeepInterviewIntentManifest(inner.intent_contract);
+		if (!specPath || !expectedSha || content === undefined)
+			throw new StateCommandError(2, "deep-interview handoff requires a persisted intent-validated spec");
+		if (createHash("sha256").update(content).digest("hex") !== expectedSha)
+			throw new StateCommandError(2, "deep-interview handoff spec hash mismatch");
+		const observedIds = [...new Set(content.match(DEEP_INTERVIEW_INTENT_ID_RE) ?? [])].sort();
+		const rounds = Array.isArray(inner.rounds)
+			? inner.rounds
+					.filter(
+						(round): round is Record<string, unknown> =>
+							Boolean(round) && typeof round === "object" && !Array.isArray(round),
+					)
+					.map(round => ({ round: round.round, answer_hash: round.answer_hash }))
+			: [];
+		try {
+			assertDeepInterviewIntentReview(
+				inner.intent_review,
+				inner.intent_contract as DeepInterviewIntentManifest,
+				observedIds,
+				rounds,
+			);
+		} catch (error) {
+			throw new StateCommandError(
+				2,
+				`deep-interview handoff intent validation failed: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
+	};
 	if (inner.crystal !== undefined) {
 		const crystal = requireReadyCanonicalCrystal(inner.crystal);
 		if (!specPath || !expectedSha || content === undefined)
@@ -1671,6 +1705,7 @@ async function assertDeepInterviewHandoffReady(
 				2,
 				"deep-interview crystallized handoff spec is not the canonical Crystal rendering",
 			);
+		assertLockedIntentContract();
 		if (inner.execution_approval !== "approved" && options.requireExecutionApproval)
 			throw new StateCommandError(2, "deep-interview crystallization never grants execution approval");
 		if (options.requireExecutionApproval) {
@@ -1692,38 +1727,7 @@ async function assertDeepInterviewHandoffReady(
 	}
 	if (options.requireExecutionApproval)
 		throw new StateCommandError(2, "deep-interview execution handoff requires a ready approved Crystal");
-	if (inner.intent_contract === undefined) {
-		if (inner.intent_contract_required === true)
-			throw new StateCommandError(2, "deep-interview handoff requires a locked Round 0 intent contract");
-		return;
-	}
-	assertDeepInterviewIntentManifest(inner.intent_contract);
-	if (!specPath || !expectedSha || content === undefined)
-		throw new StateCommandError(2, "deep-interview handoff requires a persisted intent-validated spec");
-	if (createHash("sha256").update(content).digest("hex") !== expectedSha)
-		throw new StateCommandError(2, "deep-interview handoff spec hash mismatch");
-	const observedIds = [...new Set(content.match(DEEP_INTERVIEW_INTENT_ID_RE) ?? [])].sort();
-	const rounds = Array.isArray(inner.rounds)
-		? inner.rounds
-				.filter(
-					(round): round is Record<string, unknown> =>
-						Boolean(round) && typeof round === "object" && !Array.isArray(round),
-				)
-				.map(round => ({ round: round.round, answer_hash: round.answer_hash }))
-		: [];
-	try {
-		assertDeepInterviewIntentReview(
-			inner.intent_review,
-			inner.intent_contract as DeepInterviewIntentManifest,
-			observedIds,
-			rounds,
-		);
-	} catch (error) {
-		throw new StateCommandError(
-			2,
-			`deep-interview handoff intent validation failed: ${error instanceof Error ? error.message : String(error)}`,
-		);
-	}
+	assertLockedIntentContract();
 }
 
 /**
@@ -1748,7 +1752,7 @@ async function assertDeepInterviewHandoffReady(
 async function handleHandoffUnlocked(
 	args: readonly string[],
 	cwd: string,
-	options: { callerLockHeld?: boolean } = {},
+	options: { callerLockHeld?: boolean; calleeLockHeld?: boolean } = {},
 ): Promise<StateCommandResult> {
 	const selectors = await resolveSelectors(args, cwd, "handoff");
 	const { gjcSessionId: sessionId, threadId, turnId } = selectors;
@@ -1794,7 +1798,8 @@ async function handleHandoffUnlocked(
 	)
 		throw new StateCommandError(2, `gjc state ${caller} handoff: caller is not active`);
 	if (caller === "deep-interview" && callee === "ultragoal") {
-		if (existingCaller.active !== true || existingCaller.current_phase !== "handoff")
+		const exactRecovery = existingCaller.active === false && existingCaller.handoff_to === callee;
+		if ((!exactRecovery && existingCaller.active !== true) || existingCaller.current_phase !== "handoff")
 			throw new StateCommandError(2, "deep-interview execution handoff requires active handoff phase");
 		const receipt = isPlainObject(existingCaller.receipt) ? existingCaller.receipt : undefined;
 		const checksum = isPlainObject(receipt?.content_sha256) ? receipt.content_sha256 : undefined;
@@ -1918,6 +1923,13 @@ async function handleHandoffUnlocked(
 	if (!calleePath) {
 		throw new StateCommandError(2, `gjc state handoff failed to resolve workflow callee path for ${callee}`);
 	}
+	if (!options.calleeLockHeld) {
+		return withWorkflowStateLock(
+			calleePath,
+			() => handleHandoffUnlocked(args, cwd, { ...options, calleeLockHeld: true }),
+			{ cwd },
+		);
+	}
 	const calleeRead = await readExistingStateForMutation(calleePath);
 	if (calleeRead.kind === "corrupt" && !forced) {
 		throw new StateCommandError(
@@ -1994,6 +2006,7 @@ async function handleHandoffUnlocked(
 		force,
 		fromPhase: typeof existingCallee.current_phase === "string" ? existingCallee.current_phase : undefined,
 		toPhase: calleeInitial,
+		lockHeld: options.calleeLockHeld,
 	});
 	await updateWorkflowTransactionJournal(cwd, sessionId, mutationId, { steps: ["callee-mode-state"] });
 	const callerWrite = await writeJsonAtomic(cwd, callerPath, mergedCallerState, "handoff", {
