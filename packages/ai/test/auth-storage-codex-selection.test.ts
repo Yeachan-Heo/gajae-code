@@ -453,6 +453,38 @@ describe("AuthStorage codex oauth ranking", () => {
 		).resolves.toBe("api-acct-entitled");
 	});
 
+	test("falls back to a Plus-labelled account when the preferred Pro Sol credential cannot resolve", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("openai-codex", [
+			{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			{ type: "oauth", ...createCredential("acct-pro", "pro@example.com") },
+		]);
+		const plusReport = createCodexUsageReport({
+			accountId: "acct-plus",
+			primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		plusReport.metadata = { ...plusReport.metadata, planType: "plus" };
+		usageByAccount.set("acct-plus", plusReport);
+		const proReport = createCodexUsageReport({
+			accountId: "acct-pro",
+			primary: { usedFraction: 0.2, resetInMs: 30 * 60 * 1000 },
+			secondary: { usedFraction: 0.2, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+		});
+		proReport.metadata = { ...proReport.metadata, planType: "pro" };
+		usageByAccount.set("acct-pro", proReport);
+		vi.spyOn(oauthUtils, "getOAuthApiKey").mockImplementation(async (_provider, credentials) => {
+			const credential = credentials["openai-codex"] as OAuthCredentials | undefined;
+			if (!credential?.accountId || credential.accountId === "acct-pro") return null;
+			return { apiKey: `api-${credential.accountId}`, newCredentials: credential };
+		});
+
+		await expect(
+			authStorage.getApiKey("openai-codex", "session-sol-pro-fallback", { modelId: "gpt-5.6-sol" }),
+		).resolves.toBe("api-acct-plus");
+	});
+
 	test("does not reject GPT-5.6 Sol when the ChatGPT plan is unavailable", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
