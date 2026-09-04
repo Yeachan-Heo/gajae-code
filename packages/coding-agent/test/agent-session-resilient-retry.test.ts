@@ -2640,7 +2640,6 @@ describe.serial("AgentSession resilient retry", () => {
 					return stream;
 				},
 			});
-			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 			const { retryStartEvents } = track(session);
 			const observedDeltas: string[] = [];
 			session.subscribe(event => {
