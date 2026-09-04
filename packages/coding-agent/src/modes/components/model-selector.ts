@@ -1731,7 +1731,7 @@ export class ModelSelectorComponent extends Container {
 		try {
 			await load;
 		} catch (error) {
-			if (!this.#disposed && this.#viewMode === "models") {
+			if (!this.#disposed && (this.#viewMode === "models" || this.#viewMode === "smart-routing")) {
 				this.#errorMessage = error instanceof Error ? error.message : String(error);
 				this.#buildProviderTabs();
 				this.#updateTabBar();

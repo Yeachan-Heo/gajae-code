@@ -61,6 +61,7 @@ function createContext(
 		settings?: Settings;
 		noProfiles?: boolean;
 		providerOrder?: readonly string[];
+		refreshError?: Error;
 	} = {},
 ) {
 	const settings = options.settings ?? Settings.isolated();
@@ -69,7 +70,9 @@ function createContext(
 	const registry = {
 		getAll: () => catalog,
 		getAvailable: () => catalog,
-		refresh: vi.fn(async () => {}),
+		refresh: vi.fn(async () => {
+			if (options.refreshError) throw options.refreshError;
+		}),
 		getError: () => undefined,
 		getCanonicalModels: () => [],
 		getCanonicalModelSelections: (query: { candidates?: Model[] } = {}) =>
@@ -290,6 +293,22 @@ describe("/model smart-routing panel integration", () => {
 		const { panel, selector } = await openPanel({ smartRoutingOnly: true, noProfiles: true });
 		expect(selector.__testViewMode()).toBe("smart-routing");
 		expect(renderText(panel)).toContain("Smart routing setup");
+	});
+
+	test("standalone /routing renders catalog refresh failures instead of hanging", async () => {
+		const { ctx, editorContainer } = createContext({
+			noProfiles: true,
+			refreshError: new Error("offline refresh failed"),
+		});
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector({ smartRoutingOnly: true });
+		const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		await settle();
+		installTheme();
+
+		const text = renderText(selector);
+		expect(text).toContain("offline refresh failed");
+		expect(text).not.toContain("Loading models...");
 	});
 
 	test("standalone panel cancel closes the selector instead of falling back to the preset landing", async () => {
