@@ -596,6 +596,7 @@ export class ModelSelectorComponent extends Container {
 			// The landing only needs profile definitions and provider authentication.
 			// Refresh static configuration without enumerating and canonicalizing the
 			// full browser catalog, then resolve preset authentication once.
+			this.#presetCatalogRefreshPending = true;
 			if ((this.#modelRegistry.getModelProfiles?.().size ?? 0) > 0) {
 				this.#renderPresetLanding();
 			} else {
@@ -1338,6 +1339,10 @@ export class ModelSelectorComponent extends Container {
 		return this.#modelRegistry.getModelProfile?.(name) ?? this.#modelRegistry.getModelProfiles?.().get(name);
 	}
 
+	#isPresetAvailabilityPending(): boolean {
+		return this.#presetCatalogRefreshPending || this.#providerAuthPending;
+	}
+
 	#isProviderAuthenticated(providerId: string): boolean | undefined {
 		return this.#providerAuthById.get(providerId);
 	}
@@ -2025,7 +2030,7 @@ export class ModelSelectorComponent extends Container {
 			}
 			if (row.kind === "group") {
 				const authenticated = this.#isPresetGroupUsable(row.profiles);
-				const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+				const mark = this.#isPresetAvailabilityPending() ? "…" : authenticated ? "✓" : "✗";
 				const containsActive =
 					this.#activeModelProfile !== undefined &&
 					row.profiles.some(profile => profile.name === this.#activeModelProfile);
@@ -2037,7 +2042,7 @@ export class ModelSelectorComponent extends Container {
 			}
 			const presentation = getModelProfilePresentation(row.profile);
 			const authenticated = this.#isPresetAuthenticated(row.profile);
-			const mark = this.#providerAuthPending ? "…" : authenticated ? "✓" : "✗";
+			const mark = this.#isPresetAvailabilityPending() ? "…" : authenticated ? "✓" : "✗";
 			const isActive = row.profile.name === this.#activeModelProfile;
 			const label = `  ${mark} ${presentation.displayName}`;
 			const renderedLabel = selected ? theme.fg("accent", label) : authenticated ? label : theme.fg("dim", label);
@@ -2580,7 +2585,7 @@ export class ModelSelectorComponent extends Container {
 				this.#onSelectCallback({ kind: "deleteProfile", profileName: this.#previewProfileName });
 				return;
 			}
-			if (this.#providerAuthPending) {
+			if (this.#isPresetAvailabilityPending()) {
 				this.#presetLoginHint = "Refreshing preset availability...";
 				this.#renderPresetLanding();
 				return;
@@ -2637,7 +2642,7 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		if (row.kind === "group") {
-			if (this.#providerAuthPending) {
+			if (this.#isPresetAvailabilityPending()) {
 				this.#presetLoginHint = "Refreshing preset availability...";
 				this.#renderPresetLanding();
 				return;
@@ -2665,7 +2670,7 @@ export class ModelSelectorComponent extends Container {
 			this.#renderPresetLanding();
 			return;
 		}
-		if (this.#providerAuthPending && !isCustomUserProfile(row.profile)) {
+		if (this.#isPresetAvailabilityPending() && !isCustomUserProfile(row.profile)) {
 			this.#presetLoginHint = "Refreshing preset availability...";
 			this.#renderPresetLanding();
 			return;

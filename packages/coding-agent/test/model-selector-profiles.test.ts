@@ -523,6 +523,31 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("Codex Eco");
 	});
 
+	test("defers preset actions while the initial static catalog refresh is pending", async () => {
+		installTestTheme();
+		const gate = Promise.withResolvers<void>();
+		const registry = createRegistry() as unknown as TestModelRegistry & {
+			refreshStatic: () => Promise<void>;
+		};
+		registry.refreshStatic = () => gate.promise;
+		const selector = createSelector(() => {}, { registry });
+		await Bun.sleep(0);
+
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("… CODEX");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Refreshing preset availability...");
+		expect(rendered).not.toContain("Run /login provider-a");
+
+		gate.resolve();
+		await Bun.sleep(10);
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Codex Eco");
+	});
+
 	test("up and down navigation stays on provider rows while collapsed", async () => {
 		installTestTheme();
 		const registry = createRegistry();
