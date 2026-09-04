@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getSessionsDir } from "@gajae-code/utils";
 import { isSettingsInitialized, Settings } from "../config/settings";
-import { listProjectSessionTranscriptFiles, parseSessionEntries } from "../session/session-manager";
+import {
+	type FileEntry,
+	listProjectSessionTranscriptFiles,
+	parseSessionEntries,
+	RESUME_TRANSCRIPT_MAX_BYTES,
+} from "../session/session-manager";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -121,7 +126,15 @@ const TRACE_SOURCE_EXTENSIONS = new Set([
 	".yaml",
 ]);
 
-const DEEP_INTERVIEW_NON_TEXT_CONTENT_TYPES = new Set(["image", "audio", "video", "file", "content"]);
+const DEEP_INTERVIEW_NON_TEXT_CONTENT_TYPES = new Set([
+	"image",
+	"audio",
+	"video",
+	"file",
+	"content",
+	"toolCall",
+	"thinking",
+]);
 
 interface DeepInterviewTraceSummary {
 	enabled: true;
@@ -192,6 +205,31 @@ async function readCrystallizeInput(rawInput: string | undefined, cwd: string): 
 	return parsed as Record<string, unknown>;
 }
 
+function activeSessionEntries(entries: FileEntry[]): FileEntry[] {
+	const body = entries.slice(1);
+	if (
+		body.length === 0 ||
+		body.some(entry => typeof (entry as { id?: unknown }).id !== "string" || !("parentId" in entry))
+	)
+		return body;
+	const byId = new Map(body.map(entry => [(entry as { id: string }).id, entry]));
+	const branch: typeof body = [];
+	const visited = new Set<string>();
+	let current = body.at(-1);
+	while (current) {
+		const id = (current as { id: string }).id;
+		if (visited.has(id)) throw new DeepInterviewCommandError(2, "live session transcript branch contains a cycle");
+		visited.add(id);
+		branch.push(current);
+		const parentId = (current as { parentId: string | null }).parentId;
+		if (parentId === null) break;
+		current = byId.get(parentId);
+		if (!current) throw new DeepInterviewCommandError(2, "live session transcript branch has a missing parent");
+	}
+	branch.reverse();
+	return branch;
+}
+
 async function authoritativeConversationSnapshot(
 	cwd: string,
 	sessionId: string,
@@ -253,6 +291,9 @@ async function authoritativeConversationSnapshot(
 	if (!sessionFile)
 		throw new DeepInterviewCommandError(2, "an authenticated session transcript is required for crystallization");
 	try {
+		const transcriptStat = await fs.stat(sessionFile);
+		if (!transcriptStat.isFile() || transcriptStat.size > RESUME_TRANSCRIPT_MAX_BYTES)
+			throw new DeepInterviewCommandError(2, "live session transcript exceeds the bounded resume limit");
 		const text = await fs.readFile(sessionFile, "utf-8");
 		for (const line of text.split(/\r?\n/)) {
 			if (!line.trim()) continue;
@@ -270,7 +311,7 @@ async function authoritativeConversationSnapshot(
 		)
 			throw new DeepInterviewCommandError(2, "live session transcript identity mismatch");
 		const messages: Array<{ index: number; role: string; content: string }> = [];
-		for (const entry of entries.slice(1)) {
+		for (const entry of activeSessionEntries(entries)) {
 			if (entry.type !== "message") continue;
 			const index = messages.length;
 			const message = entry.message as unknown;
@@ -369,6 +410,8 @@ async function handleCrystallizeUnlocked(
 	if (existingRead.kind === "valid" && existing.active === false)
 		throw new DeepInterviewCommandError(2, "cannot crystallize an inactive deep-interview state");
 	const storedPrior = (existing.state as Record<string, unknown> | undefined)?.crystal;
+	if (input.prior !== undefined && storedPrior === undefined)
+		throw new DeepInterviewCommandError(2, "supplied prior crystal requires canonical stored crystal provenance");
 	if (
 		input.prior !== undefined &&
 		storedPrior !== undefined &&

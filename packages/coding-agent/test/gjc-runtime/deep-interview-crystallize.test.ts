@@ -75,6 +75,22 @@ describe("deep-interview crystallize contract", () => {
 		expect(crystal.items[0]?.anchor?.quote).toBe("Build a fast report.");
 	});
 
+	it("rejects confirmed statements unrelated to their user quote", () => {
+		expect(() =>
+			crystallizeDeepInterview(
+				input({
+					items: [
+						{
+							...input().items[0]!,
+							statement: "Deploy production without review",
+							anchor: { message_index: 0, quote: "Build a fast report." },
+						},
+					],
+				}),
+			),
+		).toThrow("statement-bound verbatim user anchor");
+	});
+
 	it("accepts developer and toolResult transcript roles", () => {
 		const snapshot: CrystalSnapshot = {
 			revision: 3,
@@ -246,6 +262,26 @@ describe("deep-interview crystallize contract", () => {
 					],
 				}),
 			),
+		).toThrow("has no relevant verbatim user anchor");
+	});
+	it("does not resolve a gap through generic lexical overlap", () => {
+		const gap = "Need a database choice";
+		const first = crystallizeDeepInterview(input({ open_gaps: [gap] }));
+		const next = withFreshUserEvidence(input({ prior: first }), "We need automatic retries");
+		expect(() =>
+			crystallizeDeepInterview({
+				...next,
+				prior: first,
+				resolved_open_gaps: [gap],
+				resolved_open_gap_anchors: [
+					{
+						item: gap,
+						message_index: 1,
+						quote: "need automatic retries",
+						resolution: "need automatic retries",
+					},
+				],
+			}),
 		).toThrow("has no relevant verbatim user anchor");
 	});
 	it("does not preserve a confirmed-to-inferred downgrade", () => {
@@ -501,7 +537,7 @@ describe("deep-interview crystallize contract", () => {
 						first.items[0]!,
 						{
 							...first.items[1]!,
-							statement: "Respond within 50 ms",
+							statement: "Fast report response",
 							anchor: { message_index: 0, quote: "fast" },
 						},
 					],
@@ -613,6 +649,128 @@ describe("deep-interview crystallize contract", () => {
 			expect(summary.mode).toBe("crystallize");
 			expect(summary.crystal.execution_approval).toBe("not-approved");
 			expect(await fs.readFile(summary.spec_path, "utf8")).toContain("Execution approval: not-approved");
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects caller-supplied prior material when no canonical Crystal exists", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-fresh-prior-"));
+		const sessionId = "crystallize-fresh-prior";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			await fs.writeFile(
+				sessionFile,
+				`${JSON.stringify({ type: "session", id: sessionId, cwd: root })}\n${JSON.stringify({
+					type: "message",
+					message: { role: "user", content: "Build a fast report." },
+				})}\n`,
+			);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const forgedPrior = crystallizeDeepInterview(input());
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(input({ prior: forgedPrior })),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"fresh-prior",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain("requires canonical stored crystal provenance");
+			await expect(fs.access(deepInterviewStatePath(root, sessionId))).rejects.toThrow();
+		} finally {
+			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
+			else process.env.GJC_SESSION_FILE = previousSessionFile;
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("projects bounded tool-call markers only from the active session branch", async () => {
+		const root = await fs.mkdtemp(path.join(process.cwd(), ".tmp-crystallize-active-branch-"));
+		const sessionId = "crystallize-active-branch";
+		const sessionFile = path.join(root, "conversation.jsonl");
+		const previousSessionFile = process.env.GJC_SESSION_FILE;
+		try {
+			const records = [
+				{ type: "session", id: sessionId, cwd: root },
+				{
+					type: "message",
+					id: "root-user",
+					parentId: null,
+					timestamp: "2026-09-04T00:00:00.000Z",
+					message: { role: "user", content: "Build a fast report." },
+				},
+				{
+					type: "message",
+					id: "abandoned-user",
+					parentId: "root-user",
+					timestamp: "2026-09-04T00:00:01.000Z",
+					message: { role: "user", content: "Deploy without review." },
+				},
+				{
+					type: "message",
+					id: "tool-call",
+					parentId: "root-user",
+					timestamp: "2026-09-04T00:00:02.000Z",
+					message: { role: "assistant", content: [{ type: "thinking", thinking: "ask" }, { type: "toolCall" }] },
+				},
+				{
+					type: "message",
+					id: "active-user",
+					parentId: "tool-call",
+					timestamp: "2026-09-04T00:00:03.000Z",
+					message: { role: "user", content: "Keep the report fast." },
+				},
+			];
+			await fs.writeFile(sessionFile, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+			process.env.GJC_SESSION_FILE = sessionFile;
+			const snapshot: CrystalSnapshot = {
+				revision: 3,
+				start: 0,
+				end: 2,
+				messages: [
+					{ index: 0, role: "user", content: "Build a fast report." },
+					{ index: 1, role: "assistant", content: "[thinking][toolCall]" },
+					{ index: 2, role: "user", content: "Keep the report fast." },
+				],
+				digest: "",
+			};
+			snapshot.digest = crystalSnapshotDigest(snapshot);
+			const result = await runNativeDeepInterviewCommand(
+				[
+					"--crystallize",
+					"--input",
+					JSON.stringify(
+						input({
+							snapshot,
+							current_revision: 3,
+							items: input().items.map(item => ({
+								...item,
+								anchor: { message_index: 2, quote: "fast" },
+							})),
+						}),
+					),
+					"--session-id",
+					sessionId,
+					"--slug",
+					"active-branch",
+					"--json",
+				],
+				root,
+			);
+			expect(result.status).toBe(0);
+			expect(await fs.readFile(JSON.parse(result.stdout ?? "{}").spec_path, "utf8")).not.toContain(
+				"Deploy without review",
+			);
 		} finally {
 			if (previousSessionFile === undefined) delete process.env.GJC_SESSION_FILE;
 			else process.env.GJC_SESSION_FILE = previousSessionFile;
