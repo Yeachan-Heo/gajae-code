@@ -17,6 +17,7 @@
 ### Added
 
 - Added cancellable, one-shot `enqueueBeforeRender` preparation on the existing frame scheduler and a single-owner `setRenderPreparationLifecycleCallbacks` seam for invalidation and restart preparation. Stop, terminal loss, and disposal cancel stale work; restart preparation runs before the first forced frame without adding another streaming timer.
+- `fuzzyFilter` / `fuzzyMatch` now handle Hangul the same way path autocomplete does, so the command palette, model selector, OAuth selector, and session selector stop silently hiding entries. That matcher had no Hangul or normalization handling at all: a chosung query returned nothing (`ㅎㄱ` against `한글경로 설정` matched 0 items), and a composed query matched only composed entries (1 of 2 when both NFC and NFD spellings were present) — which on macOS means filesystem-derived text was routinely invisible. Both sides are now NFC-folded before comparison and a bare consonant matches a syllable's initial. The initial-jamo table, the character comparison, and the folding step moved into a single shared `hangul` module that both matchers import instead of keeping a second copy; scoring, word-boundary rewards, whitespace token semantics, and the alphanumeric-swap fallback are unchanged, and a decomposed target now scores identically to its composed form.
 
 ## [0.16.3] - 2026-09-04
 
@@ -25,7 +26,6 @@
 ## [0.16.1] - 2026-09-03
 
 - Skill slash-token autocomplete now recognizes subsequent `/skill:` and `/skill-` tokens on the same or later lines without broadening ordinary inline slash-command completion; completion remains suppressed inside inline code and replaces only the active token.
-- `fuzzyFilter` / `fuzzyMatch` now handle Hangul the same way path autocomplete does, so the command palette, model selector, OAuth selector, and session selector stop silently hiding entries. That matcher had no Hangul or normalization handling at all: a chosung query returned nothing (`ㅎㄱ` against `한글경로 설정` matched 0 items), and a composed query matched only composed entries (1 of 2 when both NFC and NFD spellings were present) — which on macOS means filesystem-derived text was routinely invisible. Both sides are now NFC-folded before comparison and a bare consonant matches a syllable's initial. The initial-jamo table, the character comparison, and the folding step moved into a single shared `hangul` module that both matchers import instead of keeping a second copy; scoring, word-boundary rewards, whitespace token semantics, and the alphanumeric-swap fallback are unchanged, and a decomposed target now scores identically to its composed form.
 
 ## [0.16.0] - 2026-09-02
 
