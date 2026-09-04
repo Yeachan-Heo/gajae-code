@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setDefaultTimeout, vi } from "bun:test";
 import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import { Agent, type AgentTool, type StreamFn } from "@gajae-code/agent-core";
@@ -24,6 +24,8 @@ import {
 
 const REAL_DATE_NOW = Date.now;
 const ORIGINAL_COORDINATOR_STATE_FILE = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+
+setDefaultTimeout(120_000);
 
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a

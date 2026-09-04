@@ -150,6 +150,7 @@ import { shouldHostSdk } from "../sdk/host";
 import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
+import { resolveStreamFirstEventTimeoutMs } from "../sdk/retry-settings";
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed, isSessionDisposalIncompleteError } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
@@ -4312,9 +4313,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			maxRetryDelayMs: retrySettings.maxDelayMs,
 			requestMaxRetries: retrySettings.requestMaxRetries,
 			streamMaxRetries: retrySettings.streamMaxRetries,
-			streamFirstEventTimeoutMs: settings.has("retry.streamFirstEventTimeoutMs")
-				? retrySettings.streamFirstEventTimeoutMs
-				: undefined,
+			streamFirstEventTimeoutMs: resolveStreamFirstEventTimeoutMs(settings),
 			kimiApiFormat: settings.get("providers.kimiApiFormat") ?? "anthropic",
 			shouldPause: options.shouldPause,
 			preferWebsockets: preferOpenAICodexWebsockets,
