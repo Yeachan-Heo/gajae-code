@@ -119,7 +119,9 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 		// different concurrent top-level session (review thread P1).
 		const manager =
 			this.session.getAsyncJobManager?.() ??
-			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.forEndpoint(
+				this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+			) ??
 			AsyncJobManager.instance();
 		if (!manager) {
 			throw new ToolError("Async execution is disabled; the monitor tool is unavailable in this session.");
@@ -197,7 +199,11 @@ export class MonitorTool implements AgentTool<typeof monitorSchema, MonitorToolD
 			// endpoint-less fallback scan could attach a foreign session's
 			// registration (review thread P2).
 			const registration = generation
-				? lookupOwnedRegistration(jobId, generation, this.session.getSessionId?.() ?? "local")
+				? lookupOwnedRegistration(
+						jobId,
+						generation,
+						this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
+					)
 				: undefined;
 			const ownedCompletion = registration
 				? {

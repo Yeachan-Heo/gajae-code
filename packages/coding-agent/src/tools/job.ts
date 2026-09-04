@@ -396,7 +396,11 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 			const generation = manager.getJob?.(job.id)?.generation;
 			if (!generation) continue;
 			// The endpoint disambiguates concurrent sessions' same job ids (review P1).
-			const registration = lookupOwnedRegistration(job.id, generation, this.session.getSessionId?.() ?? "local");
+			const registration = lookupOwnedRegistration(
+				job.id,
+				generation,
+				this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
+			);
 			if (registration) unregisterOwnedRegistration(registration);
 		}
 

@@ -227,7 +227,9 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		// or belong to a same-id subagent of another session (review thread P1).
 		const manager =
 			this.session.getAsyncJobManager?.() ??
-			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.forEndpoint(
+				this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+			) ??
 			AsyncJobManager.instance();
 		if (!manager) {
 			return {
