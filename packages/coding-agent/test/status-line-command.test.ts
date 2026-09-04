@@ -142,6 +142,29 @@ describe("status line command segment", () => {
 		}
 	});
 
+	it("does not abort a committed command when a draft preview hides it", async () => {
+		const marker = path.join(os.tmpdir(), `gjc-status-line-preview-${Date.now()}.txt`);
+		const quotedMarker = marker.replaceAll("'", "'\\''");
+		const component = makeComponent(`sleep 0.2; printf preview-safe > '${quotedMarker}'; printf done`, {
+			timeoutMs: 1_000,
+		});
+		try {
+			component.render(120);
+			component.getPreviewContentForSettings(120, {
+				preset: "custom",
+				leftSegments: [],
+				rightSegments: [],
+				segmentOptions: {},
+			});
+			await Bun.sleep(300);
+
+			expect(await Bun.file(marker).text()).toBe("preview-safe");
+		} finally {
+			component.dispose();
+			await fs.rm(marker, { force: true });
+		}
+	});
+
 	it("refreshes an idle command without another incidental render", async () => {
 		const marker = path.join(os.tmpdir(), `gjc-status-line-refresh-${Date.now()}.txt`);
 		const quotedMarker = marker.replaceAll("'", "'\\''");

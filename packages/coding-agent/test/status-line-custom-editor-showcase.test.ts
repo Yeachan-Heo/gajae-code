@@ -13,10 +13,35 @@ describe("status line custom editor showcase", () => {
 		const keys = STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_ENTRIES.map(
 			entry => `${entry.stateId}/${entry.columns}x${entry.rows}/${entry.renderMode}`,
 		);
+		const expectedKeys = new Set([
+			...[
+				"root-statusbar",
+				"picked-origin-slot",
+				"palette-exact-insert",
+				"separator-control",
+				"separator-choice-focused",
+				"separator-choice-applied",
+				"option-boolean-choice-focused",
+				"option-enum-choice-focused",
+				"option-numeric-choice-focused",
+				"option-choice-applied",
+				"exit-restored",
+				"confirm-persisted",
+				"overflow-two-row-warning",
+			].map(state => `${state}/80x32/unicode-color`),
+			"overflow-two-row-warning/48x40/unicode-color",
+			"narrow-cjk/48x40/unicode-color",
+			...[
+				"root-statusbar",
+				"picked-origin-slot",
+				"separator-choice-focused",
+				"option-boolean-choice-focused",
+				"option-enum-choice-focused",
+				"option-numeric-choice-focused",
+			].map(state => `${state}/80x32/ascii-no-color`),
+		]);
 		expect(new Set(keys).size).toBe(STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_EXPECTED_ENTRY_COUNT);
-		expect(keys).toContain("root-statusbar/80x24/unicode-color");
-		expect(keys).toContain("overflow-two-row-warning/48x36/unicode-color");
-		expect(keys).toContain("option-numeric-choice-focused/80x24/ascii-no-color");
+		expect(new Set(keys)).toEqual(expectedKeys);
 	});
 
 	it("renders required editor witnesses from the production settings selector", async () => {
@@ -24,19 +49,19 @@ describe("status line custom editor showcase", () => {
 		const picked = await renderStatusLineCustomEditorShowcase({
 			stateId: "picked-origin-slot",
 			columns: 80,
-			rows: 24,
+			rows: 32,
 			renderMode: "ascii-no-color",
 		});
 		const choice = await renderStatusLineCustomEditorShowcase({
 			stateId: "separator-choice-focused",
 			columns: 80,
-			rows: 24,
+			rows: 32,
 			renderMode: "ascii-no-color",
 		});
 		const narrow = await renderStatusLineCustomEditorShowcase({
 			stateId: "overflow-two-row-warning",
 			columns: 48,
-			rows: 36,
+			rows: 40,
 			renderMode: "ascii-no-color",
 		});
 
@@ -89,8 +114,40 @@ describe("status line custom editor showcase", () => {
 			});
 			expect(strictVerify.exitCode).not.toBe(0);
 			expect(strictVerify.stderr.toString()).toContain("Missing approved independent review");
+
+			const manifestText = await Bun.file(path.join(outputRoot, "manifest.json")).text();
+			const manifest = JSON.parse(manifestText) as { sourceHead: string; sourceHash: string; captureActor: string };
+			const manifestSha256 = new Bun.CryptoHasher("sha256").update(manifestText).digest("hex");
+			await Bun.write(
+				path.join(outputRoot, "independent-review.json"),
+				`${JSON.stringify(
+					{
+						reviewer: `${manifest.captureActor}-independent`,
+						reviewerAssociation: "MEMBER",
+						verdict: "approved",
+						evidence: "https://github.com/Yeachan-Heo/gajae-code/pull/5278#pullrequestreview-1",
+						manifestSha256,
+						sourceHash: manifest.sourceHash,
+						headSha: manifest.sourceHead,
+					},
+					null,
+					2,
+				)}\n`,
+			);
+			const approvedVerify = Bun.spawnSync({
+				cmd: [
+					"bun",
+					"packages/coding-agent/scripts/verify-status-line-custom-editor-showcase.ts",
+					"--root",
+					outputRoot,
+					"--require-independent-review",
+				],
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			expect(approvedVerify.exitCode).toBe(0);
 		} finally {
 			await fs.rm(outputRoot, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 });

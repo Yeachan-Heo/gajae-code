@@ -821,11 +821,12 @@ export class StatusLineComponent implements Component {
 			Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
 		> &
 			StatusLineSettings,
+		previewOnly = false,
 	): SegmentContext {
 		const state = this.session.state;
 
 		this.#syncCachedUsageForActiveProvider();
-		this.refreshUsageInBackground();
+		if (!previewOnly) this.refreshUsageInBackground();
 
 		// Get usage statistics
 		const aggregateUsageStats = this.session.sessionManager?.getUsageStatistics() ?? {
@@ -856,8 +857,9 @@ export class StatusLineComponent implements Component {
 		const commandSegmentActive =
 			effectiveSettings.leftSegments.includes("command") || effectiveSettings.rightSegments.includes("command");
 		const commandOptions = commandSegmentActive ? this.#trustedCommandOptions() : undefined;
-		const commandKey = commandOptions ? this.#refreshCommandInBackground(commandOptions) : undefined;
-		if (!commandKey) this.#disableCommandSegment();
+		const commandKey =
+			!previewOnly && commandOptions ? this.#refreshCommandInBackground(commandOptions) : this.#commandConfigKey;
+		if (!previewOnly && !commandKey) this.#disableCommandSegment();
 
 		return {
 			session: this.session,
@@ -876,14 +878,16 @@ export class StatusLineComponent implements Component {
 			git: {
 				branch: this.#getCurrentBranch(),
 				status: this.#getGitStatus(),
-				pr: prSegmentActive ? this.#lookupPr() : null,
+				pr: prSegmentActive ? (previewOnly ? (this.#cachedPr ?? null) : this.#lookupPr()) : null,
 			},
 			usage: this.#cachedUsage,
-			command: commandKey
+			command: commandSegmentActive
 				? {
 						output: this.#commandOutput,
 						failed: this.#commandFailed,
-						pending: this.#commandInFlightKey === commandKey,
+						pending: previewOnly
+							? this.#commandOutput === null && !this.#commandFailed
+							: this.#commandInFlightKey === commandKey,
 					}
 				: undefined,
 		};
@@ -1034,8 +1038,9 @@ export class StatusLineComponent implements Component {
 			Pick<StatusLineSettings, "leftSegments" | "rightSegments" | "separator" | "segmentOptions">
 		> &
 			StatusLineSettings,
+		previewOnly = false,
 	): CollectedStatusSegments {
-		const ctx = this.#buildSegmentContext(width, effectiveSettings);
+		const ctx = this.#buildSegmentContext(width, effectiveSettings, previewOnly);
 		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
 		// Use the subtle surface tone (the same elevated background as user-message
@@ -1333,9 +1338,9 @@ export class StatusLineComponent implements Component {
 	 * being dropped. Falls back to the polished justified single row whenever
 	 * everything fits on one line.
 	 */
-	#buildStatusRows(width: number, maxRows: number): string[] {
+	#buildStatusRows(width: number, maxRows: number, previewOnly = false): string[] {
 		const effectiveSettings = this.#resolveSettings();
-		const seg = this.#collectStatusSegments(width, effectiveSettings);
+		const seg = this.#collectStatusSegments(width, effectiveSettings, previewOnly);
 		const cacheKey = JSON.stringify({
 			width,
 			maxRows,
@@ -1370,14 +1375,14 @@ export class StatusLineComponent implements Component {
 				.join(","),
 			version: this.#version,
 		});
-		if (this.#renderedRowsCache?.key === cacheKey) {
+		if (!previewOnly && this.#renderedRowsCache?.key === cacheKey) {
 			this.#renderedRowsCacheHits++;
 			return [...this.#renderedRowsCache.rows];
 		}
-		this.#renderedRowsCacheMisses++;
+		if (!previewOnly) this.#renderedRowsCacheMisses++;
 
 		if (seg.left.length === 0 && seg.right.length === 0) {
-			this.#renderedRowsCache = { key: cacheKey, rows: [] };
+			if (!previewOnly) this.#renderedRowsCache = { key: cacheKey, rows: [] };
 			return [];
 		}
 
@@ -1455,7 +1460,7 @@ export class StatusLineComponent implements Component {
 			if (dropped > 0) {
 				const priorityRow = this.#priorityRowFor(seg, [], [], topFillWidth);
 				if (priorityRow !== null) {
-					this.#renderedRowsCache = { key: cacheKey, rows: [priorityRow] };
+					if (!previewOnly) this.#renderedRowsCache = { key: cacheKey, rows: [priorityRow] };
 					return [priorityRow];
 				}
 			}
@@ -1495,7 +1500,7 @@ export class StatusLineComponent implements Component {
 			if (packedRows.length === 0 && marker) rows = [marker];
 		}
 
-		this.#renderedRowsCache = { key: cacheKey, rows };
+		if (!previewOnly) this.#renderedRowsCache = { key: cacheKey, rows };
 		return [...rows];
 	}
 
@@ -1521,7 +1526,7 @@ export class StatusLineComponent implements Component {
 		const previousSettings = this.#settings;
 		this.#settings = { ...previousSettings, previewHighlightSegment: undefined, ...previewSettings };
 		try {
-			return this.#buildStatusRows(width, this.#resolveMaxRows()).join("\n");
+			return this.#buildStatusRows(width, this.#resolveMaxRows(), true).join("\n");
 		} finally {
 			this.#settings = previousSettings;
 		}
@@ -1621,7 +1626,7 @@ export class StatusLineComponent implements Component {
 		this.#resolvedSettingsCache = undefined;
 		this.#resolvedSettingsFingerprint = undefined;
 		try {
-			const seg = this.#collectStatusSegments(width, this.#resolveSettings());
+			const seg = this.#collectStatusSegments(width, this.#resolveSettings(), true);
 			const placed = this.#placePreviewSegments(seg, width);
 			return { ...placed, separator: seg.separatorDef };
 		} finally {

@@ -1,6 +1,10 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+
+- Status-line settings now include a draft-local spatial custom editor with exact-slot keyboard reordering, hidden-segment palette management, command text configuration, persisted Confirm/Exit semantics, live multi-row preview compatibility, narrow/Unicode rendering, and deterministic visual evidence.
+
 ### Fixed
 
 - Plain and explicit-model launches now refresh a missing provider's cached dynamic catalog before resolving a qualified startup selector, so configured models such as `glm-zcode/glm-5.3` no longer open in `no-model` state while preserving cache-only startup for already available models.

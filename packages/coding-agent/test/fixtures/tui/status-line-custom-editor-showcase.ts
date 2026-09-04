@@ -47,17 +47,17 @@ export const STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_ENTRIES: StatusLineCustomEditorS
 	...BASE_STATES.filter(stateId => stateId !== "narrow-cjk").map(stateId => ({
 		stateId,
 		columns: 80,
-		rows: 24,
+		rows: 32,
 		renderMode: "unicode-color" as const,
 	})),
-	{ stateId: "overflow-two-row-warning", columns: 48, rows: 36, renderMode: "unicode-color" },
-	{ stateId: "narrow-cjk", columns: 48, rows: 36, renderMode: "unicode-color" },
-	{ stateId: "root-statusbar", columns: 80, rows: 24, renderMode: "ascii-no-color" },
-	{ stateId: "picked-origin-slot", columns: 80, rows: 24, renderMode: "ascii-no-color" },
-	{ stateId: "separator-choice-focused", columns: 80, rows: 24, renderMode: "ascii-no-color" },
-	{ stateId: "option-boolean-choice-focused", columns: 80, rows: 24, renderMode: "ascii-no-color" },
-	{ stateId: "option-enum-choice-focused", columns: 80, rows: 24, renderMode: "ascii-no-color" },
-	{ stateId: "option-numeric-choice-focused", columns: 80, rows: 24, renderMode: "ascii-no-color" },
+	{ stateId: "overflow-two-row-warning", columns: 48, rows: 40, renderMode: "unicode-color" },
+	{ stateId: "narrow-cjk", columns: 48, rows: 40, renderMode: "unicode-color" },
+	{ stateId: "root-statusbar", columns: 80, rows: 32, renderMode: "ascii-no-color" },
+	{ stateId: "picked-origin-slot", columns: 80, rows: 32, renderMode: "ascii-no-color" },
+	{ stateId: "separator-choice-focused", columns: 80, rows: 32, renderMode: "ascii-no-color" },
+	{ stateId: "option-boolean-choice-focused", columns: 80, rows: 32, renderMode: "ascii-no-color" },
+	{ stateId: "option-enum-choice-focused", columns: 80, rows: 32, renderMode: "ascii-no-color" },
+	{ stateId: "option-numeric-choice-focused", columns: 80, rows: 32, renderMode: "ascii-no-color" },
 ];
 
 export const STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_EXPECTED_ENTRY_COUNT =
@@ -77,6 +77,9 @@ function driveUntil(component: SettingsSelectorComponent, width: number, witness
 		if (Bun.stripANSI(render(component, width)).includes(witness)) return;
 		component.handleInput("\x1b[B");
 	}
+	throw new Error(
+		`Could not reach showcase state ${JSON.stringify(witness)}:\n${Bun.stripANSI(render(component, width))}`,
+	);
 }
 
 function focusOption(component: SettingsSelectorComponent, width: number, target: string, rightMoves: number): void {
@@ -118,16 +121,23 @@ function buildComponent(dense = false, cjk = false): SettingsSelectorComponent {
 			},
 			getStatusLinePreview: () => currentPreview,
 			getStatusLinePreviewForSettings: preview => {
-				if (cjk) return "상태줄 경계 · 意味の境界 · 语义边界";
+				if (cjk) return "상태줄 경계 · 意味の境界 · 语义边界\n보조 행 · 補助行 · 辅助行";
+				if (dense) {
+					return `left=${(preview.leftSegments ?? []).join(",")}\nright=${(preview.rightSegments ?? []).join(",")}`;
+				}
 				return formatPreview(preview);
 			},
-			getStatusLinePreviewPartsForSettings: preview => ({
-				left: (preview.leftSegments ?? []).map(segment => segment.replace(/_/g, " ")),
-				leftIds: preview.leftSegments ?? [],
-				right: [...(preview.rightSegments ?? []).map(segment => segment.replace(/_/g, " ")), "v0.16.1"],
-				rightIds: [...(preview.rightSegments ?? []), null],
-				separator: { left: "|", right: "|" },
-			}),
+			...(cjk
+				? {}
+				: {
+						getStatusLinePreviewPartsForSettings: (preview: StatusLinePreviewSettings) => ({
+							left: (preview.leftSegments ?? []).map(segment => segment.replace(/_/g, " ")),
+							leftIds: preview.leftSegments ?? [],
+							right: [...(preview.rightSegments ?? []).map(segment => segment.replace(/_/g, " ")), "v0.16.1"],
+							rightIds: [...(preview.rightSegments ?? []), null],
+							separator: { left: "|", right: "|" },
+						}),
+					}),
 			onCancel: () => {},
 		},
 	);

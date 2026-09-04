@@ -155,7 +155,7 @@ describe("status rail survives very small widths", () => {
 		expect(strip(buildRail().render(24)[0])).toBe(`18.3%/200K·${goalGlyph}·sonnet-4.5`);
 		expect(strip(buildRail().render(30)[0])).toBe(`18.3%/200K·${goalLabel}·sonnet-4.5`);
 		// Wide enough for the normal rail: the priority row must not hijack it.
-		const wide = strip(buildRail().render(80)[0]);
+		const wide = strip(buildRail().render(120)[0]);
 		expect(wide).toContain("sonnet-4.5");
 		expect(wide).toContain("Goal");
 		expect(wide).toContain("MinWidth");

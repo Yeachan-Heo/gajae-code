@@ -134,11 +134,12 @@ describe("status line preview highlight", () => {
 			previewHighlightSegment: "gajae",
 		});
 
-		expect(component.getTopBorder(80).content).toContain("\x1b[7m");
+		const focusBackground = theme.getFgAnsi("text").replace("\x1b[38;", "\x1b[48;");
+		expect(component.getTopBorder(80).content).toContain(focusBackground);
 
 		component.updateSettings({ separator: "pipe" });
 
-		expect(component.getTopBorder(80).content).not.toContain("\x1b[7m");
+		expect(component.getTopBorder(80).content).not.toContain(focusBackground);
 	});
 });
 

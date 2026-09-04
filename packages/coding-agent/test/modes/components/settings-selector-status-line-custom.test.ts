@@ -1,7 +1,8 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { KeybindingsManager } from "@gajae-code/coding-agent/config/keybindings";
 import type { SettingPath } from "@gajae-code/coding-agent/config/settings";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import {
@@ -10,7 +11,8 @@ import {
 } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { getPreset } from "@gajae-code/coding-agent/modes/components/status-line/presets";
 import type { StatusLineSegmentId } from "@gajae-code/coding-agent/modes/components/status-line/types";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, theme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { setKeybindings } from "@gajae-code/tui";
 
 interface ChangedSetting {
 	path: SettingPath;
@@ -18,6 +20,7 @@ interface ChangedSetting {
 }
 
 interface SelectorOptions {
+	disableStatusLineStringPreview?: boolean;
 	getStatusLinePreview?: (width?: number) => string;
 	getStatusLinePreviewForSettings?: (preview: StatusLinePreviewSettings, width?: number) => string;
 	getStatusLinePreviewPartsForSettings?: (
@@ -40,7 +43,12 @@ beforeAll(async () => {
 beforeEach(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
+	setKeybindings(KeybindingsManager.inMemory());
 	vi.restoreAllMocks();
+});
+
+afterEach(() => {
+	setKeybindings(KeybindingsManager.inMemory());
 });
 
 function createSelector(options: SelectorOptions = {}) {
@@ -65,9 +73,13 @@ function createSelector(options: SelectorOptions = {}) {
 				previewWidths.push(width);
 				return options.getStatusLinePreview?.(width) ?? `preview-${width ?? "current"}`;
 			},
-			getStatusLinePreviewForSettings: (preview, width) =>
-				options.getStatusLinePreviewForSettings?.(preview, width) ??
-				`ACTUAL left=${preview.leftSegments?.join(",") ?? ""} right=${preview.rightSegments?.join(",") ?? ""} sep=${preview.separator} width=${width ?? "current"}`,
+			...(options.disableStatusLineStringPreview
+				? {}
+				: {
+						getStatusLinePreviewForSettings: (preview: StatusLinePreviewSettings, width?: number) =>
+							options.getStatusLinePreviewForSettings?.(preview, width) ??
+							`ACTUAL left=${preview.leftSegments?.join(",") ?? ""} right=${preview.rightSegments?.join(",") ?? ""} sep=${preview.separator} width=${width ?? "current"}`,
+					}),
 			getStatusLinePreviewPartsForSettings: options.getStatusLinePreviewPartsForSettings,
 			onCancel: () => {},
 		},
@@ -139,6 +151,34 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		expect(render(component)).toContain("Simulated statusbar");
 	});
 
+	it("honors remapped select navigation, confirm, and cancel actions", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "path"]);
+		settings.set("statusLine.rightSegments", []);
+		const { component, previews } = createSelector();
+
+		selectCustomEditor(component);
+		setKeybindings(
+			KeybindingsManager.inMemory({
+				"tui.select.up": "f6",
+				"tui.select.down": "f7",
+				"tui.select.confirm": "f8",
+				"tui.select.cancel": "f9",
+			}),
+		);
+		component.handleInput("\x1b[19~"); // F8 opens the editor.
+		component.handleInput("\x1b[19~"); // Pick model.
+		expect(render(component)).toContain("Selected: model");
+		component.handleInput("\x1b[18~"); // F7 moves to the palette.
+		expect(render(component)).toContain("Focus: palette:");
+		component.handleInput("\x1b[17~"); // F6 returns to the statusbar.
+		expect(render(component)).toContain("Focus: statusbar:");
+		component.handleInput("\x1b[20~"); // F9 cancels the editor.
+
+		expect(settings.get("statusLine.leftSegments")).toEqual(["model", "path"]);
+		expect(previews.at(-1)).toMatchObject({ leftSegments: ["model", "path"] });
+	});
+
 	it("adds hidden palette segments at an exact statusbar slot", () => {
 		settings.set("statusLine.preset", "custom");
 		settings.set("statusLine.leftSegments", ["path", "git"]);
@@ -187,6 +227,19 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		expect(render(component)).not.toContain("ACTUAL left=model,path");
 	});
 
+	it("focuses the segment moved to the palette after Delete", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "path"]);
+		settings.set("statusLine.rightSegments", []);
+		const { component } = createSelector();
+
+		openCustomEditor(component);
+		component.handleInput("\x1b[3~");
+		component.handleInput("\n");
+
+		expect(render(component)).toContain("Selected: model");
+	});
+
 	it("applies separator and typed segment options through visible choice panels", () => {
 		settings.set("statusLine.preset", "custom");
 		settings.set("statusLine.leftSegments", ["model"]);
@@ -228,6 +281,37 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		component.handleInput("\x1b[C");
 		component.handleInput("\n");
 		expect(render(component)).toContain("[40]");
+	});
+
+	it("edits custom command values without leaking cancelled text", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["command"]);
+		settings.set("statusLine.rightSegments", []);
+		settings.set("statusLine.segmentOptions", { command: { command: "" } });
+		const { component, changedSettings } = createSelector();
+
+		openCustomEditor(component);
+		driveUntil(component, "Focus: separator-control");
+		for (let i = 0; i < 12; i++) component.handleInput("\x1b[C");
+		expect(render(component)).toContain("Focus: option:command.command");
+
+		component.handleInput("\n");
+		expect(render(component)).toContain("Status line command");
+		component.handleInput("discarded");
+		component.handleInput("\x1b");
+		expect(render(component)).toContain("Command: (empty)");
+
+		component.handleInput("\n");
+		component.handleInput("printf '界'");
+		component.handleInput("\n");
+		expect(render(component)).toContain("Command: printf '界'");
+
+		driveUntil(component, "Focus: confirm");
+		component.handleInput("\n");
+		expect(changedSettings).toContainEqual({
+			path: "statusLine.segmentOptions",
+			value: expect.objectContaining({ command: { command: "printf '界'" } }),
+		});
 	});
 
 	it("preserves empty custom layouts and moves a selected segment between statusbar and palette", () => {
@@ -272,6 +356,7 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		settings.set("statusLine.leftSegments", ["gajae", "hostname", "model", "mode", "path", "git"]);
 		settings.set("statusLine.rightSegments", ["context_pct", "time_spent"]);
 		const { component } = createSelector({
+			disableStatusLineStringPreview: true,
 			getStatusLinePreviewPartsForSettings: () => ({
 				left: ["🦞", "🖥 Suhoui-MacBookAir", "⬢ gpt-5.5", "📁 gajae-code/status-bar-improved", "⑂ branch"],
 				leftIds: ["gajae", "hostname", "model", "path", "git"],
@@ -290,6 +375,127 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 		expect(output).not.toContain("┆ path ┆");
 		expect(output).not.toContain("┆ git ┆");
 		expect(output).toContain("right context pct / time spent / v0.16.1");
+	});
+
+	it("uses the simulation width and preserves unknown visibility in string preview fallback", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "path"]);
+		settings.set("statusLine.rightSegments", []);
+		let receivedWidth: number | undefined;
+		const { component } = createSelector({
+			getStatusLinePreviewForSettings: (_preview, width) => {
+				receivedWidth = width;
+				return `FALLBACK-${width}`;
+			},
+		});
+
+		openCustomEditor(component);
+		const output = render(component, 80);
+
+		expect(receivedWidth).toBe(78);
+		expect(output).toContain("FALLBACK-78");
+		expect(output).not.toContain("┆ model ┆");
+		expect(output).not.toContain("┆ path ┆");
+	});
+
+	it("renders distinct left and right preview separators", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "path"]);
+		settings.set("statusLine.rightSegments", ["jobs", "context_pct"]);
+		const { component } = createSelector({
+			disableStatusLineStringPreview: true,
+			getStatusLinePreviewPartsForSettings: () => ({
+				left: ["L1", "L2"],
+				leftIds: ["model", "path"],
+				right: ["R1", "R2"],
+				rightIds: ["jobs", "context_pct"],
+				separator: { left: "<", right: ">" },
+			}),
+		});
+
+		openCustomEditor(component);
+		const output = render(component, 120);
+
+		expect(output).toContain("L1 < L2");
+		expect(output).toContain("R1 > R2");
+	});
+
+	it("does not claim wrapping for a short narrow layout", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model"]);
+		settings.set("statusLine.rightSegments", []);
+		const { component } = createSelector({
+			getStatusLinePreviewPartsForSettings: () => ({
+				left: ["model"],
+				leftIds: ["model"],
+				right: [],
+				rightIds: [],
+				separator: { left: "|", right: "|" },
+			}),
+		});
+
+		openCustomEditor(component);
+
+		expect(render(component, 48)).not.toContain("Warning: statusbar wrapped to 2 rows");
+	});
+
+	it("preserves draft focus and terminal-cell bounds across resize", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "path"]);
+		settings.set("statusLine.rightSegments", ["jobs"]);
+		const { component } = createSelector();
+
+		openCustomEditor(component);
+		component.handleInput("\n");
+		component.handleInput("\x1b[C");
+		for (const width of [48, 120, 64]) {
+			const lines = component.render(width);
+			expect(Bun.stripANSI(lines.join("\n"))).toContain("Selected: model");
+			expect(lines.every(line => Bun.stringWidth(Bun.stripANSI(line)) <= width)).toBe(true);
+		}
+		component.handleInput("\n");
+		expect(render(component)).toContain("ACTUAL left=path,model");
+	});
+
+	it("ignores mouse reports without changing keyboard focus or draft", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "path"]);
+		settings.set("statusLine.rightSegments", []);
+		const { component } = createSelector();
+
+		openCustomEditor(component);
+		const before = render(component);
+		component.handleInput("\x1b[<0;10;5M");
+		component.handleInput("\x1b[<0;10;5m");
+
+		expect(render(component)).toBe(before);
+	});
+
+	it("uses distinct theme roles for focused and selected segments", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model"]);
+		settings.set("statusLine.rightSegments", []);
+		const { component } = createSelector();
+
+		openCustomEditor(component);
+		const focusBackground = theme.getFgAnsi("text").replace("\x1b[38;", "\x1b[48;");
+		const selectedBackground = theme.getFgAnsi("warning").replace("\x1b[38;", "\x1b[48;");
+		expect(component.render(80).join("\n")).toContain(focusBackground);
+		component.handleInput("\n");
+		expect(component.render(80).join("\n")).toContain(selectedBackground);
+		expect(selectedBackground).not.toBe(focusBackground);
+	});
+
+	it("keeps repeated resize rendering bounded", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["gajae", "hostname", "model", "mode", "path", "git", "pr"]);
+		settings.set("statusLine.rightSegments", ["session_name", "jobs", "context_pct", "time_spent", "subagents"]);
+		const { component } = createSelector();
+		openCustomEditor(component);
+
+		const started = performance.now();
+		for (let i = 0; i < 250; i++) component.render([40, 64, 80, 120][i % 4] ?? 80);
+		expect(performance.now() - started).toBeLessThan(1_500);
 	});
 
 	it("does not highlight a hidden slot segment when the selected segment moves next to it", () => {
@@ -387,6 +593,34 @@ describe("SettingsSelectorComponent status line custom editor", () => {
 			await fs.rm(agentDir, { recursive: true, force: true });
 			await Settings.init({ inMemory: true });
 		}
+	});
+
+	it("normalizes invalid segment entries while preserving opaque option sections", () => {
+		settings.set("statusLine.preset", "custom");
+		settings.set("statusLine.leftSegments", ["model", "future-segment", 42, "", "model"] as never);
+		settings.set("statusLine.rightSegments", ["future-segment", "jobs"] as never);
+		settings.set("statusLine.segmentOptions", {
+			model: { showThinkingLevel: false },
+			futurePlugin: { label: "界" },
+		});
+		const { component, changedSettings } = createSelector();
+
+		openCustomEditor(component);
+		const output = render(component);
+		expect(output).toContain("future-segment");
+		expect(output).toContain("42");
+		driveUntil(component, "Focus: confirm");
+		component.handleInput("\n");
+
+		expect(changedSettings).toContainEqual({
+			path: "statusLine.leftSegments",
+			value: ["model", "future-segment", "42"],
+		});
+		expect(changedSettings).toContainEqual({ path: "statusLine.rightSegments", value: ["jobs"] });
+		expect(changedSettings).toContainEqual({
+			path: "statusLine.segmentOptions",
+			value: expect.objectContaining({ futurePlugin: { label: "界" } }),
+		});
 	});
 
 	it("renders a two-row overflow warning at narrow width", () => {

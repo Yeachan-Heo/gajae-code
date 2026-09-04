@@ -88,6 +88,14 @@ class TextInputSubmenu extends Container {
 	handleInput(data: string): void {
 		handleInputOrEscape(data, this.#input, this.onCancel);
 	}
+
+	submit(): void {
+		this.onSubmit(this.#input.getValue());
+	}
+
+	cancel(): void {
+		this.onCancel();
+	}
 }
 
 class SelectSubmenu extends Container {
@@ -214,6 +222,8 @@ function mergeSegmentOptions(
 	overrides: StatusLineSegmentOptions | undefined,
 ): StatusLineSegmentOptions {
 	return {
+		...base,
+		...overrides,
 		model: base?.model || overrides?.model ? { ...(base?.model ?? {}), ...(overrides?.model ?? {}) } : undefined,
 		path: base?.path || overrides?.path ? { ...(base?.path ?? {}), ...(overrides?.path ?? {}) } : undefined,
 		git: base?.git || overrides?.git ? { ...(base?.git ?? {}), ...(overrides?.git ?? {}) } : undefined,
@@ -231,13 +241,31 @@ function effectiveSegmentOptions(
 	return mergeSegmentOptions(getPreset(preset).segmentOptions, options);
 }
 
+function normalizeEditorSegments(value: unknown): StatusLineSegmentId[] {
+	if (!Array.isArray(value)) return [];
+	const seen = new Set<string>();
+	const normalized: StatusLineSegmentId[] = [];
+	for (const raw of value) {
+		const id = typeof raw === "string" ? raw : String(raw);
+		if (!id || seen.has(id)) continue;
+		seen.add(id);
+		normalized.push(id as StatusLineSegmentId);
+	}
+	return normalized;
+}
+
 function effectiveCustomSegments(
 	preset: StatusLinePreset,
-	leftSegments: StatusLineSegmentId[],
-	rightSegments: StatusLineSegmentId[],
+	leftSegments: unknown,
+	rightSegments: unknown,
 ): { leftSegments: StatusLineSegmentId[]; rightSegments: StatusLineSegmentId[] } {
 	if (preset === "custom") {
-		return { leftSegments: [...leftSegments], rightSegments: [...rightSegments] };
+		const left = normalizeEditorSegments(leftSegments);
+		const leftIds = new Set(left);
+		return {
+			leftSegments: left,
+			rightSegments: normalizeEditorSegments(rightSegments).filter(id => !leftIds.has(id)),
+		};
 	}
 	const presetDef = getPreset(preset);
 	return {
@@ -279,7 +307,8 @@ type StatusLineOptionPath =
 	| "git.showUntracked"
 	| "time.format"
 	| "time.showSeconds"
-	| "usage.mode";
+	| "usage.mode"
+	| "command.command";
 type StatusLineChoiceTarget = "separator" | StatusLineOptionPath;
 type StatusLineRootFocus =
 	| { kind: "statusbar"; side: StatusLineSide; index: number }
@@ -336,6 +365,7 @@ class StatusLineCustomEditor extends Container {
 	#focus: StatusLineFocus = { kind: "statusbar", side: "left", index: 0 };
 	#picked: PickedStatusLineSegment | undefined;
 	#pickedStatusbarFocus: Extract<StatusLineRootFocus, { kind: "statusbar" }> | undefined;
+	#textInput: TextInputSubmenu | undefined;
 
 	constructor(
 		private readonly callbacks: SettingsCallbacks,
@@ -470,6 +500,10 @@ class StatusLineCustomEditor extends Container {
 		return this.#choiceDescriptors().find(descriptor => descriptor.target === target);
 	}
 
+	#controlTargets(): StatusLineChoiceTarget[] {
+		return [...this.#choiceDescriptors().map(descriptor => descriptor.target), "command.command"];
+	}
+
 	#hiddenSegments(): StatusLineSegmentId[] {
 		const visible = new Set([...this.#draft.leftSegments, ...this.#draft.rightSegments]);
 		return PUBLIC_STATUS_SEGMENTS.filter(id => !visible.has(id));
@@ -500,7 +534,6 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	#normalizeFocus(): void {
-		const descriptors = this.#choiceDescriptors();
 		if (this.#focus.kind === "choice") {
 			const descriptor = this.#descriptor(this.#focus.target);
 			if (!descriptor) {
@@ -535,7 +568,7 @@ class StatusLineCustomEditor extends Container {
 			}
 		} else if (
 			this.#focus.kind === "option-control" &&
-			!descriptors.some(descriptor => descriptor.target === (this.#focus as { path: StatusLineOptionPath }).path)
+			!this.#controlTargets().includes((this.#focus as { path: StatusLineOptionPath }).path)
 		) {
 			this.#focus = { kind: "separator-control" };
 		}
@@ -664,18 +697,15 @@ class StatusLineCustomEditor extends Container {
 
 	#moveChoiceControl(delta: -1 | 1): void {
 		if (this.#focus.kind !== "separator-control" && this.#focus.kind !== "option-control") return;
-		const descriptors = this.#choiceDescriptors();
+		const targets = this.#controlTargets();
 		const currentTarget = this.#focus.kind === "separator-control" ? "separator" : this.#focus.path;
-		const currentIndex = Math.max(
-			0,
-			descriptors.findIndex(descriptor => descriptor.target === currentTarget),
-		);
-		const next = descriptors[(currentIndex + delta + descriptors.length) % descriptors.length];
+		const currentIndex = Math.max(0, targets.indexOf(currentTarget));
+		const next = targets[(currentIndex + delta + targets.length) % targets.length];
 		if (!next) return;
 		this.#focus =
-			next.target === "separator"
+			next === "separator"
 				? { kind: "separator-control" }
-				: { kind: "option-control", path: next.target as StatusLineOptionPath };
+				: { kind: "option-control", path: next as StatusLineOptionPath };
 	}
 
 	#moveChoiceTarget(delta: -1 | 1): void {
@@ -756,10 +786,13 @@ class StatusLineCustomEditor extends Container {
 	#hideFocusedSegment(): void {
 		if (this.#picked || this.#focus.kind !== "statusbar") return;
 		const group = this.#draft[`${this.#focus.side}Segments`];
-		if (!group[this.#focus.index]) return;
+		const removed = group[this.#focus.index];
+		if (!removed) return;
 		group.splice(this.#focus.index, 1);
 		const hidden = this.#hiddenSegments();
-		this.#focus = hidden.length ? { kind: "palette", index: hidden.length - 1 } : { kind: "separator-control" };
+		this.#focus = hidden.length
+			? { kind: "palette", index: Math.max(0, hidden.indexOf(removed)) }
+			: { kind: "separator-control" };
 		this.#updatePreviewHighlight();
 		this.#preview();
 	}
@@ -777,6 +810,27 @@ class StatusLineCustomEditor extends Container {
 			),
 			returnFocus,
 		};
+	}
+
+	#openCommandInput(): void {
+		this.#textInput = new TextInputSubmenu(
+			"Status line command",
+			"Runs in the configured shell with a short timeout and cached refreshes.",
+			this.#draft.segmentOptions.command?.command ?? "",
+			value => {
+				this.#setOption("command.command", value);
+				this.#textInput = undefined;
+				this.#focus = { kind: "option-control", path: "command.command" };
+				this.#updatePreviewHighlight();
+				this.#preview();
+			},
+			() => {
+				this.#textInput = undefined;
+				this.#focus = { kind: "option-control", path: "command.command" };
+				this.#updatePreviewHighlight();
+				this.#preview();
+			},
+		);
 	}
 
 	#applyChoice(): void {
@@ -805,7 +859,8 @@ class StatusLineCustomEditor extends Container {
 			return;
 		}
 		if (this.#focus.kind === "option-control") {
-			this.#previewHighlightSegment = this.#descriptor(this.#focus.path)?.highlightSegment;
+			this.#previewHighlightSegment =
+				this.#focus.path === "command.command" ? "command" : this.#descriptor(this.#focus.path)?.highlightSegment;
 			return;
 		}
 		if (this.#focus.kind === "choice") {
@@ -927,7 +982,7 @@ class StatusLineCustomEditor extends Container {
 				this.#focus.kind === "statusbar" &&
 				this.#focus.side === side &&
 				this.#focus.index === index;
-			rendered.push(this.#renderSegment(id, selected, visibleIds?.has(id) ?? false));
+			rendered.push(this.#renderSegment(id, selected, visibleIds ? visibleIds.has(id) : true));
 		}
 		if (this.#picked && this.#focus.kind === "statusbar" && this.#focus.side === side) {
 			rendered.splice(
@@ -976,22 +1031,27 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	#renderActualStatusbar(width: number, parts: StatusLinePreviewParts | undefined): string[] {
-		if (parts) return this.#renderActualStatusbarParts(width, parts);
-		const rendered = this.callbacks.getStatusLinePreviewForSettings?.(this.#draftPreviewSettings(true), width);
-		if (!rendered) return [];
-		return rendered
-			.split("\n")
-			.map(line => line.trimEnd())
-			.filter(line => line.length > 0)
-			.map(line => this.#centerVisible(this.#fit(line, this.#simulationWidth(width)), width));
+		const rendered = this.callbacks.getStatusLinePreviewForSettings?.(
+			this.#draftPreviewSettings(true),
+			this.#simulationWidth(width),
+		);
+		if (rendered) {
+			return rendered
+				.split("\n")
+				.map(line => line.trimEnd())
+				.filter(line => line.length > 0)
+				.map(line => this.#centerVisible(this.#fit(line, this.#simulationWidth(width)), width));
+		}
+		return parts ? this.#renderActualStatusbarParts(width, parts) : [];
 	}
 
 	#renderActualStatusbarParts(width: number, parts: StatusLinePreviewParts): string[] {
 		const barWidth = this.#simulationWidth(width);
 		const indent = this.#simulationIndent(width);
-		const separator = theme.fg("statusLineSep", ` ${parts.separator.left} `);
-		const left = parts.left.join(separator);
-		const right = parts.right.join(separator);
+		const leftSeparator = theme.fg("statusLineSep", ` ${parts.separator.left} `);
+		const rightSeparator = theme.fg("statusLineSep", ` ${parts.separator.right} `);
+		const left = parts.left.join(leftSeparator);
+		const right = parts.right.join(rightSeparator);
 		const combinedGap = Math.max(1, barWidth - visibleWidth(left) - visibleWidth(right));
 		if (visibleWidth(left) + visibleWidth(right) + 1 <= barWidth) {
 			return [this.#fit(`${indent}${left}${" ".repeat(combinedGap)}${right}`, width)];
@@ -1064,6 +1124,7 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	override render(width: number): string[] {
+		if (this.#textInput) return this.#textInput.render(width);
 		this.#normalizeFocus();
 		const lines: string[] = [];
 		lines.push(truncateToWidth(theme.bold(theme.fg("accent", "Status Line Custom Editor")), width));
@@ -1081,7 +1142,7 @@ class StatusLineCustomEditor extends Container {
 		}
 		const slotRows = this.#renderSlotRows(width, actualStatusbarParts);
 		lines.push(...slotRows);
-		if (actualStatusbar.length > 1 || slotRows.length > 1 || width < 64) {
+		if (actualStatusbar.length > 1 || slotRows.length > 1) {
 			lines.push(this.#fit(theme.fg("warning", "  Warning: statusbar wrapped to 2 rows"), width));
 			if (this.#focus.kind === "statusbar") {
 				const focused = this.#picked ? this.#picked.id : this.#focusSegment();
@@ -1127,6 +1188,10 @@ class StatusLineCustomEditor extends Container {
 				),
 			);
 		}
+		const commandFocused = this.#focus.kind === "option-control" && this.#focus.path === "command.command";
+		lines.push(
+			truncateToWidth(`  ${commandFocused ? this.#focusBox("Command: command") : "Command: command"}`, width),
+		);
 		if (focusedDescriptor) {
 			const current = focusedDescriptor.currentValue();
 			const choices = focusedDescriptor.values
@@ -1135,6 +1200,9 @@ class StatusLineCustomEditor extends Container {
 			lines.push(
 				truncateToWidth(`${theme.fg("accent", theme.nav.cursor)} ${focusedDescriptor.label}: ${choices}`, width),
 			);
+		} else if (commandFocused) {
+			const command = this.#draft.segmentOptions.command?.command ?? "";
+			lines.push(truncateToWidth(`${theme.fg("accent", theme.nav.cursor)} Command: ${command || "(empty)"}`, width));
 		} else {
 			const separator = descriptors[0];
 			if (separator) {
@@ -1262,6 +1330,17 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	handleInput(data: string): void {
+		const kb = getKeybindings();
+		const selectUp = kb.matches(data, "tui.select.up");
+		const selectDown = kb.matches(data, "tui.select.down");
+		const selectConfirm = kb.matches(data, "tui.select.confirm") || data === "\n";
+		const selectCancel = kb.matches(data, "tui.select.cancel");
+		if (this.#textInput) {
+			if (selectCancel) this.#textInput.cancel();
+			else if (selectConfirm) this.#textInput.submit();
+			else this.#textInput.handleInput(data);
+			return;
+		}
 		if (this.#focus.kind === "choice") {
 			if (matchesKey(data, "left")) {
 				this.#moveVertical(-1);
@@ -1275,23 +1354,23 @@ class StatusLineCustomEditor extends Container {
 				this.#preview();
 				return;
 			}
-			if (matchesKey(data, "up")) {
+			if (selectUp) {
 				this.#moveChoiceTarget(-1);
 				this.#updatePreviewHighlight();
 				this.#preview();
 				return;
 			}
-			if (matchesKey(data, "down")) {
+			if (selectDown) {
 				this.#moveChoiceTarget(1);
 				this.#updatePreviewHighlight();
 				this.#preview();
 				return;
 			}
-			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+			if (selectConfirm) {
 				this.#applyChoice();
 				return;
 			}
-			if (matchesKey(data, "escape")) {
+			if (selectCancel) {
 				this.#focus = cloneRootFocus(this.#focus.returnFocus);
 				this.#updatePreviewHighlight();
 				this.#preview();
@@ -1300,17 +1379,17 @@ class StatusLineCustomEditor extends Container {
 			return;
 		}
 
-		if (matchesKey(data, "escape")) {
+		if (selectCancel) {
 			this.#cancel();
 			return;
 		}
-		if (matchesKey(data, "up")) {
+		if (selectUp) {
 			this.#moveVertical(-1);
 			this.#updatePreviewHighlight();
 			this.#preview();
 			return;
 		}
-		if (matchesKey(data, "down")) {
+		if (selectDown) {
 			this.#moveVertical(1);
 			this.#updatePreviewHighlight();
 			this.#preview();
@@ -1344,7 +1423,7 @@ class StatusLineCustomEditor extends Container {
 			this.#hideFocusedSegment();
 			return;
 		}
-		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+		if (selectConfirm) {
 			switch (this.#focus.kind) {
 				case "statusbar":
 					if (this.#picked) this.#dropPicked();
@@ -1358,7 +1437,8 @@ class StatusLineCustomEditor extends Container {
 					this.#openChoice("separator", { kind: "separator-control" });
 					return;
 				case "option-control":
-					this.#openChoice(this.#focus.path, { kind: "option-control", path: this.#focus.path });
+					if (this.#focus.path === "command.command") this.#openCommandInput();
+					else this.#openChoice(this.#focus.path, { kind: "option-control", path: this.#focus.path });
 					return;
 				case "confirm":
 					this.#save();

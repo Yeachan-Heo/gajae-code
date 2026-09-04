@@ -1,6 +1,5 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_ENTRIES } from "../test/fixtures/tui/status-line-custom-editor-showcase";
 import { ansiToHtml } from "./capture-sticky-viewport-showcase";
 
 const CAPTURE_TOOL_VERSION = "status-line-custom-editor-showcase-v1";
@@ -8,25 +7,61 @@ const CANONICAL_COMMAND =
 	"bun packages/coding-agent/scripts/capture-status-line-custom-editor-showcase.ts --out .gjc/qa/status-line-custom-editor-<run>";
 const FIXED_CLOCK = "2026-01-01T00:00:00.000Z";
 
-function expectedWrappingPolicy(columns: number): string {
-	return columns < 64 ? "two-row-warning" : "single-row-when-fits";
+const UNICODE_STATES = [
+	"root-statusbar",
+	"picked-origin-slot",
+	"palette-exact-insert",
+	"separator-control",
+	"separator-choice-focused",
+	"separator-choice-applied",
+	"option-boolean-choice-focused",
+	"option-enum-choice-focused",
+	"option-numeric-choice-focused",
+	"option-choice-applied",
+	"exit-restored",
+	"confirm-persisted",
+	"overflow-two-row-warning",
+] as const;
+const ASCII_STATES = [
+	"root-statusbar",
+	"picked-origin-slot",
+	"separator-choice-focused",
+	"option-boolean-choice-focused",
+	"option-enum-choice-focused",
+	"option-numeric-choice-focused",
+] as const;
+const EXPECTED_KEYS = new Set([
+	...UNICODE_STATES.map(state => `${state}/80x32/unicode-color`),
+	"overflow-two-row-warning/48x40/unicode-color",
+	"narrow-cjk/48x40/unicode-color",
+	...ASCII_STATES.map(state => `${state}/80x32/ascii-no-color`),
+]);
+
+function expectedWrappingPolicy(statusbarRows: number): string {
+	return statusbarRows > 2 ? "two-row" : "single-row";
 }
 
 interface ManifestFile {
 	tool: string;
+	sourceHead: string;
+	sourceHash: string;
+	captureActor: string;
 	entries: Array<{
 		key: string;
 		stateId: string;
 		viewport: { columns: number; rows: number };
 		renderMode: string;
+		simulatedStatusbarRows: number;
 		files: Array<{ path: string; sha256: string; byte_length: number }>;
 	}>;
 	independentReview?: {
 		reviewer: string;
+		reviewerAssociation: "OWNER" | "MEMBER" | "COLLABORATOR";
 		verdict: "approved" | "rejected";
 		evidence: string;
 		manifestSha256?: string;
 		sourceHash?: string;
+		headSha?: string;
 	};
 }
 
@@ -34,8 +69,13 @@ function sha256(value: string): string {
 	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
-function expectedKey(entry: (typeof STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_ENTRIES)[number]): string {
-	return `${entry.stateId}/${entry.columns}x${entry.rows}/${entry.renderMode}`;
+function measuredStatusbarRows(plain: string): number {
+	const lines = plain.split("\n");
+	const heading = lines.findIndex(line => line.includes("Simulated statusbar"));
+	if (heading < 0) return 0;
+	let end = heading + 1;
+	while (end < lines.length && lines[end]?.trim() && !lines[end]?.includes("Warning:")) end++;
+	return Math.max(0, end - heading - 1);
 }
 
 function parseArgs(args: string[]): { root: string; requireIndependentReview: boolean } {
@@ -123,18 +163,24 @@ async function main(): Promise<void> {
 	const manifest = JSON.parse(manifestText) as ManifestFile;
 	const manifestSha256 = sha256(manifestText);
 	if (manifest.tool !== CAPTURE_TOOL_VERSION) throw new Error(`Unexpected tool version: ${manifest.tool}`);
-	const expectedKeys = new Set(STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_ENTRIES.map(expectedKey));
+	if (!/^[0-9a-f]{40}$/.test(manifest.sourceHead)) throw new Error("Manifest source HEAD is not a full commit SHA");
+	if (!/^sha256:[0-9a-f]{64}$/.test(manifest.sourceHash)) throw new Error("Manifest source hash is invalid");
 	const actualKeys = new Set(manifest.entries.map(entry => entry.key));
 	if (manifest.entries.length !== actualKeys.size) throw new Error("Duplicate showcase entries found");
-	if (manifest.entries.length !== expectedKeys.size) throw new Error("Unexpected showcase entry count");
-	for (const key of expectedKeys) if (!actualKeys.has(key)) throw new Error(`Missing showcase key: ${key}`);
+	if (manifest.entries.length !== EXPECTED_KEYS.size) throw new Error("Unexpected showcase entry count");
+	for (const key of EXPECTED_KEYS) if (!actualKeys.has(key)) throw new Error(`Missing showcase key: ${key}`);
+	for (const key of actualKeys) if (!EXPECTED_KEYS.has(key)) throw new Error(`Unexpected showcase key: ${key}`);
 	if (requireIndependentReview) {
 		const review = manifest.independentReview ?? (await tryReadReview(root));
 		if (
 			review?.verdict !== "approved" ||
-			!review.evidence ||
+			!review.reviewer?.trim() ||
+			review.reviewer === manifest.captureActor ||
+			!(["OWNER", "MEMBER", "COLLABORATOR"] as const).includes(review.reviewerAssociation) ||
+			!/^https:\/\/github\.com\//.test(review.evidence) ||
 			review.manifestSha256 !== manifestSha256 ||
-			!review.sourceHash?.startsWith("sha256:")
+			review.sourceHash !== manifest.sourceHash ||
+			review.headSha !== manifest.sourceHead
 		) {
 			throw new Error("Missing approved independent review in manifest");
 		}
@@ -197,8 +243,10 @@ async function main(): Promise<void> {
 			viewport?: { columns?: number; rows?: number };
 			renderMode?: string;
 			fixedClock?: string;
+			simulatedStatusbarRows?: number;
 			wrappingPolicy?: string;
 		};
+		const actualStatusbarRows = measuredStatusbarRows(plain);
 		if (
 			metadata.tool !== CAPTURE_TOOL_VERSION ||
 			metadata.command !== CANONICAL_COMMAND ||
@@ -207,7 +255,9 @@ async function main(): Promise<void> {
 			metadata.viewport?.rows !== entry.viewport.rows ||
 			metadata.renderMode !== entry.renderMode ||
 			metadata.fixedClock !== FIXED_CLOCK ||
-			metadata.wrappingPolicy !== expectedWrappingPolicy(entry.viewport.columns)
+			entry.simulatedStatusbarRows !== actualStatusbarRows ||
+			metadata.simulatedStatusbarRows !== actualStatusbarRows ||
+			metadata.wrappingPolicy !== expectedWrappingPolicy(actualStatusbarRows)
 		) {
 			throw new Error(`${entry.key}: metadata does not match manifest`);
 		}
@@ -238,6 +288,12 @@ async function main(): Promise<void> {
 		}
 		if (entry.stateId.includes("narrow") && !plain.includes("Focused target:")) {
 			throw new Error(`${entry.key}: narrow state missing focused target witness`);
+		}
+		if (entry.stateId === "overflow-two-row-warning" && actualStatusbarRows !== 4) {
+			throw new Error(`${entry.key}: expected two actual and two slot statusbar rows`);
+		}
+		if (entry.stateId === "narrow-cjk" && !plain.includes("상태줄 경계 · 意味の境界 · 语义边界")) {
+			throw new Error(`${entry.key}: missing exact mixed-width semantic witness`);
 		}
 	}
 	for (const filePath of await collectRelativeFiles(root)) {

@@ -10,6 +10,14 @@ import { ansiToHtml } from "./capture-sticky-viewport-showcase";
 const CANONICAL_COMMAND =
 	"bun packages/coding-agent/scripts/capture-status-line-custom-editor-showcase.ts --out .gjc/qa/status-line-custom-editor-<run>";
 const CAPTURE_TOOL_VERSION = "status-line-custom-editor-showcase-v1";
+const SOURCE_PATHS = [
+	"packages/coding-agent/src/modes/components/settings-selector.ts",
+	"packages/coding-agent/src/modes/components/tool-status-header.ts",
+	"packages/coding-agent/src/modes/controllers/selector-controller.ts",
+	"packages/tui/src/components/settings-list.ts",
+	"packages/coding-agent/test/fixtures/tui/status-line-custom-editor-showcase.ts",
+	"packages/coding-agent/scripts/verify-status-line-custom-editor-showcase.ts",
+] as const;
 
 interface ArtifactFile {
 	path: string;
@@ -22,6 +30,7 @@ interface ManifestEntry {
 	stateId: string;
 	viewport: { columns: number; rows: number };
 	renderMode: string;
+	simulatedStatusbarRows: number;
 	files: ArtifactFile[];
 }
 
@@ -42,12 +51,31 @@ function sha256(value: string): string {
 	return new Bun.CryptoHasher("sha256").update(value).digest("hex");
 }
 
+function commandOutput(command: string[]): string | undefined {
+	const result = Bun.spawnSync({ cmd: command, stdout: "pipe", stderr: "pipe" });
+	if (result.exitCode !== 0) return undefined;
+	const output = result.stdout.toString().trim();
+	return output || undefined;
+}
+
+async function sourceHash(): Promise<string> {
+	const entries = await Promise.all(
+		SOURCE_PATHS.map(async sourcePath => `${sourcePath}:${sha256(await Bun.file(sourcePath).text())}`),
+	);
+	return `sha256:${sha256(entries.join("\n"))}`;
+}
+
 function entryKey(entry: StatusLineCustomEditorShowcaseEntry): string {
 	return `${entry.stateId}/${entry.columns}x${entry.rows}/${entry.renderMode}`;
 }
 
-function clipRows(text: string, rows: number): string {
-	return text.split("\n").slice(0, rows).join("\n");
+function simulatedStatusbarRows(text: string): number {
+	const lines = Bun.stripANSI(text).split("\n");
+	const heading = lines.findIndex(line => line.includes("Simulated statusbar"));
+	if (heading < 0) return 0;
+	let end = heading + 1;
+	while (end < lines.length && lines[end]?.trim() && !lines[end]?.includes("Warning:")) end++;
+	return Math.max(0, end - heading - 1);
 }
 
 async function writeArtifact(root: string, relativePath: string, content: string): Promise<ArtifactFile> {
@@ -59,6 +87,10 @@ async function writeArtifact(root: string, relativePath: string, content: string
 
 async function main(): Promise<void> {
 	const root = outputPath(process.argv.slice(2));
+	const sourceHead = commandOutput(["git", "rev-parse", "HEAD"]);
+	if (!sourceHead) throw new Error("Could not resolve source HEAD");
+	const captureActor = commandOutput(["gh", "api", "user", "--jq", ".login"]) ?? "unauthenticated";
+	const digest = await sourceHash();
 	const independentReviewPath = path.join(root, "independent-review.json");
 	const existingIndependentReview = (await Bun.file(independentReviewPath).exists())
 		? await Bun.file(independentReviewPath).text()
@@ -72,7 +104,12 @@ async function main(): Promise<void> {
 	for (const entry of STATUS_LINE_CUSTOM_EDITOR_SHOWCASE_ENTRIES) {
 		const key = entryKey(entry);
 		const dir = key.replace(/[^a-zA-Z0-9._/-]/g, "_");
-		const terminalAnsi = clipRows(await renderStatusLineCustomEditorShowcase(entry), entry.rows);
+		const terminalAnsi = await renderStatusLineCustomEditorShowcase(entry);
+		const renderedRows = terminalAnsi.split("\n").length;
+		if (renderedRows > entry.rows) {
+			throw new Error(`${key}: rendered ${renderedRows} rows for a ${entry.rows}-row viewport`);
+		}
+		const statusbarRows = simulatedStatusbarRows(terminalAnsi);
 		const terminalPlain = Bun.stripANSI(terminalAnsi);
 		const html = ansiToHtml(terminalAnsi);
 		const metadata = json({
@@ -82,7 +119,8 @@ async function main(): Promise<void> {
 			viewport: { columns: entry.columns, rows: entry.rows },
 			renderMode: entry.renderMode,
 			fixedClock: "2026-01-01T00:00:00.000Z",
-			wrappingPolicy: entry.columns < 64 ? "two-row-warning" : "single-row-when-fits",
+			simulatedStatusbarRows: statusbarRows,
+			wrappingPolicy: statusbarRows > 2 ? "two-row" : "single-row",
 		});
 		const files = [
 			await writeArtifact(root, `${dir}/terminal.txt`, terminalPlain),
@@ -95,10 +133,15 @@ async function main(): Promise<void> {
 			stateId: entry.stateId,
 			viewport: { columns: entry.columns, rows: entry.rows },
 			renderMode: entry.renderMode,
+			simulatedStatusbarRows: statusbarRows,
 			files,
 		});
 	}
-	await writeArtifact(root, "manifest.json", json({ tool: CAPTURE_TOOL_VERSION, entries }));
+	await writeArtifact(
+		root,
+		"manifest.json",
+		json({ tool: CAPTURE_TOOL_VERSION, sourceHead, sourceHash: digest, captureActor, entries }),
+	);
 	process.stdout.write(`Captured ${entries.length} status-line custom editor showcase entries at ${root}\n`);
 }
 
