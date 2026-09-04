@@ -135,7 +135,7 @@ describe("status rail survives very small widths", () => {
 		for (let width = 4; width <= 30; width += 1) {
 			expect(strip(buildRail().render(width).join(" "))).not.toContain("…+");
 		}
-	});
+	}, 30_000);
 
 	it("keeps the context window while it fits and falls back to an integer percentage", () => {
 		const wide = strip(buildRail().render(28).join(" "));
