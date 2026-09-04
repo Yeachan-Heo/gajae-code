@@ -148,78 +148,94 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		expect(user?.content).toEqual([{ type: "text", text: "redacted prompt" }]);
 	});
 
-	it("submits public Function Hook transformations through a legacy handler", async () => {
-		const contexts: Context[] = [];
-		const runtime = new ExtensionRuntime();
-		const eventBus = new EventBus();
-		const sessionManager = SessionManager.inMemory(tempDir.path());
-		const extension = await loadExtensionFromFactory(
-			api => {
-				api.registerFunctionHook(
-					"before_agent_start",
-					async invocation => ({
-						action: "continue",
-						event: {
-							...invocation.payload,
-							prompt: "public redacted prompt",
-							images: undefined,
-							systemPrompt: ["function system"],
-						},
-					}),
-					{ capabilities: ["ui.transform"] },
-				);
-				api.on("before_agent_start", event => ({
-					systemPrompt: [...event.systemPrompt, "legacy system"],
-				}));
-			},
-			tempDir.path(),
-			eventBus,
-			runtime,
-			"public-function-hook",
-		);
-		const extensionRunner = new ExtensionRunner([extension], runtime, tempDir.path(), sessionManager, modelRegistry);
-		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
-		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
-		const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
-		const agent = new Agent({
-			getApiKey: () => "test-key",
-			convertToLlm,
-			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
-			streamFn: (streamModel, context, streamOptions) => {
-				contexts.push(structuredClone(context));
-				return mockModel.stream(streamModel, context, streamOptions);
-			},
-		});
-		session = new AgentSession({
-			agent,
-			sessionManager,
-			settings: Settings.isolated({ "compaction.enabled": false }),
-			modelRegistry,
-			extensionRunner,
-		});
+	it("submits public Function Hook transformations with and without a legacy handler", async () => {
+		for (const withLegacy of [false, true]) {
+			const contexts: Context[] = [];
+			const runtime = new ExtensionRuntime();
+			const eventBus = new EventBus();
+			const sessionManager = SessionManager.inMemory(tempDir.path());
+			const extension = await loadExtensionFromFactory(
+				api => {
+					api.registerFunctionHook(
+						"before_agent_start",
+						async invocation => ({
+							action: "continue",
+							event: {
+								...invocation.payload,
+								prompt: "public redacted prompt",
+								images: undefined,
+								systemPrompt: ["function system"],
+							},
+						}),
+						{ capabilities: ["ui.transform"] },
+					);
+					if (withLegacy) {
+						api.on("before_agent_start", event => ({
+							systemPrompt: [...event.systemPrompt, "legacy system"],
+						}));
+					}
+				},
+				tempDir.path(),
+				eventBus,
+				runtime,
+				"public-function-hook",
+			);
+			const extensionRunner = new ExtensionRunner(
+				[extension],
+				runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+			if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
+			const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
+			const agent = new Agent({
+				getApiKey: () => "test-key",
+				convertToLlm,
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (streamModel, context, streamOptions) => {
+					contexts.push(structuredClone(context));
+					return mockModel.stream(streamModel, context, streamOptions);
+				},
+			});
+			session = new AgentSession({
+				agent,
+				sessionManager,
+				settings: Settings.isolated({ "compaction.enabled": false }),
+				modelRegistry,
+				extensionRunner,
+			});
 
-		await session.prompt("public secret", {
-			images: [{ type: "image", data: "secret-image", mimeType: "image/png" }],
-		});
+			await session.prompt("public secret", {
+				images: [{ type: "image", data: "secret-image", mimeType: "image/png" }],
+			});
 
-		expect(contexts[0]?.systemPrompt).toEqual(["function system", "legacy system"]);
-		const user = contexts[0] ? findPromptMessage(contexts[0].messages, "public redacted prompt") : undefined;
-		expect(user?.content).toEqual([{ type: "text", text: "public redacted prompt" }]);
+			expect(contexts[0]?.systemPrompt).toEqual(
+				withLegacy ? ["function system", "legacy system"] : ["function system"],
+			);
+			const user = contexts[0] ? findPromptMessage(contexts[0].messages, "public redacted prompt") : undefined;
+			expect(user?.content).toEqual([{ type: "text", text: "public redacted prompt" }]);
+		}
 	});
 
 	it("submits transformed custom prompt content", async () => {
 		const contexts: Context[] = [];
-		createSession({ prompt: "transformed custom", images: [] }, contexts);
+		createSession({ prompt: "transformed custom" }, contexts);
 
 		await session.promptCustomMessage({
 			customType: "function-hook-test",
-			content: "custom secret",
+			content: [
+				{ type: "text", text: "custom secret" },
+				{ type: "image", data: "custom-image", mimeType: "image/png" },
+			],
 			display: false,
 			attribution: "user",
 		});
 
 		const submitted = JSON.stringify(contexts);
 		expect(submitted).toContain("transformed custom");
+		expect(submitted).toContain("custom-image");
 		expect(submitted).not.toContain("custom secret");
 	});
 

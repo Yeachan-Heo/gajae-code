@@ -12473,7 +12473,12 @@ export class AgentSession {
 			const promptAttribution: "user" | "agent" | undefined =
 				"attribution" in message ? message.attribution : undefined;
 			let effectivePrompt = expandedText;
-			let effectiveImages = options?.images;
+			const messageImages =
+				"content" in message && Array.isArray(message.content)
+					? message.content.filter((content): content is ImageContent => content.type === "image")
+					: undefined;
+			let effectiveImages =
+				options?.images ?? (messageImages && messageImages.length > 0 ? messageImages : undefined);
 			let promptMessage = message;
 			let phaseACompleted = false;
 			let fileMentionMessages: AgentMessage[] = [];
