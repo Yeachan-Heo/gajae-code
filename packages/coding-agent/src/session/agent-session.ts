@@ -7006,26 +7006,30 @@ export class AgentSession {
 			// Failed and aborted outcomes fall through to terminal handling. The
 			// generation guard drops a successful continuation if a newer prompt/abort
 			// has moved the run on.
-			if (event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)) {
-				this.#lastAssistantMessage = undefined;
-				const outcome = event.maintenanceOutcome;
-				if (
-					outcome &&
-					outcome !== "aborted" &&
-					!maintenanceWasDisposed &&
-					!this.#isDisposed &&
-					maintenanceGeneration !== undefined &&
-					this.#promptGeneration === maintenanceGeneration
-				) {
-					this.#scheduleAgentContinue({
-						generation: maintenanceGeneration,
-						skipCompactionCheck: true,
-						resourceRunId: activePromptHandle,
-						maintenanceContinuation: true,
-						sdkRunToken: attemptScope ? this.#sdkRunTokensByAttemptScope.get(attemptScope) : undefined,
-					});
+			if (event.stopReason === "maintenance") {
+				if (isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)) {
+					this.#lastAssistantMessage = undefined;
+					if (
+						!maintenanceWasDisposed &&
+						!this.#isDisposed &&
+						maintenanceGeneration !== undefined &&
+						this.#promptGeneration === maintenanceGeneration
+					) {
+						this.#scheduleAgentContinue({
+							generation: maintenanceGeneration,
+							skipCompactionCheck: true,
+							resourceRunId: activePromptHandle,
+							maintenanceContinuation: true,
+							sdkRunToken: attemptScope ? this.#sdkRunTokensByAttemptScope.get(attemptScope) : undefined,
+						});
+					}
+					return;
 				}
-				return;
+				// Cancellation already owns teardown and terminal publication. Running
+				// normal post-turn finalization here can deadlock abort/dispose while the
+				// maintenance barrier is unwinding. Failed maintenance alone carries the
+				// synthetic assistant error that must flow through terminal handling.
+				if (event.maintenanceOutcome === "aborted") return;
 			}
 			const usage = this.getSessionStats().tokens;
 			await this.#goalRuntime.onAgentEnd({

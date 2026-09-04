@@ -2125,7 +2125,7 @@ describe("SessionSdkSessionRuntime", () => {
 			while (!transport.sent.some(frame => frame.id === "predecessor-prompt")) await Bun.sleep(10);
 			await handlers.get("agent_start")?.({}, ctx); // lifecycle epoch 1
 			await handlers.get("agent_end")?.(
-				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "completed" },
+				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "compacted" },
 				ctx,
 			);
 			transport.feed("client", {
@@ -2148,7 +2148,7 @@ describe("SessionSdkSessionRuntime", () => {
 			while (abortCalls < 1) await Bun.sleep(10);
 			await handlers.get("agent_end")?.({ type: "agent_end" }, ctx); // delayed predecessor
 			await handlers.get("agent_end")?.(
-				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "completed" },
+				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "compacted" },
 				ctx,
 			);
 			abortRelease.resolve();

@@ -188,7 +188,7 @@ export interface AgentEndEvent {
 	sdkRunToken?: string;
 	/** Indicates whether the loop ended normally, suspended, cancelled, or entered maintenance. */
 	stopReason?: "completed" | "paused" | "cancelled" | "maintenance";
-	/** Present for maintenance checkpoints; non-aborted checkpoints are not terminal. */
+	/** Present for maintenance checkpoints; only committed maintenance outcomes are non-terminal. */
 	maintenanceOutcome?: MidRunMaintenanceOutcome;
 }
 
