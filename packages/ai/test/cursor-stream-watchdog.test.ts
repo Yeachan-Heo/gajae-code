@@ -95,6 +95,7 @@ async function collectTerminal(
 		execHandlers?: CursorExecHandlers;
 		signal?: AbortSignal;
 		conversationId?: string;
+		onPayload?: () => Promise<unknown>;
 	},
 ): Promise<{ events: unknown[]; result: AssistantMessage }> {
 	const stream = streamModel({ ...cursorModel, baseUrl }, baseContext, { apiKey: "test-token", ...options });
@@ -124,6 +125,24 @@ function isTerminalEvent(event: unknown): boolean {
 }
 
 describe("Cursor raw transport watchdog", () => {
+	it("bounds a payload hook that never settles by the first-event deadline", async () => {
+		const never = Promise.withResolvers<unknown>();
+		const { events, result } = await collectTerminal("http://127.0.0.1:1", {
+			streamFirstEventTimeoutMs: 10,
+			onPayload: () => never.promise,
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("first transport event");
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			providerCode: "stream_first_event_timeout",
+			requestBytes: 0,
+			firstEventTimeoutMs: 10,
+		});
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("keeps the normal exec budget when transport idle watching is disabled", () => {
 		expect(cursorExecDeadlineMsForTest(undefined)).toBe(480_000);
 		expect(cursorExecDeadlineMsForTest(0)).toBe(480_000);

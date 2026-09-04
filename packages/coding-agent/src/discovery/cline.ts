@@ -63,7 +63,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const cwdIsWithinHome =
 		homeRelative === "" ||
 		(homeRelative !== ".." && !homeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(homeRelative));
-	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : ctx.cwd);
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : path.parse(ctx.cwd).root);
 	const readOptions = getReadOptions(ctx, "project");
 	const found = await findClinerules(ctx.cwd, stopDirectory, readOptions);
 	if (!found) {

@@ -235,6 +235,34 @@ export function disposeCursorConversation(conversationId: string): void {
 	conversationLastAccess.delete(conversationId);
 }
 
+async function waitForCursorSetup<T>(
+	setup: Promise<T>,
+	signal: AbortSignal | undefined,
+	timeoutMs: number | undefined,
+	timeoutError: () => Error,
+): Promise<T> {
+	setup.catch(() => {});
+	const deadline = Promise.withResolvers<never>();
+	deadline.promise.catch(() => {});
+	const deadlineTimer =
+		timeoutMs !== undefined && timeoutMs > 0
+			? setTimeout(() => deadline.reject(timeoutError()), timeoutMs)
+			: undefined;
+	const aborted = Promise.withResolvers<never>();
+	aborted.promise.catch(() => {});
+	const onAbort = () => aborted.reject(cursorAbortError(signal!));
+	if (signal) signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		const racers: Promise<T | never>[] = [setup];
+		if (deadlineTimer) racers.push(deadline.promise);
+		if (signal) racers.push(aborted.promise);
+		return await Promise.race(racers);
+	} finally {
+		if (signal) signal.removeEventListener("abort", onAbort);
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+	}
+}
+
 async function waitForCursorMutationLock(
 	conversationId: string,
 	signal: AbortSignal | undefined,
@@ -1048,6 +1076,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let h2RequestCloseHandler: (() => void) | undefined;
 		let h2RequestAbortedHandler: (() => void) | undefined;
 		let gracefulCloseCheckTimer: NodeJS.Timeout | undefined;
+		let completedSuccessfully = false;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
 		const h2Completion = Promise.withResolvers<void>();
 		h2Completion.promise.catch(() => {});
@@ -1222,28 +1251,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// history/blob/protobuf serialization. Synchronous setup cannot be
 			// interrupted by a timer; the remaining-budget check below prevents a
 			// credential-bearing request after serialization already exhausted it.
-			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
-			const previousCacheEntry = conversationCache.get(conversationId);
-			const conversationContext = buildCursorConversationContext(context, model, options, baseUrl, apiKey);
-			const reusableCacheEntry =
-				options?.onPayload === undefined &&
-				previousCacheEntry &&
-				canReuseCursorConversationContext(previousCacheEntry.context, conversationContext)
-					? previousCacheEntry
-					: undefined;
-			// Request construction writes history and attachment blobs. Work against a
-			// private snapshot so aborts, hook failures, and transport failures cannot
-			// publish partial state or leak blobs into a later request reusing the ID.
-			const blobStore = new Map(reusableCacheEntry?.blobs);
-			const cachedState = reusableCacheEntry?.state;
-			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
-				conversationId,
-				blobStore,
-				conversationState: cachedState,
-			});
+			let requestByteLength = 0;
 			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
 				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
-					requestBytes: requestBytes.length,
+					requestBytes: requestByteLength,
 					firstEventElapsedMs: Date.now() - firstEventStartedAt,
 					firstEventTimeoutMs,
 					endpointClass,
@@ -1264,6 +1275,32 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 				return remaining;
 			};
+			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
+			const previousCacheEntry = conversationCache.get(conversationId);
+			const conversationContext = buildCursorConversationContext(context, model, options, baseUrl, apiKey);
+			const reusableCacheEntry =
+				options?.onPayload === undefined &&
+				previousCacheEntry &&
+				canReuseCursorConversationContext(previousCacheEntry.context, conversationContext)
+					? previousCacheEntry
+					: undefined;
+			// Request construction writes history and attachment blobs. Work against a
+			// private snapshot so aborts, hook failures, and transport failures cannot
+			// publish partial state or leak blobs into a later request reusing the ID.
+			const blobStore = new Map(reusableCacheEntry?.blobs);
+			const cachedState = reusableCacheEntry?.state;
+			const setupPromise = buildGrpcRequest(model, context, options, {
+				conversationId,
+				blobStore,
+				conversationState: cachedState,
+			});
+			const { requestBytes, conversationState } = await waitForCursorSetup(
+				setupPromise,
+				options?.signal,
+				assertFirstEventBudget(),
+				createFirstEventTimeoutError,
+			);
+			requestByteLength = requestBytes.length;
 			let remainingFirstEventTimeoutMs = assertFirstEventBudget();
 			// A capped non-abortable mutation remains the conversation's admission
 			// lock until its actual handler settles. Wait before opening another
@@ -2111,6 +2148,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+			completedSuccessfully = true;
 			stream.push({
 				type: "done",
 				reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -2174,8 +2212,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// callback before tearing down a successful HTTP/2 request, otherwise the
 			// final exec response can be lost when close wins the writer race.
 			await waitForCursorWrites(h2Request, CURSOR_WRITE_DRAIN_TIMEOUT_MS, forceCloseTransport).catch(() => {});
-			h2Request?.close();
-			h2Client?.close();
+			if (completedSuccessfully) {
+				h2Request?.end();
+				h2Client?.close();
+				// A valid turnEnded can arrive before the peer closes its response half.
+				// Send END_STREAM first; only force cleanup after a bounded grace period
+				// when the peer leaves the completed stream open indefinitely.
+				if (h2Request && !h2Request.closed && !h2Request.destroyed) {
+					const gracefulTeardownTimer = setTimeout(forceCloseTransport, 100);
+					h2Request.once("close", () => clearTimeout(gracefulTeardownTimer));
+				}
+			} else {
+				h2Request?.close();
+				h2Client?.close();
+			}
 			proxiedSocket?.destroy();
 		}
 	})();

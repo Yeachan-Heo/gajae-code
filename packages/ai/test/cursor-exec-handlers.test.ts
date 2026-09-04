@@ -697,6 +697,40 @@ describe("Cursor request lifecycle", () => {
 		}
 	});
 
+	it("ends a successful request without resetting the HTTP2 stream", async () => {
+		const requestEnded = Promise.withResolvers<void>();
+		let requestAborted = false;
+		const server = http2.createServer();
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			stream.on("aborted", () => {
+				requestAborted = true;
+			});
+			stream.on("end", () => requestEnded.resolve());
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.once("data", () => stream.end(frameServerMessage(createTurnEndedMessage())));
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			for await (const _event of streamCursor(
+				{ ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` },
+				{ messages: [{ role: "user", content: "finish", timestamp: 0 }] },
+				{ apiKey: "test-token" },
+			)) {
+				// Drain the request to its successful terminal event.
+			}
+			await requestEnded.promise;
+			expect(requestAborted).toBe(false);
+		} finally {
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
 	it("drains an admitted exec response before completing after turnEnded", async () => {
 		const { promise: releasePromise, resolve: releaseHandler } = Promise.withResolvers<void>();
 		const { promise: handlerStarted, resolve: markHandlerStarted } = Promise.withResolvers<void>();

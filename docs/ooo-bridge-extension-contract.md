@@ -105,6 +105,6 @@ The loader scans one level under each `extensions` directory. Complex packages s
 
 `GJC_CONFIG_DIR` selects the **home-relative** config directory name: the config root is `<home>/<GJC_CONFIG_DIR>`, defaulting to `~/.gjc`. It does not select a project directory — the project-level path is the constant `.gjc` (`discovery/helpers.ts`, `getProjectAgentDir()`), so `GJC_CONFIG_DIR` never moves it. `GJC_CODING_AGENT_DIR` overrides the agent directory **path** rather than naming one under `$HOME`; it is resolved with `path.resolve`, so an absolute value is used as-is and a relative value is resolved against the current working directory.
 
-Discovery is the exception to that second override. The native provider builds its user-level root from `GJC_CONFIG_DIR` alone (`<home>/<config-dir>/agent`) and never consults `getAgentDir()`, so an operator who sets `GJC_CODING_AGENT_DIR` moves the agent directory for the rest of the product but **not** for extension, skill, rule, or hook discovery.
+Native discovery honors the selected agent directory profile. With no override it derives the user-level root from `GJC_CONFIG_DIR` (`<home>/<config-dir>/agent`); when `GJC_CODING_AGENT_DIR` is set, extension, skill, rule, hook, settings, and custom-tool discovery use that explicit agent directory. Explicit-home loads still derive or receive their agent directory from the supplied home and never fall back to the process-global profile.
 
 Hooks are not the input bridge surface: `packages/coding-agent/src/capability/hook.ts` defines pre/post tool hooks only.

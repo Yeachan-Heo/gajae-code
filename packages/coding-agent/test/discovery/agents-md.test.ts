@@ -13,6 +13,18 @@ function context(cwd: string, repoRoot: string): LoadContext {
 }
 
 describe("AGENTS.md discovery bounds", () => {
+	test("walks ordinary projects outside home through their parent directories", async () => {
+		const root = path.join(path.sep, "repo");
+		const cwd = path.join(root, "packages", "app");
+		const calls: string[] = [];
+		await loadAgentsMd({ cwd, home: path.join(path.sep, "unrelated-home"), repoRoot: null }, async candidate => {
+			calls.push(candidate);
+			return { content: null, byteLength: 0, tooLarge: false };
+		});
+
+		expect(calls).toContain(path.join(root, "AGENTS.md"));
+	});
+
 	test("limits ancestor candidates to 32 directories and passes the per-file byte limit to its reader", async () => {
 		const root = path.join(path.sep, "repo");
 		const cwd = path.join(root, ...Array.from({ length: 32 }, (_value, index) => `level-${index}`));

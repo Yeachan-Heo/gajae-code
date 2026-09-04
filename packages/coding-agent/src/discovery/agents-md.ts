@@ -123,7 +123,7 @@ export async function loadAgentsMd(
 	const cwdIsWithinHome =
 		homeRelative === "" ||
 		(homeRelative !== ".." && !homeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(homeRelative));
-	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : ctx.cwd);
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : path.parse(ctx.cwd).root);
 	const relativeStop = path.relative(stopDirectory, ctx.cwd);
 	const effectiveStopDirectory =
 		relativeStop === "" ||
