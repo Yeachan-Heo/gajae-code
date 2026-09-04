@@ -3,6 +3,8 @@ import type { Effort } from "@gajae-code/ai/core";
 import {
 	type Component,
 	Container,
+	Ellipsis,
+	getKeybindings,
 	Input,
 	matchesKey,
 	resolvePetMode,
@@ -14,6 +16,8 @@ import {
 	type Tab,
 	TabBar,
 	Text,
+	truncateToWidth,
+	visibleWidth,
 } from "@gajae-code/tui";
 import { type SettingPath, settings } from "../../config/settings";
 import type {
@@ -41,7 +45,7 @@ import { normalizeProviderOrder } from "./provider-order-context";
 import { getSettingsForTab, type SettingDef } from "./settings-defs";
 import { getPreset } from "./status-line/presets";
 import { ALL_SEGMENT_IDS } from "./status-line/segments";
-import type { StatusLineSegmentOptions } from "./tool-status-header";
+import type { StatusLinePreviewParts, StatusLineSegmentOptions } from "./tool-status-header";
 
 /**
  * A submenu component for selecting from a list of options.
@@ -263,20 +267,75 @@ function statusSegmentLabel(id: StatusLineSegmentId): string {
 	return id.replace(/_/g, " ");
 }
 
-function segmentPlacement(
-	id: StatusLineSegmentId,
-	leftSegments: StatusLineSegmentId[],
-	rightSegments: StatusLineSegmentId[],
-): "hidden" | "left" | "right" {
-	if (leftSegments.includes(id)) return "left";
-	if (rightSegments.includes(id)) return "right";
-	return "hidden";
+type StatusLineSide = "left" | "right";
+type StatusLineOptionPath =
+	| "model.showThinkingLevel"
+	| "path.abbreviate"
+	| "path.maxLength"
+	| "path.stripWorkPrefix"
+	| "git.showBranch"
+	| "git.showStaged"
+	| "git.showUnstaged"
+	| "git.showUntracked"
+	| "time.format"
+	| "time.showSeconds"
+	| "usage.mode";
+type StatusLineChoiceTarget = "separator" | StatusLineOptionPath;
+type StatusLineRootFocus =
+	| { kind: "statusbar"; side: StatusLineSide; index: number }
+	| { kind: "palette"; index: number }
+	| { kind: "separator-control" }
+	| { kind: "option-control"; path: StatusLineOptionPath }
+	| { kind: "confirm" }
+	| { kind: "exit" };
+type StatusLineFocus =
+	| StatusLineRootFocus
+	| { kind: "choice"; target: StatusLineChoiceTarget; focusedIndex: number; returnFocus: StatusLineRootFocus };
+
+interface PickedStatusLineSegment {
+	id: StatusLineSegmentId;
+	origin: { kind: "statusbar"; side: StatusLineSide; index: number } | { kind: "palette" };
+}
+
+interface StatusLineChoiceDescriptor {
+	target: StatusLineChoiceTarget;
+	label: string;
+	values: SelectItem[];
+	currentValue: () => string;
+	apply: (value: string) => void;
+	highlightSegment?: StatusLineSegmentId;
+}
+
+const SEPARATOR_OPTIONS: SelectItem[] = [
+	{ value: "powerline", label: "Powerline" },
+	{ value: "powerline-thin", label: "Thin chevron" },
+	{ value: "slash", label: "Slash" },
+	{ value: "pipe", label: "Pipe" },
+	{ value: "block", label: "Block" },
+	{ value: "none", label: "None" },
+	{ value: "ascii", label: "ASCII" },
+];
+
+function isDeleteKey(data: string): boolean {
+	const kb = getKeybindings();
+	return (
+		kb.matches(data, "tui.editor.deleteCharForward") ||
+		matchesKey(data, "delete") ||
+		matchesKey(data, "shift+delete") ||
+		data === "\x1b[3~"
+	);
+}
+
+function cloneRootFocus(focus: StatusLineRootFocus): StatusLineRootFocus {
+	return { ...focus };
 }
 
 class StatusLineCustomEditor extends Container {
-	#list!: SettingsList;
 	#draft: StatusLineDraft;
 	#previewHighlightSegment: StatusLineSegmentId | undefined;
+	#focus: StatusLineFocus = { kind: "statusbar", side: "left", index: 0 };
+	#picked: PickedStatusLineSegment | undefined;
+	#pickedStatusbarFocus: Extract<StatusLineRootFocus, { kind: "statusbar" }> | undefined;
 
 	constructor(
 		private readonly callbacks: SettingsCallbacks,
@@ -299,275 +358,808 @@ class StatusLineCustomEditor extends Container {
 				settings.get("statusLine.segmentOptions") as StatusLineSegmentOptions,
 			),
 		};
-		this.#preview();
-		this.#build();
-	}
-
-	#build(): void {
-		this.clear();
-		this.addChild(new Text(theme.bold(theme.fg("accent", "Status Line Custom Editor")), 0, 0));
-		this.addChild(new Spacer(1));
-		this.#list = new SettingsList(
-			this.#items(),
-			14,
-			getSettingsListTheme(),
-			(id, value) => this.#handleChange(id, value),
-			() => this.#cancel(),
-			item => this.#setSelectedItem(item),
-			2,
-		);
-		this.addChild(this.#list);
-	}
-
-	#refresh(): void {
-		this.#list.setItems(this.#items());
-	}
-	#setSelectedItem(item: SettingItem | undefined): void {
-		this.#previewHighlightSegment = this.#highlightSegmentForItem(item);
+		this.#normalizeFocus();
 		this.#preview();
 	}
 
-	#highlightSegmentForItem(item: SettingItem | undefined): StatusLineSegmentId | undefined {
-		if (!item) return undefined;
-		if (item.id.startsWith("segment.")) {
-			return item.id.slice("segment.".length) as StatusLineSegmentId;
-		}
-		if (item.id.startsWith("moveup.")) {
-			return item.id.slice("moveup.".length) as StatusLineSegmentId;
-		}
-		if (item.id.startsWith("movedown.")) {
-			return item.id.slice("movedown.".length) as StatusLineSegmentId;
-		}
-		if (item.id.startsWith("option.")) {
-			const [segment] = item.id.slice("option.".length).split(".");
-			return segment as StatusLineSegmentId;
-		}
-		return undefined;
+	get navigationLocked(): boolean {
+		return true;
 	}
 
-	#items(): SettingItem[] {
-		const items: SettingItem[] = [
+	#choiceDescriptors(): StatusLineChoiceDescriptor[] {
+		return [
 			{
-				id: "action.save",
-				label: "Save custom status line",
-				description: "Persist the previewed custom status line to user config.",
-				currentValue: "approve",
-				values: ["approve"],
-			},
-			{
-				id: "action.cancel",
-				label: "Cancel and restore",
-				description: "Close without persisting draft settings and restore the previous preview.",
-				currentValue: "restore",
-				values: ["restore"],
-			},
-			{
-				id: "separator",
+				target: "separator",
 				label: "Separator",
-				description: "Separator style between status line segments.",
-				currentValue: this.#draft.separator,
-				submenu: (currentValue, done) =>
-					new SelectSubmenu(
-						"Status Line Separator",
-						"Style of separators between segments.",
-						[
-							{ value: "powerline", label: "Powerline" },
-							{ value: "powerline-thin", label: "Thin chevron" },
-							{ value: "slash", label: "Slash" },
-							{ value: "pipe", label: "Pipe" },
-							{ value: "block", label: "Block" },
-							{ value: "none", label: "None" },
-							{ value: "ascii", label: "ASCII" },
-						],
-						currentValue,
-						done,
-						() => done(),
-					),
+				values: SEPARATOR_OPTIONS,
+				currentValue: () => this.#draft.separator,
+				apply: value => {
+					this.#draft.separator = value as StatusLineSeparatorStyle;
+				},
+			},
+			{
+				target: "model.showThinkingLevel",
+				label: "Model: show thinking level",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.model?.showThinkingLevel !== false),
+				apply: value => this.#setOption("model.showThinkingLevel", value),
+				highlightSegment: "model",
+			},
+			{
+				target: "path.abbreviate",
+				label: "Path: abbreviate",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.path?.abbreviate !== false),
+				apply: value => this.#setOption("path.abbreviate", value),
+				highlightSegment: "path",
+			},
+			{
+				target: "path.maxLength",
+				label: "Path: max length",
+				values: PATH_LENGTH_OPTIONS,
+				currentValue: () => String(this.#draft.segmentOptions.path?.maxLength ?? 32),
+				apply: value => this.#setOption("path.maxLength", value),
+				highlightSegment: "path",
+			},
+			{
+				target: "path.stripWorkPrefix",
+				label: "Path: strip work prefix",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.path?.stripWorkPrefix === true),
+				apply: value => this.#setOption("path.stripWorkPrefix", value),
+				highlightSegment: "path",
+			},
+			{
+				target: "git.showBranch",
+				label: "Git: show branch",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.git?.showBranch !== false),
+				apply: value => this.#setOption("git.showBranch", value),
+				highlightSegment: "git",
+			},
+			{
+				target: "git.showStaged",
+				label: "Git: show staged",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.git?.showStaged !== false),
+				apply: value => this.#setOption("git.showStaged", value),
+				highlightSegment: "git",
+			},
+			{
+				target: "git.showUnstaged",
+				label: "Git: show unstaged",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.git?.showUnstaged !== false),
+				apply: value => this.#setOption("git.showUnstaged", value),
+				highlightSegment: "git",
+			},
+			{
+				target: "git.showUntracked",
+				label: "Git: show untracked",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.git?.showUntracked !== false),
+				apply: value => this.#setOption("git.showUntracked", value),
+				highlightSegment: "git",
+			},
+			{
+				target: "time.format",
+				label: "Time: format",
+				values: TIME_FORMAT_OPTIONS,
+				currentValue: () => this.#draft.segmentOptions.time?.format ?? "24h",
+				apply: value => this.#setOption("time.format", value),
+			},
+			{
+				target: "time.showSeconds",
+				label: "Time: show seconds",
+				values: BOOL_VALUES.map(value => ({ value, label: value })),
+				currentValue: () => String(this.#draft.segmentOptions.time?.showSeconds === true),
+				apply: value => this.#setOption("time.showSeconds", value),
+			},
+			{
+				target: "usage.mode",
+				label: "Usage: mode",
+				values: USAGE_MODE_OPTIONS,
+				currentValue: () => this.#draft.segmentOptions.usage?.mode ?? "used",
+				apply: value => this.#setOption("usage.mode", value),
+				highlightSegment: "usage",
 			},
 		];
+	}
 
-		for (const id of PUBLIC_STATUS_SEGMENTS) {
-			items.push({
-				id: `segment.${id}`,
-				label: `Segment: ${statusSegmentLabel(id)}`,
-				description: "Cycle placement: hidden → left → right. Use move actions below to reorder visible segments.",
-				currentValue: segmentPlacement(id, this.#draft.leftSegments, this.#draft.rightSegments),
-				values: ["hidden", "left", "right"],
-			});
-			if (segmentPlacement(id, this.#draft.leftSegments, this.#draft.rightSegments) !== "hidden") {
-				items.push(
-					{
-						id: `moveup.${id}`,
-						label: `Move left: ${statusSegmentLabel(id)}`,
-						currentValue: "←",
-						values: ["←"],
-					},
-					{
-						id: `movedown.${id}`,
-						label: `Move right: ${statusSegmentLabel(id)}`,
-						currentValue: "→",
-						values: ["→"],
-					},
-				);
-			}
-			if (id === "usage") {
-				items.push({
-					id: "option.usage.mode",
-					label: "Usage: mode",
-					currentValue: this.#draft.segmentOptions.usage?.mode ?? "used",
-					submenu: (currentValue, done) =>
-						new SelectSubmenu(
-							"Usage mode",
-							"Show used quota or remaining quota in the usage segment.",
-							USAGE_MODE_OPTIONS,
-							currentValue,
-							done,
-							() => done(),
-						),
-				});
-			}
-			if (id === "command") {
-				items.push({
-					id: "option.command.command",
-					label: "Command: command",
-					description: "Shell command whose sanitized stdout is shown in the status line.",
-					currentValue: this.#draft.segmentOptions.command?.command ?? "",
-					submenu: (currentValue, done) =>
-						new TextInputSubmenu(
-							"Status line command",
-							"Runs in the configured shell with a short timeout and cached refreshes.",
-							currentValue,
-							value => done(value),
-							() => done(),
-						),
-				});
-			}
+	#descriptor(target: StatusLineChoiceTarget): StatusLineChoiceDescriptor | undefined {
+		return this.#choiceDescriptors().find(descriptor => descriptor.target === target);
+	}
+
+	#hiddenSegments(): StatusLineSegmentId[] {
+		const visible = new Set([...this.#draft.leftSegments, ...this.#draft.rightSegments]);
+		return PUBLIC_STATUS_SEGMENTS.filter(id => !visible.has(id));
+	}
+
+	#paletteSegments(includePicked = this.#focus.kind === "palette"): StatusLineSegmentId[] {
+		const visible = new Set([...this.#draft.leftSegments, ...this.#draft.rightSegments]);
+		const selected = includePicked ? this.#picked?.id : undefined;
+		return PUBLIC_STATUS_SEGMENTS.filter(id => !visible.has(id) || id === selected);
+	}
+
+	#focusSegment(): StatusLineSegmentId | undefined {
+		if (this.#focus.kind !== "statusbar") return undefined;
+		return this.#draft[`${this.#focus.side}Segments`][this.#focus.index];
+	}
+
+	#segmentCount(side: StatusLineSide, omitPicked = false): number {
+		const segments = this.#draft[`${side}Segments`];
+		if (
+			!omitPicked ||
+			!this.#picked ||
+			this.#picked.origin.kind !== "statusbar" ||
+			this.#picked.origin.side !== side
+		) {
+			return segments.length;
 		}
+		return Math.max(0, segments.length - 1);
+	}
 
-		items.push(
-			{
-				id: "option.model.showThinkingLevel",
-				label: "Model: show thinking level",
-				currentValue: String(this.#draft.segmentOptions.model?.showThinkingLevel !== false),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.path.abbreviate",
-				label: "Path: abbreviate",
-				currentValue: String(this.#draft.segmentOptions.path?.abbreviate !== false),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.path.maxLength",
-				label: "Path: max length",
-				currentValue: String(this.#draft.segmentOptions.path?.maxLength ?? 32),
-				submenu: (currentValue, done) =>
-					new SelectSubmenu(
-						"Path max length",
-						"Maximum displayed path length.",
-						PATH_LENGTH_OPTIONS,
-						currentValue,
-						done,
-						() => done(),
-					),
-			},
-			{
-				id: "option.path.stripWorkPrefix",
-				label: "Path: strip work prefix",
-				currentValue: String(this.#draft.segmentOptions.path?.stripWorkPrefix === true),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.git.showBranch",
-				label: "Git: show branch",
-				currentValue: String(this.#draft.segmentOptions.git?.showBranch !== false),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.git.showStaged",
-				label: "Git: show staged",
-				currentValue: String(this.#draft.segmentOptions.git?.showStaged !== false),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.git.showUnstaged",
-				label: "Git: show unstaged",
-				currentValue: String(this.#draft.segmentOptions.git?.showUnstaged !== false),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.git.showUntracked",
-				label: "Git: show untracked",
-				currentValue: String(this.#draft.segmentOptions.git?.showUntracked !== false),
-				values: BOOL_VALUES,
-			},
-			{
-				id: "option.time.format",
-				label: "Time: format",
-				currentValue: this.#draft.segmentOptions.time?.format ?? "24h",
-				submenu: (currentValue, done) =>
-					new SelectSubmenu(
-						"Time format",
-						"Clock format for the time segment.",
-						TIME_FORMAT_OPTIONS,
-						currentValue,
-						done,
-						() => done(),
-					),
-			},
-			{
-				id: "option.time.showSeconds",
-				label: "Time: show seconds",
-				currentValue: String(this.#draft.segmentOptions.time?.showSeconds === true),
-				values: BOOL_VALUES,
-			},
+	#normalizeFocus(): void {
+		const descriptors = this.#choiceDescriptors();
+		if (this.#focus.kind === "choice") {
+			const descriptor = this.#descriptor(this.#focus.target);
+			if (!descriptor) {
+				this.#focus = { kind: "separator-control" };
+			} else {
+				this.#focus.focusedIndex = Math.max(0, Math.min(this.#focus.focusedIndex, descriptor.values.length - 1));
+			}
+			return;
+		}
+		if (this.#focus.kind === "statusbar") {
+			const max = this.#picked
+				? this.#segmentCount(this.#focus.side, true)
+				: this.#draft[`${this.#focus.side}Segments`].length - 1;
+			if (max < 0) {
+				const otherSide: StatusLineSide = this.#focus.side === "left" ? "right" : "left";
+				if (this.#draft[`${otherSide}Segments`].length > 0) {
+					this.#focus = { kind: "statusbar", side: otherSide, index: 0 };
+				} else if (this.#paletteSegments().length > 0) {
+					this.#focus = { kind: "palette", index: 0 };
+				} else {
+					this.#focus = { kind: "separator-control" };
+				}
+			} else {
+				this.#focus.index = Math.max(0, Math.min(this.#focus.index, max));
+			}
+		} else if (this.#focus.kind === "palette") {
+			const palette = this.#paletteSegments();
+			if (palette.length === 0) {
+				this.#focus = { kind: "separator-control" };
+			} else {
+				this.#focus.index = Math.max(0, Math.min(this.#focus.index, palette.length - 1));
+			}
+		} else if (
+			this.#focus.kind === "option-control" &&
+			!descriptors.some(descriptor => descriptor.target === (this.#focus as { path: StatusLineOptionPath }).path)
+		) {
+			this.#focus = { kind: "separator-control" };
+		}
+	}
+
+	#rootOrder(): StatusLineRootFocus[] {
+		const roots: StatusLineRootFocus[] = [];
+		roots.push(this.#nearestStatusbarFocus());
+		if (this.#paletteSegments().length > 0) roots.push({ kind: "palette", index: 0 });
+		roots.push({ kind: "separator-control" });
+		roots.push({ kind: "confirm" }, { kind: "exit" });
+		return roots;
+	}
+
+	#nearestStatusbarFocus(): StatusLineRootFocus {
+		if (this.#focus.kind === "statusbar") {
+			return { kind: "statusbar", side: this.#focus.side, index: this.#focus.index };
+		}
+		if (this.#draft.leftSegments.length > 0 || this.#picked) {
+			return {
+				kind: "statusbar",
+				side: "left",
+				index: this.#picked ? this.#segmentCount("left", true) : 0,
+			};
+		}
+		if (this.#draft.rightSegments.length > 0) {
+			return { kind: "statusbar", side: "right", index: 0 };
+		}
+		return { kind: "statusbar", side: "left", index: 0 };
+	}
+
+	#rootFocusKey(focus: StatusLineRootFocus): string {
+		switch (focus.kind) {
+			case "statusbar":
+				return `${focus.kind}:${focus.side}:${focus.index}`;
+			case "palette":
+				return `${focus.kind}:${focus.index}`;
+			case "option-control":
+				return `${focus.kind}:${focus.path}`;
+			default:
+				return focus.kind;
+		}
+	}
+
+	#moveVertical(delta: -1 | 1): void {
+		if (this.#focus.kind === "choice") {
+			const descriptor = this.#descriptor(this.#focus.target);
+			if (!descriptor || descriptor.values.length === 0) return;
+			this.#focus.focusedIndex =
+				(this.#focus.focusedIndex + delta + descriptor.values.length) % descriptor.values.length;
+			return;
+		}
+		if (this.#picked) {
+			if (this.#focus.kind === "palette") {
+				if (delta === -1) this.#focus = this.#pickedStatusbarFocus ?? this.#nearestStatusbarFocus();
+			} else if (delta === 1) {
+				if (this.#focus.kind === "statusbar") this.#pickedStatusbarFocus = { ...this.#focus };
+				this.#focus = { kind: "palette", index: this.#focusPaletteIndex() };
+			}
+			this.#normalizeFocus();
+			return;
+		}
+		const order = this.#rootOrder();
+		const currentKey = this.#rootFocusKey(this.#focus);
+		const currentIndex = Math.max(
+			0,
+			order.findIndex(item => this.#rootFocusKey(item) === currentKey),
 		);
-
-		return items;
+		this.#focus = cloneRootFocus(order[(currentIndex + delta + order.length) % order.length] ?? order[0]);
+		this.#normalizeFocus();
 	}
 
-	#handleChange(id: string, value: string): void {
-		if (id === "action.save") {
-			this.#save();
-			return;
-		}
-		if (id === "action.cancel") {
-			this.#cancel();
-			return;
-		}
-		if (id === "separator") {
-			this.#draft.separator = value as StatusLineSeparatorStyle;
-		} else if (id.startsWith("segment.")) {
-			this.#setSegmentPlacement(
-				id.slice("segment.".length) as StatusLineSegmentId,
-				value as "hidden" | "left" | "right",
-			);
-		} else if (id.startsWith("moveup.")) {
-			this.#moveSegment(id.slice("moveup.".length) as StatusLineSegmentId, -1);
-		} else if (id.startsWith("movedown.")) {
-			this.#moveSegment(id.slice("movedown.".length) as StatusLineSegmentId, 1);
-		} else if (id.startsWith("option.")) {
-			this.#setOption(id.slice("option.".length), value);
-		}
+	#focusPaletteIndex(): number {
+		if (this.#focus.kind === "palette") return this.#focus.index;
+		if (this.#picked) return Math.max(0, this.#paletteSegments(true).indexOf(this.#picked.id));
+		return Math.max(0, Math.min(this.#paletteSegments(false).length - 1, 0));
+	}
+
+	#linearVisibleFocus(): Array<{ side: StatusLineSide; index: number }> {
+		return [
+			...this.#draft.leftSegments.map((_, index) => ({ side: "left" as const, index })),
+			...this.#draft.rightSegments.map((_, index) => ({ side: "right" as const, index })),
+		];
+	}
+
+	#moveVisibleFocus(delta: -1 | 1): void {
+		if (this.#focus.kind !== "statusbar") return;
+		const focus = this.#focus;
+		const items = this.#linearVisibleFocus();
+		if (items.length === 0) return;
+		const currentIndex = Math.max(
+			0,
+			items.findIndex(item => item.side === focus.side && item.index === focus.index),
+		);
+		this.#focus = { kind: "statusbar", ...items[(currentIndex + delta + items.length) % items.length] };
+	}
+
+	#slotOrder(): Array<{ side: StatusLineSide; index: number }> {
+		const leftCount = this.#segmentCount("left", true);
+		const rightCount = this.#segmentCount("right", true);
+		return [
+			...Array.from({ length: leftCount + 1 }, (_, index) => ({ side: "left" as const, index })),
+			...Array.from({ length: rightCount + 1 }, (_, index) => ({ side: "right" as const, index })),
+		];
+	}
+
+	#movePickedSlot(delta: -1 | 1): void {
+		if (!this.#picked || this.#focus.kind !== "statusbar") return;
+		const focus = this.#focus;
+		const slots = this.#slotOrder();
+		const currentIndex = Math.max(
+			0,
+			slots.findIndex(item => item.side === focus.side && item.index === focus.index),
+		);
+		this.#focus = { kind: "statusbar", ...slots[Math.max(0, Math.min(slots.length - 1, currentIndex + delta))] };
+		this.#pickedStatusbarFocus = { ...this.#focus };
+		this.#updatePreviewHighlight();
+	}
+
+	#movePaletteFocus(delta: -1 | 1): void {
+		if (this.#focus.kind !== "palette") return;
+		const palette = this.#paletteSegments();
+		if (palette.length === 0) return;
+		this.#focus.index = (this.#focus.index + delta + palette.length) % palette.length;
+	}
+
+	#moveChoiceControl(delta: -1 | 1): void {
+		if (this.#focus.kind !== "separator-control" && this.#focus.kind !== "option-control") return;
+		const descriptors = this.#choiceDescriptors();
+		const currentTarget = this.#focus.kind === "separator-control" ? "separator" : this.#focus.path;
+		const currentIndex = Math.max(
+			0,
+			descriptors.findIndex(descriptor => descriptor.target === currentTarget),
+		);
+		const next = descriptors[(currentIndex + delta + descriptors.length) % descriptors.length];
+		if (!next) return;
+		this.#focus =
+			next.target === "separator"
+				? { kind: "separator-control" }
+				: { kind: "option-control", path: next.target as StatusLineOptionPath };
+	}
+
+	#moveChoiceTarget(delta: -1 | 1): void {
+		if (this.#focus.kind !== "choice") return;
+		const focus = this.#focus;
+		const descriptors = this.#choiceDescriptors();
+		const currentIndex = Math.max(
+			0,
+			descriptors.findIndex(descriptor => descriptor.target === focus.target),
+		);
+		const next = descriptors[(currentIndex + delta + descriptors.length) % descriptors.length];
+		if (!next) return;
+		const currentValue = next.currentValue();
+		this.#focus = {
+			kind: "choice",
+			target: next.target,
+			focusedIndex: Math.max(
+				0,
+				next.values.findIndex(value => value.value === currentValue),
+			),
+			returnFocus:
+				next.target === "separator"
+					? { kind: "separator-control" }
+					: { kind: "option-control", path: next.target as StatusLineOptionPath },
+		};
+	}
+
+	#pickFocusedStatusbar(): void {
+		if (this.#focus.kind !== "statusbar") return;
+		const id = this.#focusSegment();
+		if (!id) return;
+		this.#picked = { id, origin: { kind: "statusbar", side: this.#focus.side, index: this.#focus.index } };
+		this.#pickedStatusbarFocus = { kind: "statusbar", side: this.#focus.side, index: this.#focus.index };
+		this.#updatePreviewHighlight();
 		this.#preview();
-		this.#refresh();
 	}
 
-	#setSegmentPlacement(id: StatusLineSegmentId, placement: "hidden" | "left" | "right"): void {
+	#pickFocusedPalette(): void {
+		if (this.#focus.kind !== "palette") return;
+		const id = this.#paletteSegments()[this.#focus.index];
+		if (!id) return;
+		this.#picked = { id, origin: { kind: "palette" } };
+		this.#focus = { kind: "statusbar", side: "left", index: this.#segmentCount("left", true) };
+		this.#pickedStatusbarFocus = { ...this.#focus };
+		this.#updatePreviewHighlight();
+		this.#preview();
+	}
+
+	#dropPicked(): void {
+		if (!this.#picked || this.#focus.kind !== "statusbar") return;
+		const id = this.#picked.id;
+		const nextLeft = this.#draft.leftSegments.filter(segment => segment !== id);
+		const nextRight = this.#draft.rightSegments.filter(segment => segment !== id);
+		const target = this.#focus.side === "left" ? nextLeft : nextRight;
+		target.splice(Math.max(0, Math.min(target.length, this.#focus.index)), 0, id);
+		this.#draft.leftSegments = nextLeft;
+		this.#draft.rightSegments = nextRight;
+		this.#focus = { kind: "statusbar", side: this.#focus.side, index: target.indexOf(id) };
+		this.#picked = undefined;
+		this.#pickedStatusbarFocus = undefined;
+		this.#updatePreviewHighlight();
+		this.#preview();
+	}
+
+	#dropPickedToPalette(): void {
+		if (!this.#picked || this.#focus.kind !== "palette") return;
+		const id = this.#picked.id;
 		this.#draft.leftSegments = this.#draft.leftSegments.filter(segment => segment !== id);
 		this.#draft.rightSegments = this.#draft.rightSegments.filter(segment => segment !== id);
-		if (placement === "left") this.#draft.leftSegments.push(id);
-		if (placement === "right") this.#draft.rightSegments.push(id);
+		this.#picked = undefined;
+		this.#pickedStatusbarFocus = undefined;
+		const hidden = this.#hiddenSegments();
+		this.#focus = { kind: "palette", index: Math.max(0, hidden.indexOf(id)) };
+		this.#updatePreviewHighlight();
+		this.#preview();
 	}
 
-	#moveSegment(id: StatusLineSegmentId, delta: -1 | 1): void {
-		const group = this.#draft.leftSegments.includes(id) ? this.#draft.leftSegments : this.#draft.rightSegments;
-		const index = group.indexOf(id);
-		if (index < 0) return;
-		const nextIndex = Math.max(0, Math.min(group.length - 1, index + delta));
-		if (nextIndex === index) return;
-		const [segment] = group.splice(index, 1);
-		if (segment) group.splice(nextIndex, 0, segment);
+	#hideFocusedSegment(): void {
+		if (this.#picked || this.#focus.kind !== "statusbar") return;
+		const group = this.#draft[`${this.#focus.side}Segments`];
+		if (!group[this.#focus.index]) return;
+		group.splice(this.#focus.index, 1);
+		const hidden = this.#hiddenSegments();
+		this.#focus = hidden.length ? { kind: "palette", index: hidden.length - 1 } : { kind: "separator-control" };
+		this.#updatePreviewHighlight();
+		this.#preview();
+	}
+
+	#openChoice(target: StatusLineChoiceTarget, returnFocus: StatusLineRootFocus): void {
+		const descriptor = this.#descriptor(target);
+		if (!descriptor) return;
+		const currentValue = descriptor.currentValue();
+		this.#focus = {
+			kind: "choice",
+			target,
+			focusedIndex: Math.max(
+				0,
+				descriptor.values.findIndex(value => value.value === currentValue),
+			),
+			returnFocus,
+		};
+	}
+
+	#applyChoice(): void {
+		if (this.#focus.kind !== "choice") return;
+		const descriptor = this.#descriptor(this.#focus.target);
+		if (!descriptor) return;
+		const value = descriptor.values[this.#focus.focusedIndex]?.value;
+		if (value === undefined) return;
+		descriptor.apply(value);
+		this.#focus = cloneRootFocus(this.#focus.returnFocus);
+		this.#updatePreviewHighlight();
+		this.#preview();
+	}
+
+	#updatePreviewHighlight(): void {
+		if (this.#picked) {
+			this.#previewHighlightSegment = this.#picked.id;
+			return;
+		}
+		if (this.#focus.kind === "statusbar") {
+			this.#previewHighlightSegment = this.#focusSegment();
+			return;
+		}
+		if (this.#focus.kind === "palette") {
+			this.#previewHighlightSegment = this.#paletteSegments()[this.#focus.index];
+			return;
+		}
+		if (this.#focus.kind === "option-control") {
+			this.#previewHighlightSegment = this.#descriptor(this.#focus.path)?.highlightSegment;
+			return;
+		}
+		if (this.#focus.kind === "choice") {
+			this.#previewHighlightSegment = this.#descriptor(this.#focus.target)?.highlightSegment;
+			return;
+		}
+		this.#previewHighlightSegment = undefined;
+	}
+
+	#focusLabel(): string {
+		switch (this.#focus.kind) {
+			case "statusbar":
+				return `statusbar:${this.#focus.side}:${this.#focus.index}`;
+			case "palette":
+				return `palette:${this.#focus.index}`;
+			case "option-control":
+				return `option:${this.#focus.path}`;
+			case "choice":
+				return `choice:${this.#focus.target}`;
+			default:
+				return this.#focus.kind;
+		}
+	}
+
+	#separatorGlyph(): string {
+		if (theme.getSymbolPreset() === "ascii") {
+			return this.#draft.separator === "none" ? " " : this.#draft.separator === "pipe" ? " | " : " / ";
+		}
+		switch (this.#draft.separator) {
+			case "pipe":
+				return " | ";
+			case "block":
+				return " █ ";
+			case "none":
+				return " ";
+			case "ascii":
+				return " > ";
+			case "powerline":
+				return "  ";
+			case "powerline-thin":
+				return " ❯ ";
+			case "slash":
+				return " / ";
+		}
+	}
+
+	#fit(line: string, width: number): string {
+		const ascii = theme.getSymbolPreset() === "ascii";
+		const fitted = truncateToWidth(
+			line,
+			ascii ? Math.max(0, width - 2) : width,
+			ascii ? Ellipsis.Ascii : Ellipsis.Unicode,
+		);
+		if (!ascii) return fitted;
+		return fitted.replace(/·/g, "-").replace(/│/g, "|").replace(/…/g, "...");
+	}
+
+	#padEndVisible(line: string, width: number): string {
+		return line + " ".repeat(Math.max(0, width - visibleWidth(line)));
+	}
+
+	#padStartVisible(line: string, width: number): string {
+		return " ".repeat(Math.max(0, width - visibleWidth(line))) + line;
+	}
+
+	#centerVisible(line: string, width: number): string {
+		const left = Math.floor(Math.max(0, width - visibleWidth(line)) / 2);
+		return " ".repeat(left) + line;
+	}
+
+	#simulationWidth(width: number): number {
+		return Math.max(1, width - 2);
+	}
+
+	#simulationIndent(width: number): string {
+		return " ".repeat(Math.max(0, Math.floor((width - this.#simulationWidth(width)) / 2)));
+	}
+
+	#highlightBox(text: string, style: "focus" | "selected"): string {
+		const selectedText = `> ${text} <`;
+		const bgColor = style === "selected" ? "warning" : "text";
+		const brightBg = theme.getFgAnsi(bgColor).replace("\x1b[38;", "\x1b[48;");
+		const darkFg = theme.getBgAnsi("selectedBg").replace("\x1b[48;", "\x1b[38;");
+		return `${brightBg}${darkFg}${selectedText}\x1b[0m`;
+	}
+
+	#focusBox(text: string): string {
+		return this.#highlightBox(text, "focus");
+	}
+
+	#selectedBox(text: string): string {
+		return this.#highlightBox(text, "selected");
+	}
+
+	#dashedBox(text: string): string {
+		return theme.fg("dim", theme.getSymbolPreset() === "ascii" ? `[ ${text} ]` : `┆ ${text} ┆`);
+	}
+
+	#renderSegment(id: StatusLineSegmentId, selected: boolean, visibleInStatusbar: boolean): string {
+		const label = statusSegmentLabel(id);
+		if (selected) return this.#focusBox(label);
+		if (visibleInStatusbar) return label;
+		return this.#dashedBox(label);
+	}
+
+	#renderSide(side: StatusLineSide, visibleIds: ReadonlySet<StatusLineSegmentId> | undefined): string {
+		const segments = this.#draft[`${side}Segments`];
+		const rendered: string[] = [];
+		for (let index = 0; index < segments.length; index++) {
+			const id = segments[index];
+			if (!id) continue;
+			const isOrigin =
+				this.#picked?.origin.kind === "statusbar" &&
+				this.#picked.origin.side === side &&
+				this.#picked.origin.index === index;
+			if (isOrigin) continue;
+			const selected =
+				!this.#picked &&
+				this.#focus.kind === "statusbar" &&
+				this.#focus.side === side &&
+				this.#focus.index === index;
+			rendered.push(this.#renderSegment(id, selected, visibleIds?.has(id) ?? false));
+		}
+		if (this.#picked && this.#focus.kind === "statusbar" && this.#focus.side === side) {
+			rendered.splice(
+				Math.max(0, Math.min(rendered.length, this.#focus.index)),
+				0,
+				this.#selectedBox(statusSegmentLabel(this.#picked.id)),
+			);
+		}
+		return rendered.length
+			? rendered.join(theme.fg("statusLineSep", this.#separatorGlyph()))
+			: theme.fg("muted", "(empty)");
+	}
+
+	#draftPreviewSettings(includePickedPlacement = false): StatusLinePreviewSettings {
+		let leftSegments = [...this.#draft.leftSegments];
+		let rightSegments = [...this.#draft.rightSegments];
+		let previewHighlightSegment = this.#previewHighlightSegment;
+		if (includePickedPlacement && this.#picked) {
+			const id = this.#picked.id;
+			leftSegments = leftSegments.filter(segment => segment !== id);
+			rightSegments = rightSegments.filter(segment => segment !== id);
+			if (this.#focus.kind === "statusbar") {
+				const target = this.#focus.side === "left" ? leftSegments : rightSegments;
+				target.splice(Math.max(0, Math.min(target.length, this.#focus.index)), 0, id);
+				previewHighlightSegment = id;
+			}
+		}
+		return {
+			preset: "custom",
+			leftSegments,
+			rightSegments,
+			separator: this.#draft.separator,
+			segmentOptions: cloneSegmentOptions(this.#draft.segmentOptions),
+			sessionAccent: settings.get("statusLine.sessionAccent"),
+			maxRows: settings.get("statusLine.maxRows"),
+			previewHighlightSegment,
+			previewHighlightStyle: this.#picked ? "selected" : "focus",
+		};
+	}
+
+	#actualStatusbarParts(width: number): StatusLinePreviewParts | undefined {
+		return this.callbacks.getStatusLinePreviewPartsForSettings?.(
+			this.#draftPreviewSettings(true),
+			this.#simulationWidth(width),
+		);
+	}
+
+	#renderActualStatusbar(width: number, parts: StatusLinePreviewParts | undefined): string[] {
+		if (parts) return this.#renderActualStatusbarParts(width, parts);
+		const rendered = this.callbacks.getStatusLinePreviewForSettings?.(this.#draftPreviewSettings(true), width);
+		if (!rendered) return [];
+		return rendered
+			.split("\n")
+			.map(line => line.trimEnd())
+			.filter(line => line.length > 0)
+			.map(line => this.#centerVisible(this.#fit(line, this.#simulationWidth(width)), width));
+	}
+
+	#renderActualStatusbarParts(width: number, parts: StatusLinePreviewParts): string[] {
+		const barWidth = this.#simulationWidth(width);
+		const indent = this.#simulationIndent(width);
+		const separator = theme.fg("statusLineSep", ` ${parts.separator.left} `);
+		const left = parts.left.join(separator);
+		const right = parts.right.join(separator);
+		const combinedGap = Math.max(1, barWidth - visibleWidth(left) - visibleWidth(right));
+		if (visibleWidth(left) + visibleWidth(right) + 1 <= barWidth) {
+			return [this.#fit(`${indent}${left}${" ".repeat(combinedGap)}${right}`, width)];
+		}
+		return [
+			this.#fit(
+				`${indent}${this.#padEndVisible(truncateToWidth(left, barWidth, Ellipsis.Unicode), barWidth)}`,
+				width,
+			),
+			this.#fit(
+				`${indent}${this.#padStartVisible(truncateToWidth(right, barWidth, Ellipsis.Unicode), barWidth)}`,
+				width,
+			),
+		];
+	}
+
+	#renderSlotRows(width: number, parts: StatusLinePreviewParts | undefined): string[] {
+		const barWidth = this.#simulationWidth(width);
+		const indent = this.#simulationIndent(width);
+		const leftVisible = parts ? new Set(parts.leftIds) : undefined;
+		const rightVisible = parts
+			? new Set(parts.rightIds.filter((id): id is StatusLineSegmentId => id !== null))
+			: undefined;
+		const left = `${theme.bold("left")} ${this.#renderSide("left", leftVisible)}`;
+		const rightExtras =
+			parts?.right
+				.filter((part, index) => parts.rightIds[index] === null && /^v\d/.test(Bun.stripANSI(part)))
+				.map(part => theme.fg("dim", Bun.stripANSI(part))) ?? [];
+		const rightCore = this.#renderSide("right", rightVisible);
+		const right =
+			rightExtras.length > 0
+				? `${theme.bold("right")} ${rightCore}${theme.fg("statusLineSep", this.#separatorGlyph())}${rightExtras.join(
+						theme.fg("statusLineSep", this.#separatorGlyph()),
+					)}`
+				: `${theme.bold("right")} ${rightCore}`;
+		const combinedGap = Math.max(1, barWidth - visibleWidth(left) - visibleWidth(right));
+		if (visibleWidth(left) + visibleWidth(right) + 1 <= barWidth) {
+			return [this.#fit(`${indent}${left}${" ".repeat(combinedGap)}${right}`, width)];
+		}
+		return [
+			this.#fit(
+				`${indent}${this.#padEndVisible(truncateToWidth(left, barWidth, Ellipsis.Unicode), barWidth)}`,
+				width,
+			),
+			this.#fit(
+				`${indent}${this.#padStartVisible(truncateToWidth(right, barWidth, Ellipsis.Unicode), barWidth)}`,
+				width,
+			),
+		];
+	}
+
+	#renderChoicePanel(width: number): string[] {
+		if (this.#focus.kind !== "choice") return [];
+		const focus = this.#focus;
+		const descriptor = this.#descriptor(focus.target);
+		if (!descriptor) return [];
+		const values = descriptor.values.map((value, index) => {
+			const selected = index === focus.focusedIndex;
+			const active = value.value === descriptor.currentValue();
+			const activeMarker = theme.getSymbolPreset() === "ascii" ? "v " : "✓ ";
+			const label = `${active ? activeMarker : ""}${value.label}`;
+			if (selected) return this.#focusBox(label);
+			if (active) return this.#selectedBox(label);
+			return label;
+		});
+		return [
+			truncateToWidth(theme.bold(`Choices: ${descriptor.label}: ${values.join("  ")}`), width),
+			truncateToWidth(theme.fg("dim", "  Left/Right value · Up/Down option · Enter apply · Esc return"), width),
+		];
+	}
+
+	override render(width: number): string[] {
+		this.#normalizeFocus();
+		const lines: string[] = [];
+		lines.push(truncateToWidth(theme.bold(theme.fg("accent", "Status Line Custom Editor")), width));
+		const focusLine = `Focus: ${this.#focusLabel()}`;
+		lines.push(truncateToWidth(theme.fg("muted", focusLine), width));
+		if (this.#picked) {
+			lines.push(truncateToWidth(theme.fg("accent", `Selected: ${statusSegmentLabel(this.#picked.id)}`), width));
+		}
+		lines.push("");
+		lines.push(this.#centerVisible(theme.bold("Simulated statusbar"), width));
+		const actualStatusbarParts = this.#actualStatusbarParts(width);
+		const actualStatusbar = this.#renderActualStatusbar(width, actualStatusbarParts);
+		if (actualStatusbar.length > 0) {
+			lines.push(...actualStatusbar);
+		}
+		const slotRows = this.#renderSlotRows(width, actualStatusbarParts);
+		lines.push(...slotRows);
+		if (actualStatusbar.length > 1 || slotRows.length > 1 || width < 64) {
+			lines.push(this.#fit(theme.fg("warning", "  Warning: statusbar wrapped to 2 rows"), width));
+			if (this.#focus.kind === "statusbar") {
+				const focused = this.#picked ? this.#picked.id : this.#focusSegment();
+				if (focused) lines.push(this.#fit(`  Focused target: ${statusSegmentLabel(focused)}`, width));
+			}
+		}
+		lines.push("");
+		const paletteSegments = this.#paletteSegments();
+		const paletteTokens = paletteSegments.map((id, index) => {
+			const selected = this.#picked?.id === id;
+			const focused = this.#focus.kind === "palette" && this.#focus.index === index;
+			const label = `{${statusSegmentLabel(id)}}`;
+			if (selected) return this.#selectedBox(label);
+			return focused ? this.#focusBox(label) : theme.fg("muted", label);
+		});
+		lines.push(truncateToWidth(theme.bold("Hidden segment palette"), width));
+		lines.push(truncateToWidth(`  ${paletteTokens.length ? paletteTokens.join(" ") : "(empty)"}`, width));
+		if (width < 64 && this.#focus.kind === "palette") {
+			const focusedPalette = paletteSegments[this.#focus.index];
+			if (focusedPalette)
+				lines.push(truncateToWidth(`  Focused palette target: ${statusSegmentLabel(focusedPalette)}`, width));
+		}
+		lines.push("");
+		lines.push(truncateToWidth(theme.bold("Visible choices"), width));
+		const descriptors = this.#choiceDescriptors();
+		const focusedDescriptor = descriptors.find(
+			descriptor =>
+				(this.#focus.kind === "separator-control" && descriptor.target === "separator") ||
+				(this.#focus.kind === "option-control" && descriptor.target === this.#focus.path) ||
+				(this.#focus.kind === "choice" && descriptor.target === this.#focus.target),
+		);
+		const summaryRows = [descriptors.slice(0, 6), descriptors.slice(6)];
+		for (const row of summaryRows) {
+			lines.push(
+				truncateToWidth(
+					`  ${row
+						.map(descriptor => {
+							const focused = focusedDescriptor?.target === descriptor.target;
+							return focused ? this.#focusBox(descriptor.label) : descriptor.label;
+						})
+						.join(" · ")}`,
+					width,
+				),
+			);
+		}
+		if (focusedDescriptor) {
+			const current = focusedDescriptor.currentValue();
+			const choices = focusedDescriptor.values
+				.map(value => (value.value === current ? `[${value.label}]` : value.label))
+				.join(" | ");
+			lines.push(
+				truncateToWidth(`${theme.fg("accent", theme.nav.cursor)} ${focusedDescriptor.label}: ${choices}`, width),
+			);
+		} else {
+			const separator = descriptors[0];
+			if (separator) {
+				const current = separator.currentValue();
+				const choices = separator.values
+					.map(value => (value.value === current ? `[${value.label}]` : value.label))
+					.join(" | ");
+				lines.push(truncateToWidth(`  ${separator.label}: ${choices}`, width));
+			}
+		}
+		lines.push("");
+		const confirm = this.#focus.kind === "confirm" ? theme.bold(theme.fg("accent", "[Confirm]")) : "[Confirm]";
+		const exit = this.#focus.kind === "exit" ? theme.bold(theme.fg("accent", "[Exit]")) : "[Exit]";
+		lines.push(truncateToWidth(`  ${confirm} ${exit}`, width));
+		lines.push(...this.#renderChoicePanel(width));
+		lines.push(
+			truncateToWidth(
+				theme.fg(
+					"dim",
+					"  Enter select/drop/apply · Left/Right segment/palette/value · Up/Down slots/palette/options/actions · Delete hide · Esc exit",
+				),
+				width,
+			),
+		);
+		return lines.map(line => this.#fit(line, width));
 	}
 
 	#setOption(path: string, value: string): void {
@@ -622,16 +1214,11 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	#preview(): void {
-		this.callbacks.onStatusLinePreview?.({
-			preset: "custom",
-			leftSegments: [...this.#draft.leftSegments],
-			rightSegments: [...this.#draft.rightSegments],
-			separator: this.#draft.separator,
-			segmentOptions: cloneSegmentOptions(this.#draft.segmentOptions),
-			sessionAccent: settings.get("statusLine.sessionAccent"),
-			maxRows: settings.get("statusLine.maxRows"),
-			previewHighlightSegment: this.#previewHighlightSegment,
-		});
+		this.callbacks.onRenderRequested?.();
+	}
+
+	#emitDraftToParentPreview(): void {
+		this.callbacks.onStatusLinePreview?.(this.#draftPreviewSettings());
 	}
 
 	#restorePreview(): void {
@@ -665,7 +1252,7 @@ class StatusLineCustomEditor extends Container {
 		this.callbacks.onChange("statusLine.separator", this.#draft.separator);
 		this.callbacks.onChange("statusLine.segmentOptions", cloneSegmentOptions(this.#draft.segmentOptions));
 		this.#previewHighlightSegment = undefined;
-		this.#preview();
+		this.#emitDraftToParentPreview();
 		this.done("saved");
 	}
 
@@ -675,7 +1262,112 @@ class StatusLineCustomEditor extends Container {
 	}
 
 	handleInput(data: string): void {
-		this.#list.handleInput(data);
+		if (this.#focus.kind === "choice") {
+			if (matchesKey(data, "left")) {
+				this.#moveVertical(-1);
+				this.#updatePreviewHighlight();
+				this.#preview();
+				return;
+			}
+			if (matchesKey(data, "right")) {
+				this.#moveVertical(1);
+				this.#updatePreviewHighlight();
+				this.#preview();
+				return;
+			}
+			if (matchesKey(data, "up")) {
+				this.#moveChoiceTarget(-1);
+				this.#updatePreviewHighlight();
+				this.#preview();
+				return;
+			}
+			if (matchesKey(data, "down")) {
+				this.#moveChoiceTarget(1);
+				this.#updatePreviewHighlight();
+				this.#preview();
+				return;
+			}
+			if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+				this.#applyChoice();
+				return;
+			}
+			if (matchesKey(data, "escape")) {
+				this.#focus = cloneRootFocus(this.#focus.returnFocus);
+				this.#updatePreviewHighlight();
+				this.#preview();
+				return;
+			}
+			return;
+		}
+
+		if (matchesKey(data, "escape")) {
+			this.#cancel();
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			this.#moveVertical(-1);
+			this.#updatePreviewHighlight();
+			this.#preview();
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			this.#moveVertical(1);
+			this.#updatePreviewHighlight();
+			this.#preview();
+			return;
+		}
+		if (matchesKey(data, "left")) {
+			if (this.#focus.kind === "palette") this.#movePaletteFocus(-1);
+			else if (this.#focus.kind === "separator-control" || this.#focus.kind === "option-control")
+				this.#moveChoiceControl(-1);
+			else if (this.#focus.kind === "confirm" || this.#focus.kind === "exit") {
+				this.#focus = this.#focus.kind === "confirm" ? { kind: "exit" } : { kind: "confirm" };
+			} else if (this.#picked) this.#movePickedSlot(-1);
+			else this.#moveVisibleFocus(-1);
+			this.#updatePreviewHighlight();
+			this.#preview();
+			return;
+		}
+		if (matchesKey(data, "right")) {
+			if (this.#focus.kind === "palette") this.#movePaletteFocus(1);
+			else if (this.#focus.kind === "separator-control" || this.#focus.kind === "option-control")
+				this.#moveChoiceControl(1);
+			else if (this.#focus.kind === "confirm" || this.#focus.kind === "exit") {
+				this.#focus = this.#focus.kind === "confirm" ? { kind: "exit" } : { kind: "confirm" };
+			} else if (this.#picked) this.#movePickedSlot(1);
+			else this.#moveVisibleFocus(1);
+			this.#updatePreviewHighlight();
+			this.#preview();
+			return;
+		}
+		if (isDeleteKey(data)) {
+			this.#hideFocusedSegment();
+			return;
+		}
+		if (matchesKey(data, "enter") || matchesKey(data, "return") || data === "\n") {
+			switch (this.#focus.kind) {
+				case "statusbar":
+					if (this.#picked) this.#dropPicked();
+					else this.#pickFocusedStatusbar();
+					return;
+				case "palette":
+					if (this.#picked) this.#dropPickedToPalette();
+					else this.#pickFocusedPalette();
+					return;
+				case "separator-control":
+					this.#openChoice("separator", { kind: "separator-control" });
+					return;
+				case "option-control":
+					this.#openChoice(this.#focus.path, { kind: "option-control", path: this.#focus.path });
+					return;
+				case "confirm":
+					this.#save();
+					return;
+				case "exit":
+					this.#cancel();
+					return;
+			}
+		}
 	}
 }
 
@@ -728,6 +1420,7 @@ export interface StatusLinePreviewSettings {
 	separator?: StatusLineSeparatorStyle;
 	segmentOptions?: StatusLineSegmentOptions;
 	previewHighlightSegment?: StatusLineSegmentId;
+	previewHighlightStyle?: "focus" | "selected";
 	sessionAccent?: boolean;
 	maxRows?: number;
 }
@@ -757,6 +1450,13 @@ export interface SettingsCallbacks {
 	onStatusLinePreview?: (settings: StatusLinePreviewSettings) => void;
 	/** Get current rendered status line for inline preview */
 	getStatusLinePreview?: (width?: number) => string;
+	/** Render a status-line preview for supplied draft settings without mutating the live status line. */
+	getStatusLinePreviewForSettings?: (settings: StatusLinePreviewSettings, width?: number) => string;
+	/** Render status-line segment groups for supplied draft settings without mutating the live status line. */
+	getStatusLinePreviewPartsForSettings?: (
+		settings: StatusLinePreviewSettings,
+		width?: number,
+	) => StatusLinePreviewParts;
 	/** Called when plugins change */
 	onPluginsChanged?: () => void;
 	/** Called when asynchronously rebuilt settings content needs a repaint. */
@@ -1253,14 +1953,7 @@ export class SettingsSelectorComponent extends Container {
 
 		// Add status line preview for appearance tab
 		if (tabId === "appearance") {
-			this.#statusPreviewContainer = new Container();
-			this.#statusPreviewContainer.addChild(new Spacer(1));
-			this.#statusPreviewContainer.addChild(
-				new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
-			);
-			this.#statusPreviewText = new Text(this.#getStatusPreviewString(), 0, 0);
-			this.#statusPreviewContainer.addChild(this.#statusPreviewText);
-			this.#statusPreviewContainer.addChild(new Spacer(1));
+			this.#statusPreviewContainer = this.#createStatusPreviewContainer();
 			this.addChild(this.#statusPreviewContainer);
 		}
 
@@ -1323,6 +2016,39 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(this.#currentList);
 	}
 
+	#createStatusPreviewContainer(): Container {
+		const container = new Container();
+		container.addChild(new Spacer(1));
+		container.addChild(
+			new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
+		);
+		this.#statusPreviewText = new Text(this.#getStatusPreviewString(), 0, 0);
+		container.addChild(this.#statusPreviewText);
+		container.addChild(new Spacer(1));
+		return container;
+	}
+
+	#hideStatusPreview(): void {
+		if (!this.#statusPreviewContainer) return;
+		this.removeChild(this.#statusPreviewContainer);
+		this.#statusPreviewContainer = null;
+		this.#statusPreviewText = null;
+	}
+
+	#showStatusPreview(): void {
+		if (this.#statusPreviewContainer || this.#currentTabId !== "appearance") return;
+		const container = this.#createStatusPreviewContainer();
+		this.#statusPreviewContainer = container;
+		const children = [...this.children];
+		const listIndex = this.#currentList ? children.indexOf(this.#currentList) : -1;
+		if (listIndex >= 0) {
+			children.splice(listIndex, 0, container);
+			this.replaceChildren(children);
+		} else {
+			this.addChild(container);
+		}
+	}
+
 	/** Map a definition list to UI items, dropping any whose condition is false. */
 	#buildItemsForDefs(defs: SettingDef[]): SettingItem[] {
 		const items: SettingItem[] = [];
@@ -1365,9 +2091,15 @@ export class SettingsSelectorComponent extends Container {
 				id: STATUS_LINE_CUSTOM_EDITOR_ID,
 				label: "Status Line Custom Editor",
 				description:
-					"Edit custom status line segments, placement, separator, and typed segment options with live previews.",
+					"Edit custom status line segments, placement, separator, and typed segment options in a simulated statusbar.",
 				currentValue: "open",
-				submenu: (_currentValue, done) => new StatusLineCustomEditor(customEditorCallbacks, done),
+				submenu: (_currentValue, done) => {
+					this.#hideStatusPreview();
+					return new StatusLineCustomEditor(customEditorCallbacks, value => {
+						this.#showStatusPreview();
+						done(value);
+					});
+				},
 			};
 			const presetIndex = items.findIndex(item => item.id === "statusLine.preset");
 			if (presetIndex >= 0) {
@@ -1512,6 +2244,10 @@ export class SettingsSelectorComponent extends Container {
 		// Handle tab switching — but NOT when a text input is active, since
 		// arrow keys must reach the cursor and Tab must not switch tabs.
 		if (!this.#textInputActive && tabNavigation) {
+			if (this.#currentList?.navigationLocked) {
+				this.#currentList.handleInput(data);
+				return;
+			}
 			this.#tabBar.handleInput(data);
 			return;
 		}

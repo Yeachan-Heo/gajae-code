@@ -1976,6 +1976,22 @@ export class SelectorController {
 								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
 							return this.ctx.statusLine.getPreviewContent(availableWidth);
 						},
+						getStatusLinePreviewForSettings: (previewSettings, width?: number) => {
+							const availableWidth =
+								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
+							return this.ctx.statusLine.getPreviewContentForSettings(availableWidth, {
+								...buildStatusLineSettings(settings),
+								...previewSettings,
+							});
+						},
+						getStatusLinePreviewPartsForSettings: (previewSettings, width?: number) => {
+							const availableWidth =
+								width ?? this.ctx.editor.getTopBorderAvailableWidth(this.ctx.ui.terminal.columns);
+							return this.ctx.statusLine.getPreviewPartsForSettings(availableWidth, {
+								...buildStatusLineSettings(settings),
+								...previewSettings,
+							});
+						},
 						onPluginsChanged: () => {
 							this.ctx.ui.requestRender();
 						},

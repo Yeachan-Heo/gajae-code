@@ -62,6 +62,11 @@ export class SettingsList implements Component {
 		this.#notifySelectionChange();
 	}
 
+	get navigationLocked(): boolean {
+		const submenu = this.#submenuComponent as (Component & { navigationLocked?: boolean }) | null;
+		return submenu?.navigationLocked === true;
+	}
+
 	#clampSelectedIndex(): void {
 		if (this.#items.length === 0) {
 			this.#selectedIndex = 0;

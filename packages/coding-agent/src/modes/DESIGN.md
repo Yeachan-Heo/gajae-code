@@ -347,6 +347,60 @@ CJK/Latin todo, IRC, status, and BTW text break at semantic phrase boundaries,
 not inside a phase/action/status label, short identifier, or grapheme cluster.
 Those defects, width overflow, overlap, hidden focus/cursor, and lost anchors
 are blocking visual-QA failures.
+
+### Status Line Custom Editor simulation
+
+The Appearance tab's Status Line Custom Editor is a spatial editor, not a
+generic setting row list. It renders a simulated statusbar with left/right
+segment areas, a hidden-segment palette, visible Separator and segment-option
+controls, and Confirm/Exit actions. It must not render legacy `Segment`,
+`Move left`, or `Move right` rows.
+
+The editor owns transient state locally: focused statusbar slot, focused palette
+item, focused root control, open visible-choice panel, picked segment, floating
+ghost, empty origin slot, and overflow warning. Durable settings remain only the
+existing `statusLine.leftSegments`, `statusLine.rightSegments`,
+`statusLine.separator`, and `statusLine.segmentOptions` keys; Confirm persists
+through the existing settings guard, while Exit or root-state Escape restores
+the previous preview and closes.
+
+Focus variants are `statusbar`, `palette`, `separator-control`,
+`option-control(path)`, `choice(target, focusedValue, returnFocus)`, `confirm`,
+and `exit`. Left/Right is owned by the editor while active and never switches
+settings tabs. Enter selects/deselects, picks/drops, applies a focused choice,
+or activates Confirm/Exit according to focus. Up/Down traverses palette,
+visible root controls, actions, and choice candidates. Escape inside `choice`
+returns to the opener without mutation; Escape everywhere else cancels and
+restores. Delete only hides a focused visible statusbar segment.
+
+Separator and every segment option are visible-choice controls, never cycle-only
+rows. Descriptor data owns labels, allowed values, visible current-value
+formatting, and typed draft application. Separator choices are Powerline, Thin
+chevron, Slash, Pipe, Block, None, and ASCII. Boolean options show `true` and
+`false`; enum options show their union values; `path.maxLength` shows `16`,
+`24`, `32`, `40`, `50`, `60`, and `80`.
+
+At constrained width the simulated statusbar renders as two rows and emits an
+explicit overflow/wrap warning. ANSI-aware cell measurement remains mandatory;
+ASCII/no-color output must retain textual focus, ghost/origin, selected choice,
+and warning affordances.
+
+Deterministic evidence belongs to
+`test/fixtures/tui/status-line-custom-editor-showcase.ts`, captured by
+`scripts/capture-status-line-custom-editor-showcase.ts --out
+.gjc/qa/status-line-custom-editor-<run>` and verified by
+`scripts/verify-status-line-custom-editor-showcase.ts --root
+.gjc/qa/status-line-custom-editor-<run> --require-independent-review`. The
+canonical states are `root-statusbar`, `picked-origin-slot`,
+`palette-exact-insert`, `separator-control`, `separator-choice-focused`,
+`separator-choice-applied`, `option-boolean-choice-focused`,
+`option-enum-choice-focused`, `option-numeric-choice-focused`,
+`option-choice-applied`, `exit-restored`, `confirm-persisted`,
+`overflow-two-row-warning`, and `narrow-cjk`. Each state records
+`terminal.txt`, `terminal-ansi.txt`, `terminal.html`, and `metadata.json`, plus
+the root manifest. Missing state witnesses, ANSI/plain mismatch, invalid
+metadata, and absent independent review are blocking visual-QA failures.
+
 ### Sticky viewport deterministic visual QA
 
 `test/fixtures/tui/sticky-viewport-showcase.ts` is a fixed-clock, no-network,

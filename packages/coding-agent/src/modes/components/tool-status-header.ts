@@ -57,6 +57,7 @@ export interface StatusLineSettings {
 	separator?: StatusLineSeparatorStyle;
 	segmentOptions?: StatusLineSegmentOptions;
 	previewHighlightSegment?: StatusLineSegmentId;
+	previewHighlightStyle?: "focus" | "selected";
 	showHookStatus?: boolean;
 	showSkillHud?: boolean;
 	showActionHints?: boolean;
@@ -76,6 +77,14 @@ export interface StatusLineComponentOptions {
 export interface StatusLineActionHint {
 	id: AppKeybinding;
 	content: string;
+}
+
+export interface StatusLinePreviewParts {
+	left: string[];
+	leftIds: StatusLineSegmentId[];
+	right: string[];
+	rightIds: (StatusLineSegmentId | null)[];
+	separator: SeparatorDef;
 }
 
 const ACTION_HINT_PRIORITY: readonly AppKeybinding[] = [
@@ -145,6 +154,7 @@ interface CollectedStatusSegments {
 	/** Parallel to `right`; null for action hints, job counts and the version tag. */
 	rightSegIds: (StatusLineSegmentId | null)[];
 	previewHighlightSegment: StatusLineSegmentId | undefined;
+	previewHighlightStyle: "focus" | "selected";
 	sessionAccent: boolean | undefined;
 	leftSepWidth: number;
 	rightSepWidth: number;
@@ -952,7 +962,14 @@ export class StatusLineComponent implements Component {
 		if (available <= 0 || count <= 0) return "";
 		const withCount = `…+${count}`;
 		const text = visibleWidth(withCount) <= available ? withCount : "…";
-		return theme.fg("dim", text);
+		return truncateToWidth(theme.fg("dim", text), available);
+	}
+
+	#renderPreviewHighlight(content: string, style: "focus" | "selected"): string {
+		const bgColor = style === "selected" ? "warning" : "text";
+		const bgAnsi = theme.getFgAnsi(bgColor).replace("\x1b[38;", "\x1b[48;");
+		const fgAnsi = theme.getBgAnsi("selectedBg").replace("\x1b[48;", "\x1b[38;");
+		return `${bgAnsi}${fgAnsi}> ${Bun.stripANSI(content)} <\x1b[0m`;
 	}
 
 	#renderStatusGroup(
@@ -1030,8 +1047,9 @@ export class StatusLineComponent implements Component {
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
 
 		const previewHighlightSegment = effectiveSettings.previewHighlightSegment;
+		const previewHighlightStyle = effectiveSettings.previewHighlightStyle ?? "focus";
 		const highlightSegment = (segId: StatusLineSegmentId, content: string): string =>
-			previewHighlightSegment === segId ? `\x1b[7m${content}\x1b[27m` : content;
+			previewHighlightSegment === segId ? this.#renderPreviewHighlight(content, previewHighlightStyle) : content;
 
 		const left: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
@@ -1093,6 +1111,7 @@ export class StatusLineComponent implements Component {
 			right,
 			rightSegIds,
 			previewHighlightSegment,
+			previewHighlightStyle,
 			sessionAccent: effectiveSettings.sessionAccent,
 			leftSepWidth: visibleWidth(separatorDef.left),
 			rightSepWidth: visibleWidth(separatorDef.right),
@@ -1189,7 +1208,7 @@ export class StatusLineComponent implements Component {
 
 	#buildStatusLine(width: number, precollected?: CollectedStatusSegments): string {
 		const seg = precollected ?? this.#collectStatusSegments(width, this.#resolveSettings());
-		const { ctx, separatorDef, bgAnsi, fgAnsi, sepAnsi, previewHighlightSegment } = seg;
+		const { ctx, separatorDef, bgAnsi, fgAnsi, sepAnsi, previewHighlightSegment, previewHighlightStyle } = seg;
 		const { leftSepWidth, rightSepWidth, leftCapWidth, rightCapWidth } = seg;
 		const topFillWidth = Math.max(0, width);
 
@@ -1222,7 +1241,10 @@ export class StatusLineComponent implements Component {
 					const overflow = totalWidth() - budget;
 					const shrunk = this.#shrinkPathToWidth(left[pathIdx], ctx, overflow);
 					if (shrunk !== null) {
-						left[pathIdx] = previewHighlightSegment === "path" ? `\x1b[7m${shrunk}\x1b[27m` : shrunk;
+						left[pathIdx] =
+							previewHighlightSegment === "path"
+								? this.#renderPreviewHighlight(shrunk, previewHighlightStyle)
+								: shrunk;
 						leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 					}
 				}
@@ -1493,6 +1515,120 @@ export class StatusLineComponent implements Component {
 	 */
 	getPreviewContent(width: number): string {
 		return this.#buildStatusRows(width, this.#resolveMaxRows()).join("\n");
+	}
+
+	getPreviewContentForSettings(width: number, previewSettings: StatusLineSettings): string {
+		const previousSettings = this.#settings;
+		this.#settings = { ...previousSettings, previewHighlightSegment: undefined, ...previewSettings };
+		try {
+			return this.#buildStatusRows(width, this.#resolveMaxRows()).join("\n");
+		} finally {
+			this.#settings = previousSettings;
+		}
+	}
+
+	#placePreviewSegments(
+		seg: CollectedStatusSegments,
+		width: number,
+	): {
+		left: string[];
+		leftIds: StatusLineSegmentId[];
+		right: string[];
+		rightIds: (StatusLineSegmentId | null)[];
+	} {
+		const {
+			ctx,
+			previewHighlightSegment,
+			previewHighlightStyle,
+			leftSepWidth,
+			rightSepWidth,
+			leftCapWidth,
+			rightCapWidth,
+		} = seg;
+		const rank = this.#priorityRanker(seg);
+		const layout = (budget: number) => {
+			const left = [...seg.left];
+			const leftIds = [...seg.leftSegIds];
+			const right = [...seg.right];
+			const rightIds = [...seg.rightSegIds];
+			let leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+			let rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
+			const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
+			let dropped = 0;
+
+			const pathIdx = leftIds.indexOf("path");
+			if (pathIdx >= 0 && totalWidth() > budget) {
+				const shrunk = this.#shrinkPathToWidth(left[pathIdx], ctx, totalWidth() - budget);
+				if (shrunk !== null) {
+					left[pathIdx] =
+						previewHighlightSegment === "path"
+							? this.#renderPreviewHighlight(shrunk, previewHighlightStyle)
+							: shrunk;
+					leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+				}
+			}
+			while (totalWidth() > budget && (left.length > 0 || right.length > 0)) {
+				let victimSide: "left" | "right" | null = null;
+				let victimIndex = -1;
+				let victimRank = Number.POSITIVE_INFINITY;
+				for (let index = right.length - 1; index >= 0; index -= 1) {
+					const candidate = rank(rightIds[index]);
+					if (candidate < victimRank) {
+						victimRank = candidate;
+						victimSide = "right";
+						victimIndex = index;
+					}
+				}
+				for (let index = left.length - 1; index >= 0; index -= 1) {
+					const candidate = rank(leftIds[index]);
+					if (candidate < victimRank) {
+						victimRank = candidate;
+						victimSide = "left";
+						victimIndex = index;
+					}
+				}
+				if (victimSide === null) break;
+				if (victimSide === "right") {
+					right.splice(victimIndex, 1);
+					rightIds.splice(victimIndex, 1);
+					rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
+				} else {
+					left.splice(victimIndex, 1);
+					leftIds.splice(victimIndex, 1);
+					leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+				}
+				dropped += 1;
+			}
+			return { left, leftIds, right, rightIds, dropped };
+		};
+
+		let placed = layout(Math.max(0, width));
+		let reserved = 0;
+		if (placed.dropped > 0 && width > 0) {
+			for (let pass = 0; pass < 4; pass += 1) {
+				const needed = Math.min(width, visibleWidth(`…+${placed.dropped}`));
+				if (needed <= reserved) break;
+				reserved = needed;
+				placed = layout(Math.max(0, width - reserved));
+			}
+		}
+		return placed;
+	}
+
+	getPreviewPartsForSettings(width: number, previewSettings: StatusLineSettings): StatusLinePreviewParts {
+		const previousSettings = this.#settings;
+		this.#settings = { ...previousSettings, ...previewSettings };
+		this.#resolvedSettingsCache = undefined;
+		this.#resolvedSettingsFingerprint = undefined;
+		try {
+			const seg = this.#collectStatusSegments(width, this.#resolveSettings());
+			const placed = this.#placePreviewSegments(seg, width);
+			return { ...placed, separator: seg.separatorDef };
+		} finally {
+			this.#settings = previousSettings;
+			this.#resolvedSettingsCache = undefined;
+			this.#resolvedSettingsFingerprint = undefined;
+		}
 	}
 
 	getCacheStatsForTest(): { rowHits: number; rowMisses: number } {
