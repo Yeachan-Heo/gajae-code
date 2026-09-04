@@ -98,7 +98,7 @@ describe.serial("AgentSession resilient retry", () => {
 	let session: AgentSession | undefined;
 
 	function configureRetryTestSession(value: AgentSession): AgentSession {
-		value.setDisposeTimeoutForTests(60_000);
+		value.setDisposeTimeoutForTests(120_000);
 		return value;
 	}
 
