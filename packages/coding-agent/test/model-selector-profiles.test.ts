@@ -496,9 +496,13 @@ describe("model selector profiles", () => {
 
 	test("up and down navigation stays on provider rows while collapsed", async () => {
 		installTestTheme();
-		const selector = createSelector(() => {});
+		const registry = createRegistry();
+		const getAvailable = vi.fn(registry.getAvailable);
+		registry.getAvailable = getAvailable;
+		const selector = createSelector(() => {}, { registry });
 		await Bun.sleep(10);
 		installTestTheme();
+		getAvailable.mockClear();
 
 		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("CODEX");
@@ -519,6 +523,7 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("CODEX");
 		expect(rendered).not.toContain("Codex Eco");
 		expect(rendered).not.toContain("profile-a");
+		expect(getAvailable).not.toHaveBeenCalled();
 	});
 
 	test("landing header shows the session's current preset, model, and role assignments", async () => {

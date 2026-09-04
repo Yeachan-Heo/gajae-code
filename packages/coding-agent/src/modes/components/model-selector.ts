@@ -426,6 +426,8 @@ export class ModelSelectorComponent extends Container {
 	#presetScopeIndex: number = 0;
 	#providerAuthById = new Map<string, boolean>();
 	#bareProfileAuthByName = new Map<string, boolean>();
+	// Rebuilt with the provider and bare-selector snapshots on every catalog or credential refresh.
+	#profileAuthByName = new Map<string, boolean>();
 	#providerAuthPending: boolean = false;
 	#providerAuthRefreshGeneration = 0;
 	#presetLoginHint?: string;
@@ -1404,9 +1406,13 @@ export class ModelSelectorComponent extends Container {
 		return [...missing].sort((a, b) => a.localeCompare(b));
 	}
 
-	#isPresetAuthenticated(profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[]): boolean {
+	#isPresetAuthenticated(
+		profileOrProfiles: ModelProfileDefinition | ModelProfileDefinition[],
+		computeCurrent = false,
+	): boolean {
 		const profiles = Array.isArray(profileOrProfiles) ? profileOrProfiles : [profileOrProfiles];
 		return profiles.every(profile => {
+			if (!computeCurrent) return this.#profileAuthByName.get(profile.name) === true;
 			if (profile.source !== "user") {
 				if (inspectProxyProviderId(this.#settings).status === "invalid") return false;
 				const proxyProvider = tryResolveProxyProviderId(this.#settings);
@@ -1502,6 +1508,7 @@ export class ModelSelectorComponent extends Container {
 		const refreshGeneration = ++this.#providerAuthRefreshGeneration;
 		this.#providerAuthById = new Map();
 		this.#bareProfileAuthByName = new Map();
+		this.#profileAuthByName = new Map();
 		const availableModels = this.#getProfileAvailableModels();
 		const resolutionRegistry = this.#createProfileResolutionRegistry(availableModels);
 		const providers = new Set<string>();
@@ -1611,6 +1618,11 @@ export class ModelSelectorComponent extends Container {
 			)
 				return;
 			this.#bareProfileAuthByName = new Map(profileAuthEntries);
+			this.#profileAuthByName = new Map(
+				[...this.#getPresetGroups().values()]
+					.flat()
+					.map(profile => [profile.name, this.#isPresetAuthenticated(profile, true)]),
+			);
 		} finally {
 			if (
 				!this.#disposed &&
