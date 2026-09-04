@@ -28,9 +28,9 @@ import {
 	type FunctionHookRegistrationOptions,
 	intersectFunctionHookGrants,
 	normalizeFunctionHookGrant,
-	tagFunctionHookHandler,
 	validateFunctionHookTarget,
 } from "./function-hooks";
+import { tagFunctionHookHandler } from "./function-hooks-internal";
 import type {
 	Extension,
 	ExtensionAPI,

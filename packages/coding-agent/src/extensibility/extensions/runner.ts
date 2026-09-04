@@ -40,7 +40,6 @@ import {
 	functionHookGrantHash,
 	functionHookPayloadHash,
 	functionHookTransformAllowed,
-	getFunctionHookRegistration,
 	intersectFunctionHookGrants,
 	isPlainFunctionHookData,
 	isSafeFunctionHookValue,
@@ -49,6 +48,7 @@ import {
 	redactFunctionHookValue,
 	sanitizeFunctionHookReason,
 } from "./function-hooks";
+import { getFunctionHookRegistration } from "./function-hooks-internal";
 import type {
 	AfterProviderResponseEvent,
 	BeforeAgentStartEvent,

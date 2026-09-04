@@ -222,42 +222,6 @@ export function validateFunctionHookTarget(target: string): string {
 	return target;
 }
 
-/** Metadata tag carried by a wrapper stored in Extension.handlers. */
-export const FUNCTION_HOOK_REGISTRATION = Symbol("gjc.functionHookRegistration");
-
-export type TaggedFunctionHookHandler = ((...args: unknown[]) => Promise<unknown>) & {
-	readonly [FUNCTION_HOOK_REGISTRATION]: FunctionHookRegistration;
-};
-
-export function tagFunctionHookHandler(registration: FunctionHookRegistration): TaggedFunctionHookHandler {
-	if (registration.event === "*" && registration.target !== undefined)
-		throw new Error("Wildcard function hooks cannot declare a target");
-	if (registration.target !== undefined && registration.target !== "*")
-		validateFunctionHookTarget(registration.target);
-	const tagged = (async () => undefined) as TaggedFunctionHookHandler;
-	const frozenRegistration = Object.freeze({
-		...registration,
-		grant: Object.freeze(registration.grant),
-		provenance: Object.freeze({ ...registration.provenance }),
-	});
-	Object.defineProperty(tagged, FUNCTION_HOOK_REGISTRATION, {
-		configurable: false,
-		enumerable: false,
-		writable: false,
-		value: frozenRegistration,
-	});
-	return tagged;
-}
-
-export function getFunctionHookRegistration(value: unknown): FunctionHookRegistration | undefined {
-	if (typeof value !== "function") return undefined;
-	try {
-		return (value as Partial<TaggedFunctionHookHandler>)[FUNCTION_HOOK_REGISTRATION];
-	} catch {
-		return undefined;
-	}
-}
-
 function expandedOperations(capabilities: readonly FunctionHookCapability[]): Set<FunctionHookOperation> {
 	const operations = new Set<FunctionHookOperation>();
 	for (const capability of capabilities) {

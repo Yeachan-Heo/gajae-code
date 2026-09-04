@@ -2,7 +2,14 @@
  * Tool wrappers for extensions.
  */
 import type { AgentTool, AgentToolContext, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import type { ImageContent, Static, TextContent, TSchema } from "@gajae-code/ai/core";
+import {
+	type ImageContent,
+	type Static,
+	type TextContent,
+	type ToolCall,
+	type TSchema,
+	validateToolArguments,
+} from "@gajae-code/ai/core";
 import type { Theme } from "../../modes/theme/theme";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
@@ -134,7 +141,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
-		params = toolCallEvent.input as Static<TParameters>;
+		params = validateToolArguments(this.tool, {
+			type: "toolCall",
+			id: toolCallId,
+			name: this.tool.name,
+			arguments: toolCallEvent.input,
+		} satisfies ToolCall) as Static<TParameters>;
 
 		// Execute the actual tool
 		let result: { content: any; details?: TDetails };

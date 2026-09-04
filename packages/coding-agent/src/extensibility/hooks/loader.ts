@@ -18,12 +18,11 @@ import {
 	type FunctionHookPayloadFor,
 	type FunctionHookRegistration,
 	type FunctionHookRegistrationOptions,
-	getFunctionHookRegistration,
 	intersectFunctionHookGrants,
 	normalizeFunctionHookGrant,
-	tagFunctionHookHandler,
 	validateFunctionHookTarget,
 } from "../extensions/function-hooks";
+import { getFunctionHookRegistration, tagFunctionHookHandler } from "../extensions/function-hooks-internal";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,

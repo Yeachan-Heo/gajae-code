@@ -5,8 +5,8 @@ import {
 	type FunctionHookRegistration,
 	type FunctionHookRegistrationOptions,
 	normalizeFunctionHookGrant,
-	tagFunctionHookHandler,
 } from "../src/extensibility/extensions/function-hooks";
+import { tagFunctionHookHandler } from "../src/extensibility/extensions/function-hooks-internal";
 import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
@@ -14,6 +14,8 @@ import {
 	testSetExtensionHandlerTimeoutMs,
 } from "../src/extensibility/extensions/runner";
 import type { Extension, ExtensionSessionMetadata, ToolCallEvent } from "../src/extensibility/extensions/types";
+import { ExtensionToolWrapper } from "../src/extensibility/extensions/wrapper";
+import { Type } from "../src/extensibility/typebox";
 import { SessionManager } from "../src/session/session-manager";
 import { EventBus } from "../src/utils/event-bus";
 
@@ -92,6 +94,11 @@ afterEach(() => {
 
 describe("capability-scoped function hooks", () => {
 	test("applies a host-owned grant ceiling and provenance", async () => {
+		const packageJson = (await Bun.file(new URL("../package.json", import.meta.url)).json()) as {
+			exports: Record<string, unknown>;
+		};
+		expect(packageJson.exports["./extensibility/extensions/function-hooks-internal"]).toBeNull();
+		expect(packageJson.exports["./extensibility/extensions/function-hooks-internal.js"]).toBeNull();
 		const runtime = new ExtensionRuntime();
 		let networkCapability: unknown = "unset";
 		let provenance: unknown;
@@ -471,6 +478,37 @@ describe("capability-scoped function hooks", () => {
 			isError: false,
 		});
 		expect(result?.isError).toBe(true);
+	});
+
+	test("validates transformed tool calls against the active tool schema", async () => {
+		let executed = false;
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async invocation => ({
+					action: "continue",
+					event: { ...(invocation.payload as ToolCallEvent), input: {} },
+				}),
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		const wrapped = new ExtensionToolWrapper(
+			{
+				name: "read",
+				label: "Read",
+				description: "Read a file",
+				parameters: Type.Object({ path: Type.String() }, { additionalProperties: false }),
+				execute: async () => {
+					executed = true;
+					return { content: [{ type: "text" as const, text: "ok" }] };
+				},
+			},
+			runner,
+		);
+		await expect(wrapped.execute("call-1", { path: "safe.txt" })).rejects.toThrow();
+		expect(executed).toBe(false);
 	});
 
 	test("snapshots a returned transformation before downstream dispatch", async () => {
