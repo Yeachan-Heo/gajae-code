@@ -309,6 +309,8 @@ describe("/model smart-routing panel integration", () => {
 		const text = renderText(selector);
 		expect(text).toContain("offline refresh failed");
 		expect(text).not.toContain("Loading models...");
+		selector.handleInput("\x1b");
+		expect(ctx.restoreComposer).toHaveBeenCalledTimes(1);
 	});
 
 	test("standalone panel cancel closes the selector instead of falling back to the preset landing", async () => {

@@ -2357,7 +2357,11 @@ export class ModelSelectorComponent extends Container {
 
 	handleInput(keyData: string): void {
 		if (this.#viewMode === "smart-routing") {
-			this.#smartRoutingPanel?.handleInput(keyData);
+			if (this.#smartRoutingPanel) {
+				this.#smartRoutingPanel.handleInput(keyData);
+			} else if (getKeybindings().matches(keyData, "tui.select.cancel")) {
+				this.#onCancelCallback();
+			}
 			return;
 		}
 		if (this.#assignmentState === "assigning") {
