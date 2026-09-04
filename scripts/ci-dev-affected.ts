@@ -75,6 +75,11 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
 	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
 	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
+	"packages/coding-agent/src/modes/components/model-selector.ts": [
+		"packages/coding-agent/test/model-selector-profiles-redteam.test.ts",
+		"packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts",
+		"packages/coding-agent/test/model-selector-smart-routing.integration.test.ts",
+	],
 	"packages/ai/src/providers/anthropic.ts": [
 		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
 		"packages/ai/test/anthropic-stream-envelope.test.ts",

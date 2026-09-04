@@ -3046,6 +3046,7 @@ export class ModelRegistry {
 		refreshGeneration = this.#catalogRefreshGeneration,
 		providerRefresh?: ProviderRefreshFence,
 	): Promise<void> {
+		const profileAvailabilityEvidenceBefore = this.#profileAvailabilityEvidenceFingerprint();
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
 			providerFilter
@@ -3252,12 +3253,32 @@ export class ModelRegistry {
 			});
 		}
 		if (discovered.length === 0) {
-			if (clearPublishedModelIds.size > 0) {
+			if (
+				clearPublishedModelIds.size > 0 ||
+				profileAvailabilityEvidenceBefore !== this.#profileAvailabilityEvidenceFingerprint()
+			) {
 				this.#rebuildCanonicalIndex();
 			}
 			return;
 		}
 		this.#mergeDiscoveredModels(discovered);
+	}
+
+	#profileAvailabilityEvidenceFingerprint(): string {
+		return JSON.stringify(
+			[...this.#descriptorDiscoveryEvidence.entries()]
+				.sort(([left], [right]) => left.localeCompare(right))
+				.map(([provider, evidence]) => [
+					provider,
+					evidence.fresh,
+					evidence.profileFresh,
+					evidence.authGeneration,
+					evidence.endpoint,
+					evidence.profileEndpoint,
+					[...evidence.modelIds].sort(),
+					evidence.profileModelIds === undefined ? undefined : [...evidence.profileModelIds].sort(),
+				]),
+		);
 	}
 
 	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {

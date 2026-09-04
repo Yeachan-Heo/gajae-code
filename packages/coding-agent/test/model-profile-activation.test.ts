@@ -330,6 +330,52 @@ describe("model profile activation", () => {
 		}
 	});
 
+	test("notifies mounted consumers when fresh discovery evidence changes from non-empty to empty", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-notify-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
+			let discoveryCount = 0;
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (!url.endsWith("/models")) throw new Error(`Unexpected model discovery request: ${input}`);
+				discoveryCount += 1;
+				return new Response(JSON.stringify({ data: discoveryCount === 1 ? [{ id: "claude-opus-5" }] : [] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+			let catalogNotifications = 0;
+			registry.onCatalogChanged(() => {
+				catalogNotifications += 1;
+			});
+
+			await registry.refreshProvider("anthropic", "online");
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
+			const notificationsAfterNonEmpty = catalogNotifications;
+
+			await registry.refreshProvider("anthropic", "online");
+			expect(catalogNotifications).toBeGreaterThan(notificationsAfterNonEmpty);
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(false);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
 	test("built-in claude-opus retains bundled Opus 5 after live catalog discovery fails", async () => {
 		const tempDir = TempDir.createSync("@gjc-profile-stale-catalog-");
 		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);

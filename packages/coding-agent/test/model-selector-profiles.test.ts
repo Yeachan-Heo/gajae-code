@@ -461,6 +461,45 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("✗ REGISTRY FALLBACK");
 	});
 
+	test("fences preset actions and rebuilds availability when disabled providers change", async () => {
+		installTestTheme();
+		const settings = Settings.isolated();
+		const profiles = new Map<string, ModelProfileDefinition>([[profile.name, profile]]);
+		const refreshGate = Promise.withResolvers<"key">();
+		let delayProviderAuth = false;
+		const registry = createRegistry() as unknown as TestModelRegistry & {
+			getAvailableForProfileActivation: () => Model[];
+			getApiKeyForProvider: (provider: string) => Promise<string>;
+		};
+		registry.getModelProfiles = () => new Map(profiles);
+		registry.getModelProfile = (name: string) => profiles.get(name);
+		registry.getAvailableModelProfileNames = () => [...profiles.keys()];
+		registry.getAvailableForProfileActivation = () =>
+			settings.get("disabledProviders").includes("provider-a") ? [] : [defaultModel, alternateModel];
+		registry.getApiKeyForProvider = async provider => {
+			if (delayProviderAuth && provider === "provider-a") return refreshGate.promise;
+			return "key";
+		};
+
+		const selector = createSelector(() => {}, { registry, settings });
+		await Bun.sleep(10);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("✓ CUSTOM");
+
+		delayProviderAuth = true;
+		settings.set("disabledProviders", ["provider-a"]);
+		let rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("… CUSTOM");
+
+		selector.handleInput("\n");
+		rendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(rendered).toContain("Refreshing preset availability...");
+		expect(rendered).not.toContain("No available model matches this preset");
+
+		refreshGate.resolve("key");
+		await Bun.sleep(10);
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("✗ CUSTOM");
+	});
+
 	beforeAll(async () => {
 		testTheme = await getThemeByName("red-claw");
 		installTestTheme();

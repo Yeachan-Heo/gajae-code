@@ -571,11 +571,15 @@ export class ModelSelectorComponent extends Container {
 			});
 		}
 
-		// Proxy changes invalidate preset availability. Provider-order changes are
+		// Proxy and provider-policy changes invalidate preset availability. Provider-order changes are
 		// advisory only while smart routing is mounted and must not discard its draft.
 		this.#unsubscribeProviderOrderChanged = this.#settings.onChanged?.(path => {
 			if (this.#disposed) return;
-			if (path === "modelProfile.proxyProvider" || path === "modelProfile.proxyMode") {
+			if (
+				path === "modelProfile.proxyProvider" ||
+				path === "modelProfile.proxyMode" ||
+				path === "disabledProviders"
+			) {
 				if (this.#viewMode === "presets") void this.#refreshProviderAuth();
 				return;
 			}

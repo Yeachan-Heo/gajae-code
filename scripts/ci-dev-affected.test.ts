@@ -1382,6 +1382,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
+	test("model selector changes schedule adjacent preset and smart-routing regressions", () => {
+		const keys = targeted(["packages/coding-agent/src/modes/components/model-selector.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/model-selector-profiles-redteam.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/model-preset-landing-redteam-qa.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/model-selector-smart-routing.integration.test.ts");
+	});
 	test("file-tool sources schedule their ACP and publication regression suites", () => {
 		const expected: Record<string, string> = {
 			"packages/coding-agent/src/tools/atomic-file-write.ts": "packages/coding-agent/test/file-tools-atomicity.test.ts",
