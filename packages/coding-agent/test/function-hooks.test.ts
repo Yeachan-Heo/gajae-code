@@ -278,6 +278,9 @@ describe("capability-scoped function hooks", () => {
 		]);
 		const result = await runner.emitFunctionHooks({ type: "context", messages: [] });
 		expect(result.action).toBe("deny");
+		await expect(runner.emitContext([{ role: "user", content: "secret" }] as never)).rejects.toThrow(
+			"Function hook timed out",
+		);
 	});
 
 	test("does not expose session metadata without session.read", async () => {
