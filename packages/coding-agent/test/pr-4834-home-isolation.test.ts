@@ -305,7 +305,7 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 			providers: ["cline"],
 		});
 		expect(result.items.map(item => item.content)).toEqual(["# safe clinerules"]);
-		expect(result.items[0]?._source.path).toBe(safeFile);
+		expect(await fs.realpath(result.items[0]?._source.path ?? "")).toBe(await fs.realpath(safeFile));
 	});
 
 	test("explicit home native project discovery stays on the fixed .gjc root", async () => {
@@ -570,7 +570,9 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		});
 
 		expect(result.items.map(item => item.content)).toEqual(["# nested project system"]);
-		expect(result.items[0]?._source.path).toBe(path.join(nestedProject, ".gjc", "SYSTEM.md"));
+		expect(await fs.realpath(result.items[0]?._source.path ?? "")).toBe(
+			await fs.realpath(path.join(nestedProject, ".gjc", "SYSTEM.md")),
+		);
 	});
 
 	test("explicit home does not walk a no-repo cwd into unrelated ancestors", async () => {
@@ -801,8 +803,11 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		expect(skills.items.map(item => item.name)).toEqual(["explicit-skill"]);
 		for (const item of [...system.items, ...skills.items]) {
 			const itemPath = (item as { path?: string }).path ?? "";
-			expect(itemPath.startsWith(homeAgentDir)).toBe(false);
-			expect(itemPath.startsWith(explicitAgentDir)).toBe(true);
+			const canonicalItemPath = await fs.realpath(itemPath);
+			const canonicalHomeAgentDir = await fs.realpath(homeAgentDir);
+			const canonicalExplicitAgentDir = await fs.realpath(explicitAgentDir);
+			expect(canonicalItemPath.startsWith(canonicalHomeAgentDir)).toBe(false);
+			expect(canonicalItemPath.startsWith(canonicalExplicitAgentDir)).toBe(true);
 		}
 	});
 
@@ -881,7 +886,9 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		});
 
 		expect(result.items.map(item => item.name)).toEqual(["home"]);
-		expect(result.items[0]?._source.path).toBe(path.join(homeAgentDir, "ssh.json"));
+		expect(await fs.realpath(result.items[0]?._source.path ?? "")).toBe(
+			await fs.realpath(path.join(homeAgentDir, "ssh.json")),
+		);
 		expect([...reads].filter(filePath => filePath.startsWith(decoyAgentDir))).toEqual([]);
 	});
 

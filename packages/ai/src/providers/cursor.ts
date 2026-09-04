@@ -1435,7 +1435,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-request-id": crypto.randomUUID(),
 			});
 			const writer = h2Request as CursorRequestWriter;
-			writer.isActive = () => !h2Settled && !transportTerminalized && !writer.closed;
+			writer.isActive = () => !h2Settled && !transportTerminalized && !isClosedCursorRequest(writer);
 			writer.registerShellGate = close => {
 				if (!writer.isActive()) {
 					close();
