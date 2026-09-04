@@ -1076,7 +1076,13 @@ export class ExtensionRunner {
 						}
 					}
 					nextPromise = invoke(index + 1, candidateSnapshot, downstreamGrant, controller.signal);
-					return (await nextPromise) as FunctionHookResult;
+					const downstreamResult = await nextPromise;
+					try {
+						return cloneFunctionHookDataStrict(downstreamResult) as FunctionHookResult;
+					} catch {
+						nextFailureReason = "Function hook continuation result could not be snapshotted";
+						throw new Error(nextFailureReason);
+					}
 				};
 				const outcome = await this.#runFunctionHookWithTimeout(
 					registration.handler,

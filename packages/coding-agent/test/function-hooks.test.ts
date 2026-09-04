@@ -282,6 +282,40 @@ describe("capability-scoped function hooks", () => {
 		expect(event.input).toEqual({ path: "reviewed.txt" });
 	});
 
+	test("does not expose the chain-owned continuation result", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (invocation, _capabilities, next) => {
+					const result = await next({
+						...(invocation.payload as ToolCallEvent),
+						input: { path: "reviewed.txt" },
+					});
+					if (result.action === "continue" && result.event) {
+						(result.event as ToolCallEvent).input = { path: "mutated-result.txt" };
+					}
+					return result;
+				},
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+			registration(
+				"tool_call",
+				async (invocation, _capabilities, next) => {
+					expect((invocation.payload as ToolCallEvent).input).toEqual({ path: "reviewed.txt" });
+					return await next();
+				},
+				{ capabilities: ["tool.inspect", "tool.deny"] },
+				1,
+				"read",
+			),
+		]);
+		const event = toolCall();
+		expect(await runner.emitToolCall(event)).toBeUndefined();
+		expect(event.input).toEqual({ path: "reviewed.txt" });
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(
