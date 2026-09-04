@@ -6129,7 +6129,7 @@ export class AgentSession {
 		const explicitStateFile = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 		const stateFile =
 			explicitStateFile ||
-			(context.sessionId.trim()
+			(context.sessionFile && context.sessionId.trim()
 				? path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json")
 				: null);
 		return { ...context, stateFile };

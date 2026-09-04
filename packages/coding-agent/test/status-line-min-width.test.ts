@@ -53,7 +53,7 @@ function buildRail(overrides: SessionOverrides = {}, goalActive = true): StatusL
 	const component = new StatusLineComponent(createSession(overrides), { version: "9.9.9" });
 	component.updateSettings({
 		preset: "custom",
-		leftSegments: ["model", "mode", "git", "path"],
+		leftSegments: ["model", "mode"],
 		rightSegments: ["session_name", "cost"],
 		separator: "slash",
 		showSkillHud: false,
