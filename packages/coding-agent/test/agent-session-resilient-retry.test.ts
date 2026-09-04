@@ -93,6 +93,11 @@ describe.serial("AgentSession resilient retry", () => {
 	let modelRegistry: ModelRegistry;
 	let session: AgentSession | undefined;
 
+	function withShardDisposeBudget(value: AgentSession): AgentSession {
+		value.setDisposeTimeoutForTests(15_000);
+		return value;
+	}
+
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@pi-resilient-retry-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
@@ -139,7 +144,9 @@ describe.serial("AgentSession resilient retry", () => {
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		return withShardDisposeBudget(
+			new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry }),
+		);
 	}
 
 	function buildStatusErrorSession(options: {
@@ -246,7 +253,9 @@ describe.serial("AgentSession resilient retry", () => {
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		return withShardDisposeBudget(
+			new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry }),
+		);
 	}
 
 	// Builds a session pinned to an explicit model (e.g. ollama-cloud) so
@@ -284,7 +293,9 @@ describe.serial("AgentSession resilient retry", () => {
 			...options.settingsOverrides,
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		return withShardDisposeBudget(
+			new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry }),
+		);
 	}
 	// Builds a single-model session with a BARE default retry configuration:
 	// no explicit retry.* keys are set, so `legacyRetryConfigured` is false.
@@ -322,7 +333,7 @@ describe.serial("AgentSession resilient retry", () => {
 		// Only compaction is disabled; no retry.* keys are seeded.
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({
+		return withShardDisposeBudget(new AgentSession({
 			agent,
 			sessionManager,
 			settings,
@@ -333,7 +344,7 @@ describe.serial("AgentSession resilient retry", () => {
 						await extensionRunner.emitAfterProviderResponse(response, model, scope);
 					}
 				: undefined,
-		});
+		}));
 	}
 	function buildBareStreamingSession(options: {
 		model?: Model;
@@ -354,13 +365,13 @@ describe.serial("AgentSession resilient retry", () => {
 		});
 		const settings = Settings.isolated({ "compaction.enabled": false });
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
-		return new AgentSession({
+		return withShardDisposeBudget(new AgentSession({
 			agent,
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
 			extensionRunner: options.extensionRunner,
-		});
+		}));
 	}
 	function createExtensionRunner(handlers = new Map<string, Array<() => Promise<void>>>()) {
 		const extension: Extension = {
