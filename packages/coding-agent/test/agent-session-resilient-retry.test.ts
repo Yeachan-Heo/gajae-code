@@ -355,6 +355,7 @@ describe.serial("AgentSession resilient retry", () => {
 				sessionManager,
 				settings,
 				modelRegistry,
+
 				extensionRunner,
 				onResponse: extensionRunner
 					? async (response, model, scope) => {
@@ -389,6 +390,7 @@ describe.serial("AgentSession resilient retry", () => {
 				sessionManager: SessionManager.inMemory(tempDir.path()),
 				settings,
 				modelRegistry,
+
 				extensionRunner: options.extensionRunner,
 			}),
 		);
@@ -1697,13 +1699,14 @@ describe.serial("AgentSession resilient retry", () => {
 			{ name: "positive", setting: 12_345, expected: 12_345 },
 		]) {
 			const capturedTimeouts: Array<number | undefined> = [];
+			const caseRoot = path.join(tempDir.path(), testCase.name);
 			const settings = Settings.isolated({
 				"compaction.enabled": false,
 				...(testCase.setting === undefined ? {} : { "retry.streamFirstEventTimeoutMs": testCase.setting }),
 			});
 			const { session: configuredSession } = await createAgentSession({
-				cwd: tempDir.path(),
-				agentDir: tempDir.path(),
+				cwd: caseRoot,
+				agentDir: caseRoot,
 				model,
 				modelRegistry,
 				settings,
@@ -1718,7 +1721,7 @@ describe.serial("AgentSession resilient retry", () => {
 				enableLsp: false,
 				toolNames: [],
 				workspaceTree: {
-					rootPath: tempDir.path(),
+					rootPath: caseRoot,
 					rendered: "",
 					truncated: false,
 					totalLines: 0,
