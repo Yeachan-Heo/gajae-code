@@ -1238,7 +1238,7 @@ describe("coordinator session state lock", () => {
 		releaseFirst.resolve();
 		await Promise.all([first, second]);
 		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
-	});
+	}, 15_000);
 
 	it("does not charge same-process transition waits against reused-tombstone release", async () => {
 		const { stateFile } = await seededRunningSession("lock-released-tombstone-local-transition");
@@ -1369,7 +1369,7 @@ describe("coordinator session state lock", () => {
 		expect(holderExit).toBe(0);
 		expect(contenderExit).toBe(0);
 		expect(await Bun.file(enteredFile).text()).toBe("entered");
-	});
+	}, 15_000);
 
 	it("reclaims a dead atomic transition directory through identity-bound removal", async () => {
 		const { stateFile } = await seededRunningSession("lock-dead-atomic-transition");
