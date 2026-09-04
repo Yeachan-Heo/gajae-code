@@ -956,7 +956,10 @@ export async function offerMacosCommunityApp(
 						destinationRootIdentity,
 						log,
 					);
-					if (!stagedRemoved) throw new Error("the staged app bundle could not be removed after detecting an existing verified installation");
+					if (!stagedRemoved)
+						throw new Error(
+							"the staged app bundle could not be removed after detecting an existing verified installation",
+						);
 				} catch (error) {
 					throw new Error(
 						`concurrent verified installation detected but staged bundle cleanup failed: ${error instanceof Error ? error.message : String(error)}`,
