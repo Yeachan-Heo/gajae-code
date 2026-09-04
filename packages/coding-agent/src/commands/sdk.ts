@@ -1091,28 +1091,46 @@ export default class Sdk extends Command {
 		let broker: Broker | undefined;
 		try {
 			broker = await withBrokerStartupLock(agentDir, async deadline => {
-				if (await reconcileBrokerGenerationForStartup({ agentDir }, deadline)) return undefined;
-				const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
-				if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
-					await Bun.sleep(startupDelayMs);
-				const candidate = new Broker({
-					agentDir,
-					masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
-						"sdk.masterOrphanGraceMs",
-					),
-					resolveDirectoryMigration: async cwd => {
-						const settings = await Settings.loadForScope({ cwd, agentDir });
-						try {
-							const policy = settings.get("session.directoryMigration");
-							return policy === "disabled" ? "disabled" : "copy-retain";
-						} finally {
-							await settings.close();
-						}
-					},
-				});
-				broker = candidate;
-				await candidate.start();
-				return candidate;
+				const remainingMs = Math.max(1, deadline - Date.now());
+				const testWatchdogMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS ?? 0);
+				const watchdogMs =
+					Number.isSafeInteger(testWatchdogMs) && testWatchdogMs > 0 && testWatchdogMs <= remainingMs
+						? testWatchdogMs
+						: remainingMs;
+				const startupWatchdog = setTimeout(() => {
+					process.stderr.write(`SDK broker startup exceeded its ${watchdogMs}ms fence deadline.\n`);
+					process.exit(1);
+				}, watchdogMs);
+				try {
+					if (await reconcileBrokerGenerationForStartup({ agentDir }, deadline)) return undefined;
+					if (process.env.GJC_SDK_TEST_BROKER_STARTUP_STALL === "1") {
+						const stalled = Promise.withResolvers<void>();
+						await stalled.promise;
+					}
+					const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
+					if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
+						await Bun.sleep(startupDelayMs);
+					const candidate = new Broker({
+						agentDir,
+						masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
+							"sdk.masterOrphanGraceMs",
+						),
+						resolveDirectoryMigration: async cwd => {
+							const settings = await Settings.loadForScope({ cwd, agentDir });
+							try {
+								const policy = settings.get("session.directoryMigration");
+								return policy === "disabled" ? "disabled" : "copy-retain";
+							} finally {
+								await settings.close();
+							}
+						},
+					});
+					broker = candidate;
+					await candidate.start();
+					return candidate;
+				} finally {
+					clearTimeout(startupWatchdog);
+				}
 			});
 		} catch (error) {
 			if (broker) {

@@ -11,6 +11,7 @@ import {
 	brokerOwnerForTest,
 	closeBrokerClientBeforeDeadline,
 	ensureBroker,
+	readBrokerDiscoveryBeforeDeadlineForTest,
 	withBrokerStartupLock,
 } from "../src/sdk/broker/ensure";
 
@@ -414,6 +415,53 @@ it("stale broker client teardown cannot extend an expired retirement deadline", 
 	await stalled.promise;
 });
 
+it("bounds the initial discovery read before taking the spawn lock", async () => {
+	const stalled = Promise.withResolvers<BrokerDiscovery | null>();
+	const readSpy = spyOn(brokerDiscovery, "readBrokerDiscovery").mockImplementation(() => stalled.promise);
+	try {
+		await expect(readBrokerDiscoveryBeforeDeadlineForTest("/unused", undefined, Date.now() + 25)).rejects.toThrow(
+			"Timed out reading SDK broker discovery.",
+		);
+	} finally {
+		readSpy.mockRestore();
+		stalled.resolve(null);
+	}
+});
+
+it("kills a broker bootstrap that outlives the startup fence deadline", async () => {
+	const dir = await temp();
+	let brokerPid: number | undefined;
+	try {
+		const child = Bun.spawn([process.execPath, "run", cli, "sdk", "broker-internal", "--agent-dir", dir], {
+			cwd: import.meta.dir,
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				GJC_SDK_TEST_BROKER_STARTUP_STALL: "1",
+				GJC_SDK_TEST_BROKER_STARTUP_WATCHDOG_MS: "250",
+			},
+		});
+		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect(code).toBe(1);
+		expect(error).toContain("SDK broker startup exceeded its 250ms fence deadline.");
+
+		const discovery = await ensureBroker({ agentDir: dir });
+		brokerPid = discovery.pid;
+		expect(discovery.pid).toBeGreaterThan(0);
+	} finally {
+		if (brokerPid !== undefined)
+			try {
+				process.kill(brokerPid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await brokerOwnerForTest(dir)?.stop();
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 15_000);
+
 it("releases the spawn lock when the under-lock discovery read fails so the next spawn succeeds", async () => {
 	const dir = await temp();
 	const readBrokerDiscovery = brokerDiscovery.readBrokerDiscovery;
@@ -547,6 +595,31 @@ it("a recycled live PID does not keep a dead spawn-lock generation alive", async
 		const release = await acquireSpawnLockForTest(dir, { retries: 20, retryDelayMs: 10 });
 		await release();
 		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.spawn.lock");
+	} finally {
+		holder.kill("SIGKILL");
+		await fs.rm(dir, { recursive: true, force: true });
+	}
+}, 30_000);
+
+it("never reclaims a dead broker lock qualified to a different host", async () => {
+	const dir = await temp();
+	const ready = path.join(dir, "holder.ready");
+	const journal = path.join(dir, "journal");
+	const holder = spawnLockWorker(dir, ready, journal, "holder", 60_000);
+	try {
+		await waitForFile(ready);
+		holder.kill("SIGKILL");
+		await holder.exited;
+		const infoPath = path.join(dir, "sdk", "broker.spawn.lock", "info");
+		const info = JSON.parse(await fs.readFile(infoPath, "utf8")) as Record<string, unknown>;
+		expect(typeof info.owner_host_id).toBe("string");
+		info.owner_host_id = "foreign-installation-host";
+		await fs.writeFile(infoPath, JSON.stringify(info));
+
+		await expect(acquireSpawnLockForTest(dir, { retries: 1, retryDelayMs: 1 })).rejects.toThrow(
+			"Failed to acquire lock",
+		);
+		expect(await fs.stat(path.join(dir, "sdk", "broker.spawn.lock"))).toBeDefined();
 	} finally {
 		holder.kill("SIGKILL");
 		await fs.rm(dir, { recursive: true, force: true });

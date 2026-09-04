@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import packageJson from "../../../package.json" with { type: "json" };
 import { acquireFileLock, type FileLockOptions, withFileLock } from "../../config/file-lock";
+import { loadInstallationHostId, loadLegacyInstallationHostId } from "../../config/machine-identity";
 import { SdkClient } from "../client/client";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
@@ -43,6 +44,29 @@ const STARTUP_LOCK_TARGET_NAME = "broker.startup";
 
 type SpawnLockOptions = Pick<FileLockOptions, "retries" | "retryDelayMs" | "signal">;
 
+interface BrokerLockHostIdentity {
+	ownerHostId: string;
+	previousOwnerHostIds: readonly string[];
+}
+
+let brokerLockHostIdentityPromise: Promise<BrokerLockHostIdentity> | undefined;
+
+async function brokerLockHostIdentity(): Promise<BrokerLockHostIdentity> {
+	const pending =
+		brokerLockHostIdentityPromise ??
+		Promise.all([loadInstallationHostId(), loadLegacyInstallationHostId()]).then(([ownerHostId, legacyHostId]) => ({
+			ownerHostId,
+			previousOwnerHostIds: legacyHostId === ownerHostId ? [] : [legacyHostId],
+		}));
+	brokerLockHostIdentityPromise = pending;
+	try {
+		return await pending;
+	} catch (error) {
+		if (brokerLockHostIdentityPromise === pending) brokerLockHostIdentityPromise = undefined;
+		throw error;
+	}
+}
+
 async function readBrokerDiscoveryBeforeDeadline(
 	agentDir: string,
 	heartbeatTtlMs: number | undefined,
@@ -78,9 +102,11 @@ async function readBrokerDiscoveryBeforeDeadline(
  * the exact directory generation, and ownership includes the OS incarnation.
  */
 async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}): Promise<() => Promise<void>> {
+	const hostIdentity = await brokerLockHostIdentity();
 	return acquireFileLock(path.join(agentDir, "sdk", SPAWN_LOCK_TARGET_NAME), {
 		retries: Math.ceil(SPAWN_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
 		retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
+		...hostIdentity,
 		...options,
 	});
 }
@@ -90,13 +116,18 @@ async function acquireSpawnLock(agentDir: string, options: SpawnLockOptions = {}
  * The parent-held spawn lock prevents ordinary stampedes; this second fence keeps
  * startup single-flight if that detached child's launcher dies and its lock is reclaimed.
  */
-export function withBrokerStartupLock<T>(agentDir: string, operation: (deadline: number) => Promise<T>): Promise<T> {
+export async function withBrokerStartupLock<T>(
+	agentDir: string,
+	operation: (deadline: number) => Promise<T>,
+): Promise<T> {
+	const hostIdentity = await brokerLockHostIdentity();
 	return withFileLock(
 		path.join(agentDir, "sdk", STARTUP_LOCK_TARGET_NAME),
 		() => operation(Date.now() + STALE_BROKER_RETIREMENT_TIMEOUT_MS + BROKER_PUBLICATION_TIMEOUT_MS),
 		{
 			retries: Math.ceil(STARTUP_LOCK_WAIT_MS / SPAWN_LOCK_RETRY_DELAY_MS),
 			retryDelayMs: SPAWN_LOCK_RETRY_DELAY_MS,
+			...hostIdentity,
 		},
 	);
 }
@@ -442,15 +473,25 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
 }
 
 async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: EnsureInitiator): Promise<EnsureOutcome> {
+	const initialDiscoveryDeadline =
+		Date.now() + (initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS);
 	const priorOwner = owners.get(settings.agentDir);
-	const existing = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	const existing = await readBrokerDiscoveryBeforeDeadline(
+		settings.agentDir,
+		settings.heartbeatTtlMs,
+		initialDiscoveryDeadline,
+	);
 	if (initiator === "fixture-lease" && (priorOwner || existing)) throw fixtureLeaseUnavailable();
 	if (priorOwner) {
 		// A retained cleanup failure fences every discovery record. Only a ready
 		// record bound to this exact child incarnation may be reused.
 		if (priorOwner.canReuse(existing)) return { kind: "prior-local-owner", discovery: existing!, owner: priorOwner };
 		await priorOwner.stop();
-		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		const discoveredAfterCleanup = await readBrokerDiscoveryBeforeDeadline(
+			settings.agentDir,
+			settings.heartbeatTtlMs,
+			initialDiscoveryDeadline,
+		);
 		if (discoveredAfterCleanup && isBrokerGenerationCompatible(discoveredAfterCleanup))
 			return { kind: "external-discovery", discovery: discoveredAfterCleanup };
 		// Stale-generation retirement is serialized under the spawn lock below.
@@ -699,6 +740,8 @@ export function startFixtureBrokerCommandWithLeaseForTest(command: FixtureBroker
 
 /** Test hook: returns a stop handle for the detached broker this process spawned. */
 export const acquireSpawnLockForTest = acquireSpawnLock;
+/** Test hook: proves discovery reads honor their enclosing absolute deadline. */
+export const readBrokerDiscoveryBeforeDeadlineForTest = readBrokerDiscoveryBeforeDeadline;
 
 export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 	return owners.get(agentDir);
