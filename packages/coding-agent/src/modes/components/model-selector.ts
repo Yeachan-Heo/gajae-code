@@ -557,6 +557,7 @@ export class ModelSelectorComponent extends Container {
 					this.#tui.requestRender();
 					return;
 				}
+				if (this.#viewMode === "smart-routing" && this.#smartRoutingPanel) return;
 				// The in-flight load already consumes the latest registry snapshot. Avoid
 				// materializing the same catalog again from its own change notification.
 				if (this.#catalogLoadPromise) return;

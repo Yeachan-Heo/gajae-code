@@ -66,6 +66,7 @@ function createContext(
 	} = {},
 ) {
 	const settings = options.settings ?? Settings.isolated();
+	let notifyCatalogChanged = () => {};
 	const ui = { setFocus: vi.fn(), requestRender: vi.fn(), terminal: { rows: 40, columns: 120 } };
 	const editorContainer = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
 	const registry = {
@@ -77,6 +78,10 @@ function createContext(
 		refreshStatic: vi.fn(async () => {
 			await options.refreshStaticGate;
 		}),
+		onCatalogChanged: (listener: () => void) => {
+			notifyCatalogChanged = listener;
+			return () => {};
+		},
 		getError: () => undefined,
 		getCanonicalModels: () => [],
 		getCanonicalModelSelections: (query: { candidates?: Model[] } = {}) =>
@@ -125,7 +130,7 @@ function createContext(
 		notifyConfigChanged: vi.fn(async () => {}),
 		restoreComposer: vi.fn(),
 	};
-	return { ctx, settings, session, editorContainer };
+	return { ctx, settings, session, editorContainer, notifyCatalogChanged: () => notifyCatalogChanged() };
 }
 
 async function settle(): Promise<void> {
@@ -140,8 +145,9 @@ async function openPanel(options: Parameters<typeof createContext>[0] & { smartR
 	panel: SmartRoutingPanelComponent;
 	settings: Settings;
 	ctx: ReturnType<typeof createContext>["ctx"];
+	notifyCatalogChanged: () => void;
 }> {
-	const { ctx, settings, editorContainer } = createContext(options);
+	const { ctx, settings, editorContainer, notifyCatalogChanged } = createContext(options);
 	const controller = new SelectorController(ctx as never);
 	controller.showModelSelector(options.smartRoutingOnly ? { smartRoutingOnly: true } : undefined);
 	const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
@@ -160,7 +166,7 @@ async function openPanel(options: Parameters<typeof createContext>[0] & { smartR
 	await settle();
 	const panel = selector.__testGetSmartRoutingPanel();
 	if (!panel) throw new Error("Smart-routing landing row did not open the panel");
-	return { controller, selector, panel, settings, ctx };
+	return { controller, selector, panel, settings, ctx, notifyCatalogChanged };
 }
 
 describe("/model smart-routing panel integration", () => {
@@ -315,6 +321,17 @@ describe("/model smart-routing panel integration", () => {
 		gate.resolve();
 		await settle();
 		expect(selector.__testGetSmartRoutingPanel()).toBeDefined();
+	});
+
+	test("catalog changes preserve a landing-launched smart-routing draft", async () => {
+		const { panel, selector, notifyCatalogChanged } = await openPanel();
+		const editedProviders = [...panel.getProviderOrder()].reverse();
+		panel.__testSetProviders(editedProviders);
+
+		notifyCatalogChanged();
+		await settle();
+		expect(selector.__testGetSmartRoutingPanel()).toBe(panel);
+		expect(panel.getProviderOrder()).toEqual(editedProviders);
 	});
 
 	test("standalone /routing renders catalog refresh failures instead of hanging", async () => {
