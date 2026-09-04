@@ -1315,6 +1315,7 @@ describe.serial("AgentSession resilient retry", () => {
 			expect(retryStartEvents).toHaveLength(0);
 			expect(requestedModels).toHaveLength(1);
 			expect(lastAssistant(session).stopReason).toBe("error");
+			vi.restoreAllMocks();
 			await session.dispose();
 			session = undefined;
 		}
