@@ -112,7 +112,7 @@ function createRegistry(
 	return {
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
-		getAvailable: () => [
+		getAvailable: vi.fn(() => [
 			codexModel,
 			anthropicModel,
 			minimaxModel,
@@ -120,7 +120,7 @@ function createRegistry(
 			{ ...noSuffixModel, provider: "provider-b" },
 			...builtinCodexModels,
 			...builtinComboModels,
-		],
+		]),
 		getAll: () => [
 			codexModel,
 			anthropicModel,
@@ -133,7 +133,7 @@ function createRegistry(
 		hasConfiguredProviderAuth: (provider: string) => authenticatedProviders.includes(provider),
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
-		getCanonicalModelSelections: () => [],
+		getCanonicalModelSelections: vi.fn(() => []),
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(profileMap),
 		getModelProfile: (name: string) => profileMap.get(name),
@@ -187,6 +187,33 @@ function cursorRowLabel(selector: ModelSelectorComponent): string | undefined {
 }
 
 describe("preset landing adversarial QA", () => {
+	test("defers browser catalog materialization until model browsing starts", async () => {
+		const registry = Object.assign(createRegistry(["openai-codex"]), {
+			getAvailableForProfileActivation: vi.fn(() => [codexModel, ...builtinCodexModels]),
+		});
+		const ui = { requestRender: vi.fn() } as unknown as TUI;
+		const selector = new ModelSelectorComponent(
+			ui,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		await rendered(selector);
+		expect(registry.refresh).not.toHaveBeenCalled();
+		expect(registry.getAvailable).not.toHaveBeenCalled();
+		expect(registry.getCanonicalModelSelections).not.toHaveBeenCalled();
+
+		selector.handleInput("g");
+		const text = await rendered(selector);
+		expect(registry.refresh).toHaveBeenCalledTimes(1);
+		expect(registry.getAvailable).toHaveBeenCalledTimes(1);
+		expect(registry.getCanonicalModelSelections).toHaveBeenCalledTimes(1);
+		expect(text).toContain("gpt-5.5");
+	});
 	beforeAll(async () => {
 		testTheme = await getThemeByName("red-claw");
 		installTestTheme();
@@ -229,7 +256,7 @@ describe("preset landing adversarial QA", () => {
 		selector.handleInput("\n");
 		selector.handleInput("\n");
 		selector.handleInput("g");
-		const text = normalizeRenderedText(selector.render(260).join("\n"));
+		const text = await rendered(selector);
 		expect(text).toContain("Models");
 		expect(text).toContain("gpt-5.5");
 		expect(text).not.toContain("Preset preview:");
@@ -247,6 +274,7 @@ describe("preset landing adversarial QA", () => {
 		expect(text).toContain("CODEX");
 		selector.handleInput("\x1b[A");
 		selector.handleInput("\n");
+		await rendered(selector);
 		selector.handleInput("\n");
 		text = normalizeRenderedText(selector.render(260).join("\n"));
 		expect(text).toContain("Action for:");

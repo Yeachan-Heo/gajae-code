@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Mid-run OpenAI remote-compaction fallback failures now stop before another provider request, surface the local summarization error through ACP/SDK terminal handling, and leave the uncompacted context unsubmitted. Successful local fallback still commits the compaction and resumes normally.
+- Opening `/model` now renders the preset landing before loading the full model browser catalog. Available-model enumeration, canonical search indexing, sorting, and the redundant offline registry refresh are deferred until the user searches or chooses a browse action, while scoped and direct-search selectors still load immediately.
 - `/model` provider-tab refreshes now reuse the already loaded static catalog and update only the selected provider's discovery state, avoiding repeated signed preset registry work while retaining full-catalog refresh behavior for static configuration changes.
 - Added the `command` status-line segment for user-produced HUD content. It runs
   configured user/global shell commands in the background with scheduled cached

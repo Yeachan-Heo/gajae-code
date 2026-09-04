@@ -204,6 +204,7 @@ describe("model selector profiles", () => {
 		expect(rendered).toContain("REGISTRY LIVE");
 		expect(rendered).not.toContain("Models (all)");
 		selector.handleInput("f");
+		await Bun.sleep(0);
 		rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("fresh-registry-model");
 	});
