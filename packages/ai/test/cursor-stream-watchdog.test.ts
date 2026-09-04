@@ -212,6 +212,7 @@ describe("Cursor raw transport watchdog", () => {
 	it("does not reserve detached-mutation capacity for ordinary execs", async () => {
 		const serverStreams: http2.ServerHttp2Stream[] = [];
 		const release = Promise.withResolvers<void>();
+		const allStarted = Promise.withResolvers<void>();
 		let executions = 0;
 		const execFrame = buildServerMessageFrame({
 			case: "execServerMessage",
@@ -240,6 +241,7 @@ describe("Cursor raw transport watchdog", () => {
 				execHandlers: {
 					piRead: async call => {
 						executions += 1;
+						if (executions === 65) allStarted.resolve();
 						await release.promise;
 						return {
 							role: "toolResult",
@@ -253,18 +255,20 @@ describe("Cursor raw transport watchdog", () => {
 				},
 			}),
 		);
-		const settleTimer = setTimeout(() => {
+		const endStreams = (): void => {
 			release.resolve();
 			for (const stream of serverStreams) {
 				if (!stream.closed && !stream.destroyed) stream.end(Buffer.concat([turnEndedFrame, endFrame]));
 			}
-		}, 100);
+		};
 		try {
+			const admitted = await Promise.race([allStarted.promise.then(() => true), Bun.sleep(2_000).then(() => false)]);
+			expect(admitted).toBe(true);
+			endStreams();
 			await Promise.all(pending);
 			expect(executions).toBe(65);
 		} finally {
-			clearTimeout(settleTimer);
-			release.resolve();
+			endStreams();
 		}
 	});
 
