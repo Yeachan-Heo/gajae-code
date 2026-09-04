@@ -2,12 +2,11 @@
  * Model entitlement facts shared by Codex credential selection and provider
  * error presentation.
  *
- * Pro-tier Codex models such as GPT-5.6 Sol are marketed for higher plans, but
- * the provider grants them per account: trial, grandfathered and experiment
- * accounts carry an ordinary plan label and are still accepted. The plan label
- * therefore orders credentials; the provider decides entitlement. This module
- * names the plan policy used for that ordering and keeps the provider's
- * deterministic rejection wording in one place.
+ * Live provider entitlement is authoritative for GPT-5.6 Sol access: local
+ * plan labels rank candidates without denying Sol requests before transport.
+ * Spark retains its existing local filter that excludes non-Pro candidates
+ * whenever a confirmed Pro candidate exists. This module names those model
+ * policies and keeps the provider's deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
