@@ -548,10 +548,16 @@ describe("Cursor request lifecycle", () => {
 	it("rolls back checkpoint usage when a stream fails before retry", async () => {
 		const server = http2.createServer();
 		let requestCount = 0;
+		let retryPayload: AgentRunRequest | undefined;
 		server.on("stream", (stream: http2.ServerHttp2Stream) => {
 			requestCount++;
+			const requestChunks: Buffer[] = [];
 			stream.on("error", () => {});
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.on("data", (chunk: Buffer) => {
+				requestChunks.push(chunk);
+				if (requestCount === 2) retryPayload ??= decodeRunRequest(requestChunks);
+			});
 			stream.once("data", () => {
 				if (requestCount === 1) {
 					stream.write(frameServerMessage(createConversationCheckpointMessage(500)));
@@ -593,6 +599,64 @@ describe("Cursor request lifecycle", () => {
 				(event): event is Extract<AssistantMessageEvent, { type: "done" }> => event.type === "done",
 			);
 			expect(done?.message.usage.input).toBe(0);
+			expect(retryPayload?.conversationState?.tokenDetails?.usedTokens ?? 0).toBe(0);
+		} finally {
+			disposeCursorConversation(conversationId);
+			await new Promise<void>(resolve => server.close(() => resolve()));
+		}
+	});
+
+	it("does not reuse cached state after the credential authority changes", async () => {
+		const server = http2.createServer();
+		let requestCount = 0;
+		let secondPayload: AgentRunRequest | undefined;
+		server.on("stream", (stream: http2.ServerHttp2Stream) => {
+			requestCount++;
+			const requestChunks: Buffer[] = [];
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" });
+			stream.on("data", (chunk: Buffer) => {
+				requestChunks.push(chunk);
+				if (requestCount === 2) secondPayload ??= decodeRunRequest(requestChunks);
+			});
+			stream.once("data", () => {
+				stream.end(
+					requestCount === 1
+						? Buffer.concat([
+								frameServerMessage(createConversationCheckpointMessage(500)),
+								frameServerMessage(createTurnEndedMessage()),
+							])
+						: frameServerMessage(createTurnEndedMessage()),
+				);
+			});
+		});
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(0, "127.0.0.1", resolve);
+		});
+
+		const conversationId = `credential-isolation-${crypto.randomUUID()}`;
+		try {
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected TCP server address");
+			const model = { ...cursorModel, baseUrl: `http://127.0.0.1:${address.port}` };
+			const firstContext: Context = { messages: [{ role: "user", content: "first", timestamp: 0 }] };
+			let firstDone: Extract<AssistantMessageEvent, { type: "done" }> | undefined;
+			for await (const event of streamCursor(model, firstContext, { apiKey: "tenant-a", conversationId })) {
+				if (event.type === "done") firstDone = event;
+			}
+			if (!firstDone) throw new Error("Expected first Cursor request to complete");
+
+			const secondContext: Context = {
+				messages: [...firstContext.messages, firstDone.message, { role: "user", content: "second", timestamp: 1 }],
+			};
+			for await (const _event of streamCursor(model, secondContext, {
+				apiKey: "tenant-b",
+				conversationId,
+			})) {
+				// Drain the request to its terminal event.
+			}
+
+			expect(secondPayload?.conversationState?.tokenDetails?.usedTokens ?? 0).toBe(0);
 		} finally {
 			disposeCursorConversation(conversationId);
 			await new Promise<void>(resolve => server.close(() => resolve()));

@@ -79,6 +79,7 @@ import {
 	type ConversationStateStructure,
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
+	ConversationTokenDetailsSchema,
 	ConversationTurnStructureSchema,
 	CursorRuleSchema,
 	CursorRuleSource,
@@ -176,8 +177,23 @@ import {
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 export { CURSOR_CLIENT_VERSION };
 
-const conversationStateCache = new Map<string, ConversationStateStructure>();
-const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
+interface CursorConversationContext {
+	endpointKey: string;
+	credentialKey: string;
+	modelKey: string;
+	systemPromptKey: string;
+	customSystemPromptKey: string;
+	toolsKey: string;
+	messageKeys: string[];
+}
+
+interface CursorConversationCacheEntry {
+	state: ConversationStateStructure;
+	blobs: Map<string, Uint8Array>;
+	context: CursorConversationContext;
+}
+
+const conversationCache = new Map<string, CursorConversationCacheEntry>();
 // A capped non-abortable mutation may outlive the provider turn. Keep a
 // conversation-scoped lock until the actual handler settles so a retry or a
 // later turn cannot start another request while the detached mutation is still
@@ -215,8 +231,7 @@ function registerCursorMutationLock(conversationId: string, lock: Promise<void>)
 
 /** Drop all cached state + blob bytes for a conversation (F15 bound + session-teardown hook). */
 export function disposeCursorConversation(conversationId: string): void {
-	conversationStateCache.delete(conversationId);
-	conversationBlobStores.delete(conversationId);
+	conversationCache.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
 }
 
@@ -256,13 +271,13 @@ function touchCursorConversation(conversationId: string): void {
 		if (id !== conversationId && now - ts > CURSOR_CONVERSATION_TTL_MS) disposeCursorConversation(id);
 	}
 	conversationLastAccess.set(conversationId, now);
-	const state = conversationStateCache.get(conversationId);
-	if (state !== undefined) {
-		conversationStateCache.delete(conversationId);
-		conversationStateCache.set(conversationId, state);
+	const entry = conversationCache.get(conversationId);
+	if (entry !== undefined) {
+		conversationCache.delete(conversationId);
+		conversationCache.set(conversationId, entry);
 	}
-	while (conversationStateCache.size > CURSOR_MAX_CONVERSATIONS) {
-		const oldest = conversationStateCache.keys().next().value;
+	while (conversationCache.size > CURSOR_MAX_CONVERSATIONS) {
+		const oldest = conversationCache.keys().next().value;
 		if (oldest === undefined || oldest === conversationId) break;
 		disposeCursorConversation(oldest);
 	}
@@ -1208,16 +1223,24 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// interrupted by a timer; the remaining-budget check below prevents a
 			// credential-bearing request after serialization already exhausted it.
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
-			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
-			conversationBlobStores.set(conversationId, blobStore);
-			const cachedState = conversationStateCache.get(conversationId);
+			const previousCacheEntry = conversationCache.get(conversationId);
+			const conversationContext = buildCursorConversationContext(context, model, options, baseUrl, apiKey);
+			const reusableCacheEntry =
+				options?.onPayload === undefined &&
+				previousCacheEntry &&
+				canReuseCursorConversationContext(previousCacheEntry.context, conversationContext)
+					? previousCacheEntry
+					: undefined;
+			// Request construction writes history and attachment blobs. Work against a
+			// private snapshot so aborts, hook failures, and transport failures cannot
+			// publish partial state or leak blobs into a later request reusing the ID.
+			const blobStore = new Map(reusableCacheEntry?.blobs);
+			const cachedState = reusableCacheEntry?.state;
 			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
 				conversationState: cachedState,
 			});
-			conversationStateCache.set(conversationId, conversationState);
-			touchCursorConversation(conversationId);
 			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
 				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
 					requestBytes: requestBytes.length,
@@ -1444,9 +1467,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
+			let pendingConversationCheckpoint: ConversationStateStructure | undefined;
 			const usageState: UsageState = {
 				sawTokenDelta: false,
-				conversationUsedTokens: 0,
+				conversationUsedTokens: cachedState?.tokenDetails?.usedTokens ?? 0,
 				checkpointOutputTokens: 0,
 				hasConversationCheckpoint: false,
 			};
@@ -1479,8 +1503,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				conversationStateCache.set(conversationId, checkpoint);
-				touchCursorConversation(conversationId);
+				pendingConversationCheckpoint = checkpoint;
 			};
 
 			const messageQueue = createCursorMessageQueueForTest(error => {
@@ -2062,6 +2085,28 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 
 			finalizeCursorUsage(output, usageState);
+			if (options?.onPayload === undefined && conversationCache.get(conversationId) === previousCacheEntry) {
+				const checkpointState = pendingConversationCheckpoint ?? conversationState;
+				const stateToCommit =
+					usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0
+						? create(ConversationStateStructureSchema, {
+								...checkpointState,
+								tokenDetails: create(ConversationTokenDetailsSchema, {
+									usedTokens: output.usage.totalTokens,
+									maxTokens: checkpointState.tokenDetails?.maxTokens ?? 0,
+								}),
+							})
+						: checkpointState;
+				conversationCache.set(conversationId, {
+					state: stateToCommit,
+					blobs: blobStore,
+					context: {
+						...conversationContext,
+						messageKeys: [...conversationContext.messageKeys, hashCursorConversationMessage(output)],
+					},
+				});
+				touchCursorConversation(conversationId);
+			}
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
@@ -4541,6 +4586,65 @@ function extractImages(content: (TextContent | ImageContent)[]) {
 				},
 			}),
 		);
+}
+
+function buildCursorConversationContext(
+	context: Context,
+	model: Model<"cursor-agent">,
+	options: CursorOptions | undefined,
+	baseUrl: string,
+	apiKey: string,
+): CursorConversationContext {
+	return {
+		endpointKey: hashCursorConversationValue(baseUrl),
+		credentialKey: hashCursorConversationValue({ apiKey, authCredentialType: options?.authCredentialType }),
+		modelKey: hashCursorConversationValue({
+			provider: model.provider,
+			id: model.id,
+			wireModelId: model.wireModelId,
+		}),
+		systemPromptKey: hashCursorConversationValue(context.systemPrompt ?? []),
+		customSystemPromptKey: hashCursorConversationValue(options?.customSystemPrompt ?? ""),
+		toolsKey: hashCursorConversationValue(
+			(context.tools ?? []).map(tool => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: toolWireSchema(tool),
+				strict: tool.strict,
+				customFormat: tool.customFormat,
+				customWireName: tool.customWireName,
+			})),
+		),
+		messageKeys: context.messages.map(hashCursorConversationMessage),
+	};
+}
+
+function hashCursorConversationMessage(message: { role: string; content: unknown }): string {
+	return hashCursorConversationValue({ role: message.role, content: message.content });
+}
+
+function hashCursorConversationValue(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(value) ?? "")
+		.digest("hex");
+}
+
+function canReuseCursorConversationContext(
+	previous: CursorConversationContext,
+	current: CursorConversationContext,
+): boolean {
+	if (
+		previous.endpointKey !== current.endpointKey ||
+		previous.credentialKey !== current.credentialKey ||
+		previous.modelKey !== current.modelKey ||
+		previous.systemPromptKey !== current.systemPromptKey ||
+		previous.customSystemPromptKey !== current.customSystemPromptKey ||
+		previous.toolsKey !== current.toolsKey ||
+		previous.messageKeys.length > current.messageKeys.length
+	) {
+		return false;
+	}
+	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
 }
 
 async function buildGrpcRequest(
