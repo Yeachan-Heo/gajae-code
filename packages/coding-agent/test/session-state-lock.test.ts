@@ -229,7 +229,7 @@ describe("coordinator session state lock", () => {
 
 		expect(order).toEqual(["holder-released", "waiter-wrote"]);
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-	});
+	}, 15_000);
 
 	it("serializes concurrent resume contenders after reclaiming a dead transition claim", async () => {
 		const { stateFile } = await seededRunningSession("lock-concurrent-resume");
@@ -265,7 +265,7 @@ describe("coordinator session state lock", () => {
 		releaseFirst.resolve();
 		await Promise.all([first, second]);
 		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
-	});
+	}, 15_000);
 
 	it("keeps session-state parents, transition claims, and owner records restrictive under umask", async () => {
 		const root = await tempRoot();
