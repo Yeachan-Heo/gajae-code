@@ -250,12 +250,11 @@ export interface ToolSession {
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/**
-	 * Async-job ownership/lookup endpoint key. For SDK sessions created with an
-	 * explicit provider session id this is a JSON tuple (see async/support.ts),
-	 * NOT a path-safe session id — workflow/session-identity consumers must use
-	 * getSessionId(); only AsyncJobManager ownership and endpoint-first lookup
-	 * may use this (subagent-inherited managers are registered under the
-	 * parent's endpoint only; review thread P1).
+	 * Opaque async-job ownership/lookup endpoint key. This is not a workflow or
+	 * path identity: workflow/session consumers must use getSessionId(). Only
+	 * AsyncJobManager ownership and endpoint-first lookup may use this accessor
+	 * (subagent-inherited managers are registered under the parent's endpoint;
+	 * review thread P1).
 	 */
 	getAsyncEndpointId?: () => string | null;
 	/** Get credential-selection session identity. */

@@ -300,7 +300,8 @@ export interface ExecutorOptions {
 	managedPersistence?: ManagedTaskPersistence;
 	/**
 	 * The parent session's ENDPOINT-owned AsyncJobManager (resolved by the
-	 * TaskTool via forEndpoint(sessionId) ?? instance()). Model metadata and
+	 * TaskTool via its opaque async endpoint accessor, then the process-global
+	 * fallback). Model metadata and
 	 * live-handle state for THIS subagent are recorded in the SAME manager the
 	 * task job runs in — with concurrent top-level sessions the process-global
 	 * instance belongs to a different session and would surface this subagent

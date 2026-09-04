@@ -1107,7 +1107,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			manager.failNow(jobId, jobGeneration, "Bash job owner was torn down.");
 		});
 		void completion.promise.finally(unregisterOwnerCleanup);
-		registerOwnedIfLineaged(manager, options.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
+		registerOwnedIfLineaged(
+			manager,
+			options.toolCallId,
+			jobId,
+			this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+		);
 
 		return {
 			jobId,
@@ -1132,7 +1137,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	 * running (review thread P1).
 	 */
 	#resolveOwnedJobManager(): AsyncJobManager | undefined {
-		const endpointId = this.session.getSessionId?.() ?? undefined;
+		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined;
 		if (this.session.getAsyncJobManager) return this.session.getAsyncJobManager();
 		return AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance();
 	}
@@ -1681,7 +1686,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Monitor jobs are exact owned background work of the turn that started
 		// them: register the five-tuple so scope:"owned" terminal abort stops the
 		// monitor too (review thread P2).
-		registerOwnedIfLineaged(manager, opts.toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
+		registerOwnedIfLineaged(
+			manager,
+			opts.toolCallId,
+			jobId,
+			this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+		);
 		currentJobId = jobId;
 		return { jobId, label, commandCwd: prepared.commandCwd };
 	}
@@ -1883,19 +1893,31 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 			if (waitResult.kind === "completed") {
 				ownedManager.acknowledgeDeliveries([job.jobId]);
-				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
+				unregisterForegroundOwnedBash(
+					ownedManager,
+					job.jobId,
+					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
+				);
 				return waitResult.result;
 			}
 			if (waitResult.kind === "failed") {
 				ownedManager.acknowledgeDeliveries([job.jobId]);
-				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
+				unregisterForegroundOwnedBash(
+					ownedManager,
+					job.jobId,
+					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
+				);
 				throw waitResult.error;
 			}
 			if (waitResult.kind === "aborted") {
 				ownedManager.cancel(job.jobId);
 				const terminal = await job.completion;
 				ownedManager.acknowledgeDeliveries([job.jobId]);
-				unregisterForegroundOwnedBash(ownedManager, job.jobId, this.session.getSessionId?.() ?? "local");
+				unregisterForegroundOwnedBash(
+					ownedManager,
+					job.jobId,
+					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local",
+				);
 				if (terminal.kind === "failed") {
 					throw new ToolAbortError(
 						formatManagedAbortFailure(terminal.error, terminal.result, job.getLatestText()),
@@ -2621,7 +2643,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							throw error;
 						}
 						const ptyGeneration = ptyManager.getJob(ptyJobId)?.generation ?? ptyJobId;
-						registerOwnedIfLineaged(ptyManager, toolCallId, ptyJobId, this.session.getSessionId?.() ?? undefined);
+						registerOwnedIfLineaged(
+							ptyManager,
+							toolCallId,
+							ptyJobId,
+							this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+						);
 						const unregisterPtyOwnerCleanup = ptyManager.registerOwnerCleanup(ptyOwnerId, () => {
 							killPtyOnce();
 							ptyManager.failNow(ptyJobId, ptyGeneration, ownerTeardownText());

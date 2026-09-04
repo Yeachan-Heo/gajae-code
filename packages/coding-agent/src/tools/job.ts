@@ -105,7 +105,9 @@ export class JobTool implements AgentTool<typeof jobSchema, JobToolDetails> {
 	): Promise<AgentToolResult<JobToolDetails>> {
 		const manager =
 			this.session.getAsyncJobManager?.() ??
-			AsyncJobManager.forEndpoint(this.session.getSessionId?.() ?? undefined) ??
+			AsyncJobManager.forEndpoint(
+				this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+			) ??
 			AsyncJobManager.instance();
 		if (!manager) {
 			return {

@@ -888,7 +888,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * thread P1).
 	 */
 	#resolveOwnedJobManager(): AsyncJobManager | undefined {
-		const endpointId = this.session.getSessionId?.() ?? undefined;
+		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined;
 		return (
 			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
 		);
@@ -1245,7 +1245,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					manager,
 					resumeToolCallId ?? descriptor.toolCallId,
 					resumeJobId,
-					this.session.getSessionId?.() ?? undefined,
+					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
 				);
 				return resumeJobId;
 			};
@@ -1477,7 +1477,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
-				registerOwnedIfLineaged(manager, _toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
+				registerOwnedIfLineaged(
+					manager,
+					_toolCallId,
+					jobId,
+					this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined,
+				);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
 					manager.registerResumeDescriptor(

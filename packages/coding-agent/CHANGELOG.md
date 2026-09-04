@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- SDK-hosted workflow tools now retain the logical session id for ask, skill, deep-interview, and ultragoal state paths while job, monitor, bash, cron, task, and subagent ownership routes through a separate opaque async endpoint key. Explicit provider session identities no longer create encoded duplicate workflow trees or redirect endpoint-owned work to another live session.
 - Plain and explicit-model launches now refresh a missing provider's cached dynamic catalog before resolving a qualified startup selector, so configured models such as `glm-zcode/glm-5.3` no longer open in `no-model` state while preserving cache-only startup for already available models.
 - The explicit thinking-choice gate for xAI models now derives from the parsed grok generation (4.5+) shared with `@gajae-code/ai`, instead of the exact ids `grok-4.5`/`grok-4.6`. A future grok release failed the id list, so `supportsReasoningEffort` stayed `false` and the user's thinking level was silently dropped from requests; reseller-hosted grok routes (OpenRouter & co.) keep their existing audited-transport behavior.
 

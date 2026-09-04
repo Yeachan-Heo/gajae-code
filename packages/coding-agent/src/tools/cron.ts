@@ -592,7 +592,7 @@ export class CronTool implements AgentTool<typeof cronSchema, CronToolDetails> {
 	}
 
 	#resolveOwnedJobManager(): AsyncJobManager | undefined {
-		const endpointId = this.session.getSessionId?.() ?? undefined;
+		const endpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? undefined;
 		return (
 			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
 		);
