@@ -2148,8 +2148,7 @@ export class SlackNotificationDaemon {
 				current.seenEventIds.includes(routing.eventId) ||
 				current.seenInteractionIds.includes(routing.interactionId) ||
 				current.seenRetryKeys.includes(routing.retryKey) ||
-				(routing.kind === "action" && replyableActionId(current.pendingActionId) !== routing.actionId) ||
-				(routing.kind === "message" && replyableActionId(current.pendingActionId) !== undefined)
+				(routing.kind === "action" && replyableActionId(current.pendingActionId) !== routing.actionId)
 			)
 				return current;
 			receipt = {
