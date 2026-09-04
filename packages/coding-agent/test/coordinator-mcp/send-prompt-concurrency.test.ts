@@ -4,9 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
 import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
-import type { SessionIndex } from "../../src/sdk/broker/session-index";
+import { SessionIndex } from "../../src/sdk/broker/session-index";
 import type { SessionRouterClient } from "../../src/sdk/router";
-import { prepareExactSessionAuthority } from "../helpers/sdk-exact-session-authority";
+import { registerExactSessionAuthority } from "../helpers/sdk-exact-session-authority";
 
 async function withTempRoot(run: (root: string) => Promise<void>): Promise<void> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coord-race-"));
@@ -46,13 +46,14 @@ describe("send_prompt same-session concurrency", () => {
 				heartbeatAt: Date.now(),
 			};
 			await writeBrokerDiscovery(agentDir, discovery);
-			const authority = await prepareExactSessionAuthority({
+			const authority = await registerExactSessionAuthority({
 				agentDir,
 				cwd: root,
 				sessionId,
 				url: sessionUrl,
 				token: "session-token",
 			});
+			const authorityIncarnation = brokerProcessIncarnation(authority.pid);
 
 			const server = await createCoordinatorMcpServer({
 				env: {
@@ -76,6 +77,8 @@ describe("send_prompt same-session concurrency", () => {
 										live: true,
 										endpointGeneration: 1,
 										pid: authority.pid,
+										processIncarnation: authorityIncarnation,
+										hostIncarnation: authorityIncarnation,
 										endpointMtimeMs: authority.endpointMtimeMs,
 									});
 									// The creation verifier reconciliation (#4731) requires the
@@ -94,31 +97,23 @@ describe("send_prompt same-session concurrency", () => {
 							close: async () => {},
 						}) as never,
 					routerDeps: {
-						createIndex: () =>
-							({
-								open: async () => {},
-								refresh: async () => {},
-								refreshIfChanged: async () => true,
-								listSessions: () => ({
-									indexSeq: 1,
-									sessions: brokerSessions.map(session => ({
-										sessionId: session.sessionId,
-										locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
-										live: session.live,
-										endpointGeneration: session.endpointGeneration,
-										pid: session.pid,
-										endpointMtimeMs: session.endpointMtimeMs,
-										indexSeq: 1,
-									})),
-									warnings: [],
-								}),
-							}) as unknown as SessionIndex,
+						createIndex: () => new SessionIndex(agentDir),
 						createClient: async () => {
 							const client: SessionRouterClient = {
 								onFrame: () => () => {},
 								request: async frame => {
 									if (frame.type === "event_replay")
 										return { ok: true, generation: 1, lastSeq: 0, events: [] };
+									if (frame.type === "session_activate") {
+										return {
+											type: "session_activate_result",
+											id: "activate-race-session",
+											ok: true,
+											status: "activated",
+											sessionId: frame.sessionId,
+											generation: frame.endpointGeneration,
+										};
+									}
 									expect(frame.type).toBe("control_request");
 									expect(frame.operation).toBe("turn.prompt");
 									return { accepted: true, command_id: "runtime-command", turn_id: "runtime-turn" };
@@ -141,6 +136,13 @@ describe("send_prompt same-session concurrency", () => {
 			});
 			expect(started.ok).toBe(true);
 			expect((started.session as { session_id: string }).session_id).toBe(sessionId);
+			await expect(
+				server.callTool("gjc_coordinator_activate_session", {
+					session_id: sessionId,
+					idempotency_key: "activate-session",
+					allow_mutation: true,
+				}),
+			).resolves.toMatchObject({ ok: true, state: "ready_for_input" });
 
 			// The exact race the maintainer reproduced 25/25: two same-session prompts at once.
 			const results = await Promise.all([
