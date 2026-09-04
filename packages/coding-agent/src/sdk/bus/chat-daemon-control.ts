@@ -136,7 +136,7 @@ export type ChatDaemonAction = "stop" | "reload";
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
 	discord: 73,
-	slack: 77,
+	slack: 78,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
