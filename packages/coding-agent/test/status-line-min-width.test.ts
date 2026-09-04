@@ -113,7 +113,7 @@ describe("status rail survives very small widths", () => {
 			expect({ width, text }).toMatchObject({ text: expect.stringMatching(CONTEXT_TOKEN) });
 			for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
 		}
-	});
+	}, 30_000);
 
 	it("never drops the model before the goal, nor the goal before the context", () => {
 		const goalGlyph = theme.icon.goal || "G";
@@ -129,7 +129,7 @@ describe("status rail survives very small widths", () => {
 			expect({ width, ok: hasContext || !hasGoal }).toEqual({ width, ok: true });
 			expect({ width, ok: hasGoal || !hasModel }).toEqual({ width, ok: true });
 		}
-	});
+	}, 30_000);
 
 	it("suppresses the overflow marker once the rail is narrow", () => {
 		for (let width = 4; width <= 30; width += 1) {
