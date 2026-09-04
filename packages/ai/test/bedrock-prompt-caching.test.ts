@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { supportsPromptCaching } from "../src/providers/amazon-bedrock";
+import { getBundledModels } from "../src/models";
+import { parseBedrockClaudeGeneration, supportsPromptCaching } from "../src/providers/amazon-bedrock";
 import type { Model } from "../src/types";
 
 function bedrockModel(id: string, cachePriced = false): Model<"bedrock-converse-stream"> {
@@ -49,5 +50,35 @@ describe("Bedrock prompt caching support", () => {
 		expect(supportsPromptCaching(bedrockModel("amazon.nova-pro-v1", true))).toBe(true);
 		expect(supportsPromptCaching(bedrockModel("amazon.nova-pro-v1"))).toBe(false);
 		expect(supportsPromptCaching(bedrockModel("mistral.mistral-large-2407-v1:0"))).toBe(false);
+	});
+});
+
+// Pre-3.5 ids intentionally parse as undefined (no Bedrock cache points).
+// Frozen history — a new id shape failing to parse is not in this table and
+// must trip the sweep below.
+const LEGACY_UNPARSABLE_BEDROCK_CLAUDE_IDS: Record<string, true> = {
+	"anthropic.claude-3-haiku-20240307-v1:0": true,
+	"anthropic.claude-3-opus-20240229-v1:0": true,
+	"anthropic.claude-3-sonnet-20240229-v1:0": true,
+	"eu.anthropic.claude-3-haiku-20240307-v1:0": true,
+	"eu.anthropic.claude-3-opus-20240229-v1:0": true,
+	"eu.anthropic.claude-3-sonnet-20240229-v1:0": true,
+};
+
+describe("bundled Bedrock catalog id-shape tripwire", () => {
+	it("parses a generation out of every bundled Bedrock Claude id", () => {
+		const unparsable = getBundledModels("amazon-bedrock")
+			.filter(model => model.id.toLowerCase().includes("claude"))
+			.filter(model => parseBedrockClaudeGeneration(model.id.toLowerCase()) === undefined)
+			.filter(model => !(model.id in LEGACY_UNPARSABLE_BEDROCK_CLAUDE_IDS));
+		expect(unparsable.map(model => model.id)).toEqual([]);
+	});
+
+	it("guards against the sweep going vacuous", () => {
+		const claudeIds = getBundledModels("amazon-bedrock").filter(model => model.id.toLowerCase().includes("claude"));
+		expect(claudeIds.length).toBeGreaterThan(0);
+		expect(
+			claudeIds.filter(model => parseBedrockClaudeGeneration(model.id.toLowerCase()) !== undefined).length,
+		).toBeGreaterThan(0);
 	});
 });

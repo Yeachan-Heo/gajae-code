@@ -70,7 +70,7 @@ export function isAuditedOpenAIReasoningTransport(
  */
 export function isDirectXaiReasoningEffortModel(provider: string, modelId: string): boolean {
 	if (provider !== "xai") return false;
-	const generation = /^grok-(\d{1,2})(?:\.(\d{1,2}))?/.exec(modelId.toLowerCase());
+	const generation = /^grok-(\d{1,2})(?:[.-](\d{1,2}))?/.exec(modelId.toLowerCase());
 	if (!generation) return false;
 	const major = Number(generation[1]);
 	const minor = generation[2] === undefined ? 0 : Number(generation[2]);

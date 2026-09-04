@@ -299,7 +299,6 @@ describe("generated model policies", () => {
 		const models = [
 			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),
 			createModel({ id: "grok-4.6", api: "openai-completions", provider: "xai", reasoning: false }),
-			createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai", reasoning: false }),
 			createModel({ id: "grok-4.6", api: "openai-completions", provider: "openrouter", reasoning: false }),
 		];
 
@@ -315,12 +314,37 @@ describe("generated model policies", () => {
 			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh },
 		});
 		expect(models[0]?.maxTokens).toBe(32_000);
-		expect(models[2]).toMatchObject({
-			reasoning: true,
-			thinking: { mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.XHigh },
-		});
-		expect(models[3]?.reasoning).toBe(false);
-		expect(models[3]?.thinking).toBeUndefined();
+		expect(models[2]?.reasoning).toBe(false);
+		expect(models[2]?.thinking).toBeUndefined();
+	});
+
+	it("keeps catalog reasoning flags authoritative outside the stale-row corrections", () => {
+		const staleFutureRow = [
+			createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai", reasoning: false }),
+		];
+		applyGeneratedModelPolicies(staleFutureRow);
+		// The pin is a per-row data correction for observed staleness, not a
+		// family rule; unobserved rows keep whatever the catalog says.
+		expect(staleFutureRow[0]?.reasoning).toBe(false);
+		expect(staleFutureRow[0]?.thinking).toBeUndefined();
+
+		const nonReasoning = [
+			createModel({
+				id: "grok-4.20-0309-non-reasoning",
+				api: "openai-completions",
+				provider: "xai",
+				reasoning: false,
+			}),
+		];
+		applyGeneratedModelPolicies(nonReasoning);
+		expect(nonReasoning[0]?.reasoning).toBe(false);
+		expect(nonReasoning[0]?.thinking).toBeUndefined();
+	});
+
+	it("derives thinking config for future direct xAI grok generations from catalog reasoning", () => {
+		const model = createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai" });
+
+		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.XHigh });
 	});
 
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {

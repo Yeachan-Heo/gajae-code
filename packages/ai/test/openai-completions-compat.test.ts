@@ -172,6 +172,7 @@ describe("openai-completions compatibility", () => {
 		expect(xaiCompat("grok-4.5")).toBe(true);
 		expect(xaiCompat("grok-4.6")).toBe(true);
 		expect(xaiCompat("grok-4.7")).toBe(true);
+		expect(xaiCompat("grok-4-7")).toBe(true);
 		expect(xaiCompat("grok-5")).toBe(true);
 		expect(xaiCompat("grok-4")).toBe(false);
 		expect(xaiCompat("grok-4.1")).toBe(false);

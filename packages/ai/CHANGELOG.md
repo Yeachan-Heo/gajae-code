@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Bedrock prompt caching is now gated on the Claude generation parsed from the model id instead of version-literal fragments (`-4-`/`-4.`, `claude-haiku`, and two 3.x literals). A future generation's Bedrock id (`us.anthropic.claude-opus-5-…`, or a new model kind) matched none of the literals, so cache points were silently omitted and every request re-paid full input pricing. Behavior for the documented support set — 3.5 Haiku, 3.7 Sonnet, and 4.x naming including `us.`/`eu.`/`global.` inference profiles — is unchanged, per AWS's prompt-caching support matrix. A bundled-catalog tripwire now fails when a regenerated catalog introduces a Claude id shape the parser cannot read, so shape drift is loud instead of silently disabling caching.
+
+- Direct-xAI `reasoning_effort` support is now derived from the parsed grok generation (4.5+, dot- or dash-separated) instead of the exact ids `grok-4.5`/`grok-4.6` in the compat layer and the coding-agent thinking-choice gate; a future grok release failed the id list, so `supportsReasoningEffort` stayed `false` and the user's thinking level was silently dropped from requests with no error. The generated-policy `reasoning` pin stays scoped to the two rows whose upstream metadata shipped stale — a per-row data correction, not a family rule — so catalog `reasoning: false` flags (including the bundled grok `-non-reasoning` variants) remain authoritative for everything else. Reseller routes (OpenRouter & co.) keep their existing audited-transport behavior.
+
 - Cursor payload hooks now receive protobuf requests as JSON-safe values, await asynchronous inspection or replacement, and validate replacement payloads before transport. Checkpoint state containing 64-bit protobuf fields no longer makes hook-side `JSON.stringify` fail on JavaScript `bigint` values.
 
 ## [0.16.3] - 2026-09-04
@@ -21,10 +25,6 @@
 - Exported `detectDiscoveredApiFamily` from `utils/discovery/openai-compatible`: infers the wire API family (`anthropic-messages` vs `openai-completions`) for a discovered model on a mixed OpenAI-compatible gateway, using the OpenAI `owned_by` owner first and the model id (`claude-*` vs `gpt-*`/`o1`/`codex`/…) as fallback, returning `undefined` when inconclusive. Consumed by custom-provider auto model discovery in `packages/coding-agent`.
 
 ### Fixed
-
-- Bedrock prompt caching is now gated on the Claude generation parsed from the model id instead of version-literal fragments (`-4-`/`-4.`, `claude-haiku`, and two 3.x literals). A future generation's Bedrock id (`us.anthropic.claude-opus-5-…`, or a new model kind) matched none of the literals, so cache points were silently omitted and every request re-paid full input pricing. Behavior for the documented support set — 3.5 Haiku, 3.7 Sonnet, and 4.x naming including `us.`/`eu.`/`global.` inference profiles — is unchanged, per AWS's prompt-caching support matrix.
-
-- Direct-xAI `reasoning_effort` support is now derived from the parsed grok generation (4.5+) instead of the exact ids `grok-4.5`/`grok-4.6`, which were duplicated across the compat layer, generated model policies, and the coding-agent thinking-choice gate. A future grok release failed the id list in all of them, so `supportsReasoningEffort` stayed `false` and the user's thinking level was silently dropped from requests with no error. A shared version-floor helper scoped to the direct `xai` provider replaces the duplicates; reseller routes (OpenRouter & co.) keep their existing audited-transport behavior.
 
 - Antigravity discovery now keeps mid-rollout models that the backend marks `isInternal` when the same response surfaces them through `agentModelSorts`. Internal models absent from the IDE's surfaced model groups remain hidden, and denylisted or retired selectors still take precedence.
 - Tokenless loopback auth-broker requests carrying a browser `Origin` header are now rejected before credential reads or mutations. Native loopback clients without `Origin`, authenticated browser-origin clients, and the public health endpoint retain their existing behavior.

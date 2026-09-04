@@ -5,11 +5,7 @@ import {
 	isCodexProductTransport,
 } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import {
-	isAuditedOpenAIReasoningTransport,
-	isDirectXaiReasoningEffortModel,
-	resolveOpenAICompat,
-} from "./openai-completions-compat";
+import { isAuditedOpenAIReasoningTransport, resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -276,7 +272,12 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
 			source.reasoning = true;
 		}
-		if (isDirectXaiReasoningEffortModel(source.provider, source.id)) {
+		// Per-row data correction: upstream metadata shipped stale `reasoning`
+		// for exactly these ids. Not a family rule — catalog `reasoning` flags
+		// (e.g. the grok `-non-reasoning` variants) stay authoritative for
+		// everything else; the generation floor in isDirectXaiReasoningEffortModel
+		// covers the transport capability.
+		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
 			source.reasoning = true;
 		}
 		if (

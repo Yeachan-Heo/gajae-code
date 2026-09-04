@@ -646,7 +646,7 @@ export function supportsPromptCaching(model: Model<"bedrock-converse-stream">): 
  * Cross-region profiles (us./eu./global. prefixes) keep the same model
  * segment, so a substring match is enough.
  */
-function parseBedrockClaudeGeneration(id: string): { major: number; minor: number } | undefined {
+export function parseBedrockClaudeGeneration(id: string): { major: number; minor: number } | undefined {
 	const familyFirst = /claude-(\d{1,2})-(\d{1,2})-/.exec(id);
 	if (familyFirst) {
 		return { major: Number(familyFirst[1]), minor: Number(familyFirst[2]) };
