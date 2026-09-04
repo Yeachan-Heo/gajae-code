@@ -1,10 +1,10 @@
-import { describe, expect, it, vi } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
-import { ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
+import { __chatEffectJournalTestHooks, ChatEffectJournal } from "../src/sdk/bus/chat-effect-journal";
 import { ConversationStore } from "../src/sdk/bus/conversation-store";
 import type { SlackConversation } from "../src/sdk/bus/slack-conversation";
 import { SlackEndpointBindingError, SlackNotificationDaemon } from "../src/sdk/bus/slack-daemon";
@@ -12,6 +12,10 @@ import { SlackLiveProvider, SlackProviderError } from "../src/sdk/bus/slack-live
 import { SlackProvider, type SlackSocketEnvelope } from "../src/sdk/bus/slack-provider";
 import { SdkClientError } from "../src/sdk/client/client";
 import { type SessionAttachment, SessionRouterError } from "../src/sdk/router";
+
+afterEach(() => {
+	__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+});
 
 class FakeSlack {
 	handler: ((envelope: SlackSocketEnvelope) => void | Promise<void>) | undefined;
@@ -307,19 +311,37 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
 				const conversation = await daemon.notify("session", "root");
 				authorityId = "device-bound-authority";
-				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = () => {
+					throw new Error("effect migration exploded");
+				};
+				await expect(
+					daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId),
+				).rejects.toThrow("effect migration exploded");
 
 				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
+				const fenced = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session" && record.rootTs === conversation.rootTs,
+				);
+				expect(fenced?.attachmentAuthorityId).toBe("device-bound-authority");
+				expect(fenced?.attachmentAuthorityMigrationFromId).toBe("legacy-authority");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				let effect = (await journal.list()).find(record => record.kind === "provider-post");
+				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
+					"legacy-authority",
+				);
+
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
 				const migrated = Object.values((await store.load()).conversations).find(
 					record => record.sessionId === "session" && record.rootTs === conversation.rootTs,
 				);
-				expect(migrated?.attachmentAuthorityId).toBe("device-bound-authority");
-
-				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
-				const effect = (await journal.list()).find(record => record.kind === "provider-post");
+				expect(migrated?.attachmentAuthorityMigrationFromId).toBeUndefined();
+				effect = (await journal.list()).find(record => record.kind === "provider-post");
 				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
 					"device-bound-authority",
 				);
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
 			},
 			{
 				resolveAttachment: async sessionId => ({ ...endpoint(sessionId), authorityId }),

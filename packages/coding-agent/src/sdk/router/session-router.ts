@@ -28,7 +28,8 @@ import {
 import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
 
 export interface SessionEndpointIdentity {
-	readonly dev: bigint;
+	/** Device identity is Router-internal proof and optional for public digest callers. */
+	readonly dev?: bigint;
 	readonly mtimeMs: number;
 	readonly mtimeNs: bigint;
 	readonly ctimeNs: bigint;
@@ -60,7 +61,9 @@ function createSessionAttachmentAuthorityId(input: SessionAttachmentAuthorityInp
 		.digest("hex");
 	const endpointIdentity = input.endpointIdentity
 		? {
-				...(includeDevice ? { dev: input.endpointIdentity.dev.toString() } : {}),
+				...(includeDevice && input.endpointIdentity.dev !== undefined
+					? { dev: input.endpointIdentity.dev.toString() }
+					: {}),
 				mtimeMs: input.endpointIdentity.mtimeMs,
 				mtimeNs: input.endpointIdentity.mtimeNs.toString(),
 				ctimeNs: input.endpointIdentity.ctimeNs.toString(),

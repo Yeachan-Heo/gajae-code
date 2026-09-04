@@ -291,6 +291,7 @@ export class ChatDaemonRuntime {
 	readonly #cleanupWork = new Map<string, Promise<void>>();
 	readonly #retirementWork = new Map<string, Promise<void>>();
 	readonly #attachmentBarriers = new Map<string, Promise<void>>();
+	readonly #readyAttachments = new WeakSet<SessionAttachment>();
 	readonly #cleanupFailures = new Map<string, unknown>();
 	#replayReady: Promise<void> = Promise.resolve();
 	#stopping = false;
@@ -309,7 +310,8 @@ export class ChatDaemonRuntime {
 			deps: {
 				...deps.routerDeps,
 				onFrame: async (attachment, frame) => await this.#handleFrame(attachment, frame),
-				onAttachment: async attachment => this.#onAttachment(attachment),
+				onAttachment: attachment => this.#onAttachment(attachment),
+				onAttachmentReady: async attachment => await this.#onAttachmentReady(attachment),
 				onReplayReady: async () => await this.#replayReady,
 				onSessionRemoved: async (attachment, reason) => await this.#onSessionRemoved(attachment, reason),
 			},
@@ -500,8 +502,13 @@ export class ChatDaemonRuntime {
 		}
 	}
 
-	async #onAttachment(attachment: SessionAttachment): Promise<void> {
-		const revivedTransport = this.#attachments.get(attachment.sessionId) === attachment;
+	#onAttachment(attachment: SessionAttachment): void {
+		this.#attachments.set(attachment.sessionId, attachment);
+	}
+
+	async #onAttachmentReady(attachment: SessionAttachment): Promise<void> {
+		if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+		const revivedTransport = this.#readyAttachments.has(attachment);
 		const migrateAttachmentAuthority = async (): Promise<void> => {
 			if (
 				!attachment.legacyAuthorityId ||
@@ -509,27 +516,38 @@ export class ChatDaemonRuntime {
 				attachment.legacyAuthorityId === attachment.authorityId
 			)
 				return;
-			if (this.#discord)
-				await this.#discord.migrateAttachmentAuthority(
-					attachment.sessionId,
-					attachment.generation,
-					attachment.legacyAuthorityId,
-					attachment.authorityId,
-				);
-			if (this.#slack)
-				await this.#slack.migrateAttachmentAuthority(
-					attachment.sessionId,
-					attachment.generation,
-					attachment.legacyAuthorityId,
-					attachment.authorityId,
-				);
+			try {
+				if (this.#discord)
+					await this.#discord.migrateAttachmentAuthority(
+						attachment.sessionId,
+						attachment.generation,
+						attachment.legacyAuthorityId,
+						attachment.authorityId,
+					);
+				if (this.#slack)
+					await this.#slack.migrateAttachmentAuthority(
+						attachment.sessionId,
+						attachment.generation,
+						attachment.legacyAuthorityId,
+						attachment.authorityId,
+					);
+			} catch (error) {
+				logger.warn(`SDK attachment authority migration remains durably fenced for retry: ${String(error)}`);
+			}
 		};
-		this.#attachments.set(attachment.sessionId, attachment);
 		if (revivedTransport) {
-			await migrateAttachmentAuthority();
-			this.#presentation?.connectSession(attachment.sessionId, {
-				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
-			});
+			const barrier = migrateAttachmentAuthority();
+			this.#attachmentBarriers.set(attachment.sessionId, barrier);
+			try {
+				await barrier;
+				if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+				this.#presentation?.connectSession(attachment.sessionId, {
+					sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
+				});
+			} finally {
+				if (this.#attachmentBarriers.get(attachment.sessionId) === barrier)
+					this.#attachmentBarriers.delete(attachment.sessionId);
+			}
 			return;
 		}
 		const discord = this.#discord;
@@ -549,8 +567,18 @@ export class ChatDaemonRuntime {
 			if (cleanup) await cleanup.catch(error => logger.warn(`SDK cleanup retry pending: ${String(error)}`));
 			await migrateAttachmentAuthority();
 			const [discordRecovered, slackRecovered] = await Promise.all([
-				discord?.recoverCleanup(attachment.sessionId, attachment.generation, attachment.authorityId) ?? true,
-				slack?.recoverCleanup(attachment.sessionId, attachment.generation, attachment.authorityId) ?? true,
+				discord?.recoverCleanup(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.authorityId,
+					attachment.legacyAuthorityId,
+				) ?? true,
+				slack?.recoverCleanup(
+					attachment.sessionId,
+					attachment.generation,
+					attachment.authorityId,
+					attachment.legacyAuthorityId,
+				) ?? true,
 			]);
 			if (!discordRecovered || !slackRecovered)
 				throw new Error("successor_attachment_blocked_until_retirement_is_verified");
@@ -569,6 +597,7 @@ export class ChatDaemonRuntime {
 		try {
 			await barrier;
 			if (this.#attachments.get(attachment.sessionId) !== attachment) return;
+			this.#readyAttachments.add(attachment);
 			this.#presentation?.connectSession(attachment.sessionId, {
 				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
 			});

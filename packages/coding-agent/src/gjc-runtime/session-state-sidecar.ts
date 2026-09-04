@@ -177,6 +177,7 @@ export const __sessionStateSidecarTestHooks: {
 	beforeRescopeJournalWrite?: (cwd: string) => void | Promise<void>;
 	beforePersistFromEvent?: (eventType: string, cwd: string) => void | Promise<void>;
 	beforeRescopePublish?: () => void | Promise<void>;
+	beforeRescopeClear?: () => void | Promise<void>;
 } = {};
 
 interface RuntimeStateEvent {
@@ -2322,6 +2323,7 @@ export async function clearCoordinatorRuntimeStateRescope(
 	expectedMoveId?: string,
 	previousCwd?: string,
 ): Promise<void> {
+	await __sessionStateSidecarTestHooks.beforeRescopeClear?.();
 	const identity = normalizedIdentity(context);
 	const candidateCwds = [context.cwd, previousCwd].filter((cwd): cwd is string => typeof cwd === "string");
 	const journalFiles = orderedDistinctStateFiles(

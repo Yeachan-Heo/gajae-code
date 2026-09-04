@@ -1607,6 +1607,26 @@ describe("SessionRouter dispatch authority", () => {
 		);
 	});
 
+	test("keeps device identity optional for public attachment authority callers", () => {
+		const authorityId = sessionAttachmentAuthorityId({
+			sessionId: "router-session",
+			generation: 1,
+			pid: 42,
+			endpointMtimeMs: 1_000.123,
+			url: "ws://router.test",
+			token: "secret",
+			endpointIdentity: {
+				mtimeMs: 1_000.123,
+				mtimeNs: 1_000_123_456n,
+				ctimeNs: 1_000_123_457n,
+				size: 64n,
+				ino: 11n,
+			},
+		});
+
+		expect(authorityId).toMatch(/^[0-9a-f]{64}$/);
+	});
+
 	test("revokes lifecycle adoption when the index remains missing or terminal", async () => {
 		const fixture = await routerFixture({ initiallyIndexed: false });
 		const endpoint = JSON.parse(fs.readFileSync(fixture.endpointFile, "utf8")) as Record<string, unknown>;
