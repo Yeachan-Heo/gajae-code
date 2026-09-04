@@ -1,6 +1,14 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
+import * as path from "node:path";
 import type { Model } from "@gajae-code/ai";
-import { refreshMissingQualifiedModelProviders } from "../src/config/model-resolver";
+import { TempDir } from "@gajae-code/utils";
+import { ModelRegistry } from "../src/config/model-registry";
+import {
+	refreshMissingQualifiedModelProviders,
+	resolveStartupModelRefreshSelectors,
+} from "../src/config/model-resolver";
+import { Settings } from "../src/config/settings";
+import { AuthStorage } from "../src/session/auth-storage";
 
 const model = (provider: string, id: string): Model =>
 	({ provider, id, name: id, api: "anthropic-messages", contextWindow: 1_000_000, maxTokens: 131_072 }) as Model;
@@ -56,6 +64,20 @@ describe("startup dynamic model refresh", () => {
 		expect(fixture.refreshCalls).toEqual([]);
 	});
 
+	test("does not refresh an available concrete selector whose suffix resembles thinking", async () => {
+		const fixture = setup({
+			models: [model("dynamic-provider", "new-model:high")],
+		});
+
+		const refreshed = await refreshMissingQualifiedModelProviders(
+			"dynamic-provider/new-model:high",
+			fixture.modelRegistry as never,
+		);
+
+		expect(refreshed).toBe(false);
+		expect(fixture.refreshCalls).toEqual([]);
+	});
+
 	test("does not refresh an absent or unqualified selector", async () => {
 		const fixture = setup();
 
@@ -92,5 +114,49 @@ describe("startup dynamic model refresh", () => {
 
 		expect(refreshed).toBe(true);
 		expect(fixture.refreshCalls).toEqual([["glm-zcode", "online-if-uncached"]]);
+	});
+
+	test("preserves explicit provider qualifiers and suppresses credential, profile, and resume refreshes", () => {
+		const settings = Settings.isolated({ modelRoles: { default: "dynamic-provider/default-model" } });
+
+		expect(
+			resolveStartupModelRefreshSelectors(
+				{ model: "new-model", provider: "dynamic-provider", hasStartupProfile: false },
+				settings,
+			),
+		).toBe("dynamic-provider/new-model");
+		expect(
+			resolveStartupModelRefreshSelectors(
+				{ model: "dynamic-provider/new-model", provider: "dynamic-provider", hasStartupProfile: true },
+				settings,
+			),
+		).toBe("dynamic-provider/new-model");
+		expect(
+			resolveStartupModelRefreshSelectors(
+				{ credential: "dynamic-provider/id:1", hasStartupProfile: false },
+				settings,
+			),
+		).toBeUndefined();
+		expect(resolveStartupModelRefreshSelectors({ hasStartupProfile: true }, settings)).toBeUndefined();
+		expect(resolveStartupModelRefreshSelectors({ resume: true, hasStartupProfile: false }, settings)).toBeUndefined();
+	});
+
+	test("provider-scoped refresh does not resolve unrelated provider credentials", async () => {
+		using tempDir = TempDir.createSync("@gjc-startup-provider-scope-");
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("google", "test-key");
+		const credentialProviders: string[] = [];
+		const peekSpy = vi.spyOn(authStorage, "peekApiKey").mockImplementation(async provider => {
+			credentialProviders.push(provider);
+			return provider === "google" ? "test-key" : undefined;
+		});
+		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		try {
+			await registry.refreshProvider("google", "offline");
+			expect(credentialProviders).toEqual(["google"]);
+		} finally {
+			peekSpy.mockRestore();
+			authStorage.close();
+		}
 	});
 });

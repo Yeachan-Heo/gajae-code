@@ -72,6 +72,7 @@ export async function fetchGeminiModels(
 	const baseUrl = normalizeBaseUrl(options.baseUrl);
 	const pageSize = normalizePositiveInt(options.pageSize, DEFAULT_PAGE_SIZE);
 	const maxPages = normalizePositiveInt(options.maxPages, DEFAULT_MAX_PAGES);
+	const signal = options.signal ?? AbortSignal.timeout(5_000);
 
 	const bundledById = new Map(
 		getBundledModels("google").map(model => [model.id, model as Model<"google-generative-ai">]),
@@ -86,7 +87,7 @@ export async function fetchGeminiModels(
 		try {
 			response = await fetchImpl(requestUrl, {
 				method: "GET",
-				signal: options.signal,
+				signal,
 			});
 		} catch {
 			return null;

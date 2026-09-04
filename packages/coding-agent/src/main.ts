@@ -32,10 +32,12 @@ import { findConfigFile } from "./config";
 import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
+	parseModelString,
 	refreshMissingQualifiedModelProviders,
 	resolveCliModel,
 	resolveModelRoleValue,
 	resolveModelScope,
+	resolveStartupModelRefreshSelectors,
 	type ScopedModel,
 } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
@@ -55,7 +57,7 @@ import type { PrintModeOptions } from "./modes/print-mode";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { applyCliRuntimeApiKeyOverride } from "./runtime-api-key";
-import { parseCliCredentialSelector } from "./runtime-credential-selector";
+import { type CliCredentialSelector, parseCliCredentialSelector } from "./runtime-credential-selector";
 import type { MCPManager } from "./runtime-mcp";
 import {
 	type CreateAgentSessionOptions,
@@ -1651,14 +1653,59 @@ export async function runRootCommand(
 			)
 		: undefined;
 
-	const startupModelSelectors =
-		parsedArgs.model && !parsedArgs.credential
-			? parsedArgs.provider && !parsedArgs.model.toLowerCase().startsWith(`${parsedArgs.provider.toLowerCase()}/`)
-				? `${parsedArgs.provider}/${parsedArgs.model}`
-				: parsedArgs.model
-			: !parsedArgs.model && !parsedArgs.continue && !parsedArgs.resume
-				? settingsInstance.getModelRole("default")
-				: undefined;
+	if (parsedArgs.apiKey && parsedArgs.credential) {
+		process.stderr.write(`${chalk.red("--api-key and --credential cannot be used together")}\n`);
+		process.exit(1);
+	}
+	if (parsedArgs.credential && parsedArgs.preferCredential) {
+		process.stderr.write(`${chalk.red("--credential and --prefer-credential cannot be used together")}\n`);
+		process.exit(1);
+	}
+	if (parsedArgs.apiKey && parsedArgs.preferCredential) {
+		process.stderr.write(`${chalk.red("--api-key and --prefer-credential cannot be used together")}\n`);
+		process.exit(1);
+	}
+
+	let credentialSelector: CliCredentialSelector | undefined;
+	let preferredCredentialSelector: CliCredentialSelector | undefined;
+	try {
+		credentialSelector = parsedArgs.credential ? parseCliCredentialSelector(parsedArgs.credential) : undefined;
+		preferredCredentialSelector = parsedArgs.preferCredential
+			? parseCliCredentialSelector(parsedArgs.preferCredential)
+			: undefined;
+		if (preferredCredentialSelector) {
+			const provider =
+				preferredCredentialSelector.provider ??
+				authStorage.resolveRuntimePreferredCredentialSelectorProvider(preferredCredentialSelector.selector);
+			authStorage.setRuntimePreferredCredentialSelector(provider, preferredCredentialSelector.selector);
+		}
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`${chalk.red(message)}\n`);
+		process.exit(1);
+	}
+
+	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
+	const startupModelSelectors = resolveStartupModelRefreshSelectors(
+		{
+			model: parsedArgs.model,
+			provider: parsedArgs.provider,
+			credential: parsedArgs.credential,
+			continue: parsedArgs.continue,
+			resume: parsedArgs.resume,
+			hasStartupProfile: hasRootStartupProfile,
+		},
+		settingsInstance,
+	);
+	const explicitStartupModelSelector = parsedArgs.model
+		? typeof startupModelSelectors === "string"
+			? startupModelSelectors
+			: parsedArgs.model
+		: undefined;
+	if (parsedArgs.apiKey && explicitStartupModelSelector) {
+		const parsedModel = parseModelString(explicitStartupModelSelector);
+		if (parsedModel) authStorage.setRuntimeApiKey(parsedModel.provider, parsedArgs.apiKey);
+	}
 	await logger.time(
 		"refreshStartupModelProviders",
 		refreshMissingQualifiedModelProviders,
@@ -1800,7 +1847,6 @@ export async function runRootCommand(
 	if (isInteractive && sessionOptions.mcpConfigPath) {
 		sessionOptions.deferMcpConfigStartup = true;
 	}
-	const hasRootStartupProfile = Boolean(settingsInstance.get("modelProfile.default") || parsedArgs.mpreset);
 	// ACP is not carved out: `gjc acp` is broker-backed and never builds a local
 	// session here, and the broker-launched lifecycle child defers memory startup
 	// unconditionally (createLifecycleAgentSession) so readiness never waits on
@@ -1811,37 +1857,8 @@ export async function runRootCommand(
 	const acpStartupOptions = mode === "acp" ? resolveAcpStartupOptions(parsedArgs, sessionOptions) : undefined;
 
 	// Handle CLI credential selection and --api-key as runtime overrides (not persisted).
-	if (parsedArgs.apiKey && parsedArgs.credential) {
-		process.stderr.write(`${chalk.red("--api-key and --credential cannot be used together")}\n`);
-		process.exit(1);
-	}
-	if (parsedArgs.credential && parsedArgs.preferCredential) {
-		process.stderr.write(`${chalk.red("--credential and --prefer-credential cannot be used together")}\n`);
-		process.exit(1);
-	}
-	if (parsedArgs.apiKey && parsedArgs.preferCredential) {
-		process.stderr.write(`${chalk.red("--api-key and --prefer-credential cannot be used together")}\n`);
-		process.exit(1);
-	}
-
-	if (parsedArgs.credential) {
-		try {
-			sessionOptions.credentialSelector = parseCliCredentialSelector(parsedArgs.credential);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			process.stderr.write(`${chalk.red(message)}\n`);
-			process.exit(1);
-		}
-	}
-	if (parsedArgs.preferCredential) {
-		try {
-			sessionOptions.preferredCredentialSelector = parseCliCredentialSelector(parsedArgs.preferCredential);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			process.stderr.write(`${chalk.red(message)}\n`);
-			process.exit(1);
-		}
-	}
+	if (credentialSelector) sessionOptions.credentialSelector = credentialSelector;
+	if (preferredCredentialSelector) sessionOptions.preferredCredentialSelector = preferredCredentialSelector;
 	if (parsedArgs.apiKey) {
 		if (!sessionOptions.model && !sessionOptions.modelPattern) {
 			process.stderr.write(

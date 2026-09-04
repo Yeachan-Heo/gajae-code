@@ -1621,6 +1621,7 @@ export class AuthStorage {
 	 */
 	setRuntimeApiKey(provider: string, apiKey: string): void {
 		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.get(storageProvider) === apiKey) return;
 		this.#runtimeOverrides.set(storageProvider, apiKey);
 		this.#bumpGeneration("set-runtime-api-key", storageProvider);
 	}
@@ -1937,6 +1938,8 @@ export class AuthStorage {
 			throw new Error(`Preferred credential selector cannot be combined with a credential selector for ${provider}`);
 		}
 		this.#assertPreferredCredentialSelectorUsable(storageProvider, selector);
+		const existing = this.#runtimePreferredCredentialSelectors.get(storageProvider);
+		if (existing?.kind === selector.kind && existing.value === selector.value) return;
 		this.#runtimePreferredCredentialSelectors.set(storageProvider, selector);
 		this.#bumpGeneration("set-runtime-preferred-credential-selector", provider);
 	}

@@ -180,6 +180,7 @@ export async function fetchAntigravityDiscoveryModels(
 	options: FetchAntigravityDiscoveryModelsOptions,
 ): Promise<Model<"google-gemini-cli">[] | null> {
 	const fetcher = options.fetcher ?? fetch;
+	const signal = options.signal ?? AbortSignal.timeout(5_000);
 	const targetProvider = options.targetProvider ?? "google-antigravity";
 	const endpoints = options.endpoint
 		? [trimTrailingSlashes(options.endpoint)]
@@ -196,7 +197,7 @@ export async function fetchAntigravityDiscoveryModels(
 					"User-Agent": options.userAgent ?? getAntigravityUserAgent(),
 				},
 				body: JSON.stringify({}),
-				signal: options.signal,
+				signal,
 			});
 		} catch {
 			continue;

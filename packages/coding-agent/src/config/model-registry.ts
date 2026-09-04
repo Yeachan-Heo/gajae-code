@@ -3578,8 +3578,9 @@ export class ModelRegistry {
 		// through discovery.type.
 		if (this.#configuredProviderIds.has("vllm")) configuredDiscoveryProviders.add("vllm");
 		if (this.#configuredProviderIds.has("sglang")) configuredDiscoveryProviders.add("sglang");
-		const managerOptions = (await this.#collectBuiltInModelManagerOptions(configuredDiscoveryProviders)).filter(
-			entry => (providerFilter ? providerFilter.has(entry.options.providerId) : true),
+		const managerOptions = await this.#collectBuiltInModelManagerOptions(
+			configuredDiscoveryProviders,
+			providerFilter,
 		);
 		if (managerOptions.length === 0) {
 			return [];
@@ -3592,6 +3593,7 @@ export class ModelRegistry {
 
 	async #collectBuiltInModelManagerOptions(
 		excludedProviderIds: ReadonlySet<string> = new Set(),
+		providerFilter?: ReadonlySet<string>,
 	): Promise<ModelManagerDiscoveryOptions[]> {
 		const specialProviderDescriptors: Array<{
 			providerId: string;
@@ -3635,10 +3637,16 @@ export class ModelRegistry {
 		];
 		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const standardProviderDescriptors = PROVIDER_DESCRIPTORS.filter(
-			descriptor => !disabledProviders.has(descriptor.providerId) && !excludedProviderIds.has(descriptor.providerId),
+			descriptor =>
+				!disabledProviders.has(descriptor.providerId) &&
+				!excludedProviderIds.has(descriptor.providerId) &&
+				(providerFilter === undefined || providerFilter.has(descriptor.providerId)),
 		);
 		const enabledSpecialProviderDescriptors = specialProviderDescriptors.filter(
-			descriptor => !disabledProviders.has(descriptor.providerId) && !excludedProviderIds.has(descriptor.providerId),
+			descriptor =>
+				!disabledProviders.has(descriptor.providerId) &&
+				!excludedProviderIds.has(descriptor.providerId) &&
+				(providerFilter === undefined || providerFilter.has(descriptor.providerId)),
 		);
 		for (const descriptor of standardProviderDescriptors) {
 			if (!descriptor.allowUnauthenticated) continue;
