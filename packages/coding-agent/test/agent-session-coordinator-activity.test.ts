@@ -719,6 +719,7 @@ describe("AgentSession coordinator activity labels", () => {
 		})();
 
 		await session.agent.prompt("run a tool, then fail the next turn");
+		await session.awaitSessionSettlement();
 		const settled = await settledActivity(stateFile);
 		sampling = false;
 		await sampler;
