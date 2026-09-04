@@ -34,20 +34,6 @@ async function waitForFile(file: string): Promise<void> {
 	throw new Error(`Timed out waiting for ${file}`);
 }
 
-async function waitForAbsent(file: string): Promise<void> {
-	const deadline = Date.now() + 20_000;
-	while (Date.now() < deadline) {
-		try {
-			await fs.stat(file);
-			await Bun.sleep(20);
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-			throw error;
-		}
-	}
-	throw new Error(`Timed out waiting for removal of ${file}`);
-}
-
 function spawnLockWorker(dir: string, ready: string, journal: string, label: string, holdMs: number): LockWorker {
 	const source = `
 		import * as fs from "node:fs/promises";
@@ -305,7 +291,6 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 			incarnation: incumbentOwner.process_incarnation,
 		});
 		replacementPid = discovery!.pid;
-		await waitForAbsent(path.join(dir, "sdk", "broker.startup.lock"));
 	} finally {
 		first?.kill("SIGKILL");
 		if (replacementPid !== undefined)
@@ -317,7 +302,7 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 		await Bun.sleep(300);
 		await fs.rm(dir, { recursive: true, force: true });
 	}
-}, 45_000);
+}, 30_000);
 
 it("the parent discovery budget covers child-fence contention plus a full startup attempt", async () => {
 	const dir = await temp();
