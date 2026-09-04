@@ -1368,7 +1368,8 @@ function assertRelocationRuntimeStateIdentity(previous: Record<string, unknown>,
 function runtimeStateFileForContext(context: RuntimeStateContext): string | null {
 	const explicit = process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim();
 	if (explicit) return explicit;
-	if (!context.sessionId.trim() || !context.sessionFile) return null;
+	if (context.sessionFile === null) return null;
+	if (!context.sessionId.trim()) return null;
 	return path.join(sessionRuntimeDir(context.cwd, context.sessionId), "runtime-state.json");
 }
 function branchForContext(context: RuntimeStateContext): string | null {
