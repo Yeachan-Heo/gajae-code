@@ -10,6 +10,11 @@ import {
 export const CHAT_EFFECT_JOURNAL_VERSION = 1;
 export const MAX_TERMINAL_CHAT_EFFECTS = 128;
 
+/** Test-only failure seam for durable authority migration regressions. */
+export const __chatEffectJournalTestHooks: {
+	beforeAuthorityMigrationEffect?: (effectId: string) => void | Promise<void>;
+} = {};
+
 export function chatEffectJournalPath(agentDir: string, transport: "discord" | "slack"): string {
 	return conversationStorePath(agentDir, transport, "effects.json");
 }
@@ -193,6 +198,7 @@ export class ChatEffectJournal {
 		if (!previousAuthorityId || !currentAuthorityId || previousAuthorityId === currentAuthorityId) return;
 		for (const effect of await this.list()) {
 			if (effect.sessionId !== sessionId || effect.endpointGeneration !== endpointGeneration) continue;
+			await __chatEffectJournalTestHooks.beforeAuthorityMigrationEffect?.(effect.id);
 			await this.#store.transact(effect.id, current => {
 				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
 					return current;

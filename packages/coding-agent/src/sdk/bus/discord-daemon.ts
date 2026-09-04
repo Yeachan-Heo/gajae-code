@@ -153,6 +153,17 @@ type DiscordInboundClaim = {
 	liveCallbackEffect?: ChatEffect<DiscordInboundEffectPayload>;
 };
 
+function attachmentAcceptsAuthority(attachment: SessionAttachment, authorityId: string | undefined): boolean {
+	return (
+		attachment.authorityId === authorityId ||
+		(attachment.legacyAuthorityId !== undefined && attachment.legacyAuthorityId === authorityId)
+	);
+}
+
+function recordAcceptsAuthority(record: DiscordConversation, authorityId: string | undefined): boolean {
+	return record.attachmentAuthorityId === authorityId || record.attachmentAuthorityMigrationFromId === authorityId;
+}
+
 /** SDK-only Discord threaded notification daemon. It owns no AgentSession and never retains endpoint credentials. */
 export class DiscordNotificationDaemon {
 	readonly #store: ConversationStore<DiscordConversation>;
@@ -484,22 +495,21 @@ export class DiscordNotificationDaemon {
 			await this.#store.transact(key, current => {
 				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
 					return current;
-				let receiptChanged = false;
-				const inboundDispatches = current.inboundDispatches?.map(receipt => {
-					if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
-					receiptChanged = true;
-					return { ...receipt, attachmentAuthorityId: currentAuthorityId };
-				});
-				const attachmentAuthorityId =
-					current.attachmentAuthorityId === previousAuthorityId
-						? currentAuthorityId
-						: current.attachmentAuthorityId;
-				if (attachmentAuthorityId === current.attachmentAuthorityId && !receiptChanged) return current;
+				if (
+					current.attachmentAuthorityId !== previousAuthorityId &&
+					!recordAcceptsAuthority(current, previousAuthorityId)
+				)
+					return current;
+				if (
+					current.attachmentAuthorityId === currentAuthorityId &&
+					current.attachmentAuthorityMigrationFromId === previousAuthorityId
+				)
+					return current;
 				return normalizeDiscordConversation({
 					...current,
 					generation: current.generation + 1,
-					attachmentAuthorityId,
-					...(inboundDispatches === undefined ? {} : { inboundDispatches }),
+					attachmentAuthorityId: currentAuthorityId,
+					attachmentAuthorityMigrationFromId: previousAuthorityId,
 					updatedAt: this.#now(),
 				});
 			});
@@ -510,6 +520,29 @@ export class DiscordNotificationDaemon {
 			previousAuthorityId,
 			currentAuthorityId,
 		);
+		for (const key of Object.keys(document.conversations)) {
+			await this.#store.transact(key, current => {
+				if (
+					!current ||
+					current.sessionId !== sessionId ||
+					current.endpointGeneration !== endpointGeneration ||
+					current.attachmentAuthorityId !== currentAuthorityId ||
+					current.attachmentAuthorityMigrationFromId !== previousAuthorityId
+				)
+					return current;
+				const inboundDispatches = current.inboundDispatches?.map(receipt => {
+					if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
+					return { ...receipt, attachmentAuthorityId: currentAuthorityId };
+				});
+				return normalizeDiscordConversation({
+					...current,
+					generation: current.generation + 1,
+					attachmentAuthorityMigrationFromId: undefined,
+					...(inboundDispatches === undefined ? {} : { inboundDispatches }),
+					updatedAt: this.#now(),
+				});
+			});
+		}
 	}
 
 	/** Posts a safe command outcome to the active mapped conversation. */
@@ -528,11 +561,21 @@ export class DiscordNotificationDaemon {
 		if (closing) await this.#driveClose(closing);
 	}
 
-	async recoverCleanup(sessionId: string, endpointGeneration: number, authorityId?: string): Promise<boolean> {
+	async recoverCleanup(
+		sessionId: string,
+		endpointGeneration: number,
+		authorityId?: string,
+		legacyAuthorityId?: string,
+	): Promise<boolean> {
 		const record = await this.#bySession(sessionId);
 		if (record?.endpointGeneration !== endpointGeneration) return true;
 		if (record?.state === "closed" || record?.state === "archived" || record?.state === "resuming") return true;
-		if (!closingIntent(record) && record?.state === "active" && record.attachmentAuthorityId === authorityId)
+		if (
+			!closingIntent(record) &&
+			record?.state === "active" &&
+			(record.attachmentAuthorityId === authorityId ||
+				(legacyAuthorityId !== undefined && record.attachmentAuthorityId === legacyAuthorityId))
+		)
 			return true;
 		if (!closingIntent(record)) return false;
 		await this.#driveClose(record);
@@ -637,7 +680,10 @@ export class DiscordNotificationDaemon {
 	): Promise<DiscordConversation | undefined> {
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.state === "closed") return undefined;
-		if (attachmentAuthorityId !== undefined && record.attachmentAuthorityId !== attachmentAuthorityId) {
+		if (
+			attachmentAuthorityId !== undefined &&
+			!(await this.#mappingAuthorityCurrent(record, endpointGeneration, attachmentAuthorityId))
+		) {
 			await this.retireAttachment(sessionId, record.endpointGeneration ?? endpointGeneration);
 			return undefined;
 		}
@@ -1355,7 +1401,7 @@ export class DiscordNotificationDaemon {
 			current?.state !== "active" ||
 			current.sessionId !== record.sessionId ||
 			current.endpointGeneration !== receipt.endpointGeneration ||
-			current.attachmentAuthorityId !== receipt.attachmentAuthorityId ||
+			!recordAcceptsAuthority(current, receipt.attachmentAuthorityId) ||
 			!claimed
 		)
 			return undefined;
@@ -1460,7 +1506,7 @@ export class DiscordNotificationDaemon {
 		return (
 			record.state === "active" &&
 			record.endpointGeneration === attachment.generation &&
-			record.attachmentAuthorityId === attachment.authorityId
+			attachmentAcceptsAuthority(attachment, record.attachmentAuthorityId)
 		);
 	}
 	async #bindingCurrent(
@@ -1474,7 +1520,7 @@ export class DiscordNotificationDaemon {
 				!!attachment &&
 				attachment.isCurrent() &&
 				attachment.generation === endpointGeneration &&
-				attachment.authorityId === attachmentAuthorityId
+				attachmentAcceptsAuthority(attachment, attachmentAuthorityId)
 			);
 		} catch {
 			return false;
@@ -1487,6 +1533,18 @@ export class DiscordNotificationDaemon {
 	): Promise<void> {
 		if (!(await this.#bindingCurrent(sessionId, endpointGeneration, attachmentAuthorityId)))
 			throw new DiscordAttachmentBindingError();
+	}
+	async #mappingAuthorityCurrent(
+		record: DiscordConversation,
+		endpointGeneration: number,
+		requestedAuthorityId: string | undefined,
+	): Promise<boolean> {
+		if (requestedAuthorityId === undefined || record.attachmentAuthorityId === requestedAuthorityId) return true;
+		if (!record.sessionId || record.endpointGeneration !== endpointGeneration) return false;
+		return (
+			(await this.#bindingCurrent(record.sessionId, endpointGeneration, record.attachmentAuthorityId)) &&
+			(await this.#bindingCurrent(record.sessionId, endpointGeneration, requestedAuthorityId))
+		);
 	}
 	#isDefiniteSdkPreSendFailure(error: unknown): boolean {
 		if (error instanceof DiscordAttachmentBindingError) return true;
@@ -1515,14 +1573,13 @@ export class DiscordNotificationDaemon {
 		if (existing?.state === "active" && existing.threadId) {
 			if (
 				existing.endpointGeneration === input.endpointGeneration &&
-				(input.attachmentAuthorityId === undefined ||
-					existing.attachmentAuthorityId === input.attachmentAuthorityId)
+				(await this.#mappingAuthorityCurrent(existing, input.endpointGeneration, input.attachmentAuthorityId))
 			)
 				return existing;
 			if (
 				existing.endpointGeneration === input.endpointGeneration &&
 				input.attachmentAuthorityId !== undefined &&
-				existing.attachmentAuthorityId !== input.attachmentAuthorityId
+				!(await this.#mappingAuthorityCurrent(existing, input.endpointGeneration, input.attachmentAuthorityId))
 			) {
 				await this.retireAttachment(input.sessionId, input.endpointGeneration);
 				return await this.#ensureConversation(input);
@@ -1545,7 +1602,7 @@ export class DiscordNotificationDaemon {
 			}
 			if (
 				created.endpointGeneration === input.endpointGeneration &&
-				(input.attachmentAuthorityId === undefined || created.attachmentAuthorityId === input.attachmentAuthorityId)
+				(await this.#mappingAuthorityCurrent(created, input.endpointGeneration, input.attachmentAuthorityId))
 			)
 				return created;
 			await this.#requireLiveBinding(input.sessionId, input.endpointGeneration, input.attachmentAuthorityId);
@@ -1589,13 +1646,13 @@ export class DiscordNotificationDaemon {
 			if (active?.state === "active" && active.threadId) {
 				if (
 					active.endpointGeneration === endpointGeneration &&
-					(attachmentAuthorityId === undefined || active.attachmentAuthorityId === attachmentAuthorityId)
+					(await this.#mappingAuthorityCurrent(active, endpointGeneration, attachmentAuthorityId))
 				)
 					return active;
 				if (
 					active.endpointGeneration === endpointGeneration &&
 					attachmentAuthorityId !== undefined &&
-					active.attachmentAuthorityId !== attachmentAuthorityId
+					!(await this.#mappingAuthorityCurrent(active, endpointGeneration, attachmentAuthorityId))
 				) {
 					await this.retireAttachment(sessionId, endpointGeneration);
 					continue;
@@ -2244,7 +2301,7 @@ export class DiscordNotificationDaemon {
 			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
 			...(components ? { components } : {}),
 		};
-		if (payload.attachmentAuthorityId !== record.attachmentAuthorityId)
+		if (!recordAcceptsAuthority(record, payload.attachmentAuthorityId))
 			throw new DiscordAttachmentBindingError("Discord provider effect belongs to another attachment.");
 		await this.#runEffect(
 			id,
@@ -2286,7 +2343,7 @@ export class DiscordNotificationDaemon {
 						(allowInactive || current.state === "active") &&
 						current.generation === record.generation &&
 						current.endpointGeneration === record.endpointGeneration &&
-						current.attachmentAuthorityId === payload.attachmentAuthorityId &&
+						recordAcceptsAuthority(current, payload.attachmentAuthorityId) &&
 						(!actionPublication || current.pendingActionEffectId === id);
 				return (
 					mappingCurrent &&
@@ -2309,22 +2366,27 @@ export class DiscordNotificationDaemon {
 		closing = false,
 		occurrenceId?: string,
 	): Promise<void> {
-		const existingEffect = await this.#effects.read<{ attachmentAuthorityId?: string }>(id);
-		if (existingEffect && existingEffect.payload.attachmentAuthorityId !== record.attachmentAuthorityId)
+		const expectedPayload = {
+			threadId: record.threadId!,
+			locked,
+			...(record.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: record.attachmentAuthorityId }),
+			...(occurrenceId === undefined ? {} : { occurrenceId }),
+		};
+		const existingEffect = await this.#effects.read<typeof expectedPayload>(id);
+		const payload = existingEffect?.payload ?? expectedPayload;
+		if (
+			payload.threadId !== expectedPayload.threadId ||
+			payload.locked !== expectedPayload.locked ||
+			payload.occurrenceId !== expectedPayload.occurrenceId ||
+			!recordAcceptsAuthority(record, payload.attachmentAuthorityId)
+		)
 			throw new DiscordAttachmentBindingError("Discord thread effect belongs to another attachment.");
 		await this.#runEffect(
 			id,
 			operation,
 			record.sessionId,
 			record.endpointGeneration!,
-			{
-				threadId: record.threadId!,
-				locked,
-				...(record.attachmentAuthorityId === undefined
-					? {}
-					: { attachmentAuthorityId: record.attachmentAuthorityId }),
-				...(occurrenceId === undefined ? {} : { occurrenceId }),
-			},
+			payload,
 
 			async (ensure, beforeProvider) => {
 				await ensure();
@@ -2371,20 +2433,29 @@ export class DiscordNotificationDaemon {
 	async #createThreadEffect(intent: DiscordConversation, name: string): Promise<DiscordThread> {
 		const effectId = `create:${intent.sessionId}:${intent.createNonce}`;
 		const nonce = discordEffectNonce(effectId);
+		const expectedPayload = {
+			guildId: intent.guildId,
+			parentId: intent.parentChannelId,
+			name,
+			nonce,
+			...(intent.attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId: intent.attachmentAuthorityId }),
+		};
+		const existingEffect = await this.#effects.read<typeof expectedPayload>(effectId);
+		const payload = existingEffect?.payload ?? expectedPayload;
+		if (
+			payload.guildId !== expectedPayload.guildId ||
+			payload.parentId !== expectedPayload.parentId ||
+			payload.name !== expectedPayload.name ||
+			payload.nonce !== expectedPayload.nonce ||
+			!recordAcceptsAuthority(intent, payload.attachmentAuthorityId)
+		)
+			throw new DiscordAttachmentBindingError("Discord create effect belongs to another attachment.");
 		const receipt = await this.#runEffect(
 			effectId,
 			"create-thread",
 			intent.sessionId,
 			intent.endpointGeneration!,
-			{
-				guildId: intent.guildId,
-				parentId: intent.parentChannelId,
-				name,
-				nonce,
-				...(intent.attachmentAuthorityId === undefined
-					? {}
-					: { attachmentAuthorityId: intent.attachmentAuthorityId }),
-			},
+			payload,
 			async ensure => {
 				await ensure();
 				const existing = await this.options.provider.findThreadByNonce({
@@ -2441,7 +2512,7 @@ export class DiscordNotificationDaemon {
 			intent.sessionId === effect.sessionId &&
 			intent.guildId === payload.guildId &&
 			intent.parentChannelId === payload.parentId &&
-			intent.attachmentAuthorityId === payload.attachmentAuthorityId &&
+			recordAcceptsAuthority(intent, payload.attachmentAuthorityId) &&
 			discordEffectNonce(`create:${intent.sessionId}:${intent.createNonce}`) === payload.nonce;
 		if (!matchesIntent || !intent) {
 			if (effect.state !== "terminal") await this.#terminalizeEffect(effect.id, "rejected");

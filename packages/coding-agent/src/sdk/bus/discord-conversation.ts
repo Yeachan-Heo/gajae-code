@@ -30,6 +30,8 @@ export interface DiscordConversation extends ConversationRecord {
 	createLeaseExpiresAt?: number;
 	endpointGeneration?: number;
 	attachmentAuthorityId?: string;
+	/** Durable dual-authority fence while mapping and effect migration is incomplete. */
+	attachmentAuthorityMigrationFromId?: string;
 	/** Immutable lineage for archive and resume provider effects. */
 	effectIncarnationId?: string;
 	/** Current archive operation authority. */

@@ -41,6 +41,7 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 	afterEach(() => {
 		FileLockTestHooks.afterParentMkdir = undefined;
 		__sessionStateSidecarTestHooks.beforePersistFromEvent = undefined;
+		__sessionStateSidecarTestHooks.beforeRescopeClear = undefined;
 		if (process.cwd() !== processCwdAtStart) {
 			process.chdir(processCwdAtStart);
 		}
@@ -474,6 +475,60 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			).toBe(false);
 		} finally {
 			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("retains the coordinator rescope fence when abort journal cleanup fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		const unregister = sessionManager.registerBeforeMoveListener(() => {
+			throw new Error("later listener refused");
+		});
+		try {
+			__sessionStateSidecarTestHooks.beforeRescopeClear = () => {
+				throw new Error("abort journal cleanup exploded");
+			};
+			await expect(sessionManager.moveTo(cwdB)).rejects.toThrow();
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(
+				fs.existsSync(path.join(sessionRuntimeDir(cwdB, session.sessionId), "runtime-state-rescope.json")),
+			).toBe(true);
+			__sessionStateSidecarTestHooks.beforeRescopeClear = undefined;
+			unregister();
+			await expect(sessionManager.moveTo(cwdB)).rejects.toThrow("Coordinator rescope barrier is already active");
+		} finally {
+			__sessionStateSidecarTestHooks.beforeRescopeClear = undefined;
+			unregister();
+			await session.dispose();
+		}
+	}, 20_000);
+
+	it("retains the coordinator rescope fence and move identity when journal cleanup fails", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const cwdB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(cwdB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			__sessionStateSidecarTestHooks.beforeRescopeClear = () => {
+				throw new Error("rescope journal cleanup exploded");
+			};
+			await sessionManager.moveTo(cwdB);
+
+			expect(
+				fs.existsSync(path.join(sessionRuntimeDir(cwdB, session.sessionId), "runtime-state-rescope.json")),
+			).toBe(true);
+			await expect(sessionManager.moveTo(cwdA)).rejects.toThrow("Coordinator rescope barrier is already active");
+		} finally {
+			__sessionStateSidecarTestHooks.beforeRescopeClear = undefined;
 			await session.dispose();
 		}
 	}, 20_000);

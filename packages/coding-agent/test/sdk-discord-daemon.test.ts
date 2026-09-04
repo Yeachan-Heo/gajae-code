@@ -1,10 +1,11 @@
-import { describe, expect, test, vi } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ChatDeliveryError } from "../src/sdk/bus/chat-daemon-runtime";
 import {
+	__chatEffectJournalTestHooks,
 	type ChatEffect,
 	ChatEffectJournal,
 	type ChatEffectLease,
@@ -28,6 +29,10 @@ import type {
 } from "../src/sdk/bus/discord-provider";
 import { SdkClientError } from "../src/sdk/client/client";
 import type { SessionAttachment } from "../src/sdk/router";
+
+afterEach(() => {
+	__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+});
 
 const actionCustomIds = new Map<string, string>();
 
@@ -222,19 +227,37 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 					content: "root",
 				});
 				authorityId = "device-bound-authority";
-				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = () => {
+					throw new Error("effect migration exploded");
+				};
+				await expect(
+					daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId),
+				).rejects.toThrow("effect migration exploded");
 
 				const store = new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" });
+				const fenced = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session" && record.threadId === conversation.threadId,
+				);
+				expect(fenced?.attachmentAuthorityId).toBe("device-bound-authority");
+				expect(fenced?.attachmentAuthorityMigrationFromId).toBe("legacy-authority");
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
+				let effect = (await journal.list()).find(record => record.kind === "post-message");
+				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
+					"legacy-authority",
+				);
+
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+				await daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId);
 				const migrated = Object.values((await store.load()).conversations).find(
 					record => record.sessionId === "session" && record.threadId === conversation.threadId,
 				);
-				expect(migrated?.attachmentAuthorityId).toBe("device-bound-authority");
-
-				const journal = new ChatEffectJournal({ agentDir, transport: "discord" });
-				const effect = (await journal.list()).find(record => record.kind === "post-message");
+				expect(migrated?.attachmentAuthorityMigrationFromId).toBeUndefined();
+				effect = (await journal.list()).find(record => record.kind === "post-message");
 				expect((effect?.payload as { attachmentAuthorityId?: string }).attachmentAuthorityId).toBe(
 					"device-bound-authority",
 				);
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
 			},
 			{
 				resolveAttachment: async sessionId => ({
