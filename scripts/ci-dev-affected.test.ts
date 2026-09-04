@@ -1401,6 +1401,45 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+	test("extensibility sources select the bounded Function Hooks/plugin owner shard", () => {
+		const ownerTests = [
+			"packages/coding-agent/test/function-hooks.test.ts",
+			"packages/coding-agent/test/extensions-discovery.test.ts",
+			"packages/coding-agent/test/extensions-runner.test.ts",
+			"packages/coding-agent/test/extensions-wrapper.test.ts",
+			"packages/coding-agent/test/hook-event-normalization.test.ts",
+			"packages/coding-agent/test/gjc-plugin-schema.test.ts",
+			"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
+			"packages/coding-agent/test/gjc-plugin-registry.test.ts",
+			"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
+			"packages/coding-agent/test/gjc-plugin-loader.test.ts",
+			"packages/coding-agent/test/gjc-plugin-constrained-hooks.test.ts",
+			"packages/coding-agent/test/gjc-plugin-hook-extension.test.ts",
+			"packages/coding-agent/test/gjc-plugin-activation-dispatch.test.ts",
+			"packages/coding-agent/test/gjc-plugin-observability.test.ts",
+			"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
+		];
+		const changedSources = [
+			"packages/coding-agent/src/extensibility/extensions/function-hooks.ts",
+			"packages/coding-agent/src/extensibility/extensions/runner.ts",
+			"packages/coding-agent/src/extensibility/extensions/loader.ts",
+			"packages/coding-agent/src/extensibility/extensions/wrapper.ts",
+			"packages/coding-agent/src/extensibility/extensions/types.ts",
+			"packages/coding-agent/src/extensibility/hooks/loader.ts",
+			"packages/coding-agent/src/extensibility/hooks/types.ts",
+			"packages/coding-agent/src/extensibility/gjc-plugins/compiler.ts",
+			"packages/coding-agent/src/extensibility/gjc-plugins/schema.ts",
+			"packages/coding-agent/src/extensibility/gjc-plugins/registry.ts",
+			"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts",
+			"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts",
+		];
+		for (const changedSource of changedSources) {
+			const keys = targeted([changedSource]).map(task => task.key);
+			for (const ownerTest of ownerTests) expect(keys).toContain(`test:${ownerTest}`);
+			expect(keys).not.toContain("test:@gajae-code/coding-agent");
+			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
+		}
+	});
 	test("never emits a runnable task for a nonexistent test path", () => {
 		const missing = "packages/coding-agent/test/write-acp-fs-missing.test.ts";
 		const tasks = planTargetedTasks([missing], targetingPackages, [...testFiles, missing], true);

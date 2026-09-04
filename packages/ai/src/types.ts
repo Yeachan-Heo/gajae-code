@@ -464,6 +464,7 @@ export interface StreamOptions {
 		payload: unknown,
 		model?: Model<Api>,
 		scope?: AttemptScopeRef,
+		signal?: AbortSignal,
 	) => unknown | undefined | Promise<unknown | undefined>;
 	/**
 	 * Optional callback for provider response metadata after headers are received.
@@ -473,6 +474,7 @@ export interface StreamOptions {
 		response: ProviderResponseMetadata,
 		model?: Model<Api>,
 		scope?: AttemptScopeRef,
+		signal?: AbortSignal,
 	) => void | Promise<void>;
 	/**
 	 * Internal dispatch-admission hook. Providers invoke this immediately before

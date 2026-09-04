@@ -3,10 +3,11 @@ import {
 	type FunctionHook,
 	type FunctionHookEventType,
 	type FunctionHookRegistration,
+	type FunctionHookRegistrationOptions,
 	normalizeFunctionHookGrant,
 	tagFunctionHookHandler,
 } from "../src/extensibility/extensions/function-hooks";
-import { ExtensionRuntime } from "../src/extensibility/extensions/loader";
+import { ExtensionRuntime, loadExtensionFromFactory } from "../src/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -14,6 +15,7 @@ import {
 } from "../src/extensibility/extensions/runner";
 import type { Extension, ExtensionSessionMetadata, ToolCallEvent } from "../src/extensibility/extensions/types";
 import { SessionManager } from "../src/session/session-manager";
+import { EventBus } from "../src/utils/event-bus";
 
 type HookRegistration = Omit<FunctionHookRegistration, "grant"> & {
 	grant?: Parameters<typeof normalizeFunctionHookGrant>[0];
@@ -89,7 +91,45 @@ afterEach(() => {
 });
 
 describe("capability-scoped function hooks", () => {
-	test("composes wildcard observation before exact transformation without exposing tool input", async () => {
+	test("applies a host-owned grant ceiling and provenance", async () => {
+		const runtime = new ExtensionRuntime();
+		let networkCapability: unknown = "unset";
+		let provenance: unknown;
+		const extension = await loadExtensionFromFactory(
+			api => {
+				api.registerFunctionHook(
+					"tool_call",
+					async (invocation, capabilities, next) => {
+						networkCapability = capabilities.network;
+						provenance = invocation.provenance;
+						return await next();
+					},
+					{
+						target: "read",
+						capabilities: ["tool.inspect", "network.fetch"],
+						networkDestinations: ["https://example.com"],
+						provenance: { source: "builtin", path: "/spoofed" },
+					} as FunctionHookRegistrationOptions & {
+						provenance: { source: "builtin"; path: string };
+					},
+				);
+			},
+			process.cwd(),
+			new EventBus(),
+			runtime,
+			"project-extension",
+		);
+		const runner = new ExtensionRunner([extension], runtime, process.cwd(), SessionManager.inMemory(), {} as never);
+		expect(await runner.emitToolCall(toolCall())).toBeUndefined();
+		expect(networkCapability).toBeUndefined();
+		expect(provenance).toEqual({
+			source: "extension",
+			extensionId: "project-extension",
+			path: "project-extension",
+		});
+	});
+
+	test("composes wildcard observation before exact transformation without exposing wildcard payload", async () => {
 		const calls: string[] = [];
 		const runner = makeRunner([
 			registration(
@@ -329,6 +369,90 @@ describe("capability-scoped function hooks", () => {
 		expect(await runner.emitBeforeAgentStart("hello", undefined, [])).toBeUndefined();
 	});
 
+	test("returns before-agent prompt and image transformations without legacy handlers", async () => {
+		const runner = makeRunner([
+			registration(
+				"before_agent_start",
+				async invocation => ({
+					action: "continue",
+					event: {
+						...invocation.payload,
+						prompt: "redacted",
+						images: undefined,
+						systemPrompt: ["safe system"],
+					},
+				}),
+				{ capabilities: ["ui.transform"] },
+				0,
+			),
+		]);
+		expect(
+			await runner.emitBeforeAgentStart(
+				"secret",
+				[{ type: "image", data: "base64", mimeType: "image/png" }],
+				["system"],
+			),
+		).toEqual({ prompt: "redacted", images: undefined, systemPrompt: ["safe system"] });
+	});
+
+	test("does not treat concurrent top-level dispatches as recursive re-entry", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => {
+					await Bun.sleep(10);
+					return await next();
+				},
+				{ capabilities: ["tool.inspect"] },
+				0,
+				"read",
+			),
+		]);
+		const results = await Promise.all(Array.from({ length: 20 }, () => runner.emitToolCall(toolCall())));
+		expect(results.every(result => result === undefined)).toBe(true);
+	});
+
+	test("rejects transformed tool identity", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async invocation => ({
+					action: "continue",
+					event: { ...(invocation.payload as ToolCallEvent), toolName: "bash" },
+				}),
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		expect((await runner.emitToolCall(toolCall()))?.block).toBe(true);
+	});
+
+	test("rejects malformed transformed tool-result content", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_result",
+				async invocation => ({
+					action: "continue",
+					event: { ...invocation.payload, content: [{ type: "text" }] } as never,
+				}),
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		const result = await runner.emitToolResult({
+			type: "tool_result",
+			toolName: "read",
+			toolCallId: "call-1",
+			input: { path: "file.txt" },
+			content: [{ type: "text", text: "safe" }],
+			details: undefined,
+			isError: false,
+		});
+		expect(result?.isError).toBe(true);
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(
@@ -492,5 +616,41 @@ describe("capability-scoped function hooks", () => {
 		await runner.emitFunctionHooks({ type: "session_before_switch", reason: "new" });
 		expect(emitMessage).toBeDefined();
 		expect(() => emitMessage?.()).toThrow("no longer active");
+	});
+
+	test("propagates provider-request cancellation and invalidates capabilities", async () => {
+		let invocationAborted = false;
+		let notify: (() => void) | undefined;
+		const runner = makeRunner([
+			registration(
+				"before_provider_request",
+				async (invocation, capabilities) => {
+					notify = () => capabilities.ui?.notify("late");
+					invocationAborted = invocation.signal.aborted;
+					await new Promise<void>(resolve => {
+						if (invocation.signal.aborted) {
+							resolve();
+							return;
+						}
+						invocation.signal.addEventListener(
+							"abort",
+							() => {
+								invocationAborted = true;
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+				},
+				{ capabilities: ["ui.transform", "ui.notify"] },
+				0,
+			),
+		]);
+		const controller = new AbortController();
+		const pending = runner.emitBeforeProviderRequest({ prompt: "secret" }, undefined, controller.signal);
+		controller.abort(new Error("cancelled"));
+		await expect(pending).rejects.toThrow("Function hook timed out");
+		expect(invocationAborted).toBe(true);
+		expect(() => notify?.()).toThrow("no longer active");
 	});
 });

@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import type { AgentMessage } from "@gajae-code/agent-core";
@@ -35,6 +36,7 @@ import {
 	type FunctionHookRegistration,
 	type FunctionHookResult,
 	functionHookDenyAllowed,
+	functionHookEventIdentityMatches,
 	functionHookGrantHash,
 	functionHookPayloadHash,
 	functionHookTransformAllowed,
@@ -96,6 +98,8 @@ import { createExtensionSettings } from "./types";
 interface BeforeAgentStartCombinedResult {
 	messages?: NonNullable<BeforeAgentStartEventResult["message"]>[];
 	systemPrompt?: string[];
+	prompt?: string;
+	images?: ImageContent[];
 }
 
 const BEFORE_AGENT_START_RESULT_KEYS = new Set(["message", "systemPrompt"]);
@@ -258,7 +262,7 @@ export class ExtensionRunner {
 	#functionHookAuditSequence = 0;
 	#functionHookAudit: FunctionHookAuditRecord[] = [];
 	#functionHookAuditSink: FunctionHookAuditSink | undefined;
-	#functionHookDepth = 0;
+	#functionHookDepth = new AsyncLocalStorage<number>();
 
 	#getModel: () => Model | undefined = () => undefined;
 	#getCredentialSessionId: () => string = () => "";
@@ -895,6 +899,7 @@ export class ExtensionRunner {
 	#functionHookErrorResult(event: ExtensionEvent, reason: string): FunctionHookDispatchResult<ExtensionEvent> {
 		if (
 			event.type === "tool_call" ||
+			event.type === "tool_result" ||
 			event.type === "before_provider_request" ||
 			event.type.startsWith("session_before_")
 		) {
@@ -967,7 +972,8 @@ export class ExtensionRunner {
 	): Promise<FunctionHookDispatchResult<TEvent>> {
 		const handlers = this.#matchingFunctionHooks(event);
 		if (handlers.length === 0) return { action: "continue", event };
-		if (this.#functionHookDepth >= 16) {
+		const functionHookDepth = this.#functionHookDepth.getStore() ?? 0;
+		if (functionHookDepth >= 16) {
 			const reason = "Function hook re-entry depth exceeded";
 			this.emitError({ extensionPath: "<function-hooks>", event: event.type, error: reason });
 			return this.#functionHookErrorResult(event, reason) as FunctionHookDispatchResult<TEvent>;
@@ -975,8 +981,7 @@ export class ExtensionRunner {
 		const parentSignal = options.signal ?? new AbortController().signal;
 		const eventId = randomUUID();
 		const correlationId = options.correlationId ?? eventId;
-		this.#functionHookDepth += 1;
-		try {
+		return await this.#functionHookDepth.run(functionHookDepth + 1, async () => {
 			const invoke = async (
 				index: number,
 				currentEvent: TEvent,
@@ -1059,7 +1064,7 @@ export class ExtensionRunner {
 					if (
 						nextEvent !== undefined &&
 						(!isPlainFunctionHookData(candidate) ||
-							candidate.type !== currentEvent.type ||
+							!functionHookEventIdentityMatches(currentEvent, candidate) ||
 							!isValidFunctionHookEventValue(candidate) ||
 							!functionHookTransformAllowed(currentEvent, effectiveGrant))
 					) {
@@ -1161,7 +1166,7 @@ export class ExtensionRunner {
 					if (candidate !== undefined) {
 						if (
 							!isPlainFunctionHookData(candidate) ||
-							(candidate as { type?: unknown }).type !== currentEvent.type ||
+							!functionHookEventIdentityMatches(currentEvent, candidate as ExtensionEvent) ||
 							!isValidFunctionHookEventValue(candidate as ExtensionEvent)
 						) {
 							const reason = "Function hook returned an invalid transformed event";
@@ -1224,9 +1229,7 @@ export class ExtensionRunner {
 				return failureResult(reason);
 			};
 			return await invoke(0, event, undefined, parentSignal);
-		} finally {
-			this.#functionHookDepth -= 1;
-		}
+		});
 	}
 
 	#isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
@@ -1297,7 +1300,8 @@ export class ExtensionRunner {
 		continueWhile?: () => boolean,
 		scope?: AttemptScopeRef,
 	): Promise<RunnerEmitResult<TEvent>> {
-		const functionDispatch = await this.emitFunctionHooks(event);
+		const eventSignal = "signal" in event && event.signal instanceof AbortSignal ? event.signal : undefined;
+		const functionDispatch = await this.emitFunctionHooks(event, { signal: eventSignal });
 		if (functionDispatch.action === "deny") {
 			if (this.#isSessionBeforeEvent(event)) return { cancel: true } as RunnerEmitResult<TEvent>;
 			return undefined as RunnerEmitResult<TEvent>;
@@ -1574,8 +1578,8 @@ export class ExtensionRunner {
 		return currentText !== text || currentImages !== images ? { text: currentText, images: currentImages } : {};
 	}
 
-	async emitContext(messages: AgentMessage[], scope?: AttemptScopeRef): Promise<AgentMessage[]> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "context", messages });
+	async emitContext(messages: AgentMessage[], scope?: AttemptScopeRef, signal?: AbortSignal): Promise<AgentMessage[]> {
+		const functionDispatch = await this.emitFunctionHooks({ type: "context", messages }, { signal });
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value as AgentMessage[];
 		const transformedMessages = functionDispatch.event.messages;
@@ -1614,8 +1618,9 @@ export class ExtensionRunner {
 	async emitBeforeProviderRequest(
 		payload: unknown,
 		scope?: AttemptScopeRef,
+		signal?: AbortSignal,
 	): Promise<BeforeProviderRequestEventResult> {
-		const functionDispatch = await this.emitFunctionHooks({ type: "before_provider_request", payload });
+		const functionDispatch = await this.emitFunctionHooks({ type: "before_provider_request", payload }, { signal });
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value;
 		const handlers = this.#legacyHandlers("before_provider_request");
@@ -1648,14 +1653,18 @@ export class ExtensionRunner {
 		response: ProviderResponseMetadata,
 		_model?: Model,
 		scope?: AttemptScopeRef,
+		signal?: AbortSignal,
 	): Promise<void> {
-		const functionDispatch = await this.emitFunctionHooks({
-			type: "after_provider_response",
-			status: response.status,
-			headers: response.headers,
-			requestId: response.requestId,
-			metadata: response.metadata,
-		});
+		const functionDispatch = await this.emitFunctionHooks(
+			{
+				type: "after_provider_response",
+				status: response.status,
+				headers: response.headers,
+				requestId: response.requestId,
+				metadata: response.metadata,
+			},
+			{ signal },
+		);
 		if (functionDispatch.action !== "continue") return;
 		const functionEvent = functionDispatch.event;
 		const handlers = this.#legacyHandlers("after_provider_response");
@@ -1678,28 +1687,46 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPrompt: string[],
+		signal?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult | undefined> {
-		const functionDispatch = await this.emitFunctionHooks({
-			type: "before_agent_start",
-			prompt,
-			images,
-			systemPrompt,
-		});
+		const functionDispatch = await this.emitFunctionHooks(
+			{
+				type: "before_agent_start",
+				prompt,
+				images,
+				systemPrompt,
+			},
+			{ signal },
+		);
 		if (functionDispatch.action === "deny") throw new Error(functionDispatch.reason);
 		if (functionDispatch.action === "return") return functionDispatch.value as BeforeAgentStartCombinedResult;
+		const transformedPrompt = functionDispatch.event.prompt;
+		const transformedImages = functionDispatch.event.images;
+		const promptModified = transformedPrompt !== prompt;
+		const imagesModified = JSON.stringify(transformedImages) !== JSON.stringify(images);
+		const functionSystemPromptModified =
+			JSON.stringify(functionDispatch.event.systemPrompt) !== JSON.stringify(systemPrompt);
 		const handlers = this.#legacyHandlers("before_agent_start");
-		if (handlers.length === 0) return undefined;
+		if (handlers.length === 0) {
+			return promptModified || imagesModified || functionSystemPromptModified
+				? {
+						...(promptModified ? { prompt: transformedPrompt } : {}),
+						...(imagesModified ? { images: transformedImages } : {}),
+						...(functionSystemPromptModified ? { systemPrompt: functionDispatch.event.systemPrompt } : {}),
+					}
+				: undefined;
+		}
 
 		const ctx = this.createContext();
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
 		let currentSystemPrompt = functionDispatch.event.systemPrompt;
-		let systemPromptModified = false;
+		let systemPromptModified = functionSystemPromptModified;
 
 		for (const { ext, handler } of handlers) {
 			const event: BeforeAgentStartEvent = {
 				type: "before_agent_start",
-				prompt,
-				images,
+				prompt: transformedPrompt,
+				images: transformedImages,
 				systemPrompt: currentSystemPrompt,
 			};
 			const handlerResult = await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs);
@@ -1724,10 +1751,12 @@ export class ExtensionRunner {
 			}
 		}
 
-		if (messages.length > 0 || systemPromptModified) {
+		if (messages.length > 0 || systemPromptModified || promptModified || imagesModified) {
 			return {
 				messages: messages.length > 0 ? messages : undefined,
 				systemPrompt: systemPromptModified ? currentSystemPrompt : undefined,
+				prompt: promptModified ? transformedPrompt : undefined,
+				images: imagesModified ? transformedImages : undefined,
 			};
 		}
 

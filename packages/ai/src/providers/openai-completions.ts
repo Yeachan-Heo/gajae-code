@@ -632,7 +632,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					effectiveToolStrictModeOverride,
 				);
 				appliedToolStrictMode = toolStrictMode;
-				options?.onPayload?.(params, undefined, options?.attemptScope);
+				options?.onPayload?.(params, undefined, options?.attemptScope, options?.signal);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,

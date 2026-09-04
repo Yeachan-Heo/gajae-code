@@ -21,10 +21,12 @@ import { getAllPluginExtensionPaths } from "../plugins/loader";
 import * as TypeBox from "../typebox";
 import { resolvePath } from "../utils";
 import {
+	DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
 	type FunctionHook,
 	type FunctionHookEventType,
 	type FunctionHookPayloadFor,
 	type FunctionHookRegistrationOptions,
+	intersectFunctionHookGrants,
 	normalizeFunctionHookGrant,
 	tagFunctionHookHandler,
 	validateFunctionHookTarget,
@@ -286,7 +288,10 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		} else if (options.target !== undefined) {
 			validateFunctionHookTarget(options.target);
 		}
-		const grant = normalizeFunctionHookGrant(options);
+		const grant = intersectFunctionHookGrants(
+			normalizeFunctionHookGrant(options),
+			DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+		);
 		const registration = {
 			event,
 			...(options.target === undefined ? {} : { target: options.target }),
@@ -295,14 +300,9 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 			handler: handler as unknown as FunctionHook,
 			grant,
 			provenance: {
-				source: options.provenance?.source ?? ("extension" as const),
-				...(options.provenance?.scope === undefined ? {} : { scope: options.provenance.scope }),
-				...(options.provenance?.plugin === undefined ? {} : { plugin: options.provenance.plugin }),
-				extensionId: options.provenance?.extensionId ?? this.extension.path,
-				path: options.provenance?.path ?? this.extension.path,
-				...(options.provenance?.activationGeneration === undefined
-					? {}
-					: { activationGeneration: options.provenance.activationGeneration }),
+				source: "extension" as const,
+				extensionId: this.extension.path,
+				path: this.extension.path,
 			},
 		};
 		const list = this.extension.handlers.get(event) ?? [];

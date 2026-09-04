@@ -12472,6 +12472,9 @@ export class AgentSession {
 			hasPendingNextTurnMessages = pendingNextTurnMessageCount > 0;
 			const promptAttribution: "user" | "agent" | undefined =
 				"attribution" in message ? message.attribution : undefined;
+			let effectivePrompt = expandedText;
+			let effectiveImages = options?.images;
+			let promptMessage = message;
 			let phaseACompleted = false;
 			let fileMentionMessages: AgentMessage[] = [];
 			let beforeAgentStartResultMessages: BeforeAgentStartInternalMessage[] = [];
@@ -12492,7 +12495,7 @@ export class AgentSession {
 				if (!phaseACompleted) {
 					phaseACompleted = true;
 					// Phase A (one-time side-effectful products; runs once).
-					const fileMentions = extractFileMentions(expandedText);
+					const fileMentions = extractFileMentions(effectivePrompt);
 					if (fileMentions.length > 0) {
 						const cwd = this.sessionManager.getCwd();
 						// Collect resolved paths already shown (read or mentioned) in the
@@ -12520,7 +12523,7 @@ export class AgentSession {
 							recentlyShownPaths,
 						});
 					}
-					const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
+					const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(effectivePrompt);
 					hindsightRecall = this.getHindsightSessionState()?.getRecallSnippetForInjection();
 					planReferenceMessage = await this.#buildPlanReferenceMessage();
 					// Emit before_agent_start extension event. Race hook completion with
@@ -12531,14 +12534,27 @@ export class AgentSession {
 							generation,
 							preflightSignal,
 							this.#extensionRunner.emitBeforeAgentStart(
-								expandedText,
-								options?.images,
+								effectivePrompt,
+								effectiveImages,
 								beforeAgentStartSystemPrompt,
+								preflightSignal,
 							),
 						);
 						if (result?.messages) beforeAgentStartResultMessages = [...result.messages];
+						if (result?.prompt !== undefined) effectivePrompt = result.prompt;
+						if (result && Object.hasOwn(result, "images")) effectiveImages = result.images;
+						if (result?.prompt !== undefined || (result && Object.hasOwn(result, "images"))) {
+							if (promptMessage.role === "user" || promptMessage.role === "developer") {
+								promptMessage = {
+									...promptMessage,
+									content: [{ type: "text", text: effectivePrompt }, ...(effectiveImages ?? [])],
+								};
+							}
+						}
 						if (result?.systemPrompt !== undefined) {
 							this.agent.setSystemPrompt(result.systemPrompt);
+						} else if (result?.prompt !== undefined) {
+							this.agent.setSystemPrompt(await this.#buildSystemPromptForAgentStart(effectivePrompt));
 						} else {
 							this.agent.setSystemPrompt(beforeAgentStartSystemPrompt);
 						}
@@ -12555,8 +12571,8 @@ export class AgentSession {
 									generation,
 									preflightSignal,
 									contributor({
-										prompt: expandedText,
-										images: options?.images,
+										prompt: effectivePrompt,
+										images: effectiveImages,
 										sessionId: this.sessionId,
 									}),
 								);
@@ -12614,7 +12630,7 @@ export class AgentSession {
 				}
 
 				const promptIndex = messages.length;
-				messages.push(message);
+				messages.push(promptMessage);
 
 				// Re-present captured pending next-turn messages (never drained here).
 				// Reclassify deferred envelopes before injecting them into the new

@@ -12,12 +12,14 @@ import { type NormalizedHook, normalizeDirectoryHook } from "../../hooks/normali
 import type { HookMessage } from "../../session/messages";
 import type { SessionManager } from "../../session/session-manager";
 import {
+	DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
 	type FunctionHook,
 	type FunctionHookEventType,
 	type FunctionHookPayloadFor,
 	type FunctionHookRegistration,
 	type FunctionHookRegistrationOptions,
 	getFunctionHookRegistration,
+	intersectFunctionHookGrants,
 	normalizeFunctionHookGrant,
 	tagFunctionHookHandler,
 	validateFunctionHookTarget,
@@ -181,7 +183,10 @@ async function createHookAPI(
 				...(options.registrationId === undefined ? {} : { registrationId: options.registrationId }),
 				registrationOrder: functionHookRegistrationOrder++,
 				handler: handler as unknown as FunctionHook,
-				grant: normalizeFunctionHookGrant(options),
+				grant: intersectFunctionHookGrants(
+					normalizeFunctionHookGrant(options),
+					DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT,
+				),
 				provenance: { source: "extension", path: sourcePath, extensionId: sourcePath },
 			};
 			const list = handlers.get(event) ?? [];
@@ -432,7 +437,6 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 							? {}
 							: { registrationId: functionRegistration.registrationId }),
 						...functionRegistration.grant,
-						provenance: functionRegistration.provenance,
 					});
 					continue;
 				}

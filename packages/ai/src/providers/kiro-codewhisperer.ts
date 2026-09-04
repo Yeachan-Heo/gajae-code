@@ -197,7 +197,7 @@ export const streamKiroCodeWhisperer: StreamFunction<"kiro-codewhisperer-stream"
 				conversationState,
 			};
 
-			options?.onPayload?.(requestBody, model, options?.attemptScope);
+			options?.onPayload?.(requestBody, model, options?.attemptScope, options?.signal);
 
 			const host = `${STREAMING_SERVICE_NAME}.${region}.amazonaws.com`;
 			const url = `https://${host}/`;

@@ -19,12 +19,19 @@ export function normalizeProviderResponse(
 }
 
 export async function notifyProviderResponse(
-	options: { onResponse?: StreamOptions["onResponse"]; attemptScope?: AttemptScopeRef } | undefined,
+	options:
+		| { onResponse?: StreamOptions["onResponse"]; attemptScope?: AttemptScopeRef; signal?: AbortSignal }
+		| undefined,
 	response: Response,
 	model?: Model<Api>,
 	requestId?: string | null,
 	metadata?: Record<string, unknown>,
 ): Promise<void> {
 	if (!options?.onResponse) return;
-	await options.onResponse(normalizeProviderResponse(response, requestId, metadata), model, options.attemptScope);
+	await options.onResponse(
+		normalizeProviderResponse(response, requestId, metadata),
+		model,
+		options.attemptScope,
+		options.signal,
+	);
 }

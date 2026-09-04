@@ -102,8 +102,6 @@ export interface FunctionHookGrant {
 export interface FunctionHookRegistrationOptions extends FunctionHookGrantInput {
 	target?: string;
 	registrationId?: string;
-	/** Host-supplied provenance used by adapters; the implementation supplies the path. */
-	provenance?: Partial<FunctionHookProvenance>;
 }
 
 export interface FunctionHookProvenance {
@@ -341,8 +339,14 @@ export function intersectFunctionHookGrants(
 			allowed.networkDestinations.includes(destination),
 		),
 		filesystemRoots: grant.filesystemRoots.filter(root => allowed.filesystemRoots.includes(root)),
+		attenuateDownstream: grant.attenuateDownstream,
 	});
 }
+
+/** Host-owned ceiling for caller-registered in-process extension and hook middleware. */
+export const DEFAULT_EXTENSION_FUNCTION_HOOK_GRANT = normalizeFunctionHookGrant({
+	capabilities: ["tool", "ui", "session", "audit"],
+});
 
 export function attenuateFunctionHookGrant(
 	grant: FunctionHookGrant,
@@ -457,6 +461,86 @@ export function isSafeFunctionHookValue(value: unknown, seen = new WeakSet<objec
 	}
 }
 
+function isFunctionHookContent(value: unknown): boolean {
+	if (!isPlainFunctionHookData(value) || value === null || typeof value !== "object") return false;
+	const content = value as Record<string, unknown>;
+	if (content.type === "text")
+		return (
+			typeof content.text === "string" &&
+			(content.textSignature === undefined || typeof content.textSignature === "string")
+		);
+	if (content.type === "image") return typeof content.data === "string" && typeof content.mimeType === "string";
+	return false;
+}
+
+function isFunctionHookImage(value: unknown): boolean {
+	return (
+		isPlainFunctionHookData(value) &&
+		value !== null &&
+		typeof value === "object" &&
+		(value as Record<string, unknown>).type === "image" &&
+		typeof (value as Record<string, unknown>).data === "string" &&
+		typeof (value as Record<string, unknown>).mimeType === "string"
+	);
+}
+
+function isFunctionHookAssistantContent(value: unknown): boolean {
+	if (isFunctionHookContent(value)) return true;
+	if (!isPlainFunctionHookData(value) || value === null || typeof value !== "object") return false;
+	const content = value as Record<string, unknown>;
+	if (content.type === "thinking") return typeof content.thinking === "string";
+	if (content.type === "redactedThinking") return typeof content.data === "string";
+	if (content.type === "toolCall") {
+		return (
+			typeof content.id === "string" &&
+			typeof content.name === "string" &&
+			content.arguments !== null &&
+			typeof content.arguments === "object" &&
+			!Array.isArray(content.arguments) &&
+			isPlainFunctionHookData(content.arguments)
+		);
+	}
+	return false;
+}
+
+function isFunctionHookMessage(value: unknown): boolean {
+	if (!isPlainFunctionHookData(value) || value === null || typeof value !== "object") return false;
+	const message = value as Record<string, unknown>;
+	if (typeof message.role !== "string") return false;
+	if (message.role === "user" || message.role === "developer") {
+		return (
+			(typeof message.content === "string" ||
+				(Array.isArray(message.content) && message.content.every(isFunctionHookContent))) &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	if (message.role === "toolResult") {
+		return (
+			typeof message.toolCallId === "string" &&
+			typeof message.toolName === "string" &&
+			Array.isArray(message.content) &&
+			message.content.every(isFunctionHookContent) &&
+			typeof message.isError === "boolean" &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	if (message.role === "assistant") {
+		return (
+			Array.isArray(message.content) &&
+			message.content.every(isFunctionHookAssistantContent) &&
+			typeof message.api === "string" &&
+			typeof message.provider === "string" &&
+			typeof message.model === "string" &&
+			typeof message.stopReason === "string" &&
+			typeof message.timestamp === "number" &&
+			Number.isFinite(message.timestamp)
+		);
+	}
+	return isSafeFunctionHookValue(message);
+}
+
 export function isValidFunctionHookEventValue(event: ExtensionEvent): boolean {
 	try {
 		if (!isPlainFunctionHookData(event) || typeof event.type !== "string") return false;
@@ -465,15 +549,17 @@ export function isValidFunctionHookEventValue(event: ExtensionEvent): boolean {
 				return (
 					typeof event.toolName === "string" &&
 					typeof event.toolCallId === "string" &&
-					isSafeFunctionHookValue(event.input) &&
-					!Array.isArray(event.input)
+					event.input !== null &&
+					typeof event.input === "object" &&
+					!Array.isArray(event.input) &&
+					isSafeFunctionHookValue(event.input)
 				);
 			case "tool_result":
 				return (
 					typeof event.toolName === "string" &&
 					typeof event.toolCallId === "string" &&
 					Array.isArray(event.content) &&
-					event.content.every(item => isSafeFunctionHookValue(item)) &&
+					event.content.every(isFunctionHookContent) &&
 					typeof event.isError === "boolean" &&
 					(event.details === undefined || isSafeFunctionHookValue(event.details))
 				);
@@ -481,18 +567,17 @@ export function isValidFunctionHookEventValue(event: ExtensionEvent): boolean {
 				return (
 					typeof event.text === "string" &&
 					(event.images === undefined ||
-						(Array.isArray(event.images) && event.images.every(item => isSafeFunctionHookValue(item)))) &&
+						(Array.isArray(event.images) && event.images.every(isFunctionHookImage))) &&
 					(event.source === "interactive" || event.source === "sdk" || event.source === "extension")
 				);
 			case "context":
-				return Array.isArray(event.messages) && event.messages.every(item => isSafeFunctionHookValue(item));
+				return Array.isArray(event.messages) && event.messages.every(isFunctionHookMessage);
 			case "before_agent_start":
 				return (
 					typeof event.prompt === "string" &&
 					Array.isArray(event.systemPrompt) &&
 					event.systemPrompt.every(item => typeof item === "string") &&
-					(event.images === undefined ||
-						(Array.isArray(event.images) && event.images.every(item => isSafeFunctionHookValue(item))))
+					(event.images === undefined || (Array.isArray(event.images) && event.images.every(isFunctionHookImage)))
 				);
 			case "before_provider_request":
 				return isSafeFunctionHookValue(event.payload);
@@ -510,6 +595,16 @@ export function isValidFunctionHookEventValue(event: ExtensionEvent): boolean {
 	} catch {
 		return false;
 	}
+}
+
+export function functionHookEventIdentityMatches(original: ExtensionEvent, candidate: ExtensionEvent): boolean {
+	if (original.type !== candidate.type) return false;
+	if (original.type === "tool_call" && candidate.type === "tool_call")
+		return original.toolName === candidate.toolName && original.toolCallId === candidate.toolCallId;
+	if (original.type === "tool_result" && candidate.type === "tool_result")
+		return original.toolName === candidate.toolName && original.toolCallId === candidate.toolCallId;
+	if (original.type === "input" && candidate.type === "input") return original.source === candidate.source;
+	return true;
 }
 
 export function cloneFunctionHookData<T>(value: T): T {

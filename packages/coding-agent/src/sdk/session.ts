@@ -1110,7 +1110,6 @@ export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): Exte
 				...(target === undefined ? {} : { target }),
 				registrationId: hook.extensionId,
 				...(hook.grant ?? {}),
-				...(hook.provenance ? { provenance: hook.provenance } : {}),
 			};
 			api.registerFunctionHook(registrationEvent as FunctionHookEventType, handler, options);
 		}
@@ -4310,21 +4309,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!obfuscator?.hasSecrets() || !obfuscateMessagesFn) return converted;
 			return obfuscateMessagesFn(obfuscator, converted);
 		};
-		const transformContext = async (messages: AgentMessage[], _signal?: AbortSignal, scope?: AttemptScopeRef) => {
+		const transformContext = async (messages: AgentMessage[], signal?: AbortSignal, scope?: AttemptScopeRef) => {
 			// External Agent events dispatch listeners without awaiting them. The
 			// session-owned barrier makes any pre-admission artifact transformation
 			// visible before this provider context is normalized.
 			await session?.awaitPendingContextTransformations();
-			return extensionRunner ? await extensionRunner.emitContext(messages, scope) : messages;
+			return extensionRunner ? await extensionRunner.emitContext(messages, scope, signal) : messages;
 		};
 		const onPayload = extensionRunner
-			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef) => {
-					return await extensionRunner.emitBeforeProviderRequest(payload, scope);
+			? async (payload: unknown, _model?: Model, scope?: AttemptScopeRef, signal?: AbortSignal) => {
+					return await extensionRunner.emitBeforeProviderRequest(payload, scope, signal);
 				}
 			: undefined;
 		const onResponse: SimpleStreamOptions["onResponse"] | undefined = extensionRunner
-			? async (response, model, scope) => {
-					await extensionRunner.emitAfterProviderResponse(response, model, scope);
+			? async (response, model, scope, signal) => {
+					await extensionRunner.emitAfterProviderResponse(response, model, scope, signal);
 				}
 			: undefined;
 

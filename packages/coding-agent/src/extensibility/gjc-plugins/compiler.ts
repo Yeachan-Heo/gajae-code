@@ -447,7 +447,11 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			networkDestinations: hook.networkDestinations,
 			filesystemRoots: hook.filesystemRoots,
 		});
-		hooks.push({
+		const functionHook =
+			hook.capabilities !== undefined ||
+			hook.networkDestinations !== undefined ||
+			hook.filesystemRoots !== undefined;
+		const normalizedHook: NormalizedHookSurface = {
 			extensionId: surfaceIds.hook(hook.event, hook.phase, hook.target, hook.name),
 			name: hook.name,
 			event: hook.event,
@@ -456,15 +460,15 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			relativePath: hook.path,
 			sha256: digest,
 			implementationHash: digest,
-			capabilities: [...grant.capabilities],
-			networkDestinations: [...grant.networkDestinations],
-			filesystemRoots: [...grant.filesystemRoots],
-			capabilityHash: functionHookGrantHash(grant),
-			functionHook:
-				hook.capabilities !== undefined ||
-				hook.networkDestinations !== undefined ||
-				hook.filesystemRoots !== undefined,
-		});
+		};
+		if (functionHook) {
+			normalizedHook.capabilities = [...grant.capabilities];
+			normalizedHook.networkDestinations = [...grant.networkDestinations];
+			normalizedHook.filesystemRoots = [...grant.filesystemRoots];
+			normalizedHook.capabilityHash = functionHookGrantHash(grant);
+			normalizedHook.functionHook = true;
+		}
+		hooks.push(normalizedHook);
 	}
 
 	const mcps: NormalizedMcpSurface[] = [];

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent, type AgentMessage } from "@gajae-code/agent-core";
-import { getBundledModel, type Message } from "@gajae-code/ai";
+import { type Context, getBundledModel, type Message } from "@gajae-code/ai";
 import { inferCopilotInitiator } from "@gajae-code/ai/providers/github-copilot-headers";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
@@ -38,8 +38,8 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession() {
-		const emitBeforeAgentStart = vi.fn().mockResolvedValue({
+	function createSession(
+		beforeAgentStartResult: Record<string, unknown> = {
 			messages: [
 				{
 					customType: "before-start",
@@ -47,7 +47,10 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 					display: false,
 				},
 			],
-		});
+		},
+		capturedContexts?: Context[],
+	) {
+		const emitBeforeAgentStart = vi.fn().mockResolvedValue(beforeAgentStartResult);
 		const extensionRunner = {
 			emitBeforeAgentStart,
 			emit: vi.fn().mockResolvedValue(undefined),
@@ -57,6 +60,7 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
+		const mockModel = createMockModel({ responses: [{ content: ["Done"] }] });
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: {
@@ -65,7 +69,10 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 				tools: [],
 				messages: [],
 			},
-			streamFn: createMockModel({ responses: [{ content: ["Done"] }] }).stream,
+			streamFn: (streamModel, context, streamOptions) => {
+				capturedContexts?.push(structuredClone(context));
+				return mockModel.stream(streamModel, context, streamOptions);
+			},
 		});
 
 		session = new AgentSession({
@@ -119,6 +126,20 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 		}
 		expect(llmInjected.attribution).toBe("user");
 		expect(inferCopilotInitiator(llmMessages)).toBe("user");
+	});
+
+	it("submits Function Hook prompt and image transformations to the model", async () => {
+		const contexts: Context[] = [];
+		createSession({ prompt: "redacted prompt", images: [], systemPrompt: ["redacted system"] }, contexts);
+
+		await session.prompt("secret prompt", {
+			images: [{ type: "image", data: "secret-image", mimeType: "image/png" }],
+		});
+
+		const submitted = contexts[0];
+		expect(submitted?.systemPrompt).toEqual(["redacted system"]);
+		const user = submitted?.messages.find(message => message.role === "user");
+		expect(user?.content).toEqual([{ type: "text", text: "redacted prompt" }]);
 	});
 
 	it("defaults before_agent_start message attribution to agent for synthetic prompts", async () => {

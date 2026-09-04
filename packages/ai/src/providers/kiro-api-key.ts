@@ -612,7 +612,7 @@ export const streamKiroApiKey: StreamFunction<"kiro-codewhisperer-stream"> = (
 			const usesExplicitBaseUrl = Boolean(configuredBaseUrl) && !isRegionDerivedKiroApiBaseUrl(configuredBaseUrl);
 			const endpoint = configuredBaseUrl || kiroApiBaseUrl(kiroApiRegion(options));
 			const request = buildApiKeyRequest(model, context, options);
-			options?.onPayload?.(request, model, options?.attemptScope);
+			options?.onPayload?.(request, model, options?.attemptScope, options?.signal);
 
 			const response = await fetch(endpoint, {
 				method: "POST",

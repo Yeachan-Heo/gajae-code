@@ -131,7 +131,7 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 			const { baseUrl } = resolveAzureConfig(model, options);
 			const params = buildParams(model, context, options, deploymentName, baseUrl);
 			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getOpenAIStreamIdleTimeoutMs();
-			options?.onPayload?.(params, model, options?.attemptScope);
+			options?.onPayload?.(params, model, options?.attemptScope, options?.signal);
 			rawRequestDump = {
 				provider: model.provider,
 				api: output.api,

@@ -64,6 +64,29 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // Behavioral-owner tests cover entrypoint contracts whose names intentionally do
 // not follow the source-file basename convention. They supplement, rather than
 // replace, direct-basename test selection and owner fallback tasks.
+// Extensibility is a cross-layer contract: Function Hooks are registered by
+// extension and hook loaders, dispatched by ExtensionRunner/tool wrappers, and
+// persisted/activated through the GJC plugin metadata path. Keep this shard
+// explicit and bounded instead of falling back to the package-wide test suite
+// when one of those files changes.
+const EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS = [
+	"packages/coding-agent/test/function-hooks.test.ts",
+	"packages/coding-agent/test/extensions-discovery.test.ts",
+	"packages/coding-agent/test/extensions-runner.test.ts",
+	"packages/coding-agent/test/extensions-wrapper.test.ts",
+	"packages/coding-agent/test/hook-event-normalization.test.ts",
+	"packages/coding-agent/test/gjc-plugin-schema.test.ts",
+	"packages/coding-agent/test/gjc-plugin-compiler.test.ts",
+	"packages/coding-agent/test/gjc-plugin-registry.test.ts",
+	"packages/coding-agent/test/gjc-plugin-registry-v2.test.ts",
+	"packages/coding-agent/test/gjc-plugin-loader.test.ts",
+	"packages/coding-agent/test/gjc-plugin-constrained-hooks.test.ts",
+	"packages/coding-agent/test/gjc-plugin-hook-extension.test.ts",
+	"packages/coding-agent/test/gjc-plugin-activation-dispatch.test.ts",
+	"packages/coding-agent/test/gjc-plugin-observability.test.ts",
+	"packages/coding-agent/test/gjc-plugin-runtime-adapters.test.ts",
+] as const;
+
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
 	"packages/agent/src/agent.ts": [
@@ -91,6 +114,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
 	"packages/coding-agent/src/session/agent-session.ts": [
 		"packages/coding-agent/test/agent-session-concurrent.test.ts",
+		"packages/coding-agent/test/agent-session-before-agent-start-attribution.test.ts",
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
 	],
@@ -109,6 +133,23 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
+	// Function Hooks and the extension/hook adapters share one bounded owner
+	// shard: changing any layer can alter registration, dispatch, or payload
+	// authority, and basename matching misses the prefixed plugin contracts.
+	"packages/coding-agent/src/extensibility/extensions/function-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/extensions/index.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/extensions/loader.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/extensions/runner.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/extensions/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/extensions/wrapper.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/hooks/loader.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/hooks/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/gjc-plugins/compiler.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/gjc-plugins/schema.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/gjc-plugins/registry.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/gjc-plugins/types.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/gjc-plugins/constrained-hooks.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
+	"packages/coding-agent/src/extensibility/gjc-plugins/runtime-quarantine.ts": EXTENSIBILITY_BEHAVIORAL_OWNER_TESTS,
 };
 
 export interface PackageManifest {
