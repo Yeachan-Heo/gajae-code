@@ -1959,7 +1959,7 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		}
 	});
 
-	it("rejects an orphaned message effect after a pending action appears", async () => {
+	it("replays an orphaned message effect when a stale intent gains a pending action", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-orphan-message-"));
 		try {
 			const first = new SlackNotificationDaemon({
@@ -2018,8 +2018,10 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 				authorizeActor: actorId => actorId === "U1",
 			});
 			await restarted.start();
-			expect(replayed).toEqual([]);
-			expect(await journal.read(effectId)).toMatchObject({ state: "terminal", receipt: { status: "rejected" } });
+			expect(replayed).toEqual([
+				expect.objectContaining({ type: "user_message", sessionId: "session", text: "persisted prompt" }),
+			]);
+			expect(await journal.read(effectId)).toMatchObject({ state: "terminal", receipt: { status: "sent" } });
 			await restarted.stop();
 		} finally {
 			await fs.rm(agentDir, { recursive: true, force: true });

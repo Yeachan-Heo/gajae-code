@@ -110,11 +110,6 @@ describe.serial("AgentSession resilient retry", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
-	function withDisposeBudget(value: AgentSession): AgentSession {
-		value.setDisposeTimeoutForTests(60_000);
-		return value;
-	}
-
 	afterEach(async () => {
 		// Teardown uses real timer/deadline state. Restore test clocks and scheduler
 		// hooks before disposing so a mocked Date.now cannot wedge cleanup.
