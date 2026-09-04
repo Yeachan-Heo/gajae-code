@@ -2846,7 +2846,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "test-only disposal completion seam, not a user-facing SDK control seam",
+		"rationale": "internal retained teardown join used by session owners, not an independent user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -2857,7 +2857,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "test-only disposal timeout seam, not a user-facing SDK control seam",
+		"rationale": "test-only disposal deadline seam, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -2868,7 +2868,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "test-only post-prompt task seam, not a user-facing SDK control seam",
+		"rationale": "test-only retained post-prompt task seam, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
@@ -2879,7 +2879,7 @@
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
 		"decision": "exclude",
-		"rationale": "test-only worker integration seam, not a user-facing SDK control seam",
+		"rationale": "test-only worker-integration scheduler seam, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
