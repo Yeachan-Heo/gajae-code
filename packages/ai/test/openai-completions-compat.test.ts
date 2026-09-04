@@ -130,8 +130,8 @@ describe("openai-completions compatibility", () => {
 		}
 	});
 
-	it("serializes direct xAI Grok 4.5 and 4.6 reasoning efforts without changing other Grok routes", async () => {
-		async function captureXaiPayload(modelId: "grok-4.5" | "grok-4.6", reasoning: "low" | "xhigh") {
+	it("serializes direct xAI Grok 4.5+ reasoning efforts without changing other Grok routes", async () => {
+		async function captureXaiPayload(modelId: string, reasoning: "low" | "xhigh") {
 			const model: Model<"openai-completions"> = {
 				id: modelId,
 				name: modelId,
@@ -154,36 +154,33 @@ describe("openai-completions compatibility", () => {
 			return (await promise) as Record<string, unknown>;
 		}
 
-		expect(
-			resolveOpenAICompat({
-				id: "grok-4.5",
-				name: "Grok 4.5",
+		function xaiCompat(id: string, provider = "xai", baseUrl = "https://api.x.ai/v1") {
+			return resolveOpenAICompat({
+				id,
+				name: id,
 				api: "openai-completions",
-				provider: "xai",
-				baseUrl: "https://api.x.ai/v1",
+				provider,
+				baseUrl,
 				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 				contextWindow: 500_000,
 				maxTokens: 64_000,
-			}).supportsReasoningEffort,
-		).toBe(true);
+			}).supportsReasoningEffort;
+		}
+
+		expect(xaiCompat("grok-4.5")).toBe(true);
+		expect(xaiCompat("grok-4.6")).toBe(true);
+		expect(xaiCompat("grok-4.7")).toBe(true);
+		expect(xaiCompat("grok-5")).toBe(true);
+		expect(xaiCompat("grok-4")).toBe(false);
+		expect(xaiCompat("grok-4.1")).toBe(false);
+		expect(xaiCompat("grok-code-fast-1")).toBe(false);
+		expect(xaiCompat("x-ai/grok-4.5", "custom", "https://api.x.ai/v1")).toBe(false);
 		expect((await captureXaiPayload("grok-4.5", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.6", "xhigh")).reasoning_effort).toBe("xhigh");
-		expect(
-			resolveOpenAICompat({
-				id: "grok-4.6",
-				name: "Grok 4.6",
-				api: "openai-completions",
-				provider: "openrouter",
-				baseUrl: "https://openrouter.ai/api/v1",
-				reasoning: true,
-				input: ["text"],
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 500_000,
-				maxTokens: 64_000,
-			}).supportsReasoningEffort,
-		).toBe(true);
+		expect((await captureXaiPayload("grok-4.7", "low")).reasoning_effort).toBe("low");
+		expect(xaiCompat("x-ai/grok-4.6", "openrouter", "https://openrouter.ai/api/v1")).toBe(true);
 	});
 
 	it("fails closed for arbitrary custom reasoning transports and honors explicit opt-in", async () => {

@@ -5,7 +5,11 @@ import {
 	isCodexProductTransport,
 } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import { isAuditedOpenAIReasoningTransport, resolveOpenAICompat } from "./openai-completions-compat";
+import {
+	isAuditedOpenAIReasoningTransport,
+	isDirectXaiReasoningEffortModel,
+	resolveOpenAICompat,
+} from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -265,9 +269,6 @@ export function modelSupportsReasoningControl<TApi extends Api>(
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
-		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
-			source.reasoning = true;
-		}
 		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
@@ -275,7 +276,7 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
 			source.reasoning = true;
 		}
-		if (source.provider === "omlx") {
+		if (isDirectXaiReasoningEffortModel(source.provider, source.id)) {
 			source.reasoning = true;
 		}
 		if (

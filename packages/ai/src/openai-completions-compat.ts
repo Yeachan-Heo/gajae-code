@@ -63,6 +63,20 @@ export function isAuditedOpenAIReasoningTransport(
 	return AUDITED_REASONING_EFFORT_HOST_SUFFIXES.some(suffix => hostnameMatches(hostname, suffix));
 }
 
+/**
+ * xAI's first-party API accepts `reasoning_effort` on grok 4.5 and later;
+ * resellers may strip the parameter, so this is scoped to the direct `xai`
+ * provider only.
+ */
+export function isDirectXaiReasoningEffortModel(provider: string, modelId: string): boolean {
+	if (provider !== "xai") return false;
+	const generation = /^grok-(\d{1,2})(?:\.(\d{1,2}))?/.exec(modelId.toLowerCase());
+	if (!generation) return false;
+	const major = Number(generation[1]);
+	const minor = generation[2] === undefined ? 0 : Number(generation[2]);
+	return major > 4 || (major === 4 && minor >= 5);
+}
+
 export type ResolvedOpenAICompat = Required<
 	Omit<
 		OpenAICompat,
@@ -185,7 +199,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("fireworks.ai") ||
 		isDirectDeepseekApi;
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
-	const isDirectXaiReasoningEffortModel = provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6");
+
 	const isMistral = provider === "mistral" || baseUrl.includes("mistral.ai");
 
 	// Hosts whose chat-completions endpoints are known to accept multiple
@@ -278,7 +292,8 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		supportsResponsesSessionAffinity: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
 		supportsReasoningEffort:
-			hasAuditedReasoningEffortTransport && ((!isGrok && !isZai) || isDirectXaiReasoningEffortModel),
+			hasAuditedReasoningEffortTransport &&
+			((!isGrok && !isZai) || isDirectXaiReasoningEffortModel(provider, model.id)),
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,

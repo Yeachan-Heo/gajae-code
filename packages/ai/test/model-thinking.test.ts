@@ -299,6 +299,7 @@ describe("generated model policies", () => {
 		const models = [
 			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),
 			createModel({ id: "grok-4.6", api: "openai-completions", provider: "xai", reasoning: false }),
+			createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai", reasoning: false }),
 			createModel({ id: "grok-4.6", api: "openai-completions", provider: "openrouter", reasoning: false }),
 		];
 
@@ -314,8 +315,12 @@ describe("generated model policies", () => {
 			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh },
 		});
 		expect(models[0]?.maxTokens).toBe(32_000);
-		expect(models[2]?.reasoning).toBe(false);
-		expect(models[2]?.thinking).toBeUndefined();
+		expect(models[2]).toMatchObject({
+			reasoning: true,
+			thinking: { mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.XHigh },
+		});
+		expect(models[3]?.reasoning).toBe(false);
+		expect(models[3]?.thinking).toBeUndefined();
 	});
 
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {

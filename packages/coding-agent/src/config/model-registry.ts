@@ -40,6 +40,7 @@ import {
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
 import { fetchModelsDevPayload } from "@gajae-code/ai/provider-models/openai-compat";
+import { isDirectXaiReasoningEffortModel } from "@gajae-code/ai/providers/openai-completions-compat";
 import {
 	detectDiscoveredApiFamily,
 	resolveLoopbackOpenAIBaseUrl,
@@ -282,7 +283,7 @@ export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssig
 	if (
 		model.provider === "openai" ||
 		model.provider === "openai-codex" ||
-		(model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6"))
+		isDirectXaiReasoningEffortModel(model.provider, model.id)
 	)
 		return true;
 	if (role === null) return false;
