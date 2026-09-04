@@ -33,7 +33,7 @@ async function mkCwd(): Promise<string> {
 	return cwd;
 }
 
-async function bundleWithHook(hookBody: string): Promise<string> {
+async function bundleWithHook(hookBody: string, hookOptions: Record<string, unknown> = {}): Promise<string> {
 	const src = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hooksrc-"));
 	tempDirs.push(src);
 	await fs.mkdir(path.join(src, "hooks"), { recursive: true });
@@ -44,7 +44,16 @@ async function bundleWithHook(hookBody: string): Promise<string> {
 			kind: "gajae-code-plugin",
 			name: "hook-bundle",
 			version: "1.0.0",
-			hooks: [{ name: "h", event: "tool_call", target: "read", phase: "before", path: "hooks/h.ts" }],
+			hooks: [
+				{
+					name: "h",
+					event: "tool_call",
+					target: "read",
+					phase: "before",
+					path: "hooks/h.ts",
+					...hookOptions,
+				},
+			],
 		}),
 	);
 	return src;
@@ -136,6 +145,20 @@ describe("constrained plugin hooks", () => {
 		const res = await loadConstrainedPluginHooks({ cwd });
 		expect(res.hooks).toHaveLength(0);
 		expect(res.quarantine.some(q => q.code === "invalid_hook")).toBe(true);
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+	});
+
+	test("quarantines plugin function hooks before importing them into the host realm", async () => {
+		const cwd = await mkCwd();
+		const markerPath = path.join(cwd, "imported");
+		const src = await bundleWithHook(
+			`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function(api){ api.on("tool_call", ()=>({})); }\n`,
+			{ capabilities: ["tool.inspect"] },
+		);
+		await installGjcBundle({ cwd }, "project", src);
+		const res = await loadConstrainedPluginHooks({ cwd });
+		expect(res.hooks).toHaveLength(0);
+		expect(res.quarantine.some(q => q.code === "security_policy")).toBe(true);
 		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 });

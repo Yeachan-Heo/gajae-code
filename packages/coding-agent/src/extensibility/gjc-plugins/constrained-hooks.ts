@@ -67,17 +67,6 @@ async function resolveConstrainedHookFile(root: string, relativePath: string): P
 	return fileReal;
 }
 
-function assertFunctionHookSourceIsConstrained(source: string, relativePath: string): void {
-	const forbidden =
-		/\b(?:Bun|Deno|process|globalThis|global|require|eval|Function)\b|\bimport\s*\(|\b(?:node|bun):|\b(?:constructor|prototype)\b/;
-	if (forbidden.test(source)) {
-		throw new GjcPluginLoadError(
-			"security_policy",
-			`GJC function hook source uses an ambient or dynamic authority in ${relativePath}; function hooks may only use the constrained registration API`,
-		);
-	}
-}
-
 export interface DeclaredHook {
 	plugin: string;
 	scope: GjcPluginScope;
@@ -190,8 +179,12 @@ export class ConstrainedPluginHookDescriptor {
 		}
 		const resolvedPath = await resolveConstrainedHookFile(this.pluginRoot, this.relativePath);
 		if (this.implementationHash) await verifyImplementationHash(resolvedPath, this.implementationHash);
-		if (this.functionHook)
-			assertFunctionHookSourceIsConstrained(await fs.readFile(resolvedPath, "utf8"), this.relativePath);
+		if (this.functionHook) {
+			throw new GjcPluginLoadError(
+				"security_policy",
+				`Plugin function hook "${this.plugin}" requires an isolated runtime and cannot execute in the host realm`,
+			);
+		}
 		const registered: { event: string; handler: (...a: never[]) => unknown }[] = [];
 		const deny = (method: string) => () => {
 			throw new GjcPluginLoadError(

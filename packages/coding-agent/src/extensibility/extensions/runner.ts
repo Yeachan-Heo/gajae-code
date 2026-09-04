@@ -997,10 +997,11 @@ export class ExtensionRunner {
 						? attenuateFunctionHookGrant(effectiveGrant, registration.grant.attenuateDownstream)
 						: allowedGrant;
 				const wildcard = registration.event === "*" || registration.target === "*";
-				const failureResult = (reason: string): FunctionHookDispatchResult<TEvent> =>
-					(wildcard && !functionHookDenyAllowed(currentEvent, effectiveGrant)
-						? { action: "continue", event: currentEvent }
-						: this.#functionHookErrorResult(currentEvent, reason)) as FunctionHookDispatchResult<TEvent>;
+				const failureResult = (reason: string): FunctionHookDispatchResult<TEvent> => {
+					if (functionHookDenyAllowed(currentEvent, effectiveGrant)) return { action: "deny", reason };
+					if (wildcard) return { action: "continue", event: currentEvent };
+					return this.#functionHookErrorResult(currentEvent, reason) as FunctionHookDispatchResult<TEvent>;
+				};
 				const payload = Object.freeze(
 					compatibilityPayloadForFunctionHook(currentEvent, effectiveGrant, wildcard),
 				) as Readonly<TEvent>;
@@ -1048,11 +1049,22 @@ export class ExtensionRunner {
 				};
 				const capabilities = createFunctionHookCapabilities(effectiveGrant, bindings);
 				let nextCalled = false;
+				let nextFailureReason: string | undefined;
 				let nextPromise: Promise<FunctionHookDispatchResult<TEvent>> | undefined;
 				const next: FunctionHookNext = async nextEvent => {
 					if (nextCalled) throw new Error("Function hook next() may only be called once");
 					nextCalled = true;
 					const candidate = (nextEvent ?? currentEvent) as TEvent;
+					if (
+						nextEvent !== undefined &&
+						(!isPlainFunctionHookData(candidate) ||
+							candidate.type !== currentEvent.type ||
+							!isValidFunctionHookEventValue(candidate) ||
+							!functionHookTransformAllowed(currentEvent, effectiveGrant))
+					) {
+						nextFailureReason = "Function hook passed an invalid or unauthorized event to next()";
+						throw new Error(nextFailureReason);
+					}
 					nextPromise = invoke(index + 1, candidate, downstreamGrant, controller.signal);
 					return (await nextPromise) as FunctionHookResult;
 				};
@@ -1065,26 +1077,37 @@ export class ExtensionRunner {
 					indexed.ext,
 					controller,
 				);
+				if (outcome.status === "timeout") {
+					controller.abort(new Error("Function hook invocation timed out"));
+					active = false;
+					chainSignal.removeEventListener("abort", abortFromChain);
+					this.#appendFunctionHookAudit(registration, invocation, "timeout");
+					return failureResult("Function hook timed out");
+				}
+				if (outcome.status === "error") {
+					controller.abort(new Error("Function hook invocation failed"));
+					active = false;
+					chainSignal.removeEventListener("abort", abortFromChain);
+					this.#appendFunctionHookAudit(registration, invocation, "error", outcome.error);
+					return failureResult(outcome.error);
+				}
+				if (nextFailureReason) {
+					controller.abort(new Error(nextFailureReason));
+					active = false;
+					chainSignal.removeEventListener("abort", abortFromChain);
+					this.#appendFunctionHookAudit(registration, invocation, "error", nextFailureReason);
+					return failureResult(nextFailureReason);
+				}
+				if (nextCalled) {
+					const nextResult = (await nextPromise) as FunctionHookDispatchResult<TEvent>;
+					controller.abort(new Error("Function hook invocation completed"));
+					active = false;
+					chainSignal.removeEventListener("abort", abortFromChain);
+					return nextResult;
+				}
 				controller.abort(new Error("Function hook invocation completed"));
 				active = false;
 				chainSignal.removeEventListener("abort", abortFromChain);
-				if (outcome.status === "timeout") {
-					this.#appendFunctionHookAudit(registration, invocation, "timeout");
-					return (
-						wildcard
-							? { action: "continue", event: currentEvent }
-							: this.#functionHookErrorResult(currentEvent, "Function hook timed out")
-					) as FunctionHookDispatchResult<TEvent>;
-				}
-				if (outcome.status === "error") {
-					this.#appendFunctionHookAudit(registration, invocation, "error", outcome.error);
-					return (
-						wildcard
-							? { action: "continue", event: currentEvent }
-							: this.#functionHookErrorResult(currentEvent, outcome.error)
-					) as FunctionHookDispatchResult<TEvent>;
-				}
-				if (nextCalled) return (await nextPromise) as FunctionHookDispatchResult<TEvent>;
 				const rawResult = outcome.value;
 				if (rawResult === undefined) {
 					this.#appendFunctionHookAudit(registration, invocation, "continue");

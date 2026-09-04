@@ -528,12 +528,12 @@ function boundedUiLines(value: string[]): string[] {
 	return value.slice(0, 32).map(line => boundedText(line, 512));
 }
 
-function allowedOrigin(value: string | URL, destinations: readonly string[]): boolean {
+function allowedUrl(value: string | URL, destinations: readonly string[]): URL | undefined {
 	try {
 		const url = new URL(value);
-		return url.protocol === "https:" && destinations.includes(url.origin);
+		return url.protocol === "https:" && destinations.includes(url.origin) ? url : undefined;
 	} catch {
-		return false;
+		return undefined;
 	}
 }
 
@@ -598,9 +598,10 @@ export function createFunctionHookCapabilities(
 		});
 	}
 	if (operations.has("session.read") || operations.has("session.message") || operations.has("session.deny")) {
-		const metadata = bindings.sessionMetadata
-			? Object.freeze(cloneFunctionHookData(bindings.sessionMetadata))
-			: undefined;
+		const metadata =
+			operations.has("session.read") && bindings.sessionMetadata
+				? Object.freeze(cloneFunctionHookData(bindings.sessionMetadata))
+				: undefined;
 		Object.assign(result, {
 			session: Object.freeze({
 				canRead: operations.has("session.read"),
@@ -645,9 +646,9 @@ export function createFunctionHookCapabilities(
 			network: Object.freeze({
 				fetch: (input: string | URL, init?: RequestInit) => {
 					assertActive(bindings);
-					if (!allowedOrigin(input, grant.networkDestinations))
-						throw new Error("Function hook network destination is outside its declared grant");
-					return bindings.fetch(input, { ...init, redirect: "error" });
+					const url = allowedUrl(input, grant.networkDestinations);
+					if (!url) throw new Error("Function hook network destination is outside its declared grant");
+					return bindings.fetch(url, { ...init, redirect: "error" });
 				},
 			}),
 		});
@@ -680,8 +681,11 @@ export function compatibilityPayloadForFunctionHook(
 		}
 		return deepFreezeFunctionHookData(redacted) as unknown as ExtensionEvent;
 	}
-	if (wildcard && event.type !== "tool_call" && event.type !== "tool_result")
-		return deepFreezeFunctionHookData(redactFunctionHookValue(event)) as unknown as ExtensionEvent;
+	const canInspectNonTool =
+		(event.type.startsWith("session_") && operations.has("session.read")) ||
+		(!event.type.startsWith("session_") && operations.has("ui.transform"));
+	if ((wildcard || !canInspectNonTool) && event.type !== "tool_call" && event.type !== "tool_result")
+		return Object.freeze({ type: event.type }) as ExtensionEvent;
 	return deepFreezeFunctionHookData(cloneFunctionHookData(event));
 }
 

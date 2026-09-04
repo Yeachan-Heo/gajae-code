@@ -12,7 +12,7 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "../src/extensibility/extensions/runner";
-import type { Extension, ToolCallEvent } from "../src/extensibility/extensions/types";
+import type { Extension, ExtensionSessionMetadata, ToolCallEvent } from "../src/extensibility/extensions/types";
 import { SessionManager } from "../src/session/session-manager";
 
 type HookRegistration = Omit<FunctionHookRegistration, "grant"> & {
@@ -43,13 +43,14 @@ function makeExtension(registrations: HookRegistration[]): Extension {
 	};
 }
 
-function makeRunner(registrations: HookRegistration[]): ExtensionRunner {
+function makeRunner(registrations: HookRegistration[], sessionMetadata?: ExtensionSessionMetadata): ExtensionRunner {
 	return new ExtensionRunner(
 		[makeExtension(registrations)],
 		new ExtensionRuntime(),
 		process.cwd(),
 		SessionManager.inMemory(),
 		{} as never,
+		sessionMetadata,
 	);
 }
 
@@ -226,5 +227,127 @@ describe("capability-scoped function hooks", () => {
 		const result = await runner.emitToolCall(event);
 		expect(result?.block).toBe(true);
 		expect(event.input).toEqual({ path: "secret.txt" });
+	});
+
+	test("rejects an inspect-only replacement passed through next", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (invocation, _capabilities, next) =>
+					await next({
+						...(invocation.payload as ToolCallEvent),
+						input: { path: "bypass.txt" },
+					}),
+				{ capabilities: ["tool.inspect"] },
+				0,
+				"read",
+			),
+		]);
+		const event = toolCall();
+		const result = await runner.emitToolCall(event);
+		expect(result?.block).toBe(true);
+		expect(event.input).toEqual({ path: "secret.txt" });
+	});
+
+	test("fails closed when an enforcement-capable wildcard times out", async () => {
+		testSetExtensionHandlerTimeoutMs(10);
+		const runner = makeRunner([
+			registration(
+				"*",
+				async () => {
+					await Bun.sleep(50);
+				},
+				{ capabilities: ["tool.deny"] },
+				0,
+			),
+		]);
+		expect((await runner.emitToolCall(toolCall()))?.block).toBe(true);
+	});
+
+	test("fails closed for timed-out wildcard UI enforcement", async () => {
+		testSetExtensionHandlerTimeoutMs(10);
+		const runner = makeRunner([
+			registration(
+				"*",
+				async () => {
+					await Bun.sleep(50);
+				},
+				{ capabilities: ["ui.transform"] },
+				0,
+			),
+		]);
+		const result = await runner.emitFunctionHooks({ type: "context", messages: [] });
+		expect(result.action).toBe("deny");
+	});
+
+	test("does not expose session metadata without session.read", async () => {
+		let metadata: unknown = "unset";
+		const runner = makeRunner(
+			[
+				registration(
+					"session_before_switch",
+					async (_invocation, capabilities, next) => {
+						metadata = capabilities.session?.metadata;
+						return await next();
+					},
+					{ capabilities: ["session.message"] },
+					0,
+				),
+			],
+			{ kind: "main", taskDepth: 0, currentAgentType: "executor" },
+		);
+		await runner.emitFunctionHooks({ type: "session_before_switch", reason: "new" });
+		expect(metadata).toBeUndefined();
+	});
+
+	test("redacts exact non-tool payloads without an inspection grant", async () => {
+		let payload: unknown;
+		const runner = makeRunner([
+			registration(
+				"context",
+				async (invocation, _capabilities, next) => {
+					payload = invocation.payload;
+					return await next();
+				},
+				undefined,
+				0,
+			),
+		]);
+		await runner.emitFunctionHooks({ type: "context", messages: [{ token: "secret" }] } as never);
+		expect(payload).toEqual({ type: "context" });
+	});
+
+	test("fails closed when a hook calls next twice", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (_invocation, _capabilities, next) => {
+					await next();
+					return await next();
+				},
+				{ capabilities: ["tool.deny"] },
+				0,
+				"read",
+			),
+		]);
+		expect((await runner.emitToolCall(toolCall()))?.block).toBe(true);
+	});
+
+	test("invalidates retained capability methods after invocation completion", async () => {
+		let emitMessage: (() => void) | undefined;
+		const runner = makeRunner([
+			registration(
+				"session_before_switch",
+				async (_invocation, capabilities, next) => {
+					emitMessage = () => capabilities.session?.emitMessage({ customType: "late", content: "late" });
+					return await next();
+				},
+				{ capabilities: ["session.message"] },
+				0,
+			),
+		]);
+		await runner.emitFunctionHooks({ type: "session_before_switch", reason: "new" });
+		expect(emitMessage).toBeDefined();
+		expect(() => emitMessage?.()).toThrow("no longer active");
 	});
 });

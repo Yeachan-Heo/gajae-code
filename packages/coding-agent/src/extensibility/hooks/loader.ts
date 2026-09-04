@@ -415,8 +415,19 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 			for (const handler of handlers) {
 				const functionRegistration = getFunctionHookRegistration(handler);
 				if (functionRegistration) {
+					const normalized = hook.normalization;
+					const normalizedTarget = normalized && normalized.toolName !== "*" ? normalized.toolName : undefined;
+					if (
+						normalized &&
+						(functionRegistration.event !== normalized.runtimeEvent ||
+							(functionRegistration.target !== undefined && functionRegistration.target !== normalizedTarget))
+					) {
+						throw new Error("Function hook registration conflicts with its normalized discovery target");
+					}
 					api.registerFunctionHook(functionRegistration.event, functionRegistration.handler, {
-						...(functionRegistration.target === undefined ? {} : { target: functionRegistration.target }),
+						...(normalizedTarget === undefined && functionRegistration.target === undefined
+							? {}
+							: { target: normalizedTarget ?? functionRegistration.target }),
 						...(functionRegistration.registrationId === undefined
 							? {}
 							: { registrationId: functionRegistration.registrationId }),
