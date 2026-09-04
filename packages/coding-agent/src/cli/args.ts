@@ -144,6 +144,7 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 		unknownFlags: new Map(),
 	};
 	const consumerFlags = new Map<ConsumerLaunchFlagName, string>();
+	let hasThinkingFlag = false;
 
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
@@ -350,6 +351,10 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			}
 			result.tools = validTools;
 		} else if (arg === "--thinking") {
+			if (hasThinkingFlag) {
+				throw new CliParseError("--thinking can only be specified once");
+			}
+			hasThinkingFlag = true;
 			// Match --credential / --mcp-config: a missing value or a following flag is
 			// a usage error, not a silent no-op / accidental consumption of `-p`.
 			const next = args[i + 1];

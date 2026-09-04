@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type CliConfig, CliParseError } from "@gajae-code/utils/cli";
 import { parseArgs } from "../src/cli/args";
 import Acp from "../src/commands/acp";
@@ -635,6 +636,10 @@ test("ACP fails closed for local-only startup flags while translating model and 
 	expect(resolveAcpStartupOptions(parsed, { model, thinkingLevel: "high" as never })).toEqual({
 		modelId: "openai-codex/gpt-5.6",
 		thinkingLevel: "high",
+	});
+	const thinkingOff = parseArgs(["--thinking=off"]);
+	expect(resolveAcpStartupOptions(thinkingOff, { thinkingLevel: ThinkingLevel.Off })).toEqual({
+		thinkingLevel: "off",
 	});
 
 	const unsupported = parseArgs(["--model", "gpt-5.6", "--no-lsp", "initial prompt"]);
