@@ -62,6 +62,28 @@ export function parseModelString(
 		: { provider, id: modelStr.slice(slashIdx + 1) };
 }
 
+export async function refreshMissingQualifiedModelProvider(
+	selector: string | undefined,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "refreshProvider">,
+): Promise<boolean> {
+	if (!selector) return false;
+	const parsedSelector = parseModelString(selector);
+	if (!parsedSelector) return false;
+	if (
+		modelRegistry
+			.getAvailable()
+			.some(
+				model =>
+					model.provider.toLowerCase() === parsedSelector.provider.toLowerCase() &&
+					model.id.toLowerCase() === parsedSelector.id.toLowerCase(),
+			)
+	)
+		return false;
+
+	await modelRegistry.refreshProvider(parsedSelector.provider, "online-if-uncached");
+	return true;
+}
+
 /**
  * Format a model as "provider/modelId" string.
  */

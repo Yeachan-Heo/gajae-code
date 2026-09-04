@@ -31,7 +31,13 @@ import { selectSession } from "./cli/session-picker";
 import { findConfigFile } from "./config";
 import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
-import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
+import {
+	refreshMissingQualifiedModelProvider,
+	resolveCliModel,
+	resolveModelRoleValue,
+	resolveModelScope,
+	type ScopedModel,
+} from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
 import { resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
@@ -1644,6 +1650,20 @@ export async function runRootCommand(
 				},
 			)
 		: undefined;
+
+	const startupModelSelector = parsedArgs.model
+		? parsedArgs.provider && !parsedArgs.model.toLowerCase().startsWith(`${parsedArgs.provider.toLowerCase()}/`)
+			? `${parsedArgs.provider}/${parsedArgs.model}`
+			: parsedArgs.model
+		: !parsedArgs.continue && !parsedArgs.resume
+			? selectorHead(settingsInstance.getModelRole("default"))
+			: undefined;
+	await logger.time(
+		"refreshStartupModelProvider",
+		refreshMissingQualifiedModelProvider,
+		startupModelSelector,
+		modelRegistry,
+	);
 
 	let scopedModels: ScopedModel[] = [];
 	const modelPatterns = parsedArgs.models ?? settingsInstance.get("enabledModels");

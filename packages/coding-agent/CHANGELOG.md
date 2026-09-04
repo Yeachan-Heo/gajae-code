@@ -3,6 +3,8 @@
 ## [Unreleased]
 ### Fixed
 
+- Plain and explicit-model launches now refresh a missing provider's cached dynamic catalog before resolving a qualified startup selector, so configured models such as `glm-zcode/glm-5.3` no longer open in `no-model` state while preserving cache-only startup for already available models.
+
 - The status-line usage segment now paints only the active model's provider, so switching to Grok no longer keeps a stale Claude 5h/7d pair. Canonical Grok Build reports render only their authoritative weekly window, while monthly credits are omitted instead of being mislabeled as `7d`.
 
 - Moving the `/model` preset cursor now reuses the authentication snapshot produced by catalog and credential refreshes instead of resolving every profile against the full model catalog on each Up/Down keypress; auth-dependent preset actions remain blocked until the initial static refresh and the availability snapshot are complete.
