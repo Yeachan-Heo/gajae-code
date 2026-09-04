@@ -54,6 +54,11 @@ describe("send_prompt same-session concurrency", () => {
 				token: "session-token",
 			});
 			const authorityIncarnation = brokerProcessIncarnation(authority.pid);
+			const authorityIndex = new SessionIndex(agentDir);
+			await authorityIndex.open();
+			expect(authorityIndex.listSessions().sessions).toContainEqual(
+				expect.objectContaining({ sessionId, live: true, endpointGeneration: 1 }),
+			);
 
 			const server = await createCoordinatorMcpServer({
 				env: {

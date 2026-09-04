@@ -1315,6 +1315,7 @@ describe("chat daemon worker", () => {
 				},
 			},
 		});
+		await firstClient.waitForRequest(frame => frame.type === "control_request");
 		expect(firstClient.requests).toContainEqual({
 			type: "control_request",
 			operation: "turn.prompt",
