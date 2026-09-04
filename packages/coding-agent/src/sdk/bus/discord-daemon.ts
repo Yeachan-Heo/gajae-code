@@ -541,7 +541,6 @@ export class DiscordNotificationDaemon {
 
 	async retireAttachment(sessionId: string, endpointGeneration: number): Promise<void> {
 		await this.#invalidateSessionWork(sessionId);
-		await this.#drainSessionWork(sessionId, this.#now() + 5_000);
 		const intentKey = this.#intentKey(sessionId);
 		const now = this.#now();
 		await this.#store.transact(intentKey, current => {
@@ -564,6 +563,7 @@ export class DiscordNotificationDaemon {
 		});
 		const record = await this.#bySession(sessionId);
 		if (!record?.threadId || record.endpointGeneration !== endpointGeneration) return;
+		await this.#drainSessionWork(sessionId, this.#now() + 5_000);
 		for (const receipt of record.inboundDispatches ?? [])
 			await this.#terminalizeInbound(record, receipt, "stale_binding");
 		const key = discordConversationKey({

@@ -85,6 +85,7 @@ describe("send_prompt same-session concurrency", () => {
 										processIncarnation: authorityIncarnation,
 										hostIncarnation: authorityIncarnation,
 										endpointMtimeMs: authority.endpointMtimeMs,
+										endpointFileId: authority.endpointFileId,
 									});
 									// The creation verifier reconciliation (#4731) requires the
 									// broker to prove which sidecar key became runtime authority.

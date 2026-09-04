@@ -9,6 +9,7 @@ export interface ExactSessionAuthorityFixture {
 	readonly endpointGeneration: number;
 	readonly pid: number;
 	readonly endpointMtimeMs: number;
+	readonly endpointFileId: string;
 	readonly endpoint: {
 		readonly sessionId: string;
 		readonly pid: number;
@@ -39,11 +40,13 @@ export async function prepareExactSessionAuthority(
 		token: options.token,
 	};
 	await Bun.write(endpointFile, `${JSON.stringify({ version: 1, ...endpoint })}\n`);
+	const endpointStat = await fs.stat(endpointFile);
 	return {
 		sessionId: options.sessionId,
 		endpointGeneration,
 		pid: process.pid,
-		endpointMtimeMs: (await fs.stat(endpointFile)).mtimeMs,
+		endpointMtimeMs: endpointStat.mtimeMs,
+		endpointFileId: `${endpointStat.dev}:${endpointStat.ino}`,
 		endpoint,
 	};
 }
@@ -73,6 +76,7 @@ export async function publishExactSessionAuthority(
 		// incarnation to mirror a genuine host.
 		processIncarnation: processIncarnation(process.pid),
 		endpointMtimeMs: authority.endpointMtimeMs,
+		endpointFileId: authority.endpointFileId,
 		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
 		version: SESSION_INDEX_EVENT_VERSION,
 		indexSeq: 1,
