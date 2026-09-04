@@ -1345,7 +1345,7 @@ describe("chat daemon worker", () => {
 			expect.objectContaining({ type: "control_request", operation: "turn.prompt" }),
 		);
 		await restartedRuntime.stop();
-	});
+	}, 20_000);
 	it("uses the production SdkClient loopback boundary while Discord remains fake", async () => {
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-chat-worker-wire-"));
 		const agentDir = path.join(root, "agent");

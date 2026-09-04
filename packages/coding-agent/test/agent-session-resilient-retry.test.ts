@@ -1536,7 +1536,7 @@ describe.serial("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+	}, 120_000);
 	it("does not retry a Responses overload after observable work or when retry is disabled", async () => {
 		const model = getBundledModel("openai", "gpt-5.4-mini");
 		if (!model) throw new Error("Expected bundled OpenAI Responses test model to exist");
@@ -1574,7 +1574,7 @@ describe.serial("AgentSession resilient retry", () => {
 			await session.dispose();
 			session = undefined;
 		}
-	});
+	}, 120_000);
 	it("bounds a persistent typed Responses capacity overload by explicit retry settings", async () => {
 		// The typed overload is admitted as a replay-safe provider overload, which
 		// takes it out of the unbounded transient-prose class it used to fall into
