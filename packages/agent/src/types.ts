@@ -214,14 +214,19 @@ export type ManagedAttemptOutcomeHandler = (
  * Outcome of a cooperative mid-run context-maintenance checkpoint (see
  * {@link AgentLoopConfig.maintainContext}). Any value other than "not-needed"
  * means the checkpoint mutated (or attempted to mutate) durable context, so the
- * loop ends the current run without the lossy `agent_end` finalization and the
- * maintenance owner resumes the run on the rewritten context.
+ * loop ends the current run without lossy finalization. Committed maintenance
+ * resumes on rewritten context; failed or aborted maintenance terminalizes.
  */
 export type MidRunMaintenanceOutcome = "not-needed" | "pruned" | "compacted" | "promoted" | "failed" | "aborted";
 
 export interface ContextMaintenanceResult {
 	outcome: MidRunMaintenanceOutcome;
 	releaseCurrentContext?: boolean;
+	errorMessage?: string;
+}
+
+export function isContinuingMidRunMaintenanceOutcome(outcome: unknown): boolean {
+	return outcome === "pruned" || outcome === "compacted" || outcome === "promoted";
 }
 
 /**
@@ -438,9 +443,9 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * non-optional loop signal, and `awaitEventDrain(invocationSignal)` waits for
 	 * prior event consumer bodies with loop and invocation cancellation composed.
 	 * Any outcome other than "not-needed" ends the current run with
-	 * `agent_end.stopReason === "maintenance"` (NOT the lossy pause / completed
-	 * finalization); the callback's continuation owner resumes the run on the
-	 * rewritten context.
+	 * `agent_end.stopReason === "maintenance"`. Successful maintenance resumes
+	 * on rewritten context; `failed` and `aborted` are terminal and never resend
+	 * the unchanged context.
 	 */
 	maintainContext?: (
 		context: AgentContext,

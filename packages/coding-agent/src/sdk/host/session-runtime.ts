@@ -4,7 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import { ThinkingLevel } from "@gajae-code/agent-core";
+import { isContinuingMidRunMaintenanceOutcome, ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, ImageContent, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
@@ -4364,7 +4364,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			};
 			void attempt().finally(() => skillTerminalRecoveryControllers.delete(recoveryKey));
 		};
-		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
+		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) {
 			try {
 				current.runtime.emitEvent({ type, sessionId: ctx.sessionManager.getSessionId() });
 			} catch {
@@ -4495,7 +4495,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		} catch {
 			observed = false;
 		}
-		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") return;
+		if (type === "agent_end" && isContinuingMidRunMaintenanceOutcome(maintenanceOutcome)) return;
 		if (type === "agent_end") {
 			if (current.lifecycleEpoch !== eventLifecycleEpoch) {
 				// A successor agent_start won the lifecycle race while this event's

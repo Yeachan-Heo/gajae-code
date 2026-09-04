@@ -22,7 +22,7 @@ import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { convertToLlm } from "@gajae-code/coding-agent/session/messages";
 import { getLatestCompactionEntry, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { getProjectAgentDir, TempDir } from "@gajae-code/utils";
+import { getProjectAgentDir, hookFetch, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 
 /**
@@ -441,6 +441,63 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 				),
 			),
 		).toBe(false);
+	});
+
+	it("terminalizes a failed local fallback after remote compaction returns 404 (issue #5254)", async () => {
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const bundledCodex = modelRegistry.find("openai-codex", "gpt-5.5");
+		if (!bundledCodex) throw new Error("Expected bundled openai-codex model");
+		const codexModel = { ...bundledCodex, contextWindow: 200_000, maxTokens: 32_768 };
+		const requestUrls: string[] = [];
+		using _hook = hookFetch(input => {
+			requestUrls.push(String(input instanceof Request ? input.url : input));
+			return new Response("not found", { status: 404, statusText: "Not Found" });
+		});
+		const loop = await buildLoopSession({
+			model: codexModel,
+			responder: call =>
+				call === 1
+					? assistantFor(codexModel, {
+							content: [{ type: "toolCall", id: "issue-5254", name: "noop", arguments: {} }],
+							totalTokens: THRESHOLD + 80_000,
+							stopReason: "toolUse",
+						})
+					: assistantFor(codexModel, {
+							content: [{ type: "text", text: "oversized context was resubmitted" }],
+							totalTokens: 200_000,
+							stopReason: "error",
+							errorMessage: "context_length_exceeded",
+						}),
+		});
+		await seedCompactableLoop(loop.session, codexModel);
+
+		await loop.session.prompt("go");
+		await loop.session.waitForIdle();
+
+		expect(requestUrls.filter(url => url.endsWith("/responses/compact")).length).toBeGreaterThan(0);
+		expect(requestUrls.some(url => !url.endsWith("/responses/compact"))).toBe(true);
+		expect(getLatestCompactionEntry(loop.session.sessionManager.getBranch())).toBeNull();
+		expect(loop.streamCallCount()).toBe(1);
+		const compactionFailure = loop.events.find(
+			(event): event is Extract<AgentSessionEvent, { type: "auto_compaction_end" }> =>
+				event.type === "auto_compaction_end" && event.errorMessage !== undefined,
+		);
+		expect(compactionFailure?.errorMessage).toContain("Summarization failed: not found");
+		expect(
+			loop.session.messages.some(
+				message =>
+					message.role === "assistant" && message.errorMessage?.includes("Summarization failed: not found"),
+			),
+		).toBe(true);
+		expect(
+			loop.agentEvents.filter(
+				event =>
+					event.type === "agent_end" &&
+					event.stopReason === "maintenance" &&
+					event.maintenanceOutcome === "failed",
+			),
+		).toHaveLength(1);
+		await loop.session.dispose();
 	});
 
 	it("without the maintenance hook, a long tool loop grows past the threshold into provider overflow", async () => {

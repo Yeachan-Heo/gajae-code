@@ -36,6 +36,7 @@ import {
 	canContinuePersistedHistory,
 	dispatchedToolIdentity,
 	getAgentTerminalOwnerContext,
+	isContinuingMidRunMaintenanceOutcome,
 	isNonDispatchedToolEvent,
 	type ManagedAttemptContinuationOwnership,
 	type ManagedAttemptDecision,
@@ -1044,7 +1045,7 @@ type AutoCompactionTerminalStatus =
 	| { kind: "compacted"; continuationScheduled?: boolean }
 	| { kind: "aborted"; source: "signal" | "hook" }
 	| { kind: "skipped"; continuationScheduled?: boolean }
-	| { kind: "failed" };
+	| { kind: "failed"; errorMessage: string };
 
 type ToolOutputPruneResult = {
 	prunedCount: number;
@@ -5918,7 +5919,9 @@ export class AgentSession {
 		const canonicalAdmission = this.#reserveCanonicalMessageAdmission(event);
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
 		const maintenanceCheckpoint =
-			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
+			event.type === "agent_end" &&
+			event.stopReason === "maintenance" &&
+			isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome);
 		const terminalClaim =
 			maintenanceCheckpoint || !terminalOwner
 				? undefined
@@ -6196,9 +6199,13 @@ export class AgentSession {
 			this.#requestWorkerIntegrationAttempt();
 		}
 		// A maintenance agent_end is an internal checkpoint only while another
-		// continuation will follow. An aborted maintenance run is its terminal
-		// settlement and must reach public subscribers.
-		if (event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted")
+		// continuation will follow. Failed or aborted maintenance is terminal and
+		// must reach public subscribers.
+		if (
+			event.type === "agent_end" &&
+			event.stopReason === "maintenance" &&
+			isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)
+		)
 			return;
 
 		// Hold agent_end until the prompt's finally and all earlier async event work
@@ -6983,7 +6990,7 @@ export class AgentSession {
 
 		if (
 			event.type === "agent_end" &&
-			!(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted")
+			!(event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome))
 		) {
 			this.#releaseDeferredSdkFollowUps();
 		}
@@ -6996,9 +7003,10 @@ export class AgentSession {
 			// the same run on the rewritten context (no synthetic prompt), skipping
 			// the goal-runtime / skill-state / retry / compaction finalization a
 			// normal agent_end runs — none of that applies to an in-progress run.
-			// "aborted" settles without resuming; the generation guard drops the
-			// continuation if a newer prompt/abort has moved the run on.
-			if (event.stopReason === "maintenance") {
+			// Failed and aborted outcomes fall through to terminal handling. The
+			// generation guard drops a successful continuation if a newer prompt/abort
+			// has moved the run on.
+			if (event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)) {
 				this.#lastAssistantMessage = undefined;
 				const outcome = event.maintenanceOutcome;
 				if (
@@ -7083,6 +7091,13 @@ export class AgentSession {
 				return;
 			}
 			this.#lastSuccessfulYieldToolCallId = undefined;
+			if (event.stopReason === "maintenance" && event.maintenanceOutcome === "failed") {
+				// The maintenance error already terminalized the run. Retrying this
+				// synthetic assistant failure would resubmit the unchanged context that
+				// maintenance failed to rewrite.
+				this.#resolveRetry();
+				return;
+			}
 
 			// Check for retryable errors first (overloaded, rate limit, server errors)
 			if (this.#isRetryableError(msg)) {
@@ -8580,7 +8595,8 @@ export class AgentSession {
 					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
 					: undefined;
 		const isTerminalAgentEnd =
-			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
+			event.type === "agent_end" &&
+			!(event.stopReason === "maintenance" && isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome));
 		const finishAttempt = () => {
 			if (!isTerminalAgentEnd) return;
 			// A merged wake batch whose flush fired while still streaming cleared its
@@ -18407,18 +18423,23 @@ export class AgentSession {
 	 * prune → promote → compact machinery and returns an explicit outcome.
 	 *
 	 * A non-"not-needed" outcome ends the current run losslessly
-	 * (`agent_end.stopReason === "maintenance"`); the `agent_end` handler is the
-	 * single continuation owner that resumes the run with no synthetic prompt.
-	 * This method never self-continues, runs goal-runtime hooks, clears skill
-	 * state, or emits a user-facing pause.
+	 * (`agent_end.stopReason === "maintenance"`). The `agent_end` handler resumes
+	 * committed maintenance with no synthetic prompt and terminalizes failed or
+	 * aborted maintenance. This method never self-continues, runs goal-runtime
+	 * hooks, clears skill state, or emits a user-facing pause.
 	 */
 	async #runMidRunMaintenance(
 		context: AgentContext,
 		lifecycle: MidRunMaintenanceLifecycle,
 	): Promise<ContextMaintenanceResult> {
-		const result = (outcome: MidRunMaintenanceOutcome, releaseCurrentContext = false): ContextMaintenanceResult => ({
+		const result = (
+			outcome: MidRunMaintenanceOutcome,
+			releaseCurrentContext = false,
+			errorMessage?: string,
+		): ContextMaintenanceResult => ({
 			outcome,
 			...(releaseCurrentContext ? { releaseCurrentContext: true } : {}),
+			...(errorMessage ? { errorMessage } : {}),
 		});
 		if (this.#isDisposed) return { outcome: "aborted" };
 		const invocationController = new AbortController();
@@ -18529,7 +18550,13 @@ export class AgentSession {
 			if (compactionStatus.kind === "aborted") {
 				return compactionStatus.source === "hook" ? result("not-needed") : result("aborted");
 			}
-			return result("failed");
+			return result(
+				"failed",
+				false,
+				compactionStatus.kind === "failed"
+					? compactionStatus.errorMessage
+					: "Context maintenance could not commit a compaction before the next model request.",
+			);
 		} finally {
 			this.#activeMidRunBarrierControllers.delete(invocationController);
 		}
@@ -20286,7 +20313,7 @@ export class AgentSession {
 						? `Context overflow recovery failed: ${errorMessage}`
 						: `Auto-compaction failed: ${errorMessage}`,
 			});
-			return { kind: "failed" };
+			return { kind: "failed", errorMessage };
 		} finally {
 			if (this.#autoCompactionAbortController === autoCompactionAbortController) {
 				this.#autoCompactionAbortController = undefined;

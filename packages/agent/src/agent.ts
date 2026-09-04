@@ -54,7 +54,7 @@ import type {
 	StreamFn,
 	ToolCallContext,
 } from "./types";
-import { setAgentTerminalOwnerContext } from "./types";
+import { isContinuingMidRunMaintenanceOutcome, setAgentTerminalOwnerContext } from "./types";
 
 /**
  * Closed runtime allowlist of failure-classifier codes. The public diagnostic
@@ -2147,12 +2147,15 @@ export class Agent {
 						}
 						this.#state.isStreaming = false;
 						this.#state.streamMessage = null;
-						// A maintenance checkpoint is only non-terminal while a continuation will
-						// follow. An aborted maintenance yields none, and because the loop runs with
+						// A maintenance checkpoint is only non-terminal while a committed rewrite
+						// will continue. Failed or aborted maintenance yields none. Because the loop runs with
 						// `resourceSealOwner: "caller"` it deliberately leaves sealing to us, so
 						// treating it as a checkpoint here would leave the run open forever and make
 						// every cancel report `run_not_sealed`.
-						if (event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted") {
+						if (
+							event.stopReason === "maintenance" &&
+							isContinuingMidRunMaintenanceOutcome(event.maintenanceOutcome)
+						) {
 							this.#managedLogicalRunOwner ??= managedLogicalRunOwner ?? runId;
 							maintenanceInterrupted = true;
 							this.#emit(event);

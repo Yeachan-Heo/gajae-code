@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Mid-run OpenAI remote-compaction fallback failures now stop before another provider request, surface the local summarization error through ACP/SDK terminal handling, and leave the uncompacted context unsubmitted. Successful local fallback still commits the compaction and resumes normally.
 - `/model` provider-tab refreshes now reuse the already loaded static catalog and update only the selected provider's discovery state, avoiding repeated signed preset registry work while retaining full-catalog refresh behavior for static configuration changes.
 - Added the `command` status-line segment for user-produced HUD content. It runs
   configured user/global shell commands in the background with scheduled cached

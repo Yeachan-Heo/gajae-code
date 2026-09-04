@@ -89,6 +89,7 @@ import {
 	type AgentTool,
 	type AgentToolContext,
 	type AgentToolResult,
+	isContinuingMidRunMaintenanceOutcome,
 	type ManagedAttemptOutcome,
 	type StandaloneRunOwnership,
 	type StreamFn,
@@ -1260,13 +1261,12 @@ function publishAgentEnd(
 	event: Extract<AgentEvent, { type: "agent_end" }>,
 	scope?: AttemptScope,
 ): void {
-	// Aborted maintenance yields no continuation, so it is terminal for standalone
-	// ownership and resource sealing. The event itself keeps its `maintenance`
-	// stopReason so AgentSession can still report the aborted maintenance
-	// settlement to its consumers.
+	// Only maintenance that committed a context mutation can continue. Failed and
+	// aborted maintenance are terminal so the unchanged context is never resent.
 	const publishedEvent = scope ? { ...event, scope } : event;
 	const maintenanceContinues =
-		publishedEvent.stopReason === "maintenance" && publishedEvent.maintenanceOutcome !== "aborted";
+		publishedEvent.stopReason === "maintenance" &&
+		isContinuingMidRunMaintenanceOutcome(publishedEvent.maintenanceOutcome);
 	stream.push(publishedEvent);
 	const standalone = config.standaloneRunOwnership
 		? standaloneOwnershipStates.get(config.standaloneRunOwnership)
@@ -3739,6 +3739,16 @@ async function runLoopBody(
 				}
 
 				if (outcome !== "not-needed") {
+					if (outcome === "failed") {
+						const errorMessage =
+							maintenance.errorMessage ??
+							"Context maintenance failed before the next model request; the unchanged context was not resubmitted.";
+						const message = managedFailureMessage(new Error(errorMessage), config);
+						stream.push({ type: "message_start", message, scope: attemptScope });
+						stream.push({ type: "message_end", message, scope: attemptScope });
+						currentContext.messages.push(message);
+						newMessages.push(message);
+					}
 					publishAgentEnd(
 						stream,
 						config,
