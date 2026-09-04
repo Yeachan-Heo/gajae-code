@@ -559,7 +559,11 @@ export class ModelSelectorComponent extends Container {
 				}
 				// The in-flight load already consumes the latest registry snapshot. Avoid
 				// materializing the same catalog again from its own change notification.
-				if (!this.#catalogLoaded || this.#catalogLoadPromise) return;
+				if (this.#catalogLoadPromise) return;
+				if (!this.#catalogLoaded) {
+					void this.#initializeCatalogView();
+					return;
+				}
 				if (this.#refreshCatalogView()) this.#tui.requestRender();
 			});
 		}

@@ -238,6 +238,34 @@ describe("preset landing adversarial QA", () => {
 		expect(text).not.toContain("Loading models...");
 	});
 
+	test("retries a failed deferred load when the catalog changes", async () => {
+		let notifyCatalogChanged = () => {};
+		const registry = Object.assign(createRegistry(["openai-codex"]), {
+			onCatalogChanged: (listener: () => void) => {
+				notifyCatalogChanged = listener;
+				return () => {};
+			},
+		});
+		registry.refresh.mockRejectedValueOnce(new Error("offline refresh failed"));
+		const selector = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		await rendered(selector);
+		selector.handleInput("g");
+		expect(await rendered(selector)).toContain("offline refresh failed");
+		notifyCatalogChanged();
+		const recovered = await rendered(selector);
+		expect(recovered).toContain("gpt-5.5");
+		expect(recovered).not.toContain("offline refresh failed");
+	});
+
 	test("renders static preset refresh failures on the landing", async () => {
 		const registry = createRegistry(["openai-codex"]);
 		registry.refreshStatic.mockRejectedValueOnce(new Error("static refresh failed"));
