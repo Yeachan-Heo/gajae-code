@@ -20,6 +20,7 @@
 - `install:dev` now builds the workspace native addon before linking the source CLI, preventing fresh or cleaned development checkouts from failing startup with a missing or stale addon.
 - Plain and explicit-model launches now refresh a missing provider's cached dynamic catalog before resolving a qualified startup selector, so configured models such as `glm-zcode/glm-5.3` no longer open in `no-model` state while preserving cache-only startup for already available models.
 - The explicit thinking-choice gate for xAI models now derives from the parsed grok generation (4.5+) shared with `@gajae-code/ai`, instead of the exact ids `grok-4.5`/`grok-4.6`. A future grok release failed the id list, so `supportsReasoningEffort` stayed `false` and the user's thinking level was silently dropped from requests; reseller-hosted grok routes (OpenRouter & co.) keep their existing audited-transport behavior.
+- Primary model binding no longer rejects GPT-5.6 Sol solely because the selected OpenAI Codex OAuth account is locally labelled Plus. Binding succeeds and live provider entitlement remains authoritative, while genuine provider rejections still surface the existing actionable guidance.
 
 - The status-line usage segment now paints only the active model's provider, so switching to Grok no longer keeps a stale Claude 5h/7d pair. Canonical Grok Build reports render only their authoritative weekly window, while monthly credits are omitted instead of being mislabeled as `7d`.
 

@@ -2,13 +2,14 @@
  * Model entitlement facts shared by Codex credential selection and provider
  * error presentation.
  *
- * GPT-5.6 Sol is a Pro-tier ChatGPT Codex model. The usage endpoint is the
- * authority for the account tier; this module only names the model policy and
- * keeps the provider's deterministic rejection wording in one place.
+ * Live provider entitlement is authoritative for model access: local usage
+ * planType is a ranking hint only and never denies a request before transport.
+ * This module only names the model policy and keeps the provider's
+ * deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
-const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free", "plus"]);
+const OPENAI_CODEX_PRO_DENIED_PLAN_TYPES = new Set(["free"]);
 
 export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
 
@@ -16,9 +17,9 @@ export type OpenAICodexProEntitlement = "entitled" | "denied" | "unknown";
  * Classify a ChatGPT `plan_type` for strict Pro-tier Codex models.
  *
  * The usage endpoint remains authoritative: only exact, documented tier names
- * are classified. Known Free/Plus tiers can be rejected locally, while missing
- * or unfamiliar values stay unknown and reach the provider instead of being
- * guessed from a substring.
+ * are classified. Known Free tiers can be rejected locally, while Plus,
+ * missing, or unfamiliar values stay unknown and reach the provider instead
+ * of being guessed from a substring.
  */
 export function classifyOpenAICodexProEntitlement(planType: string | undefined): OpenAICodexProEntitlement {
 	const normalized = planType?.trim().toLowerCase();

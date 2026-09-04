@@ -4962,15 +4962,20 @@ export class AuthStorage {
 		);
 
 		// Skip the Pro-plan filter when no candidate is confirmed Pro, so users with only
-		// non-Pro accounts can still attempt Spark requests (e.g. trial/grandfathered access).
-		const enforceProRequirement =
-			requiresProModel && candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
-		// Spark retains its historical Plus fallback for grandfathered accounts.
-		// Sol is different: confirmed Free/Plus plans cannot call it, so reject the
-		// model before returning an OAuth bearer and letting the turn fail remotely.
-		// Unknown plan names still reach the provider because the usage endpoint is
-		// authoritative and future tiers must not be denied by a client-side guess.
+		// non-Pro accounts can still attempt requests (e.g. trial/grandfathered access).
+		// Live provider entitlement is authoritative: never reject before transport
+		// based on local usage planType. Provider-confirmed entitlement failures are
+		// mapped to the actionable error in openai-codex-responses.
 		const strictProRequirement = requiresStrictOpenAICodexProModel(provider, options?.modelId);
+		const enforceProRequirement =
+			requiresProModel &&
+			!strictProRequirement &&
+			candidates.some(candidate => hasOpenAICodexProPlan(candidate.usage));
+		// Spark retains its historical Plus fallback for grandfathered accounts.
+		// Sol is different: a confirmed Free plan cannot call it, so reject the
+		// model before returning an OAuth bearer and letting the turn fail remotely.
+		// Plus and unknown plan names still reach the provider because local usage
+		// metadata is not authoritative for their live Sol entitlement.
 		if (
 			strictProRequirement &&
 			candidates.length > 0 &&

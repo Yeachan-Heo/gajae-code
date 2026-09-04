@@ -371,12 +371,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		expect(apiKey?.startsWith("api-acct-plus-")).toBe(true);
 	});
 
-	test.each([
-		"plus",
-		"free",
-		" Plus ",
-		"FREE",
-	])("rejects GPT-5.6 Sol for the known denied %s ChatGPT plan", async planType => {
+	test.each(["free", "FREE", " Free "])("rejects GPT-5.6 Sol for the unsupported %s ChatGPT plan", async planType => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.set("openai-codex", [
@@ -398,6 +393,30 @@ describe("AuthStorage codex oauth ranking", () => {
 			'This ChatGPT Codex account cannot use model "gpt-5.6-sol". Select a model available to this ChatGPT account',
 		);
 	});
+
+	test.each(["plus", " Plus ", "PLUS"])(
+		"allows GPT-5.6 Sol for the provider-decided %s ChatGPT plan",
+		async planType => {
+			if (!authStorage) throw new Error("test setup failed");
+
+			await authStorage.set("openai-codex", [
+				{ type: "oauth", ...createCredential("acct-plus", "plus@example.com") },
+			]);
+			const plusReport = createCodexUsageReport({
+				accountId: "acct-plus",
+				primary: { usedFraction: 0.05, resetInMs: 30 * 60 * 1000 },
+				secondary: { usedFraction: 0.05, resetInMs: 6 * 24 * 60 * 60 * 1000 },
+			});
+			plusReport.metadata = { ...plusReport.metadata, planType };
+			usageByAccount.set("acct-plus", plusReport);
+
+			await expect(
+				authStorage.getApiKey("openai-codex", `session-sol-${planType.trim().toLowerCase()}`, {
+					modelId: "gpt-5.6-sol",
+				}),
+			).resolves.toBe("api-acct-plus");
+		},
+	);
 
 	test.each([
 		"pro",
@@ -507,7 +526,7 @@ describe("AuthStorage codex oauth ranking", () => {
 		).resolves.toBe("api-acct-future");
 	});
 
-	test("does not apply the ChatGPT entitlement gate to an API-key credential", async () => {
+	test("allows GPT-5.6 Sol on an API-key credential without consulting usage planType", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.set("openai-codex", { type: "api_key", key: "api-key-credential" });
