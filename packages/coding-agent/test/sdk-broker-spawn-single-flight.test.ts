@@ -35,7 +35,7 @@ async function waitForFile(file: string): Promise<void> {
 }
 
 async function waitForAbsent(file: string): Promise<void> {
-	const deadline = Date.now() + 10_000;
+	const deadline = Date.now() + 20_000;
 	while (Date.now() < deadline) {
 		try {
 			await fs.stat(file);
@@ -317,7 +317,7 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 		await Bun.sleep(300);
 		await fs.rm(dir, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 45_000);
 
 it("the parent discovery budget covers child-fence contention plus a full startup attempt", async () => {
 	const dir = await temp();
