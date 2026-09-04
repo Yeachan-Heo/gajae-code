@@ -47,7 +47,8 @@ function captureCursorPayload(context: Context): Promise<AgentRunRequest> {
 	const { promise, resolve, reject } = Promise.withResolvers<AgentRunRequest>();
 	streamCursor(cursorModel, context, {
 		apiKey: "test-token",
-		onPayload: payload => {
+		onPayload: async payload => {
+			await Bun.sleep(1);
 			try {
 				JSON.stringify(payload);
 				resolve(fromJson(AgentRunRequestSchema, payload as JsonValue));
