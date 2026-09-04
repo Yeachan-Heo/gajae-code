@@ -2379,7 +2379,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			// already ran above, so exactly ONE remote handle exists and is retained
 			// across the fold.
 			const bridgeManager = ownedManager;
-			const bridgeEndpointId = this.session.getSessionId?.() ?? "local";
+			const bridgeEndpointId = this.session.getAsyncEndpointId?.() ?? this.session.getSessionId?.() ?? "local";
 			const bridgeLabel = command.length > 120 ? `${command.slice(0, 117)}...` : command;
 			const bridgeCompletion = Promise.withResolvers<ManagedBashJobCompletion>();
 			let bridgeForegroundSettled = false;

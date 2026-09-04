@@ -8,6 +8,11 @@ import type {
 	ClientBridgeTerminalOutput,
 } from "../src/session/client-bridge";
 import { type FoldAdapter, FoldCoordinator } from "../src/session/fold-coordinator";
+import {
+	bindToolLineage,
+	lookupOwnedRegistration,
+	resetTerminalAbortRegistriesForTests,
+} from "../src/session/terminal-abort";
 import type { ToolSession } from "../src/tools";
 import { BashTool, STEER_FOLD_GRACE_MS, steerFoldReasonLine } from "../src/tools/bash";
 
@@ -20,7 +25,12 @@ interface Harness {
 
 function makeHarness(
 	bridge: ClientBridge,
-	options: { autoBackgroundEnabled?: boolean; thresholdMs?: number; maxRunningJobs?: number } = {},
+	options: {
+		autoBackgroundEnabled?: boolean;
+		thresholdMs?: number;
+		maxRunningJobs?: number;
+		asyncEndpointId?: string;
+	} = {},
 ): Harness {
 	const delivered: Array<{ jobId: string; text: string }> = [];
 	const manager = new AsyncJobManager({
@@ -53,6 +63,7 @@ function makeHarness(
 		},
 		getClientBridge: () => bridge,
 		getSessionId: () => "acp-session",
+		getAsyncEndpointId: () => options.asyncEndpointId ?? "acp-session",
 		getAgentId: () => "0-Main",
 		getAsyncJobManager: () => manager,
 		registerForegroundFoldParticipant: (adapter: FoldAdapter) => {
@@ -88,10 +99,47 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
 
 afterEach(() => {
 	mock.restore();
+	resetTerminalAbortRegistriesForTests();
 	AsyncJobManager.resetForTests();
 });
 
 describe("BashTool ACP terminal fold", () => {
+	it("registers client terminal ownership under the opaque async endpoint", async () => {
+		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const handle: ClientBridgeTerminalHandle = {
+			terminalId: "term-endpoint-ownership",
+			waitForExit: () => exit.promise,
+			currentOutput: async () => ({ output: "endpoint output\n", truncated: false }),
+			kill: async () => {},
+			release: async () => {},
+		};
+		const bridge: ClientBridge = { capabilities: { terminal: true }, createTerminal: async () => handle };
+		const endpointId = '["async-job-endpoint","provider","/tmp/session.jsonl"]';
+		const h = makeHarness(bridge, { asyncEndpointId: endpointId });
+		bindToolLineage("call-endpoint-ownership", {
+			lineageIdHash: "client-terminal-lineage",
+			promptAttemptEpoch: 7,
+			endpointGeneration: 0,
+			endpointId,
+		});
+
+		const resultPromise = new BashTool(h.session).execute(
+			"call-endpoint-ownership",
+			{ command: "sleep 30" },
+			undefined,
+			() => {},
+		);
+		await waitFor(() => h.adapters.length === 1);
+		const adapter = h.adapters[0]!;
+		expect(lookupOwnedRegistration(adapter.jobId, adapter.jobGeneration, endpointId)).toBeDefined();
+		expect(lookupOwnedRegistration(adapter.jobId, adapter.jobGeneration, "acp-session")).toBeUndefined();
+
+		foldVia(adapter);
+		await resultPromise;
+		exit.resolve({ exitCode: 0, signal: null });
+		await waitFor(() => h.delivered.length === 1);
+	}, 10_000);
+
 	it("folds a client terminal, retaining exactly one remote handle across the fold", async () => {
 		const exit = Promise.withResolvers<{ exitCode: number; signal: null }>();
 		const handle: ClientBridgeTerminalHandle = {
