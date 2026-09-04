@@ -62,6 +62,14 @@ function spawnLockWorker(dir: string, ready: string, journal: string, label: str
 	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
 }
 
+function spawnEnsureWorker(dir: string): LockWorker {
+	const source = `
+		import { ensureBroker } from ${JSON.stringify(ensureModule)};
+		await ensureBroker({ agentDir: ${JSON.stringify(dir)} });
+	`;
+	return Bun.spawn([process.execPath, "-e", source], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+}
+
 function spawnStaleBrokerWorker(dir: string, ready: string): LockWorker {
 	const source = `
 		import * as fs from "node:fs/promises";
@@ -114,22 +122,15 @@ function spawnExpiringStaleDiscoveryWorker(dir: string, ready: string, lifetimeM
  * not each spawn a detached broker. Exactly one broker may exist afterwards
  * and the lock tree must carry no quarantine tombstones.
  */
-it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and leave no tombstones", async () => {
+it("concurrent OS processes on a cold agent dir spawn exactly one broker and leave no tombstones", async () => {
 	const dir = await temp();
 	const brokerPids = new Set<number>();
 	try {
-		const invocations = Array.from({ length: 6 }, (_, i) =>
-			Bun.spawn([process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir], {
-				cwd: import.meta.dir,
-				stdout: "pipe",
-				stderr: "pipe",
-				env: { ...process.env, GJC_TEST_SPAWN_RACE: String(i) },
-			}),
-		);
+		const invocations = Array.from({ length: 6 }, () => spawnEnsureWorker(dir));
 		const results = await Promise.all(
-			invocations.map(async child => ({ code: await child.exited, out: await new Response(child.stdout).text() })),
+			invocations.map(async child => ({ code: await child.exited, error: await new Response(child.stderr).text() })),
 		);
-		for (const result of results) expect(result.code).toBe(0);
+		expect(results).toEqual(results.map(() => ({ code: 0, error: "" })));
 		const discovery = await brokerDiscovery.readBrokerDiscovery(dir, undefined);
 		expect(discovery).toBeDefined();
 		brokerPids.add(discovery!.pid);
@@ -183,7 +184,7 @@ it("source-mode CLI resolves a relative agent dir once for parent and detached b
 	}
 }, 30_000);
 
-it("concurrent CLI replacement composes stale-generation fencing with single-flight spawn", async () => {
+it("concurrent process replacement composes stale-generation fencing with single-flight spawn", async () => {
 	const dir = await temp();
 	const ready = path.join(dir, "stale.ready");
 	const staleBroker = spawnStaleBrokerWorker(dir, ready);
@@ -191,13 +192,7 @@ it("concurrent CLI replacement composes stale-generation fencing with single-fli
 	try {
 		await waitForFile(ready);
 		const stale = JSON.parse(await fs.readFile(ready, "utf8")) as brokerDiscovery.BrokerDiscovery;
-		const invocations = Array.from({ length: 6 }, () =>
-			Bun.spawn([process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", dir], {
-				cwd: import.meta.dir,
-				stdout: "pipe",
-				stderr: "pipe",
-			}),
-		);
+		const invocations = Array.from({ length: 6 }, () => spawnEnsureWorker(dir));
 		const results = await Promise.all(
 			invocations.map(async child => ({
 				code: await child.exited,
