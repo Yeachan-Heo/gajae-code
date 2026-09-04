@@ -610,7 +610,9 @@ function handleContentBlockStop(
 
 /**
  * Check if the model supports prompt caching.
- * Supported: Anthropic model 3.5 Haiku, Anthropic model 3.7 Sonnet, Anthropic model 4.x+ models, Haiku 4.5+
+ * Supported: Claude 3.5 Haiku, Claude 3.7 Sonnet, and every later Claude
+ * generation:
+ * https://docs.aws.amazon.com/bedrock/latest/userguide/prompt-caching.html
  *
  * For base models and system-defined inference profiles the model ID / ARN
  * contains the model name, so we can decide locally.
@@ -619,19 +621,41 @@ function handleContentBlockStop(
  * set AWS_BEDROCK_FORCE_CACHE=1 to enable cache points.  Amazon Nova models
  * have automatic caching and don't need explicit cache points.
  */
-function supportsPromptCaching(model: Model<"bedrock-converse-stream">): boolean {
+export function supportsPromptCaching(model: Model<"bedrock-converse-stream">): boolean {
 	if (model.cost.cacheRead || model.cost.cacheWrite) return true;
 	const id = model.id.toLowerCase();
-	// Anthropic model 4.x models (opus-4, sonnet-4, haiku-4)
-	if (id.includes("claude") && (id.includes("-4-") || id.includes("-4."))) return true;
-	// Anthropic model 3.5 Haiku, Anthropic model 3.7 Sonnet (legacy naming)
-	if (id.includes("claude-3-7-sonnet") || id.includes("claude-3-5-haiku")) return true;
-	// Anthropic model Haiku 4.5+ (new naming)
-	if (id.includes("claude-haiku")) return true;
+	if (id.includes("claude")) {
+		const generation = parseBedrockClaudeGeneration(id);
+		if (generation !== undefined) {
+			if (generation.major >= 4) return true;
+			if (generation.major === 3 && generation.minor === 7) return true;
+			if (generation.major === 3 && generation.minor === 5 && id.includes("haiku")) return true;
+		}
+	}
 	// Application inference profiles don't contain the model name in the ARN.
 	// Allow users to force cache points via environment variable.
 	if (typeof process !== "undefined" && $flag("AWS_BEDROCK_FORCE_CACHE")) return true;
 	return false;
+}
+
+/**
+ * Bedrock Claude ids come in two shapes:
+ *  - family-first (3.x era): anthropic.claude-3-5-haiku-20241022-v1:0
+ *  - kind-first (4+ era):    anthropic.claude-opus-4-20250514-v1:0,
+ *                            anthropic.claude-haiku-4-5-20251001-v1:0
+ * Cross-region profiles (us./eu./global. prefixes) keep the same model
+ * segment, so a substring match is enough.
+ */
+function parseBedrockClaudeGeneration(id: string): { major: number; minor: number } | undefined {
+	const familyFirst = /claude-(\d{1,2})-(\d{1,2})-/.exec(id);
+	if (familyFirst) {
+		return { major: Number(familyFirst[1]), minor: Number(familyFirst[2]) };
+	}
+	const kindFirst = /claude-[a-z]+-(\d{1,2})(?:[.-](\d{1,2}))?/.exec(id);
+	if (kindFirst) {
+		return { major: Number(kindFirst[1]), minor: kindFirst[2] === undefined ? 0 : Number(kindFirst[2]) };
+	}
+	return undefined;
 }
 
 /**
