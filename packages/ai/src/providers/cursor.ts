@@ -1211,12 +1211,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
 			conversationBlobStores.set(conversationId, blobStore);
 			const cachedState = conversationStateCache.get(conversationId);
-			previousConversationState = cachedState;
-			const usageContext = buildCursorUsageContext(context, model, options);
-			previousUsageContext = conversationUsageContextCache.get(conversationId);
-			conversationUsageContextCache.set(conversationId, usageContext);
-			const reusableCachedState =
-				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext) ? cachedState : undefined;
 			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
