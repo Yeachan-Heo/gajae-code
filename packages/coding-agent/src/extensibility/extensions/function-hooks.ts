@@ -418,7 +418,7 @@ export function functionHookPayloadHash(value: unknown): string {
 }
 
 export function isPlainFunctionHookData(value: unknown, seen = new WeakSet<object>()): boolean {
-	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+	if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean") return true;
 	if (typeof value === "number") return Number.isFinite(value);
 	if (typeof value !== "object" || seen.has(value)) return false;
 	seen.add(value);

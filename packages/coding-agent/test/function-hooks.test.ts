@@ -316,6 +316,19 @@ describe("capability-scoped function hooks", () => {
 		expect(event.input).toEqual({ path: "reviewed.txt" });
 	});
 
+	test("continues ordinary events with undefined optional fields", async () => {
+		const runner = makeRunner([
+			registration(
+				"*",
+				async (_invocation, _capabilities, next) => await next(),
+				{ capabilities: ["ui.transform"] },
+				0,
+			),
+		]);
+		expect(await runner.emitInput("hello", undefined, "interactive")).toEqual({});
+		expect(await runner.emitBeforeAgentStart("hello", undefined, [])).toBeUndefined();
+	});
+
 	test("snapshots a returned transformation before downstream dispatch", async () => {
 		const runner = makeRunner([
 			registration(
