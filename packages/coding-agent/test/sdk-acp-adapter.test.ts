@@ -896,7 +896,6 @@ test("the production ACP MCP launch path preserves broker admission timeout fail
 			message: "SDK host startup was not admitted before the queue wait cutoff.",
 		});
 	} finally {
-		controller.abort();
 		server?.stop(true);
 		await fs.rm(root, { recursive: true, force: true });
 	}
