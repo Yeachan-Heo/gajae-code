@@ -109,18 +109,19 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		context?: AgentToolContext,
 	) {
 		const scope = context?.attemptScope;
+		const toolCallEvent = {
+			type: "tool_call" as const,
+			toolName: this.tool.name,
+			toolCallId,
+			input: params as Record<string, unknown>,
+		};
 		// Emit tool_call event - extensions can block execution
 		if (this.runner.hasHandlers("tool_call")) {
 			try {
-				const callResult = (await this.runner.emitToolCall(
-					{
-						type: "tool_call",
-						toolName: this.tool.name,
-						toolCallId,
-						input: params as Record<string, unknown>,
-					},
-					scope,
-				)) as ToolCallEventResult | undefined;
+				const callResult = (await this.runner.emitToolCall(toolCallEvent, scope, {
+					signal,
+					correlationId: toolCallId,
+				})) as ToolCallEventResult | undefined;
 
 				if (callResult?.block) {
 					const reason = callResult.reason || "Tool execution was blocked by an extension";
@@ -133,6 +134,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
 			}
 		}
+		params = toolCallEvent.input as Static<TParameters>;
 
 		// Execute the actual tool
 		let result: { content: any; details?: TDetails };
@@ -161,6 +163,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					isError: !!executionError,
 				},
 				scope,
+				{ signal, correlationId: toolCallId },
 			);
 
 			if (resultResult) {

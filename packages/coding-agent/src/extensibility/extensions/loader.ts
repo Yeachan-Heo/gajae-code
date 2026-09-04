@@ -19,8 +19,16 @@ import { EventBus } from "../../utils/event-bus";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 import * as TypeBox from "../typebox";
-
 import { resolvePath } from "../utils";
+import {
+	type FunctionHook,
+	type FunctionHookEventType,
+	type FunctionHookPayloadFor,
+	type FunctionHookRegistrationOptions,
+	normalizeFunctionHookGrant,
+	tagFunctionHookHandler,
+	validateFunctionHookTarget,
+} from "./function-hooks";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -260,10 +268,45 @@ class ConcreteExtensionAPI implements ExtensionAPI {
 		private readonly cwd: string,
 		public readonly events: EventBus,
 	) {}
+	#functionHookRegistrationOrder = 0;
 
 	on<F extends HandlerFn>(event: string, handler: F): void {
 		const list = this.extension.handlers.get(event) ?? [];
 		list.push(handler);
+		this.extension.handlers.set(event, list);
+	}
+
+	registerFunctionHook<T extends FunctionHookEventType>(
+		event: T,
+		handler: FunctionHook<FunctionHookPayloadFor<T>>,
+		options: FunctionHookRegistrationOptions = {},
+	): void {
+		if (event === "*") {
+			if (options.target !== undefined) throw new Error("Wildcard function hooks cannot declare a target");
+		} else if (options.target !== undefined) {
+			validateFunctionHookTarget(options.target);
+		}
+		const grant = normalizeFunctionHookGrant(options);
+		const registration = {
+			event,
+			...(options.target === undefined ? {} : { target: options.target }),
+			...(options.registrationId === undefined ? {} : { registrationId: options.registrationId }),
+			registrationOrder: this.#functionHookRegistrationOrder++,
+			handler: handler as unknown as FunctionHook,
+			grant,
+			provenance: {
+				source: options.provenance?.source ?? ("extension" as const),
+				...(options.provenance?.scope === undefined ? {} : { scope: options.provenance.scope }),
+				...(options.provenance?.plugin === undefined ? {} : { plugin: options.provenance.plugin }),
+				extensionId: options.provenance?.extensionId ?? this.extension.path,
+				path: options.provenance?.path ?? this.extension.path,
+				...(options.provenance?.activationGeneration === undefined
+					? {}
+					: { activationGeneration: options.provenance.activationGeneration }),
+			},
+		};
+		const list = this.extension.handlers.get(event) ?? [];
+		list.push(tagFunctionHookHandler(registration));
 		this.extension.handlers.set(event, list);
 	}
 

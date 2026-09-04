@@ -716,7 +716,7 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 		const { typeDir, hookType, level } = typeDirRequests[i];
 		const typeEntries = typeEntriesResults[i];
 
-		for (const entry of typeEntries) {
+		for (const entry of [...typeEntries].sort((a, b) => a.name.localeCompare(b.name))) {
 			if (entry.name.startsWith(".")) continue;
 			if (!entry.isFile()) continue;
 

@@ -3,6 +3,7 @@
  */
 
 export type { SlashCommandInfo, SlashCommandLocation, SlashCommandSource } from "../slash-commands";
+export * from "./function-hooks";
 export {
 	discoverAndLoadExtensions,
 	ExtensionRuntimeNotInitializedError,

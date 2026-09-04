@@ -1,3 +1,4 @@
+import { redactCrashSecrets } from "@gajae-code/utils";
 import { identityEquals, identityKey } from "./lifecycle-reconciliation";
 import type { GjcBundleIdentity, GjcRuntimeFinding, GjcRuntimeSnapshot, GjcRuntimeSnapshotState } from "./types";
 
@@ -28,7 +29,11 @@ export class GjcRuntimeFindingAccumulator {
 	constructor(readonly generation: number) {}
 
 	add(finding: GjcRuntimeFinding): void {
-		this.findings.push(finding);
+		this.findings.push({
+			...finding,
+			message: redactCrashSecrets(finding.message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, "?")).slice(0, 2048),
+			...(finding.generation === undefined ? { generation: this.generation } : {}),
+		});
 	}
 
 	addAll(findings: readonly GjcRuntimeFinding[]): void {

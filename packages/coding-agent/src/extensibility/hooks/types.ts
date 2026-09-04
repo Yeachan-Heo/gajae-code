@@ -8,6 +8,12 @@ import type { HookMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
 import type { BashToolDetails, FindToolDetails, ReadToolDetails, SearchToolDetails } from "../../tools";
 import type {
+	FunctionHook,
+	FunctionHookEventType,
+	FunctionHookPayloadFor,
+	FunctionHookRegistrationOptions,
+} from "../extensions/function-hooks";
+import type {
 	AgentEndEvent,
 	AgentStartEvent,
 	AutoCompactionEndEvent,
@@ -42,6 +48,23 @@ import type {
 
 // Re-export for backward compatibility
 export type { ExecOptions, ExecResult } from "../../exec/exec";
+/** Capability-scoped Function Hooks share the ExtensionRunner event contract. */
+export type {
+	FunctionHook,
+	FunctionHookAuditRecord,
+	FunctionHookCapabilities,
+	FunctionHookCapability,
+	FunctionHookEventType,
+	FunctionHookGrant,
+	FunctionHookGrantInput,
+	FunctionHookNext,
+	FunctionHookOperation,
+	FunctionHookPayloadFor,
+	FunctionHookProvenance,
+	FunctionHookRegistration,
+	FunctionHookRegistrationOptions,
+	FunctionHookResult,
+} from "../extensions/function-hooks";
 
 /**
  * UI context for hooks to request interactive UI from the harness.
@@ -499,6 +522,11 @@ export interface HookAPI {
 	on(event: "todo_reminder", handler: HookHandler<TodoReminderEvent>): void;
 	on(event: "tool_call", handler: HookHandler<ToolCallEvent, ToolCallEventResult>): void;
 	on(event: "tool_result", handler: HookHandler<ToolResultEvent, ToolResultEventResult>): void;
+	registerFunctionHook<T extends FunctionHookEventType>(
+		event: T,
+		handler: FunctionHook<FunctionHookPayloadFor<T>>,
+		options?: FunctionHookRegistrationOptions,
+	): void;
 
 	/**
 	 * Send a custom message to the session. Creates a CustomMessageEntry that

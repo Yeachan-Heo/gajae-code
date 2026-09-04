@@ -27,6 +27,117 @@ function isEnoent(error: unknown): boolean {
 	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
 }
 
+function registryRecord(value: unknown, field: string): Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new GjcPluginLoadError("invalid_manifest", `Invalid GJC plugin registry field ${field}`);
+	}
+	return value as Record<string, unknown>;
+}
+
+function rejectRegistryKeys(value: Record<string, unknown>, allowed: readonly string[], field: string): void {
+	const allowedSet = new Set(allowed);
+	for (const key of Object.keys(value)) {
+		if (!allowedSet.has(key)) {
+			throw new GjcPluginLoadError("invalid_manifest", `Unknown GJC plugin registry field ${field}.${key}`);
+		}
+	}
+}
+
+function validateRegistryEntryShape(value: unknown, field: string): void {
+	const entry = registryRecord(value, field);
+	rejectRegistryKeys(
+		entry,
+		[
+			"name",
+			"version",
+			"scope",
+			"enabled",
+			"pluginRoot",
+			"manifestPath",
+			"manifestHash",
+			"source",
+			"installedAt",
+			"updatedAt",
+			"copiedFiles",
+			"surfaces",
+			"disabledSurfaceIds",
+			"quarantine",
+			"migration",
+		],
+		field,
+	);
+	const source = registryRecord(entry.source, `${field}.source`);
+	rejectRegistryKeys(source, ["kind", "uri", "ref", "sha", "resolvedAt"], `${field}.source`);
+	const surfaces = registryRecord(entry.surfaces, `${field}.surfaces`);
+	rejectRegistryKeys(
+		surfaces,
+		["subskills", "tools", "hooks", "mcps", "systemAppendices", "agentAppendices"],
+		`${field}.surfaces`,
+	);
+	const surfaceKeys: Record<string, readonly string[]> = {
+		subskills: [
+			"extensionId",
+			"name",
+			"description",
+			"parent",
+			"phase",
+			"activationArg",
+			"relativePath",
+			"sha256",
+			"toolRefs",
+		],
+		tools: [
+			"extensionId",
+			"name",
+			"relativePath",
+			"sha256",
+			"description",
+			"schema",
+			"schemaHash",
+			"implementationHash",
+			"presentationHash",
+			"metadataVersion",
+		],
+		hooks: [
+			"extensionId",
+			"name",
+			"event",
+			"target",
+			"phase",
+			"relativePath",
+			"sha256",
+			"implementationHash",
+			"capabilities",
+			"networkDestinations",
+			"filesystemRoots",
+			"capabilityHash",
+			"functionHook",
+		],
+		mcps: ["extensionId", "name", "transport", "configHash", "config"],
+		systemAppendices: ["extensionId", "name", "relativePath", "content", "contentHash", "bytes"],
+		agentAppendices: ["extensionId", "name", "relativePath", "content", "contentHash", "bytes", "agent"],
+	};
+	for (const [surfaceName, allowed] of Object.entries(surfaceKeys)) {
+		const items = surfaces[surfaceName];
+		if (!Array.isArray(items))
+			throw new GjcPluginLoadError("invalid_manifest", `Invalid ${field}.surfaces.${surfaceName}`);
+		for (let index = 0; index < items.length; index += 1) {
+			const item = registryRecord(items[index], `${field}.surfaces.${surfaceName}[${index}]`);
+			rejectRegistryKeys(item, allowed, `${field}.surfaces.${surfaceName}[${index}]`);
+		}
+	}
+	if (!Array.isArray(entry.copiedFiles) || !Array.isArray(entry.disabledSurfaceIds)) {
+		throw new GjcPluginLoadError("invalid_manifest", `Invalid GJC plugin registry arrays at ${field}`);
+	}
+	if (entry.quarantine !== undefined && !Array.isArray(entry.quarantine)) {
+		throw new GjcPluginLoadError("invalid_manifest", `Invalid ${field}.quarantine`);
+	}
+	if (entry.migration !== undefined) {
+		const migration = registryRecord(entry.migration, `${field}.migration`);
+		rejectRegistryKeys(migration, ["status", "metadataVersion", "migratedAt", "failure"], `${field}.migration`);
+	}
+}
+
 /**
  * Deterministic ordering: scope (user before project) -> normalized name ->
  * resolved plugin root. Collisions are errors elsewhere; order only controls
@@ -69,8 +180,9 @@ async function readRegistryRaw(scope: GjcPluginScope, cwd: string): Promise<GjcP
 		);
 	if (
 		!Array.isArray(registry.plugins) ||
-		registry.plugins.some(plugin => {
+		registry.plugins.some((plugin, index) => {
 			if (!plugin || typeof plugin !== "object") return true;
+			validateRegistryEntryShape(plugin, `plugins[${index}]`);
 			const entry = plugin as GjcPluginRegistryEntry;
 			return (
 				entry.scope !== scope ||

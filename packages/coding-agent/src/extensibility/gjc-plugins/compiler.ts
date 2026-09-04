@@ -3,6 +3,7 @@ import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { parseFrontmatter, pathIsWithin } from "@gajae-code/utils";
+import { functionHookGrantHash, normalizeFunctionHookGrant } from "../extensions/function-hooks";
 import { classifyStdioInvocation } from "./mcp-policy";
 import { canonicalizeJsonSchema, extractDeclaredToolSchema, schemaHash } from "./metadata";
 import { resolveWithinRoot } from "./paths";
@@ -261,7 +262,7 @@ function schemaFromSnapshots(
 }
 
 function mcpConfigHash(entry: GjcPluginMcpManifestEntry): string {
-	const canonical = JSON.stringify({
+	const canonical = canonicalJson({
 		name: entry.name,
 		transport: entry.transport,
 		command: entry.command ?? null,
@@ -356,12 +357,6 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 					: [];
 		const toolRefs: NormalizedSubskillToolSurface[] = [];
 		const seenToolRefs = new Set<string>();
-		for (const [toolRel, info] of manifestSubskillFiles) {
-			const extensionId = surfaceIds.subskillTool(fm.binds_to, fm.phase, fm.activation_arg, toolRel);
-			if (seenToolRefs.has(extensionId)) continue;
-			seenToolRefs.add(extensionId);
-			toolRefs.push({ extensionId, relativePath: toolRel, implementationHash: info.sha256 });
-		}
 		for (const toolRel of fmToolPaths) {
 			if (toolRel.trim().length === 0) continue;
 			const toolFile = await resolveDeclaredFile(pluginRoot, toolRel);
@@ -447,6 +442,11 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 				`GJC plugin hook "${hook.name}": tool_result requires the after phase`,
 			);
 		}
+		const grant = normalizeFunctionHookGrant({
+			capabilities: hook.capabilities,
+			networkDestinations: hook.networkDestinations,
+			filesystemRoots: hook.filesystemRoots,
+		});
 		hooks.push({
 			extensionId: surfaceIds.hook(hook.event, hook.phase, hook.target, hook.name),
 			name: hook.name,
@@ -456,6 +456,14 @@ export async function compileGjcPluginBundle(root: string): Promise<NormalizedGj
 			relativePath: hook.path,
 			sha256: digest,
 			implementationHash: digest,
+			capabilities: [...grant.capabilities],
+			networkDestinations: [...grant.networkDestinations],
+			filesystemRoots: [...grant.filesystemRoots],
+			capabilityHash: functionHookGrantHash(grant),
+			functionHook:
+				hook.capabilities !== undefined ||
+				hook.networkDestinations !== undefined ||
+				hook.filesystemRoots !== undefined,
 		});
 	}
 
