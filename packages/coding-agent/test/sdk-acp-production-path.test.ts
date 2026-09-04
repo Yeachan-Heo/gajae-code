@@ -266,12 +266,14 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const cwd = path.join(directory, "workspace");
 	const token = "acp-contract-token";
+	const hostIncarnation = brokerProcessIncarnation(process.pid);
 	const brokerSessions: Record<string, unknown>[] = [
 		{
 			sessionId: "owned-session",
 			locator: { cwd, worktreeRoot: null, stateRoot: path.join(cwd, ".gjc", "state") },
 			live: true,
 			endpointGeneration: 1,
+			...(hostIncarnation === undefined ? {} : { processIncarnation: hostIncarnation, hostIncarnation }),
 		},
 	];
 	const lifecycleInputs: Record<string, unknown>[] = [];
