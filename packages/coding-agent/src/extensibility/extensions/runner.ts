@@ -23,7 +23,7 @@ import type { AttemptRecordStore } from "../../session/attempt-record-store";
 import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import {
 	attenuateFunctionHookGrant,
-	cloneFunctionHookData,
+	cloneFunctionHookDataStrict,
 	compatibilityPayloadForFunctionHook,
 	createFunctionHookCapabilities,
 	type FunctionHook,
@@ -1066,7 +1066,15 @@ export class ExtensionRunner {
 						nextFailureReason = "Function hook passed an invalid or unauthorized event to next()";
 						throw new Error(nextFailureReason);
 					}
-					const candidateSnapshot = nextEvent === undefined ? currentEvent : cloneFunctionHookData(candidate);
+					let candidateSnapshot = currentEvent;
+					if (nextEvent !== undefined) {
+						try {
+							candidateSnapshot = cloneFunctionHookDataStrict(candidate);
+						} catch {
+							nextFailureReason = "Function hook replacement event could not be snapshotted";
+							throw new Error(nextFailureReason);
+						}
+					}
 					nextPromise = invoke(index + 1, candidateSnapshot, downstreamGrant, controller.signal);
 					return (await nextPromise) as FunctionHookResult;
 				};
@@ -1161,7 +1169,14 @@ export class ExtensionRunner {
 							this.#appendFunctionHookAudit(registration, invocation, "error", reason);
 							return failureResult(reason);
 						}
-						nextEvent = cloneFunctionHookData(candidate as TEvent);
+						try {
+							nextEvent = cloneFunctionHookDataStrict(candidate as TEvent);
+						} catch {
+							const reason = "Function hook replacement event could not be snapshotted";
+							this.emitError({ extensionPath: indexed.ext.path, event: currentEvent.type, error: reason });
+							this.#appendFunctionHookAudit(registration, invocation, "error", reason);
+							return failureResult(reason);
+						}
 					}
 					this.#appendFunctionHookAudit(registration, invocation, "continue");
 					return await invoke(index + 1, nextEvent, downstreamGrant, chainSignal);

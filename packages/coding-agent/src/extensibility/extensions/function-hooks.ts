@@ -520,6 +520,13 @@ export function cloneFunctionHookData<T>(value: T): T {
 	}
 }
 
+/** Security-boundary clone for transformed events; never aliases caller-owned data. */
+export function cloneFunctionHookDataStrict<T>(value: T): T {
+	const cloned = structuredClone(value);
+	if (!isPlainFunctionHookData(cloned)) throw new Error("Function hook snapshot is not plain data");
+	return cloned;
+}
+
 function boundedUiKey(value: string): string {
 	return boundedText(value, 80);
 }

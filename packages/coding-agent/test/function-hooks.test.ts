@@ -317,6 +317,30 @@ describe("capability-scoped function hooks", () => {
 		expect(event.input).toEqual({ path: "reviewed.txt" });
 	});
 
+	test("fails closed when a replacement cannot be snapshotted", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async invocation => {
+					const candidate = {
+						...(invocation.payload as ToolCallEvent),
+						input: { path: "proxy.txt" },
+					};
+					return { action: "continue", event: new Proxy(candidate, {}) };
+				},
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+		]);
+		const event = toolCall();
+		expect((await runner.emitToolCall(event))?.block).toBe(true);
+		expect(event.input).toEqual({ path: "secret.txt" });
+		expect(runner.getFunctionHookAudit().at(-1)?.reason).toBe(
+			"Function hook replacement event could not be snapshotted",
+		);
+	});
+
 	test("fails closed when an enforcement-capable wildcard times out", async () => {
 		testSetExtensionHandlerTimeoutMs(10);
 		const runner = makeRunner([
