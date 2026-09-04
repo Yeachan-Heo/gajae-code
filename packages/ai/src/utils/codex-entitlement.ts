@@ -5,8 +5,9 @@
  * Live provider entitlement is authoritative for GPT-5.6 Sol access on Plus
  * and unknown plans: those local usage labels only rank candidates. A
  * confirmed Free-only pool remains locally unsupported. Spark retains its
- * existing local Pro-preference policy. This module names those model policies
- * and keeps the provider's deterministic rejection wording in one place.
+ * existing local filter that excludes non-Pro candidates whenever a confirmed
+ * Pro candidate exists. This module names those model policies and keeps the
+ * provider's deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
