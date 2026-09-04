@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { SdkClient, type SdkClientError } from "../src/sdk/client/client";
+import { SdkClient, type SdkClientError, SdkPreparedDispatchError } from "../src/sdk/client/client";
 
 /*
  * Dispatch-aware requests (#4640).
@@ -671,6 +671,86 @@ test("reconnect moves the dispatch boundary to the new generation only", async (
 	});
 });
 
+test("connected-only prepared dispatch fails pre-send without reconnecting", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 3, reconnectBackoffMs: 10 });
+		const socket = await connect(client, "prepared");
+		socket.readyState = FakeWebSocket.CLOSED;
+		socket.emit("close");
+		const instances = FakeWebSocket.instances.length;
+		let dispatched = false;
+		await expect(
+			client.request(
+				{ type: "control_request", operation: "turn.prompt" },
+				{ connectedOnly: true, beforeDispatch: () => (dispatched = true) },
+			),
+		).rejects.toMatchObject({ code: "connection_closed" });
+		expect(dispatched).toBe(false);
+		expect(FakeWebSocket.instances).toHaveLength(instances);
+		await client.close().catch(() => undefined);
+	});
+});
+
+test("connected-only brands closed and expired clients as prepared failures", async () => {
+	await withFakeTransport(async () => {
+		const closed = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		await closed.close();
+		await expect(
+			closed.request({ type: "control_request", operation: "closed" }, { connectedOnly: true }),
+		).rejects.toBeInstanceOf(SdkPreparedDispatchError);
+
+		const expired = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, deadline: Date.now() - 1 });
+		await expect(
+			expired.request({ type: "control_request", operation: "expired" }, { connectedOnly: true }),
+		).rejects.toBeInstanceOf(SdkPreparedDispatchError);
+		await expired.close().catch(() => undefined);
+	});
+});
+
+test("connected-only keeps observer-triggered retirement prepared", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client, "prepared-observer");
+		const request = client.request(
+			{ type: "control_request", operation: "turn.prompt" },
+			{
+				connectedOnly: true,
+				beforeDispatch: () => {
+					socket.readyState = FakeWebSocket.CLOSED;
+					socket.emit("close");
+				},
+			},
+		);
+		await expect(request).rejects.toBeInstanceOf(SdkPreparedDispatchError);
+		expect(socket.sent).toHaveLength(0);
+		await client.close().catch(() => undefined);
+	});
+});
+
+test("connected-only preserves a post-wire unavailable response as non-prepared", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0 });
+		const socket = await connect(client, "prepared-response");
+		const request = client.request({ type: "control_request", operation: "turn.prompt" }, { connectedOnly: true });
+		await flush();
+		const frame = sentFrame(socket);
+		socket.message({
+			type: "control_response",
+			id: frame.id,
+			ok: false,
+			error: { code: "unavailable", message: "busy" },
+		});
+		try {
+			await request;
+			throw new Error("Expected unavailable response");
+		} catch (error) {
+			expect(error).toMatchObject({ code: "unavailable" });
+			expect(error).not.toBeInstanceOf(SdkPreparedDispatchError);
+		}
+		await client.close();
+	});
+});
+
 test("stale-generation close events never retire requests on the active transport", async () => {
 	await withFakeTransport(async () => {
 		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 1, reconnectBackoffMs: 10 });
@@ -905,6 +985,18 @@ test("client close after dispatch settles the request as uncertain, not hung", a
 		socket.readyState = FakeWebSocket.CLOSED;
 		socket.emit("close");
 		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+	});
+});
+
+test("socket error after dispatch settles unavailable as uncertain", async () => {
+	await withFakeTransport(async () => {
+		const client = new SdkClient("ws://sdk.test", "token", { reconnectAttempts: 0, timeoutMs: 10_000 });
+		const socket = await connect(client);
+		const request = client.request({ type: "control_request", operation: "turn.prompt" });
+		await flush();
+		socket.emit("error", new Event("error"));
+		await expect(request).rejects.toMatchObject({ code: "uncertain_after_send" });
+		await client.close().catch(() => undefined);
 	});
 });
 

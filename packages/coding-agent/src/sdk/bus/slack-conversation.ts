@@ -76,6 +76,7 @@ export function normalizeSlackConversation(record: SlackConversation): SlackConv
 export function acceptsSlackInbound(record: SlackConversation, rootTs: string, endpointGeneration: number): boolean {
 	return (
 		(record.state === "active" || record.state === "resumed_root") &&
+		record.cleanupEffectId === undefined &&
 		record.rootTs === rootTs &&
 		record.endpointGeneration === endpointGeneration
 	);
