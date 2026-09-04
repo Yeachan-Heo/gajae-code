@@ -62,26 +62,33 @@ export function parseModelString(
 		: { provider, id: modelStr.slice(slashIdx + 1) };
 }
 
-export async function refreshMissingQualifiedModelProvider(
-	selector: string | undefined,
-	modelRegistry: Pick<ModelRegistry, "getAvailable" | "refreshProvider">,
+export async function refreshMissingQualifiedModelProviders(
+	selectors: ModelSelectorValue | undefined,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refreshProvider">,
 ): Promise<boolean> {
-	if (!selector) return false;
-	const parsedSelector = parseModelString(selector);
-	if (!parsedSelector) return false;
-	if (
-		modelRegistry
-			.getAvailable()
-			.some(
-				model =>
-					model.provider.toLowerCase() === parsedSelector.provider.toLowerCase() &&
-					model.id.toLowerCase() === parsedSelector.id.toLowerCase(),
-			)
-	)
-		return false;
+	const refreshedProviders = new Set<string>();
+	for (const selector of normalizeModelSelectorValue(selectors)) {
+		const parsedSelector = parseModelString(selector);
+		if (!parsedSelector) continue;
+		const provider = modelRegistry
+			.getDiscoverableProviders()
+			.find(candidate => candidate.toLowerCase() === parsedSelector.provider.toLowerCase());
+		if (!provider || refreshedProviders.has(provider)) continue;
+		if (
+			modelRegistry
+				.getAvailable()
+				.some(
+					model =>
+						model.provider.toLowerCase() === provider.toLowerCase() &&
+						model.id.toLowerCase() === parsedSelector.id.toLowerCase(),
+				)
+		)
+			continue;
 
-	await modelRegistry.refreshProvider(parsedSelector.provider, "online-if-uncached");
-	return true;
+		await modelRegistry.refreshProvider(provider, "online-if-uncached");
+		refreshedProviders.add(provider);
+	}
+	return refreshedProviders.size > 0;
 }
 
 /**

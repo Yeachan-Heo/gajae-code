@@ -32,7 +32,7 @@ import { findConfigFile } from "./config";
 import { activateModelProfile, ModelProfileCredentialError } from "./config/model-profile-activation";
 import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import {
-	refreshMissingQualifiedModelProvider,
+	refreshMissingQualifiedModelProviders,
 	resolveCliModel,
 	resolveModelRoleValue,
 	resolveModelScope,
@@ -1651,18 +1651,18 @@ export async function runRootCommand(
 			)
 		: undefined;
 
-	const startupModelSelector =
+	const startupModelSelectors =
 		parsedArgs.model && !parsedArgs.credential
 			? parsedArgs.provider && !parsedArgs.model.toLowerCase().startsWith(`${parsedArgs.provider.toLowerCase()}/`)
 				? `${parsedArgs.provider}/${parsedArgs.model}`
 				: parsedArgs.model
 			: !parsedArgs.model && !parsedArgs.continue && !parsedArgs.resume
-				? selectorHead(settingsInstance.getModelRole("default"))
+				? settingsInstance.getModelRole("default")
 				: undefined;
 	await logger.time(
-		"refreshStartupModelProvider",
-		refreshMissingQualifiedModelProvider,
-		startupModelSelector,
+		"refreshStartupModelProviders",
+		refreshMissingQualifiedModelProviders,
+		startupModelSelectors,
 		modelRegistry,
 	);
 
