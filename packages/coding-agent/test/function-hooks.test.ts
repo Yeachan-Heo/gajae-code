@@ -282,6 +282,41 @@ describe("capability-scoped function hooks", () => {
 		expect(event.input).toEqual({ path: "reviewed.txt" });
 	});
 
+	test("snapshots a returned transformation before downstream dispatch", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async invocation => {
+					const candidate = {
+						...(invocation.payload as ToolCallEvent),
+						input: { path: "reviewed.txt" },
+					};
+					void Bun.sleep(1).then(() => {
+						candidate.input.path = "mutated-after-return.txt";
+					});
+					return { action: "continue", event: candidate };
+				},
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+			registration(
+				"tool_call",
+				async (invocation, _capabilities, next) => {
+					await Bun.sleep(10);
+					expect((invocation.payload as ToolCallEvent).input).toEqual({ path: "reviewed.txt" });
+					return await next();
+				},
+				{ capabilities: ["tool.inspect", "tool.deny"] },
+				1,
+				"read",
+			),
+		]);
+		const event = toolCall();
+		expect(await runner.emitToolCall(event)).toBeUndefined();
+		expect(event.input).toEqual({ path: "reviewed.txt" });
+	});
+
 	test("fails closed when an enforcement-capable wildcard times out", async () => {
 		testSetExtensionHandlerTimeoutMs(10);
 		const runner = makeRunner([

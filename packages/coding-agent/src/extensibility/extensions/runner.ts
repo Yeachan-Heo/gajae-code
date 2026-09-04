@@ -1161,7 +1161,7 @@ export class ExtensionRunner {
 							this.#appendFunctionHookAudit(registration, invocation, "error", reason);
 							return failureResult(reason);
 						}
-						nextEvent = candidate as TEvent;
+						nextEvent = cloneFunctionHookData(candidate as TEvent);
 					}
 					this.#appendFunctionHookAudit(registration, invocation, "continue");
 					return await invoke(index + 1, nextEvent, downstreamGrant, chainSignal);
