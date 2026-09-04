@@ -511,11 +511,13 @@ export class ChatDaemonRuntime {
 
 	async #onAttachment(attachment: SessionAttachment): Promise<void> {
 		const revivedTransport = this.#attachments.get(attachment.sessionId) === attachment;
-		if (
-			attachment.legacyAuthorityId &&
-			attachment.authorityId &&
-			attachment.legacyAuthorityId !== attachment.authorityId
-		) {
+		const migrateAttachmentAuthority = async (): Promise<void> => {
+			if (
+				!attachment.legacyAuthorityId ||
+				!attachment.authorityId ||
+				attachment.legacyAuthorityId === attachment.authorityId
+			)
+				return;
 			if (this.#discord)
 				await this.#discord.migrateAttachmentAuthority(
 					attachment.sessionId,
@@ -530,9 +532,10 @@ export class ChatDaemonRuntime {
 					attachment.legacyAuthorityId,
 					attachment.authorityId,
 				);
-		}
+		};
 		this.#attachments.set(attachment.sessionId, attachment);
 		if (revivedTransport) {
+			await migrateAttachmentAuthority();
 			this.#presentation?.connectSession(attachment.sessionId, {
 				sendReply: route => attachment.send({ type: "reply", id: route.actionId, answer: route.answer }),
 			});
@@ -553,6 +556,7 @@ export class ChatDaemonRuntime {
 			}
 			const cleanup = this.#cleanupWork.get(attachment.sessionId);
 			if (cleanup) await cleanup.catch(error => logger.warn(`SDK cleanup retry pending: ${String(error)}`));
+			await migrateAttachmentAuthority();
 			const [discordRecovered, slackRecovered] = await Promise.all([
 				discord?.recoverCleanup(attachment.sessionId, attachment.generation, attachment.authorityId) ?? true,
 				slack?.recoverCleanup(attachment.sessionId, attachment.generation, attachment.authorityId) ?? true,

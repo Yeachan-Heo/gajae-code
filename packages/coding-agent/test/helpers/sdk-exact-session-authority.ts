@@ -77,6 +77,7 @@ export async function publishExactSessionAuthority(
 		// incarnation to mirror a genuine host.
 		processIncarnation: processIncarnation(process.pid),
 		endpointMtimeMs: authority.endpointMtimeMs,
+		endpointFileId: authority.endpointFileId,
 		...(hostIncarnation === undefined ? {} : { hostIncarnation }),
 		version: SESSION_INDEX_EVENT_VERSION,
 		indexSeq: 1,
