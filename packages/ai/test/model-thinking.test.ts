@@ -56,7 +56,7 @@ describe("thinking control modes", () => {
 });
 
 describe("model thinking metadata", () => {
-	it("exposes the exact direct xAI Grok 4.5 and 4.6 effort ranges", () => {
+	it("derives conservative direct xAI effort ranges from the Grok generation", () => {
 		const grok45 = createModel({
 			id: "grok-4.5",
 			api: "openai-completions",
@@ -64,6 +64,21 @@ describe("model thinking metadata", () => {
 		});
 		const grok46 = createModel({
 			id: "grok-4.6",
+			api: "openai-completions",
+			provider: "xai",
+		});
+		const grok45Preview = createModel({
+			id: "grok-4.5-preview",
+			api: "openai-completions",
+			provider: "xai",
+		});
+		const grok5 = createModel({
+			id: "grok-5",
+			api: "openai-completions",
+			provider: "xai",
+		});
+		const grok420 = createModel({
+			id: "grok-4.20-0309-reasoning",
 			api: "openai-completions",
 			provider: "xai",
 		});
@@ -78,10 +93,19 @@ describe("model thinking metadata", () => {
 			minLevel: Effort.Low,
 			maxLevel: Effort.XHigh,
 		});
+		expect(grok45Preview.thinking).toEqual(grok45.thinking);
+		expect(grok5.thinking).toEqual(grok45.thinking);
+		expect(grok420.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.High,
+		});
 		expect(() => requireSupportedEffort(grok45, Effort.Minimal)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok45, Effort.XHigh)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok46, Effort.Minimal)).toThrow(/not supported/);
 		expect(() => requireSupportedEffort(grok46, Effort.Max)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(grok5, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(grok420, Effort.XHigh)).toThrow(/not supported/);
 	});
 
 	it("exposes Alibaba DeepSeek V4 Flash's documented low/high/max efforts", () => {
@@ -299,7 +323,10 @@ describe("generated model policies", () => {
 		const models = [
 			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),
 			createModel({ id: "grok-4.6", api: "openai-completions", provider: "xai", reasoning: false }),
+
 			createModel({ id: "grok-4.6", api: "openai-completions", provider: "openrouter", reasoning: false }),
+			createModel({ id: "mlx-reasoner", api: "openai-completions", provider: "omlx", reasoning: false }),
+			createModel({ id: "grok-5", api: "openai-completions", provider: "xai", reasoning: false }),
 		];
 
 		applyGeneratedModelPolicies(models);
@@ -316,6 +343,12 @@ describe("generated model policies", () => {
 		expect(models[0]?.maxTokens).toBe(32_000);
 		expect(models[2]?.reasoning).toBe(false);
 		expect(models[2]?.thinking).toBeUndefined();
+		expect(models[3]).toMatchObject({
+			reasoning: true,
+			compat: { supportsReasoningEffort: true, thinkingFormat: "qwen-chat-template" },
+		});
+		expect(models[4]?.reasoning).toBe(false);
+		expect(models[4]?.thinking).toBeUndefined();
 	});
 
 	it("keeps catalog reasoning flags authoritative outside the stale-row corrections", () => {
@@ -341,10 +374,10 @@ describe("generated model policies", () => {
 		expect(nonReasoning[0]?.thinking).toBeUndefined();
 	});
 
-	it("derives thinking config for future direct xAI grok generations from catalog reasoning", () => {
+	it("derives conservative thinking config for future direct xAI generations with catalog reasoning", () => {
 		const model = createModel({ id: "grok-4.7", api: "openai-completions", provider: "xai" });
 
-		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.XHigh });
+		expect(model.thinking).toMatchObject({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High });
 	});
 
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {

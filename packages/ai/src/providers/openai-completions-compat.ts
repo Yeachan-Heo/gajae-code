@@ -5,7 +5,9 @@
  */
 export {
 	detectOpenAICompat,
+	type GrokGeneration,
 	isDirectXaiReasoningEffortModel,
+	parseDirectXaiReasoningEffortGeneration,
 	type ResolvedOpenAICompat,
 	resolveOpenAICompat,
 } from "../openai-completions-compat";

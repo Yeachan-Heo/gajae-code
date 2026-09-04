@@ -280,11 +280,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
 	if (!modelSupportsReasoningControl(model)) return false;
-	if (
-		model.provider === "openai" ||
-		model.provider === "openai-codex" ||
-		isDirectXaiReasoningEffortModel(model.provider, model.id)
-	)
+	if (model.provider === "openai" || model.provider === "openai-codex" || isDirectXaiReasoningEffortModel(model))
 		return true;
 	if (role === null) return false;
 	if (role === "default") return true;

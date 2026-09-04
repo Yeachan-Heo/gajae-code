@@ -131,13 +131,13 @@ describe("openai-completions compatibility", () => {
 	});
 
 	it("serializes direct xAI Grok 4.5+ reasoning efforts without changing other Grok routes", async () => {
-		async function captureXaiPayload(modelId: string, reasoning: "low" | "xhigh") {
+		async function captureXaiPayload(modelId: string, reasoning: "low" | "xhigh", baseUrl = "https://api.x.ai/v1") {
 			const model: Model<"openai-completions"> = {
 				id: modelId,
 				name: modelId,
 				api: "openai-completions",
 				provider: "xai",
-				baseUrl: "https://api.x.ai/v1",
+				baseUrl,
 				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -169,18 +169,51 @@ describe("openai-completions compatibility", () => {
 			}).supportsReasoningEffort;
 		}
 
-		expect(xaiCompat("grok-4.5")).toBe(true);
-		expect(xaiCompat("grok-4.6")).toBe(true);
-		expect(xaiCompat("grok-4.7")).toBe(true);
-		expect(xaiCompat("grok-4-7")).toBe(true);
-		expect(xaiCompat("grok-5")).toBe(true);
-		expect(xaiCompat("grok-4")).toBe(false);
-		expect(xaiCompat("grok-4.1")).toBe(false);
-		expect(xaiCompat("grok-code-fast-1")).toBe(false);
-		expect(xaiCompat("x-ai/grok-4.5", "custom", "https://api.x.ai/v1")).toBe(false);
+		for (const id of [
+			"grok-4.5",
+			"grok-4.6",
+			"grok-4.7",
+			"grok-4.20",
+			"grok-4.20-0309-reasoning",
+			"grok-4.20-beta-latest-reasoning",
+			"grok-4.20-multi-agent-beta-latest",
+			"grok-5",
+			"grok-10.1-preview",
+		]) {
+			expect(xaiCompat(id), id).toBe(true);
+		}
+		for (const id of [
+			"grok-3",
+			"grok-3-mini",
+			"grok-4",
+			"grok-4.1",
+			"grok-code-fast-1",
+			"ungrok-4.6",
+			"grok-04.6",
+			"grok-4.06",
+			"grok-4.6-",
+			"grok-4.6--preview",
+			"grok-4.6-preview_fast",
+			"grok-4.6-fast-non-reasoning",
+			"grok-4.20-0309-non-reasoning",
+			"grok-4.20-beta-latest-non-reasoning",
+			"GROK-4.6",
+		]) {
+			expect(xaiCompat(id), id).toBe(false);
+		}
+		expect(xaiCompat("grok-4.6", "xai", "https://proxy.example.com/v1")).toBe(false);
+		expect(xaiCompat("grok-4.6", "xai", "http://localhost:4000/v1")).toBe(false);
+		expect(xaiCompat("grok-4.6", "xai", "https://api.x.ai.evil.example/v1")).toBe(false);
+		expect(xaiCompat("grok-4.6", "custom", "https://api.x.ai/v1")).toBe(false);
+		expect(xaiCompat("grok-4.6", "openai", "https://api.openai.com/v1")).toBe(false);
+		expect(xaiCompat("x-ai/grok-4.6", "openai", "https://api.openai.com/v1")).toBe(false);
 		expect((await captureXaiPayload("grok-4.5", "low")).reasoning_effort).toBe("low");
 		expect((await captureXaiPayload("grok-4.6", "xhigh")).reasoning_effort).toBe("xhigh");
 		expect((await captureXaiPayload("grok-4.7", "low")).reasoning_effort).toBe("low");
+		expect((await captureXaiPayload("grok-4.20-0309-reasoning", "low")).reasoning_effort).toBe("low");
+		expect((await captureXaiPayload("grok-4.6", "xhigh", "https://proxy.example.com/v1")).reasoning_effort).toBe(
+			undefined,
+		);
 		expect(xaiCompat("x-ai/grok-4.6", "openrouter", "https://openrouter.ai/api/v1")).toBe(true);
 	});
 
@@ -224,6 +257,13 @@ describe("openai-completions compatibility", () => {
 			baseUrl: "http://localhost:4000/v1",
 		});
 		expect(knownLabelOnUnknownEndpoint.payload).not.toHaveProperty("reasoning_effort");
+
+		const grokOnOpenAIOrigin = await captureCustomPayload({
+			id: "grok-4.6",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+		});
+		expect(grokOnOpenAIOrigin.payload).not.toHaveProperty("reasoning_effort");
 
 		const qwenByNameOnly = await captureCustomPayload({
 			id: "qwen-custom-reasoner",

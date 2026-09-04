@@ -20,6 +20,7 @@ import {
 	kNoAuth,
 	MODEL_ROLE_IDS,
 	ModelRegistry,
+	requiresExplicitThinkingChoice,
 } from "@gajae-code/coding-agent/config/model-registry";
 import {
 	type ModelLookupRegistry,
@@ -39,6 +40,39 @@ import { $credentialEnv, hookFetch, Snowflake } from "@gajae-code/utils";
 describe("model roles", () => {
 	test("default is the only built-in model role", () => {
 		expect(MODEL_ROLE_IDS).toEqual(["default"]);
+	});
+
+	test("direct xAI generation parsing gates explicit thinking choice fail-closed", () => {
+		function grok(id: string, baseUrl = "https://api.x.ai/v1"): Model<"openai-completions"> {
+			return {
+				id,
+				name: id,
+				api: "openai-completions",
+				provider: "xai",
+				baseUrl,
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 500_000,
+				maxTokens: 64_000,
+			};
+		}
+
+		for (const id of ["grok-4.5", "grok-4.6", "grok-4.7", "grok-4.20-0309-reasoning", "grok-5"]) {
+			expect(requiresExplicitThinkingChoice(grok(id), null), id).toBe(true);
+		}
+		for (const id of [
+			"grok-3",
+			"grok-4",
+			"grok-4.1",
+			"grok-4.6-",
+			"grok-4.6-fast-non-reasoning",
+			"grok-4.20-0309-non-reasoning",
+		]) {
+			expect(requiresExplicitThinkingChoice(grok(id), null), id).toBe(false);
+		}
+		expect(requiresExplicitThinkingChoice(grok("grok-4.6", "https://proxy.example.com/v1"), null)).toBe(false);
 	});
 });
 

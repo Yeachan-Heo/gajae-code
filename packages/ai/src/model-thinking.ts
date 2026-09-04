@@ -5,7 +5,11 @@ import {
 	isCodexProductTransport,
 } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import { isAuditedOpenAIReasoningTransport, resolveOpenAICompat } from "./openai-completions-compat";
+import {
+	isAuditedOpenAIReasoningTransport,
+	parseDirectXaiReasoningEffortGeneration,
+	resolveOpenAICompat,
+} from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -63,6 +67,12 @@ const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max]
 const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
 const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
+const GROK_4_20_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
+const GROK_4_20_REASONING_MODEL_IDS = new Set([
+	"grok-4.20-0309-reasoning",
+	"grok-4.20-beta-latest-reasoning",
+	"grok-4.20-multi-agent-beta-latest",
+]);
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -265,6 +275,9 @@ export function modelSupportsReasoningControl<TApi extends Api>(
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
+		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
+			source.reasoning = true;
+		}
 		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
@@ -272,12 +285,7 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
 			source.reasoning = true;
 		}
-		// Per-row data correction: upstream metadata shipped stale `reasoning`
-		// for exactly these ids. Not a family rule — catalog `reasoning` flags
-		// (e.g. the grok `-non-reasoning` variants) stay authoritative for
-		// everything else; the generation floor in isDirectXaiReasoningEffortModel
-		// covers the transport capability.
-		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
+		if (source.provider === "omlx") {
 			source.reasoning = true;
 		}
 		if (
@@ -810,11 +818,13 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
-	if (model.provider === "xai" && model.id === "grok-4.5") {
+	const grokGeneration = parseDirectXaiReasoningEffortGeneration(model);
+	if (grokGeneration !== undefined) {
+		if (grokGeneration.major === 4 && grokGeneration.minor === 6) return GROK_4_6_EFFORTS;
+		if (GROK_4_20_REASONING_MODEL_IDS.has(model.id)) {
+			return GROK_4_20_EFFORTS;
+		}
 		return GROK_4_5_EFFORTS;
-	}
-	if (model.provider === "xai" && model.id === "grok-4.6") {
-		return GROK_4_6_EFFORTS;
 	}
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;

@@ -21,29 +21,62 @@ function bedrockModel(id: string, cachePriced = false): Model<"bedrock-converse-
 }
 
 describe("Bedrock prompt caching support", () => {
-	it("enables cache points for the documented 3.x pair", () => {
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-3-5-haiku-20241022-v1:0"))).toBe(true);
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-3-7-sonnet-20250219-v1:0"))).toBe(true);
+	it("parses both Claude naming schemes across base ids, regional profiles, and ARNs", () => {
+		for (const id of [
+			"anthropic.claude-3-5-haiku-20241022-v1:0",
+			"eu.anthropic.claude-3-7-sonnet-20250219-v1:0",
+			"anthropic.claude-opus-4-20250514-v1:0",
+			"global.anthropic.claude-sonnet-4-5-20250929-v1:0",
+			"au.anthropic.claude-haiku-4-5-20251001-v1:0",
+			"jp.anthropic.claude-sonnet-4-6",
+			"apac.anthropic.claude-opus-5",
+			"arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-6-v1:0",
+			"arn:aws-us-gov:bedrock:us-gov-west-1::foundation-model/anthropic.claude-opus-4-20250514-v1:0",
+		]) {
+			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(true);
+		}
 	});
 
-	it("keeps older and unversioned 3.x Claude models uncached", () => {
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-3-opus-20240229-v1:0"))).toBe(false);
-		// 3.5 Sonnet predates Bedrock cache points; only Haiku of that minor is documented.
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-3-5-sonnet-20240620-v1:0"))).toBe(false);
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-v2:0"))).toBe(false);
-	});
-
-	it("enables cache points for 4.x kind-first naming, including cross-region profiles", () => {
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-opus-4-20250514-v1:0"))).toBe(true);
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-sonnet-4-5-20250929-v1:0"))).toBe(true);
-		expect(supportsPromptCaching(bedrockModel("us.anthropic.claude-haiku-4-5-20251001-v1:0"))).toBe(true);
-		expect(supportsPromptCaching(bedrockModel("eu.anthropic.claude-3-7-sonnet-20250219-v1:0"))).toBe(true);
+	it("keeps unsupported Claude 3.x generations and families uncached", () => {
+		for (const id of [
+			"anthropic.claude-3-opus-20240229-v1:0",
+			"anthropic.claude-3-haiku-20240307-v1:0",
+			"anthropic.claude-3-5-sonnet-20240620-v1:0",
+			"anthropic.claude-3-7-haiku-20250219-v1:0",
+			"anthropic.claude-v2:0",
+		]) {
+			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(false);
+		}
 	});
 
 	it("keeps covering future generations without a source patch", () => {
-		expect(supportsPromptCaching(bedrockModel("us.anthropic.claude-opus-5-20300101-v1:0"))).toBe(true);
-		expect(supportsPromptCaching(bedrockModel("eu.anthropic.claude-fable-5-20300101-v1:0"))).toBe(true);
-		expect(supportsPromptCaching(bedrockModel("anthropic.claude-6-1-20400101-v1:0"))).toBe(true);
+		for (const id of [
+			"us.anthropic.claude-opus-5-20300101-v1:0",
+			"eu.anthropic.claude-fable-5-20300101-v1:0",
+			"anthropic.claude-6-1-fable-20400101-v1:0",
+		]) {
+			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(true);
+		}
+	});
+
+	it("rejects non-Claude lookalikes and malformed model ids", () => {
+		for (const id of [
+			"amazon.claude-opus-5-20300101-v1:0",
+			"notanthropic.claude-opus-5-20300101-v1:0",
+			"anthropic.not-claude-opus-5-20300101-v1:0",
+			"custom-anthropic.claude-opus-5-20300101-v1:0",
+			"custom/us.anthropic.claude-opus-5-20300101-v1:0",
+			"arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/us.anthropic.claude-opus-5",
+			"arn:aws:bedrock:us-east-1:123456789012:prompt/us.anthropic.claude-opus-5",
+			"anthropic.claude-opus-04-5-20300101-v1:0",
+			"anthropic.claude-opus-4-05-20300101-v1:0",
+			"anthropic.claude-opus-4-5--preview",
+			"anthropic.claude-opus-4-5-preview_1",
+			"anthropic.claude-6-1-20400101-v1:0",
+			"ANTHROPIC.CLAUDE-OPUS-5",
+		]) {
+			expect(supportsPromptCaching(bedrockModel(id)), id).toBe(false);
+		}
 	});
 
 	it("trusts catalog cache pricing for non-Claude models and excludes the rest", () => {
