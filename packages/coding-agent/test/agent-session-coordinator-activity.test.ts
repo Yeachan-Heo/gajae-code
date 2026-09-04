@@ -8,6 +8,7 @@ import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
 import { Settings } from "../src/config/settings";
 import {
+	__sessionStateSidecarPerfCounters,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
 	persistCoordinatorRuntimeStateFromEvent,
 } from "../src/gjc-runtime/session-state-sidecar";
@@ -37,6 +38,7 @@ afterEach(async () => {
 	for (const session of sessions.splice(0)) await session.dispose();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
+	__sessionStateSidecarPerfCounters.reset();
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
@@ -312,6 +314,26 @@ async function settledActivity(stateFile: string): Promise<Record<string, unknow
 }
 
 describe("AgentSession coordinator activity labels", () => {
+	it("skips coordinator persistence for memory-only sessions without a state sink", async () => {
+		delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-activity-memory-only-"));
+		tempDirs.push(root);
+		const agent = new Agent({
+			initialState: { model: createModel(), systemPrompt: ["initial"], tools: [], messages: [] },
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(root),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry: {} as never,
+		});
+		sessions.push(session);
+		__sessionStateSidecarPerfCounters.reset();
+		await session.queueCoordinatorRuntimeStatePersistForTests({ type: "turn_start" }, Promise.resolve());
+
+		expect(__sessionStateSidecarPerfCounters.persistFromEventCalls).toBe(0);
+	});
+
 	it("publishes only canonical labels proven against the session's registered tools", async () => {
 		const { session, stateFile, tools } = await newSession();
 
