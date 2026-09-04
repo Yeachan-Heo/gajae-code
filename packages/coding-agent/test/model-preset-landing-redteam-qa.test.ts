@@ -237,6 +237,66 @@ describe("preset landing adversarial QA", () => {
 		expect(text).toContain("offline refresh failed");
 		expect(text).not.toContain("Loading models...");
 	});
+
+	test("renders static preset refresh failures on the landing", async () => {
+		const registry = createRegistry(["openai-codex"]);
+		registry.refreshStatic.mockRejectedValueOnce(new Error("static refresh failed"));
+		const selector = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		const text = await rendered(selector);
+		expect(text).toContain("static refresh failed");
+		expect(text).toContain("Model presets");
+	});
+
+	test("re-evaluates preset versus browser mode after static refresh", async () => {
+		let profiles = new Map<string, ModelProfileDefinition>();
+		const addedRegistry = createRegistry(["openai-codex"], []);
+		addedRegistry.getModelProfiles = () => new Map(profiles);
+		addedRegistry.getModelProfile = (name: string) => profiles.get(name);
+		addedRegistry.refreshStatic.mockImplementation(async () => {
+			profiles = new Map([[codexEco.name, codexEco]]);
+		});
+		const added = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			addedRegistry as never,
+			[],
+			() => {},
+			() => {},
+		);
+		expect(await rendered(added)).toContain("Model presets");
+		expect(addedRegistry.refresh).not.toHaveBeenCalled();
+		expect(addedRegistry.getCanonicalModelSelections).not.toHaveBeenCalled();
+
+		profiles = new Map([[codexEco.name, codexEco]]);
+		const removedRegistry = createRegistry(["openai-codex"], [codexEco]);
+		removedRegistry.getModelProfiles = () => new Map(profiles);
+		removedRegistry.getModelProfile = (name: string) => profiles.get(name);
+		removedRegistry.refreshStatic.mockImplementation(async () => {
+			profiles.clear();
+		});
+		const removed = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			removedRegistry as never,
+			[],
+			() => {},
+			() => {},
+		);
+		const removedText = await rendered(removed);
+		expect(removedText).toContain("Models");
+		expect(removedRegistry.getAvailable).toHaveBeenCalledTimes(1);
+	});
 	beforeAll(async () => {
 		testTheme = await getThemeByName("red-claw");
 		installTestTheme();

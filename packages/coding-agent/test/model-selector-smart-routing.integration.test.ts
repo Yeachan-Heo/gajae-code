@@ -62,6 +62,7 @@ function createContext(
 		noProfiles?: boolean;
 		providerOrder?: readonly string[];
 		refreshError?: Error;
+		refreshStaticGate?: Promise<void>;
 	} = {},
 ) {
 	const settings = options.settings ?? Settings.isolated();
@@ -72,6 +73,9 @@ function createContext(
 		getAvailable: () => catalog,
 		refresh: vi.fn(async () => {
 			if (options.refreshError) throw options.refreshError;
+		}),
+		refreshStatic: vi.fn(async () => {
+			await options.refreshStaticGate;
 		}),
 		getError: () => undefined,
 		getCanonicalModels: () => [],
@@ -293,6 +297,24 @@ describe("/model smart-routing panel integration", () => {
 		const { panel, selector } = await openPanel({ smartRoutingOnly: true, noProfiles: true });
 		expect(selector.__testViewMode()).toBe("smart-routing");
 		expect(renderText(panel)).toContain("Smart routing setup");
+	});
+
+	test("landing waits for static refresh before opening smart routing", async () => {
+		const gate = Promise.withResolvers<void>();
+		const { ctx, editorContainer } = createContext({ refreshStaticGate: gate.promise });
+		const controller = new SelectorController(ctx as never);
+		controller.showModelSelector();
+		const selector = editorContainer.addChild.mock.calls[0]?.[0] as ModelSelectorComponent;
+		for (let index = 0; index < 20 && selector.__testSelectedPresetRowIdentity() !== "smartRouting"; index++) {
+			selector.handleInput("\x1b[B");
+		}
+		selector.handleInput("\n");
+		expect(selector.__testGetSmartRoutingPanel()).toBeUndefined();
+		expect(renderText(selector)).toContain("Refreshing model configuration...");
+
+		gate.resolve();
+		await settle();
+		expect(selector.__testGetSmartRoutingPanel()).toBeDefined();
 	});
 
 	test("standalone /routing renders catalog refresh failures instead of hanging", async () => {
