@@ -1651,13 +1651,14 @@ export async function runRootCommand(
 			)
 		: undefined;
 
-	const startupModelSelector = parsedArgs.model
-		? parsedArgs.provider && !parsedArgs.model.toLowerCase().startsWith(`${parsedArgs.provider.toLowerCase()}/`)
-			? `${parsedArgs.provider}/${parsedArgs.model}`
-			: parsedArgs.model
-		: !parsedArgs.continue && !parsedArgs.resume
-			? selectorHead(settingsInstance.getModelRole("default"))
-			: undefined;
+	const startupModelSelector =
+		parsedArgs.model && !parsedArgs.credential
+			? parsedArgs.provider && !parsedArgs.model.toLowerCase().startsWith(`${parsedArgs.provider.toLowerCase()}/`)
+				? `${parsedArgs.provider}/${parsedArgs.model}`
+				: parsedArgs.model
+			: !parsedArgs.model && !parsedArgs.continue && !parsedArgs.resume
+				? selectorHead(settingsInstance.getModelRole("default"))
+				: undefined;
 	await logger.time(
 		"refreshStartupModelProvider",
 		refreshMissingQualifiedModelProvider,
