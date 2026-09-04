@@ -2,10 +2,11 @@
  * Model entitlement facts shared by Codex credential selection and provider
  * error presentation.
  *
- * Live provider entitlement is authoritative for model access: local usage
- * planType is a ranking hint only and never denies a request before transport.
- * This module only names the model policy and keeps the provider's
- * deterministic rejection wording in one place.
+ * Live provider entitlement is authoritative for GPT-5.6 Sol access on Plus
+ * and unknown plans: those local usage labels only rank candidates. A
+ * confirmed Free-only pool remains locally unsupported. Spark retains its
+ * existing local Pro-preference policy. This module names those model policies
+ * and keeps the provider's deterministic rejection wording in one place.
  */
 
 const OPENAI_CODEX_PRO_ENTITLED_PLAN_TYPES = new Set(["pro", "business", "enterprise", "team"]);
