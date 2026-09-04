@@ -2,12 +2,18 @@
  * CLI argument parsing
  */
 import * as path from "node:path";
-import { type Effort, THINKING_EFFORTS } from "@gajae-code/ai/core";
+import { ThinkingLevel } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
 import { CliParseError } from "@gajae-code/utils/cli";
-import { parseEffort } from "../thinking";
+import { parseThinkingLevel } from "../thinking";
 import { BUILTIN_TOOLS } from "../tools";
-import { type ConsumerLaunchFlagName, LAUNCH_PARSE_FLAGS, launchFlagIsOwnedBy } from "./root-flags";
+import {
+	type ConsumerLaunchFlagName,
+	LAUNCH_PARSE_FLAGS,
+	launchFlagIsOwnedBy,
+	ROOT_THINKING_LEVELS,
+	type RootThinkingLevel,
+} from "./root-flags";
 
 const ROOT_FLAG_TOKENS = new Set<string>();
 for (const [name, descriptor] of Object.entries(LAUNCH_PARSE_FLAGS)) {
@@ -55,7 +61,7 @@ export interface Args {
 	mcpConfig?: string;
 	/** Opt a standalone session out of conventional MCP autoload (mutually exclusive with --mcp-config). */
 	noMcp?: boolean;
-	thinking?: Effort;
+	thinking?: RootThinkingLevel;
 	continue?: boolean;
 	resume?: string | true;
 	help?: boolean;
@@ -348,15 +354,15 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			// a usage error, not a silent no-op / accidental consumption of `-p`.
 			const next = args[i + 1];
 			if (!next || next.startsWith("-")) {
-				throw new CliParseError(`--thinking requires <level> (${THINKING_EFFORTS.join(", ")})`);
+				throw new CliParseError(`--thinking requires <level> (${ROOT_THINKING_LEVELS.join(", ")})`);
 			}
 			const rawThinking = args[++i];
-			const thinking = parseEffort(rawThinking);
-			if (thinking === undefined) {
+			const thinking = parseThinkingLevel(rawThinking);
+			if (thinking === undefined || thinking === ThinkingLevel.Inherit) {
 				// Fail closed: a silent ignore left users believing `ultra` (or any typo)
-				// was applied. Help / Flags.options advertise the real Effort enum.
+				// was applied. Help / Flags.options advertise the root thinking levels.
 				throw new CliParseError(
-					`Invalid --thinking level "${rawThinking}". Expected one of: ${THINKING_EFFORTS.join(", ")}`,
+					`Invalid --thinking level "${rawThinking}". Expected one of: ${ROOT_THINKING_LEVELS.join(", ")}`,
 				);
 			}
 			result.thinking = thinking;

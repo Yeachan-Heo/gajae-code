@@ -118,8 +118,9 @@ describe("GJC inshellisense completion spec", () => {
 			expect(findSubcommand(spec, command), command).toBeDefined();
 		}
 		expect(names(findSubcommand(spec, "web-search")!.name)).toContain("q");
-		// Root help must advertise the real Effort enum — not the retired `ultra` token.
+		// Root help must advertise the real thinking selector — not the retired `ultra` token.
 		expect(findOption(spec.options, "--thinking")?.args?.suggestions).toEqual([
+			"off",
 			"minimal",
 			"low",
 			"medium",

@@ -1,6 +1,8 @@
+import { THINKING_EFFORTS } from "@gajae-code/ai/core";
 import { type FlagDescriptor, Flags } from "@gajae-code/utils/cli";
 
-const ROOT_THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const ROOT_THINKING_LEVELS = ["off", ...THINKING_EFFORTS] as const;
+export type RootThinkingLevel = (typeof ROOT_THINKING_LEVELS)[number];
 
 /** Public launch flags shared by root help, completion, and the launch command. */
 export const ROOT_LAUNCH_FLAGS = {
@@ -63,8 +65,8 @@ export const ROOT_LAUNCH_FLAGS = {
 	tmux: Flags.boolean({ description: "Launch interactive startup inside tmux" }),
 	tools: Flags.string({ description: "Comma-separated list of tools to enable (default: all)" }),
 	thinking: Flags.string({
-		description: `Set thinking level: ${ROOT_THINKING_EFFORTS.join(", ")}`,
-		options: ROOT_THINKING_EFFORTS,
+		description: `Set thinking level: ${ROOT_THINKING_LEVELS.join(", ")}`,
+		options: ROOT_THINKING_LEVELS,
 	}),
 	"no-rules": Flags.boolean({ description: "Disable rules discovery and loading" }),
 	export: Flags.string({ description: "Export session file to HTML and exit" }),
