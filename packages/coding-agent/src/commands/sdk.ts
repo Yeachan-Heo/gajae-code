@@ -1087,11 +1087,11 @@ export default class Sdk extends Command {
 			await runSessionHost();
 			return;
 		}
-		const agentDir = internal.agentDir;
+		const agentDir = path.resolve(internal.agentDir);
 		let broker: Broker | undefined;
 		try {
-			broker = await withBrokerStartupLock(agentDir, async () => {
-				if (await reconcileBrokerGenerationForStartup({ agentDir })) return undefined;
+			broker = await withBrokerStartupLock(agentDir, async deadline => {
+				if (await reconcileBrokerGenerationForStartup({ agentDir }, deadline)) return undefined;
 				const startupDelayMs = Number(process.env.GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS ?? 0);
 				if (Number.isSafeInteger(startupDelayMs) && startupDelayMs > 0 && startupDelayMs <= 10_000)
 					await Bun.sleep(startupDelayMs);
@@ -1125,12 +1125,15 @@ export default class Sdk extends Command {
 			// This process spawns detached with stdio ignored (see ensure.ts), so the
 			// durable marker is the only channel the caller has to see why start()
 			// failed instead of a bare exit code (#3963).
-			await writeBrokerStartupFailureMarker(agentDir, {
-				reason: error instanceof Error ? error.message : String(error),
-				exitCode: 1,
-				signal: null,
-				pid: process.pid,
-			});
+			const incarnation = processIncarnation(process.pid);
+			if (incarnation)
+				await writeBrokerStartupFailureMarker(agentDir, {
+					reason: error instanceof Error ? error.message : String(error),
+					exitCode: 1,
+					signal: null,
+					pid: process.pid,
+					incarnation,
+				});
 			throw error;
 		}
 		if (!broker) return;
@@ -1139,12 +1142,15 @@ export default class Sdk extends Command {
 			// Another broker owns discovery; this process exits cleanly (code 0) as
 			// the race loser. Record why so a caller polling for a winner that never
 			// appears can diagnose the loss instead of seeing only a bare exit 0.
-			await writeBrokerStartupFailureMarker(agentDir, {
-				reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
-				exitCode: 0,
-				signal: null,
-				pid: process.pid,
-			});
+			const incarnation = processIncarnation(process.pid);
+			if (incarnation)
+				await writeBrokerStartupFailureMarker(agentDir, {
+					reason: "Another broker owns the lock/discovery; this broker exited as the race loser.",
+					exitCode: 0,
+					signal: null,
+					pid: process.pid,
+					incarnation,
+				});
 			return;
 		}
 		// A live broker must not keep advertising sessions whose host process is

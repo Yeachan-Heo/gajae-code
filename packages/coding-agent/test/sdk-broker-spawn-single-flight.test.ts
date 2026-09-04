@@ -1,5 +1,6 @@
 import { expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import packageJson from "../package.json" with { type: "json" };
@@ -17,7 +18,7 @@ const cli = path.resolve(import.meta.dir, "../src/cli.ts");
 const brokerModule = path.resolve(import.meta.dir, "../src/sdk/broker/broker.ts");
 const discoveryModule = path.resolve(import.meta.dir, "../src/sdk/broker/discovery.ts");
 const ensureModule = path.resolve(import.meta.dir, "../src/sdk/broker/ensure.ts");
-const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-spawn-race-"));
+const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-race-"));
 type LockWorker = Bun.Subprocess<"ignore", "pipe", "pipe">;
 
 async function waitForFile(file: string): Promise<void> {
@@ -124,12 +125,9 @@ it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and 
 		expect(names).not.toContain("broker.spawn.lock");
 		const sessions = await fs.readdir(path.join(sdk, "sessions")).catch(() => [] as string[]);
 		expect(sessions.filter(name => name.startsWith("index.jsonl.lock"))).toEqual([]);
-		// Exactly one broker process bound to this dir.
-		const ps = Bun.spawnSync(["ps", "-Ao", "args="]).stdout.toString();
-		const brokers = ps
-			.split("\n")
-			.filter(line => line.includes("broker-internal") && line.includes(`--agent-dir ${dir}`));
-		expect(brokers).toHaveLength(1);
+		const broker = native.Process.fromPid(discovery!.pid);
+		expect(broker?.args()).toContain("broker-internal");
+		expect(broker?.args()).toContain(dir);
 	} finally {
 		for (const pid of brokerPids)
 			try {
@@ -141,6 +139,35 @@ it("concurrent CLI invocations on a cold agent dir spawn exactly one broker and 
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }, 60_000);
+
+it("source-mode CLI resolves a relative agent dir once for parent and detached broker", async () => {
+	const root = await temp();
+	const relativeAgentDir = "relative-agent";
+	const agentDir = path.join(root, relativeAgentDir);
+	let brokerPid: number | undefined;
+	try {
+		const child = Bun.spawn(
+			[process.execPath, "run", cli, "sdk", "session", "list", "--scope", "all", "--agent-dir", relativeAgentDir],
+			{ cwd: root, stdout: "pipe", stderr: "pipe" },
+		);
+		const [code, error] = await Promise.all([child.exited, new Response(child.stderr).text()]);
+		expect({ code, error }).toEqual({ code: 0, error: "" });
+		const discovery = await brokerDiscovery.readBrokerDiscovery(agentDir);
+		expect(discovery).not.toBeNull();
+		brokerPid = discovery!.pid;
+		expect(native.Process.fromPid(brokerPid)?.args()).toContain(agentDir);
+		expect(await brokerDiscovery.readBrokerDiscovery(path.resolve(import.meta.dir, relativeAgentDir))).toBeNull();
+	} finally {
+		if (brokerPid !== undefined)
+			try {
+				process.kill(brokerPid, "SIGTERM");
+			} catch {
+				// gone
+			}
+		await Bun.sleep(300);
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
 
 it("concurrent CLI replacement composes stale-generation fencing with single-flight spawn", async () => {
 	const dir = await temp();
@@ -170,10 +197,9 @@ it("concurrent CLI replacement composes stale-generation fencing with single-fli
 		expect(replacement).toMatchObject({ packageGeneration: packageJson.version });
 		expect(replacement!.ownerId).not.toBe(stale.ownerId);
 		currentPid = replacement!.pid;
-		const ps = Bun.spawnSync(["ps", "-Ao", "args="]).stdout.toString();
-		expect(
-			ps.split("\n").filter(line => line.includes("broker-internal") && line.includes(`--agent-dir ${dir}`)),
-		).toHaveLength(1);
+		const broker = native.Process.fromPid(replacement!.pid);
+		expect(broker?.args()).toContain("broker-internal");
+		expect(broker?.args()).toContain(dir);
 		const sdkEntries = await fs.readdir(path.join(dir, "sdk"));
 		expect(sdkEntries).not.toContain("broker.spawn.lock");
 		expect(sdkEntries).not.toContain("broker.startup.lock");
@@ -243,7 +269,12 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 				env: { ...process.env, GJC_SDK_TEST_BROKER_STARTUP_DELAY_MS: "10000" },
 			},
 		);
-		await waitForFile(path.join(dir, "sdk", "broker.startup.lock", "info"));
+		const startupLockInfoPath = path.join(dir, "sdk", "broker.startup.lock", "info");
+		await waitForFile(startupLockInfoPath);
+		const incumbentOwner = JSON.parse(await fs.readFile(startupLockInfoPath, "utf8")) as {
+			pid: number;
+			process_incarnation: string;
+		};
 		first.kill("SIGKILL");
 		await first.exited;
 
@@ -260,6 +291,10 @@ it("retries discovery after a launcher dies while its child holds the startup fe
 		expect({ code, error }).toEqual({ code: 0, error: "" });
 		const discovery = await brokerDiscovery.readBrokerDiscovery(dir);
 		expect(discovery).not.toBeNull();
+		expect(discovery).toMatchObject({
+			pid: incumbentOwner.pid,
+			incarnation: incumbentOwner.process_incarnation,
+		});
 		replacementPid = discovery!.pid;
 		expect(await fs.readdir(path.join(dir, "sdk"))).not.toContain("broker.startup.lock");
 	} finally {

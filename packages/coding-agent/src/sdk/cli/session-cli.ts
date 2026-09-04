@@ -455,7 +455,7 @@ export async function runSdkSearch(
 	createService: (agentDir: string) => SessionLifecycleService = createBrokerSessionLifecycleService,
 	probe: (agentDir: string, result: SdkSearchResultV1) => Promise<SdkSearchResultV1> = probeSearchRows,
 ): Promise<{ result: SdkSearchResultV1; exitCode: 0 | 1 }> {
-	const agentDir = args.agentDir ?? getAgentDir();
+	const agentDir = path.resolve(args.agentDir ?? getAgentDir());
 	const locator = await resolveSessionLocator(args.repo ?? process.cwd(), agentDir);
 	const scope: ScopeNameV1 =
 		args.scope === undefined || args.scope === "repo" || args.scope === "pwd" || args.scope === "global"
@@ -1804,7 +1804,7 @@ export async function runSdkSessionCli(
 				"Expected one of: list, inspect, send, status, tail, retire, raw (control|query|global).",
 				2,
 			);
-		const agentDir = args.agentDir ?? getAgentDir();
+		const agentDir = path.resolve(args.agentDir ?? getAgentDir());
 		if (action === "list") {
 			writeOutput(stripSecretFields(await runList(agentDir, args)));
 			return;

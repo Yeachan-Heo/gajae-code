@@ -1,8 +1,9 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { processIncarnation } from "./process-incarnation";
 
 export interface BrokerStartupFailureMarker {
-	version: 1;
+	version: 2;
 	reason: string;
 	exitCode: number | null;
 	signal: string | null;
@@ -16,6 +17,8 @@ export interface BrokerStartupFailureMarker {
 	 * failure.
 	 */
 	pid: number;
+	/** Kernel-derived identity for the exact process incarnation that wrote the marker. */
+	incarnation: string;
 }
 
 const BROKER_STARTUP_FAILURE_FILE = "broker.startup-failure.json";
@@ -30,14 +33,16 @@ function boundedMarker(
 	exitCode: number | null,
 	signal: string | null,
 	pid: number,
+	incarnation: string,
 ): BrokerStartupFailureMarker {
 	return {
-		version: 1,
+		version: 2,
 		reason: reason.slice(0, MAX_BROKER_STARTUP_FAILURE_REASON),
 		exitCode,
 		signal,
 		writtenAt: Date.now(),
 		pid,
+		incarnation,
 	};
 }
 
@@ -49,13 +54,15 @@ function boundedMarker(
  */
 export async function writeBrokerStartupFailureMarker(
 	agentDir: string,
-	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number },
+	failure: { reason: string; exitCode: number | null; signal: string | null; pid: number; incarnation?: string },
 ): Promise<void> {
 	try {
+		const incarnation = failure.incarnation ?? processIncarnation(failure.pid);
+		if (!incarnation) return;
 		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
 		await Bun.write(
 			brokerStartupFailurePath(agentDir),
-			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid)),
+			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal, failure.pid, incarnation)),
 		);
 	} catch {
 		// Best-effort only.
@@ -74,7 +81,7 @@ export async function readBrokerStartupFailureMarker(
 		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
 		const marker = value as Partial<BrokerStartupFailureMarker>;
 		if (
-			marker.version !== 1 ||
+			marker.version !== 2 ||
 			typeof marker.reason !== "string" ||
 			marker.reason.length === 0 ||
 			(marker.exitCode !== null && typeof marker.exitCode !== "number") ||
@@ -82,7 +89,9 @@ export async function readBrokerStartupFailureMarker(
 			typeof marker.writtenAt !== "number" ||
 			typeof marker.pid !== "number" ||
 			!Number.isInteger(marker.pid) ||
-			marker.pid <= 0
+			marker.pid <= 0 ||
+			typeof marker.incarnation !== "string" ||
+			marker.incarnation.length === 0
 		)
 			return undefined;
 		return marker as BrokerStartupFailureMarker;
