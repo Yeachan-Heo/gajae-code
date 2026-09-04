@@ -86,6 +86,7 @@ type SemVer = {
 type GeminiKind = "pro" | "flash";
 type AnthropicKind = "opus" | "sonnet" | "fable";
 type OpenAIVariant =
+	| "astra"
 	| "base"
 	| "codex"
 	| "codex-max"
@@ -1014,7 +1015,7 @@ function parseAnthropicModel(modelId: string): AnthropicModel | null {
 
 function parseOpenAIModel(modelId: string): OpenAIModel | null {
 	const match =
-		/gpt-(\d+(?:\.\d+){0,2})(?:-(codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
+		/gpt-(\d+(?:\.\d+){0,2})(?:-(astra|codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/.exec(
 			modelId,
 		);
 	if (!match) {

@@ -65461,6 +65461,33 @@
 			},
 			"applyPatchToolType": "freeform"
 		},
+		"gpt-6-astra": {
+			"id": "gpt-6-astra",
+			"name": "GPT-6-Astra",
+			"api": "openai-codex-responses",
+			"provider": "openai-codex",
+			"baseUrl": "https://chatgpt.com/backend-api",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 272000,
+			"maxTokens": 128000,
+			"preferWebsockets": true,
+			"priority": 1,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max"
+			}
+		},
 		"gpt-daybreak-blue-latest": {
 			"id": "gpt-daybreak-blue-latest",
 			"name": "Daybreak Blue",

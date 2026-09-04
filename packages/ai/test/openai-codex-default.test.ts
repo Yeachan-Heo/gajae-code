@@ -30,4 +30,20 @@ describe("OpenAI Codex defaults", () => {
 			expect(model.longContextPricing?.threshold).toBe(272_000);
 		}
 	});
+
+	it("bundles GPT-6-Astra with the discovered Codex metadata", () => {
+		const model = getBundledModel("openai-codex", "gpt-6-astra");
+
+		expect(model.name).toBe("GPT-6-Astra");
+		expect(model.api).toBe("openai-codex-responses");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toEqual(["text", "image"]);
+		expect(model.preferWebsockets).toBe(true);
+		// `/codex/models` reports a 272K prompt budget for Astra; it is not in the
+		// forced 372K GPT-5.6 tier and no first-party pricing has been published.
+		expect(model.contextWindow).toBe(272_000);
+		expect(model.maxTokens).toBe(128_000);
+		expect(model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.Max });
+	});
 });

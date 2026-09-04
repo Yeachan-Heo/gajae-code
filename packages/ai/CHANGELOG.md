@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Bundled `openai-codex/gpt-6-astra` (GPT-6-Astra) from `/codex/models` discovery so ChatGPT accounts with Astra access can select it from the static `/model` fallback without a live discovery pass. The entry carries the discovered 272K prompt budget, 128K output cap, text+image input, websocket preference, and low–max reasoning efforts; cost stays zero because no first-party pricing is published. The OpenAI model-id parser now recognizes the `astra` variant, so `gpt-6-astra` receives the post-5.6 effort ladder instead of falling through as an unknown model.
+
 ### Fixed
 
 - Bedrock prompt caching is now gated on the Claude generation parsed from the model id instead of version-literal fragments (`-4-`/`-4.`, `claude-haiku`, and two 3.x literals). A future generation's Bedrock id (`us.anthropic.claude-opus-5-…`, or a new model kind) matched none of the literals, so cache points were silently omitted and every request re-paid full input pricing. Behavior for the documented support set — 3.5 Haiku, 3.7 Sonnet, and 4.x naming including `us.`/`eu.`/`au.`/`jp.`/`global.` inference profiles — is unchanged, per AWS's prompt-caching support matrix. A bundled-catalog tripwire now fails when a regenerated catalog introduces a Claude id shape the parser cannot read, so shape drift is loud instead of silently disabling caching.
