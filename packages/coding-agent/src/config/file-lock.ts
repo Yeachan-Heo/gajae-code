@@ -38,9 +38,9 @@ const DEFAULT_OPTIONS: Required<
 	retryDelayMs: 100,
 };
 
-/** Release retries cover transient Windows/Dropbox handle denial without extending the lock indefinitely. */
-export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 5;
-export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 10;
+/** Release retries cover transient handle denial and a competing exact-removal quarantine cleanup. */
+export const FILE_LOCK_RELEASE_RETRY_ATTEMPTS = 20;
+export const FILE_LOCK_RELEASE_RETRY_DELAY_MS = 25;
 const PROCESS_START_TIME_FORMAT = "utc-v1";
 
 type LocalLockState = {
