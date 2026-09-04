@@ -111,6 +111,7 @@ function createRegistry(
 	const profileMap = new Map(profiles.map(profile => [profile.name, profile]));
 	return {
 		refresh: vi.fn(async () => {}),
+		refreshStatic: vi.fn(async () => {}),
 		getError: () => undefined,
 		getAvailable: vi.fn(() => [
 			codexModel,
@@ -203,6 +204,7 @@ describe("preset landing adversarial QA", () => {
 		);
 
 		await rendered(selector);
+		expect(registry.refreshStatic).toHaveBeenCalledTimes(1);
 		expect(registry.refresh).not.toHaveBeenCalled();
 		expect(registry.getAvailable).not.toHaveBeenCalled();
 		expect(registry.getCanonicalModelSelections).not.toHaveBeenCalled();
@@ -214,6 +216,26 @@ describe("preset landing adversarial QA", () => {
 		expect(registry.getAvailable).toHaveBeenCalledTimes(1);
 		expect(registry.getCanonicalModelSelections).toHaveBeenCalledTimes(1);
 		expect(text).toContain("gpt-5.5");
+	});
+
+	test("renders deferred catalog refresh failures instead of hanging on the loading frame", async () => {
+		const registry = createRegistry(["openai-codex"]);
+		registry.refresh.mockRejectedValueOnce(new Error("offline refresh failed"));
+		const selector = new ModelSelectorComponent(
+			{ requestRender: vi.fn() } as unknown as TUI,
+			undefined,
+			Settings.isolated(),
+			registry as never,
+			[],
+			() => {},
+			() => {},
+		);
+
+		await rendered(selector);
+		selector.handleInput("g");
+		const text = await rendered(selector);
+		expect(text).toContain("offline refresh failed");
+		expect(text).not.toContain("Loading models...");
 	});
 	beforeAll(async () => {
 		testTheme = await getThemeByName("red-claw");

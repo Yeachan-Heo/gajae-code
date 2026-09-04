@@ -412,6 +412,7 @@ export class ModelSelectorComponent extends Container {
 	#disposed = false;
 	#catalogLoaded = false;
 	#catalogLoadPromise?: Promise<void>;
+	#presetCatalogRefreshPending = false;
 	/** Standalone smart-routing entry: cancel closes the selector instead of falling back to the preset landing. */
 	#smartRoutingOnly = false;
 
@@ -547,6 +548,7 @@ export class ModelSelectorComponent extends Container {
 			this.#unsubscribeCatalogChanged = this.#modelRegistry.onCatalogChanged(() => {
 				if (this.#disposed) return;
 				if (this.#viewMode === "presets") {
+					if (this.#presetCatalogRefreshPending) return;
 					this.#rebuildRoleModels();
 					this.#clampPresetCursor();
 					void this.#refreshProviderAuth();
@@ -579,10 +581,11 @@ export class ModelSelectorComponent extends Container {
 
 		if (this.#viewMode === "presets" && (this.#modelRegistry.getModelProfiles?.().size ?? 0) > 0) {
 			// The landing only needs profile definitions and provider authentication.
-			// Do not enumerate and canonicalize the full model catalog until browsing.
-			void this.#refreshProviderAuth();
+			// Refresh static configuration without enumerating and canonicalizing the
+			// full browser catalog, then resolve preset authentication once.
 			this.#renderPresetLanding();
 			this.#tui.requestRender();
+			void this.#initializePresetLanding();
 		} else {
 			if (this.#viewMode === "presets") this.#viewMode = "models";
 			void this.#initializeCatalogView();
@@ -1671,6 +1674,24 @@ export class ModelSelectorComponent extends Container {
 		this.#searchInput.setValue(value);
 	}
 
+	async #initializePresetLanding(): Promise<void> {
+		this.#presetCatalogRefreshPending = true;
+		try {
+			const refreshStatic = this.#modelRegistry.refreshStatic;
+			if (typeof refreshStatic === "function") await refreshStatic.call(this.#modelRegistry);
+		} catch (error) {
+			this.#errorMessage = error instanceof Error ? error.message : String(error);
+		} finally {
+			this.#presetCatalogRefreshPending = false;
+		}
+		if (this.#disposed || this.#viewMode !== "presets") return;
+		this.#rebuildRoleModels();
+		this.#clampPresetCursor();
+		void this.#refreshProviderAuth();
+		this.#renderPresetLanding();
+		this.#tui.requestRender();
+	}
+
 	#switchToModelMode(seed?: string, options?: { imageRoleFilter?: boolean }): void {
 		this.#viewMode = "models";
 		this.#expandedPresetProviderId = undefined;
@@ -1709,6 +1730,14 @@ export class ModelSelectorComponent extends Container {
 		this.#catalogLoadPromise = load;
 		try {
 			await load;
+		} catch (error) {
+			if (!this.#disposed && this.#viewMode === "models") {
+				this.#errorMessage = error instanceof Error ? error.message : String(error);
+				this.#buildProviderTabs();
+				this.#updateTabBar();
+				this.#updateList();
+				this.#tui.requestRender();
+			}
 		} finally {
 			if (this.#catalogLoadPromise === load) this.#catalogLoadPromise = undefined;
 		}

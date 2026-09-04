@@ -1835,6 +1835,25 @@ export class ModelRegistry {
 	/**
 	 * Reload models from disk (embedded + accepted registry + custom from models.yml).
 	 */
+	async refreshStatic(): Promise<void> {
+		if (this.#disposed) return;
+		await this.#enqueueCatalogMutation(async () => {
+			if (this.#disposed) return;
+			this.#catalogRefreshGeneration++;
+			this.#suspendRebuild();
+			try {
+				this.#reloadStaticModels();
+				this.#suppressedSelectors.clear();
+				this.#modelBindingsApplier.apply();
+			} finally {
+				this.#resumeRebuild();
+			}
+		});
+	}
+
+	/**
+	 * Reload models from disk and refresh runtime provider discovery state.
+	 */
 	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
 		if (this.#disposed) return;
 		await this.#enqueueCatalogMutation(async () => {
