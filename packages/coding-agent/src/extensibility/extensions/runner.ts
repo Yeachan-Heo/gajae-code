@@ -23,6 +23,7 @@ import type { AttemptRecordStore } from "../../session/attempt-record-store";
 import { createReadonlySessionManager, type SessionManager } from "../../session/session-manager";
 import {
 	attenuateFunctionHookGrant,
+	cloneFunctionHookData,
 	compatibilityPayloadForFunctionHook,
 	createFunctionHookCapabilities,
 	type FunctionHook,
@@ -1065,7 +1066,8 @@ export class ExtensionRunner {
 						nextFailureReason = "Function hook passed an invalid or unauthorized event to next()";
 						throw new Error(nextFailureReason);
 					}
-					nextPromise = invoke(index + 1, candidate, downstreamGrant, controller.signal);
+					const candidateSnapshot = nextEvent === undefined ? currentEvent : cloneFunctionHookData(candidate);
+					nextPromise = invoke(index + 1, candidateSnapshot, downstreamGrant, controller.signal);
 					return (await nextPromise) as FunctionHookResult;
 				};
 				const outcome = await this.#runFunctionHookWithTimeout(

@@ -249,6 +249,39 @@ describe("capability-scoped function hooks", () => {
 		expect(event.input).toEqual({ path: "secret.txt" });
 	});
 
+	test("snapshots a replacement before downstream dispatch", async () => {
+		const runner = makeRunner([
+			registration(
+				"tool_call",
+				async (invocation, _capabilities, next) => {
+					const candidate = {
+						...(invocation.payload as ToolCallEvent),
+						input: { path: "reviewed.txt" },
+					};
+					const result = await next(candidate);
+					candidate.input.path = "mutated-after-review.txt";
+					return result;
+				},
+				{ capabilities: ["tool.transform"] },
+				0,
+				"read",
+			),
+			registration(
+				"tool_call",
+				async (invocation, _capabilities, next) => {
+					expect((invocation.payload as ToolCallEvent).input).toEqual({ path: "reviewed.txt" });
+					return await next();
+				},
+				{ capabilities: ["tool.inspect", "tool.deny"] },
+				1,
+				"read",
+			),
+		]);
+		const event = toolCall();
+		expect(await runner.emitToolCall(event)).toBeUndefined();
+		expect(event.input).toEqual({ path: "reviewed.txt" });
+	});
+
 	test("fails closed when an enforcement-capable wildcard times out", async () => {
 		testSetExtensionHandlerTimeoutMs(10);
 		const runner = makeRunner([
@@ -281,6 +314,7 @@ describe("capability-scoped function hooks", () => {
 		await expect(runner.emitContext([{ role: "user", content: "secret" }] as never)).rejects.toThrow(
 			"Function hook timed out",
 		);
+		await expect(runner.emitBeforeProviderRequest({ prompt: "secret" })).rejects.toThrow("Function hook timed out");
 	});
 
 	test("does not expose session metadata without session.read", async () => {

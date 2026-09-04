@@ -715,7 +715,12 @@ export function functionHookTransformAllowed(event: ExtensionEvent, grant: Funct
 export function functionHookDenyAllowed(event: ExtensionEvent, grant: FunctionHookGrant): boolean {
 	const operations = expandedOperations(grant.capabilities);
 	if (event.type === "tool_call" || event.type === "tool_result") return operations.has("tool.deny");
-	if (event.type === "input" || event.type === "before_agent_start" || event.type === "context")
+	if (
+		event.type === "input" ||
+		event.type === "before_agent_start" ||
+		event.type === "before_provider_request" ||
+		event.type === "context"
+	)
 		return operations.has("ui.transform");
 	return event.type.startsWith("session_before_") && operations.has("session.deny");
 }
