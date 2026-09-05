@@ -334,6 +334,27 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		}
 	});
 
+	test("explicit home plugin preflight stays on the fixed .gjc project root", async () => {
+		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+		const outside = path.join(tempDir, "outside-configured-plugin-root");
+		try {
+			process.env.GJC_CONFIG_DIR = ".gjc-alt";
+			await fs.mkdir(outside, { recursive: true });
+			await fs.symlink(outside, path.join(project, ".gjc-alt"), "dir");
+			await fs.mkdir(path.join(project, ".gjc", "plugins"), { recursive: true });
+
+			const result = await loadCapabilityForHome<Skill>(skillCapability.id, home, {
+				cwd: project,
+				providers: ["claude-plugins"],
+			});
+			expect(result.items).toEqual([]);
+			expect(result.warnings).toEqual([]);
+		} finally {
+			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
+			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
+		}
+	});
+
 	test("explicit home fails closed when its .gjc root redirects outside the profile", async () => {
 		const decoyRoot = path.join(tempDir, "decoy-profile", ".gjc");
 		await seedProfile(path.join(decoyRoot, "agent"), "decoy");

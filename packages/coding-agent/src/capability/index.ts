@@ -10,6 +10,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+	CONFIG_DIR_NAME,
 	getAgentDir,
 	getConfigDirName,
 	getPluginsDir,
@@ -164,7 +165,7 @@ async function assertExplicitHomeRoots(
 	// The marketplace provider derives its user registry from the XDG-aware
 	// helper rather than a fixed `<home>/.gjc/plugins` path.
 	if (providerIds.has("claude-plugins")) {
-		addProjectRoot(path.join(getConfigDirName(), "plugins"), "project plugin registry root", true);
+		addProjectRoot(path.join(CONFIG_DIR_NAME, "plugins"), "project plugin registry root", true);
 		addUserRoot(getPluginsDir(canonicalHome), "plugin registry root");
 	}
 
