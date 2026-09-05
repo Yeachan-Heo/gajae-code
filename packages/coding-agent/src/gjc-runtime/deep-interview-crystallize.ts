@@ -656,6 +656,7 @@ function isUnsafeResolution(value: string): boolean {
 		/^(?:yes|no|true|false|enabled|disabled|예|네|아니요|아니|是|否|はい|いいえ)[.!。！？]?$/iu.test(value.trim());
 	return (
 		(profile.negative && !standaloneBinary) ||
+		/\b(?:different\s+from|other\s+than|not\s+equal\s+to|anything\s+but|except\s+for)\b/i.test(value) ||
 		profile.interrogative ||
 		profile.conditional ||
 		profile.hedged ||
@@ -822,7 +823,12 @@ function validateStoredRemovalAnchors(
 		const quote = text(raw.quote, `prior.removed_item_anchors[${index}].quote`, 500);
 		const resolution = text(raw.resolution, `prior.removed_item_anchors[${index}].resolution`, 500);
 		const message = priorSnapshot.messages.find(candidate => candidate.index === messageIndex);
-		if (!removedIds.includes(item) || message?.role !== "user" || !message.content.includes(quote))
+		const rolledOut = messageIndex < priorSnapshot.start;
+		if (
+			!removedIds.includes(item) ||
+			messageIndex > priorSnapshot.end ||
+			(!rolledOut && (message?.role !== "user" || !message.content.includes(quote)))
+		)
 			throw new Error("prior crystal removal evidence is invalid");
 		return { item, message_index: messageIndex, quote, resolution };
 	});
@@ -883,7 +889,14 @@ export function crystallizeDeepInterview(value: unknown): DeepInterviewCrystal {
 			priorCrystal.execution_approval !== "not-approved"
 		)
 			throw new Error("prior crystal is invalid");
-		canonicalPriorItems = validateItems(priorCrystal.items, priorSnapshot);
+		canonicalPriorItems = validateItems(priorCrystal.items);
+		const inWindowPriorItems = priorCrystal.items.filter(
+			item =>
+				item.anchor &&
+				item.anchor.message_index >= priorSnapshot!.start &&
+				item.anchor.message_index <= priorSnapshot!.end,
+		);
+		validateItems(inWindowPriorItems, priorSnapshot);
 	}
 	const priorEnd =
 		priorCrystal && isRecord(priorCrystal.source) && typeof priorCrystal.source.end === "number"
