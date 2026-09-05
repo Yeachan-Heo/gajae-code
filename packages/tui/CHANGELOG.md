@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Loader and other same-width frames skip the unused transcript-wide reflow measurement, reducing repeated text-width work in long sessions while preserving width-change rendering.
+
 ## [0.16.6] - 2026-09-07
 
 ## [0.16.5] - 2026-09-07
