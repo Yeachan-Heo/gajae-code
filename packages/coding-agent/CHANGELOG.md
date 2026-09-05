@@ -37,6 +37,7 @@
   refreshes, bounded timeout/output, ANSI sanitization, placeholder degradation,
   disposal cancellation, and custom-editor configuration while preserving
   synchronous TUI rendering; project-scoped settings cannot trigger execution.
+- Coordinator MCP delegation now releases the session transition lock after durable admission so force/queue prompts can dispatch during bounded completion observation. New and reused delegates persist and replay the complete bounded response, including timeout and waiting snapshots, while receipt-first crash recovery preserves accepted prompt identity and successor terminal fences without redispatch. Pending delegate responses pin their source prompt/turn through age and size compaction until final response commit; resumed keys with missing live authority remain unsealed and fail closed instead of redispatching or sealing a busy error.
 
 ### Fixed
 
