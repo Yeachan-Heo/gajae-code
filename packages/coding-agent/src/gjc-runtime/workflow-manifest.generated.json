@@ -156,8 +156,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "approve-execution"
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -175,16 +174,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "kickoff",
-          "write-spec",
-          "crystallize",
-          "write-artifact",
-          "stage",
-          "check",
-          "apply",
-          "discard",
-          "approve-execution"
+          "doctor"
         ],
         "name": "session-id",
         "type": "string"
@@ -246,9 +236,7 @@
       },
       {
         "appliesToVerbs": [
-          "doctor",
-          "crystallize",
-          "approve-execution"
+          "doctor"
         ],
         "name": "json",
         "type": "boolean"
@@ -418,6 +406,11 @@
         "verb": "write-spec"
       },
       {
+        "from": "interviewing",
+        "to": "handoff",
+        "verb": "crystallize"
+      },
+      {
         "from": "handoff",
         "to": "complete",
         "verb": "clear"
@@ -431,21 +424,12 @@
     "typedArgs": [
       {
         "appliesToVerbs": [
-          "write",
-          "api"
-        ],
-        "name": "input",
-        "type": "string"
-      },
-      {
-        "appliesToVerbs": [
           "read",
           "write",
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "approve-execution"
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -466,13 +450,10 @@
           "doctor",
           "kickoff",
           "write-spec",
-          "crystallize",
-          "write-artifact",
           "stage",
           "check",
           "apply",
-          "discard",
-          "approve-execution"
+          "discard"
         ],
         "name": "session-id",
         "type": "string"
@@ -534,9 +515,7 @@
       },
       {
         "appliesToVerbs": [
-          "doctor",
-          "crystallize",
-          "approve-execution"
+          "doctor"
         ],
         "name": "json",
         "type": "boolean"
@@ -566,6 +545,13 @@
         "appliesToVerbs": [
           "kickoff"
         ],
+        "name": "trace",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "kickoff"
+        ],
         "name": "threshold",
         "type": "number"
       },
@@ -588,10 +574,17 @@
       },
       {
         "appliesToVerbs": [
-          "write-spec",
+          "write-spec"
+        ],
+        "name": "slug",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
           "crystallize"
         ],
         "name": "slug",
+        "required": true,
         "type": "string"
       },
       {
@@ -621,7 +614,16 @@
       },
       {
         "appliesToVerbs": [
+          "write-spec"
+        ],
+        "name": "force",
+        "type": "boolean"
+      },
+      {
+        "appliesToVerbs": [
+          "kickoff",
           "write-spec",
+          "crystallize",
           "stage",
           "check",
           "apply",
@@ -629,18 +631,45 @@
           "read",
           "write",
           "clear",
-          "handoff"
+          "handoff",
+          "approve-execution"
         ],
         "name": "json",
         "type": "boolean"
       },
       {
         "appliesToVerbs": [
+          "api"
+        ],
+        "name": "input",
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "write",
           "stage",
           "crystallize"
         ],
         "name": "input",
         "required": true,
+        "type": "string"
+      },
+      {
+        "appliesToVerbs": [
+          "approve-execution"
+        ],
+        "enumValues": [
+          "deep-interview"
+        ],
+        "name": "mode",
+        "type": "enum"
+      },
+      {
+        "appliesToVerbs": [
+          "crystallize",
+          "approve-execution"
+        ],
+        "name": "session-id",
         "type": "string"
       },
       {
@@ -1012,8 +1041,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "approve-execution"
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -1033,14 +1061,7 @@
           "handoff",
           "doctor",
           "kickoff",
-          "write-spec",
-          "crystallize",
-          "write-artifact",
-          "stage",
-          "check",
-          "apply",
-          "discard",
-          "approve-execution"
+          "write-artifact"
         ],
         "name": "session-id",
         "type": "string"
@@ -1102,9 +1123,7 @@
       },
       {
         "appliesToVerbs": [
-          "doctor",
-          "crystallize",
-          "approve-execution"
+          "doctor"
         ],
         "name": "json",
         "type": "boolean"
@@ -1403,8 +1422,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "approve-execution"
+          "doctor"
         ],
         "enumValues": [
           "deep-interview",
@@ -1422,16 +1440,7 @@
           "clear",
           "contract",
           "handoff",
-          "doctor",
-          "kickoff",
-          "write-spec",
-          "crystallize",
-          "write-artifact",
-          "stage",
-          "check",
-          "apply",
-          "discard",
-          "approve-execution"
+          "doctor"
         ],
         "name": "session-id",
         "type": "string"
@@ -1493,9 +1502,7 @@
       },
       {
         "appliesToVerbs": [
-          "doctor",
-          "crystallize",
-          "approve-execution"
+          "doctor"
         ],
         "name": "json",
         "type": "boolean"
