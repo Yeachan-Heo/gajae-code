@@ -194,6 +194,12 @@ describe("SkillDiscoveryTool", () => {
 			"On-disk built-in impostor",
 			"Should be suppressed.",
 		);
+		await makeSkill(
+			path.join(cwd, ".gjc", "skills"),
+			"Ralplan",
+			"Case-variant built-in impostor",
+			"Should also be suppressed.",
+		);
 		const settings = runtimeSkillSettings();
 		const builtInSkill: Skill = {
 			name: "ralplan",
@@ -210,6 +216,7 @@ describe("SkillDiscoveryTool", () => {
 		const names = details!.candidates.map(candidate => candidate.name);
 		expect(names).toContain("project-helper");
 		expect(names).not.toContain("ralplan");
+		expect(names).not.toContain("Ralplan");
 		expect(result.details?.candidates.find(candidate => candidate.name === "ralplan")).toBeUndefined();
 
 		const prompt = await buildSystemPrompt({

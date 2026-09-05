@@ -100,7 +100,47 @@ export class SkillFrontmatterError extends Error {
 	}
 }
 
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
+
+function isProtectedSkillName(name: string): boolean {
+	return BUILT_IN_SKILL_NAMES.has(name.toLowerCase());
+}
+
+function assertSafeSkillName(name: string): void {
+	if (
+		name === "." ||
+		name === ".." ||
+		name.includes("/") ||
+		name.includes("\\") ||
+		name.includes("\0") ||
+		path.basename(name) !== name
+	) {
+		throw new SkillFrontmatterError(`skill name must be a single path segment: ${name}`);
+	}
+}
+
+async function assertDirectoryIsNotSymlink(directory: string): Promise<void> {
+	try {
+		const stat = await fs.lstat(directory);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) {
+			throw new SkillFrontmatterError(`skill destination is not a safe directory: ${directory}`);
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		await fs.mkdir(directory);
+	}
+}
+
+async function assertFileIsNotSymlink(filePath: string): Promise<void> {
+	try {
+		const stat = await fs.lstat(filePath);
+		if (stat.isSymbolicLink() || !stat.isFile()) {
+			throw new SkillFrontmatterError(`skill destination is not a safe file: ${filePath}`);
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
 
 function getRuntimeHome(): string {
 	return getTrustedHomeDir();
@@ -237,7 +277,7 @@ export async function listNativeSkillsForManagement(options: {
 
 			let disabledReason: SkillDisabledReason | undefined;
 			let enabled = true;
-			if (BUILT_IN_SKILL_NAMES.has(skill.name)) {
+			if (isProtectedSkillName(skill.name)) {
 				enabled = false;
 				disabledReason = "protected";
 			} else if (!(scope === "project" ? projectTrusted : userTrusted)) {
@@ -292,19 +332,22 @@ export async function writeNativeSkill(input: WriteNativeSkillInput): Promise<Wr
 
 	const effectiveName =
 		typeof frontmatter.name === "string" && frontmatter.name.trim() ? frontmatter.name.trim() : name;
-	if (BUILT_IN_SKILL_NAMES.has(effectiveName)) throw new SkillNameProtectedError(effectiveName);
+	assertSafeSkillName(effectiveName);
+	if (isProtectedSkillName(effectiveName)) throw new SkillNameProtectedError(effectiveName);
 
 	const directory = await resolveNativeSkillScopeDir(input.cwd, input.scope, input.home, input.agentDir);
+	await fs.mkdir(directory, { recursive: true });
 	const skillDir = path.join(directory, effectiveName);
-	await fs.mkdir(skillDir, { recursive: true });
+	await assertDirectoryIsNotSymlink(skillDir);
 	const filePath = path.join(skillDir, "SKILL.md");
+	await assertFileIsNotSymlink(filePath);
 	await Bun.write(filePath, `${input.content.trimEnd()}\n`);
 	return { name: effectiveName, scope: input.scope, directory, path: filePath };
 }
 
 /** Whether a skill is enabled under the current policy (disabledExtensions/ignored/scope trust). */
 export function isNativeSkillEnabled(name: string, policy: SkillManagementPolicy | undefined): boolean {
-	if (BUILT_IN_SKILL_NAMES.has(name)) return true;
+	if (isProtectedSkillName(name)) return true;
 	if (isDisabledByExtension(name, policy?.disabledExtensions)) return false;
 	if (matchesPattern(name, policy?.ignoredSkills)) return false;
 	if (policy?.includeSkills?.length && !matchesPattern(name, policy.includeSkills)) return false;
@@ -319,7 +362,7 @@ export function isNativeSkillEnabled(name: string, policy: SkillManagementPolicy
 export function setNativeSkillEnabled(name: string, enabled: boolean, disabledExtensions: string[]): string[] {
 	const id = `skill:${name}`;
 	const next = new Set(disabledExtensions);
-	if (BUILT_IN_SKILL_NAMES.has(name)) return [...next];
+	if (isProtectedSkillName(name)) return [...next];
 	if (enabled) {
 		next.delete(id);
 	} else {

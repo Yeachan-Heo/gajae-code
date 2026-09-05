@@ -162,10 +162,31 @@ describe("skill-management", () => {
 
 		it("rejects bundled workflow skill names", async () => {
 			await withTempDirs(async (cwd, home) => {
-				const protectedContent = ["---", "name: ultragoal", "description: Impostor", "---", "", "# x"].join("\n");
+				for (const name of ["ultragoal", "Ultragoal"]) {
+					const protectedContent = ["---", `name: ${name}`, "description: Impostor", "---", "", "# x"].join("\n");
+					await expect(
+						writeNativeSkill({ cwd, home, scope: "project", name, content: protectedContent }),
+					).rejects.toBeInstanceOf(SkillNameProtectedError);
+				}
+			});
+		});
+
+		it("rejects path traversal names and symlinked destinations", async () => {
+			await withTempDirs(async (cwd, home) => {
+				const traversalContent = validContent.replace("name: my-skill", "name: ../outside");
 				await expect(
-					writeNativeSkill({ cwd, home, scope: "project", name: "ultragoal", content: protectedContent }),
-				).rejects.toBeInstanceOf(SkillNameProtectedError);
+					writeNativeSkill({ cwd, home, scope: "user", name: "outside", content: traversalContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+
+				const skillsDir = path.join(home, ".gjc", "agent", "skills");
+				const outsideDir = path.join(home, "outside");
+				await fs.mkdir(skillsDir, { recursive: true });
+				await fs.mkdir(outsideDir);
+				await fs.symlink(outsideDir, path.join(skillsDir, "my-skill"), "dir");
+				await expect(
+					writeNativeSkill({ cwd, home, scope: "user", name: "my-skill", content: validContent }),
+				).rejects.toBeInstanceOf(SkillFrontmatterError);
+				await expect(fs.stat(path.join(outsideDir, "SKILL.md"))).rejects.toMatchObject({ code: "ENOENT" });
 			});
 		});
 
@@ -195,7 +216,9 @@ describe("skill-management", () => {
 
 		it("never disables bundled workflow skills", () => {
 			expect(setNativeSkillEnabled("ralplan", false, [])).toEqual([]);
+			expect(setNativeSkillEnabled("Ralplan", false, [])).toEqual([]);
 			expect(isNativeSkillEnabled("ralplan", { disabledExtensions: ["skill:ralplan"] })).toBe(true);
+			expect(isNativeSkillEnabled("Ralplan", { disabledExtensions: ["skill:Ralplan"] })).toBe(true);
 		});
 
 		it("reflects ignore/include policy", () => {

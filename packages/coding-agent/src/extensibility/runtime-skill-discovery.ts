@@ -62,7 +62,7 @@ function getRuntimeHome(): string {
 const DEFAULT_LIMIT = 20;
 const MAX_LIMIT = 50;
 const MAX_DIAGNOSTICS = 10;
-const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
+const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS.map(name => name.toLowerCase()));
 
 function normalizeLimit(limit: number | undefined): number {
 	if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_LIMIT;
@@ -201,7 +201,7 @@ interface ScanJobResult {
 }
 
 function isAllowedByPolicy(skill: CapabilitySkill, policy: SkillsSettings | undefined, diagnostics: string[]): boolean {
-	if (BUILT_IN_SKILL_NAMES.has(skill.name)) {
+	if (BUILT_IN_SKILL_NAMES.has(skill.name.toLowerCase())) {
 		pushDiagnostic(
 			diagnostics,
 			`skill "${skill.name}" is a bundled GJC workflow skill and always resolves to the bundled definition; the filesystem copy at ${skill.path} is shadowed`,
@@ -517,7 +517,7 @@ export async function findRuntimeSkillByName(
 ): Promise<Skill | undefined> {
 	const normalized = name.trim();
 	if (!normalized) return undefined;
-	if (BUILT_IN_SKILL_NAMES.has(normalized)) return undefined;
+	if (BUILT_IN_SKILL_NAMES.has(normalized.toLowerCase())) return undefined;
 	const hasExplicitHome = home !== undefined;
 	const resolvedHome = home ?? getRuntimeHome();
 	const resolvedAgentDir = resolveRuntimeAgentDir(resolvedHome, agentDir, hasExplicitHome);
