@@ -358,6 +358,17 @@ describe("announceSessionToPaseo", () => {
 		});
 	});
 
+	test("preserves TLS and authentication options on the configured default address", async () => {
+		const daemonHost = "tcp://127.0.0.1:6767?ssl=true&password=secret";
+		const dependencies = deps({ configValue: config({ gjc: providerEntry() }, daemonHost) });
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "imported",
+			providerKey: "gjc",
+		});
+		expect(dependencies.recorder.probes).toEqual([{ kind: "tcp", host: "127.0.0.1", port: 6767 }]);
+		expect(dependencies.recorder.imports[0]).toMatchObject({ daemonHost });
+	});
+
 	test("does not import through live pid IPC when explicit PASEO_LISTEN is unreachable", async () => {
 		const dependencies = deps({
 			env: { PASEO_LISTEN: "127.0.0.1:7777" },
