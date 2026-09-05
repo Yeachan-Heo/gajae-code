@@ -166,6 +166,11 @@ describe("resolveDaemonTarget", () => {
 			host: "127.0.0.1",
 			port: 7777,
 		});
+		expect(await resolveDaemonTarget(config({}, "127.0.0.1:6767"), base)).toEqual({
+			kind: "tcp",
+			host: "localhost",
+			port: 6767,
+		});
 		expect(await resolveDaemonTarget({ version: 1 }, base)).toEqual({ kind: "tcp", host: "localhost", port: 6767 });
 	});
 
@@ -297,6 +302,16 @@ describe("announceSessionToPaseo", () => {
 
 	test("does not fall through from an invalid explicit PASEO_HOST", async () => {
 		const dependencies = deps({ env: { PASEO_HOST: "not-an-endpoint" } });
+		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
+			kind: "skipped",
+			reason: "unsupported-daemon-target",
+		});
+		expect(dependencies.recorder.probes).toHaveLength(0);
+		expect(dependencies.recorder.imports).toHaveLength(0);
+	});
+
+	test("does not fall through from an invalid explicit PASEO_LISTEN", async () => {
+		const dependencies = deps({ env: { PASEO_LISTEN: "not-an-endpoint" } });
 		expect(await announceSessionToPaseo({ sessionId: SESSION_ID, cwd: CWD }, dependencies)).toEqual({
 			kind: "skipped",
 			reason: "unsupported-daemon-target",
