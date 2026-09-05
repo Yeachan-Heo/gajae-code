@@ -197,6 +197,10 @@ export class ReverseLeaseRuntime {
 
 	disconnect(connectionId: string): void {
 		const now = this.#now();
+		const prefix = `${connectionId}\u0000`;
+		for (const key of this.#idempotency.keys()) {
+			if (key.startsWith(prefix)) this.#idempotency.delete(key);
+		}
 		for (const lease of this.#leases.values())
 			if (lease.connectionId === connectionId) {
 				lease.expiresAt = now;

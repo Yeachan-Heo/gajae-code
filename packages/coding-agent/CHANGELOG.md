@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- SDK snapshot pages now read and integrity-check one contiguous span instead of rereading chunks per row. Reverse-provider disconnects discard connection-scoped registration receipts; relay shutdown releases backpressure listeners without destroying caller-owned sinks, and fragmented request frames are assembled once per newline.
 - The read-URL cache is now bounded (FIFO, 64 keys), so long-lived TUI and SDK-host processes no longer retain every fetched page's full output and image payload for the process lifetime; an evicted entry simply refetches on the next read, and unpersisted sessions sharing a working directory remain isolated by session identity.
 - The insane-search web bridge now kills the engine's whole process group instead of only the `python3` process. `killChild` promised a group kill but the engine was not spawned detached, so when the bridge timeout fired mid-flight (25s default vs the engine's internal 90s playwright budget), `node` and headless `chromium` children survived as orphans. The engine now leads its own POSIX process group and receives group-wide SIGTERM→SIGKILL escalation even when the group leader exits during the grace period, with a direct child-kill fallback on Windows.
 - Contribution-prep outbound artifacts now redact complete AWS credentials, including AKIA/ASIA access-key IDs and SecretAccessKey/SessionToken values in shell-style and escaped JSON forms, while preserving structured output and existing GitHub, Slack, authorization-header, and cookie redaction.
