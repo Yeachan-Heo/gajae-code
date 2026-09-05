@@ -679,7 +679,7 @@ export async function offerMacosCommunityApp(
 	};
 	try {
 		const releaseResponse = await fetchImpl(
-			`${GITHUB_API_ORIGIN}/repos/${COMMUNITY_APP_REPOSITORY}/releases/latest`,
+			`${GITHUB_API_ORIGIN}/repos/${COMMUNITY_APP_REPOSITORY}/releases?per_page=20`,
 			{
 				headers: {
 					Accept: "application/vnd.github+json",
@@ -691,11 +691,18 @@ export async function offerMacosCommunityApp(
 		);
 		if (!releaseResponse.ok)
 			return failure(`no canonical published release is available (HTTP ${releaseResponse.status})`, log);
-		const release = JSON.parse(await readResponseText(releaseResponse, MAX_RELEASE_BYTES)) as ReleasePayload;
+		const payload = JSON.parse(await readResponseText(releaseResponse, MAX_RELEASE_BYTES)) as
+			| ReleasePayload
+			| ReleasePayload[];
+		const releases = Array.isArray(payload) ? payload : [payload];
 		throwIfInterrupted();
+		const release = releases.find(candidate => {
+			const tagVersion = releaseVersion(candidate.tag_name);
+			return Boolean(tagVersion && !candidate.draft && candidate.assets?.length);
+		});
+		if (!release) return failure("no canonical published release is available", log);
 		const tagVersion = releaseVersion(release.tag_name);
-		if (!tagVersion || release.draft || release.prerelease || !release.assets?.length)
-			return failure("no canonical published release is available", log);
+		if (!tagVersion || !release.assets?.length) return failure("no canonical published release is available", log);
 		const dmg = release.assets.find(
 			asset => asset.name.toLowerCase().endsWith(".dmg") && assetMatchesArchitecture(asset.name, arch, tagVersion),
 		);

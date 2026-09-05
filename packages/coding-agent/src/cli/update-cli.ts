@@ -30,6 +30,7 @@ import {
 	verifyDownloadedBinaryChecksum,
 	versionFromTag,
 } from "./github-release";
+import { offerMacosCommunityApp } from "./macos-community-app";
 import { runNotifyCommand } from "./notify-cli";
 
 const PACKAGE = "@gajae-code/coding-agent";
@@ -1264,8 +1265,6 @@ export interface UpdateCommandDependencies {
 	recoverNotifications?: (settings: Settings) => Promise<void>;
 	runPostUpdateRecovery?: (runtimePath: string) => Promise<void>;
 	offerCommunityApp?: (runtimePath: string) => Promise<void>;
-	spawnCommunityApp?: (argv: string[]) => Promise<number>;
-	supportsCommunityApp?: (runtimePath: string) => Promise<boolean>;
 	recordTelemetryEvent?: (event: TelemetryEventName, details: TelemetryDetails) => unknown;
 	exit?: (code: number) => never;
 }
@@ -1330,36 +1329,16 @@ async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
 	return await child.exited;
 }
 
-async function spawnCommunityAppOffer(argv: string[]): Promise<number> {
-	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-	return await child.exited;
-}
-
-async function supportsCommunityAppOffer(runtimePath: string): Promise<boolean> {
-	const child = Bun.spawn([runtimePath, "--supports-macos-community-app"], {
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
-	return exitCode === 0 && stdout.trim() === "macos-community-app-offer";
-}
-
 async function runCommunityAppOfferFromRuntime(
 	runtimePath: string,
-	deps: Pick<UpdateCommandDependencies, "offerCommunityApp" | "spawnCommunityApp" | "supportsCommunityApp">,
+	deps: Pick<UpdateCommandDependencies, "offerCommunityApp">,
 ): Promise<void> {
 	if (deps.offerCommunityApp) {
 		await deps.offerCommunityApp(runtimePath);
 		return;
 	}
-	const supports = await (deps.supportsCommunityApp ?? supportsCommunityAppOffer)(runtimePath);
-	if (!supports) return;
-	const exitCode = await (deps.spawnCommunityApp ?? spawnCommunityAppOffer)([
-		runtimePath,
-		"--internal-macos-community-app-offer",
-	]);
-	if (exitCode !== 0) throw new Error(`the verified runtime community app offer exited ${exitCode}`);
+	const result = await offerMacosCommunityApp();
+	if (result.status === "failed") throw new Error(result.reason);
 }
 
 async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {

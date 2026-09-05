@@ -916,39 +916,6 @@ describe("update-cli managed notification recovery", () => {
 			expect(events).toContain("update_install_completed");
 		});
 
-		it("capability-gates the offer command on the verified update runtime", async () => {
-			const calls: string[] = [];
-			await runUpdateCommand(
-				{ force: false, check: false },
-				{
-					platform: "darwin",
-					getLatestRelease: async () => release,
-					resolveUpdateTarget: async () => ({ method: "binary", path: "/standalone/gjc" }),
-					performUpdate: async () => ({ ok: true, path: "/standalone/gjc" }),
-					runPostUpdateRecovery: async () => {
-						calls.push("recovery");
-					},
-					refreshInstalledDefaultSkills: async () => {
-						calls.push("refresh");
-					},
-					supportsCommunityApp: async runtimePath => {
-						calls.push(`support:${runtimePath}`);
-						return true;
-					},
-					spawnCommunityApp: async argv => {
-						calls.push(argv.join("|"));
-						return 0;
-					},
-				},
-			);
-			expect(calls).toEqual([
-				"recovery",
-				"refresh",
-				"support:/standalone/gjc",
-				"/standalone/gjc|--internal-macos-community-app-offer",
-			]);
-		});
-
 		it("does not preflight a migration target when the release decision is already up to date", async () => {
 			const calls: string[] = [];
 			await runUpdateCommand(

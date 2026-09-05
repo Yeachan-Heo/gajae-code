@@ -248,7 +248,7 @@ process.exit(0);
 			command,
 			cleanupCommand: command,
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest")) {
+				if (url.includes("/releases?")) {
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
@@ -279,7 +279,7 @@ process.exit(0);
 });
 
 describe("macOS community app verified installation", () => {
-	test("verifies checksum, bundle identity, signature, architecture, cleanup, and launch", async () => {
+	test("installs a published prerelease after checksum, identity, signature, and architecture verification", async () => {
 		const homeDir = await tempDir();
 		const dmg = new Uint8Array([1, 2, 3, 4]);
 		const dmgName = "gajae-app-desktop-1.0.0-macos-arm64.dmg";
@@ -329,10 +329,11 @@ describe("macOS community app verified installation", () => {
 			command,
 			cleanupCommand: command,
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest")) {
+				if (url.includes("/releases?")) {
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
+							prerelease: true,
 							assets: [
 								{ name: dmgName, browser_download_url: dmgUrl },
 								{ name: `${dmgName}.sha256`, browser_download_url: checksumUrl },
@@ -364,7 +365,7 @@ describe("macOS community app verified installation", () => {
 			cleanupCommand: command,
 			log: message => calls.push(["log", message]),
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest"))
+				if (url.includes("/releases?"))
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
@@ -395,7 +396,7 @@ describe("macOS community app verified installation", () => {
 			command,
 			cleanupCommand: command,
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest"))
+				if (url.includes("/releases?"))
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
@@ -424,7 +425,7 @@ describe("macOS community app verified installation", () => {
 			command,
 			cleanupCommand: command,
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest")) {
+				if (url.includes("/releases?")) {
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
@@ -466,7 +467,7 @@ describe("macOS community app attach cleanup", () => {
 				return { exitCode: argv[0] === "/usr/bin/mdfind" ? 1 : 0, stdout: "", stderr: "" };
 			},
 			fetchImpl: async (url, init) => {
-				if (url.includes("/releases/latest"))
+				if (url.includes("/releases?"))
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
@@ -537,7 +538,7 @@ describe("macOS community app attach cleanup", () => {
 				command,
 				cleanupCommand: command,
 				fetchImpl: async url => {
-					if (url.includes("/releases/latest"))
+					if (url.includes("/releases?"))
 						return new Response(
 							JSON.stringify({
 								tag_name: "v1.0.0",
@@ -604,7 +605,7 @@ describe("macOS community app attach cleanup", () => {
 			cleanupCommand: command,
 			log: message => logs.push(message),
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest"))
+				if (url.includes("/releases?"))
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
@@ -660,7 +661,7 @@ describe("macOS community app attach cleanup", () => {
 			command,
 			cleanupCommand: command,
 			fetchImpl: async url => {
-				if (url.includes("/releases/latest"))
+				if (url.includes("/releases?"))
 					return new Response(
 						JSON.stringify({
 							tag_name: "v1.0.0",
