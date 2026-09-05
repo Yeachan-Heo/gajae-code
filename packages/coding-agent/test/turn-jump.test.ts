@@ -28,6 +28,30 @@ function registerUserAnchors(messages: AgentMessage[]): void {
 }
 
 describe("transcript turn actions", () => {
+	it("retains navigation order across insertion, reordering, and removal of the active anchor", async () => {
+		const messages = [userMessage("one"), userMessage("two"), userMessage("three")];
+		registerUserAnchors(messages);
+		const { controller, revealViewportAnchor } = createController(messages);
+		await controller.actionRegistry.execute("app.transcript.prevTurn");
+		messages.reverse();
+		await controller.actionRegistry.execute("app.transcript.prevTurn");
+		const inserted = userMessage("inserted");
+		associateSessionMessageViewportAnchorId(inserted, "inserted");
+		messages.unshift(inserted);
+		await controller.actionRegistry.execute("app.transcript.nextTurn");
+		await controller.actionRegistry.execute("app.transcript.nextTurn");
+		messages.splice(messages.indexOf(inserted), 1);
+		await controller.actionRegistry.execute("app.transcript.prevTurn");
+		messages.splice(0, messages.length);
+		expect(controller.actionRegistry.isAvailable("app.transcript.prevTurn")).toBe(false);
+		expect(revealViewportAnchor.mock.calls).toEqual([
+			["user-2", "top"],
+			["user-1", "top"],
+			["user-2", "top"],
+			["inserted", "top"],
+			["user-2", "top"],
+		]);
+	});
 	it("jumps previous, previous, then next through user turns", async () => {
 		const messages = [userMessage("one"), userMessage("two"), userMessage("three")];
 		registerUserAnchors(messages);

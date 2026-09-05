@@ -8,6 +8,7 @@
 import * as os from "node:os";
 import {
 	type AssistantMessage,
+	clampThinkingLevelForModel,
 	Effort,
 	type Message,
 	type MessageAttribution,
@@ -1023,7 +1024,7 @@ export async function generateSummary(
 			maxTokens,
 			signal,
 			apiKey,
-			reasoning: Effort.High,
+			reasoning: maintenanceReasoning(model),
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,
@@ -1120,7 +1121,7 @@ export async function generateHandoff(
 		{
 			apiKey,
 			signal,
-			reasoning: Effort.High,
+			reasoning: maintenanceReasoning(model),
 			toolChoice: "none",
 			initiatorOverride: options.initiatorOverride,
 			metadata: options.metadata,
@@ -1347,6 +1348,22 @@ export function prepareCompaction(
 const TURN_PREFIX_SUMMARIZATION_PROMPT = prompt.render(compactionTurnPrefixPrompt);
 
 /**
+ * Reasoning effort for a maintenance one-shot call (summary, turn-prefix
+ * summary, handoff), sized against the model that will actually run it.
+ *
+ * These calls want `high`, but they must never *demand* it: the fallback
+ * chain hands them whatever same-provider model has the most context, and a
+ * reasoning-capable model on a transport without reasoning control (the
+ * registry strips `thinking` for a proxied `openai-codex` baseUrl) rejects any
+ * explicit effort inside the provider mapper. The agent turn already clamps
+ * through this helper; the maintenance calls must not be the one path that
+ * still sends a raw effort.
+ */
+function maintenanceReasoning(model: Model): Effort | undefined {
+	return clampThinkingLevelForModel(model, Effort.High);
+}
+
+/**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds id/parentId when saving.
  *
@@ -1555,7 +1572,7 @@ async function generateTurnPrefixSummary(
 			maxTokens,
 			signal,
 			apiKey,
-			reasoning: Effort.High,
+			reasoning: maintenanceReasoning(model),
 			initiatorOverride: options?.initiatorOverride,
 			metadata: options?.metadata,
 			sessionId: options?.sessionId,

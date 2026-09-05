@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- When every auto-compaction candidate fails, the reported error now leads with the first candidate's failure and lists each candidate that was tried with its own error. The chain starts at the session model and ends on a same-provider largest-context fallback, so surfacing only the final error named a model the user never chose (e.g. `openai-codex/gpt-5.4` on an `astra` preset session) and hid that their own model had already failed the same way.
 
 ## [0.16.4] - 2026-09-05
 ### Added
@@ -22,6 +25,7 @@
 ### Fixed
 
 - Session runtime caches avoid redundant sentinel scans, obsolete permission wrappers, and unnecessary blob-buffer copies; streaming-edit pre-cache reads can no longer publish after invalidation, and oversized IRC replies use bounded UTF-8 truncation.
+- Registry fingerprints now enforce the existing regular-file and 32 MiB admission limits with bounded reads. Model activation, thinking overlay lookup, transcript navigation, slash autocomplete, and observer digest updates avoid repeated allocations; status lines without a git segment no longer request git status.
 - Credential replacement lookups now propagate the owning request's cancellation through scoped and allowed unscoped retries, preventing aborted turns from continuing OAuth preparation or selecting another key.
 - Removing the committed status-line command segment or clearing its trusted command now cancels the running process and clears stale output; draft-only previews remain side-effect-free.
 - Slack inbound acknowledgment reactions now use bounded, abortable, tracked provider work that drains on shutdown or attachment retirement without delaying accepted turns; rejected or timed-out reactions emit sanitized diagnostics.

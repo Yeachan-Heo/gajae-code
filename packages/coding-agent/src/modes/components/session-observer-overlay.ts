@@ -272,7 +272,7 @@ export class SessionObserverOverlayComponent extends TranscriptViewerOverlay {
 		this.#cache = {
 			...cache,
 			completeOffset: cache.completeOffset + complete.bytes.length,
-			prefixDigest: digest(Buffer.concat([snapshot.prefix, complete.bytes])),
+			prefixDigest: crypto.createHash("sha256").update(snapshot.prefix).update(complete.bytes).digest("hex"),
 			entries,
 			model: parsed.model ?? cache.model,
 			...projection.state,

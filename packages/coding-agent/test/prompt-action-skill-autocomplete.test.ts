@@ -36,6 +36,22 @@ function createProvider() {
 }
 
 describe("prompt action skill autocomplete", () => {
+	it("keeps per-query ranking and exact-command collision rules across repeated sync and async lookups", async () => {
+		const provider = createProvider();
+		const cases: Array<[string, string[]]> = [
+			["/fast", ["fast"]],
+			["/skill:be", ["skill:beta"]],
+			["/mode", ["model", "skill:mode", "fast", "goal", "init"]],
+			["/deep", ["skill:deep-interview"]],
+			["/fast", ["fast"]],
+		];
+		for (const [query, expected] of cases) {
+			expect(provider.trySyncSlashCompletion(query)?.items.map(item => item.value)).toEqual(expected);
+			expect((await provider.getSuggestions([query], 0, query.length))?.items.map(item => item.value)).toEqual(
+				expected,
+			);
+		}
+	});
 	it("normalizes direct skill-name typing to the canonical skill command", async () => {
 		const provider = createProvider();
 		const suggestions = await provider.getSuggestions(["/deep"], 0, 5);
