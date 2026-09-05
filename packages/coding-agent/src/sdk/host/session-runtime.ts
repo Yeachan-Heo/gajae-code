@@ -2168,15 +2168,19 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 			);
 		if (!assistant || typeof assistant !== "object") return { hasActivity: false };
 		const content = (assistant as { content?: unknown }).content;
-		const usage = (assistant as { usage?: unknown }).usage;
-		const totalTokens =
-			usage !== null && typeof usage === "object" ? (usage as { totalTokens?: unknown }).totalTokens : undefined;
 		// Missing usage is not evidence of a zero-token turn: some compatible
-		// providers omit usage entirely. Only an explicit, finite zero is the
-		// fail-closed signal; positive usage remains valid terminal activity.
+		// providers omit usage entirely or report null. Malformed non-null usage
+		// must not inherit that compatibility path and independently prove success.
+		const hasUsage = Object.hasOwn(assistant, "usage");
+		const usage = hasUsage ? (assistant as { usage?: unknown }).usage : undefined;
 		const hasTokenActivity =
-			totalTokens === undefined ||
-			(typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0);
+			!hasUsage ||
+			usage === null ||
+			(typeof usage === "object" &&
+				!Array.isArray(usage) &&
+				typeof (usage as { totalTokens?: unknown }).totalTokens === "number" &&
+				Number.isFinite((usage as { totalTokens: number }).totalTokens) &&
+				(usage as { totalTokens: number }).totalTokens > 0);
 		if (typeof content === "string") {
 			const bounded = sanitizeTurnResultContent(content);
 			return { content: bounded, hasActivity: content.trim().length > 0 || hasTokenActivity };
@@ -2198,12 +2202,23 @@ function promptTerminalEvidenceFromAgentEnd(event: unknown): PromptTerminalEvide
 					return typeof data === "string" && data.trim().length > 0;
 				}
 				if (type === "toolCall") {
-					const toolCall = block as { id?: unknown; name?: unknown };
+					const toolCall = block as {
+						id?: unknown;
+						name?: unknown;
+						arguments?: unknown;
+						incompleteArguments?: unknown;
+						incompleteArgumentsReason?: unknown;
+					};
 					return (
 						typeof toolCall.id === "string" &&
-						toolCall.id.length > 0 &&
+						toolCall.id.trim().length > 0 &&
 						typeof toolCall.name === "string" &&
-						toolCall.name.length > 0
+						toolCall.name.trim().length > 0 &&
+						toolCall.arguments !== null &&
+						typeof toolCall.arguments === "object" &&
+						!Array.isArray(toolCall.arguments) &&
+						(toolCall.incompleteArguments === undefined || toolCall.incompleteArguments === false) &&
+						toolCall.incompleteArgumentsReason === undefined
 					);
 				}
 				return false;

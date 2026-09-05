@@ -5076,6 +5076,11 @@ describe("post-acceptance invocation terminalization", () => {
 				usage: undefined,
 			},
 			{
+				name: "usage-null",
+				content: [{ type: "thinking", thinking: "" }],
+				usage: null,
+			},
+			{
 				name: "positive-token-usage",
 				content: [{ type: "thinking", thinking: "" }],
 				usage: { totalTokens: 1 },
@@ -5108,6 +5113,90 @@ describe("post-acceptance invocation terminalization", () => {
 						turnId: accepted.result?.turnId,
 					}),
 				).toMatchObject({ status: "terminal_ok" });
+				await harness.stop();
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+	test("fails closed for malformed usage and incomplete tool evidence", async () => {
+		const cases = [
+			{ name: "primitive-usage", content: [{ type: "thinking", thinking: "" }], usage: "bad" },
+			{ name: "array-usage", content: [{ type: "thinking", thinking: "" }], usage: [] },
+			{ name: "missing-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { input: 0 } },
+			{
+				name: "undefined-total-tokens",
+				content: [{ type: "thinking", thinking: "" }],
+				usage: { totalTokens: undefined },
+			},
+			{ name: "negative-total-tokens", content: [{ type: "thinking", thinking: "" }], usage: { totalTokens: -1 } },
+			{
+				name: "nan-total-tokens",
+				content: [{ type: "thinking", thinking: "" }],
+				usage: { totalTokens: Number.NaN },
+			},
+			{
+				name: "infinite-total-tokens",
+				content: [{ type: "thinking", thinking: "" }],
+				usage: { totalTokens: Number.POSITIVE_INFINITY },
+			},
+			{
+				name: "incomplete-tool-call",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-1",
+						name: "read",
+						arguments: {},
+						incompleteArguments: true,
+						incompleteArgumentsReason: "truncated",
+					},
+				],
+				usage: { totalTokens: 0 },
+			},
+			{
+				name: "malformed-tool-arguments",
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: null }],
+				usage: { totalTokens: 0 },
+			},
+			{
+				name: "orphaned-incomplete-reason",
+				content: [
+					{
+						type: "toolCall",
+						id: "call-1",
+						name: "read",
+						arguments: {},
+						incompleteArgumentsReason: "malformed",
+					},
+				],
+				usage: { totalTokens: 0 },
+			},
+		] as const;
+		for (const testCase of cases) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-terminal-malformed-${testCase.name}-`));
+			try {
+				const harness = await invocationHarness(`terminal-malformed-${testCase.name}`, cwd, {
+					sendUserMessage: async (_content, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						await Promise.withResolvers<void>().promise;
+					},
+				});
+				const accepted = await harness.control("turn.prompt", { text: "hello" });
+				await harness.emit("agent_start");
+				await harness.emit("agent_end", {
+					messages: [{ role: "assistant", content: testCase.content, usage: testCase.usage }],
+				});
+				expect(
+					await settledStatus(harness, "turn.result", {
+						kind: "prompt",
+						commandId: accepted.result?.commandId,
+						turnId: accepted.result?.turnId,
+					}),
+				).toMatchObject({
+					status: "failed",
+					error: { code: "prompt_failed", message: "Prompt submission failed." },
+				});
 				await harness.stop();
 			} finally {
 				await rm(cwd, { recursive: true, force: true });
