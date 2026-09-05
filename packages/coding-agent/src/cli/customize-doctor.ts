@@ -1213,8 +1213,8 @@ async function collectPluginBundles(cwd: string): Promise<CustomizeDoctorSurface
 					hook.relativePath === compiled?.relativePath &&
 					hook.implementationHash === compiled?.implementationHash &&
 					(hook.functionHook !== true ||
-						(hook.capabilityHash === functionHookGrantHash(grant) &&
-							hook.capabilityHash === compiled?.capabilityHash &&
+						(hook.capabilityHash?.toLowerCase() === functionHookGrantHash(grant).toLowerCase() &&
+							hook.capabilityHash?.toLowerCase() === compiled?.capabilityHash?.toLowerCase() &&
 							JSON.stringify(grant.capabilities) === JSON.stringify(compiled?.capabilities ?? []) &&
 							JSON.stringify(grant.networkDestinations) ===
 								JSON.stringify(compiled?.networkDestinations ?? []) &&

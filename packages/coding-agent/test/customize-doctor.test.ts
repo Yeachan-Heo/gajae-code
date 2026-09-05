@@ -311,7 +311,7 @@ describe("customize doctor (#4288)", () => {
 								capabilities: [...grant.capabilities],
 								networkDestinations: [],
 								filesystemRoots: [],
-								capabilityHash: functionHookGrantHash(grant),
+								capabilityHash: functionHookGrantHash(grant).toUpperCase(),
 								functionHook: true,
 							},
 						],

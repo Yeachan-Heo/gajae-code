@@ -929,10 +929,10 @@ export class ExtensionRunner {
 				resolve("timeout");
 			}, extensionHandlerTimeoutMs);
 		});
-		const aborted = new Promise<"aborted">(resolve => {
-			if (parentSignal.aborted) resolve("aborted");
-			else parentSignal.addEventListener("abort", () => resolve("aborted"), { once: true });
-		});
+		const { promise: aborted, resolve: resolveAborted } = Promise.withResolvers<"aborted">();
+		const resolveAbort = () => resolveAborted("aborted");
+		if (parentSignal.aborted) resolveAborted("aborted");
+		else parentSignal.addEventListener("abort", resolveAbort, { once: true });
 		try {
 			const value = await Promise.race([
 				Promise.resolve()
@@ -964,6 +964,7 @@ export class ExtensionRunner {
 		} finally {
 			if (timer !== undefined) clearTimeout(timer);
 			parentSignal.removeEventListener("abort", abortFromParent);
+			parentSignal.removeEventListener("abort", resolveAbort);
 		}
 	}
 
@@ -1409,6 +1410,7 @@ export class ExtensionRunner {
 		event.isError = functionEvent.isError;
 		const handlers = this.#legacyHandlers("tool_result");
 		if (handlers.length === 0) {
+			if (!functionModified) return undefined;
 			return {
 				content: event.content,
 				details: event.details,
