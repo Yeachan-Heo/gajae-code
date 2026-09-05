@@ -2,13 +2,13 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, type AgentTool } from "@gajae-code/agent-core";
-import type { AssistantMessage } from "@gajae-code/ai";
+import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { createMockModel, registerMockApi } from "@gajae-code/ai/providers/mock";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession, StreamingEditFileCache } from "@gajae-code/coding-agent/session/agent-session";
 import { EphemeralBlobStore, MemoryBlobStore } from "@gajae-code/coding-agent/session/blob-store";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
 
 registerMockApi();
@@ -65,6 +65,96 @@ async function settleEvents(): Promise<void> {
 }
 
 describe("session runtime cache hot paths", () => {
+	it.each([
+		"malformed URL",
+		"local root failure",
+	])("admits failed edits and revokes pre-cache reads after %s", async mode => {
+		using dir = TempDir.createSync("precache-invalidation-failure-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const pending = Promise.withResolvers<string>();
+		const started = Promise.withResolvers<void>();
+		const replacementStarted = Promise.withResolvers<void>();
+		const originalRead = fs.promises.readFile;
+		let reads = 0;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			reads++;
+			if (reads > 1) {
+				replacementStarted.resolve();
+				return Promise.resolve("fresh");
+			}
+			started.resolve();
+			return pending.promise;
+		}) as typeof originalRead);
+		const publishSpy = spyOn(StreamingEditFileCache.prototype, "set");
+		const clearSpy = spyOn(StreamingEditFileCache.prototype, "clear");
+		const debugSpy = spyOn(logger, "debug");
+		const rootSpy = spyOn(session.sessionManager, "getArtifactsDir");
+		const received: ToolResultMessage[] = [];
+		const completed: string[] = [];
+		const unsubscribe = session.subscribe(event => {
+			if (event.type === "message_end" && event.message.role === "toolResult") received.push(event.message);
+			if (event.type === "tool_execution_end") completed.push(event.toolCallId);
+		});
+		try {
+			startEdit(session, filePath, "pending");
+			await started.promise;
+			if (mode === "local root failure") {
+				rootSpy.mockImplementation(() => {
+					throw new Error("local root unavailable");
+				});
+			}
+			const failedPath = mode === "malformed URL" ? "local://bad" + "%ZZ" : "local://file.txt";
+			const message: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: "failed-edit",
+				toolName: "edit",
+				content: [{ type: "text", text: "edit failed" }],
+				details: { path: failedPath },
+				isError: true,
+				timestamp: Date.now(),
+			};
+			session.agent.emitExternalEvent({
+				type: "tool_execution_end",
+				toolCallId: message.toolCallId,
+				toolName: "edit",
+				result: { content: message.content, details: message.details },
+				isError: true,
+			});
+			session.agent.emitExternalEvent({ type: "message_end", message });
+			// Revocation must precede the asynchronous admission/spill boundary.
+			expect(clearSpy).toHaveBeenCalledTimes(1);
+			pending.resolve("stale");
+			await session.awaitPendingContextTransformations();
+			await settleEvents();
+			expect(debugSpy.mock.calls).toContainEqual([
+				"Failed to resolve streaming-edit cache invalidation path",
+				{ path: failedPath, error: expect.any(String) },
+			]);
+			if (mode === "local root failure") expect(rootSpy).toHaveBeenCalled();
+			expect(received).toEqual([message]);
+			expect(completed).toEqual([message.toolCallId]);
+			expect(session.sessionManager.buildSessionContext().messages).toContainEqual(message);
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toHaveLength(0);
+			startEdit(session, filePath, "replacement");
+			await replacementStarted.promise;
+			await settleEvents();
+			expect(reads).toBe(2);
+			expect(publishSpy.mock.calls.filter(([key]) => key === filePath)).toEqual([[filePath, "fresh"]]);
+		} finally {
+			pending.resolve("stale");
+			unsubscribe();
+			rootSpy.mockRestore();
+			debugSpy.mockRestore();
+			clearSpy.mockRestore();
+			publishSpy.mockRestore();
+			readSpy.mockRestore();
+			await session.dispose();
+			sessions.splice(sessions.indexOf(session), 1);
+		}
+	});
 	it.each([
 		["mixed multibyte", "界🙂".repeat(4000)],
 		["surrogate boundary", `ab${"🙂".repeat(2000)}`],
