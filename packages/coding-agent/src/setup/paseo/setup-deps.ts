@@ -87,7 +87,7 @@ export function resolvePaseoHome(env: NodeJS.ProcessEnv = process.env, home: str
 export function createDefaultPaseoPaths(
 	agentDir: string = getAgentDir(),
 	home: string = os.homedir(),
-	env: NodeJS.ProcessEnv = {},
+	env: NodeJS.ProcessEnv = process.env,
 ): PaseoPaths {
 	const paseoHome = resolvePaseoHome(env, home);
 	return {

@@ -13,11 +13,11 @@ import {
 	type PaseoDaemonTarget,
 	parseDaemonListen,
 	resolveDaemonTarget,
-	resolvePaseoHome,
 	selectProviderKey,
-	sessionListContainsLiveSessionForTests,
+	sessionListContainsLiveSession,
 	startPaseoAnnouncement,
 } from "../src/setup/paseo/announce";
+import { resolvePaseoHome } from "../src/setup/paseo/setup-deps";
 
 const SESSION_ID = "01a045e7-3d51-7387-a868-a8ba3eecd2d1";
 const CWD = "/Users/probe/git/example";
@@ -141,6 +141,16 @@ describe("resolveDaemonTarget", () => {
 		).toEqual({ kind: "tcp", host: "10.1.1.1", port: 9999 });
 	});
 
+	test("prefers PASEO_LISTEN over the running daemon pid file", async () => {
+		expect(
+			await resolveDaemonTarget(config({}, "127.0.0.1:6767"), {
+				...base,
+				env: { PASEO_LISTEN: "127.0.0.1:7777" },
+				readJson: async () => ({ listen: "/tmp/from-pid.sock" }),
+			}),
+		).toEqual({ kind: "tcp", host: "127.0.0.1", port: 7777 });
+	});
+
 	test("prefers the running daemon's pid file over the configured listener", async () => {
 		expect(
 			await resolveDaemonTarget(config({}, "127.0.0.1:6767"), {
@@ -205,7 +215,7 @@ describe("resolvePaseoHome", () => {
 describe("broker live-session matching", () => {
 	test("uses the current locator.cwd shape", () => {
 		expect(
-			sessionListContainsLiveSessionForTests(
+			sessionListContainsLiveSession(
 				[{ sessionId: SESSION_ID, live: true, locator: { cwd: CWD, worktreeRoot: null, stateRoot: "/tmp/state" } }],
 				SESSION_ID,
 				CWD,
@@ -221,7 +231,7 @@ describe("broker live-session matching", () => {
 		await fs.symlink(real, linked);
 		try {
 			expect(
-				sessionListContainsLiveSessionForTests(
+				sessionListContainsLiveSession(
 					[
 						{
 							sessionId: SESSION_ID,
