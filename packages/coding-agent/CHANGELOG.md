@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- SDK snapshot pages now read and integrity-check one contiguous span instead of rereading chunks per row. Reverse-provider disconnects discard connection-scoped registration receipts; relay shutdown releases backpressure listeners without destroying caller-owned sinks, and fragmented request frames are assembled once per newline.
+
 ## [0.16.4] - 2026-09-05
 ### Added
 
@@ -21,7 +23,6 @@
 
 ### Fixed
 
-- SDK snapshot pages now read and integrity-check one contiguous span instead of rereading chunks per row. Reverse-provider disconnects discard connection-scoped registration receipts; relay shutdown releases backpressure listeners without destroying caller-owned sinks, and fragmented request frames are assembled once per newline.
 - Credential replacement lookups now propagate the owning request's cancellation through scoped and allowed unscoped retries, preventing aborted turns from continuing OAuth preparation or selecting another key.
 - Removing the committed status-line command segment or clearing its trusted command now cancels the running process and clears stale output; draft-only previews remain side-effect-free.
 - Slack inbound acknowledgment reactions now use bounded, abortable, tracked provider work that drains on shutdown or attachment retirement without delaying accepted turns; rejected or timed-out reactions emit sanitized diagnostics.
