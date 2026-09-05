@@ -50,6 +50,30 @@ describe("streaming lifetime regressions", () => {
 		});
 	}
 
+	it("preserves a source error when iterator cleanup throws synchronously", async () => {
+		const sourceFailure = new Error("source failed");
+		const cleanupFailure = new Error("cleanup failed");
+		const source: AsyncIterableIterator<number> = {
+			[Symbol.asyncIterator]() {
+				return this;
+			},
+			async next() {
+				throw sourceFailure;
+			},
+			return() {
+				throw cleanupFailure;
+			},
+		};
+
+		await expect(
+			(async () => {
+				for await (const _value of iterateWithIdleTimeout(source, { errorMessage: "timeout" })) {
+					// The source fails before yielding.
+				}
+			})(),
+		).rejects.toBe(sourceFailure);
+	});
+
 	for (const finish of [complete, completeSimple]) {
 		for (const outcome of ["done", "error", "throw"] as const) {
 			it(`${finish.name} drains events and preserves ${outcome} result semantics`, async () => {
