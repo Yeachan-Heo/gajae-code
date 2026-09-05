@@ -208,7 +208,11 @@ function attachmentAcceptsAuthority(attachment: SessionAttachment, authorityId: 
 }
 
 function recordAcceptsAuthority(record: SlackConversation, authorityId: string | undefined): boolean {
-	return record.attachmentAuthorityId === authorityId || record.attachmentAuthorityMigrationFromId === authorityId;
+	return (
+		record.attachmentAuthorityId === authorityId ||
+		(record.attachmentAuthorityMigrationFromId !== undefined &&
+			record.attachmentAuthorityMigrationFromId === authorityId)
+	);
 }
 
 function replyableActionId(actionId: string | undefined): string | undefined {
@@ -727,27 +731,31 @@ export class SlackNotificationDaemon {
 			authority.attachmentAuthorityId ??
 			(attachment?.generation === authority.endpointGeneration ? attachment.authorityId : undefined);
 		await this.#verifyExistingRoot(rootTs);
-		return await claimSlackThreadBinding({
-			store: this.store,
-			key: this.#intentKey(sessionId),
-			teamId: this.options.teamId,
-			channelId: this.options.channelId,
+		return await this.#journal.withSessionMutationGate(
 			sessionId,
-			rootTs,
-			endpointGeneration: authority.endpointGeneration,
-			...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
-			revalidate: async () => {
-				const current = await this.#bindingAuthority(sessionId);
-				if (
-					!current ||
-					current.endpointGeneration !== authority.endpointGeneration ||
-					current.attachmentAuthorityId !== attachmentAuthorityId
-				)
-					return false;
-				return commitAuthority ? await commitAuthority() : true;
-			},
-			now: this.#now,
-		});
+			async () =>
+				await claimSlackThreadBinding({
+					store: this.store,
+					key: this.#intentKey(sessionId),
+					teamId: this.options.teamId,
+					channelId: this.options.channelId,
+					sessionId,
+					rootTs,
+					endpointGeneration: authority.endpointGeneration,
+					...(attachmentAuthorityId === undefined ? {} : { attachmentAuthorityId }),
+					revalidate: async () => {
+						const current = await this.#bindingAuthority(sessionId);
+						if (
+							!current ||
+							current.endpointGeneration !== authority.endpointGeneration ||
+							current.attachmentAuthorityId !== attachmentAuthorityId
+						)
+							return false;
+						return commitAuthority ? await commitAuthority() : true;
+					},
+					now: this.#now,
+				}),
+		);
 	}
 
 	/**
@@ -807,62 +815,66 @@ export class SlackNotificationDaemon {
 		const generation = endpoint.generation;
 		const pendingKey = this.#intentKey(sessionId);
 		let claimed = false;
-		const pending = await this.store.transact(pendingKey, current => {
-			if (current?.state === "active" && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId))
-				return current;
-			const now = this.#now();
-			if (
-				current?.rootPublicationOwner !== undefined &&
-				current.rootPublicationOwner !== this.#publicationOwnerId &&
-				!this.#leaseExpired(current.rootPublicationLeaseExpiresAt, now)
-			)
-				return current;
-			if (current?.state === "posting_root") {
-				if (current.rootPublicationOwner === this.#publicationOwnerId) return current;
-				claimed = true;
-				return nextRecord(current, {
-					rootPublicationOwner: this.#publicationOwnerId,
-					rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
-					rootPublicationFence: (current.rootPublicationFence ?? 0) + 1,
-					updatedAt: now,
-				});
-			}
-			claimed = true;
-			return {
-				generation: (current?.generation ?? 0) + 1,
-				state: "posting_root",
-				teamId: this.options.teamId,
-				channelId: this.options.channelId,
-				sessionId,
-				clientMsgId: requestedClientMsgId ?? this.#randomId(),
-				rootPublicationOwner: this.#publicationOwnerId,
-				rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
-				rootPublicationFence: (current?.rootPublicationFence ?? 0) + 1,
-				endpointGeneration: generation,
-				attachmentAuthorityId: endpoint.authorityId,
-				updatedAt: now,
-				seenEventIds:
-					current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
-						? current.seenEventIds
-						: [],
-				seenContextIds:
-					current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
-						? current.seenContextIds
-						: [],
-				seenRetryKeys:
-					current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
-						? current.seenRetryKeys
-						: [],
-				seenInteractionIds:
-					current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
-						? current.seenInteractionIds
-						: [],
-				inboundDispatches:
-					current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
-						? (current.inboundDispatches ?? [])
-						: [],
-			};
-		});
+		const pending = await this.#journal.withSessionMutationGate(
+			sessionId,
+			async () =>
+				await this.store.transact(pendingKey, current => {
+					if (current?.state === "active" && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId))
+						return current;
+					const now = this.#now();
+					if (
+						current?.rootPublicationOwner !== undefined &&
+						current.rootPublicationOwner !== this.#publicationOwnerId &&
+						!this.#leaseExpired(current.rootPublicationLeaseExpiresAt, now)
+					)
+						return current;
+					if (current?.state === "posting_root") {
+						if (current.rootPublicationOwner === this.#publicationOwnerId) return current;
+						claimed = true;
+						return nextRecord(current, {
+							rootPublicationOwner: this.#publicationOwnerId,
+							rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
+							rootPublicationFence: (current.rootPublicationFence ?? 0) + 1,
+							updatedAt: now,
+						});
+					}
+					claimed = true;
+					return {
+						generation: (current?.generation ?? 0) + 1,
+						state: "posting_root",
+						teamId: this.options.teamId,
+						channelId: this.options.channelId,
+						sessionId,
+						clientMsgId: requestedClientMsgId ?? this.#randomId(),
+						rootPublicationOwner: this.#publicationOwnerId,
+						rootPublicationLeaseExpiresAt: now + this.#publicationLeaseMs,
+						rootPublicationFence: (current?.rootPublicationFence ?? 0) + 1,
+						endpointGeneration: generation,
+						attachmentAuthorityId: endpoint.authorityId,
+						updatedAt: now,
+						seenEventIds:
+							current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
+								? current.seenEventIds
+								: [],
+						seenContextIds:
+							current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
+								? current.seenContextIds
+								: [],
+						seenRetryKeys:
+							current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
+								? current.seenRetryKeys
+								: [],
+						seenInteractionIds:
+							current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
+								? current.seenInteractionIds
+								: [],
+						inboundDispatches:
+							current && attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
+								? (current.inboundDispatches ?? [])
+								: [],
+					};
+				}),
+		);
 		// An already-active session root is authoritative whether this daemon
 		// published it or adopted an operator-supplied one, so it is checked before
 		// the publication identity a claim of our own would have written.
@@ -1024,15 +1036,22 @@ export class SlackNotificationDaemon {
 							`notification:${sessionId}:${publicationId}`,
 							clientMsgId => `notification:${sessionId}:${clientMsgId}`,
 						);
-			await this.#postDurable(publication.effectId, sessionId, conversationGeneration, {
-				channel: conversation.channelId,
-				threadTs: conversation.rootTs,
-				text: body,
-				clientMsgId: publication.clientMsgId,
-				...(conversation.attachmentAuthorityId === undefined
-					? {}
-					: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
-			});
+			const durable = await this.#providerEffectPayload(
+				publication.effectId,
+				sessionId,
+				conversationGeneration,
+				{
+					channel: conversation.channelId,
+					threadTs: conversation.rootTs,
+					text: body,
+					clientMsgId: publication.clientMsgId,
+					...(conversation.attachmentAuthorityId === undefined
+						? {}
+						: { attachmentAuthorityId: conversation.attachmentAuthorityId }),
+				},
+				conversation.attachmentAuthorityMigrationFromId,
+			);
+			await this.#postDurable(publication.effectId, sessionId, conversationGeneration, durable.payload);
 			return conversation;
 		}
 		let actionClaimed = false;
@@ -1141,55 +1160,57 @@ export class SlackNotificationDaemon {
 		currentAuthorityId: string,
 	): Promise<void> {
 		if (!previousAuthorityId || !currentAuthorityId || previousAuthorityId === currentAuthorityId) return;
-		const document = await this.store.load();
-		for (const key of Object.keys(document.conversations)) {
-			await this.store.transact(key, current => {
-				if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
-					return current;
-				if (
-					current.attachmentAuthorityId !== previousAuthorityId &&
-					!recordAcceptsAuthority(current, previousAuthorityId)
-				)
-					return current;
-				if (
-					current.attachmentAuthorityId === currentAuthorityId &&
-					current.attachmentAuthorityMigrationFromId === previousAuthorityId
-				)
-					return current;
-				return nextRecord(current, {
-					attachmentAuthorityId: currentAuthorityId,
-					attachmentAuthorityMigrationFromId: previousAuthorityId,
-					updatedAt: this.#now(),
+		await this.#journal.withSessionMutationGate(sessionId, async () => {
+			const document = await this.store.load();
+			for (const key of Object.keys(document.conversations)) {
+				await this.store.transact(key, current => {
+					if (!current || current.sessionId !== sessionId || current.endpointGeneration !== endpointGeneration)
+						return current;
+					if (
+						current.attachmentAuthorityId !== previousAuthorityId &&
+						!recordAcceptsAuthority(current, previousAuthorityId)
+					)
+						return current;
+					if (
+						current.attachmentAuthorityId === currentAuthorityId &&
+						current.attachmentAuthorityMigrationFromId === previousAuthorityId
+					)
+						return current;
+					return nextRecord(current, {
+						attachmentAuthorityId: currentAuthorityId,
+						attachmentAuthorityMigrationFromId: previousAuthorityId,
+						updatedAt: this.#now(),
+					});
 				});
-			});
-		}
-		await this.#journal.migrateAttachmentAuthorityId(
-			sessionId,
-			endpointGeneration,
-			previousAuthorityId,
-			currentAuthorityId,
-		);
-		for (const key of Object.keys(document.conversations)) {
-			await this.store.transact(key, current => {
-				if (
-					!current ||
-					current.sessionId !== sessionId ||
-					current.endpointGeneration !== endpointGeneration ||
-					current.attachmentAuthorityId !== currentAuthorityId ||
-					current.attachmentAuthorityMigrationFromId !== previousAuthorityId
-				)
-					return current;
-				const inboundDispatches = current.inboundDispatches?.map(receipt => {
-					if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
-					return { ...receipt, attachmentAuthorityId: currentAuthorityId };
+			}
+			await this.#journal.migrateAttachmentAuthorityIdWhileHoldingGate(
+				sessionId,
+				endpointGeneration,
+				previousAuthorityId,
+				currentAuthorityId,
+			);
+			for (const key of Object.keys(document.conversations)) {
+				await this.store.transact(key, current => {
+					if (
+						!current ||
+						current.sessionId !== sessionId ||
+						current.endpointGeneration !== endpointGeneration ||
+						current.attachmentAuthorityId !== currentAuthorityId ||
+						current.attachmentAuthorityMigrationFromId !== previousAuthorityId
+					)
+						return current;
+					const inboundDispatches = current.inboundDispatches?.map(receipt => {
+						if (receipt.attachmentAuthorityId !== previousAuthorityId) return receipt;
+						return { ...receipt, attachmentAuthorityId: currentAuthorityId };
+					});
+					return nextRecord(current, {
+						attachmentAuthorityMigrationFromId: undefined,
+						...(inboundDispatches === undefined ? {} : { inboundDispatches }),
+						updatedAt: this.#now(),
+					});
 				});
-				return nextRecord(current, {
-					attachmentAuthorityMigrationFromId: undefined,
-					...(inboundDispatches === undefined ? {} : { inboundDispatches }),
-					updatedAt: this.#now(),
-				});
-			});
-		}
+			}
+		});
 	}
 
 	/** Posts a safe command outcome to the active mapped root. */
@@ -1620,71 +1641,76 @@ export class SlackNotificationDaemon {
 			: actionId
 				? { type: "reply", id: actionId, answer: inboundText, idempotencyKey, routing }
 				: { type: "user_message", sessionId: record.sessionId, text: inboundText, idempotencyKey, routing };
-		const existingEffect = await this.#journal.read<SlackInboundEffectPayload>(effectId);
-		const payload = existingEffect?.payload ?? initialPayload;
-		const dispatchKind = payload.routing.kind;
-		await this.#rescheduleAfterEffectTransition(
-			this.#journal.enqueue({
-				id: effectId,
-				kind:
-					dispatchKind === "command"
-						? "sdk.inbound.command"
-						: dispatchKind === "action"
-							? "sdk.inbound.reply"
-							: "sdk.inbound.user_message",
-				transport: "slack",
-				sessionId: record.sessionId,
-				endpointGeneration: endpoint.generation,
-				payload,
-			}),
-		);
 		let sessionId: string | undefined;
 		let receipt: SlackInboundDispatchReceipt | undefined;
-		await this.store.transact(key, current => {
-			if (
-				!current?.sessionId ||
-				!acceptsSlackInbound(current, inbound.rootTs, endpoint.generation) ||
-				!attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId)
-			)
-				return current;
-			const existing = (current.inboundDispatches ?? []).find(
-				candidate =>
-					candidate.eventId === inbound.eventId ||
-					candidate.interactionId === interactionId ||
-					candidate.retryKey === retryKey,
+		let payload: SlackInboundEffectPayload = initialPayload;
+		await this.#journal.withSessionMutationGate(record.sessionId, async () => {
+			const existingEffect = await this.#journal.read<SlackInboundEffectPayload>(effectId);
+			payload = existingEffect?.payload ?? initialPayload;
+			const dispatchKind = payload.routing.kind;
+			await this.#rescheduleAfterEffectTransition(
+				this.#journal.enqueueWhileHoldingSessionMutationGate({
+					id: effectId,
+					kind:
+						dispatchKind === "command"
+							? "sdk.inbound.command"
+							: dispatchKind === "action"
+								? "sdk.inbound.reply"
+								: "sdk.inbound.user_message",
+					transport: "slack",
+					sessionId: record.sessionId,
+					endpointGeneration: endpoint.generation,
+					payload,
+				}),
 			);
-			if (existing) {
+
+			await this.store.transact(key, current => {
+				if (
+					!current?.sessionId ||
+					!acceptsSlackInbound(current, inbound.rootTs, endpoint.generation) ||
+					!attachmentAcceptsAuthority(endpoint, current.attachmentAuthorityId) ||
+					!recordAcceptsAuthority(current, payload.routing.attachmentAuthorityId)
+				)
+					return current;
+				const existing = (current.inboundDispatches ?? []).find(
+					candidate =>
+						candidate.eventId === inbound.eventId ||
+						candidate.interactionId === interactionId ||
+						candidate.retryKey === retryKey,
+				);
+				if (existing) {
+					sessionId = current.sessionId;
+					receipt = existing;
+					return current;
+				}
+				if (
+					current.seenEventIds.includes(inbound.eventId) ||
+					current.seenInteractionIds.includes(interactionId) ||
+					current.seenRetryKeys.includes(retryKey) ||
+					(dispatchKind === "action" && replyableActionId(current.pendingActionId) !== payload.routing.actionId) ||
+					(dispatchKind === "message" && replyableActionId(current.pendingActionId) !== undefined)
+				)
+					return current;
 				sessionId = current.sessionId;
-				receipt = existing;
-				return current;
-			}
-			if (
-				current.seenEventIds.includes(inbound.eventId) ||
-				current.seenInteractionIds.includes(interactionId) ||
-				current.seenRetryKeys.includes(retryKey) ||
-				(dispatchKind === "action" && replyableActionId(current.pendingActionId) !== payload.routing.actionId) ||
-				(dispatchKind === "message" && replyableActionId(current.pendingActionId) !== undefined)
-			)
-				return current;
-			sessionId = current.sessionId;
-			receipt = {
-				key: `${inbound.eventId}:${interactionId}`,
-				eventId: inbound.eventId,
-				interactionId,
-				retryKey,
-				eventContext: inbound.eventContext,
-				kind: dispatchKind,
-				...(dispatchKind === "action" ? { actionId: payload.routing.actionId } : {}),
-				endpointGeneration: endpoint.generation,
-				...(current.attachmentAuthorityId === undefined
-					? {}
-					: { attachmentAuthorityId: current.attachmentAuthorityId }),
-				effectId,
-				idempotencyKey,
-			};
-			return nextRecord(current, {
-				inboundDispatches: [...(current.inboundDispatches ?? []), receipt],
-				updatedAt: this.#now(),
+				receipt = {
+					key: `${inbound.eventId}:${interactionId}`,
+					eventId: inbound.eventId,
+					interactionId,
+					retryKey,
+					eventContext: inbound.eventContext,
+					kind: dispatchKind,
+					...(dispatchKind === "action" ? { actionId: payload.routing.actionId } : {}),
+					endpointGeneration: endpoint.generation,
+					...(current.attachmentAuthorityId === undefined
+						? {}
+						: { attachmentAuthorityId: current.attachmentAuthorityId }),
+					effectId,
+					idempotencyKey,
+				};
+				return nextRecord(current, {
+					inboundDispatches: [...(current.inboundDispatches ?? []), receipt],
+					updatedAt: this.#now(),
+				});
 			});
 		});
 		if (!sessionId || !receipt) {

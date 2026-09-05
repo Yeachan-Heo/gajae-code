@@ -349,6 +349,121 @@ describe("SlackNotificationDaemon fake-provider acceptance", () => {
 		);
 	});
 
+	it("replays a stable notification from the legacy payload while migration is fenced", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.notify("session", "root");
+				await daemon.notify("session", "legacy notification", undefined, 1, "stable-notification");
+				const postsBeforeMigration = fake.posts.length;
+				authorityId = "device-bound-authority";
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = () => {
+					throw new Error("effect migration exploded");
+				};
+				await expect(
+					daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", authorityId),
+				).rejects.toThrow("effect migration exploded");
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = undefined;
+
+				await daemon.notify("session", "replacement body", undefined, 1, "stable-notification");
+				expect(fake.posts).toHaveLength(postsBeforeMigration);
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const effect = (await journal.list()).find(candidate => candidate.id.startsWith("notification:session:"));
+				expect(effect).toMatchObject({
+					payload: {
+						text: "legacy notification",
+						attachmentAuthorityId: "legacy-authority",
+					},
+				});
+				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
+				expect(
+					Object.values((await store.load()).conversations).find(record => record.sessionId === "session"),
+				).toMatchObject({ attachmentAuthorityMigrationFromId: "legacy-authority" });
+			},
+			{
+				resolveAttachment: async sessionId => ({ ...endpoint(sessionId), authorityId }),
+			},
+		);
+	});
+
+	it("rejects a provider effect that omits attachment authority", async () => {
+		await withDaemon(
+			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.notify("session", "root");
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				await expect(
+					journal.enqueue({
+						id: "missing-authority",
+						kind: "provider-post",
+						transport: "slack",
+						sessionId: "session",
+						endpointGeneration: 1,
+						payload: {
+							channel: "C1",
+							threadTs: "1.1",
+							text: "forged",
+							clientMsgId: "missing-authority",
+							attachmentAuthorityId: undefined,
+						},
+					}),
+				).rejects.toThrow("attachment authority");
+			},
+			{
+				resolveAttachment: async sessionId => ({ ...endpoint(sessionId), authorityId: "current-authority" }),
+			},
+		);
+	});
+
+	it("fences an effect enqueued after the migration journal snapshot", async () => {
+		let authorityId = "legacy-authority";
+		await withDaemon(
+			async (daemon, _fake, _injected, _setEndpointGeneration, agentDir) => {
+				await daemon.notify("session", "root");
+				authorityId = "current-authority";
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				let paused = true;
+				__chatEffectJournalTestHooks.beforeAuthorityMigrationEffect = async () => {
+					if (!paused) return;
+					paused = false;
+					entered.resolve();
+					await release.promise;
+				};
+
+				const journal = new ChatEffectJournal({ agentDir, transport: "slack" });
+				const migration = daemon.migrateAttachmentAuthority("session", 1, "legacy-authority", "current-authority");
+				await entered.promise;
+				const late = journal.enqueue({
+					id: "late-slack-effect",
+					kind: "provider-post",
+					transport: "slack",
+					sessionId: "session",
+					endpointGeneration: 1,
+					payload: {
+						channel: "C1",
+						threadTs: "1.1",
+						text: "late",
+						clientMsgId: "late-slack-effect",
+						attachmentAuthorityId: "legacy-authority",
+					},
+				});
+				release.resolve();
+				await migration;
+				await expect(late).rejects.toThrow("attachment authority");
+				expect(await journal.read("late-slack-effect")).toBeUndefined();
+				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
+				const migrated = Object.values((await store.load()).conversations).find(
+					record => record.sessionId === "session",
+				);
+				expect(migrated?.attachmentAuthorityId).toBe("current-authority");
+				expect(migrated?.attachmentAuthorityMigrationFromId).toBeUndefined();
+			},
+			{
+				resolveAttachment: async sessionId => ({ ...endpoint(sessionId), authorityId }),
+			},
+		);
+	});
+
 	it("scopes deterministic root publication identities to the configured channel", async () => {
 		const firstAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-one-"));
 		const secondAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-root-channel-two-"));
