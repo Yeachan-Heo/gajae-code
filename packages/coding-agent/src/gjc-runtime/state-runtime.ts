@@ -2487,6 +2487,7 @@ async function handleHandoffUnlocked(
 		nowIso: handoffAt,
 		mutationId,
 	});
+	callerReceipt.forced = forced;
 	const normalizedCaller =
 		caller === "deep-interview"
 			? (normalizeDeepInterviewEnvelope(migrateWorkflowState(existingCaller, caller).state) as Record<
@@ -2725,7 +2726,7 @@ async function handleHandoffUnlocked(
 					fromPhase: undefined,
 					callerState: existingCaller,
 					calleeState: retryCalleeState,
-					forced,
+					forced: callerReceiptForRetry?.forced === true,
 				});
 			await completeWorkflowTransactionJournal(cwd, sessionId, retryMutationId);
 		}
@@ -2836,6 +2837,7 @@ async function handleHandoffUnlocked(
 		nowIso: handoffAt,
 		mutationId,
 	});
+	calleeReceipt.forced = forced;
 
 	const calleeInitial = initialPhaseForSkill(workflowCallee);
 	const normalizedCallee =
@@ -3126,12 +3128,25 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				throw error;
 			const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
 			const persistedRevision = existingStateRevision(envelope);
+			const pendingJournal =
+				typeof existingReceipt.mutation_id === "string"
+					? await readWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id)
+					: undefined;
+			const expectedJournalPaths = [resolvedStatePath, auditPath(cwd, selectors.gjcSessionId)].map(value =>
+				path.resolve(value),
+			);
 			if (
 				!persistedReceipt ||
 				typeof persistedRevision !== "number" ||
 				persistedRevision !== existingReceipt.state_revision ||
 				persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
-				persistedReceipt.mutated_at !== existingReceipt.approved_at
+				persistedReceipt.mutated_at !== existingReceipt.approved_at ||
+				pendingJournal?.status !== "pending" ||
+				pendingJournal.mutation_id !== existingReceipt.mutation_id ||
+				pendingJournal.steps.length !== 1 ||
+				pendingJournal.steps[0] !== "approval-state" ||
+				pendingJournal.paths.length !== expectedJournalPaths.length ||
+				pendingJournal.paths.some((value, index) => path.resolve(value) !== expectedJournalPaths[index])
 			)
 				throw error;
 			await appendExecutionApprovalAudit({
@@ -3143,6 +3158,10 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 				revision: persistedRevision,
 				receipt: persistedReceipt,
 			});
+			await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string, {
+				steps: ["approval-state", "approval-audit"],
+			});
+			await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, existingReceipt.mutation_id as string);
 			await assertDeepInterviewHandoffReady(envelope, {
 				cwd,
 				sessionId: selectors.gjcSessionId,
@@ -3169,6 +3188,13 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	};
 	envelope.state = inner;
 	envelope.updated_at = approvedAt;
+	await beginWorkflowTransactionJournal({
+		cwd,
+		sessionId: selectors.gjcSessionId,
+		mutationId,
+		caller: "deep-interview",
+		paths: [resolvedStatePath, auditPath(cwd, selectors.gjcSessionId)],
+	});
 	const writeResult = await writeGuardedWorkflowEnvelopeAtomic(statePath, envelope, {
 		cwd,
 		policy: "source",
@@ -3203,6 +3229,9 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	const stampedApprovalReceipt = isPlainObject(writeResult.stamped.receipt) ? writeResult.stamped.receipt : undefined;
 	if (!stampedApprovalReceipt)
 		throw new StateCommandError(1, "approval writer did not return a stamped workflow receipt");
+	await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
+		steps: ["approval-state"],
+	});
 	await appendExecutionApprovalAudit({
 		cwd,
 		sessionId: selectors.gjcSessionId,
@@ -3212,6 +3241,10 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 		revision: writeResult.revision,
 		receipt: persistedWorkflowReceipt(stampedApprovalReceipt, "deep-interview")!,
 	});
+	await updateWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId, {
+		steps: ["approval-state", "approval-audit"],
+	});
+	await completeWorkflowTransactionJournal(cwd, selectors.gjcSessionId, mutationId);
 	await syncSkillActiveState({
 		cwd,
 		skill: "deep-interview",
