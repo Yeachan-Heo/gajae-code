@@ -1291,9 +1291,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		provider: Provider,
 		credential: OAuthCredential,
 		signal?: AbortSignal,
+		options?: { forceFresh?: boolean },
 	): Promise<UsageReport | null> {
 		let reports: UsageReport[] | null;
 		try {
+			if (options?.forceFresh) this.#invalidateUsageCache();
 			reports = await this.#raceWithSignal(this.#loadUsageReports(provider), signal);
 		} catch (error) {
 			// A caller cancellation is control flow, not a missing usage report.

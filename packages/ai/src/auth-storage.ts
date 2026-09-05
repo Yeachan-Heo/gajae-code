@@ -582,7 +582,12 @@ export interface AuthCredentialStore {
 	 *
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
-	getUsageReport?(provider: Provider, credential: OAuthCredential, signal?: AbortSignal): Promise<UsageReport | null>;
+	getUsageReport?(
+		provider: Provider,
+		credential: OAuthCredential,
+		signal?: AbortSignal,
+		options?: { forceFresh?: boolean },
+	): Promise<UsageReport | null>;
 	/**
 	 * Optional store hook to invalidate a specific credential after the upstream
 	 * provider returned 401 on a supposedly-fresh key. Remote stores force the
@@ -1246,6 +1251,7 @@ function storedCredentialArraysEqual(left: StoredCredential[], right: StoredCred
 		const rightEntry = right[index];
 		if (!leftEntry || !rightEntry) return false;
 		if (leftEntry.id !== rightEntry.id) return false;
+		if (leftEntry.revision !== rightEntry.revision) return false;
 		if (!authCredentialEquals(leftEntry.credential, rightEntry.credential)) return false;
 	}
 	return true;
@@ -1349,6 +1355,7 @@ export class AuthStorage {
 	#rankingStrategyResolver?: (provider: Provider) => CredentialRankingStrategy | undefined;
 	#usageCache: UsageCache;
 	#usageRequestInFlight: Map<string, Promise<UsageReport | null>> = new Map();
+	#usageInvalidationGenerations: Map<string, number> = new Map();
 	#usageReportsInFlight: Map<string, Promise<UsageReport[] | null>> = new Map();
 	#usageFetch: typeof fetch;
 	#usageRequestTimeoutMs: number;
@@ -2713,8 +2720,9 @@ export class AuthStorage {
 			throw new Error("Credential authority changed during refresh");
 		}
 		if (persist && !this.#store.refreshSnapshot) this.#store.updateAuthCredential(target.id, credential);
+		const persisted = this.#store.listAuthCredentials(provider).find(entry => entry.id === target.id);
 		const updated = [...entries];
-		updated[index] = { id: target.id, credential };
+		updated[index] = persisted ?? { id: target.id, credential, revision: target.revision };
 		this.#setStoredCredentials(provider, updated);
 		if (
 			credential.type === "oauth" &&
@@ -3907,9 +3915,13 @@ export class AuthStorage {
 
 		const inFlight = this.#usageRequestInFlight.get(cacheKey);
 		if (inFlight) return inFlight;
+		const invalidationGeneration = this.#usageInvalidationGenerations.get(cacheKey) ?? 0;
 
 		const promise = (async () => {
 			const report = await this.#fetchUsageUncached(request, timeoutMs, logDetails);
+			if ((this.#usageInvalidationGenerations.get(cacheKey) ?? 0) !== invalidationGeneration) {
+				return report;
+			}
 			const ttlJitter = USAGE_REPORT_TTL_MS * (Math.random() * 0.5 - 0.25);
 			if (report !== null) {
 				// Success: stagger per-credential cache expiry so all accounts don't
@@ -4136,7 +4148,7 @@ export class AuthStorage {
 	async #getUsageReport(
 		provider: Provider,
 		credential: OAuthCredential,
-		options?: { baseUrl?: string; timeoutMs?: number; signal?: AbortSignal },
+		options?: { baseUrl?: string; timeoutMs?: number; signal?: AbortSignal; forceFresh?: boolean },
 	): Promise<UsageReport | null> {
 		// Store-level hook (e.g. `RemoteAuthCredentialStore`) is authoritative
 		// when present: the broker already aggregates usage from a less-throttled
@@ -4144,15 +4156,24 @@ export class AuthStorage {
 		// whole point of routing through it.
 		const storeHook = this.#store.getUsageReport?.bind(this.#store);
 		if (storeHook) {
-			return storeHook(provider, credential, options?.signal);
+			return storeHook(provider, credential, options?.signal, { forceFresh: options?.forceFresh });
 		}
 		return raceUsageWithSignal(
-			this.#fetchUsageCached(
+			(options?.forceFresh ? this.#fetchUsageUncached : this.#fetchUsageCached).call(
+				this,
 				this.#buildUsageRequestForOauth(provider, credential, options?.baseUrl),
 				options?.timeoutMs ?? this.#usageRequestTimeoutMs,
 			),
 			options?.signal,
 		);
+	}
+
+	#invalidateUsageReport(provider: Provider, credential: OAuthCredential, baseUrl?: string): void {
+		const request = this.#buildUsageRequestForOauth(provider, credential, baseUrl);
+		const cacheKey = this.#buildUsageReportCacheKey(request);
+		this.#usageInvalidationGenerations.set(cacheKey, (this.#usageInvalidationGenerations.get(cacheKey) ?? 0) + 1);
+		this.#usageRequestInFlight.delete(cacheKey);
+		this.#usageCache.deletePrefix?.(cacheKey);
 	}
 
 	async fetchUsageReports(options?: {
@@ -5022,6 +5043,7 @@ export class AuthStorage {
 					allowBlocked: false,
 					prefetchedUsage: candidate.usage,
 					usagePrechecked: candidate.usageChecked,
+					prefetchedUsageAccountId: candidate.selection.credential.accountId,
 					enforceSparkProRequirement,
 				},
 				reloadsUsed,
@@ -5031,7 +5053,7 @@ export class AuthStorage {
 		}
 
 		if (fallback && this.#isCredentialBlocked(providerKey, fallback.selection.index)) {
-			return this.#tryOAuthCredential(
+			const resolved = await this.#tryOAuthCredential(
 				provider,
 				fallback.selection,
 				providerKey,
@@ -5042,13 +5064,14 @@ export class AuthStorage {
 					allowBlocked: true,
 					prefetchedUsage: fallback.usage,
 					usagePrechecked: fallback.usageChecked,
+					prefetchedUsageAccountId: fallback.selection.credential.accountId,
 					enforceSparkProRequirement,
 				},
 				reloadsUsed,
 				sessionSelector,
 			);
+			if (resolved) return resolved;
 		}
-
 		return undefined;
 	}
 
@@ -5329,6 +5352,7 @@ export class AuthStorage {
 			allowBlocked: boolean;
 			prefetchedUsage?: UsageReport | null;
 			usagePrechecked?: boolean;
+			prefetchedUsageAccountId?: string;
 			enforceSparkProRequirement?: boolean;
 		},
 		reloadsUsed = 0,
@@ -5339,8 +5363,10 @@ export class AuthStorage {
 			allowBlocked,
 			prefetchedUsage = null,
 			usagePrechecked = false,
+			prefetchedUsageAccountId,
 			enforceSparkProRequirement = false,
 		} = usageOptions;
+		const prefetchedUsageRevision = usagePrechecked ? selection.revision : undefined;
 		if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
 		if (!allowBlocked && this.#isCredentialBlocked(providerKey, selection.index)) {
 			return undefined;
@@ -5353,18 +5379,27 @@ export class AuthStorage {
 		const requiresProModel = requiresOpenAICodexProModel(provider, options?.modelId);
 		let usage: UsageReport | null = null;
 		let usageChecked = false;
+		let usageCredentialRevision: number | undefined;
+		let usageAccountId: string | undefined;
 
 		if ((checkUsage && !allowBlocked) || requiresProModel) {
-			if (usagePrechecked) {
+			if (
+				usagePrechecked &&
+				selection.revision === prefetchedUsageRevision &&
+				selection.credential.accountId === prefetchedUsageAccountId
+			) {
 				usage = prefetchedUsage;
 				usageChecked = true;
 			} else {
 				usage = await this.#getUsageReport(provider, selection.credential, {
 					...options,
+					forceFresh: usagePrechecked,
 					timeoutMs: this.#usageRequestTimeoutMs,
 				});
 				usageChecked = true;
 			}
+			usageCredentialRevision = selection.revision;
+			usageAccountId = selection.credential.accountId;
 			if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 				const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
 				this.#markCredentialBlocked(
@@ -5379,6 +5414,21 @@ export class AuthStorage {
 
 		try {
 			if (!this.#reconcileOAuthCredentialSelection(provider, selection)) return undefined;
+			if (
+				requiresProModel &&
+				(selection.revision !== usageCredentialRevision || selection.credential.accountId !== usageAccountId)
+			) {
+				this.#invalidateUsageReport(provider, selection.credential, options?.baseUrl);
+				usage = await this.#getUsageReport(provider, selection.credential, {
+					...options,
+					forceFresh: true,
+					timeoutMs: this.#usageRequestTimeoutMs,
+				});
+				usageChecked = true;
+				usageCredentialRevision = selection.revision;
+				usageAccountId = selection.credential.accountId;
+				if (enforceSparkProRequirement && !hasOpenAICodexProPlan(usage)) return undefined;
+			}
 			const selectionCredentialId = selection.id;
 			let result: { newCredentials: OAuthCredentials; apiKey: string } | null;
 			// The refresh result carries the effective (possibly guard-adopted)
@@ -5437,13 +5487,15 @@ export class AuthStorage {
 			);
 
 			if ((checkUsage && !allowBlocked) || requiresProModel) {
-				const sameAccount = selection.credential.accountId === updated.accountId;
+				const sameAccount = usageAccountId === updated.accountId;
 				if (!usageChecked || !sameAccount) {
 					usage = await this.#getUsageReport(provider, updated, {
 						...options,
+						forceFresh: !sameAccount,
 						timeoutMs: this.#usageRequestTimeoutMs,
 					});
 					usageChecked = true;
+					usageAccountId = updated.accountId;
 				}
 				if (checkUsage && !allowBlocked && usage && this.#isUsageLimitReached(usage)) {
 					const resetAtMs = this.#getUsageResetAtMs(usage, Date.now());
