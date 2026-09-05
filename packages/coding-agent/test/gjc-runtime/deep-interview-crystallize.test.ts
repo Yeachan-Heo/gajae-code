@@ -190,6 +190,31 @@ describe("deep-interview crystallize contract", () => {
 		).toThrow("conservative derivation failed");
 	});
 
+	it("splits a prior quoted question before an anchored directive", () => {
+		const content = 'We asked, "Should we deploy?" Deploy a fast report.';
+		const snapshot: CrystalSnapshot = {
+			revision: 1,
+			start: 0,
+			end: 0,
+			messages: [{ index: 0, role: "user", content }],
+			digest: "",
+		};
+		snapshot.digest = crystalSnapshotDigest(snapshot);
+		const crystal = crystallizeDeepInterview(
+			input({
+				snapshot,
+				items: [
+					{
+						...input().items[0]!,
+						statement: "Deploy a fast report",
+						anchor: { message_index: 0, quote: "Deploy a fast report." },
+					},
+				],
+			}),
+		);
+		expect(crystal.lifecycle).toBe("ready");
+	});
+
 	it("preserves semantic qualifiers and single-codepoint CJK negation", () => {
 		for (const quote of [
 			"Do not build a fast report.",
