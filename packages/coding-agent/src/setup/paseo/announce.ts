@@ -33,8 +33,6 @@ import { AgentDirSessionLifecycleClient } from "../../sdk/lifecycle/broker-clien
 import { sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { PROVIDER_EXTENDS, PROVIDER_KEY, resolvePaseoHome } from "./setup-deps";
 
-export { resolvePaseoHome } from "./setup-deps";
-
 /** Cheap liveness probe of the daemon socket. Only gates the expensive CLI spawn. */
 const DAEMON_PROBE_TIMEOUT_MS = 750;
 /** Bound on the broker `session.list` traversal that proves our own liveness. */
@@ -161,43 +159,28 @@ export function parseDaemonListen(raw: string): PaseoDaemonTarget | undefined {
 export async function resolveDaemonTarget(
 	config: unknown,
 	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
-): Promise<PaseoDaemonTarget> {
-	return (await resolveDaemonTargets(config, deps))[0] ?? DEFAULT_DAEMON_TARGET;
-}
-
-async function resolveDaemonTargets(
-	config: unknown,
-	deps: Pick<PaseoAnnounceDependencies, "env" | "paseoHome" | "readJson">,
-): Promise<PaseoDaemonTarget[]> {
+): Promise<PaseoDaemonTarget | undefined> {
 	const explicitHost = deps.env.PASEO_HOST?.trim();
 	if (explicitHost) {
-		const explicitTarget = parseDaemonListen(explicitHost);
-		return explicitTarget ? [explicitTarget] : [];
+		return parseDaemonListen(explicitHost);
 	}
+	const explicitListen = deps.env.PASEO_LISTEN?.trim();
+	if (explicitListen) return parseDaemonListen(explicitListen);
 
 	const pidFile = asRecord(await deps.readJson(path.join(deps.paseoHome, "paseo.pid")));
 	const pidListen = typeof pidFile?.listen === "string" ? pidFile.listen : pidFile?.sockPath;
 	const pidTarget = typeof pidListen === "string" ? parseDaemonListen(pidListen) : undefined;
+	if (pidTarget?.kind === "ipc") return pidTarget;
 
 	const parsed = asRecord(config);
 	const configured = asRecord(parsed?.daemon)?.listen ?? parsed?.listen;
-	const configuredRaw = deps.env.PASEO_LISTEN?.trim() || (typeof configured === "string" ? configured : undefined);
-	const configuredTarget = configuredRaw ? parseDaemonListen(configuredRaw) : undefined;
-	const configuredIpc = configuredTarget?.kind === "ipc" ? configuredTarget : undefined;
-	const pidIpc = pidTarget?.kind === "ipc" ? pidTarget : undefined;
-	const configuredTcp =
-		configuredTarget?.kind === "tcp" && !(configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767)
-			? configuredTarget
-			: undefined;
-	const directIpc = deps.env.PASEO_LISTEN?.trim();
-	const directIpcTarget = directIpc ? parseDaemonListen(directIpc) : undefined;
-	const targets = [
-		directIpcTarget?.kind === "ipc" ? directIpcTarget : undefined,
-		pidIpc,
-		configuredIpc,
-		configuredTcp,
-	].filter((target): target is PaseoDaemonTarget => target !== undefined);
-	return targets.length > 0 ? [targets[0]!] : [DEFAULT_DAEMON_TARGET];
+	if (typeof configured !== "string") return DEFAULT_DAEMON_TARGET;
+	const configuredTarget = parseDaemonListen(configured);
+	if (!configuredTarget) return DEFAULT_DAEMON_TARGET;
+	if (configuredTarget.kind === "tcp" && configuredTarget.host === "127.0.0.1" && configuredTarget.port === 6767) {
+		return DEFAULT_DAEMON_TARGET;
+	}
+	return configuredTarget;
 }
 
 /**
@@ -243,17 +226,10 @@ export async function announceSessionToPaseo(
 	const cli = deps.resolveCli();
 	if (!cli) return { kind: "skipped", reason: "cli-missing" };
 
-	const targets = await resolveDaemonTargets(config, deps);
-	if (deps.env.PASEO_HOST?.trim() && targets.length === 0)
+	const target = await resolveDaemonTarget(config, deps);
+	if ((deps.env.PASEO_HOST?.trim() || deps.env.PASEO_LISTEN?.trim()) && target === undefined)
 		return { kind: "skipped", reason: "unsupported-daemon-target" };
-	let reachable = false;
-	for (const target of targets) {
-		if (await deps.probeDaemon(target)) {
-			reachable = true;
-			break;
-		}
-	}
-	if (!reachable) return { kind: "skipped", reason: "daemon-unreachable" };
+	if (!target || !(await deps.probeDaemon(target))) return { kind: "skipped", reason: "daemon-unreachable" };
 	if (signal?.aborted) return { kind: "failed", detail: "Paseo announcement cancelled" };
 
 	// Importing a session the broker does not yet report as live would make ACP
@@ -369,17 +345,13 @@ function isSessionLive(agentDir: string): (sessionId: string, cwd: string) => Pr
 			response => sessionListPageFromResponse(response),
 		);
 		for (const { sessions } of pages) {
-			if (sessionListContainsLiveSessionForTests(sessions, sessionId, canonicalCwd)) return true;
+			if (sessionListContainsLiveSession(sessions, sessionId, canonicalCwd)) return true;
 		}
 		return false;
 	};
 }
 
-export function sessionListContainsLiveSessionForTests(
-	sessions: readonly unknown[],
-	sessionId: string,
-	cwd: string,
-): boolean {
+export function sessionListContainsLiveSession(sessions: readonly unknown[], sessionId: string, cwd: string): boolean {
 	for (const value of sessions) {
 		const session = asRecord(value);
 		if (session?.sessionId !== sessionId || session.live !== true) continue;
