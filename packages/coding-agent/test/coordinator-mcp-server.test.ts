@@ -166,6 +166,7 @@ type SdkControlServerOptions = {
 	/** Deterministic barrier after canonical report safe response persistence and before outer idempotency completion. */
 	afterCanonicalReportSafeResponse?: (sessionId: string, response: Record<string, unknown>) => void | Promise<void>;
 	afterDelegateAdmission?: (sessionId: string) => void | Promise<void>;
+	afterDelegateCreationCompleted?: () => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
 	readCoordinatorSessionEntries?: (directory: string) => Promise<string[]>;
@@ -416,6 +417,7 @@ async function createSdkControlServer(
 			afterCanonicalReportCommit: serverOptions.afterCanonicalReportCommit,
 			afterCanonicalReportSafeResponse: serverOptions.afterCanonicalReportSafeResponse,
 			afterDelegateAdmission: serverOptions.afterDelegateAdmission,
+			afterDelegateCreationCompleted: serverOptions.afterDelegateCreationCompleted,
 			beforeDelegateResponseCommit: serverOptions.beforeDelegateResponseCommit,
 			afterDelegateResponseCommit: serverOptions.afterDelegateResponseCommit,
 			readCoordinatorSessionEntries: serverOptions.readCoordinatorSessionEntries,
@@ -4803,6 +4805,30 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			};
 			return { root, controls, queries, server, open, request };
 		}
+
+		it("recovers a new delegate interrupted immediately after creation completion", async () => {
+			const f = await fixture(false, {
+				afterDelegateCreationCompleted: () => {
+					throw new Error("injected crash after creation completion");
+				},
+			});
+			expect(await f.server.callTool("gjc_delegate_execute", f.request)).toMatchObject({ ok: false });
+			const fresh = await f.open();
+			const recovered = await fresh.callTool("gjc_delegate_execute", f.request);
+			expect(recovered).toMatchObject({ ok: true, completion: { reason: "timeout" } });
+			expect(await fresh.callTool("gjc_delegate_execute", f.request)).toEqual(recovered);
+			expect(f.controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+			expect(f.controls.filter(control => control.operation === "turn.prompt")).toHaveLength(1);
+			const outer = await Bun.file(receiptPath(f.root, f.request.idempotency_key)).json();
+			expect(outer.state).toBe("completed");
+			const paths = coordinatorStatePaths(f.server.config.stateRoot, f.server.config.namespace.identity);
+			const transaction = await readSessionTransaction(paths, outer.admission.session_id);
+			expect(
+				Object.values(transaction!.requests.prompts).find(
+					request => request.sdk_idempotency_key === f.request.idempotency_key,
+				)?.delegate_response_pending,
+			).not.toBe(true);
+		});
 
 		for (const mode of ["force", "queue"] as const) {
 			for (const awaitCompletion of [true, false]) {

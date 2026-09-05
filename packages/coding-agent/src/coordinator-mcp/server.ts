@@ -313,6 +313,7 @@ interface CoordinatorServices {
 	afterCanonicalReportSafeResponse?: (sessionId: string, response: Record<string, unknown>) => void | Promise<void>;
 	/** Test barriers around delegate admission and outer response durability. */
 	afterDelegateAdmission?: (sessionId: string) => void | Promise<void>;
+	afterDelegateCreationCompleted?: () => void | Promise<void>;
 	beforeDelegateResponseCommit?: () => void | Promise<void>;
 	afterDelegateResponseCommit?: () => void | Promise<void>;
 	readCoordinatorSessionEntries?: (directory: string) => Promise<string[]>;
@@ -8723,10 +8724,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									codex_handoff: codexHandoff,
 									...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
 								};
-								if (creationKey) {
-									await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
-									await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
-								}
 								const admission: DelegateAdmissionCheckpoint = {
 									kind: "delegate_admission",
 									session_id: sessionId,
@@ -8745,6 +8742,12 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									admission,
 									delegate_response_pin: delegateResponsePin,
 								});
+								// A completed creation must never outlive the outer recovery identity.
+								if (creationKey) {
+									await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+									await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+									await services.afterDelegateCreationCompleted?.();
+								}
 								await services.afterDelegateAdmission?.(sessionId);
 								return admission.response;
 							};
