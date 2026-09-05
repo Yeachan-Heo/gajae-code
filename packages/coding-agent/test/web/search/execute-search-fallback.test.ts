@@ -6,6 +6,7 @@ import { runSearchQuery } from "../../../src/web/search";
 import * as provider from "../../../src/web/search/provider";
 import type { SearchParams } from "../../../src/web/search/providers/base";
 import { OpenAICompatibleSearchProvider } from "../../../src/web/search/providers/openai-compatible";
+import { PerplexityProvider } from "../../../src/web/search/providers/perplexity";
 import { SearchProviderError, type SearchProviderId, type SearchResponse } from "../../../src/web/search/types";
 
 function fakeProvider(
@@ -16,8 +17,13 @@ function fakeProvider(
 }
 
 const authStorage = {} as AuthStorage;
+const originalPerplexityApiKey = process.env.PERPLEXITY_API_KEY;
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+	vi.restoreAllMocks();
+	if (originalPerplexityApiKey === undefined) delete process.env.PERPLEXITY_API_KEY;
+	else process.env.PERPLEXITY_API_KEY = originalPerplexityApiKey;
+});
 
 describe("executeSearch fallback", () => {
 	it("falls through after a no-citation generic failure and preserves ordering", async () => {
@@ -73,6 +79,45 @@ describe("executeSearch fallback", () => {
 		expect(result.content[0]?.text).toContain("https://exa.example");
 		expect(result.content[0]?.text).not.toContain(secret);
 		expect(result.details.warning).not.toContain(secret);
+	});
+
+	it("falls through after Perplexity repeats a structural-empty response", async () => {
+		process.env.PERPLEXITY_API_KEY = "test-key";
+		let calls = 0;
+		using _hook = hookFetch(async () => {
+			calls++;
+			return Response.json({
+				id: `empty-${calls}`,
+				model: "sonar-pro",
+				created: 1,
+				choices: [
+					{ index: 0, message: { role: "assistant", content: "" }, delta: { role: "assistant", content: "" } },
+				],
+				citations: ["https://example.com/source"],
+				search_results: [{ title: "Source", url: "https://example.com/source" }],
+				usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+			});
+		});
+		vi.spyOn(provider, "resolveProviderChain").mockResolvedValue([
+			new PerplexityProvider(),
+			fakeProvider("exa", async () => ({
+				provider: "exa",
+				sources: [{ title: "Exa", url: "https://exa.example" }],
+			})),
+		]);
+
+		const result = await runSearchQuery(
+			{ query: "anything" },
+			{
+				authStorage: {
+					getOAuthAccess: async () => undefined,
+				} as unknown as AuthStorage,
+			},
+		);
+
+		expect(calls).toBe(2);
+		expect(result.content[0]?.text).toContain("https://exa.example");
+		expect(result.details.warning).toContain("Perplexity web search returned no answer");
 	});
 
 	it("rethrows caller abort instead of falling through", async () => {

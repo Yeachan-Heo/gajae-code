@@ -7,6 +7,7 @@
 
 ### Fixed
 
+- Perplexity web search now clamps upstream search breadth to the API's 3–100 contract, retries one structurally empty completion, rejects malformed or ungrounded success payloads through the provider fallback path, and preserves valid grounded responses.
 - SDK-hosted workflow tools now retain the logical session id for ask, skill, deep-interview, and ultragoal state paths while job, monitor, bash, cron, task, and subagent ownership routes through a separate opaque async endpoint key. Explicit provider session identities no longer create encoded duplicate workflow trees or redirect endpoint-owned work to another live session.
 - Explicit root startup `--thinking off` and `--thinking=off` now override a configured higher startup default while leaving the provider `Effort` catalog unchanged.
 - Skills installed from marketplace plugins are now enumerated into sessions instead of only resolving by exact name. `loadSkills` asked the `native` provider alone, so every installed plugin skill was absent from `/` autocomplete and from the `skill` tool's `Available:` list while `gjc skill list` reported it and the discovery fallback still loaded it — 46 installed skills presented as 5. The already-registered marketplace provider is now loaded alongside `native`, keeping `<plugin>:<skill>` namespacing and per-item scope trust.

@@ -9,16 +9,9 @@
 
 import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
 import { $env, readSseJson } from "@gajae-code/utils";
-import type {
-	PerplexityMessageOutput,
-	PerplexityRequest,
-	PerplexityResponse,
-	SearchCitation,
-	SearchResponse,
-	SearchSource,
-} from "../../../web/search/types";
+import type { PerplexityRequest, SearchCitation, SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
-import { dateToAgeSeconds } from "../utils";
+import { clampNumResults, dateToAgeSeconds } from "../utils";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
@@ -29,6 +22,8 @@ const PERPLEXITY_OAUTH_ASK_URL = "https://www.perplexity.ai/rest/sse/perplexity_
 const DEFAULT_MAX_TOKENS = 8192;
 const DEFAULT_TEMPERATURE = 0.2;
 const DEFAULT_NUM_SEARCH_RESULTS = 10;
+const MIN_NUM_SEARCH_RESULTS = 3;
+const MAX_NUM_SEARCH_RESULTS = 100;
 const OAUTH_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
 const OAUTH_API_VERSION = "2.18";
 const OAUTH_USER_AGENT = "Perplexity/641 CFNetwork/1568 Darwin/25.2.0";
@@ -239,11 +234,7 @@ async function findPerplexityAuth(
 }
 
 /** Call Perplexity API-key endpoint. */
-async function callPerplexityApi(
-	apiKey: string,
-	request: PerplexityRequest,
-	signal?: AbortSignal,
-): Promise<PerplexityResponse> {
+async function callPerplexityApi(apiKey: string, request: PerplexityRequest, signal?: AbortSignal): Promise<unknown> {
 	const response = await fetch(PERPLEXITY_API_URL, {
 		method: "POST",
 		headers: {
@@ -265,7 +256,11 @@ async function callPerplexityApi(
 		);
 	}
 
-	return response.json() as Promise<PerplexityResponse>;
+	try {
+		return await response.json();
+	} catch {
+		throw new SearchProviderError("perplexity", "Perplexity API returned invalid JSON", 502);
+	}
 }
 
 function buildOAuthSources(event: PerplexityOAuthStreamEvent): SearchSource[] {
@@ -426,22 +421,79 @@ async function callPerplexityOAuth(
 	};
 }
 
-function messageContentToText(content: PerplexityMessageOutput["content"]): string {
-	if (!content) return "";
+type JsonObject = Record<string, unknown>;
+
+function malformedResponse(detail: string): never {
+	throw new SearchProviderError("perplexity", `Perplexity API returned malformed response body (${detail})`, 502);
+}
+
+function isJsonObject(value: unknown): value is JsonObject {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function optionalArray(value: unknown, detail: string): unknown[] {
+	if (value === undefined || value === null) return [];
+	if (!Array.isArray(value)) malformedResponse(detail);
+	return value;
+}
+
+function messageContentToText(content: unknown): string {
+	if (content === undefined || content === null) return "";
 	if (typeof content === "string") return content;
-	return content.map(chunk => (chunk.type === "text" ? chunk.text : "")).join("");
+	if (!Array.isArray(content)) malformedResponse("message content must be a string or array");
+
+	return content
+		.map(chunk => {
+			if (!isJsonObject(chunk) || typeof chunk.type !== "string") {
+				malformedResponse("message content chunks must be objects with a type");
+			}
+			if (chunk.type !== "text") return "";
+			if (typeof chunk.text !== "string") malformedResponse("text content chunks must contain text");
+			return chunk.text;
+		})
+		.join("");
 }
 
 /** Parse API response into unified SearchResponse */
-function parseResponse(response: PerplexityResponse): SearchResponse {
-	const messageContent = response.choices[0]?.message?.content ?? null;
+function parseResponse(value: unknown): SearchResponse {
+	if (!isJsonObject(value)) malformedResponse("expected a JSON object");
+
+	const choices = optionalArray(value.choices, "choices must be an array");
+	const firstChoice = choices[0];
+	if (firstChoice !== undefined && !isJsonObject(firstChoice)) malformedResponse("choices must contain objects");
+	const message = firstChoice?.message;
+	if (message !== undefined && !isJsonObject(message)) malformedResponse("choice message must be an object");
+	const messageContent = message?.content;
 	const answer = messageContentToText(messageContent);
 
 	const sources: SearchSource[] = [];
 	const citations: SearchCitation[] = [];
 
-	const citationUrls = response.citations ?? [];
-	const searchResults = response.search_results ?? [];
+	const citationUrls = optionalArray(value.citations, "citations must be an array").map(url => {
+		if (typeof url !== "string" || url.length === 0) malformedResponse("citations must contain non-empty URLs");
+		return url;
+	});
+	const searchResults = optionalArray(value.search_results, "search_results must be an array").map(result => {
+		if (!isJsonObject(result)) malformedResponse("search_results must contain objects");
+		if (typeof result.url !== "string" || result.url.length === 0) {
+			malformedResponse("search_results entries must contain a non-empty URL");
+		}
+		if (result.title !== undefined && typeof result.title !== "string") {
+			malformedResponse("search_results titles must be strings");
+		}
+		if (result.snippet !== undefined && typeof result.snippet !== "string") {
+			malformedResponse("search_results snippets must be strings");
+		}
+		if (result.date !== undefined && result.date !== null && typeof result.date !== "string") {
+			malformedResponse("search_results dates must be strings");
+		}
+		return {
+			title: result.title ?? result.url,
+			url: result.url,
+			snippet: result.snippet,
+			date: result.date,
+		};
+	});
 
 	if (citationUrls.length > 0) {
 		for (const url of citationUrls) {
@@ -475,16 +527,21 @@ function parseResponse(response: PerplexityResponse): SearchResponse {
 		answer: answer || undefined,
 		sources,
 		citations: citations.length > 0 ? citations : undefined,
-		usage: response.usage
+		usage: isJsonObject(value.usage)
 			? {
-					inputTokens: response.usage.prompt_tokens,
-					outputTokens: response.usage.completion_tokens,
-					totalTokens: response.usage.total_tokens,
+					inputTokens: typeof value.usage.prompt_tokens === "number" ? value.usage.prompt_tokens : undefined,
+					outputTokens:
+						typeof value.usage.completion_tokens === "number" ? value.usage.completion_tokens : undefined,
+					totalTokens: typeof value.usage.total_tokens === "number" ? value.usage.total_tokens : undefined,
 				}
 			: undefined,
-		model: response.model,
-		requestId: response.id,
+		model: typeof value.model === "string" ? value.model : undefined,
+		requestId: typeof value.id === "string" ? value.id : undefined,
 	};
+}
+
+function normalizeNumSearchResults(value: number | undefined): number {
+	return Math.max(MIN_NUM_SEARCH_RESULTS, clampNumResults(value, DEFAULT_NUM_SEARCH_RESULTS, MAX_NUM_SEARCH_RESULTS));
 }
 
 function applySourceLimit(result: SearchResponse, limit?: number): SearchResponse {
@@ -503,6 +560,9 @@ export async function searchPerplexity(params: PerplexitySearchParams): Promise<
 
 	if (auth.type === "oauth" || auth.type === "cookies") {
 		const oauthResult = await callPerplexityOAuth(auth, params);
+		if (!oauthResult.answer.trim()) {
+			throw new SearchProviderError("perplexity", "Perplexity web search returned no answer", 424);
+		}
 		return applySourceLimit(
 			{
 				provider: "perplexity",
@@ -529,7 +589,7 @@ export async function searchPerplexity(params: PerplexitySearchParams): Promise<
 		max_tokens: params.max_tokens ?? DEFAULT_MAX_TOKENS,
 		temperature: params.temperature ?? DEFAULT_TEMPERATURE,
 		search_mode: "web",
-		num_search_results: params.num_search_results ?? DEFAULT_NUM_SEARCH_RESULTS,
+		num_search_results: normalizeNumSearchResults(params.num_search_results),
 		web_search_options: {
 			search_type: "pro",
 			search_context_size: "medium",
@@ -543,8 +603,16 @@ export async function searchPerplexity(params: PerplexitySearchParams): Promise<
 		request.search_recency_filter = params.search_recency_filter;
 	}
 
-	const response = await callPerplexityApi(auth.token, request, params.signal);
-	const result = parseResponse(response);
+	let result: SearchResponse | undefined;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		const response = await callPerplexityApi(auth.token, request, params.signal);
+		result = parseResponse(response);
+		if (result.answer?.trim()) break;
+	}
+
+	if (!result?.answer?.trim()) {
+		throw new SearchProviderError("perplexity", "Perplexity web search returned no answer", 424);
+	}
 	result.authMode = "api_key";
 	return applySourceLimit(result, params.num_results);
 }
