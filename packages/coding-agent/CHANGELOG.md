@@ -17,6 +17,8 @@
 
 - Tool hot paths avoid overlap-table allocations for equal/append-only ACP output, redundant UTF-8 tail previews, repeated diagnostics suffix scans, and duplicate background GitHub-cache refreshes. Job polling now releases watches and timers when a progress callback throws.
 
+- SDK snapshot pages now read and integrity-check one contiguous span instead of rereading chunks per row. Reverse-provider disconnects discard connection-scoped registration receipts; relay shutdown releases backpressure listeners without destroying caller-owned sinks, and fragmented request frames are assembled once per newline.
+
 ## [0.16.4] - 2026-09-05
 ### Added
 
