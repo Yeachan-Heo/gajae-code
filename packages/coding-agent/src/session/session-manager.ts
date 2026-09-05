@@ -18903,10 +18903,8 @@ export class SessionManager {
 	 * cap are weakly held so a GC cycle can reclaim them between reads.
 	 */
 	#getSessionContextForRead(): Readonly<SessionContext> {
-		const hasResidentSentinel = this.#fileEntries.some(entry => containsResidentSentinel(entry));
 		const cached = dereferenceMaterializedCache(this.#sessionContextCache);
 		if (
-			!hasResidentSentinel &&
 			cached &&
 			this.#sessionContextEntryRevision === this.#entryRevision &&
 			this.#sessionContextLeafRevision === this.#leafRevision &&
@@ -18914,6 +18912,8 @@ export class SessionManager {
 		) {
 			return cached;
 		}
+		// Only sentinel-free contexts are cached; revisions guard warm reads.
+		const hasResidentSentinel = this.#fileEntries.some(entry => containsResidentSentinel(entry));
 		this.#pathOnlyContextBuildCount++;
 		let resolvedProviderState: SessionEntry[] = [];
 		if (this.#coldSidecarActive() && this.#sidecarRuntime) {

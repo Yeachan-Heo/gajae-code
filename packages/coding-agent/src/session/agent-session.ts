@@ -1672,13 +1672,10 @@ function dedupeIrcReply(text: string): string {
 	}
 	let result = out.join("\n");
 	if (Buffer.byteLength(result, "utf8") > IRC_REPLY_MAX_BYTES) {
-		// Trim by characters until we're under the byte budget — handles multi-byte
-		// glyphs at the boundary without splitting them.
+		// Bound the UTF-8 prefix without repeatedly measuring the shrinking reply.
 		const suffix = "\n[…truncated]";
 		const budget = IRC_REPLY_MAX_BYTES - Buffer.byteLength(suffix, "utf8");
-		while (Buffer.byteLength(result, "utf8") > budget) {
-			result = result.slice(0, -1);
-		}
+		result = truncateHeadBytes(result, budget).text;
 		result += suffix;
 	}
 	return result;
@@ -8206,6 +8203,7 @@ export class AgentSession {
 		this.#streamingEditPrecheckedToolCallIds.clear();
 		this.#streamingEditParsedToolCallCache.clear();
 		this.#streamingEditFileCache.clear();
+		this.#streamingEditPrecachePending.clear();
 	}
 
 	#getStreamingEditToolCall(event: AgentEvent): StreamingEditParsedToolCall | undefined {
@@ -8286,23 +8284,27 @@ export class AgentSession {
 		return block?.type === "toolCall" && this.#provisionalStreamingToolCallIds.has(block.id);
 	}
 
-	#streamingEditPrecachePending = new Set<string>();
+	#streamingEditPrecachePending = new Map<string, symbol>();
 	async #preCacheFileAsync(resolvedPath: string): Promise<void> {
 		if (this.#streamingEditFileCache.has(resolvedPath)) return;
 		if (this.#streamingEditPrecachePending.has(resolvedPath)) return;
-		this.#streamingEditPrecachePending.add(resolvedPath);
+		const token = Symbol();
+		this.#streamingEditPrecachePending.set(resolvedPath, token);
 		try {
 			const stat = await fs.promises.stat(resolvedPath);
 			if (stat.size > MAX_EDIT_FILE_BYTES) return;
 
 			const rawText = await fs.promises.readFile(resolvedPath, "utf-8");
+			if (this.#streamingEditPrecachePending.get(resolvedPath) !== token) return;
 			if (this.#streamingEditFileCache.has(resolvedPath)) return;
 			const { text } = stripBom(rawText);
 			this.#streamingEditFileCache.set(resolvedPath, normalizeToLF(text));
 		} catch {
 			// Don't cache on read errors (including ENOENT) - let the edit tool handle them
 		} finally {
-			this.#streamingEditPrecachePending.delete(resolvedPath);
+			if (this.#streamingEditPrecachePending.get(resolvedPath) === token) {
+				this.#streamingEditPrecachePending.delete(resolvedPath);
+			}
 		}
 	}
 
@@ -8326,6 +8328,7 @@ export class AgentSession {
 		const resolvedPath = this.#resolveSessionFsPath(filePath);
 		if (resolvedPath === undefined) return;
 		this.#streamingEditFileCache.delete(resolvedPath);
+		this.#streamingEditPrecachePending.delete(resolvedPath);
 	}
 
 	/**
@@ -10275,6 +10278,7 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
+		wrappersByVersion?.clear();
 		const wrapped = this.#wrapToolForCwdTransitionFence(
 			this.#wrapToolForWorkflowMutationGuard(
 				this.#wrapToolForAcpPermission(
