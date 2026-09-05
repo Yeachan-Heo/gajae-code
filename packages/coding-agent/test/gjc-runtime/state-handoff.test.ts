@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -26,7 +26,11 @@ import {
 	runNativeStateCommand,
 	type StateCommandResult,
 } from "../../src/gjc-runtime/state-runtime";
-import { stampWorkflowEnvelopeChecksum, withWorkflowStateLock } from "../../src/gjc-runtime/state-writer";
+import {
+	readWorkflowTransactionJournal,
+	stampWorkflowEnvelopeChecksum,
+	withWorkflowStateLock,
+} from "../../src/gjc-runtime/state-writer";
 import { WORKFLOW_STATE_VERSION } from "../../src/skill-state/workflow-state-contract";
 
 const TEST_SESSION_ID = "test-session";
@@ -976,6 +980,15 @@ describe("gjc state handoff", () => {
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
 					.status,
 			).toBe(0);
+			const recoveredAudit = (await fs.readFile(auditPath(cwd, TEST_SESSION_ID), "utf8"))
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>)
+				.filter(
+					entry =>
+						entry.verb === "handoff" && entry.mutation_id === mutationId && typeof entry.caller_path === "string",
+				);
+			expect(recoveredAudit.map(entry => entry.forced)).toEqual([false]);
 			expect(
 				(
 					await runNativeStateCommand(
@@ -1466,18 +1479,100 @@ describe("gjc state handoff", () => {
 		await withTempCwd(async cwd => {
 			const { callerPath } = await writePublishedReadyCrystal(cwd);
 			const approvalAuditPath = auditPath(cwd, TEST_SESSION_ID);
-			await fs.mkdir(approvalAuditPath, { recursive: true });
-			const first = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			const appendFile = fs.appendFile.bind(fs);
+			let auditAppendCount = 0;
+			const appendSpy = spyOn(fs, "appendFile").mockImplementation(async (...args) => {
+				auditAppendCount++;
+				if (auditAppendCount === 2) throw new Error("injected specialized approval audit failure");
+				return appendFile(...args);
+			});
+			let first: StateCommandResult;
+			try {
+				first = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			} finally {
+				appendSpy.mockRestore();
+			}
 			expect(first.status).not.toBe(0);
-			expect(((await readJson(callerPath))?.state as Record<string, unknown>)?.execution_approval).toBe("approved");
-			await fs.rm(approvalAuditPath, { recursive: true, force: true });
+			const persisted = await readJson(callerPath);
+			const persistedInner = persisted?.state as Record<string, unknown>;
+			const approvalReceipt = persistedInner.execution_approval_receipt as Record<string, unknown>;
+			expect(persistedInner.execution_approval).toBe("approved");
+			expect(persisted?.state_revision).toBe(approvalReceipt.state_revision);
+			expect((persisted?.receipt as Record<string, unknown>)?.mutation_id).toBe(approvalReceipt.mutation_id);
+			expect(
+				await readWorkflowTransactionJournal(cwd, TEST_SESSION_ID, approvalReceipt.mutation_id as string),
+			).toMatchObject({ status: "pending", steps: ["approval-state"] });
 			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
-			expect(retried.status).toBe(0);
+			expect(retried.status, retried.stderr).toBe(0);
 			expect(await fs.readFile(approvalAuditPath, "utf8")).toContain('"verb":"approve-execution"');
 			expect(
 				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ultragoal", "--json"], cwd))
 					.status,
 			).toBe(0);
+		});
+	});
+
+	it("does not mint approval audit provenance without a pending approval journal", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			await fs.rm(auditPath(cwd, TEST_SESSION_ID), { force: true });
+			const retried = await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd);
+			expect(retried.status).toBe(2);
+			expect(retried.stderr).toContain("sanctioned approval audit record");
+		});
+	});
+
+	it("preserves forced D-to-R provenance across caller-write recovery", async () => {
+		await withTempCwd(async cwd => {
+			await writePublishedReadyCrystal(cwd);
+			expect((await runNativeDeepInterviewCommand(["approve-execution", "--json"], cwd)).status).toBe(0);
+			const handoffAt = "2026-09-04T00:00:00.000Z";
+			const mutationId = `deep-interview:handoff:ralplan:${handoffAt}`;
+			const priorFailpoint = process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER;
+			const originalToISOString = Date.prototype.toISOString;
+			Date.prototype.toISOString = () => handoffAt;
+			process.env.GJC_STATE_HANDOFF_FAIL_AFTER_CALLER = mutationId;
+			try {
+				expect(
+					(
+						await runNativeStateCommand(
+							["handoff", "--mode", "deep-interview", "--to", "ralplan", "--force", "--json"],
+							cwd,
+						)
+					).status,
+				).toBe(1);
+			} finally {
+				Date.prototype.toISOString = originalToISOString;
+				restoreEnvironmentValue("GJC_STATE_HANDOFF_FAIL_AFTER_CALLER", priorFailpoint);
+			}
+			expect(
+				(await runNativeStateCommand(["handoff", "--mode", "deep-interview", "--to", "ralplan", "--json"], cwd))
+					.status,
+			).toBe(0);
+			const recoveredAudit = (await fs.readFile(auditPath(cwd, TEST_SESSION_ID), "utf8"))
+				.split(/\r?\n/)
+				.filter(Boolean)
+				.map(line => JSON.parse(line) as Record<string, unknown>)
+				.filter(
+					entry =>
+						entry.verb === "handoff" && entry.mutation_id === mutationId && typeof entry.caller_path === "string",
+				);
+			expect(recoveredAudit.map(entry => entry.forced)).toEqual([true]);
+			expect(
+				(
+					await runNativeStateCommand(
+						["write", "--mode", "ralplan", "--input", JSON.stringify({ current_phase: "handoff" }), "--json"],
+						cwd,
+					)
+				).status,
+			).toBe(0);
+			const blocked = await runNativeStateCommand(
+				["handoff", "--mode", "ralplan", "--to", "ultragoal", "--json"],
+				cwd,
+			);
+			expect(blocked.status, blocked.stderr).toBe(2);
+			expect(blocked.stderr).toContain("cannot authenticate Deep Interview approval lineage");
 		});
 	});
 
