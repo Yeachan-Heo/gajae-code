@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as tls from "node:tls";
-import { Effort } from "@gajae-code/ai";
+import { clampThinkingLevelForModel, Effort } from "@gajae-code/ai";
 import {
 	applyClaudeToolPrefix,
 	buildAnthropicClientOptions,
@@ -1087,6 +1087,26 @@ describe("Anthropic request fingerprint alignment", () => {
 			{ thinkingEnabled: false },
 		)) as { thinking?: { type?: string } };
 
+		expect(payload.thinking).toBeUndefined();
+	});
+
+	it("omits wire thinking for unverified Anthropic reasoning transports", async () => {
+		const model: Model<"anthropic-messages"> = {
+			...ANTHROPIC_MODEL,
+			provider: "anthropic",
+			baseUrl: "http://proxy.invalid/v1",
+		};
+		const reasoning = clampThinkingLevelForModel(model, Effort.High);
+		const payload = (await captureAnthropicPayload(
+			model,
+			{
+				systemPrompt: ["Stay concise."],
+				messages: [{ role: "user", content: "Hi", timestamp: Date.now() }],
+			},
+			{ thinkingEnabled: reasoning !== undefined, reasoning },
+		)) as { thinking?: unknown };
+
+		expect(reasoning).toBeUndefined();
 		expect(payload.thinking).toBeUndefined();
 	});
 

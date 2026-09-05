@@ -101,6 +101,24 @@ async function tick(): Promise<void> {
 }
 
 describe("StatusLineComponent cache red-team coverage", () => {
+	it.each(["left", "right"] as const)("queries git status only with a git segment on the %s", async side => {
+		spyOn(git.head, "resolveSync").mockImplementation(() => refHead("feature/gated"));
+		const statusSpy = spyOn(git.status, "summary").mockResolvedValue({ staged: 1, unstaged: 2, untracked: 3 });
+		const component = new StatusLineComponent(makeSession(), { version: "redteam" });
+		component.updateSettings({ preset: "custom", leftSegments: ["path"], rightSegments: [] });
+		component.render(160);
+		await tick();
+		expect(statusSpy).not.toHaveBeenCalled();
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: side === "left" ? ["git"] : [],
+			rightSegments: side === "right" ? ["git"] : [],
+			segmentOptions: { git: { showStaged: false, showUnstaged: false, showUntracked: false } },
+		});
+		component.render(160);
+		await tick();
+		expect(statusSpy).toHaveBeenCalledTimes(1);
+	});
 	it("limits branch resolution inside TTL and refreshes once at the TTL boundary", () => {
 		let now = 50_000;
 		spyOn(Date, "now").mockImplementation(() => now);

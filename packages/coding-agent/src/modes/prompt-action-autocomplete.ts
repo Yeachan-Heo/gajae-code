@@ -89,23 +89,37 @@ function getSlashCommandPriority(command: SlashCommand | undefined, item: Autoco
 	return ADVANCED_SLASH_COMMAND_PRIORITIES.get(item.value) ?? 0;
 }
 
+interface SlashCommandMetadata {
+	command: SlashCommand;
+	index: number;
+	lowerName: string;
+	normalizedName: string;
+	normalizedDescription: string | undefined;
+}
+
+interface SkillCommandMetadata {
+	command: SlashCommand;
+	lowerSkillName: string;
+	searchTargets: string[];
+	collisionSearchTargets: string[];
+}
+
 function sortSlashCommandSuggestions(
 	suggestions: { items: AutocompleteItem[]; prefix: string } | null,
-	commands: SlashCommand[],
+	commandMetadata: ReadonlyMap<string, SlashCommandMetadata>,
 ): { items: AutocompleteItem[]; prefix: string } | null {
 	if (!suggestions) return null;
 	const query = suggestions.prefix.slice(1).toLowerCase();
 	const normalizedQuery = normalizeFuzzyText(query);
-	const commandIndexes = new Map(commands.map((command, index) => [command.name, index]));
-	const commandByName = new Map(commands.map(command => [command.name, command]));
 	const items = suggestions.items
 		.map((item, index) => {
-			const command = commandByName.get(item.value);
-			const commandIndex = commandIndexes.get(item.value) ?? index;
-			const lowerName = item.value.toLowerCase();
-			const lowerDesc = command?.description?.toLowerCase() ?? item.description?.toLowerCase() ?? "";
-			const normalizedName = normalizeFuzzyText(item.value);
-			const normalizedDesc = normalizeFuzzyText(lowerDesc);
+			const metadata = commandMetadata.get(item.value);
+			const command = metadata?.command;
+			const commandIndex = metadata?.index ?? index;
+			const lowerName = metadata?.lowerName ?? item.value.toLowerCase();
+			const normalizedName = metadata?.normalizedName ?? normalizeFuzzyText(item.value);
+			const normalizedDesc =
+				metadata?.normalizedDescription ?? normalizeFuzzyText(item.description?.toLowerCase() ?? "");
 			const nameScore = autocompleteFuzzyMatch(normalizedQuery, normalizedName)
 				? autocompleteFuzzyScore(normalizedQuery, normalizedName)
 				: 0;
@@ -180,7 +194,8 @@ function isSlashTokenInsideInlineCodeSpan(
 export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#baseProvider: CombinedAutocompleteProvider;
 	#actions: PromptActionDefinition[];
-	#commands: SlashCommand[];
+	#commandMetadata = new Map<string, SlashCommandMetadata>();
+	#skillCommandMetadata: SkillCommandMetadata[] = [];
 	#getPromptSuggestion: (() => string | null) | undefined;
 
 	constructor(
@@ -191,7 +206,28 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	) {
 		this.#baseProvider = new CombinedAutocompleteProvider(commands, basePath);
 		this.#actions = actions;
-		this.#commands = commands;
+		for (const [index, command] of commands.entries()) {
+			this.#commandMetadata.set(command.name, {
+				command,
+				index,
+				lowerName: command.name.toLowerCase(),
+				normalizedName: normalizeFuzzyText(command.name),
+				normalizedDescription:
+					command.description === undefined ? undefined : normalizeFuzzyText(command.description.toLowerCase()),
+			});
+			if (command.name.startsWith("skill:")) {
+				const skillName = command.name.slice("skill:".length);
+				const name = normalizeFuzzyText(command.name);
+				const alias = normalizeFuzzyText(`skill-${skillName}`);
+				const description = normalizeFuzzyText(command.description ?? "");
+				this.#skillCommandMetadata.push({
+					command,
+					lowerSkillName: skillName.toLowerCase(),
+					searchTargets: [name, alias, normalizeFuzzyText(skillName), description],
+					collisionSearchTargets: [name, alias, description],
+				});
+			}
+		}
 		this.#getPromptSuggestion = getPromptSuggestion;
 	}
 
@@ -244,7 +280,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			});
 			return sortSlashCommandSuggestions(
 				mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
-				this.#commands,
+				this.#commandMetadata,
 			);
 		}
 		if (rawSlashPrefix && slashTokenInsideCode) {
@@ -334,7 +370,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		const skillCommandSuggestions = this.#getSkillCommandSuggestions(textBeforeCursor, { includeEmpty: false });
 		return sortSlashCommandSuggestions(
 			mergeAutocompleteSuggestions(baseSuggestions, skillCommandSuggestions),
-			this.#commands,
+			this.#commandMetadata,
 		);
 	}
 	trySyncInlineReplace(textBeforeCursor: string): { replaceLen: number; insert: string } | null {
@@ -354,20 +390,11 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 			query.startsWith("skill-") ? `skill:${query.slice("skill-".length)}` : query,
 		);
 		if (query.length > 0 && normalizedQuery.length === 0) return null;
-		const exactNonSkillCommand = this.#commands.some(
-			command => command.name === query && !command.name.startsWith("skill:"),
-		);
-		const items = this.#commands
-			.filter(command => command.name.startsWith("skill:"))
-			.map(command => {
-				const skillName = command.name.slice("skill:".length);
-				if (exactNonSkillCommand && query === skillName.toLowerCase()) return null;
-				const searchTargets = [
-					command.name,
-					`skill-${skillName}`,
-					...(exactNonSkillCommand ? [] : [skillName]),
-					command.description ?? "",
-				].map(target => normalizeFuzzyText(target));
+		const exactNonSkillCommand = this.#commandMetadata.has(query) && !query.startsWith("skill:");
+		const items = this.#skillCommandMetadata
+			.map(({ command, lowerSkillName, searchTargets: allSearchTargets, collisionSearchTargets }) => {
+				if (exactNonSkillCommand && query === lowerSkillName) return null;
+				const searchTargets = exactNonSkillCommand ? collisionSearchTargets : allSearchTargets;
 				if (
 					!searchTargets.some(
 						target => autocompleteFuzzyMatch(normalizedQuery, target) || target.includes(normalizedQuery),

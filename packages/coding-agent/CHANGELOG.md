@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- Registry fingerprints now enforce the existing regular-file and 32 MiB admission limits with bounded reads. Model activation, thinking overlay lookup, transcript navigation, slash autocomplete, and observer digest updates avoid repeated allocations; status lines without a git segment no longer request git status.
 - Credential replacement lookups now propagate the owning request's cancellation through scoped and allowed unscoped retries, preventing aborted turns from continuing OAuth preparation or selecting another key.
 - Removing the committed status-line command segment or clearing its trusted command now cancels the running process and clears stale output; draft-only previews remain side-effect-free.
 - Slack inbound acknowledgment reactions now use bounded, abortable, tracked provider work that drains on shutdown or attachment retirement without delaying accepted turns; rejected or timed-out reactions emit sanitized diagnostics.

@@ -4560,10 +4560,10 @@ export class ModelRegistry {
 			.get(model.provider.toLowerCase())
 			?.get(model.id.toLowerCase())?.thinking;
 		if (overrideThinking !== undefined) return { ...model, thinking: overrideThinking as ThinkingConfig };
-		const overlay = [...this.#runtimeModelOverlays, ...this.#customModelOverlays].find(
-			candidate =>
-				candidate.provider === model.provider && candidate.id === model.id && candidate.thinking !== undefined,
-		);
+		const hasDeclaredThinking = (candidate: CustomModelOverlay) =>
+			candidate.provider === model.provider && candidate.id === model.id && candidate.thinking !== undefined;
+		const overlay =
+			this.#runtimeModelOverlays.find(hasDeclaredThinking) ?? this.#customModelOverlays.find(hasDeclaredThinking);
 		return overlay?.thinking === undefined ? model : { ...model, thinking: overlay.thinking };
 	}
 	/**
@@ -5215,15 +5215,20 @@ export class ModelRegistry {
 	 * usable until live catalog evidence exists so offline startup is unchanged.
 	 */
 	getAvailableForProfileActivation(): Model<Api>[] {
+		const bundledIdsByProvider = new Map<string, Set<string>>();
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
 			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
 			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
-			const bundledModelIds = new Set(
-				(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
-					candidate => candidate.id,
-				),
-			);
+			let bundledModelIds = bundledIdsByProvider.get(model.provider);
+			if (!bundledModelIds) {
+				bundledModelIds = new Set(
+					(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
+						candidate => candidate.id,
+					),
+				);
+				bundledIdsByProvider.set(model.provider, bundledModelIds);
+			}
 			if (!bundledModelIds.has(model.id)) return true;
 			if (
 				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
@@ -5236,9 +5241,8 @@ export class ModelRegistry {
 	}
 
 	#hasCustomModelOverlay(provider: string, id: string): boolean {
-		return [...this.#customModelOverlays, ...this.#runtimeModelOverlays].some(
-			overlay => overlay.provider === provider && overlay.id === id,
-		);
+		const matches = (overlay: CustomModelOverlay) => overlay.provider === provider && overlay.id === id;
+		return this.#customModelOverlays.some(matches) || this.#runtimeModelOverlays.some(matches);
 	}
 
 	#hasFreshOrStaticModelEvidence(model: Model<Api>): boolean {

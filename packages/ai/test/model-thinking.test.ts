@@ -56,6 +56,28 @@ describe("thinking control modes", () => {
 });
 
 describe("model thinking metadata", () => {
+	it("fails closed when a reasoning model lacks thinking metadata", () => {
+		const model = createModel({
+			id: "claude-sonnet-4-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		});
+		const rawModel = { ...model, thinking: undefined };
+
+		expect(clampThinkingLevelForModel(rawModel, Effort.High)).toBeUndefined();
+	});
+
+	it("fails closed for Anthropic models routed through an unknown proxy", () => {
+		const model = createModel({
+			id: "claude-sonnet-4-5",
+			api: "anthropic-messages",
+			provider: "anthropic",
+		});
+		const proxiedModel = { ...model, baseUrl: "http://proxy.invalid/v1" };
+
+		expect(clampThinkingLevelForModel(proxiedModel, Effort.High)).toBeUndefined();
+	});
+
 	it("derives conservative direct xAI effort ranges from the Grok generation", () => {
 		const grok45 = createModel({
 			id: "grok-4.5",
