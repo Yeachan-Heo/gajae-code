@@ -89,7 +89,7 @@ export class ReverseLeaseRuntime {
 	readonly #onDefinitionsRemoved?: ReverseLeaseOptions["onDefinitionsRemoved"];
 	readonly #onCancel?: ReverseLeaseOptions["onCancel"];
 	readonly #leases = new Map<string, ProviderLease>();
-	readonly #idempotency = new Map<string, { fingerprint: string; lease: ProviderLease }>();
+	readonly #idempotency = new Map<string, { connectionId: string; fingerprint: string; lease: ProviderLease }>();
 	readonly #outstanding = new Map<string, Outstanding>();
 	readonly #installedCapabilities = new Set<string>();
 	readonly #sweepTimer: ReturnType<typeof setInterval>;
@@ -139,7 +139,7 @@ export class ReverseLeaseRuntime {
 				active: true,
 			};
 			this.#leases.set(capability, lease);
-			if (idempotencyKey) this.#idempotency.set(key, { fingerprint, lease });
+			if (idempotencyKey) this.#idempotency.set(key, { connectionId, fingerprint, lease });
 			return { ...lease };
 		}
 		const reclaiming =
@@ -152,7 +152,7 @@ export class ReverseLeaseRuntime {
 			existing!.expiresAt = now + this.#leaseTtlMs;
 			existing!.graceUntil = undefined;
 			existing!.active = true;
-			if (idempotencyKey) this.#idempotency.set(key, { fingerprint, lease: existing! });
+			if (idempotencyKey) this.#idempotency.set(key, { connectionId, fingerprint, lease: existing! });
 			return { ...existing! };
 		}
 		this.#installDefinitionsFor(capability, definitions);
@@ -165,7 +165,7 @@ export class ReverseLeaseRuntime {
 			active: true,
 		};
 		this.#leases.set(capability, lease);
-		if (idempotencyKey) this.#idempotency.set(key, { fingerprint, lease });
+		if (idempotencyKey) this.#idempotency.set(key, { connectionId, fingerprint, lease });
 		return { ...lease };
 	}
 
@@ -197,9 +197,8 @@ export class ReverseLeaseRuntime {
 
 	disconnect(connectionId: string): void {
 		const now = this.#now();
-		const prefix = `${connectionId}\u0000`;
-		for (const key of this.#idempotency.keys()) {
-			if (key.startsWith(prefix)) this.#idempotency.delete(key);
+		for (const [key, entry] of this.#idempotency) {
+			if (entry.connectionId === connectionId) this.#idempotency.delete(key);
 		}
 		for (const lease of this.#leases.values())
 			if (lease.connectionId === connectionId) {

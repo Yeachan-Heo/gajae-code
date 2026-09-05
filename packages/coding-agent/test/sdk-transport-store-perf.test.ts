@@ -110,6 +110,23 @@ describe("SDK transport/store bounded hot paths", () => {
 		}
 	});
 
+	test("disconnect preserves receipts for connection IDs containing the disconnected ID and NUL", () => {
+		const runtime = new ReverseLeaseRuntime({ sendFrame: () => {} });
+		try {
+			runtime.registerProvider("a", "filesystem", { old: true }, undefined, "receipt");
+			runtime.registerProvider("a\u0000x", "network", { old: true }, undefined, "receipt");
+			runtime.disconnect("a");
+			expect(() => runtime.registerProvider("a\u0000x", "network", { changed: true }, undefined, "receipt")).toThrow(
+				"idempotency_conflict",
+			);
+			const registered = runtime.registerProvider("a", "filesystem", { changed: true }, undefined, "receipt");
+			expect(registered.definitions).toEqual({ changed: true });
+			expect(runtime.getInstalledDefinitions("network")).toEqual({ old: true });
+		} finally {
+			runtime.dispose();
+		}
+	});
+
 	test("disconnect clears only matching connection receipts and preserves lease reclaim grace", () => {
 		let now = 100;
 		const removed: string[] = [];
