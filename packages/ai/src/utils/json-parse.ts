@@ -249,6 +249,8 @@ export function findUnnecessaryUnicodeEscape(json: string): string | undefined {
 	const len = json.length;
 	let inString = false;
 	let i = 0;
+	let nextQuote = -1;
+	let nextBackslash = -1;
 
 	const hexAt = (start: number): number | undefined => {
 		if (start + 3 >= len) return undefined;
@@ -268,10 +270,16 @@ export function findUnnecessaryUnicodeEscape(json: string): string | undefined {
 		// Jump straight to the next quote or backslash. A per-character walk costs
 		// ~40ms on a 1MB literal-UTF-8 payload (a large `write`), and every byte in
 		// between is by definition uninteresting.
-		const nextQuote = json.indexOf('"', i);
-		const nextBackslash = json.indexOf("\\", i);
-		if (nextQuote === -1 && nextBackslash === -1) return undefined;
-		i = nextBackslash === -1 || (nextQuote !== -1 && nextQuote < nextBackslash) ? nextQuote : nextBackslash;
+		if (nextQuote < i) {
+			const offset = json.indexOf('"', i);
+			nextQuote = offset === -1 ? len : offset;
+		}
+		if (nextBackslash < i) {
+			const offset = json.indexOf("\\", i);
+			nextBackslash = offset === -1 ? len : offset;
+		}
+		i = Math.min(nextQuote, nextBackslash);
+		if (i === len) return undefined;
 
 		if (json.charCodeAt(i) === QUOTE) {
 			inString = false;

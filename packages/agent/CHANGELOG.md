@@ -6,6 +6,10 @@
 
 - Failed cooperative context maintenance now terminalizes the active run with its concrete maintenance error instead of advertising a continuation over unchanged context. Only committed prune, compaction, or promotion outcomes remain resumable.
 
+### Performance
+
+- Bound stream abort-race retention to the current read and reuse history hashes when checking append-only context rewrites.
+
 ## [0.16.3] - 2026-09-04
 
 ## [0.16.2] - 2026-09-04
