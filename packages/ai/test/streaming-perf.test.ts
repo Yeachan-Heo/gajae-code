@@ -12,17 +12,22 @@ import {
 } from "../src/utils/json-parse";
 
 describe("streaming lifetime regressions", () => {
-	for (const exit of ["break", "consumer-error", "source-error", "natural", "timeout"] as const) {
+	for (const exit of ["break", "consumer-error", "source-error", "natural", "abort", "timeout"] as const) {
 		it(`closes the source exactly once on ${exit}, without waiting for return`, async () => {
 			let closes = 0;
 			let reads = 0;
 			const failure = new Error("source failed");
+			const controller = new AbortController();
 			const source: AsyncIterableIterator<number> = {
 				[Symbol.asyncIterator]() {
 					return this;
 				},
 				async next() {
 					if (exit === "source-error") throw failure;
+					if (exit === "abort") {
+						controller.abort(failure);
+						return Promise.withResolvers<IteratorResult<number>>().promise;
+					}
 					if (exit === "timeout") return Promise.withResolvers<IteratorResult<number>>().promise;
 					return reads++ === 0 ? { done: false, value: 7 } : { done: true, value: undefined };
 				},
@@ -36,43 +41,45 @@ describe("streaming lifetime regressions", () => {
 				for await (const value of iterateWithIdleTimeout(source, {
 					errorMessage: "timeout",
 					idleTimeoutMs: exit === "timeout" ? 5 : undefined,
+					abortSignal: controller.signal,
 				})) {
 					values.push(value);
 					if (exit === "break") break;
 					if (exit === "consumer-error") throw failure;
 				}
 			};
-			if (exit === "consumer-error" || exit === "source-error") await expect(consume()).rejects.toBe(failure);
+			if (exit === "consumer-error" || exit === "source-error" || exit === "abort")
+				await expect(consume()).rejects.toBe(failure);
 			else if (exit === "timeout") await expect(consume()).rejects.toThrow("timeout");
 			else await consume();
-			expect(values).toEqual(exit === "source-error" || exit === "timeout" ? [] : [7]);
+			expect(values).toEqual(exit === "source-error" || exit === "abort" || exit === "timeout" ? [] : [7]);
 			expect(closes).toBe(exit === "natural" ? 0 : 1);
 		});
 	}
 
-	it("preserves a source error when iterator cleanup throws synchronously", async () => {
-		const sourceFailure = new Error("source failed");
-		const cleanupFailure = new Error("cleanup failed");
-		const source: AsyncIterableIterator<number> = {
-			[Symbol.asyncIterator]() {
-				return this;
-			},
-			async next() {
-				throw sourceFailure;
-			},
-			return() {
-				throw cleanupFailure;
-			},
-		};
-
-		await expect(
-			(async () => {
-				for await (const _value of iterateWithIdleTimeout(source, { errorMessage: "timeout" })) {
-					// The source fails before yielding.
-				}
-			})(),
-		).rejects.toBe(sourceFailure);
-	});
+	for (const closeFailure of ["throw", "reject"] as const) {
+		it(`preserves source rejection when return fails with ${closeFailure}`, async () => {
+			let closes = 0;
+			const sourceFailure = new Error("source failed");
+			const returnFailure = new Error("return failed");
+			const source: AsyncIterableIterator<number> = {
+				[Symbol.asyncIterator]() {
+					return this;
+				},
+				async next() {
+					throw sourceFailure;
+				},
+				return() {
+					closes++;
+					if (closeFailure === "throw") throw returnFailure;
+					return Promise.reject(returnFailure);
+				},
+			};
+			const iterator = iterateWithIdleTimeout(source, { errorMessage: "timeout" });
+			await expect(iterator.next()).rejects.toBe(sourceFailure);
+			expect(closes).toBe(1);
+		});
+	}
 
 	for (const finish of [complete, completeSimple]) {
 		for (const outcome of ["done", "error", "throw"] as const) {
