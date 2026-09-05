@@ -807,6 +807,7 @@ describe("SessionLifecycleService", () => {
 			stateRoot: "/tmp/workspace/.gjc/state",
 			endpointGeneration: 2,
 			endpointMtimeMs: 1,
+			endpointFileId: "dev:123",
 			processIncarnation: "linux:123",
 			hostIncarnation: "host:123",
 			lifecycleRequestId: "retire-effect",
@@ -823,6 +824,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: target.stateRoot,
 				endpointGeneration: target.endpointGeneration,
 				endpointMtimeMs: target.endpointMtimeMs,
+				endpointFileId: target.endpointFileId,
 				processIncarnation: target.processIncarnation,
 				hostIncarnation: target.hostIncarnation,
 				lifecycleRequestId: target.lifecycleRequestId,
@@ -840,6 +842,7 @@ describe("SessionLifecycleService", () => {
 			operation: "session.reconcile_uncertain",
 			result: { sessionId: target.sessionId },
 		});
+		expect(result.ok && result.result).toMatchObject({ endpointFileId: target.endpointFileId });
 		expect(result.ok && result.result).not.toHaveProperty("stateRoot");
 		expect(result.ok && result.result).not.toHaveProperty("processIncarnation");
 		expect(client.calls[0]?.input).toEqual({ ...target });
@@ -858,6 +861,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: "/tmp/workspace/.gjc/state",
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
+				endpointFileId: "dev:123",
 				processIncarnation: "linux:123",
 				hostIncarnation: "host:123",
 				lifecycleRequestId: "retire-effect",
@@ -879,6 +883,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: "/tmp/workspace/.gjc/state",
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
+				endpointFileId: "dev:123",
 				processIncarnation: "linux:123",
 				hostIncarnation: "host:123",
 				lifecycleRequestId: "retire-effect",
@@ -895,6 +900,7 @@ describe("SessionLifecycleService", () => {
 				stateRoot: "/tmp/workspace/../workspace/.gjc/state",
 				endpointGeneration: 2,
 				endpointMtimeMs: 1,
+				endpointFileId: "dev:123",
 				processIncarnation: "linux:123",
 				hostIncarnation: "host:123",
 				lifecycleRequestId: "retire-effect",

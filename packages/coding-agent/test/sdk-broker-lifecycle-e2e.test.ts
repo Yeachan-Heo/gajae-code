@@ -4865,6 +4865,69 @@ test("close removes an unchanged dead endpoint with a fractional nanosecond mtim
 	}
 });
 
+test("close fails closed when a dead endpoint is replaced before its descriptor is opened", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-dead-endpoint-replacement-"));
+	const agentDir = path.join(root, "agent");
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sessionId = "dead-endpoint-replacement";
+	const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+	const displacedPath = `${endpointPath}.displaced`;
+	const deadPid = 4_194_304;
+	const broker = new Broker({ agentDir });
+	const predecessorSource = JSON.stringify({ sessionId, pid: deadPid, url: "ws://127.0.0.1:1", token: "predecessor" });
+	const successorSource = JSON.stringify({ sessionId, pid: deadPid, url: "ws://127.0.0.1:1", token: "successor" });
+	let replacedBeforeOpen = false;
+	try {
+		expect(() => process.kill(deadPid, 0)).toThrow();
+		await fs.mkdir(path.dirname(endpointPath), { recursive: true });
+		await fs.writeFile(endpointPath, predecessorSource);
+		const fixedMtimeSeconds = 1_700_000_000;
+		await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+		const predecessor = await fs.stat(endpointPath, { bigint: true });
+		const predecessorFileId = `${predecessor.dev}:${predecessor.ino}`;
+		const endpointMtimeMs = Number(predecessor.mtimeNs / 1_000_000n);
+		await broker.start();
+		await broker.index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
+			endpointGeneration: 1,
+			pid: deadPid,
+			processIncarnation: "dead-incarnation",
+			endpointMtimeMs,
+			endpointFileId: predecessorFileId,
+		});
+		const realOpen = fs.open.bind(fs);
+		const openSpy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			if (!replacedBeforeOpen && path.resolve(file) === path.resolve(endpointPath)) {
+				replacedBeforeOpen = true;
+				await fs.rename(endpointPath, displacedPath);
+				await fs.writeFile(endpointPath, successorSource);
+				await fs.utimes(endpointPath, fixedMtimeSeconds, fixedMtimeSeconds);
+			}
+			return await (realOpen as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+		}) as typeof fs.open);
+		try {
+			await expect(
+				broker.handleRequest("session.close", { sessionId }, "dead-endpoint-replacement-close"),
+			).resolves.toMatchObject({
+				ok: false,
+				error: { code: "terminal_uncertain" },
+			});
+		} finally {
+			openSpy.mockRestore();
+		}
+		expect(replacedBeforeOpen).toBe(true);
+		const successor = await fs.stat(endpointPath, { bigint: true });
+		expect(`${successor.dev}:${successor.ino}`).not.toBe(predecessorFileId);
+		expect(Number(successor.mtimeNs / 1_000_000n)).toBe(endpointMtimeMs);
+		expect(await fs.readFile(endpointPath, "utf8")).toBe(successorSource);
+	} finally {
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
 test("startup cleanup accepts a payload-durable scrubbed endpoint placeholder", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-scrubbed-endpoint-"));
 	const agentDir = path.join(root, "agent");

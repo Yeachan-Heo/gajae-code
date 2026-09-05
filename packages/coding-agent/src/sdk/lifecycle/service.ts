@@ -134,6 +134,7 @@ export interface SessionReconcileUncertainTarget {
 	readonly stateRoot: string;
 	readonly endpointGeneration: number;
 	readonly endpointMtimeMs: number;
+	readonly endpointFileId?: string;
 	readonly processIncarnation: string;
 	readonly hostIncarnation: string;
 	readonly lifecycleRequestId: string;
@@ -200,6 +201,7 @@ export interface SessionLifecycleSessionResult {
 	readonly sessionId: string;
 	readonly cwd?: string;
 	readonly endpointGeneration?: number;
+	readonly endpointFileId?: string;
 	readonly reused?: boolean;
 	readonly note?: string;
 }
@@ -445,6 +447,7 @@ export function validateSessionReconcileUncertainTarget(value: unknown): value i
 		typeof target.endpointMtimeMs === "number" &&
 		Number.isFinite(target.endpointMtimeMs) &&
 		target.endpointMtimeMs > 0 &&
+		(target.endpointFileId === undefined || bounded(target.endpointFileId, 256)) &&
 		bounded(target.processIncarnation, 256) &&
 		bounded(target.hostIncarnation, 256) &&
 		bounded(target.lifecycleRequestId, 128) &&
@@ -511,6 +514,7 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 		sessionId: string;
 		cwd?: string;
 		endpointGeneration?: number;
+		endpointFileId?: string;
 		reused?: boolean;
 		note?: string;
 	} = { sessionId };
@@ -518,6 +522,8 @@ function sessionResult(value: unknown, expectedSessionId?: string): SessionLifec
 	const endpointGeneration = record.endpointGeneration;
 	if (typeof endpointGeneration === "number" && Number.isSafeInteger(endpointGeneration) && endpointGeneration > 0)
 		result.endpointGeneration = endpointGeneration;
+	if (typeof record.endpointFileId === "string" && record.endpointFileId.length > 0)
+		result.endpointFileId = record.endpointFileId;
 	if (typeof record.reused === "boolean") result.reused = record.reused;
 	if (typeof record.note === "string") result.note = record.note;
 	return result;
@@ -536,13 +542,18 @@ function reconcileUncertainResult(
 		value.stateRoot !== target.stateRoot ||
 		value.endpointGeneration !== target.endpointGeneration ||
 		value.endpointMtimeMs !== target.endpointMtimeMs ||
+		value.endpointFileId !== target.endpointFileId ||
 		value.processIncarnation !== target.processIncarnation ||
 		value.hostIncarnation !== target.hostIncarnation ||
 		value.lifecycleRequestId !== target.lifecycleRequestId ||
 		value.remoteCreateKey !== target.remoteCreateKey
 	)
 		return undefined;
-	return { sessionId: target.sessionId, endpointGeneration: target.endpointGeneration };
+	return {
+		sessionId: target.sessionId,
+		endpointGeneration: target.endpointGeneration,
+		...(target.endpointFileId === undefined ? {} : { endpointFileId: target.endpointFileId }),
+	};
 }
 
 function savedSessionTranscriptIdentity(value: unknown): SessionLifecycleSavedSessionIdentity | undefined {

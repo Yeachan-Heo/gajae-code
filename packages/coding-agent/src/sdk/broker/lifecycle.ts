@@ -3828,6 +3828,8 @@ async function removeExactDeadSessionEndpoint(
 		const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
 		if (bytesRead !== Number(metadata.size)) return false;
 		const source = bytes.subarray(0, bytesRead);
+		if (record.endpointFileId !== undefined && record.endpointFileId !== `${metadata.dev}:${metadata.ino}`)
+			return false;
 		const endpoint = JSON.parse(source.toString("utf8")) as { sessionId?: unknown; pid?: unknown; stale?: unknown };
 		const indexedEndpointMtimeMs = Math.trunc(record.endpointMtimeMs);
 		if (
