@@ -11,6 +11,7 @@ import type { AgentServerMessage, InteractionUpdate } from "../src/providers/cur
 import {
 	AgentServerMessageSchema,
 	ConversationStateStructureSchema,
+	ConversationTokenDetailsSchema,
 	ExecServerAbortSchema,
 	ExecServerControlMessageSchema,
 	ExecServerMessageSchema,
@@ -1059,6 +1060,16 @@ describe("Cursor raw transport watchdog", () => {
 					}),
 				20,
 			);
+			setTimeout(
+				() =>
+					sendServerMessage(stream, {
+						case: "conversationCheckpointUpdate",
+						value: create(ConversationStateStructureSchema, {
+							tokenDetails: create(ConversationTokenDetailsSchema, { usedTokens: 29 }),
+						}),
+					}),
+				30,
+			);
 		});
 
 		const { events, result } = await collectTerminal(baseUrl, {
@@ -1069,7 +1080,9 @@ describe("Cursor raw transport watchdog", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("stream stalled while waiting for the next event");
 		expect(result.content).toContainEqual(expect.objectContaining({ type: "text", text: "partial" }));
+		expect(result.usage.input).toBe(20);
 		expect(result.usage.output).toBe(9);
+		expect(result.usage.totalTokens).toBe(29);
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 

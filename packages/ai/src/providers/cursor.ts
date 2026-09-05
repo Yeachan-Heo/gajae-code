@@ -1239,6 +1239,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (options.signal.aborted) onCallerAbort();
 			options.signal.addEventListener("abort", onCallerAbort, { once: true });
 		}
+		const usageState: UsageState = {
+			sawTokenDelta: false,
+			conversationUsedTokens: 0,
+			checkpointOutputTokens: 0,
+			hasConversationCheckpoint: false,
+		};
 
 		try {
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
@@ -1289,6 +1295,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// publish partial state or leak blobs into a later request reusing the ID.
 			const blobStore = new Map(reusableCacheEntry?.blobs);
 			const cachedState = reusableCacheEntry?.state;
+			usageState.conversationUsedTokens = cachedState?.tokenDetails?.usedTokens ?? 0;
 			const setupPromise = buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
@@ -1505,13 +1512,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
 			let pendingConversationCheckpoint: ConversationStateStructure | undefined;
-			const usageState: UsageState = {
-				sawTokenDelta: false,
-				conversationUsedTokens: cachedState?.tokenDetails?.usedTokens ?? 0,
-				checkpointOutputTokens: 0,
-				hasConversationCheckpoint: false,
-			};
-
 			const state: BlockState = {
 				get currentTextBlock() {
 					return currentTextBlock;
@@ -2167,6 +2167,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			output.errorStatus = extractHttpStatusFromError(mappedError);
 			output.transportFailure = transportFailureFacts(mappedError);
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
+			finalizeCursorUsage(output, usageState);
+			calculateCost(model, output.usage);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
