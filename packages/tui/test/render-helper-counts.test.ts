@@ -417,6 +417,8 @@ describe("TUI render helper counters", () => {
 			await committedFrame(tui, term, "resize");
 
 			const measurements = TUI.getRenderCountersForTest().widthReflowVisibleWidthCalls;
+			// Viewport repaints skip the decision; plain hosts still consume the
+			// scan, including the overwide CJK fixture at 12 columns.
 			if (repaint === "viewport") expect(measurements).toBe(0);
 			else expect(measurements).toBeGreaterThan(0);
 			expect(visible(term).filter(Boolean)).toContain(visibleText);
