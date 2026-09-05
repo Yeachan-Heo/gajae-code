@@ -744,6 +744,7 @@ function matchesLifecycleReplayEndpointFile(
 }
 
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
+
 function expectedEndpointAuthority(input: Record<string, unknown>): EndpointAuthority | BrokerResponse {
 	const endpointGeneration = input.endpointGeneration;
 	const endpointIncarnation = input.endpointIncarnation;
