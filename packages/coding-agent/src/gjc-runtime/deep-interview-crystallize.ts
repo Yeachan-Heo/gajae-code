@@ -323,18 +323,13 @@ function anchoredClause(content: string, quote: string): string {
 	const quoteIndex = content.indexOf(quote);
 	if (quoteIndex < 0) return content;
 	const before = content.slice(0, quoteIndex);
-	const boundary = Math.max(
-		before.lastIndexOf("."),
-		before.lastIndexOf("!"),
-		before.lastIndexOf("?"),
-		before.lastIndexOf("\n"),
-	);
+	const boundaryPattern = /(?:[!?]\s+|\.\s+(?=[\p{Lu}"'])|\n+)/gu;
+	let boundary = -1;
+	for (const match of before.matchAll(boundaryPattern)) boundary = match.index + match[0].length - 1;
 	const afterStart = quoteIndex + quote.length;
 	const after = content.slice(afterStart);
-	const endOffsets = [after.indexOf("."), after.indexOf("!"), after.indexOf("?"), after.indexOf("\n")].filter(
-		offset => offset >= 0,
-	);
-	const end = endOffsets.length > 0 ? afterStart + Math.min(...endOffsets) + 1 : content.length;
+	const endMatch = /(?:[!?](?:\s|$)|\.(?=\s+[\p{Lu}"']|$)|\n)/u.exec(after);
+	const end = endMatch ? afterStart + endMatch.index + 1 : content.length;
 	return content.slice(boundary + 1, end).trim();
 }
 
