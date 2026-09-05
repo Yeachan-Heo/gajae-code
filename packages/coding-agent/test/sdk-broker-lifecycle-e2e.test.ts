@@ -5334,6 +5334,31 @@ test("idempotent lifecycle replay refreshes unchanged authority after a broker r
 				},
 			},
 		});
+		const malformedReplayKey = "replay-authority-malformed-session";
+		const malformedReplayIdentity = await deriveIdempotencyIdentity(
+			agentDir,
+			"session.resume",
+			malformedReplayKey,
+			targetHash,
+		);
+		expect(await restarted.ledger.begin(malformedReplayIdentity, requestHash)).toMatchObject({ kind: "new" });
+		await restarted.ledger.transition(malformedReplayIdentity, "terminal_ok", {
+			response: {
+				ok: true,
+				result: {
+					sessionId: "../../outside",
+					cwd: root,
+					endpointGeneration: 2,
+					pid: host.pid,
+					endpointMtimeMs,
+					reused: true,
+				},
+			},
+		});
+		expect(await restarted.handleRequest("session.resume", { cwd: root, sessionId }, malformedReplayKey)).toEqual({
+			ok: false,
+			error: { code: "invalid_input", message: "replayed sessionId must be a canonical safe identifier" },
+		});
 	} finally {
 		await initial?.stop();
 		await restarted?.stop();
