@@ -1577,7 +1577,7 @@ describe("SessionRouter dispatch authority", () => {
 			await fixture.router.reconcile();
 			expect(adopted.isCurrent()).toBe(false);
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
-			expect(removed).toEqual(["removed"]);
+			expect(removed).toEqual(["replaced_same_generation"]);
 		} finally {
 			await fixture.router.stop();
 		}
