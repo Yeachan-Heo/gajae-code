@@ -203,6 +203,7 @@ export class DiscordNotificationDaemon {
 	readonly #dispatchLeaseMs = 60_000;
 	readonly #providerOwner = randomUUID();
 	readonly #providerLeaseMs = 60_000;
+	readonly #migratedAttachmentAuthorities = new Set<string>();
 	constructor(private readonly options: DiscordNotificationDaemonOptions) {
 		this.#store = new ConversationStore({ agentDir: options.agentDir, kind: "discord", now: options.now });
 		this.#effects = new ChatEffectJournal({ agentDir: options.agentDir, transport: "discord", now: options.now });
@@ -213,18 +214,25 @@ export class DiscordNotificationDaemon {
 		};
 		this.#resolveAttachment = async (sessionId, expectedGeneration) => {
 			const attachment = await options.resolveAttachment(sessionId, expectedGeneration);
+			const migrationKey = attachment
+				? `${attachment.sessionId}:${attachment.generation}:${attachment.legacyAuthorityId ?? ""}:${attachment.authorityId ?? ""}`
+				: undefined;
 			if (
 				attachment?.isCurrent() &&
 				attachment.legacyAuthorityId &&
 				attachment.authorityId &&
-				attachment.legacyAuthorityId !== attachment.authorityId
-			)
+				attachment.legacyAuthorityId !== attachment.authorityId &&
+				migrationKey &&
+				!this.#migratedAttachmentAuthorities.has(migrationKey)
+			) {
 				await this.migrateAttachmentAuthority(
 					attachment.sessionId,
 					attachment.generation,
 					attachment.legacyAuthorityId,
 					attachment.authorityId,
 				);
+				this.#migratedAttachmentAuthorities.add(migrationKey);
+			}
 			return attachment;
 		};
 	}

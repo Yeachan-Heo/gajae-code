@@ -261,6 +261,7 @@ export class SlackNotificationDaemon {
 	#leaseRecoveryTimerGeneration = 0;
 	#leaseRecoveryScheduling: Promise<void> = Promise.resolve();
 	#recoveringLeasedEffects = false;
+	readonly #migratedAttachmentAuthorities = new Set<string>();
 
 	constructor(private readonly options: SlackNotificationDaemonOptions) {
 		this.store =
@@ -272,18 +273,25 @@ export class SlackNotificationDaemon {
 		this.#journal = new ChatEffectJournal({ agentDir: options.agentDir, transport: "slack", now: this.#now });
 		this.#resolveAttachment = async sessionId => {
 			const attachment = await options.resolveAttachment(sessionId);
+			const migrationKey = attachment
+				? `${attachment.sessionId}:${attachment.generation}:${attachment.legacyAuthorityId ?? ""}:${attachment.authorityId ?? ""}`
+				: undefined;
 			if (
 				attachment?.isCurrent() &&
 				attachment.legacyAuthorityId &&
 				attachment.authorityId &&
-				attachment.legacyAuthorityId !== attachment.authorityId
-			)
+				attachment.legacyAuthorityId !== attachment.authorityId &&
+				migrationKey &&
+				!this.#migratedAttachmentAuthorities.has(migrationKey)
+			) {
 				await this.migrateAttachmentAuthority(
 					attachment.sessionId,
 					attachment.generation,
 					attachment.legacyAuthorityId,
 					attachment.authorityId,
 				);
+				this.#migratedAttachmentAuthorities.add(migrationKey);
+			}
 			return attachment;
 		};
 	}

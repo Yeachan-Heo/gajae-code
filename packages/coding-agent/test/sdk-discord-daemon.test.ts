@@ -215,6 +215,61 @@ function inbound(threadId: string, id: string, generation = 1, customId?: string
 }
 
 describe("DiscordNotificationDaemon fake-provider acceptance", () => {
+	test("migrates legacy authority when a standalone daemon resolves an attachment", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-standalone-migration-"));
+		try {
+			const provider = new FakeDiscordProvider();
+			const legacy = new DiscordNotificationDaemon({
+				agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId: "legacy-authority",
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			});
+			const conversation = await legacy.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				attachmentAuthorityId: "legacy-authority",
+				content: "root",
+			});
+			const current = new DiscordNotificationDaemon({
+				agentDir,
+				guildId: "guild",
+				parentChannelId: "parent",
+				provider,
+				resolveAttachment: async sessionId => ({
+					sessionId,
+					generation: 1,
+					authorityId: "current-authority",
+					legacyAuthorityId: "legacy-authority",
+					isCurrent: () => true,
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+			});
+			await current.notify({
+				sessionId: "session",
+				endpointGeneration: 1,
+				attachmentAuthorityId: "current-authority",
+				content: "after migration",
+			});
+			const record = Object.values(
+				(await new ConversationStore<DiscordConversation>({ agentDir, kind: "discord" }).load()).conversations,
+			).find(item => item.sessionId === "session");
+			expect(record?.attachmentAuthorityId).toBe("current-authority");
+			expect(record?.attachmentAuthorityMigrationFromId).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	test("migrates persisted attachment and effect authority after device binding", async () => {
 		let authorityId = "legacy-authority";
 		await withDaemon(

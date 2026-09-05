@@ -305,6 +305,42 @@ function messageEnvelope(
 }
 
 describe("SlackNotificationDaemon fake-provider acceptance", () => {
+	it("migrates legacy authority when a standalone daemon resolves an attachment", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-slack-standalone-migration-"));
+		try {
+			const fake = new FakeSlack();
+			const legacy = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async sessionId => endpoint(sessionId),
+			});
+			await legacy.postRoot("session", "root", 1);
+			const current = new SlackNotificationDaemon({
+				agentDir,
+				repo: agentDir,
+				teamId: "T1",
+				channelId: "C1",
+				provider: new SlackProvider(fake),
+				resolveAttachment: async sessionId => ({
+					...endpoint(sessionId),
+					authorityId: "current-authority",
+					legacyAuthorityId: "session:1",
+				}),
+			});
+			await current.notify("session", "after migration");
+			const record = Object.values(
+				(await new ConversationStore<SlackConversation>({ agentDir, kind: "slack" }).load()).conversations,
+			).find(item => item.sessionId === "session");
+			expect(record?.attachmentAuthorityId).toBe("current-authority");
+			expect(record?.attachmentAuthorityMigrationFromId).toBeUndefined();
+		} finally {
+			await fs.rm(agentDir, { recursive: true, force: true });
+		}
+	});
+
 	it("migrates persisted attachment and effect authority after device binding", async () => {
 		let authorityId = "legacy-authority";
 		await withDaemon(
