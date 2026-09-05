@@ -1670,6 +1670,7 @@ async function handleClear(args: readonly string[], cwd: string): Promise<StateC
 					`existing state for ${mode} is corrupt or tampered (${existingRead.error}); use --force to overwrite`,
 				);
 			}
+			if (existingRead.kind === "valid") assertNoFutureWorkflowEnvelope(existingRead.value, mode, `clear ${mode}`);
 			const existing = existingRead.kind === "valid" ? existingRead.value : {};
 			const staleReason = await describeStaleClearState(cwd, sessionId, mode, existing);
 			if (staleReason && !forced) {
@@ -2705,6 +2706,27 @@ async function handleHandoffUnlocked(
 			steps.add("caller-mode-state");
 			steps.add("active-state");
 			await updateWorkflowTransactionJournal(cwd, sessionId, retryMutationId, { steps: [...steps] });
+			if (
+				caller === "deep-interview" &&
+				!(await hasAuditedDeepInterviewHandoff(cwd, sessionId, workflowCallee, {
+					handoffAt: retryAt,
+				}))
+			)
+				await appendHandoffAudit({
+					cwd,
+					sessionId,
+					caller,
+					callee: workflowCallee,
+					callerPath,
+					calleePath,
+					activePath,
+					mutationId: retryMutationId,
+					handoffAt: retryAt,
+					fromPhase: undefined,
+					callerState: existingCaller,
+					calleeState: retryCalleeState,
+					forced,
+				});
 			await completeWorkflowTransactionJournal(cwd, sessionId, retryMutationId);
 		}
 		await touchStateActivityMarker(cwd, sessionId, callerPath);
@@ -3008,6 +3030,34 @@ async function handleHandoff(args: readonly string[], cwd: string): Promise<Stat
 	);
 }
 
+async function appendExecutionApprovalAudit(options: {
+	cwd: string;
+	sessionId: string;
+	statePath: string;
+	approvedAt: string;
+	mutationId: string;
+	revision: number;
+	receipt: WorkflowStateReceipt;
+}): Promise<void> {
+	await appendAuditEntry(options.cwd, options.sessionId, {
+		ts: options.approvedAt,
+		skill: "deep-interview",
+		category: "state",
+		verb: "approve-execution",
+		owner: "gjc-state-cli",
+		mutation_id: options.mutationId,
+		from_phase: "handoff",
+		to_phase: "handoff",
+		forced: false,
+		paths: [options.statePath],
+		approved_at: options.approvedAt,
+		state_path: options.statePath,
+		state_revision: options.revision,
+		receipt_state_revision: options.revision,
+		receipt: options.receipt,
+	} as AuditEntry & Record<string, unknown>);
+}
+
 async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSelectors): Promise<StateCommandResult> {
 	if (selectors.mode !== "deep-interview")
 		throw new StateCommandError(2, "approve-execution requires --mode deep-interview");
@@ -3064,12 +3114,42 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	if (inner.execution_approval === "approved") {
 		if (existingReceipt?.schema_version !== 1 || existingReceipt.method !== "explicit-state-action")
 			throw new StateCommandError(2, "deep-interview execution approval lacks explicit provenance");
-		await assertDeepInterviewHandoffReady(envelope, {
-			cwd,
-			sessionId: selectors.gjcSessionId,
-			statePath,
-			requireExecutionApproval: true,
-		});
+		try {
+			await assertDeepInterviewHandoffReady(envelope, {
+				cwd,
+				sessionId: selectors.gjcSessionId,
+				statePath,
+				requireExecutionApproval: true,
+			});
+		} catch (error) {
+			if (!(error instanceof StateCommandError) || !error.message.includes("sanctioned approval audit record"))
+				throw error;
+			const persistedReceipt = persistedWorkflowReceipt(envelope.receipt, "deep-interview");
+			const persistedRevision = existingStateRevision(envelope);
+			if (
+				!persistedReceipt ||
+				typeof persistedRevision !== "number" ||
+				persistedRevision !== existingReceipt.state_revision ||
+				persistedReceipt.mutation_id !== existingReceipt.mutation_id ||
+				persistedReceipt.mutated_at !== existingReceipt.approved_at
+			)
+				throw error;
+			await appendExecutionApprovalAudit({
+				cwd,
+				sessionId: selectors.gjcSessionId,
+				statePath: resolvedStatePath,
+				approvedAt: existingReceipt.approved_at as string,
+				mutationId: existingReceipt.mutation_id as string,
+				revision: persistedRevision,
+				receipt: persistedReceipt,
+			});
+			await assertDeepInterviewHandoffReady(envelope, {
+				cwd,
+				sessionId: selectors.gjcSessionId,
+				statePath,
+				requireExecutionApproval: true,
+			});
+		}
 		return {
 			status: 0,
 			stdout: `${JSON.stringify({ skill: "deep-interview", execution_approval: "approved", state_path: statePath })}\n`,
@@ -3123,23 +3203,15 @@ async function handleApproveExecutionUnlocked(cwd: string, selectors: ResolvedSe
 	const stampedApprovalReceipt = isPlainObject(writeResult.stamped.receipt) ? writeResult.stamped.receipt : undefined;
 	if (!stampedApprovalReceipt)
 		throw new StateCommandError(1, "approval writer did not return a stamped workflow receipt");
-	await appendAuditEntry(cwd, selectors.gjcSessionId, {
-		ts: approvedAt,
-		skill: "deep-interview",
-		category: "state",
-		verb: "approve-execution",
-		owner: "gjc-state-cli",
-		mutation_id: mutationId,
-		from_phase: "handoff",
-		to_phase: "handoff",
-		forced: false,
-		paths: [resolvedStatePath],
-		approved_at: approvedAt,
-		state_path: resolvedStatePath,
-		state_revision: writeResult.revision,
-		receipt_state_revision: writeResult.revision,
-		receipt: stampedApprovalReceipt,
-	} as AuditEntry & Record<string, unknown>);
+	await appendExecutionApprovalAudit({
+		cwd,
+		sessionId: selectors.gjcSessionId,
+		statePath: resolvedStatePath,
+		approvedAt,
+		mutationId,
+		revision: writeResult.revision,
+		receipt: persistedWorkflowReceipt(stampedApprovalReceipt, "deep-interview")!,
+	});
 	await syncSkillActiveState({
 		cwd,
 		skill: "deep-interview",
