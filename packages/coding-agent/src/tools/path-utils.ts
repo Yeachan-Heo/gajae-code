@@ -696,6 +696,8 @@ export interface ToolScopeOptions {
 	surfaceExactFilePaths?: boolean;
 	/** Extra hint appended to "Path not found" when stat fails and the user supplied multiple paths. */
 	multipathStatHint?: string;
+	/** Cancels internal-URL resolution and prevents further scope work. */
+	signal?: AbortSignal;
 }
 
 export interface ToolScopeResolution {
@@ -719,6 +721,7 @@ export interface ToolScopeResolution {
  */
 export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<ToolScopeResolution> {
 	const { rawPaths: inputs, cwd, internalUrlAction, getArtifactsDir, getAuthorizedArtifactsDirs } = opts;
+	opts.signal?.throwIfAborted();
 	const rawPaths = inputs.map(normalizePathLikeInput);
 	if (rawPaths.some(rawPath => rawPath.length === 0)) {
 		throw new ToolError("`paths` must contain non-empty paths or globs");
@@ -727,6 +730,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	const resolvedPathInputs: string[] = [];
 	const immutableSourcePaths = new Set<string>();
 	for (const rawPath of rawPaths) {
+		opts.signal?.throwIfAborted();
 		if (!internalRouter.canHandle(rawPath)) {
 			resolvedPathInputs.push(rawPath);
 			continue;
@@ -739,7 +743,9 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 			getArtifactsDir,
 			getAuthorizedArtifactsDirs,
 			mcpManager: opts.mcpManager,
+			signal: opts.signal,
 		});
+		opts.signal?.throwIfAborted();
 		if (!resource.sourcePath) {
 			throw new ToolError(`Cannot ${internalUrlAction} internal URL without a backing file: ${rawPath}`);
 		}
@@ -753,6 +759,7 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 	let effectivePaths = resolvedPathInputs;
 	if (resolvedPathInputs.length > 1) {
 		const partition = await partitionExistingPaths(resolvedPathInputs, cwd, parseSearchPath);
+		opts.signal?.throwIfAborted();
 		if (partition.valid.length === 0) {
 			throw new ToolError(`Path not found: ${partition.missing.join(", ")}`);
 		}

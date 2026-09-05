@@ -82,6 +82,32 @@ describe("SearchTool timeout", () => {
 		await expect(execution).rejects.toBeInstanceOf(ToolAbortError);
 	});
 
+	it("waits for native cancellation cleanup before returning the timeout", async () => {
+		let cleanupSettled = false;
+		const grep: typeof grepFn = async options => {
+			const signal = options.signal;
+			if (!(signal instanceof AbortSignal)) throw new Error("Expected search abort signal");
+			return await new Promise<GrepResult>((_resolve, reject) => {
+				signal.addEventListener(
+					"abort",
+					() => {
+						setTimeout(() => {
+							cleanupSettled = true;
+							reject(new DOMException("Aborted", "AbortError"));
+						}, 50);
+					},
+					{ once: true },
+				);
+			});
+		};
+		const tool = new SearchTool(createSession(tempDir), { grep });
+
+		await expect(tool.execute("joined-timeout", { pattern: "needle", timeout: 0.5 })).rejects.toThrow(
+			"Search timed out after 0.5s; increase timeout or narrow paths/pattern",
+		);
+		expect(cleanupSettled).toBe(true);
+	});
+
 	it("does not surface partial results collected before a later target times out", async () => {
 		await Bun.write(path.join(tempDir, "second.txt"), "needle\n");
 		let calls = 0;

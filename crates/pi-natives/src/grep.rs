@@ -1125,6 +1125,25 @@ mod tests {
 
 	#[cfg(unix)]
 	#[test]
+	fn grep_direct_file_respects_pre_cancelled_token() {
+		let root = TempDirGuard::new();
+		let file = root.path().join("regular.txt");
+		write_file(&file, "needle\n");
+		let ct = task::CancelToken::new(Some(0), None);
+		std::thread::sleep(Duration::from_millis(1));
+		let result = grep_sync(base_grep_config(&file), None, ct);
+
+		let Err(err) = result else {
+			panic!("pre-cancelled direct-file grep should fail before returning matches");
+		};
+		assert!(
+			err.to_string().contains("Timeout"),
+			"expected timeout cancellation error, got: {err}"
+		);
+	}
+
+	#[cfg(unix)]
+	#[test]
 	fn grep_special_root_path_returns_empty_result() {
 		let root = TempDirGuard::new();
 		let fifo = root.path().join("direct.fifo");
@@ -1182,6 +1201,7 @@ fn run_parallel_search(
 	entries: &[FileEntry],
 	matcher: &grep_regex::RegexMatcher,
 	params: SearchParams,
+	ct: &task::CancelToken,
 ) -> Vec<FileSearchResult> {
 	let file_params = per_file_params(params);
 	let raw: Vec<Option<FileSearchResult>> = entries
@@ -1189,7 +1209,9 @@ fn run_parallel_search(
 		.map_init(
 			|| build_searcher_for_params(file_params),
 			|searcher, entry| {
+				ct.heartbeat().ok()?;
 				let bytes = read_file_bytes(&entry.path).ok()??;
+				ct.heartbeat().ok()?;
 				let search = if file_params.mode == OutputMode::FilesWithMatches {
 					let matched = matcher.is_match(bytes.as_slice()).ok()?;
 					SearchResultInternal {
@@ -1201,6 +1223,7 @@ fn run_parallel_search(
 				} else {
 					run_search_slice(searcher, matcher, bytes.as_slice(), file_params).ok()?
 				};
+				ct.heartbeat().ok()?;
 				Some(FileSearchResult {
 					relative_path: entry.relative_path.clone(),
 					matches:       search.matches,
@@ -1278,9 +1301,17 @@ impl ParallelVisitor for StreamingGrepVisitor<'_> {
 			return WalkState::Continue;
 		}
 
+		if let Err(err) = self.ct.heartbeat() {
+			*self.error.lock().expect("error lock poisoned") = Some(err.to_string());
+			return WalkState::Quit;
+		}
 		let Ok(Some(bytes)) = read_file_bytes(entry.path()) else {
 			return WalkState::Continue;
 		};
+		if let Err(err) = self.ct.heartbeat() {
+			*self.error.lock().expect("error lock poisoned") = Some(err.to_string());
+			return WalkState::Quit;
+		}
 		let search = if self.params.mode == OutputMode::FilesWithMatches {
 			let Ok(matched) = self.matcher.is_match(bytes.as_slice()) else {
 				return WalkState::Continue;
@@ -1299,6 +1330,10 @@ impl ParallelVisitor for StreamingGrepVisitor<'_> {
 			};
 			search
 		};
+		if let Err(err) = self.ct.heartbeat() {
+			*self.error.lock().expect("error lock poisoned") = Some(err.to_string());
+			return WalkState::Quit;
+		}
 
 		self.results.push(FileSearchResult {
 			relative_path: relative.into_owned(),
@@ -1596,6 +1631,7 @@ fn grep_sync(
 	}
 
 	if metadata.is_file() {
+		ct.heartbeat()?;
 		if let Some(filter) = type_filter.as_ref()
 			&& !matches_type_filter(&search_path, filter)
 		{
@@ -1617,11 +1653,13 @@ fn grep_sync(
 				limit_reached:      None,
 			});
 		};
+		ct.heartbeat()?;
 
 		if output_mode == OutputMode::FilesWithMatches && max_count.is_none() && offset == 0 {
 			let matched = matcher
 				.is_match(bytes.as_slice())
 				.map_err(|err| Error::from_reason(format!("Search failed: {err}")))?;
+			ct.heartbeat()?;
 			if !matched {
 				return Ok(GrepResult {
 					matches:            Vec::new(),
@@ -1652,6 +1690,7 @@ fn grep_sync(
 
 		let search = run_search(&matcher, bytes.as_slice(), params)
 			.map_err(|err| Error::from_reason(format!("Search failed: {err}")))?;
+		ct.heartbeat()?;
 
 		if search.match_count == 0 {
 			return Ok(GrepResult {
@@ -1741,7 +1780,9 @@ fn grep_sync(
 				limit_reached:      None,
 			});
 		}
-		run_parallel_search(&entries, &matcher, params)
+		let results = run_parallel_search(&entries, &matcher, params, &ct);
+		ct.heartbeat()?;
+		results
 	} else {
 		run_streaming_grep(
 			&search_path,

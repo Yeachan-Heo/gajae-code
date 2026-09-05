@@ -5,7 +5,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { GrepMatch, GrepResult, grep as grepFn } from "@gajae-code/natives";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { prompt, untilAborted } from "@gajae-code/utils";
+import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { getFileReadCache } from "../edit/file-read-cache";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
@@ -134,6 +134,7 @@ function containsTopLevelComma(entry: string): boolean {
 async function resolveArchiveSearchPaths(
 	paths: string[],
 	cwd: string,
+	signal?: AbortSignal,
 ): Promise<{
 	resolvedPaths: string[];
 	displayMap: Map<string, string>;
@@ -147,64 +148,71 @@ async function resolveArchiveSearchPaths(
 	const unreadable: string[] = [];
 	let tempDir: string | undefined;
 	const archiveCache = new Map<string, ArchiveReader>();
-
-	for (let idx = 0; idx < paths.length; idx++) {
-		const entry = paths[idx];
-		const candidates = parseArchivePathCandidates(entry);
-		// Longest archive prefix first; we want the one whose member portion is non-empty.
-		const member = candidates.find(c => c.subPath !== "" && c.archivePath !== entry);
-		if (!member) continue;
-
-		const archiveAbs = resolveReadPath(member.archivePath, cwd);
-		let archive = archiveCache.get(archiveAbs);
-		if (!archive) {
-			try {
-				archive = await openArchive(archiveAbs);
-			} catch (err) {
-				unreadable.push(`${entry} (cannot open archive: ${(err as Error).message})`);
-				continue;
-			}
-			archiveCache.set(archiveAbs, archive);
-		}
-
-		let extracted: ExtractedArchiveFile;
-		try {
-			extracted = await archive.readFile(member.subPath);
-		} catch (err) {
-			unreadable.push(`${entry} (${(err as Error).message})`);
-			continue;
-		}
-		// UTF-8 only — binary members would just produce noise through ripgrep.
-		if (extracted.bytes.some(byte => byte === 0)) {
-			unreadable.push(`${entry} (binary archive entry)`);
-			continue;
-		}
-		let text: string;
-		try {
-			text = new TextDecoder("utf-8", { fatal: true }).decode(extracted.bytes);
-		} catch {
-			unreadable.push(`${entry} (non-UTF-8 archive entry)`);
-			continue;
-		}
-
-		if (!tempDir) {
-			tempDir = await mkdtemp(path.join(tmpdir(), "gjc-search-archive-"));
-		}
-		// Per-entry filename keeps the scratch path unique even when two selectors
-		// resolve to members with the same basename.
-		const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
-		const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
-		await writeFile(tempPath, text);
-		resolvedPaths[idx] = tempPath;
-		displayMap.set(tempPath, entry);
-		displaySet.add(entry);
-	}
-
 	const cleanup = async () => {
 		if (tempDir) {
 			await rm(tempDir, { recursive: true, force: true }).catch(() => {});
 		}
 	};
+
+	try {
+		for (let idx = 0; idx < paths.length; idx++) {
+			signal?.throwIfAborted();
+			const entry = paths[idx];
+			const candidates = parseArchivePathCandidates(entry);
+			// Longest archive prefix first; we want the one whose member portion is non-empty.
+			const member = candidates.find(c => c.subPath !== "" && c.archivePath !== entry);
+			if (!member) continue;
+
+			const archiveAbs = resolveReadPath(member.archivePath, cwd);
+			let archive = archiveCache.get(archiveAbs);
+			if (!archive) {
+				try {
+					archive = await openArchive(archiveAbs);
+				} catch (err) {
+					unreadable.push(`${entry} (cannot open archive: ${(err as Error).message})`);
+					continue;
+				}
+				archiveCache.set(archiveAbs, archive);
+			}
+
+			let extracted: ExtractedArchiveFile;
+			try {
+				extracted = await archive.readFile(member.subPath);
+			} catch (err) {
+				unreadable.push(`${entry} (${(err as Error).message})`);
+				continue;
+			}
+			signal?.throwIfAborted();
+			// UTF-8 only — binary members would just produce noise through ripgrep.
+			if (extracted.bytes.some(byte => byte === 0)) {
+				unreadable.push(`${entry} (binary archive entry)`);
+				continue;
+			}
+			let text: string;
+			try {
+				text = new TextDecoder("utf-8", { fatal: true }).decode(extracted.bytes);
+			} catch {
+				unreadable.push(`${entry} (non-UTF-8 archive entry)`);
+				continue;
+			}
+
+			if (!tempDir) {
+				tempDir = await mkdtemp(path.join(tmpdir(), "gjc-search-archive-"));
+			}
+			// Per-entry filename keeps the scratch path unique even when two selectors
+			// resolve to members with the same basename.
+			const safeBase = path.basename(member.subPath).replace(/[^\w.-]+/g, "_") || "entry";
+			const tempPath = path.join(tempDir, `${idx}-${safeBase}`);
+			await writeFile(tempPath, text);
+			resolvedPaths[idx] = tempPath;
+			displayMap.set(tempPath, entry);
+			displaySet.add(entry);
+		}
+	} catch (error) {
+		await cleanup();
+		throw error;
+	}
+
 	return { resolvedPaths, displayMap, displaySet, unreadable, cleanup };
 }
 
@@ -281,7 +289,8 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 		const timeoutSignal = AbortSignal.timeout(timeoutMs);
 		const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 
-		return untilAborted(combinedSignal, async () => {
+		try {
+			combinedSignal.throwIfAborted();
 			const normalizedPattern = pattern.trim();
 			if (!normalizedPattern) {
 				throw new ToolError("Pattern must not be empty");
@@ -302,7 +311,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				displaySet: archiveDisplaySet,
 				unreadable: archiveUnreadable,
 				cleanup: cleanupArchiveScratch,
-			} = await resolveArchiveSearchPaths(paths, this.session.cwd);
+			} = await resolveArchiveSearchPaths(paths, this.session.cwd, combinedSignal);
 			try {
 				if (archiveUnreadable.length > 0 && resolvedPaths.length === archiveUnreadable.length) {
 					// All inputs were archive selectors we couldn't materialize; surface the
@@ -334,6 +343,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					trackImmutableSources: true,
 					surfaceExactFilePaths: true,
 					multipathStatHint: " (`paths` entries must each exist relative to cwd)",
+					signal: combinedSignal,
 				});
 				const { searchPath, isDirectory, multiTargets, exactFilePaths, missingPaths, immutableSourcePaths } = scope;
 				// When the only input was an archive selector, surface that selector instead
@@ -666,7 +676,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 			} finally {
 				await cleanupArchiveScratch();
 			}
-		}).catch(error => {
+		} catch (error) {
 			const nativeTimedOut = error instanceof Error && error.message === "Aborted: Timeout";
 			if ((timeoutSignal.aborted || nativeTimedOut) && !signal?.aborted) {
 				const seconds = timeoutMs % 1000 === 0 ? `${timeoutMs / 1000}` : (timeoutMs / 1000).toFixed(1);
@@ -676,7 +686,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 				throw new ToolAbortError();
 			}
 			throw error;
-		});
+		}
 	}
 }
 
