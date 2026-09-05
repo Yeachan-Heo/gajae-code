@@ -77,6 +77,45 @@ describe("resolveActiveProjectRegistryPath", () => {
 		expect(result).toBe(path.join(tmpDir, "sub", ".gjc", "plugins", "installed_plugins.json"));
 	});
 
+	it("stops at an explicitly supplied home before an unrelated ancestor registry", async () => {
+		const suppliedHome = path.join(tmpDir, "alternate-home");
+		const cwd = path.join(suppliedHome, "nested", "project");
+		fs.mkdirSync(cwd, { recursive: true });
+		fs.mkdirSync(path.join(tmpDir, ".gjc"), { recursive: true });
+
+		const result = await resolveActiveProjectRegistryPath(cwd, suppliedHome);
+
+		expect(result).toBeNull();
+	});
+
+	it("canonicalizes a symlinked cwd before comparing the supplied-home boundary", async () => {
+		if (process.platform === "win32") return;
+		const suppliedHome = path.join(tmpDir, "real-home");
+		const linkedHome = path.join(tmpDir, "linked-home");
+		const realCwd = path.join(suppliedHome, "nested", "project");
+		fs.mkdirSync(realCwd, { recursive: true });
+		fs.symlinkSync(suppliedHome, linkedHome, "dir");
+		fs.mkdirSync(path.join(tmpDir, ".gjc"), { recursive: true });
+
+		const result = await resolveActiveProjectRegistryPath(path.join(linkedHome, "nested", "project"), suppliedHome);
+
+		expect(result).toBeNull();
+	});
+
+	it("reuses the canonical cwd for the .git fallback boundary", async () => {
+		if (process.platform === "win32") return;
+		const suppliedHome = path.join(tmpDir, "real-home-git");
+		const linkedHome = path.join(tmpDir, "linked-home-git");
+		const realCwd = path.join(suppliedHome, "nested", "project");
+		fs.mkdirSync(realCwd, { recursive: true });
+		fs.symlinkSync(suppliedHome, linkedHome, "dir");
+		fs.mkdirSync(path.join(tmpDir, ".git"), { recursive: true });
+
+		const result = await resolveActiveProjectRegistryPath(path.join(linkedHome, "nested", "project"), suppliedHome);
+
+		expect(result).toBeNull();
+	});
+
 	it("falls back to .git root when no .gjc/ exists", async () => {
 		// Layout: tmpDir/.git/   +   tmpDir/sub/  (cwd)
 		// No .gjc/ anywhere → second pass finds .git/ at tmpDir.

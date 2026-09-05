@@ -5,12 +5,14 @@
  * This handles AGENTS.md files that live in project root (not in config directories
  * like .OpenAI code backend/ or .gemini/, which are handled by their respective providers).
  */
+import type * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
+import type { FileIdentity } from "../capability/fs";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { calculateDepth, createSourceMeta } from "./helpers";
+import { calculateDepth, canonicalizePathWithinHome, createSourceMeta } from "./helpers";
 
 const PROVIDER_ID = "agents-md";
 const DISPLAY_NAME = "AGENTS.md";
@@ -25,17 +27,60 @@ const AGGREGATE_LIMIT_WARNING = "Skipped one or more AGENTS.md files that exceed
 export type AgentsMdReader = (
 	filePath: string,
 	maxBytes: number,
+	options?: { noFollow?: boolean; home?: string; homeIdentity?: FileIdentity },
 ) => Promise<{ content: string | null; byteLength: number; tooLarge: boolean }>;
+
+function sameFileIdentity(left: fsSync.Stats, right: fsSync.Stats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
 
 async function readBoundedAgentsMdFile(
 	filePath: string,
 	maxBytes: number,
+	options?: { noFollow?: boolean; home?: string; homeIdentity?: FileIdentity },
 ): Promise<{ content: string | null; byteLength: number; tooLarge: boolean }> {
+	const noFollow = options?.noFollow === true;
+	const homeIsStable = async (): Promise<boolean> => {
+		if (!options?.home || !options.homeIdentity) return true;
+		try {
+			const current = await fs.stat(options.home);
+			return current.dev === options.homeIdentity.dev && current.ino === options.homeIdentity.ino;
+		} catch {
+			return false;
+		}
+	};
+	let before: fsSync.Stats | undefined;
+	let canonicalPath: string | undefined;
 	try {
-		const file = await fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+		if (!(await homeIsStable())) return { content: null, byteLength: 0, tooLarge: false };
+		if (noFollow) {
+			// `loadAgentsMd` canonicalizes the candidate before calling the reader,
+			// but that pathname can be swapped before open. Recheck the canonical
+			// target immediately before opening and bracket the descriptor with
+			// identity checks so explicit-home reads cannot follow a raced link.
+			canonicalPath = await fs.realpath(filePath);
+			if (canonicalPath !== path.resolve(filePath)) return { content: null, byteLength: 0, tooLarge: false };
+			before = await fs.lstat(filePath);
+			if (before.isSymbolicLink() || !before.isFile() || before.nlink !== 1)
+				return { content: null, byteLength: 0, tooLarge: false };
+		}
+		const flags =
+			fs.constants.O_RDONLY |
+			(typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0) |
+			(noFollow && typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0);
+		const file = await fs.open(filePath, flags);
 		try {
 			const stats = await file.stat();
 			if (!stats.isFile()) return { content: null, byteLength: 0, tooLarge: false };
+			if (before && (!sameFileIdentity(before, stats) || stats.nlink !== 1))
+				return { content: null, byteLength: 0, tooLarge: false };
+			if (before) {
+				if (canonicalPath !== (await fs.realpath(filePath)))
+					return { content: null, byteLength: 0, tooLarge: false };
+				const after = await fs.lstat(filePath);
+				if (after.isSymbolicLink() || after.nlink !== 1 || !sameFileIdentity(before, after))
+					return { content: null, byteLength: 0, tooLarge: false };
+			}
 			const bytes = Buffer.alloc(maxBytes + 1);
 			let bytesRead = 0;
 			while (bytesRead < bytes.length) {
@@ -44,6 +89,9 @@ async function readBoundedAgentsMdFile(
 				bytesRead += result.bytesRead;
 			}
 			if (bytesRead > maxBytes) return { content: null, byteLength: bytesRead, tooLarge: true };
+			if (before && canonicalPath !== (await fs.realpath(filePath)))
+				return { content: null, byteLength: 0, tooLarge: false };
+			if (!(await homeIsStable())) return { content: null, byteLength: 0, tooLarge: false };
 			return {
 				content: new TextDecoder().decode(bytes.subarray(0, bytesRead)),
 				byteLength: bytesRead,
@@ -71,6 +119,17 @@ export async function loadAgentsMd(
 	let aggregateBytes = 0;
 	let omittedOversizedFile = false;
 	let omittedAggregateFile = false;
+	const homeRelative = path.relative(ctx.home, ctx.cwd);
+	const cwdIsWithinHome =
+		homeRelative === "" ||
+		(homeRelative !== ".." && !homeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(homeRelative));
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : path.parse(ctx.cwd).root);
+	const relativeStop = path.relative(stopDirectory, ctx.cwd);
+	const effectiveStopDirectory =
+		relativeStop === "" ||
+		(relativeStop !== ".." && !relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+			? stopDirectory
+			: ctx.cwd;
 
 	while (true) {
 		scannedDirectories += 1;
@@ -81,25 +140,32 @@ export async function loadAgentsMd(
 		if (!baseName.startsWith(".")) {
 			const remainingAggregateBytes = MAX_AGGREGATE_BYTES - aggregateBytes;
 			const allowedBytes = Math.min(MAX_FILE_BYTES, remainingAggregateBytes);
-			const result = await readCandidate(candidate, allowedBytes);
+			const authorizedCandidate = await canonicalizePathWithinHome(ctx, candidate, undefined, "project");
+			const result = authorizedCandidate
+				? await readCandidate(authorizedCandidate, allowedBytes, {
+						noFollow: ctx.isolatedHome === true,
+						home: ctx.home,
+						homeIdentity: ctx.homeIdentity,
+					})
+				: { content: null, byteLength: 0, tooLarge: false };
 			if (result.tooLarge) {
 				if (allowedBytes < MAX_FILE_BYTES) omittedAggregateFile = true;
 				else omittedOversizedFile = true;
 			} else if (result.content !== null) {
-				const fileDir = path.dirname(candidate);
+				const filePath = authorizedCandidate ?? candidate;
+				const fileDir = path.dirname(filePath);
 				items.push({
-					path: candidate,
+					path: filePath,
 					content: result.content,
 					level: "project",
 					depth: calculateDepth(ctx.cwd, fileDir, path.sep),
-					_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
+					_source: createSourceMeta(PROVIDER_ID, filePath, "project"),
 				});
 				aggregateBytes += result.byteLength;
 			}
 		}
 
-		const stopDirectory = ctx.repoRoot ?? ctx.home;
-		if (current === stopDirectory) break;
+		if (current === effectiveStopDirectory) break;
 		if (scannedDirectories === MAX_ANCESTOR_DIRECTORIES) {
 			warnings.push(DIRECTORY_LIMIT_WARNING);
 			break;

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
+import type * as tls from "node:tls";
 import { create, fromBinary, fromJson, type JsonValue, toBinary, toJson } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import { $env, extractHttpStatusFromError, sanitizeText } from "@gajae-code/utils";
@@ -29,7 +30,8 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { getStreamIdleTimeoutMs } from "../utils/idle-iterator";
+import { transportFailureFacts } from "../utils/fallback-transport";
+import { FirstEventTimeoutError, getStreamFirstEventTimeoutMs, getStreamIdleTimeoutMs } from "../utils/idle-iterator";
 import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
@@ -175,9 +177,28 @@ import {
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 export { CURSOR_CLIENT_VERSION };
 
-const conversationStateCache = new Map<string, ConversationStateStructure>();
-const conversationBlobStores = new Map<string, Map<string, Uint8Array>>();
-const conversationUsageContextCache = new Map<string, CursorUsageContext>();
+interface CursorConversationContext {
+	endpointKey: string;
+	credentialKey: string;
+	modelKey: string;
+	systemPromptKey: string;
+	customSystemPromptKey: string;
+	toolsKey: string;
+	messageKeys: string[];
+}
+
+interface CursorConversationCacheEntry {
+	state: ConversationStateStructure;
+	blobs: Map<string, Uint8Array>;
+	context: CursorConversationContext;
+}
+
+const conversationCache = new Map<string, CursorConversationCacheEntry>();
+// A capped non-abortable mutation may outlive the provider turn. Keep a
+// conversation-scoped lock until the actual handler settles so a retry or a
+// later turn cannot start another request while the detached mutation is still
+// changing local state.
+const conversationMutationLocks = new Map<string, Promise<void>>();
 
 // F15: bound the module-global conversation caches so long-lived / many-session use cannot
 // grow them without limit. LRU by conversation count + TTL on idle conversations.
@@ -185,12 +206,93 @@ const CURSOR_MAX_CONVERSATIONS = 64;
 const CURSOR_CONVERSATION_TTL_MS = 60 * 60 * 1000;
 const conversationLastAccess = new Map<string, number>();
 
+const conversationMutationLockReservations = new Set<string>();
+
+function reserveCursorMutationLock(conversationId: string): boolean {
+	if (conversationMutationLocks.has(conversationId) || conversationMutationLockReservations.has(conversationId))
+		return false;
+	if (conversationMutationLocks.size + conversationMutationLockReservations.size >= CURSOR_MAX_CONVERSATIONS) {
+		return false;
+	}
+	conversationMutationLockReservations.add(conversationId);
+	return true;
+}
+
+function releaseCursorMutationLockReservation(conversationId: string): void {
+	conversationMutationLockReservations.delete(conversationId);
+}
+
+function registerCursorMutationLock(conversationId: string, lock: Promise<void>): void {
+	conversationMutationLocks.set(conversationId, lock);
+	void lock.then(() => {
+		if (conversationMutationLocks.get(conversationId) === lock) conversationMutationLocks.delete(conversationId);
+	});
+}
+
 /** Drop all cached state + blob bytes for a conversation (F15 bound + session-teardown hook). */
 export function disposeCursorConversation(conversationId: string): void {
-	conversationStateCache.delete(conversationId);
-	conversationBlobStores.delete(conversationId);
-	conversationUsageContextCache.delete(conversationId);
+	conversationCache.delete(conversationId);
 	conversationLastAccess.delete(conversationId);
+}
+
+async function waitForCursorSetup<T>(
+	setup: Promise<T>,
+	signal: AbortSignal | undefined,
+	timeoutMs: number | undefined,
+	timeoutError: () => Error,
+): Promise<T> {
+	setup.catch(() => {});
+	const deadline = Promise.withResolvers<never>();
+	deadline.promise.catch(() => {});
+	const deadlineTimer =
+		timeoutMs !== undefined && timeoutMs > 0
+			? setTimeout(() => deadline.reject(timeoutError()), timeoutMs)
+			: undefined;
+	const aborted = Promise.withResolvers<never>();
+	aborted.promise.catch(() => {});
+	const onAbort = () => aborted.reject(cursorAbortError(signal!));
+	if (signal) {
+		signal.addEventListener("abort", onAbort, { once: true });
+		if (signal.aborted) onAbort();
+	}
+	try {
+		const racers: Promise<T | never>[] = [setup];
+		if (deadlineTimer) racers.push(deadline.promise);
+		if (signal) racers.push(aborted.promise);
+		return await Promise.race(racers);
+	} finally {
+		if (signal) signal.removeEventListener("abort", onAbort);
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+	}
+}
+
+async function waitForCursorMutationLock(
+	conversationId: string,
+	signal: AbortSignal | undefined,
+	timeoutMs: number | undefined,
+	timeoutError: () => Error,
+): Promise<void> {
+	const lock = conversationMutationLocks.get(conversationId);
+	if (!lock) return;
+	if (signal?.aborted) throw cursorAbortError(signal);
+	const deadline = Promise.withResolvers<never>();
+	deadline.promise.catch(() => {});
+	const deadlineTimer =
+		timeoutMs !== undefined && timeoutMs > 0
+			? setTimeout(() => deadline.reject(timeoutError()), timeoutMs)
+			: undefined;
+	const aborted = Promise.withResolvers<never>();
+	aborted.promise.catch(() => {});
+	const onAbort = () => aborted.reject(cursorAbortError(signal!));
+	if (signal) signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		const racers: Promise<never>[] = [deadline.promise];
+		if (signal) racers.push(aborted.promise);
+		await Promise.race([lock, ...racers]);
+	} finally {
+		if (signal) signal.removeEventListener("abort", onAbort);
+		if (deadlineTimer) clearTimeout(deadlineTimer);
+	}
 }
 
 /** Refresh recency for a conversation and evict TTL-stale / LRU-overflow entries (F15). */
@@ -200,13 +302,13 @@ function touchCursorConversation(conversationId: string): void {
 		if (id !== conversationId && now - ts > CURSOR_CONVERSATION_TTL_MS) disposeCursorConversation(id);
 	}
 	conversationLastAccess.set(conversationId, now);
-	const state = conversationStateCache.get(conversationId);
-	if (state !== undefined) {
-		conversationStateCache.delete(conversationId);
-		conversationStateCache.set(conversationId, state);
+	const entry = conversationCache.get(conversationId);
+	if (entry !== undefined) {
+		conversationCache.delete(conversationId);
+		conversationCache.set(conversationId, entry);
 	}
-	while (conversationStateCache.size > CURSOR_MAX_CONVERSATIONS) {
-		const oldest = conversationStateCache.keys().next().value;
+	while (conversationCache.size > CURSOR_MAX_CONVERSATIONS) {
+		const oldest = conversationCache.keys().next().value;
 		if (oldest === undefined || oldest === conversationId) break;
 		disposeCursorConversation(oldest);
 	}
@@ -220,6 +322,300 @@ export interface CursorOptions extends StreamOptions {
 }
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
+const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
+const CURSOR_MAX_QUEUED_SERVER_BYTES = 64 * 1024 * 1024;
+// Connect frames routinely carry tool payloads and checkpoint blobs larger than
+// 4 KiB. Keep a finite protocol bound for hostile peers, but do not reject
+// valid server messages merely because they exceed the old debug-text limit.
+const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
+// A held exec cannot be allowed to turn the response stream into an unbounded
+// staging area. One maximum-sized frame plus its envelope is enough to retain
+// a complete frame while parser backpressure is active; additional input is a
+// protocol failure rather than silently dropping raw progress.
+const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
+const CURSOR_MAX_BLOB_STORE_ENTRIES = 256;
+const CURSOR_MAX_BLOB_STORE_BYTES = 64 * 1024 * 1024;
+const CURSOR_BLOB_ID_BYTES = 32;
+const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
+const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
+const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
+
+interface CursorPendingChunk {
+	bytes: Buffer;
+	offset: number;
+	next: CursorPendingChunk | null;
+}
+
+/**
+ * Bounded response staging for Connect frames. Incoming HTTP/2 chunks are
+ * retained by reference and consumed from the head; a frame split across
+ * chunks is copied once for protobuf decoding instead of repeatedly growing a
+ * single Buffer with Buffer.concat.
+ */
+class CursorPendingBuffer {
+	#head: CursorPendingChunk | null = null;
+	#tail: CursorPendingChunk | null = null;
+	#byteLength = 0;
+	#lookup: {
+		logicalOffset: number;
+		chunk: CursorPendingChunk;
+		chunkOffset: number;
+	} | null = null;
+
+	get length(): number {
+		return this.#byteLength;
+	}
+
+	append(bytes: Uint8Array): void {
+		if (bytes.length === 0) return;
+		const chunk: CursorPendingChunk = {
+			bytes: Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes),
+			offset: 0,
+			next: null,
+		};
+		if (this.#tail) this.#tail.next = chunk;
+		else this.#head = chunk;
+		this.#tail = chunk;
+		this.#byteLength += chunk.bytes.length;
+	}
+
+	clear(): void {
+		this.#head = null;
+		this.#tail = null;
+		this.#byteLength = 0;
+		this.#lookup = null;
+	}
+
+	consume(length: number): void {
+		if (!Number.isInteger(length) || length < 0 || length > this.#byteLength) {
+			throw new RangeError(`Cannot consume ${length} bytes from a ${this.#byteLength}-byte buffer`);
+		}
+		let remaining = length;
+		while (remaining > 0) {
+			const chunk = this.#head;
+			if (!chunk) throw new RangeError("Pending buffer ended while consuming bytes");
+			const available = chunk.bytes.length - chunk.offset;
+			const consumed = Math.min(remaining, available);
+			chunk.offset += consumed;
+			remaining -= consumed;
+			if (chunk.offset === chunk.bytes.length) {
+				this.#head = chunk.next;
+				chunk.next = null;
+				if (!this.#head) this.#tail = null;
+			}
+		}
+		this.#byteLength -= length;
+		this.#lookup = null;
+	}
+
+	#locate(offset: number): { chunk: CursorPendingChunk; chunkOffset: number } {
+		if (!Number.isInteger(offset) || offset < 0 || offset >= this.#byteLength) {
+			throw new RangeError(`Pending buffer offset ${offset} is outside ${this.#byteLength} bytes`);
+		}
+
+		let chunk: CursorPendingChunk | null;
+		let chunkOffset: number;
+		let logicalOffset: number;
+		if (this.#lookup && offset >= this.#lookup.logicalOffset) {
+			chunk = this.#lookup.chunk;
+			chunkOffset = this.#lookup.chunkOffset;
+			logicalOffset = this.#lookup.logicalOffset;
+		} else {
+			chunk = this.#head;
+			chunkOffset = chunk?.offset ?? 0;
+			logicalOffset = 0;
+		}
+
+		while (chunk) {
+			const available = chunk.bytes.length - chunkOffset;
+			if (offset < logicalOffset + available) {
+				this.#lookup = { logicalOffset: offset, chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
+				return { chunk, chunkOffset: chunkOffset + (offset - logicalOffset) };
+			}
+			logicalOffset += available;
+			chunk = chunk.next;
+			chunkOffset = chunk?.offset ?? 0;
+		}
+
+		throw new RangeError(`Pending buffer offset ${offset} is outside ${this.#byteLength} bytes`);
+	}
+
+	byteAt(offset: number): number {
+		const location = this.#locate(offset);
+		return location.chunk.bytes[location.chunkOffset];
+	}
+
+	readUInt32BE(offset: number): number {
+		if (!Number.isInteger(offset) || offset < 0 || offset + 4 > this.#byteLength) {
+			throw new RangeError(`Cannot read a 32-bit value at offset ${offset}`);
+		}
+		return (
+			((this.byteAt(offset) << 24) |
+				(this.byteAt(offset + 1) << 16) |
+				(this.byteAt(offset + 2) << 8) |
+				this.byteAt(offset + 3)) >>>
+			0
+		);
+	}
+
+	subarray(offset: number, length: number): Buffer {
+		if (!Number.isInteger(length) || length < 0 || offset < 0 || offset + length > this.#byteLength) {
+			throw new RangeError(`Cannot slice ${length} bytes at offset ${offset}`);
+		}
+		if (length === 0) return Buffer.alloc(0);
+		const first = this.#locate(offset);
+		const contiguous = first.chunk.bytes.length - first.chunkOffset;
+		if (length <= contiguous) return first.chunk.bytes.subarray(first.chunkOffset, first.chunkOffset + length);
+
+		const result = Buffer.allocUnsafe(length);
+		let written = 0;
+		let chunk: CursorPendingChunk | null = first.chunk;
+		let chunkOffset = first.chunkOffset;
+		while (chunk && written < length) {
+			const available = Math.min(length - written, chunk.bytes.length - chunkOffset);
+			chunk.bytes.copy(result, written, chunkOffset, chunkOffset + available);
+			written += available;
+			chunk = chunk.next;
+			chunkOffset = chunk?.offset ?? 0;
+		}
+		return result;
+	}
+}
+
+function cursorAbortError(signal: AbortSignal): Error {
+	const reason = signal.reason;
+	if (reason instanceof Error) {
+		// Normalize the default AbortError DOMException Bun supplies when abort()
+		// runs without a custom reason: Cursor's established terminal text is
+		// "Request was aborted", and the generic-abort matcher keys on it. Keep
+		// custom AbortError diagnostics intact; the name alone does not prove the
+		// caller omitted a reason.
+		if (
+			reason.name === "AbortError" &&
+			(reason.message === "The operation was aborted." || reason.message === "This operation was aborted")
+		) {
+			return new Error("Request was aborted");
+		}
+		return reason;
+	}
+	return new Error("Request was aborted");
+}
+
+/** Marker failures must escape resolveExecHandler instead of becoming a late wire response. */
+class CursorExecAdmissionClosedError extends Error {
+	constructor(message = "Cursor non-abortable exec was marked after wrapper terminalization") {
+		super(message);
+		this.name = "CursorExecAdmissionClosedError";
+	}
+}
+
+/** Exported for deterministic coverage of the Cursor exec-budget derivation. */
+export function cursorExecDeadlineMsForTest(idleTimeoutMs: number | undefined): number {
+	// A non-positive idle override explicitly DISABLES the transport watchdog;
+	// it must not collapse the exec deadline to the minimum clamp. Treat it
+	// like the normal 120-second input so disabling transport watching cannot
+	// make local tools stricter than the default (for example, bash's 300s).
+	if (idleTimeoutMs === undefined || idleTimeoutMs <= 0) {
+		return 120_000 * CURSOR_EXEC_DEADLINE_MULTIPLIER;
+	}
+	return Math.max(CURSOR_MIN_EXEC_DEADLINE_MS, idleTimeoutMs * CURSOR_EXEC_DEADLINE_MULTIPLIER);
+}
+
+/** Settlement proof for a started non-abortable Cursor exec. */
+export interface CursorNonAbortableSettlement {
+	/** Resolves when the marked mutation settles; never rejects. */
+	settled: Promise<void>;
+}
+
+function runWithCursorExecDeadline<T>(
+	operation: (signal: AbortSignal, markNonAbortable: () => void) => Promise<T>,
+	signal: AbortSignal | undefined,
+	deadlineMs: number,
+	onNonAbortableStarted?: (settlement: CursorNonAbortableSettlement) => void,
+	onOperationFinished?: () => void,
+	onWrapperFinished?: () => void,
+	onControllerReady?: (abort: (reason?: Error) => void) => void,
+	transportTerminated?: () => boolean,
+): Promise<T> {
+	const result = Promise.withResolvers<T>();
+	const operationCompletion = Promise.withResolvers<void>();
+	operationCompletion.promise.catch(() => {});
+	const controller = new AbortController();
+	const abortController = (reason?: Error): void => {
+		if (!controller.signal.aborted) controller.abort(reason);
+	};
+	let settled = false;
+	let nonAbortableStarted = false;
+	let abortError: Error | undefined;
+	let timer: NodeJS.Timeout | undefined;
+
+	const cleanup = () => {
+		if (timer) clearTimeout(timer);
+		if (signal) signal.removeEventListener("abort", onAbort);
+	};
+	const settle = (settlement: () => void) => {
+		if (settled) return;
+		settled = true;
+		cleanup();
+		onWrapperFinished?.();
+		settlement();
+	};
+	const onAbort = () => {
+		if (signal) {
+			abortError = cursorAbortError(signal);
+			abortController(abortError);
+			if (!nonAbortableStarted) settle(() => result.reject(abortError!));
+		}
+	};
+	onControllerReady?.(abortController);
+
+	if (signal?.aborted) {
+		abortController(cursorAbortError(signal));
+		settle(() => result.reject(cursorAbortError(signal)));
+		onOperationFinished?.();
+		return result.promise;
+	}
+	if (signal) signal.addEventListener("abort", onAbort, { once: true });
+	timer = setTimeout(() => {
+		// The deadline cannot forcibly cancel the handler's local work; it aborts
+		// the per-exec signal so cooperative tools stop, and the rejection below
+		// still bounds how long this turn waits for the handler promise.
+		abortError = new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`);
+		abortController(abortError);
+		if (!nonAbortableStarted) settle(() => result.reject(abortError!));
+	}, deadlineMs);
+	void operation(controller.signal, () => {
+		if (nonAbortableStarted) return;
+		if (settled || transportTerminated?.()) {
+			throw new CursorExecAdmissionClosedError();
+		}
+		nonAbortableStarted = true;
+		onNonAbortableStarted?.({
+			settled: operationCompletion.promise,
+		});
+	}).then(
+		value => {
+			operationCompletion.resolve();
+			onOperationFinished?.();
+			settle(() => (abortError ? result.reject(abortError) : result.resolve(value)));
+		},
+		error => {
+			operationCompletion.resolve();
+			onOperationFinished?.();
+			settle(() => result.reject(abortError ?? error));
+		},
+	);
+	return result.promise;
+}
+
+/** Exported for production-bridge coverage of non-abortable terminal ordering. */
+export function runWithCursorExecDeadlineForTest<T>(
+	operation: (signal: AbortSignal, markNonAbortable: () => void) => Promise<T>,
+	signal: AbortSignal | undefined,
+	deadlineMs: number,
+): Promise<T> {
+	return runWithCursorExecDeadline(operation, signal, deadlineMs);
+}
 
 interface CursorLogEntry {
 	ts: number;
@@ -256,13 +652,215 @@ function frameConnectMessage(data: Uint8Array, flags = 0): Buffer {
 	return frame;
 }
 
+function isClosedCursorRequest(request: http2.ClientHttp2Stream): boolean {
+	return request.closed || request.destroyed || request.writableEnded || request.writableFinished;
+}
+
+const CURSOR_WRITE_DRAIN_TIMEOUT_MS = 5_000;
+const CURSOR_MAX_PENDING_SHELL_WRITE_BYTES = 1024 * 1024;
+const pendingCursorWrites = new WeakMap<object, Set<Promise<void>>>();
+const cursorWriteErrors = new WeakMap<object, unknown>();
+
+function closeStalledCursorRequest(request: http2.ClientHttp2Stream): void {
+	// A request whose peer stopped reading may never invoke a write callback. Close
+	// and destroy both sides of the stream so the bounded drain cannot leave a
+	// live HTTP/2 transport behind. Test writers may only implement one of these
+	// methods, hence the defensive checks.
+	try {
+		request.close?.();
+	} catch {
+		// Teardown is best effort; the timeout remains the authoritative result.
+	}
+	try {
+		request.destroy?.();
+	} catch {
+		// Teardown is best effort; the timeout remains the authoritative result.
+	}
+}
+
+/** Wait until every frame accepted by a request has reached the HTTP/2 writer. */
+async function waitForCursorWrites(
+	request: http2.ClientHttp2Stream | null,
+	timeoutMs = CURSOR_WRITE_DRAIN_TIMEOUT_MS,
+	onTimeout?: (error: Error) => void,
+): Promise<void> {
+	if (!request) return;
+	const pending = pendingCursorWrites.get(request);
+	if (!pending) return;
+	const boundedTimeoutMs = Math.max(1, timeoutMs);
+	const deadline = Date.now() + boundedTimeoutMs;
+	let timeout: NodeJS.Timeout | undefined;
+	try {
+		while (pending.size > 0) {
+			const writesDone = Promise.all([...pending]);
+			// The timeout race may win while one or more writes later reject. Keep a
+			// rejection handler attached so late callback errors never become unhandled.
+			writesDone.catch(() => {});
+			const remainingMs = deadline - Date.now();
+			if (remainingMs <= 0) {
+				const error = new Error(`Cursor request write drain timed out after ${boundedTimeoutMs}ms`);
+				try {
+					onTimeout?.(error);
+				} catch {
+					// The transport teardown callback is best effort.
+				}
+				if (!onTimeout) closeStalledCursorRequest(request);
+				throw error;
+			}
+			const timeoutDeferred = Promise.withResolvers<never>();
+			timeoutDeferred.promise.catch(() => {});
+			timeout = setTimeout(() => {
+				const error = new Error(`Cursor request write drain timed out after ${boundedTimeoutMs}ms`);
+				// Reject first so teardown callbacks that synchronously complete or
+				// fail a write cannot replace the deterministic timeout outcome.
+				timeoutDeferred.reject(error);
+				try {
+					onTimeout?.(error);
+				} catch {
+					// The transport teardown callback is best effort.
+				}
+				if (!onTimeout) closeStalledCursorRequest(request);
+			}, remainingMs);
+			const timeoutPromise = timeoutDeferred.promise;
+			await Promise.race([writesDone, timeoutPromise]);
+			if (timeout) {
+				clearTimeout(timeout);
+				timeout = undefined;
+			}
+			const writeError = cursorWriteErrors.get(request);
+			if (writeError !== undefined) throw writeError;
+		}
+		const writeError = cursorWriteErrors.get(request);
+		if (writeError !== undefined) throw writeError;
+	} finally {
+		if (timeout) clearTimeout(timeout);
+		pendingCursorWrites.delete(request);
+		cursorWriteErrors.delete(request);
+	}
+}
+
+/** Exported for deterministic coverage of successful writer teardown ordering. */
+export function waitForCursorWritesForTest(request: http2.ClientHttp2Stream | null, timeoutMs?: number): Promise<void> {
+	return waitForCursorWrites(request, timeoutMs);
+}
+
+async function waitForCursorWriteDrain(
+	request: http2.ClientHttp2Stream,
+	timeoutMs = CURSOR_WRITE_DRAIN_TIMEOUT_MS,
+): Promise<void> {
+	if (isClosedCursorRequest(request)) throw new Error("Cursor request closed while waiting for write backpressure");
+	const settled = Promise.withResolvers<void>();
+	const onDrain = () => settled.resolve();
+	const onClose = () => settled.reject(new Error("Cursor request closed while waiting for write backpressure"));
+	const onError = (error: unknown) => settled.reject(error);
+	request.once("drain", onDrain);
+	request.once("close", onClose);
+	request.once("error", onError);
+	const timeout = setTimeout(
+		() => {
+			const error = new Error(`Cursor request write backpressure timed out after ${timeoutMs}ms`);
+			settled.reject(error);
+			closeStalledCursorRequest(request);
+		},
+		Math.max(1, timeoutMs),
+	);
+	try {
+		await settled.promise;
+	} finally {
+		clearTimeout(timeout);
+		request.removeListener("drain", onDrain);
+		request.removeListener("close", onClose);
+		request.removeListener("error", onError);
+	}
+}
+
+export function waitForCursorWriteDrainForTest(request: http2.ClientHttp2Stream, timeoutMs?: number): Promise<void> {
+	return waitForCursorWriteDrain(request, timeoutMs);
+}
+
+/**
+ * Late exec/stream handlers can finish after the bounded settlement fence has
+ * closed the HTTP/2 request. Treat those writes as dropped transport output;
+ * never let a synchronous write-after-end error escape into the process.
+ */
+function writeCursorFrame(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
+	if (isClosedCursorRequest(request)) return false;
+	let completed = false;
+	const completion = Promise.withResolvers<void>();
+	const pending = pendingCursorWrites.get(request) ?? new Set<Promise<void>>();
+	pendingCursorWrites.set(request, pending);
+	// The final request drain observes this rejection, but an asynchronous writer
+	// callback can run before that drain starts. Mark it handled immediately so a
+	// late transport error cannot surface as an unhandled rejection in the gap.
+	completion.promise.catch(() => {});
+	pending.add(completion.promise);
+	const finish = (error?: unknown) => {
+		if (completed) return;
+		completed = true;
+		pending.delete(completion.promise);
+		if (error != null && !cursorWriteErrors.has(request)) cursorWriteErrors.set(request, error);
+		if (typeof request.removeListener === "function") {
+			request.removeListener("close", onClose);
+			request.removeListener("error", finish);
+		}
+		if (error == null) completion.resolve();
+		else completion.reject(error);
+	};
+	const onClose = () => finish(new Error("Cursor request closed before write completed"));
+	try {
+		// The real HTTP/2 stream always exposes EventEmitter methods. Keep the
+		// test seam tolerant of a minimal writer stub as well.
+		if (typeof request.once === "function") {
+			request.once("close", onClose);
+			request.once("error", finish);
+		}
+		return request.write(frame, finish) !== false;
+	} catch (error) {
+		if (isClosedCursorRequest(request)) {
+			finish();
+			return false;
+		}
+		const code = (error as NodeJS.ErrnoException).code;
+		if (
+			code === "ERR_STREAM_WRITE_AFTER_END" ||
+			code === "ERR_HTTP2_INVALID_STREAM" ||
+			code === "ERR_HTTP2_STREAM_CLOSED"
+		) {
+			finish();
+			return false;
+		}
+		finish(error);
+		throw error;
+	}
+}
+
+/** Exported for deterministic coverage of the post-fence write race. */
+export function writeCursorFrameForTest(request: http2.ClientHttp2Stream, frame: Uint8Array): boolean {
+	return writeCursorFrame(request, frame);
+}
+
+interface CursorRequestWriter extends http2.ClientHttp2Stream {
+	isActive(): boolean;
+	registerShellGate(close: () => void): () => void;
+}
+
 function parseConnectEndStream(data: Uint8Array): Error | null {
 	try {
 		const payload = JSON.parse(new TextDecoder().decode(data));
-		const error = payload?.error;
+		if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+			return new Error("Invalid Connect end stream envelope");
+		}
+		if ("error" in payload && (!payload.error || typeof payload.error !== "object" || Array.isArray(payload.error))) {
+			return new Error("Invalid Connect end stream error envelope");
+		}
+		const error = payload.error as { code?: unknown; message?: unknown } | undefined;
 		if (error) {
-			const code = typeof error.code === "string" ? error.code : "unknown";
-			const message = typeof error.message === "string" ? error.message : "Unknown error";
+			const code =
+				typeof error.code === "string" ? error.code.slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH) : "unknown";
+			const message =
+				typeof error.message === "string"
+					? error.message.slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH)
+					: "Unknown error";
 			return new Error(`Connect error ${code}: ${message}`);
 		}
 		return null;
@@ -271,186 +869,13 @@ function parseConnectEndStream(data: Uint8Array): Error | null {
 	}
 }
 
-interface CursorRequestWriter {
-	enqueue(frame: Uint8Array): void;
-	isActive(): boolean;
-	registerShellGate(close: () => void): () => void;
-}
-
-class CursorRequestCoordinator implements CursorRequestWriter {
-	#state: "open" | "draining" | "failed" | "succeeded" = "open";
-	#tasks = new Set<Promise<void>>();
-	#taskChain = Promise.resolve();
-	#hasAdmittedTask = false;
-	#frames: Uint8Array[] = [];
-	#writing = false;
-	#drainWaiters: Array<() => void> = [];
-	#failure: Error | null = null;
-	#shellGates = new Set<() => void>();
-	#request: http2.ClientHttp2Stream;
-	#stopHeartbeat: () => void;
-	#onSuccess: () => void;
-	#onFailure: (error: Error) => void;
-	#drainTimer: NodeJS.Timeout | null = null;
-	#drainTimeoutMs: number | undefined;
-
-	constructor(
-		request: http2.ClientHttp2Stream,
-		stopHeartbeat: () => void,
-		onSuccess: () => void,
-		onFailure: (error: Error) => void,
-		drainTimeoutMs: number | undefined,
-	) {
-		this.#request = request;
-		this.#stopHeartbeat = stopHeartbeat;
-		this.#onSuccess = onSuccess;
-		this.#onFailure = onFailure;
-		this.#drainTimeoutMs = drainTimeoutMs;
-	}
-
-	isActive(): boolean {
-		return this.#state === "open" || this.#state === "draining";
-	}
-
-	canAdmitTask(): boolean {
-		return this.#state === "open";
-	}
-
-	hasTurnEnded(): boolean {
-		return this.#state === "draining" || this.#state === "succeeded";
-	}
-
-	failureError(): Error | null {
-		return this.#failure;
-	}
-
-	enqueue(frame: Uint8Array): void {
-		if (!this.isActive()) return;
-		this.#frames.push(Buffer.from(frame));
-		this.#writeNext();
-	}
-
-	registerShellGate(close: () => void): () => void {
-		if (!this.isActive()) {
-			close();
-			return () => {};
-		}
-		this.#shellGates.add(close);
-		return () => this.#shellGates.delete(close);
-	}
-
-	admit(taskFactory: () => Promise<void>): void {
-		if (!this.canAdmitTask()) return;
-		this.#admitOrdered(taskFactory, false);
-	}
-
-	admitCheckpoint(taskFactory: () => Promise<void>): Promise<void> {
-		if (this.#state === "failed") return Promise.reject(this.#failure ?? new Error("Cursor request failed"));
-		return this.#admitOrdered(taskFactory, true);
-	}
-
-	#admitOrdered(taskFactory: () => Promise<void>, allowAfterSuccess: boolean): Promise<void> {
-		const orderedTask = this.#hasAdmittedTask
-			? this.#taskChain.then(() => {
-					if (this.#state === "failed" || (!allowAfterSuccess && this.#state === "succeeded")) return;
-					return taskFactory();
-				})
-			: taskFactory();
-		this.#hasAdmittedTask = true;
-		this.#taskChain = orderedTask.then(
-			() => {},
-			error => {
-				this.fail(error instanceof Error ? error : new Error(String(error)));
-			},
-		);
-		this.#tasks.add(orderedTask);
-		void orderedTask.then(
-			() => this.#tasks.delete(orderedTask),
-			() => this.#tasks.delete(orderedTask),
-		);
-		return orderedTask;
-	}
-
-	turnEnded(): void {
-		if (this.#state !== "open") return;
-		this.#state = "draining";
-		this.#stopHeartbeat();
-		if (this.#drainTimeoutMs !== undefined && this.#drainTimeoutMs > 0) {
-			this.#drainTimer = setTimeout(() => {
-				this.fail(new Error(`Cursor admitted work drain timed out after ${this.#drainTimeoutMs}ms`));
-			}, this.#drainTimeoutMs);
-		}
-		void Promise.all([...this.#tasks]).then(
-			() => {
-				if (this.#state !== "draining") return;
-				this.#drain(() => {
-					if (this.#state !== "draining") return;
-					if (this.#drainTimer) {
-						clearTimeout(this.#drainTimer);
-						this.#drainTimer = null;
-					}
-					this.#state = "succeeded";
-					this.#onSuccess();
-				});
-			},
-			error => this.fail(error instanceof Error ? error : new Error(String(error))),
-		);
-	}
-
-	fail(error: Error): void {
-		if (this.#state === "failed" || this.#state === "succeeded") return;
-		this.#state = "failed";
-		this.#failure = error;
-		if (this.#drainTimer) {
-			clearTimeout(this.#drainTimer);
-			this.#drainTimer = null;
-		}
-		this.#stopHeartbeat();
-		for (const close of this.#shellGates) close();
-		this.#shellGates.clear();
-		this.#frames = [];
-		this.#writing = false;
-		this.#releaseDrains();
-		this.#request.close();
-		this.#onFailure(error);
-	}
-
-	#writeNext(): void {
-		if (this.#writing || !this.isActive()) return;
-		const frame = this.#frames.shift();
-		if (!frame) {
-			this.#releaseDrains();
-			return;
-		}
-		this.#writing = true;
-		try {
-			this.#request.write(frame, error => {
-				this.#writing = false;
-				if (error) {
-					this.fail(error);
-					return;
-				}
-				this.#writeNext();
-			});
-		} catch (error) {
-			this.#writing = false;
-			this.fail(error instanceof Error ? error : new Error(String(error)));
-		}
-	}
-
-	#drain(resolve: () => void): void {
-		if (!this.#writing && this.#frames.length === 0) {
-			resolve();
-			return;
-		}
-		this.#drainWaiters.push(resolve);
-	}
-
-	#releaseDrains(): void {
-		if (this.#writing || this.#frames.length > 0) return;
-		const waiters = this.#drainWaiters;
-		this.#drainWaiters = [];
-		for (const resolve of waiters) resolve();
+function decodeGrpcMessage(value: unknown): string {
+	const raw = typeof value === "string" ? value : value == null ? "" : String(value);
+	const boundedRaw = raw.slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH);
+	try {
+		return decodeURIComponent(boundedRaw).slice(0, CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH);
+	} catch {
+		return boundedRaw;
 	}
 }
 
@@ -628,12 +1053,35 @@ export function mapH2TransportError(error: unknown, baseUrl: string): unknown {
 	);
 }
 
+/** Whether a decoded server envelope carries a known semantic message. */
+function isMeaningfulCursorServerMessage(msg: AgentServerMessage): boolean {
+	switch (msg.message.case) {
+		case "interactionUpdate":
+			return msg.message.value.message.case !== undefined;
+		case "execServerMessage":
+			return msg.message.value.message.case !== undefined;
+		case "kvServerMessage":
+			return msg.message.value.message.case !== undefined;
+		case "conversationCheckpointUpdate":
+			return true;
+		default:
+			return false;
+	}
+}
+
 export const streamCursor: StreamFunction<"cursor-agent"> = (
 	model: Model<"cursor-agent">,
 	context: Context,
 	options?: CursorOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	// Cursor owns this watchdog, so the budget begins at streamCursor()
+	// invocation—before system-prompt normalization/rule protobuf construction
+	// as well as history/blob/request serialization.
+	const firstEventStartedAt = Date.now();
+	const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+	const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+	const endpointClass = (model.baseUrl || CURSOR_API_URL) === CURSOR_API_URL ? "canonical" : "custom";
 	const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
 	(async () => {
@@ -660,58 +1108,377 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
-		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
+		const shellGates = new Set<() => void>();
+		let proxiedSocket: tls.TLSSocket | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
-		let onAbort: (() => void) | undefined;
-		let coordinator: CursorRequestCoordinator = undefined!;
+		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
+		let h2ClientCloseHandler: (() => void) | undefined;
+		let h2RequestErrorHandler: ((error: Error) => void) | undefined;
+		let h2RequestCloseHandler: (() => void) | undefined;
+		let h2RequestAbortedHandler: (() => void) | undefined;
+		let gracefulCloseCheckTimer: NodeJS.Timeout | undefined;
+		let completedSuccessfully = false;
 		const baseUrl = model.baseUrl || CURSOR_API_URL;
-		let activeConversationId: string | undefined;
-		let previousConversationState: ConversationStateStructure | undefined;
-		let previousUsageContext: CursorUsageContext | undefined;
+		const h2Completion = Promise.withResolvers<void>();
+		h2Completion.promise.catch(() => {});
+		let h2Settled = false;
+		let h2Failure: unknown;
+		let sawTurnEnded = false;
+		let terminalAdmissionMode: "open" | "raw-eof" | "closed" = "open";
+		let responseEnded = false;
+		let queueDrained = false;
+		let postTurnEndedCheckpointTimer: NodeJS.Timeout | undefined;
+		let endStreamError: Error | null = null;
+		const pendingBuffer = new CursorPendingBuffer();
+		let bufferedObservationOffset = 0;
+		let bufferedObservationTurnEnded = false;
+		const closeTerminalAdmission = (pauseRequest = true): void => {
+			terminalAdmissionMode = "closed";
+			transportWatchdogClosed = true;
+			if (transportWatchdog) {
+				clearTimeout(transportWatchdog);
+				transportWatchdog = null;
+			}
+			if (pauseRequest) h2Request?.pause();
+		};
+		const sealExecAdmissionAtRawEof = (): void => {
+			if (terminalAdmissionMode !== "open") return;
+			terminalAdmissionMode = "raw-eof";
+		};
+		const settleH2 = (error?: unknown): void => {
+			if (h2Settled) return;
+			h2Settled = true;
+			if (error !== undefined) {
+				h2Failure = mapH2TransportError(error, baseUrl);
+				h2Completion.reject(h2Failure);
+			} else {
+				h2Completion.resolve();
+			}
+		};
+		const settleH2WhenReady = (): void => {
+			if (terminalDrainMode) return;
+			if (!queueDrained) return;
+			if (endStreamError) {
+				settleBehindFence(() => settleH2(endStreamError));
+			} else if (sawTurnEnded && responseEnded) {
+				// A drained turnEnded is the successful terminal condition; Cursor
+				// may leave the HTTP/2 response open after sending it.
+				settleBehindFence(() => settleH2());
+			} else if (sawTurnEnded && !postTurnEndedCheckpointTimer) {
+				// Cursor may send a final conversation checkpoint immediately after
+				// turnEnded without an END_STREAM frame. Give that non-executable
+				// message a bounded grace window before publishing the terminal.
+				postTurnEndedCheckpointTimer = setTimeout(() => {
+					postTurnEndedCheckpointTimer = undefined;
+					const request = h2Request;
+					if (!request || isClosedCursorRequest(request)) {
+						settleBehindFence(() => settleH2());
+						return;
+					}
+					settleBehindFence(() => {
+						localTransportCloseRequested = true;
+						closeStalledCursorRequest(request);
+						settleH2();
+					});
+				}, 25);
+			} else if (responseEnded) {
+				settleBehindFence(() => settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded")));
+			}
+		};
+		let transportWatchdog: NodeJS.Timeout | null = null;
+		let transportWatchdogClosed = false;
+		let callerAbortError: Error | undefined;
+		let pendingNonAbortableExec: CursorNonAbortableSettlement | undefined;
+		let localTransportCloseRequested = false;
+		let transportTerminalized = false;
+		let terminalDrainMode = false;
+		let terminalDrain: (() => void) | undefined;
+		let terminalDrainStarted = false;
+		let execQueuePrefix: Promise<void> | undefined;
+		let terminalPendingError: unknown;
+		let terminalBoundarySeen = false;
+		// Lookahead can validate turnEnded while an exec handler holds the normal
+		// parser. Close new exec admission immediately, but leave the validated
+		// prefix available for ordered processing once that handler settles.
+		let terminalBoundaryObserved = false;
+		// When lookahead observes turnEnded in a coalesced buffer, retain its byte
+		// offset so processPendingBuffer can drain the validated prefix without
+		// admitting executable frames from the tail after that boundary.
+		let bufferedTerminalBoundaryOffset: number | undefined;
+		let processPendingBuffer: (() => void) | undefined;
+		let activeExecAbort: ((reason?: Error) => void) | undefined;
+		const closeTransportLocally = (): void => {
+			localTransportCloseRequested = true;
+			h2Request?.close();
+			h2Client?.close();
+			proxiedSocket?.destroy();
+		};
+		const forceCloseTransport = (): void => {
+			closeTransportLocally();
+			try {
+				h2Request?.destroy();
+			} catch {
+				// Teardown is best effort; the write-drain timeout remains authoritative.
+			}
+			try {
+				h2Client?.destroy();
+			} catch {
+				// Teardown is best effort; the write-drain timeout remains authoritative.
+			}
+			proxiedSocket?.destroy();
+		};
+		// Terminal publication (caller abort, transport error, or stream end)
+		// must wait for any started non-abortable mutation to settle: a network
+		// reset mid-exec otherwise publishes the terminal and lets a retry start
+		// while the filesystem mutation is still running. Non-abortable means the
+		// mutation promise itself is the terminal boundary; publishing earlier
+		// would permit a post-terminal filesystem commit.
+		const settleBehindFence = (publish: () => void): void => {
+			if (pendingNonAbortableExec) {
+				void pendingNonAbortableExec.settled.then(publish);
+				return;
+			}
+			publish();
+		};
+		const terminalize = (error: unknown, mode: "hard" | "drainable" = "hard"): void => {
+			if (transportTerminalized) {
+				if (callerAbortError) {
+					terminalPendingError = callerAbortError;
+					terminalDrainMode = false;
+					settleBehindFence(() => settleH2(callerAbortError));
+				}
+				return;
+			}
+			transportTerminalized = true;
+			terminalDrainMode = mode === "drainable" && !callerAbortError;
+			if (callerAbortError) terminalPendingError = callerAbortError;
+			else if (terminalPendingError === undefined) terminalPendingError = error;
+			for (const close of shellGates) close();
+			shellGates.clear();
+			activeExecAbort?.(error instanceof Error ? error : new Error(String(error)));
+			activeExecAbort = undefined;
+			closeTerminalAdmission();
+			closeTransportLocally();
+			if (terminalDrainMode) {
+				processPendingBuffer?.();
+				terminalDrain?.();
+			} else {
+				settleBehindFence(() => settleH2(error));
+			}
+		};
+		const closeForCallerAbort = () => {
+			terminalize(callerAbortError!);
+		};
+		const onCallerAbort = () => {
+			const signal = options?.signal;
+			if (!signal) return;
+			if (callerAbortError) return;
+			callerAbortError = cursorAbortError(signal);
+			closeForCallerAbort();
+		};
+		// Abort fence: install the listener before any setup work so a caller that
+		// aborts during payload construction or a proxy handshake can never lose the
+		// race against request creation and credential transmission.
+		if (options?.signal) {
+			// Adding an abort listener to an ALREADY-aborted signal never fires
+			// (and the watchdog-owning provider disabled the wrapper's immediate
+			// aborted check), so onCallerAbort is invoked directly: the cancelled
+			// request must terminate promptly instead of opening an HTTP/2 stream
+			// and lingering until the first-event timeout. The in-try aborted
+			// check converts this into the stream's aborted terminal.
+			if (options.signal.aborted) onCallerAbort();
+			options.signal.addEventListener("abort", onCallerAbort, { once: true });
+		}
+		const usageState: UsageState = {
+			sawTokenDelta: false,
+			conversationUsedTokens: 0,
+			checkpointOutputTokens: 0,
+			hasConversationCheckpoint: false,
+		};
 
 		try {
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error("Cursor API key (access token) is required");
 			}
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+			// Cursor owns the first-event watchdog, so its budget starts before
+			// history/blob/protobuf serialization. Synchronous setup cannot be
+			// interrupted by a timer; the remaining-budget check below prevents a
+			// credential-bearing request after serialization already exhausted it.
+			let requestByteLength = 0;
+			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
+				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
+					requestBytes: requestByteLength,
+					firstEventElapsedMs: Date.now() - firstEventStartedAt,
+					firstEventTimeoutMs,
+					endpointClass,
+				});
+			const getRemainingFirstEventTimeoutMs = (): number | undefined =>
+				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
+					? firstEventTimeoutMs
+					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
+			const assertFirstEventBudget = (): number | undefined => {
+				const remaining = getRemainingFirstEventTimeoutMs();
+				if (
+					remaining !== undefined &&
+					firstEventTimeoutMs !== undefined &&
+					firstEventTimeoutMs > 0 &&
+					remaining <= 0
+				) {
+					throw createFirstEventTimeoutError();
+				}
+				return remaining;
+			};
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
-			activeConversationId = conversationId;
-			const cachedBlobStore = conversationBlobStores.get(conversationId);
-			const blobStore = new Map(cachedBlobStore);
-			const cachedState = conversationStateCache.get(conversationId);
-			previousConversationState = cachedState;
-			const usageContext = buildCursorUsageContext(context, model, options);
-			previousUsageContext = conversationUsageContextCache.get(conversationId);
-			conversationUsageContextCache.set(conversationId, usageContext);
-			const reusableCachedState =
-				cachedState && canReuseCursorUsageContext(previousUsageContext, usageContext) ? cachedState : undefined;
-			const { requestBytes, conversationState } = await buildGrpcRequest(model, context, options, {
+			const previousCacheEntry = conversationCache.get(conversationId);
+			const conversationContext = buildCursorConversationContext(context, model, options, baseUrl, apiKey);
+			const reusableCacheEntry =
+				options?.onPayload === undefined &&
+				previousCacheEntry &&
+				canReuseCursorConversationContext(previousCacheEntry.context, conversationContext)
+					? previousCacheEntry
+					: undefined;
+			// Request construction writes history and attachment blobs. Work against a
+			// private snapshot so aborts, hook failures, and transport failures cannot
+			// publish partial state or leak blobs into a later request reusing the ID.
+			const blobStore = new Map(reusableCacheEntry?.blobs);
+			const cachedState = reusableCacheEntry?.state;
+			usageState.conversationUsedTokens = cachedState?.tokenDetails?.usedTokens ?? 0;
+			const setupPromise = buildGrpcRequest(model, context, options, {
 				conversationId,
 				blobStore,
-				conversationState: reusableCachedState,
+				conversationState: cachedState,
 			});
-			conversationStateCache.set(conversationId, conversationState);
+			const { requestBytes, conversationState } = await waitForCursorSetup(
+				setupPromise,
+				options?.signal,
+				assertFirstEventBudget(),
+				createFirstEventTimeoutError,
+			);
+			requestByteLength = requestBytes.length;
+			let remainingFirstEventTimeoutMs = assertFirstEventBudget();
+			// A capped non-abortable mutation remains the conversation's admission
+			// lock until its actual handler settles. Wait before opening another
+			// authenticated transport request.
+			await waitForCursorMutationLock(
+				conversationId,
+				options?.signal,
+				remainingFirstEventTimeoutMs,
+				createFirstEventTimeoutError,
+			);
+			remainingFirstEventTimeoutMs = assertFirstEventBudget();
+			// Recheck immediately before any network work: the caller may have
+			// aborted while the payload was being constructed.
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
 			const targetUrl = new URL(baseUrl);
 			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
+			remainingFirstEventTimeoutMs = assertFirstEventBudget();
+
+			// Cursor owns the first-event watchdog, so its budget starts before
+			// history/blob/protobuf serialization. Synchronous setup cannot be
+			// interrupted by a timer; the remaining-budget check below prevents a
+			// credential-bearing request after serialization already exhausted it.
+			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const clearTransportWatchdog = () => {
+				if (transportWatchdog) {
+					clearTimeout(transportWatchdog);
+					transportWatchdog = null;
+				}
+			};
+			const armTransportWatchdog = (timeoutMs: number | undefined, errorFactory: () => Error) => {
+				if (transportWatchdogClosed) return;
+				clearTransportWatchdog();
+				if (timeoutMs === undefined || timeoutMs <= 0) return;
+				transportWatchdog = setTimeout(() => {
+					if (transportWatchdogClosed) return;
+					const error = errorFactory();
+					terminalize(error);
+				}, timeoutMs);
+			};
+			const refreshTransportWatchdog = () => {
+				if (terminalAdmissionMode !== "open") return;
+				// An in-flight exec handler legitimately produces no inbound frames
+				// while it runs: a heartbeat/checkpoint arriving after it started
+				// must not re-arm the watchdog the exec path cleared, or a slow
+				// local tool call would terminalize the stream mid-exec.
+				if (execInFlight) return;
+				armTransportWatchdog(idleTimeoutMs, () => new Error("stream stalled while waiting for the next event"));
+			};
+			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
 			if (proxyUrl) {
-				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
+				// The watchdog settles the h2 promise but cannot interrupt the
+				// handshake await below: race the tunnel connect against the same
+				// first-event deadline so setup is actually bounded, and destroy the
+				// socket if it materializes after the deadline already fired.
+				const tunnel = connectProxiedSocket(proxyUrl, baseUrl, {
 					signal: options?.signal,
 					timeoutMs: 30_000,
 				});
+				let tunnelDeadline: NodeJS.Timeout | undefined;
+				const deadline = Promise.withResolvers<never>();
+				const boundedTunnel =
+					remainingFirstEventTimeoutMs !== undefined && remainingFirstEventTimeoutMs > 0
+						? Promise.race([
+								tunnel,
+								deadline.promise.catch(error => {
+									throw error;
+								}),
+							])
+						: null;
+				if (boundedTunnel) {
+					// The rejection may never be observed when the tunnel wins the
+					// race; keep it handled so it cannot surface as unhandled.
+					deadline.promise.catch(() => {});
+					tunnelDeadline = setTimeout(
+						() => deadline.reject(createFirstEventTimeoutError()),
+						remainingFirstEventTimeoutMs,
+					);
+				}
+				try {
+					proxiedSocket = await (boundedTunnel ?? tunnel);
+				} catch (error) {
+					// If the real tunnel still completes after the deadline won the
+					// race, it must not leak: destroy it as soon as it lands.
+					void tunnel.then(
+						socket => socket.destroy(),
+						() => {},
+					);
+					throw error;
+				} finally {
+					if (tunnelDeadline) clearTimeout(tunnelDeadline);
+				}
+				// The handshake may have outlived the first-event watchdog: never
+				// create the authenticated request once the stream already failed.
+				if (h2Settled) {
+					proxiedSocket.destroy();
+					await h2Completion.promise;
+				}
+				assertFirstEventBudget();
 				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
 			} else {
 				h2Client = http2.connect(baseUrl);
 			}
+			if (h2Settled) await h2Completion.promise;
+			assertFirstEventBudget();
+			// Recheck after the (possibly async) proxy handshake, immediately before
+			// the bearer-authenticated request is created.
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+			h2ClientErrorHandler = error => {
+				if (terminalBoundarySeen || terminalBoundaryObserved || sawTurnEnded) return;
+				terminalize(error, "drainable");
+			};
+			h2Client.on("error", h2ClientErrorHandler);
+			h2ClientCloseHandler = () => {
+				if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+				terminalize(new Error("Cursor HTTP/2 session closed before turnEnded"), "drainable");
+			};
+			h2Client.on("close", h2ClientCloseHandler);
 
 			options?.onStreamCreated?.();
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
 			h2Request = h2Client.request({
 				":method": "POST",
 				":path": "/agent.v1.AgentService/Run",
@@ -724,78 +1491,77 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
-			const stopHeartbeat = () => {
-				if (heartbeatTimer) {
-					clearInterval(heartbeatTimer);
-					heartbeatTimer = null;
+			const writer = h2Request as CursorRequestWriter;
+			writer.isActive = () => !h2Settled && !transportTerminalized && !isClosedCursorRequest(writer);
+			writer.registerShellGate = close => {
+				if (!writer.isActive()) {
+					close();
+					return () => {};
 				}
+				shellGates.add(close);
+				return () => shellGates.delete(close);
 			};
-			let resolveH2: (() => void) | undefined;
-			let rejectH2: ((error: Error) => void) | undefined;
-			const inboundEnd = Promise.withResolvers<void>();
-			let inboundSettled = false;
-			let inboundTimeout: NodeJS.Timeout | undefined;
-			const settleInbound = (error?: Error) => {
-				if (inboundSettled) return;
-				inboundSettled = true;
-				if (inboundTimeout) {
-					clearTimeout(inboundTimeout);
-					inboundTimeout = undefined;
+			h2RequestErrorHandler = error => {
+				if (terminalBoundarySeen || terminalBoundaryObserved || sawTurnEnded) return;
+				terminalize(error, "drainable");
+			};
+			h2Request.on("error", h2RequestErrorHandler);
+			const handleUnexpectedRequestClose = (kind: "closed" | "aborted"): void => {
+				if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+				// Node emits `aborted`/`close` with rstCode=0 for a graceful remote
+				// end while a request stream is paused. Preserve the raw-EOF path so
+				// buffered turnEnded frames can still be parsed. A nonzero reset code
+				// is a terminal transport failure: close admission and abort the active
+				// exec before any queued frame can dispatch.
+				if ((h2Request?.rstCode ?? 0) === 0) {
+					// A graceful close can be reported before the final data/end event;
+					// defer one turn so a coalesced turnEnded can establish success. If
+					// no frame arrives, treat a close with no buffered work as terminal
+					// and abort any active exec rather than waiting for the watchdog.
+					if (gracefulCloseCheckTimer) return;
+					gracefulCloseCheckTimer = setTimeout(() => {
+						gracefulCloseCheckTimer = undefined;
+						if (h2Settled || localTransportCloseRequested || responseEnded || sawTurnEnded) return;
+						const error = new Error("Cursor stream ended before turnEnded");
+						if (pendingBuffer.length === 0 && !processingPausedForQueue) {
+							responseEnded = true;
+							terminalize(error, "drainable");
+							return;
+						}
+						responseEnded = true;
+						observeBufferedTerminal(true);
+						if (transportTerminalized) return;
+						if (!sawTurnEnded) {
+							terminalize(
+								pendingBuffer.length > 0 ? new Error("Cursor HTTP/2 stream ended before turnEnded") : error,
+								"drainable",
+							);
+							return;
+						}
+						sealExecAdmissionAtRawEof();
+						processPendingBuffer?.();
+						finishResponseAfterParsing();
+					}, 0);
+					return;
 				}
-				if (error) inboundEnd.reject(error);
-				else inboundEnd.resolve();
+				responseEnded = true;
+				terminalize(new Error(`Cursor HTTP/2 request ${kind} before turnEnded`), "drainable");
 			};
-			void inboundEnd.promise.catch(() => {});
-			const armInboundTimeout = () => {
-				const timeoutMs = options?.streamIdleTimeoutMs ?? 0;
-				if (timeoutMs <= 0 || inboundSettled) return;
-				inboundTimeout = setTimeout(
-					() => settleInbound(new Error("Cursor stream did not reach its inbound terminal frame")),
-					timeoutMs,
-				);
-			};
-			coordinator = new CursorRequestCoordinator(
-				h2Request,
-				stopHeartbeat,
-				() => {
-					const resolve = resolveH2;
-					resolveH2 = undefined;
-					resolve?.();
-				},
-				error => {
-					const reject = rejectH2;
-					rejectH2 = undefined;
-					reject?.(error);
-				},
-				options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs(),
-			);
-			h2Client.on("error", error => {
-				settleInbound(error);
-				coordinator.fail(error);
-			});
-			h2Request.on("error", error => {
-				settleInbound(error);
-				coordinator.fail(error);
-			});
-
+			h2RequestCloseHandler = () => handleUnexpectedRequestClose("closed");
+			h2RequestAbortedHandler = () => handleUnexpectedRequestClose("aborted");
+			h2Request.on("close", h2RequestCloseHandler);
+			h2Request.on("aborted", h2RequestAbortedHandler);
+			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+			// Cursor owns the first-event watchdog, so its budget starts before
+			// history/blob/protobuf serialization. Synchronous setup cannot be
+			// interrupted by a timer; the remaining-budget check below prevents a
+			// credential-bearing request after serialization already exhausted it.
 			stream.push({ type: "start", partial: output });
 
-			let pendingBuffer = Buffer.alloc(0);
-			const checkpointTasks: Promise<void>[] = [];
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
-			const cachedConversationUsedTokens =
-				conversationState.tokenDetails && canReuseCursorUsageContext(previousUsageContext, usageContext)
-					? conversationState.tokenDetails.usedTokens
-					: 0;
-			const usageState: UsageState = {
-				sawTokenDelta: false,
-				conversationUsedTokens: cachedConversationUsedTokens,
-				checkpointOutputTokens: 0,
-				hasConversationCheckpoint: false,
-			};
-
+			let pendingConversationCheckpoint: ConversationStateStructure | undefined;
 			const state: BlockState = {
 				get currentTextBlock() {
 					return currentTextBlock;
@@ -824,133 +1590,572 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			const onConversationCheckpoint = (checkpoint: ConversationStateStructure) => {
-				usageState.pendingCheckpoint = checkpoint;
+				pendingConversationCheckpoint = checkpoint;
 			};
 
+			const messageQueue = createCursorMessageQueueForTest(error => {
+				log("error", "handleServerMessage", { error: String(error) });
+				terminalize(error);
+			});
+			terminalDrain = (): void => {
+				if (terminalDrainStarted) return;
+				terminalDrainStarted = true;
+				// A transport terminal can preempt an abortable exec whose handler ignores
+				// its signal. Do not wait on that queue chain; the bounded settlement fence
+				// below still protects any mutation that explicitly became non-abortable.
+				const queueCompletion =
+					processingPausedForExec || execInFlight ? (execQueuePrefix ?? Promise.resolve()) : messageQueue.drain();
+				void queueCompletion.then(
+					() => {
+						queueDrained = true;
+						settleBehindFence(() => settleH2(terminalPendingError));
+					},
+					error => {
+						queueDrained = true;
+						settleBehindFence(() => settleH2(error));
+					},
+				);
+			};
+			const drainMessageQueue = (): void => {
+				void messageQueue.drain().then(
+					() => {
+						queueDrained = true;
+						settleH2WhenReady();
+					},
+					error => {
+						queueDrained = true;
+						settleBehindFence(() => settleH2(error));
+					},
+				);
+			};
 			h2Request.on("trailers", trailers => {
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
-					coordinator.fail(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+					terminalize(new Error(`gRPC error ${status}: ${decodeGrpcMessage(msg)}`), "drainable");
 				}
 			});
-			h2Request.on("end", () => {
-				settleInbound();
-				if (!coordinator.hasTurnEnded()) {
-					coordinator.fail(new Error("Cursor stream ended before turnEnded"));
-				}
-			});
-			h2Request.on("close", () => {
-				const error = new Error("Cursor stream closed before inbound completion");
-				if (!inboundSettled) settleInbound(error);
-				coordinator.fail(error);
-			});
-			onAbort = () => {
-				settleInbound(new Error("Request was aborted"));
-				coordinator.fail(new Error("Request was aborted"));
-			};
-			if (options?.signal) {
-				options.signal.addEventListener("abort", onAbort, { once: true });
-				if (options.signal.aborted) onAbort();
-			}
 
-			h2Request.on("data", (chunk: Buffer) => {
-				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
-
-				while (pendingBuffer.length >= 5) {
-					const flags = pendingBuffer[0];
-					const msgLen = pendingBuffer.readUInt32BE(1);
-					if (pendingBuffer.length < 5 + msgLen) break;
-
-					const messageBytes = pendingBuffer.subarray(5, 5 + msgLen);
-					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
-
+			let processingPausedForExec = false;
+			let processingPausedForQueue = false;
+			// True while any exec server message handler is running; suppresses
+			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
+			let execInFlight = false;
+			/**
+			 * Inspect buffered protocol frames while normal parsing is paused behind an
+			 * exec. This deliberately shares the Connect/protobuf framing rules with the
+			 * main parser: a complete terminal frame can preempt a held handler, while
+			 * malformed, oversized, or EOF-truncated bytes fail immediately instead of
+			 * remaining in an unbounded side buffer.
+			 */
+			const observeBufferedTerminal = (atEof = false): boolean => {
+				// Once a validated terminal boundary is known, every later byte is a
+				// tail. Never inspect its framing: a malformed or oversized tail must
+				// not replace the already-authoritative success.
+				if (terminalBoundarySeen || terminalBoundaryObserved) return true;
+				let offset = bufferedObservationOffset;
+				let observedTurnEnded = sawTurnEnded || bufferedObservationTurnEnded;
+				while (pendingBuffer.length - offset >= 5) {
+					const flags = pendingBuffer.byteAt(offset);
+					const msgLen = pendingBuffer.readUInt32BE(offset + 1);
+					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
+						const error = new Error("Cursor HTTP/2 frame exceeds the maximum message length");
+						endStreamError = error;
+						responseEnded = true;
+						terminalize(error);
+						return true;
+					}
+					if (pendingBuffer.length - offset < 5 + msgLen) break;
+					const messageBytes = pendingBuffer.subarray(offset + 5, msgLen);
 					if (flags & CONNECT_END_STREAM_FLAG) {
-						const endError = parseConnectEndStream(messageBytes);
-						if (endError) {
-							coordinator.fail(endError);
-						} else {
-							coordinator.turnEnded();
+						const error = parseConnectEndStream(messageBytes);
+						if (error) {
+							endStreamError = error;
+							responseEnded = true;
+							terminalize(error, "drainable");
+							return true;
+						}
+						if (!observedTurnEnded) {
+							const missingTurnEnded = new Error("Cursor HTTP/2 stream ended before turnEnded");
+							endStreamError = missingTurnEnded;
+							responseEnded = true;
+							terminalize(missingTurnEnded, "drainable");
+							return true;
+						}
+						terminalBoundarySeen = true;
+						closeTerminalAdmission();
+						bufferedObservationOffset = offset + 5 + msgLen;
+						bufferedObservationTurnEnded = observedTurnEnded;
+						drainMessageQueue();
+						return true;
+					}
+					try {
+						const message = fromBinary(AgentServerMessageSchema, messageBytes);
+						if (
+							message.message.case === "interactionUpdate" &&
+							message.message.value.message?.case === "turnEnded"
+						) {
+							observedTurnEnded = true;
+							sawTurnEnded = true;
+							terminalBoundaryObserved = true;
+							bufferedTerminalBoundaryOffset = offset;
+							closeTerminalAdmission();
+							bufferedObservationOffset = offset + 5 + msgLen;
+							bufferedObservationTurnEnded = true;
+							return true;
+						}
+					} catch (error) {
+						const parseError = error instanceof Error ? error : new Error(String(error));
+						endStreamError = parseError;
+						responseEnded = true;
+						terminalize(parseError);
+						return true;
+					}
+					offset += 5 + msgLen;
+				}
+				bufferedObservationOffset = offset;
+				bufferedObservationTurnEnded = observedTurnEnded;
+				if (atEof && pendingBuffer.length > offset) {
+					const error = new Error("Cursor HTTP/2 stream ended with a truncated Connect frame");
+					endStreamError = error;
+					terminalize(error);
+					return true;
+				}
+				return false;
+			};
+			const applyBufferedNonExecMessage = (serverMessage: AgentServerMessage): void => {
+				log("serverMessage", serverMessage.message.case, serverMessage.message.value);
+				switch (serverMessage.message.case) {
+					case "interactionUpdate":
+						processInteractionUpdate(serverMessage.message.value, output, stream, state, usageState);
+						return;
+					case "kvServerMessage":
+						handleKvServerMessage(serverMessage.message.value as KvServerMessage, blobStore, writer);
+						return;
+					case "conversationCheckpointUpdate":
+						handleConversationCheckpointUpdate(
+							serverMessage.message.value,
+							output,
+							usageState,
+							onConversationCheckpoint,
+						);
+						return;
+					default:
+						return;
+				}
+			};
+			const finishResponseAfterParsing = (): void => {
+				if (!responseEnded || processingPausedForExec || processingPausedForQueue) return;
+				if (terminalBoundarySeen) {
+					// A validated turnEnded makes every remaining byte transport tail,
+					// including an incomplete 1–4 byte frame header. Never turn tail
+					// noise into a truncated-stream failure after the authoritative boundary.
+					pendingBuffer.clear();
+				} else if (pendingBuffer.length > 0) {
+					endStreamError = new Error("Cursor HTTP/2 stream ended with a truncated Connect frame");
+				}
+				drainMessageQueue();
+			};
+			processPendingBuffer = () => {
+				if ((processingPausedForExec || processingPausedForQueue) && !terminalDrainMode) {
+					observeBufferedTerminal(responseEnded);
+					return;
+				}
+				while (pendingBuffer.length >= 5) {
+					if (terminalBoundarySeen) {
+						const flags = pendingBuffer.byteAt(0);
+						const msgLen = pendingBuffer.readUInt32BE(1);
+						if (pendingBuffer.length < 5 + msgLen) {
+							if (responseEnded) pendingBuffer.clear();
+							break;
+						}
+						const messageBytes = pendingBuffer.subarray(5, msgLen);
+						pendingBuffer.consume(5 + msgLen);
+						if (flags & CONNECT_END_STREAM_FLAG) {
+							responseEnded = true;
+							const endError = parseConnectEndStream(messageBytes);
+							if (endError) {
+								endStreamError = endError;
+								terminalize(endError, "drainable");
+							}
+							pendingBuffer.clear();
+							continue;
+						}
+						try {
+							const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+							if (serverMessage.message.case === "conversationCheckpointUpdate") {
+								if (messageQueue.pendingBytes() + 5 + msgLen > CURSOR_MAX_QUEUED_SERVER_BYTES) {
+									terminalize(new Error("Cursor server-message queue exceeded its bounded byte capacity"));
+									break;
+								}
+								queueDrained = false;
+								const queuedCheckpoint = messageQueue.enqueue(
+									() => applyBufferedNonExecMessage(serverMessage),
+									5 + msgLen,
+								);
+								void queuedCheckpoint.catch(() => {});
+								drainMessageQueue();
+							}
+						} catch {
+							// A validated terminal boundary makes all non-checkpoint bytes tail.
 						}
 						continue;
+					}
+					const flags = pendingBuffer.byteAt(0);
+					const msgLen = pendingBuffer.readUInt32BE(1);
+					if (msgLen > CURSOR_MAX_GRPC_MESSAGE_LENGTH) {
+						terminalize(new Error("Cursor HTTP/2 frame exceeds the maximum message length"));
+						break;
+					}
+					if (pendingBuffer.length < 5 + msgLen) break;
+
+					// Lookahead may have found turnEnded later in this same buffer while
+					// an earlier exec was held. Track the boundary as frames are consumed;
+					// once it is reached, normal parsing handles turnEnded and then drops
+					// the entire tail. This keeps late execs from setting the exec pause.
+					const atBufferedTerminalBoundary = terminalBoundaryObserved && bufferedTerminalBoundaryOffset === 0;
+					const consumedFrameLength = 5 + msgLen;
+					const messageBytes = pendingBuffer.subarray(5, msgLen);
+					pendingBuffer.consume(consumedFrameLength);
+					if (bufferedTerminalBoundaryOffset !== undefined) {
+						bufferedTerminalBoundaryOffset = Math.max(0, bufferedTerminalBoundaryOffset - consumedFrameLength);
+					}
+					bufferedObservationOffset = 0;
+					bufferedObservationTurnEnded = false;
+					if (
+						terminalAdmissionMode === "closed" &&
+						!(flags & CONNECT_END_STREAM_FLAG) &&
+						!terminalDrainMode &&
+						!terminalBoundaryObserved
+					)
+						continue;
+
+					if (flags & CONNECT_END_STREAM_FLAG) {
+						closeTerminalAdmission();
+						responseEnded = true;
+						terminalBoundaryObserved = false;
+						const parsedEndError = parseConnectEndStream(messageBytes);
+						const endError =
+							parsedEndError ??
+							(!sawTurnEnded ? new Error("Cursor HTTP/2 stream ended before turnEnded") : undefined);
+						if (endError) {
+							endStreamError = endError;
+							terminalize(endError, "drainable");
+						} else {
+							terminalBoundarySeen = true;
+						}
+						pendingBuffer.clear();
+						break;
+					}
+					if (messageQueue.pendingBytes() + consumedFrameLength > CURSOR_MAX_QUEUED_SERVER_BYTES) {
+						terminalize(new Error("Cursor server-message queue exceeded its bounded byte capacity"));
+						break;
 					}
 
 					try {
 						const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
+						// Cursor can make meaningful progress (heartbeats, usage deltas,
+						// checkpoints, and server-side exec) without emitting a normalized
+						// assistant event. Watch the validated Connect/protobuf boundary rather
+						// than the normalized stream so those turns do not false-stall.
+						const isMeaningful = isMeaningfulCursorServerMessage(serverMessage);
+						if (isMeaningful) refreshTransportWatchdog();
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
 						const isConversationCheckpoint = serverMessage.message.case === "conversationCheckpointUpdate";
-						if (isConversationCheckpoint) {
-							checkpointTasks.push(
-								coordinator.admitCheckpoint(() => {
-									handleConversationCheckpointUpdate(
-										serverMessage.message.value as ConversationStateStructure,
-										output,
-										usageState,
-										onConversationCheckpoint,
-									);
-									return Promise.resolve();
-								}),
-							);
+						if (isTurnEnded) {
+							// Record the boundary at parse time, before the queued handler runs,
+							// so a following coalesced END_STREAM cannot race ahead of the
+							// already-admitted prefix and report a false missing-turn failure.
+							sawTurnEnded = true;
+							terminalBoundarySeen = true;
+							terminalBoundaryObserved = false;
+							closeTerminalAdmission(false);
+							if (!processingPausedForExec && !processingPausedForQueue) h2Request?.resume();
+						}
+						if (isConversationCheckpoint && terminalBoundarySeen) {
+							applyBufferedNonExecMessage(serverMessage);
 							continue;
 						}
+						if (atBufferedTerminalBoundary && !isTurnEnded) continue;
 						// Serialize handlers: exec messages can be asynchronous, and resolving the
 						// request on turnEnded before prior handlers finish loses their responses.
-						if (!coordinator.canAdmitTask()) continue;
-						coordinator.admit(() =>
-							handleServerMessage(
-								serverMessage,
-								output,
-								stream,
-								state,
-								blobStore,
-								coordinator,
-								options?.execHandlers,
-								options?.onToolResult,
-								usageState,
-								requestContextTools,
-								onConversationCheckpoint,
-								requestContextRules,
-							),
-						);
-
+						const isExecServerMessage = serverMessage.message.case === "execServerMessage";
+						if (terminalAdmissionMode === "raw-eof" && isExecServerMessage && !sawTurnEnded) continue;
+						if (terminalDrainMode) {
+							if (terminalBoundarySeen || isExecServerMessage) continue;
+							if (isTurnEnded) {
+								sawTurnEnded = true;
+								terminalBoundarySeen = true;
+								closeTerminalAdmission();
+								continue;
+							}
+							applyBufferedNonExecMessage(serverMessage);
+							continue;
+						}
+						const isExecutable = isExecServerMessage && isMeaningful;
+						if (isExecutable) {
+							processingPausedForExec = true;
+							clearTransportWatchdog();
+							execQueuePrefix = messageQueue.drain();
+						}
+						let mutationSlotReserved = false;
+						const queued = messageQueue.enqueue(async () => {
+							const dropExecutable = (): void => {
+								if (!isExecutable) return;
+								processingPausedForExec = false;
+								processPendingBuffer?.();
+							};
+							if (transportTerminalized && !(terminalDrainMode && !isExecServerMessage)) {
+								dropExecutable();
+								return;
+							}
+							if (
+								isExecServerMessage &&
+								terminalAdmissionMode === "closed" &&
+								!(terminalBoundaryObserved && !terminalBoundarySeen)
+							) {
+								dropExecutable();
+								return;
+							}
+							// An exec frame asks this process to perform work before Cursor can
+							// response. Its deadline is independent from raw transport
+							// progress, and pausing the request supplies bounded backpressure.
+							if (isExecutable) {
+								clearTransportWatchdog();
+								execInFlight = true;
+							}
+							let execSucceeded = false;
+							try {
+								const run = (execSignal?: AbortSignal, markNonAbortable?: () => void) =>
+									handleServerMessage(
+										serverMessage,
+										output,
+										stream,
+										state,
+										blobStore,
+										writer,
+										options?.execHandlers,
+										options?.onToolResult,
+										usageState,
+										requestContextTools,
+										onConversationCheckpoint,
+										requestContextRules,
+										execSignal,
+										markNonAbortable,
+									);
+								if (isExecutable) {
+									// The deadline races the handler promise but the per-exec
+									// AbortSignal it owns reaches cooperative handlers so caller
+									// cancellation and the local deadline can actually stop work.
+									await runWithCursorExecDeadline(
+										run,
+										options?.signal,
+										cursorExecDeadlineMsForTest(idleTimeoutMs),
+										settlement => {
+											if (!reserveCursorMutationLock(conversationId)) {
+												throw new CursorExecAdmissionClosedError(
+													"Cursor non-abortable mutation capacity exhausted",
+												);
+											}
+											mutationSlotReserved = true;
+											pendingNonAbortableExec = settlement;
+											const lock = settlement.settled.then(
+												() => undefined,
+												() => undefined,
+											);
+											registerCursorMutationLock(conversationId, lock);
+											releaseCursorMutationLockReservation(conversationId);
+											mutationSlotReserved = false;
+										},
+										() => {
+											if (mutationSlotReserved) {
+												releaseCursorMutationLockReservation(conversationId);
+												mutationSlotReserved = false;
+											}
+										},
+										() => {
+											activeExecAbort = undefined;
+											if (mutationSlotReserved) {
+												releaseCursorMutationLockReservation(conversationId);
+												mutationSlotReserved = false;
+											}
+										},
+										abort => {
+											activeExecAbort = abort;
+										},
+										() => transportTerminalized,
+									);
+								} else {
+									await run();
+								}
+								execSucceeded = true;
+							} finally {
+								if (isExecutable) {
+									execInFlight = false;
+									if (
+										execSucceeded &&
+										!transportWatchdogClosed &&
+										!callerAbortError &&
+										terminalAdmissionMode !== "closed"
+									) {
+										processingPausedForExec = false;
+										h2Request!.resume();
+										if (isMeaningful) refreshTransportWatchdog();
+										processPendingBuffer?.();
+									} else if (transportTerminalized || terminalAdmissionMode === "closed") {
+										// A queued exec may be dropped after a trailer/reset or another
+										// earlier terminal closes admission. Do not leave parser state
+										// permanently paused while that dropped promise accounts down.
+										processingPausedForExec = false;
+										processPendingBuffer?.();
+									}
+								}
+							}
+						}, consumedFrameLength);
+						void queued.catch(() => {});
+						// Terminal bookkeeping belongs to the validated frame boundary,
+						// before parser backpressure can break this loop. The queued handler
+						// still runs in order, while settlement waits for queue drain.
 						if (isTurnEnded) {
-							coordinator.turnEnded();
+							sawTurnEnded = true;
+							// Make the boundary durable before inspecting the next frame's
+							// header. A malformed or oversized coalesced tail is not allowed
+							// to replace this validated terminal success.
+							terminalBoundarySeen = true;
+							terminalBoundaryObserved = false;
+							closeTerminalAdmission(false);
+							drainMessageQueue();
+						}
+						// A single HTTP/2 data chunk can contain hundreds of valid,
+						// inexpensive Connect frames. Stop parsing at the queue bound and
+						// resume after the ordered chain drains instead of rejecting the
+						// 257th frame before any queued microtask can decrement pending.
+						if (!isExecServerMessage && messageQueue.pending() >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
+							processingPausedForQueue = true;
+							h2Request!.pause();
+							const resumeAfterDrain = () => {
+								processingPausedForQueue = false;
+								if (processingPausedForExec || callerAbortError) return;
+								if (transportWatchdogClosed && !terminalBoundaryObserved && !terminalBoundarySeen) return;
+								if (terminalAdmissionMode !== "closed") h2Request!.resume();
+								// A lookahead turnEnded closes admission before the validated
+								// prefix reaches the queue bound. Continue parsing that prefix
+								// without reopening transport or admitting tail execs.
+								if (
+									!transportTerminalized ||
+									terminalDrainMode ||
+									terminalBoundaryObserved ||
+									terminalBoundarySeen
+								)
+									processPendingBuffer?.();
+							};
+							// Consume both outcomes: `finally()` would create a second rejected
+							// promise when the boundary handler fails, even though the queue's
+							// normal error path already consumed the original rejection.
+							void queued.then(resumeAfterDrain, resumeAfterDrain);
+							break;
+						}
+
+						if (isExecutable) {
+							observeBufferedTerminal(responseEnded);
+							break;
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
+						terminalize(e);
+						break;
 					}
+				}
+				// HTTP/2 can emit `end` while a coalesced chunk still has frames
+				// parked behind queue backpressure. Drain only after every buffered
+				// frame has been parsed into the ordered queue.
+				finishResponseAfterParsing();
+			};
+
+			h2Request.on("end", () => {
+				responseEnded = true;
+				if (endStreamError && !h2Settled) {
+					terminalize(endStreamError);
+					return;
+				}
+				if (observeBufferedTerminal(true)) {
+					if (terminalDrainMode) {
+						processPendingBuffer?.();
+						terminalDrain?.();
+					}
+					return;
+				}
+				if (transportTerminalized) return;
+				if (!sawTurnEnded && !h2Settled) {
+					terminalize(
+						pendingBuffer.length > 0
+							? new Error("Cursor HTTP/2 stream ended before turnEnded")
+							: new Error("Cursor stream ended before turnEnded"),
+						"drainable",
+					);
+					return;
+				}
+				sealExecAdmissionAtRawEof();
+				processPendingBuffer?.();
+				finishResponseAfterParsing();
+			});
+
+			h2Request.on("data", (chunk: Buffer) => {
+				if (terminalBoundarySeen) {
+					const remaining = CURSOR_MAX_PENDING_SERVER_BYTES - pendingBuffer.length;
+					if (remaining > 0) pendingBuffer.append(chunk.subarray(0, remaining));
+					processPendingBuffer?.();
+					return;
+				}
+				let offset = 0;
+				while (
+					offset < chunk.length &&
+					!h2Settled &&
+					!transportTerminalized &&
+					!terminalBoundarySeen &&
+					!terminalBoundaryObserved
+				) {
+					const available = CURSOR_MAX_PENDING_SERVER_BYTES - pendingBuffer.length;
+					if (available <= 0) {
+						processPendingBuffer?.();
+						if (h2Settled) return;
+						const error = new Error("Cursor HTTP/2 response exceeded the maximum pending byte length");
+						endStreamError = error;
+						terminalize(error);
+						return;
+					}
+					const length = Math.min(available, chunk.length - offset);
+					pendingBuffer.append(chunk.subarray(offset, offset + length));
+					offset += length;
+					processPendingBuffer?.();
 				}
 			});
 
-			coordinator.enqueue(frameConnectMessage(requestBytes));
+			if (callerAbortError) throw callerAbortError;
+			if (h2Settled) {
+				await h2Completion.promise;
+			}
+			writeCursorFrame(writer, frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
-				if (!coordinator.isActive()) return;
+				if (h2Settled || isClosedCursorRequest(writer)) return;
 				const heartbeatMessage = create(AgentClientMessageSchema, {
 					message: { case: "clientHeartbeat", value: create(ClientHeartbeatSchema, {}) },
 				});
 				const heartbeatBytes = toBinary(AgentClientMessageSchema, heartbeatMessage);
-				coordinator.enqueue(frameConnectMessage(heartbeatBytes));
+				writeCursorFrame(writer, frameConnectMessage(heartbeatBytes));
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-			await new Promise<void>((resolve, reject) => {
-				resolveH2 = resolve;
-				rejectH2 = reject;
-				const initialFailure = coordinator.failureError();
-				if (initialFailure) {
-					rejectH2 = undefined;
-					reject(initialFailure);
-				} else if (coordinator.hasTurnEnded() && !coordinator.isActive()) {
-					resolveH2 = undefined;
-					resolve();
-				}
-			});
-			armInboundTimeout();
-			await inboundEnd.promise;
-			await Promise.all(checkpointTasks);
+			// The watchdog was armed before setup; never restart it after request creation.
+			await h2Completion.promise;
+			// A successful terminal frame can settle before the HTTP/2 writer callback.
+			// Bound this final drain so a peer that stopped reading cannot hold the
+			// request open forever, and surface asynchronous callback failures as a
+			// failed request instead of publishing a false successful result.
+			await waitForCursorWrites(h2Request, CURSOR_WRITE_DRAIN_TIMEOUT_MS, forceCloseTransport);
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -985,39 +2190,33 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			}
 
 			finalizeCursorUsage(output, usageState);
-			const stateToCommit =
-				usageState.pendingCheckpoint ?? conversationStateCache.get(conversationId) ?? conversationState;
-			if (
-				usageState.pendingCheckpoint ||
-				usageState.hasConversationCheckpoint ||
-				usageState.conversationUsedTokens > 0
-			) {
-				conversationStateCache.set(
-					conversationId,
-					create(ConversationStateStructureSchema, {
-						...stateToCommit,
-						...(usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0
-							? {
-									tokenDetails: create(ConversationTokenDetailsSchema, {
-										usedTokens: output.usage.totalTokens,
-										maxTokens: stateToCommit.tokenDetails?.maxTokens ?? 0,
-									}),
-								}
-							: {}),
-					}),
-				);
+			if (options?.onPayload === undefined && conversationCache.get(conversationId) === previousCacheEntry) {
+				const checkpointState = pendingConversationCheckpoint ?? conversationState;
+				const stateToCommit =
+					usageState.hasConversationCheckpoint || usageState.conversationUsedTokens > 0
+						? create(ConversationStateStructureSchema, {
+								...checkpointState,
+								tokenDetails: create(ConversationTokenDetailsSchema, {
+									usedTokens: output.usage.totalTokens,
+									maxTokens: checkpointState.tokenDetails?.maxTokens ?? 0,
+								}),
+							})
+						: checkpointState;
+				conversationCache.set(conversationId, {
+					state: stateToCommit,
+					blobs: blobStore,
+					context: {
+						...conversationContext,
+						messageKeys: [...conversationContext.messageKeys, hashCursorConversationMessage(output)],
+					},
+				});
 				touchCursorConversation(conversationId);
 			}
-			conversationUsageContextCache.set(conversationId, {
-				...usageContext,
-				messageKeys: [...usageContext.messageKeys, hashCursorUsageMessage(output)],
-			});
-			conversationBlobStores.set(conversationId, blobStore);
-			touchCursorConversation(conversationId);
 			calculateCost(model, output.usage);
 
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
+			completedSuccessfully = true;
 			stream.push({
 				type: "done",
 				reason: output.stopReason as "stop" | "length" | "toolUse",
@@ -1025,34 +2224,78 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
-			if (activeConversationId) {
-				if (previousConversationState) conversationStateCache.set(activeConversationId, previousConversationState);
-				else conversationStateCache.delete(activeConversationId);
-				if (previousUsageContext) conversationUsageContextCache.set(activeConversationId, previousUsageContext);
-				else conversationUsageContextCache.delete(activeConversationId);
-			}
 			// Keep the completion promise terminal even for synchronous setup/write
 			// failures that may not emit a separate HTTP/2 error event.
-			const mappedError = mapH2TransportError(coordinator?.failureError() ?? error, baseUrl);
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			if (!h2Settled) terminalize(error);
+			// Caller cancellation remains authoritative even when a transport event
+			// rejected h2Completion first; the abort listener can run while the
+			// settlement fence is awaiting a detached mutation.
+			const mappedError = callerAbortError ?? h2Failure ?? error;
+			output.stopReason = callerAbortError || options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(mappedError);
+			output.transportFailure = transportFailureFacts(mappedError);
 			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
+			finalizeCursorUsage(output, usageState);
+			calculateCost(model, output.usage);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		} finally {
+			options?.signal?.removeEventListener("abort", onCallerAbort);
+			if (gracefulCloseCheckTimer) {
+				clearTimeout(gracefulCloseCheckTimer);
+				gracefulCloseCheckTimer = undefined;
+			}
+			pendingBuffer.clear();
+			bufferedObservationOffset = 0;
+			bufferedObservationTurnEnded = false;
+			bufferedTerminalBoundaryOffset = undefined;
+			terminalBoundaryObserved = false;
+			transportWatchdogClosed = true;
+			if (transportWatchdog) {
+				clearTimeout(transportWatchdog);
+				transportWatchdog = null;
+			}
 			if (heartbeatTimer) {
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
 			}
-			if (options?.signal && onAbort) {
-				options.signal.removeEventListener("abort", onAbort);
+			if (postTurnEndedCheckpointTimer) {
+				clearTimeout(postTurnEndedCheckpointTimer);
+				postTurnEndedCheckpointTimer = undefined;
 			}
-			if (h2Request && !h2Request.closed && !h2Request.destroyed) {
-				h2Request.end();
+			if (h2Request && h2RequestErrorHandler) {
+				h2Request.removeListener("error", h2RequestErrorHandler);
 			}
-			h2Client?.close();
+			if (h2Client && h2ClientErrorHandler) {
+				// Keep a listener installed while the session closes. Node treats a late
+				// ClientHttp2Session error without listeners as an uncaught exception.
+				h2Client.on("error", () => {});
+				h2Client.removeListener("error", h2ClientErrorHandler);
+			}
+			// A queued exec handler can still be draining when the caller aborts; its
+			// late writes must fail quietly on the closed stream instead of crashing
+			// the process with ERR_STREAM_WRITE_AFTER_END.
+			h2Request?.on("error", () => {});
+			// `write()` only queues the frame. Await each accepted frame's completion
+			// callback before tearing down a successful HTTP/2 request, otherwise the
+			// final exec response can be lost when close wins the writer race.
+			await waitForCursorWrites(h2Request, CURSOR_WRITE_DRAIN_TIMEOUT_MS, forceCloseTransport).catch(() => {});
+			if (completedSuccessfully) {
+				h2Request?.end();
+				h2Client?.close();
+				// A valid turnEnded can arrive before the peer closes its response half.
+				// Send END_STREAM first; only force cleanup after a bounded grace period
+				// when the peer leaves the completed stream open indefinitely.
+				if (h2Request && !h2Request.closed && !h2Request.destroyed) {
+					const gracefulTeardownTimer = setTimeout(forceCloseTransport, 100);
+					h2Request.once("close", () => clearTimeout(gracefulTeardownTimer));
+				}
+			} else {
+				h2Request?.close();
+				h2Client?.close();
+			}
 			proxiedSocket?.destroy();
 		}
 	})();
@@ -1080,24 +2323,9 @@ interface BlockState {
 
 interface UsageState {
 	sawTokenDelta: boolean;
-	/**
-	 * Latest `ConversationTokenDetails.used_tokens`: the whole conversation's
-	 * token consumption as counted by Cursor, not this turn's output.
-	 */
 	conversationUsedTokens: number;
-	/** Output tokens already included in the latest checkpoint snapshot. */
 	checkpointOutputTokens: number;
-	/** Whether the current stream received a checkpoint, including an explicit zero. */
 	hasConversationCheckpoint: boolean;
-	pendingCheckpoint?: ConversationStateStructure;
-}
-
-interface CursorUsageContext {
-	modelKey: string;
-	systemPromptKey: string;
-	customSystemPromptKey: string;
-	toolsKey: string;
-	messageKeys: string[];
 }
 
 async function handleServerMessage(
@@ -1113,6 +2341,8 @@ async function handleServerMessage(
 	requestContextTools: McpToolDefinition[],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 	requestContextRules: CursorRule[] = [],
+	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
@@ -1132,6 +2362,8 @@ async function handleServerMessage(
 			output,
 			stream,
 			requestContextRules,
+			execSignal,
+			markNonAbortable,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -1164,19 +2396,22 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		writer.enqueue(frameConnectMessage(responseBytes));
+		writeCursorFrame(writer, frameConnectMessage(responseBytes));
 
 		log("kvClient", "getBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	} else if (kvCase === "setBlobArgs") {
 		const { blobId, blobData } = kvMsg.message.value;
 		const blobIdKey = Buffer.from(blobId).toString("hex");
-		blobStore.set(blobIdKey, blobData);
+		const stored =
+			blobId.byteLength === CURSOR_BLOB_ID_BYTES && storeCursorServerBlob(blobStore, blobIdKey, blobData);
 
 		const response = create(KvClientMessageSchema, {
 			id: kvMsg.id,
 			message: {
 				case: "setBlobResult",
-				value: create(SetBlobResultSchema, {}),
+				value: create(SetBlobResultSchema, {
+					error: stored ? undefined : { message: "Cursor blob store exceeded its bounded capacity" },
+				}),
 			},
 		});
 
@@ -1185,10 +2420,40 @@ function handleKvServerMessage(
 		});
 
 		const responseBytes = toBinary(AgentClientMessageSchema, kvClientMessage);
-		writer.enqueue(frameConnectMessage(responseBytes));
+		writeCursorFrame(writer, frameConnectMessage(responseBytes));
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
+}
+
+function storeCursorServerBlob(
+	blobStore: Map<string, Uint8Array>,
+	blobId: string,
+	blobData: Uint8Array,
+	limits: { maxEntries: number; maxBytes: number } = {
+		maxEntries: CURSOR_MAX_BLOB_STORE_ENTRIES,
+		maxBytes: CURSOR_MAX_BLOB_STORE_BYTES,
+	},
+): boolean {
+	const existingBytes = blobStore.get(blobId)?.byteLength ?? 0;
+	let totalBytes = 0;
+	for (const value of blobStore.values()) totalBytes += value.byteLength;
+	if (!blobStore.has(blobId) && blobStore.size >= limits.maxEntries) return false;
+	if (totalBytes - existingBytes + blobData.byteLength > limits.maxBytes) return false;
+	blobStore.set(blobId, blobData);
+	return true;
+}
+
+export function storeCursorBlobForTest(
+	blobStore: Map<string, Uint8Array>,
+	blobId: Uint8Array,
+	blobData: Uint8Array,
+	limits: { maxEntries: number; maxBytes: number },
+): boolean {
+	return (
+		blobId.byteLength === CURSOR_BLOB_ID_BYTES &&
+		storeCursorServerBlob(blobStore, Buffer.from(blobId).toString("hex"), blobData, limits)
+	);
 }
 
 function sendShellStreamEvent(
@@ -1230,6 +2495,8 @@ async function handleShellStreamArgs(
 	h2Request: CursorRequestWriter,
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
+	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const normalizedWorkingDirectory = args.workingDirectory || process.cwd();
 	const normalizedArgs: ShellArgs = { ...args, workingDirectory: normalizedWorkingDirectory };
@@ -1249,6 +2516,49 @@ async function handleShellStreamArgs(
 	let stdoutBuffer = "";
 	let stderrBuffer = "";
 	let callbacksOpen = true;
+	let pendingShellWriteBytes = 0;
+	let shellWriteFailure: unknown;
+	let shellWriteChain = Promise.resolve();
+	const queueShellStreamEvent = (event: ShellStream["event"]): void => {
+		if (shellWriteFailure || !callbacksOpen || !h2Request.isActive()) return;
+		const frame = encodeExecClientMessageFrame(execMsg, {
+			case: "shellStream",
+			value: create(ShellStreamSchema, { event }),
+		});
+		if (pendingShellWriteBytes + frame.length > CURSOR_MAX_PENDING_SHELL_WRITE_BYTES) {
+			const error = new Error(
+				`Cursor shell output exceeded ${CURSOR_MAX_PENDING_SHELL_WRITE_BYTES} pending write bytes`,
+			);
+			shellWriteFailure = error;
+			callbacksOpen = false;
+			closeStalledCursorRequest(h2Request);
+			shellWriteChain = shellWriteChain.then(() => {
+				throw error;
+			});
+			shellWriteChain.catch(() => {});
+			return;
+		}
+		pendingShellWriteBytes += frame.length;
+		const queuedWrite = shellWriteChain
+			.then(async () => {
+				if (shellWriteFailure) throw shellWriteFailure;
+				const writable = writeCursorFrame(h2Request, frame);
+				if (writable) return;
+				if (isClosedCursorRequest(h2Request)) {
+					throw new Error("Cursor request closed while forwarding shell output");
+				}
+				await waitForCursorWriteDrain(h2Request);
+			})
+			.finally(() => {
+				pendingShellWriteBytes -= frame.length;
+			});
+		shellWriteChain = queuedWrite;
+		queuedWrite.catch(error => {
+			shellWriteFailure ??= error;
+			callbacksOpen = false;
+			closeStalledCursorRequest(h2Request);
+		});
+	};
 	const unregisterShellGate = h2Request.registerShellGate(() => {
 		callbacksOpen = false;
 		if (stdoutFlushTimer) clearTimeout(stdoutFlushTimer);
@@ -1267,7 +2577,7 @@ async function handleShellStreamArgs(
 			const toSend = stdoutBuffer.slice(0, safeEnd);
 			const remaining = stdoutBuffer.slice(safeEnd);
 			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
+				queueShellStreamEvent({
 					case: "stdout",
 					value: create(ShellStreamStdoutSchema, { data: sanitizeText(toSend) }),
 				});
@@ -1286,7 +2596,7 @@ async function handleShellStreamArgs(
 			const toSend = stderrBuffer.slice(0, safeEnd);
 			const remaining = stderrBuffer.slice(safeEnd);
 			if (toSend) {
-				sendShellStreamEvent(h2Request, execMsg, {
+				queueShellStreamEvent({
 					case: "stderr",
 					value: create(ShellStreamStderrSchema, { data: sanitizeText(toSend) }),
 				});
@@ -1349,11 +2659,15 @@ async function handleShellStreamArgs(
 	// Falls back to the batch shell handler otherwise.
 	const streamHandler = execHandlers?.shellStream?.bind(execHandlers);
 	const batchHandler = execHandlers?.shell?.bind(execHandlers);
-	const handler = streamHandler ? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks) : batchHandler;
+	const handler = streamHandler
+		? (shellArgs: ShellArgs) => streamHandler(shellArgs, streamCallbacks, execSignal, markNonAbortable)
+		: batchHandler
+			? (shellArgs: ShellArgs) => batchHandler(shellArgs, execSignal, markNonAbortable)
+			: undefined;
 
 	const { execResult } = await resolveExecHandler(
 		args as any,
-		handler as typeof batchHandler,
+		handler,
 		onToolResult,
 		toolResult => buildShellResultFromToolResult(normalizedArgs as any, toolResult),
 		reason =>
@@ -1372,6 +2686,8 @@ async function handleShellStreamArgs(
 	if (stderrFlushTimer) clearTimeout(stderrFlushTimer);
 	flushStdout();
 	flushStderr();
+	await shellWriteChain;
+	if (shellWriteFailure) throw shellWriteFailure;
 
 	sendShellStreamExitFromResult(h2Request, execMsg, sanitizedExecResult, sendBufferedOutput);
 	// Cursor can keep the turn pending when it receives only stream deltas.
@@ -1501,6 +2817,8 @@ async function handleExecServerMessage(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	requestContextRules: CursorRule[] = [],
+	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1542,6 +2860,8 @@ async function handleExecServerMessage(
 				toolResult => buildReadResultFromToolResult(args.path, toolResult),
 				reason => buildReadRejectedResult(args.path, reason),
 				error => buildReadErrorResult(args.path, error),
+				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "readResult", execResult);
 			return;
@@ -1555,6 +2875,8 @@ async function handleExecServerMessage(
 				toolResult => buildLsResultFromToolResult(args.path, toolResult),
 				reason => buildLsRejectedResult(args.path, reason),
 				error => buildLsErrorResult(args.path, error),
+				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "lsResult", execResult);
 			return;
@@ -1568,6 +2890,7 @@ async function handleExecServerMessage(
 				toolResult => buildGrepResultFromToolResult(args, toolResult),
 				reason => buildGrepErrorResult(reason),
 				error => buildGrepErrorResult(error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "grepResult", execResult);
 			return;
@@ -1590,6 +2913,8 @@ async function handleExecServerMessage(
 					),
 				reason => buildWriteRejectedResult(args.path, reason),
 				error => buildWriteErrorResult(args.path, error),
+				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "writeResult", execResult);
 			return;
@@ -1603,6 +2928,8 @@ async function handleExecServerMessage(
 				toolResult => buildDeleteResultFromToolResult(args.path, toolResult),
 				reason => buildDeleteRejectedResult(args.path, reason),
 				error => buildDeleteErrorResult(args.path, error),
+				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "deleteResult", execResult);
 			return;
@@ -1617,6 +2944,8 @@ async function handleExecServerMessage(
 				toolResult => buildShellResultFromToolResult(normalizedArgs, toolResult),
 				reason => buildShellRejectedResult(normalizedArgs.command, normalizedArgs.workingDirectory, reason),
 				error => buildShellFailureResult(normalizedArgs.command, normalizedArgs.workingDirectory, error),
+				execSignal,
+				markNonAbortable,
 			);
 			const sanitizedExecResult = sanitizeShellExecResult(execResult);
 			sendExecClientMessage(h2Request, execMsg, "shellResult", sanitizedExecResult);
@@ -1624,7 +2953,15 @@ async function handleExecServerMessage(
 		}
 		case "shellStreamArgs": {
 			const args = execMsg.message.value;
-			await handleShellStreamArgs(args, execMsg, h2Request, execHandlers, onToolResult);
+			await handleShellStreamArgs(
+				args,
+				execMsg,
+				h2Request,
+				execHandlers,
+				onToolResult,
+				execSignal,
+				markNonAbortable,
+			);
 			return;
 		}
 		case "backgroundShellSpawnArgs": {
@@ -1678,6 +3015,7 @@ async function handleExecServerMessage(
 				toolResult => buildDiagnosticsResultFromToolResult(args.path, toolResult),
 				reason => buildDiagnosticsRejectedResult(args.path, reason),
 				error => buildDiagnosticsErrorResult(args.path, error),
+				execSignal,
 			);
 			sendExecClientMessage(h2Request, execMsg, "diagnosticsResult", execResult);
 			return;
@@ -1692,6 +3030,8 @@ async function handleExecServerMessage(
 				toolResult => buildMcpResultFromToolResult(mcpCall, toolResult),
 				_reason => buildMcpToolNotFoundResult(mcpCall),
 				error => buildMcpErrorResult(error),
+				execSignal,
+				markNonAbortable,
 			);
 			sendExecClientMessage(h2Request, execMsg, "mcpResult", execResult);
 			return;
@@ -1722,7 +3062,7 @@ async function handleExecServerMessage(
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", {
 				path: piReadDisplayPath(args.path, args.offset, args.limit),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piRead?.bind(execHandlers),
@@ -1741,7 +3081,7 @@ async function handleExecServerMessage(
 				command: args.command,
 				timeout: piTimeout(args.timeout),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piBash?.bind(execHandlers),
@@ -1760,7 +3100,7 @@ async function handleExecServerMessage(
 				path: args.path,
 				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piEdit?.bind(execHandlers),
@@ -1779,7 +3119,7 @@ async function handleExecServerMessage(
 				path: args.path,
 				content: args.content,
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piWrite?.bind(execHandlers),
@@ -1803,7 +3143,7 @@ async function handleExecServerMessage(
 				context: args.context,
 				limit: piLimit(args.limit),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piGrep?.bind(execHandlers),
@@ -1822,7 +3162,7 @@ async function handleExecServerMessage(
 				paths: [piJoinPath(args.path, args.pattern)],
 				limit: piLimit(args.limit),
 			});
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piFind?.bind(execHandlers),
@@ -1838,7 +3178,7 @@ async function handleExecServerMessage(
 			const args = execMsg.message.value;
 			const toolCallId = crypto.randomUUID();
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", { path: piLsPath(args.path) });
-			const call = { args, toolCallId };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piLs?.bind(execHandlers),
@@ -1918,10 +3258,18 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	messageCase: TCase,
 	value: Extract<ExecClientMessage["message"], { case: TCase }>["value"],
 ): void {
+	writeCursorFrame(
+		h2Request,
+		encodeExecClientMessageFrame(execMsg, { case: messageCase, value } as ExecClientMessage["message"]),
+	);
+	log("execClientMessage", messageCase, value);
+}
+
+function encodeExecClientMessageFrame(execMsg: ExecServerMessage, message: ExecClientMessage["message"]): Buffer {
 	const execClientMessage = create(ExecClientMessageSchema, {
 		id: execMsg.id,
 		execId: execMsg.execId,
-		message: { case: messageCase, value } as ExecClientMessage["message"],
+		message,
 	});
 
 	const clientMessage = create(AgentClientMessageSchema, {
@@ -1929,9 +3277,7 @@ function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["mess
 	});
 
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.enqueue(frameConnectMessage(responseBytes));
-
-	log("execClientMessage", messageCase, value);
+	return frameConnectMessage(responseBytes);
 }
 
 function sendExecClientThrow(
@@ -1949,7 +3295,7 @@ function sendExecClientThrow(
 	const clientMessage = create(AgentClientMessageSchema, {
 		message: { case: "execClientControlMessage", value: controlMessage },
 	});
-	h2Request.enqueue(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	writeCursorFrame(h2Request, frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
 	sendExecClientStreamClose(h2Request, execMsg);
 }
 
@@ -1966,25 +3312,33 @@ function sendExecClientStreamClose(h2Request: CursorRequestWriter, execMsg: Exec
 		message: { case: "execClientControlMessage", value: closeMessage },
 	});
 	const responseBytes = toBinary(AgentClientMessageSchema, clientMessage);
-	h2Request.enqueue(frameConnectMessage(responseBytes));
+	writeCursorFrame(h2Request, frameConnectMessage(responseBytes));
 	log("execClientControl", "streamClose", { id: execMsg.id, execId: execMsg.execId });
 }
 
 /** Exported for tests: verifies handler is invoked with correct `this` when passed as bound. */
 export async function resolveExecHandler<TArgs, TResult>(
 	args: TArgs,
-	handler: ((args: TArgs) => Promise<CursorExecHandlerResult<TResult>>) | undefined,
+	handler:
+		| ((
+				args: TArgs,
+				signal?: AbortSignal,
+				markNonAbortable?: () => void,
+		  ) => Promise<CursorExecHandlerResult<TResult>>)
+		| undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	buildFromToolResult: (toolResult: ToolResultMessage) => TResult,
 	buildRejected: (reason: string) => TResult,
 	buildError: (error: string) => TResult,
+	signal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<{ execResult: TResult; toolResult?: ToolResultMessage }> {
 	if (!handler) {
 		return { execResult: buildRejected("Tool not available") };
 	}
 
 	try {
-		const handlerResult = await handler(args);
+		const handlerResult = await handler(args, signal, markNonAbortable);
 		const { execResult, toolResult } = splitExecHandlerResult(handlerResult);
 		const finalToolResult = await applyToolResultHandler(toolResult, onToolResult);
 
@@ -1996,27 +3350,72 @@ export async function resolveExecHandler<TArgs, TResult>(
 		}
 		return { execResult: buildRejected("Tool returned no result") };
 	} catch (error) {
+		if (error instanceof CursorExecAdmissionClosedError) throw error;
 		const message = error instanceof Error ? error.message : String(error);
 		return { execResult: buildError(message) };
 	}
 }
 
 /** Exported for deterministic coverage of ordered server-message handling. */
-export function createCursorMessageQueueForTest(onError?: (error: unknown) => void): {
-	enqueue(handler: () => void | Promise<void>): Promise<void>;
+export function createCursorMessageQueueForTest(
+	onError?: (error: unknown) => void,
+	maxPendingBytes = CURSOR_MAX_QUEUED_SERVER_BYTES,
+): {
+	enqueue(handler: () => void | Promise<void>, byteSize?: number): Promise<void>;
 	drain(): Promise<void>;
+	pending(): number;
+	pendingBytes(): number;
 } {
 	let chain = Promise.resolve();
+	let pending = 0;
+	let pendingBytes = 0;
+	let closed = false;
+	let hasAdmittedTask = false;
 	return {
-		enqueue(handler) {
-			const result = chain.then(handler);
-			chain = result.catch(error => {
+		enqueue(handler, byteSize = 0) {
+			if (closed) return Promise.reject(new Error("Cursor server-message queue is closed"));
+			if (pending >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
+				const error = new Error("Cursor server-message queue exceeded its bounded capacity");
+				closed = true;
+				onError?.(error);
+				return Promise.reject(error);
+			}
+			if (byteSize < 0 || pendingBytes + byteSize > maxPendingBytes) {
+				const error = new Error("Cursor server-message queue exceeded its bounded byte capacity");
+				closed = true;
+				onError?.(error);
+				return Promise.reject(error);
+			}
+			pending += 1;
+			pendingBytes += byteSize;
+			let result: Promise<void>;
+			if (!hasAdmittedTask) {
+				hasAdmittedTask = true;
+				try {
+					result = Promise.resolve(handler());
+				} catch (error) {
+					result = Promise.reject(error);
+				}
+			} else {
+				result = chain.then(handler);
+			}
+			const accounting = result.finally(() => {
+				pending -= 1;
+				pendingBytes -= byteSize;
+			});
+			chain = accounting.catch(error => {
 				onError?.(error);
 			});
-			return result;
+			return accounting;
 		},
 		drain() {
 			return chain;
+		},
+		pending() {
+			return pending;
+		},
+		pendingBytes() {
+			return pendingBytes;
 		},
 	};
 }
@@ -2999,32 +4398,20 @@ function handleConversationCheckpointUpdate(
 		return;
 	}
 	const previousUsedTokens = usageState.conversationUsedTokens;
-	// `used_tokens` counts the whole conversation, so it is prompt-side usage and
-	// must not be attributed to this turn's output. Checkpoints can arrive while
-	// output is still streaming; the split is applied once the stream finalizes.
 	usageState.conversationUsedTokens = usedTokens;
-	usageState.checkpointOutputTokens =
-		usageState.hasConversationCheckpoint && usedTokens < previousUsedTokens ? 0 : output.usage.output;
+	usageState.checkpointOutputTokens = usedTokens < previousUsedTokens ? 0 : output.usage.output;
 	usageState.hasConversationCheckpoint = true;
 }
 
-/**
- * Cursor streams output tokens as deltas and reports whole-conversation
- * consumption separately as `ConversationTokenDetails.used_tokens`. Derive
- * prompt tokens from the difference so context accounting and compaction see a
- * real prompt size instead of zero.
- */
+/** Derive prompt usage from Cursor's whole-conversation checkpoint total. */
 export function finalizeCursorUsage(output: AssistantMessage, usageState: UsageState): void {
 	const used = usageState.conversationUsedTokens;
-	if (!usageState.hasConversationCheckpoint && used <= 0) {
-		return;
-	}
+	if (!usageState.hasConversationCheckpoint && used <= 0) return;
 	const outputIncludedInSnapshot = usageState.hasConversationCheckpoint ? usageState.checkpointOutputTokens : 0;
 	output.usage.input = Math.max(0, used - outputIncludedInSnapshot);
 	output.usage.totalTokens = output.usage.input + output.usage.output;
 }
 
-/** Exposes {@link finalizeCursorUsage} for tests without a live HTTP/2 stream. */
 export function finalizeCursorUsageForTest(
 	usedTokens: number,
 	outputTokens: number,
@@ -3368,43 +4755,6 @@ function buildConversationTurns(messages: Message[], blobStore: Map<string, Uint
 	return turns;
 }
 
-function buildCursorUsageContext(
-	context: Context,
-	model: Model<"cursor-agent">,
-	options: CursorOptions | undefined,
-): CursorUsageContext {
-	return {
-		modelKey: hashCursorUsageValue({ provider: model.provider, id: model.id, wireModelId: model.wireModelId }),
-		systemPromptKey: hashCursorUsageValue(context.systemPrompt ?? []),
-		customSystemPromptKey: hashCursorUsageValue(options?.customSystemPrompt ?? ""),
-		toolsKey: hashCursorUsageValue(context.tools ?? []),
-		messageKeys: context.messages.map(message => hashCursorUsageMessage(message)),
-	};
-}
-
-function hashCursorUsageMessage(message: { role: string; content: unknown }): string {
-	return hashCursorUsageValue({ role: message.role, content: message.content });
-}
-
-function hashCursorUsageValue(value: unknown): string {
-	return createHash("sha256")
-		.update(JSON.stringify(value) ?? "")
-		.digest("hex");
-}
-
-function canReuseCursorUsageContext(previous: CursorUsageContext | undefined, current: CursorUsageContext): boolean {
-	if (
-		!previous ||
-		previous.modelKey !== current.modelKey ||
-		previous.systemPromptKey !== current.systemPromptKey ||
-		previous.customSystemPromptKey !== current.customSystemPromptKey ||
-		previous.toolsKey !== current.toolsKey
-	)
-		return false;
-	if (previous.messageKeys.length > current.messageKeys.length) return false;
-	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
-}
-
 /** Exported for tests: decodes Cursor history blobs built from conversation messages. */
 export function buildCursorHistoryForTest(messages: Message[]): {
 	rootPromptMessagesJson: unknown[];
@@ -3457,6 +4807,65 @@ function extractImages(content: (TextContent | ImageContent)[]) {
 				},
 			}),
 		);
+}
+
+function buildCursorConversationContext(
+	context: Context,
+	model: Model<"cursor-agent">,
+	options: CursorOptions | undefined,
+	baseUrl: string,
+	apiKey: string,
+): CursorConversationContext {
+	return {
+		endpointKey: hashCursorConversationValue(baseUrl),
+		credentialKey: hashCursorConversationValue({ apiKey, authCredentialType: options?.authCredentialType }),
+		modelKey: hashCursorConversationValue({
+			provider: model.provider,
+			id: model.id,
+			wireModelId: model.wireModelId,
+		}),
+		systemPromptKey: hashCursorConversationValue(context.systemPrompt ?? []),
+		customSystemPromptKey: hashCursorConversationValue(options?.customSystemPrompt ?? ""),
+		toolsKey: hashCursorConversationValue(
+			(context.tools ?? []).map(tool => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: toolWireSchema(tool),
+				strict: tool.strict,
+				customFormat: tool.customFormat,
+				customWireName: tool.customWireName,
+			})),
+		),
+		messageKeys: context.messages.map(hashCursorConversationMessage),
+	};
+}
+
+function hashCursorConversationMessage(message: { role: string; content: unknown }): string {
+	return hashCursorConversationValue({ role: message.role, content: message.content });
+}
+
+function hashCursorConversationValue(value: unknown): string {
+	return createHash("sha256")
+		.update(JSON.stringify(value) ?? "")
+		.digest("hex");
+}
+
+function canReuseCursorConversationContext(
+	previous: CursorConversationContext,
+	current: CursorConversationContext,
+): boolean {
+	if (
+		previous.endpointKey !== current.endpointKey ||
+		previous.credentialKey !== current.credentialKey ||
+		previous.modelKey !== current.modelKey ||
+		previous.systemPromptKey !== current.systemPromptKey ||
+		previous.customSystemPromptKey !== current.customSystemPromptKey ||
+		previous.toolsKey !== current.toolsKey ||
+		previous.messageKeys.length > current.messageKeys.length
+	) {
+		return false;
+	}
+	return previous.messageKeys.every((key, index) => key === current.messageKeys[index]);
 }
 
 async function buildGrpcRequest(

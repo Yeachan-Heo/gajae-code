@@ -1030,81 +1030,145 @@ export class Agent {
 		// `this === undefined`, throwing "undefined is not an object (this.#optionsForCall)".
 		const read = source.read?.bind(source);
 		if (read) {
-			guarded.read = async args => {
+			guarded.read = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await read(args);
+				const result = await read(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const ls = source.ls?.bind(source);
 		if (ls) {
-			guarded.ls = async args => {
+			guarded.ls = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await ls(args);
+				const result = await ls(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const grep = source.grep?.bind(source);
 		if (grep) {
-			guarded.grep = async args => {
+			guarded.grep = async (args, signal) => {
 				this.#assertActiveRun(runId);
-				const result = await grep(args);
+				const result = await grep(args, signal);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const write = source.write?.bind(source);
 		if (write) {
-			guarded.write = async args => {
+			guarded.write = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await write(args);
+				const result = await write(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const deleteHandler = source.delete?.bind(source);
 		if (deleteHandler) {
-			guarded.delete = async args => {
+			guarded.delete = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await deleteHandler(args);
+				const result = await deleteHandler(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const shell = source.shell?.bind(source);
 		if (shell) {
-			guarded.shell = async args => {
+			guarded.shell = async (args, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await shell(args);
+				const result = await shell(args, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const shellStream = source.shellStream?.bind(source);
 		if (shellStream) {
-			guarded.shellStream = async (args, callbacks) => {
+			guarded.shellStream = async (args, callbacks, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await shellStream(args, callbacks);
+				const result = await shellStream(args, callbacks, signal, markNonAbortable);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const diagnostics = source.diagnostics?.bind(source);
 		if (diagnostics) {
-			guarded.diagnostics = async args => {
+			guarded.diagnostics = async (args, signal) => {
 				this.#assertActiveRun(runId);
-				const result = await diagnostics(args);
+				const result = await diagnostics(args, signal);
 				this.#assertActiveRun(runId);
 				return result;
 			};
 		}
 		const mcp = source.mcp?.bind(source);
 		if (mcp) {
-			guarded.mcp = async call => {
+			guarded.mcp = async (call, signal, markNonAbortable) => {
 				this.#assertActiveRun(runId);
-				const result = await mcp(call);
+				const result = await mcp(call, signal, markNonAbortable);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		// Preserve Pi handlers end-to-end (probepark blocker): the production Agent guard previously dropped every pi* handler.
+		const piRead = source.piRead?.bind(source);
+		if (piRead) {
+			guarded.piRead = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piRead(call);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		const piBash = source.piBash?.bind(source);
+		if (piBash) {
+			guarded.piBash = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piBash(call);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		const piEdit = source.piEdit?.bind(source);
+		if (piEdit) {
+			guarded.piEdit = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piEdit(call);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		const piWrite = source.piWrite?.bind(source);
+		if (piWrite) {
+			guarded.piWrite = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piWrite(call);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		const piGrep = source.piGrep?.bind(source);
+		if (piGrep) {
+			guarded.piGrep = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piGrep(call);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		const piFind = source.piFind?.bind(source);
+		if (piFind) {
+			guarded.piFind = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piFind(call);
+				this.#assertActiveRun(runId);
+				return result;
+			};
+		}
+		const piLs = source.piLs?.bind(source);
+		if (piLs) {
+			guarded.piLs = async call => {
+				this.#assertActiveRun(runId);
+				const result = await piLs(call);
 				this.#assertActiveRun(runId);
 				return result;
 			};

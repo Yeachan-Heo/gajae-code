@@ -156,6 +156,18 @@ describe("agents provider project-level discovery", () => {
 			expect(names).not.toContain("above-home-skill");
 		});
 
+		test("project walk-up reaches parents when an ordinary cwd is outside home", () => {
+			const outsideHomeCtx: LoadContext = {
+				cwd: subProject,
+				home: path.join(tempDir, "unrelated-profile-home"),
+				repoRoot: null,
+			};
+			const candidates = getProjectPathCandidates(outsideHomeCtx, "skills");
+
+			expect(candidates).toContain(path.join(repoRoot, ".agent", "skills"));
+			expect(candidates).toContain(path.join(repoRoot, ".agents", "skills"));
+		});
+
 		test("project and user candidates do not overlap when cwd is under home", () => {
 			// Regression for https://github.com/can1357/gajae-code/issues/1116.
 			const noRepoCtx: LoadContext = { cwd: subProject, home: repoRoot, repoRoot: null };

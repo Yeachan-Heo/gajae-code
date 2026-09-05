@@ -16,7 +16,9 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import { rootContainsGjcManifest } from "../extensibility/gjc-plugins";
 import {
 	type ClaudePluginRoot,
+	canonicalizePathWithinHome,
 	createSourceMeta,
+	getReadOptionsForContainment,
 	invalidateClaudePluginRoots,
 	listClaudePluginRoots,
 	loadFilesFromDir,
@@ -40,9 +42,20 @@ interface ResolvedPluginDir {
 	warning?: string;
 }
 
-async function readPluginManifest(root: ClaudePluginRoot): Promise<ClaudePluginManifest | null> {
-	const manifestPath = path.join(root.path, ".claude-plugin", "plugin.json");
-	const raw = await readFile(manifestPath);
+async function readPluginManifest(
+	root: ClaudePluginRoot,
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
+): Promise<ClaudePluginManifest | null> {
+	const manifestPath = await canonicalizePathWithinHome(
+		ctx,
+		path.join(root.path, ".claude-plugin", "plugin.json"),
+		root.path,
+		root.scope,
+	);
+	if (!manifestPath) return null;
+	const readOptions = await getReadOptionsForContainment(ctx, root.scope, root.path);
+	if (ctx.isolatedHome && !readOptions) return null;
+	const raw = await readFile(manifestPath, readOptions);
 	if (raw === null) return null;
 
 	try {
@@ -60,11 +73,12 @@ function isWithinPluginRoot(rootPath: string, targetPath: string): boolean {
 }
 
 async function resolvePluginDir(
+	ctx: Pick<LoadContext, "home" | "isolatedHome" | "userAgentDir" | "homeIdentity" | "userAgentIdentity">,
 	root: ClaudePluginRoot,
 	manifestKeys: ReadonlyArray<keyof ClaudePluginManifest>,
 	fallback: string,
 ): Promise<ResolvedPluginDir> {
-	const manifest = await readPluginManifest(root);
+	const manifest = await readPluginManifest(root, ctx);
 	const fallbackDir = path.join(root.path, fallback);
 
 	let configured: string | undefined;
@@ -84,7 +98,8 @@ async function resolvePluginDir(
 
 	const resolved = path.resolve(root.path, configured);
 	if (isWithinPluginRoot(root.path, resolved)) {
-		return { dir: resolved };
+		const canonical = await canonicalizePathWithinHome(ctx, resolved, root.path, root.scope);
+		if (canonical) return { dir: canonical };
 	}
 
 	return {
@@ -96,16 +111,27 @@ async function resolvePluginDir(
 async function listNonGjcPluginRoots(
 	home: string,
 	cwd: string,
+	isolatedHome: boolean,
+	homeIdentity?: LoadContext["homeIdentity"],
 	allowedLevels: ReadonlySet<"user" | "project"> = new Set(["user", "project"]),
 ): Promise<{ roots: ClaudePluginRoot[]; warnings: string[] }> {
-	await invalidateClaudePluginRoots(home, cwd);
-	const { roots, warnings } = await listClaudePluginRoots(home, cwd);
+	await invalidateClaudePluginRoots(home, cwd, isolatedHome);
+	const { roots, warnings } = await listClaudePluginRoots(home, cwd, isolatedHome, homeIdentity);
 	const filteredRoots: ClaudePluginRoot[] = [];
 	const filteredWarnings = allowedLevels.size === 2 ? [...warnings] : [];
 
 	for (const root of roots) {
 		if (!allowedLevels.has(root.scope)) continue;
-		if (await rootContainsGjcManifest(root.path)) {
+		const manifestReadOptions = isolatedHome
+			? {
+					isolatedHome: true,
+					home,
+					homeIdentity,
+					scope: "project" as const,
+					bypassCache: true,
+				}
+			: undefined;
+		if (await rootContainsGjcManifest(root.path, manifestReadOptions)) {
 			filteredWarnings.push(`[claude-plugins] Skipping gajae-code plugin root (binding-only): ${root.path}`);
 			continue;
 		}
@@ -126,17 +152,25 @@ export async function loadMarketplaceSkills(
 	const items: Skill[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd, allowedLevels);
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(
+		ctx.home,
+		ctx.cwd,
+		ctx.isolatedHome ?? false,
+		ctx.homeIdentity,
+		allowedLevels,
+	);
 	warnings.push(...rootWarnings);
 
 	const results = await Promise.all(
 		roots.map(async root => {
-			const { dir: skillsDir, warning } = await resolvePluginDir(root, ["skills"], "skills");
+			const { dir: skillsDir, warning } = await resolvePluginDir(ctx, root, ["skills"], "skills");
 			const result = await scanSkillsFromDir(ctx, {
 				dir: skillsDir,
 				providerId: PROVIDER_ID,
 				level: root.scope,
 				requireDescription: true,
+				containmentRoot: root.path,
+				scope: root.scope,
 			});
 			return { root, result, warning };
 		}),
@@ -162,14 +196,26 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 	const items: SlashCommand[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(
+		ctx.home,
+		ctx.cwd,
+		ctx.isolatedHome ?? false,
+		ctx.homeIdentity,
+	);
 	warnings.push(...rootWarnings);
 
 	const results = await Promise.all(
 		roots.map(async root => {
-			const { dir: commandsDir, warning } = await resolvePluginDir(root, ["commands", "slash-commands"], "commands");
+			const { dir: commandsDir, warning } = await resolvePluginDir(
+				ctx,
+				root,
+				["commands", "slash-commands"],
+				"commands",
+			);
 			const result = await loadFilesFromDir<SlashCommand>(ctx, commandsDir, PROVIDER_ID, root.scope, {
 				extensions: ["md"],
+				containmentRoot: root.path,
+				scope: root.scope,
 				transform: (name, content, filePath, source) => {
 					const cmdName = name.replace(/\.md$/, "");
 					return {
@@ -202,7 +248,12 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 	const items: Hook[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(
+		ctx.home,
+		ctx.cwd,
+		ctx.isolatedHome ?? false,
+		ctx.homeIdentity,
+	);
 	warnings.push(...rootWarnings);
 
 	const hookTypes = ["pre", "post"] as const;
@@ -218,6 +269,8 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 		loadTasks.map(async ({ root, hookType }) => {
 			const hooksDir = path.join(root.path, "hooks", hookType);
 			return loadFilesFromDir<Hook>(ctx, hooksDir, PROVIDER_ID, root.scope, {
+				containmentRoot: root.path,
+				scope: root.scope,
 				transform: (name, _content, filePath, source) => {
 					const toolName = name.replace(/\.(sh|bash|zsh|fish)$/, "");
 					return {
@@ -249,13 +302,20 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 	const items: CustomTool[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(
+		ctx.home,
+		ctx.cwd,
+		ctx.isolatedHome ?? false,
+		ctx.homeIdentity,
+	);
 	warnings.push(...rootWarnings);
 
 	const results = await Promise.all(
 		roots.map(async root => {
 			const toolsDir = path.join(root.path, "tools");
 			return loadFilesFromDir<CustomTool>(ctx, toolsDir, PROVIDER_ID, root.scope, {
+				containmentRoot: root.path,
+				scope: root.scope,
 				transform: (name, _content, filePath, source) => {
 					const toolName = name.replace(/\.(ts|js|sh|bash|py)$/, "");
 					return {
@@ -286,12 +346,20 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	const items: MCPServer[] = [];
 	const warnings: string[] = [];
 
-	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(ctx.home, ctx.cwd);
+	const { roots, warnings: rootWarnings } = await listNonGjcPluginRoots(
+		ctx.home,
+		ctx.cwd,
+		ctx.isolatedHome ?? false,
+		ctx.homeIdentity,
+	);
 	warnings.push(...rootWarnings);
 
 	for (const root of roots) {
-		const mcpPath = path.join(root.path, ".mcp.json");
-		const raw = await readFile(mcpPath);
+		const mcpPath = await canonicalizePathWithinHome(ctx, path.join(root.path, ".mcp.json"), root.path, root.scope);
+		if (!mcpPath) continue;
+		const readOptions = await getReadOptionsForContainment(ctx, root.scope, root.path);
+		if (ctx.isolatedHome && !readOptions) continue;
+		const raw = await readFile(mcpPath, readOptions);
 		if (raw === null) continue; // file absent — skip silently
 
 		let parsed: unknown;

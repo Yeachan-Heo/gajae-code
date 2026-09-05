@@ -11,10 +11,10 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { logger, tryParseJson } from "@gajae-code/utils";
 import { registerProvider } from "../capability";
-import { readFile } from "../capability/fs";
+import { type ReadFileOptions, readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
+import { canonicalizePathWithinHome, createSourceMeta, expandEnvVarsDeep, getReadOptions } from "./helpers";
 
 const PROVIDER_ID = "mcp-json";
 const DISPLAY_NAME = "MCP Config";
@@ -440,18 +440,40 @@ async function readExactMCPConfigFile(filePath: string): Promise<string | null> 
 export async function loadMCPJsonFile(
 	filePath: string,
 	level: "user" | "project",
-	options?: { quiet?: boolean; useCache?: boolean },
+	options?: { quiet?: boolean; useCache?: boolean; readOptions?: ReadFileOptions },
 ): Promise<MCPJsonLoadResult> {
 	const warnings: string[] = [];
 	const items: MCPServer[] = [];
+	let sourcePath = filePath;
+	if (options?.readOptions?.isolatedHome) {
+		if (typeof options.readOptions.home !== "string") {
+			if (options.quiet) warnings.push("MCP configuration unavailable");
+			return { items, warnings, disabledServers: [] };
+		}
+		const authorizedPath = await canonicalizePathWithinHome(
+			{
+				home: options.readOptions.home,
+				isolatedHome: true,
+				userAgentDir: options.readOptions.userAgentDir,
+			},
+			filePath,
+			undefined,
+			options.readOptions.scope ?? "project",
+		);
+		if (!authorizedPath) {
+			if (options.quiet) warnings.push("MCP configuration unavailable");
+			return { items, warnings, disabledServers: [] };
+		}
+		sourcePath = authorizedPath;
+	}
 
 	const content = options?.quiet
-		? await readExactMCPConfigFile(filePath)
+		? options.readOptions?.isolatedHome
+			? await readFile(sourcePath, { ...options.readOptions, bypassCache: true })
+			: await readExactMCPConfigFile(sourcePath)
 		: options?.useCache === false
-			? await Bun.file(filePath)
-					.text()
-					.catch(() => null)
-			: await readFile(filePath);
+			? await readFile(filePath, { ...options.readOptions, bypassCache: true })
+			: await readFile(filePath, options?.readOptions);
 	if (content === null) {
 		if (options?.quiet) warnings.push("MCP configuration unavailable");
 		return { items, warnings, disabledServers: [] };
@@ -474,7 +496,7 @@ export async function loadMCPJsonFile(
 	} else {
 		validConfig = config as MCPConfigFile;
 	}
-	const source = createSourceMeta(PROVIDER_ID, filePath, level);
+	const source = createSourceMeta(PROVIDER_ID, sourcePath, level);
 	items.push(...transformMCPConfig(validConfig, source, options?.quiet));
 
 	return {
@@ -490,7 +512,11 @@ export async function loadMCPJsonFile(
 async function load(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
 	const filenames = ["mcp.json", ".mcp.json"];
 	const results = await Promise.all(
-		filenames.map(filename => loadMCPJsonFile(path.join(ctx.cwd, filename), "project")),
+		filenames.map(filename =>
+			loadMCPJsonFile(path.join(ctx.cwd, filename), "project", {
+				readOptions: getReadOptions(ctx, "project"),
+			}),
+		),
 	);
 
 	const allItems = results.flatMap(r => r.items);

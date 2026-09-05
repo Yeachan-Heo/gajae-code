@@ -647,6 +647,18 @@ export function setAgentDir(dir: string): void {
 	process.env.GJC_CODING_AGENT_DIR = dir;
 }
 
+/**
+ * Rebuild the resolver from the current trusted environment. Callers that
+ * temporarily used {@link setAgentDir} must first restore the original
+ * GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR values, then call this function;
+ * an originally absent override remains absent and keeps following HOME.
+ */
+export function resetAgentDirFromEnvironment(): void {
+	const snapshot = dirs.trustSnapshot;
+	const override = trustedValue("GJC_CODING_AGENT_DIR", snapshot) ?? trustedValue("PI_CODING_AGENT_DIR", snapshot);
+	dirs = new DirResolver(override, snapshot);
+}
+
 /** Get the agent config directory (~/.gjc/agent). */
 export function getAgentDir(): string {
 	dirs.refreshConfigDirOverride();
@@ -712,7 +724,14 @@ export function getPluginsDir(home?: string): string {
 	if (home !== undefined) {
 		const explicitPath = () => path.join(home, resolveConfigDirName(dirs.trustSnapshot), "plugins");
 		try {
-			if (home !== dirs.trustedHome) return explicitPath();
+			const canonical = (value: string): string => {
+				try {
+					return fs.realpathSync.native(value);
+				} catch {
+					return path.resolve(value);
+				}
+			};
+			if (canonical(home) !== canonical(dirs.trustedHome)) return explicitPath();
 		} catch {
 			// An explicit home is the caller's documented escape hatch. If the
 			// authoritative home is unavailable, do not let its fail-closed resolver
@@ -972,9 +991,9 @@ export function getMCPConfigPath(scope: "user" | "project", cwd: string = getPro
 }
 
 /** Get the SSH config file path. */
-export function getSSHConfigPath(scope: "user" | "project", cwd: string = getProjectDir()): string {
+export function getSSHConfigPath(scope: "user" | "project", cwd: string = getProjectDir(), agentDir?: string): string {
 	if (scope === "user") {
-		return path.join(getAgentDir(), "ssh.json");
+		return path.join(agentDir ?? getAgentDir(), "ssh.json");
 	}
 	return path.join(getProjectAgentDir(cwd), "ssh.json");
 }

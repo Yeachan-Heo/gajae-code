@@ -6,10 +6,14 @@
  * and call them without the class instance. Before the constructor binding fix this threw:
  *   "undefined is not an object (evaluating 'this.#optionsForCall')"
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { create } from "@bufbuild/protobuf";
 import type { AgentEvent, AgentTool } from "@gajae-code/agent-core";
 import { dispatchedToolIdentity } from "@gajae-code/agent-core";
+import { runWithCursorExecDeadlineForTest } from "@gajae-code/ai/providers/cursor";
 import {
 	DeleteArgsSchema,
 	DiagnosticsArgsSchema,
@@ -23,6 +27,9 @@ import {
 	ShellArgsSchema,
 	WriteArgsSchema,
 } from "@gajae-code/ai/providers/cursor/gen/agent_pb";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
+import type { ToolSession } from "@gajae-code/coding-agent/tools";
+import { WriteTool } from "@gajae-code/coding-agent/tools/write";
 import { CursorExecHandlers } from "../src/cursor";
 
 function makeTool(name: string): AgentTool {
@@ -47,6 +54,18 @@ function makeHandlers(): CursorExecHandlers {
 	return new CursorExecHandlers({ cwd: process.cwd(), tools } as never);
 }
 
+function createToolSession(cwd: string): ToolSession {
+	return {
+		cwd,
+		hasUI: false,
+		getSessionFile: () => path.join(cwd, "session.jsonl"),
+		getSessionSpawns: () => "*",
+		getArtifactsDir: () => path.join(cwd, "artifacts"),
+		allocateOutputArtifact: async () => ({ id: "artifact-1", path: path.join(cwd, "artifact-1.log") }),
+		settings: Settings.isolated(),
+	};
+}
+
 describe("CursorExecHandlers detached invocation (#484)", () => {
 	it("read works when called detached without losing #optionsForCall", async () => {
 		const handlers = makeHandlers();
@@ -56,6 +75,282 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 		expect(result.isError).toBeFalsy();
 		expect(result.toolName).toBe("read");
 	});
+
+	it("passes cancellation to native writes and rejects an already-aborted write", async () => {
+		const signals: AbortSignal[] = [];
+		const writeTool = {
+			name: "write",
+			label: "write",
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				if (signal) signals.push(signal);
+				return { content: [{ type: "text" as const, text: "written" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const controller = new AbortController();
+		const args = create(WriteArgsSchema, { path: "state.txt", fileText: "state", toolCallId: "write-1" });
+
+		await handlers.write(args, controller.signal);
+		expect(signals).toEqual([controller.signal]);
+
+		controller.abort(new Error("timed out"));
+		await expect(handlers.write(args, controller.signal)).rejects.toThrow("timed out");
+		expect(signals).toEqual([controller.signal]);
+	});
+
+	it("marks a production non-abortable Pi write before dispatch", async () => {
+		const writeTool = { ...makeTool("write"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		let marked = false;
+		await handlers.piWrite({
+			args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+			toolCallId: "archive-write",
+			markNonAbortable: () => {
+				marked = true;
+			},
+		});
+		expect(marked).toBe(true);
+	});
+	it("marks a production non-abortable native write before dispatch", async () => {
+		const writeTool = { ...makeTool("write"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		let marked = false;
+		await handlers.write(
+			create(WriteArgsSchema, { path: "native.txt", fileText: "body", toolCallId: "native-write" }),
+			undefined,
+			() => {
+				marked = true;
+			},
+		);
+		expect(marked).toBe(true);
+	});
+	it("withholds cancellation and delays terminal settlement for a native non-abortable write", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const observedSignals: Array<AbortSignal | undefined> = [];
+		const writeTool = {
+			...makeTool("write"),
+			nonAbortable: true,
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				observedSignals.push(signal);
+				started.resolve();
+				await release.promise;
+				return { content: [{ type: "text" as const, text: "written" }], details: {} };
+			},
+		} as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const controller = new AbortController();
+		let terminalSettled = false;
+		const pending = runWithCursorExecDeadlineForTest(
+			(signal, markNonAbortable) =>
+				handlers.write(
+					create(WriteArgsSchema, { path: "native.txt", fileText: "body", toolCallId: "native-held" }),
+					signal,
+					markNonAbortable,
+				),
+			controller.signal,
+			20,
+		).finally(() => {
+			terminalSettled = true;
+		});
+
+		await started.promise;
+		controller.abort(new Error("caller cancelled native write"));
+		await Bun.sleep(25);
+		expect(observedSignals).toEqual([undefined]);
+		expect(terminalSettled).toBe(false);
+		release.resolve();
+		await expect(pending).rejects.toThrow("Cursor local exec exceeded its 20ms deadline");
+		expect(terminalSettled).toBe(true);
+	});
+	it("propagates a closed admission marker instead of returning a tool error", async () => {
+		const writeTool = { ...makeTool("write"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		const marker = new Error("Cursor non-abortable exec was marked after wrapper terminalization");
+		marker.name = "CursorExecAdmissionClosedError";
+
+		await expect(
+			handlers.write(
+				create(WriteArgsSchema, { path: "native.txt", fileText: "body", toolCallId: "closed-admission" }),
+				undefined,
+				() => {
+					throw marker;
+				},
+			),
+		).rejects.toBe(marker);
+	});
+
+	it("marks a production non-abortable Pi edit before dispatch", async () => {
+		const editTool = { ...makeTool("edit"), nonAbortable: true };
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["edit", editTool]]) } as never);
+		let marked = false;
+		await handlers.piEdit({
+			args: create(PiEditExecArgsSchema, {
+				path: "edited.txt",
+				edits: [{ oldText: "a", newText: "b" }],
+			}),
+			toolCallId: "pi-edit",
+			markNonAbortable: () => {
+				marked = true;
+			},
+		});
+		expect(marked).toBe(true);
+	});
+	it("withholds the abort signal from a non-abortable tool so its promise is true settlement", async () => {
+		const controller = new AbortController();
+		const seen: Array<AbortSignal | undefined> = [];
+		const writeTool = {
+			...makeTool("write"),
+			nonAbortable: true,
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				seen.push(signal);
+				return { content: [{ type: "text" as const, text: "done" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		await handlers.piWrite({
+			args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+			toolCallId: "archive-write-nosignal",
+			signal: controller.signal,
+			markNonAbortable: () => {},
+		});
+		// The per-exec signal reaches the bridge, but a non-abortable tool must
+		// receive undefined: untilAborted(signal, ...) would reject early and let
+		// the settlement fence publish the terminal while the mutation still runs.
+		expect(seen).toEqual([undefined]);
+	});
+
+	it("prevents signal-aware archive execution from settling before its detached mutation", async () => {
+		const controller = new AbortController();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		let archiveMutationCount = 0;
+		let dispatchedSignal: AbortSignal | undefined;
+		const writeTool = {
+			...makeTool("write"),
+			nonAbortable: true,
+			execute: async (_toolCallId: string, _args: Record<string, unknown>, signal?: AbortSignal) => {
+				dispatchedSignal = signal;
+				started.resolve();
+				const detachedMutation = release.promise.then(() => {
+					archiveMutationCount += 1;
+				});
+				if (signal) {
+					const aborted = Promise.withResolvers<never>();
+					const rejectOnAbort = () => aborted.reject(signal.reason);
+					if (signal.aborted) rejectOnAbort();
+					else signal.addEventListener("abort", rejectOnAbort, { once: true });
+					// This models the production failure mode: an abort-aware wrapper can
+					// reject while its underlying archive mutation remains detached.
+					await Promise.race([detachedMutation, aborted.promise]);
+				} else {
+					await detachedMutation;
+				}
+				return { content: [{ type: "text" as const, text: "done" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map([["write", writeTool]]) } as never);
+		let bridgeSettled = false;
+		const pending = handlers
+			.piWrite({
+				args: create(PiWriteExecArgsSchema, { path: "archive.zip:entry.txt", content: "next" }),
+				toolCallId: "archive-write-cancelled",
+				signal: controller.signal,
+				markNonAbortable: () => {},
+			})
+			.then(
+				() => ({ ok: true as const }),
+				error => ({ ok: false as const, error }),
+			)
+			.then(outcome => {
+				bridgeSettled = true;
+				return outcome;
+			});
+
+		await started.promise;
+		controller.abort(new Error("caller cancelled archive mutation"));
+		await Bun.sleep(10);
+		const settledBeforeMutation = bridgeSettled;
+		expect(dispatchedSignal).toBeUndefined();
+
+		release.resolve();
+		const outcome = await pending;
+		expect(settledBeforeMutation).toBe(false);
+		expect(outcome).toEqual({ ok: true });
+		expect(archiveMutationCount).toBe(1);
+	});
+
+	for (const termination of ["caller abort", "local deadline"] as const) {
+		it(`keeps the ${termination} terminal behind a production archive commit`, async () => {
+			const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-archive-terminal-"));
+			const archivePath = path.join(tmpDir, "state.zip");
+			const commitStarted = Promise.withResolvers<void>();
+			const releaseCommit = Promise.withResolvers<void>();
+			const operationSettled = Promise.withResolvers<void>();
+			const realRename = fs.rename.bind(fs);
+			let mutationCount = 0;
+			let mutationCountAtTerminal: number | undefined;
+			let terminalPublished = false;
+			const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+				if (String(to) === archivePath) {
+					commitStarted.resolve();
+					await releaseCommit.promise;
+					await realRename(from, to);
+					mutationCount += 1;
+					return;
+				}
+				await realRename(from, to);
+			});
+
+			try {
+				const writeTool = new WriteTool(createToolSession(tmpDir));
+				const handlers = new CursorExecHandlers({ cwd: tmpDir, tools: new Map([["write", writeTool]]) } as never);
+				const controller = new AbortController();
+				const pending = runWithCursorExecDeadlineForTest(
+					async (signal, markNonAbortable) => {
+						try {
+							return await handlers.piWrite({
+								args: create(PiWriteExecArgsSchema, { path: "state.zip:entry.txt", content: "next" }),
+								toolCallId: `archive-${termination}`,
+								signal,
+								markNonAbortable,
+							});
+						} finally {
+							operationSettled.resolve();
+						}
+					},
+					termination === "caller abort" ? controller.signal : undefined,
+					20,
+				)
+					.then(
+						() => undefined,
+						() => undefined,
+					)
+					.then(() => {
+						terminalPublished = true;
+						mutationCountAtTerminal = mutationCount;
+					});
+
+				await commitStarted.promise;
+				if (termination === "caller abort") controller.abort(new Error("caller cancelled archive write"));
+				await Bun.sleep(5_200);
+				const terminalPublishedBeforeCommit = terminalPublished;
+				releaseCommit.resolve();
+				await operationSettled.promise;
+				await pending;
+
+				expect(terminalPublishedBeforeCommit).toBe(false);
+				expect(mutationCountAtTerminal).toBe(1);
+				expect(mutationCount).toBe(1);
+				await Bun.sleep(20);
+				expect(mutationCount).toBe(1);
+			} finally {
+				releaseCommit.resolve();
+				rename.mockRestore();
+				await fs.rm(tmpDir, { recursive: true, force: true });
+			}
+		}, 7_000);
+	}
 
 	it("a representative set of handlers all work detached", async () => {
 		const handlers = makeHandlers();
@@ -372,5 +667,25 @@ describe("CursorExecHandlers dispatched tool identity", () => {
 		const start = events.find(event => event.type === "tool_execution_start");
 		expect(start).toBeDefined();
 		expect(dispatchedToolIdentity(start as object)).toBeUndefined();
+	});
+
+	it("marks Cursor delete as a non-abortable mutation in the settlement fence", async () => {
+		const target = `${__dirname}/delete-fence-target.tmp`;
+		await Bun.write(target, "stale");
+		const handlers = new CursorExecHandlers({ cwd: process.cwd(), tools: new Map<string, AgentTool>() } as never);
+		let marked = false;
+		const controller = new AbortController();
+
+		const result = await handlers.delete(
+			create(DeleteArgsSchema, { path: target, toolCallId: "delete-fence-1" }),
+			controller.signal,
+			() => {
+				marked = true;
+			},
+		);
+
+		expect(marked).toBe(true);
+		expect(result.isError ?? false).toBe(false);
+		await controller.abort(new Error("post-delete abort"));
 	});
 });

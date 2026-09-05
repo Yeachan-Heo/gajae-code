@@ -134,7 +134,7 @@ const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_foun
 // on both sides of the anchor phrase), since a deterministic history fault such
 // as `Previous response's tool call ID is malformed.` must stay fatal:
 // replaying it re-sends the same offending item.
-const CODEX_PREVIOUS_RESPONSE_ID_TOKEN = String.raw`previous[ _-]response[ _-]id`;
+const CODEX_PREVIOUS_RESPONSE_ID_TOKEN = `previous[ _-]response[ _-]id`;
 // Prose anchor reference ("Previous response with id 'resp_1' not found."):
 // the canonical `previous_response_not_found` wording, which codex-lb re-codes
 // as `invalid_request_error` the same way it re-codes the anchor-expiry fault
@@ -146,7 +146,7 @@ const CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN = `previous[ _-]response`;
 // the same offending item. Tempering the qualifier⇄token scan against these
 // tokens keeps them fatal while pure anchor-stale prose still matches.
 const CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD = `tool[ _]calls?|function[ _]calls?|custom[ _]tools?|call[ _-]?ids?|message[ _]?ids?|items?\\b|output[ _-]?items?`;
-const CODEX_ANCHOR_STALE_QUALIFIER = String.raw`invalid|expired|unknown|stale|not[ _-]?found|no longer`;
+const CODEX_ANCHOR_STALE_QUALIFIER = `invalid|expired|unknown|stale|not[ _-]?found|no longer`;
 const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE = new RegExp(
 	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})[^\\n]{0,48}?${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}` +
 		`|${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}[^\\n]{0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})`,

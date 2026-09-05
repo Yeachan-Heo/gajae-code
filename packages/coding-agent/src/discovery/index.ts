@@ -59,6 +59,7 @@ export {
 	listCapabilities,
 	// Loading API
 	loadCapability,
+	loadCapabilityForHome,
 	releaseSettingsScope,
 	// Cache management
 	reset,

@@ -852,21 +852,58 @@ export interface CursorShellStreamCallbacks {
 export interface CursorPiCall<TArgs> {
 	args: TArgs;
 	toolCallId: string;
+	/** Per-exec cancellation signal; aborted when the caller aborts or the local exec deadline fires. */
+	signal?: AbortSignal;
+	/** Marks a started mutation that must settle before Cursor can terminalize the exec. */
+	markNonAbortable?: () => void;
 }
 
 export interface CursorExecHandlers {
-	read?: (args: ReadArgs) => Promise<CursorExecHandlerResult<ReadResult>>;
-	ls?: (args: LsArgs) => Promise<CursorExecHandlerResult<LsResult>>;
-	grep?: (args: GrepArgs) => Promise<CursorExecHandlerResult<GrepResult>>;
-	write?: (args: WriteArgs) => Promise<CursorExecHandlerResult<WriteResult>>;
-	delete?: (args: DeleteArgs) => Promise<CursorExecHandlerResult<DeleteResult>>;
-	shell?: (args: ShellArgs) => Promise<CursorExecHandlerResult<ShellResult>>;
+	read?: (
+		args: ReadArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<ReadResult>>;
+	ls?: (
+		args: LsArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<LsResult>>;
+	grep?: (args: GrepArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<GrepResult>>;
+	write?: (
+		args: WriteArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable mutation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<WriteResult>>;
+	delete?: (
+		args: DeleteArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable mutation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<DeleteResult>>;
+	shell?: (
+		args: ShellArgs,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	shellStream?: (
 		args: ShellArgs,
 		callbacks: CursorShellStreamCallbacks,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
-	diagnostics?: (args: DiagnosticsArgs) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
-	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;
+	diagnostics?: (args: DiagnosticsArgs, signal?: AbortSignal) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
+	mcp?: (
+		call: CursorMcpCall,
+		signal?: AbortSignal,
+		/** Marks a started non-abortable operation so the exec terminal waits for settlement. */
+		markNonAbortable?: () => void,
+	) => Promise<CursorExecHandlerResult<McpResult>>;
 	piRead?: (call: CursorPiCall<PiReadExecArgs>) => Promise<CursorExecHandlerResult<PiReadExecResult>>;
 	piBash?: (call: CursorPiCall<PiBashExecArgs>) => Promise<CursorExecHandlerResult<PiBashExecResult>>;
 	piEdit?: (call: CursorPiCall<PiEditExecArgs>) => Promise<CursorExecHandlerResult<PiEditExecResult>>;

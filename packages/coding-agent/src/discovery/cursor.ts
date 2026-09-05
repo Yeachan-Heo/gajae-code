@@ -25,7 +25,15 @@ import { ruleCapability } from "../capability/rule";
 import type { Settings } from "../capability/settings";
 import { settingsCapability } from "../capability/settings";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { buildRuleFromMarkdown, createSourceMeta, getProjectPath, getUserPath, loadFilesFromDir } from "./helpers";
+import {
+	buildRuleFromMarkdown,
+	canonicalizePathWithinHome,
+	createSourceMeta,
+	getProjectPath,
+	getReadOptions,
+	getUserPath,
+	loadFilesFromDir,
+} from "./helpers";
 
 const PROVIDER_ID = "cursor";
 const DISPLAY_NAME = "Cursor";
@@ -79,15 +87,20 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const items: Settings[] = [];
 	const warnings: string[] = [];
 
-	const userPath = getUserPath(ctx, "cursor", "settings.json");
+	const rawUserPath = getUserPath(ctx, "cursor", "settings.json");
+	const rawProjectPath = getProjectPath(ctx, "cursor", "settings.json");
 
-	const [userContent, projectPath] = await Promise.all([
-		userPath ? readFile(userPath) : Promise.resolve(null),
-		getProjectPath(ctx, "cursor", "settings.json"),
+	const [userPath, projectPath] = await Promise.all([
+		rawUserPath ? canonicalizePathWithinHome(ctx, rawUserPath, undefined, "user") : Promise.resolve(null),
+		rawProjectPath ? canonicalizePathWithinHome(ctx, rawProjectPath, undefined, "project") : Promise.resolve(null),
 	]);
 
-	const projectContentPromise = projectPath ? readFile(projectPath) : Promise.resolve(null);
+	const userContentPromise = userPath ? readFile(userPath, getReadOptions(ctx, "user")) : Promise.resolve(null);
+	const projectContentPromise = projectPath
+		? readFile(projectPath, getReadOptions(ctx, "project"))
+		: Promise.resolve(null);
 
+	const userContent = await userContentPromise;
 	if (userContent && userPath) {
 		const parsed = tryParseJson<Record<string, unknown>>(userContent);
 		if (parsed) {

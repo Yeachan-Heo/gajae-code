@@ -3,6 +3,12 @@
 ## [Unreleased]
 ### Fixed
 
+- Ordinary Agents, AGENTS.md, and Cline project discovery again walks parent directories when the working tree is outside the user home and has no detected repository root; explicit-home isolation remains bounded to its supplied home. The non-Linux isolation path now runs in the Windows affected CI lane (#4834 review).
+- Explicit-home capability discovery now validates only the selected provider roots, isolates plugin-root caching from ordinary loads, and rejects configured extension paths that escape the canonical home.
+- `loadCapabilityForHome` no longer falls back to the process-global agent directory when an explicit home is supplied. The user agent directory is derived from the supplied home (`<home>/<configDir>/agent`) unless the caller passes an explicit `agentDir`, and a non-absolute home fails closed instead of silently resolving against the process profile. Explicit-home loads can no longer read another profile's SYSTEM.md/RULES.md/AGENTS.md, skills, commands, hooks, settings, or custom-tool descriptors; a decoy-process-profile test instruments every filesystem read across all eight surfaces to prove zero reads escape the supplied home (#4834).
+- An explicit `agentDir` redirect now applies uniformly to native user-scope surfaces instead of only to MCP: `loadCapability`/`loadCapabilityForHome` set the context user scope only for an explicit agent directory, and the native SYSTEM.md, RULES.md, skills, config-dir, and AGENTS.md loaders resolve user paths from it. The process-default (no explicit `agentDir`) layout is unchanged (#4834 review).
+- `loadCapability` keeps `getAgentDir()` as the DEFAULT context user scope for native surfaces, so a process-selected non-default profile (GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR / setAgentDir()) is never split across two directories: an explicit `options.agentDir` still wins, and `loadCapabilityForHome` still derives its scope from the supplied home (#4834 review).
+
 - When every auto-compaction candidate fails, the reported error now leads with the first candidate's failure and lists each candidate that was tried with its own error. The chain starts at the session model and ends on a same-provider largest-context fallback, so surfacing only the final error named a model the user never chose (e.g. `openai-codex/gpt-5.4` on an `astra` preset session) and hid that their own model had already failed the same way.
 
 ## [0.16.4] - 2026-09-05
@@ -127,6 +133,10 @@
 - Coordinator projection consumers now retry a bounded number of fresh authoritative scans when concurrent session churn races a candidate. Cap exhaustion, owner disappearance, unsupported authority, and parse failures remain fail-closed, while settled concurrent SDK sessions no longer permanently starve the session reaper or coordinator mutations. (#5168)
 
 - Coordinator session-state locks now reclaim an empty, identity-qualified released transition tombstone on POSIX after a short release grace period. Live, foreign, malformed, non-empty, or identity-changed claims remain fail-closed, while persistent macOS/File Provider debris no longer burns the full transition timeout on every state write. (#5159)
+- Fresh SDK and print sessions now admit a matching credential- and endpoint-scoped discovered-model cache before validating an explicit provider/model, and revalidate pre-existing dynamic targets against the selected row; caller-supplied registries stay immutable while foreign credentials and unknown models remain fail-closed.
+
+- `gjc auth-gateway serve` now requires `--provider=<id>`; existing unscoped invocations must choose the provider whose source-backed model catalog and broker credential the gateway should expose.
+- `gjc auth-gateway serve` verifies an enabled broker credential before binding and reports only redacted provider-scoped status/check information.
 
 - A runtime-state marker recorded against a different workspace path now reports that mismatch instead of claiming the file is unreadable, and a terminal, not-live marker that travelled into the current workspace with its session directory is adopted rather than refused. Live, non-terminal, and out-of-workspace markers are still refused untouched.
 - An unavailable provider-qualified `modelRoles.default` selection now reports the requested model instead of silently starting on another provider's baseline. This keeps signed-registry omissions and failed catalog admission actionable rather than routing requests to an unrelated retired model. (#5144)

@@ -1,5 +1,6 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { LoadContext } from "@gajae-code/coding-agent/capability/types";
@@ -12,6 +13,18 @@ function context(cwd: string, repoRoot: string): LoadContext {
 }
 
 describe("AGENTS.md discovery bounds", () => {
+	test("walks ordinary projects outside home through their parent directories", async () => {
+		const root = path.join(path.sep, "repo");
+		const cwd = path.join(root, "packages", "app");
+		const calls: string[] = [];
+		await loadAgentsMd({ cwd, home: path.join(path.sep, "unrelated-home"), repoRoot: null }, async candidate => {
+			calls.push(candidate);
+			return { content: null, byteLength: 0, tooLarge: false };
+		});
+
+		expect(calls).toContain(path.join(root, "AGENTS.md"));
+	});
+
 	test("limits ancestor candidates to 32 directories and passes the per-file byte limit to its reader", async () => {
 		const root = path.join(path.sep, "repo");
 		const cwd = path.join(root, ...Array.from({ length: 32 }, (_value, index) => `level-${index}`));
@@ -123,6 +136,24 @@ describe("AGENTS.md discovery bounds", () => {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});
+	test.skipIf(process.platform === "win32")("rejects a hardlinked candidate in isolated-home mode", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-hardlink-"));
+		const home = path.join(tempDir, "home");
+		const project = path.join(home, "project");
+		const outside = path.join(tempDir, "outside.md");
+		const candidate = path.join(project, "AGENTS.md");
+		try {
+			fs.mkdirSync(project, { recursive: true });
+			fs.writeFileSync(outside, "outside instructions");
+			fs.linkSync(outside, candidate);
+			await expect(loadAgentsMd({ cwd: project, home, repoRoot: project, isolatedHome: true })).resolves.toEqual({
+				items: [],
+				warnings: [],
+			});
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 	test("ignores non-regular AGENTS.md candidates", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-"));
 		const agentPath = path.join(tempDir, "AGENTS.md");
@@ -159,6 +190,71 @@ describe("AGENTS.md discovery bounds", () => {
 				// No pending reader remains after the non-blocking descriptor check.
 			}
 			await loadPromise.catch(() => {});
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+	test.skipIf(process.platform === "win32")(
+		"rejects a leaf symlink swap after explicit-home canonicalization",
+		async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-race-"));
+			const home = path.join(tempDir, "home");
+			const project = path.join(home, "project");
+			const candidate = path.join(project, "AGENTS.md");
+			const outside = path.join(tempDir, "outside.md");
+			const backup = path.join(project, "AGENTS.safe.md");
+			await fsPromises.mkdir(project, { recursive: true });
+			await fsPromises.writeFile(candidate, "safe instructions");
+			await fsPromises.writeFile(outside, "outside instructions");
+			let swapped = false;
+			const realOpen = fsPromises.open.bind(fsPromises);
+			const openSpy = spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+				const [filePath] = args;
+				if (!swapped && String(filePath) === candidate) {
+					swapped = true;
+					await fsPromises.rename(candidate, backup);
+					await fsPromises.symlink(outside, candidate);
+				}
+				return await realOpen(...args);
+			});
+			try {
+				const result = await loadAgentsMd({ cwd: project, home, repoRoot: project, isolatedHome: true });
+				expect(swapped).toBe(true);
+				expect(result.items).toEqual([]);
+			} finally {
+				openSpy.mockRestore();
+				fs.rmSync(tempDir, { recursive: true, force: true });
+			}
+		},
+	);
+	test.skipIf(process.platform === "win32")("rejects an ancestor symlink swap during an isolated read", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-agents-md-ancestor-race-"));
+		const home = path.join(tempDir, "home");
+		const project = path.join(home, "project");
+		const movedProject = path.join(home, "project-original");
+		const outside = path.join(tempDir, "outside");
+		const candidate = path.join(project, "AGENTS.md");
+		const outsideCandidate = path.join(outside, "AGENTS.md");
+		await fsPromises.mkdir(project, { recursive: true });
+		await fsPromises.mkdir(outside, { recursive: true });
+		await fsPromises.writeFile(candidate, "safe instructions");
+		await fsPromises.writeFile(outsideCandidate, "outside instructions");
+		let swapped = false;
+		const realOpen = fsPromises.open.bind(fsPromises);
+		const openSpy = spyOn(fsPromises, "open").mockImplementation(async (...args) => {
+			const [filePath] = args;
+			if (!swapped && String(filePath) === candidate) {
+				swapped = true;
+				await fsPromises.rename(project, movedProject);
+				await fsPromises.symlink(outside, project, "dir");
+			}
+			return await realOpen(...args);
+		});
+		try {
+			const result = await loadAgentsMd({ cwd: project, home, repoRoot: project, isolatedHome: true });
+			expect(swapped).toBe(true);
+			expect(result.items).toEqual([]);
+		} finally {
+			openSpy.mockRestore();
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	});

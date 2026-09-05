@@ -126,6 +126,23 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		expect(windowsContract.run).toContain("constructing or restarting provider transport cannot mutate session lifecycle");
 	});
 
+	test("keeps Windows dev-doctor requiredness aligned with its explicit-home eligibility paths", async () => {
+		const d = await workflow();
+		const eligibility = String(requiredJob(d, "windows-dev-doctor").if);
+		const affected = requiredJob(d, "affected");
+		const producer = requiredJob(d, "affected-evidence-producer");
+		const producerRequired = requiredEnvValue(namedStep(producer, "Produce affected evidence"), "CI_DEV_WINDOWS_DOCTOR_REQUIRED");
+		const affectedRequired = requiredEnvValue(affected, "CI_DEV_WINDOWS_DOCTOR_REQUIRED");
+		for (const changedPath of [
+			"packages/coding-agent/src/capability/fs.ts",
+			"packages/coding-agent/test/pr-4834-home-isolation.test.ts",
+		]) {
+			expect(eligibility).toContain(changedPath);
+			expect(producerRequired).toContain(changedPath);
+			expect(affectedRequired).toContain(changedPath);
+		}
+	});
+
 	test("keeps affected validation pinned while reserving an explicit virtual-integration dispatch head", async () => {
 		const d = await workflow();
 		const dispatchInputs = Object.keys(d.on.workflow_dispatch.inputs);
@@ -282,5 +299,11 @@ describe("dev-ci Telegram daemon generation guard topology", () => {
 		// static workflow gate fail. Concurrency admits only group +
 		// cancel-in-progress; queue depth is platform-controlled.
 		expect(Object.keys(raw!).sort()).toEqual(["cancel-in-progress", "group"]);
+	});
+	test("dispatch workflow admission cannot deadlock its virtual integration job", async () => {
+		const source = await Bun.file(".github/workflows/dev-ci.yml").text();
+		const workflowConcurrency = source.match(/group:\s*>-\s*\n\s*\$\{\{[\s\S]*?cancel-in-progress:/)?.[0] ?? "";
+		expect(workflowConcurrency).toContain("format('dev-ci-dispatch-{0}', github.run_id)");
+		expect(workflowConcurrency).not.toContain("'dev-ci-virtual-integration'");
 	});
 });

@@ -291,6 +291,23 @@ describe("explicit MCP JSON exact-file trust", () => {
 		expect(result.items.map(server => server.name)).toEqual(["exact"]);
 		expect(result.warnings).toEqual([]);
 	});
+	test("quiet isolated loading reads the authorized canonical path", async () => {
+		const home = path.join(tempDir, "home");
+		const realPath = path.join(home, "real.json");
+		const linkedPath = path.join(home, "linked.json");
+		await fs.mkdir(home, { recursive: true });
+		await fs.writeFile(realPath, exactConfigText("canonical"));
+		await fs.symlink(realPath, linkedPath, "file");
+
+		const result = await loadMCPJsonFile(linkedPath, "project", {
+			quiet: true,
+			useCache: false,
+			readOptions: { isolatedHome: true, home },
+		});
+
+		expect(result.items.map(server => server.name)).toEqual(["canonical"]);
+		expect(result.warnings).toEqual([]);
+	});
 	test("reports unavailable exact config paths with the generic warning", async () => {
 		const result = await loadMCPJsonFile(path.join(tempDir, "missing.json"), "project", {
 			quiet: true,

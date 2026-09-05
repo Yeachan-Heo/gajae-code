@@ -32,9 +32,11 @@ import type { Settings as RuntimeSettings } from "../config/settings";
 
 import {
 	buildExtensionModuleItems,
+	canonicalizePathWithinHome,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	getProjectPath,
+	getReadOptions,
 	getUserPath,
 	loadFilesFromDir,
 	scanSkillsFromDir,
@@ -53,9 +55,12 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const warnings: string[] = [];
 
 	// User-level only: ~/.config/opencode/AGENTS.md
-	const userAgentsMd = getUserPath(ctx, "opencode", "AGENTS.md");
+	const rawUserAgentsMd = getUserPath(ctx, "opencode", "AGENTS.md");
+	const userAgentsMd = rawUserAgentsMd
+		? await canonicalizePathWithinHome(ctx, rawUserAgentsMd, undefined, "user")
+		: null;
 	if (userAgentsMd) {
-		const content = await readFile(userAgentsMd);
+		const content = await readFile(userAgentsMd, getReadOptions(ctx, "user"));
 		if (content) {
 			items.push({
 				path: userAgentsMd,
@@ -115,8 +120,10 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 	const projectPluginsDir = getProjectPath(ctx, "opencode", "plugins");
 
 	const [userPaths, projectPaths] = await Promise.all([
-		userPluginsDir ? discoverExtensionModulePaths(ctx, userPluginsDir) : Promise.resolve([]),
-		projectPluginsDir ? discoverExtensionModulePaths(ctx, projectPluginsDir) : Promise.resolve([]),
+		userPluginsDir ? discoverExtensionModulePaths(ctx, userPluginsDir, { scope: "user" }) : Promise.resolve([]),
+		projectPluginsDir
+			? discoverExtensionModulePaths(ctx, projectPluginsDir, { scope: "project" })
+			: Promise.resolve([]),
 	]);
 
 	const items = buildExtensionModuleItems(PROVIDER_ID, userPaths, projectPaths);
@@ -201,9 +208,12 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<SettingsCapabi
 	const warnings: string[] = [];
 
 	// User-level: ~/.config/opencode/opencode.json
-	const userConfigPath = getUserPath(ctx, "opencode", "opencode.json");
+	const rawUserConfigPath = getUserPath(ctx, "opencode", "opencode.json");
+	const userConfigPath = rawUserConfigPath
+		? await canonicalizePathWithinHome(ctx, rawUserConfigPath, undefined, "user")
+		: null;
 	if (userConfigPath) {
-		const content = await readFile(userConfigPath);
+		const content = await readFile(userConfigPath, getReadOptions(ctx, "user"));
 		if (content) {
 			const parsed = tryParseJson<Record<string, unknown>>(content);
 			if (parsed) {
@@ -220,19 +230,26 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<SettingsCapabi
 	}
 
 	// Project-level: opencode.json in project root
-	const projectConfigPath = path.join(ctx.cwd, "opencode.json");
-	const content = await readFile(projectConfigPath);
-	if (content) {
-		const parsed = tryParseJson<Record<string, unknown>>(content);
-		if (parsed) {
-			items.push({
-				path: projectConfigPath,
-				data: parsed,
-				level: "project",
-				_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
-			});
-		} else {
-			warnings.push(`Invalid JSON in ${projectConfigPath}`);
+	const projectConfigPath = await canonicalizePathWithinHome(
+		ctx,
+		path.join(ctx.cwd, "opencode.json"),
+		undefined,
+		"project",
+	);
+	if (projectConfigPath) {
+		const content = await readFile(projectConfigPath, getReadOptions(ctx, "project"));
+		if (content) {
+			const parsed = tryParseJson<Record<string, unknown>>(content);
+			if (parsed) {
+				items.push({
+					path: projectConfigPath,
+					data: parsed,
+					level: "project",
+					_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
+				});
+			} else {
+				warnings.push(`Invalid JSON in ${projectConfigPath}`);
+			}
 		}
 	}
 

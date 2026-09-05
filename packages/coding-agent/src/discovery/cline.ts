@@ -6,21 +6,38 @@
  */
 import * as path from "node:path";
 import { registerProvider } from "../capability";
-import { readDirEntries, readFile } from "../capability/fs";
+import { type ReadFileOptions, readDirEntries, readFile } from "../capability/fs";
 import type { Rule } from "../capability/rule";
 import { ruleCapability } from "../capability/rule";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { buildRuleFromMarkdown, createSourceMeta, loadFilesFromDir } from "./helpers";
+import {
+	buildRuleFromMarkdown,
+	canonicalizePathWithinHome,
+	createSourceMeta,
+	getReadOptions,
+	loadFilesFromDir,
+} from "./helpers";
 
 const PROVIDER_ID = "cline";
 const DISPLAY_NAME = "Cline";
 const PRIORITY = 40;
 
-async function findClinerules(startDir: string): Promise<{ path: string; isDir: boolean } | null> {
+async function findClinerules(
+	startDir: string,
+	stopAt: string,
+	readOptions?: ReadFileOptions,
+): Promise<{ path: string; isDir: boolean } | null> {
 	let current = path.resolve(startDir);
+	const resolvedStop = path.resolve(stopAt);
+	const relativeStop = path.relative(resolvedStop, current);
+	const effectiveStop =
+		relativeStop === "" ||
+		(relativeStop !== ".." && !relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+			? resolvedStop
+			: current;
 
 	while (true) {
-		const entries = await readDirEntries(current);
+		const entries = await readDirEntries(current, readOptions);
 		const entry = entries.find(e => e.name === ".clinerules");
 		if (entry) {
 			return {
@@ -29,7 +46,7 @@ async function findClinerules(startDir: string): Promise<{ path: string; isDir: 
 			};
 		}
 		const parent = path.dirname(current);
-		if (parent === current) return null;
+		if (current === effectiveStop || parent === current) return null;
 		current = parent;
 	}
 }
@@ -42,7 +59,13 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	const warnings: string[] = [];
 
 	// Project-level only (Cline uses root-level .clinerules)
-	const found = await findClinerules(ctx.cwd);
+	const homeRelative = path.relative(ctx.home, ctx.cwd);
+	const cwdIsWithinHome =
+		homeRelative === "" ||
+		(homeRelative !== ".." && !homeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(homeRelative));
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : path.parse(ctx.cwd).root);
+	const readOptions = getReadOptions(ctx, "project");
+	const found = await findClinerules(ctx.cwd, stopDirectory, readOptions);
 	if (!found) {
 		return { items, warnings };
 	}
@@ -60,14 +83,19 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		if (result.warnings) warnings.push(...result.warnings);
 	} else {
 		// Single file format
-		const content = await readFile(found.path);
+		const filePath = await canonicalizePathWithinHome(ctx, found.path, undefined, "project");
+		if (!filePath) {
+			warnings.push(`Refusing to read .clinerules outside the supplied home at ${found.path}`);
+			return { items, warnings };
+		}
+		const content = await readFile(filePath, readOptions);
 		if (content === null) {
-			warnings.push(`Failed to read .clinerules at ${found.path}`);
+			warnings.push(`Failed to read .clinerules at ${filePath}`);
 			return { items, warnings };
 		}
 
-		const source = createSourceMeta(PROVIDER_ID, found.path, "project");
-		items.push(buildRuleFromMarkdown("clinerules.md", content, found.path, source, { ruleName: "clinerules" }));
+		const source = createSourceMeta(PROVIDER_ID, filePath, "project");
+		items.push(buildRuleFromMarkdown("clinerules.md", content, filePath, source, { ruleName: "clinerules" }));
 	}
 
 	return { items, warnings };

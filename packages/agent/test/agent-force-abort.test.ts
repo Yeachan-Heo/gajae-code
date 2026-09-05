@@ -349,6 +349,70 @@ describe("Agent.forceAbort", () => {
 		await expect(secondPrompt).resolves.toBeUndefined();
 	});
 
+	it("preserves Pi handlers and forwards abort signals to native Cursor handlers", async () => {
+		const model = createMockModel();
+		const stream = new AssistantMessageEventStream();
+		let capturedHandlers: CursorExecHandlers | undefined;
+		const nativeSignals: AbortSignal[] = [];
+		const piSignals: AbortSignal[] = [];
+		let nativeMarkerForwarded = false;
+		const streamFn: StreamFn = (_selectedModel, _context, options?: SimpleStreamOptions) => {
+			capturedHandlers = options?.cursorExecHandlers;
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: model.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			cursorExecHandlers: {
+				write: async (args, signal, markNonAbortable) => {
+					if (signal) nativeSignals.push(signal);
+					if (markNonAbortable) nativeMarkerForwarded = true;
+					return {
+						role: "toolResult",
+						toolCallId: args.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+				piWrite: async call => {
+					if (call.signal) piSignals.push(call.signal);
+					return {
+						role: "toolResult",
+						toolCallId: call.toolCallId,
+						toolName: "write",
+						content: [],
+						isError: false,
+						timestamp: Date.now(),
+					};
+				},
+			},
+			streamFn,
+		});
+
+		const prompt = agent.prompt("run");
+		await waitForStreaming(agent);
+		const handlers = await waitForCapturedCursorHandlers(() => capturedHandlers);
+		const controller = new AbortController();
+		await handlers.write?.(
+			{ $typeName: "agent.v1.WriteArgs", path: "state.txt", fileText: "state", toolCallId: "native" } as Parameters<
+				NonNullable<CursorExecHandlers["write"]>
+			>[0],
+			controller.signal,
+			() => {},
+		);
+		await handlers.piWrite?.({ args: {} as never, toolCallId: "pi", signal: controller.signal });
+
+		expect(nativeSignals).toEqual([controller.signal]);
+		expect(piSignals).toEqual([controller.signal]);
+		// The Agent run guard must forward the third markNonAbortable argument
+		// so the native write path can activate the settlement fence.
+		expect(nativeMarkerForwarded).toBe(true);
+
+		stream.push({ type: "done", reason: "stop", message: createAssistantMessage([{ type: "text", text: "done" }]) });
+		await expect(prompt).resolves.toBeUndefined();
+	});
+
 	it("drops partial thinking and tool-use from replay history when a streamed turn is aborted", async () => {
 		const model = createMockModel({ responses: [{ content: ["after abort"] }] });
 		const firstStream = new AssistantMessageEventStream();

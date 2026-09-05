@@ -18,7 +18,9 @@ import type { LoadContext, LoadResult } from "../capability/types";
 import {
 	buildRuleFromMarkdown,
 	calculateDepth,
+	canonicalizePathWithinHome,
 	createSourceMeta,
+	getReadOptions,
 	loadFilesFromDir,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -46,13 +48,24 @@ function getUserPathCandidates(ctx: LoadContext, ...segments: string[]): string[
 export function getProjectPathCandidates(ctx: LoadContext, ...segments: string[]): string[] {
 	const paths: string[] = [];
 	let current = ctx.cwd;
+	const homeRelative = path.relative(ctx.home, ctx.cwd);
+	const cwdIsWithinHome =
+		homeRelative === "" ||
+		(homeRelative !== ".." && !homeRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(homeRelative));
+	const stopDirectory = ctx.repoRoot ?? (ctx.isolatedHome || cwdIsWithinHome ? ctx.home : path.parse(ctx.cwd).root);
+	const relativeStop = path.relative(stopDirectory, ctx.cwd);
+	const effectiveStopDirectory =
+		relativeStop === "" ||
+		(relativeStop !== ".." && !relativeStop.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeStop))
+			? stopDirectory
+			: ctx.cwd;
 	while (true) {
 		if (current !== ctx.home) {
 			for (const baseDir of AGENT_DIR_CANDIDATES) {
 				paths.push(path.join(current, baseDir, ...segments));
 			}
 		}
-		if (current === (ctx.repoRoot ?? ctx.home)) break;
+		if (current === effectiveStopDirectory) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
@@ -181,12 +194,21 @@ registerProvider<SlashCommand>(slashCommandCapability.id, {
 // Context Files (AGENTS.md)
 async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
 	const load = async (filePath: string, level: "user" | "project"): Promise<ContextFile | null> => {
-		const content = await readFile(filePath);
+		const scope = level === "user" ? "user" : "project";
+		const canonicalPath = await canonicalizePathWithinHome(ctx, filePath, undefined, scope);
+		if (!canonicalPath) return null;
+		const content = await readFile(canonicalPath, getReadOptions(ctx, scope));
 		if (!content) return null;
-		// filePath is <ancestor>/.agent(s)/AGENTS.md — go up past the config dir to the ancestor
-		const ancestorDir = path.dirname(path.dirname(filePath));
+		// canonicalPath is <ancestor>/.agent(s)/AGENTS.md — go up past the config dir to the ancestor
+		const ancestorDir = path.dirname(path.dirname(canonicalPath));
 		const depth = level === "project" ? calculateDepth(ctx.cwd, ancestorDir, path.sep) : undefined;
-		return { path: filePath, content, level, depth, _source: createSourceMeta(PROVIDER_ID, filePath, level) };
+		return {
+			path: canonicalPath,
+			content,
+			level,
+			depth,
+			_source: createSourceMeta(PROVIDER_ID, canonicalPath, level),
+		};
 	};
 
 	const results = await Promise.all([
@@ -208,9 +230,12 @@ registerProvider<ContextFile>(contextFileCapability.id, {
 // System Prompt (SYSTEM.md)
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const load = async (filePath: string, level: "user" | "project"): Promise<SystemPrompt | null> => {
-		const content = await readFile(filePath);
+		const scope = level === "user" ? "user" : "project";
+		const canonicalPath = await canonicalizePathWithinHome(ctx, filePath, undefined, scope);
+		if (!canonicalPath) return null;
+		const content = await readFile(canonicalPath, getReadOptions(ctx, scope));
 		if (!content) return null;
-		return { path: filePath, content, level, _source: createSourceMeta(PROVIDER_ID, filePath, level) };
+		return { path: canonicalPath, content, level, _source: createSourceMeta(PROVIDER_ID, canonicalPath, level) };
 	};
 
 	const results = await Promise.all([
