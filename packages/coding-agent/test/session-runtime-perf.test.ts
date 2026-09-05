@@ -143,6 +143,55 @@ describe("session runtime cache hot paths", () => {
 		}
 	});
 
+	it("bounds unresolved pre-cache generations across repeated invalidation", async () => {
+		using dir = TempDir.createSync("precache-generation-bound-");
+		const filePath = path.resolve(dir.path(), "file.txt");
+		await Bun.write(filePath, "old");
+		const session = createSession(dir.path());
+		const reads: Array<ReturnType<typeof Promise.withResolvers<string>>> = [];
+		const firstStarted = Promise.withResolvers<void>();
+		const secondStarted = Promise.withResolvers<void>();
+		const originalRead = fs.promises.readFile;
+		const readSpy = spyOn(fs.promises, "readFile").mockImplementation(((...args: Parameters<typeof originalRead>) => {
+			if (String(args[0]) !== filePath) return originalRead(...args);
+			const pending = Promise.withResolvers<string>();
+			reads.push(pending);
+			if (reads.length === 1) firstStarted.resolve();
+			if (reads.length === 2) secondStarted.resolve();
+			return pending.promise;
+		}) as typeof originalRead);
+		try {
+			const invalidate = () =>
+				session.agent.emitExternalEvent({
+					type: "message_end",
+					message: {
+						role: "toolResult",
+						toolCallId: "edit",
+						toolName: "edit",
+						content: [{ type: "text", text: "ok" }],
+						details: { path: filePath },
+						isError: false,
+						timestamp: Date.now(),
+					},
+				});
+			startEdit(session, filePath, "first");
+			await firstStarted.promise;
+			invalidate();
+			await settleEvents();
+			startEdit(session, filePath, "second");
+			await secondStarted.promise;
+			invalidate();
+			startEdit(session, filePath, "third");
+			await settleEvents();
+			expect(readSpy).toHaveBeenCalledTimes(2);
+			for (const pending of reads) pending.resolve("stale");
+			await settleEvents();
+		} finally {
+			for (const pending of reads) pending.resolve("stale");
+			readSpy.mockRestore();
+		}
+	});
+
 	it("keeps only the current permission wrapper across bridge and provider replacements", () => {
 		using dir = TempDir.createSync("wrapper-generations-");
 		const tool: AgentTool = {
