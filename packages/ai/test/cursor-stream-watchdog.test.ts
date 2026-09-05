@@ -1585,6 +1585,30 @@ describe("Cursor raw transport watchdog", () => {
 		expect(events.filter(isTerminalEvent)).toHaveLength(1);
 	});
 
+	it("keeps a non-zero gRPC trailer authoritative after turnEnded", async () => {
+		const baseUrl = await createCursorServer(stream => {
+			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });
+			stream.on("wantTrailers", () => {
+				stream.sendTrailers({ "grpc-status": "13", "grpc-message": "late%20failure" });
+			});
+			setTimeout(() => {
+				sendInteractionUpdate(stream, {
+					case: "turnEnded",
+					value: create(TurnEndedUpdateSchema, {}),
+				});
+				stream.end();
+			}, 10);
+		});
+
+		const { events, result } = await collectTerminal(baseUrl, {
+			streamIdleTimeoutMs: 100,
+			streamFirstEventTimeoutMs: 500,
+		});
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("gRPC error 13: late failure");
+		expect(events.filter(isTerminalEvent)).toHaveLength(1);
+	});
+
 	it("drops buffered execs when a gRPC trailer failure closes admission", async () => {
 		const baseUrl = await createCursorServer(stream => {
 			stream.respond({ ":status": 200, "content-type": "application/connect+proto" }, { waitForTrailers: true });

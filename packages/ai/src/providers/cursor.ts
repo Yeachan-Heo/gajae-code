@@ -323,6 +323,7 @@ export interface CursorOptions extends StreamOptions {
 
 const CONNECT_END_STREAM_FLAG = 0b00000010;
 const CURSOR_MAX_PENDING_SERVER_MESSAGES = 256;
+const CURSOR_MAX_QUEUED_SERVER_BYTES = 64 * 1024 * 1024;
 // Connect frames routinely carry tool payloads and checkpoint blobs larger than
 // 4 KiB. Keep a finite protocol bound for hostile peers, but do not reject
 // valid server messages merely because they exceed the old debug-text limit.
@@ -332,6 +333,8 @@ const CURSOR_MAX_GRPC_MESSAGE_LENGTH = 16 * 1024 * 1024;
 // a complete frame while parser backpressure is active; additional input is a
 // protocol failure rather than silently dropping raw progress.
 const CURSOR_MAX_PENDING_SERVER_BYTES = CURSOR_MAX_GRPC_MESSAGE_LENGTH + 5;
+const CURSOR_MAX_BLOB_STORE_ENTRIES = 256;
+const CURSOR_MAX_BLOB_STORE_BYTES = 64 * 1024 * 1024;
 const CURSOR_MAX_GRPC_ERROR_MESSAGE_LENGTH = 4096;
 const CURSOR_EXEC_DEADLINE_MULTIPLIER = 4;
 const CURSOR_MIN_EXEC_DEADLINE_MS = 100;
@@ -1616,7 +1619,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				);
 			};
 			h2Request.on("trailers", trailers => {
-				if (terminalBoundarySeen || terminalBoundaryObserved || sawTurnEnded) return;
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
@@ -1820,6 +1822,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						pendingBuffer.clear();
 						break;
 					}
+					if (messageQueue.pendingBytes() + consumedFrameLength > CURSOR_MAX_QUEUED_SERVER_BYTES) {
+						terminalize(new Error("Cursor server-message queue exceeded its bounded byte capacity"));
+						break;
+					}
 
 					try {
 						const serverMessage = fromBinary(AgentServerMessageSchema, messageBytes);
@@ -1982,7 +1988,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 									}
 								}
 							}
-						});
+						}, consumedFrameLength);
 						void queued.catch(() => {});
 						// Terminal bookkeeping belongs to the validated frame boundary,
 						// before parser backpressure can break this loop. The queued handler
@@ -2371,13 +2377,15 @@ function handleKvServerMessage(
 	} else if (kvCase === "setBlobArgs") {
 		const { blobId, blobData } = kvMsg.message.value;
 		const blobIdKey = Buffer.from(blobId).toString("hex");
-		blobStore.set(blobIdKey, blobData);
+		const stored = storeCursorServerBlob(blobStore, blobIdKey, blobData);
 
 		const response = create(KvClientMessageSchema, {
 			id: kvMsg.id,
 			message: {
 				case: "setBlobResult",
-				value: create(SetBlobResultSchema, {}),
+				value: create(SetBlobResultSchema, {
+					error: stored ? undefined : { message: "Cursor blob store exceeded its bounded capacity" },
+				}),
 			},
 		});
 
@@ -2390,6 +2398,33 @@ function handleKvServerMessage(
 
 		log("kvClient", "setBlobResult", { blobId: blobIdKey.slice(0, 40) });
 	}
+}
+
+function storeCursorServerBlob(
+	blobStore: Map<string, Uint8Array>,
+	blobId: string,
+	blobData: Uint8Array,
+	limits: { maxEntries: number; maxBytes: number } = {
+		maxEntries: CURSOR_MAX_BLOB_STORE_ENTRIES,
+		maxBytes: CURSOR_MAX_BLOB_STORE_BYTES,
+	},
+): boolean {
+	const existingBytes = blobStore.get(blobId)?.byteLength ?? 0;
+	let totalBytes = 0;
+	for (const value of blobStore.values()) totalBytes += value.byteLength;
+	if (!blobStore.has(blobId) && blobStore.size >= limits.maxEntries) return false;
+	if (totalBytes - existingBytes + blobData.byteLength > limits.maxBytes) return false;
+	blobStore.set(blobId, blobData);
+	return true;
+}
+
+export function storeCursorBlobForTest(
+	blobStore: Map<string, Uint8Array>,
+	blobId: string,
+	blobData: Uint8Array,
+	limits: { maxEntries: number; maxBytes: number },
+): boolean {
+	return storeCursorServerBlob(blobStore, blobId, blobData, limits);
 }
 
 function sendShellStreamEvent(
@@ -3293,17 +3328,22 @@ export async function resolveExecHandler<TArgs, TResult>(
 }
 
 /** Exported for deterministic coverage of ordered server-message handling. */
-export function createCursorMessageQueueForTest(onError?: (error: unknown) => void): {
-	enqueue(handler: () => void | Promise<void>): Promise<void>;
+export function createCursorMessageQueueForTest(
+	onError?: (error: unknown) => void,
+	maxPendingBytes = CURSOR_MAX_QUEUED_SERVER_BYTES,
+): {
+	enqueue(handler: () => void | Promise<void>, byteSize?: number): Promise<void>;
 	drain(): Promise<void>;
 	pending(): number;
+	pendingBytes(): number;
 } {
 	let chain = Promise.resolve();
 	let pending = 0;
+	let pendingBytes = 0;
 	let closed = false;
 	let hasAdmittedTask = false;
 	return {
-		enqueue(handler) {
+		enqueue(handler, byteSize = 0) {
 			if (closed) return Promise.reject(new Error("Cursor server-message queue is closed"));
 			if (pending >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
 				const error = new Error("Cursor server-message queue exceeded its bounded capacity");
@@ -3311,7 +3351,14 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 				onError?.(error);
 				return Promise.reject(error);
 			}
+			if (byteSize < 0 || pendingBytes + byteSize > maxPendingBytes) {
+				const error = new Error("Cursor server-message queue exceeded its bounded byte capacity");
+				closed = true;
+				onError?.(error);
+				return Promise.reject(error);
+			}
 			pending += 1;
+			pendingBytes += byteSize;
 			let result: Promise<void>;
 			if (!hasAdmittedTask) {
 				hasAdmittedTask = true;
@@ -3325,6 +3372,7 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 			}
 			const accounting = result.finally(() => {
 				pending -= 1;
+				pendingBytes -= byteSize;
 			});
 			chain = accounting.catch(error => {
 				onError?.(error);
@@ -3336,6 +3384,9 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 		},
 		pending() {
 			return pending;
+		},
+		pendingBytes() {
+			return pendingBytes;
 		},
 	};
 }

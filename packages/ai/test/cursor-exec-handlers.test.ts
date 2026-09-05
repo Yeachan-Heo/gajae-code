@@ -9,6 +9,7 @@ import {
 	createCursorMessageQueueForTest,
 	disposeCursorConversation,
 	resolveExecHandler,
+	storeCursorBlobForTest,
 	streamCursor,
 	waitForCursorWriteDrainForTest,
 	waitForCursorWritesForTest,
@@ -549,6 +550,31 @@ describe("Cursor request writer teardown", () => {
 		);
 		expect(closed).toBe(true);
 		expect(destroyed).toBe(true);
+	});
+});
+
+describe("Cursor hostile server storage bounds", () => {
+	it("rejects queued decoded bytes beyond the aggregate budget and releases accounting", async () => {
+		const release = Promise.withResolvers<void>();
+		const queue = createCursorMessageQueueForTest(undefined, 10);
+		const first = queue.enqueue(() => release.promise, 8);
+		expect(queue.pendingBytes()).toBe(8);
+		await expect(queue.enqueue(() => {}, 3)).rejects.toThrow("bounded byte capacity");
+		release.resolve();
+		await first;
+		expect(queue.pendingBytes()).toBe(0);
+	});
+
+	it("rejects blob entry and byte growth without evicting retained values", () => {
+		const blobs = new Map<string, Uint8Array>();
+		expect(storeCursorBlobForTest(blobs, "a", new Uint8Array(4), { maxEntries: 2, maxBytes: 6 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, "b", new Uint8Array(2), { maxEntries: 2, maxBytes: 6 })).toBe(true);
+		expect(storeCursorBlobForTest(blobs, "c", new Uint8Array(1), { maxEntries: 2, maxBytes: 6 })).toBe(false);
+		expect(storeCursorBlobForTest(blobs, "a", new Uint8Array(5), { maxEntries: 2, maxBytes: 6 })).toBe(false);
+		expect([...blobs.entries()].map(([id, value]) => [id, value.byteLength])).toEqual([
+			["a", 4],
+			["b", 2],
+		]);
 	});
 });
 

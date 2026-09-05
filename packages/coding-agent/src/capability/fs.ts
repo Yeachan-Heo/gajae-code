@@ -376,6 +376,11 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 	const authorized = await statAuthorizedPath(abs, options);
 	if (options?.isolatedHome && authorized === null) return [];
 	try {
+		if (!options?.isolatedHome) {
+			const entries = await fs.promises.readdir(abs, { withFileTypes: true });
+			if (useCache) dirCache.set(abs, entries);
+			return entries;
+		}
 		// Linux can enumerate a pinned directory descriptor through /proc. Node
 		// does not expose an equivalent descriptor path on macOS or Windows, so
 		// use direct readdir only after validating the authorized path both before
@@ -387,12 +392,11 @@ export async function readDirEntries(dirPath: string, options?: ReadFileOptions)
 			if (useCache) dirCache.set(abs, entries);
 			return entries;
 		}
-		const noFollow = options?.isolatedHome ? (fs.constants.O_NOFOLLOW ?? 0) : 0;
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
 		const directoryOnly = fs.constants.O_DIRECTORY ?? 0;
 		handle = await fs.promises.open(abs, fs.constants.O_RDONLY | noFollow | directoryOnly);
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
-		const directoryPath =
-			process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : options?.isolatedHome ? null : abs;
+		const directoryPath = process.platform === "linux" ? `/proc/self/fd/${handle.fd}` : null;
 		if (directoryPath === null) return [];
 		if (!(await validateOpenedPath(handle, abs, options, authorized, "directory"))) return [];
 		const entries = await fs.promises.readdir(directoryPath, { withFileTypes: true });

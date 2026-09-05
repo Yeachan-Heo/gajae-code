@@ -355,6 +355,22 @@ describe("PR #4834: loadCapabilityForHome never falls back to the process profil
 		}
 	});
 
+	test("ordinary Linux directory discovery does not depend on procfs", async () => {
+		if (process.platform !== "linux") return;
+		const ordinaryDir = path.join(tempDir, "ordinary-discovery");
+		await writeFile(path.join(ordinaryDir, "skill.md"), "content");
+		const realReaddir = fs.readdir.bind(fs);
+		vi.spyOn(fs, "readdir").mockImplementation(((target: nfs.PathLike, options?: nfs.ObjectEncodingOptions) => {
+			if (String(target).startsWith("/proc/self/fd/")) {
+				return Promise.reject(Object.assign(new Error("procfs unavailable"), { code: "ENOENT" }));
+			}
+			return realReaddir(target, options);
+		}) as unknown as typeof fs.readdir);
+
+		const entries = await readDirEntries(ordinaryDir);
+		expect(entries.map(entry => entry.name)).toEqual(["skill.md"]);
+	});
+
 	test("explicit home fails closed when its .gjc root redirects outside the profile", async () => {
 		const decoyRoot = path.join(tempDir, "decoy-profile", ".gjc");
 		await seedProfile(path.join(decoyRoot, "agent"), "decoy");
